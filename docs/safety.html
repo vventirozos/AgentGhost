@@ -140,7 +140,7 @@
       <h4>What the container can reach</h4>
       <ul>
         <li>One directory: <code>$GHOST_HOME/sandbox</code>, mounted as <code>/workspace</code>.</li>
-        <li>The internet, via Tor.</li>
+        <li>The internet, via Tor &mdash; <strong>transparently, since 2026-09-09</strong>: an in-container Tor plus iptables rules in the container's own network namespace send every TCP connection and every DNS query through Tor and reject everything else, loaded through a privileged exec the sandbox cannot undo. Before that date this line was <em>not true</em>: the container had direct egress from your real IP, and the code's own comments believed otherwise. Details and the measurements: <a href="sandbox/docker.html">the sandbox page</a>.</li>
         <li>Services it started itself.</li>
       </ul>
     </div>

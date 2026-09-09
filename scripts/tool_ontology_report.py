@@ -100,8 +100,8 @@ def main() -> int:
     if args.fs_batch_arms:
         arm_report = fs_batch_arm_uptake(
             TrajectoryCollector(root=root, session_id="reader")
-            .iter_trajectories())
-    _stream = collector.iter_trajectories()
+            .iter_trajectories(include_probes=True))  # corpus-purity report: every kind, probe turns included (§4FS review)
+    _stream = collector.iter_trajectories(include_probes=True)  # every kind, probes included (§4FS review)
     if args.simulate_fs_batch:
         _stream = simulate_fs_batch(_stream)
     macros = mine_sequences(
@@ -145,7 +145,7 @@ def main() -> int:
         from ghost_agent.utils.leaked_framing import scan_trajectories
         _pur = scan_trajectories(
             TrajectoryCollector(root=root, session_id="reader")
-            .iter_trajectories())
+            .iter_trajectories(include_probes=True))  # corpus-purity report: every kind, probe turns included (§4FS review)
         _n, _c = _pur["calls"], _pur["corrupt_calls"]
         _line = (f"corpus purity: {_c} of {_n} tool calls carried leaked "
                  f"tool-call framing and were EXCLUDED "

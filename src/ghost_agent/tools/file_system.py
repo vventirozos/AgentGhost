@@ -3183,6 +3183,25 @@ def _download_redirect_target(status, headers, cur_url, ssrf_reason):
     return None, None
 
 
+#: A plain-curl identity for the retry a refused Tor request gets. Cloudflare
+#: answers a Chrome-impersonating client from a Tor exit with a challenge
+#: page (HTTP 403, text/html) while a plain curl over the SAME circuit gets
+#: the file — measured three for three on 2026-09-09. The retry stays on
+#: Tor: the agent's egress is Tor-only, and no message may suggest otherwise.
+_PLAIN_PROFILE_UA = "curl/8.7.1"
+
+
+def _server_name(resp) -> str:
+    """The `Server:` header, bounded and printable — remote-controlled text
+    that lands in a message the model reads (review, 2026-09-09)."""
+    try:
+        raw = str(resp.headers.get("server") or "").strip()
+    except Exception:  # noqa: BLE001
+        raw = ""
+    raw = "".join(ch for ch in raw if ch.isprintable())[:40]
+    return raw or "the server"
+
+
 async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filename: str = None):
     # --- SSRF guard (shared) ---
     # Block file:// and internal/metadata hosts BEFORE any fetch, so the
@@ -3216,6 +3235,7 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
 
     headers = {"User-Agent": "Mozilla/5.0"}
     last_error = None
+    _plain = False           # switched on by the first Tor refusal (see _PLAIN_PROFILE_UA)
     for attempt in range(3):
         try:
             if curl_requests:
@@ -3224,7 +3244,10 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
                     target_path = _get_safe_path(sandbox_dir, filename)
                 except ValueError as ve: return str(ve)
                 
-                async with curl_requests.AsyncSession(impersonate="chrome110", proxies=proxies, timeout=60.0) as client:
+                async with curl_requests.AsyncSession(
+                        impersonate=(None if _plain else "chrome110"),
+                        headers=({"User-Agent": _PLAIN_PROFILE_UA} if _plain else None),
+                        proxies=proxies, timeout=60.0) as client:
                     # Manual redirect follow (auto-redirect OFF) so each hop's
                     # Location is SSRF-validated before we fetch it.
                     cur_url = url
@@ -3252,6 +3275,20 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
                         # unbounded response queue in RAM the whole 5s.
                         await _aclose_curl(resp)
                         if resp.status_code in [401, 403, 503] and mode == "TOR":
+                            # ⚠ RECORD THE REFUSAL. This path re-tried with a fresh Tor
+                            # identity and left `last_error` at None, so three Cloudflare
+                            # 403s reported as "Failed after 3 attempts. Last error: None"
+                            # — the model retried the same tool blind (§4FR, 2026-09-09).
+                            last_error = (f"HTTP {resp.status_code} from {_server_name(resp)} "
+                                          f"({'plain' if _plain else 'chrome110'} profile)")
+                            if not _plain:
+                                # The site refused the FINGERPRINT, not the exit: the
+                                # next attempt uses a plain curl identity on the same
+                                # circuit, without spending 5 s on a new one (review,
+                                # 2026-09-09). `continue` — this branch sits AFTER the
+                                # hop loop, inside the attempt loop.
+                                _plain = True
+                                continue
                             await asyncio.to_thread(request_new_tor_identity)
                             await asyncio.sleep(5)
                             continue
@@ -3307,6 +3344,11 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
                                 continue  # closes this stream, re-requests the validated hop
                             if resp.status_code != 200:
                                 if resp.status_code in [401, 403, 503] and mode == "TOR":
+                                    # ⚠ RECORD THE REFUSAL. This path re-tried with a fresh Tor
+                                    # identity and left `last_error` at None, so three Cloudflare
+                                    # 403s reported as "Failed after 3 attempts. Last error: None"
+                                    # — the model retried the same tool blind (§4FR, 2026-09-09).
+                                    last_error = (f"HTTP {resp.status_code} from {_server_name(resp)}")
                                     # Rotation happens ONCE below the hop
                                     # loop — rotating here too doubled the
                                     # identity churn + 10s of sleep per retry.
@@ -3360,6 +3402,26 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
                 await asyncio.sleep(5)
                 continue
             
+    if mode == "TOR":
+        # The host's egress is Tor, and some sites answer a browser-shaped
+        # Tor client with a challenge page (Cloudflare: HTTP 403, text/html)
+        # while a plain curl from the sandbox — which has its own direct
+        # egress by design, see sandbox/docker.py — gets the file. Say so,
+        # and name that route: the model's only other option is to retry
+        # this one, which it did twice on 2026-09-09 (request probe, §4FR).
+        # §4FS review: a first version recommended `curl` from the sandbox.
+        # The sandbox's egress is cleartext from the host IP (docker.py sets
+        # no proxy; under host networking its Tor cannot bind), and the
+        # agent's rule is Tor-only — a tool message must not steer the model
+        # through that hole. The plain-profile retry above is the honest
+        # remedy; past it, the file has to come from the user.
+        return (
+            f"Error: Failed after 3 attempts over Tor — {last_error or 'no usable response'}. "
+            "Tried a browser profile and a plain curl profile over Tor; the site refuses this "
+            "agent from Tor exits, and retrying this tool will not change that. The agent's "
+            "egress is Tor-only by policy: ask the user to provide the file or a mirror that "
+            "accepts Tor. Do NOT fetch it any other way."
+        )
     return f"Error: Failed after 3 attempts. Last error: {last_error}"
 
 async def tool_file_search(pattern: str, sandbox_dir: Path, filename: str = None, sandbox_manager=None):

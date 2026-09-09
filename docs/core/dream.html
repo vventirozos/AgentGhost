@@ -368,6 +368,23 @@
   cut, and it only became possible because the calls carry labels &mdash; which is why the unlabelled ones
   were labelled rather than left for the next person to guess at.</p>
 
+  <h2>Diagnostics never teach — now at the one place every learner reads <span class="tag">2026-09-09 &sect;4FS</span></h2>
+  <p>&sect;4FB gated the three outcome-credit sites on <code>turn_origin == "probe"</code>. The three LESSON producers were
+  never gated: the perfection protocol wrote three playbook lessons stamped <code>origin=probe</code> ("Optimization
+  Analysis: Run exactly this in the sandbox…"), and the dream seed and the post-mortem distilled two more from probe
+  trajectories and stamped them <code>auto</code> ("When executing shell commands, ensure the command is run verbatim…"
+  &mdash; a rule about the operator's diagnostic phrasing, hydrated into real shell tasks). Every one of the ~40 readers
+  of <code>TrajectoryCollector.iter_trajectories()</code> is a learner or a report, so the gate now lives there:
+  <code>task_kind == "probe"</code> records are skipped unless a caller passes <code>include_probes=True</code>. The
+  perfection protocol, which does not read the collector, is gated at both its scheduling and its write site. Four readers opt back in with a stated reason, because they are DETECTORS or explicit joins rather than learners: the
+  framing-leak health gauge and the tool-ontology corpus-purity report (a dialect regression that appears first in a
+  probe must still register), the human-feedback join (a label names one request explicitly) and the escalation
+  audit (the verifier ledger is not probe-gated). The five leaked lessons (and one more that criticised a successful
+  recovery) were retired through the archive-then-delete API &mdash; and because the retrieval path renders a
+  lesson's vector twin VERBATIM when its playbook row is gone, and the idle-phase orphan reconcile needs 15&ndash;60
+  min of idle plus a 2 h cooldown, the same reconcile now also runs at boot (review, 2026-09-09).
+  Pins: <code>tests/test_probe_never_teaches.py</code>.</p>
+
   <h2>Counterfactual replay — regression-of-learning, phase 1 (2026-07-17)</h2>
   <p><code>core/counterfactual.py</code>. Every concluded self-play sim now persists its
   challenge spec (prompt + setup + validator + outcome) to

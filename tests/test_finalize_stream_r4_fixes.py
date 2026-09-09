@@ -170,6 +170,15 @@ class TestIncrementalMechanism:
             chunks = await _drive(a, deltas)
             got = _client_text(chunks)
             want = naive_client(deltas)
+            # §4FS (2026-09-09): when prose survived and markup was
+            # scrubbed, the generator appends ONE note after the prose. The
+            # differential comparison stays byte-exact on the prose; the
+            # note's presence is pinned to "markup was actually scrubbed".
+            from ghost_agent.core.reply_smoothing import UNPARSED_TOOL_CALL_NOTE
+            _note_suffix = "\n\n" + UNPARSED_TOOL_CALL_NOTE
+            had_note = got.endswith(_note_suffix)
+            if had_note:
+                got = got[:-len(_note_suffix)]
             if not want.strip():
                 # the scrub consumed everything → the generator's deliberate
                 # EMPTY-OUTPUT FALLBACK fires (a feature, not a divergence).
@@ -180,6 +189,17 @@ class TestIncrementalMechanism:
                 assert got == want, (
                     f"stream {stream_no} diverged\ndeltas={deltas!r}\n"
                     f"got ={got!r}\nwant={want!r}")
+                # A statement about SHAPES, independent of the generator's
+                # regex: the note follows a CALL-shaped tag (tool_call /
+                # function / tool) that is not inline code and not a
+                # <tool_response> echo (review, 2026-09-09).
+                import re as _re
+                # …and an opening tag needs its '>' to be a tag at all
+                _call_shape = bool(_re.search(r"(?<!`)<(?:tool_call|function|tool)\b[^>]*>", joined, _re.I))
+                assert had_note == _call_shape, (
+                    f"stream {stream_no}: note {'present' if had_note else 'absent'} "
+                    f"but call-shaped markup {'found' if _call_shape else 'absent'}\n"
+                    f"joined={joined!r}")
 
 
 # ── R5: arm identity, not text property ──────────────────────────────────────

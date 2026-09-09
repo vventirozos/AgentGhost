@@ -166,12 +166,16 @@ class TestPreambleRollback:
         agent.available_tools = {"weather_lookup": weather}
         body = {"messages": [{"role": "user", "content": "what's the weather?"}]}
 
-        with patch("ghost_agent.core.agent.pretty_log"), \
+        with patch("ghost_agent.core.agent.pretty_log") as plog, \
              patch("ghost_agent.core.agent.get_active_tool_definitions",
                    return_value=[{"function": {"name": "weather_lookup"}}]):
             final, _, _ = await agent.handle_chat(body, FakeBgTasks())
 
-        # Both the legitimate preamble and the final answer must be present.
+        # The rollback must NOT fire: the real tool ran, and both the
+        # legitimate preamble and the answer are delivered. (Single-tool
+        # turns are not smoothed — the ≥2 gate, kept after §4FS's one-day
+        # trial of ≥1 — so the preamble reaches the user untouched.)
+        weather.assert_awaited()
         assert "Let me check the weather first" in final, (
             f"Legitimate preamble was dropped (false-positive rollback). final={final!r}"
         )

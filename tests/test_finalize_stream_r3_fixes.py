@@ -96,7 +96,12 @@ class TestIncrementalScrub:
         chunks = await _drive(a, [
             "pre ", "<tool_call>", "body one ", "body two ",
             "</tool_call>", " post text"])
-        assert _client_text(chunks) == "pre  post text"
+        # §4FS (2026-09-09): a PARTIAL scrub — prose survived, a tool call
+        # was swallowed — appends ONE note after the prose so the user knows
+        # the step never ran. The mechanism pin is unchanged: the prose is
+        # byte-exact, and the note follows it.
+        from ghost_agent.core.reply_smoothing import UNPARSED_TOOL_CALL_NOTE
+        assert _client_text(chunks) == "pre  post text\n\n" + UNPARSED_TOOL_CALL_NOTE
 
     @pytest.mark.asyncio
     async def test_unclosed_opener_spam_is_linear_enough(self):

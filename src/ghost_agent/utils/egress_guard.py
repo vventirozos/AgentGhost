@@ -51,8 +51,12 @@ the patch is on ``socket.socket`` (the CPython layer). It is BLIND to:
     socket guard cannot be).
   * **Subprocesses** — Chromium (playwright) and the docker sandbox have
     their own address space + libc; their egress is enforced by the
-    browser ``--proxy-server`` arg + in-runner SSRF interceptor and the
-    sandbox's internal Tor daemon, not by this patch.
+    browser ``--proxy-server`` arg + in-runner SSRF interceptor and, for
+    the sandbox, by TRANSPARENT Tor in the container's own network
+    namespace (in-container tor + iptables REDIRECT loaded through a
+    privileged exec the sandbox cannot undo — sandbox/tor_egress.py,
+    §4FU 2026-09-09; before that date this line claimed an "internal Tor
+    daemon" that never ran, and the sandbox was direct). Not by this patch.
   * **libc getaddrinfo** — a cleartext DNS lookup that precedes a (blocked)
     direct connect still leaks the target name. The real egress paths avoid
     it by using ``socks5h`` (DNS at the Tor exit) and ``resolve=not

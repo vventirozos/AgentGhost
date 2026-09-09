@@ -195,4 +195,8 @@ def test_browser_commit_retry_and_file_hint():
     assert "wait_until='commit'" in src or 'wait_until="commit"' in src
     from ghost_agent.tools.tool_failure import get_fallback_hint
     hint = get_fallback_hint("execute", "bash: line 1: file: command not found")
-    assert hint and "od -An" in hint
+    # §4FR (2026-09-09): `file` and `xxd` are INSTALLED since sandbox v7, so
+    # the hint no longer names workarounds for them — it teaches the
+    # availability probe and the generic byte-peek fallback instead.
+    assert hint and "command -v" in hint and "od -A" in hint
+    assert "`file <f>`" not in hint and "`xxd`" not in hint

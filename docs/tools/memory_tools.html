@@ -523,6 +523,19 @@
   <p><code>tool_recall</code> graded every hit HIGH / MEDIUM / LOW (distance &lt; 0.8 / &lt; 1.15 / &lt; 1.35) — into the operator's log only. The model saw "Found N highly relevant memories" over rows scored LOW, and invented a project codename from pg_stat notes (trajectories 929115b8, c8ee1d80). Each chunk now carries <code>RELEVANCE: &lt;grade&gt; (distance d)</code>, and the header names the best grade; an all-LOW recall reads <code>SYSTEM: Found N memories (best match: LOW — these are probably UNRELATED to the query; do not present them as facts about it).</code> That header is one of the empty shapes the <a href="../core/evidence_gate.html">evidence gate</a> recognises. Rows past the 1.35 cut are still dropped. Tests: <code>tests/test_4fd_tool_output_counts_and_relevance.py</code>.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+
+  <h2>A missing file is told what ingest does NOT do <span class="tag">2026-09-09 &sect;4FR</span></h2>
+  <p>Request d50a34bd, turn 1: the model called <code>knowledge_base(action='transcribe',
+  filename='postgresql-19-A4.pdf')</code> on a file it had not fetched yet, believing one call
+  downloads and indexes. The answer, "File not found. Check list_files to see the exact name", was
+  the wrong advice for this case &mdash; the file was never there, and listing the sandbox cannot help
+  &mdash; and the turn cost 40 s and a strike while the model worked out the download route by itself.
+  The message now says the action <strong>never downloads</strong> and names the route that does, in
+  the tool's own vocabulary: <code>file_system(operation='download', url='&lt;url&gt;', path='&lt;name&gt;')</code>,
+  and if that tool reports the site refuses it, ask the user for the file (never fetch it another way &mdash; the sandbox's egress is cleartext; review 2026-09-09), then call again with <code>filename='&lt;name&gt;'</code>; <code>list_files</code> is kept as the last
+  resort for a file that should already exist. The containment refusal (&sect;4DX) is a different branch
+  and keeps its own wording &mdash; a refused file must never read as a missing one; both are pinned
+  side by side in <code>tests/test_kb_ingest_not_found_message.py</code>.</p>
 </main>
 </body>
 </html>

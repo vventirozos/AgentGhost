@@ -369,7 +369,10 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
     is_web = filename.lower().startswith("http://") or filename.lower().startswith("https://")
     
     if is_web and filename.lower().split("?")[0].endswith(".pdf"):
-        return "Error: You cannot directly ingest a PDF URL. If you already downloaded it to the sandbox, pass the LOCAL FILENAME (e.g. 'document.pdf') instead of the URL. If you haven't downloaded it, use file_system(operation='download') first."
+        return ("Error: You cannot directly ingest a PDF URL. If you already downloaded it to the sandbox, "
+                "pass the LOCAL FILENAME (e.g. 'document.pdf') instead of the URL. If you haven't downloaded "
+                "it, use file_system(operation='download') first; if that tool reports the site refuses it, "
+                "ask the user to provide the file — do not fetch it any other way.")
 
     full_text = ""
     if is_web:
@@ -489,7 +492,26 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
                     if filename in current_library:
                         return f"Skipped: '{filename}' is already in KB."
                 else:
-                    return f"Error: File '{filename}' not found. Check list_files to see the exact name."
+                    # ⚠ SAY WHAT THIS ACTION DOES NOT DO. "Check list_files"
+                    # was the wrong advice for the common case: the model
+                    # called ingest on a file it had not fetched yet, believing
+                    # one call downloads and indexes (2026-09-09, request
+                    # d50a34bd — a wasted 40 s turn). The file was never there;
+                    # listing the sandbox cannot help. Name the route that can.
+                    # §4FS review: no "curl from the sandbox" fallback here — the
+                    # sandbox's egress is cleartext from the host IP, and the
+                    # agent's rule is Tor-only. The download tool now retries
+                    # a refused site with a plain profile over Tor itself.
+                    return (
+                        f"Error: File '{filename}' not found in the sandbox. This action "
+                        "never downloads — it reads a file that is ALREADY there. If the "
+                        "file lives at a URL, fetch it first with "
+                        f"file_system(operation='download', url='<the url>', path={filename!r}), "
+                        f"then call again with filename={filename!r}. If the download tool "
+                        "reports the site refuses it, ask the user to provide the file — do "
+                        "not fetch it any other way. If it should already exist, list_files "
+                        "shows the exact name."
+                    )
             except:
                 return f"Error: File '{filename}' not found."
                 

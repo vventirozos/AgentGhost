@@ -257,7 +257,7 @@ class _Col:
         self._t = traj
         self.updates = []
 
-    def iter_trajectories(self, day=None):
+    def iter_trajectories(self, day=None, include_probes=False):  # mirrors the real signature (§4FS)
         return iter([self._t])
 
     def update_outcome(self, tid, outcome, reason="", source="", **kw):

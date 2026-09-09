@@ -82,7 +82,9 @@ def _index_trajectories(root: Path, wanted: set) -> Dict[str, Any]:
         return out
     try:
         collector = TrajectoryCollector(root=root)
-        for t in collector.iter_trajectories():
+        # the verifier ledger is not probe-gated; join every kind so a probe row
+        # renders as what it is, not as a missing record (§4FS review)
+        for t in collector.iter_trajectories(include_probes=True):
             if t.id in wanted:
                 out[t.id] = t
                 if len(out) == len(wanted):

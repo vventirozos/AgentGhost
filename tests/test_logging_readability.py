@@ -43,7 +43,7 @@ def test_browser_uses_dedicated_icon():
 def test_docker_sandbox_titles_decollided():
     src = inspect.getsource(docker_mod)
     for t in ('"Sandbox Provision"', '"Sandbox Chromium"', '"Sandbox Ready"',
-              '"Sandbox Image"', '"Sandbox Tor"'):
+              '"Sandbox Image"', '"Sandbox Egress"'):   # §4FU: the Tor block became the egress enforcement
         assert t in src, f"missing distinct boot title {t}"
 
 

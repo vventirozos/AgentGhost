@@ -140,6 +140,9 @@ class TestWiring:
         assert "from .reply_smoothing import smooth_reply" in src
         idx = src.find("from .reply_smoothing import smooth_reply")
         window = src[idx - 600:idx]
+        # ≥2 real tool runs: the 2026-07-17 decision, kept after a one-day
+        # trial of ≥1 (§4FS review: pass 1 ate numbered instructions in
+        # single-tool turns).
         assert ">= 2" in window and "_synthetic" in window
 
     def test_prompt_forbids_repeated_summaries(self):

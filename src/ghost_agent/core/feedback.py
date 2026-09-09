@@ -100,7 +100,10 @@ def find_trajectory_for_request(collector: Any, request_id: str,
         day = (today - datetime.timedelta(days=back)).strftime("%Y-%m-%d")
         found = None
         try:
-            for traj in collector.iter_trajectories(day=day):
+            # A human label names ONE request explicitly; if that request was a
+            # probe, the label must still find it (outcome credit is probe-gated
+            # elsewhere) rather than be reported as a lost write. §4FS review.
+            for traj in collector.iter_trajectories(day=day, include_probes=True):
                 if _matches_request(traj, rid):
                     found = traj
         except Exception as e:  # noqa: BLE001 — a bad day file must not 500 the label

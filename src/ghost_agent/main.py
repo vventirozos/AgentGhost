@@ -3507,6 +3507,32 @@ def main():
         context.journal = MemoryJournal(context.memory_dir)
         context.skill_memory = SkillMemory(memory_dir)
         context.frontier_tracker = FrontierTracker(memory_dir)
+        # §4FS review: a pruned lesson's vector twin is rendered VERBATIM
+        # by the retrieval path when its playbook row is gone (skills.py,
+        # `text = … if lesson_entry else doc`), and the idle-phase reconcile
+        # that deletes orphans needs 15-60 min of idle plus a 2 h cooldown.
+        # Six lessons retired on 2026-09-09 kept teaching for hours. So:
+        # reconcile at boot too — best-effort, off the loop, the same call
+        # the idle cycle makes.
+        try:
+            _ms_boot = getattr(context, "memory_system", None)
+            if _ms_boot is not None:
+                import threading as _thr
+
+                def _boot_orphan_reconcile():
+                    try:
+                        _n = context.skill_memory.reconcile_vector_orphans(_ms_boot)
+                        if _n:
+                            pretty_log("Skill Store",
+                                       f"boot reconcile removed {_n} orphan lesson twin(s)",
+                                       icon=Icons.MEM_SAVE)
+                    except Exception as _e:  # noqa: BLE001
+                        logging.getLogger("GhostAgent").debug(
+                            "boot orphan reconcile skipped: %s", _e)
+                _thr.Thread(target=_boot_orphan_reconcile,
+                            name="skill-orphan-reconcile", daemon=True).start()
+        except Exception:  # noqa: BLE001
+            pass
     
     app = create_app()
     app.router.lifespan_context = lifespan

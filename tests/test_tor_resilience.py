@@ -200,8 +200,17 @@ async def test_tool_download_file_retry():
             result = await tool_download_file("http://example.com/file.txt", sandbox_mock, "socks5://127.0.0.1:9050", "file.txt")
         
         assert "SUCCESS" in result
-        assert mock_renew.call_count == 2
-        assert mock_sleep.call_count == 2
+        # §4FS review (2026-09-09): a REFUSAL (the 503) no longer rotates the
+        # identity — it switches the next attempt to a plain curl profile on
+        # the same circuit, because the site refused the fingerprint, not the
+        # exit. An EXCEPTION still rotates. So: one rotation, one sleep, and
+        # the second session must be the plain profile.
+        assert mock_renew.call_count == 1
+        assert mock_sleep.call_count == 1
+        sessions = mock_requests.AsyncSession.call_args_list
+        assert sessions[0].kwargs.get("impersonate") == "chrome110"
+        assert sessions[1].kwargs.get("impersonate") is None
+        assert sessions[1].kwargs.get("headers", {}).get("User-Agent", "").startswith("curl/")
 
 @pytest.mark.asyncio
 async def test_tool_get_weather_retry():

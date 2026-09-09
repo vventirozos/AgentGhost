@@ -64,6 +64,16 @@
   <p class="note"><strong>Reviewed residual — <code>verify=False</code> on the HTTPS checks.</strong> The weather / <code>1.1.1.1</code> / <code>check.torproject.org</code> fetches disable TLS verification (a Tor-exit-compatibility choice). This means the Tor-anonymity confirmation is forgeable by a malicious exit and forged weather bodies enter model context. Left as-is deliberately: flipping <code>verify</code> on the LIVE Tor path risks regressing the weather/health tools against exits with cert-handling quirks (the usual reason it was set), the threat model (an adversary controlling the operator's own Tor exit) is narrow, weather text is already treated as untrusted external content (same trust boundary as web_search), and the wrong-anonymity-label consequence is low-stakes. Revisit if the endpoints prove stable with verification on.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+
+  <h2>Weather over Tor: a refusal is recorded, not swallowed <span class="tag">2026-09-09 &sect;4FS</span></h2>
+  <p>The same retry shape the download tool had in &sect;4FR: a 401/403/503 from the geocoder, the forecast
+  API or the wttr.in fallback over Tor rotated the identity and <code>continue</code>d without touching
+  <code>last_error</code>, so three refusals reported <em>"Underlying: None"</em>. All six branches now record
+  <code>HTTP &lt;status&gt; from &lt;server&gt;</code> before retrying, so the existing Tor-mode message
+  ("the upstream weather APIs rejected the request") carries the status it saw. The server name is bounded to 40 printable characters (remote-controlled text the model reads), and a
+  geocoder answer of "no such place" clears an earlier transient refusal so the model still gets "Do NOT retry the
+  same name" (review, 2026-09-09). The sessions' <code>verify=False</code>
+  was reviewed earlier and left as documented residual; unchanged here. Pins: <code>tests/test_weather_tor_refusal.py</code>.</p>
 </main>
 </body>
 </html>

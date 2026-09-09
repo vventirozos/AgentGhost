@@ -149,9 +149,61 @@
     items whose content words are ≥55% Jaccard-covered by a later group of comparable
     size (≥60%) — the pre-verification summary; the last statement wins. Groups containing
     fences are never dropped.</li>
+    <li><strong>Shape 3 — stale announcement (2026-09-09, §4FR):</strong> a non-final
+    paragraph ≤300 chars containing a sentence that announces work in the progressive
+    behind a lead adverb ("… Now ingesting into the knowledge base.", "Next, indexing…")
+    is dropped when a LATER paragraph reports that verb as done (ingested / ingestion /
+    downloaded). Only then: an announcement nothing later completes may be the truth
+    ("Now ingesting in the background — I'll report back") and stays. Request d50a34bd's
+    reply opened with exactly this beat — the model's turn-3 progress line, delivered as
+    the first sentence of a finished job — and shape 1 could not see it because the
+    connective was the paragraph's SECOND sentence. The lead adverb is required (a bare
+    gerund is a subject: "Testing is complete."), a verb followed by an auxiliary is a
+    statement, and verb morphology is naive on purpose (stem + ed/d/ion): "running" →
+    "ran" never matches, so the paragraph is kept. Fail-open like the other two.
+    Pins: <code>tests/test_reply_stale_announcement.py</code>.</li>
     <li><strong>Fail-open:</strong> fenced blocks are split-atomic (blank lines inside a
     fence don't split it), the final block is never dropped, and an over-scrub that would
     empty the reply returns the original. Idempotent.</li>
+  </ul>
+
+  <h2>What reaches the user, part two <span class="tag">2026-09-09 &sect;4FS</span></h2>
+  <ul>
+    <li><strong>An unparsed tool call is named, once, in the delivered reply.</strong> 10 of 2,185 replies
+    since July carried a literal <code>&lt;tool_call&gt;</code> block — a call whose body failed to parse,
+    delivered as prose, the file it described never written. Those were STREAMED replies: the non-stream
+    finalize already scrubbed this markup (the <code>&lt;(tool_call|tool|function)</code> re.sub) and only lacked
+    the note; a first version of the fix put a second scrub AFTER that one and therefore never fired
+    (review, 2026-09-09). Now <code>unparsed_call_markup_present</code> — the one predicate both paths use: call
+    dialects only, not <code>&lt;tool_response&gt;</code>, not inline code, not the cognitive watchdog's own
+    <code>replan</code> marker — is evaluated BEFORE the scrub, and if it held, the reply ends with one line:
+    "[A tool call in this reply could not be parsed and was NOT executed — the step it described did not
+    happen.]" No tool-count gate: the turn whose only call failed to parse ran zero tools. The finalize scrub
+    also gained the stream scrub's backtick guard. Pins: <code>tests/test_reply_toolcall_scrub.py</code>
+    (executed through <code>_finalize_and_return</code>).</li>
+    <li><strong>The smoothing gate stays at ≥2 real tool runs.</strong> §4FS lowered it to ≥1 for a day: a
+    single-tool turn does carry the stale beat ("I'll forget the PDF." then "Done"), but pass 1 also deletes
+    "First, back up… / Then restore… / Finally, verify…" — two of three instructions after one file read
+    (review). The 2026-07-17 decision was right; the single-tool beat is the accepted cost. Pass 1's
+    collateral on paragraphs that OPEN with "Now"/"Next," in multi-tool turns is pre-existing and unchanged.</li>
+    <li><strong>Shape 3 needs restatement, not just tense.</strong> A first version dropped any short "Now
+    …ing" paragraph whose verb appeared done later; in review that deleted an instruction ("Next, restarting
+    the service will pick it up — run …"), a sign-off request and a truthful in-progress notice. The rule now
+    also requires that at least half of the paragraph's content words (light stemming) recur in ONE later
+    prose paragraph — a stale beat is a beat the reply repeats. Fenced blocks are neither candidates nor
+    evidence.</li>
+    <li><strong>Streamed replies.</strong> The web UI streams and returns before <code>_finalize_and_return</code>,
+    so neither the smoother nor any scrub ever touched the common path: two multi-tool replies on 2026-09-08
+    kept "I'll build…" openers the smoother removes on sight, and one kept a tool-call block. The live stream
+    is delivered as the user saw it. The PERSISTED copy (the trajectory the dream seed, fixture mining and the
+    narration scan read) now gets the scrub and, with the same ≥2 gate and the same narration-only revert
+    guard, the smoother; the Slack promise headline quotes that copy; the streamed VERIFIER judges the scrubbed
+    view — what the user received — rather than raw markup that could earn a false REFUTE and a correction
+    banner; and when the live scrub removed a call from a reply that also had prose, the stream gets the
+    one-line note appended (the all-consumed case already had its own fallback). Still on the raw text, as
+    before: the smart-memory journal, the post-mortem, the episode record, the hydration judge, the project
+    work_log and calibration. Pins: <code>tests/test_stream_persisted_reply.py</code> (executed through the real
+    generator).</li>
   </ul>
   <p>Tests: <code>tests/test_reply_smoothing.py</code> (12 — including the verbatim WebOS
   transcript as the regression fixture). Note: the prompt edit changes the byte-stable

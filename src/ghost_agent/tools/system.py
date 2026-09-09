@@ -13,6 +13,17 @@ from ..utils.egress_guard import resolve_egress_proxy
 
 logger = logging.getLogger("GhostAgent")
 
+def _server_name(resp) -> str:
+    """The `Server:` header, bounded and printable — it is remote-controlled
+    text that lands in a message the model reads (review, 2026-09-09)."""
+    try:
+        raw = str(resp.headers.get("server") or "").strip()
+    except Exception:  # noqa: BLE001
+        raw = ""
+    raw = "".join(ch for ch in raw if ch.isprintable())[:40]
+    return raw or "the server"
+
+
 async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = None):
     if not location and profile_memory:
         # Narrow to Exception (was a bare `except:` catching BaseException —
@@ -52,6 +63,7 @@ async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = 
                     geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={urllib.parse.quote(location)}&count=1&language=en&format=json"
                     geo_resp = await client.get(geo_url)
                     if geo_resp.status_code in [401, 403, 503] and mode == "TOR":
+                        last_error = f"HTTP {geo_resp.status_code} from {_server_name(geo_resp)}"  # §4FS: record the refusal
                         await asyncio.to_thread(request_new_tor_identity)
                         await asyncio.sleep(5)
                         continue
@@ -66,6 +78,7 @@ async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = 
                         )
                         w_resp = await client.get(w_url)
                         if w_resp.status_code in [401, 403, 503] and mode == "TOR":
+                            last_error = f"HTTP {w_resp.status_code} from {_server_name(w_resp)}"  # §4FS: record the refusal
                             await asyncio.to_thread(request_new_tor_identity)
                             await asyncio.sleep(5)
                             continue
@@ -85,12 +98,14 @@ async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = 
                         # place. Record it so the final message can say so
                         # instead of the opaque "failed: None".
                         geo_not_found = True
+                        last_error = None  # a definitive answer outranks an earlier transient refusal (review, 2026-09-09)
                     break
             else:
                 async with httpx.AsyncClient(proxy=proxy_url, timeout=20.0, verify=False) as client:
                     geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={urllib.parse.quote(location)}&count=1&language=en&format=json"
                     geo_resp = await client.get(geo_url)
                     if geo_resp.status_code in [401, 403, 503] and mode == "TOR":
+                        last_error = f"HTTP {geo_resp.status_code} from {_server_name(geo_resp)}"  # §4FS: record the refusal
                         await asyncio.to_thread(request_new_tor_identity)
                         await asyncio.sleep(5)
                         continue
@@ -105,6 +120,7 @@ async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = 
                         )
                         w_resp = await client.get(w_url)
                         if w_resp.status_code in [401, 403, 503] and mode == "TOR":
+                            last_error = f"HTTP {w_resp.status_code} from {_server_name(w_resp)}"  # §4FS: record the refusal
                             await asyncio.to_thread(request_new_tor_identity)
                             await asyncio.sleep(5)
                             continue
@@ -124,6 +140,7 @@ async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = 
                         # place. Record it so the final message can say so
                         # instead of the opaque "failed: None".
                         geo_not_found = True
+                        last_error = None  # a definitive answer outranks an earlier transient refusal (review, 2026-09-09)
                     break 
         except Exception as e:
             last_error = e
@@ -142,6 +159,7 @@ async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = 
                 async with curl_requests.AsyncSession(impersonate="chrome110", proxies=proxies, timeout=20.0, verify=False) as client:
                     resp = await client.get(url)
                     if resp.status_code in [401, 403, 503] and mode == "TOR":
+                        last_error = f"HTTP {resp.status_code} from {_server_name(resp)}"  # §4FS: record the refusal
                         await asyncio.to_thread(request_new_tor_identity)
                         await asyncio.sleep(5)
                         continue
@@ -152,6 +170,7 @@ async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = 
                 async with httpx.AsyncClient(proxy=proxy_url, timeout=20.0, verify=False) as client:
                     resp = await client.get(url)
                     if resp.status_code in [401, 403, 503] and mode == "TOR":
+                        last_error = f"HTTP {resp.status_code} from {_server_name(resp)}"  # §4FS: record the refusal
                         await asyncio.to_thread(request_new_tor_identity)
                         await asyncio.sleep(5)
                         continue

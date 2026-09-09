@@ -318,6 +318,21 @@ SyntaxError: Unexpected identifier 't'</pre>
 
   <h2 id="list-count">list_files states its entry count (§4FD, 2026-09-07)</h2>
   <p>Nineteen real turns contradicted their own listing by counting it ("45 files" over 34 entries, trajectory 13798301). The listing now opens with <code>N entries under the workspace root (files, excluding dotfiles):</code> (or <code>under /&lt;subdir&gt;</code>), where N is the <em>total</em> even when the listing is capped — never make the model count a list. Tests: <code>tests/test_4fd_tool_output_counts_and_relevance.py</code>.</p>
+
+  <h2>A Tor refusal is recorded, retried with a plain profile, and stays on Tor <span class="tag">2026-09-09 &sect;4FR/&sect;4FS</span></h2>
+  <p>The host's egress is Tor, and the download client impersonates Chrome. Cloudflare answers that
+  combination from a Tor exit with a challenge page &mdash; HTTP 403, <code>text/html</code> &mdash; while a plain
+  <code>curl</code> over the SAME circuit gets the file (measured three for three). The retry loop handled a
+  refusal by rotating the Tor identity and left <code>last_error</code> at <code>None</code>, so three 403s reported
+  as <em>"Failed after 3 attempts. Last error: None"</em> and the model retried blind. Now: the refusal is
+  recorded on both client branches (<code>HTTP 403 from cloudflare (chrome110 profile)</code>, the server name
+  bounded to 40 printable characters because it is remote-controlled text the model reads), and the first
+  refusal switches the next attempt to a <strong>plain curl identity on the same Tor proxy</strong>. Past that,
+  the message says the site refuses this agent from Tor exits and that the file must come from the user.
+  A first version recommended <code>curl</code> from the sandbox: the sandbox's egress is cleartext from the
+  host IP (<code>docker.py</code> sets no proxy; under host networking its Tor cannot bind), and the agent's rule
+  is Tor-only &mdash; a tool message must not steer the model through that hole (review, 2026-09-09). Pins:
+  <code>tests/test_download_tor_refusal_message.py</code>.</p>
 </main>
 </body>
 </html>

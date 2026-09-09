@@ -284,6 +284,9 @@ def _fail_closed_classes():
                     if (isinstance(node, ast.Call)
                             and getattr(node.func, "attr", "") == "_fc_arm"):
                         arms.append(fn.name)
+                    if (isinstance(node, ast.Call)
+                            and getattr(node.func, "attr", "") == "_fc_ready_to_write"):
+                        clears.append(fn.name)
             if arms:
                 found[f"{path.name}::{cls.name}"] = {
                     "arms": sorted(set(arms)),
@@ -306,8 +309,10 @@ def test_every_fail_closed_store_can_be_disarmed_without_a_restart():
     stores = _fail_closed_classes()
     assert len(stores) >= 4, stores          # the four known ones, at least
     for name, info in stores.items():
-        recovers = bool(info["clears_outside_init"]) or \
-            "FailClosedStore" in info["bases"]
+        # a class that INHERITS the mixin but never calls `_fc_ready_to_write`
+        # is blocked until restart all the same — inheritance is not a
+        # disarm (review, 2026-09-09); the call counts as a clear above
+        recovers = bool(info["clears_outside_init"])
         assert recovers, (
             f"{name} arms a fail-closed flag in {info['arms']} and can only "
             f"clear it in __init__ — it is blocked until the process restarts")

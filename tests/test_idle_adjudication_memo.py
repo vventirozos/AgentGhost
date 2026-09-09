@@ -174,5 +174,6 @@ def test_the_pass_hands_the_memo_its_context():
     exists for, one level up."""
     import inspect
     src = inspect.getsource(FD.distill_failure_clusters)
-    assert "context=context" in src, \
+    call = src[src.index("adjudicate_unknowns("):][:300]
+    assert "context=context" in call, \
         "distill_failure_clusters does not give adjudicate_unknowns its memo"

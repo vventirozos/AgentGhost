@@ -473,7 +473,15 @@ check, journal).
    with no consumer or no measured value (e.g. digests nobody reads, re-derivations already
    cached). Measure tokens/hour and main-slot busy time before/after; the §4FM `/metrics` busy
    gate is the instrument. ⚠ Take the count BEFORE closing the recording window (item 3 below).
-3. ☐ **Operator: close the recording window** — `GHOST_LLM_RECORD=0` in
+3. ✅ **DONE 2026-09-09 11:30 (operator: "Close the recording window") — flag set to 0, day-files
+   deleted, agent restarted and verified writing nothing. ⚠ AND THE MINE SAYS IT COULD NOT HAVE
+   SUCCEEDED: 25 hours / 40 MB / 2,590 recorded calls mined to 26 fixtures and **ZERO real
+   positives** (the 22 found are all bench-origin, which "may teach but never grade") against a
+   200-real-positive gate. At this traffic mix the gate is not weeks away, it is unreachable, so the
+   window was costing ~27 MB/day for nothing. The 26-fixture mine is kept beside the August pool at
+   `system/optim/tool_choice_fixtures.sep-window.jsonl.notready`; the August 587-row pool is
+   untouched. Re-open only alongside a plan that produces REAL user positives.**
+   **Operator: close the recording window** — `GHOST_LLM_RECORD=0` in
    `bin/start-ghost-agent.sh` + delete `system/llm_recordings/*.jsonl` — after the daily gate
    promotes a tool-choice fixture pool (§4FL; miner needs ~200 real positives) AND after item 5's
    count is taken.
@@ -507,6 +515,24 @@ check, journal).
    e. ✅ a second loop-breaker signature: the same tool against the same document N times with
       all-low relevance, regardless of wording (`strikes.note_action` today fingerprints the
       result). d and e belong to item 1's class (a guard with a blind spot); do them in that pass.
+7. ✅ **DONE 2026-09-09 15:30 (§4FR) — operator: "look at the server log for the request where I asked the
+   agent to download and ingest the postgresql manual, what went wrong?" → "fix them all, verify". The
+   request had NOT failed; four defects fixed (stale reply opener, `file` missing → download scored a
+   failure, wrong not-found advice, half-wrong auto-lesson) plus two the live rounds found (`xxd`, and the
+   download tool refusing over Tor with "Last error: None"). Sandbox v7, first in-place marker upgrades.
+   Battery 32/32, suite 20,673 ×2 chunked, three live rounds; final: 38 s / 3 turns / 0 strikes.**
+8. ✅ **DONE 2026-09-09 17:15 (§4FS) — operator: "any similar bugs or defects?" → "yeah fix everything".
+   Same four shapes, five more instances: probes were teaching the playbook (gate at the shared collector +
+   Perfect-It; 6 lessons retired); unparsed tool-call markup delivered as prose (scrub at finalize, note);
+   the smoother never ran on the streamed web-UI path (persisted copy now smoothed; gate ≥1 tool); the weather
+   tool's unrecorded Tor refusals; sandbox v8 (lsof, dnsutils). Battery 23/23, suite 20,702 ×2, live-verified.**
+9. ✅ **DONE 2026-09-09 18:50 (§4FT) — operator: "re verify your changes, make sure its all perfect". Three
+   read-only reviewers briefed on consumers found eleven defects the batteries had passed at 100%: the
+   non-stream scrub was dead behind an older scrub, the fallback advice broke the Tor-only rule, retired
+   lessons' twins kept teaching, shape 3 deleted user text, the ≥1 gate ate instructions, predicate
+   asymmetries, the delta ignored the backoff, weak pins. All fixed; the download tool now retries a refused
+   site with a plain profile OVER TOR and gets the file. Batteries 26/26 + 20/20 + 12/12, suite 20,739 ×2,
+   live-verified. Recorded, not fixed: the sandbox's cleartext egress (operator decision).**
 5. ☐ **Judge precision readout (no work until traffic accrues, ~2–3 weeks):**
    `scripts/verdict_override_report.py` now shows rows per tag (`memory-claim`, `reply-shape`,
    `visual`, chains) and `Data/system/judge/withheld_verdicts.jsonl` holds verdicts the human lock
@@ -37221,3 +37247,453 @@ minutes BEFORE the restart. A long-running process imports a module at FIRST USE
 the edited `failure_distill.py` mid-life, without a deploy. Harmless here (the code was complete and its
 suite was green), but it means an edit to a lazily-imported module is live the moment it is saved, not at
 the next restart.
+
+## §4FR — "download and ingest this PDF": four small fixes from one request that did not fail, and the two the live checks found (2026-09-09 12:20–15:30)
+
+**Trigger:** operator, 12:15: "look at the server log for a request that I asked the agent to download and
+ingest the postgresql manual, what went wrong?" → assessment → "fix them all, verify your changes".
+
+**The request (d50a34bd, 09:30, 272 s, 4 turns).** Nothing failed: the manual is in the knowledge base,
+3,091 pages / 8,287 chunks, and the outline route shipped in §4FO had its first real use — 4,138 table-of-contents
+entries across six levels, 93 at the chapter level (70 chapters + 15 appendices + 8 parts). But the run took
+4.5 minutes for what should have been 3, scored two "failures" that were not failures, and ended with a reply
+whose first line contradicts its second.
+
+| turn | what happened | cost |
+|---|---|---|
+| 1 | `knowledge_base(action='transcribe', filename='postgresql-19-A4.pdf')` on a file it had not fetched yet; "File not found. Check list_files" → Strike 1 | 40 s |
+| 2 | `curl … && ls -la … && file … && du -h …` — curl fetched all 16 MB; `file` is not in the sandbox image → **exit 127** → FAILURE BANNER → Strike 2 → a failed step in the trajectory | 40 s |
+| 3 | the ingest: 3,091 pages, 8,287 chunks | 120 s (real work) |
+| 4 | the reply | 14 s |
+
+About 60 of the 272 seconds were the planner monologue running before every turn (the live `use_planning`
+arm) — not a fault, but a quarter of the wall clock.
+
+### Four defects, four fixes
+
+**1. The reply opened with a stale beat.** Delivered text, first two paragraphs:
+> Download succeeded (16 MB, valid). Now ingesting into the knowledge base.
+>
+> The PostgreSQL 19 manual has been successfully downloaded and ingested into the knowledge base.
+
+The opener is the model's turn-3 progress line, delivered as the first sentence of a finished job. Reply
+smoothing (2026-07-17) exists to strip exactly this and missed it: shape 1 is anchored at the paragraph
+START, and "Now ingesting…" is the paragraph's SECOND sentence. ("valid" was never checked either — the check
+is the command that was not found.)
+
+Shape 3, `core/reply_smoothing.py`: a short, non-final paragraph that announces work in the progressive
+behind a lead adverb ("… Now ingesting…", "Next, indexing…") is dropped when a LATER paragraph reports that
+verb as done (ingested / ingestion / downloaded) — and only then, because an announcement nothing later
+completes may be the truth ("Now ingesting in the background; I'll report back") and stays. The lead adverb is
+required on purpose (a bare gerund is a subject: "Testing is complete."), a verb followed by an auxiliary is a
+statement, and verb morphology is naive (stem + ed/d/ion): "running" → "ran" never matches and the paragraph
+is kept. The real reply is the fixture; exactly one paragraph is removed from it. The 2026-07-17 WebOS fixture
+smooths to the identical text with and without the rule — the rule adds a case, it does not widen the old ones.
+
+**2. A successful download was recorded as a failure.** `file` was not in the image, so the model's standard
+verification chain exited 127. The sandbox even carried a canned hint for this — "that utility isn't
+installed; use `head -c 16 | od`" — so the gap was KNOWN and worked around rather than fixed. `file` is now in
+both install surfaces (the runtime provisioner and `sandbox/Dockerfile`) under marker **v6**. And for the first
+time a bump does not cost the operator's next request a full provision (~5 minutes of apt + pip + torch +
+Chromium, the price v2→v5 each paid): an image carrying the v5 marker with a working Chromium gets only the
+delta (`apt-get install -y file`), the binary is PROBED with `command -v file` before the marker is written
+(the v2 lesson: a marker asserts what somebody checked), the old marker is removed, and the image is committed.
+Any failure falls through to the full provision, which now also removes the superseded marker. The fallback
+hint no longer routes the model around a tool it has.
+
+**…and then the live check found the same shape one tool over.** After the v6 deploy the original request
+shape (a small PDF) ran clean through `file` — and took Strike 1/6 anyway: the model's verification chain is
+`file x.pdf && head -c 200 x.pdf | xxd | head -5`, and **`xxd` was missing too**, exit 127, failure banner, a
+failed step in the trajectory for a download that had succeeded. The hint table had been routing around
+`xxd` as well ("`xxd` → `od -A x -t x1z`"). So **v7** adds `xxd`, upgrades in place from v6 by the same
+delta mechanism (its second use, an hour after its first), and the hint now teaches only the availability
+probe and the `od`/python fallbacks — no more named workarounds for tools that should simply be there.
+
+**3. A wasted first turn.** The model believed one ingest call also downloads and called it on a file that did
+not exist yet. The tool's answer — "Check list_files to see the exact name" — was the wrong advice for this
+case: the file was never there. The message now says the action **never downloads** and names the route that
+does, in the tool's own vocabulary (`file_system(operation='download', url=…, path=…)`, then call again),
+with list_files kept as the last resort for a file that should already exist. The §4DX containment refusal is
+a different branch and keeps its own wording; both are pinned side by side.
+
+**3b. …and the route that message names was broken.** The v7 live run followed the new advice —
+`file_system(operation='download', …)` — and it failed twice: *"Failed after 3 attempts. Last error: None"*.
+Two strikes, then the model fell back to curl by itself. Reproduced outside the agent with the real tool and
+a spy on its hop handler: the host's egress is Tor and the client impersonates Chrome, and Cloudflare answers
+that combination from a Tor exit with a challenge page — `status=403 server=cloudflare`, three times, three
+identity rotations — while a plain curl over the SAME Tor circuit gets HTTP 200, and the sandbox's curl
+(direct egress by design) gets the file. The retry loop handled a 401/403/503 by rotating the identity and
+never recorded it, so `last_error` stayed None and the model learned nothing. Two fixes: the refusal is now
+recorded on both client branches (`HTTP 403 from cloudflare`), and the Tor-mode message says retrying will not
+help and names the fallback — `execute(command="curl -L -o '<path>' '<url>'")` — which both knowledge_base
+messages now name as well, so the three teachers agree. The WEB-mode message is unchanged. I did not change the
+client's fingerprint policy: that is an egress decision, not a wording one.
+
+**4. A half-wrong lesson.** The post-mortem captured "the tool expected a local file path instead of a URL" —
+but no URL was ever passed. Retired through the store's own archive-then-delete API (`remove_by_trigger`; the
+playbook reads from disk on every operation, so this was safe beside the live process); its vector twin is
+left for the idle store-hygiene reconcile, which exists for exactly that orphan. Playbook 116 → 115.
+
+### Defects in my own work (R8)
+
+1. Three of my pins could not tell their mutant apart: a list item opening "- Now …" and a fence opening
+   "```\nNow …" never match the sentence-start regex anyway, so the list and fence guards were redundant
+   FOR THOSE FIXTURES; the "lead adverb optional" mutant was equivalent because the separator `[,\s]+`
+   still demanded a lead. Fixtures moved the beat mid-item / mid-fence; the mutant now removes both the
+   lead and the separator. And one mutant survived because it hit a branch nothing drove — §4DX's symlink
+   fallback refusal — so that branch has a pin now too.
+2. Two mutants were not applied on the first run: I had over-escaped the regex and the Dockerfile's
+   trailing backslash. Anchors are now derived from the files.
+3. One of my own test fixtures opened with "Now," — which pass 1 already strips — so it tested nothing
+   about the new rule until moved mid-paragraph.
+4. The v6 fix was verified live and found INCOMPLETE for its own purpose — the model's standard download
+   verification still scored a failure, on `xxd`. Fixed as v7 above; the fixture is the second live run's
+   command, verbatim.
+5. Fix 3's first version named ONE route, and that route was broken. The message is the teacher at the
+   moment of the mistake; a teacher that names a dead path costs two strikes instead of one. The live
+   check, not the review, found it — the third time today the live run found what the pins could not.
+6. The full provision removed only the legacy v1 marker; after an upgrade an image would have carried v5
+   and v6 together. Harmless but untidy; fixed and pinned.
+
+### Verification
+
+Battery `battery_4fr.json`: **32 mutants, 32 killed**, controls correct (noop SURVIVED, known-bad KILLED,
+none not-applied) — covering the rule unwired, the completion check dropped, completion sought in the same
+paragraph, lead adverb optional, auxiliary lookahead removed, final paragraph eligible, the three guards, the
+completion suffixes, the message reverted / gutted / reordered / leaked into the refusal branch, the delta tools dropped
+from either surface, the marker not bumped in either, the upgrade trusting apt's exit code, not committing,
+running with Chromium missing, marking a failed upgrade ok, leaving either marker behind, and the hint
+reverted, the Tor refusal unrecorded on either client branch, the fallback dropped from any of the three
+messages, Tor advice leaking into WEB mode. Pins: `tests/test_reply_stale_announcement.py` (17),
+`tests/test_kb_ingest_not_found_message.py` (6), `tests/test_download_tor_refusal_message.py` (8),
+`tests/test_sandbox_v7_file_xxd_upgrade.py` (8); 14 marker pins in `test_sandbox_chromium_gate.py` and the
+`bughunt` / `4bw_A` sandbox tests moved to v7. Suite **20,673 passed / 65 skipped / 0 failed**, twice — run in three foreground chunks at `-n 2`: with llama-server
+resident, the sandbox VM and 3.8 GB of swap the box sits at 15% free, and both a `-n 4` run and a `-n 2` background
+run were killed by the low-memory watchdog (at 28% and 45%). Chunking bounds per-worker growth; the union covers
+every test file. Docs: `docs/core/agent.html` (shape 3),
+`docs/sandbox/docker.html` (v6 + in-place upgrade), `docs/tools/memory_tools.html` (the message), `docs/tools/file_system.html` (the Tor refusal).
+
+### Live, three rounds — each found the next defect
+
+**Round 1 (v6, 13:34, listener 92623).** The v5 → v6 in-place upgrade fired on first sandbox use: *"Upgrading v5 →
+v6 in place (adds `file`)…"* at +20.9 s, image committed at +22.9 s — two seconds, not five minutes; `file` on the
+manual returned `PDF document, version 1.4`, exit 0, no strike; marker v6 present, v5 gone. The not-found message
+reached the model verbatim. The original request shape on a 13 KB PDF: 86 s, 3 turns, a clean reply — and Strike 1/6
+on the download step, because the chain was `… && file dummy.pdf && head -c 200 dummy.pdf | xxd | head -5` and
+`xxd` was missing. → v7.
+
+**Round 2 (v7, 14:26, listener 99498).** v6 → v7 in place in 1.4 s; `head -c 16 … | xxd` returned the PDF magic,
+exit 0, no strike; `file` and `xxd` present, v6 gone. The original request shape: this time the model took the
+route the new message recommends, `file_system(operation='download')`, and it failed twice — *"Failed after 3
+attempts. Last error: None"* — two strikes, then curl (which now took no strike), then ingest. 119 s, 5 turns.
+→ the download tool's refusal reporting, and all three messages naming the curl fallback.
+
+**Round 3 (final, 15:15, listener 83007).** The original request shape: **38 s, 3 turns, zero strikes** — curl,
+ingest, a reply that opens with the result. Forced onto the download tool by name, the model received, verbatim:
+*"Failed after 3 attempts over Tor — HTTP 403 from cloudflare. Some sites refuse the agent's Tor client (a
+challenge page is the usual shape); retrying this tool will not change that. The sandbox has its own direct
+egress, so fetch it there: execute(command="curl -L -o 'probe_dl.pdf' '…'"), then continue with that file."*
+The probe document was forgotten after each round; the manual is intact at 8,287 chunks with its outline record.
+
+Compared with the request that started this: 272 s / 4 turns / 2 false strikes / a self-contradicting opener,
+against 38 s / 3 turns / 0 strikes / a clean opener — on a 13 KB file rather than a 16 MB one, so the ingest
+time is not comparable, but the turn count, the strikes and the reply are.
+
+
+## §4FS — "any similar bugs?": the same four shapes, five more instances, all fixed (2026-09-09 15:40–17:15)
+
+**Trigger:** operator, after §4FR: "any similar bugs or defects?" → assessment → "yeah fix everything".
+
+Each §4FR shape was checked for other instances with evidence, not guesswork: every "command not found" in
+415 trajectory files, every retry loop with a `last_error`, every "not found — try X" tool message, every
+delivered reply of the last two days for surviving narration, the hint table, the lesson store by origin.
+
+### What was found, and what was done
+
+**1. Diagnostic probes were teaching the playbook.** The store held 3 lessons stamped `origin=probe` (the
+perfection protocol: "Optimization Analysis: Run exactly this in the sandbox: echo if-probe-ok…") and 2 more
+distilled from probe trajectories by the dream seed and the post-mortem and stamped `auto` — one of them,
+"When executing shell commands, ensure the command is run verbatim unless…", a rule about the operator's
+diagnostic phrasing, already hydrated into real shell tasks. The learning-health gauge defines a probe count
+above zero as a leak; §4FB gated the three OUTCOME-CREDIT sites on probe origin and never the three LESSON
+producers. Every one of the ~40 readers of `TrajectoryCollector.iter_trajectories()` is a learner or a report,
+so the gate lives there now: `task_kind == "probe"` records are skipped unless a caller passes
+`include_probes=True` (an AST pin requires any such caller to say why). The perfection protocol does not
+read the collector and is gated at both its scheduling site (no worker call either) and its write site.
+Six lessons retired through the archive-then-delete API — the five leaked ones and one that criticised a
+recovery that had succeeded. Playbook 118 → 112; probe-stamped lessons 3 → 0.
+
+**2. Unparsed tool-call markup was delivered as prose.** 10 of 2,185 replies since July, most recently the
+2026-09-08 schema comparison whose reply ended in `<tool_call><function=execute><parameter=command>python3 -c "…`
+— the call had failed to parse and the loop delivered it verbatim, the step never run. The parser side is
+chased by the CDATA hints; the delivery side had no guard. `strip_unparsed_tool_calls` now runs at finalize
+UNCONDITIONALLY (the turn whose only call failed to parse ran zero tools, so no tool-count gate could see
+it), whole-text (a leaked call spans blank lines — a paragraph-wise first version kept its tail), fence-aware,
+and leaves ONE line: "[A tool call in this reply could not be parsed and was NOT executed — the step it
+described did not happen.]" The two real leaked replies are the fixtures.
+
+**3. The smoother never ran on the common path.** Two multi-tool replies from 2026-09-08 kept "I'll build…"
+openers that the smoother removes on sight when run directly on their text — so it had not run. Yesterday's
+log is rotated, but the code says why: the web UI streams and returns before `_finalize_and_return`, the one
+place the smoother is called (a comment at the calibration site already recorded the same asymmetry for
+calibration, fixed there in July and not for smoothing). The live stream is delivered as the user saw it; the
+PERSISTED copy — the trajectory the dream seed, fixture mining and the narration scan read — now gets the scrub
+and the smoother with the same gate and the same narration-only revert guard, and when the live scrub removed
+a call from a reply that also had prose, the stream gets the one-line note appended (the all-consumed case
+already had its own fallback text). The smoothing gate also went from ≥2 to ≥1 real tool run: a single-tool
+turn carries the same stale beat ("I'll forget the PostgreSQL 19 PDF." then "Done — removed", live
+2026-09-09). Conversational 0-tool replies are still never rewritten.
+
+**4. The weather tool had the download tool's exact retry shape.** Six Tor branches (geocoder and forecast
+on both clients, plus the wttr.in fallback) rotated the identity on 401/403/503 without recording it, so three
+refusals reported "Underlying: None". Each now records `HTTP <status> from <server>` first; the existing
+message ("the upstream weather APIs rejected the request") carries the status it saw. The sessions'
+`verify=False` was reviewed in an earlier round and left as documented residual — unchanged.
+
+**5. Two more sandbox gaps, with evidence.** After `file` and `xxd`, the only commands the model ever reached
+for that the image lacked were `lsof` (×2) and `nslookup`/`host` (×1 each). Sandbox v8 adds `lsof` and
+`dnsutils`, upgraded in place from v7 by the delta mechanism (its third use today). The upgrade test now reads
+the ladder — current marker, previous marker, delta, probe — from the source, so the next bump does not
+churn it. `pdftotext` stays absent on purpose: it would enable the manual-parsing anti-pattern §4FO forbids.
+
+### Checked and clean
+The swarm, database and trigger retry loops all record their errors; the swarm tool is hidden when
+unconfigured (its two "not configured" calls were July's); the other "not found — list files" messages fit
+their cases, since those files should exist; 22 lessons of `origin=auto` and 92 legacy ones were not touched.
+
+### Defects in my own work (R8)
+1. A non-raw heredoc turned the scrub regex's `\b` into a BACKSPACE byte; the pattern could never match, and
+   the first test run said so. Anchors and regexes are now written raw or derived from the file.
+2. The first scrub was paragraph-wise and kept the tail of a call that spans blank lines. The real leaked
+   reply caught it.
+3. Two battery mutants were unanchored because the weather tool's curl and httpx branches mirror each other
+   for more than twelve lines; the anchors grow until unique.
+4. The sandbox pin asserted the previous delta's apt tail verbatim and broke on this bump; it now asserts the
+   delta packages, whichever they are.
+
+### Verification
+Battery `battery_4fs.json`: **23 mutants, 23 killed**, controls correct — the collector gate removed / defaulted
+to include / keyed on the wrong kind; both Perfect-It gates; the scrub's fence guard, note, unclosed-block arm,
+function pass and case-insensitivity; the finalize scrub unwired; the smoothing gate back to ≥2; the geocoder and
+forecast refusals unrecorded; the sandbox delta dropped / marker not bumped / wrong delta; the Dockerfile list;
+and on the stream path: persisted copy not scrubbed, not smoothed, its gate drifted, the note doubling the
+all-consumed fallback, the note firing without any markup. First run: 18/23 — five survivors were weak PINS
+(a fallback that records the same refusal masked the primary branch; a pin that reads its expectation from
+the source followed the mutant; a fixture whose function tag always sat inside a wrapper) and were replaced
+by pins that discriminate. Pins: `tests/test_probe_never_teaches.py` (7), `tests/test_reply_toolcall_scrub.py` (9),
+`tests/test_stream_persisted_reply.py` (5), `tests/test_weather_tor_refusal.py` (3),
+`tests/test_sandbox_marker_upgrade.py` (8, ladder read from source); the smoothing wiring pin moved to ≥1.
+Suite **20,702 passed / 65 skipped / 0 failed**, twice, in three foreground chunks at `-n 2`. Three existing
+pins had to be re-based, each on its real property: the preamble-rollback test proved "no false rollback" by
+the preamble surviving delivery (it now proves it by the tool having run and the smoother being what removed
+the line); two stream-scrub tests compared client text byte-for-byte against a naive scrub (still exact on the
+prose; the note's presence is now pinned to "markup was actually scrubbed"). Docs: `docs/core/agent.html` (§4FS section), `docs/core/dream.html` (the collector gate),
+`docs/tools/system.html` (the weather refusal), `docs/sandbox/docker.html` (v8).
+
+### Live (deployed 17:07, listener 8208; health 200, no boot errors)
+
+* **Sandbox v7 → v8 in place**: *"Upgrading v7 → v8 in place (adds lsof + dnsutils)…"* at +22.3 s, image committed
+  at +24.7 s — 2.4 seconds; `lsof -v` and `host -V` (BIND 9.18.49) both answered, exit 0, zero strikes; marker v8,
+  v7 gone. Third delta upgrade today, third time under three seconds.
+* **Collector gate on the real root**: 2,191 trajectory records, 89 of them probes — all 89 excluded from the default
+  view, 0 left.
+* **Probe turns teach nothing**: four probe requests, no "Saved optimization strategy" line, playbook count unchanged
+  across them, probe-stamped lessons 0 (were 3).
+* **Weather over Tor**: Open-Meteo answered (Athens, 31.6 °C, clear) — so the refusal message was not exercised
+  live; the six recording lines are covered by the executed pins, which drive each branch to a refusal the others
+  cannot mask.
+* **The streamed-reply changes** are not exercisable by a probe (the note needs the model to emit a tool call in
+  its final generation; the persisted-copy smoothing needs a streamed multi-tool turn with narration). Both are
+  pinned at the source and mutation-tested; the first real console turns tomorrow are the live check, and the
+  narration scan (`scratchpad/idle_census.py`'s sibling in this section) is the instrument to re-run.
+
+
+## §4FT — Re-verification of the day's work: three read-only reviewers, eleven findings, all fixed (2026-09-09 17:20–18:50)
+
+**Trigger:** operator: "re verify your changes, make sure its all perfect." Three read-only reviewers (delivery
+path; learning + tools; tests), each briefed to replay the CONSUMERS of a change rather than read the diff, plus my
+own targeted checks. What they found is why the instruction was right.
+
+### The findings, and what changed
+
+1. **My non-stream scrub was dead code.** `_finalize_and_return` already scrubbed `<tool_call|tool|function>`
+   markup (an older re.sub) BEFORE the new scrub ran, so the new one saw nothing and the note never reached a
+   user on that path. The 10 leaked replies were all streamed ones. Fix: the shared predicate
+   `unparsed_call_markup_present` is evaluated BEFORE the old scrub and the note appended after it; the old scrub
+   gained the stream scrub's backtick guard. Both reviewers found this independently; the source-order pin I
+   had written passed with the feature dead — replaced by an executed pin through `_finalize_and_return`.
+2. **My fallback advice broke the Tor-only rule.** The download tool's message (and both knowledge_base
+   messages) recommended `curl` from the sandbox — cleartext from the host IP: `docker.py` sets no proxy and
+   under host networking its Tor cannot bind. Withdrawn. The honest remedy was in my own measurement: plain curl
+   over the SAME Tor circuit got 200 where the Chrome-impersonating client got 403 — so the first refusal now
+   switches the next attempt to a plain curl identity on the same Tor proxy; past that the file must come from
+   the user, and no tool message suggests any other route. (The sandbox's cleartext egress itself is a
+   pre-existing gap outside this scope, recorded below.)
+3. **The retired lessons kept teaching.** Retrieval renders a lesson's vector twin VERBATIM when its playbook
+   row is gone, and the idle-phase orphan reconcile needs 15–60 min of idle plus a 2 h cooldown. The six
+   lessons I retired at 15:30 were still injectable at 18:00. Fix: the same reconcile runs at boot, best-effort,
+   off the loop — and the log settles how real the finding was: the idle hygiene, when it finally ran,
+   logged *"dropped 5 orphan vector twin(s) with no playbook entry"* — five of today's retired lessons had been
+   hydratable until then. The boot reconcile found none left at 18:38 and, by design, said nothing.
+4. **The cognitive watchdog's own replan call would have tripped the note and been stripped from the record.**
+   The predicate now excludes `function=replan` (both dialects), and so does the scrub.
+5. **Shape 3 deleted user-facing text 5 times out of 6 in review.** Four of the six were really pass 1 (the
+   2026-07-17 rule drops any short paragraph that OPENS with "Now"/"Next," — pre-existing, unchanged); the
+   others were shape 3's. Shape 3 now also requires that at least half of the paragraph's content words recur
+   in one later prose paragraph — a stale beat is a beat the reply repeats — and fenced blocks are neither
+   candidates nor evidence, and a colon is not a sentence boundary. The reviewer's five cases are pins, placed
+   mid-paragraph so shape 3 alone decides them.
+6. **The ≥1 smoothing gate let pass 1 eat numbered instructions** ("First, back up… / Then restore… /
+   Finally, verify…" → only "Finally" survived, after one file read). Reverted to ≥2 on both paths; the
+   2026-07-17 decision was right and the single-tool stale beat is the accepted cost. The rollback test got its
+   original assertion back.
+7. **Predicate asymmetries**: `<tool_response>` (an echoed RESULT) tripped the stream note; the attribute
+   dialect `<function name="x">` escaped the record scrub; an inline `` `<tool_call>` `` mention truncated a
+   reply about the syntax; an unbalanced ``` shielded a leak; whitespace was collapsed globally. All fixed in
+   the one predicate both paths now share; the streamed verifier judges the scrubbed view (what the user saw),
+   and the Slack promise headline quotes the treated copy. Still on raw text, as before: journal, post-mortem,
+   episode, hydration judge, work_log, calibration.
+8. **The v8 in-place delta ignored the provisioning backoff**: a broken mirror would have been hit with a
+   600 s apt on every command while the lock was held. The delta now respects the backoff (it does not arm it —
+   a failed delta must still fall through to the full provision in the same call, which arms it on its own
+   failure).
+9. **The weather tool**: a transient 403 then "no such place" produced the retry-inviting message instead of
+   "Do NOT retry the same name" — a definitive answer now clears the earlier refusal; the `Server:` header is
+   bounded to 40 printable characters (remote-controlled text the model reads), in both tools.
+10. **Four collector readers are DETECTORS, not learners**, and must see probes: the framing-leak gauge, the
+    ontology purity report, the human-feedback join, the escalation audit — each opts in with a stated reason;
+    an AST pin counts the opt-ins (7) so a new one is a decision. `TrajectoryCollector.count()` now agrees with
+    the iterator.
+11. **Weak pins**: four weather branches were masked by a sibling that recorded the same refusal; the sandbox
+    lockstep pin was satisfied by the word "Dockerfile"; the Perfect-It scheduling pin survived an arm swap; the
+    fail-closed class pin accepted inheritance as a disarm; the memo pin did not say which callee; the fuzz
+    note-check echoed the implementation's regex. All replaced by pins that discriminate, most of them
+    executed through the real paths (`_finalize_and_return`, the stream generator, `tool_get_weather` per
+    branch).
+
+Two things I fixed on my own before the reports: the suggested commands were interpolated unquoted (a
+prompt-injected URL would have become part of a command the tool recommended) — moot once the advice was
+withdrawn — and I confirmed `_is_narration_only_trim` is module-level, so the streaming smoother was real.
+
+### Verification
+Batteries on the final tree: `battery_4ft.json` (this round) **26/26**, `battery_4fr.json` **20/20**,
+`battery_4fs.json` **12/12** (its reworked sites moved into 4ft); every control correct. Suite
+**20,739 passed / 65 skipped / 0 failed**, twice, chunked at `-n 2`. Three existing pins re-based on the new
+contracts with their discriminating power kept (the Tor-resilience retry test now asserts the profile switch).
+Docs: `agent.html`, `file_system.html`, `memory_tools.html`, `docker.html`, `dream.html`, `system.html`.
+
+### Live (deployed 18:38, listener 21108; health 200, no boot errors)
+* **The download tool over Tor, on the site that refused the browser profile** — forced onto
+  `file_system(operation='download')` by name: *"SUCCESS: Downloaded 'https://www.w3.org/…/dummy.pdf' to
+  'probe_reverify.pdf'"*, `download [tor]`, 13,264 bytes, `PDF document, version 1.4`. Two rounds ago this was
+  "Failed after 3 attempts. Last error: None"; one round ago it was a message recommending cleartext curl. Now
+  it is the file, over Tor.
+* Sandbox marker v8, `lsof` and `host` present, no reprovision on this deploy.
+* The playbook holds 0 probe-stamped lessons; the idle hygiene dropped the 5 orphan twins the reviewer warned
+  about before the deploy; the boot reconcile is the guarantee for the next prune.
+
+### Recorded, not fixed (outside this scope)
+* The sandbox's egress is cleartext from the host IP by design (`docker.py`: no proxy, "avoid routing heavy
+  package installs through Tor"; under host networking the in-container Tor cannot bind), and the model uses
+  sandbox `curl` freely — request d50a34bd fetched 16 MB that way at 900 KB/s. The Tor-only rule the README
+  states does not hold for the sandbox. An operator decision.
+* Pass 1's collateral on paragraphs that OPEN with "Now"/"Next," in multi-tool turns (an instruction, a
+  sign-off request, a truthful in-progress notice) is the 2026-07-17 design; four of the reviewer's five shape-3
+  cases were this. Tightening pass 1 the way shape 3 was tightened (restatement) is the candidate.
+* The streamed path's other consumers (journal, post-mortem, episode, hydration judge, work_log, calibration)
+  still read the raw text, as they always did.
+
+## §4FU — The sandbox's egress: measured direct, made Tor-only, transparently (2026-09-09 19:00–20:45)
+
+**Trigger:** operator, after §4FT: "is it safe to leave the sandbox egress as is?" → measured, answered no →
+"proceed with 1."
+
+**The measurement.** From inside the live container, a plain request answered `{"IsTor": false, "IP": <the
+operator's real address>}`; the agent's own tools answered `{"IsTor": true, …}`. Bridge networking, no proxy
+variables, no Tor process, DNS through the host's resolver. The host's egress guard exempts the sandbox on the
+belief that "its egress is enforced by the sandbox's internal Tor daemon" — that daemon never ran (under host
+networking it cannot bind; under bridge it was never started with a usable config). The trajectory corpus holds
+161 sandbox commands that reached the network (125 curl/wget, 19 pip, 12 Python requests, 3 apt, 2 git), each
+from the real IP. The sharp risk: a fetched page can tell the model to run a command that posts data
+somewhere, and that leaves from the real IP past every host-side guard. `docs/safety.html` said "The internet,
+via Tor" for the sandbox; it was not true.
+
+**The design (option 1, hybrid), proven first by a spike on the live container:**
+* an in-container Tor from `/etc/tor/torrc.ghost`, started as root, dropping to `debian-tor`, with
+  `TransPort 9040` and `DNSPort 5353` beside its SocksPort (bootstrapped in 16 s);
+* iptables in the container's OWN network namespace — the only place the original destination of a redirected
+  connection survives, which is why "TransPort on the host" cannot serve a bridged container — sending every
+  TCP connection to the TransPort and every DNS query to the DNSPort, exempting Tor's own traffic (by uid) and
+  loopback FIRST, rejecting everything else (other UDP, ICMP, all IPv6);
+* loaded through a **privileged `docker exec`**: the container runs with Docker's default capability set, which
+  lacks `NET_ADMIN`, so a command the model runs — root or not — cannot flush the rules ("needs NET_ADMIN",
+  measured);
+* provisioning stays direct: apt, pip and the Chromium download run BEFORE the rules go in (the reason the old
+  design gave for direct egress); a runtime `pip install` by the model goes through Tor now (measured: `pip
+  download six` succeeded);
+* fail-closed from the moment the rules go in: until Tor bootstraps, and if it ever dies, nothing leaves.
+
+Spike results, live container: `curl` with no proxy flags → `IsTor: true`; raw `urllib` → `IsTor: true` on a
+different exit; `host example.com` resolved through the DNSPort; an IP-literal HTTP fetch got no direct answer
+(it cannot — the filter chain rejects anything not redirected); UDP to port 123 blocked; IPv6 blocked; root's
+`iptables -F` refused; pip over Tor fine.
+
+**The code.** `sandbox/tor_egress.py` holds the configuration as data (the torrc, the idempotent rule script,
+the probes, the JSON verdict parser) so it can be pinned without a container. `DockerSandbox._enforce_tor_egress()`
+sequences it once per container generation, after provisioning, replacing the old "in-container Tor for browser
+proxying" block: guard (host networking → not applied, said once — rules in a shared namespace would rewrite the
+HOST's traffic), presence of iptables and tor (v9 image; ERROR if absent), torrc, start Tor, **rules via
+privileged exec**, check Tor runs as `debian-tor` (a root-owned Tor would be exempted from nothing), wait for
+bootstrap (≤75 s), verify with a plain request to check.torproject.org — `IsTor: true` → "ENFORCED — the sandbox
+exits via <ip>"; `false` → LEAK at ERROR; unparseable → enforced-unverified. State in `_egress_state`. Sandbox
+image v9 adds `iptables`, in place from v8. The egress guard's docstring and `docs/safety.html` now say what is
+true, and since when.
+
+### Defects in my own work (R8)
+1. The first recreation pin forgot the readiness stamp `mark_ready()` sets, so the second call short-circuited
+   before the enforcement block and the pin read "never re-applied"; the reset now mirrors the real recreation
+   path.
+2. The logging-readability pin still named the removed "Sandbox Tor" title.
+3. The first suite chunk was killed by the memory watchdog mid-run and had to be restarted; the operator asked
+   for a single suite run rather than two, and got one.
+4. **The first deploy shipped a sandbox with no network at all.** The "already running" check was
+   `pgrep -f 'tor -f /etc/tor/torrc.ghost'` inside an `sh -c` wrapper whose OWN command line carries that literal:
+   it matched the wrapper (root), the start was skipped, the running-as-`debian-tor` check read the wrapper's owner,
+   and the live log said "rules loaded but Tor is not running as debian-tor — BLOCKED (fail-closed)". From inside:
+   curl exit 6, DNS "connection refused", nothing on 5353/9040. The fail-closed half held; the enforcement half
+   never started. Fixed by anchoring the pattern on Tor's own command line (`^tor -f …`; the wrapper's begins with
+   `sh`), proven by running the exact generated commands through `docker exec` before redeploying (Tor up as
+   `debian-tor`, three listeners; a second run is a no-op — same pid, log untouched). Pinned: the pattern is run
+   against the wrapper's own command line and must not match; a real Tor line must.
+5. Found while proving 4: the bootstrap poll greps the notice log, and the container's filesystem outlives a
+   restart while its processes do not — the log already held TWO "Bootstrapped 100%" lines (the spike's and the
+   evening's), so a restarted container would have passed the poll before its Tor had a circuit. A fresh start now
+   truncates the log first, inside the start branch only (truncating a live Tor's log would cut its bootstrap line
+   and the poll would never pass). Pinned both ways; two mutants added (keep the stale log; truncate unconditionally).
+
+### Verification
+Battery `battery_4fu.json`: **22 mutants, 22 killed** (19 in the first pass, three added with R8-4/5), controls correct — Tor's own traffic no longer exempted,
+exemptions after the redirects, DNS not redirected, catch-all TCP removed, default REJECT removed, IPv6 open,
+replies not accepted, Tor as root, verification through the SOCKS port, rules loaded unprivileged, the
+host-networking guard removed, missing iptables silently direct, no-bootstrap path flushing the rules, a direct
+answer called enforced, a root Tor trusted, enforcement on every command, the policy gate removed, rules only
+after bootstrap, the v9 delta wrong. Pins: `tests/test_sandbox_tor_egress.py` (24: the configuration as data,
+the sequencing through the exec stub, the wrapper self-match, the log truncation). Suite **20,761 passed / 65 skipped / 0 failed** (one run, per the operator, chunked at `-n 2`). Docs: `docs/sandbox/docker.html` (the egress section),
+`docs/safety.html`, `utils/egress_guard.py` docstring.
+
+**Live, first deploy (20:23, listener 76363): FAILED** — through the agent, `curl` exit 6 and one execution-fail
+strike; log "rules loaded but Tor is not running as debian-tor — BLOCKED (fail-closed)"; from inside, rules
+present, marker v9, udp/ipv6/root-flush all blocked, `tor user: root`, DNS refused. The sandbox was safe and
+useless (R8-4). **Live, second deploy (20:34, listener 24610): PASSED** — through the agent, the plain sandbox
+`curl` answered `{"IsTor":true,"IP":"171.25.193.35"}`, 0 strikes; log "Tor-only rules loaded; waiting for the
+in-container Tor to bootstrap…" at +13.4 s and "Tor-only egress ENFORCED — the sandbox exits via 171.25.193.35"
+at +18.7 s. From inside, no proxy flags: `curl` and raw `urllib` both `IsTor: true`; `host example.com`
+resolved through the DNSPort; UDP to 1.1.1.1:123 blocked; IPv6 blocked; `iptables -t nat -F GHOST_TOR` as the
+container's root "needs NET_ADMIN"; Tor runs as `debian-tor`; marker v9; rules present. The suite was NOT
+re-run for the two R8 fixes (the operator asked for one run; the two fixes live in one module whose 24 pins and
+22-mutant battery ran green after them, and the sequencing module was untouched).
+
+**Known costs.** Runtime installs and any model-run network code are Tor-speed now. Names OrbStack's resolver
+used to answer for the container (`host.docker.internal`) no longer resolve; nothing in the sandbox relied on
+them. Under host networking (the Linux default) the enforcement does not apply and says so — that topology
+needs the host-side design, not this one.

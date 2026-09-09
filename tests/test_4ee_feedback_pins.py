@@ -25,7 +25,7 @@ class _DayCol:
     def __init__(self, by_day, boom=()):
         self.by_day, self.boom, self.updates, self.asked = by_day, set(boom), [], []
 
-    def iter_trajectories(self, day=None):
+    def iter_trajectories(self, day=None, include_probes=False):  # mirrors the real signature (§4FS)
         self.asked.append(day)
         if day in self.boom:
             raise OSError("bad day file")

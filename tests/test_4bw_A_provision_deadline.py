@@ -60,7 +60,7 @@ class TestTheDerivationRemovesTheInversion:
     def test_a_command_without_a_timeout_prefix_uses_the_wedge_default(self):
         assert d._provision_deadline_s("sh -c 'echo hi >> /etc/sudoers'") \
             == d._EXEC_DAEMON_DEADLINE_S
-        assert d._provision_deadline_s("test -f /root/.supercharged.v5") \
+        assert d._provision_deadline_s("test -f /root/.supercharged.v9") \
             == d._EXEC_DAEMON_DEADLINE_S
 
     def test_grace_can_never_produce_a_non_clearing_deadline(self, monkeypatch):

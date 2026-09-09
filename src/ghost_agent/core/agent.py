@@ -18564,10 +18564,23 @@ class GhostAgent:
         #   3. `[^>]*>` in the open tag tolerates attributes
         #      (`<tool_call name="...">`) without being fooled by
         #      a stray `>` in the body.
+        # §4FS: remember whether an UNPARSED CALL is about to be scrubbed —
+        # the shared predicate (not inline code, not the watchdog's replan
+        # marker, not a <tool_response>) — so the reply can SAY a step did
+        # not happen. A first version ran its own scrub AFTER this one and
+        # therefore never saw anything (review, 2026-09-09).
+        try:
+            from .reply_smoothing import unparsed_call_markup_present as _ucm_present
+            _had_call_markup = _ucm_present(final_ai_content)
+        except Exception:  # noqa: BLE001
+            _had_call_markup = False
         final_ai_content = re.sub(
             # `\Z` (absolute EOS) instead of `$` so trailing
             # newlines after a tool_call don't escape the scrub.
-            r'<(tool_call|tool|function)\b[^>]*>.*?(?:</\1\b[^>]*>|\Z)',
+            # `(?<!`)`: inline code is the user's question about the
+            # syntax, not a leak — the stream scrub had this guard, this
+            # one did not (§4FS).
+            r'(?<!`)<(tool_call|tool|function)\b[^>]*>.*?(?:</\1\b[^>]*>|\Z)',
             '',
             final_ai_content,
             flags=re.DOTALL | re.IGNORECASE,
@@ -18626,6 +18639,29 @@ class GhostAgent:
         # progress. Gated on ≥2 real tool runs so conversational and
         # single-tool answers are never touched; runs BEFORE the verifier
         # gate so the verdict judges the text the user actually receives.
+        # §4FS (2026-09-09): the scrub above removed an unparsed call — say
+        # so, once, so the user is not left believing the step happened.
+        # No tool-count gate: the turn whose only call failed to parse ran
+        # zero tools.
+        if _had_call_markup:
+            try:
+                from .reply_smoothing import UNPARSED_TOOL_CALL_NOTE as _tc_note
+                if _tc_note not in final_ai_content:
+                    final_ai_content = (final_ai_content.rstrip() + "\n\n" + _tc_note
+                                        if final_ai_content.strip() else _tc_note)
+                pretty_log(
+                    "Reply Scrub",
+                    "a tool call in the reply could not be parsed — told the user it did not run",
+                    level="WARNING", icon=Icons.WARN,
+                )
+            except Exception as _sc_exc:  # noqa: BLE001
+                logger.debug("tool-call note skipped: %s", _sc_exc)
+
+        # Gate: ≥2 real tool runs — the 2026-07-17 decision, kept. §4FS
+        # tried ≥1 for a day: a single-tool turn does carry the stale beat
+        # ("I'll forget the PDF." then "Done"), but pass 1 also deletes
+        # "First, back up… / Then restore… / Finally, verify…" — two of
+        # three instructions after one file read (review, 2026-09-09).
         if sum(1 for t in tools_run_this_turn
                if t and not t.get("_synthetic")) >= 2:
             try:
@@ -18839,9 +18875,17 @@ class GhostAgent:
                 if _bg is None:
                     _bg = set()
                     self.context._pending_background_tasks = _bg
-                _pp_task = asyncio.create_task(_deferred_perfect_it())
-                _bg.add(_pp_task)
-                _pp_task.add_done_callback(_bg.discard)
+                # §4FS: diagnostics never teach (§4FB's rule, applied to the
+                # producer it missed). Three playbook lessons were stamped
+                # origin=probe by this path — the model's optimisation of
+                # "Run exactly this and report the exit code" is not a
+                # lesson about anything a user will ask.
+                if turn_origin(self.context) == "probe":
+                    logger.debug("Perfect-It skipped: probe-origin turn")
+                else:
+                    _pp_task = asyncio.create_task(_deferred_perfect_it())
+                    _bg.add(_pp_task)
+                    _pp_task.add_done_callback(_bg.discard)
 
         if tools_run_this_turn and not final_ai_content:
             # Walk back to the last *real* tool output. Reading
@@ -26381,12 +26425,14 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             # corpus stores the ANSWER the user saw, not tag-soup (which
             # then trained the self-improvement loop on garbage).
             _stream_effective_content = full_content
+            _scrub_fallback_emitted = False
             if (
                 _stream_scrub_active
                 and full_content.strip()
                 and len(full_content.strip()) > len(stream_prefix.strip())
                 and _scrubbed_emitted_len <= len(stream_prefix)
             ):
+                _scrub_fallback_emitted = True
                 _intended = ""
                 _fn_m = re.search(
                     r'<function(?:\s+name=|=)\s*["\']?([a-zA-Z0-9_]+)',
@@ -26450,6 +26496,43 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         f"Scrub consumed entire response (intended={_intended or 'unknown'}); emitted fallback.",
                         level="WARNING", icon=Icons.WARN,
                     )
+
+            # §4FS: a PARTIAL scrub — prose plus a tool call the model emitted
+            # in its final generation — removed the markup from the live
+            # stream silently, so the user read "Building bell-bearings.html…"
+            # and no file appeared, with nothing saying the step never ran.
+            # Append, once, the same note the non-stream path delivers. (The
+            # all-consumed case above already emitted its own fallback.)
+            try:
+                from .reply_smoothing import (
+                    UNPARSED_TOOL_CALL_NOTE as _tc_note,
+                    unparsed_call_markup_present as _ucm_present)
+                # The shared predicate, on the text this stream produced
+                # (the prefix was delivered before the scrub existed): not
+                # a <tool_response> echo, not inline code, not the
+                # watchdog's own replan marker (review, 2026-09-09).
+                if (_stream_scrub_active and not _scrub_fallback_emitted
+                        and _ucm_present((full_content or "")[len(stream_prefix or ""):])):
+                    _note_chunk = {
+                        "id": f"chatcmpl-{req_id}",
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": stream_model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": "\n\n" + _tc_note},
+                            "finish_reason": None,
+                        }],
+                    }
+                    yield f"data: {json.dumps(_note_chunk)}\n\n".encode('utf-8')
+                    pretty_log(
+                        "Reply Scrub",
+                        "a tool call in the streamed reply could not be parsed — "
+                        "told the user it did not run",
+                        level="WARNING", icon=Icons.WARN,
+                    )
+            except Exception as _nc_exc:  # noqa: BLE001
+                logger.debug("stream tool-call note skipped: %s", _nc_exc)
 
             # ⚠ THE [DONE] SENTINEL IS NOW RELEASED AT THE VERY END OF THIS
             # GENERATOR (see the release site at the bottom of stream_wrapper).
@@ -26765,6 +26848,30 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # when the reply was all scrubbed tool-XML), never tag-soup.
                     _traj_content = locals().get(
                         "_stream_effective_content", full_content) or full_content
+                    # §4FS: the web UI streams and returns before
+                    # _finalize_and_return, so its PERSISTED reply — what
+                    # the dream seed, fixture mining and the narration scan
+                    # read — never saw the scrub or the smoother: two
+                    # multi-tool replies on 2026-09-08 kept "I'll build…"
+                    # openers the smoother removes on sight, and one kept
+                    # a <tool_call> block. The live stream is already
+                    # delivered; the record gets the same treatment the
+                    # non-stream reply gets.
+                    try:
+                        from .reply_smoothing import (
+                            smooth_reply as _sr_smooth,
+                            strip_unparsed_tool_calls as _sr_strip)
+                        if isinstance(_traj_content, str):
+                            _traj_content = _sr_strip(_traj_content)
+                            _n_real = sum(
+                                1 for t in (stream_tools_snapshot or [])
+                                if t and not (t or {}).get("_synthetic"))
+                            if _n_real >= 2:
+                                _sm = _sr_smooth(_traj_content)
+                                if not _is_narration_only_trim(_sm, _traj_content):
+                                    _traj_content = _sm
+                    except Exception as _sr_exc:  # noqa: BLE001
+                        logger.debug("streamed reply smoothing skipped: %s", _sr_exc)
                     if (isinstance(_traj_content, str)
                             and _traj_content.strip()):
                         self._record_turn_trajectory(
@@ -26849,7 +26956,12 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             _np_store, _np_get_alog(self.context), _np_pid,
                             model_notified=_model_notified,
                             req_id=str(req_id or ""),
-                            headline=_np_head(full_content, limit=220),
+                            headline=_np_head(
+                                # §4FS: the treated (scrubbed, smoothed) copy
+                                # when it exists — the raw opener is the
+                                # stale beat §4FR removes.
+                                locals().get("_traj_content") or full_content,
+                                limit=220),
                         )
                 except Exception:
                     logger.debug("streamed notify backstop skipped",
@@ -26921,9 +27033,16 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 # (same lesson as _on_done's once-silent
                 # exception path).
                 try:
+                    # §4FS: the claim is what the USER received. The live
+                    # scrub removed unparsed tool XML from the stream; a
+                    # verdict on the raw text would judge markup the user
+                    # never saw — and a confident REFUTE queues a visible
+                    # correction banner (review, 2026-09-09).
+                    _sv_source = (_stream_scrub_pattern.sub('', full_content)
+                                  if _stream_scrub_active else full_content)
                     _sv_claim = re.sub(
                         r'<think>.*?(?:</think>|$)', '',
-                        full_content,
+                        _sv_source,
                         flags=re.DOTALL | re.IGNORECASE,
                     ).strip()
                     _sv_tool = _find_substantive_tool_for_verifier(
@@ -27459,6 +27578,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         p_msg = perfection_data["choices"][0]["message"].get("content", "")
         p_msg = re.sub(r'<tool_call>.*?</tool_call>', '', p_msg, flags=re.DOTALL | re.IGNORECASE).strip()
 
+        if turn_origin(self.context) == "probe":
+            # The inline (--perfect-it) path reaches here without the
+            # scheduling gate above; same rule, same reason (§4FS).
+            return p_msg
         if p_msg and getattr(self.context, 'skill_memory', None):
             await asyncio.to_thread(
                 self.context.skill_memory.learn_lesson,

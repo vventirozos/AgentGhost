@@ -617,6 +617,7 @@ class TrajectoryCollector:
         *,
         day: Optional[str] = None,
         session_id: Optional[str] = None,
+        include_probes: bool = False,
     ) -> Iterator[Trajectory]:
         """Stream trajectories from disk, overlaying outcome
         corrections from the sidecar.
@@ -624,6 +625,17 @@ class TrajectoryCollector:
         Filters:
           - `day` (YYYY-MM-DD) restricts to one partition; None walks all.
           - `session_id` restricts to one session; None walks all.
+          - `include_probes`: ``task_kind == "probe"`` records — the
+            operator's diagnostic requests (X-Ghost-Origin: probe) — are
+            SKIPPED unless this is True. §4FS (2026-09-09): every consumer
+            of this iterator is a learner or a report (dream seeds, the
+            post-mortem, fixture mining, experiment stats, backtests), and
+            five playbook lessons had been distilled from probe turns
+            ("Run exactly this and report the exit code" became a rule
+            about shell commands). §4FB's rule — diagnostics never teach —
+            was applied at the outcome-credit sites; this is the same rule
+            at the one place all the readers share. A caller that genuinely
+            wants probes says so.
 
         For every trajectory whose id has a sidecar correction, the
         ``outcome`` (and ``failure_reason``, when the sidecar carries
@@ -663,6 +675,9 @@ class TrajectoryCollector:
                                 traj = Trajectory.from_dict(d_obj)
                             except Exception:
                                 # Schema drift — skip but don't crash the walk.
+                                continue
+                            if (not include_probes
+                                    and str(getattr(traj, "task_kind", "") or "") == "probe"):
                                 continue
                             corr = corrections.get(traj.id)
                             if corr:
@@ -785,10 +800,13 @@ class TrajectoryCollector:
             h.update(f"{p.name}|{st.st_size}|{st.st_mtime_ns}\n".encode("utf-8"))
         return h.hexdigest()[:16]
 
-    def count(self) -> int:
-        """Cheap count: iterates lazily without parsing the whole trajectory."""
+    def count(self, *, include_probes: bool = False) -> int:
+        """Count records under the same probe gate as `iter_trajectories`
+        (a counter that disagrees with the iterator is a trap for the next
+        reader — §4FS review). Parses only the `task_kind` field."""
         if not self.root.exists():
             return 0
+        import json
         n = 0
         for day_dir in self.root.iterdir():
             if not day_dir.is_dir():
@@ -797,8 +815,15 @@ class TrajectoryCollector:
                 try:
                     with file_path.open("r", encoding="utf-8") as f:
                         for line in f:
-                            if line.strip():
-                                n += 1
+                            if not line.strip():
+                                continue
+                            if not include_probes:
+                                try:
+                                    if json.loads(line).get("task_kind") == "probe":
+                                        continue
+                                except Exception:  # noqa: BLE001
+                                    pass
+                            n += 1
                 except OSError:
                     continue
         return n

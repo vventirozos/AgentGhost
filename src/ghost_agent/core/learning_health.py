@@ -913,8 +913,11 @@ def _framing_leak_health(traj_root: Path) -> Dict[str, Any]:
             out["reason"] = "no trajectory corpus"
             return out
         stats = scan_trajectories(
+            # A corruption DETECTOR wants the whole corpus, probe turns included —
+            # a dialect regression that appears first in a probe must still register
+            # (§4FS review). include_probes=True is the documented exception.
             TrajectoryCollector(root=Path(traj_root),
-                                session_id="reader").iter_trajectories())
+                                session_id="reader").iter_trajectories(include_probes=True))
     except Exception as e:  # noqa: BLE001 — telemetry never breaks a turn
         out["reason"] = f"scan failed ({e})"
         return out

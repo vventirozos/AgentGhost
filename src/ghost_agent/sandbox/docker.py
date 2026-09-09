@@ -171,9 +171,9 @@ class DockerSandbox:
     # inherit them.
     #   _env_verified — the marker+chromium checks passed once for the
     #     current generation; skip re-probing them on every command.
-    #   _tor_attempted — the in-container tor spawn was already attempted
-    #     for this generation (under host networking it can never bind,
-    #     the host tor owns :9050 — retrying per command is pure waste).
+    #   _tor_attempted — the Tor-only egress enforcement (§4FU) was already
+    #     run for this generation: rules + in-container Tor are per
+    #     container, so once per generation is exactly right.
     #   _provision_backoff_until — after a failed provision, no reinstall
     #     before this wall-clock time; prevents a failing mirror from
     #     triggering a fresh multi-minute install on every command.
@@ -916,11 +916,39 @@ class DockerSandbox:
         #                mid-task (~24 s serial thrash, observed live on the
         #                chess-hosting flow). v3 images re-provision to pick
         #                these up.
-        #   v5 (now):    .supercharged.v5 — adds `stockfish` (the chess
+        #   v5:          .supercharged.v5 — adds `stockfish` (the chess
         #                project's engine-opponent mode; a recreate must
         #                not silently drop the engine). v4 images
         #                re-provision to pick it up.
-        marker_path = "/root/.supercharged.v5"
+        #   v6:          .supercharged.v6 — adds `file`. The model verifies
+        #                a download the standard way, `file x.pdf`, and the
+        #                missing binary turned a successful 16 MB fetch into
+        #                exit 127 and a failure strike (2026-09-09, request
+        #                d50a34bd). First version upgraded IN PLACE — the
+        #                delta below — not re-provisioned: a full provision
+        #                is ~5 minutes on the operator's next request, the
+        #                price every earlier bump paid.
+        #   v7:          .supercharged.v7 — adds `xxd`. The live check of v6
+        #                found the same shape one tool over: the model's
+        #                verification chain is `file x.pdf && head -c 200
+        #                x.pdf | xxd | head -5`, and the missing xxd scored
+        #                the download a failure again.
+        #   v8:          .supercharged.v8 — adds `lsof` and `dnsutils`
+        #                (host/nslookup/dig). 415 trajectory files, every
+        #                "command not found" counted: after file and xxd,
+        #                these were the only tools the model reached for
+        #                that the image lacked (lsof ×2, host/nslookup ×2).
+        #   v9 (now):    .supercharged.v9 — adds `iptables`, for the
+        #                Tor-only egress rules (§4FU, sandbox/tor_egress.py).
+        #                v8 images upgrade in place; older ones take the
+        #                full provision.
+        marker_path = "/root/.supercharged.v9"
+        # The marker this version supersedes, and the delta that lifts an
+        # image from it to this one. Keep the three in step with the history
+        # above when bumping again.
+        prev_marker_path = "/root/.supercharged.v8"
+        upgrade_delta_cmd = "timeout 600 sh -c 'apt-get update && apt-get install -y iptables'"
+        upgrade_delta_verify = "sh -c 'command -v iptables'"
 
         # The marker/chromium probes are two docker execs; running them
         # before EVERY command added latency for nothing. Verify once per
@@ -933,6 +961,59 @@ class DockerSandbox:
         else:
             marker_ok = (self._exec_run(f"test -f {marker_path}")[0] == 0)
             chromium_ok = self._chromium_binary_present()
+        # ── In-place upgrade from the previous marker (v6, 2026-09-09) ──
+        # An image carrying the PREVIOUS marker has everything but this
+        # version's delta. Install only the delta, VERIFY it landed, stamp
+        # the new marker, commit. Any failure falls through to the full
+        # provision below, which installs the same packages from scratch.
+        # The delta RESPECTS the provisioning backoff: inside one, it is
+        # skipped and the gate below reports the wait — a broken mirror must
+        # not be hit with a 600 s apt on EVERY command while the provision
+        # lock is held (review, 2026-09-09). It does not ARM the backoff
+        # itself: a failed delta falls through to the full provision in the
+        # same call, and that path arms the backoff on its own failure.
+        if (not marker_ok and chromium_ok
+                and time.time() >= self._provision_backoff_until):
+            try:
+                _prev_ok = (self._exec_run(f"test -f {prev_marker_path}")[0] == 0)
+            except Exception:  # noqa: BLE001 — a probe failure is "not present"
+                _prev_ok = False
+            if _prev_ok:
+                pretty_log(
+                    "Sandbox Provision",
+                    f"Upgrading {prev_marker_path.rsplit('.', 1)[-1]} → "
+                    f"{marker_path.rsplit('.', 1)[-1]} in place (adds iptables)…",
+                    icon=Icons.SANDBOX_BOX,
+                )
+                _verified = False
+                try:
+                    _code, _out = self._provision_exec(
+                        upgrade_delta_cmd, environment=env_vars)
+                    # The marker asserts the binary is there; only a probe
+                    # that finds it may write the marker (the v2 lesson).
+                    _verified = (
+                        _code == 0
+                        and self._exec_run(upgrade_delta_verify)[0] == 0)
+                except Exception as _e:  # noqa: BLE001 — fall through to full
+                    logger.debug("in-place sandbox upgrade raised: %s", _e)
+                if _verified:
+                    self._exec_run(f"touch {marker_path}")
+                    self._exec_run(f"rm -f {prev_marker_path}")
+                    try:
+                        pretty_log("Sandbox Cache", "Committing fast-boot image cache…",
+                                   icon=Icons.SANDBOX_BOX)
+                        self.container.commit(repository="ghost-agent-base", tag="latest")
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(f"Failed to commit sandbox image cache: {e}")
+                    marker_ok = True
+                    did_work = True
+                else:
+                    pretty_log(
+                        "Sandbox Provision",
+                        "In-place upgrade did not verify — falling back to a full provision.",
+                        level="WARNING", icon=Icons.WARN,
+                    )
+
         if not marker_ok or not chromium_ok:
             if time.time() < self._provision_backoff_until:
                 raise Exception(
@@ -965,7 +1046,7 @@ class DockerSandbox:
             # unbounded mirror/CDN stall would wedge every concurrent tool
             # call in the agent. The caps are generous — they exist to
             # bound a stall, not to race a slow link.
-            apt_cmd = "timeout 900 sh -c 'apt-get update && apt-get install -y sudo coreutils nodejs npm g++ curl wget git procps postgresql-client libpq-dev tor ripgrep sqlite3 iproute2 stockfish'"
+            apt_cmd = "timeout 900 sh -c 'apt-get update && apt-get install -y sudo coreutils nodejs npm g++ curl wget git procps postgresql-client libpq-dev tor ripgrep sqlite3 iproute2 stockfish file xxd lsof dnsutils iptables'"
             code, out = self._provision_exec(apt_cmd, environment=env_vars)
             if code != 0:
                 err_msg = out.decode("utf-8", errors="replace") if out else "Unknown error"
@@ -1064,8 +1145,10 @@ class DockerSandbox:
 
             self._exec_run(f"touch {marker_path}")
             # Remove any legacy v1 marker so a downgrade-then-upgrade
-            # cycle doesn't leave stale state around.
+            # cycle doesn't leave stale state around — and the marker this
+            # version supersedes, so an image never carries two.
             self._exec_run("rm -f /root/.supercharged")
+            self._exec_run(f"rm -f {prev_marker_path}")
 
             # Cache the fully installed environment for instant future
             # startups. Committed UNCONDITIONALLY after a successful
@@ -1085,37 +1168,17 @@ class DockerSandbox:
 
         self._env_verified = True
 
-        # Ensure Tor is installed and running inside the container for
-        # isolated browser proxying. Attempted once per container
-        # generation: under host networking (the Linux default) an
-        # in-container tor can NEVER bind :9050 (the host tor owns it in
-        # the shared netns), so re-attempting the doomed spawn on every
-        # command just added latency and flooded the log with
-        # per-command "Environment Ready" lines.
+        # §4FU: Tor-only egress for the SANDBOX, enforced in its own network
+        # namespace (see sandbox/tor_egress.py for the design and the spike
+        # that settled it). Runs AFTER provisioning — apt, pip and the
+        # Chromium download stay direct, which is what the old comment
+        # wanted — and once per container generation. Under host
+        # networking the sandbox shares the host's namespace and iptables
+        # here would rewrite the HOST's traffic: not applied, said once.
         if self.tor_proxy and not self._tor_attempted:
             self._tor_attempted = True
-            exit_code, _ = self._exec_run("test -f /usr/bin/tor")
-            if exit_code != 0:
-                did_work = True
-                pretty_log("Sandbox Tor", "Installing isolated Tor daemon…", icon=Icons.TOOL_DOWN)
-                self._exec_run("timeout 900 sh -c 'apt-get update && apt-get install -y tor'", user="root")
-
-            code, _ = self._exec_run("pgrep -x tor")
-            if code != 0:
-                did_work = True
-                self._exec_run("su - debian-tor -s /bin/sh -c 'tor --RunAsDaemon 1'", user="root")
-                # Verify it actually came up; under host networking this is
-                # EXPECTED to fail (host tor owns the port) — say so once
-                # instead of silently retrying forever.
-                time.sleep(0.5)
-                code, _ = self._exec_run("pgrep -x tor")
-                if code != 0:
-                    pretty_log(
-                        "Sandbox Tor",
-                        "In-container Tor did not start (expected under host "
-                        "networking, where the host Tor already serves :9050).",
-                        level="WARNING", icon=Icons.WARN,
-                    )
+            did_work = True
+            self._enforce_tor_egress()
 
         # Reached the end of ensure_running without raising → container +
         # mount + environment are all confirmed good. Stamp the readiness TTL
@@ -1126,6 +1189,123 @@ class DockerSandbox:
         # environment up. Silent on the steady-state common path.
         if did_work:
             pretty_log("Sandbox Ready", "Environment Ready.", icon=Icons.OK)
+
+    #: "enforced" | "blocked" (rules in, Tor not verified) | "unavailable"
+    #: (host networking / no iptables) | "" (not attempted yet). Read by
+    #: get_stats() and the health report.
+    _egress_state = ""
+    _egress_exit_ip = ""
+
+    def _container_network_mode(self) -> str:
+        try:
+            self.container.reload()
+            return str(((self.container.attrs or {}).get("HostConfig") or {}).get("NetworkMode") or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _enforce_tor_egress(self) -> None:
+        """Make every connection the sandbox opens leave through Tor.
+
+        Fail-closed by construction: the rules go in BEFORE Tor is known
+        to be up, so from that moment nothing leaves except through the
+        TransPort; if Tor never bootstraps (or dies later) the sandbox is
+        offline, not exposed. The rules are loaded through a PRIVILEGED
+        exec — the container's own capability set has no NET_ADMIN, so the
+        model, root or not, cannot undo them. Never raises: a sandbox that
+        cannot be enforced logs at ERROR and stays blocked.
+        """
+        from . import tor_egress as _te
+        if self._container_network_mode() == "host":
+            self._egress_state = "unavailable"
+            pretty_log(
+                "Sandbox Egress",
+                "host networking: the sandbox shares the host's network namespace, "
+                "transparent Tor enforcement is NOT applied (rules here would rewrite "
+                "the host's traffic). Sandbox egress is DIRECT.",
+                level="WARNING", icon=Icons.WARN,
+            )
+            return
+        try:
+            if self._exec_run("sh -c 'command -v iptables && command -v tor'")[0] != 0:
+                self._egress_state = "unavailable"
+                pretty_log(
+                    "Sandbox Egress",
+                    "iptables or tor missing in the image — Tor-only egress NOT enforced "
+                    "(provisioning incomplete; the v9 image carries both).",
+                    level="ERROR", icon=Icons.FAIL,
+                )
+                return
+            self._exec_run(_te.write_torrc_cmd(), user="root")
+            self._exec_run(_te.start_tor_cmd(), user="root")
+            # Rules first — the fail-closed moment. Privileged exec: the
+            # container has no NET_ADMIN of its own.
+            code, out = self._exec_run(_te.apply_rules_cmd(), privileged=True)
+            if code != 0:
+                self._egress_state = "unavailable"
+                pretty_log(
+                    "Sandbox Egress",
+                    f"iptables rules could not be loaded (exit {code}: "
+                    f"{(out or b'').decode('utf-8', 'replace')[:160]}) — Tor-only egress "
+                    "NOT enforced; sandbox egress is DIRECT.",
+                    level="ERROR", icon=Icons.FAIL,
+                )
+                return
+            self._egress_state = "blocked"
+            if self._exec_run(_te.tor_running_as_expected_cmd())[0] != 0:
+                pretty_log(
+                    "Sandbox Egress",
+                    f"rules loaded but Tor is not running as {_te.TOR_USER} — the sandbox "
+                    "network is BLOCKED until it does (fail-closed).",
+                    level="WARNING", icon=Icons.WARN,
+                )
+                return
+            pretty_log("Sandbox Egress", "Tor-only rules loaded; waiting for the in-container Tor to bootstrap…",
+                       icon=Icons.TOOL_DOWN)
+            deadline = time.time() + _te.BOOTSTRAP_TIMEOUT_S
+            booted = False
+            while time.time() < deadline:
+                if self._exec_run(_te.bootstrapped_cmd())[0] == 0:
+                    booted = True
+                    break
+                time.sleep(_te.BOOTSTRAP_POLL_S)
+            if not booted:
+                pretty_log(
+                    "Sandbox Egress",
+                    f"Tor did not bootstrap within {int(_te.BOOTSTRAP_TIMEOUT_S)}s — the sandbox "
+                    "network stays BLOCKED (fail-closed); it opens by itself when Tor is up.",
+                    level="WARNING", icon=Icons.WARN,
+                )
+                return
+            code, out = self._exec_run(_te.verify_cmd(), deadline_s=60.0)
+            is_tor, ip = _te.parse_tor_check((out or b"").decode("utf-8", "replace"))
+            if is_tor:
+                self._egress_state = "enforced"
+                self._egress_exit_ip = ip
+                pretty_log("Sandbox Egress", f"Tor-only egress ENFORCED — the sandbox exits via {ip}",
+                           icon=Icons.OK)
+            elif is_tor is False:
+                # Impossible by construction unless the rules were bypassed:
+                # say it as loudly as it deserves.
+                self._egress_state = "blocked"
+                pretty_log(
+                    "Sandbox Egress",
+                    f"LEAK: a plain request from the sandbox reached the internet directly "
+                    f"(IsTor=false, IP {ip}) despite the rules — investigate before using the sandbox.",
+                    level="ERROR", icon=Icons.FAIL,
+                )
+            else:
+                pretty_log(
+                    "Sandbox Egress",
+                    "rules loaded and Tor bootstrapped, but the verification request got no "
+                    "usable answer (check.torproject.org unreachable or challenged) — treated as "
+                    "enforced-unverified; re-checked on the next container generation.",
+                    level="WARNING", icon=Icons.WARN,
+                )
+                self._egress_state = "enforced"
+        except Exception as exc:  # noqa: BLE001 — never take a turn down
+            self._egress_state = self._egress_state or "unavailable"
+            pretty_log("Sandbox Egress", f"enforcement step raised ({type(exc).__name__}: {exc}) — "
+                       f"state={self._egress_state!r}", level="ERROR", icon=Icons.FAIL)
 
     def _chromium_binary_present(self) -> bool:
         """Check that Playwright's Chromium `headless_shell` is actually

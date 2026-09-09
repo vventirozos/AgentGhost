@@ -84,14 +84,27 @@
     <li><strong>PyTorch (2026-06-22)</strong>: <code>torch</code> preinstalled from the <strong>CPU wheel index</strong> (<code>--index-url https://download.pytorch.org/whl/cpu</code>) — the default wheels pull ~2&nbsp;GB of CUDA the sandbox can't use. Added because every "build/train a model" project hit <code>ModuleNotFoundError: torch</code> and ran a ~300&nbsp;s <code>pip install torch</code> mid-task, often tripping the <code>execute</code> timeout (observed live: the PetAI training task). <strong>Non-fatal</strong>: a machine that can't reach the torch CDN still gets a working sandbox (the agent falls back to a runtime install), so a torch flake can't poison provisioning of everything else.</li>
   </ul>
 
-  <h2>Provision marker is versioned (<code>/root/.supercharged.v4</code>)</h2>
+  <h2>Provision marker is versioned (<code>/root/.supercharged.v9</code>)</h2>
   <p>The runtime gate in <code>ensure_running</code> checks TWO things, not one:</p>
   <ol>
-    <li><code>test -f /root/.supercharged.v4</code> — the version-bumped marker. Older images (missing the current marker) are treated as un-provisioned, forcing a clean reinstall on next boot; e.g. a <code>v3</code> image re-provisions to pick up <code>iproute2</code>/<code>flask</code>/<code>python-chess</code>.</li>
+    <li><code>test -f /root/.supercharged.v9</code> — the version-bumped marker. Older images (missing the current marker) are treated as un-provisioned, forcing a clean reinstall on next boot; e.g. a <code>v3</code> image re-provisions to pick up <code>iproute2</code>/<code>flask</code>/<code>python-chess</code>.</li>
     <li><code>_chromium_binary_present()</code> — <code>find /root/.cache/ms-playwright -type f \( -name headless_shell -o -name chrome \) -print -quit</code>. Defends against the silent-failure mode where a prior install exited 0 but the binary isn't actually on disk (network flake, mid-extract disk-full, etc.).</li>
   </ol>
   <p>If the marker is present but the binary is missing, the gate logs <code>⚠ Provision marker present but Chromium binary missing. Reinstalling...</code> and re-runs the full install. Post-install, <code>_chromium_binary_present()</code> is checked AGAIN before the marker is touched — <strong>fail-loud:</strong> the v4 marker is never set unless the binary actually verifies on disk, so a failed install cannot silently poison future boots.</p>
   <p>Bump the marker (in both <code>sandbox/Dockerfile</code> AND <code>sandbox/docker.py</code>) any time the install surface genuinely changes — e.g. <code>.v4</code> (2026-07-12) added <code>iproute2</code>/<code>flask</code>/<code>python-chess</code>. The meta-tests <code>test_v4_marker_gate_name_pinned</code> and <code>test_provisioning_bakes_ss_flask_chess_and_stays_in_sync</code> assert the two files agree on both the marker and the package set.</p>
+  <p><strong>Bumps upgrade IN PLACE from the previous marker (2026-09-09, §4FR; v6 added <code>file</code>, v7 added <code>xxd</code> after the live check found the model's chain pipes through it too; v8 added <code>lsof</code> and <code>dnsutils</code>, the only other commands the trajectories show the model reaching for; v9 added <code>iptables</code> for the Tor-only egress rules).</strong> v6 adds <code>file</code>: the
+  model verifies a download the standard way, <code>file x.pdf</code>, and the missing binary turned
+  a successful 16 MB fetch into exit 127, a failure banner and a strike (request d50a34bd). Every
+  earlier bump made the next request pay a full provision — ~5 minutes of apt, pip, torch and
+  Chromium. Now an image carrying the PREVIOUS marker and a working Chromium gets only the delta
+  (<code>apt-get install -y file</code>), the binary is PROBED with <code>command -v file</code> before
+  the new marker is written (the v2 lesson: a marker asserts what somebody checked), the old marker is
+  removed, and the image is committed. Any failure falls through to the full provision, which installs
+  the same package list and now also removes the superseded marker. The delta obeys the same provisioning
+  backoff as the full install &mdash; armed pessimistically before the apt call, cleared on success &mdash; so a
+  broken mirror is not hit with a 600 s install on every command while the provision lock is held (review,
+  2026-09-09). Pins:
+  <code>tests/test_sandbox_v6_file_upgrade.py</code>.</p>
   <p>Covered by <code>tests/test_sandbox_chromium_gate.py</code> (13 cases including binary-present/absent probes, legacy-marker handling, post-install verification refusing to mark a broken image, Dockerfile-level assertions about <code>--with-deps</code>, and the docker.py↔Dockerfile package-sync check).</p>
 
   <h2>Resource caps</h2>
@@ -160,8 +173,59 @@
   already-ran command is no longer re-run) is in
   <code>tests/test_execute_heal_timeout_guard.py</code>.</p>
 
-  <h2>Tor</h2>
-  <p>If <code>tor_proxy</code> is set in the constructor, the container starts a <code>tor</code> daemon and outbound HTTP from inside the sandbox is routed through it. The spawn is attempted <strong>once per container generation</strong> and verified: under host networking (the Linux default) the in-container tor can never bind — the host tor already owns <code>:9050</code> in the shared netns — so the code logs one explicit warning instead of silently re-attempting the doomed spawn on every command (which flooded the log with per-command "Environment Ready" lines). The native <code>browser</code> tool additionally forces DNS-over-SOCKS via Chromium's <code>--host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE localhost"</code> and disables non-proxied WebRTC (<code>--webrtc-ip-handling-policy=disable_non_proxied_udp</code>), so the browser path cannot leak DNS or the host IP even if the LLM forgets to configure the proxy correctly.</p>
+  <h2>Egress: transparent Tor, enforced in the container <span class="tag">2026-09-09 &sect;4FU</span></h2>
+  <p><strong>What was true before.</strong> Measured from inside the live container: a plain request left from the
+  operator's real IP &mdash; bridge networking, no proxy variables, no Tor process, DNS through the host's resolver.
+  The host's egress guard exempted the sandbox on the belief that "its egress is enforced by the sandbox's internal
+  Tor daemon"; that daemon never ran (under host networking it could not bind, under bridge it was never started
+  with a usable config). Across the trajectory corpus the model reached the network from the sandbox 161 times
+  (125 curl/wget, 19 pip, 12 Python requests, 3 apt, 2 git), each from the real IP; and a fetched page can tell the
+  model to run a command that posts data somewhere, which then leaves from the real IP past every host-side guard.</p>
+  <p><strong>The design (operator's option 1, hybrid).</strong> <code>sandbox/tor_egress.py</code> holds the
+  configuration as data; <code>DockerSandbox._enforce_tor_egress()</code> sequences it, once per container generation,
+  AFTER provisioning:</p>
+  <ol>
+    <li>an in-container Tor from <code>/etc/tor/torrc.ghost</code>, started as root and dropping to
+    <code>debian-tor</code>, with <code>TransPort 9040</code> and <code>DNSPort 5353</code> beside its SocksPort;</li>
+    <li>iptables rules in the container's OWN network namespace (the only place the original destination of a
+    redirected connection survives): every TCP connection to the TransPort, every DNS query to the DNSPort, Tor's
+    own traffic (matched by uid) and loopback exempted FIRST, everything else &mdash; other UDP, ICMP, all IPv6 &mdash;
+    REJECTed;</li>
+    <li>loaded through a <strong>privileged <code>docker exec</code></strong>: the container runs with Docker's default
+    capability set, which lacks <code>NET_ADMIN</code>, so a command the model runs, root or not, cannot flush the rules
+    (verified: "needs NET_ADMIN");</li>
+    <li>the rules go in BEFORE Tor is known to be up &mdash; fail-closed: until it bootstraps, and if it ever dies,
+    nothing leaves the sandbox at all;</li>
+    <li>a verification request with no proxy flags to <code>check.torproject.org</code> must answer
+    <code>IsTor: true</code>; a <code>false</code> is logged as a LEAK at ERROR.</li>
+  </ol>
+  <p><strong>Provisioning stays direct</strong> &mdash; apt, pip and the Chromium download run before the rules,
+  which is what the old design wanted &mdash; but a runtime <code>pip install</code> or <code>apt</code> by the model
+  now goes through Tor (slower). Under host networking the enforcement is not applied and says so once: rules in a
+  shared namespace would rewrite the host's traffic. Names OrbStack's resolver used to answer for the container
+  (<code>host.docker.internal</code>) no longer resolve, since DNS goes through Tor; nothing in the sandbox relied on
+  them. The spike on the live container that settled the design: bootstrap in 16 s; <code>curl</code> and raw
+  <code>urllib</code> both <code>IsTor: true</code> on different exits; <code>host example.com</code> resolved; UDP to
+  port 123 and IPv6 blocked; <code>pip download six</code> succeeded over Tor. State is exposed as
+  <code>_egress_state</code> (enforced / blocked / unavailable). Pins: <code>tests/test_sandbox_tor_egress.py</code>.</p>
+  <p><strong>The first live run found two defects in the sequencing, both fixed the same evening.</strong>
+  (1) The "is Tor already running" check was <code>pgrep -f 'tor -f /etc/tor/torrc.ghost'</code>, run inside an
+  <code>sh -c</code> wrapper whose own command line carries that literal &mdash; so it matched the wrapper (root),
+  the start was skipped as "already running", the running-as-<code>debian-tor</code> check read the wrapper's owner,
+  and the sandbox sat fail-closed with the rules in and no Tor. The pattern is now anchored on Tor's own command
+  line (<code>TOR_PROC_PATTERN = "^tor -f …"</code>; the wrapper's begins with <code>sh</code>), and a pin runs the
+  pattern against the wrapper's own command line. (2) The bootstrap poll greps the notice log, and the container's
+  filesystem outlives a restart while its processes do not &mdash; the previous Tor's "Bootstrapped 100%" line would
+  pass the poll before this Tor had a circuit. A FRESH start now truncates the log first (never when Tor already
+  runs). Live after the fix: "Tor-only egress ENFORCED" 5 s after the rules; through the agent and from inside,
+  <code>curl</code> and raw <code>urllib</code> both <code>IsTor: true</code>; DNS resolves through the DNSPort; UDP,
+  IPv6 and a root <code>iptables -F</code> all blocked; Tor runs as <code>debian-tor</code>; marker v9.</p>
+
+  <h2>Tor <span class="tag">superseded 2026-09-09</span></h2>
+  <p>The former "the container starts a <code>tor</code> daemon and outbound HTTP is routed through it" block
+  described a daemon that never actually ran (see the egress section above for the measurement). <code>tor_proxy</code>
+  in the constructor is now the switch for the transparent enforcement; the once-per-container-generation attempt
+  discipline (<code>_tor_attempted</code>) is unchanged.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
