@@ -86,13 +86,66 @@ WORKSPACE_DESCRIPTION_BEFORE_4FJ = (
 
 HEADS = ("full", "diet", "full-legacy-workspace")
 
+# ── the retired arm, kept HERE (§4FX, 2026-09-10) ─────────────────────
+# The diet was removed from production (registry.py carries the retirement
+# note and the numbers). This bench is the harness that would re-decide it,
+# so it carries its own copy of the construction: the core set exactly as
+# §4FE shipped it, the catalog entry, and the filter. The FULL set still
+# comes from `R.TOOL_DEFINITIONS`, so a re-run measures today's real tools
+# against the frozen core rather than a stale snapshot of both.
+CORE = frozenset({
+    "file_system", "manage_projects", "web_search", "execute", "browser",
+    "manage_services", "system_utility", "deep_research", "knowledge_base",
+    "darkweb_search", "jobs", "introspect", "recall", "delegate",
+    "update_profile", "vision_analysis", "tool_catalog",
+})
+STATIC_EXTRA = frozenset({
+    "vision_analysis", "image_generation", "report_pdf",
+    "manage_composed_skills",
+})
+CATALOG_NAME = "tool_catalog"
+CATALOG_DEFINITION = {
+    "type": "function",
+    "function": {
+        "name": CATALOG_NAME,
+        "description": (
+            "Rarely-needed tools are not listed in this prompt to keep it "
+            "short. action='list' names them with one line each; "
+            "action='describe' with name='<tool>' returns that tool's full "
+            "parameter schema. After 'describe', call the tool DIRECTLY by "
+            "its name with those parameters — it is dispatchable even though "
+            "it is not advertised here."),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["list", "describe"]},
+                "name": {"type": "string",
+                         "description": "Required for action='describe'."},
+            },
+            "required": ["action"],
+        },
+    },
+}
+
+
+def apply_diet(active_tools):
+    """Keep the core set (plus any non-built-in) and append the catalog."""
+    static_names = {(t.get("function") or {}).get("name")
+                    for t in R.TOOL_DEFINITIONS} | set(STATIC_EXTRA)
+    kept = [t for t in active_tools
+            if ((t.get("function") or {}).get("name") in CORE
+                or (t.get("function") or {}).get("name") not in static_names)]
+    if not any((t.get("function") or {}).get("name") == CATALOG_NAME for t in kept):
+        kept.append(dict(CATALOG_DEFINITION))
+    return kept
+
 
 def _head(name):
     """The tool list advertised under head ``name``."""
     if name == "full":
         return list(R.TOOL_DEFINITIONS)
     if name == "diet":
-        return R.apply_tool_head_diet(list(R.TOOL_DEFINITIONS))
+        return apply_diet(list(R.TOOL_DEFINITIONS))
     if name == "full-legacy-workspace":
         out = []
         for t in R.TOOL_DEFINITIONS:
@@ -112,12 +165,12 @@ def _ok(head, picked, truth, advertised=None):
     """Scoring: exact pick; a head that advertises `tool_catalog` earns the
     designed credit when the truth is NOT among the tools it advertised
     (derived from the head actually sent, not from a name set — §4FK M6:
-    `vision_analysis` sits in TOOL_HEAD_CORE but is appended only by the
-    live builder, so it is absent from the bench diet head)."""
+    `vision_analysis` sits in CORE but is appended only by the live builder,
+    so it is absent from the bench diet head)."""
     if picked == truth:
         return True
     names = advertised if advertised is not None else _names(_head(head))
-    return "tool_catalog" in names and truth not in names and picked == "tool_catalog"
+    return CATALOG_NAME in names and truth not in names and picked == CATALOG_NAME
 
 
 def _units(rows, unit):

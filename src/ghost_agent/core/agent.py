@@ -1216,15 +1216,39 @@ _EVIDENCE_CLAIM_STOPWORDS = frozenset({
 })
 
 
-def _is_narration_only_trim(smoothed: str, original: str) -> bool:
-    """True when reply smoothing reduced a reply to a short working-
-    narration line — the inverted-trim failure (2026-07-25): the smoother
-    kept "Let me search more specifically…" and dropped the findings."""
-    s = (smoothed or "").strip()
-    return (s != (original or "").strip()
-            and len(s) < 90
-            and bool(re.match(
-                r"(Let me|Now |Next,? |I'll |I will |First,? |Then )", s)))
+# The inverted-trim guard (2026-07-25) moved to core.reply_smoothing in
+# §4FV so the two delivery paths and `treat_reply` cannot drift apart; the
+# name stays here because both finalize sites and a pin import it from
+# agent.
+from .reply_smoothing import is_narration_only_trim as _is_narration_only_trim
+
+
+def _build_memory_arc(history, ai_text, *, tools_run) -> str:
+    """The smart-memory arc for one turn: the last four user/assistant
+    messages plus the DELIVERED reply, fenced code stripped, 500 chars each.
+
+    ONE implementation for both delivery paths (§4FV, 2026-09-10). The two
+    sites were hand-mirrored and remembered different text for the same
+    turn: the streamed twin read the raw accumulator, and the non-stream one
+    runs inside the turn loop, BEFORE `_finalize_and_return` scrubs and
+    smooths `final_ai_content` in place — so an arc's first 500 chars were
+    often the turn's opening narration ("Let me check the file first.")
+    rather than its answer. Treating here is idempotent, so a caller that
+    already holds the treated view may pass it.
+    """
+    from .reply_smoothing import count_real_tools, treat_reply
+    turns = [m for m in (history or [])
+             if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
+    micro: list = []
+    for m in turns[-4:]:
+        role = str(m.get("role", "user")).upper()
+        clean_content = re.sub(r'```.*?```', '', str(m.get("content", "")),
+                               flags=re.DOTALL)
+        micro.append(f"{role}: {clean_content[:500].strip()}")
+    treated = treat_reply(str(ai_text or ""),
+                          n_real_tools=count_real_tools(tools_run))
+    clean_ai = re.sub(r'```.*?```', '', treated, flags=re.DOTALL)
+    return "\n".join(micro) + f"\nAI: {clean_ai[:500].strip()}"
 
 
 def _claim_tokens(text: str) -> set:
@@ -22676,19 +22700,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         _tool_names = ", ".join(
                             t["function"]["name"] for t in all_tools
                         ) or "(none)"
-                        # §4FE: under the tool head diet the list is the
-                        # core set; say where the rest live.
-                        try:
-                            from ..tools.registry import tool_head_diet_enabled as _thd
-                            _diet_hint = (" Rarely-needed tools are listed by "
-                                          "tool_catalog(action='list')."
-                                          if _thd() else "")
-                        except Exception:  # noqa: BLE001
-                            _diet_hint = ""
                         _native_pointer = (
                             f"(Tool schemas are advertised via the native "
                             f"`tool_calls` API on this request. Available "
-                            f"tools: {_tool_names}.{_diet_hint})"
+                            f"tools: {_tool_names}.)"
                         )
                         # QWEN_TOOL_PROMPT_NATIVE, not QWEN_TOOL_PROMPT
                         # (2026-07-31): splicing the legacy XML format rules
@@ -24830,13 +24845,9 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         from .autonomous_activity import (
                             is_internal_request as _is_int_req_m2)
                         if self.context.args.smart_memory > 0.0 and last_user_content and not forget_was_called and not last_was_failure and not _is_int_req_m2(req_id):
-                            micro_msgs = []
-                            for m in [msg for msg in messages if msg.get("role") in ["user", "assistant"]][-4:]:
-                                role = m.get("role", "user").upper()
-                                clean_content = re.sub(r'```.*?```', '', str(m.get("content", "")), flags=re.DOTALL)
-                                micro_msgs.append(f"{role}: {clean_content[:500].strip()}")
-                            clean_ai = re.sub(r'```.*?```', '', final_ai_content, flags=re.DOTALL)
-                            recent_arc = "\n".join(micro_msgs) + f"\nAI: {clean_ai[:500].strip()}"
+                            recent_arc = _build_memory_arc(
+                                messages, final_ai_content,
+                                tools_run=tools_run_this_turn)
                             if getattr(self.context, 'journal', None):
                                 await self._journal_append_safe('smart_memory', {'text': recent_arc, 'model': model})
                         break
@@ -26562,6 +26573,59 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             # durable record is best-effort; the end-of-stream contract is not.
             try:
 
+                # --- THE TREATED VIEW OF THIS REPLY (§4FV, 2026-09-10) ---
+                # Everything below this line that reads the model's answer
+                # reads THIS, not `full_content`. The non-stream path gets
+                # the same view for free — `_finalize_and_return` scrubs and
+                # smooths `final_ai_content` in place before any consumer
+                # runs — while this drain handed EIGHT readers the raw
+                # accumulator: the hedge scan, the smart-memory arc, the
+                # post-mortem, the episode, the hydration judge, the project
+                # work_log, the calibration sample and the promise
+                # backstop's headline all learned from, or judged, narration
+                # the user never received and tool markup the live scrub had
+                # already removed from the stream. (§4FT listed six of the
+                # eight; the hedge scan and the backstop were not on the
+                # list.) §4FS treated only the trajectory copy; this is the
+                # same treatment hoisted to the top of the drain so a
+                # consumer cannot pick the wrong text by accident.
+                # RAW is still right in three places, each marked at its
+                # site and enumerated by the AST pin in
+                # tests/test_stream_treated_view.py: the <think> extraction
+                # (the monologue box needs blocks that live inside the
+                # paragraphs smoothing drops), the verifier claim (the live
+                # stream showed the narration, so the verdict judges it),
+                # and this computation's own base.
+                try:
+                    from .reply_smoothing import (
+                        count_real_tools as _tr_count,
+                        treat_reply as _tr_treat)
+                    _treated_base = locals().get(
+                        "_stream_effective_content", full_content) or full_content
+                    _treated_content = _tr_treat(
+                        _treated_base,
+                        n_real_tools=_tr_count(stream_tools_snapshot))
+                    if (isinstance(_treated_content, str)
+                            and isinstance(_treated_base, str)
+                            and _treated_content != _treated_base):
+                        # Same line finalize prints on the other path: the
+                        # operator watches this stream, and a treatment that
+                        # only ever runs silently is indistinguishable from
+                        # one that never runs (§4FS's own lesson).
+                        pretty_log(
+                            "Reply Smoothing",
+                            f"streamed record treated: {len(_treated_base)} → "
+                            f"{len(_treated_content)} chars (the live stream "
+                            f"was delivered as it was)",
+                            icon=Icons.BRAIN_SUM,
+                        )
+                except Exception as _tr_exc:  # noqa: BLE001
+                    # Fail-open to the raw text: a treated view that raises
+                    # must not cost the turn its record (the same contract
+                    # every other step in this drain keeps).
+                    logger.debug("streamed reply treatment skipped: %s", _tr_exc)
+                    _treated_content = full_content
+
                 # Metacog: compute this turn's composite confidence
                 # (logprob-OPTIONAL — phase 2.5). The entropy term
                 # is used when the window observed tokens; otherwise
@@ -26613,7 +26677,11 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                                 from .reply_smoothing import (
                                                     strip_system_notes as _ssn2)
                                                 for _hedge in _utk.scan_text_for_uncertainty(
-                                                    _ssn2(full_content or "")
+                                                    # §4FV: the treated view —
+                                                    # a hedge inside scrubbed
+                                                    # markup is not the model
+                                                    # hedging to the user.
+                                                    _ssn2(_treated_content or "")
                                                 ):
                                                     _utk.flag_assumption(
                                                         _hedge, confidence=0.4,
@@ -26747,18 +26815,17 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 from .autonomous_activity import (
                     is_internal_request as _is_int_req_m1)
                 if self.context.args.smart_memory > 0.0 and last_user_content and not forget_was_called and not last_was_failure and not _is_int_req_m1(req_id):
-                    micro_msgs = []
-                    for m in [msg for msg in stream_messages_snapshot if msg.get("role") in ["user", "assistant"]][-4:]:
-                        role = m.get("role", "user").upper()
-                        clean_content = re.sub(r'```.*?```', '', str(m.get("content", "")), flags=re.DOTALL)
-                        micro_msgs.append(f"{role}: {clean_content[:500].strip()}")
-                    clean_ai = re.sub(r'```.*?```', '', full_content, flags=re.DOTALL)
-                    recent_arc = "\n".join(micro_msgs) + f"\nAI: {clean_ai[:500].strip()}"
+                    recent_arc = _build_memory_arc(
+                        stream_messages_snapshot, _treated_content,
+                        tools_run=stream_tools_snapshot)
                     if getattr(self.context, 'journal', None):
 
                         await self._journal_append_safe('smart_memory', {'text': recent_arc, 'model': stream_model})
 
                 # --- EXTRACT & LOG INTERNAL THINKING (STREAM) ---
+                # RAW on purpose (§4FV): this reads the model's <think>
+                # blocks for the UI monologue box, and the treated view can
+                # be the scrub fallback SENTENCE, which has none.
                 think_matches = re.findall(r'<think>(.*?)(?:</think>|$)', full_content, flags=re.DOTALL | re.IGNORECASE)
                 for think_text in think_matches:
                     clean_think = think_text.strip()
@@ -26798,7 +26865,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         if (getattr(self.context, 'journal', None)
                                 and self.context.args.smart_memory > 0.0
                                 and not forget_was_called):
-                            await self._journal_append_safe('post_mortem', {'user': last_user_content, 'tools': stream_tools_snapshot, 'ai': full_content, 'model': stream_model})
+                            await self._journal_append_safe('post_mortem', {'user': last_user_content, 'tools': stream_tools_snapshot, 'ai': _treated_content, 'model': stream_model})  # §4FV
                         if self.context.args.smart_memory > 0.0 and not forget_was_called:
                             # No verdict is available on the streamed path — the
                             # verifier runs as a LATE handler after the drain — so
@@ -26808,7 +26875,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             # trajectory record, which is the durable one.
                             await self._record_episode_safe(
                                 last_user_content, stream_tools_snapshot,
-                                full_content,
+                                _treated_content,   # §4FV
                                 execution_failure_count=execution_failure_count,
                                 req_id=str(req_id or ''))
 
@@ -26816,7 +26883,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 # forget, worker-hosted) — every finalized turn,
                 # matching the non-streaming site.
                 self._judge_hydration_safe(
-                    full_content, turn_id=str(req_id or ""))
+                    _treated_content, turn_id=str(req_id or ""))   # §4FV
 
                 # Peek the request-tagged project snapshot for the pid BEFORE
                 # the work_log call consumes it — the late-refute follow-up
@@ -26844,10 +26911,6 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 # and backfills the outcome by `current_trajectory_id`,
                 # so pass verifier=None here.
                 try:
-                    # Record the EFFECTIVE visible content (the fallback text
-                    # when the reply was all scrubbed tool-XML), never tag-soup.
-                    _traj_content = locals().get(
-                        "_stream_effective_content", full_content) or full_content
                     # §4FS: the web UI streams and returns before
                     # _finalize_and_return, so its PERSISTED reply — what
                     # the dream seed, fixture mining and the narration scan
@@ -26856,22 +26919,13 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # openers the smoother removes on sight, and one kept
                     # a <tool_call> block. The live stream is already
                     # delivered; the record gets the same treatment the
-                    # non-stream reply gets.
-                    try:
-                        from .reply_smoothing import (
-                            smooth_reply as _sr_smooth,
-                            strip_unparsed_tool_calls as _sr_strip)
-                        if isinstance(_traj_content, str):
-                            _traj_content = _sr_strip(_traj_content)
-                            _n_real = sum(
-                                1 for t in (stream_tools_snapshot or [])
-                                if t and not (t or {}).get("_synthetic"))
-                            if _n_real >= 2:
-                                _sm = _sr_smooth(_traj_content)
-                                if not _is_narration_only_trim(_sm, _traj_content):
-                                    _traj_content = _sm
-                    except Exception as _sr_exc:  # noqa: BLE001
-                        logger.debug("streamed reply smoothing skipped: %s", _sr_exc)
+                    # non-stream reply gets. §4FV: that treatment is now the
+                    # drain's ONE treated view (computed at its top from the
+                    # same effective-content base, i.e. the fallback
+                    # sentence when the scrub consumed the whole reply), so
+                    # the corpus and the six other consumers cannot disagree
+                    # about what this turn said.
+                    _traj_content = _treated_content
                     if (isinstance(_traj_content, str)
                             and _traj_content.strip()):
                         self._record_turn_trajectory(
@@ -26899,7 +26953,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 # late), so the outcome is execution-based here.
                 await self._write_project_work_log_safe(
                     last_user_content=last_user_content,
-                    final_ai_content=full_content,
+                    final_ai_content=_treated_content,   # §4FV
                     execution_failure_count=execution_failure_count,
                     verifier_backfill=None,
                     req_id=req_id,
@@ -26929,13 +26983,16 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         _promise_active = (_np_peek(_np_store, _np_pid)
                                            is not None)
                     _sbf = False
-                    if (full_content and not _is_internal_req_snb(req_id)
+                    if (_treated_content and not _is_internal_req_snb(req_id)
                             and not _sim and not _promise_active):
                         _sbf = _notify_promise_backstop(
                             self.context,
                             last_user_content=last_user_content,
                             tools_run=stream_tools_snapshot,
-                            final_content=full_content,
+                            # §4FV: the headline this summarises is the
+                            # delivered answer; the promise itself is
+                            # detected from the USER's request, not here.
+                            final_content=_treated_content,
                             req_id=req_id,
                             had_failures=execution_failure_count >= 3,
                         )
@@ -26958,9 +27015,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             req_id=str(req_id or ""),
                             headline=_np_head(
                                 # §4FS: the treated (scrubbed, smoothed) copy
-                                # when it exists — the raw opener is the
-                                # stale beat §4FR removes.
-                                locals().get("_traj_content") or full_content,
+                                # — the raw opener is the stale beat §4FR
+                                # removes. §4FV: one view, no `locals()`
+                                # lookup that silently falls back to raw.
+                                _treated_content or full_content,
                                 limit=220),
                         )
                 except Exception:
@@ -26982,7 +27040,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     verifier_backfill=None,
                     execution_failure_count=execution_failure_count,
                     budget_exhausted=False,
-                    final_ai_content=full_content,
+                    final_ai_content=_treated_content,   # §4FV
                     user_request=last_user_content or "",
                     truncated=stream_aborted,   # §4O R2 MAJOR-2
                 )
@@ -27038,6 +27096,11 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # verdict on the raw text would judge markup the user
                     # never saw — and a confident REFUTE queues a visible
                     # correction banner (review, 2026-09-09).
+                    # NOT `_treated_content` (§4FV), deliberately: the
+                    # treated view is also SMOOTHED, and the narration the
+                    # smoother drops is text this user did read, live. The
+                    # record keeps what the turn said; the verdict judges
+                    # what was delivered. The two differ only here.
                     _sv_source = (_stream_scrub_pattern.sub('', full_content)
                                   if _stream_scrub_active else full_content)
                     _sv_claim = re.sub(

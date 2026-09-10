@@ -88,9 +88,13 @@ tracker.verify_assumption(a, was_correct=True)
     the pre-scan, empty tracker. The scan is hoisted before the record; the surfacing block keeps
     footer/verify/reset on the already-populated tracker.</li>
     <li><strong>The streamed path never scanned at all.</strong> The end-of-stream confidence
-    reading now scans <code>full_content</code> before reading pressure, and the drain resets the
+    reading now scans the delivered reply before reading pressure, and the drain resets the
     tracker after its calibration record (finalize's reset never runs on the stream path, so
-    hedge state would otherwise leak into the next turn's reading).</li>
+    hedge state would otherwise leak into the next turn's reading). Since §4FV (2026-09-10) the
+    text it scans is the drain's treated view (<code>reply_smoothing.treat_reply</code>), not the raw
+    accumulator: a hedge inside tool markup the live scrub already removed, or inside a narration
+    paragraph the smoother drops, is not the model hedging to the user — and finalize has scanned
+    its treated <code>final_ai_content</code> all along.</li>
     <li><strong>Hedge regex broadened conservatively:</strong> adds <em>"unable to
     verify/confirm"</em>, <em>"can't confirm"</em>, <em>"I'm uncertain"</em>, <em>"no way to
     verify/confirm/check/know"</em>. Deliberately narrow — false pressure on confident turns

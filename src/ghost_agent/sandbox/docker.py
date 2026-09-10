@@ -172,14 +172,25 @@ class DockerSandbox:
     #   _env_verified — the marker+chromium checks passed once for the
     #     current generation; skip re-probing them on every command.
     #   _tor_attempted — the Tor-only egress enforcement (§4FU) was already
-    #     run for this generation: rules + in-container Tor are per
-    #     container, so once per generation is exactly right.
+    #     run for this generation. ⚠ A "generation" is a container START,
+    #     not a container (§4FW): `docker start` gives a stopped container a
+    #     FRESH network namespace — the iptables rules are gone — and none
+    #     of its processes, so the in-container Tor is not running either.
+    #     Every path that starts or recreates the container must reset this
+    #     and go through `_enforce_egress_once`.
     #   _provision_backoff_until — after a failed provision, no reinstall
     #     before this wall-clock time; prevents a failing mirror from
     #     triggering a fresh multi-minute install on every command.
     _env_verified = False
     _tor_attempted = False
     _provision_backoff_until = 0.0
+    #: The egress policy, set for real by __init__ (pinned in
+    #: tests/test_sandbox_resume_egress.py). The class default exists for the
+    #: same reason the flags above do — test stubs built via __new__ — and
+    #: because §4FW made the RESUME path read it, where the review stubs of
+    #: `_try_resume_stopped` never had it: an AttributeError there would
+    #: abort a resume that used to work.
+    tor_proxy = None
 
     # Capability flag read by tools/execute.py (see _run_in_sandbox): this
     # manager implements `execute_promotable`, so a command that outruns its
@@ -546,6 +557,28 @@ class DockerSandbox:
                 "Sandbox Resume",
                 "Resumed stopped container (in-sandbox services + runtime "
                 "state preserved)", icon=Icons.SANDBOX_BOX)
+            # §4FW: a resumed container is a NEW egress generation, and this
+            # path RETURNS before the creation path's enforcement. `docker
+            # start` recreates the network namespace (the GHOST_TOR rules
+            # are gone) and starts none of the old processes (Tor is not
+            # running) — measured on the live box 2026-09-10, thirteen
+            # minutes after a restart that resumed the sandbox: an empty nat
+            # table and a plain curl from inside answering {"IsTor": false}
+            # with the host's real address.
+            # It self-healed LATER, which is why it was invisible: the next
+            # ensure_running past the readiness TTL finds the container ready,
+            # skips this branch and falls through to the tail, which enforces
+            # before the command runs. What that leaves exposed is exactly
+            # what the resume exists to preserve — in-sandbox SERVICES and
+            # promoted jobs, which come back with the container and reach the
+            # network with no rules until some later agent command triggers
+            # the enforcement — plus any command inside the post-boot TTL.
+            # Enforcing HERE means the container is never handed back as
+            # ready without its rules.
+            # `unpause` keeps both (the freezer holds the namespace and the
+            # processes), so covering it costs one idempotent re-apply.
+            self._tor_attempted = False
+            self._enforce_egress_once()
             self.mark_ready()
             return True
         return False
@@ -1176,9 +1209,8 @@ class DockerSandbox:
         # networking the sandbox shares the host's namespace and iptables
         # here would rewrite the HOST's traffic: not applied, said once.
         if self.tor_proxy and not self._tor_attempted:
-            self._tor_attempted = True
             did_work = True
-            self._enforce_tor_egress()
+        self._enforce_egress_once()
 
         # Reached the end of ensure_running without raising → container +
         # mount + environment are all confirmed good. Stamp the readiness TTL
@@ -1202,6 +1234,19 @@ class DockerSandbox:
             return str(((self.container.attrs or {}).get("HostConfig") or {}).get("NetworkMode") or "")
         except Exception:  # noqa: BLE001
             return ""
+
+    def _enforce_egress_once(self) -> None:
+        """Enforce Tor-only egress for THIS container generation, once.
+
+        The single entry point: creation and resume both call it, and the
+        AST pin in `tests/test_sandbox_resume_egress.py` requires any future
+        path that starts a container to do the same. Cheap and idempotent
+        when the generation has already been enforced.
+        """
+        if not self.tor_proxy or self._tor_attempted:
+            return
+        self._tor_attempted = True
+        self._enforce_tor_egress()
 
     def _enforce_tor_egress(self) -> None:
         """Make every connection the sandbox opens leave through Tor.

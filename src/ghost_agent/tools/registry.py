@@ -1195,8 +1195,7 @@ CONDITIONALLY_ADVERTISED_BUILTIN_NAMES = frozenset({
 
 def get_active_tool_definitions(context, query: str = None, *,
                                 serve_tuned: bool = True,
-                                disabled=None,
-                                apply_diet: bool = True):
+                                disabled=None):
     """The advertised tool set.
 
     ⚠ `serve_tuned=False` FOR ANY CALLER THAT IS NOT BUILDING THE PROMPT.
@@ -1499,130 +1498,36 @@ def get_active_tool_definitions(context, query: str = None, *,
     # unintended difference between the arms.
     if _fs_batch_active(context):
         active_tools = _apply_fs_batch_schema(active_tools)
-    # §4FE tool head diet: advertise the core set + `tool_catalog`; every
-    # other built-in stays DISPATCHABLE by name (the handler map is
-    # untouched) and describable on demand. Applied LAST so the tuned
-    # descriptions and the fs_batch schema are computed on the same set
-    # they always were; the catalog itself is never tuned.
-    if apply_diet and tool_head_diet_enabled():
-        active_tools = apply_tool_head_diet(active_tools)
     return active_tools
 
 
-# ── §4FE tool head diet ───────────────────────────────────────────────
+# ── §4FE tool head diet — RETIRED 2026-09-10 (§4FX) ───────────────────
 #
-# Measured 2026-09-07 on the live tokenizer: the 39 static schemas cost
-# ≈18,705 tokens (18,625 measured 2026-09-07 + 80 for the §4FJ workspace text; the rendered head ~21.4k with vision/image/acquired tools),
-# 79% of every cold prefill. Eight tools account for 95% of the 2,555 real
-# calls in six weeks; sixteen were never called. Literature (arXiv
-# 2605.24660: 7 visible tools 90.3% vs 50 tools 90.8% on BFCL, adaptive short
-# lists 93.1% vs 87.1% selection; ALE-Claw: 13 vs 30 tools scored higher at
-# −44% input tokens) says a small static set does not cost selection accuracy
-# and may improve it. The set is STATIC for the whole request (never mutate
-# the schema block mid-session — every mutation re-prefills the head).
-#: Always-advertised core: every tool with ≥10 real calls in the 45-day
-#: census plus the operational seams (delegate, jobs, update_profile).
-TOOL_HEAD_CORE = frozenset({
-    "file_system", "manage_projects", "web_search", "execute", "browser",
-    "manage_services", "system_utility", "deep_research", "knowledge_base",
-    "darkweb_search", "jobs", "introspect", "recall", "delegate",
-    "update_profile", "vision_analysis", "tool_catalog",
-})
+# The arm shipped flag-gated OFF on 2026-09-07 and never flipped. It cut the
+# static head 18,625 → 11,465 tokens by advertising a 16-tool core plus a
+# `tool_catalog` lookup, on the hypothesis (arXiv 2605.24660, ALE-Claw) that a
+# short list also helps selection accuracy.
+#
+# Both halves were measured and both said no:
+#   * accuracy — 0.489 vs 0.481 per DISTINCT REQUEST, p=0.88 (n=264; the
+#     587-row reading of p=0.0003 was the wrong unit, §4FK);
+#   * the token cut — worth 9.6 s at the measured 744 tok/s, but only on a
+#     prefill that carries the whole head, and the main node's own counters
+#     say that is 1.4% of 16,018 prefills (84.7% of prompt tokens are served
+#     from cache; §4FM's re-warm keeps the head resident). Expected value:
+#     ~0.13 s per request.
+#   * the catalog tax — 11.5% of 503 real tool-using turns touched a tool the
+#     diet hides, each paying a discovery round at a median 6.3 s: ~0.7 s per
+#     tool-using turn, about five times the gain.
+#
+# What would REOPEN it: the gain scales with the full-head prefill rate, and
+# break-even is ≈7.5% (≈15% if discovery needs both a list and a describe).
+# If the re-warm loop goes away, the context or model changes, or that rate
+# climbs past ~7.5%, re-read those two numbers — they are two queries, not a
+# new bench. The experiment harness kept its own copy of the diet so a
+# re-open re-measures instead of re-arguing: scripts/tool_head_diet_bench.py.
+# Pinned deleted in tests/test_4fx_tool_head_diet_retired.py.
 
-#: Built-ins that are not in TOOL_DEFINITIONS but are added by the builder
-#: (conditionally or always); the diet treats them as static too — anything
-#: else in the set is an acquired skill or composed macro and is kept.
-TOOL_HEAD_STATIC_EXTRA = frozenset({
-    "vision_analysis", "image_generation", "report_pdf", "manage_composed_skills",
-})
-
-TOOL_CATALOG_DEFINITION = {
-    "type": "function",
-    "function": {
-        "name": "tool_catalog",
-        "description": (
-            "Rarely-needed tools are not listed in this prompt to keep it "
-            "short. action='list' names them with one line each; "
-            "action='describe' with name='<tool>' returns that tool's full "
-            "parameter schema. After 'describe', call the tool DIRECTLY by "
-            "its name with those parameters — it is dispatchable even though "
-            "it is not advertised here."),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["list", "describe"]},
-                "name": {"type": "string",
-                         "description": "Required for action='describe'."},
-            },
-            "required": ["action"],
-        },
-    },
-}
-
-
-def tool_head_diet_enabled() -> bool:
-    """Flag-gated, default OFF until the fixture bench (scripts/
-    tool_head_diet_bench.py) shows selection accuracy is flat or up."""
-    return os.getenv("GHOST_TOOL_HEAD_DIET", "0").strip().lower() in (
-        "1", "true", "yes", "on")
-
-
-def apply_tool_head_diet(active_tools):
-    """Keep the core set (plus any non-built-in — acquired skills and
-    composed macros are routed by their own admission rule) and append the
-    catalog. Order is preserved, so the pinned prefix stays byte-stable."""
-    static_names = {t.get("function", {}).get("name") for t in TOOL_DEFINITIONS}
-    static_names |= TOOL_HEAD_STATIC_EXTRA
-    kept = [t for t in active_tools
-            if (t.get("function", {}).get("name") in TOOL_HEAD_CORE
-                or t.get("function", {}).get("name") not in static_names)]
-    if not any(t.get("function", {}).get("name") == "tool_catalog" for t in kept):
-        kept.append(dict(TOOL_CATALOG_DEFINITION))
-    return kept
-
-
-def hidden_tool_definitions(context) -> list:
-    """The built-ins the diet hides for this context — the catalog's
-    inventory. Built from the SAME builder as the prompt (minus the diet), so
-    it never names a tool this CONTEXT does not register. It does not see a
-    particular agent's `disabled_tools` (a sub-agent's allow-list): such a
-    tool may be listed and is then refused at dispatch — the containment
-    boundary is the handler map, not this listing (review §4FH)."""
-    if not tool_head_diet_enabled():
-        return []
-    full = get_active_tool_definitions(context, None, serve_tuned=False,
-                                       apply_diet=False)
-    static_names = {t.get("function", {}).get("name") for t in TOOL_DEFINITIONS}
-    static_names |= TOOL_HEAD_STATIC_EXTRA
-    return [t for t in full
-            if t.get("function", {}).get("name") in static_names
-            and t.get("function", {}).get("name") not in TOOL_HEAD_CORE]
-
-
-async def tool_catalog(action: str = "list", name: str = None, context=None, **_kw):
-    """The `tool_catalog` handler. LIST: one line per hidden tool (name +
-    the head of its description). DESCRIBE: the full schema JSON of one
-    hidden tool, plus the instruction to call it by name."""
-    hidden = hidden_tool_definitions(context)
-    act = str(action or "list").strip().lower()
-    if act == "describe":
-        want = str(name or "").strip()
-        for t in hidden:
-            fn = t.get("function", {})
-            if fn.get("name") == want:
-                return ("TOOL SCHEMA (call this tool DIRECTLY by name with these "
-                        "parameters):\n" + json.dumps(t, ensure_ascii=False, indent=1))
-        known = ", ".join(sorted(t.get("function", {}).get("name", "") for t in hidden))
-        if want in TOOL_HEAD_CORE:
-            return f"'{want}' is already listed in your tool set — call it directly."
-        return (f"Error: no hidden tool named '{want}'. Hidden tools: {known}")
-    lines = [f"{len(hidden)} additional tools are available by name (use "
-             "action='describe' for the parameters of one):"]
-    for t in hidden:
-        fn = t.get("function", {})
-        desc = " ".join(str(fn.get("description") or "").split())
-        lines.append(f"- {fn.get('name')}: {desc[:110]}")
-    return "\n".join(lines)
 
 def get_available_tools(context):
     from .memory import (
@@ -1793,11 +1698,6 @@ def get_available_tools(context):
 
     from .report_pdf import tool_generate_pdf
     tools["report_pdf"] = lambda **kwargs: tool_generate_pdf(sandbox_dir=_proj_ws()[0], **kwargs)
-    # §4FE: the catalog is always dispatchable (harmless when the diet is
-    # off — it then reports zero hidden tools); hidden built-ins keep their
-    # entries above, so a call by name works whether or not it was advertised.
-    tools["tool_catalog"] = lambda **kwargs: tool_catalog(context=context, **kwargs)
-
     if getattr(context.llm_client, 'image_gen_clients', None):
         from .image_gen import tool_generate_image
         tools["image_generation"] = lambda **kwargs: tool_generate_image(llm_client=context.llm_client, sandbox_dir=_proj_ws()[0], **kwargs)

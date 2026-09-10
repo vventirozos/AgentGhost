@@ -208,6 +208,22 @@
   <code>urllib</code> both <code>IsTor: true</code> on different exits; <code>host example.com</code> resolved; UDP to
   port 123 and IPv6 blocked; <code>pip download six</code> succeeded over Tor. State is exposed as
   <code>_egress_state</code> (enforced / blocked / unavailable). Pins: <code>tests/test_sandbox_tor_egress.py</code>.</p>
+
+  <div class="note"><strong>&sect;4FW (2026-09-10) — a RESUMED container is a new generation.</strong> "Once per
+  container generation" was implemented as once per CONTAINER, on the create path. A container START is the real
+  unit: <code>docker start</code> gives a stopped container a fresh network namespace (the <code>GHOST_TOR</code>
+  rules live there and are gone) and none of its processes (the in-container Tor is not running).
+  <code>_try_resume_stopped</code> — the common path after every deploy, since the agent is restarted by killing it
+  and the container outlives that — reported the container ready and returned before the enforcement. Measured 13
+  minutes after a restart: empty nat table, <code>{"IsTor": false}</code> from inside, the host's real address. It
+  self-healed at the next <code>ensure_running</code> past the readiness TTL (which falls through to the tail and
+  enforces before the command runs), so agent-issued commands were in practice protected; what stayed exposed is
+  what the resume path exists to preserve — <strong>in-sandbox services and promoted jobs resume with the container
+  and reach the network with no rules</strong>. Fix: one guarded entry point <code>_enforce_egress_once()</code>
+  called by BOTH paths, with the resume clearing the generation flag first (a start is a new generation;
+  <code>unpause</code> keeps namespace and processes, so it is an idempotent re-apply). An AST pin requires every
+  function that starts or creates the container to call it and asserts it still sees both known paths. Pins:
+  <code>tests/test_sandbox_resume_egress.py</code>.</div>
   <p><strong>The first live run found two defects in the sequencing, both fixed the same evening.</strong>
   (1) The "is Tor already running" check was <code>pgrep -f 'tor -f /etc/tor/torrc.ghost'</code>, run inside an
   <code>sh -c</code> wrapper whose own command line carries that literal &mdash; so it matched the wrapper (root),

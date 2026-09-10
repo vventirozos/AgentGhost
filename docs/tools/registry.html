@@ -217,10 +217,45 @@
     permissive; the instruction restores parity for every operation except the batch read.
   </p>
 
-  <h2 id="head-diet">Tool head diet: <code>GHOST_TOOL_HEAD_DIET</code> (§4FE, 2026-09-07, default OFF)</h2>
-  <p>Measured on the live tokenizer: the 39 static schemas cost <strong>≈18,705 tokens</strong> (18,625 measured 2026-09-07, +80 for the §4FJ <code>workspace</code> text) (the rendered head ~21.4k), 79% of every cold prefill; the largest are <code>manage_projects</code> 3,580, <code>browser</code> 1,805, <code>manage_composed_skills</code> 1,075, <code>file_system</code> 1,034. Eight tools account for 95% of the 2,555 real calls in six weeks and sixteen were never called. The literature says a small static set does not cost selection accuracy and may improve it (arXiv 2605.24660: 7 visible tools 90.3% vs 50 tools 90.8%; adaptive short lists 93.1% vs 87.1%; ALE-Claw: 13 vs 30 tools scored higher at −44% input tokens).</p>
-  <p>With the flag on, <code>get_active_tool_definitions</code> applies <code>apply_tool_head_diet</code> LAST (after the tuned descriptions and the fs_batch schema, so those are computed on the set they always were): it keeps <code>TOOL_HEAD_CORE</code> (16 names — every tool with ≥10 real calls plus <code>delegate</code>, <code>jobs</code>, <code>update_profile</code>) and any non-built-in (acquired skills, composed macros keep their own admission rule), and appends <code>tool_catalog</code>. <strong>Nothing is removed from the handler map</strong>: every hidden built-in stays dispatchable by name, and the catalog (<code>action='list'</code> / <code>action='describe' name=…</code>) builds its inventory from the same builder as the prompt, so it can never name a tool the context cannot dispatch. The set is static for the request; the native pointer line says where the rest live. Core-16 measures 11,465 tokens including the catalog (−38% of the static schemas).</p>
-  <p>Provable before flipping: <code>scripts/tool_head_diet_bench.py</code> replays the mined tool-choice fixtures (request text + live SYSTEM_PROMPT; the recorded contexts were archived) against the live server with the full set and with the diet, temperature 0, paired per fixture with an exact McNemar. Under the diet a hidden truth counts as correct when the model picks <code>tool_catalog</code>. Tests: <code>tests/test_4fe_tool_head_diet.py</code> — flag-off byte identity, core+catalog only, every hidden tool still dispatchable, the catalog's inventory equals the hidden set, describe returns the schema. §4FI: the full 587-fixture run is resumable (<code>--resume &lt;ledger.jsonl&gt;</code> skips paid rows and appends; totals are recomputed from every ledger row) and observable (<code>&lt;ledger&gt;.progress.json</code>, RunProgress contract); <code>--limit 0</code> runs every fixture. Pins: <code>tests/test_4fi_bench_scripts.py</code>. §4FJ: <code>--pair A,B</code> chooses the two heads (<code>full</code>, <code>diet</code>, <code>full-legacy-workspace</code> — the pre-§4FJ <code>workspace</code> description kept verbatim in the script as a fixed head); only <code>diet</code> receives the catalog credit, every other head is scored on the exact pick; ledger rows carry <code>picked_&lt;head&gt;</code>/<code>ok_&lt;head&gt;</code> and an <code>arms</code> field, and resume only counts rows of the same pair. §4FK: tuned descriptions are validated against <code>TOOL_DESC_PINNED</code> — an explicit, reviewable map of sentences a tuned candidate must keep verbatim (seeded with the two <code>workspace</code> exclusion sentences the bench was written against); a blanket "every NEVER/ONLY sentence" rule was tried first and rejected because it constrained 15 of 39 tools and broke the tuning contract the read-site invariants pin. A pin that no longer occurs in the live baseline fails <code>tests/test_4fj_think_probe_and_workspace.py</code>.</p>
+  <h2 id="head-diet">Tool head diet: RETIRED <span class="tag">2026-09-10 &sect;4FX</span></h2>
+  <p>Shipped flag-gated OFF on 2026-09-07 (&sect;4FE) on the hypothesis — arXiv 2605.24660, ALE-Claw — that a short
+  static tool list cuts prefill without costing selection accuracy. <code>GHOST_TOOL_HEAD_DIET=1</code> advertised a
+  16-tool core plus a <code>tool_catalog</code> lookup, 18,625 &rarr; 11,465 tokens of static schemas, with every
+  hidden built-in still dispatchable by name. It never flipped, and on 2026-09-10 it was <strong>removed from
+  production</strong>: the flag, <code>TOOL_HEAD_CORE</code>, <code>apply_tool_head_diet</code>,
+  <code>hidden_tool_definitions</code>, the <code>tool_catalog</code> handler and the <code>apply_diet</code> seam
+  are all gone.</p>
+  <p><strong>Why, in numbers.</strong> Three quantities, each measured on real data rather than argued:</p>
+  <ul>
+    <li><strong>Accuracy: null.</strong> 0.489 vs 0.481 per DISTINCT REQUEST, p=0.88, n=264 (&sect;4FK — the
+    587-row p=0.0003 was the wrong unit; one request had been recorded 40&times;). Proving non-inferiority to a 3pp
+    margin would need n&asymp;1,500–2,000 distinct real prompts, which &sect;4FL established this traffic cannot
+    produce.</li>
+    <li><strong>The token cut buys ~0.13 s per request.</strong> 7,160 tokens is 9.6 s at the measured 744 tok/s —
+    but only on a prefill that carries the whole head, and the main node's counters say that is <strong>1.4% of
+    16,018 prefills</strong> (16.9M prompt tokens served from cache vs 3.06M prefilled = 84.7% cached; median
+    prefill 2,299 tokens). &sect;4FM's re-warm loop keeps the byte-stable head resident, which is exactly what
+    removes the diet's value.</li>
+    <li><strong>The catalog tax costs ~0.7 s per tool-using turn.</strong> The diet hides 25 of 41 static tools, and
+    <strong>11.5% of 503 real tool-using turns</strong> (Aug–Sep, 2,077 calls) touched one — each paying a
+    discovery round at a median 6.3 s per short LLM call. About five times the gain, plus the risk that the model
+    substitutes a visible tool instead of discovering the right one (the &sect;4FJ <code>workspace</code>
+    confusion, 98 wrong picks, is that failure mode).</li>
+  </ul>
+  <p><strong>What would reopen it.</strong> The gain scales linearly with the full-head prefill rate; break-even is
+  <strong>&asymp;7.5%</strong> (&asymp;15% if discovery needs both a <code>list</code> and a <code>describe</code>),
+  against 1.4% today. If the re-warm loop is removed, the model or context size changes, or that rate climbs past
+  ~7.5%, re-read those two numbers — they are two queries, not a new bench. The decision rule to re-apply: keep iff
+  measured expected gain &gt; measured expected cost AND the accuracy CI excludes harm beyond &delta;.</p>
+  <p><strong>Retired, not erased.</strong> <code>scripts/tool_head_diet_bench.py</code> stays, and now carries its
+  OWN copy of the construction (<code>CORE</code>, <code>CATALOG_DEFINITION</code>, <code>apply_diet</code>) since
+  production no longer has one; it still reads the live <code>TOOL_DEFINITIONS</code> for the full head, so a re-run
+  measures today's real tools against the frozen core. Absence pins:
+  <code>tests/test_4fx_tool_head_diet_retired.py</code> — the symbols are gone, the advertised head is
+  byte-identical with the flag on and off, every static built-in is advertised again, the catalog is not in the
+  handler map, no module reads the flag, and the bench still loads. Bench-harness pins stay in
+  <code>tests/test_4fi_bench_scripts.py</code> and <code>tests/test_4fj_think_probe_and_workspace.py</code>.</p>
+
 </main>
 </body>
 </html>

@@ -143,8 +143,15 @@
     <li><strong>Gate:</strong> only turns with ≥2 non-synthetic tool runs — conversational
     and single-tool replies are never rewritten.</li>
     <li><strong>Shape 1 — connective narration:</strong> a non-final paragraph ≤300 chars
-    opening with a progress connective (Let me / Now / Good, / Okay / Next, / I'll / I
-    need to / Time to …). Fences and list items are exempt.</li>
+    opening with a progress connective. Fences and list items are exempt. Since §4FV
+    (2026-09-10) the connectives are two classes: an <em>agent-voice beat</em> (Let me /
+    Let's / I'll / I will / I need to / Time to / Good, / Okay / Alright / Great, /
+    Perfect,) is dropped on sight — the model narrating its own next move can never be an
+    instruction addressed to the user; a bare <em>temporal lead</em> (Now / Next, / Then /
+    First,) is dropped only when a later prose paragraph RESTATES it, the same evidence
+    shape 3 requires. A temporal lead sitting on an agent beat ("Now let me fix both:",
+    "Then I'll restart it") is still a beat: the lead is stripped and the rest re-tested,
+    so the 2026-07-17 coverage survives the narrowing.</li>
     <li><strong>Shape 2 — superseded summary group:</strong> a ':'-lead-in plus its list
     items whose content words are ≥55% Jaccard-covered by a later group of comparable
     size (≥60%) — the pre-verification summary; the last statement wins. Groups containing
@@ -185,7 +192,8 @@
     single-tool turn does carry the stale beat ("I'll forget the PDF." then "Done"), but pass 1 also deletes
     "First, back up… / Then restore… / Finally, verify…" — two of three instructions after one file read
     (review). The 2026-07-17 decision was right; the single-tool beat is the accepted cost. Pass 1's
-    collateral on paragraphs that OPEN with "Now"/"Next," in multi-tool turns is pre-existing and unchanged.</li>
+    collateral on paragraphs that OPEN with "Now"/"Next," in multi-tool turns was recorded here as
+    pre-existing and unchanged; §4FV closed it (see Shape 1 above).</li>
     <li><strong>Shape 3 needs restatement, not just tense.</strong> A first version dropped any short "Now
     …ing" paragraph whose verb appeared done later; in review that deleted an instruction ("Next, restarting
     the service will pick it up — run …"), a sign-off request and a truthful in-progress notice. The rule now
@@ -200,11 +208,38 @@
     guard, the smoother; the Slack promise headline quotes that copy; the streamed VERIFIER judges the scrubbed
     view — what the user received — rather than raw markup that could earn a false REFUTE and a correction
     banner; and when the live scrub removed a call from a reply that also had prose, the stream gets the
-    one-line note appended (the all-consumed case already had its own fallback). Still on the raw text, as
-    before: the smart-memory journal, the post-mortem, the episode record, the hydration judge, the project
-    work_log and calibration. Pins: <code>tests/test_stream_persisted_reply.py</code> (executed through the real
+    one-line note appended (the all-consumed case already had its own fallback). The other consumers stayed on
+    the raw text until §4FV (below). Pins: <code>tests/test_stream_persisted_reply.py</code> (executed through the real
     generator).</li>
   </ul>
+  <h2>One treated view, every consumer <span class="tag">2026-09-10 &sect;4FV</span></h2>
+  <p><code>_finalize_and_return</code> scrubs and smooths <code>final_ai_content</code> IN PLACE, so on the
+  non-streaming path every consumer after it reads the delivered text by construction. The streamed drain had
+  no such variable: §4FS treated only the trajectory copy and handed the rest of the drain the raw
+  accumulator. <strong>Eight readers on the common (web-UI) path were learning from, or judging, text the user
+  never received</strong> — the hedge auto-scan, the smart-memory arc, the post-mortem, the episode record,
+  the hydration judge, the project work_log, the calibration sample and the promise backstop's headline. §4FT
+  listed six of the eight; the hedge scan and the backstop were not on the list.</p>
+  <p><code>reply_smoothing.treat_reply(text, n_real_tools=…)</code> is now that missing variable, computed once
+  at the top of the drain from the same effective-content base the trajectory uses (so the scrub-fallback
+  sentence, not tag soup, is what every consumer stores) and read by all of them. It is idempotent, fail-open
+  (a treatment that raises leaves the raw text rather than costing the turn its record), and it owns the
+  <code>SMOOTHING_MIN_TOOLS</code> threshold and the <code>count_real_tools</code> synthetic filter so no caller
+  can spell the gate differently.</p>
+  <p>Three readers stay on the raw accumulator, each marked at its site and enumerated by an AST pin that fails
+  when a fourth appears: the <code>&lt;think&gt;</code> extraction that feeds the web UI's monologue box (those
+  blocks live inside the paragraphs smoothing drops), the streamed verifier's claim (the live stream showed the
+  narration, so the verdict judges what was delivered — the record keeps what the turn said; this is the one
+  place the two legitimately differ), and the treated view's own base. The session store is unaffected: it
+  persists the concatenated SSE chunks, i.e. the transcript the user read.</p>
+  <p>Measured on the corpus (1,485 recorded replies with ≥2 paragraphs): the old pass 1 changed 147 replies,
+  the narrowed one changes 146. Of 27 bare temporal-lead paragraphs, 24 are still dropped because the reply
+  restates them; the three now kept are a joke line, a task-status statement and one genuine beat
+  ("Now restarting the server:") — the accepted residue.</p>
+  <p>Pins: <code>tests/test_stream_treated_view.py</code> (12, executed through the real stream generator,
+  including the zero-tool and single-tool negatives that make the assertions discriminating, plus the AST
+  enumeration) and <code>tests/test_reply_pass1_temporal.py</code> (14).</p>
+
   <p>Tests: <code>tests/test_reply_smoothing.py</code> (12 — including the verbatim WebOS
   transcript as the regression fixture). Note: the prompt edit changes the byte-stable
   system prefix, so the first boot after deploy re-prefills the main-node cache once.</p>

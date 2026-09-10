@@ -18,8 +18,10 @@ client changes):
   reply is never touched.
 * Fenced code blocks are atomic and never dropped.
 * Only three shapes are ever removed, all non-final:
-    1. connective working narration — a short paragraph opening with a
-       progress connective ("Let me…", "Now…", "Good, …", "I'll…");
+    1. connective working narration — a short paragraph opening with an
+       agent-voice beat ("Let me…", "I'll…", "Good, …"), or with a
+       temporal lead ("Now…", "Next,…") that a later paragraph RESTATES
+       (§4FV, 2026-09-10: the bare lead also opens an instruction);
     2. a superseded summary group — a lead-in-plus-list block whose
        content is restated by a later near-duplicate group (the double
        summary), judged by content-word overlap;
@@ -37,13 +39,33 @@ import re
 from typing import List
 
 # Progress connectives that open working narration. Anchored at the start
-# of a paragraph; matched case-insensitively. Deliberately verb-shaped —
-# nouns/answers ("Now playing: …" is unlikely from this agent mid-fix)
-# are accepted collateral, bounded by the length cap below.
-_CONNECTIVE_RE = re.compile(
-    r"^(?:let me\b|let's\b|now[, ]|good[,.! ]|okay\b|ok[,.! ]|alright\b|"
-    r"great[,.! ]|perfect[,.! ]|next[, ]|first[, ]|then[, ]|time to\b|"
+# of a paragraph; matched case-insensitively. Split in two by §4FV
+# (2026-09-10) because the two halves carry different risk:
+#
+# * AGENT-VOICE beats — the model narrating its OWN next move ("Let me
+#   fix both:", "I'll build the parser."). First person or an
+#   acknowledgement; never an instruction addressed to the user. Dropped
+#   on sight, as they have been since 2026-07-17.
+# * TEMPORAL leads — "Now …", "Next, …", "Then …", "First, …". The same
+#   words open a beat AND a step of a procedure the user is meant to
+#   follow ("First, back up the database…", "Next, restarting the service
+#   will pick it up — run `systemctl restart ghost`."). Pass 1 dropped
+#   those too: §4FT's reviewers found four such deletions of user-facing
+#   text, and the ≥2-tool gate was the only thing bounding the damage.
+#   These now need the same evidence shape 3 needs — the reply must
+#   RESTATE the paragraph (a stale beat is a beat the reply repeats).
+#
+# A temporal lead followed by an agent-voice beat ("Now let me fix both:",
+# "Then I'll restart it") is a beat: the lead is stripped and the rest
+# re-tested, so the 2026-07-17 coverage survives the narrowing.
+_BEAT_RE = re.compile(
+    r"^(?:let me\b|let's\b|good[,.! ]|okay\b|ok[,.! ]|alright\b|"
+    r"great[,.! ]|perfect[,.! ]|time to\b|"
     r"i'll\b|i will\b|i need to\b)",
+    re.IGNORECASE,
+)
+_TEMPORAL_LEAD_RE = re.compile(
+    r"^(?:now[, ]|next[, ]|first[, ]|then[, ])",
     re.IGNORECASE,
 )
 # A narration paragraph is a beat, not content — long paragraphs opening
@@ -93,7 +115,14 @@ def _words(text: str) -> set:
     return {w.lower() for w in _WORD_RE.findall(text) if len(w) > 2}
 
 
-def _is_narration(block: str) -> bool:
+def _is_narration(block: str, later_blocks: List[str] = ()) -> bool:
+    """Is this paragraph a working-narration beat?
+
+    `later_blocks` are the paragraphs that follow it; a TEMPORAL lead is a
+    beat only when one of them restates it (§4FV). Called with no later
+    blocks the temporal half is inert — an ambiguous opener is content
+    until the reply proves otherwise.
+    """
     stripped = block.strip()
     if not stripped or _has_fence(stripped):
         return False
@@ -101,7 +130,16 @@ def _is_narration(block: str) -> bool:
         return False
     if _LIST_START_RE.match(stripped):
         return False
-    return bool(_CONNECTIVE_RE.match(stripped))
+    if _BEAT_RE.match(stripped):
+        return True
+    m = _TEMPORAL_LEAD_RE.match(stripped)
+    if not m:
+        return False
+    # "Now let me …" / "Then I'll …": the lead is decoration on a beat.
+    if _BEAT_RE.match(stripped[m.end():].lstrip()):
+        return True
+    later_prose = [b for b in later_blocks if not _has_fence(b)]
+    return bool(later_prose) and _restated_later(stripped, later_prose)
 
 
 # ---------------------------------------------------------------------------
@@ -400,7 +438,7 @@ def smooth_reply(text: str) -> str:
     # Pass 1 — connective working narration and stale announcements
     # (never the final block).
     for i in range(len(blocks) - 1):
-        if (_is_narration(blocks[i])
+        if (_is_narration(blocks[i], blocks[i + 1:])
                 or _is_stale_announcement(blocks[i], blocks[i + 1:])):
             drop[i] = True
 
@@ -432,3 +470,63 @@ def smooth_reply(text: str) -> str:
     if not kept:
         return text
     return "\n\n".join(kept)
+
+
+# ---------------------------------------------------------------------------
+# The treated view — one reply, one treatment, every consumer (§4FV, 2026-09-10)
+# ---------------------------------------------------------------------------
+# The non-streaming finalize scrubs and smooths `final_ai_content` IN PLACE,
+# so every consumer after it (post-mortem, episode, hydration judge,
+# work_log, calibration, the hedge scan, the promise backstop) reads the
+# treated text by construction. The streamed drain has no such variable: it
+# hands each consumer the raw `full_content`, and §4FS treated only the
+# trajectory copy. Seven readers on the common (web-UI) path were therefore
+# learning from, and judging, text the user never received — narration the
+# smoother removes and tool markup the live scrub had already taken out of
+# the stream.
+#
+# `treat_reply` is that missing variable: the gate at the shared reader, so
+# a new consumer in the drain cannot pick the wrong text by accident.
+# Idempotent — the scrub leaves no markup behind and `smooth_reply` is
+# pinned idempotent — so calling it per consumer is safe.
+
+#: Real (non-synthetic) tool runs required before a reply is smoothed. The
+#: 2026-07-17 decision, re-affirmed by §4FT after a one-day trial of 1.
+#: `_finalize_and_return` spells the same threshold inline.
+SMOOTHING_MIN_TOOLS = 2
+
+
+def is_narration_only_trim(smoothed: str, original: str) -> bool:
+    """True when smoothing reduced a reply to a short working-narration
+    line — the inverted-trim failure (2026-07-25 live): the smoother kept
+    "Let me search more specifically…" and dropped the findings. Lives here
+    (not in agent.py, where it was written) so both delivery paths and
+    `treat_reply` share one definition."""
+    s = (smoothed or "").strip()
+    return (s != (original or "").strip()
+            and len(s) < 90
+            and bool(re.match(
+                r"(Let me|Now |Next,? |I'll |I will |First,? |Then )", s)))
+
+
+def treat_reply(text: str, *, n_real_tools: int) -> str:
+    """The delivered view of a reply: unparsed tool-call markup removed
+    (and said so, once), then working narration trimmed when the turn ran
+    at least `SMOOTHING_MIN_TOOLS` real tools and the trim did not leave
+    narration only. Non-strings and empty text pass through untouched."""
+    if not isinstance(text, str) or not text:
+        return text
+    out = strip_unparsed_tool_calls(text)
+    if n_real_tools >= SMOOTHING_MIN_TOOLS:
+        smoothed = smooth_reply(out)
+        if not is_narration_only_trim(smoothed, out):
+            out = smoothed
+    return out
+
+
+def count_real_tools(tools_run) -> int:
+    """Tool records that actually ran — the synthetic ones the loop
+    fabricates (plan markers, watchdog replans) do not open the smoothing
+    gate. Shared so a caller cannot spell the gate differently."""
+    return sum(1 for t in (tools_run or [])
+               if t and not (t or {}).get("_synthetic"))

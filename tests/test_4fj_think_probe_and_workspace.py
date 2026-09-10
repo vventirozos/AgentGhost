@@ -378,7 +378,8 @@ def test_bench_pair_scores_each_head_on_its_own_rule_and_writes_pair_keys(tmp_pa
     assert mod._load_ledger(next(out.glob("*.jsonl")), ("full", "diet"))[0] == set()
     # scoring rule: the catalog credit belongs to a head that advertises the
     # catalog AND does not advertise the truth — never to a core truth
-    hidden = next(iter(sorted(set(t["function"]["name"] for t in R.TOOL_DEFINITIONS) - set(R.TOOL_HEAD_CORE))))
+    # §4FX: the diet is retired from production; the bench owns its copy.
+    hidden = next(iter(sorted(set(t["function"]["name"] for t in R.TOOL_DEFINITIONS) - set(mod.CORE))))
     assert mod._ok("diet", "tool_catalog", hidden) is True
     assert mod._ok("diet", "tool_catalog", "file_system") is False        # core truth: no credit
     assert mod._ok("full", "tool_catalog", hidden) is False
@@ -388,7 +389,7 @@ def test_bench_pair_scores_each_head_on_its_own_rule_and_writes_pair_keys(tmp_pa
     # vision_analysis is in the core set but only the live builder appends it,
     # so the bench diet head never advertises it and deferring to the catalog
     # on it is the designed path
-    assert "vision_analysis" in R.TOOL_HEAD_CORE
+    assert "vision_analysis" in mod.CORE
     assert "vision_analysis" not in mod._names(mod._head("diet"))
     assert mod._ok("diet", "tool_catalog", "vision_analysis") is True
     # the wiring at the call site (§4FK M-3): a full,diet pair on a HIDDEN

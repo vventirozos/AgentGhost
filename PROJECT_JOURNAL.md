@@ -37697,3 +37697,314 @@ re-run for the two R8 fixes (the operator asked for one run; the two fixes live 
 used to answer for the container (`host.docker.internal`) no longer resolve; nothing in the sandbox relied on
 them. Under host networking (the Linux default) the enforcement does not apply and says so — that topology
 needs the host-side design, not this one.
+
+## §4FV — Pass 1 narrowed, and ONE treated view for every consumer of a streamed reply (2026-09-10 06:40–11:40)
+
+**Trigger:** operator: "what's next for this agent?" → a readout of what is open (judge readout not due;
+proposals 4 and 6 undecided; traffic is the binding constraint at 16–32 user requests a day) → **"do 1.
+verify your changes"**. Item 1 was the two things §4FT recorded and did not fix.
+
+### R0 — scope, written first
+* **Property:** every consumer that RECORDS or JUDGES a streamed turn reads the same text the user was
+  delivered — the unparsed-call scrub always, the smoother under the ≥2-real-tool gate; and pass 1 of the
+  smoother deletes a paragraph opening with a bare temporal lead only when the reply restates it.
+* **Threat model:** the reply is model-generated (arbitrary shape, not adversarial); tool snapshots and the
+  message history are internal. No untrusted input reaches these paths.
+* **Out of scope:** the value of the ≥2 gate (settled twice, §4FS/§4FT); what smoothing should remove beyond
+  the temporal narrowing; `<think>` handling; the non-stream loop's ordering.
+
+### 1. Pass 1: an opener is not evidence
+
+The 2026-07-17 rule dropped any short non-final paragraph opening with a progress connective. Half that list —
+`now`, `next`, `then`, `first` — also opens a STEP the user is meant to follow, and §4FT's reviewers caught it
+deleting four pieces of user-facing text (an instruction, a sign-off request, the first two steps of a numbered
+procedure). The ≥2-tool gate was the only thing bounding the damage; §4FS tried ≥1 for a day and had to revert.
+
+The connectives are now two classes. An **agent-voice beat** (`let me`, `let's`, `i'll`, `i will`, `i need to`,
+`time to`, `good,`, `okay`, `ok`, `alright`, `great,`, `perfect,`) is the model narrating its own next move: it
+cannot be an instruction addressed to the user, and it drops on sight as before. A bare **temporal lead** drops
+only when a later prose paragraph RESTATES it — shape 3's test, `_restated_later`, reused verbatim. A temporal
+lead sitting on a beat ("Now let me fix both:", "Then I'll restart it") is still a beat: the lead is stripped
+and the remainder re-tested, so the 2026-07-17 coverage survives the narrowing. `_is_narration` now takes the
+following blocks; called without them the temporal half is inert — a caller that forgets them gets "content",
+never a deletion.
+
+**Measured on the corpus, not asserted** (`scratchpad/pass1_corpus.py`, 1,485 recorded replies with ≥2
+paragraphs, old rule vs new): the old rule changed **147** replies, the new one changes **146**. Of the **27**
+bare temporal-lead paragraphs in the corpus, **24** are still dropped because the reply restates them. The
+three that now survive are the whole visible difference: a joke's punchline ("Then you open the door and I'm
+standing there."), a task-status statement ("Next focus: **Task 8 (Styling / styles.css)**. The only remaining
+console error…") — both user-facing text the old rule deleted — and one genuine beat, "Now restarting the
+server:", which is the accepted residue. §4FT's trade, applied: a stale beat is cheaper than a deleted
+sentence.
+
+### 2. The streamed drain had no delivered view — eight readers, not six
+
+`_finalize_and_return` scrubs and smooths `final_ai_content` IN PLACE, so on the non-streaming path every
+consumer after it reads the delivered text by construction. The streamed drain has no such variable: §4FS
+treated only the trajectory copy and handed the rest the raw accumulator. Enumerated from the source rather
+than from §4FT's list, that is **eight** readers, not six — the six recorded (smart-memory arc, post-mortem,
+episode, hydration judge, project work_log, calibration) plus **the hedge auto-scan** (a hedge inside scrubbed
+markup counted as the model hedging to the user, and it feeds `uncertainty_pressure` → composite confidence →
+the calibration sample) and **the promise backstop's headline** (§4FS fixed the stored-promise headline beside
+it and left this one).
+
+`reply_smoothing.treat_reply(text, *, n_real_tools)` is the missing variable, computed ONCE at the top of the
+drain from the same effective-content base the trajectory uses — so when the live scrub consumed the whole
+reply, every consumer stores the fallback sentence the user read, not tag soup. It owns `SMOOTHING_MIN_TOOLS`
+and `count_real_tools` so no caller can spell the gate differently, it is idempotent, and it fails open (a
+treatment that raises leaves the raw text rather than costing the turn its record). `_is_narration_only_trim`
+moved into the same module beside it; agent.py keeps the name.
+
+**Three readers stay raw, each marked at its site**, and an AST pin over the drain fails when a fourth appears:
+the `<think>` extraction that feeds the web UI's monologue box (those blocks live inside the very paragraphs
+smoothing drops — pinned by driving a reply whose narration paragraph carries an inline `<think>`), the
+streamed verifier's claim (the live stream SHOWED the narration, so the verdict judges what was delivered; the
+record keeps what the turn said — the one place the two legitimately differ), and the treated view's own base.
+
+**The smart-memory arc was a third divergence waiting to happen.** Its two sites were hand-mirrored, and the
+non-stream one runs INSIDE the turn loop, before finalize treats `final_ai_content` — so fixing only the
+streamed twin would have left the two paths remembering different text for the same turn. Both now call one
+`_build_memory_arc(history, ai_text, *, tools_run)`, and an AST enumeration requires every
+`_journal_append_safe('smart_memory', …)` writer to hand over a name assigned from it. What smart memory
+remembered as a turn's first 500 characters was frequently its opening narration; it is now the answer.
+
+### Defects in my own work (R8)
+1. **My own block comment claimed "RAW is still right in exactly two places" — there are three.** It named the
+   think extraction and the base and omitted the verifier claim, while the AST pin's allowlist beside it had
+   all three. The unchecked-claim class R8 exists to forbid, written into the comment that justifies the fix.
+2. **The role-filter pin was a fixture where the fixed and broken worlds agree.** It put the `system` row
+   BEFORE the four-message window, so removing the filter changed nothing about the assertion. Mutant M33
+   survived the first battery and named it; the row now sits inside the window.
+3. **Two of my pins could not have failed as first written** — the verifier claim is computed in a task the
+   drain SPAWNS (the first version read an empty dict and asserted on it), and the monologue pin attached a
+   handler to a logger pytest leaves at WARNING (it captured nothing). Both were instrument defects, both
+   would have shipped green.
+4. **A mutant silently left the batch.** After the arc refactor, M16 ("smart-memory arc back on the raw
+   accumulator") no longer matched any source line and the runner printed `SKIP(no-match)`. A batch that
+   reports 31/31 while one mutant never ran is the harness lying quietly; the skip line is the only thing
+   that says so, and it must be read. Replaced by M28/M31/M32 against the refactored shape.
+
+### Verification
+Battery `battery_4fv.json`: **32 mutants, 32 killed**, controls correct (a no-op comment SURVIVES, a
+pass-through `treat_reply` DIES) — the temporal leads folded back into the beat class; the restatement test
+skipped, inverted and set to 0.0; the lead-on-a-beat clause deleted; `smooth_reply` no longer passing the later
+blocks; `next` and `first` dropped from the temporal set (both directions of the parametrised pin);
+`treat_reply` without the scrub, without the gate, without the inverted-trim guard; the gate at 1; synthetic
+tools counted; and each of the nine drain readers reverted to `full_content` one at a time, plus the monologue
+and the verifier migrated TO the treated view, the base swapped for the raw accumulator, the treatment removed
+entirely, and four mutants against the arc builder. Both class enumerations were shown to FIRE: a planted
+`len(full_content)` in the drain reds the AST pin by name, and a hand-rolled arc reds the writer enumeration.
+Pins: `tests/test_reply_pass1_temporal.py` (14), `tests/test_stream_treated_view.py` (13, driven through the
+real stream generator with the zero-tool, single-tool and synthetic-tool negatives that make the assertions
+discriminating), `tests/test_memory_arc_shared.py` (11). The battery grew to **41 mutants, 41 killed** once
+§4FW joined it (below) — R7.1 wants every fix from every round in ONE batch. Suite **20,810 passed / 65
+skipped / 0 failed**, run in full twice on the final tree (four foreground chunks at `-n 2 --dist loadfile`;
+the box has llama-server resident). Docs: `docs/core/agent.html` (shape 1, the §4FS bullets it supersedes, a
+§4FV section) and `docs/core/uncertainty.html` (what the hedge scan reads).
+
+### Checked and clean
+* The **session store** persists the concatenated SSE chunks — the transcript the user read, narration
+  included. That is right for a conversation history and it is not a learner; unchanged.
+* No other reply-bearing variable is consumed in the drain (`_scrubbed_view`, `_final_view`,
+  `merged_content` do not reach it); the enumeration is over the whole class, not a list.
+* `unacknowledged_total_failure` — which the calibration sample now computes from treated text — has read the
+  treated `final_ai_content` on the non-stream path since July, and reads the (treated since §4FS) trajectory
+  record everywhere else. This is parity, not a new input.
+
+### Recorded, not fixed
+* Pass 1's acknowledgement openers ("Good,", "Okay,", "Perfect,") are unchanged. There is no measured
+  collateral for them, and the restatement test cannot be extended to the agent-voice class without gutting
+  the rule — the WebOS regression's "Let me fix both:" is not restated by anything.
+* The ≥2-tool smoothing gate is untouched (§4FT's decision). With pass 1 narrowed, the case for ≥1 is stronger
+  than it was — the shape that forced the revert now needs restatement — but that is a separate decision and
+  needs its own live evidence.
+
+### Live (three deploys today: 11:55 listener 52137, 12:09 listener 22391 with §4FW, 13:14 listener 11402 final)
+* **The check §4FS left open, green.** A streamed two-tool turn instructed to narrate. The client received
+  *"Let me run `echo alpha` in the sandbox.\n\nLet me run `echo beta` in the sandbox.\n\nBoth commands ran
+  successfully…"* — the live stream as the user saw it — and the durable record holds only *"Both commands ran
+  successfully: `echo alpha` printed "alpha" and `echo beta` printed "beta"…"*. Both beats are gone from the
+  record and from the seven other consumers that now read the same variable; the stream kept them. The
+  operator stream said so: *"reply smoothing — streamed record treated: 235 → 154 chars (the live stream was
+  delivered as it was)"*. The same check on listener 22391 (`echo one` / `echo two`) gave the same result.
+* A streamed two-tool turn with nothing to remove (write `notes_4fv.txt`, `wc -l`, 33.7 s): record identical
+  to the delivered text, no drain exception, no "treatment skipped" debug line, and no treatment line on the
+  stream.
+* That log line is new, and it is the point: a treatment that only ever runs silently cannot be told apart
+  from one that never runs. Finalize has printed its version since July; the common path printed nothing.
+
+## §4FW — A resumed sandbox is a new egress generation: §4FU's guarantee was off after every restart (2026-09-10 11:55–12:30)
+
+**Trigger:** the §4FV deploy. The boot log said *"Resumed stopped container"* and then nothing — no
+*"Tor-only egress ENFORCED"* line, where §4FU's own deploy had printed one at +18.7 s. Measured from inside the
+live container thirteen minutes later: `iptables -t nat -S` **empty**, and a plain
+`curl https://check.torproject.org/api/ip` answering **`{"IsTor": false}` from the host's real address**.
+
+**How bad, exactly** (measured, not assumed — the first draft of this entry said "every guarantee, off", which
+is not what the log shows). The hole SELF-HEALS, which is why it was invisible: the next `ensure_running` past
+the 8 s readiness TTL finds the container already running, skips the resume branch and falls through to the
+tail, which enforces BEFORE the command executes. §4FU's own deploy shows the pattern — resume at 20:32:57 with
+no enforcement, then a probe at 20:36:22 enforcing at +18.7 s. So an agent-issued sandbox command is, in
+practice, protected. What is NOT protected is exactly what the resume path exists to preserve: **in-sandbox
+services and promoted background jobs come back with the container, with no rules and no Tor**, and reach the
+network directly until some later agent command happens to trigger the enforcement — plus any command inside
+the post-boot TTL window. On this box the sandbox sat unprotected and idle from 11:56 to 12:09 today; nothing
+was running inside it, and there had been no restart between §4FU's deploy and this morning.
+
+**Why.** §4FU enforces "once per container generation" and treats a generation as a CONTAINER. It is a
+container **START**: `docker start` on a stopped container gives it a fresh network namespace — the
+`GHOST_TOR` rules live in the namespace, so they are gone — and starts none of its processes, so the
+in-container Tor is not running either. `_try_resume_stopped` starts the container, reports it ready and
+**returns**, several hundred lines before the creation path's enforcement call. §4FU's own R8-5 finding —
+"the container's filesystem outlives a restart while its processes do not" — is the same insight, applied to
+the bootstrap log and not to the enforcement.
+
+The agent is restarted by killing it (launchd `KeepAlive`), and the container outlives that, so the resume
+path is the COMMON path after every deploy, not an edge case. §4FU's live verification ran on a freshly
+created container (the v9 image upgrade), which is the one case that does enforce.
+
+**The fix.** One guarded entry point, `DockerSandbox._enforce_egress_once()` (policy check + generation flag +
+the §4FU worker), called by BOTH paths; the resume clears `_tor_attempted` first, because a start is a new
+generation. `unpause` keeps the namespace and the processes, so covering it is one idempotent re-apply. The
+class is closed by an AST pin: every function in `docker.py` that starts (`c.start()`, `c.unpause()`) or
+creates (`containers.run/create`) the container must call `_enforce_egress_once` in the same function, and the
+enumeration asserts it still sees BOTH known paths — a rename that hides a site reds it rather than shrinking
+what it checks. A second pin forbids any caller of the unguarded worker.
+
+### Defects in my own work (R8)
+1. **The battery's own harness gave false verdicts for one round.** The mutation tree was copied as
+   `src/ tests/ scripts/` only, so `test_the_image_carries_iptables_at_v9` — which reads
+   `<repo>/sandbox/Dockerfile` — failed in EVERY run. With `-x`, the sandbox mutants were "killed" by a missing
+   file rather than by a pin. Caught because the **no-op control was reported killed**, which is exactly what
+   that control is for. The tree is now copied whole and the round was re-run from scratch.
+2. **W3 survived the corrected round**: `_enforce_egress_once` with its generation flag removed re-applies the
+   rules through a privileged exec on every command, and §4FU's "once per generation" pin stayed green — it
+   drove `ensure_running()` twice, and the second call returned at the readiness-TTL fast path before reaching
+   the enforcement at all. The property was protected by the TTL, not by the flag. New pin resets the stamp
+   between the drives.
+
+### Verification
+Battery `battery_4fv.json` (§4FV + §4FW together, R7.1): **40 mutants, 40 killed**, controls correct — the
+resume path stripped of its enforcement (the defect itself), the resume keeping the previous generation's
+flag, the entry point ignoring the flag / the policy / the worker, and the enforcement hoisted above the
+readiness check. Pins: `tests/test_sandbox_resume_egress.py` (8, driven through the real
+`_try_resume_stopped` with the §4FU exec stub, including the two class enumerations and the no-policy
+negative). The existing sandbox files (`test_sandbox_tor_egress.py`, `test_bughunt_unit2_sandbox.py`,
+`test_sandbox_readiness_ttl.py`, `test_4bw_A_provision_deadline.py`) stay green unchanged.
+
+### Live (deployed 12:09 listener 22391, again 13:14 listener 11402)
+Boot log: *"Resumed stopped container"* → *"Tor-only rules loaded; waiting for the in-container Tor to
+bootstrap…"* at +0.16 s → **"Tor-only egress ENFORCED — the sandbox exits via <a Tor exit>"** at +5.86 s.
+From inside the same resumed container: `{"IsTor":true,"IP":"147.90.235.228"}`, the `GHOST_TOR` nat chain
+present with its uid/loopback exemptions first, and `tor -f /etc/tor/torrc.ghost` running as `debian-tor`.
+Before the fix, on the same container two minutes earlier: empty chain, `IsTor: false`, real IP.
+
+The 13:14 boot took §4FU's third branch — *"rules loaded and Tor bootstrapped, but the verification request
+got no usable answer"* (WARNING, state `enforced-unverified`): the check.torproject.org call did not finish
+inside its budget while the fresh circuit was still warming. Fail-closed either way — the rules were in — and
+an independent probe from inside the container two seconds later answered `{"IsTor":true,"IP":"45.84.107.198"}`.
+The verification is a report, not the enforcement; this is the branch that says so.
+
+**For the operator:** between §4FU's deploy (2026-09-09 20:34) and this fix there was exactly one restart —
+this morning's — and the sandbox was on direct cleartext egress from this machine's address for its idle
+window, 11:56 to 12:09. Nothing was running inside the container at the time (`0 promoted jobs running`, no
+services). The lasting risk this closes is the resumed SERVICE: the next long-lived process left in the
+sandbox across a restart would have egressed from the real IP until the following agent command.
+
+## §4FX — The tool head diet, retired on measurement (proposal 6, 2026-09-10 13:40–15:10)
+
+**Trigger:** operator, after §4FV/§4FW: *"what about 2, what will we gain if we keep it? also, how can we
+provefully make this decision?"* → measured → *"proceed with your recommendation."*
+
+**The state it was in.** §4FE shipped the diet flag-gated OFF on 2026-09-07: a 16-tool core plus a
+`tool_catalog` lookup, static schemas 18,625 → 11,465 tokens, every hidden built-in still dispatchable by name.
+The hypothesis (arXiv 2605.24660, ALE-Claw) was that a short list also HELPS selection. §4FK retracted the
+accuracy finding at the correct unit and the arm sat behind a flag for three days with no way to decide it.
+
+### Why it could not be decided the way it was framed
+As an accuracy A/B it is unanswerable here. Superiority is dead — **0.489 vs 0.481 per distinct request,
+p=0.88, n=264**. Non-inferiority to a 3pp margin needs roughly **n≈1,500–2,000 distinct real prompts** (the
+paired CI on 264 is about ±5–6pp); the corpus holds 264 + the 26-fixture September mine, and §4FL established
+that the recording window cannot reach the bar at this traffic. So "prove it is not worse" was never going to
+arrive.
+
+### What the decision actually rests on — three numbers, all measured
+* **Accuracy: null, with a bounded CI.** As above.
+* **The token cut is worth ~0.13 s per request.** 7,160 tokens is 9.6 s at the measured **744 tok/s** — but
+  only on a prefill that carries the whole head, and the main node's own counters say that is **1.4% of 16,018
+  prefills** (`prompt_tokens_cached_total` 16.9M vs `prompt_tokens_total` 3.06M = **84.7% of prompt tokens
+  served from cache**; median prefill 2,299 tokens, 96% under 12k). §4FM's re-warm loop keeps the byte-stable
+  head resident — the fix that made the prefix cache work is precisely what removed the diet's value.
+* **The catalog tax costs ~0.7 s per tool-using turn.** The diet hides 25 of 41 static tools. On **503 real
+  tool-using turns** (Aug–Sep, 2,077 calls) **11.5% touched at least one hidden tool** (5.0% of calls;
+  `manage_composed_skills` 30, `list_lessons` 12, `workspace` 11, `self_state` 9, `learn_skill` 7…), and each
+  such turn pays a `tool_catalog` list — usually plus a describe — at a median **6.3 s** per short LLM call.
+
+Cost is about **five times** the gain, and the middle option does not rescue it: promoting the eight hidden
+tools the corpus actually uses drops the tax to 3.2%, but those are where the tokens are — the ten tools never
+called in the corpus are only **2,643 of the 8,484 hidden tokens (31%)**, i.e. a "hide only what is never used"
+diet saves ~0.05 s per request.
+
+### The method, stated so it can be reused
+The decision needed no arm because, once the accuracy term is a bounded ~0, the remaining terms are
+**deterministic system measurements, not statistical contrasts**: gain = P(prefill carries the head) ×
+head_tokens ÷ prompt-eval rate, from the server's own counters (n=16,018); cost = P(turn needs a hidden tool) ×
+cost of a discovery round, from the trajectory corpus (n=503). Thousands of observations on each side and no
+randomisation required. For an arm to overturn a 5× gap the accuracy effect would have to be positive AND worth
+more than 0.7 s per turn — and it measures at zero.
+
+**Break-even, so the retirement is falsifiable:** the gain scales linearly with the full-head prefill rate and
+flips at **≈7.5%** (≈15% if discovery needs both a list and a describe), against **1.4%** today. If the re-warm
+loop goes away, the model or context size changes, or that rate climbs past ~7.5%, re-read those two numbers —
+two queries, not a new bench. The rule to re-apply: keep iff measured expected gain > measured expected cost AND
+the accuracy CI excludes harm beyond δ.
+
+**Honesty about the ordering (R8):** I measured first and wrote the decision rule afterwards. The numbers are
+what they are and the gap is not close, but the rule was not pre-registered, and a 1.3× result read in that
+order should not have been trusted.
+
+### What was removed, and what was deliberately kept
+Gone from production: `GHOST_TOOL_HEAD_DIET`, `TOOL_HEAD_CORE`, `TOOL_HEAD_STATIC_EXTRA`,
+`TOOL_CATALOG_DEFINITION`, `tool_head_diet_enabled`, `apply_tool_head_diet`, `hidden_tool_definitions`, the
+`tool_catalog` handler and its unconditional registration, the `apply_diet` seam on
+`get_active_tool_definitions`, and the diet's hint in the native tool pointer. `registry.py` keeps a
+retirement note carrying the three numbers and the break-even, so the next reader does not re-propose it from
+the same literature.
+
+Kept: `scripts/tool_head_diet_bench.py`, which now carries its **own** copy of the construction (`CORE`,
+`STATIC_EXTRA`, `CATALOG_DEFINITION`, `apply_diet`) because production no longer has one. It still reads the
+live `TOOL_DEFINITIONS` for the full head, so a re-run measures today's real tools against the frozen core
+rather than a stale snapshot of both. The eval ledgers under `system/eval/tool_head_diet/` stay.
+
+### Verification
+A revert needs a regression test for the ABSENCE, or the code grows back
+([[pin-the-deletion]]): `tests/test_4fx_tool_head_diet_retired.py` (7) replaces the deleted
+`tests/test_4fe_tool_head_diet.py` — the symbols are gone (named individually, so a partial resurrection is as
+loud as a full one), the advertised head is byte-identical with the flag unset and set to each of 1/true/on/yes,
+every static built-in is advertised again, `tool_catalog` is not in the handler map (it was registered
+unconditionally, so deleting only the advertisement would have left a live handler), no non-comment line in
+`src/` reads the flag, the `apply_diet` parameter is gone from the signature AND the AST, and the harness still
+loads with a core that covers the high-traffic tools (the old §4FE core-coverage pin, kept and re-pointed).
+Battery `battery_4fx.json`: **8 mutants, 8 killed**, controls correct — the diet growing back flag and all, a
+lone `TOOL_HEAD_CORE` constant, the handler re-registered, the `apply_diet` seam restored, a live path reading
+the flag again, and three against the harness (a diet head that no longer shrinks, a core that loses its
+high-traffic tools, a catalog that is never advertised). Two bench pins in
+`tests/test_4fj_think_probe_and_workspace.py` were re-pointed from `R.TOOL_HEAD_CORE` to the harness's own
+`mod.CORE`. Suite **20,811 passed / 65 skipped / 0 failed**, twice (four foreground chunks at `-n 2 --dist loadfile`). Docs: `docs/tools/registry.html` (the
+section is now the retirement, with the numbers and the reopen condition).
+
+**Checked and clean:** `optim/signatures.py` and `optim/env_mining.py` mention `tool_catalog` as a DSPy
+signature FIELD name — unrelated to the tool, untouched. No lesson, skill or launcher line referenced the flag
+or the tool; the only live-store hits were the bench's own eval ledgers.
+
+### Live (deployed 14:20, listener 83570; health 200, no boot errors)
+* **A formerly hidden tool, called directly, in one turn.** *"how many lessons are in your playbook right
+  now? Use list_lessons"* → `tool call — list_lessons` at +11.4 s, answer **"100 lessons"**, 29.9 s, one tool,
+  no discovery step. Under the diet that request was a `tool_catalog` list, then a describe, then the call.
+* `tool_catalog` appears nowhere in the log since the deploy, and is not in the handler map.
+* Third live confirmation of §4FW in passing: the boot resumed the sandbox and printed *"Tor-only egress
+  ENFORCED"* at +3.52 s.
+* One thing to fix in my own deploy habit: the readiness loop I used checks `/health` before the old process
+  has exited, so it reported "up" against the DYING instance and the listener id it printed was the old one.
+  A restart check must wait for a NEW pid, not for a healthy port.
