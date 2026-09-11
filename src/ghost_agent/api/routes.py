@@ -391,8 +391,24 @@ async def api_health(request: Request):
     except Exception:  # noqa: BLE001 — health must never raise
         node_health = {}
 
+    # Functional mood (2026-09-11, for the web face's slow baseline tint):
+    # label + provenance + when. getattr-chained so a mock or a boot
+    # without a self-model can never 500 the health endpoint.
+    mood = None
+    try:
+        _sm = getattr(context, "self_model", None)
+        _st = getattr(_sm, "state", None)
+        _m = getattr(_st, "mood", None)
+        _m = _m() if callable(_m) else _m
+        if _m is not None and getattr(_m, "label", None):
+            mood = {"label": str(_m.label), "source": str(getattr(_m, "source", "") or ""),
+                    "set_at": str(getattr(_m, "set_at", "") or "")}
+    except Exception:  # noqa: BLE001 — health must never raise
+        mood = None
+
     return JSONResponse({
         "status": "ok",
+        "mood": mood,
         "rss_mb": rss_mb,
         "rss_limit_mb": float(os.environ.get("GHOST_MAX_RSS_MB", "0") or "0"),
         "uptime_s": round(_time.monotonic() - boot_mono, 1) if boot_mono else None,

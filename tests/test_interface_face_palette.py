@@ -107,7 +107,9 @@ def test_vortex_self_similar_swallow(graph_js):
     # Background-blend luminance: EVERY form emits ~half the light
     # (introduced for vortex, extended to all faces same day).
     assert "uFormDim" in graph_js
-    assert "formDim = 0.55" in graph_js
+    # 2026-09-11: the two DATA forms (a handful of nodes) run at 0.95; every
+    # anatomy keeps the 0.55 background blend this test was written for.
+    assert "? 0.95 : 0.55;" in graph_js and "formDim = (FORM === 'conversation' || FORM === 'toolgraph')" in graph_js
     # The camera must never travel in this form.
     assert "camera.position.z = CAMERA_REST_Z;" in graph_js
     assert "vortexTravel * 7.4" not in graph_js, "camera travel must stay dead"

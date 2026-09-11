@@ -55,9 +55,11 @@ def test_forms_array_contents_and_order(graph_js):
     m = re.search(r"const FORMS = \[(.*?)\];", graph_js, re.DOTALL)
     assert m, "FORMS array missing"
     names = re.findall(r"'(\w+)'", m.group(1))
+    # 2026-09-11: two DATA forms joined (conversation, toolgraph); 'empty'
+    # stays last.
     assert names == ["abyssal", "horizon", "cortex", "vortex",
                      "lattice", "stack", "embedding", "descent",
-                     "cube", "empty"]
+                     "cube", "conversation", "toolgraph", "empty"]
     # 'empty' last: cycling INTO it disperses the face beyond the screen
     # edges and the NEXT cycle materializes abyssal from the void.
     assert names[-1] == "empty"
@@ -182,8 +184,9 @@ def test_cube_mutation_contract(graph_js):
     assert "cubeS < 0.4" in graph_js
     # Irregular organic spread boundary (per-node gate).
     assert "gate:" in graph_js and "* bp.gate" in graph_js
-    # Mutation churns faster as it strengthens.
-    assert "time * (0.7 + 1.4 * Sk)" in graph_js
+    # Mutation churns faster as it strengthens (and, since 2026-09-11, while
+    # the reply streams — the cube's 'flow' dialect).
+    assert "time * (0.7 + 1.4 * Sk + 1.0 * gaitFlow)" in graph_js
     # v2: idle complexities are already-red slow organisms (S_total
     # carries an idle breath), and the displacement field is SPATIALLY
     # coherent (position-keyed phases — neighbors move together).
@@ -246,8 +249,9 @@ def test_form_picker_menu(graph_js):
     assert "cycleForm()" in app_js, "stale-cache fallback must remain"
     # Every shipped form carries a hint line in the picker.
     for name in ("abyssal", "horizon", "cortex", "vortex", "lattice",
-                 "stack", "embedding", "descent", "cube", "empty"):
+                 "stack", "embedding", "descent", "cube", "conversation", "empty"):
         assert re.search(rf"\b{name}: '", app_js), f"hint missing for {name}"
+    assert re.search(r"\btoolgraph: \"", app_js), "hint missing for toolgraph"
     css = (_STATIC / "style.css").read_text(encoding="utf-8")
     assert "#face-form-menu" in css
     assert ".face-form-item.active" in css
@@ -284,13 +288,19 @@ const embExcite = []; let _embCenters = [];
 let beadX = 0, beadZ = 0, beadVX = 0, beadVZ = 0, beadStill = 0;
 const beadTrail = []; let _descTick = 0;
 let _cubeCx = []; let cubeActive = 0, cubeS = 0, _cubePrevTurn = false;
+const explicitEdges = [], nodeLabels = [], conversation = [], toolSeq = [];
+const toolUsage = new Map();
 const FORMS = ['abyssal', 'horizon', 'cortex', 'vortex',
-    'lattice', 'stack', 'embedding', 'descent', 'cube', 'empty'];
+    'lattice', 'stack', 'embedding', 'descent', 'cube',
+    'conversation', 'toolgraph', 'empty'];
 let formIndex = 0;
 {section}
+// Data forms with SOME data — the empty case is a separate branch.
+for (let i = 0; i < 30; i++) conversation.push({{ role: i % 2 ? 'assistant' : 'user', len: 40 * i, preview: 'm' + i, hidx: i }});
+for (const n of ['web_search', 'file_read', 'execute_code']) {{ toolUsage.set(n, {{ count: 2, lastAt: 0, first: 0 }}); toolSeq.push(n); }}
 const builders = [_buildAbyssal, _buildHorizon, _buildCortex, _buildVortex,
     _buildLattice, _buildStack, _buildEmbedding, _buildDescent, _buildCube,
-    _buildEmpty];
+    _buildConversation, _buildToolGraph, _buildEmpty];
 for (const fn of builders) {{
     basePositions.length = 0;
     fn();

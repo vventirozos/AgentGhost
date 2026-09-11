@@ -33,13 +33,18 @@
     </script>
     <!-- Vendored locally (no CDN) so the XSS-critical sanitizer chain
          (marked + DOMPurify) can't be swapped via a CDN compromise / MITM,
-         and versions are pinned. Refresh with: see docs/interfaces. -->
-    <script src="/static/vendor/marked.min.js"></script>
-    <script src="/static/vendor/purify.min.js"></script>
-    <script src="/static/vendor/mermaid.min.js"></script>
-    <script src="/static/vendor/papaparse.min.js"></script>
-    <script src="/static/vendor/chart.umd.min.js"></script>
-    <link rel="stylesheet" href="/static/style.css?v=5.9">
+         and versions are pinned. Refresh with: see docs/interfaces.
+         `defer`: classic deferred scripts run before the deferred module
+         (app.js) in document order, so the sanitizer is ready when the
+         module evaluates and the parser no longer blocks on them.
+         mermaid (3.3 MB), papaparse and chart.js are NOT loaded here any
+         more (2026-09-11): app.js fetches them on the first diagram /
+         chart render (_ensureVendor) — a cold phone load used to parse
+         3.6 MB of render-blocking script for features most turns never
+         touch. -->
+    <script defer src="/static/vendor/marked.min.js"></script>
+    <script defer src="/static/vendor/purify.min.js"></script>
+    <link rel="stylesheet" href="/static/style.css?v=6.3">
 </head>
 
 <body>
@@ -202,6 +207,11 @@
                 <!-- Chat messages -->
                 <div id="init-msg" class="message system">Initializing Ghost Interface v2.0...</div>
             </div>
+            <!-- Reading position (2026-09-11): shown when content lands
+                 below a reader who has scrolled up; nothing scrolls them
+                 down any more without asking. Same shape as #log-resume. -->
+            <button id="chat-resume" class="hidden" type="button"
+                    aria-label="Scroll to the newest messages">▼ new messages</button>
         </main>
 
         <footer id="input-area-wrapper">
@@ -216,7 +226,8 @@
                 <span id="turn-status-icon"></span>
             </div>
             <div id="input-area">
-                <textarea id="chat-input" placeholder="Enter message" rows="1"></textarea>
+                <textarea id="chat-input" placeholder="Enter message" rows="1"
+                          aria-label="Message" enterkeyhint="send"></textarea>
                 <!-- Hold-to-talk mic. RESTORED 2026-08-02. It was removed
                      2026-08-01 as "unused" — but the reason nobody used it is
                      that BOTH voice endpoints proxied to a Raspberry-Pi voice
@@ -322,9 +333,14 @@
         </div>
     </div>
 
+    <!-- Face node tooltip (2026-09-11): the conversation and tool-graph
+         forms label their nodes; hovering (or tapping exposed background)
+         shows the label here. Positioned by app.js. -->
+    <div id="face-tooltip" class="hidden" role="tooltip" aria-hidden="true"></div>
+
     <div id="toast-stack" aria-live="polite"></div>
 
-    <script type="module" src="/static/app.js?v=11.5"></script>
+    <script type="module" src="/static/app.js?v=12.1"></script>
 </body>
 
 </html>

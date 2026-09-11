@@ -34,14 +34,24 @@
     <thead><tr><th>Method · Path</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td>GET /</td><td>Auth gate (<code>?key=…</code>). Renders index.html and injects the API key into a script.</td></tr>
-      <tr><td>GET /sw.js</td><td>Service worker for offline / PWA.</td></tr>
+      <tr><td>GET /sw.js</td><td>Service worker, RENDERED (2026-09-11): the server fills a build stamp
+      and the precache list from the assets it ships. Offline shell, page-controlled updates, push
+      re-subscription, click routing — see the 2026-09-11 batch 3 section.</td></tr>
+      <tr><td>GET /api/interface/health</td><td>What the interface knows about ITSELF, no upstream call
+      (2026-09-11): uptime, active tasks, buffered bytes, websocket clients, the SSE ping interval, and
+      <code>tls: {cert_file, not_after, days_left, warn}</code> for the certificate uvicorn was started with.</td></tr>
       <tr><td>WS /ws</td><td>Persistent websocket — log line broadcast.</td></tr>
       <tr><td>POST /api/chat</td><td>Streaming or non-streaming chat. Returns <code>task_id</code> for streams. The client omits the <code>model</code> field on purpose — the agent 404s (<code>ModelNotFound</code>) on any supplied name that doesn't match its single configured <code>--model</code>, so omitting it makes chat track whatever model the agent runs.</td></tr>
       <tr><td>GET /api/chat/resume/{task_id}</td><td>Resume after disconnect at offset.</td></tr>
-      <tr><td>POST /api/chat/cancel/{task_id}</td><td>Tear down the INTERFACE's buffered
-      relay for a task (and suppress its reply-ready push). This does <em>not</em> stop the
-      agent: the composer's Stop also posts <code>/api/turn/cancel</code>, which is the one
-      that ends the turn and releases the global turn lock.</td></tr>
+      <tr><td>POST /api/chat/cancel/{task_id}</td><td>Stop a turn — ONE call since 2026-09-11.
+      Tears down the interface's buffered relay (and suppresses its reply-ready push), then
+      posts the agent's real <code>/api/turn/cancel</code> with the request id the proxy
+      minted for this task; the agent's verdict rides back as <code>agent: {cancelled, …}</code>.
+      Before this it stopped only the relay and the browser had to find its own turn on
+      <code>/api/turns</code> by session id or prompt prefix — which it still does, as the
+      FALLBACK, when <code>agent.cancelled</code> is not <code>true</code>.</td></tr>
+      <tr><td>GET /api/chat/task/{task_id}/state</td><td>Liveness probe for the resume flow:
+      <code>exists, done, error, truncated, cancelled, chunks, request_id</code>.</td></tr>
       <tr><td>POST /api/workspace/save · /load</td><td>Zip download / upload of state.</td></tr>
       <tr><td>POST /api/upload · GET /api/download/{path}</td><td>File I/O against the agent.</td></tr>
       <tr><td>POST /api/stt</td><td>Audio → text <strong>locally</strong>: <code>ffmpeg</code> transcode + Gemma 4 audio node (was: Raspberry Pi voice server, retired 2026-08-02 — the host no longer exists). See <a href="voice_server.html">Voice loop</a>.</td></tr>
@@ -910,6 +920,229 @@
   sheet closes before the upload; every close path revokes the preview), and the sheet RENDERED in
   WebKit at 390px (inside the viewport, buttons on one row ≥44px, preview capped, question box
   reachable) and hidden by default at desktop width. Cache-bust: app/matrix_graph 11.2, style 5.7.</p>
+
+  <h2>2026-09-11 — the "fix first" batch from the web-client review</h2>
+  <p>A three-lens read-only review of the client (core JS/CSS, PWA/session/push layer, server API)
+  produced 55 findings; the full list is <code>scratchpad/web_client_review_2026-09-11.md</code>.
+  The eight cheapest user-visible ones shipped the same day. Pins:
+  <code>tests/test_interface_fix_first_2026_09_11.py</code> (57 tests, behavioural ones executed
+  under node or against the FastAPI app; 10/10 mutants killed). Cache-bust: app/matrix_graph 11.6,
+  workspace 8.0, notifications 7.0, style 6.0.</p>
+  <ol>
+    <li><strong>The bubble no longer goes blank while the model reasons.</strong> The first chunk of
+    most replies opens a <code>&lt;think&gt;</code> block, which the renderer strips — so tearing the
+    typing indicator down on the first CHUNK showed an empty bubble for the whole reasoning phase.
+    <code>_renderStreamingContent</code> now returns while the stripped text is empty and reveals
+    the bubble (<code>_revealAgentBubble</code>) on the first VISIBLE character; a reasoning-only
+    reply ends as <em>No reply text (the model only reasoned).</em></li>
+    <li><strong>Retry, Regenerate, Edit &amp; resend.</strong> Every bubble with a history entry carries
+    <code>data-hidx</code> (stamped at push time and by <code>renderHistoryToLog</code>).
+    <code>_truncateToUserTurn(idx, send)</code> cuts <code>chatHistory</code> and the transcript just
+    before the user turn a bubble belongs to, refills the composer and (for Retry/Regenerate) resends
+    through the ordinary <code>sendTypedMessage</code>. The ⋯ menu offers <em>Regenerate</em> on agent
+    bubbles and <em>Edit &amp; resend</em> on user bubbles (between turns only); Stop, network-error and
+    agent error-frame pills carry a <em>Retry</em> button; ArrowUp in an empty composer recalls the last
+    message. A message carrying an attachment is refused rather than silently stripped.</li>
+    <li><strong>IME Enter.</strong> The composer ignores a keydown with <code>isComposing</code> (or
+    legacy keyCode 229), so a candidate-confirm Enter no longer sends half a word;
+    <code>enterkeyhint="send"</code> and an <code>aria-label</code> added.</li>
+    <li><strong>The document-wide <code>dblclick</code> preventDefault is gone.</strong> It broke
+    double-click word selection everywhere on a desktop; the viewport is already
+    <code>user-scalable=no</code> and buttons carry <code>touch-action: manipulation</code>.</li>
+    <li><strong>Reading position.</strong> Only your own message and a fresh render scroll
+    unconditionally. Agent/system appends, the two turn-end timeouts and the visualViewport resize
+    (<code>syncBodyHeight</code> — every keyboard show/hide) go through
+    <code>scrollToBottomIfPinned</code>: follow within 150px of the bottom, otherwise light the
+    <code>#chat-resume</code> "▼ new messages" pill (same shape as <code>#log-resume</code>).</li>
+    <li><strong>Notification permission is deliberate.</strong> The <code>{ once: true }</code>
+    click-anywhere prompt is deleted. The bell panel's top row (<code>pushRow</code>,
+    notifications.js) reads <code>Core.pushPermissionState()</code> — supported / needsInstall (iOS
+    Safari tab: Share → Add to Home Screen) / permission — and an <em>Enable alerts</em> button calls
+    <code>Core.requestNotificationPermission()</code>, which subscribes for push on a grant.</li>
+    <li><strong>SSE heartbeat.</strong> Both stream readers now share <code>_relay_task_stream</code>,
+    which parks on the task's event for at most <code>SSE_PING_S</code> (env
+    <code>GHOST_SSE_PING_S</code>, default 15s) and emits <code>: ping</code> — an SSE comment the
+    client skips by contract. Idle proxies / iOS radio sleep no longer cut a healthy stream, and the
+    periodic re-check also recovers the lost-wake race between the original and a resume reader
+    clearing the same Event (the permanent-spinner shape).</li>
+    <li><strong>Stop is one call.</strong> The proxy mints an 8-hex request id per streaming task,
+    sends it upstream as <code>X-Request-ID</code> (the Slack bot's existing contract; the agent
+    restamps every frame with it), returns it on the response (<code>X-Request-ID</code>, exposed)
+    and in the task state. <code>/api/chat/cancel</code> posts the agent's <code>/api/turn/cancel</code>
+    itself (<code>_cancel_agent_turn</code>, 4s bound, failures reported not raised). The client reads
+    the id at t=0, so thumbs and Stop know the turn before the first content frame; its
+    <code>/api/turns</code> resolution remains as the fallback.</li>
+  </ol>
+
+  <h2>2026-09-11 (later) — batch 2: recovery reconcile, per-tab identity, quota, load weight</h2>
+  <p>Review items A9–A12 and B13/B14 from <code>scratchpad/web_client_review_2026-09-11.md</code>.
+  Pins: <code>tests/test_interface_batch2_2026_09_11.py</code> (35 tests, executed under node or against
+  the app). Cache-bust: app/matrix_graph 11.7, workspace 8.1, sessions 7.8.</p>
+  <ol>
+    <li><strong>One reconcile authority.</strong> <code>_msgKey</code> / <code>_lcsPairs</code> /
+    <code>_reconcileWithLocal</code> moved from sessions.js to app.js and are exported as
+    <code>Core.reconcileWithLocal</code>; <code>load()</code> and <code>resyncCurrent()</code> consume it.
+    The locked-phone recovery path (<code>reconcileFromSession</code>) — which still compared raw lengths
+    and adopted the server copy wholesale, the F2 loss the sessions module had fixed twice — now
+    reconciles and paints only when <code>_adoptionChanges(adopted, local)</code> (length or last
+    element on the wire shape), so a local user turn the agent never stored survives a recovery and a
+    legitimately longer local copy no longer reads as "nothing new".</li>
+    <li><strong>Per-tab identity, per-session history.</strong> <code>storedSessionId()</code> reads
+    this tab's id from sessionStorage first, then the last-used one from localStorage;
+    <code>persistSessionId()</code> writes both; sessions.js binds through
+    <code>Core.persistSessionId</code>. Local history is stored under
+    <code>ghost_chat_history:&lt;sid&gt;</code> (<code>_historyKey()</code>); the legacy flat key is
+    adopted once and removed. <code>pruneLocalHistories()</code> drops keys for sessions the rail no
+    longer lists after each refresh, and a <code>storage</code> listener refreshes the rail when another
+    tab saves or switches. Two tabs on two conversations can no longer graft one history onto the other.</li>
+    <li><strong>Fallback and quota.</strong> <code>renderMarkdown</code>'s no-sanitizer fallback returns
+    <code>&lt;p&gt;…&lt;br&gt;…&lt;/p&gt;</code> (it promised that in a comment and returned bare text).
+    <code>safeStorage.set</code> returns true/false and records <code>lastError</code>;
+    <code>saveChatState</code> retries a <code>QuotaExceededError</code> with
+    <code>_slimHistoryForStorage</code> (inline <code>data:</code> images replaced by a placeholder, newest
+    200 kept) and toasts once. The server copy is unaffected.</li>
+    <li><strong>Load weight.</strong> mermaid (3.3 MB), chart.js and papaparse are no longer in
+    <code>&lt;head&gt;</code>; <code>_ensureVendor(name)</code> injects the vendored file on first use
+    (mermaid initialised on load; a failed load rejects without poisoning the next try) and
+    <code>renderMermaid</code>/<code>renderCSV</code> await it, dropping superseded clicks via
+    <code>_renderSeq</code>. marked + DOMPurify carry <code>defer</code>. Server side:
+    <code>GZipMiddleware(minimum_size=1024)</code> — Starlette excludes <code>text/event-stream</code>, and
+    the chat stream is pinned un-gzipped — and <code>VersionedStaticFiles</code> sets
+    <code>Cache-Control: public, max-age=31536000, immutable</code> on <code>?v=</code> assets and
+    <code>public, max-age=0, must-revalidate</code> otherwise (ETag 304s still work).</li>
+  </ol>
+
+  <h2>2026-09-11 (later still) — batch 3: service worker, face pause, TLS watch</h2>
+  <p>Pins: <code>tests/test_interface_batch3_2026_09_11.py</code> (42 tests: the worker is evaluated AS
+  SERVED under node with a recording ServiceWorkerGlobalScope stub; the page helpers with a DOM shim;
+  the routes against the app). Cache-bust: app/matrix_graph 11.8, workspace 8.2, sessions 7.9, status 7.3.</p>
+  <ol>
+    <li><strong>Service worker, rewritten.</strong> <code>GET /sw.js</code> is rendered by
+    <code>_render_sw()</code>: <code>_sw_precache_list()</code> collects "/", every <code>?v=</code> asset
+    index.html / app.js / workspace.js reference, the two sanitizer vendors and the icons;
+    <code>_sw_build_stamp()</code> hashes that list plus each file's size+mtime, so an edit that forgot
+    its bump still retires the old cache (<code>ghost-shell-&lt;stamp&gt;</code>) on activate. Fetch:
+    "/" is network-first (a 200 is cached under the bare path; on failure the cached copy, then a small
+    offline page); <code>/static/*</code> is cache-first, filled on miss; nothing else is intercepted.
+    The cached document carries the injected key, which the page cookie and the installed app's
+    start_url already persist on the device — no new audience. <em>Install no longer calls
+    skipWaiting()</em>: app.js watches <code>updatefound</code>, offers "A new version of the console is
+    ready — Reload" as a system bubble, posts <code>SKIP_WAITING</code> on click and reloads on
+    <code>controllerchange</code> (after the running turn, if any). <code>pushsubscriptionchange</code>
+    re-subscribes with the old key (or fetches <code>/api/push/vapid</code> with the page cookie) and
+    posts <code>push-resubscribed</code> to open pages, which run <code>ensurePushSubscription()</code>
+    — registering the new endpoint needs the API key only the page holds.
+    <code>notificationclick</code> picks the focused, then a visible, window (<code>pickClient</code>),
+    focuses it and posts <code>push-click</code>; app.js runs the resume/reconcile chain and sessions.js
+    realigns + refreshes the rail (focus alone fires no visibilitychange). Offline/online events paint
+    the chip OFFLINE / RECONNECTING.</li>
+    <li><strong><code>/api/push/vapid</code> accepts the page cookie</strong>
+    (<code>verify_interface_key_or_page_cookie</code>, that ONE read-only route — it returns the public
+    VAPID key every subscription already carries). Every writing route keeps the header-only rule; pinned
+    by grepping the decorators. <code>webpush_notify.broadcast</code> now prunes 401/403 endpoints too,
+    but only when another endpoint in the same broadcast accepted our key — all-rejected means OUR VAPID
+    config is wrong and pruning would wipe the store.</li>
+    <li><strong>The face pauses while hidden.</strong> <code>matrix_graph.setAnimationPaused(paused)</code>
+    cancels the frame / restarts the loop (only once <code>init()</code> built a renderer; idempotent
+    while running); <code>animate()</code> guards itself; a <code>visibilitychange</code> listener drives
+    it. A backgrounded phone no longer runs bloom passes nobody can see.</li>
+    <li><strong>TLS expiry watch.</strong> <code>_tls_cert_path()</code> reads uvicorn's
+    <code>--ssl-certfile</code> from argv (or <code>GHOST_TLS_CERTFILE</code>);
+    <code>tls_cert_status()</code> parses the PEM (cryptography) → <code>days_left</code>,
+    <code>warn</code> under <code>TLS_WARN_DAYS = 14</code>, never raises. <code>_tls_expiry_watch</code>
+    logs WARNING/ERROR daily. status.js polls <code>/api/interface/health</code> beside
+    <code>/api/health</code> and <code>tlsWarning()</code> turns the chip DEGRADED with "TLS certificate
+    expires in N day(s) — renew now (tailscale cert &lt;host&gt;)" — the agent's own reasons are not
+    blamed alongside it. Renewal itself stays manual: <code>tailscale cert eva.taila2b1d.ts.net</code>
+    then restart the daemon; the current certificate expires <strong>2026-10-09</strong>.</li>
+  </ol>
+
+  <h2>2026-09-11 (night) — the face's signal layer</h2>
+  <p>Operator: "any ideas to make the faces more interesting?" → fourteen ideas, all shipped. Design rule
+  kept: temperature stays the one thing the eye must track; what is added is GAIT and EVENT. Pins:
+  <code>tests/test_interface_face_signals_2026_09_11.py</code> (36 tests; pure helpers executed under node,
+  the two new builders run for both device classes by the harness in
+  <code>test_interface_face_forms_ai.py</code>). Cache-bust: app/matrix_graph 11.9, workspace 8.3, status
+  7.4, style 6.1. The agent's <code>/api/health</code> gained <code>mood</code> (agent restart needed).</p>
+  <ul>
+    <li><strong>Phase gaits.</strong> <code>faceSignalsForTicker(title, icon, detail)</code> (app.js) maps the
+    ticker's step class to <code>setPhase('search'|'read'|'tool'|'verify'|'write')</code>; smoothed gait
+    weights drive a radial factor (search +4%, read −3.5%, verify −3%), a laminar z-wave for write, a
+    shader azimuth sweep (<code>uSweep</code>/<code>uSweepAngle</code>) for search, and a stillness factor
+    that slows <code>time</code> and the pulse clock. The first visible reply character sets
+    <code>write</code>; turn end clears the phase.</li>
+    <li><strong>Tool kick + habits.</strong> a <code>Tool Call</code> line (🧰) → <code>noteToolCall(name)</code>:
+    a decaying radial kick and the tool-graph's data (<code>toolUsage</code>, <code>toolSeq</code>).</li>
+    <li><strong>Recall comet.</strong> 🔎/📍 lines → <code>noteRecall()</code> (rate-limited 1.5s): a hot
+    streak from the periphery into one node (an extra line segment) and a bell-shaped size flare; the
+    embedding form also ignites its next cluster.</li>
+    <li><strong>Verdict release.</strong> the 🧪 <code>Verify</code> line's <code>CONFIRMED</code>/<code>REFUTED</code>
+    is remembered for the turn; at turn end <code>noteVerdict(pass|refute|stop)</code>: pass = stillness +
+    a brighter hold (~2s), refute = high-frequency shudder + flinch, stop = one soft scale exhale.</li>
+    <li><strong>Background breath.</strong> status.js polls <code>/api/turns</code> with the health probe;
+    <code>backgroundBusyFrom(turns, mySessionId)</code> → <code>setBackgroundBusy</code>: outer nodes (r &gt; 1.5)
+    breathe on a slower rhythm and bloom rides it faintly.</li>
+    <li><strong>Mood baseline.</strong> <code>health.mood.label</code> → <code>setMoodHue</code> →
+    <code>moodHueFor</code> (satisfied −0.035, idle −0.06, curious +0.03, stuck +0.05, overloaded +0.07 — all
+    within the cold pole), lerped over ~1 minute onto <code>uHueDrift</code>.</li>
+    <li><strong>Composer gaze.</strong> typing → <code>setComposerGaze(true)</code>: the camera's look target
+    drops toward the composer (fades with the dive); blur / send clears it.</li>
+    <li><strong>Voice.</strong> the hold-to-talk stream gets an AnalyserNode (never routed to the speakers)
+    pumping <code>setAudioLevel</code> while recording; the TTS analyser already existed.</li>
+    <li><strong>Error kinds.</strong> <code>errorKindFor(message, type)</code> → <code>noteError(kind)</code>:
+    network flickers <code>formDim</code> with gaps, timeout fades it, refusal freezes motion; generic keeps
+    the old recoil.</li>
+    <li><strong>Idle twitch.</strong> at rest (drive &lt; 0.15, no user turn, not reduced-motion) one random
+    neighbourhood shivers every 6–14s.</li>
+    <li><strong>Two data forms.</strong> <code>conversation</code> (<code>conversationLayout</code>: a helix,
+    user r=1.15 / assistant r=0.75, size by length, newest reply hot, explicit reply→question edges, a dim
+    "future" thread) fed by <code>setConversation(chatHistory)</code> from <code>saveChatState</code>;
+    <code>toolgraph</code> (<code>toolGraphLayout</code>: ring r=1.45 around a hub, size by count, lit by
+    recency, hub spokes + call-order edges). Both use <code>LINK_MULT = 0</code> (no proximity hairball) and
+    the new explicit-edge pass in the line builder; <code>_relayoutDataForm()</code> re-lays them in place
+    when data changes, blending from current positions.</li>
+    <li><strong>Hover labels.</strong> <code>describeNodeAt(ndcX, ndcY)</code> projects the CPU-side positions
+    and returns the nearest labelled node; app.js shows it in <code>#face-tooltip</code> on pointer move / tap
+    over exposed background (<code>faceHoverAllowed</code> suppresses chrome and bubbles).</li>
+    <li><strong>Auto form.</strong> the picker's first item toggles <code>setAutoForm</code>; ticker hints
+    (coding/research/verify/memory) → <code>autoFormFor</code> → a form switch debounced to 20s that never
+    persists as the user's pick; leaving auto returns to the remembered base form.
+    <code>ghost_face_auto</code> in localStorage.</li>
+  </ul>
+
+  <h2>2026-09-11 (later night) — the face lab and the gait dialects</h2>
+  <p>Pins: <code>tests/test_interface_face_lab_and_dialects_2026_09_11.py</code>. Cache-bust: app/matrix_graph
+  12.0, workspace 8.4, palette 7.1, facelab 1.0, style 6.2.</p>
+  <p><strong>Face lab</strong> (<code>interface/static/facelab.js</code>, lazy-loaded from the command palette's
+  <em>Face lab</em> entry or <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd>). A panel docked bottom-right: a
+  form select; one button per event (tool kick, recall comet, the three verdicts, an idle twitch, the four
+  error kinds); the six gaits; toggles for background busy, gaze and auto form; a mood select and an audio
+  slider (fed at 25 Hz while held, since the face low-passes and decays the level); one slider per entry of
+  <code>TUNE</code> (0 … 4× the default; decays stay below 1) with changed rows highlighted; a live
+  <code>getDebugState()</code> readout at 8 Hz; <em>Copy JSON</em> and <em>Reset</em>.
+  <code>labActions()</code> is a table so the test proves every button names an export the face module has
+  (a renamed hook would otherwise be a dead button).</p>
+  <p><strong>TUNE</strong> (matrix_graph.js). Every amplitude the signal layer uses lives in
+  <code>TUNE_DEFAULTS</code> (26 keys) and is read as <code>TUNE.x</code> in the render loop — the test
+  asserts the two sets are equal, so no literal can creep back and no default can go unused.
+  <code>setTune(key, v)</code> validates the key, clamps to [0, 4×default] (<code>passHold</code> ≤ 0.999)
+  and persists only the DIFFS to <code>ghost_face_tune</code>; <code>resetTune()</code> clears;
+  <code>loadTuneOverrides(raw)</code> runs at boot and ignores junk. The sweep warmth became a uniform
+  (<code>uSweepHeat</code>) so it can be dragged live.</p>
+  <p><strong>Dialects</strong>. <code>DIALECTS[form]</code> gives each anatomy its grammar for the shared gaits,
+  with values from <code>DIALECT_VALUES</code>: <code>radialAxis</code> (all / xz / y / none),
+  <code>search</code> (sweep / plane / ring), <code>read</code> (contract / thicken / settle),
+  <code>tool</code> (kick / flash / ripple), <code>write</code> (wave / flow / pulse), <code>verify</code>
+  (still / align). Per frame the current dialect derives <code>gaitFlow</code>, <code>gaitThicken</code>,
+  <code>gaitFlash</code>, <code>gaitAlign</code>, which the branches read: the vortex's swallow accelerates
+  while the reply streams and slows/thickens while reading; the horizon's core flares on a tool call; the
+  lattice's runners sprint on write, its kernel flares on a tool call, and verifying snaps the grid true
+  (jitter and lean suppressed); the stack's packets climb faster and hop on each tool call; the embedding's
+  comet and the descent's bead hurry on write; the cube churns faster on write, its hearts flare on a tool
+  call and verifying tames the mutation; the cortex's lobes swell harder on a tool call; the data forms
+  pulse their newest node instead of breathing. The generic pass honours <code>radialAxis</code> (crystals
+  and data forms do not breathe; ring stacks keep their height; the terrain heaves in y), and the shader's
+  search scan has three modes (azimuth sweep, a plane along y, an expanding ring) chosen by the dialect.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

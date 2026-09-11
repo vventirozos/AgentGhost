@@ -85,7 +85,9 @@ def test_chat_payload_binds_session_id():
     # window carried no session_id and was never persisted (R3 lens B).
     assert re.search(r"payload\.session_id\s*=\s*_sid", js)
     i = js.index("const _sid = window.__ghostSessionId")
-    assert "safeStorage.get('ghost_session_id')" in js[i:i + 200], (
+    # 2026-09-11: the stored id is PER TAB first (sessionStorage), then the
+    # last-used one (localStorage) — both behind storedSessionId().
+    assert "storedSessionId()" in js[i:i + 200], (
         "an unbound early turn is still sent with no session id")
 
 
@@ -264,9 +266,13 @@ def test_status_module_contract():
     assert "memory_system_loaded" in js
     assert "biological_watchdog_alive" in js
     # The removed surfaces must not creep back in under the old names.
-    for gone in ("/api/turns", "/api/turn/cancel", "t.request_id",
+    # (2026-09-11: /api/turns is fetched again, but only to tell the FACE
+    # that a turn that is not ours holds the lock — no listing, no cancel.)
+    for gone in ("/api/turn/cancel", "t.request_id",
                  "arg.model", "status-panel", "model-pill"):
         assert gone not in js, f"{gone} is back in status.js"
+    i = js.index("fetch('/api/turns'")
+    assert "backgroundBusyFrom(" in js[i:i + 400]
 
 
 # ---------------------------------------------------------------------------

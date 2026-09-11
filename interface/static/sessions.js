@@ -50,7 +50,15 @@ export function initSessions(ctx) {
 
     let enabled = null;          // null = unknown yet
     let sessions = [];           // summaries, most recent first
-    let currentId = Core.safeStorage.get('ghost_session_id') || null;
+    // Identity is PER TAB first (2026-09-11). One flat localStorage key
+    // meant two tabs on two conversations overwrote each other's identity,
+    // and a reload of either tab reconciled one conversation's local
+    // history against the OTHER's — the next turn then persisted the graft.
+    // sessionStorage holds this tab's session; localStorage keeps the
+    // last-used one so a NEW tab opens where you left off.
+    let currentId = (typeof Core.storedSessionId === 'function')
+        ? Core.storedSessionId()
+        : (Core.safeStorage.get('ghost_session_id') || null);
     let filterText = '';
     let refreshTimer = null;
 
@@ -70,8 +78,13 @@ export function initSessions(ctx) {
         loadSeq++;
         currentId = id;
         window.__ghostSessionId = id;
-        if (id) Core.safeStorage.set('ghost_session_id', id);
-        else Core.safeStorage.remove('ghost_session_id');
+        if (typeof Core.persistSessionId === 'function') {
+            Core.persistSessionId(id);          // this tab + last-used
+        } else if (id) {
+            Core.safeStorage.set('ghost_session_id', id);   // stale app.js
+        } else {
+            Core.safeStorage.remove('ghost_session_id');
+        }
         render();
     }
 
@@ -178,6 +191,7 @@ export function initSessions(ctx) {
             note('');
             sessions = data.sessions || [];
             render();
+            pruneLocalHistories();
         } catch (e) {
             note(_railFailureNote(e));
         }
@@ -226,7 +240,7 @@ export function initSessions(ctx) {
             // the fix landed in `resyncCurrent` and this sibling path kept
             // the old behaviour, so the loss simply moved from "2s later" to
             // "on the next reload" (R3 lens B).
-            messages = _reconcileWithLocal(messages, Core.getChatHistory());
+            messages = Core.reconcileWithLocal(messages, Core.getChatHistory());
             if (Core.mergeClientLabelKeys) {
                 messages = Core.mergeClientLabelKeys(messages);
             }
@@ -402,6 +416,19 @@ export function initSessions(ctx) {
             if (ev.pointerType === 'mouse') disarmDeleteAll();
         });
 
+    // Per-session history keys would otherwise accumulate forever. Keep
+    // the ones for sessions the agent still has (plus this tab's own,
+    // which may not be persisted yet); drop the rest.
+    function pruneLocalHistories() {
+        if (typeof Core.localHistoryKeys !== 'function') return;
+        const keep = new Set(sessions.map(s => s.id));
+        if (currentId) keep.add(currentId);
+        for (const k of Core.localHistoryKeys()) {
+            const sid = k.slice('ghost_chat_history:'.length);
+            if (!keep.has(sid)) Core.safeStorage.remove(k);
+        }
+    }
+
     function scheduleRefresh() {
         clearTimeout(refreshTimer);
         refreshTimer = setTimeout(refresh, 1200);
@@ -457,98 +484,13 @@ export function initSessions(ctx) {
     // workspace load — had the user's own typed message DELETED from their
     // screen ~2s later by the resync that exists to help them (R2 lens B).
     //
-    // Stable message key. Mirrors the server's `_msg_key`: the ROLE plus a
-    // stringified content, so a multimodal payload compares by value rather
-    // than by object identity. Key ORDER matters to JSON.stringify, so
-    // objects are serialised with sorted keys — two identical multimodal
-    // parts built in different key order are the same message (R3 lens B).
-    function _msgKey(m) {
-        const c = m && m.content;
-        let text;
-        if (c === null || c === undefined) text = '';
-        else if (typeof c === 'string') text = c;
-        else text = JSON.stringify(c, (_k, v) =>
-            (v && typeof v === 'object' && !Array.isArray(v))
-                ? Object.keys(v).sort().reduce((o, kk) => (o[kk] = v[kk], o), {})
-                : v);
-        return (m && m.role) + '\u0000' + text;
-    }
-
-    // Adopt the server copy WITHOUT deleting or REORDERING anything.
-    //
-    // ⚠ This is the second version. The first took every local user message
-    // the server did not account for and `concat`ed them onto the end — an
-    // order-blind multiset. Its own comment claimed it "mirrors the server's
-    // own merge", and it did not: the server LCS-aligns and appends only the
-    // unmatched TAIL, order-preserving. Two consequences, both reproduced
-    // (R3 lens B): an abandoned question landed AFTER the reply to a later
-    // question, and — because the store truncates from the FRONT at 400
-    // while the interface caps at 500 — every message in that window looked
-    // "unaccounted" and got pasted onto the tail, where the next turn
-    // replayed it and the server appended it for good. The fix inherited the
-    // defect class it was written to remove, one layer along.
-    //
-    // Now: align local against the server with the same LCS the server uses,
-    // and re-append only what follows the last aligned position. USER
-    // messages only — a local assistant entry the server lacks is an
-    // aborted-stream stub, and dropping it is the one thing the original
-    // unconditional adopt got right.
-    // Alignment PAIRS, the same LCS traceback the server runs.
-    function _lcsPairs(serverMsgs, localMsgs) {
-        const n = serverMsgs.length, m = localMsgs.length;
-        if (!n || !m) return [];
-        const sk = serverMsgs.map(_msgKey), lk = localMsgs.map(_msgKey);
-        const table = Array.from({ length: n + 1 }, () => new Int32Array(m + 1));
-        for (let i = n - 1; i >= 0; i--) {
-            for (let j = m - 1; j >= 0; j--) {
-                table[i][j] = sk[i] === lk[j]
-                    ? table[i + 1][j + 1] + 1
-                    : Math.max(table[i + 1][j], table[i][j + 1]);
-            }
-        }
-        const pairs = [];
-        let i = 0, j = 0;
-        while (i < n && j < m) {
-            if (sk[i] === lk[j]) { pairs.push([i, j]); i++; j++; }
-            else if (table[i + 1][j] >= table[i][j + 1]) i++;
-            else j++;
-        }
-        return pairs;
-    }
-
-    function _reconcileWithLocal(serverMsgs, localMsgs) {
-        const raw = localMsgs || [];
-        if (!raw.length) return serverMsgs;
-        const local = raw.map(
-            (m) => (m && Core.toWireMessage) ? Core.toWireMessage(m) : m);
-        const pairs = _lcsPairs(serverMsgs, local);
-        const out = [];
-        let i = 0, j = 0;
-        const firstAligned = pairs.length ? pairs[0][1] : local.length;
-        const takeLocal = (k) => {
-            const m = raw[k];
-            if (!m) return;
-            // BEFORE the first aligned position sits the client's copy of
-            // history the store's 400-message cap EVICTED. Keep it whole —
-            // it is the operator's own record, and the server puts anything
-            // ahead of the alignment into `lead` (prompt only), so it can
-            // never be re-persisted from there. AFTER the first alignment,
-            // a local-only entry is a turn the agent never stored: keep the
-            // USER message (that is the F2 fix) and drop assistant entries,
-            // which are aborted-stream stubs.
-            if (k < firstAligned || m.role === 'user') out.push(m);
-        };
-        for (const [pi, pj] of pairs) {
-            while (i < pi) out.push(serverMsgs[i++]);   // server-only
-            while (j < pj) takeLocal(j++);              // local-only, in place
-            out.push(serverMsgs[pi]);
-            i = pi + 1;
-            j = pj + 1;
-        }
-        while (i < serverMsgs.length) out.push(serverMsgs[i++]);
-        while (j < local.length) takeLocal(j++);
-        return out;
-    }
+    // `_msgKey` / `_lcsPairs` / `_reconcileWithLocal` — the LCS adoption
+    // that never deletes or reorders and keeps a local-only USER turn —
+    // moved to app.js on 2026-09-11 and are consumed here as
+    // `Core.reconcileWithLocal`. ONE authority: the reconcile path in
+    // app.js (`reconcileFromSession`, the locked-phone recovery) had its
+    // own raw length compare and adopted the server copy wholesale — the
+    // F2 loss this module fixed twice, alive in a third sibling.
 
     async function resyncCurrent() {
         if (!enabled || !currentId || Core.isProcessing()) return;
@@ -582,7 +524,7 @@ export function initSessions(ctx) {
             // each time, destroying scroll position and selection forever
             // (R3 lens B). Reconciling is cheap and idempotent; rendering is
             // not.
-            const adopted = _reconcileWithLocal(messages, local);
+            const adopted = Core.reconcileWithLocal(messages, local);
             const drifted = adopted.length !== local.length
                 || JSON.stringify(adopted[adopted.length - 1] || null)
                     !== JSON.stringify(wire(local[local.length - 1]));
@@ -638,6 +580,21 @@ export function initSessions(ctx) {
     });
     document.addEventListener('visibilitychange', () => {
         if (document.visibilityState === 'visible') resyncCurrent();
+    });
+    // A notification tap landed on this window (service worker → app.js).
+    // Focus alone fires no visibilitychange, so realign explicitly and
+    // refresh the rail the reply may have retitled.
+    Core.events.addEventListener('push-click', () => {
+        resyncCurrent();
+        scheduleRefresh();
+    });
+
+    // Another tab saved a conversation (per-session history keys) or
+    // switched identity: refresh the rail so titles/counts follow. The
+    // event fires only in OTHER tabs, by spec — no self-echo.
+    window.addEventListener('storage', (e) => {
+        const k = e && typeof e.key === 'string' ? e.key : '';
+        if (k.startsWith('ghost_chat_history') || k === 'ghost_session_id') scheduleRefresh();
     });
 
     boot();

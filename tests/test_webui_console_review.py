@@ -433,12 +433,22 @@ class TestResumeAdoptsRatherThanAppends:
             f"adoption re-shaped the message and dropped tool_calls: {out}")
         assert out.get("name") == "n", out
 
-    def test_adoption_only_happens_when_the_server_has_MORE(self, app_js):
+    def test_adoption_RECONCILES_instead_of_comparing_raw_lengths(self, app_js):
+        """Until 2026-09-11 this pinned `msgs.length > chatHistory.length` as
+        the guard against silent local truncation. That guard was the F2
+        defect one path over: once local held a turn the agent never
+        persisted (legitimately `server + k`), a raw compare read "nothing
+        new" while the reply sat on the server — and when it DID adopt, it
+        replaced local wholesale and deleted the user's own message. The
+        sessions module fixed its two paths with the LCS reconcile; this
+        third sibling now goes through the same function (see
+        tests/test_interface_batch2_2026_09_11.py for the executed worlds)."""
         i = app_js.index("async function reconcileFromSession")
         body = app_js[i:app_js.index("async function", i + 10)]
-        assert "msgs.length > chatHistory.length" in body, (
-            "a SHORTER server history would now overwrite a longer local "
-            "one — silent local truncation")
+        assert "_reconcileWithLocal(msgs, chatHistory)" in body
+        assert "_adoptionChanges(adopted, chatHistory)" in body
+        assert "msgs.length > chatHistory.length" not in body, (
+            "the raw length compare is back — the F2 loss with it")
 
 
 class TestTheResyncNeverDeletesTheUsersOwnMessage:
@@ -454,9 +464,14 @@ class TestTheResyncNeverDeletesTheUsersOwnMessage:
     ignored it."""
 
     def _reconcile(self, sessions_js, server, local):
-        fn = (extract_js_function(sessions_js, "_msgKey")
-              + extract_js_function(sessions_js, "_lcsPairs")
-              + extract_js_function(sessions_js, "_reconcileWithLocal"))
+        # 2026-09-11: the helpers moved to app.js (ONE authority — the
+        # recovery path there had its own raw length compare); sessions.js
+        # consumes them as Core.reconcileWithLocal.
+        app_js = _js("app.js")
+        fn = (extract_js_function(app_js, "_msgKey")
+              + extract_js_function(app_js, "_lcsPairs")
+              + extract_js_function(app_js, "toWireMessage")
+              + extract_js_function(app_js, "_reconcileWithLocal"))
         return eval_js("const Core = {};\n" + fn,
                        f"_reconcileWithLocal({server}, {local})")
 
@@ -495,7 +510,7 @@ class TestTheResyncNeverDeletesTheUsersOwnMessage:
     def test_resync_routes_through_it(self, sessions_js):
         i = sessions_js.index("async function resyncCurrent")
         body = sessions_js[i:i + 2000]
-        assert "_reconcileWithLocal(" in body, (
+        assert "Core.reconcileWithLocal(" in body, (
             "resyncCurrent adopts the server copy directly again")
 
 
@@ -931,14 +946,17 @@ class TestTheResyncCALLERUsesTheReconciliation:
     caller uses its result."""
 
     def _run_resync(self, sessions_js, server, local):
-        fns = (extract_js_function(sessions_js, "_msgKey")
-               + extract_js_function(sessions_js, "_lcsPairs")
-               + extract_js_function(sessions_js, "_reconcileWithLocal")
+        app_js = _js("app.js")
+        fns = (extract_js_function(app_js, "_msgKey")
+               + extract_js_function(app_js, "_lcsPairs")
+               + extract_js_function(app_js, "_reconcileWithLocal")
                + extract_js_function(sessions_js, "resyncCurrent"))
         preamble = """
 let loadSeq = 0, currentId = 'S', enabled = true;
 const painted = [];
+function toWireMessage(m) { return {role: m.role, content: m.content}; }
 const Core = {
+    reconcileWithLocal: (s, l) => _reconcileWithLocal(s, l),
     isProcessing: () => false,
     getChatHistory: () => %s,
     setChatHistory: (h) => painted.push(h),
@@ -973,14 +991,17 @@ globalThis.fetch = async () => ({ok: true, json: async () => ({messages: %s})});
         """`load()` is the other adoption path (boot / refresh), and the same
         value-bypass survives there with no pin at all — the loss simply
         moves from "2s later" to "on the next reload" (R4 lens B)."""
-        fns = (extract_js_function(sessions_js, "_msgKey")
-               + extract_js_function(sessions_js, "_lcsPairs")
-               + extract_js_function(sessions_js, "_reconcileWithLocal")
+        app_js = _js("app.js")
+        fns = (extract_js_function(app_js, "_msgKey")
+               + extract_js_function(app_js, "_lcsPairs")
+               + extract_js_function(app_js, "_reconcileWithLocal")
                + extract_js_function(sessions_js, "load"))
         preamble = """
 let loadSeq = 0, currentId = 'S';
 const painted = [];
+function toWireMessage(m) { return {role: m.role, content: m.content}; }
 const Core = {
+    reconcileWithLocal: (s, l) => _reconcileWithLocal(s, l),
     isProcessing: () => false,
     getChatHistory: () => [{role:'user',content:'q1'},
                            {role:'assistant',content:'a1'},

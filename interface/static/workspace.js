@@ -12,10 +12,10 @@
 //  toasts, the per-message action menu, and the memory-correction
 //  modal.
 // ═══════════════════════════════════════════════════════════════
-import { initSessions } from './sessions.js?v=7.7';
-import { initNotifications } from './notifications.js?v=6.9';
-import { initStatus } from './status.js?v=7.2';
-import { initPalette } from './palette.js?v=7.0';
+import { initSessions } from './sessions.js?v=7.9';
+import { initNotifications } from './notifications.js?v=7.0';
+import { initStatus } from './status.js?v=7.4';
+import { initPalette } from './palette.js?v=7.1';
 
 const Core = window.GhostCore;
 
@@ -169,6 +169,23 @@ function openMessageMenu(msgDiv, anchorBtn) {
         input.focus();
         input.dispatchEvent(new Event('input'));
     }));
+    // Regenerate / Edit & resend (2026-09-11). Both cut the conversation
+    // at the user turn this bubble belongs to (data-hidx, stamped by
+    // app.js) — an agent bubble regenerates from the question before it,
+    // a user bubble comes back into the composer for editing. Offered
+    // only for bubbles that have a history index (a mid-render stub or a
+    // legacy bubble has none) and only between turns.
+    const hidx = Number(msgDiv.dataset.hidx);
+    const canCut = Number.isInteger(hidx) && hidx >= 0
+        && typeof Core.resendFromIndex === 'function' && !Core.isProcessing();
+    if (canCut) {
+        const report = (r) => { if (r && !r.ok) toast(r.reason || 'Nothing to resend', 'error'); };
+        if (isAgent) {
+            msgMenu.appendChild(menuItem('Regenerate', () => report(Core.resendFromIndex(hidx))));
+        } else {
+            msgMenu.appendChild(menuItem('Edit & resend', () => report(Core.editFromIndex(hidx))));
+        }
+    }
     if (isAgent) {
         msgMenu.appendChild(menuItem('Correct a memory…', () =>
             openMemoryModal('correct', text.slice(0, 400))));
@@ -268,7 +285,20 @@ function initMemoryModal() {
 // --- boot ------------------------------------------------------------
 Core.openMessageMenu = openMessageMenu;
 
-const ctx = { Core, el, toast, jewelHue, relTime, toggleRail, toggleDensity, openMemoryModal, isDocked, setRailOpen };
+// Face lab (2026-09-11): a tuning aid for the face's signal layer,
+// lazy-loaded on first use (palette "Face lab" or Alt+Shift+F).
+const faceLab = {
+    open: () => import('./facelab.js?v=1.1')
+        .then((m) => m.openFaceLab({ Core, el, toast }))
+        .catch((e) => toast(`Face lab failed to load: ${e && e.message || e}`, 'error')),
+};
+document.addEventListener('keydown', (e) => {
+    if (e.altKey && e.shiftKey && (e.key === 'F' || e.key === 'f' || e.code === 'KeyF')) {
+        e.preventDefault();
+        faceLab.open();
+    }
+});
+const ctx = { Core, el, toast, jewelHue, relTime, toggleRail, toggleDensity, openMemoryModal, isDocked, setRailOpen, faceLab };
 initRail();
 initDensity();
 initMemoryModal();

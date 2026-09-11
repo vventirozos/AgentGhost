@@ -146,7 +146,7 @@ class TestTaskStateAndAck:
             r = client.get("/api/chat/task/t-live/state", headers=AUTH)
             assert r.json() == {"exists": True, "done": False, "error": None,
                                 "truncated": False, "cancelled": False,
-                                "chunks": 2}
+                                "chunks": 2, "request_id": None}
             r = client.post("/api/chat/ack/t-live", headers=AUTH)
             assert r.json() == {"ok": True}
             assert server.active_chat_tasks["t-live"]["client_acked"] is True

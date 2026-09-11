@@ -15,6 +15,7 @@ from fastapi import (
     UploadFile, File, HTTPException, Header, Depends,
 )
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.gzip import GZipMiddleware
 from fastapi.responses import (
     HTMLResponse, StreamingResponse, FileResponse, JSONResponse, Response,
 )
@@ -23,6 +24,8 @@ import httpx
 import uvicorn
 import os
 import secrets
+import hashlib
+from datetime import datetime, timezone
 
 def _env_num(name: str, default, cast=float):
     """Env override that cannot crash the process at IMPORT.
@@ -170,6 +173,15 @@ WS_SEND_TIMEOUT_S = _env_num("GHOST_WS_SEND_TIMEOUT", 2.0)
 # a drip-feeding failed upstream could hold the worker for the whole chat
 # window while the client's reader sat parked on an empty stream.
 UPSTREAM_ERROR_SNIPPET_TIMEOUT_S = 5.0
+#: SSE heartbeat (2026-09-11). A reader parked on `new_data_event` sent NO
+#: bytes for the whole thinking phase of a turn (30-60s of tools, and up to
+#: GHOST_CHAT_TIMEOUT), so any idle timeout between the browser and uvicorn
+#: (Tailscale serve, a corporate proxy, an iOS radio sleeping) cut a stream
+#: that was perfectly healthy — and the client's only recovery was three
+#: blind 1s resume attempts. A comment frame every SSE_PING_S keeps the
+#: connection provably alive; SSE parsers skip comment lines by contract
+#: (the agent's own ": processing request..." already rides this path).
+SSE_PING_S = _env_num("GHOST_SSE_PING_S", 15.0)
 
 
 def _chat_timeout() -> "httpx.Timeout":
@@ -281,6 +293,27 @@ async def verify_interface_key(x_ghost_key: str | None = Header(default=None)) -
         x_ghost_key.encode("utf-8"), GHOST_API_KEY.encode("utf-8")
     ):
         raise HTTPException(status_code=401, detail="Missing or invalid X-Ghost-Key header.")
+
+
+async def verify_interface_key_or_page_cookie(request: Request,
+                                              x_ghost_key: str | None = Header(default=None)) -> None:
+    """Header OR the page cookie — for ONE read-only route (2026-09-11).
+
+    The service worker's `pushsubscriptionchange` handler runs with no page
+    open and holds no API key; it needs the PUBLIC VAPID key to re-subscribe.
+    `/api/push/vapid` returns nothing but that public key and an on/off flag
+    — data every subscription already carries — so accepting the HttpOnly,
+    SameSite=Strict page cookie there widens nothing. Every state-changing
+    route keeps the header-only rule (the cookie must never authorise a
+    write: see the note above _PAGE_COOKIE).
+    """
+    if x_ghost_key and secrets.compare_digest(
+            x_ghost_key.encode("utf-8"), GHOST_API_KEY.encode("utf-8")):
+        return
+    cookie = request.cookies.get(_PAGE_COOKIE)
+    if cookie and secrets.compare_digest(cookie.encode("utf-8"), GHOST_API_KEY.encode("utf-8")):
+        return
+    raise HTTPException(status_code=401, detail="Invalid or missing X-Ghost-Key")
 
 
 def _sse_error_frame(message: str, err_type: str) -> bytes:
@@ -445,6 +478,7 @@ async def _lifespan(_app: "FastAPI"):
     _BACKGROUND_TASKS.append(asyncio.create_task(log_streamer()))
     _BACKGROUND_TASKS.append(asyncio.create_task(_active_chat_tasks_janitor()))
     _BACKGROUND_TASKS.append(asyncio.create_task(_notify_push_poller()))
+    _BACKGROUND_TASKS.append(asyncio.create_task(_tls_expiry_watch()))
     try:
         yield
     finally:
@@ -524,9 +558,36 @@ def _get_http_client() -> httpx.AsyncClient:
         SHARED_HTTP_CLIENT = httpx.AsyncClient(timeout=_chat_timeout())
     return SHARED_HTTP_CLIENT
 
-# Mount static files
+# Mount static files (2026-09-11: with a caching policy).
+#
+# A bare `StaticFiles` mount emits ETag + Last-Modified and NO Cache-Control,
+# so every browser applied its own heuristic freshness — the hand-maintained
+# `?v=` strings were the only deliberate cache control the project had, and
+# a cold phone load re-validated ~4 MB of vendor script one asset at a time.
+# Now: an asset fetched WITH a `?v=` query is immutable for a year (the
+# version IS the content key; a bump is a new URL), one fetched without it
+# must revalidate every time (still cheap: ETag → 304).
+STATIC_IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
+STATIC_REVALIDATE_CACHE_CONTROL = "public, max-age=0, must-revalidate"
+
+
+class VersionedStaticFiles(StaticFiles):
+    """StaticFiles that states a Cache-Control policy keyed on `?v=`."""
+
+    def file_response(self, full_path, stat_result, scope, status_code: int = 200):
+        response = super().file_response(full_path, stat_result, scope, status_code)
+        qs = scope.get("query_string", b"")
+        if isinstance(qs, bytes):
+            qs = qs.decode("latin-1", errors="replace")
+        versioned = any(part.startswith("v=") and len(part) > 2
+                        for part in qs.split("&"))
+        response.headers["Cache-Control"] = (
+            STATIC_IMMUTABLE_CACHE_CONTROL if versioned else STATIC_REVALIDATE_CACHE_CONTROL)
+        return response
+
+
 static_dir = Path(__file__).parent / "static"
-app.mount("/static", StaticFiles(directory=static_dir), name="static")
+app.mount("/static", VersionedStaticFiles(directory=static_dir), name="static")
 
 # Routes whose bodies are legitimately file-sized; everything else is JSON.
 # NB: spelled without the "/api/" prefix so each full route string appears
@@ -663,6 +724,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Response compression (2026-09-11). Measured on the shipped bundle:
+# 3.98 MB → 1.19 MB (app.js 213K→65K, style.css 79K→18K, the vendored
+# mermaid 3.2 MB→966K). Starlette's GZipMiddleware excludes
+# `text/event-stream` by default (DEFAULT_EXCLUDED_CONTENT_TYPES), so the
+# chat stream, whose per-chunk delivery a compressor would buffer, is left
+# alone — pinned in tests/test_interface_batch2_2026_09_11.py rather than
+# trusted. Outermost on purpose: it only rewrites response bodies.
+GZIP_MINIMUM_SIZE = 1024
+app.add_middleware(GZipMiddleware, minimum_size=GZIP_MINIMUM_SIZE)
 
 # Global set of connected websockets
 connected_websockets = set()
@@ -1027,13 +1098,77 @@ async def get_root_touch_icon():
         headers={"Cache-Control": "public, max-age=86400"})
 
 
+# ── Service worker rendering (2026-09-11) ─────────────────────────────
+# sw.js carries two placeholders. The precache list is derived from the
+# assets index.html and the import chain actually reference (their `?v=`
+# is the version key), so a bump anywhere changes the list; the build
+# stamp also folds in each shipped file's size+mtime, so an edit that
+# forgot its bump STILL retires the old cache on the next activate.
+_SW_ASSET_RE = re.compile(r"(?:/static/|\./)([A-Za-z0-9_./-]+\.(?:js|css|png))\?v=([0-9][0-9.]*)")
+_SW_UNVERSIONED = (
+    "/static/vendor/marked.min.js", "/static/vendor/purify.min.js",
+    "/static/icons/icon-180.png", "/static/icons/icon-192.png",
+)
+_SW_SOURCE_FILES = ("index.html", "app.js", "workspace.js")
+
+
+def _sw_precache_list(root: Path | None = None) -> list:
+    root = root or static_dir
+    urls = ["/"]
+    seen = set()
+    for name in _SW_SOURCE_FILES:
+        try:
+            text = (root / name).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for m in _SW_ASSET_RE.finditer(text):
+            u = f"/static/{m.group(1)}?v={m.group(2)}"
+            if u not in seen:
+                seen.add(u)
+                urls.append(u)
+    for u in _SW_UNVERSIONED:
+        if u not in seen:
+            seen.add(u)
+            urls.append(u)
+    return urls
+
+
+def _sw_build_stamp(urls, root: Path | None = None) -> str:
+    root = root or static_dir
+    h = hashlib.sha256()
+    for u in urls:
+        h.update(u.encode("utf-8"))
+        path = u.split("?", 1)[0]
+        if path.startswith("/static/"):
+            try:
+                st = (root / path[len("/static/"):]).stat()
+                h.update(f"{st.st_size}:{int(st.st_mtime)}".encode("ascii"))
+            except OSError:
+                h.update(b"missing")
+    try:
+        st = (root / "sw.js").stat()
+        h.update(f"sw:{st.st_size}:{int(st.st_mtime)}".encode("ascii"))
+    except OSError:
+        pass
+    return h.hexdigest()[:12]
+
+
+def _render_sw(root: Path | None = None) -> str:
+    root = root or static_dir
+    urls = _sw_precache_list(root)
+    src = (root / "sw.js").read_text(encoding="utf-8")
+    return (src.replace("'__GHOST_SW_BUILD__'", json.dumps(_sw_build_stamp(urls, root)))
+               .replace("__GHOST_SW_PRECACHE__", json.dumps(urls)))
+
+
 @app.get("/sw.js")
 async def get_sw():
     # no-cache: a stale service worker is the worst kind of stale — it
     # intercepts push events with old code for up to 24h. Revalidate on
-    # every load (the file is tiny).
-    return FileResponse(
-        static_dir / "sw.js", media_type="application/javascript",
+    # every load (the file is tiny). Rendered, not served from disk: see
+    # _render_sw.
+    return Response(
+        _render_sw(), media_type="application/javascript",
         headers={"Cache-Control": "no-cache, must-revalidate"})
 
 @app.websocket("/ws")
@@ -1276,6 +1411,67 @@ async def _notify_push_poller():
         except Exception as e:
             logger.warning(f"notify push poller error: {e}")
 
+
+async def _wait_for_new_data(task, timeout: float | None = None) -> bool:
+    """Park on the task's data event for at most ``timeout`` seconds.
+
+    True = woken by data (or done/cancel); False = timed out, the caller
+    emits a heartbeat and re-checks the buffer. The re-check is deliberate:
+    it also recovers a reader whose wake was lost to another reader
+    clearing the SAME event between its own clear and wait (the original
+    stream + a resume stream share one Event), which used to park it
+    forever — the permanent-spinner shape.
+    """
+    if timeout is None:
+        timeout = SSE_PING_S
+    try:
+        await asyncio.wait_for(task["new_data_event"].wait(), timeout=timeout)
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
+async def _relay_task_stream(task, offset: int = 0):
+    """Replay a buffered chat task to ONE HTTP client as SSE bytes.
+
+    ``offset`` is a CHUNK index into ``task["buffer"]`` (the i-th upstream
+    HTTP chunk), NOT a byte offset — yielding ``task["buffer"][i]`` ships
+    an entire chunk per iteration (the byte-index version yielded one byte
+    at a time). Out-of-range offsets are clamped rather than trusted.
+
+    Shared by the primary stream and /api/chat/resume so the two readers
+    cannot drift (the resume reader once dropped the terminal marker).
+    """
+    offset = int(offset or 0)
+    offset = max(0, min(offset, len(task["buffer"])))
+    while True:
+        # Clear BEFORE reading the buffer length. The previous order
+        # (drain, then clear, then wait) had a race: the worker could
+        # append + set between the drain check and the clear, wiping the
+        # set and stranding the reader until the *next* chunk.
+        task["new_data_event"].clear()
+        while offset < len(task["buffer"]):
+            yield task["buffer"][offset]
+            offset += 1
+        if task["done"]:
+            # Surface the TERMINAL status: truncation as an SSE-shaped
+            # marker so the UI can warn that output was cut; an upstream
+            # failure (agent down, 5xx) as an error frame — HTTP 200 with
+            # an EMPTY stream rendered a bare "No response" with no
+            # diagnostic.
+            if task.get("truncated"):
+                yield _sse_error_frame(
+                    "stream truncated: "
+                    + task.get("truncated_reason", "per-task buffer cap exceeded"),
+                    "BufferCapExceeded",
+                )
+            elif task.get("error"):
+                yield _upstream_error_frame(task["error"])
+            break
+        if not await _wait_for_new_data(task):
+            yield b": ping\n\n"
+
+
 @app.post("/api/chat", dependencies=[Depends(verify_interface_key)])
 async def chat_proxy(request: Request):
     """Proxies chat requests to the Ghost Agent."""
@@ -1295,9 +1491,18 @@ async def chat_proxy(request: Request):
 
         if is_streaming:
             task_id = str(uuid.uuid4())
+            # The PROXY mints the agent's request id (2026-09-11) and sends
+            # it upstream as X-Request-ID — the contract the Slack bot
+            # already uses. Before this the id existed only inside the
+            # agent, surfaced on the FIRST content frame, i.e. after the
+            # whole tool/thinking phase — exactly when Stop gets pressed —
+            # so /api/chat/cancel could not name the turn and the client
+            # fell back to matching the prompt's first 40 characters.
+            request_id = uuid.uuid4().hex[:8]
             stream_cap = _stream_cap_bytes()
             _enforce_active_task_cap()   # BEFORE inserting, not 60s later
             active_chat_tasks[task_id] = {
+                "request_id": request_id,
                 "buffer": [],
                 "buffer_size": 0,
                 "stream_cap": stream_cap,
@@ -1319,7 +1524,10 @@ async def chat_proxy(request: Request):
                 if t is None:
                     return
                 try:
-                    async with client.stream("POST", "http://localhost:8000/api/chat", json=payload, headers={"X-Ghost-Key": GHOST_API_KEY}, timeout=_chat_timeout()) as response:
+                    _up_headers = {"X-Ghost-Key": GHOST_API_KEY}
+                    if t.get("request_id"):
+                        _up_headers["X-Request-ID"] = t["request_id"]
+                    async with client.stream("POST", "http://localhost:8000/api/chat", json=payload, headers=_up_headers, timeout=_chat_timeout()) as response:
                         try:
                             response.raise_for_status()
                         except httpx.HTTPStatusError:
@@ -1425,40 +1633,8 @@ async def chat_proxy(request: Request):
                         "TaskEvicted",
                     )
                     return
-                offset = 0  # CHUNK index, NOT byte index. task["buffer"]
-                # is a list of bytes objects; yielding `task["buffer"][i]`
-                # ships an entire HTTP chunk per iteration. The previous
-                # version used a byte index which yielded one byte at a
-                # time — devastating to throughput.
-                while True:
-                    # Clear BEFORE reading the buffer length. The previous
-                    # order (drain, then clear, then wait) had a race: the
-                    # worker could append + set between the drain check and
-                    # the clear, wiping the set and stranding the reader
-                    # until the *next* chunk. Clearing first means any set
-                    # that races the drain survives the wait.
-                    task["new_data_event"].clear()
-                    while offset < len(task["buffer"]):
-                        yield task["buffer"][offset]
-                        offset += 1
-                    if task["done"]:
-                        # Surface truncation to the client as an SSE-shaped
-                        # marker so the UI can warn the user that output
-                        # was cut. Harmless when the consumer is plain text.
-                        if task.get("truncated"):
-                            yield _sse_error_frame(
-                                "stream truncated: "
-                                + task.get("truncated_reason", "per-task buffer cap exceeded"),
-                                "BufferCapExceeded",
-                            )
-                        # An upstream failure (agent down, 5xx) was recorded
-                        # in task["error"] but never emitted: the client got
-                        # HTTP 200 with an EMPTY stream and rendered a bare
-                        # "No response" with no diagnostic.
-                        elif task.get("error"):
-                            yield _upstream_error_frame(task["error"])
-                        break
-                    await task["new_data_event"].wait()
+                async for chunk in _relay_task_stream(task, 0):
+                    yield chunk
 
             headers = {
                 "Cache-Control": "no-cache, no-store, must-revalidate, private",
@@ -1467,7 +1643,10 @@ async def chat_proxy(request: Request):
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
                 "X-Task-ID": task_id,
-                "Access-Control-Expose-Headers": "X-Task-ID"
+                # Known from t=0 (see the mint above): the client can label
+                # and cancel the turn before the first content frame.
+                "X-Request-ID": request_id,
+                "Access-Control-Expose-Headers": "X-Task-ID, X-Request-ID"
             }
             return StreamingResponse(stream_generator(), media_type="text/event-stream; charset=utf-8", headers=headers)
         else:
@@ -1504,35 +1683,12 @@ async def chat_resume_proxy(task_id: str, offset: int = 0):
     ``offset`` is a CHUNK index into the task's buffer (the i-th upstream
     HTTP chunk), NOT a byte offset. The bundled client always sends 0
     (full replay); a client passing a byte count would silently skip
-    whole chunks, so clamp to the valid range instead of trusting it.
+    whole chunks, so `_relay_task_stream` clamps it instead of trusting it.
     """
     task = active_chat_tasks.get(task_id)
     if not task:
         return _err_json(404, "Task not found or expired")
 
-    async def stream_generator():
-        client_offset = max(0, min(offset, len(task["buffer"])))
-        while True:
-            # See chat_proxy.stream_generator — clear before draining so a
-            # set() racing the drain is preserved across the wait().
-            task["new_data_event"].clear()
-            while client_offset < len(task["buffer"]):
-                yield task["buffer"][client_offset]
-                client_offset += 1
-            if task["done"]:
-                # Replay the TERMINAL status too — a resumed stream that
-                # dropped the truncation/error marker looked like a clean
-                # completion to the client.
-                if task.get("truncated"):
-                    yield _sse_error_frame(
-                        "stream truncated: "
-                        + task.get("truncated_reason", "per-task buffer cap exceeded"),
-                        "BufferCapExceeded",
-                    )
-                elif task.get("error"):
-                    yield _upstream_error_frame(task["error"])
-                break
-            await task["new_data_event"].wait()
 
     headers = {
         "Cache-Control": "no-cache, no-store, must-revalidate, private",
@@ -1541,7 +1697,7 @@ async def chat_resume_proxy(task_id: str, offset: int = 0):
         "Connection": "keep-alive",
         "X-Accel-Buffering": "no"
     }
-    return StreamingResponse(stream_generator(), media_type="text/event-stream; charset=utf-8", headers=headers)
+    return StreamingResponse(_relay_task_stream(task, offset), media_type="text/event-stream; charset=utf-8", headers=headers)
 
 @app.post("/api/chat/ack/{task_id}", dependencies=[Depends(verify_interface_key)])
 async def chat_ack_proxy(task_id: str):
@@ -1557,7 +1713,7 @@ async def chat_ack_proxy(task_id: str):
     task["client_acked"] = True
     return {"ok": True}
 
-@app.get("/api/push/vapid", dependencies=[Depends(verify_interface_key)])
+@app.get("/api/push/vapid", dependencies=[Depends(verify_interface_key_or_page_cookie)])
 async def push_vapid_key():
     """VAPID public key for pushManager.subscribe. `enabled:false` when no
     keypair is provisioned (push feature off, not an error).
@@ -1630,10 +1786,54 @@ async def chat_task_state(task_id: str):
         # had deliberately ended (R2 lens A).
         "cancelled": bool(task.get("cancelled")),
         "chunks": len(task.get("buffer", [])),
+        "request_id": task.get("request_id"),
     }
+
+AGENT_CANCEL_TIMEOUT_S = 4.0
+
+
+async def _cancel_agent_turn(request_id: str) -> dict:
+    """POST the agent's real turn cancel for ``request_id`` (bounded).
+
+    Returns the agent's verdict (``{"cancelled": bool, ...}``); a transport
+    failure is reported as ``cancelled: False`` with the reason, never
+    raised — the proxy-side teardown above it has already happened and the
+    client needs the honest answer, not a 500.
+    """
+    client = _get_http_client()
+    try:
+        resp = await client.post(
+            "http://localhost:8000/api/turn/cancel",
+            json={"request_id": request_id},
+            headers={"X-Ghost-Key": GHOST_API_KEY},
+            timeout=_proxy_timeout(AGENT_CANCEL_TIMEOUT_S),
+        )
+    except Exception as e:  # noqa: BLE001 — reported, not raised
+        return {"cancelled": False,
+                "error": str(e) or f"{type(e).__name__} contacting the agent"}
+    try:
+        data = resp.json()
+    except Exception:  # noqa: BLE001
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("cancelled", False)
+    data["status_code"] = resp.status_code
+    return data
+
 
 @app.post("/api/chat/cancel/{task_id}", dependencies=[Depends(verify_interface_key)])
 async def chat_cancel_proxy(task_id: str):
+    """Stop a turn: tear down the proxy relay AND cancel the agent's turn.
+
+    Before 2026-09-11 this only stopped the buffered relay — the agent
+    kept running the whole turn, holding the global turn lock — and the
+    client had to find its own turn on /api/turns by session id or prompt
+    prefix. The proxy minted the request id (see chat_proxy), so it can
+    name the turn itself; the agent's verdict rides back under ``agent``
+    so the client can report a refused cancel honestly. A task the proxy
+    never assigned an id to (legacy shape) keeps the old response.
+    """
     task = active_chat_tasks.get(task_id)
     if task and not task["done"]:
         if task["background_task"]:
@@ -1651,6 +1851,10 @@ async def chat_cancel_proxy(task_id: str):
         ev = task.get("new_data_event")
         if ev is not None:
             ev.set()
+        rid = task.get("request_id")
+        if rid:
+            return {"status": "cancelled", "request_id": rid,
+                    "agent": await _cancel_agent_turn(rid)}
         return {"status": "cancelled"}
     return _err_json(404, "not_found_or_done")
 
@@ -2008,6 +2212,89 @@ async def sessions_get_proxy(request: Request, session_id: str):
 async def sessions_delete_proxy(request: Request, session_id: str):
     return await _proxy_agent_api(
         request, "DELETE", f"/api/sessions/{quote(_safe_session_id(session_id), safe='')}")
+
+# ── Interface-local health + TLS expiry (2026-09-11) ──────────────────
+# /api/health is a pure passthrough to the agent, so the UI could not tell
+# "agent down" from "interface pool exhausted" from "the certificate is
+# about to lapse" — and the Let's-Encrypt-via-Tailscale cert the phone PWA
+# depends on had a renewal note in the launcher and nothing watching it.
+# On expiry the PWA, the service worker and web push all die at once with
+# only a browser interstitial to say why.
+TLS_WARN_DAYS = 14
+_STARTED_AT = time.time()
+
+
+def _tls_cert_path(argv=None, env=None) -> "Path | None":
+    """The certificate uvicorn was started with: `--ssl-certfile X` or
+    `--ssl-certfile=X` on argv (the launcher's form), else GHOST_TLS_CERTFILE."""
+    argv = list(sys.argv if argv is None else argv)
+    env = os.environ if env is None else env
+    for i, a in enumerate(argv):
+        if a == "--ssl-certfile" and i + 1 < len(argv):
+            return Path(argv[i + 1])
+        if a.startswith("--ssl-certfile="):
+            return Path(a.split("=", 1)[1])
+    if env.get("GHOST_TLS_CERTFILE"):
+        return Path(env["GHOST_TLS_CERTFILE"])
+    return None
+
+
+def tls_cert_status(path: "Path | None" = None, now: "datetime | None" = None) -> dict:
+    """{cert_file, not_after (ISO), days_left, warn, error}. Never raises."""
+    path = _tls_cert_path() if path is None else path
+    out = {"cert_file": str(path) if path else None, "not_after": None,
+           "days_left": None, "warn": False, "error": None}
+    if not path:
+        out["error"] = "no certificate configured (plain HTTP?)"
+        return out
+    try:
+        from cryptography import x509
+        pem = Path(path).read_bytes()
+        cert = x509.load_pem_x509_certificate(pem)
+        na = getattr(cert, "not_valid_after_utc", None)
+        if na is None:
+            na = cert.not_valid_after.replace(tzinfo=timezone.utc)
+        now = now or datetime.now(timezone.utc)
+        days = (na - now).total_seconds() / 86400.0
+        out["not_after"] = na.isoformat()
+        out["days_left"] = round(days, 2)
+        out["warn"] = days < TLS_WARN_DAYS
+    except Exception as e:  # noqa: BLE001 — a health probe reports, never raises
+        out["error"] = f"{type(e).__name__}: {e}"[:200]
+    return out
+
+
+async def _tls_expiry_watch():
+    """Log the expiry state once a day so the operator sees it in the
+    stream, not only in a health probe nobody opened."""
+    while True:
+        try:
+            st = tls_cert_status()
+            if st.get("days_left") is not None:
+                if st["days_left"] < 0:
+                    logger.error("TLS certificate %s EXPIRED %.1f days ago — renew: tailscale cert <host>",
+                                 st["cert_file"], -st["days_left"])
+                elif st["warn"]:
+                    logger.warning("TLS certificate %s expires in %.1f days — renew: tailscale cert <host>",
+                                   st["cert_file"], st["days_left"])
+        except Exception:  # noqa: BLE001
+            pass
+        await asyncio.sleep(24 * 3600)
+
+
+@app.get("/api/interface/health", dependencies=[Depends(verify_interface_key)])
+async def interface_health():
+    """What the INTERFACE knows about itself (no upstream call)."""
+    return {
+        "ok": True,
+        "uptime_s": round(time.time() - _STARTED_AT, 1),
+        "active_tasks": len(active_chat_tasks),
+        "buffered_bytes": _total_buffered_bytes(),
+        "ws_clients": len(connected_websockets),
+        "sse_ping_s": SSE_PING_S,
+        "tls": tls_cert_status(),
+    }
+
 
 @app.get("/api/turns", dependencies=[Depends(verify_interface_key)])
 async def turns_proxy(request: Request):

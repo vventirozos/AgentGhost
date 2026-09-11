@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=11.5';
+import * as matrixGraphFace from './matrix_graph.js?v=12.1';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -54,20 +54,75 @@ const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
     };
 })();
 
-// Safe localStorage wrapper (iOS private mode throws QuotaExceededError)
+// Safe localStorage wrapper (iOS private mode throws QuotaExceededError).
+// `set` REPORTS failure (true/false + `lastError`) since 2026-09-11: every
+// failure used to be logged as "private mode?" and dropped, so a full
+// quota on a long session silently stopped persisting history AND the
+// in-flight handle — the recovery this client is built around — on
+// exactly the heaviest conversations. saveChatState reacts to the name.
 const safeStorage = {
+    lastError: null,
     get(key) {
         try { return localStorage.getItem(key); } catch (e) { return null; }
     },
     set(key, value) {
-        try { localStorage.setItem(key, value); } catch (e) {
-            console.warn('localStorage unavailable (private mode?)', e.name);
+        try {
+            localStorage.setItem(key, value);
+            this.lastError = null;
+            return true;
+        } catch (e) {
+            this.lastError = (e && e.name) || 'Error';
+            console.warn('localStorage write failed', this.lastError);
+            return false;
         }
     },
     remove(key) {
         try { localStorage.removeItem(key); } catch (e) {}
+    },
+    keys(prefix) {
+        const out = [];
+        try {
+            for (let i = 0; i < localStorage.length; i++) {
+                const k = localStorage.key(i);
+                if (k && (!prefix || k.startsWith(prefix))) out.push(k);
+            }
+        } catch (e) { /* private mode — no enumeration */ }
+        return out;
     }
 };
+
+// ── Session identity + per-session history keys (2026-09-11) ──────────
+// This tab's session lives in sessionStorage; localStorage keeps the
+// last-used id so a NEW tab opens where you left off. Before this, one
+// flat key was shared by every tab, so two tabs on two conversations
+// overwrote each other's identity and a reload reconciled one
+// conversation's local history against the other's.
+const SESSION_ID_KEY = 'ghost_session_id';
+const HISTORY_KEY = 'ghost_chat_history';
+function storedSessionId() {
+    try {
+        const own = sessionStorage.getItem(SESSION_ID_KEY);
+        if (own) return own;
+    } catch (e) { /* fall through */ }
+    return safeStorage.get(SESSION_ID_KEY) || null;
+}
+function persistSessionId(id) {
+    try {
+        if (id) sessionStorage.setItem(SESSION_ID_KEY, id);
+        else sessionStorage.removeItem(SESSION_ID_KEY);
+    } catch (e) { /* private mode */ }
+    if (id) safeStorage.set(SESSION_ID_KEY, id);
+    else safeStorage.remove(SESSION_ID_KEY);
+}
+// Local history is keyed by the session it belongs to; the bare legacy
+// key is read once (migration) and then removed.
+function _historyKey(sid) {
+    const id = sid === undefined ? (window.__ghostSessionId || storedSessionId()) : sid;
+    return id ? `${HISTORY_KEY}:${id}` : HISTORY_KEY;
+}
+function localHistoryKeys() {
+    return safeStorage.keys(HISTORY_KEY + ':');
+}
 
 // ═══════════════════════════════════════════════════════════════
 //  Icon vocabulary — aligned 1:1 with src/ghost_agent/utils/logging.py
@@ -304,10 +359,92 @@ const notificationsSupported = ('Notification' in window) && (!isIOS || isStanda
 if ('serviceWorker' in navigator && (!isIOS || isStandalonePWA)) {
     window.addEventListener('load', () => {
         navigator.serviceWorker.register('/sw.js')
-            .then(reg => console.log('Service Worker registered successfully'))
+            .then((reg) => { _watchServiceWorkerUpdates(reg); })
             .catch(err => console.error('Service Worker registration failed:', err));
     });
+    navigator.serviceWorker.addEventListener('message', (e) => _onServiceWorkerMessage(e && e.data));
 }
+
+// ── Service worker update flow (2026-09-11) ───────────────────────────
+// sw.js used to skipWaiting() on install, swapping the worker under a page
+// mid-turn. Now a new worker waits until the operator picks "Reload" on a
+// system bubble; the swap then reloads the page — after the current turn
+// if one is running.
+let _swReloadPending = false;
+function _watchServiceWorkerUpdates(reg) {
+    if (!reg) return;
+    if (reg.waiting && navigator.serviceWorker.controller) _offerServiceWorkerUpdate(reg);
+    reg.addEventListener('updatefound', () => {
+        const nw = reg.installing;
+        if (!nw) return;
+        nw.addEventListener('statechange', () => {
+            if (nw.state === 'installed' && navigator.serviceWorker.controller) {
+                _offerServiceWorkerUpdate(reg);
+            }
+        });
+    });
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+        if (!_swReloadPending) return;      // first install, not an update
+        if (isProcessingRequest) {
+            window.GhostCore?.events?.addEventListener(
+                'turn-complete', () => location.reload(), { once: true });
+            return;
+        }
+        location.reload();
+    });
+}
+function _offerServiceWorkerUpdate(reg) {
+    const div = addMessage('system', 'A new version of the console is ready.');
+    if (!div) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'msg-retry-btn';
+    btn.textContent = 'Reload';
+    btn.setAttribute('aria-label', 'Reload to the new version');
+    btn.addEventListener('click', () => {
+        _swReloadPending = true;
+        const w = reg && reg.waiting;
+        if (w) w.postMessage({ type: 'SKIP_WAITING' });
+        else location.reload();
+    });
+    div.appendChild(document.createTextNode(' '));
+    div.appendChild(btn);
+    return div;
+}
+// Messages FROM the worker: a rotated push subscription needs the API key
+// this page holds to register its new endpoint; a notification click on an
+// already-visible window fires no visibilitychange, so the resume/resync
+// chain is kicked explicitly.
+function _onServiceWorkerMessage(data) {
+    if (!data || typeof data.type !== 'string') return false;
+    if (data.type === 'push-resubscribed') {
+        ensurePushSubscription();
+        return true;
+    }
+    if (data.type === 'push-click') {
+        try { resumeOrReconcileInflightTurn(); } catch (e) { /* not booted yet */ }
+        try {
+            window.GhostCore?.events?.dispatchEvent(new CustomEvent('push-click', { detail: data }));
+        } catch (e) { /* ignore */ }
+        return true;
+    }
+    return false;
+}
+
+// The error's KIND shapes the face's flinch (2026-09-11): network
+// flickers, refusal freezes, timeout fades; the generic recoil otherwise.
+function _faceError(message, type) {
+    const kind = typeof activeFace.errorKindFor === 'function'
+        ? activeFace.errorKindFor(message, type) : 'generic';
+    if (typeof activeFace.noteError === 'function') activeFace.noteError(kind);
+    else activeFace.triggerSpike();
+    return kind;
+}
+
+// Offline is a state, not a mystery: say so in the chip. The WebSocket's
+// own reconnect timer brings ONLINE back.
+window.addEventListener('offline', () => setConnectionState('error', 'OFFLINE'));
+window.addEventListener('online', () => setConnectionState('pending', 'RECONNECTING'));
 
 // ── Web push subscription (2026-08-01) ─────────────────────────────
 // Subscribes this device for locked-phone delivery: reply-ready pushes
@@ -361,21 +498,46 @@ async function ensurePushSubscription() {
     }
 }
 
-document.addEventListener('click', () => {
-    if (notificationsSupported && Notification.permission === "default") {
-        try {
-            const result = Notification.requestPermission();
-            if (result && typeof result.then === 'function') {
-                result.then(() => ensurePushSubscription())
-                      .catch(e => console.error('Notification permission error:', e));
-            } else {
-                ensurePushSubscription();
-            }
-        } catch (e) {
-            console.error('Notification permission error:', e);
-        }
+// Permission is asked from an EXPLICIT control (the bell panel's
+// lock-screen-alerts row, notifications.js), not from the first click
+// anywhere on the page (2026-09-11). A stray tap on the composer used to
+// throw the OS dialog with no context; on iOS a denial is permanent for
+// that install, and this permission is what the whole locked-phone push
+// feature depends on.
+//
+// What the control should show. `needsInstall` = iOS Safari tab: push is
+// only available to a Home-Screen install, so the honest action there is
+// "install", not "enable".
+function pushPermissionState() {
+    const hasApi = typeof Notification !== 'undefined' && Notification !== null;
+    const needsInstall = !!(isIOS && !isStandalonePWA);
+    const supported = !!(hasApi && !needsInstall);
+    return {
+        supported,
+        needsInstall,
+        permission: hasApi ? Notification.permission : 'unsupported',
+    };
+}
+
+// The user gesture that unlocks the OS prompt; resolves to the resulting
+// permission. Subscribes for push on a grant.
+async function requestNotificationPermission() {
+    const st = pushPermissionState();
+    if (!st.supported) return st.permission;
+    if (st.permission !== 'default') {
+        if (st.permission === 'granted') ensurePushSubscription();
+        return st.permission;
     }
-}, { once: true });
+    let result = 'default';
+    try {
+        const r = Notification.requestPermission();
+        result = (r && typeof r.then === 'function') ? await r : r;
+    } catch (e) {
+        console.error('Notification permission error:', e);
+    }
+    if (result === 'granted') ensurePushSubscription();
+    return result || Notification.permission;
+}
 
 // Already-granted permission (returning visitor): subscribe on boot.
 window.addEventListener('load', () => { ensurePushSubscription(); });
@@ -1029,12 +1191,15 @@ function renderMarkdown(text) {
             console.warn('markdown render failed, falling back to text', e);
         }
     }
-    // Fallback: HTML-escape and wrap in <p> so line breaks survive.
+    // Fallback: HTML-escape, then keep the line structure — the comment
+    // above promised <p>/<br> for two months while the code returned the
+    // bare escaped text, so a sanitizer load failure collapsed every reply
+    // into one paragraph (2026-09-11).
     const escaped = raw
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;');
-    return escaped;
+    return '<p>' + escaped.replace(/\r?\n/g, '<br>') + '</p>';
 }
 
 // Strip the agent's internal-only markup before display: <tool_call>
@@ -1087,8 +1252,190 @@ function addMessage(role, text) {
     }
     chatLog.appendChild(div);
     if (role !== 'system') decorateMessageActions();
-    scrollToBottom();
+    // Your own message always scrolls (you just sent it); anything else
+    // only follows while the log is pinned near the bottom.
+    if (role === 'user') scrollToBottom();
+    else scrollToBottomIfPinned();
     return div;
+}
+
+// ── Retry / regenerate / edit-and-resend (2026-09-11) ─────────────────
+// Every bubble that has a chatHistory entry carries its index, so the
+// ⋯ menu (workspace.js) and the Retry button on error bubbles can cut the
+// conversation at a known point instead of guessing by DOM position.
+function _stampHistoryIndex(div, idx) {
+    if (div && div.dataset && Number.isInteger(idx) && idx >= 0) {
+        div.dataset.hidx = String(idx);
+    }
+}
+
+// Plain text of a history entry, or null when it carries parts that a
+// composer cannot hold (an attached image): editing that would silently
+// drop the attachment, so the caller refuses instead.
+function _historyEntryText(entry) {
+    if (!entry) return null;
+    if (typeof entry.content === 'string') return entry.content;
+    if (Array.isArray(entry.content)) {
+        if (entry.content.some(c => c && c.type !== 'text')) return null;
+        return entry.content.map(c => (c && c.text) || '').join(' ');
+    }
+    return null;
+}
+
+// Index of the user turn that a bubble belongs to: the entry itself for a
+// user bubble, the nearest preceding user entry for an agent bubble.
+function _userTurnIndexFor(history, idx) {
+    if (!Array.isArray(history) || !Number.isInteger(idx)) return -1;
+    for (let i = Math.min(idx, history.length - 1); i >= 0; i--) {
+        if (history[i] && history[i].role === 'user') return i;
+    }
+    return -1;
+}
+
+// Cut chatHistory (and the transcript) just BEFORE the user turn that
+// `idx` belongs to and put that turn's text back in the composer. Returns
+// the text, or null with a reason when nothing was cut. `send` re-submits
+// immediately (Retry / Regenerate); without it the user edits first.
+function _truncateToUserTurn(idx, send) {
+    if (isProcessingRequest) return { ok: false, reason: 'A turn is still running — stop it first.' };
+    const at = _userTurnIndexFor(chatHistory, idx);
+    if (at < 0) return { ok: false, reason: 'No message to resend.' };
+    const text = _historyEntryText(chatHistory[at]);
+    if (text === null) return { ok: false, reason: 'That message carries an attachment and cannot be edited here.' };
+    // Drop the bubbles from that turn on (system notices included — they
+    // belong to the turn being redone). `hidx` marks the boundary.
+    if (chatLog) {
+        let cutting = false;
+        for (const node of Array.from(chatLog.children)) {
+            if (!cutting && node.dataset && Number(node.dataset.hidx) >= at) cutting = true;
+            if (cutting) node.remove();
+        }
+    }
+    chatHistory = chatHistory.slice(0, at);
+    saveChatState();
+    chatInput.value = text;
+    chatInput.style.height = '';
+    chatInput.dispatchEvent(new Event('input'));
+    if (send) {
+        sendTypedMessage();
+    } else {
+        chatInput.focus();
+        try { chatInput.setSelectionRange(text.length, text.length); } catch (e) { /* non-text input */ }
+    }
+    return { ok: true, text };
+}
+
+function retryLastTurn() {
+    return _truncateToUserTurn(chatHistory.length - 1, true);
+}
+
+// A system bubble with a Retry button — for the turn outcomes that leave
+// the user with nothing to do but retype: Stop, a network error, an error
+// frame from the agent. `retryLastTurn` re-checks isProcessing at click.
+function addRetryableSystemMessage(text) {
+    const div = addMessage('system', text);
+    if (!div) return div;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'msg-retry-btn';
+    btn.textContent = 'Retry';
+    btn.setAttribute('aria-label', 'Retry the last message');
+    btn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        const r = retryLastTurn();
+        if (!r.ok && typeof window.__ghostWorkspace?.toast === 'function') {
+            window.__ghostWorkspace.toast(r.reason, 'error');
+        }
+    });
+    div.appendChild(document.createTextNode(' '));
+    div.appendChild(btn);
+    return div;
+}
+
+// ── Adopting a server history without losing the user's own turns ─────
+// Moved here from sessions.js on 2026-09-11 so there is ONE authority:
+// the locked-phone recovery below (`reconcileFromSession`) had its own raw
+// length compare and adopted the server copy wholesale — the F2 loss the
+// sessions module had already fixed twice in its own two paths.
+//
+// Stable message key. Mirrors the server's `_msg_key`: the ROLE plus a
+// stringified content, so a multimodal payload compares by value rather
+// than by object identity; objects serialise with sorted keys.
+function _msgKey(m) {
+    const c = m && m.content;
+    let text;
+    if (c === null || c === undefined) text = '';
+    else if (typeof c === 'string') text = c;
+    else text = JSON.stringify(c, (_k, v) =>
+        (v && typeof v === 'object' && !Array.isArray(v))
+            ? Object.keys(v).sort().reduce((o, kk) => (o[kk] = v[kk], o), {})
+            : v);
+    return (m && m.role) + '\u0000' + text;
+}
+
+// Alignment PAIRS, the same LCS traceback the server runs.
+function _lcsPairs(serverMsgs, localMsgs) {
+    const n = serverMsgs.length, m = localMsgs.length;
+    if (!n || !m) return [];
+    const sk = serverMsgs.map(_msgKey), lk = localMsgs.map(_msgKey);
+    const table = Array.from({ length: n + 1 }, () => new Int32Array(m + 1));
+    for (let i = n - 1; i >= 0; i--) {
+        for (let j = m - 1; j >= 0; j--) {
+            table[i][j] = sk[i] === lk[j]
+                ? table[i + 1][j + 1] + 1
+                : Math.max(table[i + 1][j], table[i][j + 1]);
+        }
+    }
+    const pairs = [];
+    let i = 0, j = 0;
+    while (i < n && j < m) {
+        if (sk[i] === lk[j]) { pairs.push([i, j]); i++; j++; }
+        else if (table[i + 1][j] >= table[i][j + 1]) i++;
+        else j++;
+    }
+    return pairs;
+}
+
+// Adopt the server copy WITHOUT deleting or REORDERING anything: align
+// local against the server with the server's own LCS; before the first
+// aligned position keep the client's copy whole (history the store's
+// 400-message cap evicted); after it, keep a local-only USER message (a
+// turn the agent never stored) and drop local-only assistant entries
+// (aborted-stream stubs).
+function _reconcileWithLocal(serverMsgs, localMsgs) {
+    const raw = localMsgs || [];
+    if (!raw.length) return serverMsgs;
+    const local = raw.map((m) => (m && typeof toWireMessage === 'function') ? toWireMessage(m) : m);
+    const pairs = _lcsPairs(serverMsgs, local);
+    const out = [];
+    let i = 0, j = 0;
+    const firstAligned = pairs.length ? pairs[0][1] : local.length;
+    const takeLocal = (k) => {
+        const m = raw[k];
+        if (!m) return;
+        if (k < firstAligned || m.role === 'user') out.push(m);
+    };
+    for (const [pi, pj] of pairs) {
+        while (i < pi) out.push(serverMsgs[i++]);   // server-only
+        while (j < pj) takeLocal(j++);              // local-only, in place
+        out.push(serverMsgs[pi]);
+        i = pi + 1;
+        j = pj + 1;
+    }
+    while (i < serverMsgs.length) out.push(serverMsgs[i++]);
+    while (j < local.length) takeLocal(j++);
+    return out;
+}
+
+// Has adopting `serverMsgs` changed anything the tab shows? Compared on
+// the RECONCILED array, not the raw server copy: once one local turn is
+// legitimately unaccounted, local is permanently `server + k`, and a raw
+// length compare read "nothing new" (or "drifted") forever.
+function _adoptionChanges(adopted, local) {
+    const wire = (m) => (m && typeof toWireMessage === 'function') ? toWireMessage(m) : (m || null);
+    return adopted.length !== local.length
+        || JSON.stringify(wire(adopted[adopted.length - 1] || null))
+            !== JSON.stringify(wire(local[local.length - 1] || null));
 }
 
 // Per-message affordance: a small overlay row (timestamp + ⋯ menu) on
@@ -1369,6 +1716,36 @@ function _noteFeedbackFailure(div, message) {
 
 function scrollToBottom() {
     requestAnimationFrame(() => { chatLog.scrollTo({ top: chatLog.scrollHeight, behavior: 'smooth' }); });
+    _hideNewContentPill();
+}
+
+// Reading position (2026-09-11). Every append used to yank the reader to
+// the bottom — scroll up to re-read while a turn finishes, or tap the
+// composer on a phone (a viewport resize), and you were thrown down.
+// Only the user's own send and a fresh render may scroll unconditionally;
+// everything else follows the log only while it is already pinned near
+// the bottom, and otherwise lights the "new messages" pill (the log
+// console has had exactly this affordance since 07-13).
+function _isNearBottom(threshold = 150) {
+    if (!chatLog) return true;
+    return (chatLog.scrollHeight - chatLog.scrollTop - chatLog.clientHeight) <= threshold;
+}
+function scrollToBottomIfPinned() {
+    if (_isNearBottom()) scrollToBottom();
+    else _noteNewContentBelow();
+}
+const chatResumeBtn = document.getElementById('chat-resume');
+function _noteNewContentBelow() {
+    if (chatResumeBtn) chatResumeBtn.classList.remove('hidden');
+}
+function _hideNewContentPill() {
+    if (chatResumeBtn) chatResumeBtn.classList.add('hidden');
+}
+if (chatResumeBtn) {
+    chatResumeBtn.addEventListener('click', () => {
+        _hideNewContentPill();
+        chatLog.scrollTo({ top: chatLog.scrollHeight, behavior: 'smooth' });
+    });
 }
 
 // During streaming we get 50+ chunks/sec. Smooth-scrolling each one
@@ -1390,14 +1767,35 @@ function scrollToBottomDuringStream() {
 // (scheduleStreamRender) keeps it smooth. _renderStreamingContent does
 // the actual work and is also called once synchronously after the stream
 // ends to flush the final tokens.
+// Swap the waiting bubble from typing dots to a reply. Returns true the
+// first time (the bubble was still `.thinking`), false after. Pure DOM,
+// so it runs under node with a stub element.
+function _revealAgentBubble(div) {
+    if (!div || !div.classList || !div.classList.contains('thinking')) return false;
+    div.classList.remove('thinking');
+    div.textContent = "";
+    return true;
+}
+
 function _renderStreamingContent() {
     if (!currentAgentMessageDiv || currentAccumulatedContent === "") return;
     const displayContent = _stripInternalTags(currentAccumulatedContent);
+    // Reasoning only so far (an open <think> block): keep the typing dots.
+    // Rendering the empty string here is what blanked the bubble for the
+    // whole thinking phase.
+    if (!displayContent) return;
+    if (_revealAgentBubble(currentAgentMessageDiv)) {
+        // From here the reply itself is the story — the caption says so
+        // until turn end.
+        setTurnStatusDesc('writing the reply…', '💬');
+        if (typeof activeFace.setPhase === 'function') activeFace.setPhase('write');
+    }
     currentAgentMessageDiv.innerHTML = renderMarkdown(displayContent);
     // Streaming-cursor glyph; removed in sendMessage's finally.
     currentAgentMessageDiv.classList.add('streaming');
     const isAtBottom = Math.abs(chatLog.scrollHeight - chatLog.scrollTop - chatLog.clientHeight) <= 50;
     if (isAtBottom) scrollToBottomDuringStream();
+    else _noteNewContentBelow();
     decorateCodeBlocks(currentAgentMessageDiv);
 }
 let _streamRenderRafId = null;
@@ -1434,6 +1832,7 @@ function _cancelScheduledStreamRender() {
         // single message — reliably detects intentional scrollback.
         const isReading = dist > 150;
         document.body.classList.toggle('is-reading', isReading);
+        if (!isReading) _hideNewContentPill();
     };
     chatLog.addEventListener('scroll', () => {
         if (scheduled) return;
@@ -1442,8 +1841,45 @@ function _cancelScheduledStreamRender() {
     }, { passive: true });
 })();
 
+// Storage copy of a history that would not fit: inline images (data:
+// URIs) become a placeholder and only the newest 200 entries are kept.
+// The DURABLE copy is the server's; this is the reload cache.
+const LOCAL_HISTORY_MAX = 200;
+function _slimHistoryForStorage(history) {
+    const slim = (history || []).map((m) => {
+        if (!m || !Array.isArray(m.content)) return m;
+        return { ...m, content: m.content.map((part) => {
+            const url = part && part.image_url && part.image_url.url;
+            if (typeof url === 'string' && url.startsWith('data:')) {
+                return { type: 'text', text: '[image omitted from local history]' };
+            }
+            return part;
+        }) };
+    });
+    return slim.slice(-LOCAL_HISTORY_MAX);
+}
+function _isQuotaError(name) {
+    return name === 'QuotaExceededError' || name === 'NS_ERROR_DOM_QUOTA_REACHED';
+}
+let _quotaWarned = false;
 function saveChatState() {
-    safeStorage.set('ghost_chat_history', JSON.stringify(chatHistory));
+    // The conversation form's anatomy IS the history (2026-09-11).
+    if (typeof activeFace.setConversation === 'function') {
+        try { activeFace.setConversation(chatHistory); } catch (e) { /* face not booted */ }
+    }
+    const key = _historyKey();
+    if (safeStorage.set(key, JSON.stringify(chatHistory))) return true;
+    if (!_isQuotaError(safeStorage.lastError)) return false;   // private mode etc.
+    const ok = safeStorage.set(key, JSON.stringify(_slimHistoryForStorage(chatHistory)));
+    if (!_quotaWarned) {
+        _quotaWarned = true;
+        const msg = ok
+            ? 'Browser storage is full: older messages and inline images are kept only on the server now.'
+            : 'Browser storage is full: this conversation is not being saved locally (the server copy is unaffected).';
+        if (typeof window.__ghostWorkspace?.toast === 'function') window.__ghostWorkspace.toast(msg, 'error');
+        else console.warn('[Ghost] ' + msg);
+    }
+    return ok;
 }
 
 // Render a full message history into the (cleared) chat log. Shared by
@@ -1454,7 +1890,8 @@ function renderHistoryToLog(history) {
     chatLog.innerHTML = '';
     document.body.classList.add('restoring');
     _withHistoryRestore(() => {
-        for (const msg of history) {
+        for (let hidx = 0; hidx < history.length; hidx++) {
+            const msg = history[hidx];
             // Only conversational roles get bubbles — a stored session can
             // carry tool/function messages (other clients), which would
             // otherwise masquerade as USER bubbles.
@@ -1485,6 +1922,7 @@ function renderHistoryToLog(history) {
                         if (msg.feedback) div.dataset.feedback = msg.feedback;
                         if (msg.unlabelable) div.dataset.unlabelable = '1';
                     }
+                    if (roleClass !== 'system') _stampHistoryIndex(div, hidx);
                     chatLog.appendChild(div);
                 }
             }
@@ -1497,7 +1935,17 @@ function renderHistoryToLog(history) {
 }
 
 function loadChatState() {
-    const saved = safeStorage.get('ghost_chat_history');
+    let saved = safeStorage.get(_historyKey());
+    if (!saved) {
+        // Legacy flat key (pre 2026-09-11): adopt once, then remove it so
+        // no later tab can pick up a stale conversation from it.
+        const legacy = safeStorage.get(HISTORY_KEY);
+        if (legacy) {
+            saved = legacy;
+            safeStorage.remove(HISTORY_KEY);
+            safeStorage.set(_historyKey(), legacy);
+        }
+    }
     if (saved) {
         try {
             // Shape-validate: JSON.parse happily yields a string, a number
@@ -1581,7 +2029,7 @@ function saveInflightHandle() {
     if (!currentTaskId) return;
     safeStorage.set(_inflightKey(), JSON.stringify({
         taskId: currentTaskId,
-        sessionId: window.__ghostSessionId || safeStorage.get('ghost_session_id') || null,
+        sessionId: window.__ghostSessionId || storedSessionId(),
         tabId: TAB_ID,
         ts: Date.now(),
         beat: Date.now(),
@@ -1752,14 +2200,17 @@ async function reconcileFromSession(sid, handle) {
             const data = await res.json();
             if (isProcessingRequest || !_sessionStillCurrent(sid)) return;
             const msgs = Array.isArray(data.messages) ? data.messages : [];
-            if (msgs.length > chatHistory.length) {
-                // Server is canonical: ADOPT with the FULL message shape
-                // ({...m} — re-shaping to {role, content} dropped
-                // tool_calls/name and guaranteed one spurious drift
-                // re-render on the next resync), carrying the client-only
-                // label keys forward (they exist ONLY here; verbatim
-                // adoption stripped every 👍/👎 and persisted the loss).
-                chatHistory = mergeClientLabelKeys(msgs);
+            // Reconcile, never adopt wholesale (2026-09-11): this path
+            // compared raw lengths and replaced the local transcript with
+            // the server copy — deleting the operator's own typed message
+            // when the agent never persisted the turn, and reading "nothing
+            // new" whenever local was legitimately `server + k`. Same LCS
+            // the sessions module's two paths use; same drift test.
+            const adopted = msgs.length ? _reconcileWithLocal(msgs, chatHistory) : chatHistory;
+            if (msgs.length && _adoptionChanges(adopted, chatHistory)) {
+                // Carry the client-only label keys forward (they exist ONLY
+                // here; verbatim adoption stripped every 👍/👎).
+                chatHistory = mergeClientLabelKeys(adopted);
                 renderHistoryToLog(chatHistory);
                 saveChatState();
                 addMessage('system', 'Recovered the reply that finished while you were away.');
@@ -1812,8 +2263,7 @@ async function resumeOrReconcileInflightTurn() {
         // shows (/clear minted a new session while the turn hung):
         // resurrecting the old transcript into the new session would
         // duplicate it server-side. Drop it.
-        const currentSid = window.__ghostSessionId
-            || safeStorage.get('ghost_session_id') || null;
+        const currentSid = window.__ghostSessionId || storedSessionId();
         if (h.sessionId && currentSid && h.sessionId !== currentSid) {
             clearInflightHandle(h);
             return;
@@ -1867,6 +2317,16 @@ async function resumeOrReconcileInflightTurn() {
 // CLEAR the inline height so the `rows="1"` attribute regains control
 // — `height: auto` on an already-styled textarea computes from content
 // and doesn't reliably snap back to the one-row default.
+// Pre-turn posture (2026-09-11): the body leans toward the composer
+// while there is something typed in it.
+chatInput.addEventListener('blur', () => {
+    if (typeof activeFace.setComposerGaze === 'function') activeFace.setComposerGaze(false);
+});
+chatInput.addEventListener('input', function () {
+    if (typeof activeFace.setComposerGaze === 'function') {
+        activeFace.setComposerGaze(this.value.trim().length > 0);
+    }
+});
 chatInput.addEventListener('input', function () {
     if (this.value === '') {
         this.style.height = '';
@@ -1923,6 +2383,55 @@ const TICKER_VERBS = {
     'vision': 'looking at an image',
     'delegation': 'delegating a subtask',
 };
+// What a ticker line means to the FACE (2026-09-11): a gait for the
+// step class, a task hint for auto-form, whether it is a tool call (a
+// discrete kick, plus the tool-graph's data), a memory recall (a comet)
+// or the verifier's verdict. Pure; executed under node.
+const _FACE_PHASE_BY_TITLE = {
+    'web search': ['search', 'research'], 'web read': ['read', 'research'],
+    'browser': ['search', 'research'], 'memory search': ['search', 'memory'],
+    'hydrated context': ['read', null], 'file read': ['read', 'coding'],
+    'sandbox tree': ['read', 'coding'], 'vision': ['read', null],
+    'sandbox exec': ['tool', 'coding'], 'execution task': ['tool', 'coding'],
+    'file write': ['tool', 'coding'], 'worker compute': ['tool', null],
+    'delegation': ['tool', null], 'memory save': ['tool', 'memory'],
+    'graph updated': ['tool', 'memory'], 'verifier': ['verify', 'verify'],
+    'tool call': ['tool', null],
+};
+function faceSignalsForTicker(title, icon, detail) {
+    const out = { phase: null, hint: null, tool: null, recall: false, verdict: null };
+    const t = String(title || '').toLowerCase();
+    const d = String(detail || '');
+    const m = _FACE_PHASE_BY_TITLE[t];
+    if (m) { out.phase = m[0]; out.hint = m[1]; }
+    if (t === 'tool call' || icon === '🧰') {
+        out.phase = 'tool';
+        out.tool = (d.split(' · ')[0] || '').trim().toLowerCase() || null;
+    }
+    if (icon === '🔎' || icon === '📍' || t === 'memory search') out.recall = true;
+    if (icon === '🧪' || t.startsWith('verify')) {
+        out.phase = 'verify';
+        out.hint = 'verify';
+        if (/^\s*CONFIRMED/i.test(d)) out.verdict = 'pass';
+        else if (/^\s*REFUTED/i.test(d)) out.verdict = 'refute';
+    }
+    return out;
+}
+let _turnVerdict = null;
+let _lastRecallAt = 0;
+function _feedFaceFromTicker(title, icon, detail) {
+    const f = faceSignalsForTicker(title, icon, detail);
+    if (f.phase && typeof activeFace.setPhase === 'function') activeFace.setPhase(f.phase);
+    if (f.hint && typeof activeFace.setTaskHint === 'function') activeFace.setTaskHint(f.hint);
+    if (f.tool !== null && typeof activeFace.noteToolCall === 'function') activeFace.noteToolCall(f.tool);
+    if (f.recall && typeof activeFace.noteRecall === 'function') {
+        const now = Date.now();
+        if (now - _lastRecallAt > 1500) { _lastRecallAt = now; activeFace.noteRecall(); }
+    }
+    if (f.verdict) _turnVerdict = f.verdict;
+    return f;
+}
+
 const turnStatusEl = document.getElementById('turn-status');
 const turnStatusDescEl = document.getElementById('turn-status-desc');
 const turnStatusClockEl = document.getElementById('turn-status-clock');
@@ -2003,6 +2512,7 @@ function noteTickerLine(raw) {
     const detail = parts.slice(ti + 1).join(' ').trim();
     if (detail) desc += ` · ${detail.slice(0, 30)}${detail.length > 30 ? '…' : ''}`;
     setTurnStatusDesc(desc, icon);
+    _feedFaceFromTicker(title, icon, detail);
 }
 
 // Turn a failed Response into an Error that still says something.
@@ -2045,8 +2555,7 @@ async function _httpError(response, prefix) {
 // deeper (R2 lens B). `/api/turns` carries `session_id` per turn, so the
 // client can identify its own turn; if it cannot, it must NOT guess.
 async function _resolveOwnTurnId(sentText) {
-    const sid = window.__ghostSessionId
-        || safeStorage.get('ghost_session_id') || null;
+    const sid = window.__ghostSessionId || storedSessionId();
     let data;
     try {
         // BOUNDED. Stop exists for the case where the agent is wedged, and
@@ -2137,7 +2646,7 @@ async function sendMessage(isResume = false) {
         chatInput.style.height = '';
         chatLog.innerHTML = '';
         chatHistory = [];
-        safeStorage.remove('ghost_chat_history');
+        safeStorage.remove(_historyKey());
         // A surviving in-flight handle points at the OLD conversation —
         // left alone, the next reconcile would resurrect the cleared
         // transcript into the freshly minted session.
@@ -2173,15 +2682,19 @@ async function sendMessage(isResume = false) {
     if (!resuming) {
         chatInput.value = '';
         chatInput.style.height = ''; // Clear inline height → rows="1" takes over
-        addMessage('user', text);
+        const _userDiv = addMessage('user', text);
         
         currentTaskId = null;
         currentChunkIndex = 0;
         currentAccumulatedContent = "";
         currentReqId = null;
         currentTurnUnlabelable = false;
+        _turnVerdict = null;
+        if (typeof activeFace.setPhase === 'function') activeFace.setPhase(null);
+        if (typeof activeFace.setComposerGaze === 'function') activeFace.setComposerGaze(false);
 
         chatHistory.push({ role: "user", content: text });
+        _stampHistoryIndex(_userDiv, chatHistory.length - 1);
         // Remembered for Stop: with sessions disabled there is no session id
         // to match a turn on, and the turn registry's `preview` is derived
         // from exactly this text (R3 lens B).
@@ -2218,7 +2731,7 @@ async function sendMessage(isResume = false) {
         // keep theirs (this is a no-op then). Reconnects are silent — the
         // stream resuming is the only signal the user needs.
         ensureAgentBubbleForResume();
-        setTimeout(scrollToBottom, 100);
+        setTimeout(scrollToBottomIfPinned, 100);
     }
 
     // Explicitly lock the blob into an active state
@@ -2260,8 +2773,7 @@ async function sendMessage(isResume = false) {
         // (which protects user messages but not assistant ones) then deleted
         // the reply the user was reading. `saveInflightHandle` has had this
         // exact fallback all along (R3 lens B).
-        const _sid = window.__ghostSessionId
-            || safeStorage.get('ghost_session_id') || null;
+        const _sid = window.__ghostSessionId || storedSessionId();
         if (_sid) payload.session_id = _sid;
         currentChatController = new AbortController();
 
@@ -2291,6 +2803,14 @@ async function sendMessage(isResume = false) {
                 // Survive a page kill: the handle is all a reload needs to
                 // reattach this stream (see resumeOrReconcileInflightTurn).
                 saveInflightHandle();
+            }
+            // The proxy mints the agent's request id and sends it up front
+            // (2026-09-11), so Stop and the thumbs know the turn from t=0
+            // instead of after the first content frame. The frames carry
+            // the same id (restamped agent-side), so nothing disagrees.
+            if (response.headers.has('X-Request-ID')) {
+                const _rid = String(response.headers.get('X-Request-ID') || '').trim();
+                if (_rid) currentReqId = _rid.replace(/^chatcmpl-/, '');
             }
         }
 
@@ -2361,9 +2881,9 @@ async function sendMessage(isResume = false) {
                             : String(_e);
                         const _type = (_e && typeof _e === 'object' && _e.type) ? ` [${_e.type}]` : '';
                         const _eid = (_e && typeof _e === 'object' && _e.error_id) ? ` (error_id ${_e.error_id})` : '';
-                        addMessage('system', `Error${_type}: ${_msg}${_eid}`);
+                        addRetryableSystemMessage(`Error${_type}: ${_msg}${_eid}`);
                         streamHadError = true;
-                        activeFace.triggerSpike();
+                        _faceError(_msg, _type);
                         continue;
                     }
                     if (chunkContent) {
@@ -2372,14 +2892,13 @@ async function sendMessage(isResume = false) {
                                 clearInterval(currentThinkingInterval);
                                 currentThinkingInterval = null;
                             }
-                            // Swap off the typing-dots indicator and clear
-                            // whatever innerHTML the placeholder had before
-                            // content starts streaming in.
-                            currentAgentMessageDiv.classList.remove('thinking');
-                            currentAgentMessageDiv.textContent = "";
-                            // From here the reply itself is the story —
-                            // the caption says so until turn end.
-                            setTurnStatusDesc('writing the reply…', '💬');
+                            // The typing dots are NOT torn down here. The
+                            // first chunk of most replies opens a <think>
+                            // block, which the renderer strips — so tearing
+                            // the indicator down on the first CHUNK left an
+                            // EMPTY bubble for the whole reasoning phase.
+                            // _renderStreamingContent reveals the bubble on
+                            // the first VISIBLE character instead.
                         }
 
                         currentAccumulatedContent += chunkContent;
@@ -2438,6 +2957,13 @@ async function sendMessage(isResume = false) {
             chatHistory.push({ role: "assistant", content: currentAccumulatedContent,
                                reqId: currentReqId || undefined,
                                unlabelable: currentTurnUnlabelable || undefined });
+            _stampHistoryIndex(currentAgentMessageDiv, chatHistory.length - 1);
+            // A reply that was ALL reasoning (<think> with no text after
+            // it) never revealed the bubble: say so instead of leaving the
+            // dots animating on a finished turn.
+            if (_revealAgentBubble(currentAgentMessageDiv)) {
+                currentAgentMessageDiv.textContent = "No reply text (the model only reasoned).";
+            }
             // Stamp only alongside a history entry that carries the id —
             // a "No response" bubble with live thumbs would take labels
             // that can never persist (no matching entry to latch onto).
@@ -2453,6 +2979,7 @@ async function sendMessage(isResume = false) {
         } else {
             currentAgentMessageDiv.textContent = "No response";
             chatHistory.push({ role: "assistant", content: "No response" });
+            _stampHistoryIndex(currentAgentMessageDiv, chatHistory.length - 1);
             // Clear any stale stamp from a previous turn on a reused
             // bubble — an unlabeled "No response" must carry no thumbs.
             _stampReqId(currentAgentMessageDiv, null);
@@ -2473,17 +3000,26 @@ async function sendMessage(isResume = false) {
     } catch (e) {
         if (e.name === 'AbortError') {
             if (currentThinkingInterval) { clearInterval(currentThinkingInterval); currentThinkingInterval = null; }
+            // Stop is ONE call now (2026-09-11): /api/chat/cancel tears
+            // down the proxy relay AND cancels the agent's turn by the id
+            // the proxy minted, answering {agent: {cancelled}}. Only when
+            // the proxy could not (legacy task shape, transport failure,
+            // or a refusal) does this tab fall back to resolving its own
+            // turn via /api/turns — never a blind "whatever is running"
+            // cancel (review R1 M8 / R2 lens B). The ids are captured
+            // NOW: the fields below are reset before the promise settles.
+            const _rid = currentReqId, _txt = _lastSentUserText;
             if (currentTaskId) {
-                fetch(`/api/chat/cancel/${currentTaskId}`, { method: 'POST' }).catch(()=>{});
+                fetch(`/api/chat/cancel/${currentTaskId}`, { method: 'POST' })
+                    .then(r => r.json().catch(() => ({})))
+                    .then(d => {
+                        if (d && d.agent && d.agent.cancelled === true) return;
+                        return _cancelAgentTurn(_rid, _txt);
+                    })
+                    .catch(() => _cancelAgentTurn(_rid, _txt));
+            } else {
+                _cancelAgentTurn(_rid, _txt);
             }
-            // /api/chat/cancel only tears down the PROXY's buffered stream:
-            // the agent kept running the whole turn, holding the global turn
-            // lock and burning tokens, while this client said "Request
-            // cancelled by user." (review R1 M8). Cancel the real turn too —
-            // by request_id when the stream got that far, else the
-            // currently-running turn, which is ours because the lock is
-            // global. Report failure, because then it is NOT cancelled.
-            _cancelAgentTurn(currentReqId, _lastSentUserText);
             if (!resuming && currentAccumulatedContent === "" && currentAgentMessageDiv) currentAgentMessageDiv.remove();
             if (currentAccumulatedContent !== "") {
                 // Keep the reqId: a reply aborted BECAUSE it was going
@@ -2494,10 +3030,11 @@ async function sendMessage(isResume = false) {
                                    unlabelable: currentTurnUnlabelable || undefined });
                 if (currentAgentMessageDiv && currentAgentMessageDiv.isConnected) {
                     _stampReqId(currentAgentMessageDiv, currentReqId, currentTurnUnlabelable);
+                    _stampHistoryIndex(currentAgentMessageDiv, chatHistory.length - 1);
                 }
-                addMessage('system', 'Stopped by user.');
+                addRetryableSystemMessage('Stopped by user.');
             } else {
-                addMessage('system', 'Stopped by user.');
+                addRetryableSystemMessage('Stopped by user.');
             }
             currentTaskId = null;
             clearInflightHandle();
@@ -2571,9 +3108,9 @@ async function sendMessage(isResume = false) {
                         + 'Start a new chat, or switch sessions and back — the '
                         + 'server keeps the durable copy, so nothing is lost.');
                 } else {
-                    addMessage('system', `Network Error: ${_m}`);
+                    addRetryableSystemMessage(`Network Error: ${_m}`);
                 }
-                activeFace.triggerSpike();
+                _faceError(_m, 'network');
                 // The turn is abandoned client-side. If the agent finishes
                 // anyway, the sessions resync (visibilitychange) adopts it.
                 clearInflightHandle();
@@ -2624,10 +3161,19 @@ async function sendMessage(isResume = false) {
         toggleSendButtonUI(false);
         activeFace.setWorkingState(false);
         if (typeof activeFace.setUserTurn === 'function') activeFace.setUserTurn(false);
+        // The release (2026-09-11): the verifier's verdict, when one was
+        // logged for this turn, shapes how the face lets go — a pass
+        // crystallises and holds, a refute shudders, anything else
+        // exhales. Then the gait clears.
+        if (typeof activeFace.noteVerdict === 'function') {
+            activeFace.noteVerdict(_turnVerdict || 'stop');
+        }
+        _turnVerdict = null;
+        if (typeof activeFace.setPhase === 'function') activeFace.setPhase(null);
         if (ws && ws.readyState === WebSocket.OPEN) {
             setConnectionState('online', 'ONLINE');
         }
-        setTimeout(scrollToBottom, 100);
+        setTimeout(scrollToBottomIfPinned, 100);
 
         // Auto-hide planner monologue 2 seconds after reply
         monologueTimeout = setTimeout(hidePlannerMonologue, 2000);
@@ -2662,10 +3208,28 @@ sendBtn.addEventListener('click', () => {
 });
 
 chatInput.addEventListener('keydown', (e) => {
+    // An IME (CJK, Vietnamese) and most mobile predictive-text paths
+    // confirm a candidate with Enter — that keydown carries isComposing
+    // (legacy engines: keyCode 229) and must NOT send a half-composed
+    // message.
+    if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         if (!isProcessingRequest) {
             sendTypedMessage();
+        }
+        return;
+    }
+    // ArrowUp in an EMPTY composer recalls the last thing you sent — the
+    // shell habit, and the cheapest "fix a typo and resend" there is.
+    if (e.key === 'ArrowUp' && chatInput.value === '' && !isProcessingRequest) {
+        const at = _userTurnIndexFor(chatHistory, chatHistory.length - 1);
+        const text = at >= 0 ? _historyEntryText(chatHistory[at]) : null;
+        if (text) {
+            e.preventDefault();
+            chatInput.value = text;
+            chatInput.dispatchEvent(new Event('input'));
+            try { chatInput.setSelectionRange(text.length, text.length); } catch (err) { /* ignore */ }
         }
     }
 });
@@ -2691,8 +3255,14 @@ const FACE_FORM_HINTS = {
     embedding: 'latent space',
     descent: 'loss landscape',
     cube: 'infinite monolith',
+    conversation: 'this session as a strand',
+    toolgraph: "the agent's habits",
     empty: 'no face',
 };
+// Auto mode (2026-09-11): not a body plan — a setting. The form follows
+// the task the ticker sees (coding → lattice, research → embedding,
+// verifying → descent) and returns to your pick when the hint clears.
+const FACE_AUTO_HINT = 'follows the task';
 const faceFormBtn = document.getElementById('face-form-btn');
 let faceFormMenu = null;
 
@@ -2733,6 +3303,28 @@ function buildFaceFormMenu() {
     faceFormMenu.className = 'hidden';
     faceFormMenu.setAttribute('role', 'menu');
     faceFormMenu.setAttribute('aria-label', 'Face form');
+    if (typeof activeFace.setAutoForm === 'function') {
+        const auto = document.createElement('button');
+        auto.type = 'button';
+        auto.className = 'face-form-item face-form-auto';
+        auto.dataset.form = 'auto';
+        auto.setAttribute('role', 'menuitemcheckbox');
+        const al = document.createElement('span');
+        al.className = 'face-form-name';
+        al.textContent = 'auto';
+        auto.appendChild(al);
+        const ah = document.createElement('span');
+        ah.className = 'face-form-hint';
+        ah.textContent = FACE_AUTO_HINT;
+        auto.appendChild(ah);
+        auto.addEventListener('click', () => {
+            const on = activeFace.setAutoForm(!activeFace.getAutoForm());
+            markActiveFaceForm();
+            const toast = window.__ghostWorkspace && window.__ghostWorkspace.toast;
+            if (toast) toast(on ? 'Face follows the task' : 'Face: your pick');
+        });
+        faceFormMenu.appendChild(auto);
+    }
     for (const name of activeFace.getForms()) {
         const item = document.createElement('button');
         item.type = 'button';
@@ -2775,7 +3367,13 @@ function buildFaceFormMenu() {
 function markActiveFaceForm() {
     if (!faceFormMenu) return;
     const current = typeof activeFace.getForm === 'function' ? activeFace.getForm() : '';
+    const auto = typeof activeFace.getAutoForm === 'function' && activeFace.getAutoForm();
     for (const item of faceFormMenu.querySelectorAll('.face-form-item')) {
+        if (item.dataset.form === 'auto') {
+            item.classList.toggle('auto-on', !!auto);
+            item.setAttribute('aria-checked', auto ? 'true' : 'false');
+            continue;
+        }
         item.classList.toggle('active', item.dataset.form === current);
         item.setAttribute('aria-checked', item.dataset.form === current ? 'true' : 'false');
     }
@@ -3276,7 +3874,7 @@ if (downloadBtn) {
 if (window.visualViewport) {
     let bodySettleTimer = null;
     const syncBodyHeight = () => {
-        scrollToBottom();
+        scrollToBottomIfPinned();
         _vvNoteHeight();
         // Pin the body ONLY while a keyboard is genuinely open (focused
         // editable + vv meaningfully below this orientation's max — see
@@ -3348,7 +3946,41 @@ if (window.visualViewport) {
     }, 800);
 }
 
-document.addEventListener('dblclick', function (event) { event.preventDefault(); }, { passive: false });
+// Node hover / tap (2026-09-11): the conversation and tool-graph forms
+// label their nodes. Pointer events over the exposed background (not
+// over chrome or a bubble) ask the face which node is under the pointer
+// and show its label in #face-tooltip. Pure decision helper below.
+const faceTooltip = document.getElementById('face-tooltip');
+const _FACE_CHROME = '.message, header, footer, aside, #render-window, #log-console, #notif-panel, #cmd-palette, .modal-overlay, #face-form-menu, #msg-menu';
+function faceHoverAllowed(target) {
+    if (!target || typeof target.closest !== 'function') return true;
+    return !target.closest(_FACE_CHROME);
+}
+let _faceHoverRaf = null;
+function _onFacePointer(e) {
+    if (!faceTooltip || typeof activeFace.describeNodeAt !== 'function') return;
+    if (_faceHoverRaf !== null) return;
+    _faceHoverRaf = requestAnimationFrame(() => {
+        _faceHoverRaf = null;
+        if (!faceHoverAllowed(e.target)) { faceTooltip.classList.add('hidden'); return; }
+        const nx = (e.clientX / window.innerWidth) * 2 - 1;
+        const ny = -((e.clientY / window.innerHeight) * 2 - 1);
+        const hit = activeFace.describeNodeAt(nx, ny);
+        if (!hit) { faceTooltip.classList.add('hidden'); return; }
+        faceTooltip.textContent = hit.label;
+        faceTooltip.style.left = `${Math.min(e.clientX, window.innerWidth - 320)}px`;
+        faceTooltip.style.top = `${Math.min(e.clientY, window.innerHeight - 60)}px`;
+        faceTooltip.classList.remove('hidden');
+    });
+}
+window.addEventListener('pointermove', _onFacePointer, { passive: true });
+window.addEventListener('pointerdown', _onFacePointer, { passive: true });
+
+// The document-wide `dblclick` preventDefault that lived here (an iOS
+// double-tap-zoom guard) is GONE (2026-09-11): the viewport is already
+// user-scalable=no and buttons carry touch-action: manipulation, so all it
+// did on a desktop was break double-click word selection in the transcript
+// and in every text box.
 
 setTimeout(() => {
     const sysMsg = document.getElementById('init-msg');
@@ -3411,11 +4043,42 @@ if (!chatHistory || chatHistory.length === 0) renderEmptyStateHero();
 // consts in the TDZ and make `attachRenderButtons()` (called from
 // sendMessage's finally) throw on every completed message. Mirrors the
 // defensive marked/DOMPurify handling.
-if (window.mermaid) {
-    try { mermaid.initialize({ startOnLoad: false, theme: 'dark' }); }
-    catch (e) { console.warn('mermaid.initialize failed', e); }
-} else {
-    console.warn('[Ghost] mermaid CDN did not load — diagram rendering disabled.');
+// mermaid / chart.js / papaparse are loaded ON FIRST USE (2026-09-11).
+// They were five render-blocking <script> tags in <head>, 3.6 MB of which
+// mermaid alone was 3.3 MB — parsed on every cold load for features most
+// turns never touch. `_ensureVendor` injects the vendored file once and
+// resolves when its global exists; mermaid is initialised right after.
+const _VENDORS = {
+    mermaid: { src: '/static/vendor/mermaid.min.js', global: 'mermaid' },
+    chart:   { src: '/static/vendor/chart.umd.min.js', global: 'Chart' },
+    papaparse: { src: '/static/vendor/papaparse.min.js', global: 'Papa' },
+};
+const _vendorLoads = new Map();
+function _ensureVendor(name) {
+    const spec = _VENDORS[name];
+    if (!spec) return Promise.reject(new Error(`unknown vendor ${name}`));
+    if (window[spec.global]) return Promise.resolve(window[spec.global]);
+    if (_vendorLoads.has(name)) return _vendorLoads.get(name);
+    const p = new Promise((resolve, reject) => {
+        const el = document.createElement('script');
+        el.src = spec.src;
+        el.async = true;
+        el.onload = () => {
+            const g = window[spec.global];
+            if (!g) { reject(new Error(`${name} loaded but defined no ${spec.global}`)); return; }
+            if (name === 'mermaid') {
+                try { g.initialize({ startOnLoad: false, theme: 'dark' }); }
+                catch (e) { console.warn('mermaid.initialize failed', e); }
+            }
+            resolve(g);
+        };
+        el.onerror = () => reject(new Error(`${name} failed to load`));
+        document.head.appendChild(el);
+    });
+    // A failed load must not poison every later attempt.
+    p.catch(() => _vendorLoads.delete(name));
+    _vendorLoads.set(name, p);
+    return p;
 }
 
 // --- Element references ---
@@ -3801,22 +4464,34 @@ function attachRenderButtons() {
 }
 
 // --- Mermaid renderer --- (caller ran resetRenderSurfaces)
-function renderMermaid(codeText) {
+let _renderSeq = 0;   // a newer Visualize click supersedes an awaiting one
+async function renderMermaid(codeText) {
+    const seq = ++_renderSeq;
     currentRenderState = { type: 'mermaid' };
     mermaidContainer.style.display = 'flex';
 
-    if (!window.mermaid) {
-        mermaidContainer.innerHTML = `<pre style="color:#ff4444;">Diagram rendering unavailable (mermaid failed to load).</pre>`;
-        return;
-    }
-    // Visible placeholder while the async render runs — the container was
-    // just cleared by resetRenderSurfaces, so the PREVIOUS diagram can no
-    // longer masquerade as this one during the wait.
+    // Visible placeholder while the library loads and the async render
+    // runs — the container was just cleared by resetRenderSurfaces, so the
+    // PREVIOUS diagram can no longer masquerade as this one during the wait.
     const wait = document.createElement('pre');
     wait.style.color = 'rgba(158,170,192,0.6)';
     wait.textContent = 'Rendering diagram…';
     mermaidContainer.appendChild(wait);
-    mermaid.render('mermaid-graph-' + Date.now(), codeText).then(result => {
+    let mermaidLib;
+    try {
+        mermaidLib = await _ensureVendor('mermaid');
+    } catch (e) {
+        if (seq !== _renderSeq) return;
+        mermaidContainer.replaceChildren();
+        const pre = document.createElement('pre');
+        pre.style.color = '#ff4444';
+        pre.textContent = 'Diagram rendering unavailable (mermaid failed to load).';
+        mermaidContainer.appendChild(pre);
+        return;
+    }
+    if (seq !== _renderSeq) return;
+    mermaidLib.render('mermaid-graph-' + Date.now(), codeText).then(result => {
+        if (seq !== _renderSeq) return;
         mermaidContainer.innerHTML = result.svg;
     }).catch(err => {
         // textContent (not innerHTML) — the error string can echo fragments
@@ -3851,14 +4526,19 @@ function renderHTMLContent(codeText, lang) {
 }
 
 // --- CSV / Chart renderer --- (caller ran resetRenderSurfaces)
-function renderCSV(codeText) {
-    // Vendored libs are local, but a failed load previously threw a raw
-    // ReferenceError out of the click handler with the window already
+async function renderCSV(codeText) {
+    const seq = ++_renderSeq;
+    // Both libraries load on first use; a failed load previously threw a
+    // raw ReferenceError out of the click handler with the window already
     // open on stale content.
-    if (!window.Papa || !window.Chart) {
+    try {
+        await Promise.all([_ensureVendor('papaparse'), _ensureVendor('chart')]);
+    } catch (e) {
+        if (seq !== _renderSeq) return;
         _showRenderError('Chart rendering unavailable (vendor library failed to load).');
         return;
     }
+    if (seq !== _renderSeq) return;
     currentRenderState = { type: 'chart' };
     chartContainer.style.display = 'block';
 
@@ -4428,6 +5108,40 @@ function _stopTTSAudioPump() {
     }
 }
 
+// Microphone level → the face while you hold to talk (2026-09-11). The
+// input is analysed only (never routed to the speakers); the pump stops
+// with the recorder.
+let _micAnalyser = null, _micSource = null, _micData = null, _micRafId = null;
+function _startMicAudioPump(stream) {
+    try {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        _micSource = audioCtx.createMediaStreamSource(stream);
+        _micAnalyser = audioCtx.createAnalyser();
+        _micAnalyser.fftSize = 128;
+        _micData = new Uint8Array(_micAnalyser.frequencyBinCount);
+        _micSource.connect(_micAnalyser);
+        const pump = () => {
+            if (!_micAnalyser) return;
+            _micAnalyser.getByteFrequencyData(_micData);
+            let sum = 0;
+            for (let i = 0; i < _micData.length; i++) sum += _micData[i];
+            if (typeof activeFace.setAudioLevel === 'function') {
+                activeFace.setAudioLevel(Math.min(1, (sum / (_micData.length * 255)) * 2.2));
+            }
+            _micRafId = requestAnimationFrame(pump);
+        };
+        _micRafId = requestAnimationFrame(pump);
+    } catch (e) {
+        console.warn('mic analyser unavailable — face will not react to the voice', e);
+    }
+}
+function _stopMicAudioPump() {
+    if (_micRafId !== null) { cancelAnimationFrame(_micRafId); _micRafId = null; }
+    try { if (_micSource) _micSource.disconnect(); } catch (e) { /* ignore */ }
+    _micSource = null; _micAnalyser = null; _micData = null;
+    if (typeof activeFace.setAudioLevel === 'function') activeFace.setAudioLevel(0);
+}
+
 function playNextAudio() {
     if (isPlayingTTS || ttsAudioQueue.length === 0) return;
     isPlayingTTS = true;
@@ -4544,12 +5258,14 @@ if (micBtn) {
                 ? new MediaRecorder(stream, { mimeType: chosenMime })
                 : new MediaRecorder(stream);
             audioChunks = [];
+            _startMicAudioPump(stream);
 
             mediaRecorder.ondataavailable = event => {
                 if (event.data.size > 0) audioChunks.push(event.data);
             };
 
             mediaRecorder.onstop = async () => {
+                _stopMicAudioPump();
                 const blobType = mediaRecorder.mimeType || chosenMime || 'audio/webm';
                 const audioBlob = new Blob(audioChunks, { type: blobType });
                 const ext = blobType.includes('mp4') || blobType.includes('aac') ? 'm4a'
@@ -4683,7 +5399,7 @@ window.GhostCore = {
     clearConversation: () => {
         chatLog.innerHTML = '';
         chatHistory = [];
-        safeStorage.remove('ghost_chat_history');
+        safeStorage.remove(_historyKey());
         // Close the visualizer BEFORE revoking — it may be displaying one
         // of these blobs (session switches used to blank the open preview).
         closeRenderWindow();
@@ -4695,11 +5411,26 @@ window.GhostCore = {
         renderEmptyStateHero();
     },
     isProcessing: () => isProcessingRequest,
+    // Retry / regenerate / edit (2026-09-11): cut the conversation at the
+    // user turn a bubble belongs to (its data-hidx) and resend or refill.
+    // ONE reconcile authority for every server-history adoption
+    // (sessions.js load/resync + the recovery path here).
+    reconcileWithLocal: _reconcileWithLocal,
+    // Per-tab session identity + per-session local history keys.
+    storedSessionId,
+    persistSessionId,
+    localHistoryKeys,
+    resendFromIndex: (idx) => _truncateToUserTurn(idx, true),
+    editFromIndex: (idx) => _truncateToUserTurn(idx, false),
+    retryLastTurn,
+    // Lock-screen alerts row in the bell panel.
+    pushPermissionState,
+    requestNotificationPermission,
     elements: { chatLog, chatInput, logToggleBtn },
     toggleLogConsole: () => { if (logToggleBtn) logToggleBtn.click(); },
 };
 
-import('./workspace.js?v=7.9').catch(e => {
+import('./workspace.js?v=8.5').catch(e => {
     // ⚠ VISIBLE, not console-only. This module owns the sessions rail, and
     // with it `window.__ghostSessionId` — so when it fails to load, every
     // turn silently reverts to CLIENT-CARRIED history: no durable session,

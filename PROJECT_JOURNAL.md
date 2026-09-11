@@ -38275,3 +38275,228 @@ health 200, 0 boot errors; pins `tests/test_host_process_and_verdict_clarity.py`
 above); two judge phrasings ("failed to adhere to the strict output format constraint", "exceeds the
 five-word limit") did not match the first vocabulary; one alternation was redundant until a fixture made it
 load-bearing.
+
+## §4GA — Web client review + the "fix first" batch (2026-09-11)
+
+**Ask:** "suggest improvements to the web client", then "fix the 'fix first' list".
+
+**Review.** Three read-only lenses in parallel (client core JS/CSS; PWA/session/push layer; the
+server API the client consumes), top claims re-verified by hand (cert notAfter, gzip absence, the
+blank-bubble path, the raw length compare, the shared Event, no heartbeat). 55 findings, written to
+`scratchpad/web_client_review_2026-09-11.md` in eight groups (fix-first, performance, streaming model,
+server robustness, PWA/push, security, a11y, maintainability) plus a do-not-regress list. Headline
+structural lever: no typed progress events on the wire — the UI regexes `tail -F` text to guess the
+tool phase. Deadline item: **TLS cert expires 2026-10-09**, renewal manual, nothing notices.
+
+**Shipped (items 1–8 of the fix-first list).**
+1. Bubble blank during reasoning → reveal on the first VISIBLE character (`_revealAgentBubble`;
+   reasoning-only reply ends as "No reply text").
+2. Retry / Regenerate / Edit & resend → `data-hidx` on every bubble with a history entry,
+   `_truncateToUserTurn(idx, send)`, Retry button on Stop/network/error-frame pills, ArrowUp recall.
+3. IME Enter → `isComposing || keyCode === 229` guard; `enterkeyhint`, `aria-label`.
+4. Document-wide `dblclick` preventDefault deleted (pinned as an absence).
+5. Scroll-jacking → `scrollToBottomIfPinned` at addMessage (non-user), both turn-end timeouts and
+   `syncBodyHeight`; `#chat-resume` "▼ new messages" pill.
+6. Permission prompt on first click deleted → bell-panel row with a three-world state
+   (`pushPermissionState`) and an Enable button (`requestNotificationPermission`).
+7. SSE heartbeat → both readers share `_relay_task_stream`; `_wait_for_new_data` bounded by
+   `SSE_PING_S` (env `GHOST_SSE_PING_S`, 15s) → `: ping`. Side effect: recovers the lost-wake race
+   between two readers clearing one Event (review finding 25, the permanent spinner).
+8. Stop is one call → proxy mints `X-Request-ID`, sends it upstream (Slack's contract), exposes it on
+   the response and in task state; `/api/chat/cancel` posts the agent's `/api/turn/cancel` itself
+   (`_cancel_agent_turn`, 4s, reported-not-raised). Client reads the id at t=0; `/api/turns`
+   resolution kept as the fallback.
+
+**Verification.** `tests/test_interface_fix_first_2026_09_11.py`: 57 tests, behavioural ones
+executed under node (DOM shim) or against the FastAPI app. Mutation batch 10/10 killed (reveal
+regression, IME guard drop, unconditional scroll, unbounded wait, cancel-not-reaching-agent,
+off-by-one cut, needsInstall=false, request id not sent upstream, pill never lit, retry no-op);
+trap-restored, both files byte-identical after. Interface suite 658 passed / 1 skipped under
+`-n 8 --dist loadfile`. Cache-bust: app/matrix_graph 11.6, workspace 8.0, notifications 7.0,
+style 6.0; manifest rewritten.
+
+**Defects inside this section's own work (R8):** two existing pins had to move — the proxy-auth test
+asserted the exact upstream header set (now `{X-Ghost-Key, X-Request-ID}`), and the task-state
+exact-shape assertion gained `request_id`. One collision caught by an existing pin: my first
+reasoning-only placeholder reused the literal "No response", which put a second occurrence ahead of
+the `streamHadError`-gated one the phantom-reply test anchors on — reworded. One test bug: a Promise
+handed to `eval_js` serialises as `{}`; the expression needed `await`. And the shared relay
+reworded the resume-offset clamp (`min(int(offset or 0), …)`), which a text pin in
+`test_bug_hunt_fixes.py` anchors on verbatim — that one pin also fails the evolve stack's
+`deletes_a_guard` negative control (it runs the same pin file), so ONE reworded expression showed up
+as THREE failures in unrelated-looking files. Restored the exact expression. Lesson: before
+refactoring a line, grep `tests/` for its literal text — the suite's text pins are cross-file.
+
+**Docs:** `docs/interfaces/web_server.html` (endpoint rows + dated section), `docs/interfaces.html`
+("Redo a turn"). **Remaining from the review's fix-first group:** 9 reconcile path without the §4BU
+LCS fix (`app.js` `msgs.length > chatHistory.length`), 10 cross-tab session contamination (flat
+localStorage keys), 11 markdown fallback drops newlines, 12 quota errors swallowed.
+
+## §4GB — Web client batch 2: recovery reconcile, per-tab identity, quota, load weight (2026-09-11, later)
+
+**Ask:** "what's next for the client?" → operator: the log-fed status line already covers progress, so the
+typed-progress-events item (C21) is LOW; "yes, start on 1-4" = review items A9–A12 + B13/B14.
+
+**Shipped.**
+1. **One reconcile authority.** `_msgKey`/`_lcsPairs`/`_reconcileWithLocal` moved sessions.js → app.js,
+   exported as `Core.reconcileWithLocal`; `load()`/`resyncCurrent()` consume it. `reconcileFromSession`
+   (locked-phone recovery) replaced its `msgs.length > chatHistory.length` + wholesale adopt with the
+   reconcile + `_adoptionChanges(adopted, local)` (length or last element on the wire shape). The F2 loss
+   the sessions module fixed twice was alive in this third sibling — and pinned there as CORRECT
+   ("silent local truncation"); that pin now pins the reconcile and the ABSENCE of the raw compare.
+2. **Per-tab identity + per-session history.** `storedSessionId()` (sessionStorage first, localStorage
+   last-used), `persistSessionId()` writes both; sessions.js binds through the bridge (stale-app.js
+   fallback kept). History under `ghost_chat_history:<sid>` via `_historyKey()`; legacy flat key adopted
+   once then removed; `pruneLocalHistories()` after every rail refresh; `storage` listener refreshes the
+   rail on other tabs' saves. Every `safeStorage.get('ghost_session_id')` fallback site (4) → resolver.
+3. **Fallback + quota.** `renderMarkdown` fallback returns `<p>…<br>…</p>` (the comment promised it for
+   two months). `safeStorage.set` → boolean + `lastError`; `saveChatState` retries QuotaExceeded with
+   `_slimHistoryForStorage` (data: images → placeholder, newest 200) and toasts once.
+4. **Load weight.** mermaid/chart/papaparse out of `<head>` → `_ensureVendor(name)` on first use (cached
+   promise, failure does not poison, mermaid initialised on load); `renderMermaid`/`renderCSV` async with
+   `_renderSeq` superseding; marked+purify `defer`. Server: `GZipMiddleware(minimum_size=1024)` (Starlette
+   1.0 excludes text/event-stream — pinned un-gzipped, not trusted); `VersionedStaticFiles` →
+   `Cache-Control: immutable` on `?v=` assets, `must-revalidate` otherwise. Content-hash `?v=` injection
+   NOT done: the manual bumps + cachebust manifest stay.
+
+**Verification.** `tests/test_interface_batch2_2026_09_11.py`: 35 tests (recovery path executed under node
+in 4 worlds; identity/history/quota with a Map-backed Web Storage shim; loader with a fake `<script>`
+lifecycle; TestClient for gzip / Cache-Control / 304 / un-gzipped SSE). Interface suite 725 passed / 1
+skipped. Mutation batch: 16 mutants, 14/16 on the first pass — the two survivors were a text pin
+(`Core.persistSessionId(id)` still present inside an `if (false)`) and a loader-cache test whose sequential
+double call the `window.*` early return satisfied without the cache. Both replaced with EXECUTED tests
+(setCurrent under node with a recording Core; two CONCURRENT `_ensureVendor` calls → one injection); 16/16 on
+re-run, files restored byte-identical. Cache-bust: app/matrix_graph 11.7, workspace 8.1, sessions 7.8.
+
+**Pins that moved (R8):** 13 — the console-review reconcile tests now extract the helpers from app.js
+(with a `Core.reconcileWithLocal` stub for `resyncCurrent`/`load`); `test_adoption_only_happens_when_the_
+server_has_MORE` was PINNING THE DEFECT and is rewritten as `…RECONCILES_instead_of_comparing_raw_lengths`;
+the workspace test's `safeStorage.get('ghost_session_id')` window → `storedSessionId()`; the visualizer's
+`window.Papa`/`window.Chart` guard → `_ensureVendor(...)`; my own bump pin. Harness defect: the recovery
+function reads `currentAgentMessageDiv`/`stopTurnTicker` on its way out — first harness lacked both
+(ReferenceError, not a verdict).
+
+## §4GC — Web client batch 3: service worker, face pause, TLS watch (2026-09-11, evening)
+
+**Ask:** "proceed" (the next candidates named at the end of §4GB).
+
+**Shipped.**
+1. **Service worker rewritten** (`interface/static/sw.js`, rendered by `GET /sw.js`). Server fills a
+   build stamp (`_sw_build_stamp`: precache list + each shipped file's size+mtime, so an unbumped edit
+   still retires the cache) and the precache list (`_sw_precache_list`: "/", every `?v=` asset the
+   document + import chain reference, sanitizer vendors, icons; mermaid deliberately NOT). Fetch: "/"
+   network-first (200s cached under the bare path; fallback cached copy → offline page), `/static/*`
+   cache-first, nothing else intercepted. **No skipWaiting on install**: app.js watches `updatefound`,
+   offers "new version — Reload" (system bubble), posts `SKIP_WAITING`, reloads on `controllerchange`
+   after the running turn. `pushsubscriptionchange` re-subscribes (old key, else `/api/push/vapid` via
+   the page cookie) and posts `push-resubscribed` → page runs `ensurePushSubscription()` (the page holds
+   the API key; the worker never does). `notificationclick` → `pickClient` (focused > visible > first),
+   focus + `push-click` → app.js resume/reconcile + sessions.js resync/refresh. Offline/online → chip.
+   Threat note: the cached "/" carries the injected key — same secret as the cookie and the installed
+   start_url; no new audience.
+2. **`/api/push/vapid` accepts the page cookie** (`verify_interface_key_or_page_cookie`, the ONE
+   read-only route; decorator grep pins it stays one). `webpush_notify.broadcast` prunes 401/403 only
+   when another endpoint in the same broadcast succeeded — all-rejected = OUR config, don't wipe the store.
+3. **Face pauses while hidden** — `matrix_graph.setAnimationPaused` + guard in `animate()` +
+   `visibilitychange`.
+4. **TLS watch** — `_tls_cert_path` (argv `--ssl-certfile`, env), `tls_cert_status` (cryptography, never
+   raises, `warn` < 14 d), `_tls_expiry_watch` daily log, `GET /api/interface/health`; status.js polls it
+   and `tlsWarning()` turns the chip amber with the renewal command. Current cert: **expires 2026-10-09**
+   — renewal still manual (`tailscale cert eva.taila2b1d.ts.net` + daemon restart).
+
+**Verification.** `tests/test_interface_batch3_2026_09_11.py`: 42 tests (+1 live-cert skip outside the
+launcher process) — the worker evaluated AS SERVED under node with a recording SW-global stub; routes via
+TestClient; generated certs for the TLS helper. Interface suite 766 passed / 2 skipped. Mutation batch 18:
+17/18 first pass; the survivor (cache a 401 page as the shell) was a test that never checked the cache
+after the 401 — fixed, killed on re-run, files restored byte-identical. Pins moved: lifespan task count
+3→4; chip harness `calls` now includes `/api/interface/health`; bump pins. Harness defects: `new
+Request('/')` is invalid outside a browser (worker now resolves via `_abs()` — a portability fix, not a
+test hack); the event stub recorded `respondWith` on the wrong object.
+
+## §4GD — The face's signal layer: "make the faces more interesting" (2026-09-11, night)
+
+**Ask:** "any ideas to make the faces more interesting?" → 14 ideas → "implement them all, verify your
+changes". Design rule kept from 07-28: temperature is the ONE thing the eye tracks; what is added is gait
+and event, never a second colour axis.
+
+**Shipped (`matrix_graph.js` signal layer + `app.js` feed + `status.js` + `routes.py`):**
+phase gaits (`setPhase`, five smoothed weights → radial factor, write z-wave, shader azimuth sweep
+`uSweep`/`uSweepAngle`, stillness slows `time` + pulse clock); tool kick + habits (`noteToolCall`);
+recall comet (`noteRecall`: extra line segment periphery→node + bell flare, 1.5s rate limit in app.js);
+verdict release (`noteVerdict`: pass crystallises/holds, refute shudders+flinch, stop exhales the scale);
+background breath (`setBackgroundBusy` ← status.js `/api/turns`, `backgroundBusyFrom(turns, mySid)`);
+mood baseline (`setMoodHue` ← `health.mood.label`, `moodHueFor` bounded ±0.07 = cold pole only; agent
+`/api/health` gained `mood` — agent restart needed); composer gaze (look target, fades with dive); mic
+AnalyserNode → `setAudioLevel` (never routed to speakers); error kinds (`errorKindFor` → network flicker /
+timeout fade / refusal freeze); idle twitch (one neighbourhood shivers every 6–14s at rest); two data forms
+`conversation` (helix, user r=1.15 outer / assistant 0.75, size by length, newest hot, explicit edges,
+future thread) and `toolgraph` (ring + hub, size by count, lit by recency, hub spokes + call-order edges),
+both `LINK_MULT 0` + explicit-edge pass + `_relayoutDataForm`; hover labels (`describeNodeAt` manual
+projection → `#face-tooltip`, `faceHoverAllowed` suppresses chrome); auto form (`setAutoForm`/
+`autoFormFor`, 20s debounce, never persists as the pick, base form remembered). Roster is now 12; `empty`
+stays last. Docs: `docs/interfaces.html` face section rewritten; `web_server.html` dated section.
+
+**Defects found in my own work (R8):** `LINK_MULT[FORM] || 1.0` would have turned the data forms' deliberate
+0 back into 1 (a hairball) — caught while writing, pinned; `new`-form builders needed the forms_ai node
+harness to declare `explicitEdges/nodeLabels/conversation/toolUsage/toolSeq` and feed sample data; the
+status feed read `Core` that the chip harness never passes → guarded on `_ctx.Core`; the auto-form test
+stubbed `setForm` so the persistence-guard mutant SURVIVED — rewritten to run the REAL `setForm`.
+Pins moved: roster list (+2), immersion look-at regex (gaze target), two "no /api/turns in status.js"
+pins narrowed to "no listing/cancel" with the face fetch allowed, chip `calls` unchanged, bump pins,
+`saveChatState` harnesses gained an `activeFace` stub.
+
+**Verification:** `tests/test_interface_face_signals_2026_09_11.py` (36) + forms_ai harness runs the 12
+builders for both device classes; mutation batch 18 → 17/18 first pass, survivor (auto switch persisting as
+the pick) killed after the harness ran the real `setForm`; interface suite + full suite reported below.
+Live check pending the operator's eyes: this is aesthetics — the numbers (radial ±4%, z-wave 0.10,
+exhale 3.5%, twitch 0.08) are first guesses tuned in code, not on screen.
+
+## §4GE — The face lab and the gait dialects (2026-09-11, later night)
+
+**Ask:** "build the tuning lab first, then the dialects" (from the "anything else for the faces?" list).
+
+**Face lab** (`interface/static/facelab.js`, lazy from the palette's "Face lab" / Alt+Shift+F via
+workspace.js): form select; a button per event (tool kick, recall comet, pass/refute/stop, idle twitch,
+network/refusal/timeout/generic errors); the six gaits; toggles (background busy, gaze, auto form); mood
+select; audio slider (fed at 25 Hz while held — the face low-passes + decays); one slider per `TUNE` key
+(0…4× default, decays < 1, changed rows highlighted); `getDebugState()` readout at 8 Hz; Copy JSON / Reset.
+`labActions()` is a TABLE so the test proves every button names a real export.
+
+**TUNE** (matrix_graph.js): `TUNE_DEFAULTS` (26 keys) ↔ every `TUNE.x` use in the loop — the test asserts
+set equality both ways. `setTune` validates/clamps/persists DIFFS to `ghost_face_tune`; `resetTune`;
+`loadTuneOverrides` at boot ignores junk. `uSweepHeat` became a uniform so the sweep warmth is live.
+
+**Dialects**: `DIALECTS[form]` × `DIALECT_VALUES` (radialAxis all/xz/y/none, search sweep/plane/ring, read
+contract/thicken/settle, tool kick/flash/ripple, write wave/flow/pulse, verify still/align); per-frame
+`gaitFlow/gaitThicken/gaitFlash/gaitAlign` derived from the current form's dialect and read in every branch
+(vortex swallow ×flow / thicken; horizon core flash; lattice runners sprint, kernel flash, align snaps the
+grid; stack packets faster + hop per tool; embedding comet + descent bead hurry; cube churn/flash/tame;
+cortex lobes flash; data forms pulse). Generic pass honours radialAxis; shader has 3 scan modes.
+
+**Verification**: `tests/test_interface_face_lab_and_dialects_2026_09_11.py` (30) — TUNE set-equality,
+setTune/reset/overrides executed, DIALECTS coverage + value validity + distinctness executed, per-branch hook
+pins, lab actions ↔ exports cross-check, panel built + buttons fired under a DOM shim, stale-face refusal,
+palette/shortcut wiring. Interface suite 771 passed / 2 skipped. Mutation batch 13: 12/13 first pass — the
+survivor (setTune without its key guard) passed because `TUNE['nope'] = NaN` serialises as null and the test
+read `d is None`; strengthened to assert the table's KEY SET is unchanged, killed on re-run, restored
+byte-identical. Full suite 21,275 passed / 66 skipped. Pins moved:
+5 face-signals literals → TUNE forms; cube churn pin; bump pins; cachebust `_CARRIER` gained facelab.js.
+
+### §4GE live check (2026-09-11, later) — the browser found what node could not
+
+"verify your changes" → headless Chromium (SwiftShader WebGL, `--ignore-certificate-errors`) against the
+LIVE daemon at :8080, real JS, no chat turn sent: `scratchpad/verify/live_check.py` (session scratchpad),
+21 checks, 0 page errors, 0 console errors. Confirmed live: 12 forms, WebGL init (cameraZ 5), 26 tunables,
+dialect per form, service worker `activated` with a `ghost-shell-<stamp>` cache, static `immutable`,
+`/api/interface/health.tls` (28.08 days), lab opens on Alt+Shift+F with 26 sliders + 19 buttons, recall
+comet / refute / search gait / background breath all move the debug state, a slider writes `TUNE` and
+persists `ghost_face_tune`, conversation form labels a node ("You: What is the weather…"), tool graph labels
+the hub, auto form → lattice and back, lattice `align` dialect live, menu has auto + both data forms, the
+pill / tooltip / push row exist.
+
+**Two defects only the screenshots showed** (fixed, versions 12.1 / 8.5 / 1.1 / 6.3): the lab's form select
+did not follow a form change made elsewhere (now tracks `getForm()` in `refresh()`); the data forms rendered
+nearly invisible — `formDim 0.55` is a background blend tuned for hundreds of additive quads, and a
+3-message strand has three. Data forms now run at 0.95 with larger beads (1.3+ / hub 2.0). Still on the
+faint side under SwiftShader; the operator's lab pass decides. Agent `/api/health` has no `mood` yet — the
+AGENT daemon was not restarted (expected; the face stays neutral until it is).

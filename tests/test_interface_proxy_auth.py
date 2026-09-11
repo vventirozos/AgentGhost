@@ -52,7 +52,11 @@ async def test_chat_proxy_adds_auth_header_streaming(mock_client_class):
     mock_client.stream.assert_called_once()
     args, kwargs = mock_client.stream.call_args
     assert "headers" in kwargs
-    assert kwargs["headers"] == {"X-Ghost-Key": server.GHOST_API_KEY}
+    assert kwargs["headers"]["X-Ghost-Key"] == server.GHOST_API_KEY
+    # 2026-09-11: the proxy also mints the agent's request id and sends it
+    # up front (contract: tests/test_interface_fix_first_2026_09_11.py);
+    # nothing else may ride along.
+    assert set(kwargs["headers"]) == {"X-Ghost-Key", "X-Request-ID"}
 
 @pytest.mark.asyncio
 async def test_chat_proxy_adds_auth_header_non_streaming():

@@ -358,6 +358,7 @@ def broadcast(title: str, body: str, *, url: str = "/", tag: str = "") -> int:
         "title": title[:120], "body": body[:400], "url": url, "tag": tag})
     sent = 0
     dead: List[str] = []
+    auth_dead: List[str] = []
     for endpoint, sub in subs.items():
         # The egress is the sink, so the allowlist is enforced HERE too, not
         # only at `add_subscription`. The subscriptions file predates the
@@ -389,6 +390,14 @@ def broadcast(title: str, body: str, *, url: str = "/", tag: str = "") -> int:
             status = getattr(getattr(e, "response", None), "status_code", None)
             if status in (404, 410):
                 dead.append(endpoint)  # unsubscribed/expired — prune
+            elif status in (401, 403):
+                # A VAPID mismatch: EITHER this endpoint is bound to a key we
+                # no longer hold (a rotated subscription — prune) OR our own
+                # VAPID config is broken (every endpoint fails — pruning
+                # would wipe the store). Decided after the loop: prune only
+                # if another endpoint in this same broadcast accepted our key.
+                auth_dead.append(endpoint)
+                logger.warning(f"webpush: send rejected ({status}) for one endpoint: {e}")
             else:
                 logger.warning(f"webpush: send failed ({status}): {e}")
         except Exception as e:
@@ -396,6 +405,8 @@ def broadcast(title: str, body: str, *, url: str = "/", tag: str = "") -> int:
     if sent == 0 and subs:
         logger.warning("webpush: broadcast reached 0 of %d subscription(s) — "
                        "push is not working", len(subs))
+    if auth_dead and sent > 0:
+        dead.extend(auth_dead)
     if dead:
         with _lock:
             try:

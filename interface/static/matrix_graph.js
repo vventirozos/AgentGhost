@@ -236,8 +236,18 @@ const CALM = PREFERS_REDUCED_MOTION ? 0.35 : 1.0;
 //               mutation as it evolves, and on completion it tames,
 //               the cube re-knits, and the camera pulls back out.
 // The header's form button cycles these; the choice persists.
+//   conversation — THIS session as a strand (2026-09-11): one node per
+//               message climbing a slow helix, user turns on the outer
+//               rail (cold), replies inside (warmer), the newest reply
+//               hot; explicit edges thread reply→question. Fed by
+//               setConversation from app.js; hover a node to read it.
+//   toolgraph — the agent's habits (2026-09-11): tools used this session
+//               on a ring around a hub, sized by use count, lit while
+//               recent; explicit edges trace the order they were called.
+//               Fed by noteToolCall.
 const FORMS = ['abyssal', 'horizon', 'cortex', 'vortex',
-    'lattice', 'stack', 'embedding', 'descent', 'cube', 'empty'];
+    'lattice', 'stack', 'embedding', 'descent', 'cube',
+    'conversation', 'toolgraph', 'empty'];
 // Default form: VORTEX (operator pick, 2026-07-28 — superseded horizon
 // after the black-hole iteration). The form the operator last picked
 // overrides it — resolved by `resolveInitialForm` below.
@@ -307,6 +317,176 @@ const MOTE_COUNT = IS_MOBILE ? 150 : 400;
 // when the TTS engine is active; multiplies node jitter subtly so the
 // sphere "breathes with the voice."
 let audioLevel = 0.0;
+
+// ── Signal layer (2026-09-11) ──────────────────────────────────────
+// The face used to read four scalars (working, your-turn, error, the
+// activity envelope). These give it more to SAY without a second colour
+// axis — temperature stays the one thing the eye must track; what is
+// added is gait and event.
+//   phase gaits   — the turn ticker's step class → a motion grammar:
+//                   search sweeps outward, read draws inward and slows,
+//                   tool is a discrete kick, verify tightens toward
+//                   stillness, write is a laminar wave toward the viewer.
+//   recall spark  — a comet from the periphery igniting one node.
+//   verdict       — pass crystallises and holds, refute shudders, stop
+//                   exhales.
+//   background    — a second, slower breath at the edge while a dream /
+//                   self-play turn holds the lock.
+//   mood          — a slow baseline shift of the cold pole (hours).
+//   gaze          — the body leans toward the composer while you type.
+//   error kind    — network flickers, refusal freezes, timeout fades.
+export const PHASES = ['search', 'read', 'tool', 'verify', 'write'];
+let phase = null;
+const gait = { search: 0, read: 0, tool: 0, verify: 0, write: 0 };
+let toolPulse = 0.0;
+let sweepAngle = 0.0;
+let recallSpark = 0.0;
+let recallNode = -1;
+let recallDir = [0, 1, 0];
+let verdict = null;          // 'pass' | 'refute' | 'stop' | null
+let verdictEnv = 0.0;
+let backgroundBusy = 0.0, targetBackgroundBusy = 0.0;
+let moodHue = 0.0, targetMoodHue = 0.0;
+let gazeX = 0.0, gazeY = 0.0, targetGazeX = 0.0, targetGazeY = 0.0;
+let errorKind = null, errorKindEnv = 0.0;
+let idleTwitch = 0.0, idleTwitchNode = -1, idleTwitchAt = 0.0;
+// Auto form: the body plan follows the task (set from the ticker's
+// tool icons). The USER's picked form is remembered so leaving auto,
+// or a task with no hint, returns to it.
+let autoForm = false;
+let taskHint = null;
+let baseFormName = null;
+let _lastAutoSwitchAt = -1e9;
+// Conversation + tool-graph data (the two new forms' anatomy).
+const conversation = [];     // {role, preview, len, hidx}
+const toolUsage = new Map(); // name -> {count, lastAt, first}
+const toolSeq = [];          // ordered names as called
+let dataDirty = false;
+// Explicit edges (pairs of node indices) that the line builder draws in
+// addition to proximity links — the two data forms need edges that
+// mean something, not distances.
+const explicitEdges = [];
+const nodeLabels = [];       // per-node hover label (data forms)
+
+// ── Tunables (2026-09-11, the face lab) ────────────────────────────
+// Every amplitude the signal layer uses, in one table, so the lab can
+// drag them live and the operator can copy the result back into code.
+// Values are the first guesses tuned in code; overrides persist in
+// localStorage (ghost_face_tune) until baked in here.
+export const TUNE_DEFAULTS = Object.freeze({
+    radialSearch: 0.04,    // search gait: radial expansion
+    radialRead: 0.035,     // read gait: radial contraction
+    radialVerify: 0.03,    // verify gait: contraction toward stillness
+    toolKick: 0.06,        // tool call: radial kick amplitude
+    writeWave: 0.10,       // write gait: z-wave amplitude toward the viewer
+    flowWrite: 1.2,        // write gait, 'flow' dialect: extra flow speed
+    thickenLinks: 0.35,    // read gait, 'thicken' dialect: link radius growth
+    sweepHeat: 0.22,       // search gait: palette warmth of the sweep
+    sweepSpeed: 1.4,       // search gait: sweep rate (rad/s or units/s)
+    stillPass: 0.85,       // verdict pass: stillness
+    stillVerify: 0.5,      // verify gait: stillness
+    stillRead: 0.3,        // read gait: stillness
+    passDim: 0.18,         // verdict pass: luminance hold
+    passHold: 0.992,       // verdict pass: envelope decay per frame (~2s)
+    shudder: 0.035,        // verdict refute: displacement amplitude
+    exhale: 0.035,         // verdict stop: scene-scale swell
+    bgBreath: 0.012,       // background busy: scene breath
+    bgEdge: 0.05,          // background busy: outer-node radial breath
+    recallReach: 2.6,      // recall comet: streak length
+    recallFlare: 2.0,      // recall comet: node size flare (peak ×(1+flare))
+    gazeY: 0.22,           // composer gaze: look-target drop
+    netFlicker: 0.6,       // network error: flicker depth
+    timeoutFade: 0.45,     // timeout error: fade depth
+    twitch: 0.08,          // idle twitch: displacement amplitude
+    flashGain: 2.0,        // tool 'flash' dialect: core/kernel flare gain
+    alignGain: 0.7,        // verify 'align' dialect: jitter/churn suppression
+});
+export const TUNE = { ...TUNE_DEFAULTS };
+export function getTune() { return { ...TUNE }; }
+export function setTune(key, value) {
+    if (!Object.prototype.hasOwnProperty.call(TUNE_DEFAULTS, key)) return null;
+    const v = Number(value);
+    if (!Number.isFinite(v)) return TUNE[key];
+    // Non-negative, and capped at 4× the default (a decay-per-frame value
+    // is additionally capped below 1 or the envelope never ends).
+    let max = TUNE_DEFAULTS[key] * 4;
+    if (key === 'passHold') max = 0.999;
+    TUNE[key] = Math.max(0, Math.min(max, v));
+    _persistTune();
+    return TUNE[key];
+}
+export function resetTune() {
+    Object.assign(TUNE, TUNE_DEFAULTS);
+    try { localStorage.removeItem('ghost_face_tune'); } catch (e) { /* private mode */ }
+    return getTune();
+}
+function _persistTune() {
+    const diff = {};
+    for (const k of Object.keys(TUNE_DEFAULTS)) if (TUNE[k] !== TUNE_DEFAULTS[k]) diff[k] = TUNE[k];
+    try {
+        if (Object.keys(diff).length) localStorage.setItem('ghost_face_tune', JSON.stringify(diff));
+        else localStorage.removeItem('ghost_face_tune');
+    } catch (e) { /* private mode */ }
+}
+// Overrides from a previous lab session. Unknown keys and non-numbers are
+// ignored — the table is the only authority.
+export function loadTuneOverrides(raw) {
+    let obj = null;
+    try { obj = raw ? JSON.parse(raw) : null; } catch (e) { obj = null; }
+    if (!obj || typeof obj !== 'object') return 0;
+    let n = 0;
+    for (const [k, v] of Object.entries(obj)) {
+        if (Object.prototype.hasOwnProperty.call(TUNE_DEFAULTS, k) && Number.isFinite(Number(v))) {
+            TUNE[k] = Math.max(0, Math.min(k === 'passHold' ? 0.999 : TUNE_DEFAULTS[k] * 4, Number(v)));
+            n++;
+        }
+    }
+    return n;
+}
+try {
+    if (typeof localStorage !== 'undefined') loadTuneOverrides(localStorage.getItem('ghost_face_tune'));
+} catch (e) { /* private mode */ }
+
+// ── Dialects (2026-09-11) ──────────────────────────────────────────
+// The gaits are one vocabulary; each anatomy speaks it in its own
+// grammar. Fields:
+//   radialAxis  which components the radial factor touches:
+//               all | xz (rings breathe, height fixed) | y (a sheet
+//               heaves) | none (crystals and data forms do not breathe)
+//   search      sweep (azimuth scan) | plane (a plane scanning along y)
+//               | ring (an expanding ring from the centre)
+//   read        contract | thicken (flow slows, links thicken) | settle
+//   tool        kick | flash (core/kernel flare) | ripple (packets hop)
+//   write       wave (z-wave toward the viewer) | flow (the form's own
+//               flow accelerates) | pulse (the newest node pulses)
+//   verify      still | align (jitter and churn suppressed → the grid
+//               snaps true)
+export const DIALECT_VALUES = Object.freeze({
+    radialAxis: ['all', 'xz', 'y', 'none'],
+    search: ['sweep', 'plane', 'ring'],
+    read: ['contract', 'thicken', 'settle'],
+    tool: ['kick', 'flash', 'ripple'],
+    write: ['wave', 'flow', 'pulse'],
+    verify: ['still', 'align'],
+});
+export const DIALECTS = Object.freeze({
+    abyssal:      { radialAxis: 'all',  search: 'sweep', read: 'contract', tool: 'kick',   write: 'wave', verify: 'still' },
+    horizon:      { radialAxis: 'all',  search: 'ring',  read: 'contract', tool: 'flash',  write: 'flow', verify: 'still' },
+    cortex:       { radialAxis: 'all',  search: 'sweep', read: 'contract', tool: 'flash',  write: 'wave', verify: 'still' },
+    vortex:       { radialAxis: 'none', search: 'ring',  read: 'thicken',  tool: 'kick',   write: 'flow', verify: 'still' },
+    lattice:      { radialAxis: 'none', search: 'plane', read: 'settle',   tool: 'flash',  write: 'flow', verify: 'align' },
+    stack:        { radialAxis: 'xz',   search: 'plane', read: 'contract', tool: 'ripple', write: 'flow', verify: 'still' },
+    embedding:    { radialAxis: 'all',  search: 'ring',  read: 'contract', tool: 'kick',   write: 'flow', verify: 'still' },
+    descent:      { radialAxis: 'y',    search: 'plane', read: 'settle',   tool: 'kick',   write: 'flow', verify: 'still' },
+    cube:         { radialAxis: 'none', search: 'plane', read: 'settle',   tool: 'flash',  write: 'flow', verify: 'align' },
+    conversation: { radialAxis: 'none', search: 'ring',  read: 'settle',   tool: 'kick',   write: 'pulse', verify: 'still' },
+    toolgraph:    { radialAxis: 'none', search: 'sweep', read: 'settle',   tool: 'kick',   write: 'pulse', verify: 'still' },
+    empty:        { radialAxis: 'none', search: 'sweep', read: 'settle',   tool: 'kick',   write: 'wave', verify: 'still' },
+});
+const _DIALECT_DEFAULT = DIALECTS.abyssal;
+export function dialectFor(form) { return DIALECTS[form] || _DIALECT_DEFAULT; }
+// Per-frame derived gait scalars the form branches read (set in animate).
+let gaitFlow = 0, gaitThicken = 0, gaitFlash = 0, gaitAlign = 0;
 
 // --- Activity envelope (2026-07-12) -------------------------------
 // The face is ALIVE, not reactive-per-event: log lines feed small
@@ -409,6 +589,10 @@ float hueWave(vec3 p) {
 const nodeVertexShader = `
 attribute float aSeed;
 uniform float uTime;
+uniform float uSweep;
+uniform float uSweepAngle;
+uniform float uSweepMode;
+uniform float uSweepHeat;
 uniform float uCenterDim;
 uniform float uCenterXY;
 uniform float uFormDim;
@@ -464,7 +648,20 @@ void main() {
     // uHueDrift slides the whole field between the poles, and hueWave
     // sends slow currents of warmth/cold traveling through the cloud —
     // the blue↔red mutation the theme is built around.
-    vec3 jewel = palette(aSeed + uHueDrift + hueWave(instancePos));
+    // Search gait (2026-09-11): a rotating azimuth window warms the
+    // nodes it crosses — a scan sweeping the body, no CPU seed writes.
+    // Dialects: 0 = azimuth sweep, 1 = a plane scanning along y,
+    // 2 = a ring expanding from the centre (uSweepAngle is the scan
+    // position in every mode; the CPU advances it).
+    float az = atan(instancePos.z, instancePos.x);
+    float dAz = abs(mod(az - uSweepAngle + 3.14159, 6.28318) - 3.14159);
+    float scan = fract(uSweepAngle / 6.28318);
+    float dPlane = abs(instancePos.y - (scan * 4.0 - 2.0));
+    float dRing = abs(length(instancePos) - scan * 2.4);
+    float sweepD = uSweepMode < 0.5 ? dAz : (uSweepMode < 1.5 ? dPlane : dRing);
+    float sweepW = uSweepMode < 0.5 ? 0.9 : 0.45;
+    float sweepHeat = uSweep * uSweepHeat * smoothstep(sweepW, 0.0, sweepD);
+    vec3 jewel = palette(aSeed + uHueDrift + hueWave(instancePos) + sweepHeat);
 
     // Life: each node breathes between a dim floor and its full hue.
     // The breath itself travels as a slow luminance wave (uTime term)
@@ -681,8 +878,143 @@ function _buildAnatomy() {
     else if (f === 'embedding') _buildEmbedding();
     else if (f === 'descent') _buildDescent();
     else if (f === 'cube') _buildCube();
+    else if (f === 'conversation') _buildConversation();
+    else if (f === 'toolgraph') _buildToolGraph();
     else if (f === 'empty') _buildEmpty();
     else _buildAbyssal();
+    // Data forms fill these; every other form leaves them empty.
+    if (f !== 'conversation' && f !== 'toolgraph') {
+        explicitEdges.length = 0;
+        nodeLabels.length = 0;
+    }
+}
+
+// Deterministic per-index jitter so a data form re-laid out on every
+// message does not scramble the nodes already on screen.
+function _hash01(i, k) {
+    const x = Math.sin(i * 12.9898 + k * 78.233) * 43758.5453;
+    return x - Math.floor(x);
+}
+
+// Layout of the conversation strand: message i of n → {x,y,z,r}. A slow
+// helix climbing toward the viewer's eye line; user turns ride the outer
+// rail, replies the inner one, so a question and its answer sit as a
+// pair. Pure; executed under node.
+export function conversationLayout(i, n, role) {
+    const t = n > 1 ? i / (n - 1) : 0.5;
+    const theta = i * 0.62 + 0.4;
+    const r = role === 'user' ? 1.15 : 0.75;
+    return {
+        x: r * Math.cos(theta),
+        y: -1.5 + 3.0 * t,
+        z: r * Math.sin(theta),
+        r,
+    };
+}
+
+// Form K — CONVERSATION: this session as a strand. Node i is message i;
+// the far sphere parks whatever nodes the transcript does not need.
+function _buildConversation() {
+    explicitEdges.length = 0;
+    nodeLabels.length = 0;
+    const msgs = conversation.slice(-Math.max(1, NODE_COUNT - 8));
+    const n = msgs.length;
+    let k = 0;
+    for (let i = 0; i < n; i++, k++) {
+        const m = msgs[i];
+        const L = conversationLayout(i, n, m.role);
+        const isLast = i === n - 1;
+        basePositions.push({
+            kind: 0, mi: i, role: m.role, isLast,
+            hx: L.x, hy: L.y, hz: L.z,
+            jit: _hash01(i, 1) * Math.PI * 2,
+            // Size follows length: a one-liner is a bead, an essay a lantern.
+            // Baseline raised 0.7 → 1.3: few nodes, so each must carry.
+            sz: 1.3 + Math.min(1.2, Math.log10(1 + (m.len || 0)) * 0.45),
+        });
+        nodeSeeds[k] = m.role === 'user' ? 0.06 + _hash01(i, 2) * 0.03
+            : (isLast ? 0.56 : 0.26 + _hash01(i, 3) * 0.04);
+        nodeLabels[k] = (m.role === 'user' ? 'You: ' : 'Ghost: ') + (m.preview || '');
+        if (i > 0) explicitEdges.push([k - 1, k]);
+    }
+    if (n === 0) {
+        // An empty session: one seed at the origin, waiting.
+        basePositions.push({ kind: 0, mi: 0, role: 'assistant', isLast: true,
+            hx: 0, hy: 0, hz: 0, jit: 0, sz: 1.0 });
+        nodeSeeds[k] = 0.30;
+        nodeLabels[k] = 'A new conversation';
+        k++;
+    }
+    // A faint "future" thread: a few dim beads continuing the helix past
+    // the newest message — where the next turn will land.
+    const FUT = Math.min(6, NODE_COUNT - k);
+    for (let f = 0; f < FUT; f++, k++) {
+        const L = conversationLayout(n + f, Math.max(n + FUT, 2), f % 2 ? 'user' : 'assistant');
+        basePositions.push({ kind: 1, hx: L.x, hy: L.y, hz: L.z, jit: f, sz: 0.7 - f * 0.08 });
+        nodeSeeds[k] = 0.06;
+        if (k > 0) explicitEdges.push([k - 1, k]);
+    }
+    while (k < NODE_COUNT) {
+        const cosP = 2 * ((k + 0.5) / NODE_COUNT) - 1;
+        const sinP = Math.sqrt(Math.max(0, 1 - cosP * cosP));
+        const phi = k * 2.399963;
+        basePositions.push({ kind: 8, hx: 12.0 * sinP * Math.cos(phi), hy: 12.0 * cosP,
+            hz: 12.0 * sinP * Math.sin(phi) });
+        nodeSeeds[k] = 0.3;
+        k++;
+    }
+}
+
+// Tool-graph layout: tool j of m on a ring, the hub at the origin. Pure;
+// executed under node.
+export function toolGraphLayout(j, m) {
+    const theta = (j / Math.max(m, 1)) * Math.PI * 2 - Math.PI / 2;
+    return { x: 1.45 * Math.cos(theta), y: 0.25 * Math.sin(theta * 2), z: 1.45 * Math.sin(theta) };
+}
+
+// Form L — TOOL GRAPH: the agent's habits this session.
+function _buildToolGraph() {
+    explicitEdges.length = 0;
+    nodeLabels.length = 0;
+    const names = [...toolUsage.keys()].sort((a, b) => toolUsage.get(a).first - toolUsage.get(b).first)
+        .slice(0, Math.max(1, Math.min(24, NODE_COUNT - 40)));
+    let k = 0;
+    // The hub — Ghost itself.
+    basePositions.push({ kind: 2, hx: 0, hy: 0, hz: 0, jit: 0, sz: 2.0 });
+    nodeSeeds[k] = 0.50;
+    nodeLabels[k] = names.length ? `Ghost · ${toolSeq.length} tool call(s) this session` : 'Ghost · no tools used yet';
+    const hub = k++;
+    const idx = new Map();
+    for (let j = 0; j < names.length; j++, k++) {
+        const u = toolUsage.get(names[j]);
+        const L = toolGraphLayout(j, names.length);
+        basePositions.push({ kind: 0, name: names[j], hx: L.x, hy: L.y, hz: L.z,
+            jit: _hash01(j, 5) * Math.PI * 2,
+            sz: 1.4 + Math.min(1.2, Math.log2(1 + u.count) * 0.35) });
+        nodeSeeds[k] = 0.10;                       // reheated per frame by recency
+        nodeLabels[k] = `${names[j]} · ${u.count}×`;
+        idx.set(names[j], k);
+        explicitEdges.push([hub, k]);
+    }
+    // Order edges: consecutive calls, deduplicated.
+    const seen = new Set();
+    for (let s = 1; s < toolSeq.length; s++) {
+        const a = idx.get(toolSeq[s - 1]), b = idx.get(toolSeq[s]);
+        if (a === undefined || b === undefined || a === b) continue;
+        const key = a < b ? `${a}-${b}` : `${b}-${a}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        explicitEdges.push([a, b]);
+    }
+    while (k < NODE_COUNT) {
+        const cosP = 2 * ((k + 0.5) / NODE_COUNT) - 1;
+        const sinP = Math.sqrt(Math.max(0, 1 - cosP * cosP));
+        const phi = k * 2.399963;
+        basePositions.push({ kind: 8, hx: 12.0 * sinP * Math.cos(phi), hy: 12.0 * cosP,
+            hz: 12.0 * sinP * Math.sin(phi) });
+        nodeSeeds[k] = 0.3;
+        k++;
+    }
 }
 
 // Form E — EMPTY: no face at all. Nodes park on a sparse far sphere
@@ -1381,8 +1713,10 @@ export function getForm() { return FORMS[formIndex]; }
 // blends to reach the one you wanted).
 export function getForms() { return FORMS.slice(); }
 
+let _autoSwitching = false;
 export function setForm(name) {
     const i = FORMS.indexOf(name);
+    if (!_autoSwitching) baseFormName = i >= 0 ? name : baseFormName;
     if (i < 0 || i === formIndex) return FORMS[formIndex];
     // Snapshot current positions so the switch reads as the creature
     // REORGANIZING itself rather than a hard cut.
@@ -1394,8 +1728,198 @@ export function setForm(name) {
     _buildAnatomy();
     if (instancedMesh) instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
     formBlend = 0.0;
-    try { localStorage.setItem('ghost_face_form', FORMS[formIndex]); } catch (e) {}
+    if (!_autoSwitching) {
+        try { localStorage.setItem('ghost_face_form', FORMS[formIndex]); } catch (e) {}
+    }
     return FORMS[formIndex];
+}
+
+// ── Signal-layer hooks (2026-09-11) ────────────────────────────────
+
+// The ticker's step class for the running turn, or null between turns.
+export function setPhase(name) {
+    phase = PHASES.indexOf(name) >= 0 ? name : null;
+    return phase;
+}
+
+// One discrete kick per tool invocation, and the tool-graph's data.
+export function noteToolCall(name) {
+    toolPulse = Math.min(1.0, toolPulse + 0.6);
+    const n = String(name || '').trim().toLowerCase().slice(0, 40);
+    if (n) {
+        const now = Date.now();
+        const u = toolUsage.get(n);
+        if (u) { u.count++; u.lastAt = now; }
+        else toolUsage.set(n, { count: 1, lastAt: now, first: now });
+        toolSeq.push(n);
+        if (toolSeq.length > 400) toolSeq.shift();
+        dataDirty = true;
+    }
+    return toolPulse;
+}
+
+// A memory / knowledge-base hit: a comet from the periphery ignites one
+// node. Cross-form (the embedding form already had its own).
+export function noteRecall() {
+    recallSpark = 1.0;
+    recallNode = Math.floor(Math.random() * NODE_COUNT);
+    const th = Math.random() * Math.PI * 2, ph = Math.acos(2 * Math.random() - 1);
+    recallDir = [Math.sin(ph) * Math.cos(th), Math.cos(ph), Math.sin(ph) * Math.sin(th)];
+    if (FORMS[formIndex] === 'embedding' && embExcite.length) embExcite[embTo] = 1.0;
+    return recallNode;
+}
+
+// How the turn ended shapes the release: 'pass' crystallises and holds,
+// 'refute' shudders and re-weaves, anything else exhales.
+export function noteVerdict(kind) {
+    verdict = kind === 'pass' || kind === 'refute' ? kind : 'stop';
+    verdictEnv = 1.0;
+    if (verdict === 'refute') flinch = Math.min(1.0, flinch + 0.5);
+    return verdict;
+}
+
+// A dream / self-play turn holds the lock: a second, slower breath at
+// the edge — "busy with itself", visible without a spinner.
+export function setBackgroundBusy(busy) {
+    targetBackgroundBusy = busy ? 1.0 : 0.0;
+}
+
+// Mood → a slow baseline shift of the COLD pole only (never competes
+// with the hot pole). Pure mapping; executed under node.
+export function moodHueFor(label) {
+    switch (String(label || '').toLowerCase()) {
+        case 'satisfied': return -0.035;   // deeper, settled blue
+        case 'idle': return -0.06;         // toward the plum bridge — resting
+        case 'curious': return 0.03;       // indigo, leaning violet
+        case 'stuck': return 0.05;         // violet
+        case 'overloaded': return 0.07;    // violet, nearly warm
+        default: return 0.0;
+    }
+}
+export function setMoodHue(label) {
+    targetMoodHue = moodHueFor(label);
+    return targetMoodHue;
+}
+
+// The body leans toward the composer while you type (pre-turn posture).
+export function setComposerGaze(active) {
+    targetGazeY = active ? -TUNE.gazeY : 0.0;
+    targetGazeX = 0.0;
+}
+
+// Auto form: the body plan follows the task. `hint` comes from the
+// ticker's tool icons. Pure; executed under node.
+export function autoFormFor(hint, base) {
+    switch (hint) {
+        case 'coding': return 'lattice';
+        case 'research': return 'embedding';
+        case 'verify': return 'descent';
+        case 'memory': return 'embedding';
+        default: return base || 'vortex';
+    }
+}
+export function setAutoForm(on) {
+    autoForm = !!on;
+    try { localStorage.setItem('ghost_face_auto', autoForm ? '1' : '0'); } catch (e) {}
+    if (!autoForm && baseFormName && baseFormName !== FORMS[formIndex]) {
+        _autoSwitching = true;
+        try { setForm(baseFormName); } finally { _autoSwitching = false; }
+    }
+    if (autoForm) _applyAutoForm(true);
+    return autoForm;
+}
+export function getAutoForm() { return autoForm; }
+export function setTaskHint(hint) {
+    taskHint = hint || null;
+    if (autoForm) _applyAutoForm(false);
+    return taskHint;
+}
+function _applyAutoForm(force) {
+    if (!autoForm) return;
+    const now = Date.now();
+    if (!force && now - _lastAutoSwitchAt < 20000) return;   // no flicker between tools
+    const target = autoFormFor(taskHint, baseFormName || FORMS[formIndex]);
+    if (target === FORMS[formIndex]) return;
+    _lastAutoSwitchAt = now;
+    _autoSwitching = true;
+    try { setForm(target); } finally { _autoSwitching = false; }
+}
+try {
+    if (typeof localStorage !== 'undefined' && localStorage.getItem('ghost_face_auto') === '1') autoForm = true;
+} catch (e) { /* private mode */ }
+
+// The lab fires a twitch by hand; the loop fires them at rest.
+export function fireIdleTwitch() {
+    idleTwitch = 1.0;
+    idleTwitchNode = Math.floor(Math.random() * NODE_COUNT);
+    return idleTwitchNode;
+}
+
+// The conversation form's data: compact records, newest last.
+export function setConversation(messages) {
+    conversation.length = 0;
+    for (let i = 0; i < (messages || []).length; i++) {
+        const m = messages[i];
+        if (!m || (m.role !== 'user' && m.role !== 'assistant')) continue;
+        const text = typeof m.content === 'string' ? m.content
+            : Array.isArray(m.content) ? m.content.map(p => (p && p.text) || '').join(' ') : '';
+        const clean = text.replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/\s+/g, ' ').trim();
+        conversation.push({ role: m.role, len: clean.length, hidx: i,
+            preview: clean.slice(0, 90) + (clean.length > 90 ? '…' : '') });
+    }
+    dataDirty = true;
+    return conversation.length;
+}
+
+// Re-lay a data form in place when its data changed (a new message, a
+// new tool). Nodes already on screen keep their spots (deterministic
+// layout); the blend eases only what moved.
+function _relayoutDataForm() {
+    if (!dataDirty) return;
+    dataDirty = false;
+    const f = FORMS[formIndex];
+    if (f !== 'conversation' && f !== 'toolgraph') return;
+    _blendFrom.length = 0;
+    for (let k = 0; k < NODE_COUNT; k++) {
+        _blendFrom.push(currentPositions[k] ? currentPositions[k].clone() : null);
+    }
+    _buildAnatomy();
+    if (instancedMesh) instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
+    formBlend = 0.0;
+}
+
+// Hover / tap: the node nearest a normalised device coordinate
+// (-1..1) within a small radius, with its label when the form has one.
+// Manual projection of the CPU-side positions (billboarded quads have
+// no meaningful raycast geometry).
+const _pickV = typeof THREE !== 'undefined' ? new THREE.Vector3() : null;
+export function describeNodeAt(ndcX, ndcY, radius = 0.035) {
+    if (!camera || !scene || !nodeLabels.length) return null;
+    let best = -1, bestD = radius * radius;
+    for (let i = 0; i < NODE_COUNT; i++) {
+        if (!nodeLabels[i] || nodeScales[i] < 0.2) continue;
+        _pickV.copy(currentPositions[i]);
+        scene.localToWorld(_pickV);
+        _pickV.project(camera);
+        if (_pickV.z > 1) continue;
+        const dx = _pickV.x - ndcX, dy = _pickV.y - ndcY;
+        const d = dx * dx + dy * dy;
+        if (d < bestD) { bestD = d; best = i; }
+    }
+    if (best < 0) return null;
+    return { index: best, label: nodeLabels[best] };
+}
+
+// Error KIND shapes the flinch (2026-09-11): a network drop flickers
+// with gaps, a refusal freezes, a timeout fades slowly; anything else
+// is the generic recoil.
+export function errorKindFor(message, type) {
+    const m = String(message || '').toLowerCase();
+    const t = String(type || '').toLowerCase();
+    if (/refus|declin|not allowed|policy|forbidden/.test(m + ' ' + t)) return 'refusal';
+    if (/timeout|timed out|deadline/.test(m + ' ' + t)) return 'timeout';
+    if (/network|load failed|failed to fetch|disconnect|unreachable|econn|socket/.test(m + ' ' + t)) return 'network';
+    return 'generic';
 }
 
 export function cycleForm() {
@@ -1470,6 +1994,10 @@ export function init() {
             uErrorState: { value: 0.0 },
             uPulseT: { value: 0.0 },
             uAudioLevel: { value: 0.0 },
+            uSweep: { value: 0.0 },
+            uSweepAngle: { value: 0.0 },
+            uSweepMode: { value: 0.0 },
+            uSweepHeat: { value: TUNE.sweepHeat },
             uBaseColor: { value: COLORS.nodeBase },
             uErrorColor: { value: COLORS.nodeError },
             uAccentColor: { value: accentColor },
@@ -1662,7 +2190,8 @@ export function updateSphereColor(colorHex) {
 // probability, disintegrating every link. Repeat calls extend the
 // window from the latest call.
 let _spikeClearTimeout;
-export function noteError() {
+export function noteError(kind) {
+    if (kind && kind !== 'generic') { errorKind = kind; errorKindEnv = 1.0; }
     targetErrorState = 0.5;
     // Recoil: the body flinches — one sharp agitated pulse cycle — in
     // addition to the hot tint. Motion + color together read as a
@@ -1708,6 +2237,10 @@ export function getDebugState() {
         coreFlare,
         vortexTravel,
         tunnelFlow,
+        phase, gait: { ...gait }, toolPulse, recallSpark, verdict, verdictEnv,
+        backgroundBusy, moodHue, gazeY, errorKind, errorKindEnv, autoForm, taskHint,
+        conversation: conversation.length, tools: toolUsage.size,
+        dialect: dialectFor(FORMS[formIndex]), gaitFlow, gaitThicken, gaitFlash, gaitAlign,
     };
 }
 
@@ -1738,7 +2271,29 @@ export function setWorkingState(isWorking) {
 
 // --- Main animation loop -------------------------------------------
 
+// Pause the render loop while the tab is hidden (2026-09-11). The loop
+// self-scheduled forever: a backgrounded phone kept the GPU busy with
+// bloom passes nobody could see. Resume restarts it only once init() has
+// built a renderer. Returns whether the loop is RUNNING after the call.
+let _animationPaused = false;
+export function setAnimationPaused(paused) {
+    _animationPaused = !!paused;
+    if (_animationPaused) {
+        if (animationFrameId) {
+            cancelAnimationFrame(animationFrameId);
+            animationFrameId = null;
+        }
+        return false;
+    }
+    if (renderer && !animationFrameId) animate();
+    return !!animationFrameId;
+}
+if (typeof document !== 'undefined' && document.addEventListener) {
+    document.addEventListener('visibilitychange', () => setAnimationPaused(!!document.hidden));
+}
+
 function animate() {
+    if (_animationPaused) { animationFrameId = null; return; }
     animationFrameId = requestAnimationFrame(animate);
 
     const isWaking = targetWorkingState > workingState + 0.01;
@@ -1772,6 +2327,36 @@ function animate() {
     // Audio-level natural decay: even if setAudioLevel stops being
     // called (TTS queue drained), the residual level dies out fast.
     audioLevel *= 0.92;
+
+    // ── Signal-layer envelopes (2026-09-11) ─────────────────────────
+    for (const k of PHASES) gait[k] += ((phase === k ? 1 : 0) - gait[k]) * 0.04;
+    toolPulse *= 0.93;
+    if (toolPulse < 0.003) toolPulse = 0;
+    recallSpark *= 0.972;                       // ~1.5s comet
+    if (recallSpark < 0.01) { recallSpark = 0; recallNode = -1; }
+    verdictEnv *= verdict === 'pass' ? TUNE.passHold : 0.975;   // pass holds ~2s, others ~1s
+    if (verdictEnv < 0.01) { verdictEnv = 0; verdict = null; }
+    backgroundBusy += (targetBackgroundBusy - backgroundBusy) * 0.01;
+    moodHue += (targetMoodHue - moodHue) * 0.0008;     // ~1 min to settle
+    gazeX += (targetGazeX - gazeX) * 0.03;
+    gazeY += (targetGazeY - gazeY) * 0.03;
+    errorKindEnv *= 0.985;
+    if (errorKindEnv < 0.01) { errorKindEnv = 0; errorKind = null; }
+    sweepAngle += (1 / 60) * TUNE.sweepSpeed * gait.search;
+    // The current form's dialect → the scalars the branches below read.
+    const DIAL = dialectFor(FORMS[formIndex]);
+    gaitFlow = DIAL.write === 'flow' ? gait.write : 0;
+    gaitThicken = DIAL.read === 'thicken' ? gait.read : 0;
+    gaitFlash = DIAL.tool === 'flash' ? toolPulse : 0;
+    gaitAlign = DIAL.verify === 'align' ? gait.verify : 0;
+    // Stillness: a pass crystallises; a refusal freezes; verify tightens
+    // toward stillness; read slows. 0 = full motion, 1 = frozen.
+    const still = Math.min(1.0, Math.max(
+        verdict === 'pass' ? TUNE.stillPass * verdictEnv : 0,
+        errorKind === 'refusal' ? 0.9 * errorKindEnv : 0,
+        TUNE.stillVerify * gait.verify, TUNE.stillRead * gait.read));
+    const motionMul = 1.0 - still;
+    _relayoutDataForm();
 
     // Immersion follows the USER-TURN state with a slower, asymmetric
     // ease: ~5s to fully swallow (only sustained work gets there), ~10s
@@ -1815,7 +2400,8 @@ function animate() {
             + 0.45 * travelNorm * _pulseShape(_fract(pulsePhase)));
         tunnelFlow += (1 / 60) * (0.008
             + 0.014 * Math.max(workingState, activity)
-            + 0.19 * travelNorm) * flowTurb * CALM;
+            + 0.19 * travelNorm) * flowTurb * CALM
+            * (1.0 + TUNE.flowWrite * gaitFlow) * (1.0 - 0.5 * gaitThicken);
         // Swirl (final direction 2026-07-28): idle keeps its slight
         // rotation (0.125); busy ACCELERATES it moderately (+60%)
         // alongside the flow surge — falling faster AND spinning
@@ -1830,7 +2416,7 @@ function animate() {
     // Accumulate time for lines at steady pace — except inside the
     // cloud, where the data pulses rush a little faster: the interior
     // should feel BUSIER than the outside view, not emptier.
-    time += 0.005 * (1.0 + dive * 0.6);
+    time += 0.005 * (1.0 + dive * 0.6) * motionMul;
 
     // Idle breathing: ±1% scene-scale sine at ~0.1Hz. Below the
     // motion-detection threshold on both desktop and mobile; keeps the
@@ -1852,9 +2438,13 @@ function animate() {
     // The cube gets a GENTLED swell (v2): the point of its dive is
     // watching the mutation spread across the monolith, not entering a
     // cloud — full swell dissolved the silhouette into dots.
-    const sceneScale = FORM === 'vortex' ? 0.9 * breathe
+    // Verdict release: a stop EXHALES (one soft swell that lets go); the
+    // background breath is a second, slower rhythm under everything.
+    const exhale = verdict === 'stop' ? TUNE.exhale * Math.sin(Math.PI * (1.0 - verdictEnv)) * verdictEnv : 0;
+    const bgBreath = TUNE.bgBreath * backgroundBusy * Math.sin(time * 0.31 + 0.9);
+    const sceneScale = (FORM === 'vortex' ? 0.9 * breathe
         : FORM === 'cube' ? 0.9 * breathe * (1.0 + dive * 0.18)
-        : baseScale;
+        : baseScale) * (1.0 + exhale + bgBreath);
     scene.scale.set(sceneScale, sceneScale, sceneScale);
 
     // Slow continuous orbit (faster while working) plus a gentle tilt
@@ -1917,7 +2507,7 @@ function animate() {
         // the cloud it must look FORWARD through it instead — near the
         // origin, lookAt(0,0,0) turns tiny parallax offsets into wild
         // rotations (the lookAt singularity).
-        camera.lookAt(0, 0, (FORM === 'cube' ? -1.0 : -3.5) * dive);
+        camera.lookAt(gazeX, gazeY * (1.0 - dive), (FORM === 'cube' ? -1.0 : -3.5) * dive);
     }
 
     // Structure changes form slowly when idle, faster when busy. "Busy"
@@ -1939,7 +2529,7 @@ function animate() {
     // agitates both rate and amplitude — a recoil, not a flash.
     pulsePhase += (1 / 60) * (0.20 + 0.105 * currentShapeSpeed)
         * (1.0 + flinch * 1.2)
-        * (PREFERS_REDUCED_MOTION ? 0.5 : 1.0);
+        * (PREFERS_REDUCED_MOTION ? 0.5 : 1.0) * motionMul;
     flinch *= 0.97;
 
     // Major infall events: on ~1 in 5 cycle wraps, the next cycle runs
@@ -2010,13 +2600,13 @@ function animate() {
         //    shells. Collapse squeezes hardest along a slowly precessing
         //    TIDAL AXIS (directional deformation reads gravitational;
         //    the old uniform radial shrink read mechanical/boring).
-        const hAmp = pulseAmp * (1.0 + 0.55 * eventBoost);
+        const hAmp = pulseAmp * (1.0 + 0.55 * eventBoost + 0.6 * gaitFlash * TUNE.flashGain);
         const tideA = time * 0.16;
         const tideY = 0.34 * Math.sin(time * 0.05);
         const tideX = Math.cos(tideA) * (1.0 - Math.abs(tideY) * 0.5);
         const tideZ = Math.sin(tideA) * (1.0 - Math.abs(tideY) * 0.5);
         const flareEnv = Math.pow(_pulseShape(_fract(pulsePhase - 0.02)), 2.0);
-        coreFlare = 1.0 + (0.35 + 0.50 * eventBoost) * flareEnv;
+        coreFlare = 1.0 + (0.35 + 0.50 * eventBoost) * flareEnv + 0.25 * gaitFlash * TUNE.flashGain;
 
         for (let i = 0; i < NODE_COUNT; i++) {
             const bp = basePositions[i];
@@ -2161,6 +2751,7 @@ function animate() {
         const ky = 0.80 * Math.sin(time * 0.087 + 1.7);
         const kz = 0.85 * Math.cos(time * 0.067 + 0.6);
         const waveGain = 0.16 + 0.22 * drive + 0.15 * flinch;
+        const alignMul = 1.0 - TUNE.alignGain * gaitAlign;   // verify: the grid snaps true
         for (let i = 0; i < NODE_COUNT; i++) {
             const bp = basePositions[i];
             let x, y, z;
@@ -2168,17 +2759,17 @@ function animate() {
                 const w = _pulseShape(_fract(pulsePhase - bp.wp * 0.42));
                 const dxk = bp.gx - kx, dyk = bp.gy - ky, dzk = bp.gz - kz;
                 const kAtt = Math.exp(-(dxk * dxk + dyk * dyk + dzk * dzk) / 0.55);
-                const lean = 0.10 * kAtt;            // pulled toward attention
-                const wd = 0.055 * pulseAmp * w * CALM;   // along (1,1,1)/√3
+                const lean = 0.10 * kAtt * alignMul;            // pulled toward attention
+                const wd = 0.055 * pulseAmp * w * CALM * alignMul;   // along (1,1,1)/√3
                 x = bp.gx - dxk * lean + wd * 0.577
-                    + 0.018 * CALM * Math.sin(time * 1.1 + bp.jit);
+                    + 0.018 * CALM * alignMul * Math.sin(time * 1.1 + bp.jit);
                 y = bp.gy - dyk * lean + wd * 0.577
-                    + 0.018 * CALM * Math.sin(time * 0.8 + bp.jit * 2.0);
+                    + 0.018 * CALM * alignMul * Math.sin(time * 0.8 + bp.jit * 2.0);
                 z = bp.gz - dzk * lean + wd * 0.577;
                 nodeSeeds[i] = Math.min(0.60,
-                    bp.seed0 + w * waveGain + 0.28 * kAtt);
+                    bp.seed0 + w * waveGain + 0.28 * kAtt * (1.0 + gaitFlash * TUNE.flashGain));
             } else if (bp.kind === 1) {
-                const t = _fract(bp.d0 + time * bp.speed * (1.0 + 1.5 * drive));
+                const t = _fract(bp.d0 + time * bp.speed * (1.0 + 1.5 * drive + 2.0 * gaitFlow));
                 const p = -bp.span + t * 2 * bp.span;
                 // Taper at the faces so the wrap hides off-grid.
                 bp.sz = 0.85 * Math.min(1, 8 * Math.min(t, 1 - t) + 0.10);
@@ -2207,7 +2798,8 @@ function animate() {
         //    a packet passes through it; the residual-stream column
         //    sways like a slow artery. Packets heat as they rise —
         //    representation enriching layer by layer.
-        stackFlow += (1 / 60) * (0.055 + 0.16 * drive) * CALM;
+        stackFlow += (1 / 60) * (0.055 + 0.16 * drive) * CALM * (1.0 + TUNE.flowWrite * gaitFlow)
+            + (DIAL.tool === 'ripple' ? 0.004 * toolPulse : 0);   // a hop per tool call
         const pkY = [];
         for (let p = 0; p < STACK_PACKETS; p++) {
             pkY.push(-2.0 + _fract(stackFlow + p / STACK_PACKETS) * 4.0);
@@ -2272,7 +2864,7 @@ function animate() {
             ]);
             embExcite[c] *= 0.985;
         }
-        embT += (1 / 60) * (0.24 + 0.60 * drive + 0.4 * flinch) * CALM;
+        embT += (1 / 60) * (0.24 + 0.60 * drive + 0.4 * flinch + 0.8 * gaitFlow) * CALM;
         if (embT >= 1.0) {
             embExcite[embTo] = 1.0;
             embFrom = embTo;
@@ -2342,7 +2934,7 @@ function animate() {
         //    gradient step). The sheet dips under the bead and heats
         //    where it passes; ridges stay cold, valleys warm.
         const ddt = 1 / 60;
-        const lr = 1.6 * (0.55 + 0.45 * drive);
+        const lr = 1.6 * (0.55 + 0.45 * drive + 0.6 * gaitFlow);
         const eps = 0.06;
         const gX = (_lossH(beadX + eps, beadZ, time)
             - _lossH(beadX - eps, beadZ, time)) / (2 * eps);
@@ -2481,9 +3073,10 @@ function animate() {
                     const w = 1 - d / (edge + 0.4);
                     const wS = w * w;
                     const amp = (0.06 + 0.30 * St) * wS * CALM
-                        * (1 + 0.5 * flinch);
-                    // The mutation churns FASTER as it strengthens.
-                    const tk = time * (0.7 + 1.4 * Sk);
+                        * (1 + 0.5 * flinch) * (1.0 - TUNE.alignGain * gaitAlign);
+                    // The mutation churns FASTER as it strengthens (and
+                    // while the reply streams, in the 'flow' dialect).
+                    const tk = time * (0.7 + 1.4 * Sk + 1.0 * gaitFlow);
                     // SPATIALLY COHERENT field (v2, "random dots" fix):
                     // phases keyed to grid POSITION at low frequency, so
                     // neighbors move together — waves rippling through
@@ -2517,7 +3110,7 @@ function animate() {
                 const Sk = bp.ci === cubeActive ? cubeS : 0;
                 const sp = time * (0.35 + 1.3 * Sk) * CALM + bp.jit;
                 const cs = Math.cos(sp), sn = Math.sin(sp);
-                const r = bp.rr * (1 + 1.1 * Sk)
+                const r = bp.rr * (1 + 1.1 * Sk + 0.5 * gaitFlash * TUNE.flashGain)
                     * (1 + 0.10 * Math.sin(time * 0.9 + bp.jit * 2.0));
                 const ox = bp.dx * cs + bp.dz * sn;
                 const oz = -bp.dx * sn + bp.dz * cs;
@@ -2532,6 +3125,43 @@ function animate() {
             const y2 = y * kc2 - z1 * ks2;
             const z2 = y * ks2 + z1 * kc2;
             currentPositions[i].set(x1 - kfx, y2 - kfy, z2 - kfz);
+        }
+        instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
+    } else if (FORM === 'conversation') {
+        // ── CONVERSATION: the strand breathes gently; the newest reply
+        //    pulses while a turn runs; a hovering future thread waits.
+        for (let i = 0; i < NODE_COUNT; i++) {
+            const bp = basePositions[i];
+            if (bp.kind === 8) { currentPositions[i].set(bp.hx, bp.hy, bp.hz); continue; }
+            const sway = 0.03 * CALM * Math.sin(time * 0.7 + bp.jit);
+            const live = bp.isLast ? (0.06 * Math.max(userTurnState, gait.write) * _pulseShape(_fract(pulsePhase))) : 0;
+            const g = 1.0 + sway + live;
+            currentPositions[i].set(bp.hx * g, bp.hy + 0.02 * CALM * Math.sin(time * 0.5 + bp.jit * 2.0),
+                bp.hz * g);
+            if (bp.kind === 0 && bp.isLast) {
+                nodeSeeds[i] = 0.46 + 0.12 * Math.max(userTurnState, workingState);
+            }
+        }
+        instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
+    } else if (FORM === 'toolgraph') {
+        // ── TOOL GRAPH: the ring turns slowly; a tool lights while it
+        //    was used in the last minute and cools after; the hub
+        //    breathes with work.
+        const rot = time * 0.06 * CALM;
+        const cr = Math.cos(rot), sr = Math.sin(rot);
+        const now = Date.now();
+        for (let i = 0; i < NODE_COUNT; i++) {
+            const bp = basePositions[i];
+            if (bp.kind === 8) { currentPositions[i].set(bp.hx, bp.hy, bp.hz); continue; }
+            const x = bp.hx * cr + bp.hz * sr, z = -bp.hx * sr + bp.hz * cr;
+            const g = bp.kind === 2 ? 1.0 + 0.10 * workingState * _pulseShape(_fract(pulsePhase)) : 1.0;
+            currentPositions[i].set(x * g, bp.hy + 0.03 * CALM * Math.sin(time * 0.6 + bp.jit), z * g);
+            if (bp.kind === 0) {
+                const u = toolUsage.get(bp.name);
+                const age = u ? (now - u.lastAt) / 1000 : 1e9;
+                const recent = Math.max(0, 1 - age / 60);
+                nodeSeeds[i] = 0.14 + 0.46 * recent;
+            }
         }
         instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
     } else if (FORM === 'empty') {
@@ -2549,7 +3179,7 @@ function animate() {
             const bp = basePositions[i];
             if (bp.kind === 0) {
                 const wave = _pulseShape(_fract(pulsePhase - bp.lobePhase));
-                const g = 1.0 + 0.55 * pulseAmp * wave;
+                const g = 1.0 + 0.55 * pulseAmp * wave * (1.0 + 0.6 * gaitFlash * TUNE.flashGain);
                 const spread = 1.0 + 0.18 * pulseAmp * wave;
                 currentPositions[i].set(
                     bp.cx * spread + bp.dx * bp.r0 * g
@@ -2576,6 +3206,63 @@ function animate() {
                     bp.hz * g);
             }
         }
+    }
+
+    // ── Gaits + events, applied on top of every anatomy ─────────────
+    // Radial factors compose: search expands, read/verify contract, a tool
+    // call kicks, the background breath swells the edge, a refute shudders,
+    // an idle twitch shivers one neighbourhood.
+    if (FORM !== 'empty') {
+        // The dialect decides WHICH components breathe (a ring stack keeps
+        // its height, a terrain sheet heaves in y, a crystal never
+        // breathes) and whether write is the z-wave or the form's own flow.
+        const axis = DIAL.radialAxis;
+        const readRadial = DIAL.read === 'contract' ? TUNE.radialRead * gait.read : 0;
+        const toolRadial = DIAL.tool === 'kick' ? TUNE.toolKick * toolPulse : 0;
+        const radial = 1.0 + TUNE.radialSearch * gait.search - readRadial
+            - TUNE.radialVerify * gait.verify + toolRadial;
+        const shudder = verdict === 'refute' ? TUNE.shudder * verdictEnv : 0;
+        const writeW = DIAL.write === 'wave' ? gait.write : 0;
+        const twitchP = idleTwitchNode >= 0 ? currentPositions[idleTwitchNode] : null;
+        for (let i = 0; i < NODE_COUNT; i++) {
+            const p = currentPositions[i];
+            if (basePositions[i].kind === 8) continue;
+            const r = p.length();
+            let f = axis === 'none' ? 1.0 : radial;
+            if (backgroundBusy > 0.01 && r > 1.5) f += TUNE.bgEdge * backgroundBusy * Math.sin(time * 0.9 + r * 2.0);
+            if (f !== 1.0) {
+                if (axis === 'xz') { p.x *= f; p.z *= f; }
+                else if (axis === 'y') { p.y *= f; }
+                else if (axis === 'none') { p.multiplyScalar(1.0 + (f - 1.0) * 0.35); }   // breath only, gentled
+                else p.multiplyScalar(f);
+            }
+            if (writeW > 0.01) {
+                // Laminar wave toward the viewer: a travelling front on z.
+                p.z += TUNE.writeWave * writeW * CALM * Math.sin(time * 2.4 - r * 3.0);
+            }
+            if (shudder > 0) {
+                p.x += shudder * Math.sin(time * 61.0 + i * 1.7);
+                p.y += shudder * Math.cos(time * 53.0 + i * 2.3);
+            }
+            if (twitchP && idleTwitch > 0.01) {
+                const dx = p.x - twitchP.x, dy = p.y - twitchP.y, dz = p.z - twitchP.z;
+                const d2 = dx * dx + dy * dy + dz * dz;
+                if (d2 < 0.5 && d2 > 1e-6) {
+                    const w = (1 - d2 / 0.5) * idleTwitch * TUNE.twitch * CALM;
+                    const inv = 1 / Math.sqrt(d2);
+                    p.x += dx * inv * w; p.y += dy * inv * w; p.z += dz * inv * w;
+                }
+            }
+        }
+    }
+    // Idle twitch: at rest, every 6–14s one neighbourhood shivers — so
+    // "rest" is not one uniform drift. Never while working.
+    idleTwitch *= 0.94;
+    if (drive < 0.15 && userTurnState < 0.1 && !PREFERS_REDUCED_MOTION
+        && time - idleTwitchAt > 0.03 * (6 + Math.random() * 8) && Math.random() < 0.02) {
+        idleTwitchAt = time;
+        idleTwitch = 1.0;
+        idleTwitchNode = Math.floor(Math.random() * NODE_COUNT);
     }
 
     // Reorganization blend: after a form switch, ease from the snapshot
@@ -2626,9 +3313,14 @@ function animate() {
         // tears momentarily on steep ridges — computed invariant pinned
         // in tests/test_interface_face_forms_ai.py.
         descent: IS_MOBILE ? 0.38 : 0.20,
+        // Data forms: NO proximity links — their edges mean something
+        // (reply→question, call order) and are drawn explicitly below.
+        conversation: 0.0,
+        toolgraph: 0.0,
     };
     const proximitySq = PROXIMITY_SQ * (1.0 + dive * 0.15)
-        * (LINK_MULT[FORM] || 1.0);
+        * (LINK_MULT[FORM] === undefined ? 1.0 : LINK_MULT[FORM])
+        * (1.0 + TUNE.thickenLinks * gaitThicken);   // read, 'thicken' dialect
 
     for (let i = 0; i < NODE_COUNT; i++) {
         for (let j = i + 1; j < NODE_COUNT; j++) {
@@ -2660,6 +3352,34 @@ function animate() {
             }
         }
     }
+    // Explicit edges (data forms): drawn regardless of distance, and
+    // their endpoints count as connected so they render.
+    for (let e = 0; e < explicitEdges.length && lineIdx < MAX_LINES; e++) {
+        const [a, b] = explicitEdges[e];
+        if (a >= NODE_COUNT || b >= NODE_COUNT) continue;
+        connected[a] = true; connected[b] = true;
+        const P = currentPositions[a], Q = currentPositions[b];
+        linePosAttr[lineIdx * 6] = P.x; linePosAttr[lineIdx * 6 + 1] = P.y; linePosAttr[lineIdx * 6 + 2] = P.z;
+        linePosAttr[lineIdx * 6 + 3] = Q.x; linePosAttr[lineIdx * 6 + 4] = Q.y; linePosAttr[lineIdx * 6 + 5] = Q.z;
+        lineUvAttr[lineIdx * 2] = 0; lineUvAttr[lineIdx * 2 + 1] = 1;
+        lineHueAttr[lineIdx * 2] = nodeSeeds[a]; lineHueAttr[lineIdx * 2 + 1] = nodeSeeds[b];
+        lineIdx++;
+    }
+    // Recall comet: a hot streak from the periphery into the recalled
+    // node, shortening as it arrives; the node itself flares below.
+    if (recallSpark > 0 && recallNode >= 0 && recallNode < NODE_COUNT && lineIdx < MAX_LINES
+        && FORM !== 'empty') {
+        const N = currentPositions[recallNode];
+        connected[recallNode] = true;
+        const reach = TUNE.recallReach * recallSpark * recallSpark;   // eased approach
+        linePosAttr[lineIdx * 6] = N.x + recallDir[0] * reach;
+        linePosAttr[lineIdx * 6 + 1] = N.y + recallDir[1] * reach;
+        linePosAttr[lineIdx * 6 + 2] = N.z + recallDir[2] * reach;
+        linePosAttr[lineIdx * 6 + 3] = N.x; linePosAttr[lineIdx * 6 + 4] = N.y; linePosAttr[lineIdx * 6 + 5] = N.z;
+        lineUvAttr[lineIdx * 2] = 0; lineUvAttr[lineIdx * 2 + 1] = 1;
+        lineHueAttr[lineIdx * 2] = 0.60; lineHueAttr[lineIdx * 2 + 1] = 0.58;
+        lineIdx++;
+    }
     lineGeometry.attributes.position.needsUpdate = true;
     lineGeometry.attributes.aLightPass.needsUpdate = true;
     lineGeometry.attributes.aLineHue.needsUpdate = true;
@@ -2677,7 +3397,8 @@ function animate() {
         // core additionally FLARES in size when the infall surges land.
         const bpi = basePositions[i];
         const s = nodeScales[i] * (bpi.sz || 1.0)
-            * (FORM === 'horizon' && bpi.kind === 2 ? coreFlare : 1.0);
+            * (FORM === 'horizon' && bpi.kind === 2 ? coreFlare : 1.0)
+            * (i === recallNode ? 1.0 + TUNE.recallFlare * 4.0 * recallSpark * (1.0 - recallSpark) : 1.0);   // bell, peaks mid-flight
         if (s < 0.001) {
             dummy.scale.set(0, 0, 0);
             dummy.position.set(9999, 9999, 9999);
@@ -2710,12 +3431,27 @@ function animate() {
     const centerDim = FORM === 'horizon' || FORM === 'vortex' ? 0.85 : 0.30;
     const centerXY = FORM === 'vortex' ? 1.0 : 0.0;
     const waveAmp = FORM === 'vortex' ? 0.3 : 1.0;
-    const hueDriftOut = hueDrift * (FORM === 'vortex' ? 0.3 : 1.0);
+    // Mood rides the drift as a slow baseline (cold-pole shift only;
+    // the vortex keeps its anchored centre).
+    const hueDriftOut = hueDrift * (FORM === 'vortex' ? 0.3 : 1.0)
+        + moodHue * (FORM === 'vortex' ? 0.4 : 1.0);
     // Master luminance: EVERY form emits ~half the light so the face
     // BLENDS into the background (operator: "too bright and
     // distracting", then extended to all faces) — structure and motion
-    // carry visibility, not brightness.
-    const formDim = 0.55;
+    // carry visibility, not brightness. Error KINDS modulate it: a
+    // network drop flickers with gaps, a timeout fades; a pass holds a
+    // touch brighter while it crystallises.
+    // Data forms have a handful of nodes, not hundreds of additive quads:
+    // the background-blend luminance that tames an anatomy leaves a
+    // 3-message strand nearly invisible (seen in the live check). They
+    // run brighter.
+    let formDim = (FORM === 'conversation' || FORM === 'toolgraph') ? 0.95 : 0.55;
+    if (errorKind === 'network') {
+        formDim *= 1.0 - TUNE.netFlicker * errorKindEnv * (Math.sin(time * 90.0) > 0.3 ? 1.0 : 0.0);
+    } else if (errorKind === 'timeout') {
+        formDim *= 1.0 - TUNE.timeoutFade * errorKindEnv;
+    }
+    if (verdict === 'pass') formDim *= 1.0 + TUNE.passDim * verdictEnv;
 
     const nUniforms = instancedMesh.material.uniforms;
     nUniforms.uTime.value = time;
@@ -2727,6 +3463,10 @@ function animate() {
     nUniforms.uErrorState.value = errorState;
     nUniforms.uPulseT.value = pulseT;
     nUniforms.uAudioLevel.value = audioLevel;
+    nUniforms.uSweep.value = gait.search;
+    nUniforms.uSweepAngle.value = sweepAngle;
+    nUniforms.uSweepMode.value = DIAL.search === 'plane' ? 1.0 : (DIAL.search === 'ring' ? 2.0 : 0.0);
+    nUniforms.uSweepHeat.value = TUNE.sweepHeat;
     nUniforms.uAccentStrength.value = accentStrength;
     nUniforms.uHueDrift.value = hueDriftOut;
 
@@ -2767,7 +3507,10 @@ function animate() {
     // response unchanged, so a busy agent still visibly glows.
     // Background-blend bloom (×0.65, all forms — see formDim above).
     bloomPass.strength = (0.88 + workingState * 0.3 + activity * 0.35
-        + errorState * 0.5) * BLOOM_SCALE * (1.0 - 0.5 * dive) * 0.65;
+        + errorState * 0.5 + 0.20 * toolPulse + 0.25 * recallSpark
+        + (verdict === 'pass' ? 0.2 * verdictEnv : 0)
+        + 0.08 * backgroundBusy * (0.5 + 0.5 * Math.sin(time * 0.31 + 0.9)))
+        * BLOOM_SCALE * (1.0 - 0.5 * dive) * 0.65;
 
     composer.render();
 }

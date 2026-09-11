@@ -36,9 +36,56 @@ export function initNotifications(ctx) {
         badge.classList.toggle('hidden', unread === 0);
     }
 
+    // Lock-screen alerts row (2026-09-11). The OS permission prompt used
+    // to fire on the first click anywhere on the page — no context, and
+    // on iOS a denial is permanent for the install. It now lives HERE, as
+    // a deliberate control with one line saying what will be sent and the
+    // resulting state. Copy per state:
+    //   needsInstall  → iOS Safari tab: push needs a Home-Screen install
+    //   default       → "Enable" button
+    //   granted / denied / unsupported → the state, no button
+    function pushRow() {
+        if (typeof Core.pushPermissionState !== 'function') return null;
+        const st = Core.pushPermissionState();
+        const row = el('div', 'notif-push-row');
+        const text = el('div', 'notif-push-text');
+        row.appendChild(text);
+        if (st.needsInstall) {
+            text.textContent = 'Lock-screen alerts need the app installed: Share → Add to Home Screen, then enable them here.';
+            return row;
+        }
+        if (!st.supported || st.permission === 'unsupported') {
+            text.textContent = 'This browser cannot show lock-screen alerts.';
+            return row;
+        }
+        if (st.permission === 'granted') {
+            text.textContent = 'Lock-screen alerts are on: you are told when a reply is ready while this tab is hidden or the phone is locked.';
+            return row;
+        }
+        if (st.permission === 'denied') {
+            text.textContent = 'Lock-screen alerts are blocked in the browser settings for this site.';
+            return row;
+        }
+        text.textContent = 'Get told when a reply is ready while this tab is hidden or the phone is locked.';
+        const btn = el('button', 'notif-push-btn', 'Enable alerts');
+        btn.type = 'button';
+        btn.addEventListener('click', async () => {
+            btn.disabled = true;
+            const result = await Core.requestNotificationPermission();
+            toast(result === 'granted' ? 'Lock-screen alerts on'
+                : result === 'denied' ? 'Alerts blocked — allow notifications for this site to turn them on'
+                : 'Alerts not enabled', result === 'granted' ? 'info' : 'error');
+            renderList();
+        });
+        row.appendChild(btn);
+        return row;
+    }
+
     function renderList() {
         if (!listEl) return;
         listEl.replaceChildren();
+        const pr = pushRow();
+        if (pr) listEl.appendChild(pr);
         if (enabled === false) {
             listEl.appendChild(el('div', 'notif-empty',
                 'The agent’s activity ledger is disabled.'));

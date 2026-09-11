@@ -23,6 +23,12 @@
 // ═══════════════════════════════════════════════════════════════
 
 const HEALTH_POLL_MS = 25_000;
+// The interface's own probe (2026-09-11): TLS certificate expiry lives
+// here. The Let's-Encrypt-via-Tailscale cert the phone PWA depends on had
+// a renewal note in the launcher and nothing watching it; on expiry the
+// PWA, service worker and web push all die with only a browser
+// interstitial to say why. Amber under TLS_WARN_DAYS.
+const TLS_WARN_DAYS = 14;
 
 export function initStatus(_ctx) {
     const indicator = document.getElementById('status-indicator');
@@ -31,6 +37,7 @@ export function initStatus(_ctx) {
     let health = null;
     let healthOk = null;
     let healthFailNote = '';
+    let ihealth = null;      // GET /api/interface/health
 
     // 401/403 is an AUTH failure, not an unreachable agent: after a key
     // rotation the injected key is stale and every call fails, while the
@@ -78,13 +85,45 @@ export function initStatus(_ctx) {
         return parts.join(' · ');
     }
 
+    // Why the certificate matters, or null. Pure; executed under node.
+    // `days_left` is the server's number; a missing/erroring TLS block is
+    // NOT a warning (plain-HTTP dev runs have no certificate at all).
+    function tlsWarning(ih) {
+        const tls = ih && ih.tls;
+        if (!tls || typeof tls.days_left !== 'number') return null;
+        const d = tls.days_left;
+        if (d < 0) {
+            return 'TLS certificate EXPIRED ' + Math.ceil(-d) + ' day(s) ago — the phone app, '
+                + 'service worker and push are down until it is renewed (tailscale cert <host>).';
+        }
+        if (d < TLS_WARN_DAYS) {
+            return 'TLS certificate expires in ' + Math.floor(d) + ' day(s) — renew now '
+                + '(tailscale cert <host>), or the phone app, service worker and push stop.';
+        }
+        return null;
+    }
+
     function applyToChip() {
         if (!indicator) return;
-        const degraded = isDegraded(health);
+        const agentDegraded = isDegraded(health);
+        const tlsNote = tlsWarning(ihealth);
+        const degraded = agentDegraded || !!tlsNote;
         indicator.classList.toggle('degraded', degraded);
-        indicator.title = degraded
-            ? 'DEGRADED — ' + degradedReason(health, healthOk, healthFailNote)
-            : baseTitle;
+        const reasons = [];
+        if (agentDegraded) reasons.push(degradedReason(health, healthOk, healthFailNote));
+        if (tlsNote) reasons.push(tlsNote);
+        indicator.title = degraded ? 'DEGRADED — ' + reasons.join(' · ') : baseTitle;
+    }
+
+    async function pollInterfaceHealth() {
+        try {
+            const res = await fetch('/api/interface/health',
+                { signal: AbortSignal.timeout(8000) });
+            ihealth = res.ok ? await res.json() : null;
+        } catch (e) {
+            ihealth = null;    // the AGENT probe owns the "unreachable" verdict
+        }
+        window.__ghostInterfaceHealth = ihealth;
     }
 
     async function pollHealth() {
@@ -101,7 +140,38 @@ export function initStatus(_ctx) {
             healthFailNote = _healthFailureNote(e);
         }
         window.__ghostHealth = health;
+        await pollInterfaceHealth();
         applyToChip();
+        feedFace();
+    }
+
+    // The face's slow signals (2026-09-11): the agent's functional mood
+    // (health.mood.label → a baseline hue shift) and whether a turn that
+    // is NOT ours holds the lock (a dream / self-play turn → a second,
+    // slower breath at the edge). Pure decision in `backgroundBusyFrom`;
+    // executed under node.
+    function backgroundBusyFrom(turnsPayload, mySessionId) {
+        const turns = (turnsPayload && Array.isArray(turnsPayload.turns)) ? turnsPayload.turns : [];
+        return turns.some(t => t && t.running && (t.session_id || null) !== (mySessionId || null));
+    }
+    async function feedFace() {
+        // `_ctx.Core` may be absent (a harness, or a stale bridge): the face
+        // is decoration for this probe and must never take the chip down.
+        const Core = (_ctx && _ctx.Core) || null;
+        const face = Core && Core.activeFace;
+        if (!face) return;
+        try {
+            if (typeof face.setMoodHue === 'function') {
+                face.setMoodHue(health && health.mood ? health.mood.label : null);
+            }
+            if (typeof face.setBackgroundBusy === 'function') {
+                const res = await fetch('/api/turns', { signal: AbortSignal.timeout(6000) });
+                const data = res.ok ? await res.json() : null;
+                const mine = window.__ghostSessionId
+                    || (typeof Core.storedSessionId === 'function' ? Core.storedSessionId() : null);
+                face.setBackgroundBusy(backgroundBusyFrom(data, mine));
+            }
+        } catch (e) { /* the face is decoration for this probe — never fail the chip */ }
     }
 
     document.addEventListener('visibilitychange', () => {

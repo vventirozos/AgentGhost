@@ -335,9 +335,14 @@ class TestRemoval:
 
     def test_status_js_has_no_panel_and_no_turn_half(self):
         js = _js("status.js")
-        for gone in ("/api/turns", "/api/turn/cancel", "renderPanel", "openPanel",
+        # 2026-09-11: status.js reads /api/turns again — but only to tell the
+        # FACE that a turn that is not ours holds the lock (a second breath at
+        # the edge). No listing, no cancel, no panel: those stay gone.
+        for gone in ("/api/turn/cancel", "renderPanel", "openPanel",
                      "modelPill", "pillText", "status-panel", "cancelTurn"):
             assert gone not in js, f"{gone} is back"
+        i = js.index("fetch('/api/turns'")
+        assert "backgroundBusyFrom(" in js[i:i + 400], "the turn list is fetched for something other than the face"
 
     def test_the_server_still_proxies_health_for_the_tag(self):
         src = (_ROOT / "interface" / "server.py").read_text(encoding="utf-8")
@@ -346,6 +351,7 @@ class TestRemoval:
 
 _CHIP_HARNESS = """
 const HEALTH_POLL_MS = 25_000;
+const TLS_WARN_DAYS = 14;   // 2026-09-11: the chip also reads /api/interface/health
 const indicator = {
     classes: new Set(),
     title: 'Live log',
@@ -393,7 +399,8 @@ class TestStatusChip:
         # Healthy = the RESTING tooltip (the chip is the live-log button),
         # not an empty string that wipes the button's name on hover.
         assert out["title"] == "Live log"
-        assert out["calls"] == ["/api/health"]
+        # 2026-09-11: each poll also asks the interface's own probe (TLS expiry).
+        assert out["calls"] == ["/api/health", "/api/interface/health"]
         assert out["health"] == {"memory_system_loaded": True, "biological_watchdog_alive": True}
         assert out["stored"] == out["health"]
 
@@ -438,4 +445,4 @@ class TestStatusChip:
         assert out["first"] == {"degraded": True, "title": out["first"]["title"]}
         assert out["first"]["title"].startswith("DEGRADED")
         assert out["degraded"] is False and out["title"] == "Live log"
-        assert out["calls"] == ["/api/health", "/api/health"], "tab-visible must re-poll"
+        assert out["calls"] == ["/api/health", "/api/interface/health"] * 2, "tab-visible must re-poll"

@@ -73,8 +73,10 @@ def test_lookat_singularity_handled(graph_js):
     # Since the cube form (2026-07-29) the forward blend is form-aware
     # (the cube's partial dive looks less far through), but it must
     # still scale with `dive` and never target the origin.
+    # 2026-09-11: the x/y target carries the composer GAZE (gazeX, gazeY
+    # fading with the dive); the z target is unchanged.
     assert re.search(
-        r"camera\.lookAt\(0, 0, \(FORM === 'cube' \? -[\d.]+ : -3\.5\) \* dive\)",
+        r"camera\.lookAt\(gazeX, gazeY \* \(1\.0 - dive\), \(FORM === 'cube' \? -[\d.]+ : -3\.5\) \* dive\)",
         graph_js)
     assert "camera.lookAt(0, 0, 0);" not in graph_js
 

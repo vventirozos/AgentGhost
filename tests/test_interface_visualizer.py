@@ -122,7 +122,9 @@ class TestCssAndErrors:
         assert "_showRenderError" in APP
         csv_body = APP.split("function renderCSV", 1)[1].split("\nfunction ", 1)[0]
         assert "_showRenderError" in csv_body          # <2 columns / no vendor
-        assert "window.Papa" in csv_body and "window.Chart" in csv_body
+        # 2026-09-11: the libraries load on first use; the guard is the
+        # loader's rejection, not a window.* presence check.
+        assert "_ensureVendor('papaparse')" in csv_body and "_ensureVendor('chart')" in csv_body
 
 
 class TestDownloadProxyHardening:
