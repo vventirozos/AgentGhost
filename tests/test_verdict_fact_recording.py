@@ -433,7 +433,10 @@ class TestTheWriterActuallyRuns:
             if isinstance(c, ast.Call) and getattr(c.func, "attr", "") == "_record_verdict_instruments":
                 routes.append(ast.dump({k.arg: k.value for k in c.keywords}["verify_route"]))
         assert any("_verify_route" in r for r in routes), routes
-        assert sum("'reply-shape'" in r for r in routes) == 1 and sum("'memory-claim'" in r for r in routes) == 1, routes
+        # the merged mechanical exit forwards its override CHAIN as the route
+        # ("reply-shape", "turn-state" or "reply-shape+turn-state", §4FY);
+        # memory-claim keeps its literal
+        assert sum("'override'" in r for r in routes) == 1 and sum("'memory-claim'" in r for r in routes) == 1, routes
 
     def test_a_repaired_turn_keeps_BOTH_rows_with_seq_ordering(self, tmp_path):
         """An auto-repaired turn verifies twice. Both rows are real
@@ -565,7 +568,9 @@ class TestTheStampIsWiredAtTheChokePoint:
                 if "_record_verdict_instruments" in seg and node.name != "_record_verdict_instruments":
                     callers.append(node.name)
         # one recorder, called only from the verdict computation — at the
-        # tool-turn choke point AND at both tool-free exits (§4FN round 4 M1)
+        # tool-turn choke point AND at both tool-free exits: the merged
+        # mechanical exit (reply-shape + turn-state through one merge, §4FY
+        # review) and memory-claim (§4FN round 4 M1)
         assert owners == ["_record_verdict_instruments"], owners
         assert callers == ["_compute_verifier_verdict"], callers
         fn = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef)

@@ -1280,8 +1280,15 @@ _REPAIR_STANDALONE_SUFFIX = (
 )
 
 
-def _render_refute_directive(crit: str, pending_request="") -> str:
+def _render_refute_directive(crit: str, pending_request="",
+                             shape_only: bool = False) -> str:
     """The repair-round alert after a REFUTED draft (the ONLY builder).
+
+    ``shape_only`` (§4FY review): the refute is a delivery-SHAPE complaint
+    (`GhostAgent._delivery_shape_only` — strict JSON, a word cap, a raw
+    dump…) — the answer's content was never disputed, so "do NOT repeat the
+    same claim" is exactly wrong: the model must repeat it, in the shape
+    the request asked for, with no tools.
 
     Req 2422eb25 (2026-09-06): the refuted draft had not answered the request
     at all (it "acknowledged" a state block), so "diagnose and FIX it using
@@ -1298,6 +1305,16 @@ def _render_refute_directive(crit: str, pending_request="") -> str:
     which = (f'THE REQUEST YOU ARE ANSWERING (unchanged): "{head}".' if head
              else "The request you are answering is the user's most recent "
                   "one (unchanged).")
+    if shape_only:
+        return (
+            "SYSTEM ALERT — the verifier REFUTED the SHAPE of your previous "
+            f"answer, not its content: {str(crit or '').strip()}. {which} "
+            "Re-send the SAME answer in exactly the form that request asked "
+            "for — no preamble, no explanation, no extra lines or sentences "
+            "— and make NO tool calls. If your previous answer said the task "
+            "could not be done, keep saying so, as briefly as the form allows: "
+            "NEVER invent a value, number or result to satisfy the format."
+        )
     return (
         "SYSTEM ALERT — the verifier REFUTED your previous answer: "
         f"{str(crit or '').strip()}. Do NOT repeat the same claim. {which} "
@@ -11642,11 +11659,17 @@ class GhostAgent:
         # content, not trivial chat" guard as the arithmetic route below so
         # an ablation that exists to have no verdicts still has none.
         _shape = None
+        _state = None
         if (verifier is not None
                 and getattr(verifier, "llm_client", None) is not None
                 and final_ai_content
                 and not self._is_strict_trivial_chat(lc)):
             _shape = self._reply_shape_refutation(final_ai_content, last_user_content)
+            # §4FY: the turn's own STATE — the current request's mechanical
+            # constraints and its retrieval record — under the same guard,
+            # applied the same two ways as the shape check below.
+            _state = self._turn_state_refutation(
+                final_ai_content, last_user_content, tools_run_this_turn)
         # Flat early-return (not an `if (verifier is not None and ...)`
         # block) so the post-loop gate stays the single match for the
         # gate-strictness source check — and so a missing verifier /
@@ -11670,12 +11693,19 @@ class GhostAgent:
                     and evidence_tool is None
                     and final_ai_content
                     and not self._is_strict_trivial_chat(lc)):
-                if _shape is not None:          # §4FN: a tool-free non-answer
-                    self._chain_override(_shape, "reply-shape")
+                if _shape is not None or _state is not None:
+                    # §4FN reply-shape and §4FY turn-state, through the SAME
+                    # merge the tool-turn path uses — so a reply that is both
+                    # a raw dump and a constraint violation carries both
+                    # issues and the chain "reply-shape+turn-state" on either
+                    # delivery path (§4FY review: the first version exited on
+                    # the shape alone here and lost the state issue).
+                    _mech = self._merge_mechanical_refute(None, _shape, "reply-shape")
+                    _mech = self._merge_mechanical_refute(_mech, _state, "turn-state")
                     self._record_verdict_instruments(
-                        _shape, req_id=req_id, trajectory_id=trajectory_id,
-                        verify_route="reply-shape")
-                    return _shape, last_tool
+                        _mech, req_id=req_id, trajectory_id=trajectory_id,
+                        verify_route=str(getattr(_mech, "override", "") or "mechanical"))
+                    return _mech, last_tool
                 _mem = self._memory_claim_refutation(final_ai_content)
                 if _mem is not None:
                     self._chain_override(_mem, "memory-claim")
@@ -11867,6 +11897,9 @@ class GhostAgent:
                     deep=_deep,
                     trace=_trace,
                 )
+        # §4FZ: the judge's own SHAPE refute on an honest inability report
+        # is stood down — the same exemption the mechanical tier carries.
+        v_result = self._stand_down_shape_refute_on_inability(v_result, _claim_src)
         # §4BR: carry the vote counters ACROSS the ground-truth overrides.
         #
         # `verify_claim` already re-stamps them onto its own return value
@@ -11941,17 +11974,11 @@ class GhostAgent:
         # overrides and the verdict recording below — so those merge into it
         # and the verdict instruments see it (review §4FN M3). A refute that
         # already stands keeps its grounded issues in the first slots.
-        if _shape is not None:
-            if v_result is None or getattr(v_result, "verdict", None) != VerifyVerdict.REFUTED:
-                v_result = _shape
-            else:
-                try:
-                    v_result.issues = (list(getattr(v_result, "issues", None) or [])[:2]
-                                       + list(_shape.issues)[:1])
-                except Exception:  # noqa: BLE001
-                    pass
-            self._chain_override(v_result, "reply-shape",
-                                 str(getattr(v_result, "override", "") or ""))
+        v_result = self._merge_mechanical_refute(v_result, _shape, "reply-shape")
+        # §4FY turn-state override: same merge, same place, after the shape
+        # check so a chain reads in the order the arms run
+        # ("reply-shape+turn-state").
+        v_result = self._merge_mechanical_refute(v_result, _state, "turn-state")
         # Web-artifact ground-truth override — execute, don't trust. The
         # text verifier CONFIRMED (95%) a build whose data.js had a parse
         # error: every claim/evidence pair read fine, but the page threw on
@@ -13772,7 +13799,26 @@ class GhostAgent:
         r"truncat\w*\s+(?:response|reply|answer)"
         r"|(?:response|reply|answer)\s+(?:is|was|appears|seems)?\s*truncat"
         r"|internal system message|system noise"
-        r"|raw tool output pasted as the answer", re.IGNORECASE)
+        r"|raw tool output pasted as the answer"
+        # §4FY: a turn-state complaint ("strict_json: the request asked for
+        # strict JSON…", "empty_evidence: every retrieval…") is about THIS
+        # reply's shape or grounding, never project work.
+        r"|^(?:strict_json|exact|number_only|word_cap|line_cap|sentence_cap"
+        r"|empty_evidence):\s"
+        # §4FZ: the LLM judge's own vocabulary for a FORMAT refute — so a
+        # judge-found shape complaint is treated like a mechanical one
+        # (never a task, never a banner, the reshape directive, and the
+        # honest-inability stand-down). Grounded complaints that merely
+        # mention the word "constraint" in passing ("missed the explicit
+        # instruction to list the files") deliberately do not match.
+        r"|\bconstraint violation\b"
+        r"|\bviolat\w*\s+(?:the\s+|an?\s+)?(?:explicit\s+|user'?s?\s+|stated\s+)*(?:format|output|formatting)?\s*constraint"
+        r"|\b(?:explicit|strict)\s+(?:format|output|formatting|json)\s+(?:constraint|instruction|requirement)"
+        r"|\bfails?\s+(?:the\s+)?(?:explicit\s+)?(?:format\s+)?constraint\b"
+        r"|\b(?:does not|doesn't|fails? to|failed to|did not|didn't)\s+(?:satisfy|meet|follow|honou?r|adhere to|comply with|respect)\s+(?:the\s+)?(?:\w+\s+){0,3}?constraint\b"
+        r"|\bdid not (?:reply|answer|respond) with (?:just|only)\b"
+        r"|\b(?:exceeds|over)\s+the\s+[\w-]*\s*(?:word|sentence|line)s?[\s-]+(?:limit|cap|maximum)"
+        r"|\brequested '?just the number'?", re.IGNORECASE)
 
     def _file_refute_followup_tasks(self, v_result, project_id):
         """File a late refute's concrete leftovers as tasks on the project
@@ -14204,13 +14250,16 @@ class GhostAgent:
                 )
             else:
                 # Evidence existed AND a verifier is attached, yet no
-                # verdict came back — trivial-chat skip or a genuinely
-                # dead verifier path. THIS is the case worth watching.
+                # verdict came back — trivial-chat skip, a shape refute
+                # stood down on an honest inability (§4FZ, logged just
+                # above), or a genuinely dead verifier path. THIS is the
+                # case worth watching.
                 pretty_log(
                     "Verifier",
                     "LATE verdict was EMPTY despite verifiable evidence — "
-                    "trivial-chat skip or a verifier error (investigate "
-                    "if frequent)",
+                    "trivial-chat skip, a shape refute stood down on an "
+                    "honest inability (see the line above), or a verifier "
+                    "error (investigate if frequent)",
                     level="WARNING", icon=Icons.WARN,
                 )
             return
@@ -14299,7 +14348,19 @@ class GhostAgent:
             # a monotonic timestamp (for scoping + TTL), and the queue is
             # capped so a busy multi-conversation process can't accumulate an
             # unbounded banner chain.
-            if self._critic_async_enabled() or force_correction:
+            if GhostAgent._delivery_shape_only(v_result):
+                # §4FY review: a shape refute (strict JSON, a word cap, a raw
+                # dump) is not a fact to correct later — "Correction to my
+                # previous answer: the request allowed at most 1 word" tells
+                # the user nothing, and a queue slot it takes evicts a real
+                # correction (the queue keeps the newest 3).
+                pretty_log(
+                    "Verifier",
+                    "delivery-shape refute — no retroactive correction queued "
+                    "(the answer's shape was wrong, not its content)",
+                    icon=Icons.VERIFIER_LAB,
+                )
+            elif self._critic_async_enabled() or force_correction:
                 if not isinstance(getattr(self, "_pending_corrections", None), list):
                     self._pending_corrections = []
                 _corr_note = issues_str[:300]
@@ -24705,6 +24766,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     )
                                     _directive = _render_refute_directive(
                                         _crit,
+                                        shape_only=GhostAgent._delivery_shape_only(_vr),
                                         # The CURRENT request: the repair turn is
                                         # exactly where 2422eb25 lost track of it.
                                         pending_request=last_user_content,
@@ -25440,6 +25502,129 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             logger.debug("reply shape check skipped: %s: %s",
                          type(exc).__name__, exc)
             return None
+
+    def _turn_state_refutation(self, final_ai_content: str, request_text: str,
+                               tools_run=None):
+        """A REFUTED verdict when the reply contradicts the turn's own STATE
+        (§4FY: `core/turn_state_check`), or `None`. Never confirms.
+
+        State = the CURRENT request's mechanically checkable constraints
+        (strict JSON, an exact phrase, a word / line / sentence cap, a
+        number-only answer) and the turn's retrieval record (every
+        retrieval empty, the reply asserts anyway). Computed for every turn
+        that has a verifier attached — tool or not — under the same guard
+        as the reply-shape check, and applied the same way: an early exit
+        on the tool-free path, an OVERRIDE ahead of the ground-truth checks
+        on tool turns. Cross-turn constraints (a stored project constraint)
+        are deliberately NOT read here — see the module note.
+        """
+        try:
+            from .turn_state_check import refute_turn_state
+            issues = refute_turn_state(request=request_text or "",
+                                       reply=final_ai_content or "",
+                                       tools_run=tools_run)
+            if not issues:
+                return None       # ⚠ NOT a pass — nothing to say
+            from .verifier import VerifyResult, VerifyVerdict
+            return VerifyResult(
+                verdict=VerifyVerdict.REFUTED,
+                confidence=0.9,
+                reasoning="turn-state check (" + ", ".join(
+                    sorted({rule for rule, _ in issues})) + ")",
+                issues=[f"{rule}: {msg}" for rule, msg in issues][:3],
+            )
+        except Exception as exc:  # noqa: BLE001 — a checker must not break a turn
+            logger.debug("turn state check skipped: %s: %s",
+                         type(exc).__name__, exc)
+            return None
+
+    @staticmethod
+    def _merge_mechanical_refute(v_result, mech, tag: str):
+        """Apply a mechanical REFUTED verdict (`reply-shape`, `turn-state`)
+        on a tool turn: it REPLACES a verdict that is not already a refute,
+        and MERGES into one that is — the standing refute keeps its grounded
+        issues in the first slots — and either way the override chain is
+        stamped. ONE implementation for both mechanical arms (§4FY): the
+        §4FN shape block was inline and the state check would have been a
+        second copy of the same merge."""
+        if mech is None:
+            return v_result
+        from .verifier import VerifyVerdict
+        # A standing refute BELOW the 0.7 consumption gate is replaced, not
+        # merged (§4FY review, the FILE-ARTIFACT arm's rule): merging kept
+        # its 0.55 and the sidecar read "turn-state refuted" while no gate
+        # acted, no label was written and no lesson was scrubbed.
+        standing = (v_result is not None
+                    and getattr(v_result, "verdict", None) == VerifyVerdict.REFUTED
+                    and float(getattr(v_result, "confidence", 0.0) or 0.0) >= 0.7)
+        if not standing:
+            v_result = mech
+        else:
+            try:
+                prior = list(getattr(v_result, "issues", None) or [])
+                # Grounded issues lead (every consumer slices `issues[:2]`),
+                # then every mechanical issue already merged, then this one
+                # — so two arms firing keep BOTH (the first version's
+                # `[:2] + [mech]` dropped the shape issue when the state
+                # issue landed after it).
+                kept = prior[:2] + [i for i in prior[2:]
+                                    if GhostAgent._REFUTE_TASK_ARTIFACT_RE.search(str(i))]
+                for i in list(mech.issues or [])[:1]:
+                    if i not in kept:
+                        kept.append(i)
+                v_result.issues = kept[:4]
+            except Exception:  # noqa: BLE001
+                pass
+        GhostAgent._chain_override(v_result, tag,
+                                   str(getattr(v_result, "override", "") or ""))
+        return v_result
+
+    @staticmethod
+    def _stand_down_shape_refute_on_inability(v_result, claim: str):
+        """§4FZ. A REFUTED whose every issue is a delivery-shape complaint
+        (the judge's "Constraint violation: the user requested 'just the
+        number'…" or a mechanical rule's) on a reply that plainly reports
+        the task could NOT be done is no verdict at all — `None`, the
+        placeholder — never a `failed` label and never a repair round. The
+        format binds an answer, not a failure report (the 2026-07-31
+        honest-failure rule); the live case was "reply with just the
+        number" for a file that did not exist, refuted by the judge, and
+        repaired into the answer "0". The prompt now says so too; this is
+        the guard for the day the judge ignores it. Anything with a
+        grounded issue is left alone."""
+        try:
+            from .verifier import VerifyVerdict
+            if (v_result is None
+                    or getattr(v_result, "verdict", None) != VerifyVerdict.REFUTED
+                    or not GhostAgent._delivery_shape_only(v_result)):
+                return v_result
+            from .turn_state_check import _honest_inability
+            if not _honest_inability(str(claim or "")):
+                return v_result
+            pretty_log(
+                "Verifier",
+                "shape refute on an honest inability report — stood down "
+                "(the format binds an answer, not a failure report): "
+                f"{'; '.join(str(i) for i in (v_result.issues or []))[:140]}",
+                icon=Icons.VERIFIER_LAB,
+            )
+            return None
+        except Exception:  # noqa: BLE001 — a guard must never break a verdict
+            return v_result
+
+    @staticmethod
+    def _delivery_shape_only(v_result) -> bool:
+        """True when EVERY issue on a refute is a delivery-shape complaint
+        (raw dump, strict JSON, a word cap…) — the one predicate behind
+        "never a project task", "never a retroactive correction" and the
+        shape repair directive. The vocabulary is `_REFUTE_TASK_ARTIFACT_RE`,
+        so a new mechanical rule is covered by adding its issue shape once."""
+        try:
+            issues = [str(i) for i in (getattr(v_result, "issues", None) or []) if str(i).strip()]
+            return bool(issues) and all(
+                GhostAgent._REFUTE_TASK_ARTIFACT_RE.search(i) for i in issues)
+        except Exception:  # noqa: BLE001
+            return False
 
     def _memory_claim_refutation(self, final_ai_content: str):
         """A REFUTED verdict when the reply contradicts anchored memory, or
@@ -27126,16 +27311,25 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             "stream gate: empty claim after "
                             "think-strip — skipped",
                             icon=Icons.VERIFIER_LAB)
-                    elif _sv_tool is None:
-                        pretty_log(
-                            "Verifier",
-                            "stream gate: no substantive tool "
-                            f"in {len(stream_tools_snapshot)} "
-                            "record(s) — skipped (bare "
-                            "confirmations / no verifiable "
-                            "evidence)",
-                            icon=Icons.VERIFIER_LAB)
                     else:
+                        if _sv_tool is None:
+                            # §4FY review (MAJOR): this branch used to SKIP
+                            # the verdict outright, so on the web UI — which
+                            # streams — a tool-free turn never reached the
+                            # three refute-only routes (reply-shape §4FN,
+                            # memory-claim §4EQ, turn-state §4FY): ~28% of
+                            # tool-free real turns were dark. The tool-free
+                            # branch of the computation makes NO LLM call —
+                            # it runs the mechanical checks and returns —
+                            # so routing it costs one task.
+                            pretty_log(
+                                "Verifier",
+                                "stream gate: no substantive tool "
+                                f"in {len(stream_tools_snapshot)} "
+                                "record(s) — mechanical checks only "
+                                "(reply-shape / turn-state / "
+                                "memory-claim), no LLM verdict",
+                                icon=Icons.VERIFIER_LAB)
                         _sv_task = _glog.spawn_task(
                             self._compute_verifier_verdict(
                                 # ⚠ _drain_pid, NOT the sentinel: the drain

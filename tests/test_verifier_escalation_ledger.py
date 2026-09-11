@@ -665,7 +665,14 @@ class TestBothFinalizePaths:
 
     def test_streamed_gate_is_one_of_them(self):
         src = _agent_source()
-        gate = src.split("VERIFIER GATE (STREAM)")[1][:6000]
+        # bounded by the next section marker, not a magic length: §4FY's
+        # tool-free branch lengthened the gate past a `[:6000]` slice and
+        # this pin went red on text that was still there (the same trap
+        # tests/test_streaming_verifier_gate.py's `_gate_block` records)
+        import re as _re
+        block = src.split("VERIFIER GATE (STREAM)")[1]
+        end = _re.search(r"# ─+ [A-Z]", block[500:])
+        gate = block[:(end.start() + 500) if end else 14000]
         assert "_compute_verifier_verdict(" in gate
         assert "req_id=req_id" in gate
         assert "trajectory_id=current_trajectory_id" in gate

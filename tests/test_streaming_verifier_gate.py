@@ -194,7 +194,9 @@ def test_stream_gate_block_is_wired():
     assert "stream_conv_fp" in gate
     # Streamed replies have no inline note — the banner must be forced.
     assert "force_correction=True" in gate
-    # Toolless turns are skipped (no no-op task, no noise line).
+    # The substantive-tool probe still decides the LOG line; since §4FY a
+    # toolless streamed turn is no longer skipped — it reaches the
+    # mechanical (no-LLM) checks (tests/test_4fy_turn_state_check.py).
     assert "_find_substantive_tool_for_verifier" in gate
 
 

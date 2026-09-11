@@ -501,10 +501,30 @@ def test_override_provenance_is_chained_by_one_helper():
     assert bare == [], f"bare override assignments at {bare}: every arm must stamp through _chain_override"
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) == "self._chain_override"]
     tags = {n.args[1].value for n in calls if len(n.args) > 1 and isinstance(n.args[1], ast.Constant)}
-    # reply-shape (tool and tool-free), memory-claim (tool-free, round 4 M1), VISUAL (round 3 m5: a
-    # visual refute reported as "(text judge)"), web-exec, file-artifact merge + replace
-    assert tags == {"reply-shape", "memory-claim", "visual", "web-exec", "file-artifact"}, tags
-    assert len(calls) >= 7
+    # memory-claim (tool-free, round 4 M1), VISUAL (round 3 m5: a visual refute
+    # reported as "(text judge)"), web-exec, file-artifact merge + replace stamp
+    # directly; reply-shape and turn-state stamp through `_merge_mechanical_refute`
+    # on BOTH paths (§4FY review: the tool-free path used to exit on the shape
+    # alone), so they appear as that helper's constant tags, twice each
+    assert tags == {"memory-claim", "visual", "web-exec", "file-artifact"}, tags
+    merges = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+              and ast.unparse(n.func) == "self._merge_mechanical_refute"]
+    mtags = sorted(n.args[2].value for n in merges if len(n.args) > 2 and isinstance(n.args[2], ast.Constant))
+    assert mtags == ["reply-shape", "reply-shape", "turn-state", "turn-state"], mtags
+    assert len(calls) >= 5
+    # §4FY: the tool-turn mechanical arms share ONE merge helper, which stamps
+    # through the same chain helper — a replace and a merge both carry the tag
+    from ghost_agent.core.verifier import VerifyResult, VerifyVerdict
+    mech = VerifyResult(verdict=VerifyVerdict.REFUTED, confidence=0.9, reasoning="m", issues=["m1"])
+    out = GhostAgent._merge_mechanical_refute(None, mech, "turn-state")
+    assert out is mech and out.override == "turn-state"
+    standing = VerifyResult(verdict=VerifyVerdict.REFUTED, confidence=0.8, reasoning="s",
+                            issues=["s1", "s2", "s3"])
+    standing.override = "visual"                     # a dynamic stamp, as the arms leave it
+    out = GhostAgent._merge_mechanical_refute(standing, mech, "reply-shape")
+    assert out is standing and out.issues == ["s1", "s2", "m1"] and out.override == "visual+reply-shape"
+    assert GhostAgent._merge_mechanical_refute(standing, None, "turn-state") is standing
+    assert out.override == "visual+reply-shape"          # a None arm stamps nothing
 
 
 # --- round 3: the subject is read from the LINK, not from the distance -------

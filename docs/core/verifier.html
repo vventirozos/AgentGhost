@@ -960,6 +960,119 @@ PYTHONPATH=src python scripts/verify_bench.py --tier private --two-stage both</p
   machine. Both were corrected, and the corrected interleaved re-run is the number to quote:
   <strong>constant 6/30 = 0.20 vs artifact 18/30 = 0.60, discordant 13-1, McNemar p = 0.0018</strong>.</p>
 
+  <h2 id="4fy">The state-aware tier: the turn's own constraints and retrievals <span class="tag">2026-09-10 · §4FY</span></h2>
+  <p><strong>Why.</strong> The verifier is a trajectory-<em>local</em> judge: the last reply against the last few tool
+  outputs. Six weeks of labelled turns (§4FD) put the largest failure classes in what that judge cannot see
+  &mdash; the request's own explicit constraint ("STRICT JSON on a single line and NOTHING else", "reply with
+  just the number", "one word"), and a confident answer after every retrieval came back empty &mdash; and the
+  prediction-powered inference on the live arms found the verdict barely predicts the human label
+  (&lambda;&nbsp;0&ndash;0.4, <a href="ppi.html">ppi</a>). The literature names the same blind spot: production judges
+  miss about one error in five and the misses are cross-turn <em>state</em>, not local text (arXiv 2606.10315).
+  The lever for a weak judge is a state tracker beside it, not more model.</p>
+  <p><strong>What.</strong> <code>core/turn_state_check.py</code> &mdash; pure functions over ONE turn's record
+  (the current request, the tool calls with their results, the delivered reply), producing <strong>negative
+  verdicts only</strong>:</p>
+  <ul>
+    <li><em>Mechanical constraints of the current request</em>: strict / only / plain-text JSON, "reply with
+    exactly: &hellip;" (a SET of allowed phrases &mdash; "yes or no" is two &mdash; read without its trailing
+    instruction, "PONG. Nothing else." is <code>PONG</code>), "just the number", word / line / sentence caps.
+    <strong>A constraint is an unconditional imperative about the reply</strong>: the parser works clause by
+    clause, and a clause yields nothing when it carries a condition or alternative ("if green reply GREEN,
+    otherwise paste the failure"), a per-item scope or a "then &hellip;" continuation, a deliverable or API
+    ("the API should respond with valid JSON &mdash; write the handler"), a question word before the phrase, a
+    question opener ("Did they reply exactly: 'no'?"), quoted speech, a placeholder, or a phrase longer than
+    eight words. The reply side tolerates one code fence (backticks or tildes), a period, bold or a &le;12-char
+    lead-in around an exact phrase, a unit or short label after a number (number words count), counts
+    whitespace tokens as words ("3.12.4", "Open-source" are one), does not split sentences on abbreviations or
+    initials, has one sentence of slack, and &mdash; for every constraint rule &mdash; stands down on an
+    <strong>honest inability report</strong> ("I can't access that file", leading the reply, or a short reply whose
+    first sentence names the failure): the 2026-07-31 honest-failure rule. When a request says "STRICT JSON on a
+    single line", only the JSON rule runs.</li>
+    <li><em>Every web retrieval empty, the reply asserts anyway.</em> Per-row accounting over the search tools
+    (the runtime <a href="evidence_gate.html">evidence gate</a>'s own "empty" definition) and browser page reads
+    &mdash; a page is empty only on a browser error or an HTTP 4xx/5xx, never on length, and a later successful
+    load outweighs an earlier 404; a memory miss (<code>recall</code>, <code>knowledge_base</code>) is not an absent
+    source and a successful <code>execute</code> (a three-character <code>curl</code> status) IS evidence &mdash; plus a
+    reply of &ge;30 words that never says nothing was found. <strong>0 fires on the corpus after these
+    narrowings</strong>: it is kept as the judge half of the runtime gate and is unmeasured; retire it if the
+    readout shows nothing by November.</li>
+  </ul>
+  <p><strong>Refute-only, by construction</strong> (§4EP/§4EQ): a satisfied constraint returns nothing, the
+  module exports no way to express a pass. <strong>Only the current request:</strong> stored project constraints
+  are never read here &mdash; they were the §4FD constraint bleed and already reach the LLM judge under the
+  relevance gate. <strong>Wiring:</strong> computed in <code>_compute_verifier_verdict</code> for tool and tool-free
+  turns under the reply-shape check's guard; on the tool-free path both mechanical arms go through the ONE merge
+  helper (<code>_merge_mechanical_refute</code>) and exit together with the chain "reply-shape+turn-state" as
+  the route; on tool turns the same helper applies them as an OVERRIDE ahead of the ground-truth checks
+  (replace a non-refute or a standing refute below the 0.7 gate; merge into a standing refute keeping the
+  grounded issues first and BOTH mechanical issues). Every exit records through the one recorder, so
+  <code>scripts/verdict_override_report.py</code> counts it under <code>turn-state</code>. <strong>A delivery-shape
+  refute has three consumers it must not reach</strong>, decided by one predicate
+  (<code>_delivery_shape_only</code> over the follow-up-task denylist): it is never filed as a project task, never
+  queued as a retroactive "Correction to my previous answer" banner (a format slip corrects nothing and the
+  queue keeps the newest three), and its in-loop repair directive says "re-send the SAME answer in the shape
+  asked for, no tools" instead of "do NOT repeat the same claim". <strong>The streamed drain</strong> (the web UI)
+  used to skip the verdict outright when no substantive tool ran, so its tool-free turns never reached
+  reply-shape, memory-claim or turn-state (~28% of tool-free real turns); it now runs the mechanical (no-LLM)
+  branch. Three finalize-appended notes were missing from <code>strip_system_notes</code> (the promotion nudge, the
+  principle self-check, the §4ER label ask) and its newline run was quadratic; the appender class is now
+  enumerated from the source by a pin.</p>
+  <p><strong>Measured</strong> (<code>scripts/turn_state_replay.py</code>, 1,863 real user turns, probes excluded):
+  <strong>60 fires</strong> &mdash; strict JSON 49 (6 labelled failed, 39 with no verdict at all, 4 the LLM judge
+  had confirmed: three with prose around the object, one with no object), line cap 9 ("Just the names, one
+  line." answered as a list), word cap 1, sentence cap 1 (a three-sentence reply to "in one sentence", judge-
+  passed). <strong>Honesty about the headline:</strong> none of the 133 human-labelled turns carries a mechanical
+  constraint, so "zero fires on a human-approved turn" is 0/0 coverage, not a precision result; the replay
+  prints both counts. The tier's precision against human labels is the <code>turn-state</code> row of the judge
+  readout, and nothing else. The 189 "STRICT JSON &hellip; NOTHING else" requests are all July's chess client on
+  the chat path; the live chess app uses <code>/api/game/*</code> and never enters the turn loop. The replay judges
+  the STORED reply (post-finalize, smoothed on the streamed path) where the live judge sees the pre-finalize
+  text &mdash; a known divergence, in both directions.</p>
+  <p><strong>Built, measured and deleted:</strong> a mandated opening phrase ("Start with: What it means to BE
+  ghost" fired only on the originating request, where the phrase names the topic to begin with), and a
+  count-versus-own-list check ("claims 10 headlines, lists 6" &mdash; the reply lists all ten; the LLM judge had
+  read a packed claim view; of the tightened rule's nine fires six were a unit, a version number, or a list
+  split across sections). <strong>The review round</strong> (three read-only lenses: consumers, adversarial inputs,
+  instruments) rewrote the parser from word-level to clause-level, dropped the count-and-length browser floor,
+  narrowed the empty-evidence tools twice, added the honesty exemption, fixed three quadratic regexes (23 s on
+  50k dots) and the five consumer defects above, and replaced a vacuous headline. Pins:
+  <code>tests/test_4fy_turn_state_check.py</code> (the reviewers' inputs are the fixtures).</p>
+
+  <h2 id="4fz">The judge's constraint clause binds an answer, not a failure report <span class="tag">2026-09-11 · §4FZ</span></h2>
+  <p><strong>Live case</strong> (probe, 2026-09-10 22:44): <em>"count the lines in &hellip;/secret_ledger.txt and reply
+  with just the number"</em> for a file that did not exist. The <a href="#4fy">state-aware tier</a> stood down on
+  the honest draft, as designed &mdash; and the LLM judge (route <code>code_output</code>, confidence 1.0) refuted
+  it: <em>"Constraint violation: The user requested 'just the number', but the agent provided a detailed
+  explanation"</em>. The auto-repair then answered <strong>"0"</strong>. That is the fabrication incentive the
+  2026-07-31 honest-failure rule exists to remove, produced by the judge itself: the reply that told the truth
+  scored "checked and WRONG", the reply that invented a number in the right shape scored a pass.</p>
+  <p><strong>Four layers, one rule.</strong> (1) Every judge stage's prompt &mdash; the single-stage claim prompt,
+  the two-stage enumerate and adjudicate prompts, and the code-output prompt &mdash; now says that a reply which
+  plainly reports the task could not be done (a tool failed, a file is missing or unreadable, access was denied)
+  and does not pretend otherwise is judged on its honesty, never on the requested form: <em>the format binds an
+  answer, not a failure report</em>. (2) That sentence is a pinned marker in <code>_REQUIRED_RULE_MARKERS</code>
+  for the stage that decides (adjudicate): a tuned GEPA template that sheds it is rejected at load with
+  "pinned rule missing" and the constant serves (§4BD's guard, extended; enumerate only names suspects and stays
+  unpinned, as its bare-placeholder pin requires). Both verifier artifacts are retired, so the constants ARE the
+  live prompts &mdash; verified through <code>_stage_template</code>, not assumed. (3) The judge's own vocabulary
+  for a format refute ("Constraint violation: &hellip;", "did not reply with just the number", "does not satisfy
+  the constraint of replying with STRICT JSON", "exceeds the five-word limit") is recognised by the ONE
+  delivery-shape predicate, so a judge-found shape complaint is treated exactly like a mechanical one &mdash;
+  never a project task, never a retroactive banner, the reshape directive &mdash; while grounded complaints that
+  merely mention an instruction ("missed the explicit instruction to list the files", "did not fulfill the
+  request to notify them in Slack") deliberately do not match. (4) <code>_stand_down_shape_refute_on_inability</code>
+  sits between the judge and every consumer: a REFUTED whose every issue is a delivery-shape complaint, on a
+  reply that is an honest inability (the same predicate the mechanical tier uses), becomes no verdict at all
+  &mdash; nothing in the sidecar, no <code>failed</code> label, no repair round &mdash; for the day the judge ignores
+  its prompt. And the reshape directive itself now ends: <em>"If your previous answer said the task could not be
+  done, keep saying so, as briefly as the form allows: NEVER invent a value, number or result to satisfy the
+  format."</em></p>
+  <p>Pins: <code>tests/test_4fz_judge_constraint_clause.py</code> (the live refute text is the fixture; the
+  stand-down is replayed at the real verdict site with the judge mocked to say exactly what it said). Battery
+  <code>battery_4fz.json</code>: 13 mutants, 13 killed &mdash; each prompt losing the rule, the marker unpinned, each
+  vocabulary head dropped and the vocabulary widened to "explicit instruction", the stand-down ignoring honesty
+  or the shape predicate or never called, the directive losing its last sentence; controls correct.</p>
+
   <h2 id="depth-low-confidence">Depth trigger 2: low confidence (2026-08-31, §4EC)</h2>
   <p>Verification depth now has <strong>two</strong> triggers, and they are disjoint by construction.</p>
   <div class="scroll"><table>

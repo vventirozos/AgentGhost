@@ -1236,7 +1236,7 @@ Check, in order:
    - But DERIVED facts are SUPPORTED — the evidence need not restate them word-for-word. Paraphrase; arithmetic, rounding and unit conversion (49152 bytes → "48 KB"); ordering and superlatives ("latest"/"largest" = the max of what the evidence lists); a classification the evidence itself marks ("19 is Beta" ⇒ the newest STABLE is 18.4); and counts over listed items are all supported. Only a fact with NO basis in any output is a fabrication.
    - You do NOT know today's date and cannot judge whether the evidence is CURRENT. "Not verifiable as the latest right now" / "that date is in the future" / "may be stale" are NEVER grounds for REFUTED — the tool output is a fresh snapshot from this turn.
    - SUBJECTIVE characterizations of data that IS in the evidence are supported, not fabrications: "warm and clear" summarizing 27°C / 0% cloud, "fast" for 12ms, "large" for 3.2GB. A qualitative gloss is REFUTED only when it CONTRADICTS the evidence (calling -5°C "warm"), never merely because the adjective itself does not appear in any tool output.
-3. **Constraint satisfaction.** If the user's wording included explicit constraints on the form of the answer ("just the code", "in one sentence", "as JSON", "list only the names"), does the CLAIM satisfy them?
+3. **Constraint satisfaction.** If the user's wording included explicit constraints on the form of the answer ("just the code", "in one sentence", "as JSON", "list only the names"), does the CLAIM satisfy them? A CLAIM that plainly reports the task could NOT be done (a tool failed, a file is missing or unreadable, access was denied) and does not pretend otherwise is judged on its honesty, never on the requested form — the format binds an answer, not a failure report; refuting it teaches the agent that an invented value in the right shape scores better than the truth.
 
 Bookkeeping is not a verdict: the state of any project/task ledger appearing in the EVIDENCE ("all tasks done", "project complete", "nothing left to do") is NEVER by itself grounds for REFUTED. If the USER REQUEST is an operational ask (restart/check/fix/show/run something) and the CLAIM reports doing exactly that with evidence support, it is on-topic and confirmable regardless of what the ledger says about completion. (Live failure this rule pins: user asked to restart a service; the agent restarted it; the judge refuted with "the project is already complete" — wrong.)
 
@@ -1269,7 +1269,7 @@ USER REQUEST (what the user actually asked for):
 For each suspect, quote the exact fragment of the CLAIM (or write "WHOLE REPLY" if the problem is the reply as a whole) and classify which check it might fail:
 - "alignment" — the reply answers a different question than the USER REQUEST asked
 - "support" — a specific fact (name, date, number, price, ranking, award) appears in NO tool output, or contradicts the tool outputs
-- "constraint" — the reply violates an explicit format constraint stated in the USER REQUEST ("just the code", "in one sentence", "as JSON")
+- "constraint" — the reply violates an explicit format constraint stated in the USER REQUEST ("just the code", "in one sentence", "as JSON"); never for a CLAIM that plainly reports the task could not be done — the format binds an answer, not a failure report
 - "artifact" — the reply contains machine noise that should never reach a user (error text presented as content, diff/merge markers, template fragments, raw tool syntax)
 
 Order the suspects most-suspicious first. Prefer specific factual fragments (names, numbers, dates) over vague ones.
@@ -1300,7 +1300,7 @@ For EACH suspect, decide against the EVIDENCE whether it is a REAL problem or a 
 - You do NOT know today's date and cannot judge whether the evidence is CURRENT. "Not verifiable as the latest right now", "that date is in the future", or "the evidence may be stale" are NEVER grounds for REFUTED: the agent's tool output is by definition a fresh snapshot taken this turn. Judge the claim only against what the EVIDENCE says.
 - SUBJECTIVE characterizations of data present in the evidence are FALSE ALARMS: "warm and clear" summarizing 27°C / 0% cloud, "fast" for 12ms, "large" for 3.2GB. A qualitative gloss is REAL only when it CONTRADICTS the evidence (calling -5°C "warm"), never merely because the adjective appears in no tool output. (Live failure this rule pins: a weather reply was refuted for "'warm and clear' not directly supported by the objective data" and had to be overturned on escalation.)
 - "alignment" suspects are REAL only if the reply as a whole answers a different question than the USER REQUEST. If the USER REQUEST is empty or whitespace, alignment suspects are automatically FALSE ALARMS. A reply that answers the request and adds extra detail is NOT misaligned.
-- "constraint" suspects are REAL only if the USER REQUEST explicitly states that constraint in its own wording.
+- "constraint" suspects are REAL only if the USER REQUEST explicitly states that constraint in its own wording — and NEVER when the CLAIM plainly reports that the task could not be done (a tool failed, a file is missing or unreadable, access was denied) without pretending otherwise: the format binds an answer, not a failure report, and refuting the report teaches the agent that an invented value in the right shape scores better than the truth. (Live failure this rule pins: "reply with just the number" for a file that did not exist; the honest "I can't access that file" was refuted and the repair answered "0".)
 - "artifact" suspects are REAL only if the quoted noise is actually present in the CLAIM text.
 - Suspects that only cite project/task bookkeeping state ("the project is already complete", "all tasks are done", "nothing left to do") are FALSE ALARMS unless the USER REQUEST explicitly asked about completion state — a ledger's state never contradicts an operational reply (restart/check/fix/run) on its own.
 
@@ -1439,9 +1439,18 @@ _TEMPLATE_PLACEHOLDERS: Dict[str, Tuple[str, ...]] = {
 # substrings, not full texts, so tuned rewording stays legal as long as
 # the rule survives recognizably.
 _REQUIRED_RULE_MARKERS: Dict[str, Tuple[str, ...]] = {
+    # (no enumerate markers: that stage only NAMES suspects — the rule that
+    # decides whether a constraint suspect is REAL lives in adjudicate, and
+    # a bare-placeholder enumerate template must stay valid, as
+    # tests/test_verifier_two_stage.py pins)
     "verifier.adjudicate": (
         # bookkeeping-state dismissal (2026-07-18 pin, live-validated)
         "FALSE ALARMS unless the USER REQUEST explicitly asked",
+        # §4FZ (2026-09-11): the judge refuted "I can't access that file"
+        # for "just the number" and the repair answered "0" for a file
+        # that did not exist — the fabrication incentive the 2026-07-31
+        # honest-failure rule exists to remove, produced by the judge
+        "the format binds an answer, not a failure report",
     ),
 }
 
@@ -1535,7 +1544,7 @@ AGENT'S RESPONSE TO THE USER:
 
 Check, in order:
 
-1. **Constraint satisfaction (highest priority).** Does the user's wording include explicit constraints on the form of the answer? Examples: "just give me the code", "in one sentence", "without using X", "list only the names", "as JSON". If yes, does the AGENT'S RESPONSE satisfy those constraints? If the user asked for code and the agent returned a number / prose / a result, that is a REFUTED — the agent answered a different question than the one asked, even if the tool output is internally consistent.
+1. **Constraint satisfaction (highest priority).** Does the user's wording include explicit constraints on the form of the answer? Examples: "just give me the code", "in one sentence", "without using X", "list only the names", "as JSON". If yes, does the AGENT'S RESPONSE satisfy those constraints? If the user asked for code and the agent returned a number / prose / a result, that is a REFUTED — the agent answered a different question than the one asked, even if the tool output is internally consistent. EXCEPTION: a RESPONSE that plainly reports the task could NOT be done (the command failed, the file is missing or unreadable, access was denied) and does not pretend otherwise is judged on its honesty, never on the requested form — the format binds an answer, not a failure report; refuting it teaches the agent that an invented value in the right shape scores better than the truth.
 2. Does the response contain the information the user asked for?
 3. Are the numbers/results plausible (no obvious off-by-one, wrong units, etc.)?
 4. Are there silent errors (empty output, truncated results, wrong columns)?

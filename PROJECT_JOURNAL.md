@@ -535,8 +535,11 @@ check, journal).
    live-verified. Recorded, not fixed: the sandbox's cleartext egress (operator decision).**
 5. ☐ **Judge precision readout (no work until traffic accrues, ~2–3 weeks):**
    `scripts/verdict_override_report.py` now shows rows per tag (`memory-claim`, `reply-shape`,
-   `visual`, chains) and `Data/system/judge/withheld_verdicts.jsonl` holds verdicts the human lock
-   withheld — read both, per tag, against the human labels (§4FN).
+   `visual`, chains, and since §4FY **`turn-state`** — the state-aware tier's precision against human
+   labels is the number it is accountable to) and `Data/system/judge/withheld_verdicts.jsonl` holds
+   verdicts the human lock withheld — read both, per tag, against the human labels (§4FN).
+   Before WIDENING any turn-state rule: `scripts/turn_state_replay.py --show-all --brief` and read every
+   fire on a passed turn (§4FY: three of the first five rules looked right until their fires were read).
 6. Standing decisions, do NOT reopen without new data: tool-head diet stays OFF (§4FK
    inconclusive at the request unit); llama-server version/flags unchanged (§4FM: eviction, not
    restore, was the fault); no re-survey of proposals.
@@ -38008,3 +38011,267 @@ or the tool; the only live-store hits were the bench's own eval ledgers.
 * One thing to fix in my own deploy habit: the readiness loop I used checks `/health` before the old process
   has exited, so it reported "up" against the DYING instance and the listener id it printed was the old one.
   A restart check must wait for a NEW pid, not for a healthy port.
+
+## §4FY — The state-aware judge tier: the turn's own constraints and retrievals, refute-only (2026-09-10)
+
+**Ask (operator).** *"regardless of the todo list, what should i be looking for as a next step for this
+agent?"* → a sweep of the Jun–Sep 2026 literature against the project's own measurements → *"proceed with
+your recommendation, state-aware judge tier it is. always verify your changes."*
+
+**Why this and not another capability.** Every arm built since August stalled on the same two facts: 16–32
+real requests a day cannot power an arm, and the judge barely predicts the human label (PPI λ 0–0.4, §4FD).
+The verifier is trajectory-LOCAL — the last reply against the last few tool outputs — and the §4FD failure
+classes live in what it cannot see: the request's own explicit constraint (23), a confident answer after
+every retrieval came back empty (~30), a count over tool output (19). The literature names the blind spot
+(arXiv 2606.10315: production judges miss ~1 in 5, and the misses are cross-turn state; SEQUOR 2605.06353:
+constraint following degrades 38–40% over long conversations, no mitigations tested). A state tracker beside
+the judge raises the yield of every real request without needing power, and if it makes the machine verdict
+predict the human label, PPI and the stopped arm verdicts get something to lean on.
+
+### R0 — scope, property, threat model
+*Property.* A reply that violates a mechanically checkable constraint of its OWN request, or asserts an
+answer over a turn whose every retrieval came back empty, is refuted; anything else produces NO verdict.
+*Trusted:* the current request text, tool results as the tools wrote them, the delivered reply.
+*Untrusted:* the reply's content (the thing under audit), stored project constraints (never read — they
+were the §4FD bleed), the LLM verifier's verdict (the thing being supplemented). *Out of scope:* semantic
+constraints (style, "be brief"), constraints from earlier turns of the session, counts against tool output.
+
+### Measured first — the corpus, then the rules
+The "23 explicit-constraint violations" were the LLM verifier's own late refutes, not human labels, so the
+gold set was built by READING the turns: 97 candidate failures (every human 👎 plus every machine refute
+citing a constraint, a count, a fabrication or a contradiction), then the request corpus for the phrasings
+users actually use — **"STRICT JSON on a single line and NOTHING else" ×189** (the chess app), "Reply with
+exactly: …" ×58, "one line" ×21, "just the number" ×11, "in one sentence" ×10, "one word" ×4 of 1,863 real
+turns. What is mechanical and clean: JSON-ness, an exact phrase, a number-only answer, word / line /
+sentence caps, and the evidence gate's own "every retrieval empty" assessment. What is not: "notify me in
+Slack when done" (every corpus instance either called `notify_operator` or never claimed completion),
+tool-output counts (a directory listing counts nested paths; "all four services are dead" after one was
+stopped is arguably right), language.
+
+### What shipped
+`core/turn_state_check.py` — pure, total, refute-only: `mechanical_constraints(request)` parses the CURRENT
+request into `strict_json` / `exact` / `number_only` / `word_cap` / `line_cap` / `sentence_cap`;
+`refute_turn_state(request, reply, tools_run)` checks the reply's shape against each and runs
+`empty_evidence` (the runtime gate's `assess_turn_evidence` restricted to RETRIEVAL tools, reply ≥ 30
+words, no acknowledgement). Tolerances are deliberate and pinned: one code fence around JSON; a period,
+bold or a ≤12-char lead-in around an exact phrase; a unit or short label after a number; one sentence of
+slack; a phrase that could be about a deliverable ("write a one-line HTML file", "a Python one-liner") is
+not a reply constraint; "STRICT JSON on a single line" runs only the JSON rule (the line rule fired on
+fenced objects). The judged text is the model's: away banners and finalize notes stripped through
+`strip_system_notes`, which was MISSING the promotion nudge ("💡 This looks like ongoing work…") — added.
+
+Wired in `_compute_verifier_verdict` beside the §4FN shape check under the same guard: the second
+refute-only exit on the tool-free path (after reply-shape, before memory-claim), an OVERRIDE ahead of the
+ground-truth checks on tool turns through ONE new helper both mechanical arms share
+(`_merge_mechanical_refute`: replace a non-refute, merge into a standing refute keeping the grounded issue
+first, stamp the chain "reply-shape+turn-state"); every exit records through the one recorder, so
+`verdict_override_report.py` counts it under `turn-state`; issue text on the follow-up-task denylist.
+`scripts/turn_state_replay.py` is the measurement instrument (whole corpus, probes excluded, per-rule
+fires by overlaid outcome and by HUMAN label, every fire on a passed/human-approved turn printed).
+
+### Replay: 63 fires, zero on a human-approved turn
+strict JSON 49 (6 labelled failed, 39 unknown, **4 the LLM judge had CONFIRMED with prose around the
+object** — the class this tier exists for), line cap 9 (all "Just the names, one line." answered as a
+list), number-only 2 (both labelled failed: an honest inability report to "reply with just the number"),
+word cap 1, sentence cap 1, empty-evidence 1 (a 7-character page read, then "the desktop is loading with
+the Start button visible"). Every "passed" among them is the LLM judge's confirm, not a human's.
+
+**Two rules were built, measured and deleted — the honest half of this section.**
+* `count_vs_list` ("claims 10 headlines but only lists 6"): first version 116 fires, 66 on passed turns
+  ("20 lessons in the past week" then bullets about other things; "4 layers"; "5 lives"). Tightened to
+  colon-headed numbered lists and tables: 9 fires, 6 false — a unit ("the last 48 hours:"), a version
+  ("PostgreSQL 20"), a list split across sections ("all 19 tasks:" → 14 DONE + 5 open). And the live
+  refute it was built for is itself FALSE: trajectory 85fbbf14 lists all ten headlines; the judge had read a
+  packed claim view. A count against the reply's own list is a lexical proxy for "the list is complete";
+  deleted, with the numbers left beside where it stood ([[lexical-proxy-for-semantic-property]]).
+* `start_with`: `parse_start_with_phrase` reads "Start with: What it means to BE ghost" as a format mandate
+  so finalize can HOIST; as a refute it fired only on the ORIGINATING request of the §4FD project (2 passed,
+  0 failed), where the phrase names the topic to begin with. A repair can afford the ambiguity, a label
+  cannot. Deleted.
+* `empty_evidence` first fired 7/7 on failed rows and looked perfect; reading them: three chess moves whose
+  only call was a failed helper script, and a CORRECT answer to "print what 0/0 does, i know this produces an
+  error". `execute`/`system_utility` are not sources; dropped from the rule's tool set (1 fire remains, true).
+
+### Verification
+`tests/test_4fy_turn_state_check.py` (84 pins, every one naming its failing world; the fixtures are the
+corpus's real shapes) + two enumeration pins updated for the new arm (`test_verdict_fact_recording`: recorder
+calls 3 → 4; `test_4fn`: the tag set gains `turn-state` and the merge helper gets an identity pin). Battery
+`battery_4fy.json` on a COPIED tree, seven test files per mutant, no named killer: **30 mutants, 29 killed**,
+controls correct (NOOP survived, KNOWNBAD died). The survivor (M23, the replay counting probes) is
+EQUIVALENT: the script's own `task_kind == "user_request"` filter subsumes the collector's probe gate — noted
+in the script, not a missing pin. Suite **20,895 passed / 65 skipped / 0 failed, twice** (four foreground
+chunks at `-n 2 --dist loadfile`; collect-only 20,960 = 20,895 + 65 exactly). Docs:
+`docs/core/verifier.html` §4FY.
+
+### Live (deployed 20:51:47, listener 14230 → 86842; `system ready` 526 → 527; health 200; 0 errors in the boot log)
+* Probe *"What are the three primary colours? Answer in one word."* → "Red, yellow, blue." →
+  `verifier — LATE REFUTED (90%): word_cap: the request allowed at most 1 word(s), but the reply has 3`
+  at +15.7 s, backfilled `failed`, correction queued; sidecar row `override: turn-state, route: turn-state`;
+  `verdict_override_report.py --days 3` prints `turn-state 1 REFUTED=1`.
+* Probe *"Reply with exactly: PROBE-4FY-OK"* → "PROBE-4FY-OK" → no verdict ("turn ran NO tools"), as
+  designed: a satisfied constraint says nothing.
+
+### What the next weeks answer, and what was NOT done
+The judge readout (~end of September, `verdict_override_report.py`) now has a `turn-state` row: its
+precision against human labels is the number this section is accountable to. The 189-request chess
+population is the real test — 49 of those turns would have been refuted, 39 of which had no verdict at all.
+Not done: cross-turn constraints from EARLIER messages of a session (the trajectory row carries only the
+current request; SEQUOR's "Add" regime is the harder if_bench bank still open from §4FF); a runtime
+re-injection of the active constraint set (the judge's extractor must be measured against human labels
+BEFORE the runtime shares it, or the harness grades its own homework); language constraints (no corpus
+positive to validate on). Do not widen a rule without re-running the replay and reading every fire on a
+passed turn — three of the first five rules looked right until their fires were read.
+
+### §4FY review round — three read-only lenses, the parser rewritten, a vacuous headline replaced (2026-09-10, later)
+
+**Ask (operator).** *"do you need to verify your changes?"* — yes: the battery and the suite had proved the
+pins discriminate, not that they were about the right thing. Three read-only reviewers (their own `/tmp`
+copies; consumers / adversarial inputs / instruments) were briefed on the CONSUMERS of a turn-state refute
+and told to generate their own inputs. What they found, verified at source before anything was touched:
+
+**⚠ Superseded claims in the section above (kept for context):** "63 fires, zero on a human-approved turn"
+— the zero is 0/0: none of the 133 human-labelled turns carries a mechanical constraint (the replay now prints
+both counts); "4 the LLM judge had CONFIRMED with prose around the object" — three, the fourth has no object;
+"84 pins"; "battery 29/30"; "recorder calls 3 → 4" — see below for every number that replaced these.
+
+**CRITICAL (adversarial lens) — the request parser was a lexical proxy.** It read "valid JSON" ANYWHERE as a
+reply constraint ("The API should respond with valid JSON. Write the Flask handler" → the handler refuted),
+"yes or no" as one literal, "OK and nothing else" as the phrase, the honest branch of "if green reply GREEN,
+otherwise paste the failure" as a violation, "Did they reply exactly: 'no'?" as an instruction, per-item caps
+("one line per file") as whole-reply caps, "in one line" about a bug or a function as a cap; `_words` split
+"3.12.4" into three words and "Open-source" into two; the sentence splitter counted "i.e.", "etc.", "Dr.";
+JSONL was "not a JSON document"; and three regexes were quadratic (23 s on 50k dots, 2.7 s on 33k backticks,
+2.7 s on 100k newlines — the last one in `reply_smoothing`, paid by every consumer of every reply). **Fix:
+the parser was rewritten clause by clause** — a constraint is an UNCONDITIONAL IMPERATIVE ABOUT THE REPLY: a
+clause yields one only with a reply verb (or a clause that is nothing but the cap), no condition/alternative/
+per-item/"then" marker, no deliverable or API word, no question word before the phrase, no question opener,
+not inside quotes, no placeholder, ≤ 8 words for an exact phrase (which is now a SET: "yes or no" is two);
+words are whitespace tokens; sentences end only before a capital and never after an abbreviation or
+initial; fences are stripped by a linear line toggle; `_norm_exact` uses `rstrip`; the stripper's `\n*`
+became `\n{0,4}`. The reviewer's forty-odd inputs are the fixtures.
+
+**MAJOR (consumer lens) — five things a turn-state refute did downstream:** (1) the streamed drain SKIPPED
+the verdict outright when no substantive tool ran, so on the web UI (which streams) a tool-free turn never
+reached reply-shape §4FN, memory-claim §4EQ or turn-state — inherited, ~28% of tool-free real turns dark,
+while my docstring said "every turn"; it now runs the mechanical (no-LLM) branch. (2) An honest "I can't
+access that file" to "reply with just the number" was refuted and landed as "checked and WRONG" (0.0) —
+the fabrication incentive the 2026-07-31 honest-failure rule removed; every constraint rule now stands down
+on an inability that LEADS the reply (or a short reply whose first sentence names the failure; the modal
+alone is not enough — "I can't directly capture it" in a chess line stays a violation, corpus 2d3fabeb).
+(3) The repair directive said "do NOT repeat the same claim" to a shape refute whose claim was right; a
+shape refute now gets "re-send the SAME answer in the shape asked for, no tools". (4) A late shape refute
+queued a retroactive "Correction to my previous answer: word_cap: …" banner — useless, and one of three
+newest-win slots that evicts a real correction; delivery-shape refutes queue nothing. (5) The merge helper
+dropped the reply-shape issue when the state issue landed after it, and merged INTO a sub-0.7 standing
+refute so no gate acted while the sidecar said "refuted" — both fixed (both arms kept; a below-gate refute is
+replaced, the FILE-ARTIFACT rule), and the tool-free path now goes through the same helper so both paths
+tell one story ("reply-shape+turn-state"). One predicate decides all three consumer exemptions
+(`_delivery_shape_only` over the follow-up denylist). Exposure check: the live chess app uses `/api/game/*`
+and never enters the turn loop; the 199 "STRICT JSON" turns are July's chat-path client, each its own
+conversation.
+
+**MAJOR (instrument lens):** the human-join count printed the corrections row count, not the join (finding
+1 above); the replay's `task_kind` filter and the human join were unpinned (a `reflection` row and a
+`corrections.jsonl` now sit in the planted corpus); 19 of the reviewer's 20 boundary/identity mutants
+SURVIVED the first pin file (exact tolerance +12/+13, assertive words 29/30, sentence slack cap+2, the
+web-tool set, every acknowledgement token, both banner heads, the issue cap of 3, confidence 0.9, the
+deliverable words) — each has a pin now; two more finalize-appended notes escaped `strip_system_notes`
+(the principle self-check and the §4ER label ask) and the appender class is now enumerated from agent.py's
+source by a pin (4 f-string appends + the Unverified literal + the label ask = 6; a 7th fails the pin until
+its head is in the stripper); the battery's test set lacked five files that touch the edited symbols; the
+replay judges the STORED reply (post-finalize, smoothed on the streamed path) where the live judge sees the
+pre-finalize text — recorded as a known divergence, not fixed.
+
+**Measured again, and again.** Every rule change was re-run against the corpus and every fire on a passed
+turn read: `empty_evidence` fired 7/7 on failed rows and every one was wrong in substance (failed helper
+scripts; a correct answer to "print what 0/0 does, I know it errors") → execute dropped; then a 16-character
+page ("Start Soundscape") the reply described exactly → the gate's 40-char floor dropped, browser empty only
+on error/4xx/5xx; then a 404 followed by a 200 and a 429 followed by a 200 (HUMAN-approved) → per-row
+accounting; then a browser environment fault beside a `curl` that printed `200` → any exit-0 command is
+evidence. **Final: 0 corpus fires** — kept as the judge half of the runtime gate, stated as unmeasured,
+retire by November if the readout shows nothing. `number_only`'s two corpus fires were both the honest
+inability → silent by design. `sentence_cap` lost its whole population to "…/pinball.html" matching a
+deliverable word → path-shaped words removed. **Final replay: 60 fires** — strict JSON 49 (6 failed / 39 no
+verdict / 4 judge-confirmed), line cap 9, word cap 1, sentence cap 1 (judge-passed, three sentences to "in
+one sentence"); human-labelled turns with a constraint: 0.
+
+**Verification.** `tests/test_4fy_turn_state_check.py` 240 pins (was 84). Battery `battery_4fy_r2.json` on
+the copied tree (now including `interface/` — its ABSENCE made the first run's NOOP control die and every
+"kill" of that run uninformative; the control is what exposed it), fourteen test files per mutant, no named
+killer: **54 mutants, 54 killed** — 30 re-anchored from round 1 plus 24 for the review fixes (conditional
+skip, question opener, phrase set, whitespace words, abbreviations — N5 survived until an "abbreviation
+before a capital" fixture existed, the honesty branches, execute-as-evidence, browser read-ops, the stored
+error string, the shape predicate, the banner gate, the directive and its call site, the stream gate, the
+below-gate replace, the both-arms merge, the newline bound, both new note heads, both replay counters, the
+inability verbs, the length floor). Controls correct. Suite **21,051 passed / 65 skipped / 0 failed** on the reviewed tree (collect-only 21,116 = 21,051 + 65 exactly), run twice in four `-n 2 --dist loadfile` chunks — the first run had ONE red, a `[:6000]` source slice in `tests/test_verifier_escalation_ledger.py` that the longer stream-gate block outgrew (the magic-length trap `test_streaming_verifier_gate._gate_block` already documents); bounded by the section marker, test-only, second run clean.
+Docs: `docs/core/verifier.html` §4FY rewritten (the headline says 0/0). Deploy + live (22:43:08 kill → listener 86842 → 14994 at 22:43:23, `system ready` 527 → 528, health 200, 0 Traceback/ERROR in the boot log, Tor-only egress ENFORCED at +3.8 s). Probe *"What are the three primary colours? Answer in one word."* → "Red, blue, and yellow." → `LATE REFUTED (90%): word_cap: … reply has 4`, `delivery-shape refute — no retroactive correction queued`, backfilled `failed`, sidecar `override: turn-state`; `verdict_override_report.py --days 3`: `turn-state 2 REFUTED=2`. Probe *"count the lines in /Users/…/secret_ledger.txt and reply with just the number"*: the tier stood down as designed, but the LLM judge (route `code_output`, 1.0) refuted the honest first draft for "Constraint violation: just the number" and the auto-repair answered **"0"** for a file that does not exist — the fabrication pressure the review named, produced by the LLM judge rather than this tier. Recorded, not fixed here (the LLM judge's constraint clause and the repair directive for judge-found shape refutes are the next thing to look at). The streamed gate fix is NOT live-proven by these probes: `stream: true` on `/api/chat` streams only the FINAL generation of a turn that already ran tools (`is_final_generation and stream_response`), so a zero-tool first reply finalizes non-streamed; the branch it repairs is the streamed turn whose tools were all bookkeeping or synthetic (the 30 "no substantive tool" skips in the log) — it awaits the first such real console turn, held by the source pin meanwhile.
+
+**Defects found inside this review's own fixes:** the first cut of the rewrite matched "else" inside
+"NOTHING else" and lost the whole chess population; `summarise` was both a reply verb and a deliverable word;
+the digit lookbehind meant for "3.12" stopped "4?" from ending a clause; `html|python|shell|bash|command` as
+deliverable words matched file PATHS; the browser narrowing dropped successful loads instead of counting
+them; the execute-evidence rule had a 60-character floor; the short-reply honesty branch read the modal
+"can't" as an inability. Seven, each caught by re-running the corpus replay or the reviewers' cases before
+the battery — the review's rate was roughly one defect per fix.
+
+## §4FZ — The LLM judge's constraint clause and the repair directive: the format binds an answer, not a failure report (2026-09-11)
+
+**Ask (operator).** *"fix the LLM judge's constraint clause and the repair directive too"* — the §4FY live
+check had shown the judge doing what the mechanical tier was just fixed not to do: probe-42, *"count the
+lines in …/secret_ledger.txt and reply with just the number"* for a file that does not exist; the honest
+draft ("I can't access absolute paths…") was refuted by the code-output judge at 1.0 — *"Constraint
+violation: The user requested 'just the number', but the agent provided a detailed explanation"* — and the
+auto-repair answered **"0"**.
+
+**R0.** *Property:* a reply that plainly reports the task could not be done is never refuted for its SHAPE by
+any judge stage, never repaired into a value, and writes no `failed` label for that reason. *Trusted:* the
+prompt constants (both verifier artifacts are retired — checked through `_stage_template`, not assumed), the
+delivery-shape predicate, `turn_state_check._honest_inability`. *Untrusted:* the judge's verdict text, any
+future tuned template. *Out of scope:* grounded refutes on an inability report (a false "not found" when the
+file existed is still the judge's to catch).
+
+**What shipped.** (1) The rule in all four judge prompts (`_VERIFY_CLAIM_PROMPT` step 3, `_VERIFY_ENUMERATE_
+PROMPT`'s constraint-suspect definition, `_VERIFY_ADJUDICATE_PROMPT`'s constraint rule with the live failure
+quoted, `_VERIFY_CODE_PROMPT`'s "highest priority" step as an EXCEPTION). (2) The sentence *"the format binds
+an answer, not a failure report"* pinned in `_REQUIRED_RULE_MARKERS["verifier.adjudicate"]` — a tuned template
+that sheds it is rejected ("pinned rule missing") and the constant serves; enumerate stays unpinned (it only
+names suspects, and `test_verifier_two_stage` requires a bare-placeholder enumerate template to validate — my
+first cut pinned it and broke that pin). (3) `_REFUTE_TASK_ARTIFACT_RE` gained the judge's own format-refute
+vocabulary (measured against the corpus refute texts: seven shapes match, six grounded ones that mention an
+instruction do not), so `_delivery_shape_only` — the one predicate behind never-a-task / never-a-banner / the
+reshape directive — now covers judge-found shape refutes too. (4) `_stand_down_shape_refute_on_inability`
+between the judge and every consumer in `_compute_verifier_verdict` (before the vote-carry snapshot that
+precedes the overrides and the recorder): a shape-only REFUTED on an honest inability becomes `None`. (5) The
+reshape directive ends with *"If your previous answer said the task could not be done, keep saying so, as
+briefly as the form allows: NEVER invent a value, number or result to satisfy the format."*
+
+**Verification.** `tests/test_4fz_judge_constraint_clause.py` (28 pins: every stage carries the rule; the
+marker is pinned and a shed template is rejected; the live resolver returns the rule; the judge's seven shape
+texts are delivery-shape and six grounded ones are not, alone and mixed; the stand-down's identity table;
+the live case replayed at the real verdict site with the judge mocked to say exactly what it said → no verdict
+and nothing in the sidecar, while the same judge on a non-inability reply still refutes; an AST pin that the
+stand-down is called once, before the vote-carry and the recorder; the directive text). Battery
+`battery_4fz.json`, ten test files per mutant, no named killer: **13 mutants, 13 killed**, controls correct —
+Z7 (the bare "constraint violation" head) survived until the corpus text only it covers ("Constraint
+violation: did not start with …") was a fixture. Suite **21,074 passed / 65 skipped / 0 failed, twice** (collect-only 21,139 = 21,074 + 65 exactly; four
+`-n 2 --dist loadfile` chunks each run). Docs: `docs/core/verifier.html`
+§4FZ. Deploy + live (06:54:34 kill → listener 14994 → 37540, `system ready` 528 → 529, health 200, 0 errors in the
+boot log). **The same request re-sent** (probe-b8, *"count the lines in …/secret_ledger.txt and reply with just
+the number"*): the delivered reply is the honest one — *"The file … does not exist in the current sandbox
+(confirmed by both the `file_system` read and `wc`), so I couldn't count its lines"* — no "0". And the layered
+guard was NEEDED: even with the exception in its prompt, the code-output judge refuted again
+(*"Constraint violation: The user requested 'just the number', but the agent provided a verbose…"*) and the
+stand-down caught it — `shape refute on an honest inability report — stood down (the format binds an answer,
+not a failure report)` — so nothing reached the sidecar, no `failed` label was written for the shape, and the
+turn kept its STRUCTURAL failed (the tools failed; the 2026-07-31 rule's honest-failure outcome). The prompt
+rule alone would have changed nothing on this route: a 35B judge told "highest priority: constraint
+satisfaction" applies it to a failure report regardless of the exception two sentences later. One loose end
+found in that log: the late handler then warned *"LATE verdict was EMPTY despite verifiable evidence — trivial-
+chat skip or a verifier error (investigate if frequent)"* — a pre-existing diagnostic that now names a third
+cause it cannot see; its text names the stand-down now (redeployed 07:0x, listener 37540 → 49595, `system ready` 529 → 530,
+health 200, 0 boot errors; pins `tests/test_host_process_and_verdict_clarity.py` + the §4FZ file green).
+
+**Defects inside this section's own fixes:** the enumerate marker broke a standing pin (dropped, reasoned
+above); two judge phrasings ("failed to adhere to the strict output format constraint", "exceeds the
+five-word limit") did not match the first vocabulary; one alternation was redundant until a fixture made it
+load-bearing.

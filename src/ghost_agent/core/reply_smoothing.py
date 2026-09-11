@@ -302,14 +302,29 @@ def _group_blocks(blocks: List[str]) -> List[List[int]]:
 # review catch 2026-08-01: the earlier earliest-marker cut deleted
 # everything after a mid-reply lookalike, substance included).
 _TRAILING_NOTE_TAIL_RE = re.compile(
-    r"\n*---\n(?:\*\*⚠ Unverified:\*\*|\*\*Plan check:\*\*|"
+    # `\n{0,4}`, not `\n*` (§4FY review): the appended seam is exactly
+    # "\n\n---\n", and the unbounded run was quadratic on a reply of
+    # newlines (2.7 s on 100k) — paid on EVERY reply by every consumer.
+    r"\n{0,4}---\n(?:\*\*⚠ Unverified:\*\*|\*\*Plan check:\*\*|"
     # "Verifier note:" was MISSING from this list (§4L Lens-A MINOR-1)
     # while being appended BEFORE the hedge scan — a verifier note
     # quoting first-person text survived the strip and fired the hedge
     # regex, putting uncertainty_pressure on a refuted (label-0) turn:
     # the same label-echo channel as the λ leak, one banner over.
     r"\*\*Verifier note:\*\*|"
-    r"\*\*Things I'm not certain about:\*\*|\*\*Assumptions I made:\*\*)"
+    r"\*\*Things I'm not certain about:\*\*|\*\*Assumptions I made:\*\*|"
+    # §4FY: the project-promotion nudge ("💡 This looks like ongoing work
+    # (…). Want me to promote it to a tracked project?") is appended by
+    # finalize with the same `\n\n---\n` seam and was MISSING here — the
+    # state-aware judge read it as prose around a strict-JSON answer and
+    # refuted a compliant chess turn on the replay corpus (5ef33e14).
+    r"💡 This looks like ongoing work|"
+    # §4FY review R1: two more appenders shared the seam and were missing —
+    # the principle gate's note and the §4ER label request. The class is now
+    # pinned from the SOURCE: every `f"{final_ai_content}\n\n---\n<head>"`
+    # in agent.py must be stripped here (tests/test_4fy_turn_state_check.py).
+    r"\*\*Self-check \(principle\):\*\*|"
+    r"\*This was one of the shakier answers)"
     r"(?:(?!\n\n).)*$",
     re.DOTALL,
 )
