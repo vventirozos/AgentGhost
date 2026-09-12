@@ -57,7 +57,6 @@ _CARRIER = {
     "status.js": "workspace.js",
     "notifications.js": "workspace.js",
     "palette.js": "workspace.js",
-    "facelab.js": "workspace.js",     # 2026-09-11: lazy face lab
 }
 # child -> every ancestor that must move with it (root-down bumping).
 _ANCESTORS = {

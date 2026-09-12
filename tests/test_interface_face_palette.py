@@ -64,20 +64,23 @@ def test_palette_stays_on_the_thermal_axis(graph_js):
 
 
 def test_alien_forms_present(graph_js):
-    """2026-07-28: 'alive' is a property of anatomy + muscle-like motion.
-    Three interchangeable alien body plans (abyssal / horizon / cortex)
-    share ONE propulsion engine — the asymmetric _pulseShape envelope,
-    strand waves, hot core, flinch — and a header button cycles them."""
+    """2026-07-28: 'alive' is a property of anatomy + muscle-like motion;
+    the body plans share ONE propulsion engine — the asymmetric _pulseShape
+    envelope, hot core, flinch — and a header button picks them.
+    2026-09-12 (operator): abyssal / horizon / cortex were REMOVED; the
+    vortex is the surviving organic form, and the strand-wave params went
+    with the feelers."""
     assert "_pulseShape" in graph_js
     assert "kind: 0" in graph_js and "kind: 1" in graph_js and "kind: 2" in graph_js
-    for builder in ("_buildAbyssal", "_buildHorizon", "_buildCortex",
-                    "_buildVortex", "_buildEmpty"):
+    for builder in ("_buildVortex", "_buildEmpty"):
         assert builder in graph_js, f"missing {builder}"
+    for gone in ("_buildAbyssal", "_buildHorizon", "_buildCortex", "_buildStack",
+                 "_buildConversation", "_buildToolGraph"):
+        assert gone not in graph_js, f"{gone} is back"
     assert "'empty'" in graph_js, "empty form missing from the cycle"
     assert "export function cycleForm" in graph_js
     assert "export function setForm" in graph_js
     assert "ghost_face_form" in graph_js, "form choice must persist"
-    assert "swayAmp" in graph_js, "strand wave params missing"
     # The propulsion envelope must stay asymmetric (squeeze ≪ release).
     assert "if (x < 0.16)" in graph_js and "if (x < 0.62)" in graph_js
     # Uniform-random scatter must not come back.
@@ -107,9 +110,7 @@ def test_vortex_self_similar_swallow(graph_js):
     # Background-blend luminance: EVERY form emits ~half the light
     # (introduced for vortex, extended to all faces same day).
     assert "uFormDim" in graph_js
-    # 2026-09-11: the two DATA forms (a handful of nodes) run at 0.95; every
-    # anatomy keeps the 0.55 background blend this test was written for.
-    assert "? 0.95 : 0.55;" in graph_js and "formDim = (FORM === 'conversation' || FORM === 'toolgraph')" in graph_js
+    assert "formDim = 0.55" in graph_js
     # The camera must never travel in this form.
     assert "camera.position.z = CAMERA_REST_Z;" in graph_js
     assert "vortexTravel * 7.4" not in graph_js, "camera travel must stay dead"

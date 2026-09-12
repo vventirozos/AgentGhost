@@ -93,13 +93,6 @@ let flinch = 0.0;        // error recoil — one sharp agitated pulse, decays
 let _bob = 0.0;          // swim bob: rises on contraction, sinks on glide
 let _bobTarget = 0.0;
 let huePhase = 0.0;      // bounded thermal oscillation (see hueDrift)
-// Horizon event choreography: occasional cycles run HOT (deeper
-// collapse, brighter core flare, faster infall) — variability is what
-// separates a heartbeat from a metronome. coreFlare feeds the core
-// quads' render size each frame.
-let _lastPulseFract = 0.0;
-let eventBoost = 0.0;
-let coreFlare = 1.0;
 
 // ── Vortex (form 'vortex') — self-similar swallow ──────────────────
 // A logarithmic cone converging at the singularity (origin), opening
@@ -136,9 +129,6 @@ const VORTEX_KOUT = 2.6;      // exponential expansion — self-similarity knob
 const VORTEX_COS = 0.60, VORTEX_SIN = 0.80;   // cone half-angle
 
 // ── AI-form state (2026-07-29) ─────────────────────────────────────
-// stack: one shared climb accumulator — packets ride it at fixed
-// stagger offsets, so busy speeds every token without phase jumps.
-let stackFlow = 0.0;
 // embedding: the query comet's flight state. From/to are cluster
 // indices; embT is eased 0..1 along a bezier whose control point is
 // pushed outward so the flight arcs through the void between concepts.
@@ -196,58 +186,32 @@ let hueDrift = 0.0;
 // The shader-side counterpart is the uOrganic uniform.
 const CALM = PREFERS_REDUCED_MOTION ? 0.35 : 1.0;
 
-// ── Alien forms (2026-07-28) + AI forms (2026-07-29) ───────────────
+// ── Forms (roster trimmed 2026-09-12) ─────────────────────────────
 // Interchangeable body plans over ONE motion engine (the asymmetric
-// _pulseShape propulsion, metachronal strand waves, hot core, flinch,
-// thermal anatomy):
-//   abyssal — asymmetric lobed mantle tilted off-axis, feelers
-//             reaching in all directions, off-center core.
-//   horizon — eccentric orbital shells collapsing toward a burning
-//             core; filament spirals falling inward, heating as
-//             they fall.
-//   cortex  — asymmetric neural lobes swelling with thought-waves;
-//             dendrites radiating outward carrying signal trains.
-//   vortex  — a black hole ahead of the viewer; self-similar
-//             expansion flow, accretion ring, dark shadow.
-// AI forms (2026-07-29 — "this is an AI project": the machine's own
-// internals as anatomy, same engine, first ANGULAR silhouettes):
+// _pulseShape propulsion, hot core, flinch, thermal anatomy):
+//   vortex    — a black hole ahead of the viewer; self-similar
+//               expansion flow, accretion ring, dark shadow.
 //   lattice   — the weight tensor: a tumbling crystal grid; diagonal
 //               activation waves heat the sites they cross; a hot
 //               attention kernel drifts the volume, bending the grid
 //               toward itself; charge runners ride the axes.
-//   stack     — the transformer: tapering layer-rings threaded by a
-//               hot residual-stream column; token packets climb,
-//               rippling each layer they pass, enriching as they go.
 //   embedding — latent space: cold concept clusters on slow orbits; a
 //               hot query comet streaks cluster→cluster, and each
-//               arrival IGNITES the recalled cluster (it tightens,
-//               flares, cools back).
+//               arrival IGNITES the recalled cluster.
 //   descent   — the loss landscape: an undulating terrain sheet, cold
 //               ridges / warm valleys; the optimizer bead rolls
 //               downhill trailing heat, kicked to explore again
 //               whenever it settles (and on error flinches).
-//   cube      — the infinite monolith (operator concept, 2026-07-29,
-//               distilled from what they loved in lattice): a large
-//               dark cube with a FEW resident alien complexities
-//               quietly deforming it from inside. A user turn wakes
-//               one — it grows aggressively-but-not-fast, mutating
-//               and re-weaving the grid around it like a spreading
-//               infection, running crimson; the dive rides INTO the
-//               mutation as it evolves, and on completion it tames,
-//               the cube re-knits, and the camera pulls back out.
-// The header's form button cycles these; the choice persists.
-//   conversation — THIS session as a strand (2026-09-11): one node per
-//               message climbing a slow helix, user turns on the outer
-//               rail (cold), replies inside (warmer), the newest reply
-//               hot; explicit edges thread reply→question. Fed by
-//               setConversation from app.js; hover a node to read it.
-//   toolgraph — the agent's habits (2026-09-11): tools used this session
-//               on a ring around a hub, sized by use count, lit while
-//               recent; explicit edges trace the order they were called.
-//               Fed by noteToolCall.
-const FORMS = ['abyssal', 'horizon', 'cortex', 'vortex',
-    'lattice', 'stack', 'embedding', 'descent', 'cube',
-    'conversation', 'toolgraph', 'empty'];
+//   cube      — the infinite monolith: a large dark cube with a FEW
+//               resident alien complexities quietly deforming it from
+//               inside; a user turn wakes one, which spreads like an
+//               infection, running crimson, and tames on completion.
+//   empty     — no face.
+// Removed 2026-09-12 at the operator's request: abyssal, horizon,
+// cortex, stack, conversation, toolgraph (and the auto mode + face lab).
+// The header's form button opens a picker built from this roster; the
+// choice persists (server-side + localStorage).
+const FORMS = ['vortex', 'lattice', 'embedding', 'descent', 'cube', 'empty'];
 // Default form: VORTEX (operator pick, 2026-07-28 — superseded horizon
 // after the black-hole iteration). The form the operator last picked
 // overrides it — resolved by `resolveInitialForm` below.
@@ -285,9 +249,6 @@ try {
 // from their old positions into the new anatomy over ~1.4s.
 let formBlend = 1.0;
 const _blendFrom = [];
-// Abyssal fixed off-axis tilt (baked trig, applied per frame).
-const _TCX = Math.cos(0.42), _TSX = Math.sin(0.42);
-const _TCZ = Math.cos(0.18), _TSZ = Math.sin(0.18);
 
 // Immersion (2026-07-13): while a USER request is in flight the grid
 // "swallows" the camera — the scene scales up around the viewer and the
@@ -350,30 +311,12 @@ let moodHue = 0.0, targetMoodHue = 0.0;
 let gazeX = 0.0, gazeY = 0.0, targetGazeX = 0.0, targetGazeY = 0.0;
 let errorKind = null, errorKindEnv = 0.0;
 let idleTwitch = 0.0, idleTwitchNode = -1, idleTwitchAt = 0.0;
-// Auto form: the body plan follows the task (set from the ticker's
-// tool icons). The USER's picked form is remembered so leaving auto,
-// or a task with no hint, returns to it.
-let autoForm = false;
-let taskHint = null;
-let baseFormName = null;
-let _lastAutoSwitchAt = -1e9;
-// Conversation + tool-graph data (the two new forms' anatomy).
-const conversation = [];     // {role, preview, len, hidx}
-const toolUsage = new Map(); // name -> {count, lastAt, first}
-const toolSeq = [];          // ordered names as called
-let dataDirty = false;
-// Explicit edges (pairs of node indices) that the line builder draws in
-// addition to proximity links — the two data forms need edges that
-// mean something, not distances.
-const explicitEdges = [];
-const nodeLabels = [];       // per-node hover label (data forms)
 
-// ── Tunables (2026-09-11, the face lab) ────────────────────────────
-// Every amplitude the signal layer uses, in one table, so the lab can
-// drag them live and the operator can copy the result back into code.
-// Values are the first guesses tuned in code; overrides persist in
-// localStorage (ghost_face_tune) until baked in here.
-export const TUNE_DEFAULTS = Object.freeze({
+// ── Tunables ───────────────────────────────────────────────────────
+// Every amplitude the signal layer uses, in one table (the face lab
+// that dragged these live was removed 2026-09-12; the table stays so
+// tuning is one edit and the test can prove every key is read).
+export const TUNE = Object.freeze({
     radialSearch: 0.04,    // search gait: radial expansion
     radialRead: 0.035,     // read gait: radial contraction
     radialVerify: 0.03,    // verify gait: contraction toward stillness
@@ -401,89 +344,38 @@ export const TUNE_DEFAULTS = Object.freeze({
     flashGain: 2.0,        // tool 'flash' dialect: core/kernel flare gain
     alignGain: 0.7,        // verify 'align' dialect: jitter/churn suppression
 });
-export const TUNE = { ...TUNE_DEFAULTS };
-export function getTune() { return { ...TUNE }; }
-export function setTune(key, value) {
-    if (!Object.prototype.hasOwnProperty.call(TUNE_DEFAULTS, key)) return null;
-    const v = Number(value);
-    if (!Number.isFinite(v)) return TUNE[key];
-    // Non-negative, and capped at 4× the default (a decay-per-frame value
-    // is additionally capped below 1 or the envelope never ends).
-    let max = TUNE_DEFAULTS[key] * 4;
-    if (key === 'passHold') max = 0.999;
-    TUNE[key] = Math.max(0, Math.min(max, v));
-    _persistTune();
-    return TUNE[key];
-}
-export function resetTune() {
-    Object.assign(TUNE, TUNE_DEFAULTS);
-    try { localStorage.removeItem('ghost_face_tune'); } catch (e) { /* private mode */ }
-    return getTune();
-}
-function _persistTune() {
-    const diff = {};
-    for (const k of Object.keys(TUNE_DEFAULTS)) if (TUNE[k] !== TUNE_DEFAULTS[k]) diff[k] = TUNE[k];
-    try {
-        if (Object.keys(diff).length) localStorage.setItem('ghost_face_tune', JSON.stringify(diff));
-        else localStorage.removeItem('ghost_face_tune');
-    } catch (e) { /* private mode */ }
-}
-// Overrides from a previous lab session. Unknown keys and non-numbers are
-// ignored — the table is the only authority.
-export function loadTuneOverrides(raw) {
-    let obj = null;
-    try { obj = raw ? JSON.parse(raw) : null; } catch (e) { obj = null; }
-    if (!obj || typeof obj !== 'object') return 0;
-    let n = 0;
-    for (const [k, v] of Object.entries(obj)) {
-        if (Object.prototype.hasOwnProperty.call(TUNE_DEFAULTS, k) && Number.isFinite(Number(v))) {
-            TUNE[k] = Math.max(0, Math.min(k === 'passHold' ? 0.999 : TUNE_DEFAULTS[k] * 4, Number(v)));
-            n++;
-        }
-    }
-    return n;
-}
-try {
-    if (typeof localStorage !== 'undefined') loadTuneOverrides(localStorage.getItem('ghost_face_tune'));
-} catch (e) { /* private mode */ }
 
 // ── Dialects (2026-09-11) ──────────────────────────────────────────
 // The gaits are one vocabulary; each anatomy speaks it in its own
 // grammar. Fields:
 //   radialAxis  which components the radial factor touches:
-//               all | xz (rings breathe, height fixed) | y (a sheet
-//               heaves) | none (crystals and data forms do not breathe)
+//               all | xz | y (a sheet heaves) | none (crystals do not
+//               breathe)
 //   search      sweep (azimuth scan) | plane (a plane scanning along y)
 //               | ring (an expanding ring from the centre)
 //   read        contract | thicken (flow slows, links thicken) | settle
-//   tool        kick | flash (core/kernel flare) | ripple (packets hop)
+//   tool        kick | flash (core/kernel flare)
 //   write       wave (z-wave toward the viewer) | flow (the form's own
-//               flow accelerates) | pulse (the newest node pulses)
+//               flow accelerates)
 //   verify      still | align (jitter and churn suppressed → the grid
 //               snaps true)
 export const DIALECT_VALUES = Object.freeze({
     radialAxis: ['all', 'xz', 'y', 'none'],
     search: ['sweep', 'plane', 'ring'],
     read: ['contract', 'thicken', 'settle'],
-    tool: ['kick', 'flash', 'ripple'],
-    write: ['wave', 'flow', 'pulse'],
+    tool: ['kick', 'flash'],
+    write: ['wave', 'flow'],
     verify: ['still', 'align'],
 });
 export const DIALECTS = Object.freeze({
-    abyssal:      { radialAxis: 'all',  search: 'sweep', read: 'contract', tool: 'kick',   write: 'wave', verify: 'still' },
-    horizon:      { radialAxis: 'all',  search: 'ring',  read: 'contract', tool: 'flash',  write: 'flow', verify: 'still' },
-    cortex:       { radialAxis: 'all',  search: 'sweep', read: 'contract', tool: 'flash',  write: 'wave', verify: 'still' },
     vortex:       { radialAxis: 'none', search: 'ring',  read: 'thicken',  tool: 'kick',   write: 'flow', verify: 'still' },
     lattice:      { radialAxis: 'none', search: 'plane', read: 'settle',   tool: 'flash',  write: 'flow', verify: 'align' },
-    stack:        { radialAxis: 'xz',   search: 'plane', read: 'contract', tool: 'ripple', write: 'flow', verify: 'still' },
     embedding:    { radialAxis: 'all',  search: 'ring',  read: 'contract', tool: 'kick',   write: 'flow', verify: 'still' },
     descent:      { radialAxis: 'y',    search: 'plane', read: 'settle',   tool: 'kick',   write: 'flow', verify: 'still' },
     cube:         { radialAxis: 'none', search: 'plane', read: 'settle',   tool: 'flash',  write: 'flow', verify: 'align' },
-    conversation: { radialAxis: 'none', search: 'ring',  read: 'settle',   tool: 'kick',   write: 'pulse', verify: 'still' },
-    toolgraph:    { radialAxis: 'none', search: 'sweep', read: 'settle',   tool: 'kick',   write: 'pulse', verify: 'still' },
     empty:        { radialAxis: 'none', search: 'sweep', read: 'settle',   tool: 'kick',   write: 'wave', verify: 'still' },
 });
-const _DIALECT_DEFAULT = DIALECTS.abyssal;
+const _DIALECT_DEFAULT = DIALECTS.vortex;
 export function dialectFor(form) { return DIALECTS[form] || _DIALECT_DEFAULT; }
 // Per-frame derived gait scalars the form branches read (set in animate).
 let gaitFlow = 0, gaitThicken = 0, gaitFlash = 0, gaitAlign = 0;
@@ -870,151 +762,12 @@ void main() {
 function _buildAnatomy() {
     basePositions.length = 0;
     const f = FORMS[formIndex];
-    if (f === 'horizon') _buildHorizon();
-    else if (f === 'cortex') _buildCortex();
-    else if (f === 'vortex') _buildVortex();
-    else if (f === 'lattice') _buildLattice();
-    else if (f === 'stack') _buildStack();
+    if (f === 'lattice') _buildLattice();
     else if (f === 'embedding') _buildEmbedding();
     else if (f === 'descent') _buildDescent();
     else if (f === 'cube') _buildCube();
-    else if (f === 'conversation') _buildConversation();
-    else if (f === 'toolgraph') _buildToolGraph();
     else if (f === 'empty') _buildEmpty();
-    else _buildAbyssal();
-    // Data forms fill these; every other form leaves them empty.
-    if (f !== 'conversation' && f !== 'toolgraph') {
-        explicitEdges.length = 0;
-        nodeLabels.length = 0;
-    }
-}
-
-// Deterministic per-index jitter so a data form re-laid out on every
-// message does not scramble the nodes already on screen.
-function _hash01(i, k) {
-    const x = Math.sin(i * 12.9898 + k * 78.233) * 43758.5453;
-    return x - Math.floor(x);
-}
-
-// Layout of the conversation strand: message i of n → {x,y,z,r}. A slow
-// helix climbing toward the viewer's eye line; user turns ride the outer
-// rail, replies the inner one, so a question and its answer sit as a
-// pair. Pure; executed under node.
-export function conversationLayout(i, n, role) {
-    const t = n > 1 ? i / (n - 1) : 0.5;
-    const theta = i * 0.62 + 0.4;
-    const r = role === 'user' ? 1.15 : 0.75;
-    return {
-        x: r * Math.cos(theta),
-        y: -1.5 + 3.0 * t,
-        z: r * Math.sin(theta),
-        r,
-    };
-}
-
-// Form K — CONVERSATION: this session as a strand. Node i is message i;
-// the far sphere parks whatever nodes the transcript does not need.
-function _buildConversation() {
-    explicitEdges.length = 0;
-    nodeLabels.length = 0;
-    const msgs = conversation.slice(-Math.max(1, NODE_COUNT - 8));
-    const n = msgs.length;
-    let k = 0;
-    for (let i = 0; i < n; i++, k++) {
-        const m = msgs[i];
-        const L = conversationLayout(i, n, m.role);
-        const isLast = i === n - 1;
-        basePositions.push({
-            kind: 0, mi: i, role: m.role, isLast,
-            hx: L.x, hy: L.y, hz: L.z,
-            jit: _hash01(i, 1) * Math.PI * 2,
-            // Size follows length: a one-liner is a bead, an essay a lantern.
-            // Baseline raised 0.7 → 1.3: few nodes, so each must carry.
-            sz: 1.3 + Math.min(1.2, Math.log10(1 + (m.len || 0)) * 0.45),
-        });
-        nodeSeeds[k] = m.role === 'user' ? 0.06 + _hash01(i, 2) * 0.03
-            : (isLast ? 0.56 : 0.26 + _hash01(i, 3) * 0.04);
-        nodeLabels[k] = (m.role === 'user' ? 'You: ' : 'Ghost: ') + (m.preview || '');
-        if (i > 0) explicitEdges.push([k - 1, k]);
-    }
-    if (n === 0) {
-        // An empty session: one seed at the origin, waiting.
-        basePositions.push({ kind: 0, mi: 0, role: 'assistant', isLast: true,
-            hx: 0, hy: 0, hz: 0, jit: 0, sz: 1.0 });
-        nodeSeeds[k] = 0.30;
-        nodeLabels[k] = 'A new conversation';
-        k++;
-    }
-    // A faint "future" thread: a few dim beads continuing the helix past
-    // the newest message — where the next turn will land.
-    const FUT = Math.min(6, NODE_COUNT - k);
-    for (let f = 0; f < FUT; f++, k++) {
-        const L = conversationLayout(n + f, Math.max(n + FUT, 2), f % 2 ? 'user' : 'assistant');
-        basePositions.push({ kind: 1, hx: L.x, hy: L.y, hz: L.z, jit: f, sz: 0.7 - f * 0.08 });
-        nodeSeeds[k] = 0.06;
-        if (k > 0) explicitEdges.push([k - 1, k]);
-    }
-    while (k < NODE_COUNT) {
-        const cosP = 2 * ((k + 0.5) / NODE_COUNT) - 1;
-        const sinP = Math.sqrt(Math.max(0, 1 - cosP * cosP));
-        const phi = k * 2.399963;
-        basePositions.push({ kind: 8, hx: 12.0 * sinP * Math.cos(phi), hy: 12.0 * cosP,
-            hz: 12.0 * sinP * Math.sin(phi) });
-        nodeSeeds[k] = 0.3;
-        k++;
-    }
-}
-
-// Tool-graph layout: tool j of m on a ring, the hub at the origin. Pure;
-// executed under node.
-export function toolGraphLayout(j, m) {
-    const theta = (j / Math.max(m, 1)) * Math.PI * 2 - Math.PI / 2;
-    return { x: 1.45 * Math.cos(theta), y: 0.25 * Math.sin(theta * 2), z: 1.45 * Math.sin(theta) };
-}
-
-// Form L — TOOL GRAPH: the agent's habits this session.
-function _buildToolGraph() {
-    explicitEdges.length = 0;
-    nodeLabels.length = 0;
-    const names = [...toolUsage.keys()].sort((a, b) => toolUsage.get(a).first - toolUsage.get(b).first)
-        .slice(0, Math.max(1, Math.min(24, NODE_COUNT - 40)));
-    let k = 0;
-    // The hub — Ghost itself.
-    basePositions.push({ kind: 2, hx: 0, hy: 0, hz: 0, jit: 0, sz: 2.0 });
-    nodeSeeds[k] = 0.50;
-    nodeLabels[k] = names.length ? `Ghost · ${toolSeq.length} tool call(s) this session` : 'Ghost · no tools used yet';
-    const hub = k++;
-    const idx = new Map();
-    for (let j = 0; j < names.length; j++, k++) {
-        const u = toolUsage.get(names[j]);
-        const L = toolGraphLayout(j, names.length);
-        basePositions.push({ kind: 0, name: names[j], hx: L.x, hy: L.y, hz: L.z,
-            jit: _hash01(j, 5) * Math.PI * 2,
-            sz: 1.4 + Math.min(1.2, Math.log2(1 + u.count) * 0.35) });
-        nodeSeeds[k] = 0.10;                       // reheated per frame by recency
-        nodeLabels[k] = `${names[j]} · ${u.count}×`;
-        idx.set(names[j], k);
-        explicitEdges.push([hub, k]);
-    }
-    // Order edges: consecutive calls, deduplicated.
-    const seen = new Set();
-    for (let s = 1; s < toolSeq.length; s++) {
-        const a = idx.get(toolSeq[s - 1]), b = idx.get(toolSeq[s]);
-        if (a === undefined || b === undefined || a === b) continue;
-        const key = a < b ? `${a}-${b}` : `${b}-${a}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        explicitEdges.push([a, b]);
-    }
-    while (k < NODE_COUNT) {
-        const cosP = 2 * ((k + 0.5) / NODE_COUNT) - 1;
-        const sinP = Math.sqrt(Math.max(0, 1 - cosP * cosP));
-        const phi = k * 2.399963;
-        basePositions.push({ kind: 8, hx: 12.0 * sinP * Math.cos(phi), hy: 12.0 * cosP,
-            hz: 12.0 * sinP * Math.sin(phi) });
-        nodeSeeds[k] = 0.3;
-        k++;
-    }
+    else _buildVortex();
 }
 
 // Form E — EMPTY: no face at all. Nodes park on a sparse far sphere
@@ -1035,241 +788,6 @@ function _buildEmpty() {
             hz: 12.0 * sinP * Math.sin(phi),
         });
         nodeSeeds[i] = 0.3;
-    }
-}
-
-// Form A — ABYSSAL: an unclassifiable biomechanical mass. The mantle is
-// a lobed, UNEQUAL husk (no earthly symmetry) tilted off-axis, feelers
-// reach in all directions (down, sideways, some upward — reaching reads
-// sentient; hanging read jellyfish), and the core sits off-center.
-function _buildAbyssal() {
-    const CORE_COUNT = Math.max(8, Math.round(NODE_COUNT * 0.055));
-    const STRANDS = IS_MOBILE ? 8 : 11;
-    const PER_STRAND = Math.max(5, Math.floor((NODE_COUNT * 0.34) / STRANDS));
-    const MANTLE_COUNT = NODE_COUNT - CORE_COUNT - STRANDS * PER_STRAND;
-    const BELL_R = 1.5, BELL_SWEEP = 1.9;   // sweep past the equator — a husk, not a bell
-    const lobeP1 = Math.random() * Math.PI * 2;
-    const lobeP2 = Math.random() * Math.PI * 2;
-    const lobeOf = (theta, u) => 1 + 0.24 * Math.sin(2 * theta + lobeP1)
-        + 0.15 * Math.sin(3 * theta + lobeP2)
-        + 0.08 * Math.sin(5 * theta + u * 4.0);
-    let n = 0;
-
-    for (let b = 0; b < MANTLE_COUNT; b++, n++) {
-        const u = Math.sqrt((b + 0.5) / MANTLE_COUNT);
-        const theta = b * 2.399963;
-        const alpha = u * BELL_SWEEP;
-        basePositions.push({
-            kind: 0, u, theta,
-            cos: Math.cos(theta), sin: Math.sin(theta),
-            r0: BELL_R * Math.sin(alpha) * lobeOf(theta, u)
-                + (Math.random() - 0.5) * 0.07,
-            y0: 0.9 - BELL_R * 1.05 * (1 - Math.cos(alpha))
-                + (Math.random() - 0.5) * 0.07,
-        });
-        nodeSeeds[n] = 0.02 + u * 0.30 + Math.random() * 0.04;
-    }
-
-    for (let k = 0; k < STRANDS; k++) {
-        // Feelers emerge from random mantle latitudes with their own
-        // reach directions.
-        const thetaA = Math.random() * Math.PI * 2;
-        const uA = 0.55 + Math.random() * 0.45;
-        const aA = uA * BELL_SWEEP;
-        const rA = BELL_R * Math.sin(aA) * lobeOf(thetaA, uA);
-        const ax = rA * Math.cos(thetaA);
-        const az = rA * Math.sin(thetaA);
-        const ay = 0.9 - BELL_R * 1.05 * (1 - Math.cos(aA));
-        let dx = Math.cos(thetaA) * (0.5 + Math.random() * 0.5);
-        let dz = Math.sin(thetaA) * (0.5 + Math.random() * 0.5);
-        let dy = -1.1 + Math.random() * 1.7;          // most drift down, some reach up
-        const dl = Math.hypot(dx, dy, dz);
-        dx /= dl; dy /= dl; dz /= dl;
-        // Wave-plane perpendiculars for the metachronal sway.
-        let p1x = -dz, p1z = dx;
-        const p1l = Math.hypot(p1x, p1z) || 1;
-        p1x /= p1l; p1z /= p1l;
-        const p2x = dy * p1z, p2y = dz * p1x - dx * p1z, p2z = -dy * p1x;
-        const len = 1.7 + Math.random() * 1.1;
-        const swaySpeed = 0.5 + Math.random() * 0.4;
-        const swayPhase = Math.random() * Math.PI * 2;
-        for (let j = 0; j < PER_STRAND; j++, n++) {
-            const s = (j + 1) / PER_STRAND;
-            basePositions.push({
-                kind: 1, s, ax, ay, az, dx, dy, dz,
-                p1x, p1z, p2x, p2y, p2z,
-                len, swaySpeed, swayPhase,
-                swayAmp: 0.30 * Math.pow(s, 1.3),
-            });
-            nodeSeeds[n] = 0.40 + s * 0.28 + Math.random() * 0.05;
-        }
-    }
-
-    for (let c = 0; c < CORE_COUNT; c++, n++) {
-        const th = Math.random() * Math.PI * 2;
-        const ph = Math.acos(2 * Math.random() - 1);
-        const rr = 0.4 * Math.cbrt(Math.random());
-        basePositions.push({
-            kind: 2,
-            hx: 0.28 + rr * Math.sin(ph) * Math.cos(th),   // off-center on purpose
-            hy: 0.05 + rr * Math.cos(ph) * 0.7,
-            hz: -0.12 + rr * Math.sin(ph) * Math.sin(th),
-            jit: Math.random() * Math.PI * 2,
-        });
-        nodeSeeds[n] = 0.58 + Math.random() * 0.08;
-    }
-}
-
-// Form B — EVENT HORIZON: information falling into a mind. Eccentric
-// orbital shells collapse toward the core (outer first — the wave
-// travels inward), filament spirals stream in and HEAT as they fall.
-function _buildHorizon() {
-    // Core trimmed 10% → 7% of nodes and each core quad rendered at 0.7
-    // size (2026-07-28 operator: "too bright at its center"): additive
-    // stacking is what bleached the dark red into hot pink — fewer,
-    // smaller overlaps keep the center CRIMSON instead of washing out.
-    const CORE_COUNT = Math.max(10, Math.round(NODE_COUNT * 0.07));
-    const STRANDS = IS_MOBILE ? 5 : 7;
-    const PER_STRAND = Math.max(6, Math.floor((NODE_COUNT * 0.30) / STRANDS));
-    const SHELL_TOTAL = NODE_COUNT - CORE_COUNT - STRANDS * PER_STRAND;
-    const SHELLS = [
-        { r: 0.85, tilt: 0.35, omega: 0.20, off: 0.10 },
-        { r: 1.45, tilt: -0.22, omega: 0.12, off: 0.18 },
-        { r: 2.05, tilt: 0.12, omega: 0.07, off: 0.26 },
-    ];
-    let n = 0;
-    const per = Math.floor(SHELL_TOTAL / SHELLS.length);
-    for (let si = 0; si < SHELLS.length; si++) {
-        const sh = SHELLS[si];
-        const count = si === SHELLS.length - 1
-            ? SHELL_TOTAL - per * (SHELLS.length - 1) : per;
-        for (let b = 0; b < count; b++, n++) {
-            const cosP = 2 * ((b + 0.5) / count) - 1;
-            basePositions.push({
-                kind: 0, shell: si,
-                r: sh.r * (0.94 + Math.random() * 0.12),
-                cosP, sinP: Math.sqrt(Math.max(0, 1 - cosP * cosP)),
-                phi0: b * 2.399963, omega: sh.omega,
-                tiltC: Math.cos(sh.tilt), tiltS: Math.sin(sh.tilt),
-                offX: sh.off, jit: Math.random() * Math.PI * 2,
-            });
-            // Inner shells run HOT — matter heats as it falls. The inner
-            // shell sits on the arterial-red stop itself: any blue this
-            // close to the core additively mixes into magenta (the "too
-            // bright pink center" report), so the center is kept pure red
-            // and the cold blues live only in the outer shells.
-            nodeSeeds[n] = [0.58, 0.16, 0.04][si] + Math.random() * 0.03;
-        }
-    }
-    for (let k = 0; k < STRANDS; k++) {
-        const phi0 = (k / STRANDS) * Math.PI * 2 + Math.random() * 0.4;
-        const pitch = (Math.random() < 0.5 ? -1 : 1) * (0.5 + Math.random() * 0.5);
-        const flow = 1.6 + Math.random() * 0.8;
-        for (let j = 0; j < PER_STRAND; j++, n++) {
-            const s = (j + 1) / PER_STRAND;             // 0 rim → 1 core (r floor 0.45)
-            basePositions.push({ kind: 1, s, phi0, pitch, flow,
-                jit: Math.random() * Math.PI * 2,
-                // Inner filament ends shrink a little too — they pile up
-                // right where the core already stacks.
-                sz: s > 0.75 ? 0.85 : 1.0 });
-            // Filaments run red along most of their fall — violet only at
-            // the outermost rim — so the bright inner band reads crimson.
-            nodeSeeds[n] = 0.42 + s * 0.20 + Math.random() * 0.03;
-        }
-    }
-    for (let c = 0; c < CORE_COUNT; c++, n++) {
-        const th = Math.random() * Math.PI * 2;
-        const ph = Math.acos(2 * Math.random() - 1);
-        const rr = 0.38 * Math.cbrt(Math.random());
-        basePositions.push({
-            kind: 2,
-            hx: rr * Math.sin(ph) * Math.cos(th),
-            hy: rr * Math.cos(ph),
-            hz: rr * Math.sin(ph) * Math.sin(th),
-            jit: Math.random() * Math.PI * 2,
-            sz: 0.7,
-        });
-        // Tight anchor dead on the arterial-red stop — a wide seed spread
-        // let half the core drift toward violet/plum and read pink.
-        nodeSeeds[n] = 0.595 + Math.random() * 0.03;
-    }
-}
-
-// Form C — SYNTHETIC CORTEX: an asymmetric cluster of neural lobes.
-// Thought-waves swell the lobes in sequence; dendrites radiate outward
-// carrying displacement signal-trains toward their tips.
-function _buildCortex() {
-    const LOBE_CENTERS = [
-        [0.75, 0.35, 0.15], [-0.60, 0.45, -0.30],
-        [0.15, -0.25, 0.70], [-0.30, -0.40, -0.65],
-    ];
-    const LOBE_R = [0.78, 0.68, 0.62, 0.72];
-    const CORE_COUNT = Math.max(8, Math.round(NODE_COUNT * 0.06));
-    const STRANDS = IS_MOBILE ? 10 : 14;
-    const PER_STRAND = Math.max(4, Math.floor((NODE_COUNT * 0.30) / STRANDS));
-    const LOBE_TOTAL = NODE_COUNT - CORE_COUNT - STRANDS * PER_STRAND;
-    let n = 0;
-    const per = Math.floor(LOBE_TOTAL / LOBE_CENTERS.length);
-    for (let li = 0; li < LOBE_CENTERS.length; li++) {
-        const count = li === LOBE_CENTERS.length - 1
-            ? LOBE_TOTAL - per * (LOBE_CENTERS.length - 1) : per;
-        for (let b = 0; b < count; b++, n++) {
-            const th = Math.random() * Math.PI * 2;
-            const ph = Math.acos(2 * Math.random() - 1);
-            basePositions.push({
-                kind: 0, lobe: li,
-                cx: LOBE_CENTERS[li][0], cy: LOBE_CENTERS[li][1], cz: LOBE_CENTERS[li][2],
-                dx: Math.sin(ph) * Math.cos(th),
-                dy: Math.cos(ph),
-                dz: Math.sin(ph) * Math.sin(th),
-                r0: LOBE_R[li] * (0.88 + Math.random() * 0.28),
-                lobePhase: li * 0.18 + Math.random() * 0.05,
-                jit: Math.random() * Math.PI * 2,
-            });
-            nodeSeeds[n] = 0.04 + li * 0.055 + Math.random() * 0.03;
-        }
-    }
-    for (let k = 0; k < STRANDS; k++) {
-        const li = k % LOBE_CENTERS.length;
-        const th = Math.random() * Math.PI * 2;
-        const ph = Math.acos(2 * Math.random() - 1);
-        const dx = Math.sin(ph) * Math.cos(th);
-        const dy = Math.cos(ph);
-        const dz = Math.sin(ph) * Math.sin(th);
-        const ax = LOBE_CENTERS[li][0] + dx * LOBE_R[li];
-        const ay = LOBE_CENTERS[li][1] + dy * LOBE_R[li];
-        const az = LOBE_CENTERS[li][2] + dz * LOBE_R[li];
-        let p1x = -dz, p1z = dx;
-        const p1l = Math.hypot(p1x, p1z) || 1;
-        p1x /= p1l; p1z /= p1l;
-        const p2x = dy * p1z, p2y = dz * p1x - dx * p1z, p2z = -dy * p1x;
-        const len = 1.4 + Math.random() * 0.9;
-        const swaySpeed = 0.9 + Math.random() * 0.5;
-        const swayPhase = Math.random() * Math.PI * 2;
-        for (let j = 0; j < PER_STRAND; j++, n++) {
-            const s = (j + 1) / PER_STRAND;
-            basePositions.push({
-                kind: 1, s, ax, ay, az, dx, dy, dz,
-                p1x, p1z, p2x, p2y, p2z,
-                len, swaySpeed, swayPhase,
-                swayAmp: 0.10 * Math.pow(s, 1.2),
-                signal: 2.2 + Math.random() * 0.9,
-            });
-            nodeSeeds[n] = 0.40 + s * 0.28 + Math.random() * 0.05;
-        }
-    }
-    for (let c = 0; c < CORE_COUNT; c++, n++) {
-        const th = Math.random() * Math.PI * 2;
-        const ph = Math.acos(2 * Math.random() - 1);
-        const rr = 0.35 * Math.cbrt(Math.random());
-        basePositions.push({
-            kind: 2,
-            hx: rr * Math.sin(ph) * Math.cos(th),
-            hy: 0.05 + rr * Math.cos(ph),
-            hz: rr * Math.sin(ph) * Math.sin(th),
-            jit: Math.random() * Math.PI * 2,
-        });
-        nodeSeeds[n] = 0.58 + Math.random() * 0.08;
     }
 }
 
@@ -1415,79 +933,6 @@ function _buildLattice() {
         nodeSeeds[n] = 0.58 + Math.random() * 0.04;
         n++;
     }
-}
-
-// Form G — STACK: the transformer. Tapering layer-rings (wide input →
-// narrow output) threaded by the hot residual-stream column; token
-// packets climb a helix just outside the rings, RIPPLING each layer
-// they pass and enriching (heating) as they rise. The wrap top→bottom
-// hides behind a size taper at both ends.
-const STACK_LAYERS = IS_MOBILE ? 4 : 6;
-const STACK_PACKETS = IS_MOBILE ? 4 : 5;
-// Layer gap (0.72 desktop) must stay ABOVE the stack's tightened link
-// radius (see LINK_MULT) or vertical scaffold links weave the discs
-// into a solid woven cylinder (first render): the layers must read as
-// separate rings, bridged only by the column and the climbing packets.
-const STACK_Y0 = -1.8, STACK_Y1 = 1.8;
-function _stackROfY(y) {
-    const t = Math.min(Math.max((y - STACK_Y0) / (STACK_Y1 - STACK_Y0), 0), 1);
-    return 1.55 - 0.40 * t;
-}
-function _buildStack() {
-    const COL_COUNT = IS_MOBILE ? 12 : 22;
-    const PER_PACKET = IS_MOBILE ? 7 : 12;
-    const RING_TOTAL = NODE_COUNT - COL_COUNT - STACK_PACKETS * PER_PACKET;
-    const per = Math.floor(RING_TOTAL / STACK_LAYERS);
-    let n = 0;
-    for (let li = 0; li < STACK_LAYERS; li++) {
-        const count = li === STACK_LAYERS - 1
-            ? RING_TOTAL - per * (STACK_LAYERS - 1) : per;
-        const y0 = STACK_Y0 + (STACK_Y1 - STACK_Y0) * li / (STACK_LAYERS - 1);
-        for (let b = 0; b < count; b++, n++) {
-            basePositions.push({
-                kind: 0, li, y0,
-                th0: (b / count) * Math.PI * 2 + li * 0.5,
-                r0: _stackROfY(y0) * (0.97 + Math.random() * 0.06),
-                omega: (li % 2 ? -1 : 1) * (0.05 + 0.012 * li),
-                tilt: 0.03 * Math.sin(li * 2.3 + 0.7),
-                offX: 0.10 * Math.sin(li * 2.1),
-                offZ: 0.08 * Math.cos(li * 1.3),
-                jit: Math.random() * Math.PI * 2,
-            });
-            // Bottom layers coldest; refinement warms toward the top.
-            nodeSeeds[n] = 0.03
-                + (li / Math.max(STACK_LAYERS - 1, 1)) * 0.17
-                + Math.random() * 0.02;
-        }
-    }
-    for (let p = 0; p < STACK_PACKETS; p++) {
-        const off = p / STACK_PACKETS;               // stagger the climbs
-        const th0 = Math.random() * Math.PI * 2;
-        for (let j = 0; j < PER_PACKET; j++, n++) {
-            basePositions.push({
-                kind: 1, off, th0,
-                s: j / Math.max(PER_PACKET - 1, 1),  // 0 head → 1 tail
-                rr: 0.09 + Math.random() * 0.09,
-                jit: Math.random() * Math.PI * 2,
-                sz: 1.0,
-            });
-            nodeSeeds[n] = 0.42;                     // reheated per frame
-        }
-    }
-    while (n < NODE_COUNT) {   // the residual stream
-        const ci = COL_COUNT - (NODE_COUNT - n);
-        basePositions.push({
-            kind: 2,
-            y0: -1.85 + 3.7 * (ci + 0.5) / COL_COUNT,
-            rx: (Math.random() - 0.5) * 0.10,
-            rz: (Math.random() - 0.5) * 0.10,
-            jit: Math.random() * Math.PI * 2,
-            sz: 0.85,
-        });
-        nodeSeeds[n] = 0.56 + Math.random() * 0.05;
-        n++;
-    }
-    stackFlow = 0.0;
 }
 
 // Form H — EMBEDDING: latent space. Cold concept clusters anchored on
@@ -1713,10 +1158,8 @@ export function getForm() { return FORMS[formIndex]; }
 // blends to reach the one you wanted).
 export function getForms() { return FORMS.slice(); }
 
-let _autoSwitching = false;
 export function setForm(name) {
     const i = FORMS.indexOf(name);
-    if (!_autoSwitching) baseFormName = i >= 0 ? name : baseFormName;
     if (i < 0 || i === formIndex) return FORMS[formIndex];
     // Snapshot current positions so the switch reads as the creature
     // REORGANIZING itself rather than a hard cut.
@@ -1728,9 +1171,7 @@ export function setForm(name) {
     _buildAnatomy();
     if (instancedMesh) instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
     formBlend = 0.0;
-    if (!_autoSwitching) {
-        try { localStorage.setItem('ghost_face_form', FORMS[formIndex]); } catch (e) {}
-    }
+    try { localStorage.setItem('ghost_face_form', FORMS[formIndex]); } catch (e) {}
     return FORMS[formIndex];
 }
 
@@ -1742,19 +1183,9 @@ export function setPhase(name) {
     return phase;
 }
 
-// One discrete kick per tool invocation, and the tool-graph's data.
-export function noteToolCall(name) {
+// One discrete kick per tool invocation.
+export function noteToolCall() {
     toolPulse = Math.min(1.0, toolPulse + 0.6);
-    const n = String(name || '').trim().toLowerCase().slice(0, 40);
-    if (n) {
-        const now = Date.now();
-        const u = toolUsage.get(n);
-        if (u) { u.count++; u.lastAt = now; }
-        else toolUsage.set(n, { count: 1, lastAt: now, first: now });
-        toolSeq.push(n);
-        if (toolSeq.length > 400) toolSeq.shift();
-        dataDirty = true;
-    }
     return toolPulse;
 }
 
@@ -1805,109 +1236,6 @@ export function setMoodHue(label) {
 export function setComposerGaze(active) {
     targetGazeY = active ? -TUNE.gazeY : 0.0;
     targetGazeX = 0.0;
-}
-
-// Auto form: the body plan follows the task. `hint` comes from the
-// ticker's tool icons. Pure; executed under node.
-export function autoFormFor(hint, base) {
-    switch (hint) {
-        case 'coding': return 'lattice';
-        case 'research': return 'embedding';
-        case 'verify': return 'descent';
-        case 'memory': return 'embedding';
-        default: return base || 'vortex';
-    }
-}
-export function setAutoForm(on) {
-    autoForm = !!on;
-    try { localStorage.setItem('ghost_face_auto', autoForm ? '1' : '0'); } catch (e) {}
-    if (!autoForm && baseFormName && baseFormName !== FORMS[formIndex]) {
-        _autoSwitching = true;
-        try { setForm(baseFormName); } finally { _autoSwitching = false; }
-    }
-    if (autoForm) _applyAutoForm(true);
-    return autoForm;
-}
-export function getAutoForm() { return autoForm; }
-export function setTaskHint(hint) {
-    taskHint = hint || null;
-    if (autoForm) _applyAutoForm(false);
-    return taskHint;
-}
-function _applyAutoForm(force) {
-    if (!autoForm) return;
-    const now = Date.now();
-    if (!force && now - _lastAutoSwitchAt < 20000) return;   // no flicker between tools
-    const target = autoFormFor(taskHint, baseFormName || FORMS[formIndex]);
-    if (target === FORMS[formIndex]) return;
-    _lastAutoSwitchAt = now;
-    _autoSwitching = true;
-    try { setForm(target); } finally { _autoSwitching = false; }
-}
-try {
-    if (typeof localStorage !== 'undefined' && localStorage.getItem('ghost_face_auto') === '1') autoForm = true;
-} catch (e) { /* private mode */ }
-
-// The lab fires a twitch by hand; the loop fires them at rest.
-export function fireIdleTwitch() {
-    idleTwitch = 1.0;
-    idleTwitchNode = Math.floor(Math.random() * NODE_COUNT);
-    return idleTwitchNode;
-}
-
-// The conversation form's data: compact records, newest last.
-export function setConversation(messages) {
-    conversation.length = 0;
-    for (let i = 0; i < (messages || []).length; i++) {
-        const m = messages[i];
-        if (!m || (m.role !== 'user' && m.role !== 'assistant')) continue;
-        const text = typeof m.content === 'string' ? m.content
-            : Array.isArray(m.content) ? m.content.map(p => (p && p.text) || '').join(' ') : '';
-        const clean = text.replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/\s+/g, ' ').trim();
-        conversation.push({ role: m.role, len: clean.length, hidx: i,
-            preview: clean.slice(0, 90) + (clean.length > 90 ? '…' : '') });
-    }
-    dataDirty = true;
-    return conversation.length;
-}
-
-// Re-lay a data form in place when its data changed (a new message, a
-// new tool). Nodes already on screen keep their spots (deterministic
-// layout); the blend eases only what moved.
-function _relayoutDataForm() {
-    if (!dataDirty) return;
-    dataDirty = false;
-    const f = FORMS[formIndex];
-    if (f !== 'conversation' && f !== 'toolgraph') return;
-    _blendFrom.length = 0;
-    for (let k = 0; k < NODE_COUNT; k++) {
-        _blendFrom.push(currentPositions[k] ? currentPositions[k].clone() : null);
-    }
-    _buildAnatomy();
-    if (instancedMesh) instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
-    formBlend = 0.0;
-}
-
-// Hover / tap: the node nearest a normalised device coordinate
-// (-1..1) within a small radius, with its label when the form has one.
-// Manual projection of the CPU-side positions (billboarded quads have
-// no meaningful raycast geometry).
-const _pickV = typeof THREE !== 'undefined' ? new THREE.Vector3() : null;
-export function describeNodeAt(ndcX, ndcY, radius = 0.035) {
-    if (!camera || !scene || !nodeLabels.length) return null;
-    let best = -1, bestD = radius * radius;
-    for (let i = 0; i < NODE_COUNT; i++) {
-        if (!nodeLabels[i] || nodeScales[i] < 0.2) continue;
-        _pickV.copy(currentPositions[i]);
-        scene.localToWorld(_pickV);
-        _pickV.project(camera);
-        if (_pickV.z > 1) continue;
-        const dx = _pickV.x - ndcX, dy = _pickV.y - ndcY;
-        const d = dx * dx + dy * dy;
-        if (d < bestD) { bestD = d; best = i; }
-    }
-    if (best < 0) return null;
-    return { index: best, label: nodeLabels[best] };
 }
 
 // Error KIND shapes the flinch (2026-09-11): a network drop flickers
@@ -2233,13 +1561,10 @@ export function getDebugState() {
         pulse: _fract(pulsePhase),
         bob: _bob,
         anatomy: FORMS[formIndex],
-        eventBoost,
-        coreFlare,
         vortexTravel,
         tunnelFlow,
         phase, gait: { ...gait }, toolPulse, recallSpark, verdict, verdictEnv,
-        backgroundBusy, moodHue, gazeY, errorKind, errorKindEnv, autoForm, taskHint,
-        conversation: conversation.length, tools: toolUsage.size,
+        backgroundBusy, moodHue, gazeY, errorKind, errorKindEnv,
         dialect: dialectFor(FORMS[formIndex]), gaitFlow, gaitThicken, gaitFlash, gaitAlign,
     };
 }
@@ -2356,7 +1681,6 @@ function animate() {
         errorKind === 'refusal' ? 0.9 * errorKindEnv : 0,
         TUNE.stillVerify * gait.verify, TUNE.stillRead * gait.read));
     const motionMul = 1.0 - still;
-    _relayoutDataForm();
 
     // Immersion follows the USER-TURN state with a slower, asymmetric
     // ease: ~5s to fully swallow (only sustained work gets there), ~10s
@@ -2532,17 +1856,6 @@ function animate() {
         * (PREFERS_REDUCED_MOTION ? 0.5 : 1.0) * motionMul;
     flinch *= 0.97;
 
-    // Major infall events: on ~1 in 5 cycle wraps, the next cycle runs
-    // hot. Decays over ~2s so the event owns most of its cycle.
-    const _pf = _fract(pulsePhase);
-    if (_pf < _lastPulseFract && !PREFERS_REDUCED_MOTION
-        && Math.random() < 0.22) {
-        eventBoost = 1.0;
-    }
-    _lastPulseFract = _pf;
-    eventBoost *= 0.995;
-    if (eventBoost < 0.02) eventBoost = 0;
-
     const pulseAmp = (0.16 + 0.10 * drive + 0.22 * flinch)
         * (PREFERS_REDUCED_MOTION ? 0.45 : 1.0)
         * (1.0 + 0.25 * audioLevel);
@@ -2555,106 +1868,7 @@ function animate() {
     _bobTarget = 0.10 * Math.sin(time * 0.043 + 0.5);
     _bob += (_bobTarget - _bob) * 0.02;
 
-    if (FORM === 'abyssal') {
-        // ── ABYSSAL: lobed husk contraction + omnidirectional feelers,
-        //    the whole body baked onto an off-axis tilt (no "up").
-        for (let i = 0; i < NODE_COUNT; i++) {
-            const bp = basePositions[i];
-            let x, y, z;
-            if (bp.kind === 0) {
-                const local = _pulseShape(_fract(pulsePhase - bp.u * 0.16));
-                const squeeze = 1.0 - pulseAmp * local * (0.30 + 0.70 * bp.u);
-                const r = bp.r0 * squeeze
-                    + 0.025 * CALM * Math.sin(time * 1.3 + bp.theta * 3.0 + bp.u * 7.0);
-                x = r * bp.cos;
-                z = r * bp.sin;
-                y = bp.y0 + 0.20 * pulseAmp * local * bp.u
-                    + 0.02 * CALM * Math.sin(time * 0.9 + bp.theta * 2.0);
-            } else if (bp.kind === 1) {
-                // Feelers retract slightly with each contraction —
-                // reaching and recoiling, not hanging.
-                const reach = bp.len * bp.s * (1.0 - 0.22 * pulseAmp * cMargin);
-                const swayA = time * bp.swaySpeed + bp.swayPhase - bp.s * 3.3;
-                const lat = bp.swayAmp * CALM * (1.0 + 0.25 * drive) * Math.sin(swayA);
-                const lat2 = bp.swayAmp * 0.7 * CALM * Math.cos(swayA * 0.83 + 1.1);
-                x = bp.ax + bp.dx * reach + bp.p1x * lat + bp.p2x * lat2;
-                y = bp.ay + bp.dy * reach + bp.p2y * lat2;
-                z = bp.az + bp.dz * reach + bp.p1z * lat + bp.p2z * lat2;
-            } else {
-                const c = _pulseShape(_fract(pulsePhase + 0.05));
-                const g = 1.0 + 0.12 * c + 0.05 * Math.sin(time * 0.8 + bp.jit);
-                x = bp.hx * g;
-                y = bp.hy * g + 0.03 * Math.sin(time * 0.6 + bp.jit * 2.0);
-                z = bp.hz * g;
-            }
-            const x1 = x * _TCZ - y * _TSZ;
-            const y1 = x * _TSZ + y * _TCZ;
-            const y2 = y1 * _TCX - z * _TSX;
-            const z2 = y1 * _TSX + z * _TCX;
-            currentPositions[i].set(x1, y2, z2);
-        }
-    } else if (FORM === 'horizon') {
-        // ── EVENT HORIZON — a choreographed feeding cycle, not a beat:
-        //    filament surges race rim→core, the core FLARES as they
-        //    land, and a rebound ripple travels back out through the
-        //    shells. Collapse squeezes hardest along a slowly precessing
-        //    TIDAL AXIS (directional deformation reads gravitational;
-        //    the old uniform radial shrink read mechanical/boring).
-        const hAmp = pulseAmp * (1.0 + 0.55 * eventBoost + 0.6 * gaitFlash * TUNE.flashGain);
-        const tideA = time * 0.16;
-        const tideY = 0.34 * Math.sin(time * 0.05);
-        const tideX = Math.cos(tideA) * (1.0 - Math.abs(tideY) * 0.5);
-        const tideZ = Math.sin(tideA) * (1.0 - Math.abs(tideY) * 0.5);
-        const flareEnv = Math.pow(_pulseShape(_fract(pulsePhase - 0.02)), 2.0);
-        coreFlare = 1.0 + (0.35 + 0.50 * eventBoost) * flareEnv + 0.25 * gaitFlash * TUNE.flashGain;
-
-        for (let i = 0; i < NODE_COUNT; i++) {
-            const bp = basePositions[i];
-            if (bp.kind === 0) {
-                const phi = bp.phi0 + time * bp.omega * CALM;
-                const dirX = bp.sinP * Math.cos(phi);
-                const dirY = bp.cosP;
-                const dirZ = bp.sinP * Math.sin(phi);
-                const align = dirX * tideX + dirY * tideY + dirZ * tideZ;
-                const collapse = _pulseShape(_fract(pulsePhase - bp.shell * 0.12));
-                const rebound = _pulseShape(_fract(pulsePhase - 0.34 - (2 - bp.shell) * 0.10));
-                const r = bp.r
-                    * (1.0 - hAmp * collapse * (0.30 + 0.55 * align * align))
-                    * (1.0 + 0.10 * hAmp * rebound)
-                    * (1.0 + 0.04 * CALM * Math.sin(time * 0.5 + bp.jit));
-                const x = r * dirX + bp.offX * Math.sin(time * 0.07 + bp.shell * 2.1);
-                const y = r * dirY;
-                const z = r * dirZ;
-                currentPositions[i].set(
-                    x,
-                    y * bp.tiltC - z * bp.tiltS,
-                    y * bp.tiltS + z * bp.tiltC);
-            } else if (bp.kind === 1) {
-                const phi = bp.phi0 + bp.s * 4.4 + time * 0.22 * CALM;
-                // Infall surge: a packet races down the spiral each
-                // cycle (lag grows toward the rim), pulling the filament
-                // inward as it passes — it lands as the core flares.
-                const surge = _pulseShape(_fract(pulsePhase - (1.0 - bp.s) * 0.35));
-                const rr = (2.3 - 1.85 * bp.s)
-                    * (1.0 - 0.10 * (1.0 + eventBoost) * surge)
-                    * (1.0 + 0.05 * CALM * Math.sin(
-                        bp.s * 9.0 - time * bp.flow * (1.0 + eventBoost)));
-                currentPositions[i].set(
-                    rr * Math.cos(phi),
-                    bp.pitch * (bp.s - 0.5)
-                        + 0.05 * CALM * Math.sin(time * 0.7 + bp.jit),
-                    rr * Math.sin(phi));
-            } else {
-                // The core drinks: a small steady beat plus the FLARE
-                // when the surges land (size flare rides coreFlare in
-                // the instance-matrix pass below).
-                const g = 1.0 + 0.10 * _pulseShape(_fract(pulsePhase + 0.05))
-                    + 0.30 * flareEnv * (1.0 + eventBoost)
-                    + 0.05 * Math.sin(time * 0.8 + bp.jit);
-                currentPositions[i].set(bp.hx * g, bp.hy * g, bp.hz * g);
-            }
-        }
-    } else if (FORM === 'vortex') {
+    if (FORM === 'vortex') {
         // ── VORTEX: the self-similar swallow. Each wall node's depth
         //    FLOWS (dEff advances with tunnelFlow); its distance from
         //    the apex is L0·e^(−k·d) so the wrap is an invisible fractal
@@ -2790,61 +2004,6 @@ function animate() {
                 x1,
                 y * lc2 - z1 * ls2,
                 y * ls2 + z1 * lc2);
-        }
-        instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
-    } else if (FORM === 'stack') {
-        // ── STACK: token packets climb the layer stack (one shared
-        //    flow accumulator, staggered offsets); each ring RIPPLES as
-        //    a packet passes through it; the residual-stream column
-        //    sways like a slow artery. Packets heat as they rise —
-        //    representation enriching layer by layer.
-        stackFlow += (1 / 60) * (0.055 + 0.16 * drive) * CALM * (1.0 + TUNE.flowWrite * gaitFlow)
-            + (DIAL.tool === 'ripple' ? 0.004 * toolPulse : 0);   // a hop per tool call
-        const pkY = [];
-        for (let p = 0; p < STACK_PACKETS; p++) {
-            pkY.push(-2.0 + _fract(stackFlow + p / STACK_PACKETS) * 4.0);
-        }
-        for (let i = 0; i < NODE_COUNT; i++) {
-            const bp = basePositions[i];
-            let x, y, z;
-            if (bp.kind === 0) {
-                const wave = _pulseShape(_fract(pulsePhase - bp.li * 0.10));
-                let ripple = 0;
-                for (let p = 0; p < pkY.length; p++) {
-                    const dy = pkY[p] - bp.y0;
-                    ripple += Math.exp(-dy * dy / 0.05);
-                }
-                ripple = Math.min(ripple, 1.5);
-                const th = bp.th0 + time * bp.omega * CALM;
-                const r = bp.r0 * (1.0 + 0.05 * pulseAmp * wave
-                    + 0.10 * ripple * CALM);
-                x = bp.offX + r * Math.cos(th);
-                z = bp.offZ + r * Math.sin(th);
-                y = bp.y0 + bp.tilt * Math.sin(th + time * 0.1)
-                    + 0.03 * ripple * CALM
-                    + 0.02 * CALM * Math.sin(time * 0.7 + bp.jit);
-            } else if (bp.kind === 1) {
-                let tt = _fract(stackFlow + bp.off) - bp.s * 0.05;
-                if (tt < 0) tt += 1;
-                const py = -2.0 + tt * 4.0;
-                const th = bp.th0 + tt * 2.6;
-                const rr = _stackROfY(py) + 0.16;
-                x = rr * Math.cos(th)
-                    + bp.rr * Math.sin(bp.jit * 3.1 + time * 1.3) * 0.5;
-                y = py + bp.rr * Math.cos(bp.jit * 2.3 + time * 1.1) * 0.4;
-                z = rr * Math.sin(th)
-                    + bp.rr * Math.cos(bp.jit * 4.7 + time * 0.9) * 0.5;
-                // Fade through the wrap; heat with altitude.
-                bp.sz = Math.min(1, 8 * Math.min(tt, 1 - tt) + 0.06)
-                    * (1.0 - bp.s * 0.35);
-                nodeSeeds[i] = 0.28 + 0.26 * tt - bp.s * 0.05;
-            } else {
-                const c = _pulseShape(_fract(pulsePhase + 0.05));
-                x = bp.rx + 0.07 * Math.sin(time * 0.50 + bp.y0 * 2.3);
-                y = bp.y0 * (1.0 + 0.015 * c);
-                z = bp.rz + 0.07 * Math.cos(time * 0.45 + bp.y0 * 1.9);
-            }
-            currentPositions[i].set(x, y, z);
         }
         instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
     } else if (FORM === 'embedding') {
@@ -3127,84 +2286,12 @@ function animate() {
             currentPositions[i].set(x1 - kfx, y2 - kfy, z2 - kfz);
         }
         instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
-    } else if (FORM === 'conversation') {
-        // ── CONVERSATION: the strand breathes gently; the newest reply
-        //    pulses while a turn runs; a hovering future thread waits.
-        for (let i = 0; i < NODE_COUNT; i++) {
-            const bp = basePositions[i];
-            if (bp.kind === 8) { currentPositions[i].set(bp.hx, bp.hy, bp.hz); continue; }
-            const sway = 0.03 * CALM * Math.sin(time * 0.7 + bp.jit);
-            const live = bp.isLast ? (0.06 * Math.max(userTurnState, gait.write) * _pulseShape(_fract(pulsePhase))) : 0;
-            const g = 1.0 + sway + live;
-            currentPositions[i].set(bp.hx * g, bp.hy + 0.02 * CALM * Math.sin(time * 0.5 + bp.jit * 2.0),
-                bp.hz * g);
-            if (bp.kind === 0 && bp.isLast) {
-                nodeSeeds[i] = 0.46 + 0.12 * Math.max(userTurnState, workingState);
-            }
-        }
-        instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
-    } else if (FORM === 'toolgraph') {
-        // ── TOOL GRAPH: the ring turns slowly; a tool lights while it
-        //    was used in the last minute and cools after; the hub
-        //    breathes with work.
-        const rot = time * 0.06 * CALM;
-        const cr = Math.cos(rot), sr = Math.sin(rot);
-        const now = Date.now();
-        for (let i = 0; i < NODE_COUNT; i++) {
-            const bp = basePositions[i];
-            if (bp.kind === 8) { currentPositions[i].set(bp.hx, bp.hy, bp.hz); continue; }
-            const x = bp.hx * cr + bp.hz * sr, z = -bp.hx * sr + bp.hz * cr;
-            const g = bp.kind === 2 ? 1.0 + 0.10 * workingState * _pulseShape(_fract(pulsePhase)) : 1.0;
-            currentPositions[i].set(x * g, bp.hy + 0.03 * CALM * Math.sin(time * 0.6 + bp.jit), z * g);
-            if (bp.kind === 0) {
-                const u = toolUsage.get(bp.name);
-                const age = u ? (now - u.lastAt) / 1000 : 1e9;
-                const recent = Math.max(0, 1 - age / 60);
-                nodeSeeds[i] = 0.14 + 0.46 * recent;
-            }
-        }
-        instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
-    } else if (FORM === 'empty') {
+    } else {
         // ── EMPTY: the dispersed far sphere — static, unlinked,
-        //    invisible. (Must stay an explicit branch: the trailing
-        //    else belongs to cortex.)
+        //    invisible.
         for (let i = 0; i < NODE_COUNT; i++) {
             const bp = basePositions[i];
             currentPositions[i].set(bp.hx, bp.hy, bp.hz);
-        }
-    } else {
-        // ── SYNTHETIC CORTEX: thought-waves swell the lobes in
-        //    sequence; dendrites carry displacement signal-trains.
-        for (let i = 0; i < NODE_COUNT; i++) {
-            const bp = basePositions[i];
-            if (bp.kind === 0) {
-                const wave = _pulseShape(_fract(pulsePhase - bp.lobePhase));
-                const g = 1.0 + 0.55 * pulseAmp * wave * (1.0 + 0.6 * gaitFlash * TUNE.flashGain);
-                const spread = 1.0 + 0.18 * pulseAmp * wave;
-                currentPositions[i].set(
-                    bp.cx * spread + bp.dx * bp.r0 * g
-                        + 0.02 * CALM * Math.sin(time * 0.9 + bp.jit),
-                    bp.cy * spread + bp.dy * bp.r0 * g
-                        + 0.02 * CALM * Math.sin(time * 0.7 + bp.jit * 2.0),
-                    bp.cz * spread + bp.dz * bp.r0 * g);
-            } else if (bp.kind === 1) {
-                const swayA = time * bp.swaySpeed + bp.swayPhase - bp.s * 2.8;
-                const lat = bp.swayAmp * CALM * Math.sin(swayA);
-                const lat2 = bp.swayAmp * 0.7 * CALM * Math.cos(swayA * 0.83 + 1.1);
-                const sig = 0.05 * CALM * Math.sin(bp.s * 10.0 - time * bp.signal);
-                const reach = bp.len * bp.s + sig;
-                currentPositions[i].set(
-                    bp.ax + bp.dx * reach + bp.p1x * lat + bp.p2x * lat2,
-                    bp.ay + bp.dy * reach + bp.p2y * lat2,
-                    bp.az + bp.dz * reach + bp.p1z * lat + bp.p2z * lat2);
-            } else {
-                const c = _pulseShape(_fract(pulsePhase + 0.05));
-                const g = 1.0 + 0.14 * c + 0.05 * Math.sin(time * 0.8 + bp.jit);
-                currentPositions[i].set(
-                    bp.hx * g,
-                    bp.hy * g + 0.03 * Math.sin(time * 0.6 + bp.jit * 2.0),
-                    bp.hz * g);
-            }
         }
     }
 
@@ -3213,9 +2300,9 @@ function animate() {
     // call kicks, the background breath swells the edge, a refute shudders,
     // an idle twitch shivers one neighbourhood.
     if (FORM !== 'empty') {
-        // The dialect decides WHICH components breathe (a ring stack keeps
-        // its height, a terrain sheet heaves in y, a crystal never
-        // breathes) and whether write is the z-wave or the form's own flow.
+        // The dialect decides WHICH components breathe (a terrain sheet
+        // heaves in y, a crystal never breathes) and whether write is the
+        // z-wave or the form's own flow.
         const axis = DIAL.radialAxis;
         const readRadial = DIAL.read === 'contract' ? TUNE.radialRead * gait.read : 0;
         const toolRadial = DIAL.tool === 'kick' ? TUNE.toolKick * toolPulse : 0;
@@ -3306,17 +2393,12 @@ function animate() {
         // (0.88/0.95); mutation displacement deliberately exceeds the
         // link slack so the grid visibly tears and re-weaves around it.
         cube: 0.62,
-        stack: 0.25,
         embedding: 0.62,
         // Descent radius must cover a grid step across the WORST-CASE
         // analytic slope of _lossH (all terms aligned), or the sheet
         // tears momentarily on steep ridges — computed invariant pinned
         // in tests/test_interface_face_forms_ai.py.
         descent: IS_MOBILE ? 0.38 : 0.20,
-        // Data forms: NO proximity links — their edges mean something
-        // (reply→question, call order) and are drawn explicitly below.
-        conversation: 0.0,
-        toolgraph: 0.0,
     };
     const proximitySq = PROXIMITY_SQ * (1.0 + dive * 0.15)
         * (LINK_MULT[FORM] === undefined ? 1.0 : LINK_MULT[FORM])
@@ -3352,19 +2434,6 @@ function animate() {
             }
         }
     }
-    // Explicit edges (data forms): drawn regardless of distance, and
-    // their endpoints count as connected so they render.
-    for (let e = 0; e < explicitEdges.length && lineIdx < MAX_LINES; e++) {
-        const [a, b] = explicitEdges[e];
-        if (a >= NODE_COUNT || b >= NODE_COUNT) continue;
-        connected[a] = true; connected[b] = true;
-        const P = currentPositions[a], Q = currentPositions[b];
-        linePosAttr[lineIdx * 6] = P.x; linePosAttr[lineIdx * 6 + 1] = P.y; linePosAttr[lineIdx * 6 + 2] = P.z;
-        linePosAttr[lineIdx * 6 + 3] = Q.x; linePosAttr[lineIdx * 6 + 4] = Q.y; linePosAttr[lineIdx * 6 + 5] = Q.z;
-        lineUvAttr[lineIdx * 2] = 0; lineUvAttr[lineIdx * 2 + 1] = 1;
-        lineHueAttr[lineIdx * 2] = nodeSeeds[a]; lineHueAttr[lineIdx * 2 + 1] = nodeSeeds[b];
-        lineIdx++;
-    }
     // Recall comet: a hot streak from the periphery into the recalled
     // node, shortening as it arrives; the node itself flares below.
     if (recallSpark > 0 && recallNode >= 0 && recallNode < NODE_COUNT && lineIdx < MAX_LINES
@@ -3397,7 +2466,6 @@ function animate() {
         // core additionally FLARES in size when the infall surges land.
         const bpi = basePositions[i];
         const s = nodeScales[i] * (bpi.sz || 1.0)
-            * (FORM === 'horizon' && bpi.kind === 2 ? coreFlare : 1.0)
             * (i === recallNode ? 1.0 + TUNE.recallFlare * 4.0 * recallSpark * (1.0 - recallSpark) : 1.0);   // bell, peaks mid-flight
         if (s < 0.001) {
             dummy.scale.set(0, 0, 0);
@@ -3428,7 +2496,7 @@ function animate() {
     // distance (its hot zone sits on the view axis at depth) and damps
     // the hue wave/drift so its center stays anchored DARK RED instead
     // of swinging through the plum stop ("bright purple" report).
-    const centerDim = FORM === 'horizon' || FORM === 'vortex' ? 0.85 : 0.30;
+    const centerDim = FORM === 'vortex' ? 0.85 : 0.30;
     const centerXY = FORM === 'vortex' ? 1.0 : 0.0;
     const waveAmp = FORM === 'vortex' ? 0.3 : 1.0;
     // Mood rides the drift as a slow baseline (cold-pole shift only;
@@ -3441,11 +2509,7 @@ function animate() {
     // carry visibility, not brightness. Error KINDS modulate it: a
     // network drop flickers with gaps, a timeout fades; a pass holds a
     // touch brighter while it crystallises.
-    // Data forms have a handful of nodes, not hundreds of additive quads:
-    // the background-blend luminance that tames an anatomy leaves a
-    // 3-message strand nearly invisible (seen in the live check). They
-    // run brighter.
-    let formDim = (FORM === 'conversation' || FORM === 'toolgraph') ? 0.95 : 0.55;
+    let formDim = 0.55;
     if (errorKind === 'network') {
         formDim *= 1.0 - TUNE.netFlicker * errorKindEnv * (Math.sin(time * 90.0) > 0.3 ? 1.0 : 0.0);
     } else if (errorKind === 'timeout') {

@@ -1057,7 +1057,7 @@
     then restart the daemon; the current certificate expires <strong>2026-10-09</strong>.</li>
   </ol>
 
-  <h2>2026-09-11 (night) — the face's signal layer</h2>
+  <h2>2026-09-11 (night) — the face's signal layer <small>(the two data forms, hover labels and auto mode below were removed 2026-09-12)</small></h2>
   <p>Operator: "any ideas to make the faces more interesting?" → fourteen ideas, all shipped. Design rule
   kept: temperature stays the one thing the eye must track; what is added is GAIT and EVENT. Pins:
   <code>tests/test_interface_face_signals_2026_09_11.py</code> (36 tests; pure helpers executed under node,
@@ -1110,7 +1110,7 @@
     <code>ghost_face_auto</code> in localStorage.</li>
   </ul>
 
-  <h2>2026-09-11 (later night) — the face lab and the gait dialects</h2>
+  <h2>2026-09-11 (later night) — the face lab and the gait dialects <small>(the lab was removed 2026-09-12; the dialects stay)</small></h2>
   <p>Pins: <code>tests/test_interface_face_lab_and_dialects_2026_09_11.py</code>. Cache-bust: app/matrix_graph
   12.0, workspace 8.4, palette 7.1, facelab 1.0, style 6.2.</p>
   <p><strong>Face lab</strong> (<code>interface/static/facelab.js</code>, lazy-loaded from the command palette's
@@ -1143,6 +1143,24 @@
   pulse their newest node instead of breathing. The generic pass honours <code>radialAxis</code> (crystals
   and data forms do not breathe; ring stacks keep their height; the terrain heaves in y), and the shader's
   search scan has three modes (azimuth sweep, a plane along y, an expanding ring) chosen by the dialect.</p>
+
+  <h2>2026-09-12 — removals at the operator's request</h2>
+  <p>Gone: the <strong>face lab</strong> (<code>facelab.js</code>, its palette entry, shortcut and styles) and
+  with it the <code>TUNE</code> persistence (<code>setTune</code>/<code>resetTune</code>/
+  <code>loadTuneOverrides</code>, <code>ghost_face_tune</code>) — the table itself stays as a frozen
+  constant, every key still read by the loop; the <strong>auto form</strong> mode
+  (<code>setAutoForm</code>/<code>autoFormFor</code>/<code>setTaskHint</code>, the picker's first item,
+  <code>ghost_face_auto</code>, the ticker's task hints); and six forms: <strong>abyssal, horizon, cortex,
+  stack, conversation, toolgraph</strong> (their builders, animate branches, state — horizon's event
+  choreography, the stack's climb accumulator, the abyssal tilt — the explicit-edge line pass, hover
+  labels + <code>#face-tooltip</code>, <code>setConversation</code>, the tool-graph bookkeeping).
+  <code>noteToolCall()</code> is now the kick alone. Roster: <code>vortex, lattice, embedding, descent,
+  cube, empty</code> — a stored pick of a removed form falls through to the default via
+  <code>resolveInitialForm</code>. The signal layer, dialects and mood feed are unchanged. Pins:
+  <code>tests/test_interface_face_signals_2026_09_11.py</code> (absences pinned),
+  <code>test_interface_face_lab_and_dialects_2026_09_11.py</code> (now dialects + the frozen table),
+  <code>test_interface_face_forms_ai.py</code> (roster, 6 builders under node for both device classes).
+  Cache-bust: app/matrix_graph 12.2, workspace 8.6, palette 7.2, style 6.4.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

@@ -15,7 +15,7 @@
 import { initSessions } from './sessions.js?v=7.9';
 import { initNotifications } from './notifications.js?v=7.0';
 import { initStatus } from './status.js?v=7.4';
-import { initPalette } from './palette.js?v=7.1';
+import { initPalette } from './palette.js?v=7.2';
 
 const Core = window.GhostCore;
 
@@ -285,20 +285,7 @@ function initMemoryModal() {
 // --- boot ------------------------------------------------------------
 Core.openMessageMenu = openMessageMenu;
 
-// Face lab (2026-09-11): a tuning aid for the face's signal layer,
-// lazy-loaded on first use (palette "Face lab" or Alt+Shift+F).
-const faceLab = {
-    open: () => import('./facelab.js?v=1.1')
-        .then((m) => m.openFaceLab({ Core, el, toast }))
-        .catch((e) => toast(`Face lab failed to load: ${e && e.message || e}`, 'error')),
-};
-document.addEventListener('keydown', (e) => {
-    if (e.altKey && e.shiftKey && (e.key === 'F' || e.key === 'f' || e.code === 'KeyF')) {
-        e.preventDefault();
-        faceLab.open();
-    }
-});
-const ctx = { Core, el, toast, jewelHue, relTime, toggleRail, toggleDensity, openMemoryModal, isDocked, setRailOpen, faceLab };
+const ctx = { Core, el, toast, jewelHue, relTime, toggleRail, toggleDensity, openMemoryModal, isDocked, setRailOpen };
 initRail();
 initDensity();
 initMemoryModal();

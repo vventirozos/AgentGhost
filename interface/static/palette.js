@@ -6,7 +6,7 @@
 // ═══════════════════════════════════════════════════════════════
 
 export function initPalette(ctx) {
-    const { Core, el, toast, toggleRail, toggleDensity, sessions, notifications, faceLab } = ctx;
+    const { Core, el, toast, toggleRail, toggleDensity, sessions, notifications } = ctx;
 
     const overlay = document.getElementById('cmd-palette');
     const input = document.getElementById('palette-input');
@@ -33,7 +33,6 @@ export function initPalette(ctx) {
             // 2026-09-05 at the operator's request, along with the panel.
             { label: 'Stop MY turn', hint: 'cooperative cancel of this tab\'s turn', run: () => Core.cancelOwnTurn(false) },
             { label: 'Toggle density', hint: 'compact / comfortable', run: toggleDensity },
-            { label: 'Face lab', hint: 'tune the face — Alt+Shift+F', run: () => faceLab && faceLab.open() },
             {
                 label: 'Copy last reply', hint: '', run: async () => {
                     const history = Core.getChatHistory();

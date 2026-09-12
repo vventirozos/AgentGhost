@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=12.1';
+import * as matrixGraphFace from './matrix_graph.js?v=12.2';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -1863,10 +1863,6 @@ function _isQuotaError(name) {
 }
 let _quotaWarned = false;
 function saveChatState() {
-    // The conversation form's anatomy IS the history (2026-09-11).
-    if (typeof activeFace.setConversation === 'function') {
-        try { activeFace.setConversation(chatHistory); } catch (e) { /* face not booted */ }
-    }
     const key = _historyKey();
     if (safeStorage.set(key, JSON.stringify(chatHistory))) return true;
     if (!_isQuotaError(safeStorage.lastError)) return false;   // private mode etc.
@@ -2384,34 +2380,25 @@ const TICKER_VERBS = {
     'delegation': 'delegating a subtask',
 };
 // What a ticker line means to the FACE (2026-09-11): a gait for the
-// step class, a task hint for auto-form, whether it is a tool call (a
-// discrete kick, plus the tool-graph's data), a memory recall (a comet)
-// or the verifier's verdict. Pure; executed under node.
+// step class, whether it is a tool call (a discrete kick), a memory
+// recall (a comet) or the verifier's verdict. Pure; executed under node.
 const _FACE_PHASE_BY_TITLE = {
-    'web search': ['search', 'research'], 'web read': ['read', 'research'],
-    'browser': ['search', 'research'], 'memory search': ['search', 'memory'],
-    'hydrated context': ['read', null], 'file read': ['read', 'coding'],
-    'sandbox tree': ['read', 'coding'], 'vision': ['read', null],
-    'sandbox exec': ['tool', 'coding'], 'execution task': ['tool', 'coding'],
-    'file write': ['tool', 'coding'], 'worker compute': ['tool', null],
-    'delegation': ['tool', null], 'memory save': ['tool', 'memory'],
-    'graph updated': ['tool', 'memory'], 'verifier': ['verify', 'verify'],
-    'tool call': ['tool', null],
+    'web search': 'search', 'web read': 'read', 'browser': 'search',
+    'memory search': 'search', 'hydrated context': 'read', 'file read': 'read',
+    'sandbox tree': 'read', 'vision': 'read', 'sandbox exec': 'tool',
+    'execution task': 'tool', 'file write': 'tool', 'worker compute': 'tool',
+    'delegation': 'tool', 'memory save': 'tool', 'graph updated': 'tool',
+    'verifier': 'verify', 'tool call': 'tool',
 };
 function faceSignalsForTicker(title, icon, detail) {
-    const out = { phase: null, hint: null, tool: null, recall: false, verdict: null };
+    const out = { phase: null, tool: false, recall: false, verdict: null };
     const t = String(title || '').toLowerCase();
     const d = String(detail || '');
-    const m = _FACE_PHASE_BY_TITLE[t];
-    if (m) { out.phase = m[0]; out.hint = m[1]; }
-    if (t === 'tool call' || icon === '🧰') {
-        out.phase = 'tool';
-        out.tool = (d.split(' · ')[0] || '').trim().toLowerCase() || null;
-    }
+    if (_FACE_PHASE_BY_TITLE[t]) out.phase = _FACE_PHASE_BY_TITLE[t];
+    if (t === 'tool call' || icon === '🧰') { out.phase = 'tool'; out.tool = true; }
     if (icon === '🔎' || icon === '📍' || t === 'memory search') out.recall = true;
     if (icon === '🧪' || t.startsWith('verify')) {
         out.phase = 'verify';
-        out.hint = 'verify';
         if (/^\s*CONFIRMED/i.test(d)) out.verdict = 'pass';
         else if (/^\s*REFUTED/i.test(d)) out.verdict = 'refute';
     }
@@ -2422,8 +2409,7 @@ let _lastRecallAt = 0;
 function _feedFaceFromTicker(title, icon, detail) {
     const f = faceSignalsForTicker(title, icon, detail);
     if (f.phase && typeof activeFace.setPhase === 'function') activeFace.setPhase(f.phase);
-    if (f.hint && typeof activeFace.setTaskHint === 'function') activeFace.setTaskHint(f.hint);
-    if (f.tool !== null && typeof activeFace.noteToolCall === 'function') activeFace.noteToolCall(f.tool);
+    if (f.tool && typeof activeFace.noteToolCall === 'function') activeFace.noteToolCall();
     if (f.recall && typeof activeFace.noteRecall === 'function') {
         const now = Date.now();
         if (now - _lastRecallAt > 1500) { _lastRecallAt = now; activeFace.noteRecall(); }
@@ -3246,23 +3232,13 @@ if (fullscreenBtn) {
 // jumps straight to it. Falls back to the old cycle if the face module
 // predates getForms/setForm (stale cache).
 const FACE_FORM_HINTS = {
-    abyssal: 'deep-sea creature',
-    horizon: 'collapsing orbits',
-    cortex: 'neural lobes',
     vortex: 'black hole',
     lattice: 'weight tensor',
-    stack: 'transformer',
     embedding: 'latent space',
     descent: 'loss landscape',
     cube: 'infinite monolith',
-    conversation: 'this session as a strand',
-    toolgraph: "the agent's habits",
     empty: 'no face',
 };
-// Auto mode (2026-09-11): not a body plan — a setting. The form follows
-// the task the ticker sees (coding → lattice, research → embedding,
-// verifying → descent) and returns to your pick when the hint clears.
-const FACE_AUTO_HINT = 'follows the task';
 const faceFormBtn = document.getElementById('face-form-btn');
 let faceFormMenu = null;
 
@@ -3303,28 +3279,6 @@ function buildFaceFormMenu() {
     faceFormMenu.className = 'hidden';
     faceFormMenu.setAttribute('role', 'menu');
     faceFormMenu.setAttribute('aria-label', 'Face form');
-    if (typeof activeFace.setAutoForm === 'function') {
-        const auto = document.createElement('button');
-        auto.type = 'button';
-        auto.className = 'face-form-item face-form-auto';
-        auto.dataset.form = 'auto';
-        auto.setAttribute('role', 'menuitemcheckbox');
-        const al = document.createElement('span');
-        al.className = 'face-form-name';
-        al.textContent = 'auto';
-        auto.appendChild(al);
-        const ah = document.createElement('span');
-        ah.className = 'face-form-hint';
-        ah.textContent = FACE_AUTO_HINT;
-        auto.appendChild(ah);
-        auto.addEventListener('click', () => {
-            const on = activeFace.setAutoForm(!activeFace.getAutoForm());
-            markActiveFaceForm();
-            const toast = window.__ghostWorkspace && window.__ghostWorkspace.toast;
-            if (toast) toast(on ? 'Face follows the task' : 'Face: your pick');
-        });
-        faceFormMenu.appendChild(auto);
-    }
     for (const name of activeFace.getForms()) {
         const item = document.createElement('button');
         item.type = 'button';
@@ -3367,13 +3321,7 @@ function buildFaceFormMenu() {
 function markActiveFaceForm() {
     if (!faceFormMenu) return;
     const current = typeof activeFace.getForm === 'function' ? activeFace.getForm() : '';
-    const auto = typeof activeFace.getAutoForm === 'function' && activeFace.getAutoForm();
     for (const item of faceFormMenu.querySelectorAll('.face-form-item')) {
-        if (item.dataset.form === 'auto') {
-            item.classList.toggle('auto-on', !!auto);
-            item.setAttribute('aria-checked', auto ? 'true' : 'false');
-            continue;
-        }
         item.classList.toggle('active', item.dataset.form === current);
         item.setAttribute('aria-checked', item.dataset.form === current ? 'true' : 'false');
     }
@@ -3945,36 +3893,6 @@ if (window.visualViewport) {
         } catch (e) { /* never let the watchdog take the page down */ }
     }, 800);
 }
-
-// Node hover / tap (2026-09-11): the conversation and tool-graph forms
-// label their nodes. Pointer events over the exposed background (not
-// over chrome or a bubble) ask the face which node is under the pointer
-// and show its label in #face-tooltip. Pure decision helper below.
-const faceTooltip = document.getElementById('face-tooltip');
-const _FACE_CHROME = '.message, header, footer, aside, #render-window, #log-console, #notif-panel, #cmd-palette, .modal-overlay, #face-form-menu, #msg-menu';
-function faceHoverAllowed(target) {
-    if (!target || typeof target.closest !== 'function') return true;
-    return !target.closest(_FACE_CHROME);
-}
-let _faceHoverRaf = null;
-function _onFacePointer(e) {
-    if (!faceTooltip || typeof activeFace.describeNodeAt !== 'function') return;
-    if (_faceHoverRaf !== null) return;
-    _faceHoverRaf = requestAnimationFrame(() => {
-        _faceHoverRaf = null;
-        if (!faceHoverAllowed(e.target)) { faceTooltip.classList.add('hidden'); return; }
-        const nx = (e.clientX / window.innerWidth) * 2 - 1;
-        const ny = -((e.clientY / window.innerHeight) * 2 - 1);
-        const hit = activeFace.describeNodeAt(nx, ny);
-        if (!hit) { faceTooltip.classList.add('hidden'); return; }
-        faceTooltip.textContent = hit.label;
-        faceTooltip.style.left = `${Math.min(e.clientX, window.innerWidth - 320)}px`;
-        faceTooltip.style.top = `${Math.min(e.clientY, window.innerHeight - 60)}px`;
-        faceTooltip.classList.remove('hidden');
-    });
-}
-window.addEventListener('pointermove', _onFacePointer, { passive: true });
-window.addEventListener('pointerdown', _onFacePointer, { passive: true });
 
 // The document-wide `dblclick` preventDefault that lived here (an iOS
 // double-tap-zoom guard) is GONE (2026-09-11): the viewport is already
@@ -5430,7 +5348,7 @@ window.GhostCore = {
     toggleLogConsole: () => { if (logToggleBtn) logToggleBtn.click(); },
 };
 
-import('./workspace.js?v=8.5').catch(e => {
+import('./workspace.js?v=8.6').catch(e => {
     // ⚠ VISIBLE, not console-only. This module owns the sessions rail, and
     // with it `window.__ghostSessionId` — so when it fails to load, every
     // turn silently reverts to CLIENT-CARRIED history: no durable session,

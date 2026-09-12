@@ -45,7 +45,7 @@ def graph_js() -> str:
 # ── presence + cycle order ─────────────────────────────────────────
 
 def test_ai_form_builders_present(graph_js):
-    for builder in ("_buildLattice", "_buildStack", "_buildEmbedding",
+    for builder in ("_buildLattice", "_buildEmbedding",
                     "_buildDescent", "_buildCube"):
         assert builder in graph_js, f"missing {builder}"
         assert f"{builder}()" in graph_js, f"{builder} never dispatched"
@@ -55,13 +55,11 @@ def test_forms_array_contents_and_order(graph_js):
     m = re.search(r"const FORMS = \[(.*?)\];", graph_js, re.DOTALL)
     assert m, "FORMS array missing"
     names = re.findall(r"'(\w+)'", m.group(1))
-    # 2026-09-11: two DATA forms joined (conversation, toolgraph); 'empty'
-    # stays last.
-    assert names == ["abyssal", "horizon", "cortex", "vortex",
-                     "lattice", "stack", "embedding", "descent",
-                     "cube", "conversation", "toolgraph", "empty"]
+    # 2026-09-12 (operator): abyssal, horizon, cortex, stack, conversation
+    # and toolgraph removed; 'empty' stays last.
+    assert names == ["vortex", "lattice", "embedding", "descent", "cube", "empty"]
     # 'empty' last: cycling INTO it disperses the face beyond the screen
-    # edges and the NEXT cycle materializes abyssal from the void.
+    # edges and the NEXT cycle materializes vortex from the void.
     assert names[-1] == "empty"
 
 
@@ -78,15 +76,14 @@ def test_link_multiplier_map(graph_js):
     m = re.search(r"const LINK_MULT = \{(.*?)\};", graph_js, re.DOTALL)
     assert m, "per-form link multiplier map missing"
     body = m.group(1)
-    for key in ("vortex", "lattice", "stack", "embedding", "descent"):
+    for key in ("vortex", "lattice", "embedding", "descent"):
         assert re.search(rf"\b{key}:", body), f"LINK_MULT.{key} missing"
 
 
 def test_new_forms_reheat_seeds_per_frame(graph_js):
-    # lattice (wave+kernel heat), stack (packet altitude), embedding
-    # (recall ignition), descent (height+bead heat) all rewrite
-    # nodeSeeds per frame — each must flag the attribute upload, like
-    # vortex already does. 5 = vortex + the four new forms.
+    # lattice (wave+kernel heat), embedding (recall ignition), descent
+    # (height+bead heat) and cube all rewrite nodeSeeds per frame — each
+    # must flag the attribute upload, like vortex already does.
     assert graph_js.count("aSeed.needsUpdate = true") >= 5
 
 
@@ -96,22 +93,6 @@ def _const(graph_js, pattern):
     m = re.search(pattern, graph_js)
     assert m, f"constant not found: {pattern}"
     return float(m.group(1))
-
-
-def test_stack_layer_gap_clears_link_radius(graph_js):
-    """The discs must read as separate rings: the inter-layer gap has to
-    stay ABOVE the stack's link radius even at opposing tilt extremes,
-    or vertical scaffold links weave a solid cylinder (first render)."""
-    prox = _const(graph_js, r"const PROXIMITY_SQ = ([\d.]+)")
-    mult = _const(graph_js, r"stack: ([\d.]+)")
-    y0 = _const(graph_js, r"const STACK_Y0 = -([\d.]+)")
-    y1 = _const(graph_js, r"STACK_Y1 = ([\d.]+)")
-    layers = _const(graph_js, r"const STACK_LAYERS = IS_MOBILE \? \d+ : (\d+)")
-    tilt = _const(graph_js, r"tilt: ([\d.]+) \* Math\.sin\(li")
-    radius = math.sqrt(prox * mult)
-    gap = (y0 + y1) / (layers - 1)
-    assert gap - 2 * tilt > radius, (
-        f"layer gap {gap:.3f} (minus tilt) must clear link radius {radius:.3f}")
 
 
 def test_lattice_links_neighbors_but_not_diagonals(graph_js):
@@ -248,19 +229,17 @@ def test_form_picker_menu(graph_js):
     assert "face-form-menu" in app_js
     assert "cycleForm()" in app_js, "stale-cache fallback must remain"
     # Every shipped form carries a hint line in the picker.
-    for name in ("abyssal", "horizon", "cortex", "vortex", "lattice",
-                 "stack", "embedding", "descent", "cube", "conversation", "empty"):
+    for name in ("vortex", "lattice", "embedding", "descent", "cube", "empty"):
         assert re.search(rf"\b{name}: '", app_js), f"hint missing for {name}"
-    assert re.search(r"\btoolgraph: \"", app_js), "hint missing for toolgraph"
     css = (_STATIC / "style.css").read_text(encoding="utf-8")
     assert "#face-form-menu" in css
     assert ".face-form-item.active" in css
 
 
 def test_wrap_fades_hide_respawns(graph_js):
-    # Lattice runners and stack packets wrap; both must taper size at
-    # the wrap ends (bp.sz mutation) so respawns don't pop on screen.
-    assert graph_js.count("Math.min(tt, 1 - tt)") >= 1
+    # Lattice runners wrap; they must taper size at the wrap ends (bp.sz
+    # mutation) so respawns don't pop on screen. (The stack's packets,
+    # the other wrapper, left with the form on 2026-09-12.)
     assert graph_js.count("Math.min(t, 1 - t)") >= 1
 
 
@@ -283,24 +262,16 @@ const basePositions = [];
 const nodeSeeds = new Float32Array(NODE_COUNT);
 const VORTEX_APEX_Z = -2.0, VORTEX_LMIN = 0.55, VORTEX_KOUT = 2.6;
 const VORTEX_COS = 0.60, VORTEX_SIN = 0.80;
-let stackFlow = 0, embFrom = 0, embTo = 1, embT = 0.5;
+let embFrom = 0, embTo = 1, embT = 0.5;
 const embExcite = []; let _embCenters = [];
 let beadX = 0, beadZ = 0, beadVX = 0, beadVZ = 0, beadStill = 0;
 const beadTrail = []; let _descTick = 0;
 let _cubeCx = []; let cubeActive = 0, cubeS = 0, _cubePrevTurn = false;
-const explicitEdges = [], nodeLabels = [], conversation = [], toolSeq = [];
-const toolUsage = new Map();
-const FORMS = ['abyssal', 'horizon', 'cortex', 'vortex',
-    'lattice', 'stack', 'embedding', 'descent', 'cube',
-    'conversation', 'toolgraph', 'empty'];
+const FORMS = ['vortex', 'lattice', 'embedding', 'descent', 'cube', 'empty'];
 let formIndex = 0;
 {section}
-// Data forms with SOME data — the empty case is a separate branch.
-for (let i = 0; i < 30; i++) conversation.push({{ role: i % 2 ? 'assistant' : 'user', len: 40 * i, preview: 'm' + i, hidx: i }});
-for (const n of ['web_search', 'file_read', 'execute_code']) {{ toolUsage.set(n, {{ count: 2, lastAt: 0, first: 0 }}); toolSeq.push(n); }}
-const builders = [_buildAbyssal, _buildHorizon, _buildCortex, _buildVortex,
-    _buildLattice, _buildStack, _buildEmbedding, _buildDescent, _buildCube,
-    _buildConversation, _buildToolGraph, _buildEmpty];
+const builders = [_buildVortex, _buildLattice, _buildEmbedding, _buildDescent,
+    _buildCube, _buildEmpty];
 for (const fn of builders) {{
     basePositions.length = 0;
     fn();

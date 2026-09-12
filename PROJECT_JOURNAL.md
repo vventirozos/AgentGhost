@@ -38500,3 +38500,42 @@ nearly invisible — `formDim 0.55` is a background blend tuned for hundreds of 
 3-message strand has three. Data forms now run at 0.95 with larger beads (1.3+ / hub 2.0). Still on the
 faint side under SwiftShader; the operator's lab pass decides. Agent `/api/health` has no `mood` yet — the
 AGENT daemon was not restarted (expected; the face stays neutral until it is).
+
+## §4GF — Removed: the face lab, auto mode, and six forms (2026-09-12)
+
+**Ask (operator):** "remove the lab and the following faces altogether: auto, abyssal, horizon, cortex,
+stack, conversation and toolgraph".
+
+**Removed.** `facelab.js` (file), its palette entry, Alt+Shift+F shortcut, ctx wiring and styles; the
+`TUNE` persistence (`TUNE_DEFAULTS`/`getTune`/`setTune`/`resetTune`/`loadTuneOverrides`,
+`ghost_face_tune`) — the table stays as `export const TUNE = Object.freeze({...})`, every key still read
+(set-equality test); auto mode (`setAutoForm`/`getAutoForm`/`setTaskHint`/`autoFormFor`/`_applyAutoForm`,
+`ghost_face_auto`, the picker's first item, `FACE_AUTO_HINT`, the ticker's task hints — `_FACE_PHASE_BY_TITLE`
+is title→phase now); the forms abyssal, horizon, cortex, stack, conversation, toolgraph — builders,
+animate branches (the chain is now vortex → lattice → embedding → descent → cube → else empty),
+horizon's event choreography (`eventBoost`/`coreFlare`/`_lastPulseFract`), the stack's `stackFlow` and
+constants, the abyssal tilt trig, the data-form state + explicit-edge line pass + `_relayoutDataForm`,
+hover labels (`describeNodeAt`, `#face-tooltip`, `faceHoverAllowed`), `setConversation` and the
+`saveChatState` feed, `fireIdleTwitch`, `noteToolCall(name)` → `noteToolCall()` (the kick alone).
+`DIALECT_VALUES` lost `ripple`/`pulse` (no form used them; `xz` kept as vocabulary). Roster = 6; a stored
+pick of a removed form falls to the default via `resolveInitialForm`. Signal layer, dialects, mood feed,
+mic level, error kinds, idle twitch: unchanged.
+
+**Defect inside my own removal (R8):** the branch cut for the cortex `else` also took the generic gait pass
+that sat between it and the reorganisation blend — every `TUNE.radial*`/`toolKick`/`writeWave`/`shudder`/
+`twitch`/`bgEdge` key went orphan. Caught by the TUNE set-equality check run right after the surgery
+(the reason that test exists), block restored. Test-file writes were refused once because the files had
+been edited via the shell since the last read — deleted and rewritten.
+
+**Pins moved:** forms_ai roster (6), builders list, LINK_MULT keys, hints list, node harness (6 builders,
+both device classes), stack layer-gap test deleted, wrap-fade pin (lattice only); face_palette alien-forms
+test → surviving builders + ABSENCE of the removed ones, `formDim = 0.55`; cachebust `_CARRIER` minus
+facelab; bump pins (app/matrix 12.2, workspace 8.6, palette 7.2, style 6.4). `test_interface_face_signals`
+and `test_interface_face_lab_and_dialects` rewritten (absences pinned; roster chain pinned by the LAST
+`if (FORM === 'vortex')` before the gait pass — the first match is the scene-rotation block).
+
+**Verification:** interface suite 749 passed / 2 skipped; live headless-Chromium check against :8080
+(roster 6, no lab panel on Alt+Shift+F, removed exports absent from the module namespace, events still
+move the debug state, menu = roster, tooltip gone, pill + push row present): 17/17, 0 page errors, 0 console
+errors. Full suite 21,253 passed / 66 skipped.
+Docs: `docs/interfaces.html` (six forms), `web_server.html` (removal note; the two 09-11 sections marked).

@@ -500,7 +500,7 @@ class TestStaticDelivery:
 
 
 def test_touched_modules_bumped(index_html, app_js):
-    assert "app.js?v=12.1" in index_html
-    assert "workspace.js?v=8.5" in app_js and "matrix_graph.js?v=12.1" in app_js
+    assert "app.js?v=12.2" in index_html
+    assert "workspace.js?v=8.6" in app_js and "matrix_graph.js?v=12.2" in app_js
     ws = (_STATIC / "workspace.js").read_text(encoding="utf-8")
     assert "sessions.js?v=7.9" in ws
