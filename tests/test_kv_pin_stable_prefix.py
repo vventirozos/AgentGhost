@@ -99,7 +99,7 @@ async def test_unpinned_composition_unchanged(monkeypatch):
 
 class TestSourceInvariants:
     def test_pinned_stable_injection_excludes_playbook(self):
-        src = inspect.getsource(GhostAgent.handle_chat)
+        src = inspect.getsource(GhostAgent.handle_chat) + inspect.getsource(GhostAgent._run_internal_turn)
         # Under pin, _stable_injection is built WITHOUT fetched_playbook.
         assert 'if _pin_stable:' in src
         assert '_stable_injection = f"{tool_header_block}\\n\\n{active_persona}{fetched_context}{_continuity_tail}"' in src
@@ -107,7 +107,7 @@ class TestSourceInvariants:
         assert '{active_persona}{fetched_playbook}{fetched_context}' in src
 
     def test_pinned_final_gen_directive_routed_to_volatile(self):
-        src = inspect.getsource(GhostAgent.handle_chat)
+        src = inspect.getsource(GhostAgent.handle_chat) + inspect.getsource(GhostAgent._run_internal_turn)
         # Slim header flip only on the UNPINNED path...
         assert "if _is_final_generation_for_schema and not _pin_stable:" in src
         # ...pinned final-gen emits the directive for the volatile block.

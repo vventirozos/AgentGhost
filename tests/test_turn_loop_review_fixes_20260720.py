@@ -136,12 +136,12 @@ def test_promotion_nudge_counts_only_successful_writes():
 
 
 def test_scratchpad_injection_is_capped_at_source():
-    src = inspect.getsource(agent_mod.GhostAgent.handle_chat)
+    src = inspect.getsource(agent_mod.GhostAgent.handle_chat) + inspect.getsource(agent_mod.GhostAgent._run_internal_turn)
     assert "_SCRATCH_INJECT_CAP" in src
 
 
 def test_prune_reserves_injection_headroom():
-    src = inspect.getsource(agent_mod.GhostAgent.handle_chat)
+    src = inspect.getsource(agent_mod.GhostAgent.handle_chat) + inspect.getsource(agent_mod.GhostAgent._run_internal_turn)
     assert "_history_budget" in src
     assert "_INJECTION_RESERVE_TOKENS" in src
     # prune is called against the reserved budget, not raw max_context

@@ -628,11 +628,41 @@ _PROXYLESS_BROWSER_NOTE = (
 
 
 
+#: The kernel liveness probe (§4GI, 2026-09-13). `sandbox_manager.execute`
+#: wraps every command in `timeout -k 5s Ns sh -c '<cmd>'`, so the bare
+#: `pgrep -f ipykernel_launcher` matched ITS OWN wrapper's command line —
+#: exit 0 with no kernel, verified live by the review: a stale
+#: `/workspace/.kernel.json` (the bind mount survives every container
+#: restart) then read as "alive" forever and every stateful run failed
+#: "Kernel did not become ready". The bracket idiom (memory
+#: `the-probe-carries-its-own-pattern`): the regex `[i]pykernel_launcher`
+#: matches the kernel's argv but not the literal `[i]pykernel_launcher`
+#: that appears in the wrapper's own argv.
+KERNEL_LIVENESS_PROBE = "pgrep -f '[i]pykernel_launcher'"
+
+
+async def _kernel_alive(sandbox_manager, conn_file: str) -> bool:
+    """True when the connection file exists AND a kernel process is alive."""
+    _out, check_code = await asyncio.to_thread(sandbox_manager.execute, f"test -f {conn_file}")
+    if check_code != 0:
+        return False
+    _out, pgrep_code = await asyncio.to_thread(sandbox_manager.execute, KERNEL_LIVENESS_PROBE)
+    return pgrep_code == 0
+
+
 async def tool_execute(filename: str = None, content: str = None, sandbox_dir: Path = None, sandbox_manager=None, scrapbook=None, args: list = None, memory_dir: Path = None, stateful: bool = False, command: str = None, workspace_model=None, container_workdir: str = None, **kwargs):
     # When a project is active, run from /workspace/projects/<id> so files
     # written via file_system (also scoped) read back. Passed ONLY when set,
     # so sandbox managers without a `workdir` param keep working unchanged.
     _workdir_kw = {"workdir": container_workdir} if container_workdir else {}
+    # §4GI: the sandbox's egress must be Tor-only or cut off before anything
+    # runs — the consumer the enforcement code never had.
+    from ..sandbox.egress_gate import network_refusal as _egress_refusal
+    _egress_block = _egress_refusal(sandbox_manager)
+    if _egress_block is not None:
+        pretty_log("Sandbox Egress", "refusing execute — egress unavailable",
+                   level="ERROR", icon=Icons.SHIELD)
+        return _egress_block
     # --- PARAMETER HALLUCINATION HEALING ---
     command = command or kwargs.get("cmd")
     filename = filename or kwargs.get("file") or kwargs.get("script") or kwargs.get("name")
@@ -1417,16 +1447,10 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
     if ext == "py" and stateful:
         pretty_log("Stateful Execution", "Routing to Persistent Jupyter Kernel", icon=Icons.TOOL_CODE)
         conn_file = "/workspace/.kernel.json"
-        
+
         # Check if kernel is running (prevent stale file deadlocks)
-        out_chk, check_code = await asyncio.to_thread(sandbox_manager.execute, f"test -f {conn_file}")
-        
-        if check_code == 0:
-            # File exists, check if process is actually alive
-            out_pg, pgrep_code = await asyncio.to_thread(sandbox_manager.execute, "pgrep -f ipykernel_launcher")
-            if pgrep_code != 0:
-                check_code = 1 # Force reboot
-                
+        check_code = 0 if await _kernel_alive(sandbox_manager, conn_file) else 1
+
         if check_code != 0:
             # Clean up dead connection file if it exists
             await asyncio.to_thread(sandbox_manager.execute, f"rm -f {conn_file}")

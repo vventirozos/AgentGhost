@@ -228,7 +228,7 @@ def test_inline_request_path_summarizers_are_foreground():
 
     # The shield call moved into _dispatch_and_process_tool_batch with
     # the #5 step-2 extraction (2026-07-09) — inspect both.
-    chat_src = (inspect.getsource(GhostAgent.handle_chat)
+    chat_src = (inspect.getsource(GhostAgent.handle_chat) + inspect.getsource(GhostAgent._run_internal_turn)
                 + inspect.getsource(GhostAgent._dispatch_and_process_tool_batch))
     # Match up to is_background (no closing paren) so a trailing kwarg like
     # task_label= doesn't break this foreground-regression guard.

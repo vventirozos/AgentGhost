@@ -207,7 +207,15 @@
 
   <h3>3. Stateful Jupyter (line 198-306)</h3>
   <ul>
-    <li>Boots persistent <code>ipykernel_launcher</code> if not running.</li>
+    <li>Boots persistent <code>ipykernel_launcher</code> if not running — decided by
+    <code>_kernel_alive</code>: the connection file exists AND <code>KERNEL_LIVENESS_PROBE</code>
+    (<code>pgrep -f '[i]pykernel_launcher'</code>) finds a process. Until §4GI (2026-09-13) the
+    probe was a bare <code>pgrep -f ipykernel_launcher</code>, which matched its own
+    <code>timeout … sh -c</code> wrapper (exit 0 with no kernel, verified live): a stale
+    <code>.kernel.json</code> — the bind mount survives every container restart — read as
+    alive forever and every stateful run failed "Kernel did not become ready". The bracket
+    idiom matches the kernel's argv but not the literal in the wrapper's argv (memory
+    <em>the-probe-carries-its-own-pattern</em>); pinned with a simulated process table.</li>
     <li>Wraps via <code>jupyter_client.BlockingKernelClient</code>.</li>
     <li><strong>Calls <code>kc.wait_for_ready(timeout=10)</code> BEFORE <code>kc.execute()</code></strong> — without this, <code>is_alive()</code> false-negatives for ~1 s after <code>start_channels()</code> while the heartbeat channel hasn't exchanged yet. The runner's <code>except queue.Empty</code> branch reads <code>is_alive()</code> as a "kernel died?" probe, so every FIRST stateful execute of a session used to emit <code>[SYSTEM ERROR: Kernel Terminated Abruptly (Did the script call os._exit()?)]</code> even though the script hadn't run. <code>wait_for_ready</code> closes the race; a genuine launch failure surfaces as a distinct <code>[SYSTEM ERROR: Kernel did not become ready within 10s]</code> message so reflection can distinguish launch failure from runtime crash. Covered by <code>tests/test_execute_jupyter_wait_for_ready.py</code>.</li>
     <li>Streams stdout / stderr; detects 5-min timeout or mid-execution kernel death.</li>

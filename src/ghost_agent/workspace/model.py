@@ -282,6 +282,55 @@ class WorkspaceModel:
             logger.debug("record_research_artifact skipped: %s", e)
             return None
 
+    # Host-specific aliases where ONE page has two spellings. Each entry
+    # is (host, path-prefix-to-strip); the counter would otherwise treat
+    # the two as different pages and never reach its threshold. Kept as
+    # an explicit table with ONE consumer (`canonical_nav_url`) — a
+    # general rule cannot know that Telegram's `/s/` preview and the bare
+    # post are the same content. `tests/test_workspace_nav_canonical.py`
+    # walks this table and pins BOTH directions of every entry.
+    _NAV_PATH_ALIASES: tuple = (
+        # t.me/s/<channel>/<id> is the web PREVIEW of t.me/<channel>/<id>.
+        # The 2026-09-15 Revolut turn fetched one post five times across
+        # the two spellings (3 + 2) and the nudge never fired, because
+        # neither key reached 3 on its own.
+        ("t.me", "/s/"),
+    )
+
+    @classmethod
+    def canonical_nav_url(cls, url: str) -> str:
+        """Collapse spellings of the SAME page onto one counter key.
+
+        Normalises scheme/host case, drops the fragment and a trailing
+        slash, and applies the host alias table above. The query string
+        is deliberately KEPT: `?q=` genuinely changes the page, and a
+        counter that merged those would under-report real distinct work.
+        """
+        raw = (url or "").strip()
+        if not raw:
+            return ""
+        try:
+            from urllib.parse import urlsplit, urlunsplit
+            parts = urlsplit(raw)
+            host = (parts.hostname or "").lower()
+            if not host:
+                return raw.rstrip("/") or raw
+            path = parts.path or ""
+            for alias_host, prefix in cls._NAV_PATH_ALIASES:
+                if (host == alias_host or host.endswith("." + alias_host)) \
+                        and path.startswith(prefix):
+                    path = "/" + path[len(prefix):]
+                    break
+            if len(path) > 1:
+                path = path.rstrip("/")
+            netloc = host
+            if parts.port:
+                netloc = f"{host}:{parts.port}"
+            return urlunsplit(
+                ((parts.scheme or "").lower(), netloc, path, parts.query, ""))
+        except Exception:  # noqa: BLE001 — never break a browser turn
+            return raw
+
     def record_navigation(self, url: str, *, threshold: int = 3) -> Optional[str]:
         """Count visits to ``url`` this session; on EXACTLY the
         ``threshold``-th identical visit, return a one-line suggestion to
@@ -292,7 +341,10 @@ class WorkspaceModel:
         """
         if not self.enabled:
             return None
-        u = (url or "").strip()
+        # Count the PAGE, not the spelling: `t.me/s/x/1` and `t.me/x/1`
+        # share a key, so five fetches split 3/2 across them still trip
+        # the nudge at the third.
+        u = self.canonical_nav_url(url)
         if not u:
             return None
         # pop+reinsert moves u to the end (most-recently-touched), so the

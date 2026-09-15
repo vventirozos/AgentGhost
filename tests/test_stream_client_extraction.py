@@ -54,7 +54,7 @@ def test_stream_state_fields_match_the_methods_unpack():
 def test_handle_chat_delegates_the_streaming_branch():
     """The streaming branch is no longer inline: handle_chat builds StreamState
     and returns the method call, and the streamer body lives in the method."""
-    hc = inspect.getsource(GhostAgent.handle_chat)
+    hc = inspect.getsource(GhostAgent.handle_chat) + inspect.getsource(GhostAgent._run_internal_turn)
     assert "return self._stream_final_generation(ss)" in hc
     assert "async def stream_wrapper" not in hc          # moved out
     assert "async def stream_wrapper" in inspect.getsource(

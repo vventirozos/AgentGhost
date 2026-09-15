@@ -209,6 +209,34 @@
     <strong>Environment variables are read at boot only.</strong> If you run Ghost under launchd or systemd, they must be set inside the service definition — a background service doesn't inherit your shell profile. The failure mode is quiet and confusing: Ghost starts fine on a brand-new empty memory at the default path, and looks like it forgot everything.
   </div>
 
+  <h2 id="undocumented-2026-09-13">Flags that were read but documented nowhere <span class="tag">2026-09-13 &sect;4GI</span></h2>
+  <p>The review of 2026-09-13 found 17 <code>GHOST_*</code> variables read in the code and named on no page. Each is described from the comment at its read site; <code>tests/test_4gi_api_routes.py</code> now enumerates every <code>os.environ.get("GHOST_…")</code> / <code>os.getenv("GHOST_…")</code> in <code>src/</code> and fails when one is not named anywhere under <code>docs/</code>.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Variable</th><th>Default</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>GHOST_STORE_CALL_TIMEOUT</code></td><td><code>30</code></td><td>Seconds an operator surgery route (<code>/api/memory/correct</code>, <code>/delete</code>, <code>/delete_skill_twin</code>, <code>/api/lessons/quarantine</code>) waits for the store call it runs in a worker thread before answering 504 (&sect;4GI: those calls used to run on the event loop under the vector store's lock). The thread is not cancelled; the handler stops waiting.</td></tr>
+      <tr><td><code>GHOST_CORRECTION_JUDGE_TIMEOUT</code></td><td><code>20</code></td><td>Seconds allowed for the user-correction judge call (the LLM that decides whether a user's follow-up message is a correction of the previous answer) before the correction path gives up.</td></tr>
+      <tr><td><code>GHOST_DEAD_ONION_MEMO</code></td><td><code>1</code></td><td>Browser: remember an onion host that failed to load and skip it for the rest of the memo window instead of retrying it on every call. <code>0</code> disables the memo.</td></tr>
+      <tr><td><code>GHOST_DREAM_REPLAY_BATCH</code></td><td>unset</td><td>Replay engine: an explicit batch size for dream replay; unset lets the engine size the batch itself.</td></tr>
+      <tr><td><code>GHOST_EVOLVE_DREAM_CREDIT</code></td><td>unset</td><td>Evolve mutator: set to a truthy value to let dream-replay verdicts credit scaffold candidates; off by default.</td></tr>
+      <tr><td><code>GHOST_HYPOTHESIS_GROUNDING</code></td><td>unset</td><td>The env target of the <code>full_no_hypothesis</code> prune-override arm (<code>core/prune_overrides.py</code>): the arm flips hypothesis grounding off by setting this variable in the child process.</td></tr>
+      <tr><td><code>GHOST_KB_DIST_STRONG</code></td><td><code>0.30</code></td><td>Knowledge-base query: raw vector distance at or under which a hit is reported as a strong match (the companion of <code>GHOST_KB_DIST_WEAK</code>).</td></tr>
+      <tr><td><code>GHOST_MAIN_FALLBACK_TIMEOUT</code></td><td>unset</td><td>LLM client: seconds for the main-model fallback call when a pool node fails; unset uses the client's computed budget.</td></tr>
+      <tr><td><code>GHOST_ONION_BREAKER</code></td><td><code>1</code></td><td>Dark-web search: the per-engine circuit breaker that stops querying an engine after repeated failures in a run. <code>0</code> disables it.</td></tr>
+      <tr><td><code>GHOST_PROVISION_EXEC_GRACE</code></td><td><code>300</code></td><td>Sandbox: seconds of grace given to an in-flight <code>exec</code> while the container is being (re)provisioned before it is treated as lost.</td></tr>
+      <tr><td><code>GHOST_RUBRIC_MAX_ITEMS</code></td><td>the grader's default</td><td>Rubric grader: maximum number of rubric criteria generated for one answer.</td></tr>
+      <tr><td><code>GHOST_SANDBOX_EXEC_RAM_CAP_MB</code></td><td><code>32</code> (floor 1024 applied)</td><td>Sandbox: RAM cap applied to a single exec (ulimit inside the container); values under the floor are raised to it.</td></tr>
+      <tr><td><code>GHOST_SANDBOX_EXEC_STREAM</code></td><td><code>1</code></td><td>Sandbox: stream exec output as it is produced (progress-aware promotion of long commands) instead of collecting it at exit. <code>0</code> collects.</td></tr>
+      <tr><td><code>GHOST_SANDBOX_GHOSTJOB_MAX_AGE_H</code></td><td><code>48</code></td><td>Sandbox reaper: hours after which a detached job with no owner is a ghost and is reaped.</td></tr>
+      <tr><td><code>GHOST_SANDBOX_REAP_GHOSTJOBS</code></td><td><code>1</code></td><td>Sandbox reaper: <code>0</code> disables reaping of ghost jobs entirely (they then live until the container restarts).</td></tr>
+      <tr><td><code>GHOST_SWARM_AWAIT_DEADLINE</code></td><td>unset</td><td>Swarm tool: an explicit wall-clock deadline (seconds) for awaiting the swarm's sub-agents; unset uses the tool's computed deadline.</td></tr>
+      <tr><td><code>GHOST_TOR_SERVICE_LABEL</code></td><td><code>com.local.tor</code></td><td>The launchd label of the Tor service the helpers restart/inspect when the SOCKS port stops answering.</td></tr>
+      <tr><td><code>GHOST_REMOTE_SERVE_SCRIPT</code> · <code>GHOST_REMOTE_UNSERVE_SCRIPT</code></td><td><code>~/Data/AI/bin/serve-remote.sh</code> · <code>unserve-remote.sh</code></td><td>Sandbox services: the host-side scripts that publish / unpublish a sandbox service port on the remote host (the §4EJ funnel); override to point at your own.</td></tr>
+      <tr><td><code>GHOST_TTS_BON_K</code></td><td>the module default (<code>core/tts.py</code>)</td><td>Adaptive best-of-N on the verifier's wobble band: how many candidate finals are sampled when <code>GHOST_TTS_ADAPTIVE_BON</code> fires.</td></tr>
+      <tr><td><code>GHOST_VERIFY_REBUTTAL_EVIDENCE_CHARS</code></td><td><code>1800</code></td><td>Verifier: characters of evidence quoted into the rebuttal prompt when the model contests a refute.</td></tr>
+    </tbody>
+  </table></div>
+
   <h2>The other 44 flags</h2>
   <p>Mostly cooldown timings, thresholds for the metacognition stack, and switches that exist to run controlled experiments (<code>--bio-time-scale</code> compresses hours-long idle windows into minutes so the background loops can be tested in an afternoon — never set it in production). They're all documented in <a href="cli_reference.html">the full CLI reference</a>, and every one carries its own help text:</p>
 

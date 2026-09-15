@@ -67,7 +67,7 @@ from __future__ import annotations
 
 import datetime
 import re
-from typing import Optional
+from typing import Optional, Tuple   # Tuple: used by `compound_age_parts`
 
 __all__ = ["anchor", "derive", "signature", "has_anchor"]
 

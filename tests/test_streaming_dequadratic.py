@@ -62,7 +62,7 @@ def test_tool_call_probe_constant_is_used():
     """TOOL_CALL_LOOP_PROBE_EVERY was defined-but-never-consulted; the stream
     loop must now reference it to gate the tool-call collapse probe."""
     import inspect
-    src = inspect.getsource(A.GhostAgent.handle_chat)
+    src = inspect.getsource(A.GhostAgent.handle_chat) + inspect.getsource(A.GhostAgent._run_internal_turn)
     assert "next_tool_probe" in src
     assert "TOOL_CALL_LOOP_PROBE_EVERY" in src
 
@@ -71,7 +71,7 @@ def test_thinking_loop_probe_gated_by_cadence():
     """The n-gram detector must be gated on next_loop_probe (not run per
     token in the 32-64K window)."""
     import inspect
-    src = inspect.getsource(A.GhostAgent.handle_chat)
+    src = inspect.getsource(A.GhostAgent.handle_chat) + inspect.getsource(A.GhostAgent._run_internal_turn)
     # The old per-token boundary branch is gone; detection rides the cadence.
     assert "len(guard_buf) >= next_loop_probe" in src
     assert "len(guard_buf) > base_cap and len(guard_buf) <= extended_cap" not in src

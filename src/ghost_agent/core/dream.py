@@ -1828,6 +1828,12 @@ _SELFPLAY_PROTECTED_NAMES = frozenset({
 })
 
 
+#: Stamped on a self-play snapshot the walk could not finish. The purge reads
+#: it and declines (§4GK round 6) — an empty dict and an unreadable sandbox
+#: are not the same state, and the purge deletes everything not in the dict.
+_SNAPSHOT_INCOMPLETE = "__ghost_selfplay_snapshot_incomplete__"
+
+
 def _snapshot_mocks(sandbox_path: Path) -> dict:
     """Recursively snapshot the mock files the setup script produced, as
     ``{relative_posix_path: bytes}``.
@@ -1838,19 +1844,61 @@ def _snapshot_mocks(sandbox_path: Path) -> dict:
     rmtree'd ``data/`` before attempt 1 — the challenge was then falsely
     discarded as inconsistent, or the solver failed 3/3 unfairly on
     replays."""
+    # ⚠ CHECK-THEN-READ, ON A TREE THE MODEL WRITES (§4GK round 4). This was
+    # `p.is_file() and not p.is_symlink()` followed by `p.read_bytes()` — two
+    # syscalls against a path the self-play sandbox can re-point in between,
+    # which is exactly the class §4GJ round 3 closed everywhere else. It
+    # survived because the enumeration that guards the class keys on a literal
+    # `os.walk`, and this reader uses `rglob`. The dir-fd walk makes the
+    # refusal part of the open: a symlink is never listed at all.
+    from ..tools.file_system import read_bytes_nofollow_fd, walk_nofollow
     snap = {}
     try:
-        for p in sandbox_path.rglob("*"):
+        for dirpath, filenames, dfd in walk_nofollow(sandbox_path):
             try:
-                rel = p.relative_to(sandbox_path)
+                rel_dir = dirpath.relative_to(sandbox_path)
+            except ValueError:
+                continue
+            parts = rel_dir.parts
+            if parts and (parts[0] in _SELFPLAY_PROTECTED_NAMES
+                          or parts[0].startswith(".mount_sync_")):
+                continue
+            for name in filenames:
+                rel = rel_dir / name
                 top = rel.parts[0]
                 if top in _SELFPLAY_PROTECTED_NAMES or top.startswith(".mount_sync_"):
                     continue
-                if p.is_file() and not p.is_symlink():
-                    snap[rel.as_posix()] = p.read_bytes()
-            except Exception:
-                pass
-    except Exception:
+                try:
+                    snap[rel.as_posix()] = read_bytes_nofollow_fd(name, dir_fd=dfd)
+                except Exception as _fexc:  # noqa: BLE001
+                    # ⚠ AND A PER-FILE FAILURE AUTHORISES A PURGE OF THAT
+                    # FILE (§4GQ round 8). The handler below marks a failed
+                    # WALK so `_restore_mocks(purge_stragglers=True)` declines
+                    # — because the purge deletes every non-protected file NOT
+                    # NAMED IN THE SNAPSHOT. A file this branch dropped is
+                    # exactly such a file: unreadable for a moment, absent
+                    # from the snapshot, deleted for good. Same marker, same
+                    # decline, one file instead of the tree.
+                    snap[_SNAPSHOT_INCOMPLETE] = (
+                        f"{type(_fexc).__name__} reading {name!r}: {_fexc}")
+    except Exception as exc:
+        # ⚠ AN EMPTY SNAPSHOT AUTHORISES A TOTAL PURGE (§4GK round 6). This
+        # swallowed every failure and returned `{}` — and `_preflight_restore`
+        # calls `_restore_mocks(..., purge_stragglers=True)`, whose purge
+        # deletes every non-protected file NOT NAMED IN THE SNAPSHOT. With an
+        # empty snapshot that is everything the setup script created. Round 4
+        # taught the walk to raise on descriptor exhaustion and round 5 added
+        # the symlinked-root refusal; both land here. Round 5 gave the twin
+        # (`coding_loop.snapshot_workspace`) an explicit incomplete marker and
+        # left this one — the sibling one revision behind, again. The purge
+        # reads the marker and declines rather than deleting on a reading it
+        # never got.
+        snap[_SNAPSHOT_INCOMPLETE] = f"{type(exc).__name__}: {exc}"
+        logger.warning(
+            "self-play snapshot INCOMPLETE (%s: %s) — the straggler purge will "
+            "be skipped rather than wiping a sandbox we could not read",
+            type(exc).__name__, exc)
+    except BaseException:
         pass
     return snap
 
@@ -1881,7 +1929,13 @@ def _restore_mocks(sandbox_path: Path, snap: dict, purge_stragglers: bool = Fals
         parts = rel.split("/")[:-1]
         for i in range(1, len(parts) + 1):
             snap_dirs.add("/".join(parts[:i]))
-    if purge_stragglers:
+    if purge_stragglers and _SNAPSHOT_INCOMPLETE in (snap or {}):
+        logger.warning(
+            "self-play straggler purge SKIPPED — the snapshot it would delete "
+            "against is incomplete (%s); deleting everything not in a reading "
+            "we never got is the worse error",
+            (snap or {}).get(_SNAPSHOT_INCOMPLETE))
+    elif purge_stragglers:
         try:
             # Deepest-first so files are unlinked before their (now
             # empty) parent directories are considered.
@@ -1910,11 +1964,20 @@ def _restore_mocks(sandbox_path: Path, snap: dict, purge_stragglers: bool = Fals
             logger.debug(f"Straggler purge iteration failed: {e}")
     # Always: rewrite snapshot entries (recreating their directories) so
     # any in-place mutations the solver made to mock data are reverted.
+    # ⚠ THE RESTORE IS A WRITE INTO A TREE THE SOLVER CONTROLS (§4GK round 5).
+    # This was `target.parent.mkdir(parents=True); target.write_bytes(blob)`,
+    # which follows a symlink at any component. The solver runs between the
+    # snapshot and the restore; replacing `data/x.csv` with a link to a host
+    # file made the restore overwrite that file with bytes the challenge
+    # chose. Reproduced. The pre-validator restore runs with NO purge, so
+    # nothing removes the link first. Round 4 hardened the READER
+    # (`_snapshot_mocks`) in this same file and left its writer twin alone.
+    from ..tools.file_system import write_bytes_nofollow_rel
     for rel, blob in (snap or {}).items():
+        if rel == _SNAPSHOT_INCOMPLETE:
+            continue                       # a marker, not a path
         try:
-            target = sandbox_path / rel
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(blob)
+            write_bytes_nofollow_rel(sandbox_path, rel, blob)
         except Exception as e:
             logger.warning(f"Failed to restore mock {rel}: {e}")
 
@@ -2548,6 +2611,23 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             except Exception as _gcx:
                 logger.debug("graph compression skipped: %s", _gcx)
 
+            # --- CROSS-STORE RECONCILE (§4GJ) -------------------------
+            # Three stores describe one document population (vector rows,
+            # library catalogue, outline sidecar) and a fourth pair spans
+            # two stores (episode rows ↔ their vector twins). The write
+            # paths now hold one lock across each pair, so drift can no
+            # longer be CREATED; this reaps the residue already on disk —
+            # from before the fix, from a crash between two writes, or from
+            # a twin-delete that raised. Bounded, fail-safe (an invariant
+            # whose inputs will not read is skipped, never "repaired"
+            # blind), and silent unless it actually repaired something.
+            try:
+                _rec = await self._reconcile_memory_stores()
+                if _rec:
+                    metrics_note += f" ({_rec})"
+            except Exception as _rcx:
+                logger.debug("memory reconcile skipped: %s", _rcx)
+
             # RRF-weight refit from the usefulness ledger: the post-turn
             # hydration judge appends (intent, source, used) observations;
             # once enough accumulate, refit the fusion matrix, persist it,
@@ -2626,6 +2706,63 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             self.last_dream_outcome = {"phase": "error", "side_output": False}
             pretty_log("Dream Mode", msg, level="ERROR", icon=Icons.FAIL)
             return msg
+
+    async def _reconcile_memory_stores(self) -> str:
+        """Run the cross-store reconcile and return a short report fragment
+        for the dream's metrics note (``""`` when nothing was repaired).
+
+        Scheduling and reporting live here; the invariants themselves live
+        in `VectorMemory.reconcile_indexes`, which owns the sidecars. The
+        live episode-id set comes from the episode store and is passed in:
+        when it cannot be read it arrives as None and that arm is SKIPPED,
+        because reconciling episode vectors against a set that failed to
+        load would read every one of them as an orphan.
+        """
+        mem = getattr(self, "memory", None)
+        recon = getattr(mem, "reconcile_indexes", None)
+        if not callable(recon) or not _is_real_component(mem):
+            return ""
+        episodes = getattr(self.context, "episodic_memory", None)
+        live_ids = None
+        if episodes is not None and _is_real_component(episodes):
+            getter = getattr(episodes, "live_episode_ids", None)
+            if callable(getter):
+                # ⚠ PASS THE GETTER, DO NOT CALL IT HERE (§4GK round 6). The
+                # id set was read in ONE `to_thread` hop and the reaper ran in
+                # the NEXT, so any episode recorded in that gap — an ordinary
+                # request ending, on the same event loop — was reaped as an
+                # orphan, and the vector twin is the only semantic-recall copy
+                # of its trigger and lesson. Reproduced. `reconcile_indexes`
+                # invokes the getter inside its own lock, which closes the gap
+                # entirely; it still accepts a plain set from older callers and
+                # falls back to a high-water-mark rule there.
+                live_ids = getter
+        report = await asyncio.to_thread(recon, live_ids)
+        if not isinstance(report, dict):
+            return ""
+        parts = []
+        if report.get("catalogue_dropped"):
+            parts.append(f"{len(report['catalogue_dropped'])} stale catalogue entr"
+                         f"{'y' if len(report['catalogue_dropped']) == 1 else 'ies'} dropped")
+        if report.get("catalogue_adopted"):
+            parts.append(f"{len(report['catalogue_adopted'])} unlisted document(s) re-listed")
+        if report.get("outlines_dropped"):
+            parts.append(f"{len(report['outlines_dropped'])} orphan outline(s) dropped")
+        if report.get("episode_vectors_deleted"):
+            parts.append(f"{report['episode_vectors_deleted']} orphan episode vector(s) reaped")
+        if not parts:
+            # Skips are worth a line even with no repairs: an invariant that
+            # can never be CHECKED is the silent-inoperative-subsystem shape.
+            for why in report.get("skipped") or []:
+                logger.info("memory reconcile skipped an invariant: %s", why)
+            return ""
+        summary = "memory reconcile: " + ", ".join(parts)
+        if report.get("bounded"):
+            summary += " (bounded — more next cycle)"
+        pretty_log("Memory Reconcile", summary, icon=Icons.MEM_SAVE)
+        for why in report.get("skipped") or []:
+            logger.info("memory reconcile skipped an invariant: %s", why)
+        return summary
 
     def _refit_rrf_weights(self, min_observations: int = 30,
                            max_ledger_lines: int = 5000,
@@ -3695,9 +3832,23 @@ Return ONLY a JSON object with:
                         p.unlink()
                 except Exception:
                     pass
+            from ..tools.file_system import write_bytes_nofollow_rel
             for name, blob in (setup_snapshot or {}).items():
+                if name == _SNAPSHOT_INCOMPLETE:
+                    continue                       # a marker, not a path
                 try:
-                    (_P(sandbox_path) / name).write_bytes(blob)
+                    # ⚠ THE SIBLING ONE REVISION BEHIND (§4GK round 7).
+                    # `_restore_mocks` was migrated onto the nofollow writer in
+                    # rounds 5 and 6; this twin kept a plain `write_bytes`,
+                    # which follows a link at any component. The purge above
+                    # SKIPS names in the snapshot, so a link the solver plants
+                    # at a snapshot-entry name survives to be written through —
+                    # and the second of these two loops runs AFTER the verify
+                    # solver's turn. Reproduced by verbatim replay: a host file
+                    # outside the sandbox was overwritten with snapshot bytes.
+                    # The class enumeration cannot see it — its own comment
+                    # says the walk-read rule covers no writes at all.
+                    write_bytes_nofollow_rel(_P(sandbox_path), name, blob)
                 except Exception:
                     pass
         except Exception:
@@ -3731,9 +3882,23 @@ Return ONLY a JSON object with:
             sandbox_manager = isolated_context.sandbox_manager
             # Make sure mocks are restored right before validation —
             # the verify solver might have touched them.
+            from ..tools.file_system import write_bytes_nofollow_rel
             for name, blob in (setup_snapshot or {}).items():
+                if name == _SNAPSHOT_INCOMPLETE:
+                    continue                       # a marker, not a path
                 try:
-                    (_P(sandbox_path) / name).write_bytes(blob)
+                    # ⚠ THE SIBLING ONE REVISION BEHIND (§4GK round 7).
+                    # `_restore_mocks` was migrated onto the nofollow writer in
+                    # rounds 5 and 6; this twin kept a plain `write_bytes`,
+                    # which follows a link at any component. The purge above
+                    # SKIPS names in the snapshot, so a link the solver plants
+                    # at a snapshot-entry name survives to be written through —
+                    # and the second of these two loops runs AFTER the verify
+                    # solver's turn. Reproduced by verbatim replay: a host file
+                    # outside the sandbox was overwritten with snapshot bytes.
+                    # The class enumeration cannot see it — its own comment
+                    # says the walk-read rule covers no writes at all.
+                    write_bytes_nofollow_rel(_P(sandbox_path), name, blob)
                 except Exception:
                     pass
             # §4BF flip (ii): text-graded items are validated on the
@@ -5023,7 +5188,15 @@ Return ONLY a JSON object with:
             real_skills_dir = Path(self.context.sandbox_dir) / "acquired_skills"
             temp_skills_dir = Path(temp_sandbox) / "acquired_skills"
             if real_skills_dir.exists():
-                shutil.copytree(real_skills_dir, temp_skills_dir)
+                # §4GJ round 3: `acquired_skills` is model-writable, so the
+                # default (following) copytree would materialise whatever a
+                # planted link pointed at into the isolated sandbox.
+                from ..tools.file_system import copytree_nofollow
+                _skipped = copytree_nofollow(real_skills_dir, temp_skills_dir,
+                                             real_skills_dir)
+                if _skipped:
+                    logger.warning("dream: skills copy skipped %d entr(ies): %s",
+                                   len(_skipped), str(_skipped)[:200])
                 
             isolated_context = copy.copy(self.context)
             isolated_context.sandbox_dir = Path(temp_sandbox)

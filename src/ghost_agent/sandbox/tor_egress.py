@@ -167,9 +167,22 @@ def parse_tor_check(output: str) -> Tuple[Optional[bool], str]:
     the output is not that JSON (blocked, timed out, HTML challenge)."""
     try:
         data = json.loads((output or "").strip())
-        return bool(data.get("IsTor")), str(data.get("IP") or "")
     except Exception:  # noqa: BLE001
         return None, ""
+    if not isinstance(data, dict) or "IsTor" not in data:
+        # ⚠ A MISSING KEY IS "DON'T KNOW", NOT "LEAK" (§4GK round 4).
+        # `bool(data.get("IsTor"))` made valid JSON without that key read as
+        # a confirmed direct answer — and since round 4 a confirmed leak
+        # DISCONNECTS the container, so an endpoint that changed its shape
+        # would cut the sandbox off its network on every boot. The two
+        # unknown shapes (unparseable, and parseable but not this schema)
+        # now agree: inconclusive, which the caller treats as
+        # enforced-unverified and re-checks next generation.
+        return None, ""
+    _is_tor = data.get("IsTor")
+    if not isinstance(_is_tor, bool):
+        return None, str(data.get("IP") or "")
+    return _is_tor, str(data.get("IP") or "")
 
 
 #: Deep leak probes, for the operator's script and the live check — not

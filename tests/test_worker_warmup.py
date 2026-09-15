@@ -304,7 +304,7 @@ class TestWorkerTaskLabel:
         import inspect
         from ghost_agent.core.agent import GhostAgent
         # #5 step 4a moved the streaming smart-mem gate into _stream_final_generation.
-        src = (inspect.getsource(GhostAgent.handle_chat)
+        src = (inspect.getsource(GhostAgent.handle_chat) + inspect.getsource(GhostAgent._run_internal_turn)
                + inspect.getsource(GhostAgent._stream_final_generation))
         assert "_is_int_req_h(req_id)" in src          # hydration gate
         assert "_is_int_req_m1(req_id)" in src         # smart-mem (stream)

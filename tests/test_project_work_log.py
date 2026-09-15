@@ -261,7 +261,7 @@ def test_both_paths_call_work_log_helper():
     import ghost_agent.core.agent as agent_mod
     fin = inspect.getsource(agent_mod.GhostAgent._finalize_and_return)
     # #5 step 4a moved the streamed-path work_log write into _stream_final_generation.
-    hc = (inspect.getsource(agent_mod.GhostAgent.handle_chat)
+    hc = (inspect.getsource(agent_mod.GhostAgent.handle_chat) + inspect.getsource(agent_mod.GhostAgent._run_internal_turn)
           + inspect.getsource(agent_mod.GhostAgent._stream_final_generation))
     assert "_write_project_work_log_safe" in fin
     assert "_write_project_work_log_safe" in hc
@@ -279,7 +279,7 @@ def test_dispatch_accumulates_project_work():
 def test_handle_chat_resets_accumulators_and_calls_defect_hook():
     import inspect
     import ghost_agent.core.agent as agent_mod
-    src = inspect.getsource(agent_mod.GhostAgent.handle_chat)
+    src = inspect.getsource(agent_mod.GhostAgent.handle_chat) + inspect.getsource(agent_mod.GhostAgent._run_internal_turn)
     assert "_project_work_files = set()" in src
     assert "_note_defect_on_done_project(lc)" in src
     # defect hook rides the bug-report gate
@@ -326,5 +326,5 @@ def test_dispatch_captures_failure_texts():
 def test_handle_chat_inits_failure_texts():
     import inspect
     import ghost_agent.core.agent as agent_mod
-    src = inspect.getsource(agent_mod.GhostAgent.handle_chat)
+    src = inspect.getsource(agent_mod.GhostAgent.handle_chat) + inspect.getsource(agent_mod.GhostAgent._run_internal_turn)
     assert "_turn_failure_texts = []" in src

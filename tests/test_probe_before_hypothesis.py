@@ -51,7 +51,9 @@ class TestCallSiteWiring:
         # can't abort a pending write.
         src = self._src()
         idx = src.index("_noprogress_trip is not None and not force_stop")
-        window = src[idx:idx + 1400]
+        # window widened 1400 → 2800 (§4GH, 2026-09-13): the browser
+        # navigate-without-extract case sits between the trip and the tiers
+        window = src[idx:idx + 2800]
         assert "_acnt >= _hard_n" in window
         assert "READWRITE_HARD_STOP" in window
         assert "else 3" in window

@@ -43,12 +43,13 @@ DREAM_SRC = REPO_ROOT / "src" / "ghost_agent" / "core" / "dream.py"
 # Edit 3 — Widened UI scrub regex (core/agent.py, ~line 2969)
 # ---------------------------------------------------------------------------
 
-# Mirror of the scrub regex. The source-level guard test below ensures the
-# two stay in sync.
-SCRUB_PATTERN = re.compile(
-    r'<(tool_call|tool|function)\b[^>]*>.*?(?:</\1\b[^>]*>|$)',
-    flags=re.DOTALL | re.IGNORECASE,
-)
+# ⚠ THE PRODUCTION PATTERN, NOT A MIRROR (§4GT, 2026-09-14). This file
+# used to carry its own copy of the scrub regex and test THAT — the
+# behavioural cases below never touched agent.py, and two source-grep pins
+# were the only thread tying them to it. The copy had already drifted: it
+# ended `|$)` where production had moved to `|\Z)` (the trailing-newline
+# escape), so the "behaviour" being pinned was the bug.
+from ghost_agent.core.agent import _UI_SCRUB_RE as SCRUB_PATTERN
 
 
 def _scrub(s: str) -> str:
@@ -100,47 +101,36 @@ class TestUIScrubWidenedRegex:
         s = '<function   name="self_play"   extra="attr" >body</function>'
         assert _scrub(s) == ""
 
-    def test_source_contains_widened_regex(self):
-        """Guard against a refactor silently reverting to the old
-        `(?:tool_call|tool)` pattern or dropping the backreference."""
-        src = AGENT_SRC.read_text()
-        assert r"<(tool_call|tool|function)\b" in src
-        assert r"</\1\b" in src
+    def test_inline_code_about_the_syntax_is_not_a_leak(self):
+        """The user asking about `<tool_call>` in backticks is content, not
+        markup. §4FS gave the end-of-turn scrub that guard and the mid-flow
+        one never got it, so the same reply lost its example on one path and
+        kept it on the other — a drift two source greps for the pattern's
+        TEXT could not see (§4GT). World where it fails: either site without
+        the `(?<!\`)` guard."""
+        s = "Use `<tool_call>{\"name\": \"x\"}</tool_call>` to call a tool."
+        assert _scrub(s) == s.strip()
 
-    def test_end_of_handle_chat_scrub_matches_mid_flow_scrub(self):
-        """Symmetry guard: the last-resort scrub on `final_ai_content`
-        (end of handle_chat) must be at least as strict as the mid-flow
-        scrub on `ui_content`. Otherwise a bare `<function>...</function>`
-        that bypasses the mid-flow branch (e.g. via the perfect-it
-        follow-up or a non-has_tool_tag path) leaks verbatim — exactly
-        the shape the user reported as showing up as a literal XML
-        reply after a second `run self play` invocation."""
-        src = AGENT_SRC.read_text()
-        # Both occurrences of the widened pattern must be present —
-        # one for ui_content, one for final_ai_content. Both use `\Z`
-        # (absolute EOS) so a trailing `\n` after a tool_call doesn't
-        # escape the scrub.
-        count = src.count(r"<(tool_call|tool|function)\b[^>]*>.*?(?:</\1\b[^>]*>|\Z)")
-        assert count >= 2, (
-            f"Expected the widened scrub pattern at both the mid-flow "
-            f"and end-of-handle_chat sites; found {count}"
-        )
-        # Belt-and-suspenders: the OLD narrow pattern
-        # `<(?:tool_call|tool)\b...` must not appear in agent.py anymore
-        # — any remaining use would be a regression hotspot.
-        assert r"<(?:tool_call|tool)\b.*?>" not in src, (
-            "Old narrow scrub pattern still present. It misses bare "
-            "<function> blocks and nested </function> cases — replace "
-            "with the widened `(tool_call|tool|function)` + backreference."
-        )
-        # And the OLD `|$)` form on the widened pattern must also be
-        # gone — it was the source of the trailing-newline leak.
-        assert r"<(tool_call|tool|function)\b[^>]*>.*?(?:</\1\b[^>]*>|$)" not in src, (
-            "Widened scrub pattern is still using `$` as the missing-"
-            "close alternative. In non-MULTILINE mode `$` matches just "
-            "before a trailing `\\n`, letting the newline escape. Use "
-            "`\\Z` (absolute EOS) instead."
-        )
+    def test_both_ui_scrub_sites_use_the_one_pattern(self):
+        """The symmetry this class used to assert by counting literals: the
+        last-resort scrub on `final_ai_content` must be exactly as strict as
+        the mid-flow scrub on `ui_content`. They are now the same object, so
+        the claim is structural rather than textual — and a third site added
+        later has to reach for it too."""
+        import ast
+        import inspect
+        import ghost_agent.core.agent as agent_mod
+        tree = ast.parse(inspect.getsource(agent_mod))
+        uses = [n for n in ast.walk(tree)
+                if isinstance(n, ast.Name) and n.id == "_UI_SCRUB_RE"]
+        assert len(uses) >= 3, (
+            f"expected the shared UI scrub pattern at its definition and at "
+            f"both call sites, found {len(uses)} reference(s)")
+        # …and no site rebuilt the literal next to it
+        src = inspect.getsource(agent_mod)
+        assert src.count(r"<(tool_call|tool|function)\b[^>]*>") == 1, (
+            "a second copy of the UI scrub literal is back — that is how the "
+            "two sites drifted apart in the first place")
 
 
 class TestEphemeralTerminalDirectiveRetired:
@@ -785,19 +775,37 @@ class TestChallengeExtractorRobustness:
         assert _extract_xml_block("setup_script", s) == "SETUP"
         assert _extract_xml_block("validation_script", s) == "VAL"
 
-    def test_source_raises_max_tokens(self):
-        src = DREAM_SRC.read_text()
-        assert '"max_tokens": 16384' in src
-        assert '"max_tokens": 8192' not in src
+    def test_every_challenge_payload_asks_for_the_raised_cap(self):
+        """The generator truncated its own <validation_script> at 8192. Read
+        the payloads from the AST rather than grepping for one literal: a
+        SECOND payload left at the old cap is exactly the regression this
+        guards, and a text search for the new number cannot see it."""
+        import ast
+        import inspect
+        import ghost_agent.core.dream as dream_mod
+        tree = ast.parse(inspect.getsource(dream_mod))
+        # ⚠ SCOPED to the generator. dream.py carries nine `max_tokens`
+        # payloads (256 … 16384) for different calls; a rule over all of
+        # them would either be vacuous or fail on an unrelated one. The
+        # claim is about the CHALLENGE generation, so read the caps inside
+        # `synthetic_self_play` and assert the largest — the generation
+        # call — is the raised one, and that the old 8192 is nowhere in it.
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                  and n.name == "synthetic_self_play")
+        caps = [v.value for d in ast.walk(fn) if isinstance(d, ast.Dict)
+                for k, v in zip(d.keys, d.values)
+                if isinstance(k, ast.Constant) and k.value == "max_tokens"
+                and isinstance(v, ast.Constant) and isinstance(v.value, int)]
+        assert caps, "no max_tokens payload in synthetic_self_play — re-point"
+        assert max(caps) >= 16384, sorted(caps)
+        assert 8192 not in caps, sorted(caps)
 
-    def test_source_uses_whitespace_tolerant_close_tag(self):
-        src = DREAM_SRC.read_text()
-        # Scan non-comment lines only.
-        code = "\n".join(
-            line for line in src.splitlines()
-            if line.lstrip() and not line.lstrip().startswith("#")
-        )
-        assert r"</{tag}\s*>" in code
+    # NOTE (§4GT): `test_source_uses_whitespace_tolerant_close_tag` was
+    # DELETED, not converted. It grepped for the regex literal `</{tag}\s*>`
+    # while the two tests above it already DRIVE the extractor with a close
+    # tag padded by a space and by a newline. A source grep sitting on top of
+    # its own behavioural coverage is pure drift risk.
 
     def test_source_logs_both_head_and_tail_on_failure(self):
         src = DREAM_SRC.read_text()

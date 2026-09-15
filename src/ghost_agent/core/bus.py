@@ -1311,7 +1311,24 @@ class MemoryBus:
                     # one activity fact).
                     await asyncio.to_thread(smart, text, "identity")
                 else:
-                    await asyncio.to_thread(self.vector.add, text, meta)
+                    _r = await asyncio.to_thread(self.vector.add, text, meta)
+                    # ⚠ A REFUSED WRITE IS NOT AN "ok" (§4GK round 6). `add()`
+                    # returned None on refusal AND on success, so a write the
+                    # store declined — a duplicate-id collision that would have
+                    # RECLASSIFIED an existing row's type — was reported to the
+                    # caller as landed. Measured: an identity fact colliding
+                    # with an existing `auto` row answered "SUCCESS: Profile
+                    # updated" while the fact never reached the identity tier
+                    # and the surviving row stayed eviction-eligible.
+                    _refusals = tuple(getattr(self.vector, "ADD_REFUSALS", None) or ())
+                    if _refusals and _r in _refusals:
+                        # §4GK round 6: `_r` is already the store's own
+                        # "refused: …" sentence, so prefixing produced
+                        # "refused: refused: …" for the user — the doubled
+                        # word is the tell that nobody read the producer and
+                        # its classifier together.
+                        results["vector"] = str(_r)
+                        return results
                 results["vector"] = "ok"
             except Exception as e:
                 results["vector"] = f"error: {e}"
@@ -1408,8 +1425,12 @@ class MemoryBus:
         # after the turn, leaving no durable record that a fan-out write
         # half-landed. No rollback exists (by design: best-effort targets),
         # so the log line IS the repair breadcrumb.
+        # §4GK round 6: a REFUSED leg is a partial write too. This keyed on
+        # "error" only, so the store declining a write — the one outcome that
+        # needs the breadcrumb most, because nothing rolls back — produced no
+        # warning at all. Same vocabulary the tool-side classifier uses.
         _errs = {k: v for k, v in results.items()
-                 if isinstance(v, str) and v.startswith("error")}
+                 if isinstance(v, str) and v.startswith(("error", "refused"))}
         if _errs:
             logger.warning(
                 "publish_fact partial write (%s): %s — other targets "

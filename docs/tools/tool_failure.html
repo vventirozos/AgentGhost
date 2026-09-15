@@ -37,6 +37,18 @@
     </tbody>
   </table></div>
 
+  <h2 id="advisory-stripping">Classify the error, not the advice <span class="tag">2026-09-15</span></h2>
+  <p>
+    Tools append a <code>--- HINT ---</code> block to a failure for the model's benefit, and those hints <strong>enumerate failure modes by name</strong> — the browser's begins "If this is a navigation <em>timeout</em>, try <code>wait_until='domcontentloaded'</code>…". Patterns are scanned in order with first match winning, so the hint decided the class of the error it was attached to. Live: a deterministic
+  </p>
+  <pre><code>ValueError: selector '.frag_copy' did not match any element</code></pre>
+  <p>
+    was booked <code>RETRYABLE</code> on the word "timeout" three paragraphs below it, and charged to the transient strike budget (<code>Transient strike 1/4 (timeout)</code>) — a budget no retry can satisfy, because the selector will never match. Measured across the recorded trajectory corpus, <strong>31 of 53</strong> hinted tool errors (<strong>58.5%</strong>) changed class once the advice was excluded, every one of them <code>retryable</code> → <code>diagnostic</code>/<code>unknown</code>.
+  </p>
+  <p>
+    <code>strip_advisory_sections</code> now removes advisory blocks before classification — a dashed rule, a short label ending in <code>HINT</code>, a dashed rule — matched generically so <code>execute</code>'s <code>--- 💡 DIAGNOSTIC HINT ---</code> (different label, different rule length) is covered by the same implementation. It cuts to the block's closing rule rather than to end-of-text, so anything appended after a hint survives; text with no hint is returned unchanged; and a result that is <em>nothing but</em> advice classifies <code>UNKNOWN</code> rather than inventing a failure. <code>tests/test_tool_failure_hint_stripping.py</code> carries an <code>ast.parse</code> enumeration that walks every string constant in <code>src/</code> and fails if a producer ever invents a banner shape the stripper cannot see.
+  </p>
+
   <h2>Retry delay</h2>
   <pre><code>delay = min(base · 2^attempt, 30s)
 delay += 0.25 · delay · random()   # jitter</code></pre>

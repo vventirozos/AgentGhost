@@ -23,7 +23,7 @@ from ghost_agent.core.agent import GhostAgent
 
 
 def _handle_chat_src():
-    return inspect.getsource(GhostAgent.handle_chat)
+    return inspect.getsource(GhostAgent.handle_chat) + inspect.getsource(GhostAgent._run_internal_turn)
 
 
 class TestMidStreamFailOpen:

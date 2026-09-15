@@ -117,7 +117,7 @@ def test_nudge_message_does_not_assert_an_instruction_that_may_not_exist():
     explicitly forbid inventing one."""
     import inspect
     from ghost_agent.core.agent import GhostAgent
-    src = inspect.getsource(GhostAgent.handle_chat)
+    src = inspect.getsource(GhostAgent.handle_chat) + inspect.getsource(GhostAgent._run_internal_turn)
     i = src.index("Checklist Nudge")
     block = src[i:i + 1600]
     assert "You have not fulfilled the learning/profile instructions" not in block

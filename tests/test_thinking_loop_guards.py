@@ -332,10 +332,15 @@ class TestAgentModuleWiring:
         # The streaming loop emits the summary line with title="thought"
         # (past tense) so it doesn't visually collide with the live
         # "thinking" lines emitted in verbose mode. Grep the source.
+        import re
         from pathlib import Path
         source = Path(agent_mod.__file__).read_text()
         # The summary call site must use the past-tense label.
-        assert 'pretty_log(\n                                "thought"' in source
+        # ⚠ INDENT-AGNOSTIC (§4GS): the streaming loop moved into
+        # `_run_internal_turn` and sits 8 columns further left. The pin is
+        # the LABEL, not the column it happens to start in.
+        assert re.search(r'pretty_log\(\s*\n\s+"thought"', source), (
+            "the post-stream summary no longer uses the past-tense label")
         assert "thought" in source
 
 

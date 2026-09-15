@@ -123,7 +123,11 @@ class TestTheProductionSiteUsesTheBuilder:
         assert isinstance(v, ast.Name) and v.id == "last_user_content", (
             "pending_request must be the loop's last_user_content (the "
             f"CURRENT request), got {ast.dump(v)[:80]}")
-        assert _enclosing_function(calls[0]) == "handle_chat"
+        # §4GS: the repair branch moved with the internal consumer into
+        # `_run_internal_turn`; the pin is that it lives in the TURN LOOP,
+        # not in which of the loop's two halves it ended up.
+        assert _enclosing_function(calls[0]) in (
+            "handle_chat", "_run_internal_turn")
 
     def test_no_alert_text_is_assembled_outside_the_builder(self):
         """Enumeration: every literal carrying the alert's opening lives in

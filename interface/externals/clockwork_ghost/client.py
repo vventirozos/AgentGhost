@@ -265,6 +265,42 @@ NOTE_OK = f"<div style='color:{T.OK};'><i>"
 NOTE_WARN = f"<div style='color:{T.ACCENT_WARM};'><i>"
 NOTE_ERR = f"<div style='color:{T.DANGER};'><i>"
 
+
+def _restore_note(data) -> str:
+    """The one line the operator reads after a workspace restore.
+
+    ⚠ THE LOAD SIDE WAS NEVER MIGRATED (§4GK round 7). Round 6 taught the
+    SAVE side here to read `X-Ghost-Archive-Omitted` — a 200 can mean a
+    short archive — and taught `app.js` to read the restore's own
+    `not_cleared`/`unrestored`, and then left this client printing
+    "workspace restored." unconditionally. The route answers 200 with
+    `unrestored` naming files that are NOT on disk and `not_cleared` naming
+    directories whose STALE contents were carried into the "restored"
+    workspace; on the handheld both read as a clean load, which is how a
+    permissions glitch becomes data loss the operator meets weeks later in a
+    missing file. Same fields, same wording as the web client, so the two
+    consoles describe one restore the same way.
+
+    A helper rather than three lines inline because Qt is not importable in
+    this project's venv — PyQt6 lives on the handheld — so this is the part
+    a pin can actually EXECUTE.
+    """
+    nc = data.get("not_cleared") if isinstance(data, dict) else None
+    ur = data.get("unrestored") if isinstance(data, dict) else None
+    nc = nc if isinstance(nc, list) else []
+    ur = ur if isinstance(ur, list) else []
+    if not nc and not ur:
+        return f"{NOTE_OK}workspace restored.</i></div>"
+    bits = []
+    if ur:
+        bits.append(f"{len(ur)} file(s) could NOT be written")
+    if nc:
+        bits.append(f"{len(nc)} path(s) survived the wipe (stale content)")
+    names = [str(u.get("path", u)) if isinstance(u, dict) else str(u)
+             for u in list(ur) + list(nc)][:3]
+    return (f"{NOTE_WARN}workspace restored INCOMPLETE — {'; '.join(bits)}. "
+            f"First few: {', '.join(names)}.</i></div>")
+
 class ImageViewer(QDialog):
     def __init__(self, pixmap, parent=None):
         super().__init__(parent)
@@ -707,7 +743,19 @@ class MainWindow(QWidget):
                 if response.status_code == 200:
                     with open(filename, 'wb') as f:
                         f.write(response.content)
-                    self.update_chat_signal.emit("append", f"<br>{NOTE_OK}archived → {filename}</i></div>")
+                    # §4GK round 6: a SHORT archive is a 200. The agent names
+                    # the count in `X-Ghost-Archive-Omitted` (and lists them in
+                    # an `omitted.json` member); reading no headers meant this
+                    # client reported a clean save over an archive that was
+                    # missing files.
+                    _omitted = response.headers.get("X-Ghost-Archive-Omitted")
+                    if _omitted and _omitted not in ("0", ""):
+                        self.update_chat_signal.emit(
+                            "error",
+                            f"archived → {filename}, but {_omitted} file(s) could "
+                            f"NOT be read and are MISSING from it (see omitted.json)")
+                    else:
+                        self.update_chat_signal.emit("append", f"<br>{NOTE_OK}archived → {filename}</i></div>")
                 else:
                     self.update_chat_signal.emit("error", f"Save failed: HTTP {response.status_code}")
         except Exception as e:
@@ -727,7 +775,9 @@ class MainWindow(QWidget):
                     data = response.json()
                     self.conversation_history = data.get("chat_history", [])
                     self.chat_display.clear()
-                    self.chat_display.add(f"{NOTE_OK}workspace restored.</i></div>", "system")
+                    # §4GK round 7: a restore can be INCOMPLETE and still be a
+                    # 200 — `_restore_note` reads the fields that say so.
+                    self.chat_display.add(_restore_note(data), "system")
                     for msg in self.conversation_history:
                         role = msg.get("role")
                         content = msg.get("content", "")

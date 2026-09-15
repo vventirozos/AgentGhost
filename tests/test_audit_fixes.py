@@ -310,7 +310,7 @@ def test_streaming_loop_detector_thresholds_raised():
     import inspect
     from ghost_agent.core import agent as agentmod
     # #5 step 4a moved the streaming loop-detector into _stream_final_generation.
-    src = (inspect.getsource(agentmod.GhostAgent.handle_chat)
+    src = (inspect.getsource(agentmod.GhostAgent.handle_chat) + inspect.getsource(agentmod.GhostAgent._run_internal_turn)
            + inspect.getsource(agentmod.GhostAgent._stream_final_generation))
     # Pin the new thresholds so a future tweak doesn't silently regress.
     assert "tail = full_content[-400:]" in src

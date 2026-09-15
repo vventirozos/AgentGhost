@@ -335,6 +335,8 @@
   <a href="../tools/introspect.html">learning-health telemetry</a> so "0 graduated" is
   explainable. Tests: <code>tests/test_lesson_graduation_gates.py</code> (19).</p>
 
+  <h3 id="4gj-r3">Round 3: the isolated skills copy followed links <span class="tag">2026-09-13 &sect;4GJ</span></h3>
+  <p>The isolated self-play cycle copies <code>acquired_skills</code> into a temporary sandbox with <code>shutil.copytree</code>, which follows symlinks by default — and that directory is model-writable, so a planted link materialised a host file inside the isolated run. It now uses <code>copytree_nofollow</code> and logs whatever it skipped. Same shape, same round, in <a href="../core/isolation.html">isolation</a>'s fork seed, which passed <code>symlinks=False</code> — a flag that <em>follows</em>. See <a href="../tools/file_system.html#4gj-r3">the symlink class</a>.</p>
   <footer><a href="../index.html">← Back to index</a></footer>
   <h2>The idle-loop census, and asking once <span class="tag">2026-09-09 &sect;4FQ</span></h2>
   <p><strong>What the agent calls when nobody asked it to.</strong> Item 5 of the 2026-09-08 list: count
@@ -507,6 +509,18 @@
     decided the cluster for <b>23 of 23</b> stored journal runs. Reworded. ⚠ Partial: the wrapper
     still decides when the task carries no keyword of its own.
   </p>
+
+  <h2 id="4gk">Round 4: the self-play snapshot was check-then-read <span class="tag">2026-09-13 &sect;4GK</span></h2>
+  <p>The snapshot of the mock files a setup script produced walked the model-writable self-play sandbox with <code>rglob</code> and read each file after an <code>is_symlink()</code> pre-check &mdash; two syscalls against a path the sandbox can re-point in between, which is the exact pattern the symlink round removed everywhere else. It survived that round because the enumeration guarding the class keyed on a literal <code>os.walk</code>, and this reader used <code>rglob</code>. A rule that names one spelling of the thing it guards is a rule about that spelling. The snapshot now uses the dir-fd walk, where a symlink is never listed at all, and the enumeration recognises the other traversal spellings.</p>
+
+  <h2 id="4gk-r7">Round 7: the sibling one revision behind, again <span class="tag">2026-09-14 &sect;4GK round 7</span></h2>
+  <p>The self-play snapshot restore was migrated onto the symlink-refusing writer in round 5 and hardened again in round 6. Its twin &mdash; the two restores inside the lesson-verification path &mdash; kept a plain write that follows a link at any component. The purge above them deliberately skips names that are in the snapshot, so a link planted at a snapshot-entry name survives to be written through, and the second of the two runs <em>after</em> the verification solver has had its turn. Reproduced by verbatim replay: a host file outside the sandbox was overwritten with snapshot bytes. Both are migrated now. The class enumeration could not have caught it: its own comment records that the rule covers no writes at all.</p>
+  <h2 id="4gq">The per-file read failure that authorised a delete <span class="tag">2026-09-14 &sect;4GQ</span></h2>
+  <p>
+    <code>_restore_mocks(purge_stragglers=True)</code> deletes every non-protected file the snapshot does not name, which is why round 6 taught <code>_snapshot_mocks</code> to mark a failed WALK: an empty snapshot authorises a total purge. The per-file read inside that walk still swallowed its exception, and a file dropped there is exactly a file the snapshot does not name — unreadable for a moment, absent from the reading, deleted for good. Round 8 gave the per-file branch the same marker, so the purge declines on a reading it never got. The twin in <code>coding_loop</code> carried the identical hole and was fixed with it: the sibling one revision behind, inside the fix that closed the first half.
+  </p>
+  <p class="note">Pins: <code>tests/test_4gq_round8.py</code>.</p>
+
 </main>
 </body>
 </html>

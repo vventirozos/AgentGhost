@@ -20,8 +20,12 @@ class TestEmitClosuresNotVerboseGated:
     def _closure_src(self, name: str) -> str:
         import ghost_agent.core.agent as agent_mod
         src = inspect.getsource(agent_mod)
+        # ⚠ INDENT-AGNOSTIC (§4GS). The closures moved with the internal
+        # consumer into `_run_internal_turn`, so their bodies now sit 8
+        # columns further left; a hard-coded 24-space lookahead made the
+        # pin report "not found" rather than testing anything.
         m = re.search(
-            rf"def {name}\(.*?\n(?=\s{{24}}def |\s{{24}}stop_printing)",
+            rf"def {name}\(.*?\n(?=\s+def |\s+stop_printing)",
             src, re.DOTALL)
         assert m, f"{name} not found"
         return m.group(0)

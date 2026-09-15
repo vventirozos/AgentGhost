@@ -77,6 +77,40 @@ _DIAGNOSTIC_PATTERNS = [
 ]
 
 
+# Advisory blocks that tools APPEND to a failure for the model's benefit.
+# They enumerate failure modes by name ("If this is a navigation timeout,
+# try wait_until=..."), so classifying the raw text classifies the HINT:
+# a deterministic `ValueError: selector '.frag_copy' did not match any
+# element` was booked RETRYABLE on the word "timeout" three paragraphs
+# below it, and charged to the transient strike budget it can never
+# satisfy. Measured over the trajectory corpus, 31 of 53 hinted tool
+# errors — 58.5% — change class once the advice is excluded, every one
+# of them retryable→diagnostic/unknown.
+#
+# Header shapes in the tree (`--- HINT ---`, `--- 💡 DIAGNOSTIC HINT ---`)
+# are matched generically: a dashed rule, any short label ending in
+# HINT, a dashed rule. `tests/test_tool_failure_hint_stripping.py`
+# enumerates every producer in src/ and fails if one is not covered.
+_ADVISORY_BLOCK_RE = re.compile(
+    r"\n-{2,}\s*[^\n]{0,40}?\bHINTS?\b[^\n]{0,20}?-{2,}[ \t]*\n"   # header
+    r".*?"                                                          # advice
+    r"(?:\n-{3,}[ \t]*(?=\n|\Z)|\Z)",                               # closing rule or EOF
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def strip_advisory_sections(error_text: str) -> str:
+    """Remove appended ``--- HINT ---`` advice from a tool failure.
+
+    The advice is written FOR the model and names failure modes it is not
+    an instance of; only the error itself may decide the failure class.
+    Returns the text unchanged when no advisory block is present.
+    """
+    if not error_text or not isinstance(error_text, str):
+        return error_text or ""
+    return _ADVISORY_BLOCK_RE.sub("\n", error_text)
+
+
 def classify_tool_failure(error_text: str) -> Tuple[FailureClass, str]:
     """Classify a tool error string into a failure category.
 
@@ -84,6 +118,15 @@ def classify_tool_failure(error_text: str) -> Tuple[FailureClass, str]:
     """
     if not error_text or not isinstance(error_text, str):
         return FailureClass.UNKNOWN, "empty error"
+    # Classify the ERROR, never the advice appended to it.
+    error_text = strip_advisory_sections(error_text)
+    if not error_text.strip():
+        # A result that was NOTHING but advice. Same class as any other
+        # unclassifiable text, but a distinct label: "the tool returned
+        # only a hint" is precisely the situation that produced this
+        # bug, and it should be legible in the strike line rather than
+        # hiding under the generic "unclassified".
+        return FailureClass.UNKNOWN, "advice-only failure"
 
     for pat in _RETRYABLE_PATTERNS:
         m = pat.search(error_text)

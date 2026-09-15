@@ -46,7 +46,29 @@
 
   <div class="note"><strong>Tests:</strong> <code>tests/test_4fg_coding_loop.py</code> — contract parsing, workspace diff, executor selection, the success path (files from the diff, verify through the runner), the fresh-attempt-with-witness policy, the no-files-no-verify failure, the constraint gate over written files, the isolation shape, and the executed dispatch seam at the top of <code>build_coding_task</code>.</div>
 
+  <h3 id="4gj-r3">Round 3: the workspace snapshot hashed through links <span class="tag">2026-09-13 &sect;4GJ</span></h3>
+  <p><code>snapshot_workspace</code> walked the workspace with a bare <code>os.walk</code> and hashed every file it listed. <code>os.walk</code> declines to descend a linked directory but still lists a linked FILE, so the snapshot hashed whatever the model pointed at — and this snapshot is what decides whether a leaf attempt <em>changed the workspace</em> (§4FH made an empty diff a failed attempt). It now uses <code>walk_nofollow</code> plus a descriptor-relative read, so a link is never listed and never read. See <a href="../tools/file_system.html#4gj-r3">the symlink class</a>.</p>
   <footer><a href="../index.html">← Back to index</a></footer>
+
+  <h2 id="4gk">Round 4: the snapshot could take the loop down <span class="tag">2026-09-13 &sect;4GK</span></h2>
+  <p>The workspace snapshot is best-effort by contract &mdash; its result decides whether an attempt changed anything, and a failure should degrade to "nothing seen", not end the run. The dir-fd guard fails closed with a value error on a platform without descriptor-relative syscalls, and a value error is not an operating-system error, so it propagated straight out. The loop is now guarded. Separately, the walk it depends on used to truncate silently when the process ran out of descriptors, so the snapshot reported "the attempt changed no files" and discarded good work; that walk now raises on exhaustion instead of treating it as a swapped entry.</p>
+
+  <h2 id="4gk-r7">Round 7: unknown is not passed <span class="tag">2026-09-14 &sect;4GK round 7</span></h2>
+  <p>Round 6 stopped a failed <em>reading</em> of the workspace being mistaken for "the attempt changed nothing" &mdash; and did it by falling through with an empty written-list. Every gate downstream is guarded on that list, so the verify step, the smoke gate and the constraint gate all became no-ops and the attempt was returned as a <strong>success with no files and no gates</strong>; the project layer then marked the task done with no artifacts. That is worse than the discard it replaced, and it is the task-reaching-done-on-evidence-that-no-work-happened shape this project has hit before. An unknown reading is now a RETRY: the next attempt re-snapshots, and the loop's existing exhaustion path reports honestly if it never clears.</p>
+  <h2 id="4gq">A reading that half-failed is not a reading that succeeded <span class="tag">2026-09-14 &sect;4GQ</span></h2>
+  <p>
+    Round 8 over the §4GK scope, run the way R3 says to run it: the previous round's fixes are the least-reviewed code in the tree. Two findings here, both inside round 7's own fix.
+  </p>
+  <p>
+    <strong>A file the snapshot could not read was silent.</strong> <code>snapshot_workspace</code> marks a failed WALK with <code>_SNAPSHOT_INCOMPLETE</code> — that was round 5's fix — and dropped a failed FILE READ with a bare <code>continue</code>. So a leaf that writes a file the snapshot cannot read produced a reading in which that file is simply absent: indistinguishable from "that file did not change", and therefore ungated, unregistered and unmentioned. The per-file branch marks the snapshot now, exactly as the walk does.
+  </p>
+  <p>
+    <strong>And the unknown-reading branch fires only when the reading found NOTHING.</strong> <code>diff_snapshots</code> deliberately returns the real paths it did see, so a walk that failed HALFWAY yields a non-empty <code>written</code>, skips the retry branch, runs its gates on the visible subset and returns an ordinary success. Retrying there would be worse — the next attempt's <code>before</code> absorbs the files this one wrote, so they would never be reported at all. Two changes instead: the reading is <em>re-read once</em> before any of this (the failure is in the snapshot, not in the attempt, and a descriptor squeeze is transient), and if it is still partial the result SAYS so, in the ledger note and in the detail.
+  </p>
+  <p class="note">
+    Pins: <code>tests/test_4gq_round8.py</code>; battery <code>scripts/mutate_4gq.py</code> — 6 mutants + 4 controls, 6/6 killed. The battery's per-file controls earned their place immediately: the first run reported 10/10 KILLED because a fixture in the new pin file <code>del</code>-eted <code>ServiceSupervisor.host_dir</code> instead of restoring it, breaking 43 tests in every run including the controls.
+  </p>
+
 </main>
 </body>
 </html>

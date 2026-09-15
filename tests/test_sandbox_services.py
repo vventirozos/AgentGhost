@@ -60,7 +60,7 @@ def happy_handler(pid="12345", port_listens=True):
     def handler(cmd):
         if "nohup" in cmd:
             return (f"{pid}\n", 0)
-        if "kill -0" in cmd:
+        if "kill -0" in cmd and "sig TERM" not in cmd:   # §4GI: the kill script polls with kill -0 too
             return ("", 0)  # alive
         if "s.bind" in cmd:      # allocator bind probe → port is free
             return ("", 0)
@@ -424,7 +424,7 @@ class TestRemoteAccessHint:
                 (tmp_path / ".services" / "web.log").write_text(
                     "Traceback ...\nModuleNotFoundError: No module named 'chess'")
                 return ("555\n", 0)
-            if "kill -0" in cmd:
+            if "kill -0" in cmd and "sig TERM" not in cmd:   # §4GI: the kill script polls with kill -0 too
                 return ("", 0)          # process ALIVE
             if "s.bind" in cmd:
                 return ("", 0)          # allocator: the port IS free to bind
@@ -448,7 +448,7 @@ class TestRemoteAccessHint:
                 # be written by the launch itself, as in reality.
                 log_path.write_text("python3: No module named flask\n")
                 return ("777\n", 0)
-            if "kill -0" in cmd:
+            if "kill -0" in cmd and "sig TERM" not in cmd:   # §4GI: the kill script polls with kill -0 too
                 return ("", 1)  # dead
             return ("", 0)
         sup = ServiceSupervisor(FakeSandbox(tmp_path, handler))
@@ -479,17 +479,22 @@ class TestRemoteAccessHint:
         killed = []
 
         def stop_handler(cmd):
-            if "kill -TERM" in cmd or "kill -KILL" in cmd:
+            if "sig TERM" in cmd or "kill -TERM" in cmd or "kill -KILL" in cmd:   # §4GI: the shared tree script
                 killed.append(cmd)
                 return ("", 0)
-            if "kill -0" in cmd:
+            if "kill -0" in cmd and "sig TERM" not in cmd:   # §4GI: the kill script polls with kill -0 too
                 # Alive before TERM, dead after.
                 return ("", 0 if not killed else 1)
             return ("", 0)
         sb.handler = stop_handler
         out = sup.stop("dash")
         assert "stopped" in out
-        assert any("-- -12345" in c for c in killed)  # group kill
+        # §4GI: the kill is the shared dash-safe tree script — the group
+        # is signalled as `kill -TERM -$S` with S=<pid>; the old pin asserted
+        # the `-- -<pid>` form, which dash rejects ("Illegal number: -") and
+        # which therefore sent NOTHING to the group (it pinned the defect)
+        assert any("S=12345;" in c and "sig TERM" in c for c in killed), killed
+        assert not any("-- -" in c for c in killed)
         assert sup._load() == {}
 
     def test_stop_unknown(self, tmp_path):
@@ -508,7 +513,7 @@ class TestRemoteAccessHint:
             if "nohup" in cmd:
                 relaunched.append(cmd)
                 return ("888\n", 0)
-            if "kill -0" in cmd:
+            if "kill -0" in cmd and "sig TERM" not in cmd:   # §4GI: the kill script polls with kill -0 too
                 return ("", 0 if relaunched else 1)
             if "python3 -c" in cmd:
                 return ("", 0)
@@ -526,7 +531,7 @@ class TestRemoteAccessHint:
         reg = sup._load()
 
         def handler(cmd):
-            if "kill -0" in cmd:
+            if "kill -0" in cmd and "sig TERM" not in cmd:   # §4GI: the kill script polls with kill -0 too
                 return ("", 0 if str(reg["alive"]["pid"]) in cmd else 1)
             if "python3 -c" in cmd:
                 return ("", 0)
@@ -594,7 +599,7 @@ class TestZombiesAndWorkdirValidation:
     def test_zombie_pid_reads_as_dead(self, tmp_path):
         # A zombie passes bare kill -0 but the composite check exits 1.
         def handler(cmd):
-            if "kill -0" in cmd:
+            if "kill -0" in cmd and "sig TERM" not in cmd:   # §4GI: the kill script polls with kill -0 too
                 return ("", 1)      # composite: zombie -> exit 1
             return ("", 0)
         sup = ServiceSupervisor(FakeSandbox(tmp_path, handler))
@@ -657,7 +662,7 @@ class TestZombiesAndWorkdirValidation:
                 svc.mkdir(parents=True, exist_ok=True)
                 (svc / f"{m.group(1)}.pid").write_text("777")
                 return ("999\n", 0)      # $! wrapper — must be ignored
-            if "kill -0" in cmd:
+            if "kill -0" in cmd and "sig TERM" not in cmd:   # §4GI: the kill script polls with kill -0 too
                 return ("", 0)
             if "python3 -c" in cmd:
                 return ("", 0)
@@ -687,14 +692,14 @@ class TestZombiesAndWorkdirValidation:
         def handler(cmd):
             if "nohup" in cmd:
                 return ("100\n", 0)
-            if "kill -0" in cmd:
+            if "kill -0" in cmd and "sig TERM" not in cmd:   # §4GI: the kill script polls with kill -0 too
                 return ("", 0 if state["alive"] else 1)
             if "python3 -c" in cmd:
                 return ("", 0)                      # port STILL listening
             if "ss -" in cmd:
                 # The full `ss | grep | cut` pipeline yields just the pid.
                 return ("625\n", 0)                 # ss finds the orphan
-            if "kill -TERM" in cmd or "kill -KILL" in cmd:
+            if "sig TERM" in cmd or "kill -TERM" in cmd or "kill -KILL" in cmd:   # §4GI: the shared tree script
                 killed.append(cmd)
                 return ("", 0)
             return ("", 0)
@@ -1023,7 +1028,7 @@ class TestRegistrySaveIsConcurrencySafe:
 
     def test_a_failed_write_leaves_no_stray_temp(self, tmp_path):
         sup = ServiceSupervisor(FakeSandbox(tmp_path))
-        sup._save({"a": {"pid": 1}})           # seed a good registry
+        sup._save({"a": {"pid": 4242}})        # seed a good registry (§4GI: pid 1 is dropped at load)
         import ghost_agent.sandbox.services as svc
         import unittest.mock as m
         # ⚠ The INJECTION POINT moved, not the property. §4DX r5 routed this
@@ -1035,7 +1040,7 @@ class TestRegistrySaveIsConcurrencySafe:
         with m.patch.object(svc, "_write_text_nofollow",
                             side_effect=OSError("disk full")):
             with pytest.raises(OSError):
-                sup._save({"b": {"pid": 2}})
+                sup._save({"b": {"pid": 4243}})
         strays = list(sup.host_dir.glob("*.tmp"))
         assert not strays, f"a failed save left a temp file behind: {strays}"
         # the prior good registry is intact

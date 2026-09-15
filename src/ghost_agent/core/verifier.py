@@ -653,12 +653,26 @@ _EV_NOUN = (r"\b(?:evidence|tool[- ]?output|outputs?|digest|logs?|"
 # downgraded a contradiction refute (round-2 review, 8 false matches in
 # an 11-probe battery). A comma is a clause boundary here exactly like
 # a period.
+# ⚠ AN ADVERB AND A PLURAL SUBJECT ARE THE SAME COMPLAINT (§4GR,
+# 2026-09-14). Both copies of this vocabulary — here and in
+# `objection._ABSENCE_RE` — required the negation to sit flush against
+# its verb, so one word in between took the whole guard off:
+#     "…which is not EXPLICITLY in the provided tool output"   (missed)
+#     "…as they DO not appear in the evidence"                 (missed)
+# Measured on 194 refute issues mined from the live log: 13 matched, and
+# five more were absence complaints in one of these shapes — including
+# req 0516659a, whose REFUTED@0.90 over four multi-query dark-web
+# outputs (the digest was heavily cut) stood because of the adverb.
+# `not <adverb>ly` is allowed through; `not only` is NOT — "not only in
+# the evidence but also in the reply" is the opposite claim.
+_NEG_ADV = r"(?:(?!only\b)\w+ly\s+)?"
 _ABSENCE_ISSUE_RE = re.compile(
-    r"(?:not (?:in|present in|found in|mentioned in|shown in|listed in|"
-    r"stated in|supported by|corroborated by|reflected in|included in|"
+    r"(?:not " + _NEG_ADV + r"(?:in|present in|found in|mentioned in|shown in|"
+    r"listed in|stated in|supported by|corroborated by|confirmed by|"
+    r"verifiable in|reflected in|included in|"
     r"provided in|given in)"
     r"|absent from|missing from|omitted from|left out of"
-    r"|does not appear in|doesn't appear in"
+    r"|do(?:es)? not " + _NEG_ADV + r"appear in|doesn'?t " + _NEG_ADV + r"appear in"
     r"|nowhere in|never (?:mentioned|stated|given|provided|shown) in"
     r"|no (?:mention|record|trace|reference) (?:of|for|to)[^.;,\n]{0,60}\bin)"
     # ⚠ The verb→noun gap refuses claim-nouns (round-5 F5), matching the
@@ -766,7 +780,10 @@ def _normalize_for_containment(s: str) -> str:
     s = s.translate(str.maketrans({
         "‘": "'", "’": "'", "“": '"', "”": '"',
         "–": "-", "—": "-"}))
-    s = re.sub(r"[​‌‍﻿]", "", s)
+    # Escapes, not the literal invisible characters: the class is
+    # unreadable in a diff and a reviewer cannot tell a dropped
+    # codepoint from a rendering artefact (§4GJ). Byte-identical set.
+    s = re.sub("[\u200b\u200c\u200d\ufeff]", "", s)
     return re.sub(r"\s+", " ", s.strip().lower())
 
 
@@ -1528,6 +1545,15 @@ def _stage_template(name: str, baseline: str) -> str:
     return tuned
 
 
+#: How much of the CODE slot this lens carries. Was a bare 4000 until §4GW
+#: put the files the turn WROTE in here beside the command it ran: two
+#: ordinary source files are 6 kB, and cutting them to fit produced a judge
+#: that refuted a correct build for a test it could not see (3 in 10, twice,
+#: even with the elision marked and the rule stated). Widening the slot is
+#: ~600 extra prompt tokens on build turns; the alternative is a lens that
+#: relabels successful turns as failed and writes that into the corpus.
+CODE_SLOT_CHARS = 8000
+
 _VERIFY_CODE_PROMPT = """You are a code output auditor. Determine whether the agent's RESPONSE actually answers the user's INTENT — including any explicit constraints in the user's wording.
 
 USER INTENT:
@@ -1542,6 +1568,8 @@ TOOL OUTPUT:
 AGENT'S RESPONSE TO THE USER:
 {response}
 
+AN ELIDED BLOCK IS EVIDENCE OF WHAT IS THERE, NEVER OF WHAT IS NOT. Where the CODE section says the audit packer elided part of a file, you are seeing an excerpt chosen to fit this prompt, not the file. Never refute because something the user asked for is "missing" from such a file — you cannot see whether it is there. Judge an elided file only on what is visible in it.
+
 Check, in order:
 
 1. **Constraint satisfaction (highest priority).** Does the user's wording include explicit constraints on the form of the answer? Examples: "just give me the code", "in one sentence", "without using X", "list only the names", "as JSON". If yes, does the AGENT'S RESPONSE satisfy those constraints? If the user asked for code and the agent returned a number / prose / a result, that is a REFUTED — the agent answered a different question than the one asked, even if the tool output is internally consistent. EXCEPTION: a RESPONSE that plainly reports the task could NOT be done (the command failed, the file is missing or unreadable, access was denied) and does not pretend otherwise is judged on its honesty, never on the requested form — the format binds an answer, not a failure report; refuting it teaches the agent that an invented value in the right shape scores better than the truth.
@@ -1552,6 +1580,7 @@ Check, in order:
 Common failure shapes to flag:
 - User asks for code/snippet/command → agent returns a result or summary instead of the snippet
 - User asks for code AND the agent's RESPONSE does not contain a fenced code block — REFUTED regardless of what the tool output says. "The script ran correctly and prints 1 to 10" is NOT a substitute for the script itself; the user cannot paste a confirmation message into their editor. If `intent` contains verbs like give/show/write/draft + nouns like script/code/function/snippet/query/command, the response MUST include the source in a code fence.
+  EXCEPTION — the source was delivered as a FILE, not as a message: when the CODE section contains a block headed `# --- file this turn wrote: <path> ---`, the agent wrote that source into the user's own workspace and it was read back off disk to build this prompt. The user can open, run and edit it. That IS delivery of the code — "the user cannot paste a confirmation message into their editor" does not apply, because they have the file, not a message about it. Judge such a response on whether it names the artifact it wrote and reports whatever the user asked to SEE (test results, sample output, the summary), never on the absence of a fence repeating a file they already have. This binds hardest when the user asked for a short answer or asked not to be shown the code: that is an explicit constraint under check 1, and re-pasting the file would violate it. ⚠ THIS EXCEPTION NEEDS THAT BLOCK. If the CODE section contains no `# --- file this turn wrote:` header, it does not apply at all — you have no evidence the source was written anywhere, a RESPONSE that merely says it created a file is not a file, and the fence rule above stands unchanged.
   EXCEPTION — the code is the METHOD, not the deliverable: when the user's wording makes a RESULT the thing they want (e.g. "write a script to compute X and tell me the integer", "run code to find the value", "calculate/compute X", "what does this output"), and the RESPONSE states that result correctly, a missing code fence is NOT grounds for REFUTED. "write/run a script" there describes how to get the answer, not a demand to see the source. Only require the code fence when the code itself is the deliverable — the user asked to see/show/give the code with no result requested. When in doubt and the requested result is present and correct, prefer CONFIRMED over REFUTING on a missing fence alone.
 - User asks "how do I X" → agent does X and reports the answer instead of explaining the method
 - User asks for a specific format → agent ignores the format
@@ -2656,6 +2685,8 @@ class Verifier:
         # touched by the vote — so a turn that paid for three samples filed
         # as a control turn that never voted. `_vote_rec` is written by the
         # sampler itself on every exit, including that one.
+        # Optional tuple: every read below is guarded by `_vote is not
+        # None`, which pylint cannot narrow across the statements between.
         _vote = ((_vote_rec.get("n"), _vote_rec.get("agree"),
                   _vote_rec.get("drawn")) if _vote_rec else None)
         result = self._guard_truncated_absence(result, claim_t, evidence_t,
@@ -2691,8 +2722,9 @@ class Verifier:
             # still drew samples and must be recorded as a vote, otherwise
             # the all-unparseable case is again indistinguishable from a
             # control turn.
+            # guarded by `_vote is not None` on the branch above
             final.self_consistency_n, final.self_consistency_agree, \
-                final.self_consistency_drawn = _vote
+                final.self_consistency_drawn = _vote  # pylint: disable=unpacking-non-sequence
         return final
 
     def _guard_truncated_absence(self, result: Optional[VerifyResult],
@@ -3451,7 +3483,7 @@ class Verifier:
         """
         prompt = _VERIFY_CODE_PROMPT.format(
             intent=intent[:1000],
-            code=code[:4000],
+            code=code[:CODE_SLOT_CHARS],
             output=output[:4000],
             response=(response or "(response not provided to verifier)")[:4000],
         )

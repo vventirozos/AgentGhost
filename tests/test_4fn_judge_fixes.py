@@ -510,7 +510,9 @@ def test_override_provenance_is_chained_by_one_helper():
     merges = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
               and ast.unparse(n.func) == "self._merge_mechanical_refute"]
     mtags = sorted(n.args[2].value for n in merges if len(n.args) > 2 and isinstance(n.args[2], ast.Constant))
-    assert mtags == ["reply-shape", "reply-shape", "turn-state", "turn-state"], mtags
+    # §4GH (2026-09-13): a THIRD pair — the tool-turn "no claim → no judge"
+    # exit for a narration-only reply merges through the same helper.
+    assert mtags == ["reply-shape"] * 3 + ["turn-state"] * 3, mtags
     assert len(calls) >= 5
     # §4FY: the tool-turn mechanical arms share ONE merge helper, which stamps
     # through the same chain helper — a replace and a merge both carry the tag

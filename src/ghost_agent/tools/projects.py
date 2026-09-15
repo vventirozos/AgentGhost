@@ -3682,8 +3682,26 @@ async def tool_manage_projects(
                 _ignore = shutil.ignore_patterns(
                     "RELEASE.md", ".services", "__pycache__", "*.pyc",
                     "node_modules")
-                shutil.copytree(src_ws, dst_ws, ignore=_ignore,
-                                dirs_exist_ok=True)
+                # §4GJ round 3: NOT `shutil.copytree` — `src_ws` is
+                # `<sandbox>/projects/<id>`, a tree the model writes, and the
+                # default copytree follows a planted link (a link to a host
+                # private key materialised as a real file in the fork). The
+                # dir_fd walk refuses every link that leaves `src_ws`.
+                from .file_system import copytree_nofollow
+                # ⚠ SAY WHAT WAS LEFT BEHIND (§4GK round 4). `skipped` was
+                # discarded here, and `copied` is counted from the
+                # DESTINATION, so it can never disagree with it: an escaping
+                # symlink, a FIFO or a whole EACCES subtree was dropped and
+                # the tool answered a clean "Copied N files". Only the dream
+                # and isolation callers logged it.
+                _skipped = copytree_nofollow(src_ws, dst_ws, src_ws, ignore=_ignore,
+                                             dirs_exist_ok=True)
+                if _skipped:
+                    pretty_log("Project Fork",
+                               f"{len(_skipped)} entr(ies) were NOT copied into the "
+                               f"fork: {'; '.join(_skipped[:5])}"
+                               f"{'…' if len(_skipped) > 5 else ''}",
+                               level="WARNING", icon=Icons.WARN)
                 copied = sum(1 for p in dst_ws.rglob("*") if p.is_file())
                 # copytree copies MODE BITS — a fork of a chmod'd-read-only
                 # released workspace would itself be unwritable. Restore.
@@ -3951,11 +3969,20 @@ async def tool_manage_projects(
                               .get("workspace_dir") or ""))
             copied = 0
             if src_ws.is_dir() and str(dst_ws):
-                shutil.copytree(
-                    src_ws, dst_ws, dirs_exist_ok=True,
+                # §4GJ round 3: the fork path's twin — same model-writable
+                # source, same symlink-safe copy (`the-sibling-one-revision-behind`).
+                from .file_system import copytree_nofollow
+                _skipped = copytree_nofollow(
+                    src_ws, dst_ws, src_ws, dirs_exist_ok=True,
                     ignore=shutil.ignore_patterns(
                         "RELEASE.md", ".services", "__pycache__", "*.pyc",
                         "node_modules"))
+                if _skipped:                       # §4GK round 4, as above
+                    pretty_log("Project Clone",
+                               f"{len(_skipped)} entr(ies) were NOT copied into the "
+                               f"clone: {'; '.join(_skipped[:5])}"
+                               f"{'…' if len(_skipped) > 5 else ''}",
+                               level="WARNING", icon=Icons.WARN)
                 copied = sum(1 for p in dst_ws.rglob("*") if p.is_file())
                 # copytree copies mode bits — a RELEASED source is a-w.
                 try:

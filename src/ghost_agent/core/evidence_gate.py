@@ -74,6 +74,48 @@ class EvidenceAssessment:
         return self.consulted > 0 and self.substantive == 0
 
 
+#: `file_system` operations that OBSERVE the workspace. Anything else is a
+#: mutation and is not consulted. An empty operation is treated as a read:
+#: the tool rejects it, and the rejection then counts as an error (empty).
+FS_READ_OPS = frozenset({"read", "read_chunked", "search", "find", "list_files",
+                         "inspect", "read_files", ""})
+
+
+def _fs_op_is_a_read(args: Dict[str, Any]) -> bool:
+    return str((args or {}).get("operation") or "").strip().lower() in FS_READ_OPS
+
+
+def row_call_facts(t: Dict[str, Any]) -> Tuple[Dict[str, Any], str, bool]:
+    """(parsed call arguments, result text, is_error) for one recorded tool
+    row — read from the row's REAL shape.
+
+    The loop records a tool row as the API message it sends upstream:
+    ``role`` / ``tool_call_id`` / ``name`` / ``content``, where ``content``
+    is a ``ToolOutcome`` (a ``str`` subclass carrying ``status`` and the
+    call's parsed ``call_args``). No ``arguments`` or ``error`` key ever
+    exists on a production row; those spellings are accepted only for
+    hand-built rows (tests, replays). The outcome's own status is the
+    authority on failure — a REJECTED/FAILED result is an error even when
+    its text carries no ``ERROR:`` head; PARTIAL and UNRESOLVED are judged
+    by their text like an OK result.
+    """
+    content_obj = t.get("content")
+    args = t.get("arguments") or t.get("args") or getattr(content_obj, "call_args", None) or {}
+    if not isinstance(args, dict):
+        args = {}
+    content = "" if content_obj is None else str(content_obj)
+    # FAILED and REJECTED are errors. PARTIAL and UNRESOLVED are NOT: a
+    # `fact_check` PARTIAL carries the raw research results ("judge the claim
+    # from the results below"), a promoted `execute` job is UNRESOLVED with
+    # its `EXIT CODE: 0` output — both are evidence, and both were counted
+    # as such by the text shapes before the status was consulted (R3 review
+    # of the 2026-09-13 fix: `is_failure` is "not OK", which is wider).
+    status = getattr(content_obj, "status", None)
+    status_is_error = getattr(status, "value", None) in ("failed", "rejected")
+    is_error = bool(t.get("error")) or bool(t.get("is_error")) or status_is_error
+    return args, content, is_error
+
+
 def _empty_reason(name: str, args: Dict[str, Any], content: str,
                   is_error: bool) -> Optional[str]:
     """The reason this call returned no usable evidence, or None if it did.
@@ -108,9 +150,8 @@ def _empty_reason(name: str, args: Dict[str, Any], content: str,
                 "recall", "knowledge_base"):
         return None          # handled above; anything else is evidence
     if name == "file_system":
-        op = str((args or {}).get("operation") or "").lower()
-        if op in ("read", "read_chunked", "search", "find", "list_files",
-                  "inspect", "read_files", ""):
+        op = str((args or {}).get("operation") or "").strip().lower()
+        if _fs_op_is_a_read(args):
             if _FS_MISSING_RE.search(text[:300]) or text.strip() in ("", "[Empty]"):
                 return f"file_system {op or 'read'}: nothing found"
         return None
@@ -127,9 +168,11 @@ def _empty_reason(name: str, args: Dict[str, Any], content: str,
 def assess_turn_evidence(tools_run: Optional[Iterable[Dict[str, Any]]]
                          ) -> EvidenceAssessment:
     """Classify every evidence-bearing tool result recorded so far this
-    turn. ``tools_run`` rows carry ``name``, ``content`` and optionally
-    ``arguments``/``args``, ``_synthetic`` (a synthetic rejection the loop
-    minted — ignored: it is not the tool's verdict) and ``error``."""
+    turn. ``tools_run`` rows are the loop's REAL rows (``name``, ``content``
+    = a ``ToolOutcome`` carrying ``status`` + ``call_args``) or hand-built
+    ones with ``arguments``/``args`` and ``error`` keys — see
+    ``row_call_facts``. ``_synthetic`` rows (a rejection the loop minted —
+    not the tool's verdict) are ignored."""
     a = EvidenceAssessment()
     for t in tools_run or []:
         if not isinstance(t, dict) or t.get("_synthetic"):
@@ -137,11 +180,14 @@ def assess_turn_evidence(tools_run: Optional[Iterable[Dict[str, Any]]]
         name = str(t.get("name") or "").strip().lower()
         if name not in EVIDENCE_TOOLS:
             continue
-        args = t.get("arguments") or t.get("args") or {}
-        if not isinstance(args, dict):
-            args = {}
-        content = str(t.get("content") or "")
-        is_error = bool(t.get("error")) or bool(t.get("is_error"))
+        args, content, is_error = row_call_facts(t)
+        if name == "file_system" and not _fs_op_is_a_read(args):
+            # A write/replace/delete is a MUTATION: neither evidence nor its
+            # absence (module contract above). Before 2026-09-13 the loop's
+            # rows carried no arguments at all, so every write fell into the
+            # read branch, its "SUCCESS: Wrote …" counted as substantive, and
+            # one scratch-file write silenced the gate for the whole turn.
+            continue
         a.consulted += 1
         why = _empty_reason(name, args, content, is_error)
         if why is None:

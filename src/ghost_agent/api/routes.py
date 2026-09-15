@@ -1,8 +1,15 @@
 import asyncio
+import concurrent.futures
 import datetime
+import errno
+import functools
 import json
 import secrets
 import shutil
+import stat as _stat
+import sys
+import threading
+import time
 import uuid
 import httpx
 import os
@@ -14,10 +21,310 @@ from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from fastapi.security.api_key import APIKeyHeader
 from starlette.background import BackgroundTask
 from ..utils.helpers import get_utc_timestamp
+from ..utils.helpers import env_positive
 import logging
 from ..utils.logging import Icons, pretty_log, ORIGIN_PROBE, PROBE_REQUEST_PREFIX, is_probe_request_id
 
 logger = logging.getLogger("GhostAgent")
+
+# ── Store calls off the event loop (§4GI, 2026-09-13) ─────────────────────────
+# The operator "surgery" routes (memory correct/delete, skill-twin delete,
+# lesson quarantine) called the vector store and the playbook DIRECTLY from
+# an `async def` handler. `VectorMemory.correct_fragment` takes the store's
+# `threading.RLock` — the same lock the biological tick's consolidation
+# holds from a worker thread for seconds — and `quarantine_lesson` takes an
+# `fcntl.flock(LOCK_EX)` with no timeout. Either one froze the event loop:
+# every SSE stream, `/api/health` and the reaper stalled for the duration,
+# and past `GHOST_STREAM_IDLE_TIMEOUT` the user's turn was aborted as an
+# "upstream stall". ONE helper now runs every such call in a worker thread
+# under a bounded wait; `tests/test_4gi_api_routes.py` enumerates the
+# handlers from the AST and fails if a store call bypasses it.
+# §4GI: `env_positive`, not a bare float() — a typo in the env var would
+# otherwise raise at MODULE IMPORT and the agent would not boot
+# (tests/test_env_timeout_constants.py caught the first version).
+_STORE_CALL_TIMEOUT_S = max(1.0, env_positive("GHOST_STORE_CALL_TIMEOUT", 30.0))
+#: Context attributes that are persistent STORES (a lock, a file, a DB):
+#: a route may only call them through `_store_call`.
+STORE_CONTEXT_ATTRS = frozenset({
+    "memory_system", "skill_memory", "trajectory_collector", "profile_memory",
+    "graph_memory", "self_model", "calibration_tracker",
+})
+
+
+class StoreCallTimeout(Exception):
+    """A store call did not return inside `_STORE_CALL_TIMEOUT_S`."""
+
+
+# ⚠ STORE CALLS GET THEIR OWN POOL (§4GJ round 4, 2026-09-13). The first
+# version used `asyncio.to_thread`, which runs on the loop's DEFAULT
+# executor — the one every other `run_in_executor(None, ...)` in this
+# process shares (359 call sites across 38 modules at last count). A store
+# call that times out is deliberately NOT cancelled (see below), so each
+# timeout ABANDONS a worker of that shared pool for as long as the store
+# stays wedged, and nothing bounds how many can pile up. Measured: 20
+# wedged store calls blocked an unrelated `asyncio.to_thread` for 3 s, and
+# 18 of the abandoned mutations landed after their 504 — i.e. 18 operator
+# retries of one stuck route stop every tool call in the agent. A private,
+# bounded pool moves the blast radius back inside this module: when it is
+# full the next store call queues and answers 504 on its own budget, and the
+# sandbox, the file tools and the embedder keep their threads.
+def _store_worker_count() -> int:
+    """How wide the store pool is. Env-tunable, like its sibling timeout.
+
+    ⚠ IT WAS A HARD-CODED 8 (§4GK round 5) sitting next to an
+    env-configurable `_STORE_CALL_TIMEOUT_S`. One `notifications_pending`
+    poll issues up to 50 sequential store calls, so the pool width is
+    exactly the number an operator watching store 504s wants to move — and
+    it was the one number in this pair they could not move without editing
+    the source. `env_positive`, not `int(os.getenv(...))`: a typo must not
+    raise at module import and stop the agent from booting.
+    """
+    return max(1, int(env_positive("GHOST_STORE_WORKERS", 8)))
+
+
+_STORE_EXECUTOR_WORKERS = _store_worker_count()
+_STORE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_STORE_EXECUTOR_WORKERS, thread_name_prefix="ghost-store")
+#: Submitted store calls that have not finished. Only used to tell a RUNNING
+#: call from a QUEUED one at interpreter exit — see `_shutdown_store_executor`.
+_STORE_INFLIGHT = set()
+
+
+def _shutdown_store_executor(executor=None) -> None:
+    """Drop QUEUED store calls at interpreter exit, and never wait.
+
+    ⚠ NOTHING EVER SHUT THIS POOL DOWN (§4GK round 5). Its threads are
+    non-daemon — `ThreadPoolExecutor` has not made daemon threads since 3.9
+    — so `concurrent.futures.thread`'s own atexit hook joins them, and that
+    hook DRAINS the queue first: every store mutation still queued behind a
+    wedged one runs during interpreter shutdown, against half-finalised
+    modules. Cancelling the queue is the half we control. A call already
+    RUNNING in a wedged thread still blocks exit and nothing in-process can
+    change that, so name it in the log rather than leave the operator
+    staring at a process that will not die.
+
+    ⚠ AND MOVING IT OFF `atexit` GAVE UP `atexit`'s ISOLATION (§4GK round 7).
+    `atexit._run_exitfuncs` wraps every callback in its own try/except and
+    carries on; `threading._shutdown` does NOT — it walks
+    `_threading_atexits` with nothing around the call, so ONE exception out
+    of this function skips every hook registered before it, including
+    `concurrent.futures`' `_python_exit`, and then the whole non-daemon join
+    loop underneath it. The body is not exception-free: it runs at
+    finalisation, where `logger.warning` reaches handlers whose streams may
+    already be closed (`ValueError: I/O operation on closed file` is the
+    ordinary one) — a store-pool warning could take the interpreter's thread
+    shutdown with it. So the body carries the isolation the channel no
+    longer provides, and the last-resort report goes to the raw stream
+    because that is what is left when logging is gone.
+    """
+    try:
+        ex = executor if executor is not None else _STORE_EXECUTOR
+        running = [f for f in list(_STORE_INFLIGHT) if f.running()]
+        ex.shutdown(wait=False, cancel_futures=True)
+        if running:
+            logger.warning(
+                "%d store call(s) still running at exit — the interpreter "
+                "cannot exit until they return (the store is wedged)",
+                len(running))
+    except BaseException as exc:          # noqa: BLE001 - see the docstring
+        try:
+            sys.stderr.write(
+                f"store-pool shutdown hook failed ({type(exc).__name__}: "
+                f"{exc}); continuing interpreter shutdown\n")
+        except Exception:                 # pragma: no cover - stderr is gone
+            pass
+
+
+import atexit as _atexit
+
+
+def _register_store_shutdown(hook=_shutdown_store_executor) -> str:
+    """Register `hook` so it runs BEFORE the executor's own shutdown hook.
+
+    ⚠ `atexit.register` MADE THE WHOLE THING DEAD CODE (§4GK round 6).
+    `concurrent.futures.thread` registers `_python_exit` through
+    `threading._register_atexit`, and `threading._shutdown()` runs those
+    hooks — and then JOINS every non-daemon thread — inside
+    `wait_for_thread_shutdown()`, which precedes `_PyAtExit_Call`. So the
+    executor's hook drained the queue and joined the workers FIRST and
+    `_shutdown_store_executor` arrived afterwards with nothing left to
+    cancel. Measured on this interpreter against this module: one wedged
+    store call, three queued behind it, interpreter exits — all three
+    queued mutations RAN during shutdown against half-finalised modules,
+    the exact behaviour the docstring above says it prevents. The
+    "store is wedged" warning could not fire either (`running` is 0 by
+    then), which is why nothing ever looked wrong.
+
+    `threading._register_atexit` runs its hooks in REVERSE registration
+    order, before the join loop. `concurrent.futures.thread` is already
+    imported by the `ThreadPoolExecutor(...)` above, so its hook is
+    registered first and ours runs ahead of it. The name is private, so
+    the plain `atexit` path stays as a fallback: a hook that runs late is
+    what we had, and it is better than an import error at boot.
+    """
+    register = getattr(threading, "_register_atexit", None)
+    if register is not None:
+        register(hook)
+        return "threading"
+    _atexit.register(hook)           # pragma: no cover - 3.9+ always has it
+    return "atexit"
+
+
+#: Which channel the hook above actually got — read by the pin, and by an
+#: operator wondering why queued store calls landed after a shutdown.
+_STORE_SHUTDOWN_CHANNEL = _register_store_shutdown()
+
+
+async def _store_call(fn, *args, timeout: float = None, **kwargs):
+    """Run a blocking store method in a worker thread with a bounded wait.
+
+    A call that has STARTED is not cancelled on timeout (a half-applied
+    Chroma write is worse than a late one): the handler stops waiting and
+    answers 504 while the thread finishes on its own. A call still QUEUED is
+    the opposite outcome and gets the opposite treatment — it is cancelled,
+    so it cannot land minutes after its own 504. It is a thread of
+    `_STORE_EXECUTOR`, never the process-wide default one.
+
+    ⚠ THE DOCSTRING USED TO CLAIM THE FIRST FOR BOTH (§4GK round 5), which
+    held only while a worker was free. Once all `_STORE_EXECUTOR_WORKERS`
+    are busy, `asyncio.wait_for` cancels a still-queued
+    `concurrent.futures.Future` SUCCESSFULLY (measured) and the mutation
+    never runs at all. One 504 covered two opposite facts — "your edit
+    probably landed, late" and "your edit did not happen" — with nothing on
+    the wire to tell them apart. The exception now says which it was.
+    """
+    budget = float(timeout if timeout is not None else _STORE_CALL_TIMEOUT_S)
+    cf = _STORE_EXECUTOR.submit(functools.partial(fn, *args, **kwargs))
+    _STORE_INFLIGHT.add(cf)
+    cf.add_done_callback(_STORE_INFLIGHT.discard)
+    try:
+        return await asyncio.wait_for(asyncio.wrap_future(cf), timeout=budget)
+    except asyncio.TimeoutError as e:
+        # `cancel()` succeeds only for a call that never started — which is
+        # precisely the case the old docstring got wrong.
+        never_started = cf.cancel()
+        raise StoreCallTimeout(
+            f"{getattr(fn, '__name__', 'store call')} did not return within "
+            f"{budget:.0f}s "
+            + (f"(all {_STORE_EXECUTOR_WORKERS} store workers were busy: this "
+               f"call never started and has been cancelled — it did NOT take "
+               f"effect)"
+               if never_started else
+               "(the store is busy — a consolidation may hold its lock; the "
+               "call is still running and may still take effect)")
+        ) from e
+
+
+def _store_timeout_response(exc: Exception) -> JSONResponse:
+    return JSONResponse({"error": str(exc)}, 504)
+
+
+# ── Proxied inference goes through the main-slot bookkeeping (§4GI) ───────────
+# `api_generate` and the catch-all proxy posted straight through
+# `http_client`. A chat turn increments `foreground_tasks` (the background
+# scheduler's "a user is active" signal), takes `_main_node_lock` for a
+# non-streaming main call, and counts a stream in `_inflight_by_url` — the
+# stream watchdog's stall verdict reads `_own_inflight(base)` to tell "the
+# node is busy with OUR other request" from "the upstream stalled". A proxied
+# completion was invisible to all three: a user turn queued behind it was
+# aborted as an "Upstream Stream Stall (sole in-flight request)". The two
+# routes now do the same bookkeeping, in the same order, through one helper.
+import contextlib as _contextlib
+
+
+@_contextlib.asynccontextmanager
+async def _main_node_request(llm, *, hold_lock: bool):
+    """Book a request against the MAIN node the way a chat turn does.
+
+    ``hold_lock=True`` mirrors the non-streaming main path (serialised on
+    `_main_node_lock`); ``False`` mirrors the streaming path (in-flight
+    counted, no lock). Every step is optional on the client (test doubles,
+    older clients) — a missing attribute is skipped, never raised on.
+    """
+    base = str(getattr(llm, "upstream_url", "") or "")
+    # isinstance, not truthiness: a MagicMock client (the API tests) answers
+    # every getattr with a MagicMock, which is neither a lock nor a counter
+    fg_lock = getattr(llm, "_foreground_lock", None)
+    count_fg = (isinstance(fg_lock, asyncio.Lock)
+                and isinstance(getattr(llm, "foreground_tasks", None), int))
+    # ⚠ THE RELEASE MUST NOT AWAIT (round 3, 2026-09-13). The first version
+    # mutated the counter under `async with fg_lock` at BOTH ends. The
+    # decrement lives in a `finally` that runs on client disconnect, and
+    # `Lock.acquire()` there is an await point: with the lock contended (a
+    # background call polls it about once a second) and a second cancellation
+    # delivered — uvicorn's disconnect followed by shutdown — the acquire
+    # raises `CancelledError`, the decrement never runs, and
+    # `foreground_tasks` stays at 1 for the life of the process. `core/agent`
+    # hard-gates the biological tick on that counter, so all idle work stops.
+    # Reproduced: 2 cancels + a contended lock leaks; 1 cancel does not.
+    #
+    # `+=` / `-=` on an int has NO await point, so on one event loop it is
+    # already atomic with respect to every other coroutine — the lock buys
+    # nothing for a single-statement mutation and costs the release its
+    # cancellation-safety. `llm.py`'s own compound reader holds the lock
+    # across a two-field read with no await between them, which a synchronous
+    # mutation here cannot interleave with. (This is why the in-flight
+    # release, a plain `stack.callback`, survived the same cancellation while
+    # the counter did not.) `llm.py` keeps its awaited form: those decrements
+    # are not on a path a client can cancel.
+    if count_fg:
+        llm.foreground_tasks = int(llm.foreground_tasks) + 1
+    try:
+        async with _contextlib.AsyncExitStack() as stack:
+            main_lock = getattr(llm, "_main_node_lock", None)
+            if hold_lock and isinstance(main_lock, asyncio.Lock):
+                await stack.enter_async_context(main_lock)
+            # ⚠ COUNT ONLY ON THE PATH THAT DOES NOT HOLD THE LOCK (§4GJ
+            # round 4). The first version did both: it took `_main_node_lock`
+            # AND `_inflight_inc(base)`. `LLMClient._own_inflight` already
+            # adds one for a HELD main lock — that is the documented contract
+            # ("a held lock is worth exactly one more in-flight request
+            # against the main URL and needs no second counter"), and llm.py's
+            # own locked paths deliberately do not increment. So a proxied
+            # `/api/generate` counted itself twice: one real stream plus one
+            # generate read as 3 against a truth of 2, which on a 2-slot node
+            # is exactly the "Stream Stall (Self-Queued)" condition — the
+            # watchdog aborted the USER's live stream to make room for a
+            # request that did not exist.
+            inc, dec = getattr(llm, "_inflight_inc", None), getattr(llm, "_inflight_dec", None)
+            if not hold_lock and callable(inc) and callable(dec):
+                inc(base)
+                stack.callback(dec, base)
+            yield
+    finally:
+        if count_fg:
+            llm.foreground_tasks = max(0, int(llm.foreground_tasks) - 1)
+
+
+#: Client headers that must never reach the upstream: every CREDENTIAL the
+#: client sent us, and the full HOP-BY-HOP / body-framing set (RFC 9110 §7.6.1)
+#: that belongs to THIS connection and that httpx recomputes for its own.
+#:
+#: ⚠ FOUR NAMES WAS NOT THE CLASS (§4GJ round 4, 2026-09-13). The first
+#: version stripped `x-ghost-key`, `authorization`, `host`, `content-length`
+#: and forwarded everything else verbatim — confirmed by driving the real
+#: app: `proxy-authorization`, `cookie`, `connection`, `te` and `upgrade`
+#: all reached the upstream. `authorization` was stripped because it is a
+#: credential, and `proxy-authorization` and `cookie` are the SAME
+#: credential class: with a remote `--upstream-url` they leave the machine
+#: to a third party. `transfer-encoding` is the framing half: the JSON peek
+#: re-feeds the body to httpx as BYTES, so httpx sets its own
+#: `Content-Length` — a chunked JSON POST then carried both framings, which
+#: 502'd here (confirmed) and hands a laxer upstream a CL.TE desync
+#: primitive. Strip the class, not the names that happened to hurt.
+_PROXY_STRIP_HEADERS = frozenset({
+    # credentials the client presented to THIS API
+    "x-ghost-key", "authorization", "proxy-authorization", "cookie",
+    # body framing httpx recomputes for its own request
+    "host", "content-length", "transfer-encoding",
+    # hop-by-hop: they describe this connection, not the proxied one
+    "connection", "keep-alive", "proxy-authenticate", "proxy-connection",
+    "te", "trailer", "trailers", "upgrade",
+})
+
+
+def _forwardable_headers(headers) -> dict:
+    return {k: v for k, v in dict(headers).items() if str(k).lower() not in _PROXY_STRIP_HEADERS}
 
 router = APIRouter()
 
@@ -469,6 +776,11 @@ async def api_delete(request: Request):
 @router.post("/api/generate", dependencies=[Security(verify_api_key)])
 async def api_generate(request: Request):
     agent = get_agent(request)
+    # Bound BEFORE the try: the except handler below reports with it, and a
+    # name bound only inside the try makes that handler raise NameError
+    # instead (the `_wrote` class the §4GJ enumeration catches — committed
+    # here inside §4GJ's own round-3 fix, and caught by its own gate).
+    from ..core.llm import _MAIN_FALLBACK_TIMEOUT_S as _main_budget
     try:
         body = await request.json()
     except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as e:
@@ -490,10 +802,81 @@ async def api_generate(request: Request):
     }
 
     try:
-        resp = await agent.context.llm_client.http_client.post("/v1/chat/completions", json=chat_payload)
+        _llm = agent.context.llm_client
+        # a non-streaming MAIN call: serialised on the node lock like a turn's
+        #
+        # ⚠ BOUNDED (round 3, 2026-09-13). This POST passed no `timeout=`, so
+        # it inherited httpx's 1200s default WHILE HOLDING the process-wide
+        # `_main_node_lock` — one wedged upstream parks every chat turn and
+        # every embedding for twenty minutes, and Starlette does not cancel
+        # the handler when the client disconnects. `core/llm` bounds every
+        # other locked main POST for exactly this reason; reuse ITS budget
+        # (`GHOST_MAIN_FALLBACK_TIMEOUT`, 300s) rather than inventing a
+        # second number that can drift from it.
+        async with _main_node_request(_llm, hold_lock=True):
+            resp = await asyncio.wait_for(
+                _llm.http_client.post("/v1/chat/completions", json=chat_payload),
+                timeout=_main_budget,
+            )
         resp.raise_for_status()
         llm_resp = resp.json()
         content = llm_resp["choices"][0]["message"]["content"]
+    except (asyncio.TimeoutError, httpx.TimeoutException):
+        # The lock is already released (the `async with` unwound) — say so
+        # with the status that means it, not a 500 the client will retry.
+        #
+        # The CONNECTION is gone by the time this line runs: `wait_for`
+        # cancels the POST and waits for httpx's teardown, and a raw-socket
+        # upstream sees EOF in the same millisecond as the 504 (measured
+        # against a real httpx client, §4GJ round 4 — the round-4 report's
+        # "0 cancelled" is the upstream ignoring the disconnect, not a
+        # connection left open here). What we CANNOT do from this side is
+        # make a non-streaming llama-server drop the generation it has
+        # already started, so say out loud that the slot may still be warm:
+        # the operator reading the stream is the only one who can tell a
+        # queue from a stall.
+        pretty_log("Proxy Timeout",
+                   f"/api/generate: upstream did not answer within "
+                   f"{_main_budget:.0f}s — connection closed, main slot "
+                   f"released (a non-streaming upstream may still be "
+                   f"generating this answer into the void)",
+                   icon=Icons.WARN, level="WARNING")
+        return JSONResponse(
+            {"error": f"upstream did not answer within {_main_budget:.0f}s"}, 504)
+    except httpx.HTTPStatusError as e:
+        # ⚠ AN UPSTREAM FAULT IS NOT OUR FAULT (§4GJ round 4). The
+        # `raise_for_status()` above sat under the generic `except
+        # Exception`, so a 503 from llama-server came back as a 500 with an
+        # error id and a logged traceback — telling the client "the agent
+        # broke" and burying the one fact that matters in the log. The
+        # catch-all proxy has always answered 502 for exactly this
+        # condition; these two routes front the same upstream and must not
+        # disagree about whose failure it is.
+        _status = getattr(getattr(e, "response", None), "status_code", "?")
+        pretty_log("Proxy Upstream Error",
+                   f"/api/generate: upstream answered {_status}",
+                   icon=Icons.FAIL, level="ERROR")
+        return JSONResponse(
+            {"error": f"upstream error (status {_status})"}, 502)
+    except httpx.RequestError as e:
+        # ⚠ AND AN UPSTREAM THAT NEVER ANSWERED IS ALSO NOT OUR FAULT (§4GK
+        # round 5). Round 4 closed only `HTTPStatusError` — the case where
+        # llama-server is up enough to reply. The COMMON case is the one it
+        # left open: the node is down, restarting, or drops the connection
+        # mid-response, i.e. `ConnectError` / `RemoteProtocolError` /
+        # `ReadError`. Measured against a real socket: a refused connect and
+        # a mid-response RST both came back from `/api/generate` as a 500
+        # with an error id and a logged traceback, while `catch_all` — the
+        # OTHER route onto the same upstream — answered 502 for both. Round
+        # 4's own rationale is the standard: these two must not disagree
+        # about whose failure it is. `TimeoutException` is a `RequestError`
+        # too, so its 504 handler stays ABOVE this one.
+        pretty_log("Proxy Upstream Error",
+                   f"/api/generate: upstream unreachable — "
+                   f"{type(e).__name__}: {e}",
+                   icon=Icons.FAIL, level="ERROR")
+        return JSONResponse(
+            {"error": f"upstream unreachable ({type(e).__name__})"}, 502)
     except Exception:
         _eid = _log_internal_error("api_generate")
         return JSONResponse({"error": f"internal error (error_id={_eid})"}, 500)
@@ -703,7 +1086,20 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
         from ..core.sessions import get_session_store, merge_history_detail
         _sess_store = get_session_store(agent.context)
         if _sess_store is not None:
-            _existing = _sess_store.get(str(_session_id))
+            # ⚠ THE 504 IS THE PROMISE, NOT THE EXCEPTION (§4GJ round 4).
+            # This was the one `_store_call` on the chat hot path with no
+            # handler — and it sits ABOVE the `if stream:` split, so a
+            # wedged session store took BOTH chat paths down with a bare
+            # text/plain `500 Internal Server Error` from Starlette's
+            # handler: no `error.message`, no `error.type`, nothing the web
+            # UI or the Slack bot can render, and a status that says "the
+            # agent is broken" about a store that is merely busy.
+            try:
+                _existing = await _store_call(_sess_store.get, str(_session_id))
+            except StoreCallTimeout as e:
+                return JSONResponse(
+                    {"error": {"message": str(e), "type": "StoreCallTimeout"}},
+                    status_code=504)
             _stored = _existing.messages if _existing is not None else []
             # The ALIGNMENT reports what this turn adds — the caller no
             # longer guesses it from `_merged[len(_stored):]` (§4BU C2).
@@ -717,7 +1113,7 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
             body["messages"] = _merged
             messages = _merged
 
-    def _persist_session(assistant_text: str) -> None:
+    async def _persist_session(assistant_text: str) -> None:
         """Append this turn (new user messages + the reply) to the session.
         Runs AFTER the turn, so a failed turn never leaves a dangling user
         message with no reply. Never raises into the response path."""
@@ -733,9 +1129,11 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
         if not _new_msgs and not str(assistant_text or "").strip():
             return
         try:
-            _sess_store.append_turn(str(_session_id), _new_msgs,
-                                    str(assistant_text or ""))
-        except Exception:  # noqa: BLE001
+            # `append_turn` writes and fsyncs — on the loop it stalled every
+            # other request for the duration of a disk sync (§4GJ round 3).
+            await _store_call(_sess_store.append_turn, str(_session_id),
+                              _new_msgs, str(assistant_text or ""))
+        except Exception:  # noqa: BLE001 — a persist failure never breaks the reply
             _log_internal_error("session append")
 
     if stream:
@@ -744,7 +1142,39 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no"
         }
-        
+
+        # ⚠ THE MARK IS RELEASED AROUND THE SEND, NOT INSIDE THE GENERATOR
+        # (§4GJ round 4, 2026-09-13). This is round 3's CRITICAL again, on
+        # the path that carries the actual user traffic: the proxy path was
+        # given `_BookedStreamingResponse` and this one was left with a
+        # `finally` inside the body generator. A `finally` in a generator
+        # only runs when something advances or closes it — and on a
+        # mid-stream client disconnect Starlette CANCELS `stream_response`
+        # while it is suspended in `await send(...)`, so nothing is ever
+        # thrown into the generator. It is finalised by the CYCLIC garbage
+        # collector, whenever that happens to run. Measured on the real
+        # ASGI app over raw sockets: 20 mid-stream disconnects left
+        # `foreground_requests` at 11, still 11 after five seconds, 0 only
+        # after an explicit `gc.collect()` — and with `gc.disable()` it
+        # never came back at all. `core/llm` reads
+        # `foreground_requests > 0` as "a user is active" and parks EVERY
+        # background LLM call for up to ten minutes on that reading, so a
+        # handful of users closing their browser tabs silently switches the
+        # whole background stack off.
+        #
+        # The release is idempotent and lives in both places on purpose:
+        # the response's `finally` covers the send (including a client that
+        # was gone before the first chunk, where the generator never runs at
+        # all), and the generator's own `finally` covers a consumer that
+        # iterates the body without going through the ASGI call.
+        _fg_released = False
+
+        async def _release_foreground():
+            nonlocal _fg_released
+            if not _fg_released:
+                _fg_released = True
+                _mark_foreground(agent, -1)
+
         async def stream_generator():
             # Track whether any real content chunk has shipped to the
             # client. If yes, an additional `delta.content` error chunk
@@ -755,11 +1185,6 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
             # programmatic detection; emitting an extra content chunk
             # corrupts the visible reply.
             content_started = False
-            # Mark a user request active for its WHOLE lifecycle (agent
-            # loop + final-answer streaming) so background LLM work parks
-            # instead of stealing the inference slot between this
-            # request's tool calls. See LLMClient.foreground_requests.
-            _mark_foreground(agent, +1)
             try:
                 # Yield an SSE comment to send HTTP headers instantly and keep reverse proxies alive
                 yield b": processing request...\n\n"
@@ -778,9 +1203,9 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                         # The frames are llama-server's, with llama's id;
                         # the feedback contract is OUR id (see the helper).
                         yield _restamp_sse_request_id(chunk, req_id)
-                    _persist_session("".join(_acc))
+                    await _persist_session("".join(_acc))
                 else:
-                    _persist_session(content)
+                    await _persist_session(content)
                     # A trivial-fast-path reply has NO trajectory (by
                     # design), so no label can ever land on it: say so on
                     # the wire and the UI renders no thumbs (§4EX). `is
@@ -809,9 +1234,18 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                 yield b"data: [DONE]\n\n"
                 return
             finally:
-                _mark_foreground(agent, -1)
+                await _release_foreground()
 
-        return StreamingResponse(stream_generator(), media_type="text/event-stream", headers=headers)
+        # Mark a user request active for its WHOLE lifecycle (agent loop +
+        # final-answer streaming) so background LLM work parks instead of
+        # stealing the inference slot between this request's tool calls.
+        # See LLMClient.foreground_requests. Taken HERE, not in the
+        # generator, so that the release above has something to pair with
+        # even when the generator is never entered.
+        _mark_foreground(agent, +1)
+        return _BookedStreamingResponse(
+            stream_generator(), media_type="text/event-stream", headers=headers,
+            release=_release_foreground)
     
     # Non-streaming fallback. Any exception in handle_chat used to bubble
     # up as a raw 500 with no JSON body — clients then saw an HTML error
@@ -847,7 +1281,7 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
     finally:
         _mark_foreground(agent, -1)
 
-    _persist_session(content)
+    await _persist_session(content)
 
     # Token cost for the whole turn, summed across every upstream call it
     # made (tool rounds + verifier) — NOT one completion's usage. Surfaced
@@ -950,27 +1384,196 @@ async def save_workspace(request: Request):
     class _WorkspaceTooLarge(Exception):
         pass
 
+    #: Members this build could not read, as {path, reason}. An unreadable
+    #: file used to be a bare `continue` (§4GJ round 4): nothing logged,
+    #: nothing on the wire, and a 200 carrying an archive the operator
+    #: believes is their whole workspace. A restore from it then DELETES the
+    #: sandbox and writes back the subset that happened to be readable — so
+    #: the silent omission is what turns a permissions glitch into data loss.
+    #: The list rides back on the response header and, so it survives the
+    #: download, as a member of the archive itself.
+    omitted = []
+
+    def _member_info(arcname: str, st, *, is_dir: bool = False) -> zipfile.ZipInfo:
+        """A ZipInfo carrying the file's OWN mode and mtime.
+
+        ⚠ `writestr(str, ...)` mints its own ZipInfo, stamps it with the
+        archive time and hardcodes `external_attr = 0o600 << 16` — the
+        earlier `zip_file.write(path, arcname)` read both off the file.
+        Confirmed after the §4GJ R3 rewrite: `run.sh` came back `0o600`
+        instead of `0o755` (nothing in the restored sandbox is executable
+        any more) and every mtime was rewritten to the moment of the save,
+        so every incremental tool that compares timestamps sees the whole
+        tree as just-changed. The fix is to hand `writestr` a ZipInfo we
+        built ourselves.
+        """
+        if is_dir and not arcname.endswith("/"):
+            arcname += "/"
+        if st is not None:
+            try:
+                dt = time.localtime(st.st_mtime)[:6]
+            except (OSError, OverflowError, ValueError):
+                # An mtime the platform cannot even break down — and WHICH
+                # WAY it cannot matters (§4GK round 6). Round 5 clamped every
+                # unrepresentable stamp to the MAXIMUM date, so a far-PAST one
+                # was archived as 2107-12-31: measured, `time.localtime(-1e18)`
+                # raises OSError [Errno 84] and the file came back stamped 127
+                # years in the future, on the same line that exists to clamp
+                # "BOTH ends". The sign of the stamp is the direction:
+                # anything below the epoch is past (the small negatives that
+                # DO break down land in 1969 and clamp up to 1980 below),
+                # anything above it that fails is future
+                # (`time.localtime(1e18)` → OSError EINVAL).
+                dt = (_ZIP_DOS_MIN_DATE_TIME if st.st_mtime < 0
+                      else _ZIP_DOS_MAX_DATE_TIME)
+            mode = _stat.S_IMODE(st.st_mode)
+        else:
+            dt = time.localtime()[:6]
+            mode = 0o755 if is_dir else 0o644
+        # ⚠ THE DOS STAMP HAS A CEILING TOO (§4GK round 5). Round 4 clamped
+        # an mtime UP to the 1980 zip epoch and stopped there.
+        # `ZipInfo.FileHeader` packs the date as `(year-1980) << 9 | month << 5
+        # | day` into a USHORT, so a year ≥ 2108 raises `struct.error` — a
+        # plain `Exception`, which the member loop's `except (OSError,
+        # ValueError)` below does not catch. It escaped `_build_zip` entirely
+        # and the route's generic handler answered an opaque 500: ONE file
+        # with a far-future stamp made EVERY workspace save 500 until someone
+        # found it. The sandbox is model-writable (`touch -d 2200-01-01`,
+        # `os.utime`, an unpacked archive carrying bogus stamps, clock skew),
+        # so this is reachable on purpose as well as by accident — confirmed
+        # with `os.utime(f, (7258118400, 7258118400))` on a file AND on a
+        # directory, both 500. The round-4 rewrite is what introduced it:
+        # `writestr(str, data)` stamped the archive time and could never hit
+        # the ceiling; the ZipInfo that reads the file's OWN mtime can.
+        if dt[0] < 1980:                       # the zip epoch; older stamps clamp
+            dt = _ZIP_DOS_MIN_DATE_TIME
+        elif dt[0] > _ZIP_DOS_MAX_DATE_TIME[0]:
+            dt = _ZIP_DOS_MAX_DATE_TIME        # …and later ones clamp down
+        zi = zipfile.ZipInfo(arcname, dt)
+        zi.compress_type = zipfile.ZIP_STORED if is_dir else zipfile.ZIP_DEFLATED
+        zi.external_attr = (mode & 0xFFFF) << 16
+        if is_dir:
+            zi.external_attr |= 0x10           # FILE_ATTRIBUTE_DIRECTORY
+        elif st is not None:
+            zi.file_size = st.st_size          # so the zip64 decision is right
+        return zi
+
     def _build_zip() -> str:
         import tempfile
         fd, tmp_path = tempfile.mkstemp(suffix=".zip", prefix="ws_save_")
         os.close(fd)
         try:
-            with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED, False) as zip_file:
+            # ⚠ allowZip64 STAYS TRUE (§4GJ round 4). The 4th positional of
+            # `ZipFile` is `allowZip64`, whose own default is True; passing
+            # False capped the archive at 65,535 members, far below the
+            # 500 MB byte ceiling — one `node_modules` under the sandbox
+            # clears that on its own. `LargeZipFile` is then raised at
+            # CLOSE, after the whole tree has been compressed, and this
+            # route answered an opaque 500 where the byte path answers an
+            # honest 413.
+            with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED,
+                                 allowZip64=True) as zip_file:
                 zip_file.writestr("session.json", json.dumps(session_data, indent=2))
                 total = 0
-                for root, dirs, files in os.walk(sandbox_dir):
-                    if "acquired_skills" in Path(root).parts:
+                # §4GJ R3: never archive through a symlink the model planted
+                # under the mount. `os.walk` refuses linked DIRECTORIES but
+                # lists linked FILES, and `zip_file.write` follows them — so
+                # a link to a host secret was archived as a regular member
+                # and `restore` wrote those bytes back into the sandbox.
+                # `walk_nofollow` lists regular files only and hands back a
+                # directory fd, so the read is atomic with the listing (a
+                # per-entry `is_symlink()` pre-check leaves a swap window);
+                # the restore half refuses a member landing on a link.
+                from ..tools.file_system import (read_bytes_nofollow_fd,
+                                                 walk_nofollow)
+                for dirpath, file_names, _dir_fd in walk_nofollow(sandbox_dir):
+                    if "acquired_skills" in Path(dirpath).parts:
                         continue
-                    for file_name in files:
-                        file_path = Path(root) / file_name
+                    # The DIRECTORY itself is a member (§4GJ round 4). The
+                    # file-only loop dropped every directory that held no
+                    # files: `empty_dir`, and the interior nodes of a deep
+                    # tree, simply vanished from the archive — a restore
+                    # recreated leaf parents implicitly and nothing else, so
+                    # a build tree came back missing the empty directories
+                    # its tooling expects (confirmed: `empty_dir`, `nested`
+                    # and `nested/deep` were all absent).
+                    _rel_dir = Path(dirpath).relative_to(sandbox_dir)
+                    if str(_rel_dir) != ".":
+                        # ⚠ THE WHOLE DIRECTORY MEMBER IS INSIDE THE TRY
+                        # (§4GK round 5). Only the `fstat` was guarded; the
+                        # `_member_info` + `writestr` that follow it were
+                        # bare, so the two halves of ONE walk disagreed about
+                        # what an unarchivable member is: an unarchivable
+                        # FILE became an `omitted` record and a 200, while an
+                        # unarchivable DIRECTORY aborted the build and the
+                        # route answered 500. That asymmetry is how the
+                        # far-future mtime above took the whole save down
+                        # from a directory as well as from a file.
                         try:
-                            total += file_path.stat().st_size
+                            try:
+                                _dst = os.fstat(_dir_fd)
+                            except OSError:
+                                _dst = None
+                            zip_file.writestr(
+                                _member_info(f"sandbox/{_rel_dir}", _dst, is_dir=True), b"")
+                        except (OSError, ValueError) as exc:
+                            omitted.append({
+                                "path": f"{_rel_dir}/",
+                                "reason": f"{type(exc).__name__}: {exc}",
+                                "partial": False,
+                            })
+                    for file_name in file_names:
+                        file_path = Path(dirpath) / file_name
+                        arcname = f"sandbox/{file_path.relative_to(sandbox_dir)}"
+                        try:
+                            # `follow_symlinks=False`: the listing already
+                            # excluded links, and this must not become the
+                            # one call that follows one.
+                            st = os.stat(file_name, dir_fd=_dir_fd,
+                                         follow_symlinks=False)
                         except OSError:
+                            st = None
+                        # bytes already written into the archive for this
+                        # member, so a read that dies MID-COPY is reported as
+                        # a truncated member rather than as a missing one —
+                        # the two need different action from whoever restores
+                        # it, and "omitted" would be a small lie about a
+                        # member that is physically in the file.
+                        _progress = [0]
+                        try:
+                            data = None
+                            if st is None or st.st_size <= _ZIP_INLINE_MEMBER_BYTES:
+                                data = read_bytes_nofollow_fd(
+                                    file_name, dir_fd=_dir_fd,
+                                    max_bytes=_ZIP_INLINE_MEMBER_BYTES + 1)
+                                if len(data) > _ZIP_INLINE_MEMBER_BYTES:
+                                    # it grew between the stat and the read:
+                                    # stream it rather than ship a truncated
+                                    # member
+                                    data = None
+                            if data is None:
+                                total += _stream_member(zip_file, arcname, st,
+                                                        file_name, _dir_fd, total,
+                                                        _progress)
+                            else:
+                                total += len(data)
+                                if total > _MAX_WORKSPACE_SAVE_BYTES:
+                                    raise _WorkspaceTooLarge()
+                                zip_file.writestr(_member_info(arcname, st), data)
+                        except (OSError, ValueError) as exc:
+                            omitted.append({
+                                "path": str(file_path.relative_to(sandbox_dir)),
+                                "reason": f"{type(exc).__name__}: {exc}",
+                                "partial": _progress[0] > 0,
+                            })
+                            total += _progress[0]
                             continue
-                        if total > _MAX_WORKSPACE_SAVE_BYTES:
-                            raise _WorkspaceTooLarge()
-                        arcname = file_path.relative_to(sandbox_dir)
-                        zip_file.write(file_path, f"sandbox/{arcname}")
+                if omitted:
+                    # Inside the archive too: the header below is gone the
+                    # moment the browser has saved the file, and the person
+                    # who restores it months later is the one who needs to
+                    # know what is not in here.
+                    zip_file.writestr("omitted.json", json.dumps(omitted, indent=2))
             return tmp_path
         except BaseException:
             try:
@@ -978,6 +1581,61 @@ async def save_workspace(request: Request):
             except OSError:
                 pass
             raise
+
+    def _stream_member(zip_file, arcname: str, st, name, dir_fd, total: int,
+                       progress: list) -> int:
+        """Compress one member straight from its descriptor, in chunks.
+
+        ⚠ PER-MEMBER RAM WAS UNBOUNDED (§4GJ round 4). The read helper takes
+        `max_bytes=<the 500 MB archive cap>`, so a single large member was
+        materialised whole and then handed to the deflater whole: measured
+        215 MB → 369 MB RSS while archiving ONE 150 MB file, on a box that
+        already runs at 94% memory. The byte ceiling bounded the ARCHIVE,
+        never the member. Small files still go through the nofollow read
+        helper (one syscall, atomic with the listing, and no per-member zip
+        handle for the thousands of tiny files that make up a sandbox);
+        anything large is copied through a fixed buffer instead.
+
+        The symlink guarantee is unchanged: the open is `O_NOFOLLOW`
+        relative to the walk's directory fd — the same open the read helper
+        does — and the fstat re-checks that this is a regular file, so the
+        bytes can only come from the file the walk listed.
+        """
+        # ⚠ `O_NONBLOCK` IS PART OF THAT PARITY (§4GK round 5). The read
+        # helper opens `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`; this open
+        # dropped the third flag, and it is the only one that stops a
+        # non-regular final component from blocking BEFORE the `S_ISREG`
+        # check below can reject it. Measured: on a FIFO the helper opened
+        # and rejected immediately while this open was still parked after
+        # 1.5 s. It is reachable as a TOCTOU the model owns on its own
+        # mount — listed and stat'd as a regular file over the inline
+        # ceiling, then swapped for a FIFO or a device node before this
+        # line — and the cost is total: `_build_zip` runs inside
+        # `asyncio.to_thread`, which has NO timeout, so the request never
+        # completes and a default-executor worker is gone for the life of
+        # the process.
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(name, flags, dir_fd=dir_fd) if dir_fd is not None \
+            else os.open(str(name), flags)
+        try:
+            fst = os.fstat(fd)
+            if not _stat.S_ISREG(fst.st_mode):
+                raise ValueError(f"{name}: not a regular file")
+            written = 0
+            with zip_file.open(_member_info(arcname, st if st is not None else fst),
+                               "w") as dst:
+                while True:
+                    chunk = os.read(fd, _ZIP_COPY_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if total + written > _MAX_WORKSPACE_SAVE_BYTES:
+                        raise _WorkspaceTooLarge()
+                    dst.write(chunk)
+                    progress[0] = written
+            return written
+        finally:
+            os.close(fd)
 
     try:
         tmp_path = await asyncio.to_thread(_build_zip)
@@ -999,10 +1657,24 @@ async def save_workspace(request: Request):
         except OSError:
             pass
 
+    # An incomplete archive says so, on the response and on the stream. A 200
+    # with a silently short archive is the one answer this route must never
+    # give (§4GJ round 4).
+    _resp_headers = {}
+    if omitted:
+        _resp_headers["X-Ghost-Archive-Omitted"] = str(len(omitted))
+        pretty_log("Workspace Save Incomplete",
+                   f"{len(omitted)} file(s) could not be read and are NOT in "
+                   f"the archive (see omitted.json inside it): "
+                   f"{', '.join(o['path'] for o in omitted[:5])}"
+                   + (" …" if len(omitted) > 5 else ""),
+                   icon=Icons.WARN, level="WARNING")
+
     return FileResponse(
         tmp_path,
         media_type="application/zip",
         filename=filename,
+        headers=_resp_headers or None,
         background=BackgroundTask(_cleanup),
     )
 
@@ -1010,6 +1682,19 @@ _MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB hard ceiling on inbound uploads
 # Ceiling on a workspace SAVE archive (uncompressed input bytes). Mirrors the
 # load-side 500 MB inflate cap so save and load are symmetric.
 _MAX_WORKSPACE_SAVE_BYTES = 500 * 1024 * 1024
+# A member at or below this is read whole (one atomic nofollow read); anything
+# larger is streamed through `_ZIP_COPY_CHUNK_BYTES` at a time, so the archiver's
+# peak RAM is set by THIS number and not by the largest file in the sandbox.
+_ZIP_INLINE_MEMBER_BYTES = 4 * 1024 * 1024
+_ZIP_COPY_CHUNK_BYTES = 1024 * 1024
+#: The last instant a DOS date field can hold: 7 bits of year above 1980, and
+#: seconds in 2-second units. Anything later cannot be written into a zip
+#: header at all — see `_member_info`.
+_ZIP_DOS_MAX_DATE_TIME = (2107, 12, 31, 23, 59, 58)
+#: ...and the first. Both ends are named because the fallback for an mtime
+#: that will not break down has to pick ONE of them, and picking the wrong
+#: one stamps a 1930s file as 2107 (§4GK round 6).
+_ZIP_DOS_MIN_DATE_TIME = (1980, 1, 1, 0, 0, 0)
 
 
 def _is_within(base: Path, candidate: Path) -> bool:
@@ -1024,6 +1709,300 @@ def _is_within(base: Path, candidate: Path) -> bool:
         return True
     except (ValueError, OSError):
         return False
+
+
+# ── the restore side of the mode/mtime fix (§4GK round 5) ────────────────────
+# Round 4 taught the ARCHIVE to carry each member's own mode and mtime and
+# stopped there: `write_bytes()` + `mkdir()` applied neither, so the defect it
+# reported — "nothing in the restored sandbox is executable any more", "every
+# mtime rewritten to the moment of the save" — stayed true for everyone who
+# restores THROUGH THE AGENT. Measured on a real save→load round trip: the zip
+# carried `run.sh` at 0o755 (round 4's own pin passes) and the restored file
+# was 0o644 with an mtime of now. Only an external `unzip` ever saw the fix.
+#
+# Both helpers are fd-based at the call site: the tree is model-writable and
+# the write sits behind a check-then-write, so the mode and the mtime must
+# land on the descriptor we opened `O_NOFOLLOW`, never on a path that can be
+# swapped for a link between the check and the chmod.
+
+def _archived_mode(zip_info) -> int | None:
+    """The member's own permission bits, or None if the archive has none.
+
+    A DOS-only archive (anything not written by a unix zipper) carries no
+    mode in the high half of `external_attr` — restoring the 0 it decodes to
+    would make every member unreadable, so "no mode" means "leave the
+    default". setuid/setgid/sticky are dropped: the archive is model-supplied
+    input and nothing in a restored sandbox needs them.
+    """
+    raw = (zip_info.external_attr >> 16) & 0xFFFF
+    if raw == 0:
+        return None
+    return raw & 0o777
+
+
+def _archived_mtime(zip_info) -> float | None:
+    """The member's stamp as an epoch float, or None if it will not convert.
+
+    `date_time` is a DOS stamp clamped into 1980..2107 by the save side, but
+    this archive can come from anywhere — an unconvertible tuple means "leave
+    the mtime alone", not "abort the restore".
+    """
+    try:
+        return time.mktime(tuple(zip_info.date_time) + (0, 0, -1))
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _restore_file_member(path: Path, data: bytes, zip_info) -> None:
+    """Write one archived file back with its own mode and mtime.
+
+    `O_NOFOLLOW` is the enforcement behind the caller's symlink refusal, not
+    a replacement for it: the caller still refuses a destination (or parent)
+    that is already a link, and this open refuses one planted in the window
+    between that check and the write.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        mode = _archived_mode(zip_info)
+        if mode is not None:
+            os.fchmod(fd, mode)
+        mtime = _archived_mtime(zip_info)
+        if mtime is not None and os.utime in os.supports_fd:
+            os.utime(fd, (mtime, mtime))
+    finally:
+        os.close(fd)
+
+
+def _restore_dir_metadata(path: Path, zip_info) -> None:
+    """Apply an archived DIRECTORY's mode and mtime — after its contents.
+
+    Deferred on purpose: a directory archived 0o500 (or 0o555) applied at
+    `mkdir` time makes every member inside it unwritable and the restore
+    dies half-way through a sandbox it has already wiped. Extracting the
+    whole archive first and stamping the directories afterwards also gets
+    the mtimes right, since writing a member into a directory bumps it.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return                       # gone, or swapped for a link: not ours
+    try:
+        mode = _archived_mode(zip_info)
+        if mode is not None:
+            os.fchmod(fd, mode)
+        mtime = _archived_mtime(zip_info)
+        if mtime is not None and os.utime in os.supports_fd:
+            os.utime(fd, (mtime, mtime))
+    except OSError:
+        pass                         # a mode we cannot set is not a failed restore
+    finally:
+        os.close(fd)
+
+
+# ── the restored mode must not TRAP the workspace (§4GK round 6) ─────────────
+# Round 5's deferred-directory comment reasons about exactly one hazard — a
+# 0o555 directory applied before its contents land — and solves it WITHIN one
+# restore. It does not survive one call later. Measured on a plain save→load
+# round trip with no crafted archive, on a sandbox the model can chmod:
+#
+#   save Monday   (dist/ 0o555, holding bundle.js)
+#   save Tuesday  (the same, plus dist/vendor.js)
+#   restore Monday  -> 200, and the live sandbox now has a 0o555 dist/
+#   restore Tuesday -> HTTP 500, PermissionError .../live/dist/vendor.js
+#
+# Three faults compound into that 500, and the third is why it is permanent:
+#   1. the wipe called `shutil.rmtree(item, ignore_errors=True)`, which
+#      CANNOT unlink inside a non-writable directory — so the frozen tree
+#      survived the "clean" wipe and its stale contents were carried into the
+#      "restored" workspace, silently;
+#   2. `os.open(O_CREAT)` for a NEW member inside it fails EACCES, and
+#      `_restore_file_member`'s caller re-raised every errno but ELOOP — into
+#      the route's generic handler, i.e. an opaque 500 AFTER the sandbox had
+#      already been wiped;
+#   3. and nothing repaired the directory, so every later archive carrying a
+#      new member under it 500s at the same point, for ever.
+#
+# The helpers below are the repair. They are fd-based and `O_NOFOLLOW` for the
+# same reason the two above are: this tree is model-writable and every one of
+# these paths was checked a moment earlier.
+
+def _member_reason(exc: OSError) -> str:
+    """Why one member could not be restored, in a form that can go on the
+    wire: the errno NAME and the OS's own text, never the exception's repr.
+
+    ⚠ `str(exc)` PUT ABSOLUTE HOST PATHS IN THE RESPONSE (§4GK round 7).
+    `PermissionError(13, 'Permission denied', '/Users/.../sandboxes/<id>/
+    live/dist/vendor.js')` renders every one of those characters into
+    `unrestored[].reason`, four lines above the handler whose comment reads
+    "Don't leak internal exception text to the client" — the sandbox's real
+    location on the host, its id, and the server's user, handed to whoever
+    uploaded the archive. The member's own RELATIVE path is already in
+    `unrestored[].path`, which is the part the operator needs.
+    """
+    name = errno.errorcode.get(exc.errno, str(exc.errno))
+    return f"{name}: {exc.strerror or type(exc).__name__}"
+
+
+def _add_owner_access(path: Path) -> bool:
+    """Give the OWNER rwx on one directory. True if it now has it.
+
+    Never follows a link (a symlinked component is not ours to chmod) and
+    never touches anything but the owner bits: this is "can the server still
+    manage its own sandbox", not a permissions rewrite.
+
+    ⚠ IT COULD NOT REPAIR WHAT IT COULD NOT OPEN (§4GK round 7). The whole
+    helper hangs off `os.open(O_RDONLY)`, so it repaired exactly the modes
+    that still grant the owner READ: 0o555 and 0o444 heal, and 0o333, 0o111,
+    0o000 — a `chmod 111 dist` from inside the sandbox, or an archive
+    carrying that mode on a directory — fail at the `open` and return False
+    before a single bit is changed. Measured end to end: a top-level `dist/`
+    at 0o111 survives the wipe (`rmtree` cannot unlink inside it) and its
+    stale contents are carried into the "restored" workspace, which is fault
+    1 of the round-6 comment above, unfixed for a whole class of modes.
+
+    The fallback repairs through the PARENT's descriptor: `lstat` first, so a
+    symlink or a plain file is never touched, and `follow_symlinks=False` so
+    that even a link swapped in during the window is chmod'ed as a link
+    rather than through to whatever it points at. That is the same property
+    `O_NOFOLLOW` gives the fast path, kept by a different mechanism.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno in (errno.EACCES, errno.EPERM):
+            return _chmod_owner_via_parent(path)
+        return False
+    try:
+        mode = _stat.S_IMODE(os.fstat(fd).st_mode)
+        if mode & 0o700 != 0o700:
+            os.fchmod(fd, mode | 0o700)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def _chmod_owner_via_parent(path: Path) -> bool:
+    """`_add_owner_access` for a directory we cannot open for reading.
+
+    Everything here is about NOT following a link: `lstat` decides it is a
+    real directory (a symlink lstats as a link and is refused outright), the
+    chmod goes through the parent's own descriptor by NAME, and
+    `follow_symlinks=False` means a link planted in the window is chmod'ed
+    as a link instead of reaching its target. Where the platform cannot do
+    that, the repair is declined rather than performed unsafely — an
+    unrepaired directory is reported by name; a chmod through a link is a
+    hole in the sandbox.
+    """
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if not _stat.S_ISDIR(st.st_mode):
+        return False                     # a link or a file: not ours to chmod
+    if os.chmod not in os.supports_dir_fd \
+            or os.chmod not in os.supports_follow_symlinks:
+        return False                     # pragma: no cover - POSIX has both
+    pflags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        pfd = os.open(path.parent, pflags)
+    except OSError:
+        return False
+    try:
+        os.chmod(path.name, _stat.S_IMODE(st.st_mode) | 0o700,
+                 dir_fd=pfd, follow_symlinks=False)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(pfd)
+
+
+def _unfreeze_tree(root: Path) -> None:
+    """Make every real directory under `root` removable, top-down.
+
+    `os.walk` needs r+x to list a directory and `rmtree` needs w to unlink
+    inside it; a 0o555 directory has the first and not the second, which is
+    the whole of fault 1 above. Top-down matters: each directory is
+    unfrozen from its parent's listing BEFORE the walk descends into it.
+    `followlinks=False` plus the `O_NOFOLLOW` in `_add_owner_access` means a
+    symlinked subdirectory is listed and skipped, never chmod'ed through.
+    """
+    _add_owner_access(root)
+    for dirpath, dirnames, _files in os.walk(root, topdown=True, followlinks=False):
+        for name in dirnames:
+            _add_owner_access(Path(dirpath) / name)
+
+
+def _unfreeze_chain(path: Path, stop: Path) -> bool:
+    """Unfreeze every existing directory from `stop` down to `path`.
+
+    Used when a member cannot be written: the frozen directory may be the
+    parent, or any ancestor between it and the sandbox root (a member under
+    `acquired_skills/` reaches this with the whole chain skipped by the
+    wipe). Walks DOWN from `stop` so it can never chmod outside the sandbox,
+    and returns True if at least one directory was reachable — the caller
+    retries once on that.
+
+    ⚠ IT SKIPPED THE ROOT, WHICH IS THE ONLY ANCESTOR A TOP-LEVEL MEMBER HAS
+    (§4GK round 7). `rel.parts` is EMPTY for a member sitting directly in the
+    sandbox — the overwhelmingly common case — so `touched` stayed False, the
+    caller's one retry never ran, and the frozen directory the helper exists
+    to repair was the one it could not reach. `chmod 555 /workspace` from
+    inside the container was enough: every top-level member came back
+    unwritable, with a repair that had never been attempted. `stop` is the
+    sandbox root itself, so unfreezing it is still inside the mount.
+    """
+    try:
+        root = stop.resolve()
+        rel = path.resolve().relative_to(root)
+    except (ValueError, OSError):
+        return False
+    cur, touched = root, _add_owner_access(root)
+    for part in rel.parts:
+        cur = cur / part
+        touched = _add_owner_access(cur) or touched
+    return touched
+
+
+def _mkdir_unfreezing(path: Path, stop: Path) -> str | None:
+    """`mkdir -p`, repairing a frozen ancestor once. The reason it could
+    not, or None.
+
+    The directory half of the same trap: `mkdir` inside a 0o555 ancestor
+    raises EACCES exactly as `os.open(O_CREAT)` does, and it sat OUTSIDE the
+    restore's try, so it reached the generic 500 without even the errno
+    check (§4GK round 6).
+
+    ⚠ "REPORT, NEVER RAISE" WAS WRITTEN FOR TWO ERRNOS (§4GK round 7).
+    Everything else still re-raised — into the route's generic handler,
+    AFTER the wipe, which is the precise outcome the rule exists to
+    eliminate. Confirmed by driving the real route: a zip holding both
+    `sandbox/a` (a file) and `sandbox/a/b.txt` gives EEXIST here on `a/`
+    (`mkdir(exist_ok=True)` raises when the path exists and is NOT a
+    directory) and ENOTDIR one level deeper — a 500 with the workspace
+    already gone and no `unrestored` to say which member did it. One
+    upload, and the whole sandbox is destroyed for an archive that a
+    zipper can produce by accident. The retry stays EACCES/EPERM-only:
+    unfreezing an ancestor cannot fix EEXIST, and pretending to repair is
+    how a second failure gets a misleading reason.
+    """
+    for attempt in (1, 2):
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            return None
+        except OSError as exc:
+            repairable = exc.errno in (errno.EACCES, errno.EPERM)
+            if attempt == 2 or not repairable or not _unfreeze_chain(path, stop):
+                return _member_reason(exc)
+    return None                          # pragma: no cover - loop returns first
 
 
 async def _read_capped(upload: UploadFile) -> bytes:
@@ -1098,13 +2077,48 @@ async def load_workspace(request: Request, file: UploadFile = File(...)):
 
             # 1. Clear sandbox safely (Preserve permanent skills) — only AFTER
             # the archive validated above.
+            #: What the wipe could not remove. `ignore_errors=True` hid this:
+            #: a directory the restore itself froze at 0o555 (see
+            #: `_unfreeze_tree`) survived the wipe with its old contents and
+            #: was then presented as the restored workspace (§4GK round 6).
+            not_cleared = []
             for item in sandbox_dir.iterdir():
                 if item.name == "acquired_skills":
                     continue
-                if item.is_dir():
-                    shutil.rmtree(item, ignore_errors=True)
-                else:
-                    item.unlink(missing_ok=True)
+                # ⚠ UNFREEZING IS NOT UNCONDITIONAL (§4GK round 7). Round 6
+                # chmods a frozen tree writable so the wipe can clear a
+                # directory the ARCHIVE froze — and `projects/` is frozen for
+                # a different reason entirely: `set_workspace_readonly` makes a
+                # RELEASED project 0o555/0o444, and the OS half of that
+                # immutability was the last thing standing between a restore
+                # and the human-attested deliverables inside it. Round 5's
+                # `rmtree(ignore_errors=True)` could not delete through it;
+                # round 6 could, silently, reporting `not_cleared: []` and
+                # `{"status": "success"}` while the project rows pointed at a
+                # deleted directory. A restore replaces the WORKSPACE, and a
+                # released project is not part of what the archive owns.
+                if item.name == "projects":
+                    not_cleared.append(
+                        f"{item.name} (released projects are never wiped by a "
+                        f"restore)")
+                    continue
+                try:
+                    if item.is_dir() and not item.is_symlink():
+                        _unfreeze_tree(item)
+                        shutil.rmtree(item, ignore_errors=True)
+                    else:
+                        item.unlink(missing_ok=True)
+                except OSError as _exc:
+                    # ⚠ AND THE UNLINK BRANCH HAD NO HANDLER (§4GK round 7).
+                    # One `chmod 555 /workspace` from inside the container made
+                    # a PermissionError abort the whole loop, so nothing was
+                    # extracted and the client got an opaque 500 — the outcome
+                    # the "report, never raise" rule at the restore below
+                    # exists to eliminate, left open on its own wipe.
+                    not_cleared.append(f"{item.name} ({type(_exc).__name__})")
+                    continue
+                if item.exists() or item.is_symlink():
+                    not_cleared.append(item.name)
 
             # 2. Restore session state.
             chat_history = []
@@ -1119,25 +2133,160 @@ async def load_workspace(request: Request, file: UploadFile = File(...)):
                         # not whatever namespace is currently active).
                         agent.context.scratchpad.restore_state(scratchpad_data)
 
-            # 3. Extract files.
+            # 3. Extract files — WITH the modes and mtimes the archive
+            # carries (§4GK round 5). `write_bytes` + `mkdir` applied
+            # neither, so round 4's user-visible defect was only half
+            # fixed: through the agent, `run.sh` still came back 0o644 and
+            # every mtime was still the moment of the restore.
+            _dir_members = []
+            #: Members this restore could not write, as {path, reason}. A
+            #: PermissionError used to escape to the route's generic handler
+            #: — an opaque 500 handed to the operator AFTER the sandbox had
+            #: been wiped, with no way to tell which member failed (§4GK
+            #: round 6). The wipe and `_unfreeze_chain` between them make a
+            #: frozen directory recoverable; anything still unwritable after
+            #: that is reported by name instead of destroying the response.
+            unrestored = []
             for zip_info in zip_ref.infolist():
                 if not zip_info.filename.startswith("sandbox/"):
                     continue
                 rel_path = zip_info.filename[len("sandbox/"):]
                 if not rel_path:
                     continue
-                extracted_path = (sandbox_dir / rel_path).resolve()
-                # Prevent zip-slip traversal (relative_to-based; rejects
-                # sibling-dir prefix escapes).
-                if not _is_within(sandbox_dir, extracted_path):
-                    continue
-                if zip_info.is_dir():
-                    extracted_path.mkdir(parents=True, exist_ok=True)
-                else:
-                    extracted_path.parent.mkdir(parents=True, exist_ok=True)
-                    extracted_path.write_bytes(zip_ref.read(zip_info.filename))
+                # ⚠ AND THE MEMBER LOOP ITSELF COULD RAISE (§4GK round 7).
+                # Not only the two calls that had handlers: `.resolve()` and
+                # `.is_symlink()` are `os.lstat` underneath, and `lstat` on a
+                # 300-byte component answers ENAMETOOLONG — which `pathlib`
+                # re-raises rather than treating it as "not a link". Measured
+                # against the real route: `OSError [Errno 63] File name too
+                # long` out of the symlink CHECK, into the generic handler —
+                # a 500 with the sandbox already wiped. Everything a single
+                # member can do to this loop is THAT MEMBER's failure, and by
+                # here the old workspace is gone, so the whole per-member body
+                # reports and only the loop carries on.
+                try:
+                    extracted_path = (sandbox_dir / rel_path).resolve()
+                    # Prevent zip-slip traversal (relative_to-based; rejects
+                    # sibling-dir prefix escapes).
+                    #
+                    # ⚠ AND A REFUSED MEMBER IS STILL A MISSING MEMBER (§4GK
+                    # round 7). Four `continue`s in this loop dropped a member
+                    # without recording it, so the route answered
+                    # `{"status": "success", "unrestored": []}` over an archive
+                    # whose files are NOT on disk — and every client believes
+                    # that shape: app.js prints "Workspace loaded successfully",
+                    # the handheld printed "workspace restored." A refusal is a
+                    # decision the operator has to be able to see, especially
+                    # this one: a zip-slip member is the loudest thing an
+                    # archive can contain and it was the quietest thing in the
+                    # response.
+                    if not _is_within(sandbox_dir, extracted_path):
+                        unrestored.append({
+                            "path": rel_path,
+                            "reason": "REFUSED: escapes the sandbox (zip slip)"})
+                        continue
+                    if zip_info.is_dir():
+                        _why = _mkdir_unfreezing(extracted_path, sandbox_dir)
+                        if _why:
+                            unrestored.append({"path": rel_path, "reason": _why})
+                            continue
+                        # mode/mtime after the whole archive lands — see
+                        # `_restore_dir_metadata`.
+                        _dir_members.append((extracted_path, zip_info))
+                    else:
+                        _why = _mkdir_unfreezing(extracted_path.parent, sandbox_dir)
+                        if _why:
+                            unrestored.append({"path": rel_path, "reason": _why})
+                            continue
+                        # A member whose target (or whose parent) is a symlink
+                        # would write THROUGH it, outside the mount — the
+                        # `_is_within` check above resolves the path but a link
+                        # planted between that check and this write, or a link
+                        # already at the destination, still redirects the bytes.
+                        # Refuse both rather than follow (§4GJ R3) — and SAY so:
+                        # the bytes are not on disk, whatever the reason.
+                        if extracted_path.is_symlink() or extracted_path.parent.is_symlink():
+                            unrestored.append({
+                                "path": rel_path,
+                                "reason": "REFUSED: destination (or its parent) is "
+                                          "a symlink"})
+                            continue
+                        _payload = zip_ref.read(zip_info.filename)
+                        try:
+                            _restore_file_member(extracted_path, _payload, zip_info)
+                        except OSError as exc:
+                            if exc.errno == errno.ELOOP:
+                                # a link planted between the check above and the
+                                # open: the same refusal, one race window later
+                                unrestored.append({
+                                    "path": rel_path,
+                                    "reason": "REFUSED: a symlink appeared at the "
+                                              "destination during the restore"})
+                                continue
+                            if exc.errno not in (errno.EACCES, errno.EPERM):
+                                # ⚠ AND THE OTHER ERRNOS STILL RAISED (§4GK round
+                                # 7). Confirmed against the real route: EISDIR (a
+                                # member whose name is an existing directory),
+                                # ENAMETOOLONG (a >255-byte component, which a zip
+                                # can carry and this filesystem cannot) and ENOSPC
+                                # (end to end, on a full disk) each reached the
+                                # generic handler — a 500 with an error id, AFTER
+                                # the wipe, for a fault that concerns ONE member.
+                                # By this line the old workspace is already gone,
+                                # so there is no failure mode left that is better
+                                # than reporting the member by name.
+                                unrestored.append({"path": rel_path,
+                                                   "reason": _member_reason(exc)})
+                                continue
+                            # ⚠ A FROZEN ANCESTOR IS NOT A BROKEN ARCHIVE (§4GK
+                            # round 6). This used to `raise` — into the route's
+                            # generic handler, i.e. an opaque 500 AFTER the
+                            # sandbox had been wiped, which is how one 0o555
+                            # directory made every later restore fail for ever.
+                            # Repair the chain and retry ONCE; a second failure
+                            # is REPORTED, never raised, because by here the old
+                            # workspace is already gone.
+                            if _unfreeze_chain(extracted_path.parent, sandbox_dir):
+                                try:
+                                    _restore_file_member(extracted_path, _payload,
+                                                         zip_info)
+                                    continue
+                                except OSError as retry_exc:
+                                    if retry_exc.errno == errno.ELOOP:
+                                        # the same refusal as above, one retry
+                                        # later — and equally worth saying
+                                        unrestored.append({
+                                            "path": rel_path,
+                                            "reason": "REFUSED: a symlink appeared "
+                                                      "at the destination during "
+                                                      "the restore"})
+                                        continue
+                                    exc = retry_exc
+                            unrestored.append({"path": rel_path,
+                                               "reason": _member_reason(exc)})
+                except OSError as _member_exc:
+                    unrestored.append({"path": rel_path,
+                                       "reason": _member_reason(_member_exc)})
+            # Deepest first: nothing here needs its parent writable, and a
+            # directory's mtime is only final once everything inside it is.
+            for _dir_path, _dir_info in sorted(
+                    _dir_members, key=lambda pair: len(pair[0].parts), reverse=True):
+                _restore_dir_metadata(_dir_path, _dir_info)
 
-        return {"status": "success", "chat_history": chat_history}
+        if not_cleared or unrestored:
+            # Said out loud, on the wire, for the same reason the save side
+            # reports `omitted`: a restore that silently dropped members is
+            # how a permissions glitch turns into data loss the operator
+            # only discovers from the missing file (§4GJ round 4, §4GK
+            # round 6).
+            pretty_log("workspace/load",
+                       f"incomplete restore: {len(not_cleared)} entr(ies) "
+                       f"survived the wipe {not_cleared[:5]}, "
+                       f"{len(unrestored)} member(s) unwritable "
+                       f"{[u['path'] for u in unrestored[:5]]}",
+                       icon=Icons.WARN, level="WARNING")
+        return {"status": "success", "chat_history": chat_history,
+                "not_cleared": not_cleared, "unrestored": unrestored}
     except HTTPException:
         raise
     except zipfile.BadZipFile:
@@ -1158,7 +2307,15 @@ async def sessions_list(request: Request, limit: int = 50):
     store = get_session_store(agent.context)
     if store is None:
         return JSONResponse({"enabled": False, "sessions": []})
-    return JSONResponse({"enabled": True, "sessions": store.list(limit=limit)})
+    # §4GJ round 3: the session store is a STORE (files + fsync), reached via
+    # a helper rather than a context attribute — which is why the first
+    # enumeration could not see it. `list()` reads up to `limit` session
+    # files; measured at 117 ms of blocked loop at the 200-session cap.
+    try:
+        sessions = await _store_call(store.list, limit=limit)
+    except StoreCallTimeout as e:
+        return _store_timeout_response(e)
+    return JSONResponse({"enabled": True, "sessions": sessions})
 
 
 @router.post("/api/sessions", status_code=201,
@@ -1177,7 +2334,10 @@ async def sessions_create(request: Request):
     except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
         body = {}
     title = (body or {}).get("title") if isinstance(body, dict) else ""
-    sess = store.create(title=str(title or ""))
+    try:
+        sess = await _store_call(store.create, title=str(title or ""))
+    except StoreCallTimeout as e:
+        return _store_timeout_response(e)
     if sess is None:
         raise HTTPException(status_code=500, detail="session create failed")
     return JSONResponse(sess.summary(), status_code=201)
@@ -1192,9 +2352,14 @@ async def sessions_get(request: Request, session_id: str):
     store = get_session_store(agent.context)
     if store is None:
         raise HTTPException(status_code=503, detail="sessions are not enabled")
-    sess = store.get(session_id)
+    try:
+        sess = await _store_call(store.get, session_id)
+    except StoreCallTimeout as e:
+        return _store_timeout_response(e)
     if sess is None:
         raise HTTPException(status_code=404, detail="session not found")
+    # `sess` is a VALUE returned BY the store, not the store: `to_dict()` is
+    # an in-memory shape change with no IO, so it stays on the loop.
     return JSONResponse(sess.to_dict())
 
 
@@ -1205,7 +2370,11 @@ async def sessions_delete(request: Request, session_id: str):
     store = get_session_store(agent.context)
     if store is None:
         raise HTTPException(status_code=503, detail="sessions are not enabled")
-    if not store.delete(session_id):
+    try:
+        _deleted = await _store_call(store.delete, session_id)
+    except StoreCallTimeout as e:
+        return _store_timeout_response(e)
+    if not _deleted:
         raise HTTPException(status_code=404, detail="session not found")
     return JSONResponse({"deleted": True, "id": session_id})
 
@@ -1575,8 +2744,19 @@ async def notifications_pending(request: Request, consumer: str = "default",
     records = []
     cursor = offset
     for _ in range(50):
-        chunk, new_cursor = log.read_since(cursor, limit=200,
-                                           severity=SEVERITY_NOTIFY)
+        # §4GJ round 3: the activity log is a file-backed store reached via a
+        # helper — the same class as the session store. This loop runs up to
+        # 50 times, so parsing on the loop blocked it 50 x a file read.
+        # ⚠ …AND THE HANDLER FOR IT (§4GJ round 4). The wrap went in without
+        # its `except`, so a wedged ledger (a truncation racing a reader, an
+        # NFS stall) came back to the Slack bot as a bare text/plain 500 —
+        # which its poll loop cannot tell from "the agent crashed", while
+        # every other store-backed route on this API answers a JSON 504.
+        try:
+            chunk, new_cursor = await _store_call(
+                log.read_since, cursor, limit=200, severity=SEVERITY_NOTIFY)
+        except StoreCallTimeout as e:
+            return _store_timeout_response(e)
         records.extend(chunk)
         if new_cursor <= cursor:  # EOF / no progress
             # A new_cursor BELOW the request cursor is read_since's
@@ -1657,7 +2837,10 @@ async def memory_correct(request: Request):
     memory = getattr(getattr(agent, "context", None), "memory_system", None)
     if memory is None or not hasattr(memory, "correct_fragment"):
         return JSONResponse({"error": "memory system unavailable"}, 503)
-    ok, detail = memory.correct_fragment(match, replacement)
+    try:
+        ok, detail = await _store_call(memory.correct_fragment, match, replacement)
+    except StoreCallTimeout as e:
+        return _store_timeout_response(e)
     if not ok:
         return JSONResponse({"ok": False, "error": detail}, 409)
     return {"ok": True, **detail}
@@ -1681,7 +2864,10 @@ async def memory_delete(request: Request):
     memory = getattr(getattr(agent, "context", None), "memory_system", None)
     if memory is None or not hasattr(memory, "delete_fragment"):
         return JSONResponse({"error": "memory system unavailable"}, 503)
-    ok, detail = memory.delete_fragment(match)
+    try:
+        ok, detail = await _store_call(memory.delete_fragment, match)
+    except StoreCallTimeout as e:
+        return _store_timeout_response(e)
     if not ok:
         return JSONResponse({"ok": False, "error": detail}, 409)
     return {"ok": True, **detail}
@@ -1709,7 +2895,10 @@ async def memory_delete_skill_twin(request: Request):
     memory = getattr(getattr(agent, "context", None), "memory_system", None)
     if memory is None or not hasattr(memory, "delete_skill_twins"):
         return JSONResponse({"error": "memory system unavailable"}, 503)
-    removed, detail = memory.delete_skill_twins(triggers)
+    try:
+        removed, detail = await _store_call(memory.delete_skill_twins, triggers)
+    except StoreCallTimeout as e:
+        return _store_timeout_response(e)
     return {"ok": True, "requested": len(triggers), "removed": removed, **detail}
 
 
@@ -1743,7 +2932,10 @@ async def lessons_quarantine(request: Request):
     if sm is None or not callable(getattr(sm, "quarantine_lesson", None)) \
             or getattr(sm, "is_read_only", False) is True:
         return JSONResponse({"error": "skill memory unavailable or read-only"}, 503)
-    n = int(sm.quarantine_lesson(trigger, reason) or 0)
+    try:
+        n = int(await _store_call(sm.quarantine_lesson, trigger, reason) or 0)
+    except StoreCallTimeout as e:
+        return _store_timeout_response(e)
     return {"ok": n > 0, "quarantined": n, "trigger": trigger[:120]}
 
 
@@ -1812,13 +3004,33 @@ async def download_file(request: Request, filename: str):
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(path=str(file_path), filename=file_path.name)
 
+class _BookedStreamingResponse(StreamingResponse):
+    """A streaming response that releases its main-node booking in a
+    `finally` around the WHOLE send — including the case where the client is
+    already gone when the response starts, so the body generator (and its
+    own `finally`) never runs. Without this a pre-iteration disconnect left
+    `foreground_tasks` at 1 and parked the biological scheduler as "user
+    active" forever (R3 review). `release` must be idempotent
+    (`AsyncExitStack.aclose` is)."""
+
+    def __init__(self, *args, release=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._release = release
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            if self._release is not None:
+                await self._release()
+
+
 @router.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"], dependencies=[Security(verify_api_key)])
 async def catch_all(request: Request, path: str):
     agent = get_agent(request)
     url = f"/{path}"
-    headers = dict(request.headers)
-    headers.pop("host", None)
-    headers.pop("content-length", None)
+    # this API's own key and the hop-by-hop headers never go upstream (§4GI)
+    headers = _forwardable_headers(request.headers)
 
     # Sniff whether this is a streaming/SSE request so we can set the right
     # response media type AND disable buffering on intermediate proxies.
@@ -1846,11 +3058,18 @@ async def catch_all(request: Request, path: str):
     except Exception:
         forward_content = request.stream()
 
+    # Booked against the main node like a streamed turn (in-flight counted,
+    # `foreground_tasks` held) for the WHOLE life of the proxied stream: the
+    # booking is entered here and released by the generator's `finally`, or
+    # right here when the upstream send fails.
+    _llm = agent.context.llm_client
+    _booking = _contextlib.AsyncExitStack()
+    await _booking.enter_async_context(_main_node_request(_llm, hold_lock=False))
     try:
-        req = agent.context.llm_client.http_client.build_request(
+        req = _llm.http_client.build_request(
             request.method, url, headers=headers, content=forward_content
         )
-        r = await agent.context.llm_client.http_client.send(req, stream=True)
+        r = await _llm.http_client.send(req, stream=True)
 
         upstream_ct = r.headers.get("content-type", "") or ""
         is_event_stream = "text/event-stream" in upstream_ct.lower() or body_says_stream
@@ -1860,7 +3079,10 @@ async def catch_all(request: Request, path: str):
                 async for chunk in r.aiter_bytes():
                     yield chunk
             finally:
-                await r.aclose()
+                try:
+                    await r.aclose()
+                finally:
+                    await _booking.aclose()
 
         response_headers = {}
         if is_event_stream:
@@ -1868,13 +3090,31 @@ async def catch_all(request: Request, path: str):
             response_headers["X-Accel-Buffering"] = "no"
             response_headers["Cache-Control"] = "no-cache"
 
-        return StreamingResponse(
+        return _BookedStreamingResponse(
             stream_generator(),
             status_code=r.status_code,
             media_type=("text/event-stream" if is_event_stream else upstream_ct or None),
             headers=response_headers,
+            release=_booking.aclose,
         )
     except Exception as e:
+        await _booking.aclose()
         pretty_log("Proxy Failed", f"{request.method} /{path}: {type(e).__name__}: {e}",
                    icon=Icons.FAIL, level="ERROR")
         return JSONResponse({"error": f"Proxy Error: {e}"}, 502)
+    except BaseException:
+        # ⚠ `except Exception` IS NOT THE WHOLE EXIT SET HERE (§4GJ round 4).
+        # This app raises a BaseException through the RECEIVE channel on
+        # purpose: `api/body_limit.BodyTooLarge` is a BaseException so it
+        # sails past FastAPI's and these handlers' own `except Exception`
+        # and reaches the middleware as a 413. The `forward_content =
+        # request.stream()` branch reads the body from inside httpx, so that
+        # exception is thrown right here — past the release above, leaving
+        # `foreground_tasks` at 1 and the in-flight slot booked for a
+        # request that no longer exists. It only ever self-healed when the
+        # abandoned async generator was finalised; with anything holding the
+        # traceback (a logger, a debugger, an `except` frame) the counter
+        # stays at 1 and the biological tick never runs again (confirmed).
+        # Release and re-raise: the exception's whole point is to travel.
+        await _booking.aclose()
+        raise

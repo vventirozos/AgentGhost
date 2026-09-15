@@ -64,7 +64,7 @@ def test_finalize_state_is_read_only_inputs():
 
 
 def test_handle_chat_delegates_to_finalize():
-    src = inspect.getsource(GhostAgent.handle_chat)
+    src = inspect.getsource(GhostAgent.handle_chat) + inspect.getsource(GhostAgent._run_internal_turn)
     assert "_finalize_and_return(FinalizeState(" in src
     # the chain's landmarks must be gone from handle_chat
     assert "FINAL OUTPUT SCRUBBER" not in src

@@ -113,6 +113,8 @@
     <li><a href="delegation.html">core / subagent.py</a> — the delegated sub-agent's own, separately proven, context build.</li>
     <li><a href="../sandbox/docker.html">sandbox / docker.py</a> — container lifecycle, network modes, and the orphan sweeper.</li>
   </ul>
+  <h3 id="4gj-r3">Round 3: the fork's memory seed followed links <span class="tag">2026-09-13 &sect;4GJ</span></h3>
+  <p>Seeding a fork's <code>memory_dir</code> from <code>acquired_skills</code> and <code>composed_skills</code> passed <code>symlinks=False</code> to <code>shutil.copytree</code> — which means FOLLOW, not refuse. Both directories are model-writable, so a planted link seeded the fork with host bytes. Now <code>copytree_nofollow</code>, logging what it skipped. (The workspace fork at <code>fork_workspace</code> already passed <code>symlinks=True</code> and was correct.) See <a href="../tools/file_system.html#4gj-r3">the symlink class</a>.</p>
 </main>
 </body>
 </html>

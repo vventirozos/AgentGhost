@@ -105,16 +105,26 @@ class ToolOutcome(str):
     no consumer asks for.
     """
 
-    __slots__ = ("status", "world_changed", "reason_code", "declared")
+    __slots__ = ("status", "world_changed", "reason_code", "declared",
+                 "call_args")
 
     def __new__(cls, text: Any = "", status: "OutcomeStatus" = OutcomeStatus.OK,
                 world_changed: Optional[bool] = None,
                 reason_code: Optional[str] = None,
-                declared: bool = True):
+                declared: bool = True,
+                call_args: Optional[dict] = None):
         self = super().__new__(cls, "" if text is None else str(text))
         self.status = status
         self.world_changed = world_changed
         self.reason_code = reason_code
+        # The PARSED arguments of the call that produced this result, set by
+        # the dispatch loop on the row it records (2026-09-13). A tool row
+        # is also the API message, so an extra dict key would be sent
+        # upstream — the outcome object is the only place a reader of
+        # `tools_run_this_turn` can learn WHICH operation ran. The evidence
+        # gate read a `t["arguments"]` key no row ever carried and booked
+        # every `file_system write` as substantive evidence.
+        self.call_args = call_args
         # Did a PRODUCER set this status, or did `coerce` guess it from the
         # text? The distinction is what lets the shell predicates stop
         # re-sniffing a result whose author already answered the question —
@@ -139,7 +149,7 @@ class ToolOutcome(str):
     def __reduce__(self):
         return (_rebuild_outcome,
                 (str(self), self.status, self.world_changed,
-                 self.reason_code, self.declared))
+                 self.reason_code, self.declared, self.call_args))
 
     # -- what the loop asks ------------------------------------------------
     @property
@@ -318,7 +328,13 @@ def with_text(res, new_text: str):
         return ToolOutcome(new_text, status=res.status,
                            world_changed=res.world_changed,
                            reason_code=res.reason_code,
-                           declared=res.declared)
+                           declared=res.declared,
+                           # the recorded call must survive a rewrite: the
+                           # context cutter rewrites tool rows IN PLACE every
+                           # iteration, and a row that lost its arguments
+                           # read as a read to the evidence gate (R3 review
+                           # of the 2026-09-13 fix)
+                           call_args=res.call_args)
     return new_text
 
 
@@ -337,7 +353,9 @@ def append_note(res, note: str):
     return with_text(res, str(res) + note)
 
 
-def _rebuild_outcome(text, status, world_changed, reason_code, declared=True):
+def _rebuild_outcome(text, status, world_changed, reason_code, declared=True,
+                     call_args=None):
     """Module-level so pickle/copy can find it."""
     return ToolOutcome(text, status=status, world_changed=world_changed,
-                       reason_code=reason_code, declared=declared)
+                       reason_code=reason_code, declared=declared,
+                       call_args=call_args)

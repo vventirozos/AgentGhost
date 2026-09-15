@@ -36,7 +36,25 @@ from ghost_agent.sandbox.jobs import SandboxJobSupervisor
 # becomes a session/process-group leader, so its recorded `$$` IS the group
 # leader and `kill -- -<pid>` reaps the whole tree — the property
 # _kill_pgroup, cancel(), and the TTL reaper all depend on.
-_SETSID_SHIM = "import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])"
+#: The shim that makes each job its own process-group leader — and, since
+#: §4GV, RECORDS it. A job that outlives its test is otherwise untraceable:
+#: reparented to init, no registry row, nothing in its argv that says who
+#: spawned it. Four of them were found alive on this machine, the oldest
+#: sixteen days old. The record (pid, pgid, argv) is what lets the session
+#: reaper in conftest kill exactly these and nothing else.
+_SETSID_SHIM = (
+    "import json, os, sys, time\n"
+    "os.setsid()\n"
+    "_reg = os.environ.get('GHOST_TEST_JOB_REGISTRY')\n"
+    "if _reg:\n"
+    "    try:\n"
+    "        with open(_reg, 'a') as _fh:\n"
+    "            _fh.write(json.dumps({'pid': os.getpid(), "
+    "'pgid': os.getpgid(0), 'argv': sys.argv[1:], 'at': time.time()}) + '\\n')\n"
+    "    except OSError:\n"
+    "        pass\n"
+    "os.execvp(sys.argv[1], sys.argv[1:])\n"
+)
 
 
 class _FakeExecResult:
@@ -123,11 +141,24 @@ def _alive(pid) -> bool:
 def _cleanup(sup):
     """Kill leftovers by PROCESS GROUP — and only when the job really is its
     own group leader. Killing `getpgid(pid)` unconditionally would take out
-    pytest itself if the setsid shim ever stopped working."""
+    pytest itself if the setsid shim ever stopped working.
+
+    ⚠ EVERY ROW, NOT ONLY THE RUNNING ONES (§4GK round 7). This skipped any
+    entry whose state was not RUNNING — which is precisely the state a REAPED
+    or CANCELLED job is in, and those tests are the ones that spawn a busy
+    loop. In the real sandbox the kill script's `/proc` ancestry scan reaches
+    the wrapper shell; on this host there is no `/proc`, so only the group
+    kill lands and a re-parented wrapper escapes. Three `sh … job-*.cmd.sh`
+    processes, each running `while :; do echo x; sleep 0.2; done`, were found
+    orphaned at ppid 1 after a night of suite runs — leaked by the tests, not
+    by the supervisor, and burning host CPU the whole time.
+    """
     for entry in sup.list_entries():
-        if entry.get("state") != sbx_jobs.STATE_RUNNING:
+        pid = entry.get("pid")
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
             continue
-        pid = int(entry["pid"])
         try:
             if os.getpgid(pid) == pid:
                 os.killpg(pid, signal.SIGKILL)
@@ -455,7 +486,10 @@ def test_a_job_finishing_mid_reap_is_landed_not_declared_lost(sup):
     answers "not finished", and by the liveness probe the process is gone."""
     jid = "job-0000cafe"
     sup.host_dir.mkdir(parents=True, exist_ok=True)
-    (sup.host_dir / f"{jid}.exit").write_text("3\n")
+    # §4GI: a sentinel is only accepted with the job's nonce — the runner
+    # script quotes it back; a bare "3" is a forgeable bare exit code
+    sup._nonces[jid] = "aabbccdd11223344"
+    (sup.host_dir / f"{jid}.exit").write_text("aabbccdd11223344 3\n")
     (sup.host_dir / f"{jid}.log").write_text("all done\n")
     dead = subprocess.Popen(["true"])
     dead.wait()                       # reaped → its pid is not alive
@@ -610,7 +644,12 @@ def test_partial_exit_sentinel_is_not_read_as_success(sup):
     assert sup._read_exit(jid) is None
     (sup.host_dir / f"{jid}.exit").write_text("not-a-number")
     assert sup._read_exit(jid) is None
+    # §4GI: a bare exit code with no nonce is the forgeable shape — rejected
     (sup.host_dir / f"{jid}.exit").write_text("0\n")
+    assert sup._read_exit(jid) is None
+    sup._nonces[jid] = "aabbccdd11223344"
+    assert sup._read_exit(jid) is None                 # still no prefix
+    (sup.host_dir / f"{jid}.exit").write_text("aabbccdd11223344 0\n")
     assert sup._read_exit(jid) == 0
 
 

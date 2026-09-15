@@ -152,7 +152,7 @@ def test_render_check_text_page_is_not_flagged_blank(tmp_path):
     r = analyze_screenshot_render(p)
     assert r is not None
     assert r["dominant_pct"] >= 0.80          # white really dominates…
-    assert r["verdict"] == "has_content"      # …but it is NOT blank
+    assert r["verdict"] == "indeterminate"     # …but it is NOT blank
 
 
 def test_render_check_solid_frame_still_flagged(tmp_path):

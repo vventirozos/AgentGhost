@@ -217,18 +217,23 @@ def test_host_networking_is_never_enforced_and_says_so(tmp_path):
     assert any(c.args and c.args[0] == "Sandbox Egress" and "host networking" in str(c.args[1]) for c in plog.call_args_list)
 
 
-def test_missing_iptables_is_an_error_not_a_silent_direct_egress(tmp_path):
+def test_missing_iptables_is_an_error_and_the_container_is_cut_off(tmp_path):
+    """§4GI: "unavailable" used to leave the sandbox with DIRECT egress and a
+    flag nothing read; now the container is disconnected from its network
+    (fail-closed by construction) and the state is "blocked"."""
     sb = _stub(tmp_path)
     seen, plog = _drive(sb, {"command -v iptables && command -v tor": (1, b"")})
     assert not any("iptables -t nat -N" in c for c in _cmds(seen))
-    assert sb._egress_state == "unavailable"
+    assert sb._egress_state == "blocked"
+    assert sb.client.networks.get.return_value.disconnect.called
     assert any(c.kwargs.get("level") == "ERROR" and "NOT enforced" in str(c.args[1]) for c in plog.call_args_list)
 
 
-def test_a_failed_rule_load_is_an_error_and_state_unavailable(tmp_path):
+def test_a_failed_rule_load_is_an_error_and_the_container_is_cut_off(tmp_path):
     sb = _stub(tmp_path)
     seen, plog = _drive(sb, {"iptables -t nat -N": (2, b"iptables: Permission denied (you must be root).")})
-    assert sb._egress_state == "unavailable"
+    assert sb._egress_state == "blocked"
+    assert sb.client.networks.get.return_value.disconnect.called
     assert any("could not be loaded" in str(c.args[1]) for c in plog.call_args_list)
 
 
@@ -252,11 +257,27 @@ def test_tor_running_as_root_is_blocked_not_trusted(tmp_path):
     assert sb._egress_state == "blocked"
 
 
-def test_a_direct_answer_is_reported_as_a_leak(tmp_path):
+def test_a_direct_answer_CUTS_THE_CONTAINER_OFF_not_just_labels_it(tmp_path):
+    """§4GK round 4. A verification that comes back `IsTor=false` is a
+    MEASURED leak: a plain request from the sandbox reached the internet with
+    the host's IP despite the rules. This branch used to answer it with
+    `_set_egress_state("blocked")` — which writes a string and touches no
+    network. `egress_is_enforced_or_blocked()` then said True,
+    `egress_gate.network_refusal()` returned None, and `execute`/`browser`
+    kept running network work through the container that had just been proven
+    to leak. The state said "blocked" while the measurement said "direct".
+
+    Fails in any tree where the leak branch labels instead of disconnecting."""
     sb = _stub(tmp_path)
     seen, plog = _drive(sb, {T.CHECK_URL: (0, b'{"IsTor":false,"IP":"9.9.9.9"}')})
     assert sb._egress_state == "blocked"
-    assert any(c.kwargs.get("level") == "ERROR" and "LEAK" in str(c.args[1]) for c in plog.call_args_list)
+    assert any("LEAK" in str(c.args[1]) for c in plog.call_args_list)
+    # THE POINT: the container was actually disconnected from its networks,
+    # not merely relabelled.
+    assert sb.client.networks.get.return_value.disconnect.called, (
+        "the leak branch did not disconnect the container — a state string "
+        "that says 'blocked' over a live network is the fail-open this "
+        "module exists to close")
 
 
 def test_an_unusable_verification_answer_is_enforced_unverified(tmp_path):

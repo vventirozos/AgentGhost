@@ -115,13 +115,52 @@ def _words(text: str) -> set:
     return {w.lower() for w in _WORD_RE.findall(text) if len(w) > 2}
 
 
+#: Sentence boundary, good enough for "does this paragraph END on a beat?".
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+#: ⚠ "Let me know if you want the tests too." is NOT a beat — it is an offer
+#: addressed to the user, and it is the single most common way a reply ends.
+#: The trailing-beat rule below would otherwise treat it as narration.
+_OFFER_RE = re.compile(r"^let\s+(?:me|us)\s+know\b", re.IGNORECASE)
+
+
+def _trailing_beat(block: str) -> bool:
+    """Does this paragraph END on an agent-voice beat?
+
+    §4GO (2026-09-14). Pass 1 anchored the connective at the START of the
+    paragraph, and real beats rarely start there: the model reports what it
+    just saw and THEN announces the next move —
+
+        "The screenshot captured the embed widget but not the notification
+         image clearly. Let me navigate to the embed view …"
+        "The screenshot was captured. Now I'll READ THE IMAGE ITSELF …"
+
+    Four such paragraphs opened a delivered reply (req 7b2da5be) and the
+    smoother kept every one, because each opens with an observation. Shape 3
+    had already learned this lesson for announcements ("Pass 1 missed it
+    because the paragraph does not OPEN with a connective"); this is the
+    same lesson for beats.
+    """
+    sents = [x for x in _SENTENCE_SPLIT_RE.split(block.strip()) if x.strip()]
+    if len(sents) < 2:
+        return False                      # one sentence: that is shape 1
+    last = sents[-1].lstrip()
+    if _OFFER_RE.match(last):
+        return False
+    m = _TEMPORAL_LEAD_RE.match(last)
+    if m:
+        last = last[m.end():].lstrip()
+    return bool(_BEAT_RE.match(last))
+
+
 def _is_narration(block: str, later_blocks: List[str] = ()) -> bool:
     """Is this paragraph a working-narration beat?
 
     `later_blocks` are the paragraphs that follow it; a TEMPORAL lead is a
-    beat only when one of them restates it (§4FV). Called with no later
-    blocks the temporal half is inert — an ambiguous opener is content
-    until the reply proves otherwise.
+    beat only when one of them restates it (§4FV), and so is a beat that
+    does not open the paragraph (§4GO). Called with no later blocks both of
+    those halves are inert — an ambiguous paragraph is content until the
+    reply proves otherwise.
     """
     stripped = block.strip()
     if not stripped or _has_fence(stripped):
@@ -132,14 +171,21 @@ def _is_narration(block: str, later_blocks: List[str] = ()) -> bool:
         return False
     if _BEAT_RE.match(stripped):
         return True
-    m = _TEMPORAL_LEAD_RE.match(stripped)
-    if not m:
-        return False
-    # "Now let me …" / "Then I'll …": the lead is decoration on a beat.
-    if _BEAT_RE.match(stripped[m.end():].lstrip()):
-        return True
     later_prose = [b for b in later_blocks if not _has_fence(b)]
-    return bool(later_prose) and _restated_later(stripped, later_prose)
+    m = _TEMPORAL_LEAD_RE.match(stripped)
+    if m:
+        # "Now let me …" / "Then I'll …": the lead is decoration on a beat.
+        if _BEAT_RE.match(stripped[m.end():].lstrip()):
+            return True
+        return bool(later_prose) and _restated_later(stripped, later_prose)
+    # §4GO: the beat that arrives AFTER the observation it follows. Same
+    # evidence shape the temporal half and shape 3 require — a beat that is
+    # stale is a beat the reply repeats, and a paragraph the reply does not
+    # repeat is content, whatever it opens with.
+    if _trailing_beat(stripped):
+        return bool(later_prose) and _restated_anywhere_later(stripped,
+                                                              later_prose)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +262,34 @@ def _stem(word: str) -> str:
 def _content_stems(text: str) -> set:
     return {_stem(w) for w in _WORD_RE.findall(text)
             if len(w) >= 3 and w.lower() not in _STOPWORDS}
+
+
+def _restated_anywhere_later(block: str, later_prose: List[str]) -> bool:
+    """Is at least half of this paragraph's content covered by the REST of
+    the reply, taken together?
+
+    §4GO. `_restated_later` asks one later paragraph to carry the whole
+    restatement, which is right for a summary group (a summary is restated
+    by a summary) and wrong for a work beat: the beat announces one step,
+    and the answer reports its result spread across several paragraphs.
+    Measured on req 7b2da5be, the four narration paragraphs scored 0.55 /
+    0.44 / 0.36 / 0.26 against the best SINGLE paragraph and 0.82 / 0.69 /
+    0.64 / 0.37 against the union — the rule was inert on three of four
+    beats that the reply demonstrably does repeat.
+
+    Used ONLY by the trailing-beat shape, whose last sentence is
+    first-person agent voice and therefore never an instruction to the
+    user — the case the per-paragraph threshold was tightened to protect.
+    """
+    mine = _content_stems(block)
+    if len(mine) < _RESTATED_MIN_STEMS:
+        return False
+    union = set()
+    for para in later_prose:
+        union |= _content_stems(para)
+    if not union:
+        return False
+    return len(mine & union) / len(mine) >= _RESTATED_FRACTION
 
 
 def _restated_later(block: str, later_prose: List[str]) -> bool:
@@ -336,6 +410,82 @@ _CORRECTION_BANNER_RE = re.compile(
 )
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Risk-governor checkpoint answers (2026-09-15)
+#
+# When the governor fires it injects a numbered checkpoint: state what is
+# CONFIRMED vs ASSUMED, name the SINGLE smallest check, or STOP and
+# report. The model answers it in ordinary prose, and because the answer
+# is emitted on an iteration that then calls more tools, it lands in the
+# accumulated reply. Live (req 4b518a82) five such answers stacked up and
+# shipped as the opening third of a forensic report — which then said all
+# of it again in its own sections.
+#
+# This is deliberately NOT a prose heuristic standing alone. The caller
+# only offers segments that are provably not the final answer (the
+# iteration went on to call tools), and only while a steer is active; the
+# match below is the third condition, not the only one. That ordering is
+# what keeps a legitimate "**Confirmed:** … **Not confirmed:** …" section
+# in a DELIVERABLE safe: it is written on the last iteration, so it is
+# never a candidate.
+_CHECKPOINT_MARKERS = (
+    re.compile(r"\bconfirmed\b", re.IGNORECASE),
+    re.compile(r"\bassum(?:ed|e|ption)\b", re.IGNORECASE),
+    re.compile(r"\b(?:single|smallest|most valuable)\b[^.\n]{0,40}\bcheck\b",
+               re.IGNORECASE),
+    # Directive 3 splits in two: the model declares it has STOPPED, then
+    # declares it is REPORTING anyway. The live stop-declaration carried
+    # one of each and nothing else, so folding them into a single marker
+    # left it at one hit and unrecognised.
+    re.compile(r"\bno new (?:information|info)\b|\benough rounds\b|"
+               r"\bstopped producing\b", re.IGNORECASE),
+    re.compile(r"\breporting the (?:honest )?partial\b|"
+               r"\bhonest partial answer\b|\bwhat is blocked\b", re.IGNORECASE),
+)
+
+# Two distinct directives must be answered before a segment is treated as
+# a checkpoint answer. One alone ("confirmed") is ordinary English.
+_CHECKPOINT_MIN_MARKERS = 2
+
+
+def is_governor_checkpoint_answer(text: str) -> bool:
+    """True when a segment reads as an answer to the risk-governor
+    checkpoint (≥2 of its directives addressed).
+
+    Shape test only — the caller supplies the structural evidence that
+    the segment is interim. See ``core/risk.STEER_DIRECTIVE_TERMS``.
+    """
+    if not text or not text.strip():
+        return False
+    hits = sum(1 for pat in _CHECKPOINT_MARKERS if pat.search(text))
+    return hits >= _CHECKPOINT_MIN_MARKERS
+
+
+def drop_checkpoint_segments(text: str, segments) -> str:
+    """Remove recorded checkpoint answers from an assembled reply.
+
+    Exact-substring removal of segments the turn loop recorded, so
+    nothing is matched by resemblance. Fail-open in both directions: a
+    segment that is no longer present (a later stage rewrote it) is
+    skipped, and if removal would leave nothing the original is returned.
+    """
+    if not text or not segments:
+        return text
+    out = text
+    for seg in segments:
+        # No "is it present?" pre-check: `str.replace` already no-ops on
+        # an absent segment, and an explicit guard for it was an
+        # unfalsifiable branch (no mutant of it could change behaviour —
+        # found by the §R2 battery, removed rather than left standing).
+        # The empty string is handled by the shape test, which rejects it.
+        seg = (seg or "").strip()
+        if not is_governor_checkpoint_answer(seg):
+            continue
+        out = out.replace(seg, "", 1)
+    out = re.sub(r"\n{3,}", "\n\n", out).strip()
+    return out if out else text
+
+
 def strip_system_notes(text: str) -> str:
     """Return *text* without finalize-appended system notes (trailing
     Unverified / Plan check / risk-summary blocks, leading correction
@@ -439,6 +589,18 @@ def strip_unparsed_tool_calls(text: str) -> str:
     return (out + "\n\n" + UNPARSED_TOOL_CALL_NOTE) if out else UNPARSED_TOOL_CALL_NOTE
 
 
+def _is_answer_block(block: str) -> bool:
+    """Does this paragraph carry an ANSWER — something that is neither a
+    work beat nor a note this module itself appended? Used to decide
+    whether a run of beats has anything after it (§4GO)."""
+    s = (block or "").strip()
+    if not s or s == UNPARSED_TOOL_CALL_NOTE.strip():
+        return False
+    if _has_fence(s):
+        return True
+    return not (_BEAT_RE.match(s) or _trailing_beat(s))
+
+
 def smooth_reply(text: str) -> str:
     """Remove working narration and superseded summary groups from an
     accumulated multi-turn reply. See module docstring for the rules."""
@@ -455,6 +617,39 @@ def smooth_reply(text: str) -> str:
     for i in range(len(blocks) - 1):
         if (_is_narration(blocks[i], blocks[i + 1:])
                 or _is_stale_announcement(blocks[i], blocks[i + 1:])):
+            drop[i] = True
+
+    # Pass 1b — a RUN of work beats (§4GO). A trailing-beat paragraph that
+    # fails its own restatement test is kept on its own: one observation
+    # plus "Let me fix that" may be the only place a finding appears. But
+    # sitting NEXT TO another beat it is part of a working log, and a
+    # working log is not an answer — the reply moved on from it by writing
+    # the next beat. Measured on req 7b2da5be: four consecutive beats
+    # opened the delivered reply and the fourth ("The extract_text on
+    # single=1 gave the same capped preview. Let me take a full-page
+    # screenshot …") scored 0.37 against the rest of the reply, because it
+    # was restated in different words ("I captured it via the embed widget
+    # and ran vision OCR on the image directly"). Synonymy is exactly what
+    # a stem test cannot see; adjacency is structural and needs no lexicon.
+    # Never the final block, and never a LONE beat.
+    # ⚠ AND ONLY WHEN AN ANSWER FOLLOWS THE RUN. A working log is noise
+    # because the answer comes after it; with nothing but notes behind it,
+    # the log IS the reply and dropping a member deletes the only substance
+    # the user gets. Measured: the 5e9b9320 leak ("The initial diff
+    # conflated tables and indexes. Let me refine the analysis…") is a beat
+    # paragraph carrying the one finding that reply ever delivered, and the
+    # first version of this rule ate it because the beat above it was
+    # dropped.
+    for i in range(len(blocks) - 1):
+        if drop[i] or not _trailing_beat(blocks[i]):
+            continue
+        if len(blocks[i].strip()) > _MAX_NARRATION_CHARS:
+            continue
+        adjacent = (i and drop[i - 1]) or (i + 1 < len(blocks) - 1 and drop[i + 1])
+        if not adjacent:
+            continue
+        if any(_is_answer_block(blocks[j])
+               for j in range(i + 1, len(blocks)) if not drop[j]):
             drop[i] = True
 
     # Pass 2 — superseded summary groups. Compare each earlier group's
@@ -511,17 +706,114 @@ def smooth_reply(text: str) -> str:
 SMOOTHING_MIN_TOOLS = 2
 
 
+# ---------------------------------------------------------------------------
+# Narration-only replies (§4GH, 2026-09-13 — request e57ad0cf)
+# ---------------------------------------------------------------------------
+# The smoother removes beats that a LATER paragraph supersedes, and returns
+# the original when removing them would empty the reply. A reply that is
+# NOTHING BUT beats therefore ships untouched: request e57ad0cf's forced
+# final turn emitted only (dropped) tool calls, and the user received five
+# stacked "I have good coverage. Let me now dig into…" paragraphs after 339 s.
+# `narration_only` names that shape so the loop can retry the final and the
+# verifier can refute it mechanically. Deliberately NARROW — a paragraph
+# counts only when it holds a forward-looking agent-voice beat ("Let me
+# read…", "I'll fetch…"), every other sentence in it is short assessment glue
+# ("I have good coverage."), and nothing in it carries content (a URL, a
+# number, a quote, a list, code, emphasis). "Let me know if…" is addressed to
+# the user and is not a beat. Measured on the live corpus (2026-09-13, 1,878
+# user turns): 0 of 115 human-approved and 0 of 601 verifier-passed replies
+# match; the matches are e57ad0cf itself and eight one-line beats.
+_NARRATION_BEAT_SENT_RE = re.compile(
+    r"^\s*(?:(?:now|next|then|first|ok(?:ay)?|good|great|perfect|alright)[,\s]+)*"
+    r"(?:let me(?!\s+know)|let'?s(?!\s+say)|i'?ll|i will|i need to|i'?m going to|"
+    r"i am going to|time to|i should|i want to)\b",
+    re.IGNORECASE)
+#: A beat announces WORK: the opener must be followed, in the same sentence,
+#: by a work verb. "Let me be clear: that claim is false.", "I'll be direct:
+#: the file does not exist.", "I will not do that.", "Let's go with option B."
+#: open like beats and are answers (R3 review of §4GH) — none names work.
+_NARRATION_WORK_RE = re.compile(
+    r"\b(?:search|dig|read|fetch|re-?fetch|check|double-check|look|look up|take a look|"
+    r"run|re-?run|try|start|begin|kick off|proceed|continue|investigate|extract|"
+    r"navigate|open|load|gather|collect|pull|retrieve|verify|confirm|examine|explore|"
+    r"scan|query|grab|review|analy[sz]e|summari[sz]e|nail down|figure out|work out|"
+    r"sort out|go through|go ahead|write|rewrite|draft|compose|build|fix|apply|"
+    r"implement|create|generate|render|update|edit|refactor|test|install|set up|"
+    r"deploy|restart|launch|close|finish|complete|wrap up|mark|save|store|delete|"
+    r"remove|add|move|copy|upload|download|send|post|call|compute|calculate|count|"
+    r"list|find|locate|identify|compare|handle|process|parse|inspect|trace|debug|"
+    r"resolve|clean|prepare|assemble|compile|make sure|ensure|parallel)\b",
+    re.IGNORECASE)
+#: A sentence that asks the user something, addresses them, or asks for
+#: something ("I'm going to need the password…") is an answer.
+_NARRATION_ADDRESSED_RE = re.compile(
+    r"\?|\byou\b|\byour\b|\bneed (?:the|a|an|more|some)\b", re.IGNORECASE)
+
+
+def _is_work_beat(sentence: str) -> bool:
+    return (bool(_NARRATION_BEAT_SENT_RE.match(sentence))
+            and bool(_NARRATION_WORK_RE.search(sentence))
+            and not _NARRATION_ADDRESSED_RE.search(sentence))
+_NARRATION_CONTENT_RE = re.compile(
+    r"https?://|\d{2,}|`|^\s*[-*•]|^\s*\d+[.)]\s|\*\*|[\"“”]|\||!\[|\]\(",
+    re.MULTILINE)
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+#: A non-beat sentence in a beat paragraph must be this short to count as
+#: assessment glue rather than an answer.
+_NARRATION_GLUE_MAX_CHARS = 140
+
+
+def narration_only(text: str) -> bool:
+    """True when EVERY paragraph of ``text`` is a working-narration beat and
+    none carries content — the reply announces work and reports nothing."""
+    blocks = [b.strip() for b in _split_blocks(text or "") if b.strip()]
+    if not blocks:
+        return False
+    for b in blocks:
+        if len(b) > _MAX_NARRATION_CHARS or _NARRATION_CONTENT_RE.search(b):
+            return False
+        sents = [s for s in _SENT_SPLIT_RE.split(b) if s.strip()]
+        if not any(_is_work_beat(s) for s in sents):
+            return False
+        if any(len(s) > _NARRATION_GLUE_MAX_CHARS or _NARRATION_ADDRESSED_RE.search(s)
+               for s in sents if not _is_work_beat(s)):
+            return False
+    return True
+
+
+def forced_final_has_no_answer(this_turn_text: str, accumulated: str) -> bool:
+    """The forced-final decision: would the reply that ships now — the
+    accumulated narration plus this turn's own text, system notes aside —
+    contain no answer at all (empty, or narration only)?"""
+    parts = [p for p in ((accumulated or "").strip(), (this_turn_text or "").strip()) if p]
+    body = strip_system_notes("\n\n".join(parts)).strip()
+    return not body or narration_only(body)
+
+
 def is_narration_only_trim(smoothed: str, original: str) -> bool:
-    """True when smoothing reduced a reply to a short working-narration
-    line — the inverted-trim failure (2026-07-25 live): the smoother kept
-    "Let me search more specifically…" and dropped the findings. Lives here
-    (not in agent.py, where it was written) so both delivery paths and
-    `treat_reply` share one definition."""
+    """True when smoothing reduced a reply to working narration — the
+    inverted-trim failure (2026-07-25 live): the smoother kept "Let me
+    search more specifically…" and dropped the findings. Lives here (not in
+    agent.py, where it was written) so both delivery paths and
+    `treat_reply` share one definition.
+
+    ⚠ WIDENED (§4GO). The original test was "short (<90 chars) and opens
+    with a connective" — a proxy for "what survived is a beat", from a time
+    when only paragraph-INITIAL beats were dropped. Pass 1b trims deeper, so
+    a trim can now leave a LONGER beat standing (measured: the e57ad0cf
+    reply, every paragraph of it narration, smooths to one 131-char beat).
+    `narration_only` measures the thing the length bound was proxying for,
+    and it is the same predicate the forced-final guard uses, so the two
+    cannot drift apart. The short-and-connective branch is kept as-is: it
+    fires on fragments `narration_only` does not classify.
+    """
     s = (smoothed or "").strip()
-    return (s != (original or "").strip()
-            and len(s) < 90
-            and bool(re.match(
-                r"(Let me|Now |Next,? |I'll |I will |First,? |Then )", s)))
+    if s == (original or "").strip():
+        return False
+    if len(s) < 90 and bool(re.match(
+            r"(Let me|Now |Next,? |I'll |I will |First,? |Then )", s)):
+        return True
+    return narration_only(s)
 
 
 def treat_reply(text: str, *, n_real_tools: int) -> str:

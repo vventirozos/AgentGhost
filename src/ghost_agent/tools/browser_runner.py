@@ -716,6 +716,19 @@ async def op_screenshot(op):
         final_url = page.url
         _write_last_url(op["profile_dir"], final_url)
         result = {"path": out_path, "url": final_url, "used_last_url": used_fallback}
+        # How much TEXT was on the page at capture time. The pixel-side
+        # render check cannot tell a rendered page from page chrome on a
+        # gradient (measured: a Telegram share overlay and a correctly
+        # rendered desktop UI sit on opposite sides of every pixel
+        # statistic), so carry the one cheap number that separates them
+        # for a text page: an almost-empty DOM means nothing had loaded.
+        # Reported as a NUMBER, never as a verdict — a canvas game or a
+        # chart legitimately renders with no text at all.
+        try:
+            _, _, _dom_len = await _body_excerpt(page, 1)
+            result["dom_text_chars"] = int(_dom_len)
+        except Exception:
+            pass
         # Reflect the state AT capture time: if a start/play control is still
         # visible the screenshot shows the menu, not the running app (and
         # click_center, if used, failed to dismiss it).

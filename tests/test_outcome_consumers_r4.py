@@ -111,7 +111,10 @@ class TestTheLoopDoesNotDeclareOnTheProducersBehalf:
                 (ToolOutcome.rejected("SYSTEM BLOCK: x"), True),
                 (ToolOutcome.ok("declared success"), True)):
             built = eval(code, {"ToolOutcome": ToolOutcome},
-                         {"_outcome": src_outcome, "safe_res": str(src_outcome)})
+                         {"_outcome": src_outcome, "safe_res": str(src_outcome),
+                          # the recorded call arguments (2026-09-13) — not
+                          # what this pin is about
+                          "_recorded_args": {}})
             assert built.status is src_outcome.status
             assert built.declared is want, (
                 f"the loop relayed a {'declared' if want else 'DERIVED'} "
@@ -279,8 +282,8 @@ class TestTheBannerTheModelActuallyReads:
         last thing the model reads before deciding to retry or pivot."""
         from ghost_agent.core.agent import GhostAgent
 
-        src = inspect.getsource(GhostAgent._dispatch_and_process_tool_batch)
-        tree = ast.parse(src.lstrip())
+        tree = ast.parse(inspect.getsource(
+            GhostAgent._dispatch_and_process_tool_batch).lstrip())
         from ghost_agent.tools.outcome import ToolOutcome
 
         gate = _loop_expr("_failure_shaped")
@@ -306,8 +309,15 @@ class TestTheBannerTheModelActuallyReads:
                     fname="execute")
         # a plain success does not
         assert not gate(ToolOutcome.coerce("SUCCESS: wrote 10 chars"))
-        # and the hint scan must share it, not keep a second copy
-        assert src.count("_failure_shaped") >= 3
+        # and the hint scan must share it, not keep a second copy — counted
+        # off the AST (§4GJ: `src.count(...)` counted the comments that
+        # explain the gate as if they were uses of it)
+        uses = [n for n in ast.walk(tree)
+                if isinstance(n, ast.Name) and n.id == "_failure_shaped"]
+        assert len(uses) >= 3, (
+            f"`_failure_shaped` has {len(uses)} references in the dispatch "
+            "loop — a second copy of the failure vocabulary is how seven "
+            "consumers of one call came to disagree")
 
 
 class TestTheUnsweptConsumers:

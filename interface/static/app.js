@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=12.2';
+import * as matrixGraphFace from './matrix_graph.js?v=12.5';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -3454,7 +3454,19 @@ if (workspaceSaveBtn) {
             a.remove();
             window.URL.revokeObjectURL(url);
             
-            addMessage('system', 'Workspace saved successfully.');
+            // An INCOMPLETE archive must not read as a clean save (§4GK
+            // round 5). The agent sets X-Ghost-Archive-Omitted: N when N
+            // files could not be read and are therefore NOT in the zip;
+            // this branch used to say "saved successfully" for any
+            // response.ok, so the only surviving evidence was omitted.json
+            // inside an archive nobody had a reason to open — until the
+            // restore wiped the sandbox and wrote back the readable subset.
+            const omittedCount = parseInt(response.headers.get('X-Ghost-Archive-Omitted'), 10);
+            if (omittedCount > 0) {
+                addMessage('system', `Workspace saved, but ${omittedCount} file(s) could NOT be read and are MISSING from the archive — see omitted.json inside the zip before restoring from it.`);
+            } else {
+                addMessage('system', 'Workspace saved successfully.');
+            }
         } catch (err) {
             addMessage('system', `Save Workspace Error: ${err.message}`);
             activeFace.triggerSpike();
@@ -3513,7 +3525,30 @@ if (workspaceUploadInput) {
                     new CustomEvent('conversation-cleared'));
             } catch (err) { /* workspace modules not loaded */ }
 
-            addMessage('system', 'Workspace loaded successfully.');
+            // §4GK round 6: a restore can be INCOMPLETE and still be a 200.
+            // `not_cleared` names what the wipe could not remove (a directory
+            // the archive froze read-only, whose stale contents are now mixed
+            // into the "restored" workspace) and `unrestored` names members
+            // that could not be written. Reporting a clean load over either is
+            // the same defect the save side fixed for `omitted`.
+            const _nc = Array.isArray(result.not_cleared) ? result.not_cleared : [];
+            const _ur = Array.isArray(result.unrestored) ? result.unrestored : [];
+            if (_nc.length || _ur.length) {
+                const _bits = [];
+                if (_ur.length) _bits.push(`${_ur.length} file(s) could NOT be written`);
+                if (_nc.length) _bits.push(`${_nc.length} path(s) survived the wipe and may hold stale content`);
+                // §4GK round 7: `unrestored` entries are OBJECTS ({path, reason}),
+                // so joining them rendered "[object Object]" — the operator was
+                // told the restore was incomplete and shown nothing usable.
+                const _name = (x) => (x && typeof x === 'object')
+                    ? (x.path ?? JSON.stringify(x)) : String(x);
+                const _names = [..._ur, ..._nc].map(_name).slice(0, 3).join(', ');
+                addMessage('system',
+                    `Workspace loaded, but it is INCOMPLETE — ${_bits.join('; ')}. `
+                    + `First few: ${_names}.`);
+            } else {
+                addMessage('system', 'Workspace loaded successfully.');
+            }
             updateWorkspaceBtnState();
 
         } catch (error) {

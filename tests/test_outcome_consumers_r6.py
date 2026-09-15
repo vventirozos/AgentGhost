@@ -142,8 +142,14 @@ class TestTheProducersDeclareTHEIRactualOutcome:
         import ghost_agent.tools.delegate as D
         from ghost_agent.tools.outcome import ToolOutcome
 
-        src = inspect.getsource(D.tool_jobs)
-        assert "ToolOutcome.ok" in src and "ToolOutcome.failed" in src
+        # §4GJ: two `needle in src` greps -> the AST. The property is that
+        # `tool_jobs` really constructs BOTH verdicts; a comment naming
+        # either satisfied the greps.
+        built = {ast.unparse(n.func) for n in ast.walk(
+            ast.parse(inspect.getsource(D.tool_jobs).lstrip()))
+            if isinstance(n, ast.Call)}
+        assert any(u.endswith("ToolOutcome.ok") for u in built), built
+        assert any(u.endswith("ToolOutcome.failed") for u in built), built
         assert ToolOutcome.ok(
             "--- job-1 [FAILED] ---\nexited 1\nEXIT CODE: 1"
         ).exit_code_failed is False
@@ -191,13 +197,23 @@ class TestTheMeasuringInstruments:
         `mean_tool_errors` in the FROZEN regression baseline."""
         import ghost_agent.eval.behavioral as B
 
-        src = inspect.getsource(B)
-        assert '"ERROR" in str(t.get("result"' not in src, (
-            "the private whole-body substring is back")
-        assert "_action_failed" in src, (
+        # §4GJ: three source greps -> the AST. Asked as questions about
+        # real nodes: no private substring test survives, the shared
+        # predicate is CALLED, and it is passed the tool name.
+        tree = ast.parse(inspect.getsource(B))
+        privates = [ast.unparse(n) for n in ast.walk(tree)
+                    if isinstance(n, ast.Compare)
+                    and any(isinstance(o, ast.In) for o in n.ops)
+                    and "ERROR" in ast.unparse(n.left)
+                    and "result" in ast.unparse(n.comparators[0])]
+        assert not privates, (
+            f"the private whole-body substring is back: {privates}")
+        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                 and getattr(n.func, "id", "") == "_action_failed"]
+        assert calls, (
             "the eval instrument keeps its own predicate instead of the "
             "shared question")
-        assert 't.get("name")' in src, (
+        assert any("name" in ast.unparse(a) for c in calls for a in c.args), (
             "the tool name is in scope and not passed, so `execute` is "
             "judged by the generic sniffer")
 
@@ -276,11 +292,22 @@ class TestTheReplyAndTheBanner:
         branch and emitted nothing."""
         import ghost_agent.core.agent as A
 
-        src = inspect.getsource(A.GhostAgent._dispatch_and_process_tool_batch)
-        i = src.index("first_err_line = next(")
-        assert "if not first_err_line:" in src[i:i + 900], (
-            "a failure-shaped result with no Error-headed line still emits "
-            "no banner at all")
+        # §4GJ: was a 900-char window after the first `first_err_line =`.
+        # The AST asks the real question: the name is assigned, and there is
+        # a fallback branch that tests it for emptiness.
+        tree = ast.parse(inspect.getsource(
+            A.GhostAgent._dispatch_and_process_tool_batch).lstrip())
+        assigned = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                    and any(getattr(t, "id", None) == "first_err_line"
+                            for t in n.targets)]
+        assert len(assigned) >= 2, (
+            "the empty-banner fallback is gone — a failure-shaped result "
+            "with no Error-headed line emits no banner at all")
+        guards = [ast.unparse(n.test) for n in ast.walk(tree)
+                  if isinstance(n, ast.If)]
+        assert any(g.replace(" ", "") == "notfirst_err_line" for g in guards), (
+            "nothing tests `first_err_line` for emptiness, so the fallback "
+            "line is unreachable")
 
     def test_an_in_flight_call_is_not_listed_as_SUCCEEDED(self):
         """`op_outcomes` had no third state, so a detached job was reported

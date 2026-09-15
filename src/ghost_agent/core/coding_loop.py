@@ -148,30 +148,124 @@ def _workspace_dir(context, project_id: Optional[str] = None) -> Optional[Path]:
 _SNAPSHOT_SKIP_DIRS = {".git", "__pycache__", "node_modules", ".pytest_cache", ".venv"}
 
 
+#: Stamped on a snapshot the walk could not complete. `diff_snapshots` reads
+#: it and refuses to answer "nothing changed" from a reading it did not get
+#: (§4GK round 5) — an empty dict and an unreadable tree are not the same
+#: state, and the leaf loop DISCARDS an attempt that "changed nothing".
+_SNAPSHOT_INCOMPLETE = "__ghost_snapshot_incomplete__"
+
+
 def snapshot_workspace(root: Optional[Path]) -> Dict[str, str]:
-    """{relative path: sha1 of content} for every regular file under root."""
+    """{relative path: sha1 of content} for every regular file under root.
+
+    A walk that could not complete returns what it has PLUS the
+    `_SNAPSHOT_INCOMPLETE` marker, never a silently short dict.
+    """
     out: Dict[str, str] = {}
     if root is None or not root.exists():
         return out
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in _SNAPSHOT_SKIP_DIRS and not d.startswith(".")]
-        for fn in filenames:
-            if fn.startswith("."):
+    # §4GJ round 3: the workspace is model-writable, so a planted link made
+    # this hash a HOST file and let it decide whether the leaf "changed the
+    # workspace". `walk_nofollow` lists regular files only and hands back an
+    # fd so the read is atomic with the listing.
+    from ..tools.file_system import read_bytes_nofollow_fd, walk_nofollow
+    # ⚠ LAZY, NOT MATERIALISED. `walk_nofollow` closes each `dir_fd` when the
+    # generator advances, so collecting the tuples first hands the body a set
+    # of already-closed descriptors. The guard therefore wraps the LOOP.
+    # `_require_dir_fd` fails CLOSED with a ValueError on a platform without
+    # dir_fd support, and a ValueError is not an OSError — so it propagated
+    # out of a snapshot the leaf loop treats as best-effort, and the
+    # comparison that decides whether an attempt changed the workspace took
+    # the loop down instead of degrading (§4GK round 4).
+    try:
+        for dirpath, filenames, dir_fd in walk_nofollow(root):
+            if any(part in _SNAPSHOT_SKIP_DIRS or part.startswith(".")
+                   for part in Path(dirpath).relative_to(root).parts):
                 continue
-            p = Path(dirpath) / fn
-            try:
-                if p.stat().st_size > 5_000_000:
+            for fn in filenames:
+                if fn.startswith("."):
                     continue
-                h = hashlib.sha1(p.read_bytes()).hexdigest()[:16]
-            except OSError:
-                continue
-            out[str(p.relative_to(root)).replace(os.sep, "/")] = h
+                p = Path(dirpath) / fn
+                try:
+                    data = read_bytes_nofollow_fd(fn, dir_fd=dir_fd, max_bytes=5_000_001)
+                except (OSError, ValueError) as _fexc:
+                    # ⚠ A PER-FILE FAILURE IS ALSO AN INCOMPLETE READING
+                    # (§4GQ round 8). Round 5 gave the WALK an explicit
+                    # marker so a tree we could not read stops reading as
+                    # "nothing changed"; this branch dropped the file
+                    # silently, so exactly the same unknown — one file
+                    # instead of the tree — came back indistinguishable from
+                    # "that file is unchanged". A leaf that writes a file the
+                    # snapshot cannot read is then ungated and unregistered.
+                    out[_SNAPSHOT_INCOMPLETE] = (
+                        f"{type(_fexc).__name__} reading {fn!r}: {_fexc}")
+                    continue
+                if len(data) > 5_000_000:
+                    continue
+                h = hashlib.sha1(data).hexdigest()[:16]
+                out[str(p.relative_to(root)).replace(os.sep, "/")] = h
+    except (OSError, ValueError) as exc:
+        # An empty or short snapshot is INDISTINGUISHABLE from "the workspace
+        # has no files", and the leaf loop turns that into "the attempt
+        # changed nothing" and throws the work away. Say so instead.
+        out[_SNAPSHOT_INCOMPLETE] = f"{type(exc).__name__}: {exc}"
+        pretty_log("Leaf Loop",
+                   f"workspace snapshot INCOMPLETE ({type(exc).__name__}: {exc}) "
+                   "— this attempt's file-change check cannot be trusted and "
+                   "will not be read as 'changed nothing'",
+                   level="WARNING", icon=Icons.WARN)
+        # ⚠ THE GUARD MUST NAME THE SHAPE, NOT THE SCENARIO (§4GK round 5).
+        # Round 4 added `except ValueError` for `_require_dir_fd`, and in the
+        # SAME round taught `walk_nofollow` to RAISE OSError on descriptor
+        # exhaustion — which this guard does not cover. Measured: a 300-wide
+        # workspace under the daemon's 256-fd limit raised
+        # `OSError [Errno 24] Too many open files` straight out of a function
+        # the leaf loop documents as best-effort, past both call sites (which
+        # sit outside the attempt's own try), taking the loop down. The walk
+        # opens every sibling subdirectory before entering the first, so peak
+        # descriptors is tree WIDTH, not depth — one `node_modules` clears it.
+        return out
     return out
 
 
+def snapshot_incomplete(*snaps: Dict[str, str]) -> bool:
+    """True when any of these snapshots is one the walk could not finish.
+
+    The caller that must not read "no files changed" as "the attempt changed
+    nothing" asks this; `diff_snapshots` returns paths and only paths
+    (§4GK round 6).
+    """
+    return any(_SNAPSHOT_INCOMPLETE in (s or {}) for s in snaps)
+
+
 def diff_snapshots(before: Dict[str, str], after: Dict[str, str]) -> List[str]:
-    """Paths created or changed (deleted paths are not 'written')."""
-    return sorted(p for p, h in after.items() if before.get(p) != h)
+    """Paths created or changed (deleted paths are not 'written').
+
+    When either snapshot is marked incomplete the answer is UNKNOWN, and the
+    honest rendering of unknown here is "something may have been written" —
+    the caller's only use of an empty result is to DISCARD the attempt
+    (§4GK round 5).
+    """
+    if _SNAPSHOT_INCOMPLETE in before or _SNAPSHOT_INCOMPLETE in after:
+        # ⚠ A SENTINEL MUST NOT TRAVEL IN A LIST OF PATHS (§4GK round 6).
+        # Round 5 returned `[_SNAPSHOT_INCOMPLETE]` here to stop an unreadable
+        # tree reading as "nothing was written". It does stop that — by
+        # feeding a non-path into a list every consumer treats as workspace
+        # paths: the §4FH "changed nothing" gate saw a truthy list and PASSED,
+        # `smoke_gate` filtered it away, `read_text` on it raised into a
+        # swallowed handler so the constraint gate ran on an EMPTY file set,
+        # and on success `register_file_artifact` recorded
+        # `__ghost_snapshot_incomplete__` as a durable deliverable — a phantom
+        # that blocks the release rehearsal forever. That is the
+        # claim-vs-fact-deliverables class, re-created.
+        #
+        # `snapshot_incomplete()` is the question; this returns only real
+        # paths. A caller that must distinguish "nothing changed" from "we
+        # could not look" asks, and the leaf loop does.
+        return sorted(p for p, h in after.items()
+                      if p != _SNAPSHOT_INCOMPLETE and before.get(p) != h)
+    return sorted(p for p, h in after.items()
+                  if p != _SNAPSHOT_INCOMPLETE and before.get(p) != h)
 
 
 def parse_leaf_reply(text: str) -> Tuple[str, str]:
@@ -370,8 +464,41 @@ async def build_coding_task_agentic(context, description: str, *, tool_runner: T
             detail_parts.append(witness)
             continue
         after = snapshot_workspace(ws)
+        # ⚠ RETRY THE READING BEFORE RETRYING THE WORK (§4GQ round 8). The
+        # failure here is in the SNAPSHOT, not in the attempt: a descriptor
+        # squeeze or a file that moved under the walk is transient, and one
+        # re-read costs nothing next to re-running a leaf turn. Only if it is
+        # still incomplete does the unknown reach the branches below.
+        if snapshot_incomplete(after):
+            after = snapshot_workspace(ws)
         written = diff_snapshots(before, after)
+        # "we could not look" is not "it changed nothing": the §4FH gate below
+        # DISCARDS an attempt that wrote no files, and discarding good work on
+        # a failed reading is the worse error (§4GK round 6).
+        _cannot_tell = snapshot_incomplete(before, after)
         verify, summary = parse_leaf_reply(reply)
+        if not written and _cannot_tell:
+            # ⚠ "UNKNOWN" IS NOT "PASSED" (§4GK round 7). Round 6 added this
+            # branch so a failed READING could not be mistaken for "the attempt
+            # changed nothing" and discard good work. But falling through with
+            # `written == []` skips `_run_verify`, `smoke_gate` AND the
+            # constraint gate (which is guarded on `written`), so the attempt
+            # was returned as a SUCCESS with no files and no gates — and
+            # `_finalize_coding` then marked the task DONE with no artifacts.
+            # That is the task-reaching-DONE-on-evidence-that-no-work-happened
+            # class, and it is worse than the discard it replaced. An unknown
+            # reading is a RETRY, not a pass: the next attempt re-snapshots,
+            # and the loop's existing exhaustion path reports honestly if it
+            # never clears.
+            witness = ("the workspace snapshot could not be completed, so "
+                       "whether this attempt wrote anything is UNKNOWN")
+            detail_parts.append(witness)
+            pretty_log("Leaf Loop",
+                       witness + " — retrying rather than accepting an "
+                       "ungated result or discarding the work as 'changed "
+                       "nothing'",
+                       level="WARNING", icon=Icons.WARN)
+            continue
         if not written:
             # §4FH C1: a leaf that changed nothing INSIDE the project workspace
             # cannot be DONE — the six theatrical DONEs had exactly this shape
@@ -397,8 +524,26 @@ async def build_coding_task_agentic(context, description: str, *, tool_runner: T
             if not ok:
                 reason = f"constraint gate: {why}"
         if reason is None:
+            # ⚠ A PARTIAL READING IS NOT A COMPLETE ONE, AND THE RECORD MUST
+            # SAY SO (§4GQ round 8). The unknown-reading branch above fires
+            # only when the reading found NOTHING — `diff_snapshots` returns
+            # the real paths it did see — so an attempt whose walk failed
+            # HALFWAY runs its gates on the visible subset and returns as an
+            # ordinary success. The files it did not see are then ungated and
+            # unregistered, with nothing in the record to say a file might be
+            # missing. Retrying here would be worse: the next attempt's
+            # `before` absorbs the files this one wrote, so they would never
+            # be reported at all. Name it instead.
+            if snapshot_incomplete(before, after):
+                detail_parts.append(
+                    "⚠ the workspace reading was INCOMPLETE for this attempt — "
+                    f"the {len(written)} file(s) below are what could be seen, "
+                    "and there may be more that were neither gated nor "
+                    "registered")
             note = (f"leaf(agentic): {summary or _short(description, 120)} · "
-                    f"files={len(written)} · verify={'yes' if verify else 'none'}")
+                    f"files={len(written)} · verify={'yes' if verify else 'none'}"
+                    + (" · reading INCOMPLETE"
+                       if snapshot_incomplete(before, after) else ""))
             return CodingResult(True, summary or _short(description, 160), written, note,
                                 detail="; ".join(detail_parts))
         witness = reason

@@ -263,6 +263,16 @@ def _cross_encoder_rerank(query: str, candidates: list, top_k: int = 12) -> list
 # tests on MagicMock instances don't shadow it.
 _TIER_WEIGHT = 0.3
 
+class MemoryWriteRefused(RuntimeError):
+    """A write into long-lived memory did not land, and the store KNOWS it.
+
+    Not an error in the store — a refusal, which until §4GJ round 5 was
+    reported to callers as `None`, i.e. exactly what a success reported.
+    Raised by `smart_update`, whose two callers already report a partial
+    index failure when this path raises.
+    """
+
+
 class VectorMemory:
     # Bounded growth for the open-ended tiers. Entries the agent accretes
     # turn after turn — `auto` / `manual`, plus `synthesis` (dream
@@ -571,6 +581,58 @@ class VectorMemory:
 
         return parsed_results
 
+    def _quarantine_corrupt(self, path: Path, raw) -> Path:
+        """Copy the bytes of a corrupt sidecar aside, WITHOUT overwriting an
+        earlier copy, and answer where they landed.
+
+        ⚠ THE QUARANTINE WAS WRITE-ONCE (§4GK round 6). Both sidecar readers
+        wrote `<file>.corrupt` only `if not quarantine.exists()`, so the
+        FIRST corruption — any earlier, unrelated one — armed the guard and
+        permanently DISARMED it: the second corruption was flattened with no
+        copy kept while the log still said "its bytes are preserved at …".
+        Measured on the catalogue: a second corruption destroyed three real
+        document names and the operator was told they were safe. The whole
+        point of this sidecar is the event we cannot reconstruct, so one
+        sidecar per DISTINCT corrupt content — `.corrupt`, then
+        `.corrupt.<md5[:8]>`. Keying the extra copies on the content rather
+        than on a counter means re-reading the same corrupt file twice (every
+        outline write until someone fixes it) does not mint a new file each
+        time, and two genuinely different corruptions never collide.
+
+        ``raw`` is the bytes the caller ALREADY READ. Never re-read the file
+        here: re-reading inside the handler is precisely how the undecodable
+        case lost both its quarantine and its write (see
+        `_read_outlines_for_write`).
+        """
+        base = path.with_suffix(path.suffix + ".corrupt")
+        try:
+            data = raw if isinstance(raw, (bytes, bytearray)) else str(raw or "").encode("utf-8")
+        except Exception:  # noqa: BLE001 — a preserve step never raises
+            data = b""
+        if not data:
+            # The READ failed, not the parse — there are no bytes to keep,
+            # and writing an empty file here would burn the `.corrupt` name
+            # that a real copy needs.
+            logger.warning("nothing to preserve for %s (empty/unreadable read)",
+                           path)
+            return base
+        target = base
+        try:
+            if base.exists():
+                if base.read_bytes() == data:
+                    return base          # already preserved, byte for byte
+                target = path.with_suffix(
+                    f"{path.suffix}.corrupt."
+                    f"{hashlib.md5(bytes(data)).hexdigest()[:8]}")
+                if target.exists() and target.read_bytes() == data:
+                    return target
+            target.write_bytes(bytes(data))
+        except OSError as e:
+            logger.error("could NOT preserve the corrupt %s at %s: %s — the "
+                         "bytes are being replaced without a copy", path.name,
+                         target, e)
+        return target
+
     def _update_library_index(self, filename: str, action: str):
         # Locked + atomic write. The previous version had two bugs:
         #  (1) no lock — two concurrent ingests of different files raced
@@ -584,38 +646,137 @@ class VectorMemory:
         with self._get_lock():
             try:
                 if self.library_file.exists():
-                    raw = self.library_file.read_text() or "[]"
+                    # BYTES, not text (§4GK round 6, the sibling of the
+                    # outline fix below). `read_text` raises
+                    # UnicodeDecodeError on an undecodable file OUTSIDE the
+                    # inner try, so a catalogue of raw bytes never reached
+                    # the quarantine at all — it fell to the outer handler as
+                    # a plain "Library index error", nothing was preserved,
+                    # and every future ingest failed the same way forever.
+                    # `json.loads` takes bytes.
+                    raw = self.library_file.read_bytes() or b"[]"
                     try:
                         data = json.loads(raw)
+                        if not isinstance(data, list):
+                            raise ValueError("library index is not a list")
                     except Exception:
-                        # Corrupt index → start fresh rather than crash.
-                        logger.warning("Library index was corrupt; resetting to []")
-                        data = []
-                    if not isinstance(data, list):
+                        # ⚠ A CORRUPT CATALOGUE IS PRESERVED BEFORE IT IS
+                        # REPLACED (§4GK round 4, corrected in round 5). The
+                        # original code reset to `[]` and carried on, so the
+                        # next ingest overwrote the catalogue with a
+                        # single-entry list and every other document became
+                        # invisible to `list_docs` and undeletable by name —
+                        # unrecoverably, because the bytes were gone.
+                        #
+                        # Round 4's first attempt REFUSED the write instead.
+                        # That preserved the bytes but blocked every future
+                        # ingest with no recovery the agent could perform by
+                        # itself: one bad write disabled the feature until a
+                        # human intervened. Both halves are needed — copy the
+                        # bytes aside, THEN start fresh. The catalogue rebuilds
+                        # as documents are re-ingested, `reconcile_indexes`
+                        # re-adopts any document that still has rows, and the
+                        # original list is recoverable from the sidecar.
+                        _quarantine = self._quarantine_corrupt(
+                            self.library_file, raw)
+                        logger.warning(
+                            "Library index was corrupt; its bytes are preserved "
+                            "at %s and the index is being rebuilt from this "
+                            "write onward — re-ingest or run reconcile_indexes "
+                            "to recover the rest.", _quarantine)
                         data = []
                 else:
                     data = []
 
                 if action == "add" and filename not in data:
                     data.append(filename)
-                elif action == "remove" and filename in data:
-                    data.remove(filename)
+                elif action == "remove":
+                    # Match on the STRING form, not on identity (§4GJ round
+                    # 5). Every name the reconciler proposes has been through
+                    # `str(name)`, so a catalogue holding a non-string — a
+                    # hand-edited file, a json number — was asked to drop
+                    # "123" while the list held `123`: `in` said no, nothing
+                    # was removed, and the drop arm reported it dropped
+                    # anyway, every cycle forever, spending one repair from
+                    # the cap each time. By the string form the entry is
+                    # actually droppable.
+                    data = [d for d in data if str(d) != filename]
 
                 tmp = self.library_file.with_suffix(self.library_file.suffix + ".tmp")
                 tmp.write_text(json.dumps(data))
                 os.replace(tmp, self.library_file)
+                # Did it LAND? This method swallows every failure it meets
+                # (that is deliberate — a catalogue write must never sink an
+                # ingest), and the reconciler's drop arm appended the name to
+                # `catalogue_dropped` unconditionally: "the write ran"
+                # reported as "the write landed", the exact confusion the
+                # outline arm was already taught to avoid one screen below.
+                # The answer is read off the list that was just written, so
+                # an OSError swallowed above answers False, and so does a
+                # "remove" that matched nothing.
+                if action == "add":
+                    return filename in [str(d) for d in data]
+                if action == "remove":
+                    return filename not in [str(d) for d in data]
+                return True
             except Exception as e:
                 logger.error(f"Library index error: {e}")
+                return False
 
-    def get_library(self):
+    def _load_library(self) -> list:
+        """The catalogue, RAISING when the file exists and cannot be read as
+        a list of names.
+
+        Two readers, two contracts (§4GJ round 4). `get_library` swallows
+        everything and answers `[]`, which is right for a READER — a corrupt
+        `library_index.json` must not take down `list_docs` — and
+        catastrophic for the RECONCILER, which DELETES against the answer:
+        a corrupt catalogue reads as "no document is listed", and that is
+        exactly the state the adopt arm rewrites and the outline arm reaps
+        against. Measured: a `library_index.json` full of garbage returned
+        `[]` with no raise, so the reconciler's own "catalogue unreadable"
+        skip was unreachable from ANY real store state — the only way into
+        that branch was a test monkeypatching `get_library` into raising,
+        i.e. a guard that was documentation. This reader tells the truth so
+        the guard is real; everyone else keeps the forgiving one.
+
+        An EMPTY file is a truncated write, not an empty library — but it is
+        the one corruption both readers must AGREE on (§4GJ round 5).
+        `_update_library_index` has always read a zero-byte file as "[]" and
+        carried on, while this reader let `json` raise on it, so a truncated
+        catalogue disarmed the reconciler ("catalogue unreadable") until some
+        UNRELATED ingest happened to rewrite the file — the guard that never
+        actually runs, on the store where it is needed most. Reading it as an
+        empty catalogue costs nothing a raise would have saved: an empty list
+        proposes no deletion (the drop arm has nothing to iterate over) and
+        the adopt arm rebuilds the catalogue from the document rows that are
+        actually there, which is the repair this state needs. A file with
+        BYTES that will not parse is a different animal and still raises —
+        its contents are the thing we must not act against.
+        """
         if not self.library_file.exists():
             return []
-        try:
-            data = json.loads(self.library_file.read_text())
-            if isinstance(data, list):
-                return data
+        raw = self.library_file.read_text()
+        if not raw.strip():
+            logger.warning(
+                "Library index at %s is empty (a truncated write); reading it "
+                "as an empty catalogue — the reconciler's adopt arm rebuilds "
+                "it from the document rows.", self.library_file)
             return []
-        except Exception:
+        data = json.loads(raw)
+        if not isinstance(data, list):
+            raise ValueError(
+                f"library index is a {type(data).__name__}, not a list")
+        return data
+
+    def get_library(self):
+        try:
+            return self._load_library()
+        except Exception as e:  # noqa: BLE001 — see `_load_library`: every
+            # reader but the reconciler wants "empty" rather than a raise.
+            logger.warning("Library index unreadable (%s); reporting it as "
+                           "empty to readers — the reconciler SKIPS instead "
+                           "of repairing against this", e)
             return []
 
     # ── Document STRUCTURE ────────────────────────────────────────────
@@ -630,6 +791,12 @@ class VectorMemory:
     # breadcrumbs — it was computed, used, and thrown away.
 
     def _read_outlines(self) -> dict:
+        """The forgiving READER's view — ``{}`` for anything unreadable.
+
+        Right for a reader (`get_document_outline`, and the reconcile arm,
+        which deletes nothing it cannot see); wrong for a WRITER, which is
+        about to replace the file. `_read_outlines_for_write` is that one.
+        """
         try:
             if not self.outlines_file.exists():
                 return {}
@@ -637,6 +804,57 @@ class VectorMemory:
             return data if isinstance(data, dict) else {}
         except Exception:  # noqa: BLE001 — a corrupt sidecar is not a fatal
             logger.warning("Document outline index was corrupt; ignoring it")
+            return {}
+
+    def _read_outlines_for_write(self) -> dict:
+        """Same read, for the one caller that OVERWRITES the file: a sidecar
+        that will not parse is preserved before it is replaced.
+
+        ⚠ Character for character the defect `_update_library_index` was
+        fixed for one screen above, left standing on the SIBLING sidecar
+        (§4GJ round 5 — "the sibling one revision behind"). `_read_outlines`
+        answers `{}` for an unparseable `document_outlines.json`, and
+        `set_document_outline` then wrote a SINGLE-entry dict over it:
+        measured, three documents' outlines replaced by one, no quarantine,
+        `get_document_outline` answering `{}` for the other two. Nothing
+        rebuilds this file — the live one is 145 KB of 4138 entries for the
+        PostgreSQL manual, and deriving it again costs a full breadcrumb
+        sweep of ~7000 chunks.
+
+        So: copy the bytes aside, THEN start fresh. Refusing the write
+        instead would block every future ingest's outline with no recovery
+        the agent can perform by itself, which is the other half of the
+        lesson the catalogue already learned.
+        """
+        # ⚠ READ THE BYTES ONCE, AND QUARANTINE THE BYTES WE READ (§4GK
+        # round 6). This read was `read_text()` and the handler then did
+        # `quarantine.write_text(self.outlines_file.read_text())` — a SECOND
+        # read of the file that had just failed. For undecodable bytes the
+        # first read raises UnicodeDecodeError, the second raises it again
+        # inside the handler, and `except OSError` does not catch a
+        # ValueError: measured, no quarantine, no write, and EVERY future
+        # outline write failed identically forever at `logger.error` only —
+        # including `derive_document_outline`, the recovery this log line
+        # points the reader at. The sibling one screen above quarantined the
+        # `raw` it had already read and was immune; same defect, fixed for
+        # the JSON case, left standing for the bytes case.
+        raw = b""
+        try:
+            if not self.outlines_file.exists():
+                return {}
+            raw = self.outlines_file.read_bytes()
+            data = json.loads(raw or b"{}")
+            if not isinstance(data, dict):
+                raise ValueError(
+                    f"outline index is a {type(data).__name__}, not an object")
+            return data
+        except Exception as e:  # noqa: BLE001 — preserve, then continue
+            quarantine = self._quarantine_corrupt(self.outlines_file, raw)
+            logger.warning(
+                "Document outline index was corrupt (%s); its bytes are "
+                "preserved at %s and the index is being rebuilt from this "
+                "write onward — re-ingest or run derive_document_outline to "
+                "recover the rest.", e, quarantine)
             return {}
 
     def set_document_outline(self, filename: str, record: dict) -> None:
@@ -647,7 +865,7 @@ class VectorMemory:
             return
         with self._get_lock():
             try:
-                data = self._read_outlines()
+                data = self._read_outlines_for_write()
                 data[str(filename)] = record
                 tmp = self.outlines_file.with_suffix(
                     self.outlines_file.suffix + ".tmp")
@@ -755,13 +973,79 @@ class VectorMemory:
             "at": get_utc_timestamp(),
         }
     
+    #: What `add()` ANSWERS. A write into long-lived memory has four
+    #: outcomes and used to have one answer: `None`.
+    ADD_STORED = "stored"
+    ADD_REFRESHED = "refreshed"
+    ADD_REFUSED_TYPE = "refused: text is owned by another type"
+    ADD_TOO_SHORT = "refused: text too short to embed"
+    #: The two that mean "the text is now stored as the caller asked".
+    ADD_LANDED = (ADD_STORED, ADD_REFRESHED)
+    #: …and the two that mean it is not. A consumer acts on THIS list rather
+    #: than on "not in ADD_LANDED": half the store's callers hand `add` to a
+    #: MagicMock in their tests, and a stub's answer is not a refusal — it is
+    #: a test asserting the delegation. Saying which answers are refusals
+    #: keeps the vocabulary the store's own.
+    ADD_REFUSALS = (ADD_REFUSED_TYPE, ADD_TOO_SHORT)
+
     def add(self, text: str, meta: dict = None):
-        if len(text) < 5: return
+        """Store one fragment, and SAY which of the four things happened.
+
+        ⚠ A REFUSED WRITE USED TO BE INDISTINGUISHABLE FROM A SUCCESSFUL ONE
+        (§4GJ round 5). Every exit was a bare `return`, so `None` meant
+        "stored", "refreshed", "too short to embed" and "refused — this text
+        belongs to another population" alike, and no caller could tell.
+        Measured end to end: an identity fact whose text collided with an
+        existing `auto` row was refused, `update_profile` still answered
+        "SUCCESS: Profile updated" (it reports a partial index failure only
+        when the vector write RAISES), the fact never reached the `identity`
+        tier `inject_identity` queries, and the row that survived is
+        `type=auto` — which IS in `_PRUNABLE_TYPES`. The refusal is right;
+        the silence left a user's identity fact inside the eviction-eligible
+        population with nobody told.
+
+        Returns one of the ``ADD_*`` constants; ``ADD_LANDED`` is the set a
+        caller checks. Callers that only catch exceptions see no change.
+        """
+        if len(text) < 5:
+            return self.ADD_TOO_SHORT
         mem_id = hashlib.md5(text.encode("utf-8")).hexdigest()
         metadata = meta or {"timestamp": get_utc_timestamp(), "type": "auto"}
         with self._get_lock():
-            existing = self.collection.get(ids=[mem_id])
+            existing = self.collection.get(ids=[mem_id], include=["metadatas"])
             if existing and existing['ids']:
+                # ⚠ REFUSE a TYPE change, whatever else the refresh carries
+                # (§4GJ round 4). Ids are md5(text), so two writers with the
+                # same text share ONE row — and the refresh below rewrites
+                # its metadata. Measured end to end: a user
+                # memory stored as `{"type": "fact"}` whose text equalled an
+                # episode's `trigger :: lesson` became
+                # `{"type": "episode", "episode_id": 1}` the moment
+                # `record_episode` ran; the episode was later evicted, and
+                # the episode-vector reaper — which deletes by `episode_id`,
+                # and `forget_episode`, which deletes `where={"episode_id"}`
+                # — then deleted the user's fact. The collection came back
+                # EMPTY. `reconcile_vector_index` re-drives that ingest at
+                # every boot, unattended, so this needs no user present.
+                #
+                # A type is not a field, it is which population owns the
+                # row and therefore which reaper may delete it. No caller
+                # intends to hand its row to a different reaper, so the
+                # write is refused outright rather than merged: the row we
+                # cannot prove belongs to the new writer stays exactly as
+                # its owner left it. `stored_type` is how a writer asks
+                # first.
+                _old_meta = (existing.get("metadatas") or [{}])[0] or {}
+                _old_type = str(_old_meta.get("type") or "")
+                _new_type = str((metadata or {}).get("type") or "")
+                if _old_type and _new_type and _old_type != _new_type:
+                    logger.warning(
+                        "Memory add REFUSED: this exact text is already "
+                        "stored as type=%s and the write would reclassify "
+                        "it as type=%s — the row is left alone (reclassing "
+                        "it hands it to a different reaper). Text: %.60s",
+                        _old_type, _new_type, text)
+                    return self.ADD_REFUSED_TYPE
                 # Same text (id is md5 of the text) → don't re-add, but DO
                 # refresh the metadata (2026-07-22). The old blanket early
                 # return meant a vector twin's metadata could never be updated:
@@ -773,11 +1057,29 @@ class VectorMemory:
                 # lesson is removed while the twin survives, so a DISCREDITED
                 # lesson stays retrievable via the playbook's vector path.
                 # (ingest_document already used upsert for exactly this reason.)
+                #
+                # ⚠ AND THE REFRESH MERGES — it does not replace (§4GJ round
+                # 5 corrects the comment that stood here). Measured on the
+                # pinned chromadb 1.5.5: a row carrying
+                # `source_trajectory_id="T1"` still carried it after an
+                # `update()` whose metadata dict omitted the key, and
+                # `upsert()` merges too. So a same-type refresh can overwrite
+                # a stale key but cannot CLEAR one the new writer does not
+                # restate. That is survivable here, and deliberately NOT
+                # patched, because the key this path exists for IS restated:
+                # both twin writers in `skills.py` (`add_lesson` and
+                # `heal_missing_twins`) always send `source_trajectory_id`,
+                # empty string included, so retraction-by-trajectory matches
+                # what it should. A blanket "clear what the writer omitted"
+                # would instead erase `source` from every twin healed by
+                # `heal_missing_twins`, whose metadata dict omits it — the
+                # provenance mirror bulk retraction drives. Two measured
+                # facts, one decision: correct the claim, change no rows.
                 try:
                     self.collection.update(ids=[mem_id], metadatas=[metadata])
                 except Exception as e:
                     logger.debug(f"Twin metadata refresh failed (non-critical): {e}")
-                return
+                return self.ADD_REFRESHED
 
             self.collection.add(documents=[text], metadatas=[metadata], ids=[mem_id])
             # Amortised cap enforcement: only probe the count once every
@@ -788,6 +1090,46 @@ class VectorMemory:
                 self._adds_since_prune = 0
                 self._prune_if_needed()
         pretty_log("Memory Save", text, icon=Icons.MEM_SAVE)
+        return self.ADD_STORED
+
+    def stored_type(self, text: str):
+        """The ``type`` of the row this EXACT text already occupies, or None
+        when the text is not stored (or the probe failed).
+
+        The other half of `add`'s refusal to reclassify: a writer whose text
+        collides with another population's row needs to know once, rather
+        than re-attempting a write that is now correctly refused on every
+        boot. `EpisodicMemory.reconcile_vector_index` is the caller — it
+        used to count such an episode as a repairable hole forever.
+
+        ⚠ STRICT SHAPE CHECK, AND IT IS LOAD-BEARING (§4GK round 6). Round
+        6 gave `smart_update` a second caller, and that one DECIDES WHETHER
+        TO DELETE on the answer — so an invented answer destroys a fact. A
+        `MagicMock` collection satisfies every truthiness test in here and
+        `str(meta["type"])` then returns "<MagicMock name=…>": a plain
+        `smart_update` against a stubbed store refused its own write and
+        kept a row that was supposed to be replaced (3 existing pins went
+        red on exactly that). This is the store's own rule, already written
+        into `ADD_REFUSALS`: a stub's answer is not a refusal, it is a test
+        asserting the delegation. Anything that is not a real `get` result
+        answers None — the probe could not tell, which is what None means.
+        """
+        try:
+            mem_id = hashlib.md5((text or "").encode("utf-8")).hexdigest()
+            got = self.collection.get(ids=[mem_id], include=["metadatas"])
+        except Exception as e:  # noqa: BLE001 — a probe, never a failure
+            logger.debug("stored_type probe failed: %s", e)
+            return None
+        if not isinstance(got, dict):
+            return None
+        ids = got.get("ids")
+        if not (isinstance(ids, list) and ids):
+            return None
+        metas = got.get("metadatas")
+        if not (isinstance(metas, list) and metas and isinstance(metas[0], dict)):
+            return None
+        owner = metas[0].get("type")
+        return str(owner) if isinstance(owner, str) and owner else None
 
     def _prune_if_needed(self) -> int:
         """Evict the lowest-utility prunable memories when the prunable
@@ -843,6 +1185,20 @@ class VectorMemory:
             return 0
 
     def smart_update(self, text: str, type_label: str = "auto"):
+        """Replace-or-add one same-type fragment.
+
+        RAISES ``MemoryWriteRefused`` when the underlying `add` refused (the
+        text is already owned by another type, or is too short to embed).
+        That is not a style choice: both callers — `update_profile` and the
+        fact bus — already treat an exception from here as "the vector index
+        missed this write" and report a partial failure, and NOTHING else
+        told them. Measured: an identity fact colliding with an `auto` row
+        was refused and `update_profile` answered "SUCCESS: Profile updated"
+        while the fact never reached the `identity` tier. Every OTHER
+        failure keeps its old swallowed-and-logged behaviour — this raise is
+        exactly the case where the store knows the write did not land.
+        """
+        refusal = None
         try:
             with self._get_lock():
                 # Dedup candidates must be the SAME type as the incoming entry
@@ -893,6 +1249,38 @@ class VectorMemory:
                         and neighbor_key not in new_key
                     )
                     if dist < 0.50 and not keys_conflict:
+                        # ⚠ ASK WHETHER THE REPLACEMENT CAN LAND BEFORE
+                        # DESTROYING WHAT IT REPLACES (§4GK round 6).
+                        # `add()` REFUSES a duplicate-id write that would
+                        # reclassify an existing row's type, and round 5 made
+                        # that refusal raise — but neither undid this delete,
+                        # so the refusal turned a reclassification bug into
+                        # outright destruction of the fact it exists to
+                        # protect. Measured through the real `update_profile`:
+                        # an identity fact whose text was also held as an
+                        # `auto` row (an ordinary dream consolidation of the
+                        # same sentence) left the identity tier EMPTY, with
+                        # the user told only that "retrieval may not reflect
+                        # the change" — the opposite of what happened. Before
+                        # round 4's refusal existed, the new value landed.
+                        _owner = None
+                        try:
+                            _owner = self.stored_type(text)
+                        except Exception:  # noqa: BLE001 — probe, not a gate
+                            _owner = None
+                        if _owner is not None and _owner != type_label:
+                            refusal = self.ADD_REFUSED_TYPE
+                            pretty_log(
+                                "Memory Update",
+                                f"NOT refining: {text[:48]!r} is already held as "
+                                f"type={_owner!r}, so writing it as {type_label!r} "
+                                "would be refused — the existing entry is KEPT "
+                                "rather than deleted for a replacement that "
+                                "cannot land.",
+                                level="WARNING", icon=Icons.WARN)
+                            raise MemoryWriteRefused(
+                                f"{type_label} memory was not stored "
+                                f"({self.ADD_REFUSED_TYPE}): {text[:80]}")
                         self.collection.delete(ids=[existing_id])
                         pretty_log("Memory Update", f"Refining existing entry (Sim={dist:.2f})", icon=Icons.RETRY)
 
@@ -902,9 +1290,24 @@ class VectorMemory:
                 # one critical section. Routing through `self.add` also
                 # preserves the single-path invariant for callers and
                 # tests that mock `add()` directly.
-                self.add(text, meta={"timestamp": get_utc_timestamp(), "type": type_label})
+                _status = self.add(
+                    text, meta={"timestamp": get_utc_timestamp(), "type": type_label})
+                if _status in self.ADD_REFUSALS:
+                    # Only the store's OWN refusal vocabulary raises. A
+                    # stubbed `add` (a MagicMock, an old proxy) answers
+                    # something else entirely, and that is a test asserting
+                    # the delegation, not a store reporting a refusal.
+                    refusal = _status
+        except MemoryWriteRefused:
+            # Raised deliberately above, BEFORE anything was deleted: let it
+            # reach the caller instead of being logged as a generic error.
+            raise
         except Exception as e:
             logger.error(f"Smart Update Error: {e}")
+            return
+        if refusal:
+            raise MemoryWriteRefused(
+                f"{type_label} memory was not stored ({refusal}): {text[:80]}")
 
     def ingest_document(self, filename: str, chunks: List[str], _batch: bool = False):
         """Embed and store document chunks under ``type="document"``.
@@ -1430,28 +1833,511 @@ class VectorMemory:
             for c in ranked
         ]
 
-    def forget_episode(self, episode_id) -> None:
+    def forget_episode(self, episode_id) -> bool:
         """Remove an episode's vector entry by its ``episode_id`` metadata.
 
         Called by ``EpisodicMemory`` when it evicts an episode (capacity cap
         / consolidation) so the vector index — which owns a non-prunable
         ``type=="episode"`` population (see ``_prune_if_needed``) — does not
-        accumulate orphans pointing at deleted episode rows. Best-effort."""
+        accumulate orphans pointing at deleted episode rows.
+
+        Returns True when the delete ran, False when it failed. §4GJ: the
+        caller used to discard this and swallow the exception, so a failed
+        delete left a vector whose ``episode_id`` maps to no row FOREVER —
+        episodes are excluded from ``_prune_if_needed`` (only
+        ``_PRUNABLE_TYPES`` are candidates), so nothing else ever reaped it,
+        and the episodic recall tier resolved those hits to nothing. The
+        periodic reconciler (``reconcile_indexes``) is the reaper; this
+        return value is how the caller knows to say so."""
         try:
             with self._get_lock():
                 self.collection.delete(where={"episode_id": int(episode_id)})
+            return True
         except Exception as e:
-            logger.debug("forget_episode(%s) failed (non-critical): %s", episode_id, e)
+            logger.warning(
+                "forget_episode(%s) failed — its vector twin is now an "
+                "orphan until the next reconcile: %s", episode_id, e)
+            return False
 
     def delete_document_by_name(self, filename: str):
+        # ⚠ ONE critical section for rows + BOTH sidecars (§4GJ). These were
+        # three separate acquisitions of the (reentrant) lock: process death
+        # between them left a catalogue entry with no rows, and
+        # `ingest_document`'s authoritative dedup then refused the re-ingest
+        # as "already ingested" while `outline` reported "no indexed
+        # chunks" — a document that could be neither read nor rebuilt.
+        # `_update_library_index` / `drop_document_outline` take the same
+        # RLock, so re-entry is free; what matters is that no writer can
+        # interleave BETWEEN the three steps.
         with self._get_lock():
             self.collection.delete(where={"source": filename})
-        # _update_library_index takes its own lock (RLock so re-entry is fine).
-        self._update_library_index(filename, "remove")
-        # …and so does the outline sidecar: a forgotten document that keeps
-        # its structure is a claim about a document that no longer exists.
-        self.drop_document_outline(filename)
+            self._update_library_index(filename, "remove")
+            # …a forgotten document that keeps its structure is a claim
+            # about a document that no longer exists.
+            self.drop_document_outline(filename)
         return True, "Deleted"
+
+    # ── Cross-store reconciliation (§4GJ) ─────────────────────────────
+    #
+    # WHY. Three stores describe one document population — the vector rows,
+    # the library catalogue (`library_index.json`) and the outline sidecar
+    # (`document_outlines.json`) — and a fourth pair, episode rows and their
+    # vector twins, spans two stores entirely. Every write path now holds
+    # ONE lock across its pair, so drift can no longer be *created* by
+    # interleaving; what the locks cannot undo is drift already on disk from
+    # before the fix, from a crash between two writes, or from a delete that
+    # raised. This is the reaper for that residue: one pass, one place,
+    # bounded, and fail-SAFE — an invariant whose inputs cannot be read is
+    # skipped, never "repaired" against a set it could not confirm.
+
+    #: Repairs per invariant per pass. A pass is housekeeping, not a
+    #: migration: a store 10k rows out of sync converges over several
+    #: cycles instead of blocking one dream for minutes.
+    RECONCILE_MAX_REPAIRS = 200
+
+    #: Rows per page when the reconciler sweeps collection metadata. The
+    #: REPAIRS were bounded and the SCANS were not: both arms issued one
+    #: `collection.get(where=…)` and materialised every matching row's
+    #: metadata in a single list — 7,130 document chunks on the live store —
+    #: on every dream cycle. Paged, peak memory is one page; what the sweep
+    #: accumulates (a set of distinct `source` strings, a list of victim ids
+    #: capped at `RECONCILE_MAX_REPAIRS`) stays small.
+    RECONCILE_SCAN_PAGE = 500
+
+    def _scan_metadata(self, where: dict, page: int = None):
+        """Yield ``(id, metadata)`` for every row matching ``where``, one
+        page at a time.
+
+        Caller holds the lock — offsets are only stable while no writer can
+        interleave, and every writer takes the same RLock. Raises whatever
+        the store raises: the CALLER decides what an unreadable scan means,
+        and in this class it always means "prove nothing, change nothing".
+        """
+        size = max(1, int(page or self.RECONCILE_SCAN_PAGE))
+        offset = 0
+        while True:
+            res = self.collection.get(where=where, include=["metadatas"],
+                                      limit=size, offset=offset)
+            ids = (res or {}).get("ids") or []
+            metas = (res or {}).get("metadatas") or []
+            if not ids:
+                return
+            for i, rid in enumerate(ids):
+                yield rid, (metas[i] if i < len(metas) else None)
+            if len(ids) < size:
+                return
+            offset += len(ids)
+
+    def _document_has_rows(self, name: str):
+        """True / False from a TARGETED probe, or None when it could not
+        answer.
+
+        The bulk sweep is the fast path; this is the proof. Every deletion
+        below is justified by one of these, because a sweep that comes back
+        short — a page under-filled, a `where` the store version stopped
+        honouring, a metadata key renamed — under-reports the live document
+        set, and under-reporting a live document is precisely what drops its
+        catalogue line and its outline. Note the filter: `source`, not
+        `type`, so a broken `type` filter cannot make both agree.
+        """
+        try:
+            res = self.collection.get(where={"source": str(name)},
+                                      include=["metadatas"], limit=1)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("document row probe for %s failed: %s", name, e)
+            return None
+        return bool((res or {}).get("ids"))
+
+    def reconcile_indexes(self, live_episode_ids=None,
+                          max_repairs: int = None) -> dict:
+        """Restore the three pair-invariants and report what was repaired.
+
+        * catalogue ⊆ distinct ``source`` — a catalogue line whose document
+          has no rows is dropped (it blocks re-ingest via the dedup).
+        * distinct ``source`` ⊆ catalogue — rows whose document is missing
+          from the catalogue are re-listed ("adopted"): they are queryable
+          but invisible to ``list_docs`` and undeletable by name. Nothing is
+          deleted by this arm.
+        * outline sidecar ⊆ catalogue — an outline for a document that is
+          not in the catalogue is dropped.
+        * episode vectors ⊆ live episode ids — vector rows whose
+          ``episode_id`` names no live episode are deleted.
+
+        ``live_episode_ids`` must be the COMPLETE set of live episode ids,
+        or None, or a CALLABLE returning one of those. None (or an
+        unreadable store) skips the episode arm entirely: reconciling
+        against a set that failed to load would read every episode vector as
+        an orphan and delete the lot.
+
+        Prefer the callable — `episodes.live_episode_ids` itself, unread. A
+        SET is a snapshot taken before this pass started, and an episode
+        recorded between the two is live with a twin that the set does not
+        name; the arm defers those by the id high-water mark (see
+        `_reconcile_episode_vectors`) rather than reaping them, which is
+        safe but does no work. A callable is read inside this lock, and then
+        there is no gap at all.
+
+        The same rule governs every OTHER input this pass reads, because a
+        reaper that cannot prove a thing is garbage must leave it and say
+        so: a catalogue that will not parse, a metadata sweep that comes
+        back empty while the store holds rows, a repair run that stopped at
+        the cap — each is a skip with a reason, never a repair against a set
+        this pass could not confirm. Deletions are additionally justified
+        one at a time by a targeted probe.
+
+        Never raises. Returns a report dict; ``skipped`` names each
+        invariant that could not be checked and why.
+        """
+        cap = int(self.RECONCILE_MAX_REPAIRS if max_repairs is None else max_repairs)
+        report = {"catalogue_dropped": [], "catalogue_adopted": [],
+                  "outlines_dropped": [], "episode_vectors_deleted": 0,
+                  "skipped": [], "bounded": False}
+        try:
+            with self._get_lock():
+                self._reconcile_documents(report, cap)
+                self._reconcile_episode_vectors(report, cap, live_episode_ids)
+        except Exception as e:  # noqa: BLE001 — housekeeping never fails a cycle
+            logger.warning("memory reconcile aborted: %s", e)
+            report["skipped"].append(f"aborted: {e}")
+        return report
+
+    def _reconcile_documents(self, report: dict, cap: int) -> None:
+        """Catalogue ↔ rows ↔ outline sidecar. Caller holds the lock."""
+        try:
+            catalogue = list(self._load_library())
+        except Exception as e:  # noqa: BLE001 — `_load_library`, not
+            # `get_library`: a catalogue that cannot be PARSED must not be
+            # read as "nothing is listed" by the one caller that deletes
+            # against the answer.
+            report["skipped"].append(f"catalogue unreadable: {e}")
+            return
+        # The set of document sources that actually HAVE rows. One paged
+        # sweep of document metadata, not one query per catalogue entry.
+        try:
+            live_sources = set()
+            for _rid, m in self._scan_metadata({"type": "document"}):
+                if isinstance(m, dict) and m.get("source"):
+                    live_sources.add(str(m["source"]))
+        except Exception as e:  # noqa: BLE001 — cannot prove anything is
+            # orphaned without this, so prove nothing and change nothing.
+            report["skipped"].append(f"document scan failed: {e}")
+            return
+
+        # ⚠ An EMPTY sweep that did not raise is NOT evidence of absence.
+        # This arm used to guard only the EXCEPTION, so a scan that returned
+        # successfully and empty yielded `live_sources = set()` — read as
+        # "no document anywhere has rows" — and the whole catalogue was
+        # dropped, after which the outline arm, judging against the
+        # now-empty repaired catalogue, dropped every outline too. Measured
+        # against a real store holding one document (`keep.pdf`, 1 row) with
+        # the sweep stubbed empty: `catalogue_dropped: ['keep.pdf'],
+        # outlines_dropped: ['keep.pdf']` while the rows sat there
+        # untouched. The live store holds exactly one document, the
+        # PostgreSQL manual, whose outline costs a full breadcrumb sweep to
+        # rebuild and which `reconcile_indexes` does NOT rebuild.
+        #
+        # So corroborate before believing it — but the corroboration has to
+        # ask the SAME QUESTION by a different route, and round 4's did not
+        # (§4GJ round 5). It compared the document-scoped sweep against
+        # `collection.count()`, which counts EVERY row: auto memories,
+        # episode twins, skills, identity facts. Those two disagree for the
+        # most innocent reason there is — a store that holds anything at all
+        # besides documents, which every real store does — so "zero live
+        # documents" became unprovable and BOTH arms skipped forever.
+        # Measured on a store with one auto memory, one episode twin, zero
+        # documents and one residue catalogue line: "read as a FAILED scan",
+        # and that line could then never be dropped while `ingest_document`
+        # refuses to re-ingest the name forever.
+        #
+        # The right second reader is the one the deletions already use:
+        # `where={"source": name}`, a different filter key asking about the
+        # same document. If ANY name at stake still has rows, the sweep is
+        # lying and nothing here may act; if every one of them answers a
+        # definite "no rows", the empty sweep is corroborated and the arms
+        # proceed — and each individual deletion below is still proven by
+        # its own probe. Bounded by `cap`, like every other repair.
+        #
+        # Two round-6 corrections to that loop. It deduped by rebuilding
+        # `set(_at_stake)` once PER OUTLINE NAME (and against the growing
+        # list, so a name listed in both sidecars was probed twice); and it
+        # probed only `_at_stake[:cap]`. The cap bounds REPAIRS — this loop
+        # performs none, it only asks whether the sweep lied, and a name
+        # PAST the cap that still has rows is exactly the proof that it did.
+        # Measured: a catalogue whose live document sits past the first
+        # `cap` residue names corroborated the empty sweep off the residue
+        # alone and dropped the live document's line. Probes are one `get`
+        # each and this branch runs only on a sweep that came back empty,
+        # which a healthy store does not do.
+        _seen = set()
+        _at_stake = []
+        for _n in list(catalogue) + list(self._read_outlines()):
+            _s = str(_n)
+            if _s not in _seen:
+                _seen.add(_s)
+                _at_stake.append(_s)
+        if not live_sources and _at_stake:
+            for name in _at_stake:
+                has_rows = self._document_has_rows(name)
+                if has_rows is not False:
+                    report["skipped"].append(
+                        f"document scan matched no rows while a targeted "
+                        f"probe for {name} says otherwise ({has_rows}) — "
+                        f"read as a FAILED scan, not an empty library; "
+                        f"catalogue ({len(catalogue)}) and outlines left "
+                        f"alone")
+                    return
+
+        for name in catalogue:
+            if len(report["catalogue_dropped"]) >= cap:
+                report["bounded"] = True
+                break
+            if str(name) in live_sources:
+                continue
+            # PROVE it, one targeted probe per proposed deletion — bounded
+            # by `cap`, and zero probes on the healthy store that proposes
+            # none. "The sweep did not mention it" is not proof.
+            if self._document_has_rows(str(name)) is not False:
+                report["skipped"].append(
+                    f"catalogue entry {name}: the sweep did not list it but "
+                    f"a targeted probe would not confirm it has no rows — "
+                    f"left listed")
+                continue
+            # "The drop RAN" is not "the drop LANDED" — the same lesson the
+            # outline arm below was taught, never applied to the arm that
+            # reports deletions. `_update_library_index` swallows its own
+            # write failures, and a catalogue entry it cannot match (a
+            # non-string line) left the file untouched while this appended
+            # the name anyway: reported dropped every cycle forever, one
+            # repair off the cap each time, and an operator reading
+            # `catalogue_dropped` was told the residue was gone.
+            if not self._update_library_index(str(name), "remove"):
+                report["skipped"].append(
+                    f"catalogue entry {name}: proven to have no rows, but the "
+                    f"catalogue write did not land — still listed")
+                continue
+            report["catalogue_dropped"].append(str(name))
+
+        unlisted = sorted(live_sources - set(map(str, catalogue)))
+        adopt_bounded = False
+        for name in unlisted:
+            if len(report["catalogue_adopted"]) >= cap:
+                report["bounded"] = True
+                adopt_bounded = True
+                break
+            self._update_library_index(name, "add")
+            report["catalogue_adopted"].append(name)
+
+        # ⚠ THE OUTLINE IS THE IRRECOVERABLE HALF, SO IT GOES LAST (§4GK
+        # round 6). The "two readers that must agree" below are structurally
+        # ONE reader asked twice: the `type == document` sweep and the
+        # `source == name` probe differ only in their filter KEY, and the
+        # state that actually matters defeats both — the Chroma rows gone
+        # while the plain-file sidecars survive (a partial restore, a
+        # reset/recreated collection, a re-embed that dropped rows). Both
+        # answer a well-formed, non-raising "no rows", the corroboration
+        # above passes because it is asking the same blind question, and ONE
+        # unattended dream cycle deletes the catalogue line AND the outline.
+        # Measured on a real store: catalogue ['postgres_manual.pdf'] + 2
+        # outline entries + 5 rows; the rows removed with no exception →
+        # both sidecars gone, `document_outlines.json` == `{}`.
+        #
+        # No third reader exists, so the fix is the ASYMMETRY instead. A
+        # dropped catalogue line is recoverable — re-ingest the document and
+        # the adopt arm re-lists it the moment rows come back. An outline is
+        # NOT: `derive_document_outline` reads the chunks that are exactly
+        # what went missing, and the live sidecar is 145 KB of 4138 entries
+        # costing a ~7000-chunk breadcrumb sweep. So while NO document
+        # anywhere has rows, this pass cannot tell "the library is empty"
+        # from "the rows are gone", and the half it cannot rebuild is kept,
+        # with a reason. Nothing real depends on this arm to tidy up:
+        # `delete_document_by_name` drops its own outline in the same
+        # critical section, and a stale outline costs a few KB and an answer
+        # about a document `list_docs` no longer names.
+        if not live_sources:
+            if self._read_outlines():
+                report["skipped"].append(
+                    "outline sidecar: NO document anywhere has rows, which "
+                    "this pass cannot tell apart from a store whose rows "
+                    "were lost (a partial restore, a recreated collection) — "
+                    "the catalogue rebuilds itself on re-ingest, an outline "
+                    "does not, so the outlines are kept")
+            return
+
+        # Outlines ⊆ catalogue, judged against the catalogue AS REPAIRED —
+        # and only when the repair actually FINISHED. The adopt loop breaks
+        # at `cap`, and the outline arm then dropped every outline missing
+        # from a catalogue that was, by construction, missing the live
+        # documents adoption never reached. `bounded` is reported to the
+        # operator as "more next cycle"; those outlines were not deferred,
+        # they were deleted. Measured: 6 live documents, catalogue blanked,
+        # `max_repairs=3` → `adopted: [doc00, doc01, doc02]`,
+        # `outlines_dropped: [doc03, doc04, doc05]`, `bounded: True`. A
+        # bounded pass must not let a later arm act on the part it did not
+        # reach.
+        if adopt_bounded:
+            report["skipped"].append(
+                f"outline sidecar: adoption stopped at the {cap}-repair cap "
+                f"with {len(unlisted) - len(report['catalogue_adopted'])} "
+                f"document(s) still unlisted — outlines deferred, not judged "
+                f"against a half-repaired catalogue")
+            return
+        try:
+            listed = set(map(str, self._load_library()))
+        except Exception as e:  # noqa: BLE001
+            report["skipped"].append(f"catalogue unreadable after repair: {e}")
+            return
+        # `_read_outlines` and `drop_document_outline` swallow their own
+        # errors and answer `{}` / nothing, so there is nothing left here
+        # for a try to catch — the outer handler covers the unforeseen.
+        for name in list(self._read_outlines().keys()):
+            if len(report["outlines_dropped"]) >= cap:
+                report["bounded"] = True
+                break
+            name = str(name)
+            # ROWS outrank the catalogue. An outline belongs to a document,
+            # not to an index of documents, so a document with rows keeps
+            # its structure even when its catalogue line is missing
+            # (`_update_library_index` swallows its own write failures, so
+            # "adoption ran" is not "adoption landed"). The sweep above
+            # asked `type == document` and the probe asks `source == name` —
+            # two FILTERS, one reader, which is why the wholesale-loss state
+            # needed the guard above rather than a third `where`.
+            if name in listed or name in live_sources:
+                continue
+            # And the catalogue line this very pass dropped does not count
+            # as evidence AGAINST the outline (§4GK round 6): that is this
+            # pass believing its own conclusion one step later, and it is
+            # how both sidecars went in a single cycle. One cycle's grace —
+            # the rows can come back by re-ingest before the cheap half's
+            # absence is allowed to convict the half that cannot.
+            if name in report["catalogue_dropped"]:
+                report["skipped"].append(
+                    f"outline for {name}: its catalogue line was dropped by "
+                    f"THIS pass — the recoverable half goes first and the "
+                    f"outline is deferred to a later cycle")
+                continue
+            if self._document_has_rows(name) is not False:
+                report["skipped"].append(
+                    f"outline for {name}: unlisted, but a targeted probe "
+                    f"would not confirm the document has no rows — kept")
+                continue
+            self.drop_document_outline(name)
+            report["outlines_dropped"].append(name)
+
+    def _reconcile_episode_vectors(self, report: dict, cap: int,
+                                   live_episode_ids) -> None:
+        """Episode vectors ⊆ live episode ids. Caller holds the lock.
+
+        ``live_episode_ids`` may be a CALLABLE, in which case it is invoked
+        here, inside the lock, and its answer is authoritative — see the
+        stale-snapshot note below. A plain set is a snapshot and is treated
+        as one.
+        """
+        # ⚠ THE WATERMARK GUARD IS UNCONDITIONAL (§4GK round 6). The first
+        # version trusted a CALLABLE's answer absolutely, on the reasoning
+        # that reading inside this lock leaves no gap because `record_episode`
+        # commits its SQLite row before blocking here for the twin. That
+        # reasoning is one ordering assumption about another module away from
+        # being wrong — and it is wrong the moment any caller reads the ids
+        # slightly before handing them over, which is exactly what the
+        # consumer did. Deferring an above-watermark id costs NOTHING: it is
+        # reaped on the next cycle if it really is an orphan. Reaping a live
+        # episode's twin destroys the only semantic-recall copy of its trigger
+        # and lesson. On a destructive path the cheap guard stays on.
+        #
+        # It was written as a `snapshot = True` flag that nothing ever
+        # reassigned, so `if snapshot and …` was `if …` and a mutant deleting
+        # `snapshot and` was equivalent — dead code standing in for a
+        # decision (§R R2, §4GK round 6). The decision is the paragraph
+        # above: the guard is unconditional, there is no "trusted" caller,
+        # and the flag is gone so nobody re-reads it as a switch to flip.
+        if callable(live_episode_ids):
+            try:
+                live_episode_ids = live_episode_ids()
+            except Exception as e:  # noqa: BLE001 — unreadable is not empty
+                report["skipped"].append(
+                    f"episode ids unreadable ({e}) — episode vectors left alone")
+                return
+        if live_episode_ids is None:
+            report["skipped"].append(
+                "episode ids unavailable — episode vectors left alone")
+            return
+        live = set()
+        for e in live_episode_ids:
+            try:
+                live.add(int(e))
+            except (TypeError, ValueError):
+                continue
+        # ⚠ THE ID SET IS A SNAPSHOT, AND THIS ARM IS THE ONLY ONE THAT
+        # DELETES WITHOUT A PER-VICTIM PROOF (§4GJ round 5). The consumer
+        # (`dream._reconcile_memory_stores`) reads `live_episode_ids()` in
+        # one `to_thread` hop and calls this in the NEXT one; any episode
+        # recorded in that gap is live, has a twin, and is not in the set —
+        # so it was reaped as an orphan. Reproduced with the real call
+        # shape: `deleted: 1`, episode 2 still in SQLite with no twin, and
+        # the twin is the only semantic-recall copy of its trigger and
+        # lesson. It self-heals at the next boot, which then logs the
+        # "genuinely missing a twin" alarm this whole design exists to
+        # silence.
+        #
+        # The proof that needs no second store: episode ids are `INTEGER
+        # PRIMARY KEY AUTOINCREMENT`, so they only ever go UP. An id ABOVE
+        # everything the snapshot contains cannot be shown to predate the
+        # snapshot, so it is not provably an orphan and it is left alone —
+        # and an id below the high-water mark existed when the snapshot was
+        # taken, which makes its absence real evidence. The deferral costs
+        # little and self-heals: the ids it protects are the newest, the
+        # population that actually gets reaped is the evicted OLD tail, and
+        # `forget_episode` already deletes the twin of anything deleted by
+        # name. An empty live set has no high-water mark and therefore no
+        # proof of anything — every twin is deferred, with a reason, until
+        # one episode is recorded (which happens every turn).
+        watermark = max(live) if live else None
+        deferred = 0
+        victims = []
+        try:
+            # Paged, like the document sweep: this used to materialise every
+            # episode row's metadata at once.
+            for vid, meta in self._scan_metadata({"type": "episode"}):
+                ep = (meta or {}).get("episode_id") if isinstance(meta, dict) else None
+                try:
+                    ep = int(ep)
+                except (TypeError, ValueError):
+                    # No usable episode_id — missing, None, or garbage. Such a
+                    # row cannot be PROVEN orphaned, so the reaper leaves it
+                    # alone; the recall tier already skips it.
+                    # ⚠ ONE guard, deliberately: `int(None)` raises TypeError,
+                    # so an explicit `if ep is None: continue` ahead of this was
+                    # unreachable IN EFFECT — the §4GJ mutation battery proved
+                    # it equivalent, and §R R2 says an equivalent mutant means
+                    # dead code, so it was deleted rather than left standing as
+                    # an unfalsifiable guard.
+                    continue
+                if ep not in live:
+                    if watermark is None or ep > watermark:
+                        deferred += 1
+                        continue
+                    victims.append(vid)
+                if len(victims) >= cap:
+                    report["bounded"] = True
+                    break
+        except Exception as e:  # noqa: BLE001 — a sweep that died half way
+            # named only half the population; deleting that half's
+            # complement is exactly the mistake this class exists to avoid.
+            report["skipped"].append(f"episode vector scan failed: {e}")
+            return
+        if deferred:
+            report["skipped"].append(
+                f"{deferred} episode vector(s) name an episode id above the "
+                f"id set's high-water mark ({watermark}) — recorded after the "
+                f"set was read, so they cannot be proven orphaned; left alone")
+        if not victims:
+            return
+        try:
+            self.collection.delete(ids=victims)
+            report["episode_vectors_deleted"] = len(victims)
+        except Exception as e:  # noqa: BLE001
+            report["skipped"].append(f"episode vector delete failed: {e}")
 
     def correct_fragment(self, match: str, replacement: str):
         """Surgically rewrite ONE stored fragment's text, in-process.

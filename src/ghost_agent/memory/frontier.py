@@ -192,9 +192,28 @@ class FrontierTracker:
         # next _save would commit over real history.
 
     def _save(self, state: dict):
-        tmp = self.file_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state, indent=2))
-        os.replace(tmp, self.file_path)
+        # §4GJ: fsync BEFORE the rename, and a PID-unique temp name — the
+        # §4M sweep that gave every sibling store this shape (skills.py,
+        # competence.py, contradiction_log.py, journal.py,
+        # skills_auto/store.py) missed this one file. `os.replace` is atomic
+        # in the NAMESPACE, but the temp file's bytes may still be in the
+        # page cache, so a power loss could promote an empty/torn file —
+        # which `_load` then quarantines as corrupt, restarting self-play
+        # with empty cluster mastery and tier history. The fixed `.tmp` name
+        # was the §4BW shape as well: two writers (an ablation instance, the
+        # suite) truncate each other's temp mid-write.
+        tmp = self.file_path.with_suffix(f".{os.getpid()}.tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(state, indent=2))
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.file_path)
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
     @staticmethod
     def _hash_challenge(challenge: str) -> str:

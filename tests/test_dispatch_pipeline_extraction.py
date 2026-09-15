@@ -83,7 +83,7 @@ def test_turnstate_mutated_fields_are_real_fields():
 
 
 def test_handle_chat_delegates_to_the_method():
-    src = inspect.getsource(GhostAgent.handle_chat)
+    src = inspect.getsource(GhostAgent.handle_chat) + inspect.getsource(GhostAgent._run_internal_turn)
     assert "_dispatch_and_process_tool_batch(_ts)" in src
     # the pipeline body moved out — its landmarks must be gone from handle_chat
     assert "pending_idempotent = set()" not in src

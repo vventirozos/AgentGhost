@@ -1335,8 +1335,15 @@ def _fork_memory_dir(context, workspace: Path) -> Path:
             for sub in ("acquired_skills", "composed_skills"):
                 src = Path(str(real)) / sub
                 if src.is_dir():
-                    shutil.copytree(src, md / sub, symlinks=False,
-                                    dirs_exist_ok=True)
+                    # §4GJ round 3: `symlinks=False` FOLLOWS — and these two
+                    # directories are model-writable, so a planted link
+                    # seeded a fork with host bytes.
+                    from ..tools.file_system import copytree_nofollow
+                    _sk = copytree_nofollow(src, md / sub, src,
+                                            dirs_exist_ok=True)
+                    if _sk:
+                        logger.warning("isolation: seed skipped %d entr(ies): %s",
+                                       len(_sk), str(_sk)[:200])
     except Exception as exc:  # noqa: BLE001
         logger.warning("isolation: fork memory_dir seed partial (%s)", exc)
     return md

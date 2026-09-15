@@ -161,7 +161,7 @@ def test_briefing_work_log_falls_back_to_commands(tmp_path):
 def test_recovery_and_llm_retry_strip_stream_flag():
     import ghost_agent.core.agent as agent_mod
     import ghost_agent.core.llm as llm_mod
-    hc = inspect.getsource(agent_mod.GhostAgent.handle_chat)
+    hc = inspect.getsource(agent_mod.GhostAgent.handle_chat) + inspect.getsource(agent_mod.GhostAgent._run_internal_turn)
     _recov = hc[hc.index("Emergency pruning triggered"):]
     # Bounded window so the strip stays LOCAL to the recovery block; 6000
     # (was 4000) because the §4BC action-view comment in the recovery
@@ -174,7 +174,7 @@ def test_recovery_and_llm_retry_strip_stream_flag():
 
 def test_pressure_steers_and_lockdown_wired():
     import ghost_agent.core.agent as agent_mod
-    hc = inspect.getsource(agent_mod.GhostAgent.handle_chat)
+    hc = inspect.getsource(agent_mod.GhostAgent.handle_chat) + inspect.getsource(agent_mod.GhostAgent._run_internal_turn)
     assert "SYSTEM ALERT (context pressure)" in hc
     assert "SECOND overflow" in hc
     assert "_ctx_pressure_lockdown = True" in hc

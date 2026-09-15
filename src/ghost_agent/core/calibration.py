@@ -22,7 +22,7 @@ This module closes that loop. It is the calibration *spine*:
   3. **Unify.** The recorded sample carries the verbalised-uncertainty
      *pressure* alongside the objective entropy/competence components,
      so the previously-disjoint "the agent said it was unsure" track
-     and "the generation/​domain was uncertain" track are fit together.
+     and "the generation/domain was uncertain" track are fit together.
 
 Design non-negotiables (same as every other Stage-1 module):
 

@@ -1165,9 +1165,19 @@ class SkillMemory:
                     "source_refs": ",".join(lesson.get("source_refs") or [])[:400],
                     "dimension": lesson.get("dimension", "") or "",
                 }
-                memory_system.add(text, meta)
+                _r = memory_system.add(text, meta)
             except Exception as exc:
                 logger.debug("twin heal: re-embed failed: %s", exc)
+                continue
+            # §4GK round 6: `add()` answers whether the write LANDED. A refusal
+            # (a duplicate-id collision that would reclassify an existing
+            # row's type) used to be indistinguishable from a success, so a
+            # twin that never landed was still counted as healed.
+            _refusals = tuple(getattr(memory_system, "ADD_REFUSALS", None) or ())
+            if _refusals and _r in _refusals:
+                logger.warning("twin heal: the store REFUSED the write "
+                               "for %r (%s) — not counting it healed",
+                               str(text)[:60], _r)
                 continue
             healed += 1
             # Mark healed within this run too — duplicate-trigger rows
@@ -1580,7 +1590,34 @@ class SkillMemory:
                     # bulk retraction).
                     "source": new_lesson.get("source", "") or "",
                 }
-                memory_system.add(text, meta)
+                _r = memory_system.add(text, meta)
+                # ⚠ THE PRIMARY WRITE WAS THE ONE NOBODY CHECKED (§4GK round
+                # 6). `ADD_REFUSALS` was wired into the REPAIR sites —
+                # `heal_missing_twins` above, the acquired-skill backfill —
+                # and not into the write that MINTS the twin, so the only
+                # refusal that strands a brand-new lesson was silent. The
+                # playbook row lands (it is the canonical store, and the
+                # lesson IS learned), but the vector copy the playbook's
+                # semantic path reads never exists: the lesson is reachable
+                # only by the BM25/substring fallback, and the "SKILL
+                # ACQUIRED" line below says nothing about it. Refusal means
+                # this exact text is already owned by another population, so
+                # re-driving the write cannot help — heal_missing_twins will
+                # decline to count it every idle cycle. Say it once, here,
+                # where an operator can act on it.
+                _refusals = getattr(memory_system, "ADD_REFUSALS", ())
+                if isinstance(_refusals, (tuple, list)) and _r in _refusals:
+                    logger.warning(
+                        "Lesson twin NOT stored (%s) for trigger %r — the "
+                        "playbook entry is written, but the lesson is dark to "
+                        "semantic recall (substring fallback only).",
+                        _r, effective_trigger[:60])
+                    pretty_log(
+                        "Skill Store",
+                        f"twin REFUSED ({_r}) — {effective_trigger[:48]!r} is "
+                        f"in the playbook but dark to semantic recall",
+                        level="WARNING", icon=Icons.WARN,
+                    )
 
             # Name the lesson BODY, not just the trigger — "learned a lesson"
             # without the lesson is unreconstructable. Durable mirror keeps the

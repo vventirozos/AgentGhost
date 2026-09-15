@@ -216,34 +216,37 @@ async def test_curl_download_overflow_break_aborts_transfer(tmp_path):
 @pytest.mark.asyncio
 async def test_onion_fetch_streams_with_byte_cap():
     """_fetch_raw_html must STOP reading at the cap instead of materializing a
-    giant chunked body via r.text. Patches the curl_cffi Session (the default
-    branch) to stream effectively-unbounded chunks."""
+    giant chunked body via r.text — and REAP the abandoned transfer.
+
+    ⚠ This patched the SYNC `creq.Session` until 2026-09-14 (§4GM). The onion
+    fetch moved to `AsyncSession` because the sync streaming path double-frees
+    inside libcurl and aborts the process; a mock of the class the code no
+    longer builds does not fail — it lets a REAL .onion fetch through."""
+    from tests.conftest import make_streaming_resp
     import ghost_agent.tools.darkweb_search as D
     import curl_cffi.requests as creq
 
     consumed = {"chunks": 0}
 
-    class _Resp:
-        status_code = 200
-        headers = {"content-type": "text/html"}  # no content-length (chunked)
+    async def _endless():
+        while True:  # unbounded — the byte cap must break the loop
+            consumed["chunks"] += 1
+            yield b"x" * (256 * 1024)
 
-        def iter_content(self):
-            while True:  # unbounded — the byte cap must break the loop
-                consumed["chunks"] += 1
-                yield b"x" * (256 * 1024)
-
-        def close(self):
-            pass
+    resp = make_streaming_resp(200, "", content_type="text/html")  # no length
+    resp.aiter_content = MagicMock(side_effect=_endless)
 
     class _Session:
         def __init__(self, *a, **k): pass
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-        def get(self, *a, **k): return _Resp()
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, *a, **k): return resp
 
-    with patch.object(creq, "Session", _Session):
+    with patch.object(creq, "AsyncSession", _Session):
         status, text = await D._fetch_raw_html("http://x.onion/", None, 5.0)
 
     assert status == 200
     assert len(text) <= D._MAX_ONION_BODY_BYTES  # capped, not unbounded
     assert consumed["chunks"] < 1000  # stopped early, didn't read forever
+    resp.quit_now.set.assert_called()            # transfer aborted…
+    assert resp.aclose.await_count >= 1          # …and reaped

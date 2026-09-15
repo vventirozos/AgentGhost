@@ -73,9 +73,17 @@ def test_empty_and_none_are_fine():
 # ---------------------------------------------------------------------------
 
 def test_dropped_file_system_gets_note():
+    """⚠ The wording CHANGED on 2026-09-14 (§4GN) and this pin moved with it.
+    It used to assert "NOT been applied" — the note's old future-tense
+    disclaimer ("any change described above as about to happen"). A reply
+    then ended "The report is saved to /workspace/…md" (req da4c17ba), and a
+    disclaimer about what was *about to* happen does not contradict a claim
+    that it already did. The contract is now the past tense, which is the
+    tense the false claims are written in."""
     note = _dropped_mutation_note(["file_system"])
-    assert "NOT been applied" in note
     assert "file_system" in note
+    assert "written, saved or created was actually written" in note, note
+    assert "Ask me to continue" in note
 
 
 def test_dropped_terminal_tool_stays_silent():

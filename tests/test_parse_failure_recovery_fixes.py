@@ -288,7 +288,7 @@ class TestBrokenReplayScrub:
         # parse_failure_reason alone ("truncated" accompanies fully
         # executed calls; scrubbing those asks for a re-run of a
         # mutation that already happened).
-        src = inspect.getsource(GhostAgent.handle_chat)
+        src = inspect.getsource(GhostAgent.handle_chat) + inspect.getsource(GhostAgent._run_internal_turn)
         assert "_scrub_unparsed_tool_call_text(" in src
         idx_strip = src.index("clean_content_for_history = _strip_think_blocks")
         idx_scrub = src.index("_scrub_unparsed_tool_call_text(")
@@ -351,7 +351,7 @@ class TestBrokenReplayScrub:
     def test_renderer_call_site_passes_path_flag(self):
         # Source guard: the single production call site must key the
         # dialect on args.native_tools.
-        src = inspect.getsource(GhostAgent.handle_chat)
+        src = inspect.getsource(GhostAgent.handle_chat) + inspect.getsource(GhostAgent._run_internal_turn)
         assert "native=_render_native" in src
         assign = src.split("_render_native = ", 1)[1].split("req_messages", 1)[0]
         assert '"native_tools"' in assign
@@ -390,7 +390,7 @@ class TestBrokenReplayScrub:
         # args.native_tools, and the GBNF grammar (attribute dialect,
         # hard-coded) is refused with a loud warning on the native path
         # instead of silently forcing a third dialect.
-        src = inspect.getsource(GhostAgent.handle_chat)
+        src = inspect.getsource(GhostAgent.handle_chat) + inspect.getsource(GhostAgent._run_internal_turn)
         assert "SPECIALIST_TOOL_XML_NATIVE if _specialist_native" in src
         assert "SPECIALIST_TOOL_XML_LEGACY" in src
         assert "GHOST_TOOL_GRAMMAR=1 ignored" in src

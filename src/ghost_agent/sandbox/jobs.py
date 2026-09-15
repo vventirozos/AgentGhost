@@ -86,6 +86,7 @@ from ..tools.file_system import (
 from typing import Dict, List, Optional, Tuple
 
 from ..utils.logging import Icons, pretty_log
+from . import registry_guard as _rg   # ONE home for pid/port/kill rules (§4GI)
 
 logger = logging.getLogger("GhostAgent")
 
@@ -180,20 +181,9 @@ _SENTINEL_GRACE_S = 3.0
 _CEILING_MARGIN_S = 1200.0
 
 
-def _probe_inconclusive(out, code) -> bool:
-    """True when a probe's non-zero exit says "the PROBE failed", not "the
-    process is gone".
-
-    Two shapes, both measured: ``sandbox.execute`` reports an infra fault
-    (wedged daemon, container restart, provision backoff) as exit 1 with an
-    ``[SANDBOX INFRA ERROR]`` body — and it wraps every probe in its own
-    ``timeout -k 5s 15s``, whose expiry surfaces as exit 124 with the generic
-    ``[SYSTEM ERROR]: Process failed`` line and NO infra marker. Reading
-    either as death is how a live job got exit 137 with its log deleted.
-    """
-    text = str(out or "")
-    return ("SANDBOX INFRA ERROR" in text
-            or int(code or 0) in (124, 137, 143))
+#: The three-valued probe rule lives in `registry_guard` since §4GI (the
+#: services twin needed the same one); the old name is kept for readers.
+_probe_inconclusive = _rg.probe_inconclusive
 
 
 def jobs_enabled() -> bool:
@@ -316,16 +306,171 @@ class SandboxJobSupervisor:
     def __init__(self, sandbox_manager):
         self.sandbox = sandbox_manager
         self._lock = threading.RLock()
-        # jid -> the per-job sentinel nonce this process minted. In-memory
-        # by design: a nonce that survived a restart would be readable from
-        # the registry, which is the file the nonce defends against. A job
-        # adopted after a restart simply falls back to the unauthenticated
-        # read — it is already tracked, so the forgery cannot create an
-        # untracked process, only land an existing row early.
+        # jid -> the per-job sentinel nonce this process minted. Persisted
+        # (§4GI) in a HOST-ONLY file OUTSIDE the bind mount — never in the
+        # registry, which is the file the nonce defends against — so a
+        # restarted agent verifies the same nonce. Before this, a restart
+        # dropped every nonce: a forged `echo 0 > .jobs/<jid>.exit` then
+        # landed a running job as DONE (files cleaned, process orphaned),
+        # and a GENUINE "<nonce> <rc>" sentinel failed the digit check and
+        # landed the job as LOST. A job with NO known nonce is now
+        # supervised on its real process only (fail closed).
         self._nonces: Dict[str, str] = {}
+        self._nonce_pending: Dict[str, None] = {}
+        self._nonce_store: Optional[Path] = None
+        try:
+            self._nonce_store = (Path(sandbox_manager.host_workspace).resolve().parent
+                                 / "system" / "sandbox_job_nonces.json")
+            self._nonces.update(self._load_nonces())
+        except Exception:  # noqa: BLE001 — a stub manager has no workspace
+            self._nonce_store = None
         # jids already warned about a bad sentinel (one line per job, not
         # one per poll tick).
         self._warned_nonce: set = set()
+
+    # -- nonce store (host-only, §4GI) ---------------------------------------
+
+    def _load_nonces(self) -> Dict[str, str]:
+        if self._nonce_store is None or not self._nonce_store.is_file():
+            return {}
+        try:
+            # The store is bounded (`_NONCE_STORE_MAX`), so a whole-file read
+            # is small; `max_bytes` keeps the TAIL of a larger file, which
+            # cut the JSON head and trusted nothing (R3 review).
+            data = json.loads(_read_bytes_nofollow(
+                self._nonce_store, max_bytes=8 << 20).decode("utf-8", "replace"))
+        except Exception:  # noqa: BLE001 — corrupt → nothing trusted
+            return {}
+        return {str(k): str(v) for k, v in (data or {}).items()
+                if valid_job_id(k) and isinstance(v, str) and 8 <= len(v) <= 64}
+
+    #: Backstop only. The real bound is `_sync_nonces`: a nonce exists while
+    #: its job RUNS and is dropped when the registry says it is terminal.
+    _NONCE_STORE_MAX = 512
+    #: Jids whose nonce was minted by `_write_script` but whose registry row
+    #: does not exist yet (`_promote` writes it seconds later, and the mint is
+    #: NOT under `_lock`). Without this a concurrent `_save` would sync the
+    #: fresh nonce away before the row it is judged against exists.
+    #:
+    #: ⚠ AGED OUT, NEVER COUNTED OUT (§4GK round 4). This started as a
+    #: 64-entry FIFO — a COUNT bound on a TIME window — and that re-created
+    #: the very regression round 3 removed, on a shorter fuse and with the
+    #: same victim. A command has no registry row from `_write_script` until
+    #: `_promote`, which is `promote_after_s()` (90 s) away and can be the
+    #: whole exec budget; during that window the pending mark is the nonce's
+    #: only protection. Sixty-four ordinary `execute` calls evicted it, the
+    #: next `_save` dropped the nonce, `_read_exit` rejected the job's own
+    #: genuine sentinel and a ten-minute run that exited 0 was reported to the
+    #: model as EXIT CODE 137. Reproduced. Expiry is now by AGE, longer than
+    #: any window in which a row can legitimately be missing: too-long costs
+    #: one dict entry, too-short destroys an exit code.
+    _NONCE_PENDING_MAX = 4096          # memory backstop only, never the rule
+
+    #: Floor for the pending window. The mark protects the span from
+    #: `_write_script` to `_promote`, and that span is the EXEC BUDGET, not
+    #: `promote_after_s`: `_supervise` only promotes early when `_progressing`
+    #: says so, and a quiet pure-compute command waits out the whole budget
+    #: with no registry row. §4GK round 5 measured the round-4 formula at its
+    #: own documented env floors (`JOB_TTL_S=60`, `PROMOTE_AFTER_S=5`) giving
+    #: a 60 s window against a 600 s budget — the victim lost its mark 300 s
+    #: in, then its nonce, then landed LOST with a fabricated exit code: the
+    #: regression round 3 removed, reachable again by setting two knobs
+    #: inside their own documented bounds. The budget is the clock that
+    #: matters, so the floor is set above any of them.
+    _NONCE_PENDING_FLOOR_S = 3600.0
+
+    def _nonce_pending_ttl_s(self) -> float:
+        """How long a jid may sit without a registry row before its pending
+        mark is assumed dead. Too long costs one dict entry; too short
+        destroys an exit code, so this errs long by construction."""
+        return max(float(job_ttl_s()),
+                   float(promote_after_s()) * 4.0,
+                   self._NONCE_PENDING_FLOOR_S)
+
+    def _note_pending_nonce(self, jid: str) -> None:
+        now = time.time()
+        self._nonce_pending[jid] = now
+        ttl = self._nonce_pending_ttl_s()
+        for _jid, _at in list(self._nonce_pending.items()):
+            if not isinstance(_at, (int, float)) or (now - float(_at)) > ttl:
+                self._nonce_pending.pop(_jid, None)
+        # Pathological backstop: only ever reached if thousands of jobs are
+        # genuinely un-promoted inside one TTL, which is not a state the
+        # exit-code guarantee can protect anyway.
+        while len(self._nonce_pending) > self._NONCE_PENDING_MAX:
+            self._nonce_pending.pop(next(iter(self._nonce_pending)), None)
+
+    def _release_nonce(self, jid: str) -> None:
+        """This job is over and its files are gone: its nonce can never be
+        needed again (§4GK round 4).
+
+        `_sync_nonces` is described as THE lifecycle, but it is only reached
+        from `_save`, and the two in-band exits — `_finish_completed` (normal
+        completion, the commonest outcome by far) and `_kill_and_return` —
+        write no registry row and never call `_save`. The store therefore grew
+        without bound on the ordinary path, and past the cap it warned that
+        "every one belongs to a job the registry says is RUNNING", which was
+        false for every entry and sent the operator hunting rows that do not
+        exist. Measured: 600 in-band jobs, 600 nonces retained, 0 dropped."""
+        self._nonce_pending.pop(jid, None)
+        if self._nonces.pop(jid, None) is not None:
+            self._save_nonces()
+
+    def _sync_nonces(self, reg: Dict[str, dict]) -> bool:
+        """THE nonce lifecycle, in one place: a nonce is kept while its job is
+        RUNNING (or its row is still being written), and dropped otherwise.
+
+        Before this, four of the nine terminal transitions called a
+        `_drop_nonce` helper and five did not — including the commonest one,
+        normal completion. The store then grew until the 512 cap evicted
+        oldest-first, which is precisely the LONG-RUNNING job: its genuine
+        exit sentinel was rejected ("no nonce is known") and it landed LOST
+        with its exit code destroyed — the regression the whole-file read was
+        added to close. Called from `_save`, the one chokepoint every
+        transition already goes through, so the lifecycle follows the STATE
+        rather than being remembered at N call sites."""
+        keep = {jid for jid, e in reg.items()
+                if isinstance(e, dict) and e.get("state") == STATE_RUNNING}
+        keep |= set(self._nonce_pending)
+        stale = [jid for jid in list(self._nonces) if jid not in keep]
+        for jid in stale:
+            self._nonces.pop(jid, None)
+        return bool(stale)
+
+    def _save_nonces(self) -> None:
+        if self._nonce_store is None:
+            return
+        if len(self._nonces) > self._NONCE_STORE_MAX:
+            # Deliberately does NOT evict. Every surviving nonce belongs to a
+            # job `_sync_nonces` believes is still running, and dropping one
+            # destroys that job's exit code — the defect this cap used to
+            # cause. Growth is bounded by concurrent running jobs; say so.
+            logger.warning(
+                "sandbox job nonce store holds %d entries (cap %d) — none is "
+                "evicted, because dropping a nonce destroys that job's exit "
+                "code; check for jobs that never reached a terminal state",
+                len(self._nonces), self._NONCE_STORE_MAX)
+        try:
+            self._nonce_store.parent.mkdir(parents=True, exist_ok=True)
+            # ⚠ UNIQUE, NOT PER-PROCESS (§4GK round 5). A per-pid name is
+            # shared by every thread in this process, and there are three
+            # unlocked writers (`_write_script`, `_save`, `_release_nonce` —
+            # the last added in round 4, on the commonest path of all).
+            # `write_text_nofollow` opens O_TRUNC, so writer B truncates the
+            # temp A is mid-write on and both `os.replace` it: with the window
+            # widened, 7 of 8 concurrent saves raised FileNotFoundError on the
+            # replace — swallowed into a WARNING, so the caller believes the
+            # nonce is persisted — and the file left on disk was corrupt JSON,
+            # which makes `_load_nonces` return {} on the next restart and
+            # every promoted job's genuine sentinel is then rejected. The
+            # §4BW unique-temp-name class `registry.json` fixed thirty lines
+            # below, never applied here.
+            tmp = self._nonce_store.with_suffix(
+                f".{os.getpid()}.{threading.get_ident():x}.{uuid.uuid4().hex[:8]}.tmp")
+            _write_text_nofollow(tmp, json.dumps(self._nonces))
+            os.replace(tmp, self._nonce_store)
+        except Exception as e:  # noqa: BLE001 — a lost store = jobs supervised on pid only
+            logger.warning("sandbox job nonce store not written: %s", e)
 
     # -- paths / registry ----------------------------------------------------
 
@@ -413,7 +558,7 @@ class SandboxJobSupervisor:
             # NaN/Infinity parse as floats and pass a `<= 0` test, which
             # would make `time.time() >= deadline` permanently False — an
             # infinite TTL smuggled in as a number.
-            if pid <= 1 or not math.isfinite(deadline) or deadline <= 0:
+            if _rg.valid_pid(pid) is None or not math.isfinite(deadline) or deadline <= 0:
                 logger.warning(
                     "sandbox job registry: dropping unsafe row %s "
                     "(pid=%s deadline=%r) — a pid of 0/1 would signal the "
@@ -434,6 +579,12 @@ class SandboxJobSupervisor:
         return clean
 
     def _save(self, reg: Dict[str, dict]) -> None:
+        # The nonce lifecycle follows the job STATE (§4GJ round 3): every
+        # terminal transition already reaches this chokepoint, so syncing
+        # here closes the class that four scattered `_drop_nonce` calls left
+        # half-open. Persisted only when something actually changed.
+        if self._sync_nonces(reg):
+            self._save_nonces()
         self.host_dir.mkdir(parents=True, exist_ok=True)
         # UNIQUE temp name. A fixed `registry.tmp` (the shape inherited from
         # services.py) is not safe against a second process sharing this
@@ -529,17 +680,7 @@ class SandboxJobSupervisor:
         PID 1 reaps it — which would make a done job read as running forever
         (the trap services.py hit in 2026-07). State is the first field after
         the LAST ')' in /proc/<pid>/stat (comm may contain spaces/parens)."""
-        try:
-            pid = int(pid)
-        except (TypeError, ValueError):
-            return False
-        cmd = (f"sh -c 'kill -0 {pid} 2>/dev/null && "
-               f"[ \"$(sed \"s/^.*) //\" /proc/{pid}/stat 2>/dev/null "
-               f"| cut -d\" \" -f1)\" != Z ]'")
-        out, code = self._exec(cmd, timeout=15)
-        if code != 0 and _probe_inconclusive(out, code):
-            return None
-        return code == 0
+        return _rg.pid_state(self._exec, pid)
 
     def _pid_alive(self, pid) -> bool:
         """Strict liveness — UNKNOWN reads as not-alive. Only for callers
@@ -596,18 +737,15 @@ class SandboxJobSupervisor:
         the number is untrusted input; ``_load`` rejects malformed rows and
         this floor is the second gate.
         """
-        try:
-            pid = int(pid)
-        except (TypeError, ValueError):
-            return False
-        if pid <= 1:
+        if _rg.valid_pid(pid) is None:
             pretty_log(
                 "Job Kill Refused",
-                f"refusing to signal pid {pid} — 'kill -- -{pid}' targets "
+                f"refusing to signal pid {pid!r} — 'kill -{pid}' targets "
                 f"the whole container, not one job (registry row is "
                 f"malformed or tampered with)",
                 level="ERROR", icon=Icons.SHIELD)
             return False
+        pid = int(pid)
         # SESSION-scoped, not just process-group-scoped. Measured live: the
         # runner's own last-resort `timeout` wrapper calls setpgid() on
         # itself (GNU timeout runs its child in a NEW process group unless
@@ -641,32 +779,8 @@ class SandboxJobSupervisor:
         # this is a property of the sandbox, not of promotion. The
         # backgrounded-server guard in tools/execute.py is what actually
         # addresses that class, by refusing the command up front.
-        script = (
-            f'S={pid}; '
-            f'mine() {{ q=$1; d=0; while [ "$q" -gt 1 ] 2>/dev/null; do '
-            f'[ "$q" = "$S" ] && return 0; '
-            f'd=$((d+1)); [ "$d" -gt 32 ] && return 1; '
-            f'st=$(sed "s/^.*) //" "/proc/$q/stat" 2>/dev/null); '
-            f'[ -n "$st" ] || return 1; '
-            f'sd=$(echo "$st" | cut -d" " -f4); '
-            f'[ "$sd" = "$S" ] && return 0; '
-            f'q=$(echo "$st" | cut -d" " -f2); done; return 1; }}; '
-            f'sig() {{ kill -"$1" -$S 2>/dev/null || '
-            f'kill -"$1" $S 2>/dev/null; '
-            f'for f in /proc/[0-9]*; do p=${{f##*/}}; '
-            f'case "$p" in *[!0-9]*) continue;; esac; '
-            f'[ "$p" -gt 1 ] || continue; '
-            f'mine "$p" && kill -"$1" "$p" 2>/dev/null; '
-            f'done; true; }}; '
-            # Poll for death instead of a flat `sleep 2`: a cancel or a TTL
-            # expiry blocked a worker thread for a guaranteed two seconds
-            # even when the tree died on the first TERM.
-            f'sig TERM; i=0; while [ $i -lt 20 ]; do '
-            f'kill -0 $S 2>/dev/null || break; '
-            f'sleep 0.1; i=$((i+1)); done; '
-            f'sig KILL; true'
-        )
-        self._exec(f"sh -c {shlex.quote(script)}", timeout=30)
+        # The script itself lives in registry_guard.kill_tree_script (§4GI).
+        _rg.kill_tree(self._exec, pid, timeout=30)
         # Verify against the SESSION too: _probe reports alive when ANY
         # member is still running, so a surviving grandchild cannot be
         # mistaken for a clean kill just because the leader is gone.
@@ -771,6 +885,20 @@ class SandboxJobSupervisor:
         except (OSError, ValueError):
             return None
         nonce = self._nonces.get(jid)
+        if not nonce:
+            # §4GI: no nonce known for this job (promoted by a pre-fix
+            # process, or the store is gone) — a bare sentinel is exactly
+            # the forgery the nonce exists to stop. The job stays supervised
+            # on its real process (pid death → LOST/reaped by TTL).
+            if jid not in self._warned_nonce:
+                self._warned_nonce.add(jid)
+                pretty_log(
+                    "Job Sentinel Rejected",
+                    f"{jid}: exit sentinel present but no nonce is known for "
+                    f"this job — ignoring it; the job is supervised on its "
+                    f"real process instead.",
+                    level="WARNING", icon=Icons.SHIELD)
+            return None
         if nonce:
             prefix = nonce + " "
             if not txt.startswith(prefix):
@@ -984,6 +1112,8 @@ class SandboxJobSupervisor:
         ceiling = int(max(60.0, float(hard_ceiling_s)) + _CEILING_MARGIN_S)
         nonce = secrets.token_hex(8)
         self._nonces[jid] = nonce
+        self._note_pending_nonce(jid)
+        self._save_nonces()
         # ⚠ The un-migrated sibling of the `.cmd.sh` fix. Random jid plus a
         # preceding unlink narrows it; the kernel closes it.
         _write_text_nofollow(paths["script"],
@@ -1262,6 +1392,11 @@ class SandboxJobSupervisor:
                             return self._finish_completed(jid, code)
                         out = self._read_log(jid)
                         self._cleanup_files(jid, drop_log=True)
+                        # §4GK round 5: an in-band exit writes no registry row and never
+                        # reaches `_save`, so nothing else drops the nonce. Round 4 wired
+                        # the release into two of the FIVE terminal returns; these are the
+                        # other in-band ones.
+                        self._release_nonce(jid)
                         return out, 137, None
             elapsed = now - started
             time.sleep(0.05 if elapsed < 1.0
@@ -1282,6 +1417,11 @@ class SandboxJobSupervisor:
                 return self._finish_completed(jid, code)
             out = self._read_log(jid)
             self._cleanup_files(jid, drop_log=True)
+            # §4GK round 5: an in-band exit writes no registry row and never
+            # reaches `_save`, so nothing else drops the nonce. Round 4 wired
+            # the release into two of the FIVE terminal returns; these are the
+            # other in-band ones.
+            self._release_nonce(jid)
             return out, 137, None
         # alive is None → the probe failed, not the job. Handled below, at
         # the promotion decision: it must not fall through to the progress
@@ -1342,6 +1482,7 @@ class SandboxJobSupervisor:
         out = self._read_log(jid)
         self._cleanup_files(jid, drop_log=killed,
                             entry={"cleanup_paths": cleanup_paths})
+        self._release_nonce(jid)
         if not killed:
             logger.warning(
                 "sandbox job %s: pid %s survived TERM+KILL — its log is "
@@ -1375,6 +1516,7 @@ class SandboxJobSupervisor:
         job (nothing will poll for it)."""
         out = self._read_log(jid)
         self._cleanup_files(jid, drop_log=True)
+        self._release_nonce(jid)
         return out, int(code), None
 
     def _promote(self, jid: str, *, cmd: str, pid: int, workdir: str,

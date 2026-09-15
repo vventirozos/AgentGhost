@@ -352,6 +352,10 @@ bin/unserve-remote.sh 8100    # tear down (or `… all` to reset every mapping)<
   <code>tests/test_sandbox_services.py</code> and the service-token auth tests in
   <code>tests/test_game_move_api.py</code> (including "a token never unlocks /api/chat").</p>
 
+  <h2 id="4gi">One guard for both registries <span class="tag">2026-09-13 &sect;4GI</span></h2>
+  <p>The services registry (<code>/workspace/.services/registry.json</code>) is on the bind mount, so the processes it supervises can write it. The rules that make that safe were written for the <a href="jobs.html">jobs</a> twin in &sect;4DX and never reached this file: a planted <code>{"web": {"pid": 1, "port": 8100}}</code> row was trusted (<code>_entry_alive</code> fell to <code>kill -0 1</code>, true as root), and <code>stop web</code> ran <code>kill -TERM -- -1 || kill -TERM 1</code> &mdash; the <code>--</code> form is a dash syntax error, so the fallback TERMed docker-init and the whole container with it. Any infra fault on the liveness probe read as "dead": the row was popped without a kill and its port re-issued to the next start.</p>
+  <p>Now every rule lives once, in <code>sandbox/registry_guard.py</code>, and both files call it: <code>validate_row</code> (pid <code>None</code> or a signal-safe int in <code>(1, pid_max)</code>, port in range, name pattern, short container stamp) drops unsafe rows at <code>_load</code> with a log line; <code>pid_state</code> is three-valued (<code>True</code> / <code>False</code> / <code>None</code> = the probe failed) and <code>_entry_state</code> / <code>_entry_alive_or_unknown</code> treat "unknown" as alive wherever the answer would lease a port, refuse a twin, count the cap or reclaim a port (status shows <code>UNKNOWN (sandbox probe failed &mdash; not dead)</code>); <code>kill_tree</code> refuses the floor with a log line and otherwise runs the one dash-safe process-tree script (group, session, <code>/proc</code> descendants, plain-pid fallback, signal names spelled out). <code>tests/test_registry_guard_4gi.py</code> enumerates both files from the AST &mdash; a private <code>kill -TERM</code> literal or a <code>pid &lt;= 1</code> comparison reddens it &mdash; and drives the planted rows through the real supervisor over the recorded exec: no kill for pid 0/1/"1"/-1/pid_max, an infra fault keeps the row and its port, a real stop uses the shared script.</p>
+
   <h2>Tests</h2>
   <p><code>tests/test_sandbox_services.py</code> — port-spec parsing,
   validation rails, lifecycle (start/immediate-exit/stop-group-kill/restart/
@@ -400,6 +404,18 @@ bin/unserve-remote.sh 8100    # tear down (or `… all` to reset every mapping)<
   <code>HOST=0.0.0.0</code> export exposes services LAN-wide; the manager now
   offers <code>binds_host_netns()</code> for the services layer to export
   <code>HOST=127.0.0.1</code> in that mode.</p>
+  <h3 id="4gi-r3">Review round: invalid rows are quarantined, not erased <span class="tag">2026-09-13</span></h3>
+  <p>The first version dropped rows that failed validation (a name from before the 2026-08-30 pattern, a port outside the lease range) from the live map, and the next unrelated <code>_save</code> wrote the registry without them &mdash; an orphaned process squatting its port with no row. <code>_validated_rows</code> now keeps them in <code>_quarantined_rows</code>: never acted on, never leased, but written back by <code>_save</code> so the operator can still see them. Pins: <code>tests/test_4gi_review_round2.py</code>.</p>
+
+  <h2 id="4gk">Round 4: a signal sent is not a process stopped <span class="tag">2026-09-13 &sect;4GK</span></h2>
+  <p>The shared kill helper discarded its exec result and returned success once the pid passed the safety floor. The jobs supervisor re-probed afterwards and warned when a pid survived; this one did not &mdash; so stopping a service reported success, unlinked the pidfile and dropped the registry row while the process kept running and held its port. That is the remaining half of the divergence the shared module exists to close: the <em>script</em> was shared, the <em>verification</em> was not. The helper now probes after the kill and answers whether the tree is actually gone; a survivor keeps its row and its pidfile so it can be retried, and an inconclusive probe counts as gone but is logged, because refusing to release on a probe failure strands the port forever.</p>
+  <p>The pid guard also rounded: a tampered <code>pid: 2.9</code> truncated into a real kill for pid 2. A value that is not an exact integer is refused rather than rounded into a neighbour's process, and the script builder raises the error it documents instead of a type error for a null or a list.</p>
+  <h2 id="4gq">The survival verdict no longer depends on the caller <span class="tag">2026-09-14 &sect;4GQ</span></h2>
+  <p>
+    Round 7 made <code>_last_kill_survived</code> honest — a PORT HOLDER that outlives TERM+KILL is a survival, and <code>_kill_service</code> combines it with the tracked pid's answer — and left the CLEARING to the three call sites. Every one of them does it today, which is precisely the fragility: a fourth caller that forgets inherits the previous service's survival, so a process that died cleanly keeps its pidfile and the operator is told it "did NOT stop". Same latch shape round 7 found in <code>_cut_off</code>, one file over, and free to close at the callee — <code>_kill_service</code> now resets the flag on entry.
+  </p>
+  <p class="note">Pins: <code>tests/test_4gq_round8.py</code> (the stale-survival case and its control, where a real survival in THIS call still stands).</p>
+
 </main>
 </body>
 </html>

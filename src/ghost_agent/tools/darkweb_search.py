@@ -33,7 +33,9 @@ What is NEW here:
     parse out the result links. `helper_fetch_url_content` strips all tags
     to plain text (destroying the links), so it is unusable for the search
     phase; we fetch raw HTML ourselves, honouring the caller's proxy, under a
-    hard body-size cap and on a DEDICATED bounded thread pool. The *research*
+    hard body-size cap and on the EVENT LOOP behind `_onion_gate`'s bound —
+    never on a thread: curl_cffi's SYNC streaming path double-frees inside
+    libcurl and aborts the process (§4GM). The *research*
     phase reuses the same capped/proxied fetch via `_fetch_onion_text` (NOT
     the shared `helper_fetch_url_content`, which ignores the passed proxy and
     can trigger a global Tor NEWNYM / service restart on every failed fetch).
@@ -47,7 +49,6 @@ import logging
 import os
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import quote_plus, urlparse, parse_qs, unquote
 
@@ -62,8 +63,9 @@ from ..core.node_throughput import (
 # engine returning nothing was the intended outcome anyway. The
 # breaker 'worked' by accident, with its only observability dead.
 logger = logging.getLogger("GhostAgent")
-from ..utils.helpers import url_ssrf_reason
+from ..utils.helpers import url_ssrf_reason, aclose_curl_response
 from .search import (
+    source_block_failed as _source_block_failed,
     _sanitize_query,
     _proxy_for_attempt,
     _clean_for_cpp,
@@ -426,13 +428,45 @@ def _breaker_record(name: str, won: bool) -> None:
 # `helper_fetch_url_content` enforces on clearnet fetches.
 _MAX_ONION_BODY_BYTES = 5 * 1024 * 1024
 
-# Onion fetches run in worker threads (curl_cffi/httpx are sync). When the
-# per-engine deadline fires, `asyncio.wait_for` cancels the AWAIT but cannot
-# kill the thread — it keeps running until curl's own timeout. Isolating those
-# threads in a dedicated bounded pool means lingering post-deadline fetches
-# can never exhaust the process-wide default executor that the rest of the
-# agent relies on; excess fetches simply queue here instead.
-_ONION_EXECUTOR = ThreadPoolExecutor(max_workers=16, thread_name_prefix="onion-fetch")
+# Onion fetches ride the EVENT LOOP, not a thread pool (§4GM, 2026-09-14).
+#
+# ⚠ THEY USED TO RUN ON A BOUNDED ThreadPoolExecutor, AND THAT KILLED THE
+# AGENT TWICE IN TWELVE HOURS. curl_cffi's SYNCHRONOUS `Session.request`
+# with `stream=True` duplicates the easy handle (`curl_easy_duphandle`),
+# resets the parent immediately, performs on a thread pool of its own and
+# resets the DUPLICATE from a done-callback on yet another thread.
+# libcurl-impersonate does not deep-copy that option set, so the two resets
+# free the same pointer: `curl_easy_reset` → `Curl_freeset` → "pointer being
+# freed was not allocated" → abort(). Measured, not theorised: SIGABRT on
+# 2026-09-13 22:19:51 (pid 38307) and 2026-09-14 09:07:40 (pid 65198), same
+# stack both times, the second one mid-request one second after an onion
+# engine's post-deadline fetch was still lingering — and reproduced locally
+# in ~40s with this call shape on 8 threads. The process dies; launchd
+# restarts it; the request is lost.
+#
+# The ASYNC session has no `duphandle` anywhere: it takes a handle from a
+# pool and resets it on the loop thread. That is the only shape that cannot
+# corrupt libcurl's heap, and it is what every OTHER fetch in this tree
+# already uses. Cancellation improves too — `wait_for` now aborts the
+# transfer instead of orphaning a thread that runs on to curl's own timeout.
+#
+# The 16-way bound the pool gave us is KEPT, as a semaphore: excess fetches
+# queue instead of piling concurrent circuits onto Tor. It is rebuilt when
+# the running loop changes, because a semaphore that has waited on one loop
+# cannot be awaited on another and the suite builds a fresh loop per test.
+_MAX_CONCURRENT_ONION_FETCHES = 16
+_ONION_GATE: "Optional[asyncio.Semaphore]" = None
+_ONION_GATE_LOOP: Any = None
+
+
+def _onion_gate() -> asyncio.Semaphore:
+    """The concurrency bound for onion fetches, bound to the RUNNING loop."""
+    global _ONION_GATE, _ONION_GATE_LOOP
+    loop = asyncio.get_running_loop()
+    if _ONION_GATE is None or _ONION_GATE_LOOP is not loop:
+        _ONION_GATE = asyncio.Semaphore(_MAX_CONCURRENT_ONION_FETCHES)
+        _ONION_GATE_LOOP = loop
+    return _ONION_GATE
 
 
 def _load_engines() -> List[Dict[str, str]]:
@@ -891,10 +925,11 @@ async def _fetch_raw_html(url: str, proxy: Optional[str], timeout: float,
     phase needs the markup to parse out result links — and it HONOURS the
     passed proxy rather than reading it from the environment. Uses curl_cffi
     when present (TLS-impersonating, the project default) and falls back to
-    httpx. The body is size-capped (`_cap_body`) and the blocking request runs
-    on a dedicated bounded pool so a post-deadline lingering fetch can't
-    exhaust the shared executor. Returns (status_code, body); (None, "") on
-    transport failure.
+    httpx. The body is size-capped (`_cap_body`) and the request runs on the
+    EVENT LOOP behind `_onion_gate`'s 16-way bound — never on a worker
+    thread: curl_cffi's sync streaming path corrupts libcurl's heap and
+    aborts the process (see `_onion_gate`, §4GM). Returns (status_code,
+    body); (None, "") on transport failure.
 
     Redirects are followed, so the status alone cannot tell you whether the
     body came from the URL you asked for. Pass a ``meta`` dict to receive the
@@ -928,46 +963,63 @@ async def _fetch_raw_html(url: str, proxy: Optional[str], timeout: float,
                 continue
         return buf.decode("utf-8", errors="replace")
 
-    def run() -> Tuple[Optional[int], str]:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+
+    async with _onion_gate():
         try:
             import curl_cffi.requests as creq
+        except ImportError:
+            creq = None
 
-            proxies = {"http": proxy, "https": proxy} if proxy else None
-            with creq.Session(impersonate="chrome110", proxies=proxies, timeout=timeout) as c:
-                r = c.get(url, headers=headers, stream=True)
+        if creq is not None:
+            async with creq.AsyncSession(impersonate="chrome110",
+                                         proxies=proxies, timeout=timeout) as c:
+                r = await c.get(url, headers=headers, stream=True)
+                # Status and headers are parsed BEFORE the body streams, so
+                # read them now: the reaper below may abort the transfer, and
+                # a caller that reads them off a closed response is reading
+                # whatever state the abort left behind.
+                _status = r.status_code
+                _ctype = r.headers.get("content-type")
+                _clen = r.headers.get("content-length")
+                _record_final_url(meta, r)
                 buf = bytearray()
                 try:
-                    for chunk in r.iter_content():
+                    # aiter_content, NOT iter_content: on an AsyncSession
+                    # response the sync iterator yields un-awaited
+                    # Queue.get() COROUTINES, not bytes.
+                    async for chunk in r.aiter_content():
                         if chunk:
                             buf.extend(chunk)
                             if len(buf) >= _STREAM_LIMIT:
                                 break
                 finally:
-                    try: r.close()
-                    except Exception: pass
+                    # Abort + reap. Without this the cap break leaves the
+                    # transfer running until the server or curl gives up —
+                    # and on a cancellation (the per-engine deadline) the
+                    # handle would go back to the pool mid-transfer.
+                    await aclose_curl_response(r)
+                return _cap_body(_status, _ctype, _clen,
+                                 _decode(bytes(buf), _ctype))
+
+        import httpx
+
+        async with httpx.AsyncClient(proxy=proxy, timeout=timeout,
+                                     follow_redirects=True) as c:
+            async with c.stream("GET", url, headers=headers) as r:
+                buf = bytearray()
+                async for chunk in r.aiter_bytes():
+                    buf.extend(chunk)
+                    if len(buf) >= _STREAM_LIMIT:
+                        break
                 _record_final_url(meta, r)
                 return _cap_body(r.status_code, r.headers.get("content-type"),
-                                 r.headers.get("content-length"), _decode(bytes(buf), r.headers.get("content-type")))
-        except ImportError:
-            import httpx
-
-            with httpx.Client(proxy=proxy, timeout=timeout, follow_redirects=True) as c:
-                with c.stream("GET", url, headers=headers) as r:
-                    buf = bytearray()
-                    for chunk in r.iter_bytes():
-                        buf.extend(chunk)
-                        if len(buf) >= _STREAM_LIMIT:
-                            break
-                    _record_final_url(meta, r)
-                    return _cap_body(r.status_code, r.headers.get("content-type"),
-                                     r.headers.get("content-length"), _decode(bytes(buf), r.headers.get("content-type")))
-
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_ONION_EXECUTOR, run)
+                                 r.headers.get("content-length"),
+                                 _decode(bytes(buf), r.headers.get("content-type")))
 
 
 def _strip_html(html: str) -> str:
@@ -1113,11 +1165,10 @@ async def _query_engine(
         return _res
     except asyncio.TimeoutError:
         _breaker_record(engine["name"], False)
-        # The underlying fetch runs in a worker thread (curl_cffi/httpx has
-        # its own timeout), so it isn't force-killed here — but cancelling the
-        # await lets the gather proceed without waiting on this engine. The
-        # dedicated `_ONION_EXECUTOR` keeps that lingering thread off the
-        # shared pool.
+        # The fetch is now an awaitable on THIS loop (§4GM), so cancelling
+        # the await really does abort the transfer — it no longer orphans a
+        # worker thread that runs on until curl's own timeout. `_onion_gate`
+        # still bounds how many fetches run at once.
         pretty_log(
             "Darkweb Engine Error",
             f"{engine['name']}: exceeded {deadline:.0f}s deadline — skipped",
@@ -1218,6 +1269,53 @@ async def _darkweb_search_raw(
             len(engines))
 
 
+#: How many ADDITIONAL phrasings one `darkweb_search` call may carry (§4GN).
+#: Four queries × four engines = 16 onion fetches, exactly the bound
+#: `_onion_gate` already enforces, in ONE deadline instead of four.
+_MAX_EXTRA_QUERIES = 3
+
+#: Never return more than this many merged rows however many phrasings ran —
+#: the result block is read by a model, and breadth is worth nothing if it
+#: costs the context the investigation needs.
+_MULTI_QUERY_RESULT_CEILING = 24
+
+
+def _merge_across_queries(per_query: List[Tuple[str, List[Dict[str, Any]]]],
+                          cap: int) -> List[Dict[str, Any]]:
+    """Merge the ranked blocks of several phrasings into one ranked list.
+
+    Same signal the single-query merge prizes — a hidden service surfaced by
+    MORE INDEPENDENT INDEXES ranks higher — extended with the phrasing that
+    surfaced it. A host found under three different wordings is corroborated
+    in a way one wording cannot show, and the row says which wordings, so a
+    reader can tell a broad hit from a lucky one.
+    """
+    merged: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    for q, rows in per_query:
+        for r in rows:
+            host = _onion_host(r["url"])
+            if host not in merged:
+                merged[host] = {**r,
+                                "engines": set(r.get("engines") or ()),
+                                "indexes": set(r.get("indexes") or ()),
+                                "queries": [q]}
+                order.append(host)
+                continue
+            cur = merged[host]
+            cur["engines"] |= set(r.get("engines") or ())
+            cur["indexes"] |= set(r.get("indexes") or ())
+            if q not in cur["queries"]:
+                cur["queries"].append(q)
+            if not cur.get("snippet") and r.get("snippet"):
+                cur["snippet"] = r["snippet"]
+            if cur.get("title") == host and r.get("title") and r["title"] != host:
+                cur["title"] = r["title"]
+    ranked = sorted((merged[h] for h in order),
+                    key=lambda r: (-len(r["indexes"]), -len(r["queries"])))
+    return ranked[:cap]
+
+
 def _format_results(results: List[Dict[str, Any]]) -> str:
     formatted = []
     for i, r in enumerate(results, 1):
@@ -1225,44 +1323,118 @@ def _format_results(results: List[Dict[str, Any]]) -> str:
         snippet = _clean_for_cpp(r.get("snippet") or "")
         engs = ", ".join(sorted(r.get("engines", [])))
         body = (snippet + "\n") if snippet else ""
-        formatted.append(f"### {i}. {title}\n{body}[Onion: {r['url']}] (via {engs})")
+        # The phrasing tag appears ONLY on a multi-query call, so a single
+        # query's output is byte-identical to what it always was (the cache
+        # and every caller downstream read this text).
+        qs = r.get("queries") or []
+        via = f"(via {engs})" if len(qs) < 2 else \
+            f"(via {engs}; matched: {'; '.join(qs)})"
+        formatted.append(f"### {i}. {title}\n{body}[Onion: {r['url']}] {via}")
     return "\n\n".join(formatted)
+
+
+def _query_set(query: str, extra_queries: Any) -> List[str]:
+    """The phrasings this call will run: the main one plus up to
+    ``_MAX_EXTRA_QUERIES`` extras, sanitized, order-preserving, deduped.
+
+    A brief that enumerates ten search strings used to cost ten sequential
+    tool calls, so in practice it got two (§4GL/§4GN: an eight-minute
+    investigation ran exactly two dark-web queries against a brief naming
+    BreachForums, Exploit, RaidForums mirrors, paste sites and leak
+    indexes). Accepting the phrasings in ONE call makes breadth cost one
+    deadline instead of N.
+    """
+    # ⚠ DEDUPE BEFORE THE CAP. The cap exists to bound FETCH COST (engines ×
+    # phrasings); a repeated or whitespace-variant phrasing costs nothing, so
+    # letting it eat a slot would silently narrow a brief that listed five
+    # wordings, two of which happened to normalise the same way.
+    out, seen = [], set()
+    if isinstance(extra_queries, str):
+        extra_queries = [extra_queries]
+    cand = [query] + [q for q in list(extra_queries or []) if isinstance(q, str)]
+    for q in cand:
+        q = _sanitize_query(q or "")
+        k = _norm_cache_key(q)
+        if not q or k in seen:
+            continue
+        seen.add(k)
+        out.append(q)
+        if len(out) >= 1 + _MAX_EXTRA_QUERIES:
+            break
+    return out
 
 
 async def tool_darkweb_search(
     query: Optional[str] = None,
+    extra_queries: Any = None,
     anonymous: bool = False,
     tor_proxy: Optional[str] = None,
     max_results: int = 12,
     **kwargs: Any,
 ) -> str:
-    """List ranked .onion services matching a query, via onion search engines."""
+    """List ranked .onion services matching one or more queries."""
     if not query:
         return "SYSTEM ERROR: The 'query' parameter is MANDATORY. You must specify it."
-
-    if anonymous and query:
-        query, tor_proxy = _apply_anonymous_scrub(query, tor_proxy)
 
     # NOTE: the operator/quote/boolean stripping in `_sanitize_query` is
     # clearnet-derived but applies cleanly to Ahmia/Torch too — both are plain
     # keyword indexes that do not honour Google-style operators, so removing
     # them can only help, never lose a supported qualifier.
-    query = _sanitize_query(query)
-    tor_proxy = _normalize_tor_proxy(tor_proxy)
-    pretty_log("Darkweb Search", query, icon=Icons.TOOL_DARKWEB)
+    queries = _query_set(query, extra_queries)
+    if not queries:
+        return "SYSTEM ERROR: The 'query' parameter is MANDATORY. You must specify it."
+    base_proxy = _normalize_tor_proxy(tor_proxy)
+    pretty_log("Darkweb Search", " | ".join(queries), icon=Icons.TOOL_DARKWEB)
 
-    cache_key = "onion::" + _norm_cache_key(query)
+    cache_key = "onion::" + "||".join(_norm_cache_key(q) for q in queries)
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
-    ranked, _skipped, _all_skipped, _total = await _darkweb_search_raw(
-        query, tor_proxy, max_results=max_results)
+    # Each phrasing gets its OWN identity-tagged circuit in anonymous mode —
+    # the scrub is per query by design, and running the set on one circuit
+    # would relink exactly what the tagging exists to separate.
+    plans = []
+    for q in queries:
+        _q, _p = (_apply_anonymous_scrub(q, base_proxy) if anonymous
+                  else (q, base_proxy))
+        plans.append((q, _sanitize_query(_q), _normalize_tor_proxy(_p)))
+
+    raw = await asyncio.gather(
+        *[_darkweb_search_raw(sq, pp, max_results=max_results)
+          for _q, sq, pp in plans],
+        return_exceptions=True,
+    )
+    per_query, _skipped_all, _all_skipped_all, _total = [], [], [], 0
+    for (label, _sq, _pp), res in zip(plans, raw):
+        if isinstance(res, BaseException):
+            logger.warning("darkweb_search: phrasing %r failed: %s", label, res)
+            continue
+        _ranked, _skipped, _all_skipped, _tot = res
+        per_query.append((label, _ranked))
+        _skipped_all.extend(_skipped)
+        _all_skipped_all.append(_all_skipped)
+        _total = max(_total, _tot)
+    _skipped = sorted(set(_skipped_all))
+    # "All engines skipped" only if that was true for EVERY phrasing — one
+    # phrasing that reached the engines disproves the breaker-wide claim.
+    _all_skipped = bool(_all_skipped_all) and all(_all_skipped_all)
+
+    if len(queries) == 1:
+        ranked = per_query[0][1] if per_query else []
+    else:
+        ranked = _merge_across_queries(
+            per_query,
+            min(max_results * len(queries), _MULTI_QUERY_RESULT_CEILING))
     if not ranked:
         return _no_results_error(_skipped, _total, _all_skipped)
 
     reached = sorted({e for r in ranked for e in r.get("engines", [])})
     header = f"[Dark-web search — onion results, engines reached: {', '.join(reached)}]"
+    if len(queries) > 1:
+        header = (f"[Dark-web search — {len(queries)} phrasings "
+                  f"({'; '.join(queries)}), engines reached: "
+                  f"{', '.join(reached)}]")
     cacheable = header + "\n\n" + _format_results(ranked)
     # R2 M6: cache WITHOUT the NARROWED banner. It describes a transient
     # breaker state, and baking it into a 5-minute cache entry kept
@@ -1313,7 +1485,19 @@ async def tool_darkweb_research(
     cache_key = "onion-research::" + (query or "").strip().lower()
     cached = _cache_get(cache_key)
     if cached is not None:
-        return cached
+        # ⚠ A CACHE HIT MUST CARRY THE SAME STATUS AS THE RUN IT CACHED
+        # (§4GK round 4). This returned the raw report string, so the
+        # `darkweb_research_sources_partial` reason_code was dropped and
+        # `ToolOutcome.coerce` booked a plain OK — the same query answered OK
+        # from cache five minutes after answering partial. The coverage
+        # banner is IN the cached text, so the status is re-derivable without
+        # storing it separately. An all-failed run is never cached (the
+        # `_source_succeeded` gate below), so FAILED cannot occur here.
+        from .outcome import ToolOutcome
+        if "[⚠ SOURCE FAILURES:" in cached:
+            return ToolOutcome.ok(cached, world_changed=False,
+                                  reason_code="darkweb_research_sources_partial")
+        return ToolOutcome.ok(cached, world_changed=False)
 
     ranked, _skipped, _all_skipped, _total = await _darkweb_search_raw(
         query, tor_proxy, max_results=max_sources)
@@ -1649,10 +1833,10 @@ async def tool_darkweb_research(
     # prevent. `_lost` also catches anything `gather` returned as an
     # exception. `_degraded` counts sources that fell back to raw truncated
     # HTML: neither failed nor distilled, and previously reported as neither.
-    _failed = [c for c in valid_contents if "\nError:" in c]
+    _failed = [c for c in valid_contents if _source_block_failed(c)]
     _lost = len(urls) - len(valid_contents)
     _degraded = [c for c in valid_contents
-                 if "\nError:" not in c
+                 if not _source_block_failed(c)
                  and "[EDGE EXTRACTED FACTS]" not in c] if llm_client else []
     _banner = ""
     if _failed or _lost:
@@ -1709,11 +1893,31 @@ async def tool_darkweb_research(
         # is what makes this test mean what it says.
         parts = block.split("\n", 1)
         preview = parts[1].strip() if len(parts) > 1 else ""
-        return bool(preview) and not preview.startswith("Error:")
+        return bool(preview) and not _source_block_failed(block)
 
     if not _phase_truncated and any(_source_succeeded(c)
                                     for c in valid_contents):
         _cache_put(cache_key, result)
+    # §4GI round 3 — THE SIBLING ONE REVISION BEHIND. `deep_research` got
+    # its status in §4GI; this function builds the very same banner and
+    # still returned a success-shaped string on EVERY path, so an onion
+    # blackout (every hidden service down — the common case for this tool)
+    # was booked as a competent research call by `ToolOutcome.coerce`.
+    # Same rule as the clearnet sibling, for the same reason: nothing
+    # fetched is a FAILED action; partial coverage is a coverage limit the
+    # banner already reports, NOT a failed action (a non-OK status there
+    # fires the strike ledger and books `success: False` in the corpus).
+    from .outcome import ToolOutcome
+    _n_ok = len(valid_contents) - len(_failed)
+    _status_kw = {"world_changed": False}
+    if urls and _n_ok == 0:
+        _finish = lambda t: ToolOutcome.failed(                # noqa: E731
+            t, reason_code="darkweb_research_all_sources_failed", **_status_kw)
+    elif _failed or _lost:
+        _finish = lambda t: ToolOutcome.ok(                    # noqa: E731
+            t, reason_code="darkweb_research_sources_partial", **_status_kw)
+    else:
+        _finish = lambda t: ToolOutcome.ok(t, **_status_kw)    # noqa: E731
     # R3 MAJOR: research never emitted the NARROWED banner — and it is the
     # tool that depends MOST on cross-engine corroboration, since its
     # ranking picks which onions get deep-read and synthesised into a
@@ -1722,5 +1926,5 @@ async def tool_darkweb_research(
     # cache write, like the sibling: the banner describes a transient
     # breaker state and must not be served back for 5 minutes.
     if _skipped:
-        return result + "\n\n" + _narrowed_header(_skipped).lstrip("\n")
-    return result
+        return _finish(result + "\n\n" + _narrowed_header(_skipped).lstrip("\n"))
+    return _finish(result)

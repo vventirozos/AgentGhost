@@ -2516,7 +2516,9 @@ async def lifespan(app):
 
             _patch_fn = None
             if getattr(args, "postmortem_propose_patch", False):
-                async def _patch_fn(prompt: str) -> str:  # noqa: F811
+                # Deliberate rebind: the None sentinel is the "feature off"
+                # value and the def is the "feature on" one.
+                async def _patch_fn(prompt: str) -> str:  # noqa: F811  # pylint: disable=function-redefined
                     """Coding call for a code_defect: returns a
                     reproducing test + unified diff. Rides the DEFAULT
                     (main) route at background priority — chat_completion

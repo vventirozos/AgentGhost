@@ -279,8 +279,19 @@ def run_gepa(
         tuner = dspy.GEPA(metric=metric, max_full_evals=max_iterations,
                           reflection_lm=reflection_lm)
     elif hasattr(dspy, "MIPROv2"):
+        # ⚠ `num_trials` was REMOVED from MIPROv2's constructor in dspy 3.x
+        # (it is a `compile()` argument now, and the constructor knob is
+        # `num_candidates`). The installed dspy is 3.2.0, so this fallback
+        # raised TypeError the moment it was taken — dead on arrival, and
+        # invisible because GEPA is normally present. Pass the budget under
+        # the name this version accepts, and only if it accepts it (§4GJ).
         logger.info("GEPA unavailable; falling back to MIPROv2")
-        tuner = dspy.MIPROv2(metric=metric, num_trials=max_iterations)
+        import inspect as _inspect
+        _mipro_params = _inspect.signature(dspy.MIPROv2.__init__).parameters
+        _budget_kw = ("num_candidates" if "num_candidates" in _mipro_params
+                      else ("num_trials" if "num_trials" in _mipro_params else None))
+        tuner = (dspy.MIPROv2(metric=metric, **{_budget_kw: max_iterations})
+                 if _budget_kw else dspy.MIPROv2(metric=metric))
     else:
         # Last-resort: BootstrapFewShot is always present in recent dspy.
         logger.info("GEPA/MIPROv2 unavailable; falling back to BootstrapFewShot")

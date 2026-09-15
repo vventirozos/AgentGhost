@@ -318,14 +318,22 @@ class TestTheProducersRoundFiveMigrated:
         records."""
         import ghost_agent.tools.browser as B
 
-        src = inspect.getsource(B.tool_browser)
-        tree = ast.parse(src.lstrip())
+        tree = ast.parse(inspect.getsource(B.tool_browser).lstrip())
         fn = next(n for n in ast.walk(tree)
                   if isinstance(n, ast.FunctionDef) and n.name == "_reject")
         assert "ToolOutcome.rejected" in ast.unparse(fn)
-        assert "_reject(f\"Missing 'operation'" in src
-        assert "_reject(f'Unknown operation" in src or \
-               '_reject(f"Unknown operation' in src
+        # §4GJ: the two `_reject(f"…` greps -> the AST. The property is that
+        # the missing- and unknown-operation refusals BOTH route through
+        # `_reject`; matching the literal prefix also matched a comment.
+        refusals = " || ".join(
+            ast.unparse(n) for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name) and n.func.id == "_reject")
+        assert "Missing 'operation'" in refusals, (
+            "the missing-operation refusal no longer goes through `_reject` "
+            "— it is booked FAILED and arms the pre-flight guard")
+        assert "Unknown operation" in refusals, (
+            "the unknown-operation refusal no longer goes through `_reject`")
 
     def test_appending_a_note_never_strips_a_status(self):
         """`ToolOutcome` is a `str` subclass, so `res + note` is
@@ -349,8 +357,14 @@ class TestTheProducersRoundFiveMigrated:
     def test_a_zero_advance_batch_is_not_PARTIAL(self):
         import ghost_agent.tools.projects as P
 
-        src = inspect.getsource(P)
-        assert "_TO.partial if batch.count else _TO.failed" in src, (
+        # §4GJ: was the exact source line as a string. The AST asks the
+        # question instead: the constructor is CHOSEN by the advance count,
+        # partial on the truthy arm and failed on the falsy one.
+        picks = [n for n in ast.walk(ast.parse(inspect.getsource(P)))
+                 if isinstance(n, ast.IfExp)
+                 and "partial" in ast.unparse(n.body)
+                 and "failed" in ast.unparse(n.orelse)]
+        assert any("count" in ast.unparse(n.test) for n in picks), (
             "a batch that advanced NOTHING still tells the model "
             '"PART OF THIS LANDED" over an empty list')
 

@@ -191,7 +191,7 @@ class TestSourceInvariants:
         """No Phase-3 switch may be consulted before the injection is
         composed — the stable prefix must be a function of the request
         alone, never of TTS/probe configuration."""
-        src = inspect.getsource(GhostAgent.handle_chat)
+        src = inspect.getsource(GhostAgent.handle_chat) + inspect.getsource(GhostAgent._run_internal_turn)
         assembly, _, _ = src.partition("self._compose_injection(")
         assert "self._compose_injection(" not in assembly  # partition hit the call
         assert "GHOST_TTS_" not in assembly
@@ -201,7 +201,7 @@ class TestSourceInvariants:
         # The call must live INSIDE the `if not _do_repair:` guard — two
         # independent substring checks would pass even if it were moved
         # out, so assert on the guarded region itself.
-        src = inspect.getsource(GhostAgent.handle_chat)
+        src = inspect.getsource(GhostAgent.handle_chat) + inspect.getsource(GhostAgent._run_internal_turn)
         assert "if not _do_repair:" in src
         guarded = src.split("if not _do_repair:", 1)[1].split("if _do_repair:", 1)[0]
         assert "_adaptive_bon_final" in guarded
@@ -211,5 +211,5 @@ class TestSourceInvariants:
         assert '"messages": list(messages) + [{' in src
 
     def test_probe_lives_in_verifier_not_agent(self):
-        src = inspect.getsource(GhostAgent.handle_chat)
+        src = inspect.getsource(GhostAgent.handle_chat) + inspect.getsource(GhostAgent._run_internal_turn)
         assert "GHOST_VERIFY_LOGIT" not in src

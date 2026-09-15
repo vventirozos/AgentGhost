@@ -279,6 +279,97 @@ def _proxy_for_attempt(base_proxy: Optional[str], query: str, attempt: int,
         return base_proxy
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Relevance floor (2026-09-15). The wave race declares a winner on the
+# first engine that returns a NON-EMPTY batch, which is a liveness test,
+# not a relevance test: an engine that answers fast with an unrelated
+# page set wins outright. Measured on the trajectory corpus (557 recorded
+# web_search calls), 38 — 6.8% — came back with NOT ONE content word of
+# the query anywhere in the result set: "Revolut customer data breach
+# 2026 government request fraudulent" returned Bing-quiz Reddit threads;
+# "Qwen 3 Coder 30B-A3B coding benchmark" returned a Qatari district;
+# "PostgreSQL 19 latest stable release date" returned a Django CVE. The
+# model then has to reason around the junk, and the wave-1 retry never
+# fires because the wave was not EMPTY.
+#
+# The floor is deliberately the weakest rule that catches that
+# population: ONE content word anywhere in the batch is enough to pass.
+# Two properties it must not break, both found by measuring before
+# writing (an ASCII-only first draft scored every Greek query 0.0 and
+# would have rejected every one of the operator's Greek searches):
+#   * UNICODE. Tokens are casefolded and NFKD-stripped of combining
+#     marks, so Greek/accented queries tokenise like English ones.
+#   * SHORT QUERIES ARE EXEMPT. `Πεοτρόμπης` (a misspelling) correctly
+#     returns `Πετρόμπεης Μαυρομιχάλης` — zero token overlap, a GOOD
+#     spelling-corrected answer. Under _REL_MIN_QUERY_TOKENS the floor
+#     stands down, so typo-correction and rare-name lookups still work.
+# Engine text arrives with whitespace collapsed out ("RevolutLeaks
+# Passports" → "revolutleakspassports"), so both sides are compared with
+# every non-alphanumeric removed — a token match is a SUBSTRING test.
+_REL_STOPWORDS = frozenset("""
+the a an of and or to in for on with by from at is are was were be been
+being as that this these those it its into about over under how what
+when where which who why not no do does did can could should would will
+may might must i you he she they we us our your their his her
+""".split())
+
+# Below this many content words a query carries too little signal for
+# "no overlap" to mean anything: see the Πεοτρόμπης case above.
+_REL_MIN_QUERY_TOKENS = 3
+
+# …and below this much human-readable text (titles + bodies, summed over
+# the batch) the RESULTS carry too little to judge. A row that is a bare
+# href with no snippet is not evidence of irrelevance, it is an absence
+# of evidence — judging it off-topic condemns a batch for what it does
+# not contain. Real engine batches run to hundreds of characters; the
+# shapes that fall under this line are href-only rows.
+_REL_MIN_RESULT_CHARS = 80
+
+
+def _rel_fold(text: str) -> str:
+    """Casefold + strip combining marks, so `Τέμπη` and `ΤΕΜΠΗ` match."""
+    import unicodedata
+    folded = unicodedata.normalize("NFKD", (text or "").casefold())
+    return "".join(c for c in folded if not unicodedata.combining(c))
+
+
+def _rel_tokens(query: str) -> List[str]:
+    """Content words of a query: folded, >2 chars, stopwords removed."""
+    return [w for w in re.findall(r"\w+", _rel_fold(query), re.UNICODE)
+            if len(w) > 2 and w not in _REL_STOPWORDS]
+
+
+def _results_are_off_topic(query: str, results: List[Dict]) -> bool:
+    """True when NOT ONE content word of the query appears anywhere in the
+    batch — the signature of an engine answering a different question.
+
+    Conservative by construction: any single hit passes, and a query with
+    fewer than ``_REL_MIN_QUERY_TOKENS`` content words is never judged.
+    """
+    tokens = _rel_tokens(query)
+    if len(tokens) < _REL_MIN_QUERY_TOKENS:
+        return False
+    if not results:
+        return False
+    # Judge only what carries text. Absence of a snippet is not evidence
+    # of irrelevance (found by the suite: several harnesses drive the
+    # race with bare `{"href": ...}` rows, and condemning those would
+    # reject a batch for what it does not contain).
+    prose = "".join(f"{r.get('title') or ''} {r.get('body') or ''}"
+                    for r in results).strip()
+    if len(prose) < _REL_MIN_RESULT_CHARS:
+        return False
+    # One haystack for the whole batch: title, body and URL of every hit,
+    # with separators removed so the engines' space-stripped snippets
+    # ("RevolutconfirmscustomerData") still match token-wise.
+    hay = _rel_fold(" ".join(
+        f"{r.get('title') or ''} {r.get('body') or ''} "
+        f"{r.get('href') or r.get('url') or ''}"
+        for r in results))
+    hay = re.sub(r"\W+", "", hay, flags=re.UNICODE)
+    return not any(tok in hay for tok in tokens)
+
+
 def _filter_junk(raw_results) -> List[Dict]:
     """Drop results with missing/relative URLs or junk-domain hosts."""
     valid = []
@@ -315,6 +406,11 @@ def _failure_category(msg: str) -> str:
     m = (msg or "").lower()
     if not m or m == "empty" or "no results found" in m:
         return "empty"
+    # Distinct from "empty": the engine ANSWERED, the answer was about
+    # something else. Keeping the two apart is what tells the operator
+    # "Tor is fine, the engine is useless for this query".
+    if m == "off-topic":
+        return "off-topic"
     if "timed out" in m or "timeout" in m:
         return "timeout"
     if ("connect" in m or "requesterror" in m or "ssl" in m
@@ -568,6 +664,20 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
                     failures.append((engine, _brief_engine_error(e)))
                     continue
                 if valid:
+                    # Liveness is not relevance: an engine that answers
+                    # fast with an unrelated page set would otherwise win
+                    # the wave outright (measured 6.8% of all searches).
+                    # Treat it as a LOSS so the remaining engines — and
+                    # then the reformulation wave — still get their turn.
+                    if _results_are_off_topic(query, valid):
+                        pretty_log(
+                            "Search Off-Topic",
+                            f"{engine} returned {len(valid)} result(s) with no "
+                            f"query term anywhere ‹{qtag}› — not counted as a "
+                            f"win; racing on",
+                            level="WARNING", icon=Icons.WARN)
+                        failures.append((engine, "off-topic"))
+                        continue
                     pretty_log("DDGS Search",
                                f"{engine} won wave {wave} in {time.monotonic() - t0:.1f}s "
                                f"({len(valid)} results) ‹{qtag}›", icon=Icons.TOOL_SEARCH)
@@ -600,6 +710,9 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
         parts: List[str] = []
         if "empty" in cats:
             parts.append(f"{len(cats['empty'])} empty")
+        if "off-topic" in cats:
+            parts.append(
+                f"{'+'.join(e for e, _ in cats['off-topic'])} off-topic")
         for cat in ("conn-error", "timeout"):
             if cat in cats:
                 parts.append(f"{'+'.join(e for e, _ in cats[cat])} {cat}")
@@ -836,6 +949,29 @@ async def tool_search(query: Optional[str] = None, anonymous: bool = False, tor_
         # build at them instead of re-searching.
         out = out.rstrip() + f"\n\n(saved to {rel} in the active project — coding leaves read it)"
     return out
+
+def source_block_failed(block: str) -> bool:
+    """True when a ``### SOURCE: <url>`` block is one the FETCHER wrote as a
+    failure (§4GK round 4).
+
+    ⚠ ANCHORED, and it must stay that way. The rule used to be
+    ``"\\nError:" in block`` — an unanchored substring over the whole block,
+    which contains the PAGE'S OWN TEXT. A successful fetch of a page that
+    quotes ``Error: division by zero`` (a tutorial, a bug report, a log
+    excerpt — the exact material research is pointed at) counted as a failed
+    source; with one URL that makes ``_n_ok == 0``, so the "nothing fetched
+    is FAILED" rule booked a complete report as a failed action, fired the
+    strike ledger and told the model no source could be fetched. Reproduced.
+
+    Every failure producer writes ``### SOURCE: {url}\\nError: …``, so the
+    marker is the first line of the BODY. `darkweb_search`'s own
+    `_source_succeeded` already read it that way — the two disagreed inside
+    one function, so this is now the single authority both call.
+    """
+    parts = block.split("\n", 1)
+    body = parts[1].lstrip() if len(parts) > 1 else ""
+    return body.startswith("Error:")
+
 
 async def tool_deep_research(query: Optional[str] = None, anonymous: bool = False, tor_proxy: str = None, llm_client=None, model_name="default", max_context: int = 8192, workspace_model=None, **kwargs):
     if not query:
@@ -1264,7 +1400,7 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
     # count them and say so up front. Without this, 7-of-8-failed and
     # 8-of-8-failed and "the topic genuinely has nothing" all render
     # identically — and the model has no way to weigh what follows.
-    _failed = [c for c in valid_contents if "\nError:" in c]
+    _failed = [c for c in valid_contents if source_block_failed(c)]
     _lost = len(urls) - len(valid_contents)
     # ⚠ A DEGRADED SOURCE IS NEITHER FAILED NOR DISTILLED, and the banner
     # counted only the first two — so a run where every source fell back to
@@ -1272,7 +1408,7 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
     # degraded) reported ZERO problems. The model was reading raw page dumps
     # presented as extracted evidence, with nothing saying so.
     _degraded = [c for c in valid_contents
-                 if "\nError:" not in c
+                 if not source_block_failed(c)
                  and "[EDGE EXTRACTED FACTS]" not in c] if llm_client else []
     _banner = ""
     if _failed or _lost or _degraded:
@@ -1302,7 +1438,36 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
                 )
         except Exception:  # noqa: BLE001
             pass
-    return f"--- DEEP RESEARCH RESULT ---\n{full_report}\n\nSYSTEM INSTRUCTION: Analyze the text above."
+    # §4GI (2026-09-13): the STATUS rides the outcome. A report whose every
+    # source failed used to return this same success-shaped string, and
+    # `ToolOutcome.coerce` booked it OK — a Tor blackout was scored as a
+    # competent research call (strikes, competence, foresight, pre-flight
+    # all mis-credited), and `fact_check` then "verified" a page of
+    # `Error:` lines. Nothing fetched → FAILED.
+    #
+    # ⚠ ROUND 3 (2026-09-13): the "some failed → PARTIAL" arm was REMOVED,
+    # measured. `ToolOutcome.is_failure` is "status is not OK", so PARTIAL
+    # made `core/agent.py` set `turn_has_failure`, fire the strike ledger
+    # and book `success: False` in the post-mortem corpus. On the live
+    # corpus (435 trajectory files): 37 deep_research results carried a
+    # report, 14 of them carried the source-failures banner, and ZERO were
+    # all-failed — the worst real case was 6 of 8 sources lost, which still
+    # returned two good ones. So the arm turned 38% of research turns into
+    # strikes and has never once fired on the case it was built for.
+    # Partial coverage is a COVERAGE limit, not a failed action: the banner
+    # inside the text already tells the model, and the reason_code below
+    # keeps it visible to telemetry without lying to the strike ledger.
+    from .outcome import ToolOutcome
+    _text = (f"--- DEEP RESEARCH RESULT ---\n{full_report}\n\n"
+             f"SYSTEM INSTRUCTION: Analyze the text above.")
+    _n_ok = len(valid_contents) - len(_failed)
+    if urls and _n_ok == 0:
+        return ToolOutcome.failed(_text, world_changed=False,
+                                  reason_code="research_all_sources_failed")
+    if _failed or _lost:
+        return ToolOutcome.ok(_text, world_changed=False,
+                              reason_code="research_sources_partial")
+    return ToolOutcome.ok(_text, world_changed=False)
 
 async def tool_fact_check(query: Optional[str] = None, statement: Optional[str] = None, llm_client=None, tool_definitions=None, deep_research_callable: Optional[Callable] = None, model_name: str = "qwen-3.6-35b-a3", max_context: int = 8192, **kwargs: Any):
     """Verify a claim: run deep_research on it, then have the model judge the
@@ -1332,10 +1497,25 @@ async def tool_fact_check(query: Optional[str] = None, statement: Optional[str] 
                 "LLM clients not wired). Use deep_research or web_search directly.")
 
     try:
-        dr_result = str(await deep_research_callable(query_text))
+        _dr_raw = await deep_research_callable(query_text)
     except Exception as exc:
         return (f"Error: fact_check research phase failed: {exc}. "
                 f"Try web_search or deep_research directly.")
+    from .outcome import OutcomeStatus, ToolOutcome
+    _dr = ToolOutcome.coerce(_dr_raw)
+    dr_result = str(_dr)
+    # §4GI: research that fetched NOTHING (a FAILED outcome, or one of the
+    # search phase's own error strings) is not evidence — there is nothing
+    # to judge, and the judge used to "verify" a page of `Error:` lines and
+    # book a second OK on top of the research call's.
+    if _dr.status in (OutcomeStatus.FAILED, OutcomeStatus.REJECTED):
+        return ToolOutcome.failed(
+            f"FACT CHECK FAILED: no source could be fetched (timeout, block or "
+            f"unreachable — a transient network failure), so the claim was "
+            f"NOT verified — treat it as unchecked, not as false.\n"
+            f"[RESEARCH RESULTS]:\n{dr_result[:4000]}",
+            world_changed=False, reason_code="factcheck_research_failed")
+    _dr_partial = _dr.status is OutcomeStatus.PARTIAL
 
     # Bound the evidence spliced into the verify prompt the same way raw file
     # reads are bounded (chars ≈ tokens · 3.5) — deep_research can return up
@@ -1385,4 +1565,15 @@ async def tool_fact_check(query: Optional[str] = None, statement: Optional[str] 
             f"claim from the raw research results below.\n"
             f"[RESEARCH RESULTS]:\n{dr_result}",
             world_changed=False, reason_code="factcheck_verifier_empty")
+    if _dr_partial:
+        # Some sources failed, but the verification itself COMPLETED: the
+        # answer is a real answer resting on partial coverage. Round 3: this
+        # is OK, not PARTIAL, for the same measured reason as the research
+        # call above — a non-OK status is read as a failed ACTION by the
+        # strike ledger and the corpus. The label stays in the text and in
+        # the reason_code. (The two returns above keep PARTIAL: there the
+        # verification genuinely did not happen.)
+        return ToolOutcome.ok(
+            f"FACT CHECK COMPLETE (partial source coverage):\n{verdict}",
+            world_changed=False, reason_code="factcheck_partial_coverage")
     return f"FACT CHECK COMPLETE:\n{verdict}"

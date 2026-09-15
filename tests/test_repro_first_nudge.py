@@ -37,7 +37,7 @@ def test_ignores_non_bug_requests():
 
 # ── wiring into handle_chat ──────────────────────────────────────────
 def test_nudge_is_injected_before_first_llm_call():
-    src = inspect.getsource(agent_mod.GhostAgent.handle_chat)
+    src = inspect.getsource(agent_mod.GhostAgent.handle_chat) + inspect.getsource(agent_mod.GhostAgent._run_internal_turn)
     assert "SYSTEM HINT (repro-first)" in src
     assert "_is_bug_report_intent(lc)" in src
     # the nudge must come BEFORE the turn loop's first LLM request —
@@ -48,14 +48,14 @@ def test_nudge_is_injected_before_first_llm_call():
 
 
 def test_nudge_is_suppressed_in_simulations():
-    src = inspect.getsource(agent_mod.GhostAgent.handle_chat)
+    src = inspect.getsource(agent_mod.GhostAgent.handle_chat) + inspect.getsource(agent_mod.GhostAgent._run_internal_turn)
     nudge_block = src[src.index("Repro-first nudge"):
                       src.index("SYSTEM HINT (repro-first)")]
     assert "suppress_meta_task_nudges" in nudge_block
 
 
 def test_nudge_text_demands_observation_first():
-    src = inspect.getsource(agent_mod.GhostAgent.handle_chat)
+    src = inspect.getsource(agent_mod.GhostAgent.handle_chat) + inspect.getsource(agent_mod.GhostAgent._run_internal_turn)
     start = src.index("SYSTEM HINT (repro-first)")
     block = src[start:start + 1200]
     assert "reproduce" in block
@@ -65,7 +65,7 @@ def test_nudge_text_demands_observation_first():
 
 # ── post-abort grounding directive ───────────────────────────────────
 def test_thinking_loop_alert_redirects_to_grounding():
-    src = inspect.getsource(agent_mod.GhostAgent.handle_chat)
+    src = inspect.getsource(agent_mod.GhostAgent.handle_chat) + inspect.getsource(agent_mod.GhostAgent._run_internal_turn)
     start = src.index("self-repeating thinking loop")
     alert = src[start:start + 1500]
     assert "grounding tool call" in alert

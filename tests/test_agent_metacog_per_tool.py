@@ -142,7 +142,7 @@ def test_context_shield_does_not_clobber_payload_variable():
 
     The shield block moved into `_dispatch_and_process_tool_batch` with
     the #5 step-2 extraction (2026-07-09) — inspect both."""
-    src = (inspect.getsource(GhostAgent.handle_chat)
+    src = (inspect.getsource(GhostAgent.handle_chat) + inspect.getsource(GhostAgent._run_internal_turn)
            + inspect.getsource(GhostAgent._dispatch_and_process_tool_batch))
     assert "shield_payload = {" in src
     # The old clobbering assignment must be gone from the shield block.

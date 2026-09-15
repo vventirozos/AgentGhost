@@ -45,6 +45,14 @@ def create_app():
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
+        # ⚠ A RESPONSE HEADER A BROWSER CANNOT READ IS NOT A CHANNEL (§4GK
+        # round 6). CORS hides every response header except a short safelist
+        # unless it is named here, so `X-Ghost-Archive-Omitted` — the wire
+        # signal that a workspace archive is INCOMPLETE — was invisible to any
+        # browser talking to this API directly. The interface proxy is
+        # same-origin and reads it, which is exactly how a dead channel stays
+        # unnoticed: one consumer works and the others silently do not.
+        expose_headers=["X-Ghost-Archive-Omitted", "Content-Disposition"],
     )
     # Re-added by hand so it carries the auth dependency (the built-in was
     # turned off above). Registered BEFORE every router: Starlette matches

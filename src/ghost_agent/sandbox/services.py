@@ -84,7 +84,10 @@ MAX_SERVICES = 5
 # key: `acme:api` and `acme--api` both validate and both derive the stem
 # `acme--api`. Demonstrated 2026-08-30: `purge_state('acme--api')` deleted
 # `acme:api`'s saved state and `logs('acme--api')` returned its log.
-_NAME_RE = re.compile(r"^[A-Za-z](?!.*--)[A-Za-z0-9_-]{0,31}$")
+from . import registry_guard as _rg  # noqa: E402 — ONE home for pid/port/kill rules (§4GI)
+from ..utils.logging import Icons, pretty_log  # noqa: E402 — the §4GI operator lines
+
+_NAME_RE = _rg.NAME_RE
 _FORBIDDEN_CMD_RE = re.compile(
     r"(?:127\.0\.0\.1|localhost|0\.0\.0\.0)\s*:\s*(?:8000|8088)\b")
 _MAX_CMD_CHARS = 4000
@@ -400,7 +403,7 @@ class ServiceSupervisor:
             data = json.loads(_read_bytes_nofollow(
                 self._registry_path,
                 max_bytes=_REGISTRY_MAX_BYTES).decode("utf-8", "replace"))
-            return data if isinstance(data, dict) else {}
+            return self._validated_rows(data)
         except RuntimeError:
             # ⚠ NOT SWALLOWED. `host_dir` raises RuntimeError only when the
             # services directory has been REPLACED BY A SYMLINK — a security
@@ -413,6 +416,37 @@ class ServiceSupervisor:
             raise
         except Exception:  # noqa: BLE001 — absent/corrupt → empty
             return {}
+
+    def _validated_rows(self, data) -> Dict[str, dict]:
+        """§4GI: the registry is on the bind mount — every row is attacker
+        input. The same validation jobs.py got in §4DX, from the ONE module
+        (`registry_guard.validate_row`): a pid of 0/1 (or above pid_max)
+        would signal the whole container, a bad port would be leased, a bad
+        name becomes a path component. Dropped rows are logged, never
+        trusted. A service row may carry ``pid: None`` (registered before
+        its launcher reported)."""
+        if not isinstance(data, dict):
+            self._quarantined_rows = {}
+            return {}
+        clean: Dict[str, dict] = {}
+        quarantined: Dict[str, dict] = {}
+        for key, entry in data.items():
+            why = _rg.validate_row(entry, require_pid=False)
+            if why is not None or not isinstance(key, str):
+                logger.warning(
+                    "sandbox service registry: quarantining unsafe row %r (%s)",
+                    key, why or "bad key")
+                if isinstance(key, str):
+                    quarantined[key] = entry
+                continue
+            clean[key] = entry
+        # Kept OUT of the live map (never acted on) but written back by
+        # `_save`, so a legacy row — a name from before the 2026-08-30
+        # pattern, a port outside the lease range — is not erased by the
+        # next unrelated save, leaving its process squatting a port with no
+        # row (R3 review).
+        self._quarantined_rows = quarantined
+        return clean
 
     def _save(self, reg: Dict[str, dict]) -> None:
         self.host_dir.mkdir(parents=True, exist_ok=True)
@@ -431,7 +465,11 @@ class ServiceSupervisor:
             # ⚠ O_NOFOLLOW. The temp file sits in the same
             # model-writable directory; a symlink there redirects the
             # registry write onto an arbitrary host file.
-            _write_text_nofollow(tmp, json.dumps(reg, indent=2))
+            # §4GI R3: quarantined (invalid, legacy) rows ride along on disk
+            # so an unrelated save cannot erase them; they never enter `reg`.
+            _q = getattr(self, "_quarantined_rows", None) or {}
+            _on_disk = {**{k: v for k, v in _q.items() if k not in reg}, **reg}
+            _write_text_nofollow(tmp, json.dumps(_on_disk, indent=2))
             os.replace(tmp, self._registry_path)
         except Exception:
             try:
@@ -473,25 +511,18 @@ class ServiceSupervisor:
         out, code = self.sandbox.execute(cmd, timeout=timeout)
         return (out or ""), code
 
+    def _pid_state(self, pid) -> Optional[bool]:
+        """``True`` alive, ``False`` dead or not a valid target, ``None`` when
+        the PROBE failed (infra fault / timeout) — §4GI, the jobs twin's
+        three-valued probe, from the one module. Anything that would pop a
+        row, re-issue a port or refuse a start on the answer treats ``None``
+        as "unknown", which for those decisions means "assume alive"."""
+        return _rg.pid_state(self._exec, pid)
+
     def _pid_alive(self, pid) -> bool:
-        try:
-            pid = int(pid)
-        except (TypeError, ValueError):
-            return False
-        # `kill -0` alone reports ZOMBIES as alive — and in this container
-        # every dead orphan IS a zombie unless PID 1 reaps (sleep-infinity
-        # never did; docker.py now runs with init=True, but keep this
-        # zombie-proof for containers created before that). A zombie launcher
-        # made a dead service look "already running", made stop() a no-op,
-        # and suppressed start()'s exited-immediately diagnostic (observed
-        # live 2026-07-12: three defunct [sh] launchers, 137s of thrash).
-        # State = first field after the LAST ')' in /proc/<pid>/stat (comm
-        # may contain spaces/parens, so field-splitting is unsafe).
-        cmd = (f"sh -c 'kill -0 {pid} 2>/dev/null && "
-               f"[ \"$(sed \"s/^.*) //\" /proc/{pid}/stat 2>/dev/null "
-               f"| cut -d\" \" -f1)\" != Z ]'")
-        _, code = self._exec(cmd, timeout=15)
-        return code == 0
+        """Strict liveness — UNKNOWN reads as not-alive. Only where that is
+        the safe direction (confirming a kill landed)."""
+        return self._pid_state(pid) is True
 
     def _port_listening(self, port) -> bool:
         py = ("import socket,sys; s=socket.socket(); s.settimeout(1.5); "
@@ -612,6 +643,12 @@ class ServiceSupervisor:
         never trust (or signal) its pid number in the new container. Entries
         without a stamp (legacy) or an unknown current generation fall back
         to the plain pid check."""
+        return self._entry_state(entry) is True
+
+    def _entry_state(self, entry) -> Optional[bool]:
+        """Three-valued entry liveness (§4GI): ``False`` on a generation
+        mismatch or a dead/invalid pid, ``None`` when the probe itself
+        failed, ``True`` when the pid is alive in THIS container."""
         if not isinstance(entry, dict):
             return False
         stamped = entry.get("container_id")
@@ -619,7 +656,14 @@ class ServiceSupervisor:
             gen = self._container_generation()
             if gen and gen != stamped:
                 return False
-        return self._pid_alive(entry.get("pid"))
+        return self._pid_state(entry.get("pid"))
+
+    def _entry_alive_or_unknown(self, entry) -> bool:
+        """Liveness for decisions where "unknown" must count as ALIVE —
+        leasing its port to someone else, refusing to start a twin, counting
+        the cap. An infra fault used to read as "dead" here, and a live
+        service's port was re-issued (R3 review of the 2026-09-13 fixes)."""
+        return self._entry_state(entry) is not False
 
     def _holder_pid(self, port) -> Optional[int]:
         """Pid LISTENING on <port> inside the container, found via `ss`
@@ -771,7 +815,7 @@ class ServiceSupervisor:
         Holders are NEVER killed. Returns ``(None, notes)`` when nothing
         is grantable."""
         notes = []
-        alive_map = {k: self._entry_alive(e) for k, e in reg.items()
+        alive_map = {k: self._entry_alive_or_unknown(e) for k, e in reg.items()
                      if k != self_key}
         if requested is not None:
             why = self._port_block_reason(requested, reg, alive_map,
@@ -882,7 +926,7 @@ class ServiceSupervisor:
             if key is not None:
                 _, name = split_key(key)
             entry = reg.get(key) if key else None
-            if entry and self._entry_alive(entry):
+            if entry and self._entry_alive_or_unknown(entry):
                 return (f"Error: service '{name}' is already running "
                         f"(pid {entry.get('pid')}). Use action='restart' "
                         f"to replace it, or 'stop' first.")
@@ -895,7 +939,7 @@ class ServiceSupervisor:
             stem = _file_stem(key)
             _max = self._max_services()
             alive = sum(1 for k2, e2 in reg.items()
-                        if k2 != key and self._entry_alive(e2))
+                        if k2 != key and self._entry_alive_or_unknown(e2))
             if alive >= _max:
                 return (f"Error: {_max} services already running — "
                         f"stop one first (action='status' to list).")
@@ -1233,7 +1277,17 @@ class ServiceSupervisor:
                     world_changed=True, reason_code="service_pid_unknown")
 
             time.sleep(1.2)
-            if not self._pid_alive(pid):
+            _pst = self._pid_state(pid)
+            if _pst is None:
+                # §4GI: the probe failed, not the service — keep the row (it
+                # is reaped by a later confirmed probe) and say so.
+                pretty_log(
+                    "Service Probe Inconclusive",
+                    f"could not confirm '{name}' (pid {pid}) after launch — "
+                    "sandbox probe failed; the row is kept and re-checked on "
+                    "the next status/stop.",
+                    level="WARNING", icon=Icons.WARN)
+            elif _pst is False:
                 reg.pop(key, None)
                 self._save(reg)
                 tail = self._log_tail(stem)
@@ -1354,15 +1408,23 @@ class ServiceSupervisor:
             f"container is recreated).")
         return "\n".join(lines)
 
-    def _kill_pgroup(self, pid) -> None:
-        """TERM then KILL a whole process group (setsid made pid the leader),
-        with a plain-pid fallback."""
-        self._exec(f"sh -c 'kill -TERM -- -{int(pid)} 2>/dev/null || "
-                   f"kill -TERM {int(pid)} 2>/dev/null'", timeout=15)
-        time.sleep(1.0)
-        if self._pid_alive(pid):
-            self._exec(f"sh -c 'kill -KILL -- -{int(pid)} 2>/dev/null || "
-                       f"kill -KILL {int(pid)} 2>/dev/null'", timeout=15)
+    def _kill_pgroup(self, pid) -> bool:
+        """TERM then KILL a supervised process's whole tree — group, session
+        and ``/proc`` descendants — through the ONE dash-safe script in
+        ``registry_guard`` (§4GI). The pid floor lives there too: a planted
+        registry row naming pid 0/1 is REFUSED with a log line, where this
+        method used to run ``kill -TERM -- -1 || kill -TERM 1`` — the ``--``
+        form is a dash syntax error, so the fallback TERMed docker-init."""
+        # ⚠ RETURN WHAT ACTUALLY HAPPENED (§4GK round 4). This discarded
+        # `kill_tree`'s answer, so `_kill_service` could report a clean stop
+        # over a process that survived TERM+KILL — pidfile unlinked, row
+        # dropped, process still holding its port. The jobs sibling has
+        # always re-probed; this one did not.
+        return _rg.kill_tree(
+            self._exec, pid,
+            log=lambda msg: pretty_log("Service Kill", msg,
+                                       level="ERROR", icon=Icons.SHIELD),
+            timeout=30)
 
     def _kill_port_holder(self, port, owner_pid=None) -> bool:
         """Kill whatever is LISTENING on <port> in the container — the safety
@@ -1386,7 +1448,15 @@ class ServiceSupervisor:
                 "belongs to a different process tree than pid %s",
                 port, holder, owner_pid)
             return False
-        self._kill_pgroup(holder)
+        # §4GK round 6: the verdict travels here too. This threw it away and
+        # returned True unconditionally, so a reclaim whose HOLDER survived
+        # TERM+KILL still left `_last_kill_survived` False — `stop()` then
+        # reported "stopped", dropped the row and unlinked the pidfile while
+        # the port was still held. Round 5 fixed exactly this on the sibling
+        # call site in the same function.
+        if not self._kill_pgroup(holder):
+            self._last_kill_survived = True
+            return False
         return True
 
     def _kill_service(self, entry, others=()) -> bool:
@@ -1396,26 +1466,69 @@ class ServiceSupervisor:
         and claims the same port, the port legitimately belongs to IT now and
         the reclaim is skipped outright — never TERM/KILL a process a
         different registry entry owns (review 2026-07-22)."""
+        # ⚠ THE RESET BELONGS HERE, NOT IN EVERY CALLER (§4GQ round 8).
+        # `_last_kill_survived` is written by `_kill_port_holder` DURING this
+        # call and read below; every existing caller clears it first, which
+        # means the honesty of the verdict depends on each of them
+        # remembering. A caller that forgets inherits the previous service's
+        # survival: its pidfile is kept and the operator is told a process
+        # that died cleanly "did NOT stop". Same latch shape round 7 found in
+        # `_cut_off`, one file over — and free to close at the callee.
+        self._last_kill_survived = False
         pid = entry.get("pid")
         name = entry.get("name")
         port = entry.get("port")
-        was_alive = bool(pid) and self._entry_alive(entry)
+        # unknown counts as alive here: the user asked to stop, the pid is
+        # floor-checked inside the kill, and a survivor is worse than a
+        # signal to a gone process
+        was_alive = bool(pid) and self._entry_alive_or_unknown(entry)
+        survived = False
         if was_alive:
-            self._kill_pgroup(pid)
+            # `False` here means the tree is STILL RUNNING (or nothing could
+            # be sent) — not "there was nothing to kill" (§4GK round 4).
+            survived = not self._kill_pgroup(pid)
         reclaimed = False
         if port is not None and self._port_listening(port):
             _other_owns = any(
                 isinstance(o, dict) and o is not entry
-                and o.get("port") == port and self._entry_alive(o)
+                and o.get("port") == port and self._entry_alive_or_unknown(o)
                 for o in others)
             if not _other_owns:
                 reclaimed = self._kill_port_holder(port, owner_pid=pid)
-        if name:
+        # The pidfile decision reads the COMBINED verdict: round 7's first fix
+        # made `_last_kill_survived` honest but left this branch on the local
+        # `survived`, so a surviving PORT HOLDER still had its pidfile
+        # unlinked — the record of a process that is still running.
+        _survived_any = bool(survived) or bool(
+            getattr(self, "_last_kill_survived", False))
+        if name and not _survived_any:
+            # The pidfile is the only record of a process that is still
+            # running; deleting it after a failed kill orphans it for good.
             _stem = _file_stem(entry_key(entry.get("project_id"), name))
             try:
                 (self.host_dir / f"{_stem}.pid").unlink()
             except OSError:
                 pass
+        if _survived_any:
+            pretty_log("Service Stop",
+                       f"'{name or pid}' did NOT stop — its process survived "
+                       "TERM+KILL; its pidfile is kept so it can be retried",
+                       level="ERROR", icon=Icons.FAIL)
+        # ⚠ THE BOOL STILL MEANS "DID ANYTHING HAPPEN" (§4GK round 5). Round
+        # 4 made it return False on survival, which the callers could not
+        # distinguish from "there was nothing alive to kill" — so `stop()`
+        # reported a process that had just survived TERM+KILL as "was already
+        # dead; removed", the most misleading answer available. Survival is a
+        # THIRD state and travels on its own channel.
+        # ⚠ DO NOT CLOBBER A SURVIVAL THE RECLAIM ALREADY RECORDED (§4GK
+        # round 7). `_kill_port_holder` sets this True when the PORT HOLDER
+        # outlives TERM+KILL, and this line overwrote it with the tracked
+        # pid's answer alone — so round 6's fix was inert for every consumer.
+        # Measured: a service whose tracked pid is dead but whose port is held
+        # by a surviving orphan still answered "was already dead; removed",
+        # dropped the row and unlinked the pidfile. Either survival is a
+        # survival.
+        self._last_kill_survived = _survived_any
         return was_alive or reclaimed
 
     # NB: an auto-reaper for dead registry entries (`_reap_dead`) used to sit
@@ -1519,7 +1632,7 @@ class ServiceSupervisor:
                 l_hits = [k for k in reg if k.lower() == name.lower()]
                 legacy = l_hits[0] if len(l_hits) == 1 else None
             if legacy is not None and ":" not in legacy \
-                    and not self._entry_alive(reg[legacy]):
+                    and self._entry_state(reg[legacy]) is False:
                 return legacy
         return None
 
@@ -1546,8 +1659,20 @@ class ServiceSupervisor:
             _disp = entry.get("name") or key
             # reg no longer contains the popped entry — the remaining values
             # are exactly the services the reclaim must not harm.
+            self._last_kill_survived = False
             was_alive = self._kill_service(entry, others=reg.values())
+            _survived = bool(getattr(self, "_last_kill_survived", False))
+            if _survived:
+                # Put the row BACK: a process that survived the kill still
+                # holds its port, and dropping its row leaves it orphaned
+                # with nothing to retry from (§4GK round 5).
+                reg[key] = entry
             self._save(reg)
+        if _survived:
+            return (f"Service '{_disp}' did NOT stop — its process survived "
+                    f"TERM+KILL and still holds its port. The registry entry "
+                    f"is kept; retry the stop, or check the log at "
+                    f"{CONTAINER_SERVICES_DIR}/{_file_stem(key)}.log")
         state = "stopped" if was_alive else "was already dead; removed"
         return (f"Service '{_disp}' {state}. Log kept at "
                 f"{CONTAINER_SERVICES_DIR}/{_file_stem(key)}.log")
@@ -1559,14 +1684,26 @@ class ServiceSupervisor:
             reg = self._load()
             if not reg:
                 return "No services registered — nothing to stop."
-            killed, cleared = [], []
+            killed, cleared, survivors = [], [], []
             for nm, entry in list(reg.items()):
                 _others = [e for n2, e in reg.items() if n2 != nm]
-                (killed if self._kill_service(entry, others=_others)
-                 else cleared).append(nm)
+                self._last_kill_survived = False
+                _acted = self._kill_service(entry, others=_others)
+                if getattr(self, "_last_kill_survived", False):
+                    survivors.append(nm)          # keeps its row below
+                else:
+                    (killed if _acted else cleared).append(nm)
+            # Survivors keep their rows: the process is still running and
+            # still holds its port (§4GK round 5).
+            _keep = {nm: reg[nm] for nm in survivors if nm in reg}
             reg.clear()
+            reg.update(_keep)
             self._save(reg)
         parts = [f"Stopped {len(killed) + len(cleared)} service(s)."]
+        if survivors:
+            parts.append(
+                f"⚠ Did NOT stop (survived TERM+KILL, still holding their "
+                f"ports, rows kept): {', '.join(survivors)}.")
         if killed:
             parts.append(f"Killed (running/orphaned): {', '.join(killed)}.")
         if cleared:
@@ -1601,7 +1738,16 @@ class ServiceSupervisor:
             if entry is None:
                 return (f"Error: no service named '{name}' to restart "
                         f"(use action='start' with a command).")
-            self.stop(key)
+            # §4GK round 6: `stop()` now PUTS A SURVIVOR'S ROW BACK, so a
+            # discarded return meant `start()` below found a live entry and
+            # answered "already running … use action='restart'" — advice to do
+            # the thing that had just failed. Say what happened instead.
+            self._last_kill_survived = False
+            _stop_out = self.stop(key)
+            if getattr(self, "_last_kill_survived", False):
+                return (f"Error: cannot restart '{name}' — its current process "
+                        f"survived TERM+KILL and still holds its port, so a new "
+                        f"one cannot take it. {_stop_out}")
             # The stored port is a PREFERENCE like any other: if something
             # took it while the service was down, the allocator moves the
             # restart to a free port and the report says so. A persisted
@@ -1644,10 +1790,13 @@ class ServiceSupervisor:
         lines = []
         _dead = 0
         for n, e in entries.items():
-            alive = self._entry_alive(e)
-            if not alive:
+            _st = self._entry_state(e)
+            alive = _st is True
+            if _st is False:
                 _dead += 1
-            state = "RUNNING" if alive else "DEAD (exited or container recreated)"
+            state = ("RUNNING" if alive
+                     else "UNKNOWN (sandbox probe failed — not dead)" if _st is None
+                     else "DEAD (exited or container recreated)")
             _disp = e.get("name") or n
             _proj = e.get("project_id")
             part = (f"- {_disp}"
@@ -1880,7 +2029,7 @@ class ServiceSupervisor:
             claims = [(k, e) for k, e in reg.items() if e.get("port") == p]
             claim, alive = None, False
             for k, e in claims:
-                if self._entry_alive(e):
+                if self._entry_alive_or_unknown(e):
                     claim, alive = (k, e), True
                     break
             if claim is None and claims:
@@ -1934,7 +2083,7 @@ class ServiceSupervisor:
                         f"to the registry (action='status' shows the port "
                         f"map).")
             for k2, e2 in reg.items():
-                if e2.get("port") == port and self._entry_alive(e2):
+                if e2.get("port") == port and self._entry_alive_or_unknown(e2):
                     return (f"Error: port {port} already belongs to "
                             f"registered service '{e2.get('name') or k2}'"
                             + (f" of project {e2['project_id']}"
@@ -1944,7 +2093,7 @@ class ServiceSupervisor:
             owner = (str(project_id).strip() if project_id
                      else self._proc_project_hint(holder))
             key = entry_key(owner, str(name))
-            if key in reg and self._entry_alive(reg[key]):
+            if key in reg and self._entry_alive_or_unknown(reg[key]):
                 return (f"Error: service '{name}' is already registered and "
                         f"RUNNING — pick another name.")
             reg[key] = {

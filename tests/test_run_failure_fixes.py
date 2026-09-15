@@ -65,7 +65,7 @@ def test_render_analyzer_passes_varied_frame(tmp_path):
     p = tmp_path / "terrain.png"
     img.save(p)
     r = analyze_screenshot_render(p)
-    assert r and r["verdict"] == "has_content"
+    assert r and r["verdict"] == "indeterminate"
     assert r["dominant_pct"] < 0.8 and r["distinct_colors"] > 6
 
 

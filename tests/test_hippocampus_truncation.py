@@ -229,7 +229,7 @@ def test_planner_feeds_tree_update_from_the_VERIFIED_tree_only():
     `plan_json['tree_update']`; nothing in a unit test of the helpers would
     catch it. Pins the DECISION, not a spelling: on the truncated path the
     tree must come from the verified value."""
-    src = inspect.getsource(_ag.GhostAgent.handle_chat)
+    src = inspect.getsource(_ag.GhostAgent.handle_chat) + inspect.getsource(_ag.GhostAgent._run_internal_turn)
     assert "salvage_truncated_plan(plan_content)" in src
     assert re.search(r'tree_update\s*=\s*_whole_tree\s+or\s+\{\}', src), (
         "the truncated path must assign tree_update from the VERIFIED tree")
@@ -247,7 +247,7 @@ def test_planner_cap_is_raised_and_env_tunable():
     from what the calls produce: ~4.5k tokens of reasoning + ~1.5k of content
     at the observed maximum."""
     assert _ag._PLANNER_MAX_TOKENS >= 8192
-    src = inspect.getsource(_ag.GhostAgent.handle_chat)
+    src = inspect.getsource(_ag.GhostAgent.handle_chat) + inspect.getsource(_ag.GhostAgent._run_internal_turn)
     assert '"max_tokens": _PLANNER_MAX_TOKENS' in src, (
         "the planner payload must read the constant, or the cap is a literal "
         "again and the env knob is decoration")
@@ -278,7 +278,7 @@ def test_planner_no_think_is_ON_by_default_with_a_kill_switch():
     env-only switch is live in production and absent in tests, ablations and
     manual restarts — the prod/dev flag drift this repo keeps paying for."""
     assert _ag._PLANNER_NO_THINK is True, "the measured-better path is default"
-    src = inspect.getsource(_ag.GhostAgent.handle_chat)
+    src = inspect.getsource(_ag.GhostAgent.handle_chat) + inspect.getsource(_ag.GhostAgent._run_internal_turn)
     assert "/no_think" in src, "soft switch missing"
     assert '"enable_thinking": False' in src, (
         "hard switch missing — the soft one alone is not reliable")

@@ -716,9 +716,68 @@ _MEDIA_SUFFIXES = {
 #: tidy will delete it. In-flight verification screenshots stay put.
 TIDY_MIN_AGE_HOURS = 24.0
 
-#: bound on how much source text the referenced-media check will read
-#: per file — plenty for any real index.html/css, keeps the scan cheap.
-_REFERENCE_SCAN_MAX_BYTES = 512 * 1024
+#: Bound on how much source text the referenced-media check will read per
+#: file.
+#:
+#: ⚠ RAISED FROM 512 KB IN §4GK ROUND 5. The old bound was chosen as "plenty
+#: for any real index.html/css", which is true of hand-written sources and
+#: false of the build output that sits beside them — a bundled `app.js`, a
+#: sprite sheet manifest, a minified vendor file. Once round 5 made an
+#: over-cap file inconclusive rather than silently half-scanned, a single
+#: 600 KB bundle disabled the media tidy for that workspace permanently. The
+#: work this cap was protecting against is a substring search for a handful
+#: of basenames — microseconds per megabyte, no parsing — so the cap only
+#: ever needed to stop a pathological file, not an ordinary bundle.
+_REFERENCE_SCAN_MAX_BYTES = 8 * 1024 * 1024
+
+#: One chunk of the streamed basename scan (§4GK round 6).
+_REFERENCE_SCAN_CHUNK_BYTES = 1 * 1024 * 1024
+
+
+def _scan_for_basenames(fpath: Path, basenames: Dict[str, str],
+                        already: Set[str]) -> Set[str]:
+    """Which of ``basenames`` appear anywhere in ``fpath``.
+
+    Streamed in bounded chunks so a large bundle is answered COMPLETELY
+    rather than partly (§4GK round 6). A basename split across a chunk
+    boundary is caught by carrying an overlap of the longest name.
+    Raises the same `OSError`/`ValueError` the caller already handles.
+    """
+    wanted = {rel: name.lower() for rel, name in basenames.items()
+              if rel not in already}
+    if not wanted:
+        return set()
+    # ⚠ THE OVERLAP IS IN BYTES, BECAUSE THE BOUNDARY IS (§4GK round 7). The
+    # first version took `overlap` in CHARACTERS from decoded text while the
+    # chunk boundary is a BYTE offset — so a non-ASCII basename straddling it
+    # was mangled by `errors="replace"` in BOTH windows and found in neither.
+    # Measured through the real scan on this box (a Greek locale, so the case
+    # is not exotic): `εικόνα.png`, referenced at the 1 MB boundary, came back
+    # unreferenced — and the caller turns that straight into `to_delete`,
+    # which is the false DELETE this function's own contract forbids. Reading
+    # the overlap back as BYTES makes the seam decode as one piece.
+    overlap = max(len(n.encode("utf-8")) for n in wanted.values())
+    found: Set[str] = set()
+    from ..tools.file_system import read_text_nofollow
+    size = fpath.stat().st_size
+    pos = 0
+    while pos < size and wanted:
+        # Step back by the overlap in BYTES and re-read that seam, rather than
+        # carrying decoded characters across a boundary that split a codepoint.
+        _start = pos if pos == 0 else max(0, pos - overlap)
+        chunk = read_text_nofollow(fpath, errors="replace",
+                                   max_bytes=_REFERENCE_SCAN_CHUNK_BYTES
+                                   + (pos - _start),
+                                   offset=_start)
+        if not chunk:
+            break
+        pos += _REFERENCE_SCAN_CHUNK_BYTES
+        hay = chunk.lower()
+        for rel, name in list(wanted.items()):
+            if name in hay:
+                found.add(rel)
+                wanted.pop(rel, None)
+    return found
 
 
 def _referenced_media(root: Path, media_rels: List[str]) -> Set[str]:
@@ -731,6 +790,19 @@ def _referenced_media(root: Path, media_rels: List[str]) -> Set[str]:
         return set()
     basenames = {rel: rel.split("/")[-1] for rel in media_rels}
     hit: Set[str] = set()
+    # ⚠ AN INCOMPLETE SCAN MUST NOT AUTHORISE A DELETE (§4GK round 4). Every
+    # source-like file this loop cannot read — unreadable, a symlink the
+    # hardened reader refuses, or over the size cap — used to be skipped
+    # silently, and its references vanished with it. The caller turns "not in
+    # the returned set" straight into `to_delete`, so one unreadable
+    # `index.html` was enough to delete the assets it points at. This
+    # function's own contract is that a false KEEP costs kilobytes and a
+    # false DELETE breaks the build, so an unscanned file makes the answer
+    # inconclusive and everything is kept.
+    unscanned: List[str] = []
+    #: Source files the scan could not read at all. Their silence is not
+    #: evidence, so an unmatched candidate is kept when any exist.
+    partial: List[str] = []          # kept for the report shape; no longer filled
     for dirpath, _dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
         base = Path(dirpath)
         for fname in filenames:
@@ -742,22 +814,58 @@ def _referenced_media(root: Path, media_rels: List[str]) -> Set[str]:
             if not _is_source_like(rel):
                 continue
             try:
-                if fpath.is_symlink() or fpath.stat().st_size > _REFERENCE_SCAN_MAX_BYTES:
-                    continue
-                text = fpath.read_text(errors="replace")
-            except OSError:
+                # §4GJ round 3: the `is_symlink()` pre-check left a
+                # check-then-read window on a tree the model can rewrite.
+                # `read_text_nofollow` makes the refusal part of the open —
+                # the streaming scan below opens it that way per chunk.
+                # ⚠ SCANNED WHOLE, IN BOUNDED CHUNKS (§4GK round 6).
+                #
+                # Round 4 refused any file over the cap, which made the answer
+                # inconclusive and permanently disabled the media tidy for any
+                # workspace holding one ordinary bundle. Round 5 scanned the
+                # HEAD instead — better, but an unmatched candidate still fell
+                # back to keep-everything, so the tidy still could not DELETE
+                # anything in such a workspace. Both were fighting a cap that
+                # never needed to exist here: the question is "does any source
+                # file MENTION this basename", which is a substring search, not
+                # a parse. Streaming it costs one chunk of memory and answers
+                # completely, so there is no partial state left to reason about.
+                #
+                # The overlap carries the longest basename across a chunk
+                # boundary, so a name split by the read is still found.
+                _hits_here = _scan_for_basenames(fpath, basenames, hit)
+                if _hits_here:
+                    hit.update(_hits_here)
                 continue
-            # ⚠ CASE-INSENSITIVE, same reason as the keep-set (§4AT-D). An
-            # `index.html` writing `src="assets/hero.png"` against a disk file
-            # `assets/Hero.png` found no reference and the asset was deleted —
-            # the keep-set fix alone left this sibling protection exact-case,
-            # i.e. half-applied.
-            _text_low = text.lower()
-            for mrel, mname in basenames.items():
-                if mrel not in hit and mname.lower() in _text_low:
-                    hit.add(mrel)
+            except (OSError, ValueError):
+                unscanned.append(rel)
+                continue
+            # (The CASE-INSENSITIVE match of §4AT-D — an `index.html` writing
+            # `src="assets/hero.png"` against a disk file `assets/Hero.png`
+            # found no reference and the asset was deleted — now lives in
+            # `_scan_for_basenames`, which lowercases both the needle and every
+            # chunk. The inline loop that used to do it here became dead code
+            # after the streaming rewrite and referenced a name that no longer
+            # exists; the lint gate caught it, §4GK round 6.)
         if len(hit) == len(basenames):
             break
+    _unmatched = [m for m in media_rels if m not in hit]
+    if (unscanned or partial) and _unmatched:
+        # Only inconclusive about the candidates NOTHING matched: a file that
+        # was matched is referenced whatever the unread tail says.
+        _why = []
+        if unscanned:
+            _why.append(f"{len(unscanned)} unreadable ({', '.join(unscanned[:3])})")
+        if partial:
+            _why.append(f"{len(partial)} read only to the {_REFERENCE_SCAN_MAX_BYTES // (1024 * 1024)} MB "
+                        f"cap ({', '.join(partial[:3])})")
+        pretty_log(
+            "Workspace Tidy",
+            f"referenced-media scan is INCOMPLETE — {'; '.join(_why)} — so "
+            f"{len(_unmatched)} unmatched candidate(s) are KEPT this pass "
+            "rather than deleted on an answer the scan could not give.",
+            level="WARNING", icon=Icons.WARN)
+        return set(media_rels)
     return hit
 
 

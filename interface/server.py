@@ -1882,6 +1882,17 @@ async def workspace_save_proxy(request: Request):
             headers = {}
             if "content-disposition" in resp.headers:
                 headers["content-disposition"] = resp.headers["content-disposition"]
+            # ⚠ THE INCOMPLETE-ARCHIVE MARKER HAS TO SURVIVE THE PROXY (§4GK
+            # round 5). The agent answers 200 + `X-Ghost-Archive-Omitted: N`
+            # when it could not read N files, and this fresh header dict
+            # copied only `content-disposition` — so the one signal that the
+            # zip is SHORT died here, on every browser save. The operator was
+            # told "Workspace saved successfully", restored from it later,
+            # and the restore wiped the sandbox and wrote back the readable
+            # subset. `omitted.json` inside the archive survives, but nobody
+            # opens a zip they were told was fine.
+            if "x-ghost-archive-omitted" in resp.headers:
+                headers["x-ghost-archive-omitted"] = resp.headers["x-ghost-archive-omitted"]
         except Exception:
             if resp is not None:
                 # Read the error body BEFORE closing: `raise_for_status()` on

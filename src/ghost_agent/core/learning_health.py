@@ -13,12 +13,19 @@ Exposed as ``introspect action='learning'`` and ``scripts/learning_health.py``.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import sqlite3
 import time
 from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# The "a report must not die" handlers log here. ⚠ This name was READ before
+# it was ever DEFINED (2026-09-13 review): the lowest-confidence block's
+# except-handler raised NameError instead of swallowing, so the one failure
+# it existed to absorb killed the report.
+logger = logging.getLogger("GhostAgent")
 
 # FALLBACK mirrors of gates OWNED by other modules. The live values are
 # imported lazily at report time (see the ``_live_*`` helpers) so the

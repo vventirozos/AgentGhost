@@ -89,7 +89,21 @@
     <li>PDFs are also detected by the <code>%PDF-</code> magic prefix (not only the extension/header), and <code>_process_pdf</code> closes the <code>fitz</code> document in a <code>finally</code> so a mid-loop failure can't leak it.</li>
   </ul>
 
+  <h2 id="4gn">…and a post is not an image URL <span class="tag">2026-09-14 &sect;4GN</span></h2>
+  <p>
+    The re-run of that investigation (request <code>da4c17ba</code>) shows the §4GL fix working and stopping one step short. The model reached for the tool by name — <em>"Let me try <code>vision_analysis</code> on the notification screenshot. But I need to find the image URL"</em> — and then could not get one. X/Twitter and Telegram serve their images from scripted, expiring blob URLs; <code>browser</code> <code>extract_text</code> returns the page's text and never those. So the screenshot went unread a second time, for a new reason, and the report again said the sender domain was not publicly available when what had been established was that it was not in the page <em>text</em>.
+  </p>
+  <p>
+    <strong>The route already existed.</strong> <code>browser(operation="screenshot", url=…, out_path="shot.png")</code> renders the post to a PNG in the workspace, and <code>vision_analysis(action="extract_text_picture", target="/shot.png")</code> OCRs a page screenshot exactly as well as an image file. It is now stated in the three places the model actually reads: the <code>target</code> parameter description (which is where it looks when it has no URL), the <code>browser</code> <code>screenshot</code> operation description (which is where it looks when it has a page), and the system-prompt bullet — with the sentence that closes the loop: <em>"I could not find the image URL" is not a reason to stop — it is the reason this two-step route exists.</em>
+  </p>
+  <p class="note">
+    The generalisable shape: <strong>a capability is not reachable until every dead end leads to it.</strong> §4GL fixed "the model does not know the tool exists"; the tool was then chosen, hit one obstacle, and was abandoned — because the description answered "what can this analyse?" and not "what do I do when I cannot get one?". Pins: <code>tests/test_4gn_route_dropped_write_and_breadth.py</code>.
+  </p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
+
+  <h2 id="4gl">A screenshot is evidence your text tools cannot read <span class="tag">2026-09-14 &sect;4GL</span></h2>
+  <p>Vision already accepted a remote URL, fetched it over Tor behind the SSRF guard, and OCR'd it with <code>extract_text_picture</code>. Nothing said so from the research seat: the tool description was written around "generated images in your sandbox" and "UI/apps YOU built", and the system prompt mentioned vision only for checking your own screenshots. So an investigation navigated to a Telegram post carrying the one screenshot that mattered, ran <code>extract_text</code>, received the page markup, and reported the detail as unpublished. Both now state the research use and the trap behind it: <strong>extract_text returns nothing from inside an image</strong>, so "not in the page text" is not "not publicly available". If an investigation turns on something someone posted as a picture &mdash; a sender address, a header, a figure &mdash; OCR the picture, and say which images you read or that you did not try.</p>
 </main>
 </body>
 </html>

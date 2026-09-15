@@ -247,6 +247,24 @@ def turn_risk(*, step: int, tool_names: Optional[Sequence[str]] = None,
                        failure_pressure=pressure, step=s, band=band)
 
 
+# The directives the steer asks the model to answer IN ORDER. Exported so
+# the reply smoother can recognise the ANSWER and keep it out of the
+# delivered reply: the checkpoint is a protocol exchange with the loop,
+# not something the user asked for. Live (2026-09-15, req 4b518a82) the
+# answers accumulated across five iterations and shipped as the first
+# third of a forensic report, which then restated all of it.
+#
+# Owned HERE, at the producer, so re-wording the steer cannot silently
+# strip the smoother of its vocabulary — `test_risk_steer_vocabulary`
+# fails if any term stops appearing in the rendered message.
+STEER_DIRECTIVE_TERMS: tuple = (
+    "CONFIRMED",
+    "ASSUMED",
+    "SINGLE smallest check",
+    "STOP",
+)
+
+
 def risk_steer_message(reading: RiskReading) -> str:
     """The one-shot steer injected on a deep, struggling turn.
 
@@ -267,6 +285,7 @@ def risk_steer_message(reading: RiskReading) -> str:
       claim no part of that analysis supports — deep turns are also simply
       where the hard tasks live.
     """
+    _ = STEER_DIRECTIVE_TERMS  # kept in sync by test_risk_steer_vocabulary
     pct = int(round(reading.depth_prior * 100))
     beyond = reading.step > _DEPTH_CURVE[-1][0]
     where = (f"at {_DEPTH_CURVE[-1][0]} steps or more"

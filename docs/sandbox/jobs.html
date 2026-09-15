@@ -297,6 +297,9 @@ STDOUT/STDERR:
   </table>
   </div>
 
+  <h2 id="4gi">The nonce survives a restart; the rules moved to one module <span class="tag">2026-09-13 &sect;4GI</span></h2>
+  <p>The exit-sentinel nonce lived only in <code>self._nonces</code>. After an agent restart every running job had <code>nonce=None</code>, which skipped the forgery guard &mdash; a sandbox <code>echo 0 &gt; .jobs/&lt;jid&gt;.exit</code> marked a running job DONE (files cleaned, process orphaned) &mdash; and the runner's genuine <code>"&lt;nonce&gt; &lt;rc&gt;"</code> failed the digit check and landed the job as LOST. The nonces are now persisted in a <strong>host-only</strong> file outside the bind mount (<code>&lt;GHOST_HOME&gt;/system/sandbox_job_nonces.json</code>, tmp+rename, validated on load), so a restarted supervisor verifies the same nonce; a job with <em>no</em> known nonce (promoted by a pre-fix process, or a lost store) has its sentinel ignored and is supervised on its real process only &mdash; fail closed. The pid floor, the three-valued probe (<code>_probe_inconclusive</code> is now an alias) and the process-tree kill script moved verbatim to <code>sandbox/registry_guard.py</code>, shared with the <a href="services.html#4gi">services</a> twin.</p>
+
   <h2>Kill safety</h2>
   <p>Every signal this module sends is gated, because the number it signals
   is not trustworthy on its own: the registry lives on the bind mount, so the
@@ -428,6 +431,63 @@ STDOUT/STDERR:
   <code>tests/test_promoted_result_graders.py</code> (the marker wired into
   every consequential success-grader — the pins that keep this feature from
   shipping verification theatre).</p>
+  <h3 id="4gi-r3">Review round: the nonce store is bounded and dropped on the terminal transition <span class="tag">2026-09-13</span></h3>
+  <p>The first version grew <code>sandbox_job_nonces.json</code> by one row per promotion and never trimmed it, and the loader kept the <em>tail</em> 1 MB of the file &mdash; past ~25k promotions the JSON head was cut, nothing was trusted, and every genuine sentinel would have landed LOST. Nonces are now dropped in <code>_finish_completed</code>, <code>_kill_and_return</code> and at both LOST transitions (<code>_drop_nonce</code>), the store is capped at <code>_NONCE_STORE_MAX</code> (512, newest kept) and read whole. Pins: <code>tests/test_4gi_review_round2.py</code>.</p>
+  <h3 id="4gj-r3">Round 3: the nonce follows the job's state <span class="tag">2026-09-13 &sect;4GJ</span></h3>
+  <p>The §4GJ fix dropped a job's exit-sentinel nonce on four terminal transitions — and there are nine, missing the commonest one, normal completion. The 512-entry cap then evicted in insertion order, which is exactly the long-running job: promote one long job, complete 512 short ones, and the long job's nonce is gone from memory and disk, its genuine sentinel is rejected, and it lands LOST with its exit code destroyed. That is the regression the tail-read fix existed to close, reintroduced by the cap meant to bound it. Reproduced by execution. The lifecycle is no longer remembered at N call sites: <code>_sync_nonces</code> keeps a nonce only while its job is RUNNING and is called from <code>_save</code>, the one chokepoint every transition already reaches, with a bounded pending ring covering the window between minting a nonce and writing the row. The cap no longer evicts at all — after the sync every surviving nonce belongs to a running job, so it warns loudly and keeps them rather than destroying a live job's exit code.</p>
+
+  <h2 id="4gk">Round 4: the eviction regression, rebuilt inside its own fix <span class="tag">2026-09-13 &sect;4GK</span></h2>
+  <p>The pending ring described above was <em>another</em> count-bounded queue, 64 deep, guarding a <em>time</em> window. A command has no registry row from the moment its script is written until promotion &mdash; ninety seconds away, and up to the whole exec budget &mdash; and during that window the pending mark is the nonce's only protection. Sixty-four ordinary commands evicted it, the next save dropped the nonce, the exit reader rejected the job's own genuine sentinel, and a ten-minute run that exited zero was reported to the model as exit code 137. Reproduced. Expiry is now by AGE, longer than any window in which a row can legitimately be missing: too long costs one dictionary entry, too short destroys an exit code.</p>
+  <p><strong>And the "one chokepoint" was not on the common path.</strong> Normal completion and the kill-and-return path write no registry row and never call save, so on the commonest outcome of all nothing dropped the nonce: 600 in-band jobs held 600 nonces on disk and in memory. Past the cap the warning told the operator that every entry belonged to a job the registry says is RUNNING &mdash; true of none of them, and it sent them hunting rows that do not exist. Both in-band exits now release explicitly, and the warning no longer asserts what it cannot know.</p>
+
+  <h2 id="4gv">The jobs that outlived their tests <span class="tag">2026-09-14 &sect;4GV</span></h2>
+  <p>Four <code>sh -c 'while :; do echo &hellip;; sleep 0.2; done'</code> loops were
+  found alive on the host, reparented to init, the oldest started sixteen days
+  earlier &mdash; each burning a tenth of a core the whole time. They are job
+  fixtures. <code>tests/test_sandbox_job_promotion.py</code> exercises the
+  supervisor against <em>real</em> host processes through a <code>setsid</code>
+  shim, so every wedge/timeout case spawns a genuine detached process group;
+  a test that dies before its <code>_cleanup</code> &mdash; a crash, a
+  <code>--timeout</code>, an interrupted run, a <code>SIGKILL</code>ed xdist
+  worker &mdash; leaves that group with nothing left in the world that knows it
+  exists. The &sect;4GJ sweep that made <code>_cleanup</code> walk every registry
+  row rather than only the RUNNING ones stops the leak from tests that
+  <em>finish</em>; it cannot reach one that escaped before it ran.</p>
+  <p>The obvious sweep &mdash; kill anything whose command line looks like a busy
+  loop &mdash; is <a href="../audit_fixes.html">guard-the-proxy</a> with the
+  process table for a blast radius, and this project has already shipped that
+  bug once (<code>pgrep -f</code> matching the probe's own wrapper). The reaper
+  is provenance-based instead. The shim records
+  <code>{pid, pgid, argv, at}</code> as JSONL to
+  <code>$GHOST_TEST_JOB_REGISTRY</code> <em>before</em> it
+  <code>execvp</code>s, and a session-scoped autouse fixture in
+  <code>tests/conftest.py</code> reaps that registry at BOTH ends of the run
+  &mdash; at the start because the strays that motivated this predate the
+  reaper and every later run inherits them, at the end because this run's own
+  crash is the next one's inheritance.</p>
+  <p>Two factors decide every kill: the pid must still be live AND the live
+  process's argv must still equal the argv recorded with it. Pids are
+  recycled; without the second factor a stale row is a stranger's death
+  sentence. The signal goes to the process <em>group</em> (the shell loop's
+  <code>sleep</code> is a separate process; killing the leader alone leaves the
+  child orphaned and running &mdash; most of what "sixteen days" was made of),
+  and only while <code>os.getpgid(pid)</code> still equals the recorded group,
+  falling back to the bare pid otherwise. Nothing the shim did not record is
+  ever touched, a corrupt or missing registry is not an error, and the whole
+  reaper is failure-swallowing by design: a reaper that breaks a test run is
+  worse than the leak it cleans up.</p>
+  <p><strong>Postscript: the file that documents the leak was leaking.</strong> A sweep seven hours later found a <code>reaper-probe</code> loop with ppid 1 — from the FIRST, FAILING run of the very pin that proves the reaper works, where <code>subprocess.run</code> raised <code>TimeoutExpired</code> (the shim <code>exec</code>s into the loop and never returns) before the <code>try/finally</code> that kills it was entered. Each pin spawns into its own <code>tmp_path</code> registry so it owns its rows, which is precisely what put those spawns out of the session reaper's reach. The helper now records each spawn into the session registry as well, so the sweep at both ends is the backstop for this file's own processes too. A test that spawns a real detached process must assume it will not reach its own cleanup.</p>
+  <p><strong>And that fix leaked one layer down.</strong> The next sweep found a loop spawned by the BATTERY, under the mutant "the shim records nothing": there <code>_spawn_recorded</code> raises its own assertion after the process exists and before the caller has a row to kill, and the dual-record was reading the shim's row — the very thing under test. The wrapper shell now echoes <code>$!</code>, so the helper knows the pid it created independently of the mechanism being tested and registers it <em>before</em> any assertion, with the argv spelled as <code>ps</code> will show it so the two-factor identity check still holds. A helper that spawns a real detached process must assume its CALLER will never reach cleanup either. Pinned by <code>test_a_spawn_whose_HELPER_fails_is_still_reachable</code> and mutated (M11). Battery: 11 mutants + both controls, 12/12 of the ones that must die.</p>
+  <h3 id="4gz">Review round 9: one shared registry was a cross-worker kill switch <span class="tag">2026-09-15 &sect;4GZ</span></h3>
+  <p>A single registry file looked simpler and was a defect. <code>tests/test_sandbox_job_promotion.py</code> writes rows for jobs that are <em>still running</em> — measured, four live rows within four seconds of that file starting — and under <code>-n 6 --dist loadfile</code> that file runs in one worker while another worker finishes, reaps every row it can see (killing the first worker's live jobs mid-test) and unlinks the file, destroying the rows for anything it could not reach. Those jobs then leak permanently: the exact outcome the reaper exists to prevent.</p>
+  <p>The registry is now <strong>one file per session process, named by its owner's pid</strong>, and a sweep skips any registry whose owner is still alive. The owner question is asked of the <em>pid</em>, not the clock: "is this file older than N minutes" is wrong in both directions — a live worker that has not spawned a job in N minutes looks abandoned, and two back-to-back runs look live. Pid reuse can only make the answer YES for a dead owner, which merely delays a sweep; it can never turn a live worker's jobs into targets, and row-level argv identity still guards every individual kill. Both ends of the session sweep abandoned registries and this session's own — what makes that safe is the owner guard, not the timing, so a run that outlives a crashed sibling cleans up after it.</p>
+  <p>Pins: <code>tests/test_4gv_detached_job_reaper.py</code> &mdash; a really
+  spawned, really recorded, really orphaned loop is reaped; its whole group
+  dies, not just the leader; a row whose pid now belongs to a live process
+  with different argv is left alone; an unrecorded busy loop is never touched;
+  the session fixture reaps <em>before</em> the first test as well as after the
+  last. Battery: <code>scripts/mutate_4gv.py</code> (10 mutants + a no-op and a
+  known-bad control, 10/10 killed).</p>
 </main>
 </body>
 </html>

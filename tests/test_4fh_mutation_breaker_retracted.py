@@ -24,7 +24,7 @@ def test_strikes_module_carries_no_mutation_ledger():
     assert not hasattr(led, "mutation_sigs") and not hasattr(led, "note_mutation")
 
 
-def test_turn_loop_has_no_mutation_trip_and_the_metadata_tuple_is_nine_wide():
+def test_turn_loop_has_no_mutation_trip_and_the_metadata_tuple_is_ten_wide():
     src = inspect.getsource(agent_mod)
     tree = ast.parse(src)
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
@@ -36,11 +36,14 @@ def test_turn_loop_has_no_mutation_trip_and_the_metadata_tuple_is_nine_wide():
                and isinstance(n.func, ast.Attribute) and n.func.attr == "append"
                and isinstance(n.func.value, ast.Name) and n.func.value.id == "tool_call_metadata"]
     assert appends
+    # 9 wide at the retraction; the 10th element (the call's parsed
+    # arguments, recorded on the outcome for the evidence gate) was added
+    # 2026-09-13 — it is a plain dict, not a breaker key.
     for ap in appends:
-        assert isinstance(ap.args[0], ast.Tuple) and len(ap.args[0].elts) == 9
+        assert isinstance(ap.args[0], ast.Tuple) and len(ap.args[0].elts) == 10
     unpacks = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
                and isinstance(n.value, ast.Subscript)
                and ast.unparse(n.value.value) == "tool_call_metadata"]
     assert unpacks
     for up in unpacks:
-        assert len(up.targets[0].elts) == 9
+        assert len(up.targets[0].elts) == 10

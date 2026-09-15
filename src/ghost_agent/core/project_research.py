@@ -32,6 +32,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
+from ..tools.file_system import read_text_nofollow, walk_nofollow  # §4GJ: symlink-safe walk/read over a model-writable tree
 
 logger = logging.getLogger("GhostAgent")
 
@@ -189,8 +190,9 @@ def reconcile_research_dir(store, project_id: str) -> int:
         known_paths = {e.get("path") for e in get_research_index(store, project_id)
                        if isinstance(e, dict)}
         added = 0
-        import os
-        for dirpath, _dirs, files in os.walk(base):
+                # §4GJ round 3: see `project_advancer` — a linked FILE is listed by
+        # `os.walk` and read straight through. Regular files only, dir_fd read.
+        for dirpath, files, _dfd in walk_nofollow(base):
             # Only descend interest: a file is a research brief when one of its
             # parent directories is literally "research".
             rel_dir = Path(dirpath).relative_to(base).as_posix()
@@ -204,8 +206,8 @@ def reconcile_research_dir(store, project_id: str) -> int:
                 if rel in known_paths:
                     continue
                 try:
-                    text = (Path(dirpath) / fn).read_text(errors="replace")
-                except OSError:
+                    text = read_text_nofollow(fn, dir_fd=_dfd, errors="replace")
+                except (OSError, ValueError):
                     continue
                 entry = {
                     "topic": _heading_or_topic(text, Path(fn).stem),

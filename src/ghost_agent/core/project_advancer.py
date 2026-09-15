@@ -24,7 +24,6 @@ verify both paths.
 """
 
 import logging
-import os
 import re
 import threading
 import time
@@ -33,6 +32,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from ..utils.logging import Icons, pretty_log
+from ..tools.file_system import read_text_nofollow, walk_nofollow  # §4GJ: symlink-safe walk/read over a model-writable tree
 
 logger = logging.getLogger("GhostAgent")
 
@@ -85,7 +85,11 @@ def _gather_project_files(store, project_id: str, *, budget_chars: int = 400_000
     out: Dict[str, str] = {}
     total = 0
     try:
-        for dirpath, _dirs, files in os.walk(base):
+        # §4GJ round 3: `os.walk` only declines to DESCEND a linked
+        # DIRECTORY — a linked FILE is still listed and `read_text` follows
+        # it, with no race needed. This walk lists regular files only and
+        # the read is dir_fd-relative (atomic wrt every component).
+        for dirpath, files, _dfd in walk_nofollow(base):
             for fn in sorted(files):
                 rel = (Path(dirpath) / fn).relative_to(base).as_posix()
                 parts = rel.split("/")
@@ -99,10 +103,9 @@ def _gather_project_files(store, project_id: str, *, budget_chars: int = 400_000
                     continue
                 if Path(fn).suffix.lower() in _BINARY_EXTS:
                     continue
-                p = Path(dirpath) / fn
                 try:
-                    content = p.read_text(errors="replace")
-                except OSError:
+                    content = read_text_nofollow(fn, dir_fd=_dfd, errors="replace")
+                except (OSError, ValueError):
                     continue
                 if len(content) > per_file_chars:
                     # ⚠ MARK THIS ONE TOO. My first pass marked only the
@@ -132,7 +135,11 @@ def _gather_project_files(store, project_id: str, *, budget_chars: int = 400_000
                 total += len(content)
                 if len(out) >= max_files:
                     return out
-    except OSError:
+    # `_require_dir_fd` fails CLOSED with a ValueError on a platform
+    # without dir_fd support, and the nofollow readers raise one for a
+    # non-regular file — neither is an OSError, so this function's
+    # "never raises" contract needed both (§4GK round 4).
+    except (OSError, ValueError):
         return out
     return out
 
@@ -156,7 +163,7 @@ def _gather_research_briefs(store, project_id: str, *, max_briefs: int = 4,
     out: Dict[str, str] = {}
     total = 0
     try:
-        for dirpath, _dirs, files in os.walk(base):
+        for dirpath, files, _dfd in walk_nofollow(base):
             rel_dir = Path(dirpath).relative_to(base).as_posix()
             if "research" not in [p for p in rel_dir.split("/") if p]:
                 continue
@@ -165,8 +172,8 @@ def _gather_research_briefs(store, project_id: str, *, max_briefs: int = 4,
                     continue
                 rel = (Path(dirpath) / fn).relative_to(base).as_posix()
                 try:
-                    content = (Path(dirpath) / fn).read_text(errors="replace")
-                except OSError:
+                    content = read_text_nofollow(fn, dir_fd=_dfd, errors="replace")
+                except (OSError, ValueError):
                     continue
                 excerpt = content[:per_brief_chars].rstrip()
                 if len(content) > per_brief_chars:
@@ -181,7 +188,11 @@ def _gather_research_briefs(store, project_id: str, *, max_briefs: int = 4,
                     return out
             if len(out) >= max_briefs:
                 break
-    except OSError:
+    # `_require_dir_fd` fails CLOSED with a ValueError on a platform
+    # without dir_fd support, and the nofollow readers raise one for a
+    # non-regular file — neither is an OSError, so this function's
+    # "never raises" contract needed both (§4GK round 4).
+    except (OSError, ValueError):
         return out
     return out
 

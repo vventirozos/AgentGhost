@@ -46,7 +46,7 @@ def test_agent_uses_stable_query_for_tool_defs():
     """Guard: handle_chat must route tool-def selection through
     stable_tool_query, not the raw per-turn search_query."""
     import inspect
-    src = inspect.getsource(GhostAgent.handle_chat)
+    src = inspect.getsource(GhostAgent.handle_chat) + inspect.getsource(GhostAgent._run_internal_turn)
     assert "request_state.stable_tool_query(" in src
     # The old direct raw-query call must be gone.
     assert "get_active_tool_defs(search_query or \"\")" not in src

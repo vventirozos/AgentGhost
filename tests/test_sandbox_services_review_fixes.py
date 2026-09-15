@@ -62,10 +62,10 @@ class TestPortReclaimOwnership:
         kills = []
 
         def handler(cmd):
-            if "kill -TERM" in cmd or "kill -KILL" in cmd:
+            if "sig TERM" in cmd or "kill -TERM" in cmd or "kill -KILL" in cmd:   # §4GI: the shared tree script
                 kills.append(cmd)
                 return ("", 0)
-            if "kill -0" in cmd:
+            if "kill -0" in cmd and "sig TERM" not in cmd:   # §4GI: the kill script polls with kill -0 too
                 return ("", 0 if "222" in cmd else 1)  # webapp alive only
             if "python3 -c" in cmd:
                 return ("", 0)                          # 8100 answers (webapp)
@@ -90,10 +90,10 @@ class TestPortReclaimOwnership:
         kills = []
 
         def handler(cmd):
-            if "kill -TERM" in cmd or "kill -KILL" in cmd:
+            if "sig TERM" in cmd or "kill -TERM" in cmd or "kill -KILL" in cmd:   # §4GI: the shared tree script
                 kills.append(cmd)
                 return ("", 0)
-            if "kill -0" in cmd:
+            if "kill -0" in cmd and "sig TERM" not in cmd:   # §4GI: the kill script polls with kill -0 too
                 return ("", 1)                          # recorded pid dead
             if "python3 -c" in cmd:
                 return ("", 0)                          # port still answers
@@ -115,10 +115,10 @@ class TestPortReclaimOwnership:
         kills = []
 
         def handler(cmd):
-            if "kill -TERM" in cmd or "kill -KILL" in cmd:
+            if "sig TERM" in cmd or "kill -TERM" in cmd or "kill -KILL" in cmd:   # §4GI: the shared tree script
                 kills.append(cmd)
                 return ("", 0)
-            if "kill -0" in cmd:
+            if "kill -0" in cmd and "sig TERM" not in cmd:   # §4GI: the kill script polls with kill -0 too
                 return ("", 1)                          # recorded pid dead
             if "python3 -c" in cmd:
                 return ("", 0)                          # orphan still listening
@@ -143,7 +143,7 @@ class TestPortReclaimOwnership:
         def handler(cmd):
             if "nohup" in cmd:
                 return ("300\n", 0)
-            if "kill -0" in cmd:
+            if "kill -0" in cmd and "sig TERM" not in cmd:   # §4GI: the kill script polls with kill -0 too
                 return ("", 0)          # chess (111) alive; 300 alive too
             if "s.bind" in cmd:
                 return ("", 0)          # other ports free to bind
@@ -163,7 +163,7 @@ class TestPortReclaimOwnership:
         def handler(cmd):
             if "nohup" in cmd:
                 return ("300\n", 0)
-            if "kill -0" in cmd:
+            if "kill -0" in cmd and "sig TERM" not in cmd:   # §4GI: the kill script polls with kill -0 too
                 return ("", 0)                          # our pid alive
             if "python3 -c" in cmd:
                 return ("", 0)                          # port answers…
@@ -206,12 +206,12 @@ class TestContainerGenerationStamp:
         kills = []
 
         def handler(cmd):
-            if "kill -TERM" in cmd or "kill -KILL" in cmd:
+            if "sig TERM" in cmd or "kill -TERM" in cmd or "kill -KILL" in cmd:   # §4GI: the shared tree script
                 kills.append(cmd)
                 return ("", 0)
             if "nohup" in cmd:
                 return ("100\n", 0)
-            if "kill -0" in cmd:
+            if "kill -0" in cmd and "sig TERM" not in cmd:   # §4GI: the kill script polls with kill -0 too
                 return ("", 0)          # the NUMBER is alive (recycled pid)
             if "s.bind" in cmd:
                 return ("", 0)          # allocator: ports free (§4G lease)
@@ -271,7 +271,7 @@ class TestRestartPreservesRegistration:
         def broken(cmd):                # workdir vanished; everything dead
             if "test -d" in cmd:
                 return ("", 1)
-            if "kill -0" in cmd:
+            if "kill -0" in cmd and "sig TERM" not in cmd:   # §4GI: the kill script polls with kill -0 too
                 return ("", 1)
             if "python3 -c" in cmd:
                 return ("", 1)
@@ -295,7 +295,7 @@ class TestRestartPreservesRegistration:
         def broken(cmd):
             if "test -d" in cmd:
                 return ("", 1)
-            if "kill -0" in cmd:
+            if "kill -0" in cmd and "sig TERM" not in cmd:   # §4GI: the kill script polls with kill -0 too
                 return ("", 1)
             return ("", 0)
 

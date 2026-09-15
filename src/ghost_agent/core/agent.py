@@ -837,6 +837,185 @@ def _tool_is_bookkeeping(tool) -> bool:
     return name.replace("-", "_").replace(" ", "_") in _BOOKKEEPING_TOOL_NAMES
 
 
+# ── Late-verdict ordering (2026-09-13) ──────────────────────────────────────
+# A verdict can land BEFORE the turn's own records exist: a tool-free turn's
+# verdict branch has no await, so the verdict task completes on the next loop
+# tick and its done-callback runs at finalize's next yield — ahead of
+# `_record_turn_trajectory` (the corpus row + correction cache) and of
+# `_record_lesson_outcomes` (the lesson stash). Two bounded, context-keyed
+# rings make both consumers order-independent: an in-flight trajectory's
+# early verdict is parked and replayed by the record; an early lesson sign is
+# parked and booked by the stash write. Module-level (not methods) so the
+# fakes that stand in for the agent in the backfill tests keep working.
+_TRAJ_IN_FLIGHT_MAX = 64
+_PENDING_LESSON_SIGN_MAX = 256
+
+
+def _bounded_ring(context, attr: str, cap: int):
+    from collections import OrderedDict
+    ring = getattr(context, attr, None)
+    if not isinstance(ring, OrderedDict):
+        ring = OrderedDict()
+        setattr(context, attr, ring)
+    while len(ring) > cap:
+        ring.popitem(last=False)
+    return ring
+
+
+def _mark_trajectory_in_flight(context, trajectory_id) -> None:
+    if not trajectory_id:
+        return
+    ring = _bounded_ring(context, "_trajectories_in_flight", _TRAJ_IN_FLIGHT_MAX)
+    ring[trajectory_id] = True
+    ring.move_to_end(trajectory_id)
+    while len(ring) > _TRAJ_IN_FLIGHT_MAX:
+        ring.popitem(last=False)
+
+
+def _trajectory_is_in_flight(context, trajectory_id) -> bool:
+    ring = getattr(context, "_trajectories_in_flight", None)
+    try:
+        return bool(trajectory_id) and bool(ring) and trajectory_id in ring
+    except TypeError:
+        return False
+
+
+def _defer_late_backfill(context, trajectory_id, outcome, reason) -> None:
+    """Park a late verdict that landed before its trajectory row was
+    written; `GhostAgent._replay_deferred_late_backfill` runs it after."""
+    pend = _bounded_ring(context, "_pending_late_backfill", _TRAJ_IN_FLIGHT_MAX)
+    pend[trajectory_id] = (outcome, reason)
+    pend.move_to_end(trajectory_id)
+    while len(pend) > _TRAJ_IN_FLIGHT_MAX:
+        pend.popitem(last=False)
+    pretty_log(
+        "Verifier",
+        f"late {outcome} for trajectory {str(trajectory_id)[:8]} landed "
+        f"before the turn's record — deferred until the trajectory is written",
+        icon=Icons.VERIFIER_LAB,
+    )
+
+
+def _take_deferred_late_backfill(context, trajectory_id):
+    """Clear the in-flight mark; return the parked (outcome, reason) or None."""
+    if not trajectory_id:
+        return None
+    ring = getattr(context, "_trajectories_in_flight", None)
+    if isinstance(ring, dict):
+        ring.pop(trajectory_id, None)
+    pend = getattr(context, "_pending_late_backfill", None)
+    if not isinstance(pend, dict) or trajectory_id not in pend:
+        return None
+    return pend.pop(trajectory_id)
+
+
+def _park_pending_lesson_sign(context, trajectory_id, success: bool) -> None:
+    pend = _bounded_ring(context, "_pending_lesson_outcome_by_traj",
+                         _PENDING_LESSON_SIGN_MAX)
+    pend[trajectory_id] = bool(success)
+    pend.move_to_end(trajectory_id)
+    while len(pend) > _PENDING_LESSON_SIGN_MAX:
+        pend.popitem(last=False)
+    logger.info(
+        "lesson-outcome: verdict for traj %s landed before its stash — "
+        "sign parked (%s)", str(trajectory_id)[:8],
+        "success" if success else "failure",
+    )
+
+
+def _take_pending_lesson_sign(context, trajectory_id):
+    """The parked sign for ``trajectory_id`` (popped), or None."""
+    pend = getattr(context, "_pending_lesson_outcome_by_traj", None)
+    if not isinstance(pend, dict) or trajectory_id not in pend:
+        return None
+    return pend.pop(trajectory_id)
+
+
+# ── The forced final that produced no answer (§4GH, 2026-09-13) ─────────────
+_FORCED_FINAL_ANSWER_DIRECTIVE = (
+    "SYSTEM ALERT: this is the FINAL turn — tools are OFF and your last output "
+    "contained NO answer (only tool calls, or working narration such as "
+    "'Let me dig into…'). Write the answer NOW from the evidence already in "
+    "this conversation: state what you found, name the sources you actually "
+    "read, and say plainly what you could not determine. Do NOT call tools. "
+    "Do NOT describe what you will do next."
+)
+
+
+def _forced_final_has_no_answer(this_turn_text: str, accumulated: str) -> bool:
+    """`reply_smoothing.forced_final_has_no_answer` over the model's text
+    with the loop's own dropped-mutation note removed first."""
+    from .reply_smoothing import forced_final_has_no_answer
+    text = str(this_turn_text or "")
+    i = text.find(_DROPPED_NOTE_HEAD)
+    if i >= 0:
+        text = text[:i]
+    return forced_final_has_no_answer(text, accumulated)
+
+
+def _no_answer_fallback_reply(tools_run) -> str:
+    """The honest reply when a forced final produced nothing twice: the
+    §4GH fallback head (refuted by the shape check as the non-answer it is)
+    plus the last substantive evidence, so the user gets the material
+    instead of nine turns of narration."""
+    from .reply_shape_check import FALLBACK_HEADS
+    lt = (_find_substantive_tool_for_verifier(
+              tools_run, include_informational_bookkeeping=False)
+          or _find_substantive_tool_for_verifier(tools_run))
+    head = FALLBACK_HEADS["no_answer"]
+    if not lt:
+        return head + "\n\nNo tool this turn returned usable evidence. Ask me to continue."
+    name = str(lt.get("name") or "tool")
+    args = getattr(lt.get("content"), "call_args", None) or {}
+    target = str(args.get("url") or args.get("query") or args.get("path") or "").strip()
+    body = str(lt.get("content") or "").strip()[:1500]
+    where = f"`{name}`" + (f" on {target[:160]}" if target else "")
+    return (f"{head}\n\nLast evidence gathered ({where}):\n\n{body}\n\n"
+            "I could not complete the analysis in this turn; ask me to continue "
+            "and I will answer from these sources.")
+
+
+def _browser_loaded_but_never_extracted(tools_run, target: str) -> bool:
+    """§4GH: the repeated browser action is a `navigate` of ``target`` and no
+    `extract_text` of that page ran this request — the repeat is a symptom
+    (navigate returns a capped preview), and the remedy is to extract, not to
+    end the turn. Reads the recorded rows' `call_args` (§4GG)."""
+    tgt = str(target or "").strip().lower()
+    if not tgt:
+        return False
+    navigated = extracted = False
+    for r in tools_run or []:
+        if not isinstance(r, dict) or r.get("_synthetic"):
+            continue
+        if str(r.get("name") or "").lower() != "browser":
+            continue
+        args = getattr(r.get("content"), "call_args", None) or {}
+        # the breaker's target is `primary_target_from_args`: lower-cased and
+        # cut at 200 chars — compare the same form
+        if str(args.get("url") or "").strip().lower()[:200] != tgt:
+            continue
+        op = str(args.get("operation") or "").strip().lower()
+        if op == "extract_text":
+            extracted = True
+        elif op in ("navigate", ""):
+            # a screenshot loop is the breaker's classic case, not this one
+            navigated = True
+    return navigated and not extracted
+
+
+def _latch_forces_final(task_closed_this_req: bool,
+                        repair_reentry_active: bool) -> bool:
+    """The one-task-per-turn latch, as a decision the loop re-asks every
+    iteration: once a project task closed DONE this request the turn must
+    converge to a final answer — UNLESS a verifier auto-repair re-entry is
+    running (2026-09-13). The repair directive ("actually RUN it", or
+    "fix the refuted claim") needs tools; re-forcing the final while it
+    runs issued that directive into a `tool_choice: none` turn whose every
+    emitted call was dropped. Pinned as a table in
+    `tests/test_repair_reentry_latch.py`."""
+    return bool(task_closed_this_req) and not bool(repair_reentry_active)
+
+
 def _should_await_repair_verdict(budget: float, lt, unverified: bool) -> bool:
     """Loop-exit gate: is the bounded in-loop verdict await worth blocking
     the reply for? Extracted pure so the §4BC exclusion is unit-testable.
@@ -1843,7 +2022,73 @@ def _is_unverified_mutation(tool: Optional[dict]) -> bool:
     content = str(tool.get("content", "")).lower()
     if "success" not in content:
         return False
-    return any(marker in content for marker in _FILE_MUTATION_MARKERS)
+    if not any(marker in content for marker in _FILE_MUTATION_MARKERS):
+        return False
+    # ⚠ ONLY A RUNNABLE ARTIFACT CAN BE RUN (§4GL, req cf45e352). This gate
+    # used to fire on the TOOL NAME alone, so every successful file write
+    # demanded that the file be "run or rendered" before the turn could
+    # finish clean. A prose deliverable has nothing to run and nothing to
+    # render, so writing the report a request ASKED FOR could never satisfy
+    # it — and the turn was booked `failed` at confidence 0.15 with a note
+    # telling the operator to "run/preview it before relying on it".
+    #
+    # Measured on req cf45e352 (2026-09-14): an eight-minute OSINT
+    # investigation produced a 10.9 KB forensic report and a 4.4 KB standalone
+    # answer that correctly REFUSED to attribute, and was recorded as a
+    # failure. The knock-on is what makes it expensive rather than cosmetic:
+    # six lessons were filed `present-on-FAILURE` (the outcome-gated loop
+    # prunes on that), and the self-model moved to "stuck: 3 of my last 5
+    # verdict-bearing turns failed". The gate has fired six times.
+    #
+    # The original defect it was written for (req_C0: a 33-minute build finishing on
+    # an untested code write at C=0.96) is untouched — code and markup still
+    # have to be executed or rendered. Unknown or extensionless names still
+    # fire, so a `Makefile` or a `Dockerfile` keeps the guard; only the
+    # explicitly inert kinds are exempt.
+    _paths = _written_paths_from_confirmation(str(tool.get("content", "")))
+    if _paths and all(_is_inert_artifact(q) for q in _paths):
+        return False
+    return True
+
+
+#: Written artifacts that cannot be "run or rendered" by construction: prose,
+#: notes, reports, structured data. Demanding execution of these is demanding
+#: the impossible, and the turn fails for having produced what was asked for
+#: (§4GL). Anything NOT named here — including an extensionless name — still
+#: fires the gate, so the conservative default is preserved.
+_INERT_ARTIFACT_SUFFIXES = frozenset({
+    ".md", ".markdown", ".rst", ".txt", ".text", ".log",
+    ".csv", ".tsv", ".json", ".jsonl", ".ndjson",
+    ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
+    ".xml", ".rtf", ".org", ".adoc",
+})
+
+
+def _is_inert_artifact(path: str) -> bool:
+    """True when ``path`` names a file that cannot be executed or rendered."""
+    import os as _os
+    return _os.path.splitext(str(path).strip().strip("'\"").lower())[1] in \
+        _INERT_ARTIFACT_SUFFIXES
+
+
+def _written_paths_from_confirmation(content: str) -> list:
+    """Every path a file_system WRITE confirmation names, via the SAME
+    anchored patterns the deliverable bookkeeping uses — so a reworded
+    message goes blind in one place, not two, and the existing
+    producer/parser parity tripwire covers both."""
+    out = []
+    for line in str(content or "").splitlines():
+        line = line.strip()
+        m = _FS_WROTE_PAIR_RE.match(line)
+        if m:
+            out.extend([m.group(1), m.group(2)])
+            continue
+        for rx in _FS_PRODUCE_RES:
+            m = rx.match(line)
+            if m:
+                out.append(m.group(1))
+                break
+    return out
 
 
 # ── file_system SUCCESS-message parsing ──────────────────────────────
@@ -2880,6 +3125,218 @@ def _reconstruct_executed_code(
     return ""
 
 
+# ── The artifact the turn actually produced (§4GW, 2026-09-14) ───────
+# req 0a017800 built `logslow.py` + a pytest file in the sandbox, ran both,
+# and reported. The turn gate judged it twice 31 s apart — CONFIRMED 1.00,
+# then REFUTED 0.90 "The agent did not provide the source code for
+# `logslow.py` or `test_logslow.py`" — and the late verdict overwrote the
+# turn as failed, scrubbed its lessons and queued a user-facing correction.
+#
+# The judge was right about what it could see. `_reconstruct_executed_code`
+# hands the CODE slot the LAST tool call's command line, so a turn that
+# WRITES three files and then runs one of them shows the auditor a single
+# shell line — `python3 logslow.py sample.log` — and asks it whether the
+# source was delivered. 7.9 kB of source, already on disk, already re-read
+# by the FILE-ARTIFACT check two hundred lines below, were not in its view.
+# A verdict that cannot distinguish "wrote the script" from "never wrote
+# it" is a coin flip, and this one landed on both faces inside one turn.
+# The slot is capped at 4000 downstream and the COMMAND shares it, so the
+# block's budget is whatever the command leaves — never a fixed number that
+# happens to fit the commands seen so far.
+_AUDIT_SLOT_CAP = 8000           # == verifier.CODE_SLOT_CHARS, pinned
+_AUDIT_COMMAND_FLOOR = 600       # the command is never squeezed below this
+_AUDIT_SOURCE_BUDGET = 7200      # ceiling on the block, even with room spare
+_AUDIT_SOURCE_MIN_SHARE = 700    # below this a file is noise, not evidence
+_AUDIT_SOURCE_MAX_FILES = 4
+_AUDIT_HEADER_RESERVE = 380      # a header + elision notice, worst case
+_AUDIT_PATH_DISPLAY = 60         # so a deep path cannot outgrow the reserve
+# Text the auditor can actually read. An image or a wheel contributes
+# nothing but noise to a question about source.
+_AUDIT_SOURCE_EXT_RE = re.compile(
+    r"\.(?:py|js|mjs|ts|tsx|jsx|sh|bash|zsh|sql|rb|go|rs|c|h|cc|cpp|java|"
+    r"php|pl|lua|r|jl|swift|kt|scala|md|markdown|txt|json|jsonl|ya?ml|"
+    r"toml|ini|cfg|conf|html?|css|csv|tsv|xml|tex|ipynb)$", re.IGNORECASE)
+
+
+# The block headers below are a TRUST SIGNAL in the audit prompt ("this
+# file exists on disk with this content"), and the file bodies they wrap are
+# model-authored. A file whose own text contains the header would forge
+# evidence about files nobody wrote, so the marker is neutralised inside
+# every body — the one place it can appear without having been earned.
+_AUDIT_MARKER_RE = re.compile(r"^# --- (?=file this turn wrote|command this "
+                              r"turn ran)", re.MULTILINE)
+
+
+def _audit_source_budget(code_text: str) -> int:
+    """Room left for the written-source block once the command has its own.
+
+    The command is what `_reconstruct_executed_code` exists to protect, so it
+    is served first; the block gets the remainder, capped."""
+    return max(0, min(_AUDIT_SOURCE_BUDGET,
+                      _AUDIT_SLOT_CAP - max(len(code_text or ""),
+                                            _AUDIT_COMMAND_FLOOR)))
+
+
+#: What a HEAD-ONLY cut cost, measured. The first pack cut each file at its
+#: head; on the very turn that motivated this the judge then refuted with
+#: "the test suite is missing the required test case for the missing-file
+#: scenario" — about a test file cut at 1100 chars whose
+#: `test_main_missing_file_returns_2` sits at char 2300. Saying "the rest
+#: was elided" in the header did NOT stop it: measured again with a fuller
+#: disclaimer and 1280 chars, the same complaint came back 2 times in 10.
+#: A head cut systematically hides the END of a file, and the end of a
+#: source file is where the later definitions live. `pack_claim` learned
+#: this on the claim side in 2026-08 and the fix is the same one: keep both
+#: ends and elide the middle, where a judge can spare it.
+_AUDIT_HEAD_FRACTION = 0.55
+_AUDIT_ELISION = ("\n[… {n} chars elided here by the audit packer, NOT the "
+                  "end of the file — it continues below …]\n")
+
+
+def _head_and_tail(body: str, take: int, missing: int = -1) -> str:
+    """`body` cut to `take` chars keeping BOTH ends, with the seam marked.
+
+    `missing` is how many chars of the FILE are not shown — which is not
+    `len(body) - take` once `body` is itself a bounded read of a large file.
+    Defaults to the old meaning for callers that hand over a whole file."""
+    if missing < 0:
+        missing = len(body) - take
+    if take >= len(body) and missing <= 0:
+        return body
+    marker = _AUDIT_ELISION.format(n=missing)
+    head_n = int(take * _AUDIT_HEAD_FRACTION)
+    tail_n = take - head_n - len(marker)
+    if tail_n <= 0:                      # no room for two ends: head only
+        return body[:take]
+    return body[:head_n] + marker + body[-tail_n:]
+
+
+def _read_bounded(path, limit: int):
+    """Return ``(text, size_on_disk)`` without reading more than ~2*limit.
+
+    ⚠ `read_text()` here was unbounded, on the VERDICT path, over a filename
+    the model chose. A turn that writes a 400 MB log and then runs anything
+    would have had that log read whole into the agent's memory to build a
+    prompt that shows at most 7 kB of it. Both ends are kept because the
+    excerpt is what the auditor sees and the end of a source file is where
+    the later definitions live."""
+    size = path.stat().st_size
+    with path.open("rb") as fh:
+        if size <= 2 * limit:
+            raw = fh.read()
+        else:
+            head = fh.read(limit)
+            fh.seek(-limit, os.SEEK_END)
+            raw = head + fh.read(limit)
+    return raw.decode("utf-8", "replace"), size
+
+
+def _written_sources_for_audit(tools_run, host_dir,
+                               budget: int = _AUDIT_SOURCE_BUDGET,
+                               max_files: int = _AUDIT_SOURCE_MAX_FILES) -> str:
+    """The source this turn WROTE, labelled, for the code lens's CODE slot.
+
+    Reads the files back off disk rather than replaying the write-call
+    arguments: what the user can open is the deliverable, and a write whose
+    content never landed is exactly the failure the auditor should see.
+
+    `budget` is the whole block's ceiling, headers included, and is divided
+    between the files that fit — a file whose share would fall below
+    `_AUDIT_SOURCE_MIN_SHARE` is dropped rather than cut into noise, and a
+    file shorter than its share hands the remainder back. The caller sizes
+    the budget from what the COMMAND leaves (`_audit_source_budget`):
+    silently pushing the command out of the prompt would trade this blind
+    spot for the one `_reconstruct_executed_code` was written to fix.
+    Truncation is marked, never silent. Returns "" when the turn wrote
+    nothing readable; never raises.
+    """
+    if not tools_run or not host_dir:
+        return ""
+    try:
+        written = _files_mutated_this_turn(tools_run)
+    except Exception:  # noqa: BLE001
+        return ""
+    if not written:
+        return ""
+    try:
+        root = Path(str(host_dir)).resolve()
+    except Exception:  # noqa: BLE001
+        return ""
+    # Pass 1 — WHAT is there. Reading first is what makes the share honest:
+    # dividing the budget before knowing the sizes gives a 200-char README
+    # the same room as a 4 kB module, and the module pays for it.
+    files, seen = [], set()
+    for name in written:
+        if len(files) >= max_files:
+            break
+        rel = str(name).strip()
+        for pfx in _FS_PATH_PREFIXES:
+            if rel.startswith(pfx):
+                rel = rel[len(pfx):]
+                break
+        rel = rel.lstrip("/")
+        if not rel or not _AUDIT_SOURCE_EXT_RE.search(rel):
+            continue
+        key = _fs_norm(rel)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            target = (root / rel).resolve()
+            # Containment, for the same reason the artifact check scopes:
+            # a written path is model-supplied text and `..` resolves.
+            if not str(target).startswith(str(root) + os.sep):
+                continue
+            if not target.is_file():
+                continue
+            body, size = _read_bounded(target, budget)
+        except Exception:  # noqa: BLE001
+            continue
+        if not body.strip():
+            continue
+        files.append((rel, body, size))
+    if not files:
+        return ""
+
+    # Pass 2 — WHO gets the room. The header counts against the budget too:
+    # four elision notices are a kilobyte, and a budget that ignores its own
+    # labels is how the command gets pushed out of a prompt that claims to
+    # have reserved room for it. Drop the last file rather than cut every
+    # file below the point where the pack stops being readable.
+    while files and ((budget - len(files) * _AUDIT_HEADER_RESERVE)
+                     // len(files)) < _AUDIT_SOURCE_MIN_SHARE:
+        files.pop()
+    if not files:
+        return ""
+    room = (budget - len(files) * _AUDIT_HEADER_RESERVE) // len(files)
+    # A file shorter than its share hands the remainder back: two files, one
+    # of 200 chars, must not leave the other cut at half the slot.
+    spare = sum(room - len(b) for _, b, _sz in files if len(b) < room)
+    over = sum(1 for _, b, _sz in files if len(b) >= room)
+    bonus = spare // over if over else 0
+
+    blocks = []
+    for rel, body, size in files:
+        take = min(len(body), room + (bonus if len(body) >= room else 0))
+        # `size` is the file; `body` may already be a bounded read of it. The
+        # auditor is told about the FILE, so the elided count is measured
+        # against the file — not against however much of it we hold.
+        shown = _AUDIT_MARKER_RE.sub(
+            "# -- ", _head_and_tail(body, take, missing=max(0, size - take)))
+        head = (f"# --- file this turn wrote: {rel[:_AUDIT_PATH_DISPLAY]} "
+                f"({size} chars on disk)")
+        # ⚠ `take` vs the FILE, not `len(shown)`: defanging a forged header
+        # SHORTENS the text, so a whole file carrying one would otherwise be
+        # announced as elided — a truncation notice on a complete file is the
+        # same class of lie as a silent cut, pointing the other way.
+        if take < size:
+            head += (f"; only {take} of them appear below, head and tail, "
+                     f"with the middle elided by the audit packer to fit "
+                     f"this prompt")
+        blocks.append(head + " ---\n" + shown)
+    return "\n\n".join(blocks)
+
+
 def classify_thinking_budget(query: str,
                              has_coding_intent: bool = False,
                              is_meta_task: bool = False,
@@ -3525,6 +3982,23 @@ _SCRUB_TAG_NAMES = ("tool_call", "tool_response", "tool", "function")
 # via \Z (still eating) while the suffix read "closed", unfreezing the view
 # and leaking eaten internals to the client. Arm identity is exact;
 # pin-identity-not-property, in code.)
+#: The UI scrub: unparsed tool-call markup removed from text the USER will
+#: read. One pattern, two sites (mid-flow `ui_content`, end-of-turn
+#: `final_ai_content`) — they were two literals, and they had DRIFTED
+#: (§4GT, 2026-09-14): the end-of-turn copy carries `(?<!`)` because inline
+#: code is the user asking about the syntax, not a leak (§4FS), and the
+#: mid-flow copy did not — so the same reply lost its backticked
+#: `<tool_call>` example on one path and kept it on the other. The two
+#: literals were pinned only by a source grep for their text, which cannot
+#: see a difference between them.
+#:
+#: ⚠ `\Z`, never `$`: in non-MULTILINE mode `$` matches just before a
+#: trailing newline, which let the newline escape the scrub.
+_UI_SCRUB_RE = re.compile(
+    r'(?<!`)<(tool_call|tool|function)\b[^>]*>.*?(?:</\1\b[^>]*>|\Z)',
+    flags=re.DOTALL | re.IGNORECASE,
+)
+
 _MODULE_SCRUB_RE = re.compile(
     r'(?<!`)<(tool_call|tool|function|tool_response)\b[^>]*>.*?'
     r'(?:</\1\b[^>]*>|(?P<eof>\Z))',
@@ -5198,21 +5672,206 @@ _MUTATING_TOOLS_FOR_DROP_NOTE = frozenset({
 })
 
 
-def _dropped_mutation_note(dropped_names) -> str:
+def _dropped_mutation_note(dropped_names, paths=()) -> str:
     """Return the not-applied honesty note when ``dropped_names`` contains a
     mutating tool, else "". Appended to the final reply so a fix the turn
-    closure swallowed is never presented as done."""
+    closure swallowed is never presented as done.
+
+    ⚠ IT MUST CONTRADICT THE PAST TENSE, NOT ONLY THE FUTURE (§4GN). The
+    note used to say "any change described above as about to happen has NOT
+    been applied" — and the reply that prompted this fix said, flatly, "The
+    report is saved to /workspace/…md". A future-tense disclaimer does not
+    touch a past-tense claim, so the user read a sentence stating the file
+    existed and a footnote about pending work, with nothing joining them.
+    ``paths`` (parsed from the dropped call's OWN arguments, so it is exact
+    rather than prose-matched) names the file that does not exist.
+    """
     muts = sorted({str(n) for n in (dropped_names or [])
                    if str(n) in _MUTATING_TOOLS_FOR_DROP_NOTE})
     if not muts:
         return ""
+    named = [str(x) for x in (paths or []) if str(x).strip()][:3]
+    where = (" — including `" + "`, `".join(named) + "`, which "
+             + ("does" if len(named) == 1 else "do") + " NOT exist"
+             ) if named else ""
     return (
-        "\n\n⚠ Note: this turn was finalized before my pending "
-        f"{', '.join(muts)} action(s) could run — any change described "
-        "above as about to happen has NOT been applied yet. Ask me to "
+        f"\n\n{_DROPPED_NOTE_HEAD} "
+        f"{', '.join(muts)} action(s) could run — nothing described above as "
+        f"written, saved or created was actually written{where}. Ask me to "
         "continue to apply it."
     )
 
+
+def _with_abort_note(final_ai_content: str, note: str) -> str:
+    """Put an ABORT explanation into the reply whatever else accumulated.
+
+    ⚠ IT USED TO BE WRITTEN ONLY WHEN THE REPLY WAS EMPTY (§4GO,
+    2026-09-14). `if not final_ai_content:` is "no TEXT yet", and the turn
+    loop accumulates every iteration's visible text — so on any turn that
+    narrated at all, the abort explanation was dropped and the working
+    narration shipped as the answer. Measured on req f76620e1: the loop
+    breaker aborted after the third identical `browser` load, 1120 chars of
+    "Let me take a screenshot of the single message view…" went out as the
+    reply, and the turn was recorded `ok · confidence 0.74`. The user was
+    never told the attempt stopped.
+
+    Two consumers depended on the marker that was never written: the reader
+    (who sees a reply that simply ends), and `outcome_heuristics`, whose
+    STRONGEST signal is `[ATTEMPT_ABORTED_*]` in the final response — no
+    marker, no UNKNOWN→FAILED promotion, no lesson from an aborted attempt.
+    It searches anywhere in the text, so appending serves it.
+    """
+    body = (final_ai_content or "").strip()
+    if not body:
+        return note
+    if note[:48] in body:                      # idempotent across re-entry
+        return final_ai_content
+    return final_ai_content.rstrip() + "\n\n" + note
+
+
+def _dropped_write_paths(tool_calls) -> list:
+    """Paths the DROPPED `file_system` calls were about to write.
+
+    Read from the call's own arguments, so the note names the exact file
+    rather than pattern-matching the prose that claims it. Never raises: a
+    malformed argument blob costs the note its detail, not the note.
+    """
+    out = []
+    for tc in (tool_calls or []):
+        try:
+            fn = (tc or {}).get("function") or {}
+            if fn.get("name") != "file_system":
+                continue
+            args = fn.get("arguments")
+            if isinstance(args, str):
+                args = json.loads(args or "{}")
+            if not isinstance(args, dict):
+                continue
+            path = args.get("path") or args.get("file_path")
+            if isinstance(path, str) and path.strip():
+                out.append(path.strip())
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def _dropped_write_admitted(reply: str) -> bool:
+    """Does this reply carry its OWN note saying a file write was eaten?
+
+    Absence-grade evidence, and the only prose that is: everywhere else a
+    claimed-but-missing file may simply predate the turn, which is why prose
+    claims ride the emptiness-only arm. Here the turn states that its
+    `file_system` call never ran, so a file it also claims to have produced
+    is missing for a reason this turn is responsible for.
+    """
+    i = (reply or "").find(_DROPPED_NOTE_HEAD)
+    if i < 0:
+        return False
+    return "file_system" in reply[i:i + 400]
+
+
+#: The one home of the dropped-mutation note's head: `_dropped_mutation_note`
+#: writes it and the §4GH forced-final predicate strips it (a note is not an
+#: answer — with it left in, a forced final that dropped a WRITE would have
+#: read as answered and shipped the narration).
+_DROPPED_NOTE_HEAD = "⚠ Note: this turn was finalized before my pending"
+
+
+
+@dataclass
+class InternalTurnState:
+    """Inputs to `_run_internal_turn` (#5 decomposition step 4b).
+
+    Fields are the union of the region's live-in set and its live-out
+    (repack) set, computed from bytecode by `scripts/liveness_4b.py`.
+    The repack names are written back by the method's `finally`, so a
+    raising path leaves handle_chat's frame exactly as the inline code
+    would have left it.
+
+    The four fields that default to None are written in the region and
+    NOT live at its entry (`msg`, `tool_calls`, `ui_content`,
+    `parse_failure_reason`): the caller has nothing to pass.
+    """
+    TurnCancelled: Any = None
+    _active_turn: Any = None
+    _constraint_steer_pending: Any = None
+    _final_len_at_turn_start: Any = None
+    _forced_final_dropped: Any = None
+    _forced_final_retry_used: Any = None
+    _meta_nudge_fired: Any = None
+    _metacog_logprobs: Any = None
+    _origin_token: Any = None
+    _proj_task_closed_this_req: Any = None
+    _repair_reentry_active: Any = None
+    _request_constraint_block: Any = None
+    _request_constraints: Any = None
+    _request_sys3_fired_once: Any = None
+    _request_sys3_prev_justification: Any = None
+    _stable_conv_fp: Any = None
+    _stream_owns_unregister: Any = None
+    _turn_reg: Any = None
+    _user_batch_intent: Any = None
+    _verdict_is_fresh: Any = None
+    _verifier_verdict_cache: Any = None
+    _vr: Any = None
+    active_persona: Any = None
+    body: Any = None
+    char_budget: Any = None
+    consecutive_parse_errors: Any = None
+    context_pressure_steers: Any = None
+    continuity_text: Any = None
+    created_time: Any = None
+    cross_turn_repeat_hits: Any = None
+    current_plan_json: Any = None
+    current_trajectory_id: Any = None
+    effective_max_turns: Any = None
+    executed_idempotent: Any = None
+    execution_failure_count: Any = None
+    fetched_context: Any = None
+    final_ai_content: Any = None
+    fname: Any = None
+    force_final_response: Any = None
+    force_stop: Any = None
+    forget_was_called: Any = None
+    has_coding_intent: Any = None
+    is_conversational: Any = None
+    is_final_generation: Any = None
+    is_meta_task: Any = None
+    last_user_content: Any = None
+    last_was_failure: Any = None
+    lc: Any = None
+    messages: Any = None
+    model: Any = None
+    msg: Any = None
+    next_action_id: Any = None
+    notify_steer_fired: Any = None
+    parse_failure_reason: Any = None
+    payload: Any = None
+    pending_promise_steer_fired: Any = None
+    preflight_blocks_this_request: Any = None
+    prev_turn_opening_words: Any = None
+    raw_tools_called: Any = None
+    repair_round: Any = None
+    repeated_action_steered: Any = None
+    req_id: Any = None
+    req_messages: Any = None
+    request_sandbox_state: Any = None
+    request_state: Any = None
+    seen_tools: Any = None
+    stream_response: Any = None
+    strikes: Any = None
+    task_tree: Any = None
+    thinking_cap_events: Any = None
+    thought_content: Any = None
+    token: Any = None
+    tool_calls: Any = None
+    tool_usage: Any = None
+    tools_run_this_turn: Any = None
+    transient_failure_count: Any = None
+    turn: Any = None
+    ui_content: Any = None
+    wakeup_prefix: Any = None
+    was_complex_task: Any = None
 
 @dataclass
 class TurnState:
@@ -11664,7 +12323,8 @@ class GhostAgent:
                 and getattr(verifier, "llm_client", None) is not None
                 and final_ai_content
                 and not self._is_strict_trivial_chat(lc)):
-            _shape = self._reply_shape_refutation(final_ai_content, last_user_content)
+            _shape = self._reply_shape_refutation(final_ai_content, last_user_content,
+                                                  tools_run_this_turn)
             # §4FY: the turn's own STATE — the current request's mechanical
             # constraints and its retrieval record — under the same guard,
             # applied the same two ways as the shape check below.
@@ -11714,6 +12374,25 @@ class GhostAgent:
                         verify_route="memory-claim")
                     return _mem, last_tool
             return None, last_tool
+        if _shape is not None and self._verdict_is_no_claim(_shape):
+            # §4GH: the reply is working narration only — there is no claim
+            # for the judge to weigh, so it does not run, and the escalation
+            # that overturned request e57ad0cf's correct refute has nothing
+            # to overturn. Same merge and instruments as the tool-free exit
+            # so the chain reads "reply-shape(+turn-state)" on both paths.
+            _mech = self._merge_mechanical_refute(None, _shape, "reply-shape")
+            _mech = self._merge_mechanical_refute(_mech, _state, "turn-state")
+            pretty_log(
+                "Verifier",
+                "reply makes NO claim (working narration only, or the "
+                "forced-final fallback) — REFUTED mechanically, judge not "
+                "consulted",
+                icon=Icons.VERIFIER_LAB, level="WARNING",
+            )
+            self._record_verdict_instruments(
+                _mech, req_id=req_id, trajectory_id=trajectory_id,
+                verify_route=str(getattr(_mech, "override", "") or "mechanical"))
+            return _mech, last_tool
         # Replay the active project's explicit user constraints into the
         # verifier's view of the request. The current message is often just
         # "proceed" — the binding clauses ("don't come up with some random
@@ -11844,6 +12523,29 @@ class GhostAgent:
         }
         if "execute" in tool_name.lower() or "postgres" in tool_name.lower():
             code_text = _reconstruct_executed_code(messages, last_tool)
+            # §4GW: the command is what the turn RAN; the files are what it
+            # BUILT. The auditor is asked about both and used to see only
+            # the first. Augment, never replace — and only when a command
+            # was reconstructed, so the route choice below is untouched: a
+            # turn whose deliverable is a file but whose command could not
+            # be recovered still takes the claim lens it has always taken.
+            if code_text:
+                try:
+                    _wrote = _written_sources_for_audit(
+                        tools_run_this_turn,
+                        self._scoped_sandbox_for(project_id),
+                        budget=_audit_source_budget(code_text))
+                except Exception as _ws_exc:  # noqa: BLE001
+                    # Never fail a verdict over evidence gathering — but say
+                    # so: a silently thinner pack is how this defect looked
+                    # from the outside for its whole life.
+                    logger.warning("written-source audit pack skipped, the "
+                                   "code lens judges the command alone: %s",
+                                   _ws_exc)
+                    _wrote = ""
+                if _wrote:
+                    code_text = (_wrote + "\n\n# --- command this turn ran "
+                                 "---\n" + code_text)
             if code_text:
                 # The code-shaped branch judges on `output` alone — without
                 # this, a project turn ending in an execute (e.g. `python
@@ -12111,6 +12813,26 @@ class GhostAgent:
                 if _k not in _seen_keys:
                     _seen_keys.add(_k)
                     _to_check.append(_cand)
+            # ⚠ ONE EXCEPTION TO "THE LEDGER IS THE ONLY ABSENCE-GRADE
+            # EVIDENCE" (§4GN, 2026-09-14). The false-refute class above
+            # comes from turns that ran NO file tool — a reply may mention a
+            # file that predates it. A turn whose own note says its
+            # `file_system` call was DROPPED at the finish line is not that
+            # turn: it attempted the write, the write did not run, and a
+            # claim that the file exists is knowably false. Measured on
+            # req da4c17ba: a 24-minute investigation ended "The report is
+            # saved to /workspace/…md", the log said `Dropping 1 tool_call(s)
+            # — final-generation turn (names=['file_system'])`, the sandbox
+            # had no such file, and FILE-ARTIFACT reported "clean … checked
+            # for emptiness only — no files written this turn". Arming the
+            # absence leg here refutes it and hands the repair loop the one
+            # thing the user actually wanted: the file.
+            if _dropped_write_admitted(_claim_src):
+                for _cand in _claimed:
+                    _k = _fs_norm(_cand)
+                    if _k not in _seen_keys:
+                        _seen_keys.add(_k)
+                        _to_check.append(_cand)
             _to_check = _to_check[:8]
             # Soft = written-then-removed paths (absence is what "removed"
             # means, but a re-created-EMPTY one is a real defect) + the
@@ -13314,6 +14036,33 @@ class GhostAgent:
         self._deferred_verdict_task = task
         task.add_done_callback(_on_done)
 
+    # Trajectory ids allocated by a running turn and not yet written by
+    # `_record_turn_trajectory`, plus the late verdicts that arrived while
+    # they were in flight. Bounded rings (2026-09-13): a turn that dies
+    # before its record leaves an entry that ages out uncounted.
+    def _mark_trajectory_in_flight(self, trajectory_id) -> None:
+        _mark_trajectory_in_flight(self.context, trajectory_id)
+
+    def _replay_deferred_late_backfill(self, trajectory_id) -> None:
+        """Called by `_record_turn_trajectory` once the row exists: clear
+        the in-flight mark and run the deferred verdict, if any. Never
+        raises — the record must not break on a replay."""
+        try:
+            pending = _take_deferred_late_backfill(self.context, trajectory_id)
+            if pending is None:
+                return
+            outcome, reason = pending
+            pretty_log(
+                "Verifier",
+                f"replaying the deferred late {outcome} for trajectory "
+                f"{str(trajectory_id)[:8]} — the record is written",
+                icon=Icons.VERIFIER_LAB,
+            )
+            self._backfill_trajectory_outcome(trajectory_id, outcome, reason)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("deferred late-verdict replay skipped: %s: %s",
+                         type(e).__name__, e)
+
     def _backfill_trajectory_outcome(self, trajectory_id, outcome, reason=""):
         """Fold a late verifier verdict into the trajectory corpus — and,
         since 2026-08-21 (queue #7), into the agent's autobiographical
@@ -13359,6 +14108,31 @@ class GhostAgent:
                 if getattr(t, "id", None) == trajectory_id:
                     cached = t
                     break
+            # THE VERDICT BEAT THE RECORD (2026-09-13). A tool-free turn's
+            # verdict branch has no await, so the verdict task completes on
+            # the next loop tick and this callback ran at finalize's next
+            # yield — BEFORE `_record_turn_trajectory` wrote the row and
+            # before `_record_lesson_outcomes` wrote the lesson stash. The
+            # cache miss then skipped the calibration re-label and the
+            # lesson flush found nothing to drain; the stash written moments
+            # later was never consumed. Measured: 47 of 121 human-labelled
+            # turns were zero-tool. Defer to the record: the trajectory
+            # write replays this call with the row in the cache. A miss on
+            # a trajectory that is NOT in flight is a genuine eviction and
+            # keeps the immediate path.
+            if cached is None and _trajectory_is_in_flight(self.context, trajectory_id):
+                # The lesson arm gets its sign NOW, exactly as the pre-fix
+                # cache-miss path did (flush before the PASSED guard, raw
+                # sign — `_late_pass_ok` is True on a miss): a stash that
+                # already exists drains, a missing one parks the sign. The
+                # replay's own flush then finds the same sign in the retained
+                # ring and books nothing twice. Without this, a record that
+                # raises or is skipped after the deferral (streamed reply
+                # with no treated text) would leave the stash undrained.
+                self._flush_stashed_lesson_outcome(
+                    trajectory_id, outcome == _Outcome.PASSED.value)
+                _defer_late_backfill(self.context, trajectory_id, outcome, reason)
+                return
             # HUMAN LABEL WINS (2026-08-13, /api/feedback). An explicit
             # human thumb on this turn already resolved the outcome, flushed
             # the lesson stash with it, and wrote the sidecar; the sidecar is
@@ -13721,6 +14495,29 @@ class GhostAgent:
             # is evicted uncounted rather than booked as a success.
             if not trajectory_id:
                 return
+            # ...unless the late verdict already landed and parked its sign
+            # (2026-09-13): book it now, through the same retained ring the
+            # flush uses, so a later opposite-sign human label can still
+            # re-book.
+            parked = _take_pending_lesson_sign(self.context, trajectory_id)
+            if parked is not None:
+                flushed = getattr(self.context, "_flushed_triggers_by_traj", None)
+                if flushed is None:
+                    from collections import OrderedDict
+                    flushed = OrderedDict()
+                    self.context._flushed_triggers_by_traj = flushed
+                flushed[trajectory_id] = (triggers, bool(parked))
+                flushed.move_to_end(trajectory_id)
+                while len(flushed) > self._FLUSHED_TRIG_RETAIN_MAX:
+                    flushed.popitem(last=False)
+                logger.info(
+                    "lesson-outcome: late verdict had already landed for traj "
+                    "%s — booked %d surfaced trigger(s) as %s",
+                    str(trajectory_id)[:8], len(triggers),
+                    "success" if parked else "failure",
+                )
+                await asyncio.to_thread(rec, triggers, bool(parked))
+                return
             stash = getattr(self.context, "_surfaced_triggers_by_traj", None)
             if stash is None:
                 from collections import OrderedDict
@@ -13770,6 +14567,15 @@ class GhostAgent:
                 # machine's flush, or a changed mind.
                 triggers = flushed[trajectory_id][0]
             if not triggers:
+                # Nothing stashed and nothing flushed: the verdict landed
+                # BEFORE `_record_lesson_outcomes` wrote the stash (the
+                # streamed path records the trajectory — and replays the
+                # deferred verdict — before it books lessons; a user
+                # correction can land at any time). Park the sign so the
+                # stash write books it immediately instead of waiting for
+                # a second verdict that never comes (2026-09-13).
+                if trajectory_id and trajectory_id not in flushed:
+                    _park_pending_lesson_sign(self.context, trajectory_id, bool(success))
                 return
             flushed[trajectory_id] = (triggers, bool(success))
             flushed.move_to_end(trajectory_id)
@@ -15302,12 +16108,7 @@ class GhostAgent:
         # is "nothing left to match", not "two passes".
         if has_tool_tag:
             for _ in range(8):
-                _scrubbed = re.sub(
-                    r'<(tool_call|tool|function)\b[^>]*>.*?(?:</\1\b[^>]*>|\Z)',
-                    '',
-                    ui_content,
-                    flags=re.DOTALL | re.IGNORECASE,
-                )
+                _scrubbed = _UI_SCRUB_RE.sub('', ui_content)
                 if _scrubbed == ui_content:
                     break
                 ui_content = _scrubbed
@@ -15591,6 +16392,22 @@ class GhostAgent:
 
             if ui_content:
                 ui_content = ui_content.replace("\r", "")
+                # A governor checkpoint answer emitted on an iteration that
+                # goes on to call MORE tools is provably not the final
+                # answer. Record it (shape-checked at finalize) so it can be
+                # left out of the delivered reply. `tool_calls` is this
+                # iteration's batch, so the structural half of the test is
+                # decided here, where it is knowable.
+                if tool_calls and getattr(self.context, "_risk_steer_fired", False):
+                    try:
+                        from .reply_smoothing import is_governor_checkpoint_answer
+                        if is_governor_checkpoint_answer(ui_content):
+                            _segs = getattr(
+                                self.context, "_governor_checkpoint_segments", None)
+                            if isinstance(_segs, list) and len(_segs) < 12:
+                                _segs.append(ui_content)
+                    except Exception:  # noqa: BLE001 — never break the loop
+                        pass
                 if final_ai_content and not final_ai_content.endswith("\n\n"):
                     final_ai_content += "\n\n"
                 final_ai_content += ui_content
@@ -15715,6 +16532,39 @@ class GhostAgent:
             # straight back and a model pairing an un-enterable call with
             # any trivial read ended the turn on zero strikes.
             binding_failure_count = 0
+
+            def _strike_synthetic(_sfname: str, _sreason: str) -> None:
+                """A rejection the LOOP minted (unknown/disabled tool, parse
+                error, blocked write, invocation error, …) that counts as a
+                strike must ALSO reach the ledger — ONE implementation
+                (2026-09-13). Six of seven such sites did only
+                `execution_failure_count += 1`: the batch tail decays that
+                counter whenever every DISPATCHED call succeeded and the
+                ledger holds no failure, so `[hallucinated_tool, read]`
+                netted to zero strikes forever — the cap and the pivot
+                never fired. `tests/test_synthetic_strike_ledger.py`
+                enumerates the sites from the AST."""
+                nonlocal binding_failure_count
+                binding_failure_count += 1
+                strikes.reset_clean_streak()
+                _snote = strikes.note_failure(_sfname, _sreason)
+                # (sig, count, is_persistent, is_first_warning) — read
+                # defensively: test doubles hand the loop a mock ledger.
+                _scnt, _sfirst = ((_snote[1], bool(_snote[3]))
+                                  if isinstance(_snote, tuple) and len(_snote) == 4
+                                  else (0, False))
+                if _sfirst:
+                    # The same operator line the real-failure classifier
+                    # prints: without it a frozen decay had no trace here
+                    # (R3 review). The rejection text itself already tells
+                    # the model what is wrong, so no extra steer is minted.
+                    pretty_log(
+                        "Loop Breaker",
+                        f"Same synthetic rejection ×{_scnt} ({_sfname}: "
+                        f"{_sreason[:60]}) — freezing strike decay.",
+                        level="WARNING", icon=Icons.STOP,
+                    )
+
             for _tc_idx, tool in enumerate(tool_calls):
                 # Strike cap inside the per-tool loop. The outer cap
                 # at the top of the turn loop only runs at turn
@@ -15780,6 +16630,7 @@ class GhostAgent:
                     messages.append(err_msg)
                     tools_run_this_turn.append({**err_msg, "_synthetic": True})
                     execution_failure_count += 1
+                    _strike_synthetic(fname, "tool_disabled")
                     last_was_failure = True
                     continue
 
@@ -15874,6 +16725,7 @@ class GhostAgent:
                     messages.append(err_msg)
                     tools_run_this_turn.append({**err_msg, "_synthetic": True})
                     execution_failure_count += 1
+                    _strike_synthetic("system", "tool_call_parse_error")
                     last_was_failure = True
                     continue
 
@@ -15935,6 +16787,7 @@ class GhostAgent:
                     messages.append(err_msg)
                     tools_run_this_turn.append({**err_msg, "_synthetic": True})
                     execution_failure_count += 1
+                    _strike_synthetic(fname, "bad_json_arguments")
                     last_was_failure = True
                     continue
 
@@ -16045,6 +16898,7 @@ class GhostAgent:
                                 messages.append(err_msg)
                                 tools_run_this_turn.append({**err_msg, "_synthetic": True})
                                 execution_failure_count += 1
+                                _strike_synthetic(fname, "empty_write_blocked")
                                 last_was_failure = True
                                 continue
                             else:
@@ -16095,6 +16949,7 @@ class GhostAgent:
                             tools_run_this_turn.append(
                                 {**err_msg, "_synthetic": True})
                             execution_failure_count += 1
+                            _strike_synthetic(fname, "constraint_violation")
                             last_was_failure = True
                             continue
 
@@ -16388,7 +17243,12 @@ class GhostAgent:
                         # `command` arg) conservatively don't count.
                         _pf_world_mut = _call_mutated_world(
                             fname, t_args, is_mutating)
-                        tool_call_metadata.append((fname, tool["id"], a_hash, is_mutating, primary_target_from_args(t_args), is_idempotent_setter, str(t_args.get("operation") or t_args.get("action") or ""), str(t_args.get("path") or ""), _pf_world_mut))
+                        # The parsed arguments ride the metadata so the
+                        # recorded row can carry them (2026-09-13): the
+                        # evidence gate needs the OPERATION to tell a read
+                        # from a write, and the row is the only thing its
+                        # readers see.
+                        tool_call_metadata.append((fname, tool["id"], a_hash, is_mutating, primary_target_from_args(t_args), is_idempotent_setter, str(t_args.get("operation") or t_args.get("action") or ""), str(t_args.get("path") or ""), _pf_world_mut, dict(t_args) if isinstance(t_args, dict) else {}))
                         try:
                             from .foresight import call_target as _fs_ct
                             _fs_call_targets.append(_fs_ct(
@@ -16433,14 +17293,13 @@ class GhostAgent:
                         # strikes, forever. Registering the signature also
                         # gives the same-failure loop breaker something to
                         # see, which it had no way to observe here.
-                        binding_failure_count += 1
-                        strikes.reset_clean_streak()
-                        strikes.note_failure(fname, describe_invocation_error(fname, e))
+                        _strike_synthetic(fname, describe_invocation_error(fname, e))
                 else:
                     err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": _TO.failed(f"Error: Unknown tool '{fname}'", world_changed=False, reason_code="unknown_tool")}
                     messages.append(err_msg)
                     tools_run_this_turn.append({**err_msg, "_synthetic": True})
                     execution_failure_count += 1
+                    _strike_synthetic(fname, "unknown_tool")
                     # §LOG-5c: this rejection incremented the strike counter
                     # with NO operator line — a model hallucinating tool
                     # names was invisible until the strike cap fired.
@@ -16623,7 +17482,7 @@ class GhostAgent:
                 # earlier failure can't latch the pivot prompt.
                 consecutive_parse_errors = 0
                 for i, result in enumerate(results):
-                    fname, tool_id, a_hash, is_mutating, ptarget, _is_idem_setter, ptool_op, ptarget_raw, _pf_world_mut = tool_call_metadata[i]
+                    fname, tool_id, a_hash, is_mutating, ptarget, _is_idem_setter, ptool_op, ptarget_raw, _pf_world_mut, _recorded_args = tool_call_metadata[i]
                     # An exception that surfaced from the AWAITED coroutine
                     # gets the same treatment as one raised at binding time
                     # (see `describe_invocation_error`): both reach the model
@@ -17385,7 +18244,15 @@ class GhostAgent:
                                     # rebuilt from the other end — the LOOP
                                     # declaring, in a file the "execute never
                                     # declares" pin never opens.
-                                    declared=_outcome.declared)}
+                                    declared=_outcome.declared,
+                                    # The call's parsed arguments, on the
+                                    # outcome (NOT a row key — the row is the
+                                    # API message). The evidence gate reads
+                                    # them to skip mutations; before this it
+                                    # read a key no row had and booked every
+                                    # write as substantive evidence
+                                    # (2026-09-13).
+                                    call_args=_recorded_args)}
                     messages.append(tool_msg)
                     tools_run_this_turn.append(tool_msg)
 
@@ -17894,25 +18761,63 @@ class GhostAgent:
                     _hard_n = (getattr(_strk, "READWRITE_HARD_STOP", 5)
                                if _afname in getattr(_strk, "READWRITE_LOOP_TOOLS", frozenset())
                                else 3)
-                    if _acnt >= _hard_n:
+                    # §4GH: a re-navigate of a page that was never extracted
+                    # is a symptom (navigate returns a capped preview); at the
+                    # steer threshold the remedy is extract_text with the
+                    # tools kept, and at the hard threshold the grounded
+                    # conclusion — never the abort, which the force-final
+                    # made unreachable for this tool before.
+                    _nav_case = (_afname == "browser"
+                                 and _browser_loaded_but_never_extracted(
+                                     tools_run_this_turn, _atarget))
+                    if _nav_case and _acnt < _hard_n and _asig not in repeated_action_steered:
+                        repeated_action_steered.add(_asig)
+                        pretty_log(
+                            "Loop Breaker",
+                            f"No-progress: 'browser' loaded '{_atarget}' {_acnt}x and "
+                            "never extracted it — steering to extract_text (tools kept).",
+                            level="WARNING", icon=Icons.WARN,
+                        )
+                        messages.append({"role": "user", "content": (
+                            f"SYSTEM ALERT: you have loaded '{_atarget}' {_acnt} times "
+                            "with `browser` navigate and got the SAME capped preview — "
+                            "re-loading it produces NO new information. You have NOT "
+                            "read the page yet. Call browser(operation='extract_text', "
+                            f"url='{_atarget}', max_chars=8000) ONCE now and use its "
+                            "text; then answer. Do NOT navigate this URL again."
+                        )})
+                    elif _acnt >= _hard_n and _nav_case:
+                        force_final_response = True
+                        pretty_log(
+                            "Loop Breaker",
+                            f"No-progress: 'browser' on '{_atarget}' repeated {_acnt}x "
+                            "after the extract steer — forcing a grounded conclusion.",
+                            level="WARNING", icon=Icons.WARN,
+                        )
+                        messages.append({"role": "user", "content": (
+                            f"SYSTEM ALERT: you loaded '{_atarget}' {_acnt} times and never "
+                            "extracted it. Write your FINAL answer now from the evidence "
+                            "you already have; say plainly what you could not read."
+                        )})
+                    elif _acnt >= _hard_n:
                         pretty_log(
                             "Loop Breaker",
                             f"No-progress loop: '{_afname}'{_tgt_desc} repeated {_acnt}x "
                             "with no change — aborting turn loop.",
                             level="WARNING", icon=Icons.STOP,
                         )
-                        if not final_ai_content:
-                            final_ai_content = (
-                                f"[ATTEMPT_ABORTED_NO_PROGRESS] I repeated the same "
-                                f"'{_afname}' action{_tgt_desc} {_acnt} times and got the "
-                                "same result each time, so I stopped instead of looping. "
-                                "Any changes I made so far are in place. To move forward I "
-                                "need one piece of real evidence I could not get from here: "
-                                "the exact error text or failing URL from your side (e.g. "
-                                "browser devtools), or the output of re-running the failing "
-                                "step — send me that and I'll fix the actual cause instead "
-                                "of guessing."
-                            )
+                        final_ai_content = _with_abort_note(
+                            final_ai_content,
+                            f"[ATTEMPT_ABORTED_NO_PROGRESS] I repeated the same "
+                            f"'{_afname}' action{_tgt_desc} {_acnt} times and got the "
+                            "same result each time, so I stopped instead of looping. "
+                            "Any changes I made so far are in place. To move forward I "
+                            "need one piece of real evidence I could not get from here: "
+                            "the exact error text or failing URL from your side (e.g. "
+                            "browser devtools), or the output of re-running the failing "
+                            "step — send me that and I'll fix the actual cause instead "
+                            "of guessing."
+                        )
                         force_stop = True
                     elif _asig not in repeated_action_steered:
                         repeated_action_steered.add(_asig)
@@ -18665,10 +19570,10 @@ class GhostAgent:
             # `(?<!`)`: inline code is the user's question about the
             # syntax, not a leak — the stream scrub had this guard, this
             # one did not (§4FS).
-            r'(?<!`)<(tool_call|tool|function)\b[^>]*>.*?(?:</\1\b[^>]*>|\Z)',
+            _UI_SCRUB_RE.pattern,
             '',
             final_ai_content,
-            flags=re.DOTALL | re.IGNORECASE,
+            flags=_UI_SCRUB_RE.flags,
         )
         final_ai_content = re.sub(r'<tool_response.*?>.*?(?:</tool_response.*?>|\Z)', '', final_ai_content, flags=re.DOTALL | re.IGNORECASE)
         final_ai_content = re.sub(r'--- EXECUTION RESULT ---.*?(?:------------------------|$)', '', final_ai_content, flags=re.DOTALL)
@@ -18741,6 +19646,31 @@ class GhostAgent:
                 )
             except Exception as _sc_exc:  # noqa: BLE001
                 logger.debug("tool-call note skipped: %s", _sc_exc)
+
+        # Risk-governor checkpoint answers (2026-09-15). Removed BEFORE the
+        # narration smoother and outside its ≥2-tool gate: these are not
+        # narration shapes, they are answers to a question this loop asked,
+        # and the user never asked it. Ungated because the recording itself
+        # already required tool calls after the segment.
+        _ckpt_segs = list(getattr(
+            self.context, "_governor_checkpoint_segments", None) or [])
+        if _ckpt_segs and final_ai_content:
+            try:
+                from .reply_smoothing import drop_checkpoint_segments
+                _no_ckpt = drop_checkpoint_segments(final_ai_content, _ckpt_segs)
+                # Same safety rail the smoother uses: never reduce a reply
+                # to working narration, and never empty it.
+                if (_no_ckpt != final_ai_content
+                        and not _is_narration_only_trim(_no_ckpt, final_ai_content)):
+                    pretty_log(
+                        "Reply Smoothing",
+                        f"dropped {len(_ckpt_segs)} risk-governor checkpoint "
+                        f"answer(s): {len(final_ai_content)} → {len(_no_ckpt)} chars",
+                        icon=Icons.BRAIN_SUM,
+                    )
+                    final_ai_content = _no_ckpt
+            except Exception as _ck_exc:  # noqa: BLE001
+                logger.debug("checkpoint scrub skipped: %s", _ck_exc)
 
         # Gate: ≥2 real tool runs — the 2026-07-17 decision, kept. §4FS
         # tried ≥1 for a day: a single-tool turn does carry the stale beat
@@ -20674,6 +21604,1717 @@ class GhostAgent:
         except Exception as _calx:
             logger.debug("calibration record failed: %s", _calx)
 
+
+    async def _run_internal_turn(self, rs: "InternalTurnState") -> str:
+        """The internal (non-client-streaming) consumer of one turn —
+        #5 decomposition step 4b (§4GS, 2026-09-14).
+
+        Moved VERBATIM out of `handle_chat`'s turn loop. The contract is
+        three-way because the region sits in the middle of the loop body:
+        "continue" and "break" bind to the TURN loop, "proceed" falls
+        through to the dispatch pipeline (step 2) that follows it.
+
+        ⚠ THE INPUT AND REPACK SETS ARE COMPUTED, NOT GUESSED. The
+        2026-07-23 attempt stopped here: every AST heuristic missed a
+        different class of loop-carried state, and the dangerous miss is
+        SILENT — a steering flag written here and read on the NEXT turn,
+        across the loop back-edge, leaves no crash behind when it goes
+        stale. `scripts/liveness_4b.py` computes live-in at region entry
+        (the inputs) and live-out across every exit INCLUDING the
+        back-edge (the repack) from BYTECODE, where a local's reads and
+        writes are exact and the CFG is explicit. Re-run it after moving
+        anything across this boundary.
+        """
+        TurnCancelled = rs.TurnCancelled
+        _active_turn = rs._active_turn
+        _constraint_steer_pending = rs._constraint_steer_pending
+        _final_len_at_turn_start = rs._final_len_at_turn_start
+        _forced_final_dropped = rs._forced_final_dropped
+        _forced_final_retry_used = rs._forced_final_retry_used
+        _meta_nudge_fired = rs._meta_nudge_fired
+        _metacog_logprobs = rs._metacog_logprobs
+        _origin_token = rs._origin_token
+        _proj_task_closed_this_req = rs._proj_task_closed_this_req
+        _repair_reentry_active = rs._repair_reentry_active
+        _request_constraint_block = rs._request_constraint_block
+        _request_constraints = rs._request_constraints
+        _request_sys3_fired_once = rs._request_sys3_fired_once
+        _request_sys3_prev_justification = rs._request_sys3_prev_justification
+        _stable_conv_fp = rs._stable_conv_fp
+        _stream_owns_unregister = rs._stream_owns_unregister
+        _turn_reg = rs._turn_reg
+        _user_batch_intent = rs._user_batch_intent
+        _verdict_is_fresh = rs._verdict_is_fresh
+        _verifier_verdict_cache = rs._verifier_verdict_cache
+        _vr = rs._vr
+        active_persona = rs.active_persona
+        body = rs.body
+        char_budget = rs.char_budget
+        consecutive_parse_errors = rs.consecutive_parse_errors
+        context_pressure_steers = rs.context_pressure_steers
+        continuity_text = rs.continuity_text
+        created_time = rs.created_time
+        cross_turn_repeat_hits = rs.cross_turn_repeat_hits
+        current_plan_json = rs.current_plan_json
+        current_trajectory_id = rs.current_trajectory_id
+        effective_max_turns = rs.effective_max_turns
+        executed_idempotent = rs.executed_idempotent
+        execution_failure_count = rs.execution_failure_count
+        fetched_context = rs.fetched_context
+        final_ai_content = rs.final_ai_content
+        fname = rs.fname
+        force_final_response = rs.force_final_response
+        force_stop = rs.force_stop
+        forget_was_called = rs.forget_was_called
+        has_coding_intent = rs.has_coding_intent
+        is_conversational = rs.is_conversational
+        is_final_generation = rs.is_final_generation
+        is_meta_task = rs.is_meta_task
+        last_user_content = rs.last_user_content
+        last_was_failure = rs.last_was_failure
+        lc = rs.lc
+        messages = rs.messages
+        model = rs.model
+        msg = rs.msg
+        next_action_id = rs.next_action_id
+        notify_steer_fired = rs.notify_steer_fired
+        parse_failure_reason = rs.parse_failure_reason
+        payload = rs.payload
+        pending_promise_steer_fired = rs.pending_promise_steer_fired
+        preflight_blocks_this_request = rs.preflight_blocks_this_request
+        prev_turn_opening_words = rs.prev_turn_opening_words
+        raw_tools_called = rs.raw_tools_called
+        repair_round = rs.repair_round
+        repeated_action_steered = rs.repeated_action_steered
+        req_id = rs.req_id
+        req_messages = rs.req_messages
+        request_sandbox_state = rs.request_sandbox_state
+        request_state = rs.request_state
+        seen_tools = rs.seen_tools
+        stream_response = rs.stream_response
+        strikes = rs.strikes
+        task_tree = rs.task_tree
+        thinking_cap_events = rs.thinking_cap_events
+        thought_content = rs.thought_content
+        token = rs.token
+        tool_calls = rs.tool_calls
+        tool_usage = rs.tool_usage
+        tools_run_this_turn = rs.tools_run_this_turn
+        transient_failure_count = rs.transient_failure_count
+        turn = rs.turn
+        ui_content = rs.ui_content
+        wakeup_prefix = rs.wakeup_prefix
+        was_complex_task = rs.was_complex_task
+        try:
+            # Ensure msg is always defined in this scope
+            msg = {"role": "assistant", "content": "", "tool_calls": []}
+            thinking_loop_detected = False
+            # Which of the two collapse shapes killed the stream. Both
+            # take the `thinking_loop_detected` recovery path (discard
+            # + strike + retry), but they need DIFFERENT advice: the
+            # thinking-loop alert tells the model to stop re-deriving
+            # and emit one grounding tool call, which is precisely the
+            # wrong instruction for a turn that just emitted 629 of
+            # them.
+            tool_call_flood_detected = False
+            try:
+                payload["stream"] = True
+                # Metacog entropy over the INTERNAL upstream stream
+                # (2026-07-27): mirror of the client-SSE tracker at
+                # _stream_final_generation — this path previously
+                # discarded the logprobs it now requests, leaving
+                # the finalize calibration fallback stuck on the
+                # neutral 0.5. One tracker per upstream turn; the
+                # LAST turn's reading wins the stash (matches the
+                # streamed path's "last reading of the turn wins").
+                _turn_entropy_tracker = None
+                if _metacog_logprobs:
+                    try:
+                        from .entropy import EntropyTracker
+                        _turn_entropy_tracker = EntropyTracker(
+                            window=32, top_k=5)
+                    except Exception as _etix:
+                        logger.debug(
+                            "turn entropy tracker init failed: %s",
+                            _etix)
+                full_content = ""
+                reasoning_content = ""
+                # Last non-null `finish_reason` seen on the stream.
+                # "length" means the upstream hit its token cap and
+                # the answer is truncated — handled after the loop.
+                stream_finish_reason = None
+                # True if the stream aborted mid-flight — the upstream
+                # emitted a `data: {"error": ...}` frame (idle stall,
+                # mid-stream break, connect failure) instead of a clean
+                # finish. Without catching it the partial `full_content`
+                # was finalized as if complete and fed to the verifier /
+                # memory as the final answer (a truncated reply shipped
+                # with no signal). Folded into the truncation handling
+                # below so it triggers the same continuation attempt.
+                stream_errored = False
+                stream_error_msg = ""
+
+                # Thinking metrics: surfaced as a single summary line
+                # after the stream completes. We no longer print empty
+                # `=== THINKING ===` frames; in verbose mode the live
+                # tokens still echo to stdout.
+                thinking_started = time.monotonic()
+                thinking_token_count = 0
+                thinking_line_buf = ""
+                next_loop_probe = THINKING_LOOP_PROBE_EVERY
+                # Cadence anchor for the tool-call-collapse probe so it
+                # doesn't run two full-buffer regex scans on EVERY
+                # content chunk (the TOOL_CALL_LOOP_PROBE_EVERY constant
+                # existed but was never consulted).
+                next_tool_probe = TOOL_CALL_LOOP_PROBE_EVERY
+
+                # Flush-size budget for streaming thought blocks.
+                # Reasoning models (Qwen3+) emit thinking as many
+                # short newline-separated bullets; the old policy
+                # of "flush on every \n" produced 40+ log events
+                # per turn. Accumulate into ~paragraph-sized
+                # chunks and flush only on a paragraph break
+                # (blank line) or when the buffer crosses the
+                # size budget. The final `_flush_thinking` at
+                # stream end emits whatever remains.
+                _THINK_FLUSH_CHARS = 400
+
+                def _emit_thinking(text: str):
+                    nonlocal thinking_line_buf, thinking_token_count
+                    if not text:
+                        return
+                    thinking_token_count += 1
+                    # NOT gated on VERBOSE_MODE (operator request
+                    # 2026-07-08): thinking flows through the same
+                    # pretty_log pipeline as every other line, so
+                    # non-verbose mode shows it truncated to the
+                    # standard LOG_TRUNCATE_LIMIT while verbose
+                    # still gets the full blocks. The post-stream
+                    # summary line is unchanged either way.
+                    thinking_line_buf += text
+                    while True:
+                        # Prefer paragraph boundary (blank line)
+                        # as a flush point — it maps to a
+                        # natural thought break. Blocks are
+                        # emitted with raw newlines preserved so
+                        # multi-line reasoning stays readable in
+                        # the log viewer; the prior " | " join
+                        # made streamed bullets / code
+                        # unreadable.
+                        para_idx = thinking_line_buf.find("\n\n")
+                        if para_idx >= 0:
+                            block = thinking_line_buf[:para_idx].strip()
+                            thinking_line_buf = thinking_line_buf[para_idx + 2:]
+                            if block:
+                                pretty_log("thinking", block, icon=Icons.BRAIN_THINK, level="DEBUG", no_truncate=True)
+                            continue
+                        # No paragraph boundary yet — flush only
+                        # when the buffer exceeds the budget,
+                        # and cut at the last `\n` so we don't
+                        # split mid-sentence.
+                        if len(thinking_line_buf) >= _THINK_FLUSH_CHARS:
+                            last_nl = thinking_line_buf.rfind("\n")
+                            if last_nl <= 0:
+                                # No newline inside the buffer —
+                                # single runaway token stream.
+                                # Flush the whole thing; the next
+                                # chunk starts fresh.
+                                block = thinking_line_buf.strip()
+                                thinking_line_buf = ""
+                            else:
+                                block = thinking_line_buf[:last_nl].strip()
+                                thinking_line_buf = thinking_line_buf[last_nl + 1:]
+                            if block:
+                                pretty_log("thinking", block, icon=Icons.BRAIN_THINK, level="DEBUG", no_truncate=True)
+                            continue
+                        break
+
+                def _flush_thinking():
+                    nonlocal thinking_line_buf
+                    if thinking_line_buf:
+                        if thinking_line_buf.strip():
+                            pretty_log("thinking", thinking_line_buf.strip(), icon=Icons.BRAIN_THINK, level="DEBUG", no_truncate=True)
+                        thinking_line_buf = ""
+
+                stop_printing = False
+
+                async for chunk in self.context.llm_client.stream_chat_completion(payload, use_coding=has_coding_intent):
+                    self.context.last_activity_time = datetime.datetime.now() # Heartbeat to prevent Hippocampus from waking up
+                    try:
+                        chunk_str = chunk.decode("utf-8")
+                        if chunk_str.startswith("data: ") and chunk_str.strip() != "data: [DONE]":
+                            chunk_data = json.loads(chunk_str[6:])
+                            # Metacog: pipe top-logprobs into the
+                            # entropy tracker (same contract as the
+                            # client-SSE path — a malformed logprobs
+                            # payload only skips that chunk).
+                            if _turn_entropy_tracker is not None:
+                                try:
+                                    from .entropy import extract_top_logprobs
+                                    _tlp = extract_top_logprobs(chunk_data)
+                                    if _tlp:
+                                        _turn_entropy_tracker.observe(_tlp)
+                                except Exception as _etox:
+                                    logger.debug(
+                                        "entropy observe failed: %s",
+                                        _etox)
+                            # Upstream abort frame (idle stall / mid-stream
+                            # break / connect failure) — has an "error"
+                            # key, no "choices". Previously fell through
+                            # this `if "choices"` and was silently dropped,
+                            # so a half-generated reply finalized as if it
+                            # were complete. Record it so the truncation
+                            # path treats the turn as cut off.
+                            if "error" in chunk_data and "choices" not in chunk_data:
+                                stream_errored = True
+                                stream_error_msg = str(chunk_data.get("error"))[:200]
+                                # A future upstream may tighten the
+                                # logprobs guard to the native
+                                # n_probs field too — that must cost
+                                # ONE generation, not every one.
+                                # Flag it so request_logprobs falls
+                                # back to the no-tools-only gate for
+                                # the rest of the session.
+                                if ("n_probs" in payload
+                                        and "logprob" in stream_error_msg.lower()):
+                                    self.context._nprobs_rejected = True
+                                    pretty_log(
+                                        "Entropy Probe",
+                                        "upstream rejected the native n_probs "
+                                        "logprobs sidestep — disabled for this "
+                                        "session (GHOST_ENTROPY_TOOLS_NPROBS=0 "
+                                        "to silence permanently)",
+                                        level="WARNING", icon=Icons.WARN,
+                                    )
+                                pretty_log(
+                                    "Stream Aborted",
+                                    f"Upstream aborted the stream mid-answer: "
+                                    f"{stream_error_msg} — treating the partial "
+                                    f"reply as truncated.",
+                                    level="WARNING", icon=Icons.WARN,
+                                )
+                            if "choices" in chunk_data and len(chunk_data["choices"]) > 0:
+                                delta = chunk_data["choices"][0].get("delta", {})
+                                _fr = chunk_data["choices"][0].get("finish_reason")
+                                if _fr:
+                                    stream_finish_reason = _fr
+
+                                if "reasoning_content" in delta and delta["reasoning_content"] is not None:
+                                    r_token = delta["reasoning_content"]
+                                    reasoning_content += r_token
+                                    if not stop_printing:
+                                        if _tail_has_stop_marker(reasoning_content, r_token):
+                                            stop_printing = True
+                                        if not stop_printing:
+                                            if _is_think_tag_fragment(r_token, reasoning_content):
+                                                pass  # Cosmetic: skip printing fragmented XML tags
+                                            else:
+                                                clean_token = r_token.replace("<think>\n", "").replace("<think>", "")
+                                                _emit_thinking(clean_token)
+
+                                if "content" in delta and delta["content"] is not None:
+                                    text_chunk = delta["content"]
+                                    full_content += text_chunk
+                                    if not stop_printing:
+                                        if _tail_has_stop_marker(full_content, text_chunk):
+                                            stop_printing = True
+                                        if not stop_printing and not reasoning_content:
+                                            if (text_chunk.strip().lower() in ("<function", "<parameter")
+                                                    or _is_think_tag_fragment(text_chunk, full_content)):
+                                                pass  # Cosmetic: skip printing fragmented XML tags
+                                            else:
+                                                clean_token = text_chunk.replace("<think>\n", "").replace("<think>", "")
+                                                _emit_thinking(clean_token)
+
+                                    # Tool-call generation-collapse detector.
+                                    # Specialised fail-fast probe for the
+                                    # `<tool_call>`-spam shape (see the
+                                    # 8135-openings-in-97k-chars production
+                                    # trace). Fires after ~10 unclosed opens
+                                    # — typically within 1-3 seconds of the
+                                    # decoder entering the loop, versus the
+                                    # 300+ seconds it used to take to hit
+                                    # max_tokens. The generic n-gram
+                                    # thinking-loop detector above eventually
+                                    # catches this too, but only after
+                                    # ~600 chars of repetition.
+                                    if len(full_content) >= next_tool_probe:
+                                        next_tool_probe = len(full_content) + TOOL_CALL_LOOP_PROBE_EVERY
+                                        if _detect_tool_call_loop(full_content):
+                                            thinking_loop_detected = True
+                                            _opens = len(re.findall(r'<tool_call\b', full_content, re.IGNORECASE))
+                                            _closes = len(re.findall(r'</tool_call\b', full_content, re.IGNORECASE))
+                                            pretty_log(
+                                                "Tool-Call Loop",
+                                                f"Decoder collapse: {_opens} <tool_call> opens vs {_closes} closes "
+                                                f"at {len(full_content)} chars. Aborting stream.",
+                                                level="WARNING", icon=Icons.STOP,
+                                            )
+                                            break
+
+                                # --- Streaming sanity guards ---
+                                # Two failure modes to catch: (a) the model
+                                # produces an unbounded amount of thinking
+                                # without ever closing </think>, (b) it
+                                # falls into a self-repeating paragraph
+                                # loop. Both manifest as a runaway buffer
+                                # with no tool call.
+                                guard_buf = reasoning_content if reasoning_content else full_content
+                                # Self-play can install a tighter cap via
+                                # `max_thinking_chars_override` on the
+                                # GhostAgent instance (we know the
+                                # simulation is bounded and can't afford
+                                # 32k chars of wasted introspection).
+                                # Progressive thinking budget: start at 32K, but
+                                # if the model is producing diverse content (no
+                                # n-gram repetition at the initial cap), extend
+                                # to 64K. This lets complex algorithmic reasoning
+                                # and multi-step debugging breathe while still
+                                # killing genuine loops.
+                                override_cap = getattr(self, "max_thinking_chars_override", None)
+                                # base cap (MAX_THINKING_CHARS) is now implicit:
+                                # the periodic loop probe runs at all sizes, so a
+                                # loop is caught before base regardless; only the
+                                # extended hard cap needs an explicit length gate.
+                                extended_cap = override_cap or MAX_THINKING_CHARS_EXTENDED
+
+                                # Hard cap: past the extended budget, abort
+                                # regardless (a cheap length check).
+                                if len(guard_buf) > extended_cap:
+                                    thinking_loop_detected = True
+                                    pretty_log("Thinking Cap", f"Stream exceeded extended cap ({extended_cap} chars). Aborting turn.", level="WARNING", icon=Icons.STOP)
+                                    break
+
+                                # The n-gram repetition detector is O(buffer)
+                                # (`buf.count(tail)` over up to 64K chars). The
+                                # old code ran it PER TOKEN once thinking passed
+                                # base_cap (32K) — the dominant CPU cost of a long
+                                # thinking stream — because that boundary branch
+                                # ignored the `next_loop_probe` cadence. Run it
+                                # ONCE per THINKING_LOOP_PROBE_EVERY chars at ALL
+                                # sizes: early loops (below 32K) are still caught
+                                # within 500 chars, and in the 32-64K window a
+                                # clean probe implicitly allows the extension —
+                                # the separate per-token boundary check is gone.
+                                if len(guard_buf) >= next_loop_probe:
+                                    next_loop_probe = len(guard_buf) + THINKING_LOOP_PROBE_EVERY
+                                    # § finalize/stream R1 B-3: the
+                                    # full_content fallback exists for
+                                    # INLINE-think models (reasoning
+                                    # arrives as a <think> block in
+                                    # content), yet it probed ALL
+                                    # content — tool-call BODIES and
+                                    # plain no-think answers repeat
+                                    # units legitimately (30 identical
+                                    # JSON fixture rows in a file
+                                    # write, a zero-matrix dump the
+                                    # user asked for) and were aborted
+                                    # as a "thinking loop", content
+                                    # discarded + a fake failure
+                                    # strike. Probe the content
+                                    # channel only INSIDE an open
+                                    # inline <think> block — the case
+                                    # the fallback was built for. The
+                                    # tool-call-collapse probe owns
+                                    # tool degeneracies, and the
+                                    # extended hard cap + upstream
+                                    # max_tokens still bound plain-
+                                    # content runaway.
+                                    _probe_ok = True
+                                    if not reasoning_content:
+                                        # R2 M2/M3: shared mention-
+                                        # aware / closer-prefix gate.
+                                        _probe_ok = _inline_think_open(
+                                            full_content)
+                                    if _probe_ok and _detect_thinking_loop(guard_buf):
+                                        thinking_loop_detected = True
+                                        pretty_log("Thinking Loop", f"Detected n-gram repetition at {len(guard_buf)} chars. Aborting turn.", level="WARNING", icon=Icons.STOP)
+                                        break
+                                    # Paraphrase loops (verbatim
+                                    # paragraphs with varied filler
+                                    # between) dodge the exact-tail
+                                    # n-gram probe for tens of KB —
+                                    # req f59a793d ran to 19.5K chars.
+                                    # Whole-line repetition fires much
+                                    # earlier. THINKING channel only:
+                                    # generated code/data repeats
+                                    # lines legitimately.
+                                    if reasoning_content and _detect_paragraph_loop(reasoning_content):
+                                        thinking_loop_detected = True
+                                        pretty_log("Thinking Loop", f"Detected repeated-paragraph loop at {len(reasoning_content)} chars. Aborting turn.", level="WARNING", icon=Icons.STOP)
+                                        break
+
+                                if "tool_calls" in delta and delta["tool_calls"]:
+                                    if not msg.get("tool_calls"):
+                                        msg["tool_calls"] = []
+                                    for tc_chunk in delta["tool_calls"]:
+                                        idx = tc_chunk.get("index", 0)
+                                        while len(msg["tool_calls"]) <= idx:
+                                            msg["tool_calls"].append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+
+                                        if tc_chunk.get("id"):
+                                            msg["tool_calls"][idx]["id"] = tc_chunk["id"]
+                                        if tc_chunk.get("function"):
+                                            fn_chunk = tc_chunk["function"]
+                                            if fn_chunk.get("name"):
+                                                msg["tool_calls"][idx]["function"]["name"] += fn_chunk["name"]
+                                            if fn_chunk.get("arguments"):
+                                                msg["tool_calls"][idx]["function"]["arguments"] += fn_chunk["arguments"]
+
+                                    # NATIVE tool-call flood guard. The
+                                    # `_detect_tool_call_loop` probe above
+                                    # watches `full_content` for unclosed
+                                    # `<tool_call>` tags and is blind here:
+                                    # in native mode the calls never touch
+                                    # the content buffer, so a collapsed
+                                    # decoder ran to max_tokens with every
+                                    # stream guard reporting a healthy
+                                    # stream (three production floods —
+                                    # 960/817/629 calls, ~5 min each). This
+                                    # is the only probe on that channel;
+                                    # it runs where the list actually grows.
+                                    if _detect_native_tool_call_flood(msg["tool_calls"]):
+                                        thinking_loop_detected = True
+                                        tool_call_flood_detected = True
+                                        _flood_n = len(msg["tool_calls"])
+                                        # [-2:][0] = the newest COMPLETED
+                                        # entry (the last is still
+                                        # streaming its arguments), and
+                                        # total for any non-empty list —
+                                        # a log line must not be able to
+                                        # IndexError if a threshold moves.
+                                        _flood_id = _native_call_identity(
+                                            msg["tool_calls"][-2:][0])
+                                        pretty_log(
+                                            "Tool-Call Flood",
+                                            f"Native decoder collapse: {_flood_n} "
+                                            f"tool_call(s) in one message "
+                                            f"(latest: {_flood_id[0] or '?'}"
+                                            f"{' · ' + _flood_id[1][:60] if _flood_id[1] else ''}). "
+                                            "Aborting stream before dispatch.",
+                                            level="WARNING", icon=Icons.STOP,
+                                        )
+                                        break
+                    except Exception as e:
+                        logger.debug(f"XML Tool parse text stream chunk error: {type(e).__name__}")
+
+                _flush_thinking()
+                # Stash this turn's entropy reading for the finalize
+                # calibration record (req-id-tagged like the streamed
+                # path's _calib_pending). Only when tokens were
+                # actually observed — an empty window keeps the
+                # neutral-0.5 fallback semantics.
+                if _turn_entropy_tracker is not None:
+                    try:
+                        _te_reading = _turn_entropy_tracker.reading()
+                        if (_te_reading is not None
+                                and getattr(_te_reading, "n", 0) > 0):
+                            self.context.last_entropy_reading = _te_reading
+                            self.context._entropy_norm_pending = (
+                                req_id, float(_te_reading.norm))
+                    except Exception as _terx:
+                        logger.debug(
+                            "entropy reading stash failed: %s", _terx)
+                thinking_duration = time.monotonic() - thinking_started
+                if thinking_token_count > 0 or reasoning_content or full_content:
+                    reasoning_chars = len(reasoning_content)
+                    content_chars = len(full_content)
+                    # Show reasoning and content sizes separately. The
+                    # previous `{thinking_token_count} tokens · {chars}
+                    # chars` form conflated the reasoning-channel token
+                    # count (e.g. 143) with TOTAL chars across both
+                    # channels (e.g. 48821), producing a misleading
+                    # 341-chars-per-token ratio in the log that looked
+                    # like a degenerate generation when in fact it was
+                    # just a long `execute` tool_call body.
+                    pretty_log(
+                        "thought",
+                        f"reasoning: {thinking_token_count} tokens / {reasoning_chars} chars "
+                        f"| content: {content_chars} chars "
+                        f"| {thinking_duration:.1f}s",
+                        icon=Icons.BRAIN_SUM,
+                    )
+
+                # --- TRUNCATED-ANSWER AUTO-CONTINUATION ---
+                # If the upstream stopped a *text* answer at its
+                # token cap (`finish_reason == "length"`), the partial
+                # reply would be shipped mid-sentence and the verifier
+                # correctly REFUTES it. Continue the generation from
+                # where it stopped — bounded by
+                # MAX_TRUNCATION_CONTINUATIONS — so the model can
+                # finish the thought and answer any explicit question.
+                # Skip when a tool call is in flight (those turns are
+                # handled by the parse/retry path, not user-facing
+                # prose) or when the model emitted no visible content.
+                _truncated_text_turn = (
+                    (stream_finish_reason == "length" or stream_errored)
+                    and bool(full_content.strip())
+                    and not msg.get("tool_calls")
+                    and "<tool_call" not in full_content.lower()
+                    and "<function" not in full_content.lower()
+                )
+                _continue_tries = 0
+                while (
+                    _truncated_text_turn
+                    and _continue_tries < MAX_TRUNCATION_CONTINUATIONS
+                ):
+                    _continue_tries += 1
+                    pretty_log(
+                        "Truncated Output",
+                        (("Stream aborted mid-answer" if stream_errored
+                          else "Upstream stopped at token cap mid-answer")
+                         + "; continuing "
+                         f"({_continue_tries}/{MAX_TRUNCATION_CONTINUATIONS})."),
+                        level="WARNING", icon=Icons.WARN,
+                    )
+                    cont_messages = list(req_messages) + [
+                        {"role": "assistant", "content": full_content},
+                        {"role": "user", "content": (
+                            "Your previous reply was cut off before it "
+                            "finished. Continue it from exactly where it "
+                            "stopped — do NOT repeat anything you already "
+                            "wrote, do NOT restate the question, just emit "
+                            "the next characters and finish the answer."
+                        )},
+                    ]
+                    cont_payload = {
+                        **payload,
+                        "messages": cont_messages,
+                        "stream": False,
+                    }
+                    # Plain-text continuation: never invite a tool call.
+                    cont_payload.pop("tools", None)
+                    cont_payload.pop("tool_choice", None)
+                    cont_payload.pop("parallel_tool_calls", None)
+                    stream_finish_reason = None
+                    try:
+                        cont_result = await self.context.llm_client.chat_completion(cont_payload)
+                        cont_choice = (cont_result or {}).get("choices", [{}])[0]
+                        cont_text = (cont_choice.get("message", {}) or {}).get("content", "") or ""
+                        stream_finish_reason = cont_choice.get("finish_reason")
+                        # A continuation may re-open its own <think>
+                        # prelude; strip it so only answer prose is
+                        # appended to the user-facing content.
+                        cont_text = re.sub(
+                            r'<think>.*?(?:</think>|$)', '',
+                            cont_text, flags=re.DOTALL | re.IGNORECASE,
+                        )
+                        if not cont_text.strip():
+                            break
+                        # Bridge with a space only when the seam would
+                        # otherwise weld two words together; mid-token
+                        # cuts are continued without a gap.
+                        if full_content and not full_content[-1].isspace() and not cont_text[:1].isspace():
+                            full_content += cont_text if cont_text[:1] in ",.;:!?)]}\"'" else " " + cont_text
+                        else:
+                            full_content += cont_text
+                    except Exception as exc:
+                        logger.warning("Truncation continuation failed: %s", exc)
+                        break
+                    _truncated_text_turn = stream_finish_reason == "length"
+
+                merged_content = full_content
+                if reasoning_content:
+                    merged_content = f"<think>\n{reasoning_content}\n</think>\n" + full_content
+
+                # --- CROSS-TURN REPETITION GUARD (STREAMING) ---
+                # Intra-stream loop detection only sees one turn.
+                # This compares the first 300 chars of this
+                # turn's reasoning to the prior turn's; two
+                # consecutive hits at Jaccard ≥ 0.7 means the
+                # solver is re-entering the same derivation
+                # across turns and no retry will unstick it.
+                # Must run BEFORE the <think> strip below,
+                # otherwise the opening is already gone.
+                _stream_first_think_match = re.search(
+                    r'<think>(.*?)(?:</think>|$)',
+                    merged_content, flags=re.DOTALL | re.IGNORECASE,
+                )
+                _stream_first_think = (
+                    _stream_first_think_match.group(1).strip()
+                    if _stream_first_think_match else reasoning_content[:300]
+                )
+                _stream_opening_words = self._opening_word_set(_stream_first_think)
+                if len(_stream_opening_words) >= 8 and prev_turn_opening_words:
+                    _inter = _stream_opening_words & prev_turn_opening_words
+                    _uni = _stream_opening_words | prev_turn_opening_words
+                    _jac = len(_inter) / len(_uni) if _uni else 0.0
+                    # 0.85 (was 0.7): focused iterative work — refining
+                    # the same function, debugging the same test — opens
+                    # consecutive turns with naturally overlapping (~0.7)
+                    # vocabulary. Only near-identical (~0.85+) openings
+                    # indicate an actual restart-the-same-derivation loop.
+                    if _jac >= 0.85:
+                        cross_turn_repeat_hits += 1
+                        pretty_log(
+                            "Cross-Turn Repetition",
+                            f"Turn opening overlaps prior turn by {_jac:.0%} (hit {cross_turn_repeat_hits}/2).",
+                            level="WARNING", icon=Icons.WARN,
+                        )
+                        if cross_turn_repeat_hits >= 2:
+                            pretty_log(
+                                "Loop Breaker",
+                                "Cross-turn repetition loop — aborting attempt.",
+                                level="WARNING", icon=Icons.STOP,
+                            )
+                            final_ai_content = (
+                                "[ATTEMPT_ABORTED_CROSS_TURN_LOOP] The solver opened "
+                                "three consecutive turns with near-identical reasoning "
+                                f"(Jaccard {_jac:.0%}). Further retries would repeat "
+                                "the same derivation. Stopping."
+                            )
+                            force_stop = True
+                            prev_turn_opening_words = _stream_opening_words
+                            return "break"
+                    else:
+                        cross_turn_repeat_hits = 0
+                prev_turn_opening_words = _stream_opening_words
+
+                # CRITICAL FIX: Strip <think> blocks from permanent history to prevent cognitive looping
+                clean_msg_content = _strip_think_blocks(merged_content).strip()
+                msg["content"] = clean_msg_content
+
+                if thinking_loop_detected:
+                    # Discard the runaway thinking entirely so it can't
+                    # poison the next turn, and inject a hard reset
+                    # message instead of letting the empty assistant
+                    # turn fall through normal parsing.
+                    msg["content"] = ""
+                    msg["tool_calls"] = []
+                    execution_failure_count += 1
+                    thinking_cap_events += 1
+                    messages.append({"role": "assistant", "content": (
+                        "[Tool-call generation aborted: a runaway burst of tool "
+                        "calls was discarded unrun.]" if tool_call_flood_detected
+                        else "[Internal thinking aborted: runaway loop detected.]")})
+                    # Escalation: on the SECOND cap/loop event in
+                    # the same attempt, stop retrying. The solver
+                    # is stuck in a self-consistent but unwinnable
+                    # derivation (e.g. "split('\\n') on '' can't
+                    # return []") — no amount of "stop re-deriving"
+                    # reminders will unstick it. Force-stop and let
+                    # the caller surface the failure. First event
+                    # still gets the old retry path so normal
+                    # one-off over-thinking is recoverable.
+                    if thinking_cap_events >= 2:
+                        pretty_log(
+                            "Loop Breaker",
+                            f"Thinking cap hit {thinking_cap_events}x in one attempt — aborting.",
+                            level="WARNING", icon=Icons.STOP,
+                        )
+                        final_ai_content = (
+                            "[ATTEMPT_ABORTED_THINKING_LOOP] The solver hit the thinking "
+                            f"cap {thinking_cap_events} times in this attempt without "
+                            "producing a tool call. Further retries would re-enter the "
+                            "same derivation. Stopping."
+                        )
+                        force_stop = True
+                        return "break"
+                    # ONE append, TWO texts. The thinking-loop alert
+                    # tells the model to answer with ONE grounding tool
+                    # call — the exact instruction a flood already
+                    # over-obeyed, so a flood gets its own steer: the
+                    # problem was the REPEAT, not the tool. Selecting
+                    # the text (rather than branching the append and
+                    # the strike cap below) keeps both shapes on one
+                    # recovery path, so a later edit cannot fix one and
+                    # leave the other behind.
+                    _loop_steer = (
+                        "SYSTEM ALERT: Your previous turn emitted a runaway burst of "
+                        "tool calls and was killed before any of them ran. "
+                        "NOTHING executed and nothing changed — do not assume any of "
+                        "that work happened. Emit ONE tool call now, then STOP and "
+                        "wait for its result before deciding anything else. If you "
+                        "were quoting a rule about tool calls, do not quote the "
+                        "`<tool_call>` syntax — just make the call. Do not write a "
+                        "long <think> block."
+                    ) if tool_call_flood_detected else "SYSTEM ALERT: Your previous turn entered a self-repeating thinking loop and was killed. STOP re-deriving the same paragraph. Do NOT resume hypothesizing from memory — a killed loop means your mental model is missing a fact only OBSERVATION can supply. Your next output must be ONE grounding tool call: execute the code, load the page in the browser, or re-read the exact error/output you are reasoning about — then base the next step on what it returns. If a self-generated test assertion disagrees with your function's output, the TEST is likely wrong — re-read the spec and fix the assertion before changing the function. If you have ALREADY proven the task cannot be solved as specified (e.g. the validator has a structural bug), call `abort_attempt` now with a specific reason. Do not write a long <think> block."
+                    messages.append({"role": "user", "content": _loop_steer})
+                    if execution_failure_count >= 6:
+                        pretty_log("Think-Loop Halt", "Forcing final response after repeated thinking loops", icon=Icons.STOP, level="WARNING")
+                        force_final_response = True
+                    return "continue"
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                final_ai_content = "CRITICAL: The upstream LLM server is unreachable. It may have crashed due to memory pressure or is currently restarting. Please wait a moment and try again."
+                pretty_log("System Fault", "Upstream server unreachable", level="ERROR", icon=Icons.FAIL)
+                force_stop = True
+                return "break"
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 400 and "context" in e.response.text.lower():
+                    pretty_log("Context Overflow", "Emergency pruning triggered...", icon=Icons.WARN)
+                    # Emergency Prune: Keep System + Last User + 1 Last Tool Result (Truncated)
+                    system_msgs = [m for m in req_messages if m.get("role") == "system"]
+
+                    def _is_volatile_block(m) -> bool:
+                        """The synthetic per-turn `<system_state_update>`
+                        message `_compose_injection` appends. It is
+                        timestamp/plan bookkeeping, never the thing the
+                        model was working on, so recovery must not
+                        mistake it for the last real user message."""
+                        c = m.get("content")
+                        return (isinstance(c, str)
+                                and c.lstrip().startswith("<system_state_update>"))
+
+                    # Prefer the last SUBSTANTIVE user message. Under the
+                    # pin the trailing message is always the volatile
+                    # block (2026-09-04: it is now appended on every
+                    # branch, where it previously rode the tool result on
+                    # one of three), and recovering with only that block
+                    # would retry against bookkeeping instead of evidence.
+                    # Fall back to it if there is genuinely nothing else.
+                    _users = [m for m in reversed(req_messages)
+                              if m.get("role") == "user"]
+                    last_user = next(
+                        (m for m in _users if not _is_volatile_block(m)),
+                        next(iter(_users), None))
+
+                    recovery_msgs = list(system_msgs)
+                    if last_user:
+                        safe_user = last_user.copy()
+                        if isinstance(safe_user.get("content"), str) and len(safe_user["content"]) > 10000:
+                            safe_user["content"] = safe_user["content"][:10000] + "\n... [EMERGENCY TRUNCATION] ..."
+                        recovery_msgs.append(safe_user)
+
+                    # If the last thing was a tool output that caused the overflow, keep it but heavily truncated.
+                    # Walk back to the last *real* tool entry — a synthetic
+                    # agent-loop error (parse-error nudge, etc.) is not real
+                    # prior tool output and pretending it is leads the recovery
+                    # retry to plan against fabricated evidence. Also strip
+                    # internal-tracking keys (`_synthetic`) before forwarding
+                    # upstream so the LLM payload stays clean OpenAI-shape.
+                    # ACTION view first (§4BC round 2): recovery
+                    # must retry against the output the model was
+                    # actually working from, not a trailing status
+                    # listing; evidence view fills in only when the
+                    # turn was bookkeeping-only.
+                    real_tool = (_find_substantive_tool_for_verifier(
+                        tools_run_this_turn,
+                        include_informational_bookkeeping=False)
+                        or _find_substantive_tool_for_verifier(
+                            tools_run_this_turn))
+                    if real_tool is not None:
+                        # Wrap as a <tool_response> user message — the
+                        # same translation the main request path applies.
+                        # A raw orphan role:"tool" message (no preceding
+                        # assistant tool_calls) is rejected by strict
+                        # chat templates, turning a recoverable overflow
+                        # into a hard failure.
+                        _rt_content = str(real_tool.get("content", ""))[:1000] + "\n... [EMERGENCY TRUNCATION] ..."
+                        recovery_msgs.append({
+                            "role": "user",
+                            "content": (
+                                f"<tool_response name=\"{real_tool.get('name', 'unknown')}\">\n"
+                                f"{_rt_content}\n</tool_response>"
+                            ),
+                        })
+
+                    recovery_msgs.append({"role": "user", "content": "SYSTEM ALERT: The conversation history was truncated to fit within context limits. Continue task. Assume previous context has been handled."})
+
+                    # RETRY ONCE with pruned context. `stream` MUST
+                    # be off: the turn loop sets payload["stream"]=True
+                    # every iteration, and chat_completion is the
+                    # non-streaming API — reusing the flag made the
+                    # upstream answer the recovery with SSE frames
+                    # that parsed as "non-JSON body" and killed the
+                    # turn (2026-07-18, xrick feasibility session).
+                    try:
+                        payload["messages"] = recovery_msgs
+                        payload["stream"] = False
+                        messages = recovery_msgs
+                        data = await self.context.llm_client.chat_completion(payload, use_coding=has_coding_intent)
+                        if "choices" in data and len(data["choices"]) > 0:
+                            msg = data["choices"][0]["message"]
+                    except Exception as retry_e:
+                        # Surface a calm, actionable message instead of a
+                        # raw CRITICAL/traceback. The task state is intact;
+                        # the inputs were just too large to read whole.
+                        logger.error("Context overflow recovery failed: %s", retry_e)
+                        final_ai_content = (
+                            "I hit my context limit while gathering data for this step — "
+                            "the inputs were too large to read all at once, and the automatic "
+                            "recovery didn't complete. Nothing is lost: the task and its files "
+                            "are preserved. Ask me to retry the step and I'll process the large "
+                            "files with a script (summarising them) instead of reading them whole."
+                        )
+                        force_stop = True
+                        return "break"
+                else:
+                    final_ai_content = f"CRITICAL: Upstream error {e.response.status_code}: {e.response.text}"
+                    pretty_log("System Fault", f"HTTP {e.response.status_code}", level="ERROR", icon=Icons.FAIL)
+                    force_stop = True
+                    return "break"
+            except Exception as e:
+                final_ai_content = f"CRITICAL: An unexpected error occurred while communicating with the LLM: {str(e)}"
+                pretty_log("System Fault", str(e), level="ERROR", icon=Icons.FAIL)
+                force_stop = True
+                return "break"
+
+            content = msg.get("content") or ""
+
+            # Merge upstream reasoning_content if present (some models return it as a separate field)
+            if msg.get("reasoning_content"):
+                content = f"<think>\n{msg.get('reasoning_content')}\n</think>\n" + content
+
+            tool_calls, ui_content, parse_failure_reason = self._parse_assistant_tool_calls(content, msg)
+
+            ui_content = _strip_think_blocks(ui_content).strip()
+
+            # --- HALLUCINATION & LEAK SCRUBBERS ---
+            if ui_content:
+                # 1. Hard Truncation for System Prompt Bleed
+                # Shared strong/weak bleed helper (§ R1 A-F3) — same
+                # rules as the finalize twin so the two sites cannot
+                # drift (the wrapper-split lesson).
+                ui_content = _truncate_prompt_bleed(ui_content)
+
+                # 2. Regex scrubbers for XML and Execution Artifacts
+                ui_content = re.sub(r'<tool_response>.*?(?:</tool_response>|$)', '', ui_content, flags=re.DOTALL | re.IGNORECASE)
+                ui_content = re.sub(r'--- EXECUTION RESULT ---.*?(?:------------------------|$)', '', ui_content, flags=re.DOTALL)
+
+                # 3. Task Tree Regurgitation Scrubbers
+                # Old pattern was `^\s*(?: )\s*\[.*?\].*?\n?` which
+                # stripped any indented `[label]` prefix — that
+                # mangled legitimate indented markdown links
+                # ('  [docs](https://x)' → '(https://x)'). Tightened
+                # to require a task-shape token inside the
+                # brackets (a `task_NN` id or one of the status
+                # keywords) so markdown links survive.
+                ui_content = re.sub(r'(?m)^\s*\[(?:task_\d+|IN_PROGRESS|READY|PENDING|DONE|FAILED|BLOCKED)\b[^\]]*\].*?\n?', '', ui_content)
+                ui_content = _scrub_task_status_runs(ui_content)  # § R1 A-F3
+                ui_content = re.sub(r'(?m)^\s*(?:\[)?task_\d+(?:\])?\s*\n?', '', ui_content)
+                ui_content = re.sub(r'(?m)^\s*(?:FOCUS TASK|ACTIVE STRATEGY & PLAN|PLAN|THOUGHT):\s*', '', ui_content)
+
+                ui_content = ui_content.strip()
+
+            # CRITICAL: Preserve the raw XML tags in the assistant's internal message context so it remembers!
+            # BUT STRIP <think> blocks to prevent cognitive looping!
+            clean_content_for_history = _strip_think_blocks(content).strip()
+            # …EXCEPT when the XML failed to parse: replaying the
+            # broken bytes teaches the model to copy its own
+            # mistake on every retry (req 65d8cf76 looped 5x on a
+            # one-character lesion this way). Replace the failed
+            # block(s) with a constant-size note; the parsed calls
+            # (if any) live on in msg["tool_calls"] and their
+            # results in the following tool messages. Gate on an
+            # ACTUAL failed block — not on parse_failure_reason
+            # alone: "truncated" is stamped by pre-parse counting
+            # and can accompany a fully parsed+executed call, and
+            # scrubbing that would ask the model to re-run a
+            # mutation that already succeeded. The gate also
+            # guarantees the note's "SYSTEM ERROR below" promise:
+            # the recovery hint only fires for system_parse_error
+            # entries.
+            if parse_failure_reason and any(
+                (tc.get("function") or {}).get("name") == "system_parse_error"
+                for tc in tool_calls
+            ):
+                clean_content_for_history = _scrub_unparsed_tool_call_text(
+                    clean_content_for_history, parse_failure_reason,
+                )
+            msg["content"] = clean_content_for_history
+            msg["tool_calls"] = tool_calls
+
+            # Defense-in-depth for terminal tools and other cases
+            # where an earlier step set `force_final_response`. The
+            # turn was promised to be text-only, but the model can
+            # still emit a `<tool_call>` — especially after a
+            # terminal tool like `self_play` whose result text
+            # ("DO NOT call ... again") is buried inside a
+            # `<tool_response>` block and loses to the strong
+            # system-prompt directive above it. Drop those
+            # hallucinated tool_calls so the loop converges.
+            # ⚠ GATED ON `is_final_generation`, NOT `force_final_response`
+            # (2026-09-04). Those differ: `is_final_generation` is
+            # `force_final_response OR required_tool == "none"`, so a
+            # planner that signalled only through `required_tool` reached
+            # here with the flag unset and its tool_calls were dispatched
+            # on a turn declared text-only. The STREAM side already used
+            # the wider predicate (`_stream_scrub_active =
+            # bool(is_final_generation)`), so the two halves of the same
+            # promise disagreed. That gap became reachable the moment the
+            # schemas stayed attached on final-generation turns (see the
+            # payload block): the model can now see the tools it is being
+            # told not to call, and `tool_choice:"none"` suppresses the
+            # PARSED call but not the model emitting the XML in content
+            # (measured: llama.cpp returns tool_calls=[] and leaves the
+            # `<tool_call>` text in `content`, which this agent's own XML
+            # parser then picks up). One predicate, both halves.
+            if is_final_generation and tool_calls:
+                dropped = [tc.get("function", {}).get("name", "?") for tc in tool_calls]
+                logger.warning(
+                    "Dropping %d tool_call(s) — final-generation turn (names=%s)",
+                    len(tool_calls), dropped,
+                )
+                _forced_final_dropped.extend(dropped)
+                # HONESTY NOTE ON DROPPED MUTATIONS (2026-07-14). When
+                # the dropped call would have CHANGED something
+                # (file_system replace at the finish line — observed
+                # live 2026-07-12, twice), silently eating it leaves
+                # the reply implying the action happened. Append an
+                # explicit not-applied note so the user (and the next
+                # turn's context) knows the work is still pending.
+                # Terminal-tool re-calls (self_play etc.) stay silent —
+                # dropping those is the point of this guard.
+                _drop_note = _dropped_mutation_note(
+                    dropped, _dropped_write_paths(tool_calls))
+                if _drop_note:
+                    ui_content = (ui_content or "").rstrip() + _drop_note
+                tool_calls = []
+                msg["tool_calls"] = []
+
+            # Reasoning-channel divergence guard. Some models (Qwen-class
+            # reasoning variants in particular) emit `reasoning_content`
+            # explicitly disclaiming tool use ("I can answer directly
+            # without using any tools") AND still emit a structured
+            # tool_call in the same response. Trust the reasoning: drop
+            # the contradicting tool_calls and re-run the turn in
+            # final-generation mode so the model produces prose. This
+            # avoids the wasted strike on a tool call the model itself
+            # said wasn't needed (e.g. spurious `knowledge_base` saves
+            # of prose the user asked us to compose).
+            elif tool_calls and not force_final_response:
+                rc = locals().get("reasoning_content", "") or (msg.get("reasoning_content") or "")
+                if rc:
+                    _NO_TOOL_DISCLAIM_PATTERNS = (
+                        r"\bwithout\s+(?:needing\s+)?(?:any\s+|using\s+|calling\s+)?tools?\b",
+                        r"\bno\s+tools?\s+(?:are\s+)?(?:needed|required|necessary)\b",
+                        r"\bdon'?t\s+need\s+(?:any\s+|to\s+(?:use|call)\s+)?tools?\b",
+                        r"\banswer\s+(?:this\s+)?directly\s+from\s+(?:my\s+)?knowledge\b",
+                        r"\bI\s+can\s+answer\s+(?:this\s+)?directly\b",
+                    )
+                    if any(re.search(p, rc, re.IGNORECASE) for p in _NO_TOOL_DISCLAIM_PATTERNS):
+                        dropped = [tc.get("function", {}).get("name", "?") for tc in tool_calls]
+                        logger.warning(
+                            "Dropping %d tool_call(s) — reasoning channel disclaimed tools (names=%s, reasoning_head=%r)",
+                            len(tool_calls), dropped, rc[:200],
+                        )
+                        tool_calls = []
+                        msg["tool_calls"] = []
+                        force_final_response = True
+                        # Re-run the turn in final-generation mode rather
+                        # than emitting the bad-turn message — its
+                        # think-stripped content is empty, so falling
+                        # through would surface nothing useful.
+                        return "continue"
+
+            # Telemetry for un-caught divergences. When BOTH channels
+            # emit and neither drop fired, the regex set above missed
+            # the phrasing — log a sample at debug so the pattern list
+            # can be extended as new model phrasings appear.
+            if tool_calls:
+                _rc_for_log = locals().get("reasoning_content", "") or (msg.get("reasoning_content") or "")
+                if _rc_for_log and len(_rc_for_log) > 50:
+                    logger.debug(
+                        "Dual-channel emit: reasoning_content (%d chars) + tool_calls (%d, names=%s); reasoning_head=%r",
+                        len(_rc_for_log), len(tool_calls),
+                        [tc.get("function", {}).get("name", "?") for tc in tool_calls],
+                        _rc_for_log[:120],
+                    )
+
+            if not tool_calls:
+                clean_ui = ui_content.strip("` \n\r")
+                # §4GH: a forced-final turn (tools off — the breaker,
+                # the one-task latch, the planner) whose own text is
+                # empty or narration would ship the accumulated
+                # narration as the answer. One retry with a hard
+                # directive; a second miss ships an honest fallback
+                # built from the last evidence instead of the beats.
+                if is_final_generation and _forced_final_has_no_answer(
+                        clean_ui, final_ai_content):
+                    # No retry on the last budget turn — a `continue`
+                    # there exits to the exhaustion path, which ships
+                    # the narration this branch exists to replace.
+                    if (not _forced_final_retry_used
+                            and turn < effective_max_turns - 1):
+                        _forced_final_retry_used = True
+                        pretty_log(
+                            "Turn Budget",
+                            "forced final produced NO ANSWER (empty or "
+                            "working narration only) — one retry with "
+                            "a hard answer-now directive",
+                            level="WARNING", icon=Icons.WARN,
+                        )
+                        messages.append(msg)
+                        messages.append({"role": "user",
+                                         "content": _FORCED_FINAL_ANSWER_DIRECTIVE})
+                        return "continue"
+                    pretty_log(
+                        "Turn Budget",
+                        "forced final produced NO ANSWER twice — "
+                        "shipping the honest fallback (last evidence, "
+                        "not the narration)",
+                        level="WARNING", icon=Icons.FAIL,
+                    )
+                    ui_content = _no_answer_fallback_reply(tools_run_this_turn)
+                    clean_ui = ui_content.strip("` \n\r")
+                    final_ai_content = ""
+                # A write dropped on an EARLIER forced-final miss is
+                # still pending: the note rides the reply that ships.
+                _ffd_note = _dropped_mutation_note(_forced_final_dropped)
+                if _ffd_note and _DROPPED_NOTE_HEAD not in (ui_content or ""):
+                    ui_content = (ui_content or "").rstrip() + _ffd_note
+                    clean_ui = ui_content.strip("` \n\r")
+                has_img_markdown = bool(re.search(r'!\[.*?\]\(.*?\)', clean_ui))
+                # "browser" belongs here: a screenshot op returns
+                # `DOWNLOAD: /api/download/<name>` — a legitimate
+                # image source. Without it the guard false-positived
+                # on a correct browser-screenshot link whenever the
+                # DOWNLOAD line had scrolled past the 4-message
+                # link-validation window (probe req d02db9d6: the
+                # agent then burned a turn arguing with the alert).
+                has_valid_image_tool = any(t in raw_tools_called for t in ["image_generation", "execute", "file_system", "browser"])
+                has_run_tools = len(tools_run_this_turn) > 0
+
+                # Catch a PROMISED NOTIFICATION dropped at the finish
+                # line (req 11fe11d8): user said "notify me in slack
+                # when you're done", the model planned the call in
+                # reasoning, then finalized without making it. Steer
+                # ONCE toward notify_operator; never fight a
+                # force-finalising loop-breaker.
+                if (clean_ui and not notify_steer_fired
+                        and not force_final_response
+                        and not is_final_generation
+                        and not force_stop
+                        and "notify_operator" not in raw_tools_called
+                        and _user_asked_for_notification(last_user_content)):
+                    notify_steer_fired = True
+                    pretty_log(
+                        "Notify Guard",
+                        "Turn ending without the notification the user "
+                        "explicitly asked for — steering to "
+                        "notify_operator (once).",
+                        level="WARNING", icon=Icons.WARN,
+                    )
+                    messages.append(msg)
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "SYSTEM ALERT: The user explicitly asked to "
+                            "be NOTIFIED when this task is done, but you "
+                            "are ending the turn without having called "
+                            "`notify_operator`. Call `notify_operator` "
+                            "NOW with one short line summarising the "
+                            "outcome, then give your final response."
+                        ),
+                    })
+                    return "continue"
+
+                # Catch Stalled Image Mentions
+                if has_img_markdown and not has_valid_image_tool:
+                    is_valid_final = "```" in clean_ui or bool(re.search(r'\b(SUCCESS|DONE|COMPLETE|ERROR)\b', clean_ui.upper()))
+
+                    # Validate image links to see if they are preexisting (not hallucinated)
+                    if has_img_markdown and not is_valid_final:
+                        img_links = re.findall(r'!\[.*?\]\((.*?)\)', clean_ui)
+                        history_text = str([m.get("content", "") for m in messages[-4:]])
+                        all_links_valid = len(img_links) > 0 and all(link in history_text for link in img_links)
+                        if all_links_valid:
+                            is_valid_final = True
+
+                    if not is_valid_final:
+                        pretty_log("Agent Parser", "Caught image markdown without tool call.", level="WARNING", icon=Icons.WARN)
+                        messages.append(msg)
+                        messages.append({"role": "user", "content": "SYSTEM ALERT: You attempted to display an image using markdown `![]()` but you forgot to actually generate it! You MUST output the XML `<tool_call>` for `image_generation` NOW. DO NOT output the markdown tag until the tool successfully returns the filename."})
+                        execution_failure_count += 1
+                        return "continue"
+
+                # Catch Conversational Filler promising a tool call.
+                #
+                # Old version did a raw substring match on the tool
+                # name, which false-positived on any casual reply
+                # that used the word naturally — `execute` is a
+                # common English verb, `forget` is a common English
+                # verb, and tool phrases like `file system` /
+                # `knowledge base` / `deep think` come up all the
+                # time in philosophical / meta conversations. The
+                # false positive cascaded into a full "SYSTEM ALERT:
+                # output the XML!" injection that trapped the model
+                # in an execute-tool-call loop even when the user
+                # was just chatting (see 23:09 log: user asked
+                # about consciousness, reply mentioned "structured
+                # execution via tools", guard fired, Turn 2 tried
+                # to call execute and truncated).
+                #
+                # New rule: fire only when BOTH
+                #   (a) the tool name matches with word boundaries
+                #       (so `executed` / `executive` / `execution`
+                #       don't match `execute`), AND
+                #   (b) an explicit intent marker ("I'll", "let me",
+                #       "running", "calling", "using") sits within
+                #       ~12 words of the tool name — casual mention
+                #       ("execute is a common English verb") does
+                #       not have this pattern, a real tool-promise
+                #       ("Let me execute that now") does.
+                if clean_ui and not force_final_response and not is_final_generation:
+                    tool_names = list(self.available_tools.keys()) if hasattr(self, 'available_tools') else []
+                    clean_ui_lower = clean_ui.lower()
+                    # Intent markers the model uses when it actually
+                    # means to run a tool. Kept narrow on purpose —
+                    # over-broad markers (e.g. "will", "can") would
+                    # reintroduce false positives on prose.
+                    _intent_pattern = re.compile(
+                        r"\b(?:i['’]?ll|i\s+will|i\s+am\s+going\s+to|"
+                        r"let\s+me|let's|gonna|"
+                        r"now\s+(?:i['’]?m\s+)?(?:running|calling|using|executing|"
+                        r"invoking|firing)|"
+                        r"running|calling|invoking|firing\s+off|executing\s+(?:the|a))\b",
+                        re.IGNORECASE,
+                    )
+                    has_intent = bool(_intent_pattern.search(clean_ui_lower))
+
+                    mentioned_tools = []
+                    if has_intent:
+                        for t in tool_names:
+                            # Word-boundary match on both the raw
+                            # `tool_name` and the space-separated
+                            # form `tool name` so `file_system` is
+                            # caught in either shape without
+                            # matching `file` alone.
+                            pat_underscore = rf"\b{re.escape(t)}\b"
+                            pat_spaced = rf"\b{re.escape(t.replace('_', ' '))}\b"
+                            if re.search(pat_underscore, clean_ui_lower) or (
+                                "_" in t and re.search(pat_spaced, clean_ui_lower)
+                            ):
+                                mentioned_tools.append(t)
+
+                    if mentioned_tools and not has_run_tools:
+                        is_valid_final = "```" in clean_ui or bool(re.search(r'\b(SUCCESS|DONE|COMPLETE|ERROR)\b', clean_ui.upper()))
+                        if not is_valid_final and len(clean_ui.split()) < 100:
+                            pretty_log("Agent Parser", f"Caught conversational filler without XML ({mentioned_tools[0]}).", level="WARNING", icon=Icons.WARN)
+                            messages.append(msg)
+                            messages.append({"role": "user", "content": f"SYSTEM ALERT: You provided conversational text mentioning the tool `{mentioned_tools[0]}`, but you DID NOT output the actual XML `<tool_call>` block! Do not narrate your actions. Output the XML `<tool_call>` immediately."})
+                            execution_failure_count += 1
+                            return "continue"
+
+                # TRAILING-PROMISE GUARD (2026-07-14). The filler
+                # guard above only fires when a TOOL NAME is
+                # mentioned; a mid-repair turn that finalized with
+                # "…That's what's causing the error. Let me fix it."
+                # sailed through (observed live: the reply shipped, the
+                # fix never ran, and the user believed it had). Fire
+                # when the reply's LAST sentence promises imminent
+                # action after a working turn: steer ONCE to either DO
+                # the action now or state plainly that it was NOT
+                # done. `has_run_tools` keeps pure conversation exempt;
+                # "let me know…" is explicitly excluded.
+                if (clean_ui and not pending_promise_steer_fired
+                        and not force_final_response
+                        and not is_final_generation
+                        and not force_stop
+                        and has_run_tools):
+                    _last_sentence = _ends_with_action_promise(clean_ui)
+                    if _last_sentence:
+                        pending_promise_steer_fired = True
+                        pretty_log(
+                            "Pending-Promise Guard",
+                            f"Final reply ends promising an action "
+                            f"({_last_sentence[:80]!r}) — steering to "
+                            f"act-or-admit (once).",
+                            level="WARNING", icon=Icons.WARN,
+                        )
+                        messages.append(msg)
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "SYSTEM ALERT: Your reply ENDS by "
+                                f"promising an action ({_last_sentence[:120]!r}). "
+                                "The turn ends when you reply — nothing "
+                                "runs afterwards. Either output the "
+                                "tool_call(s) and DO it NOW, or rewrite "
+                                "your final sentence to state plainly "
+                                "that this was NOT done and what "
+                                "remains for the user to ask for."
+                            ),
+                        })
+                        return "continue"
+
+                # Conversational fallback removed for smarter models.
+                if not clean_ui and not force_final_response and not is_final_generation:
+                    pretty_log("Agent Parser", "Model stalled after thinking. Forcing retry.", level="WARNING", icon=Icons.WARN)
+                    messages.append(msg)
+                    messages.append({"role": "user", "content": "SYSTEM ALERT: You generated a thought process but stopped abruptly without outputting a valid XML <tool_call> or a response to the user. DO NOT STOP. If you need to use a tool, output the required XML <tool_call> block. If the task is fully complete, provide your final response to the user."})
+                    execution_failure_count += 1
+                    return "continue"
+
+                user_request_context = last_user_content.lower()
+                # §4BE: an IMPERATIVE directive, not a keyword
+                # mention. See `_has_meta_task_directive` for the
+                # measurement that forced this (59/59 false
+                # positives; the nudge's own text asserts the user
+                # gave instructions, so a keyword match made it a
+                # lie and the model wrote a junk lesson to comply).
+                has_meta_intent = _has_meta_task_directive(
+                    user_request_context)
+                meta_tools_called = any(t in raw_tools_called for t in ["learn_skill", "update_profile", "create_skill", "manage_skills"])
+                # Read-only SURFACE tools discharge the meta-task
+                # nudge: if the user asks "what have you learned
+                # today" the right answer is `list_lessons`, not a
+                # bogus `learn_skill` write. Before this exemption
+                # the nudge kept firing for 3-5 extra turns after
+                # `list_lessons` returned, and the model eventually
+                # caved and wrote a deduplicated no-op skill just
+                # to silence it (production trace 15:17, request
+                # 5C: 6 turns / 73s for one read-only query).
+                read_only_meta_tools_called = any(
+                    t in raw_tools_called
+                    for t in ["list_lessons", "recall", "manage_skills"]
+                )
+                if read_only_meta_tools_called:
+                    meta_tools_called = True
+
+                meta_tools_available = any(t in self.available_tools for t in ["learn_skill", "update_profile", "create_skill", "manage_skills"])
+                # Self-play (and any isolated simulation) sets
+                # `suppress_meta_task_nudges` to skip this check —
+                # the nudge is a production-mode feature that
+                # pushes the agent to record skills/profile updates
+                # after a real user task, and it has no place
+                # inside a throwaway simulation where all memory
+                # writes are blocked anyway.
+                suppress_nudge = getattr(self, "suppress_meta_task_nudges", False)
+                # ⚠ FIRE ONCE (§4BE round 2). The condition can only
+                # be discharged by CALLING a meta tool, so a model
+                # that correctly declines stays armed and is re-nudged
+                # on every finalisation — up to 4× — with its drafted
+                # reply discarded each time. Live req 32a8101d: the
+                # model declined twice ("there's no explicit learning
+                # or profile instruction in their message") and caved
+                # on turn 4, minting the junk lesson. The rewritten
+                # message invites declining, which would have made
+                # that pressure WORSE without this latch: now correct
+                # refusal ends the loop exactly as compliance does.
+                if _meta_nudge_fired:
+                    has_meta_intent = False
+                if not suppress_nudge and has_meta_intent and meta_tools_available and not meta_tools_called and turn < 4:
+                    _meta_nudge_fired = True
+                    pretty_log("Checklist Nudge", "Enforcing meta-task compliance", icon=Icons.SHIELD)
+                    messages.append({"role": "user", "content": (
+                        "REMINDER: the user's request appears to ask you to RECORD "
+                        "something (a lesson, a skill, or a profile fact) and no "
+                        "recording tool has run this turn. If that reading is right, "
+                        "call 'learn_skill' or 'update_profile' now. If it is NOT — "
+                        "the user only mentioned skills/lessons in passing, or asked "
+                        "you to show or define one — say so in your reply and finish "
+                        "normally; do NOT invent a lesson to satisfy this reminder."
+                    )})
+                    return "continue"
+
+                if ui_content:
+                    ui_content = ui_content.replace("\r", "")
+                    if final_ai_content and not final_ai_content.endswith("\n\n"):
+                        final_ai_content += "\n\n"
+                    final_ai_content += ui_content
+
+                # --- VERIFIER-GATE AUTO-REPAIR (in-loop re-entry) ---
+                # We're at the normal-success finalisation (model
+                # produced a final answer with no further tool calls).
+                # Verify it HERE so a high-confidence REFUTED verdict
+                # (or finalising on an unverified mutation) can trigger
+                # a bounded repair: inject the critique and `continue`
+                # the turn loop so the agent FIXES the issue instead of
+                # shipping a noted-but-wrong answer. The verdict is
+                # cached for the post-loop gate (no double LLM call on
+                # the clean path). Gated to clean first-pass successes
+                # (`execution_failure_count == 0`, `not force_stop`) so
+                # error/abort answers — which exit via other breaks —
+                # are never "repaired".
+                if (repair_round < self._MAX_VERIFIER_REPAIRS
+                        and not force_stop
+                        and execution_failure_count == 0):
+                    # Async-critic mode skips the BLOCKING verdict (it
+                    # stays deferred to the post-loop gate, off the
+                    # critical path) — but NOT the unverified-mutation
+                    # check, which is a pure predicate over this turn's
+                    # tool records (no LLM call, no latency). The
+                    # 2026-07-04 chess hunt showed why: with
+                    # --critic-nodes on, this whole block was skipped,
+                    # so SIX consecutive turns finalised on file writes
+                    # that were never run — every crash (module
+                    # shadowing, IndexError, NameError, hallucinated
+                    # API) shipped to the user, who became the test
+                    # harness. Now async mode still forces the bounded
+                    # "actually RUN it" re-entry on untested writes.
+                    #
+                    # Defensive like the post-loop gate: a verifier
+                    # error (or a misconfigured/non-async verifier in
+                    # tests) must NEVER crash or block finalisation —
+                    # on any failure we simply skip the repair and ship.
+                    _do_repair = False
+                    _directive = ""
+                    _crit = ""
+                    _refuted = False
+                    _unverified = False
+                    # ⚠ captured ABOVE the whole async/sync verdict
+                    # chain — every _compute_verifier_verdict call in
+                    # it threads this. (The first placement sat inside
+                    # the async branch alone; the sync branch raised
+                    # UnboundLocalError, which the defensive except
+                    # dutifully swallowed into "skip the repair" —
+                    # eight tests caught it because two verifier
+                    # passes became one.) On overrun the spawned task
+                    # runs post-semaphore, where the global belongs to
+                    # whoever runs next.
+                    _rv_pid = self._captured_project_id()
+                    try:
+                        from .verifier import VerifyVerdict as _VV
+                        if self._critic_async_enabled():
+                            # The deterministic mutation guard fires
+                            # regardless (LLM-free): an untested write
+                            # always forces the "actually RUN it"
+                            # re-entry. ACTION-preferred selection
+                            # (§4BC round 2): a trailing task-table
+                            # must not shadow the write before it —
+                            # under the evidence view the guard was
+                            # silently disabled on write-then-
+                            # bookkeeping turns, and the repair
+                            # await was skipped on mixed turns.
+                            _lt = (_find_substantive_tool_for_verifier(
+                                tools_run_this_turn,
+                                include_informational_bookkeeping=False)
+                                or _find_substantive_tool_for_verifier(
+                                    tools_run_this_turn))
+                            _unverified = _is_unverified_mutation(_lt)
+                            # #18: bounded verdict await at loop-exit.
+                            # The critic runs on the OFF-HOST model, so
+                            # this wait costs the MAIN slot nothing — and
+                            # it lets a REFUTED answer be REPAIRED in-loop
+                            # instead of shipping with only a next-turn
+                            # note (the production gap under
+                            # GHOST_CRITIC_ASYNC=1). Only when the last
+                            # tool is substantive and the mutation guard
+                            # didn't already trip; on timeout we hand the
+                            # still-running task to the late-verdict
+                            # handler (its side effects — correction
+                            # stash, poisoned-lesson scrub — land when
+                            # the verdict does) and mark the verdict
+                            # cache as "skipped" so the post-loop gate
+                            # doesn't spawn a SECOND full verdict for
+                            # the same turn on the already-contended
+                            # worker.
+                            _rbudget = self._critic_repair_await_budget()
+                            # §4BC: bookkeeping-evidence turns skip the
+                            # BLOCKING await (pure defer — verdict still
+                            # lands via the late handler); see
+                            # _should_await_repair_verdict.
+                            if _should_await_repair_verdict(
+                                    _rbudget, _lt, _unverified):
+                                try:
+                                    _vtask = _glog.spawn_task(
+                                        self._compute_verifier_verdict(
+                                            tools_run_this_turn=tools_run_this_turn,
+                                            messages=list(messages),
+                                            final_ai_content=final_ai_content,
+                                            last_user_content=last_user_content,
+                                            lc=lc,
+                                            req_id=req_id,
+                                            trajectory_id=current_trajectory_id,
+                                            project_id=_rv_pid,
+                                        ))
+                                    _vdone, _ = await asyncio.wait(
+                                        {_vtask}, timeout=_rbudget)
+                                    if _vtask in _vdone:
+                                        _vr, _lt = _vtask.result()
+                                        # Cache so the post-loop gate
+                                        # reuses it (no double compute
+                                        # on the common landed path).
+                                        # 3rd element (§ R1 A-F4): a
+                                        # fingerprint of the TEXT this
+                                        # verdict judged, so finalize
+                                        # can detect its own scrub/
+                                        # smooth/hoist moved the reply
+                                        # and recompute instead of
+                                        # stamping a verdict for text
+                                        # the user never receives.
+                                        _verifier_verdict_cache = (
+                                            _vr, _lt,
+                                            hash(final_ai_content))
+                                        _verdict_is_fresh = True
+                                        _refuted = (
+                                            _vr is not None
+                                            and _vr.verdict == _VV.REFUTED
+                                            and _vr.confidence >= 0.7
+                                            # §4GH: no claim → no repair
+                                            and not self._verdict_is_no_claim(_vr)
+                                        )
+                                    else:
+                                        self._attach_late_verdict_handler(
+                                            _vtask, current_trajectory_id,
+                                            _stable_conv_fp,
+                                            project_id=_rv_pid,
+                                            n_tools=len(
+                                                tools_run_this_turn or []),
+                                        )
+                                        _verifier_verdict_cache = (
+                                            None, _lt,
+                                            hash(final_ai_content))
+                                        _verdict_is_fresh = True
+                                        # §4BF R2 triage bit 2: the
+                                        # verdict EXISTS but missed
+                                        # the await window — for
+                                        # enrolled bench turns this
+                                        # separates "starved by
+                                        # latency" (fix the budget)
+                                        # from "no verdict possible"
+                                        # (toolless final) in the
+                                        # tts_bon abort triage.
+                                        try:
+                                            if _experiments_mod.arm_for(
+                                                    self.context,
+                                                    "tts_bon", req_id):
+                                                _experiments_mod.mark_trigger(
+                                                    self.context, req_id,
+                                                    "verify_late_pending",
+                                                    True)
+                                        except Exception:  # noqa: BLE001
+                                            pass
+                                except Exception as _await_exc:
+                                    logger.debug(
+                                        "async verdict await skipped: %s: %s",
+                                        type(_await_exc).__name__, _await_exc,
+                                    )
+                        elif _find_substantive_tool_for_verifier(
+                                tools_run_this_turn,
+                                include_informational_bookkeeping=False,
+                        ) is None:
+                            # SYNC mode + no action tool (§4BC scope
+                            # guard, round-2 MAJOR-3): pre-§4BC this
+                            # inline await early-returned with no LLM
+                            # call (last_tool was None); under the
+                            # widened evidence gate a bookkeeping-only
+                            # listing turn would now pay a full
+                            # BLOCKING verify_claim here. Keep sync
+                            # mode at the old behavior — cache the old
+                            # (None, None) result shape so the
+                            # post-loop gate reuses it and stays on
+                            # the quiet "bookkeeping-only" skip line.
+                            _verifier_verdict_cache = (None, None)
+                            _verdict_is_fresh = True
+                        else:
+                            _vr, _lt = await self._compute_verifier_verdict(
+                                project_id=_rv_pid,
+                                tools_run_this_turn=tools_run_this_turn,
+                                messages=messages,
+                                final_ai_content=final_ai_content,
+                                last_user_content=last_user_content,
+                                lc=lc,
+                                req_id=req_id,
+                                trajectory_id=current_trajectory_id,
+                            )
+                            # § R2 C-1: the SYNC branch (the code
+                            # default) stamped a 2-tuple, silently
+                            # bypassing the A-F4 fingerprint gate —
+                            # stamp the judged-text fingerprint here
+                            # too.
+                            _verifier_verdict_cache = (
+                                _vr, _lt, hash(final_ai_content))
+                            _verdict_is_fresh = True
+                            _refuted = (
+                                _vr is not None
+                                and _vr.verdict == _VV.REFUTED
+                                and _vr.confidence >= 0.7
+                                # §4GH: no claim → no repair
+                                and not self._verdict_is_no_claim(_vr)
+                            )
+                            # No verdict, an unconvincing (<0.7)
+                            # CONFIRMED — e.g. one capped because the
+                            # WEB-EXEC probe couldn't run — OR an
+                            # UNCERTAIN (which escalation tier-routing
+                            # now mints routinely for gloss-downgraded
+                            # refutes, 2026-08-06) is not good enough
+                            # to finalise on an untested write: force
+                            # the "actually RUN it" re-entry,
+                            # mirroring the async path's
+                            # pure-predicate behaviour.
+                            _unverified = (
+                                (_vr is None
+                                 or _vr.verdict == _VV.UNCERTAIN
+                                 or (_vr.verdict == _VV.CONFIRMED
+                                     and _vr.confidence < 0.7))
+                                and _is_unverified_mutation(_lt)
+                            )
+                        if _refuted:
+                            _crit = (
+                                "; ".join(_vr.issues[:3]) if _vr.issues
+                                else (_vr.reasoning
+                                      or "the answer was not supported by the evidence")
+                            )
+                            _directive = _render_refute_directive(
+                                _crit,
+                                shape_only=GhostAgent._delivery_shape_only(_vr),
+                                # The CURRENT request: the repair turn is
+                                # exactly where 2422eb25 lost track of it.
+                                pending_request=last_user_content,
+                            )
+                            _do_repair = True
+                        elif _unverified:
+                            _crit = "unverified mutation (untested write)"
+                            _directive = (
+                                "SYSTEM ALERT — you finalised on an UNVERIFIED change: "
+                                "the last action was a file write/replace that was never "
+                                "executed or rendered, so it is unconfirmed. Actually RUN "
+                                "or preview it now (execute it, or screenshot the rendered "
+                                "result) and confirm it works, THEN give your final answer."
+                            )
+                            _do_repair = True
+                    except Exception as _rep_exc:
+                        logger.debug(
+                            "verifier auto-repair check skipped: %s: %s",
+                            type(_rep_exc).__name__, _rep_exc,
+                        )
+                        _do_repair = False
+                    # §4F Phase 3b: adaptive best-of-N on the
+                    # verifier's WOBBLE BAND (GHOST_TTS_ADAPTIVE_BON,
+                    # default OFF). Only when NOT repairing — hard
+                    # REFUTED keeps the repair path, so the two
+                    # regeneration mechanisms never interact. Any
+                    # failure inside keeps the original answer.
+                    if not _do_repair:
+                        try:
+                            from . import tts as _tts_mod
+                            _cvr = (_verifier_verdict_cache
+                                    or (None, None))[0]
+                            _bon_arm = _experiments_mod.arm_for(
+                                self.context, "tts_bon", req_id)
+                            if _bon_arm:
+                                # §4BF R2 (rules review MAJ-8): the
+                                # starvation-triage observable. The
+                                # abort rule must distinguish "no
+                                # verdict existed at the decision
+                                # point" from "verdicts exist,
+                                # rarely wobble" — without a durable
+                                # stamp both read as silence and the
+                                # rule is unfalsifiable. ⚠ SCOPE
+                                # (R3): stamped only on finals that
+                                # REACH this gate — clean first-pass
+                                # successes (no execution failures,
+                                # not force-stopped, repair budget
+                                # unspent). Exits that never reach
+                                # it carry NO stamps and form the
+                                # rule's fourth, trigger-INELIGIBLE
+                                # bucket: the BoN decision point
+                                # never existed there, so stamping
+                                # would claim a decision that did
+                                # not happen.
+                                # Own guard (R3 MIN): a stamp
+                                # failure must never eat the
+                                # wobble/BoN path below.
+                                try:
+                                    _experiments_mod.mark_trigger(
+                                        self.context, req_id,
+                                        "verify_in_window",
+                                        _cvr is not None)
+                                except Exception:  # noqa: BLE001
+                                    pass
+                            if _tts_mod.wobble_band(_cvr):
+                                # §4BF flip (ii): the bench-scoped
+                                # tts_bon arm decides for ENROLLED
+                                # turns (today: text-graded bench
+                                # attempts — live turns never carry
+                                # this spec); the env default decides
+                                # for everyone else. Trigger stamped
+                                # on BOTH arms (presence = the wobble
+                                # condition; value = treatment ran),
+                                # so the report's TRIGGERED block is
+                                # the wobble-band subset.
+                                if _bon_arm:
+                                    _run_bon = (
+                                        _bon_arm
+                                        == _experiments_mod.TREATMENT)
+                                    _experiments_mod.mark_trigger(
+                                        self.context, req_id,
+                                        "tts_bon_fired", _run_bon)
+                                else:
+                                    _run_bon = (
+                                        _tts_mod.adaptive_bon_enabled())
+                                if _run_bon:
+                                    final_ai_content, _ = (
+                                        await self._adaptive_bon_final(
+                                            messages=messages,
+                                            final_ai_content=final_ai_content,
+                                            last_user_content=last_user_content,
+                                            model=model,
+                                        ))
+                        except Exception as _bon_exc:
+                            logger.debug(
+                                "adaptive BoN skipped: %s: %s",
+                                type(_bon_exc).__name__, _bon_exc)
+                    if _do_repair:
+                        _directive += _REPAIR_STANDALONE_SUFFIX
+                        messages.append(msg)
+                        messages.append({"role": "user", "content": _directive})
+                        repair_round += 1
+                        force_final_response = False
+                        _repair_reentry_active = True
+                        if _refuted:
+                            # REFUTED: discard the WHOLE accumulated
+                            # narration, not just this turn's tail.
+                            # The wrong claim often entered in an
+                            # EARLIER turn's working narration (req
+                            # 92a968fc: turn 6 said "All 7 tasks
+                            # completed", turn 7 got refuted — the
+                            # turn-start rewind kept turn 6's line
+                            # and the shipped reply contradicted
+                            # itself, 7 vs 6/6). The directive
+                            # already demands a clean STANDALONE
+                            # reply, so the repair turn restates
+                            # whatever still matters.
+                            final_ai_content = ""
+                        else:
+                            # UNVERIFIED: prior narration isn't
+                            # wrong, just untested — discard exactly
+                            # this turn's contribution so the
+                            # verified answer replaces the
+                            # unverified one.
+                            final_ai_content = (final_ai_content or "")[:_final_len_at_turn_start]
+                        _verdict_is_fresh = False
+                        _verifier_verdict_cache = None
+                        pretty_log(
+                            "Verifier Gate",
+                            f"{'REFUTED' if _refuted else 'UNVERIFIED'} → "
+                            f"auto-repair round {repair_round}/"
+                            f"{self._MAX_VERIFIER_REPAIRS}: {_crit[:100]}",
+                            icon=Icons.VERIFIER_LAB, level="WARNING",
+                        )
+                        return "continue"
+
+                # Internal requests never feed smart memory (same
+                # rationale as the streaming-path gate above).
+                from .autonomous_activity import (
+                    is_internal_request as _is_int_req_m2)
+                if self.context.args.smart_memory > 0.0 and last_user_content and not forget_was_called and not last_was_failure and not _is_int_req_m2(req_id):
+                    recent_arc = _build_memory_arc(
+                        messages, final_ai_content,
+                        tools_run=tools_run_this_turn)
+                    if getattr(self.context, 'journal', None):
+                        await self._journal_append_safe('smart_memory', {'text': recent_arc, 'model': model})
+                return "break"
+
+            # #5 step 2: the tool guard/dispatch/result pipeline lives in
+            # _dispatch_and_process_tool_batch (verbatim extraction against
+            # TurnState). The try/finally copy-back mirrors the method's own
+            return "proceed"
+        finally:
+            rs._forced_final_retry_used = _forced_final_retry_used
+            rs._meta_nudge_fired = _meta_nudge_fired
+            rs._repair_reentry_active = _repair_reentry_active
+            rs._verdict_is_fresh = _verdict_is_fresh
+            rs._verifier_verdict_cache = _verifier_verdict_cache
+            rs._vr = _vr
+            rs.cross_turn_repeat_hits = cross_turn_repeat_hits
+            rs.execution_failure_count = execution_failure_count
+            rs.final_ai_content = final_ai_content
+            rs.force_final_response = force_final_response
+            rs.force_stop = force_stop
+            rs.messages = messages
+            rs.msg = msg
+            rs.notify_steer_fired = notify_steer_fired
+            rs.parse_failure_reason = parse_failure_reason
+            rs.pending_promise_steer_fired = pending_promise_steer_fired
+            rs.prev_turn_opening_words = prev_turn_opening_words
+            rs.repair_round = repair_round
+            rs.thinking_cap_events = thinking_cap_events
+            rs.tool_calls = tool_calls
+            rs.ui_content = ui_content
+
     async def handle_chat(self, body: Dict[str, Any], background_tasks, request_id: Optional[str] = None):
         req_id = request_id or str(uuid.uuid4())[:8]
         token = request_id_context.set(req_id)
@@ -20758,6 +23399,10 @@ class GhostAgent:
                 # `SkillMemory.retract_lessons_from_trajectory` to
                 # actually find the lessons it needs to scrub.
                 current_trajectory_id = uuid.uuid4().hex
+                # ...and mark it IN FLIGHT until `_record_turn_trajectory`
+                # writes it: a late verdict that lands first is deferred to
+                # that write instead of finding no record (2026-09-13).
+                self._mark_trajectory_in_flight(current_trajectory_id)
 
                 if len(messages) > 500:
                     messages = [m for m in messages if m.get("role") == "system"] + messages[-500:]
@@ -20923,6 +23568,11 @@ class GhostAgent:
                 # the finalize chain's work-log write-back. Not project-
                 # gated: future lesson producers read it too.
                 self.context._turn_failure_texts = []
+                # Risk-governor checkpoint bookkeeping (2026-09-15). Both
+                # reset per turn: the flag arms recording after a steer,
+                # the list holds the answers finalize must not deliver.
+                self.context._risk_steer_fired = False
+                self.context._governor_checkpoint_segments = []
                 self.context._offproject_steer_done = False
                 # Edit-run futility tracking: basename -> {writes, runs} for
                 # code files this request. See the futility breaker in the
@@ -21898,6 +24548,29 @@ class GhostAgent:
                 # (`_verdict_is_fresh`) so a clean success costs exactly one
                 # verifier pass, same as before.
                 repair_round = 0
+                # §4GH: one retry when a FORCED final turn produces no answer
+                # (request e57ad0cf: the breaker forced the final, the model
+                # emitted three more searches — dropped — and the reply that
+                # shipped was the accumulated "Let me now dig into…" narration
+                # of nine turns). Second miss → the honest fallback.
+                _forced_final_retry_used = False
+                # Mutating tool names dropped on forced-final turns this
+                # request: the honesty note must ride whatever finally ships
+                # (the retry's answer or the fallback), not only the turn
+                # that dropped them (R3 review of §4GH).
+                _forced_final_dropped = []
+                # True while a verifier auto-repair re-entry is in progress
+                # (2026-09-13). The one-task-per-turn latch below re-asserts
+                # `force_final_response` on EVERY iteration, so the repair's
+                # own `force_final_response = False` lasted exactly until the
+                # next iteration's volatile-state assembly: the "actually RUN
+                # it" directive was issued into a tool-suppressed turn
+                # (`tool_choice: none`, every emitted call dropped), and a
+                # REFUTED repair could never gather evidence. Never cleared:
+                # after the repair's own final answer the gate either
+                # repairs again (sets it again) or the loop exits, so a
+                # reset would be dead code (its mutant is equivalent).
+                _repair_reentry_active = False
                 _verifier_verdict_cache = None
                 _verdict_is_fresh = False
                 _final_len_at_turn_start = 0
@@ -21986,8 +24659,11 @@ class GhostAgent:
                     if execution_failure_count >= 6 or total_failures >= 8:
                         pretty_log("Strike Cap", f"structural={execution_failure_count}, transient={transient_failure_count} — aborting turn loop.", icon=Icons.STOP, level="WARNING")
                         messages.append({"role": "user", "content": "SYSTEM ALERT: You have failed too many times. The task cannot be completed."})
-                        if not final_ai_content:
-                            final_ai_content = "I hit a hard limit after repeated failures and could not complete this task. Please rephrase or break it into smaller steps."
+                        final_ai_content = _with_abort_note(
+                            final_ai_content,
+                            "[ATTEMPT_ABORTED_STRIKE_CAP] I hit a hard limit after "
+                            "repeated failures and could not complete this task. "
+                            "Please rephrase or break it into smaller steps.")
                         break
 
                     turn_is_conversational = is_conversational and turn == 0
@@ -22063,6 +24739,16 @@ class GhostAgent:
                                         "content": _risk_mod.risk_steer_message(
                                             _risk_reading),
                                     })
+                                    # From here the model answers the
+                                    # checkpoint in prose. Those answers are
+                                    # a protocol exchange with this loop, not
+                                    # reply text — mark the turn so the
+                                    # accumulator can record them and
+                                    # finalize can leave them out.
+                                    try:
+                                        self.context._risk_steer_fired = True
+                                    except Exception:  # noqa: BLE001
+                                        pass
                                 else:
                                     # Visible, not debug: this is the CONTROL
                                     # arm's counterfactual, and seeing both
@@ -22815,8 +25501,16 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     fetched_playbook = ""
                     if self.context.skill_memory:
                         skill_query = last_user_content
-                        if use_plan and not turn_is_conversational and locals().get("required_tool", "none") not in ["none", "all"]:
-                            skill_query = f"Tool: {required_tool} - Context: {thought_content}"
+                        # Read the possibly-unbound name ONCE, through the
+                        # same `locals()` guard that made it safe, and use
+                        # that binding in the body (§4GJ). The old shape
+                        # tested `locals().get(...)` and then interpolated
+                        # the BARE name — correct only because the guard
+                        # implies the binding exists, which is a proof the
+                        # next editor has to redo.
+                        _req_tool = locals().get("required_tool", "none")
+                        if use_plan and not turn_is_conversational and _req_tool not in ["none", "all"]:
+                            skill_query = f"Tool: {_req_tool} - Context: {thought_content}"
                         playbook = await request_state.get_skill_playbook(skill_query or "")
                         if playbook:
                             fetched_playbook = f"### SKILL PLAYBOOK:\n{playbook}\n\n"
@@ -22888,8 +25582,16 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         dynamic_state += _eg_block + "\n\n"
                     # Re-assert the wrap-up gate every iteration: once a project
                     # task was closed this request, the turn must converge to a
-                    # final answer (no further tool calls / no next task).
-                    if _proj_task_closed_this_req:
+                    # final answer (no further tool calls / no next task) —
+                    # EXCEPT while a verifier repair re-entry is running the
+                    # tools its directive demands (`_repair_reentry_active`).
+                    # Accepted residual: during that window the model could
+                    # close a SECOND task (the dispatch-side latch only sets
+                    # the flag once); the repair is one bounded round and the
+                    # NEXT TASK pointer stays suppressed (`suppress_next_task`
+                    # keys on the flag, not on the forced final).
+                    if _latch_forces_final(_proj_task_closed_this_req,
+                                           _repair_reentry_active):
                         force_final_response = True
                     if has_coding_intent:
                         dynamic_state += f"CURRENT SANDBOX STATE:\n{sandbox_state}\n\n"
@@ -23380,1543 +26082,120 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         _stream_owns_unregister = True
                         return self._stream_final_generation(ss)
 
-                    # Ensure msg is always defined in this scope
-                    msg = {"role": "assistant", "content": "", "tool_calls": []}
-                    thinking_loop_detected = False
-                    # Which of the two collapse shapes killed the stream. Both
-                    # take the `thinking_loop_detected` recovery path (discard
-                    # + strike + retry), but they need DIFFERENT advice: the
-                    # thinking-loop alert tells the model to stop re-deriving
-                    # and emit one grounding tool call, which is precisely the
-                    # wrong instruction for a turn that just emitted 629 of
-                    # them.
-                    tool_call_flood_detected = False
+                    # §4GS step 4b: the internal consumer of this turn.
+                    # Inputs and repack come from a real liveness pass —
+                    # see `_run_internal_turn` and scripts/liveness_4b.py.
+                    # Two inputs are live here but not definitely
+                    # BOUND (conditional assignment upstream): read
+                    # them from a frame snapshot, the way the inline
+                    # code read them — lazily. See MAYBE_UNBOUND.
+                    _frame = locals()
+                    _its = InternalTurnState(
+                        TurnCancelled=TurnCancelled,
+                        _active_turn=_active_turn,
+                        _constraint_steer_pending=_constraint_steer_pending,
+                        _final_len_at_turn_start=_final_len_at_turn_start,
+                        _forced_final_dropped=_forced_final_dropped,
+                        _forced_final_retry_used=_forced_final_retry_used,
+                        _meta_nudge_fired=_meta_nudge_fired,
+                        _metacog_logprobs=_metacog_logprobs,
+                        _origin_token=_origin_token,
+                        _proj_task_closed_this_req=_proj_task_closed_this_req,
+                        _repair_reentry_active=_repair_reentry_active,
+                        _request_constraint_block=_request_constraint_block,
+                        _request_constraints=_request_constraints,
+                        _request_sys3_fired_once=_request_sys3_fired_once,
+                        _request_sys3_prev_justification=_request_sys3_prev_justification,
+                        _stable_conv_fp=_stable_conv_fp,
+                        _stream_owns_unregister=_stream_owns_unregister,
+                        _turn_reg=_turn_reg,
+                        _user_batch_intent=_user_batch_intent,
+                        _verdict_is_fresh=_verdict_is_fresh,
+                        _verifier_verdict_cache=_verifier_verdict_cache,
+                        _vr=_frame.get('_vr'),
+                        active_persona=active_persona,
+                        body=body,
+                        char_budget=char_budget,
+                        consecutive_parse_errors=consecutive_parse_errors,
+                        context_pressure_steers=context_pressure_steers,
+                        continuity_text=continuity_text,
+                        created_time=created_time,
+                        cross_turn_repeat_hits=cross_turn_repeat_hits,
+                        current_plan_json=current_plan_json,
+                        current_trajectory_id=current_trajectory_id,
+                        effective_max_turns=effective_max_turns,
+                        executed_idempotent=executed_idempotent,
+                        execution_failure_count=execution_failure_count,
+                        fetched_context=fetched_context,
+                        final_ai_content=final_ai_content,
+                        fname=fname,
+                        force_final_response=force_final_response,
+                        force_stop=force_stop,
+                        forget_was_called=forget_was_called,
+                        has_coding_intent=has_coding_intent,
+                        is_conversational=is_conversational,
+                        is_final_generation=is_final_generation,
+                        is_meta_task=is_meta_task,
+                        last_user_content=last_user_content,
+                        last_was_failure=last_was_failure,
+                        lc=lc,
+                        messages=messages,
+                        model=model,
+                        next_action_id=_frame.get('next_action_id'),
+                        notify_steer_fired=notify_steer_fired,
+                        payload=payload,
+                        pending_promise_steer_fired=pending_promise_steer_fired,
+                        preflight_blocks_this_request=preflight_blocks_this_request,
+                        prev_turn_opening_words=prev_turn_opening_words,
+                        raw_tools_called=raw_tools_called,
+                        repair_round=repair_round,
+                        repeated_action_steered=repeated_action_steered,
+                        req_id=req_id,
+                        req_messages=req_messages,
+                        request_sandbox_state=request_sandbox_state,
+                        request_state=request_state,
+                        seen_tools=seen_tools,
+                        stream_response=stream_response,
+                        strikes=strikes,
+                        task_tree=task_tree,
+                        thinking_cap_events=thinking_cap_events,
+                        thought_content=thought_content,
+                        token=token,
+                        tool_usage=tool_usage,
+                        tools_run_this_turn=tools_run_this_turn,
+                        transient_failure_count=transient_failure_count,
+                        turn=turn,
+                        wakeup_prefix=wakeup_prefix,
+                        was_complex_task=was_complex_task,
+                    )
                     try:
-                        payload["stream"] = True
-                        # Metacog entropy over the INTERNAL upstream stream
-                        # (2026-07-27): mirror of the client-SSE tracker at
-                        # _stream_final_generation — this path previously
-                        # discarded the logprobs it now requests, leaving
-                        # the finalize calibration fallback stuck on the
-                        # neutral 0.5. One tracker per upstream turn; the
-                        # LAST turn's reading wins the stash (matches the
-                        # streamed path's "last reading of the turn wins").
-                        _turn_entropy_tracker = None
-                        if _metacog_logprobs:
-                            try:
-                                from .entropy import EntropyTracker
-                                _turn_entropy_tracker = EntropyTracker(
-                                    window=32, top_k=5)
-                            except Exception as _etix:
-                                logger.debug(
-                                    "turn entropy tracker init failed: %s",
-                                    _etix)
-                        full_content = ""
-                        reasoning_content = ""
-                        # Last non-null `finish_reason` seen on the stream.
-                        # "length" means the upstream hit its token cap and
-                        # the answer is truncated — handled after the loop.
-                        stream_finish_reason = None
-                        # True if the stream aborted mid-flight — the upstream
-                        # emitted a `data: {"error": ...}` frame (idle stall,
-                        # mid-stream break, connect failure) instead of a clean
-                        # finish. Without catching it the partial `full_content`
-                        # was finalized as if complete and fed to the verifier /
-                        # memory as the final answer (a truncated reply shipped
-                        # with no signal). Folded into the truncation handling
-                        # below so it triggers the same continuation attempt.
-                        stream_errored = False
-                        stream_error_msg = ""
-
-                        # Thinking metrics: surfaced as a single summary line
-                        # after the stream completes. We no longer print empty
-                        # `=== THINKING ===` frames; in verbose mode the live
-                        # tokens still echo to stdout.
-                        thinking_started = time.monotonic()
-                        thinking_token_count = 0
-                        thinking_line_buf = ""
-                        next_loop_probe = THINKING_LOOP_PROBE_EVERY
-                        # Cadence anchor for the tool-call-collapse probe so it
-                        # doesn't run two full-buffer regex scans on EVERY
-                        # content chunk (the TOOL_CALL_LOOP_PROBE_EVERY constant
-                        # existed but was never consulted).
-                        next_tool_probe = TOOL_CALL_LOOP_PROBE_EVERY
-
-                        # Flush-size budget for streaming thought blocks.
-                        # Reasoning models (Qwen3+) emit thinking as many
-                        # short newline-separated bullets; the old policy
-                        # of "flush on every \n" produced 40+ log events
-                        # per turn. Accumulate into ~paragraph-sized
-                        # chunks and flush only on a paragraph break
-                        # (blank line) or when the buffer crosses the
-                        # size budget. The final `_flush_thinking` at
-                        # stream end emits whatever remains.
-                        _THINK_FLUSH_CHARS = 400
-
-                        def _emit_thinking(text: str):
-                            nonlocal thinking_line_buf, thinking_token_count
-                            if not text:
-                                return
-                            thinking_token_count += 1
-                            # NOT gated on VERBOSE_MODE (operator request
-                            # 2026-07-08): thinking flows through the same
-                            # pretty_log pipeline as every other line, so
-                            # non-verbose mode shows it truncated to the
-                            # standard LOG_TRUNCATE_LIMIT while verbose
-                            # still gets the full blocks. The post-stream
-                            # summary line is unchanged either way.
-                            thinking_line_buf += text
-                            while True:
-                                # Prefer paragraph boundary (blank line)
-                                # as a flush point — it maps to a
-                                # natural thought break. Blocks are
-                                # emitted with raw newlines preserved so
-                                # multi-line reasoning stays readable in
-                                # the log viewer; the prior " | " join
-                                # made streamed bullets / code
-                                # unreadable.
-                                para_idx = thinking_line_buf.find("\n\n")
-                                if para_idx >= 0:
-                                    block = thinking_line_buf[:para_idx].strip()
-                                    thinking_line_buf = thinking_line_buf[para_idx + 2:]
-                                    if block:
-                                        pretty_log("thinking", block, icon=Icons.BRAIN_THINK, level="DEBUG", no_truncate=True)
-                                    continue
-                                # No paragraph boundary yet — flush only
-                                # when the buffer exceeds the budget,
-                                # and cut at the last `\n` so we don't
-                                # split mid-sentence.
-                                if len(thinking_line_buf) >= _THINK_FLUSH_CHARS:
-                                    last_nl = thinking_line_buf.rfind("\n")
-                                    if last_nl <= 0:
-                                        # No newline inside the buffer —
-                                        # single runaway token stream.
-                                        # Flush the whole thing; the next
-                                        # chunk starts fresh.
-                                        block = thinking_line_buf.strip()
-                                        thinking_line_buf = ""
-                                    else:
-                                        block = thinking_line_buf[:last_nl].strip()
-                                        thinking_line_buf = thinking_line_buf[last_nl + 1:]
-                                    if block:
-                                        pretty_log("thinking", block, icon=Icons.BRAIN_THINK, level="DEBUG", no_truncate=True)
-                                    continue
-                                break
-
-                        def _flush_thinking():
-                            nonlocal thinking_line_buf
-                            if thinking_line_buf:
-                                if thinking_line_buf.strip():
-                                    pretty_log("thinking", thinking_line_buf.strip(), icon=Icons.BRAIN_THINK, level="DEBUG", no_truncate=True)
-                                thinking_line_buf = ""
-
-                        stop_printing = False
-
-                        async for chunk in self.context.llm_client.stream_chat_completion(payload, use_coding=has_coding_intent):
-                            self.context.last_activity_time = datetime.datetime.now() # Heartbeat to prevent Hippocampus from waking up
-                            try:
-                                chunk_str = chunk.decode("utf-8")
-                                if chunk_str.startswith("data: ") and chunk_str.strip() != "data: [DONE]":
-                                    chunk_data = json.loads(chunk_str[6:])
-                                    # Metacog: pipe top-logprobs into the
-                                    # entropy tracker (same contract as the
-                                    # client-SSE path — a malformed logprobs
-                                    # payload only skips that chunk).
-                                    if _turn_entropy_tracker is not None:
-                                        try:
-                                            from .entropy import extract_top_logprobs
-                                            _tlp = extract_top_logprobs(chunk_data)
-                                            if _tlp:
-                                                _turn_entropy_tracker.observe(_tlp)
-                                        except Exception as _etox:
-                                            logger.debug(
-                                                "entropy observe failed: %s",
-                                                _etox)
-                                    # Upstream abort frame (idle stall / mid-stream
-                                    # break / connect failure) — has an "error"
-                                    # key, no "choices". Previously fell through
-                                    # this `if "choices"` and was silently dropped,
-                                    # so a half-generated reply finalized as if it
-                                    # were complete. Record it so the truncation
-                                    # path treats the turn as cut off.
-                                    if "error" in chunk_data and "choices" not in chunk_data:
-                                        stream_errored = True
-                                        stream_error_msg = str(chunk_data.get("error"))[:200]
-                                        # A future upstream may tighten the
-                                        # logprobs guard to the native
-                                        # n_probs field too — that must cost
-                                        # ONE generation, not every one.
-                                        # Flag it so request_logprobs falls
-                                        # back to the no-tools-only gate for
-                                        # the rest of the session.
-                                        if ("n_probs" in payload
-                                                and "logprob" in stream_error_msg.lower()):
-                                            self.context._nprobs_rejected = True
-                                            pretty_log(
-                                                "Entropy Probe",
-                                                "upstream rejected the native n_probs "
-                                                "logprobs sidestep — disabled for this "
-                                                "session (GHOST_ENTROPY_TOOLS_NPROBS=0 "
-                                                "to silence permanently)",
-                                                level="WARNING", icon=Icons.WARN,
-                                            )
-                                        pretty_log(
-                                            "Stream Aborted",
-                                            f"Upstream aborted the stream mid-answer: "
-                                            f"{stream_error_msg} — treating the partial "
-                                            f"reply as truncated.",
-                                            level="WARNING", icon=Icons.WARN,
-                                        )
-                                    if "choices" in chunk_data and len(chunk_data["choices"]) > 0:
-                                        delta = chunk_data["choices"][0].get("delta", {})
-                                        _fr = chunk_data["choices"][0].get("finish_reason")
-                                        if _fr:
-                                            stream_finish_reason = _fr
-
-                                        if "reasoning_content" in delta and delta["reasoning_content"] is not None:
-                                            r_token = delta["reasoning_content"]
-                                            reasoning_content += r_token
-                                            if not stop_printing:
-                                                if _tail_has_stop_marker(reasoning_content, r_token):
-                                                    stop_printing = True
-                                                if not stop_printing:
-                                                    if _is_think_tag_fragment(r_token, reasoning_content):
-                                                        pass  # Cosmetic: skip printing fragmented XML tags
-                                                    else:
-                                                        clean_token = r_token.replace("<think>\n", "").replace("<think>", "")
-                                                        _emit_thinking(clean_token)
-
-                                        if "content" in delta and delta["content"] is not None:
-                                            text_chunk = delta["content"]
-                                            full_content += text_chunk
-                                            if not stop_printing:
-                                                if _tail_has_stop_marker(full_content, text_chunk):
-                                                    stop_printing = True
-                                                if not stop_printing and not reasoning_content:
-                                                    if (text_chunk.strip().lower() in ("<function", "<parameter")
-                                                            or _is_think_tag_fragment(text_chunk, full_content)):
-                                                        pass  # Cosmetic: skip printing fragmented XML tags
-                                                    else:
-                                                        clean_token = text_chunk.replace("<think>\n", "").replace("<think>", "")
-                                                        _emit_thinking(clean_token)
-
-                                            # Tool-call generation-collapse detector.
-                                            # Specialised fail-fast probe for the
-                                            # `<tool_call>`-spam shape (see the
-                                            # 8135-openings-in-97k-chars production
-                                            # trace). Fires after ~10 unclosed opens
-                                            # — typically within 1-3 seconds of the
-                                            # decoder entering the loop, versus the
-                                            # 300+ seconds it used to take to hit
-                                            # max_tokens. The generic n-gram
-                                            # thinking-loop detector above eventually
-                                            # catches this too, but only after
-                                            # ~600 chars of repetition.
-                                            if len(full_content) >= next_tool_probe:
-                                                next_tool_probe = len(full_content) + TOOL_CALL_LOOP_PROBE_EVERY
-                                                if _detect_tool_call_loop(full_content):
-                                                    thinking_loop_detected = True
-                                                    _opens = len(re.findall(r'<tool_call\b', full_content, re.IGNORECASE))
-                                                    _closes = len(re.findall(r'</tool_call\b', full_content, re.IGNORECASE))
-                                                    pretty_log(
-                                                        "Tool-Call Loop",
-                                                        f"Decoder collapse: {_opens} <tool_call> opens vs {_closes} closes "
-                                                        f"at {len(full_content)} chars. Aborting stream.",
-                                                        level="WARNING", icon=Icons.STOP,
-                                                    )
-                                                    break
-
-                                        # --- Streaming sanity guards ---
-                                        # Two failure modes to catch: (a) the model
-                                        # produces an unbounded amount of thinking
-                                        # without ever closing </think>, (b) it
-                                        # falls into a self-repeating paragraph
-                                        # loop. Both manifest as a runaway buffer
-                                        # with no tool call.
-                                        guard_buf = reasoning_content if reasoning_content else full_content
-                                        # Self-play can install a tighter cap via
-                                        # `max_thinking_chars_override` on the
-                                        # GhostAgent instance (we know the
-                                        # simulation is bounded and can't afford
-                                        # 32k chars of wasted introspection).
-                                        # Progressive thinking budget: start at 32K, but
-                                        # if the model is producing diverse content (no
-                                        # n-gram repetition at the initial cap), extend
-                                        # to 64K. This lets complex algorithmic reasoning
-                                        # and multi-step debugging breathe while still
-                                        # killing genuine loops.
-                                        override_cap = getattr(self, "max_thinking_chars_override", None)
-                                        # base cap (MAX_THINKING_CHARS) is now implicit:
-                                        # the periodic loop probe runs at all sizes, so a
-                                        # loop is caught before base regardless; only the
-                                        # extended hard cap needs an explicit length gate.
-                                        extended_cap = override_cap or MAX_THINKING_CHARS_EXTENDED
-
-                                        # Hard cap: past the extended budget, abort
-                                        # regardless (a cheap length check).
-                                        if len(guard_buf) > extended_cap:
-                                            thinking_loop_detected = True
-                                            pretty_log("Thinking Cap", f"Stream exceeded extended cap ({extended_cap} chars). Aborting turn.", level="WARNING", icon=Icons.STOP)
-                                            break
-
-                                        # The n-gram repetition detector is O(buffer)
-                                        # (`buf.count(tail)` over up to 64K chars). The
-                                        # old code ran it PER TOKEN once thinking passed
-                                        # base_cap (32K) — the dominant CPU cost of a long
-                                        # thinking stream — because that boundary branch
-                                        # ignored the `next_loop_probe` cadence. Run it
-                                        # ONCE per THINKING_LOOP_PROBE_EVERY chars at ALL
-                                        # sizes: early loops (below 32K) are still caught
-                                        # within 500 chars, and in the 32-64K window a
-                                        # clean probe implicitly allows the extension —
-                                        # the separate per-token boundary check is gone.
-                                        if len(guard_buf) >= next_loop_probe:
-                                            next_loop_probe = len(guard_buf) + THINKING_LOOP_PROBE_EVERY
-                                            # § finalize/stream R1 B-3: the
-                                            # full_content fallback exists for
-                                            # INLINE-think models (reasoning
-                                            # arrives as a <think> block in
-                                            # content), yet it probed ALL
-                                            # content — tool-call BODIES and
-                                            # plain no-think answers repeat
-                                            # units legitimately (30 identical
-                                            # JSON fixture rows in a file
-                                            # write, a zero-matrix dump the
-                                            # user asked for) and were aborted
-                                            # as a "thinking loop", content
-                                            # discarded + a fake failure
-                                            # strike. Probe the content
-                                            # channel only INSIDE an open
-                                            # inline <think> block — the case
-                                            # the fallback was built for. The
-                                            # tool-call-collapse probe owns
-                                            # tool degeneracies, and the
-                                            # extended hard cap + upstream
-                                            # max_tokens still bound plain-
-                                            # content runaway.
-                                            _probe_ok = True
-                                            if not reasoning_content:
-                                                # R2 M2/M3: shared mention-
-                                                # aware / closer-prefix gate.
-                                                _probe_ok = _inline_think_open(
-                                                    full_content)
-                                            if _probe_ok and _detect_thinking_loop(guard_buf):
-                                                thinking_loop_detected = True
-                                                pretty_log("Thinking Loop", f"Detected n-gram repetition at {len(guard_buf)} chars. Aborting turn.", level="WARNING", icon=Icons.STOP)
-                                                break
-                                            # Paraphrase loops (verbatim
-                                            # paragraphs with varied filler
-                                            # between) dodge the exact-tail
-                                            # n-gram probe for tens of KB —
-                                            # req f59a793d ran to 19.5K chars.
-                                            # Whole-line repetition fires much
-                                            # earlier. THINKING channel only:
-                                            # generated code/data repeats
-                                            # lines legitimately.
-                                            if reasoning_content and _detect_paragraph_loop(reasoning_content):
-                                                thinking_loop_detected = True
-                                                pretty_log("Thinking Loop", f"Detected repeated-paragraph loop at {len(reasoning_content)} chars. Aborting turn.", level="WARNING", icon=Icons.STOP)
-                                                break
-
-                                        if "tool_calls" in delta and delta["tool_calls"]:
-                                            if not msg.get("tool_calls"):
-                                                msg["tool_calls"] = []
-                                            for tc_chunk in delta["tool_calls"]:
-                                                idx = tc_chunk.get("index", 0)
-                                                while len(msg["tool_calls"]) <= idx:
-                                                    msg["tool_calls"].append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
-
-                                                if tc_chunk.get("id"):
-                                                    msg["tool_calls"][idx]["id"] = tc_chunk["id"]
-                                                if tc_chunk.get("function"):
-                                                    fn_chunk = tc_chunk["function"]
-                                                    if fn_chunk.get("name"):
-                                                        msg["tool_calls"][idx]["function"]["name"] += fn_chunk["name"]
-                                                    if fn_chunk.get("arguments"):
-                                                        msg["tool_calls"][idx]["function"]["arguments"] += fn_chunk["arguments"]
-
-                                            # NATIVE tool-call flood guard. The
-                                            # `_detect_tool_call_loop` probe above
-                                            # watches `full_content` for unclosed
-                                            # `<tool_call>` tags and is blind here:
-                                            # in native mode the calls never touch
-                                            # the content buffer, so a collapsed
-                                            # decoder ran to max_tokens with every
-                                            # stream guard reporting a healthy
-                                            # stream (three production floods —
-                                            # 960/817/629 calls, ~5 min each). This
-                                            # is the only probe on that channel;
-                                            # it runs where the list actually grows.
-                                            if _detect_native_tool_call_flood(msg["tool_calls"]):
-                                                thinking_loop_detected = True
-                                                tool_call_flood_detected = True
-                                                _flood_n = len(msg["tool_calls"])
-                                                # [-2:][0] = the newest COMPLETED
-                                                # entry (the last is still
-                                                # streaming its arguments), and
-                                                # total for any non-empty list —
-                                                # a log line must not be able to
-                                                # IndexError if a threshold moves.
-                                                _flood_id = _native_call_identity(
-                                                    msg["tool_calls"][-2:][0])
-                                                pretty_log(
-                                                    "Tool-Call Flood",
-                                                    f"Native decoder collapse: {_flood_n} "
-                                                    f"tool_call(s) in one message "
-                                                    f"(latest: {_flood_id[0] or '?'}"
-                                                    f"{' · ' + _flood_id[1][:60] if _flood_id[1] else ''}). "
-                                                    "Aborting stream before dispatch.",
-                                                    level="WARNING", icon=Icons.STOP,
-                                                )
-                                                break
-                            except Exception as e:
-                                logger.debug(f"XML Tool parse text stream chunk error: {type(e).__name__}")
-
-                        _flush_thinking()
-                        # Stash this turn's entropy reading for the finalize
-                        # calibration record (req-id-tagged like the streamed
-                        # path's _calib_pending). Only when tokens were
-                        # actually observed — an empty window keeps the
-                        # neutral-0.5 fallback semantics.
-                        if _turn_entropy_tracker is not None:
-                            try:
-                                _te_reading = _turn_entropy_tracker.reading()
-                                if (_te_reading is not None
-                                        and getattr(_te_reading, "n", 0) > 0):
-                                    self.context.last_entropy_reading = _te_reading
-                                    self.context._entropy_norm_pending = (
-                                        req_id, float(_te_reading.norm))
-                            except Exception as _terx:
-                                logger.debug(
-                                    "entropy reading stash failed: %s", _terx)
-                        thinking_duration = time.monotonic() - thinking_started
-                        if thinking_token_count > 0 or reasoning_content or full_content:
-                            reasoning_chars = len(reasoning_content)
-                            content_chars = len(full_content)
-                            # Show reasoning and content sizes separately. The
-                            # previous `{thinking_token_count} tokens · {chars}
-                            # chars` form conflated the reasoning-channel token
-                            # count (e.g. 143) with TOTAL chars across both
-                            # channels (e.g. 48821), producing a misleading
-                            # 341-chars-per-token ratio in the log that looked
-                            # like a degenerate generation when in fact it was
-                            # just a long `execute` tool_call body.
-                            pretty_log(
-                                "thought",
-                                f"reasoning: {thinking_token_count} tokens / {reasoning_chars} chars "
-                                f"| content: {content_chars} chars "
-                                f"| {thinking_duration:.1f}s",
-                                icon=Icons.BRAIN_SUM,
-                            )
-
-                        # --- TRUNCATED-ANSWER AUTO-CONTINUATION ---
-                        # If the upstream stopped a *text* answer at its
-                        # token cap (`finish_reason == "length"`), the partial
-                        # reply would be shipped mid-sentence and the verifier
-                        # correctly REFUTES it. Continue the generation from
-                        # where it stopped — bounded by
-                        # MAX_TRUNCATION_CONTINUATIONS — so the model can
-                        # finish the thought and answer any explicit question.
-                        # Skip when a tool call is in flight (those turns are
-                        # handled by the parse/retry path, not user-facing
-                        # prose) or when the model emitted no visible content.
-                        _truncated_text_turn = (
-                            (stream_finish_reason == "length" or stream_errored)
-                            and bool(full_content.strip())
-                            and not msg.get("tool_calls")
-                            and "<tool_call" not in full_content.lower()
-                            and "<function" not in full_content.lower()
-                        )
-                        _continue_tries = 0
-                        while (
-                            _truncated_text_turn
-                            and _continue_tries < MAX_TRUNCATION_CONTINUATIONS
-                        ):
-                            _continue_tries += 1
-                            pretty_log(
-                                "Truncated Output",
-                                (("Stream aborted mid-answer" if stream_errored
-                                  else "Upstream stopped at token cap mid-answer")
-                                 + "; continuing "
-                                 f"({_continue_tries}/{MAX_TRUNCATION_CONTINUATIONS})."),
-                                level="WARNING", icon=Icons.WARN,
-                            )
-                            cont_messages = list(req_messages) + [
-                                {"role": "assistant", "content": full_content},
-                                {"role": "user", "content": (
-                                    "Your previous reply was cut off before it "
-                                    "finished. Continue it from exactly where it "
-                                    "stopped — do NOT repeat anything you already "
-                                    "wrote, do NOT restate the question, just emit "
-                                    "the next characters and finish the answer."
-                                )},
-                            ]
-                            cont_payload = {
-                                **payload,
-                                "messages": cont_messages,
-                                "stream": False,
-                            }
-                            # Plain-text continuation: never invite a tool call.
-                            cont_payload.pop("tools", None)
-                            cont_payload.pop("tool_choice", None)
-                            cont_payload.pop("parallel_tool_calls", None)
-                            stream_finish_reason = None
-                            try:
-                                cont_result = await self.context.llm_client.chat_completion(cont_payload)
-                                cont_choice = (cont_result or {}).get("choices", [{}])[0]
-                                cont_text = (cont_choice.get("message", {}) or {}).get("content", "") or ""
-                                stream_finish_reason = cont_choice.get("finish_reason")
-                                # A continuation may re-open its own <think>
-                                # prelude; strip it so only answer prose is
-                                # appended to the user-facing content.
-                                cont_text = re.sub(
-                                    r'<think>.*?(?:</think>|$)', '',
-                                    cont_text, flags=re.DOTALL | re.IGNORECASE,
-                                )
-                                if not cont_text.strip():
-                                    break
-                                # Bridge with a space only when the seam would
-                                # otherwise weld two words together; mid-token
-                                # cuts are continued without a gap.
-                                if full_content and not full_content[-1].isspace() and not cont_text[:1].isspace():
-                                    full_content += cont_text if cont_text[:1] in ",.;:!?)]}\"'" else " " + cont_text
-                                else:
-                                    full_content += cont_text
-                            except Exception as exc:
-                                logger.warning("Truncation continuation failed: %s", exc)
-                                break
-                            _truncated_text_turn = stream_finish_reason == "length"
-
-                        merged_content = full_content
-                        if reasoning_content:
-                            merged_content = f"<think>\n{reasoning_content}\n</think>\n" + full_content
-
-                        # --- CROSS-TURN REPETITION GUARD (STREAMING) ---
-                        # Intra-stream loop detection only sees one turn.
-                        # This compares the first 300 chars of this
-                        # turn's reasoning to the prior turn's; two
-                        # consecutive hits at Jaccard ≥ 0.7 means the
-                        # solver is re-entering the same derivation
-                        # across turns and no retry will unstick it.
-                        # Must run BEFORE the <think> strip below,
-                        # otherwise the opening is already gone.
-                        _stream_first_think_match = re.search(
-                            r'<think>(.*?)(?:</think>|$)',
-                            merged_content, flags=re.DOTALL | re.IGNORECASE,
-                        )
-                        _stream_first_think = (
-                            _stream_first_think_match.group(1).strip()
-                            if _stream_first_think_match else reasoning_content[:300]
-                        )
-                        _stream_opening_words = self._opening_word_set(_stream_first_think)
-                        if len(_stream_opening_words) >= 8 and prev_turn_opening_words:
-                            _inter = _stream_opening_words & prev_turn_opening_words
-                            _uni = _stream_opening_words | prev_turn_opening_words
-                            _jac = len(_inter) / len(_uni) if _uni else 0.0
-                            # 0.85 (was 0.7): focused iterative work — refining
-                            # the same function, debugging the same test — opens
-                            # consecutive turns with naturally overlapping (~0.7)
-                            # vocabulary. Only near-identical (~0.85+) openings
-                            # indicate an actual restart-the-same-derivation loop.
-                            if _jac >= 0.85:
-                                cross_turn_repeat_hits += 1
-                                pretty_log(
-                                    "Cross-Turn Repetition",
-                                    f"Turn opening overlaps prior turn by {_jac:.0%} (hit {cross_turn_repeat_hits}/2).",
-                                    level="WARNING", icon=Icons.WARN,
-                                )
-                                if cross_turn_repeat_hits >= 2:
-                                    pretty_log(
-                                        "Loop Breaker",
-                                        "Cross-turn repetition loop — aborting attempt.",
-                                        level="WARNING", icon=Icons.STOP,
-                                    )
-                                    final_ai_content = (
-                                        "[ATTEMPT_ABORTED_CROSS_TURN_LOOP] The solver opened "
-                                        "three consecutive turns with near-identical reasoning "
-                                        f"(Jaccard {_jac:.0%}). Further retries would repeat "
-                                        "the same derivation. Stopping."
-                                    )
-                                    force_stop = True
-                                    prev_turn_opening_words = _stream_opening_words
-                                    break
-                            else:
-                                cross_turn_repeat_hits = 0
-                        prev_turn_opening_words = _stream_opening_words
-
-                        # CRITICAL FIX: Strip <think> blocks from permanent history to prevent cognitive looping
-                        clean_msg_content = _strip_think_blocks(merged_content).strip()
-                        msg["content"] = clean_msg_content
-
-                        if thinking_loop_detected:
-                            # Discard the runaway thinking entirely so it can't
-                            # poison the next turn, and inject a hard reset
-                            # message instead of letting the empty assistant
-                            # turn fall through normal parsing.
-                            msg["content"] = ""
-                            msg["tool_calls"] = []
-                            execution_failure_count += 1
-                            thinking_cap_events += 1
-                            messages.append({"role": "assistant", "content": (
-                                "[Tool-call generation aborted: a runaway burst of tool "
-                                "calls was discarded unrun.]" if tool_call_flood_detected
-                                else "[Internal thinking aborted: runaway loop detected.]")})
-                            # Escalation: on the SECOND cap/loop event in
-                            # the same attempt, stop retrying. The solver
-                            # is stuck in a self-consistent but unwinnable
-                            # derivation (e.g. "split('\\n') on '' can't
-                            # return []") — no amount of "stop re-deriving"
-                            # reminders will unstick it. Force-stop and let
-                            # the caller surface the failure. First event
-                            # still gets the old retry path so normal
-                            # one-off over-thinking is recoverable.
-                            if thinking_cap_events >= 2:
-                                pretty_log(
-                                    "Loop Breaker",
-                                    f"Thinking cap hit {thinking_cap_events}x in one attempt — aborting.",
-                                    level="WARNING", icon=Icons.STOP,
-                                )
-                                final_ai_content = (
-                                    "[ATTEMPT_ABORTED_THINKING_LOOP] The solver hit the thinking "
-                                    f"cap {thinking_cap_events} times in this attempt without "
-                                    "producing a tool call. Further retries would re-enter the "
-                                    "same derivation. Stopping."
-                                )
-                                force_stop = True
-                                break
-                            # ONE append, TWO texts. The thinking-loop alert
-                            # tells the model to answer with ONE grounding tool
-                            # call — the exact instruction a flood already
-                            # over-obeyed, so a flood gets its own steer: the
-                            # problem was the REPEAT, not the tool. Selecting
-                            # the text (rather than branching the append and
-                            # the strike cap below) keeps both shapes on one
-                            # recovery path, so a later edit cannot fix one and
-                            # leave the other behind.
-                            _loop_steer = (
-                                "SYSTEM ALERT: Your previous turn emitted a runaway burst of "
-                                "tool calls and was killed before any of them ran. "
-                                "NOTHING executed and nothing changed — do not assume any of "
-                                "that work happened. Emit ONE tool call now, then STOP and "
-                                "wait for its result before deciding anything else. If you "
-                                "were quoting a rule about tool calls, do not quote the "
-                                "`<tool_call>` syntax — just make the call. Do not write a "
-                                "long <think> block."
-                            ) if tool_call_flood_detected else "SYSTEM ALERT: Your previous turn entered a self-repeating thinking loop and was killed. STOP re-deriving the same paragraph. Do NOT resume hypothesizing from memory — a killed loop means your mental model is missing a fact only OBSERVATION can supply. Your next output must be ONE grounding tool call: execute the code, load the page in the browser, or re-read the exact error/output you are reasoning about — then base the next step on what it returns. If a self-generated test assertion disagrees with your function's output, the TEST is likely wrong — re-read the spec and fix the assertion before changing the function. If you have ALREADY proven the task cannot be solved as specified (e.g. the validator has a structural bug), call `abort_attempt` now with a specific reason. Do not write a long <think> block."
-                            messages.append({"role": "user", "content": _loop_steer})
-                            if execution_failure_count >= 6:
-                                pretty_log("Think-Loop Halt", "Forcing final response after repeated thinking loops", icon=Icons.STOP, level="WARNING")
-                                force_final_response = True
-                            continue
-                    except (httpx.ConnectError, httpx.ConnectTimeout):
-                        final_ai_content = "CRITICAL: The upstream LLM server is unreachable. It may have crashed due to memory pressure or is currently restarting. Please wait a moment and try again."
-                        pretty_log("System Fault", "Upstream server unreachable", level="ERROR", icon=Icons.FAIL)
-                        force_stop = True
+                        _flow = await self._run_internal_turn(_its)
+                    finally:
+                        _forced_final_retry_used = _its._forced_final_retry_used
+                        _meta_nudge_fired = _its._meta_nudge_fired
+                        _repair_reentry_active = _its._repair_reentry_active
+                        _verdict_is_fresh = _its._verdict_is_fresh
+                        _verifier_verdict_cache = _its._verifier_verdict_cache
+                        _vr = _its._vr
+                        cross_turn_repeat_hits = _its.cross_turn_repeat_hits
+                        execution_failure_count = _its.execution_failure_count
+                        final_ai_content = _its.final_ai_content
+                        force_final_response = _its.force_final_response
+                        force_stop = _its.force_stop
+                        messages = _its.messages
+                        msg = _its.msg
+                        notify_steer_fired = _its.notify_steer_fired
+                        parse_failure_reason = _its.parse_failure_reason
+                        pending_promise_steer_fired = _its.pending_promise_steer_fired
+                        prev_turn_opening_words = _its.prev_turn_opening_words
+                        repair_round = _its.repair_round
+                        thinking_cap_events = _its.thinking_cap_events
+                        tool_calls = _its.tool_calls
+                        ui_content = _its.ui_content
+                    if _flow == "continue":
+                        continue
+                    if _flow == "break":
                         break
-                    except httpx.HTTPStatusError as e:
-                        if e.response.status_code == 400 and "context" in e.response.text.lower():
-                            pretty_log("Context Overflow", "Emergency pruning triggered...", icon=Icons.WARN)
-                            # Emergency Prune: Keep System + Last User + 1 Last Tool Result (Truncated)
-                            system_msgs = [m for m in req_messages if m.get("role") == "system"]
-
-                            def _is_volatile_block(m) -> bool:
-                                """The synthetic per-turn `<system_state_update>`
-                                message `_compose_injection` appends. It is
-                                timestamp/plan bookkeeping, never the thing the
-                                model was working on, so recovery must not
-                                mistake it for the last real user message."""
-                                c = m.get("content")
-                                return (isinstance(c, str)
-                                        and c.lstrip().startswith("<system_state_update>"))
-
-                            # Prefer the last SUBSTANTIVE user message. Under the
-                            # pin the trailing message is always the volatile
-                            # block (2026-09-04: it is now appended on every
-                            # branch, where it previously rode the tool result on
-                            # one of three), and recovering with only that block
-                            # would retry against bookkeeping instead of evidence.
-                            # Fall back to it if there is genuinely nothing else.
-                            _users = [m for m in reversed(req_messages)
-                                      if m.get("role") == "user"]
-                            last_user = next(
-                                (m for m in _users if not _is_volatile_block(m)),
-                                next(iter(_users), None))
-
-                            recovery_msgs = list(system_msgs)
-                            if last_user:
-                                safe_user = last_user.copy()
-                                if isinstance(safe_user.get("content"), str) and len(safe_user["content"]) > 10000:
-                                    safe_user["content"] = safe_user["content"][:10000] + "\n... [EMERGENCY TRUNCATION] ..."
-                                recovery_msgs.append(safe_user)
-
-                            # If the last thing was a tool output that caused the overflow, keep it but heavily truncated.
-                            # Walk back to the last *real* tool entry — a synthetic
-                            # agent-loop error (parse-error nudge, etc.) is not real
-                            # prior tool output and pretending it is leads the recovery
-                            # retry to plan against fabricated evidence. Also strip
-                            # internal-tracking keys (`_synthetic`) before forwarding
-                            # upstream so the LLM payload stays clean OpenAI-shape.
-                            # ACTION view first (§4BC round 2): recovery
-                            # must retry against the output the model was
-                            # actually working from, not a trailing status
-                            # listing; evidence view fills in only when the
-                            # turn was bookkeeping-only.
-                            real_tool = (_find_substantive_tool_for_verifier(
-                                tools_run_this_turn,
-                                include_informational_bookkeeping=False)
-                                or _find_substantive_tool_for_verifier(
-                                    tools_run_this_turn))
-                            if real_tool is not None:
-                                # Wrap as a <tool_response> user message — the
-                                # same translation the main request path applies.
-                                # A raw orphan role:"tool" message (no preceding
-                                # assistant tool_calls) is rejected by strict
-                                # chat templates, turning a recoverable overflow
-                                # into a hard failure.
-                                _rt_content = str(real_tool.get("content", ""))[:1000] + "\n... [EMERGENCY TRUNCATION] ..."
-                                recovery_msgs.append({
-                                    "role": "user",
-                                    "content": (
-                                        f"<tool_response name=\"{real_tool.get('name', 'unknown')}\">\n"
-                                        f"{_rt_content}\n</tool_response>"
-                                    ),
-                                })
-
-                            recovery_msgs.append({"role": "user", "content": "SYSTEM ALERT: The conversation history was truncated to fit within context limits. Continue task. Assume previous context has been handled."})
-
-                            # RETRY ONCE with pruned context. `stream` MUST
-                            # be off: the turn loop sets payload["stream"]=True
-                            # every iteration, and chat_completion is the
-                            # non-streaming API — reusing the flag made the
-                            # upstream answer the recovery with SSE frames
-                            # that parsed as "non-JSON body" and killed the
-                            # turn (2026-07-18, xrick feasibility session).
-                            try:
-                                payload["messages"] = recovery_msgs
-                                payload["stream"] = False
-                                messages = recovery_msgs
-                                data = await self.context.llm_client.chat_completion(payload, use_coding=has_coding_intent)
-                                if "choices" in data and len(data["choices"]) > 0:
-                                    msg = data["choices"][0]["message"]
-                            except Exception as retry_e:
-                                # Surface a calm, actionable message instead of a
-                                # raw CRITICAL/traceback. The task state is intact;
-                                # the inputs were just too large to read whole.
-                                logger.error("Context overflow recovery failed: %s", retry_e)
-                                final_ai_content = (
-                                    "I hit my context limit while gathering data for this step — "
-                                    "the inputs were too large to read all at once, and the automatic "
-                                    "recovery didn't complete. Nothing is lost: the task and its files "
-                                    "are preserved. Ask me to retry the step and I'll process the large "
-                                    "files with a script (summarising them) instead of reading them whole."
-                                )
-                                force_stop = True
-                                break
-                        else:
-                            final_ai_content = f"CRITICAL: Upstream error {e.response.status_code}: {e.response.text}"
-                            pretty_log("System Fault", f"HTTP {e.response.status_code}", level="ERROR", icon=Icons.FAIL)
-                            force_stop = True
-                            break
-                    except Exception as e:
-                        final_ai_content = f"CRITICAL: An unexpected error occurred while communicating with the LLM: {str(e)}"
-                        pretty_log("System Fault", str(e), level="ERROR", icon=Icons.FAIL)
-                        force_stop = True
-                        break
-
-                    content = msg.get("content") or ""
-
-                    # Merge upstream reasoning_content if present (some models return it as a separate field)
-                    if msg.get("reasoning_content"):
-                        content = f"<think>\n{msg.get('reasoning_content')}\n</think>\n" + content
-
-                    tool_calls, ui_content, parse_failure_reason = self._parse_assistant_tool_calls(content, msg)
-
-                    ui_content = _strip_think_blocks(ui_content).strip()
-
-                    # --- HALLUCINATION & LEAK SCRUBBERS ---
-                    if ui_content:
-                        # 1. Hard Truncation for System Prompt Bleed
-                        # Shared strong/weak bleed helper (§ R1 A-F3) — same
-                        # rules as the finalize twin so the two sites cannot
-                        # drift (the wrapper-split lesson).
-                        ui_content = _truncate_prompt_bleed(ui_content)
-
-                        # 2. Regex scrubbers for XML and Execution Artifacts
-                        ui_content = re.sub(r'<tool_response>.*?(?:</tool_response>|$)', '', ui_content, flags=re.DOTALL | re.IGNORECASE)
-                        ui_content = re.sub(r'--- EXECUTION RESULT ---.*?(?:------------------------|$)', '', ui_content, flags=re.DOTALL)
-
-                        # 3. Task Tree Regurgitation Scrubbers
-                        # Old pattern was `^\s*(?: )\s*\[.*?\].*?\n?` which
-                        # stripped any indented `[label]` prefix — that
-                        # mangled legitimate indented markdown links
-                        # ('  [docs](https://x)' → '(https://x)'). Tightened
-                        # to require a task-shape token inside the
-                        # brackets (a `task_NN` id or one of the status
-                        # keywords) so markdown links survive.
-                        ui_content = re.sub(r'(?m)^\s*\[(?:task_\d+|IN_PROGRESS|READY|PENDING|DONE|FAILED|BLOCKED)\b[^\]]*\].*?\n?', '', ui_content)
-                        ui_content = _scrub_task_status_runs(ui_content)  # § R1 A-F3
-                        ui_content = re.sub(r'(?m)^\s*(?:\[)?task_\d+(?:\])?\s*\n?', '', ui_content)
-                        ui_content = re.sub(r'(?m)^\s*(?:FOCUS TASK|ACTIVE STRATEGY & PLAN|PLAN|THOUGHT):\s*', '', ui_content)
-
-                        ui_content = ui_content.strip()
-
-                    # CRITICAL: Preserve the raw XML tags in the assistant's internal message context so it remembers!
-                    # BUT STRIP <think> blocks to prevent cognitive looping!
-                    clean_content_for_history = _strip_think_blocks(content).strip()
-                    # …EXCEPT when the XML failed to parse: replaying the
-                    # broken bytes teaches the model to copy its own
-                    # mistake on every retry (req 65d8cf76 looped 5x on a
-                    # one-character lesion this way). Replace the failed
-                    # block(s) with a constant-size note; the parsed calls
-                    # (if any) live on in msg["tool_calls"] and their
-                    # results in the following tool messages. Gate on an
-                    # ACTUAL failed block — not on parse_failure_reason
-                    # alone: "truncated" is stamped by pre-parse counting
-                    # and can accompany a fully parsed+executed call, and
-                    # scrubbing that would ask the model to re-run a
-                    # mutation that already succeeded. The gate also
-                    # guarantees the note's "SYSTEM ERROR below" promise:
-                    # the recovery hint only fires for system_parse_error
-                    # entries.
-                    if parse_failure_reason and any(
-                        (tc.get("function") or {}).get("name") == "system_parse_error"
-                        for tc in tool_calls
-                    ):
-                        clean_content_for_history = _scrub_unparsed_tool_call_text(
-                            clean_content_for_history, parse_failure_reason,
-                        )
-                    msg["content"] = clean_content_for_history
-                    msg["tool_calls"] = tool_calls
-
-                    # Defense-in-depth for terminal tools and other cases
-                    # where an earlier step set `force_final_response`. The
-                    # turn was promised to be text-only, but the model can
-                    # still emit a `<tool_call>` — especially after a
-                    # terminal tool like `self_play` whose result text
-                    # ("DO NOT call ... again") is buried inside a
-                    # `<tool_response>` block and loses to the strong
-                    # system-prompt directive above it. Drop those
-                    # hallucinated tool_calls so the loop converges.
-                    # ⚠ GATED ON `is_final_generation`, NOT `force_final_response`
-                    # (2026-09-04). Those differ: `is_final_generation` is
-                    # `force_final_response OR required_tool == "none"`, so a
-                    # planner that signalled only through `required_tool` reached
-                    # here with the flag unset and its tool_calls were dispatched
-                    # on a turn declared text-only. The STREAM side already used
-                    # the wider predicate (`_stream_scrub_active =
-                    # bool(is_final_generation)`), so the two halves of the same
-                    # promise disagreed. That gap became reachable the moment the
-                    # schemas stayed attached on final-generation turns (see the
-                    # payload block): the model can now see the tools it is being
-                    # told not to call, and `tool_choice:"none"` suppresses the
-                    # PARSED call but not the model emitting the XML in content
-                    # (measured: llama.cpp returns tool_calls=[] and leaves the
-                    # `<tool_call>` text in `content`, which this agent's own XML
-                    # parser then picks up). One predicate, both halves.
-                    if is_final_generation and tool_calls:
-                        dropped = [tc.get("function", {}).get("name", "?") for tc in tool_calls]
-                        logger.warning(
-                            "Dropping %d tool_call(s) — final-generation turn (names=%s)",
-                            len(tool_calls), dropped,
-                        )
-                        # HONESTY NOTE ON DROPPED MUTATIONS (2026-07-14). When
-                        # the dropped call would have CHANGED something
-                        # (file_system replace at the finish line — observed
-                        # live 2026-07-12, twice), silently eating it leaves
-                        # the reply implying the action happened. Append an
-                        # explicit not-applied note so the user (and the next
-                        # turn's context) knows the work is still pending.
-                        # Terminal-tool re-calls (self_play etc.) stay silent —
-                        # dropping those is the point of this guard.
-                        _drop_note = _dropped_mutation_note(dropped)
-                        if _drop_note:
-                            ui_content = (ui_content or "").rstrip() + _drop_note
-                        tool_calls = []
-                        msg["tool_calls"] = []
-
-                    # Reasoning-channel divergence guard. Some models (Qwen-class
-                    # reasoning variants in particular) emit `reasoning_content`
-                    # explicitly disclaiming tool use ("I can answer directly
-                    # without using any tools") AND still emit a structured
-                    # tool_call in the same response. Trust the reasoning: drop
-                    # the contradicting tool_calls and re-run the turn in
-                    # final-generation mode so the model produces prose. This
-                    # avoids the wasted strike on a tool call the model itself
-                    # said wasn't needed (e.g. spurious `knowledge_base` saves
-                    # of prose the user asked us to compose).
-                    elif tool_calls and not force_final_response:
-                        rc = locals().get("reasoning_content", "") or (msg.get("reasoning_content") or "")
-                        if rc:
-                            _NO_TOOL_DISCLAIM_PATTERNS = (
-                                r"\bwithout\s+(?:needing\s+)?(?:any\s+|using\s+|calling\s+)?tools?\b",
-                                r"\bno\s+tools?\s+(?:are\s+)?(?:needed|required|necessary)\b",
-                                r"\bdon'?t\s+need\s+(?:any\s+|to\s+(?:use|call)\s+)?tools?\b",
-                                r"\banswer\s+(?:this\s+)?directly\s+from\s+(?:my\s+)?knowledge\b",
-                                r"\bI\s+can\s+answer\s+(?:this\s+)?directly\b",
-                            )
-                            if any(re.search(p, rc, re.IGNORECASE) for p in _NO_TOOL_DISCLAIM_PATTERNS):
-                                dropped = [tc.get("function", {}).get("name", "?") for tc in tool_calls]
-                                logger.warning(
-                                    "Dropping %d tool_call(s) — reasoning channel disclaimed tools (names=%s, reasoning_head=%r)",
-                                    len(tool_calls), dropped, rc[:200],
-                                )
-                                tool_calls = []
-                                msg["tool_calls"] = []
-                                force_final_response = True
-                                # Re-run the turn in final-generation mode rather
-                                # than emitting the bad-turn message — its
-                                # think-stripped content is empty, so falling
-                                # through would surface nothing useful.
-                                continue
-
-                    # Telemetry for un-caught divergences. When BOTH channels
-                    # emit and neither drop fired, the regex set above missed
-                    # the phrasing — log a sample at debug so the pattern list
-                    # can be extended as new model phrasings appear.
-                    if tool_calls:
-                        _rc_for_log = locals().get("reasoning_content", "") or (msg.get("reasoning_content") or "")
-                        if _rc_for_log and len(_rc_for_log) > 50:
-                            logger.debug(
-                                "Dual-channel emit: reasoning_content (%d chars) + tool_calls (%d, names=%s); reasoning_head=%r",
-                                len(_rc_for_log), len(tool_calls),
-                                [tc.get("function", {}).get("name", "?") for tc in tool_calls],
-                                _rc_for_log[:120],
-                            )
-
-                    if not tool_calls:
-                        clean_ui = ui_content.strip("` \n\r")
-                        has_img_markdown = bool(re.search(r'!\[.*?\]\(.*?\)', clean_ui))
-                        # "browser" belongs here: a screenshot op returns
-                        # `DOWNLOAD: /api/download/<name>` — a legitimate
-                        # image source. Without it the guard false-positived
-                        # on a correct browser-screenshot link whenever the
-                        # DOWNLOAD line had scrolled past the 4-message
-                        # link-validation window (probe req d02db9d6: the
-                        # agent then burned a turn arguing with the alert).
-                        has_valid_image_tool = any(t in raw_tools_called for t in ["image_generation", "execute", "file_system", "browser"])
-                        has_run_tools = len(tools_run_this_turn) > 0
-
-                        # Catch a PROMISED NOTIFICATION dropped at the finish
-                        # line (req 11fe11d8): user said "notify me in slack
-                        # when you're done", the model planned the call in
-                        # reasoning, then finalized without making it. Steer
-                        # ONCE toward notify_operator; never fight a
-                        # force-finalising loop-breaker.
-                        if (clean_ui and not notify_steer_fired
-                                and not force_final_response
-                                and not is_final_generation
-                                and not force_stop
-                                and "notify_operator" not in raw_tools_called
-                                and _user_asked_for_notification(last_user_content)):
-                            notify_steer_fired = True
-                            pretty_log(
-                                "Notify Guard",
-                                "Turn ending without the notification the user "
-                                "explicitly asked for — steering to "
-                                "notify_operator (once).",
-                                level="WARNING", icon=Icons.WARN,
-                            )
-                            messages.append(msg)
-                            messages.append({
-                                "role": "user",
-                                "content": (
-                                    "SYSTEM ALERT: The user explicitly asked to "
-                                    "be NOTIFIED when this task is done, but you "
-                                    "are ending the turn without having called "
-                                    "`notify_operator`. Call `notify_operator` "
-                                    "NOW with one short line summarising the "
-                                    "outcome, then give your final response."
-                                ),
-                            })
-                            continue
-
-                        # Catch Stalled Image Mentions
-                        if has_img_markdown and not has_valid_image_tool:
-                            is_valid_final = "```" in clean_ui or bool(re.search(r'\b(SUCCESS|DONE|COMPLETE|ERROR)\b', clean_ui.upper()))
-
-                            # Validate image links to see if they are preexisting (not hallucinated)
-                            if has_img_markdown and not is_valid_final:
-                                img_links = re.findall(r'!\[.*?\]\((.*?)\)', clean_ui)
-                                history_text = str([m.get("content", "") for m in messages[-4:]])
-                                all_links_valid = len(img_links) > 0 and all(link in history_text for link in img_links)
-                                if all_links_valid:
-                                    is_valid_final = True
-
-                            if not is_valid_final:
-                                pretty_log("Agent Parser", "Caught image markdown without tool call.", level="WARNING", icon=Icons.WARN)
-                                messages.append(msg)
-                                messages.append({"role": "user", "content": "SYSTEM ALERT: You attempted to display an image using markdown `![]()` but you forgot to actually generate it! You MUST output the XML `<tool_call>` for `image_generation` NOW. DO NOT output the markdown tag until the tool successfully returns the filename."})
-                                execution_failure_count += 1
-                                continue
-
-                        # Catch Conversational Filler promising a tool call.
-                        #
-                        # Old version did a raw substring match on the tool
-                        # name, which false-positived on any casual reply
-                        # that used the word naturally — `execute` is a
-                        # common English verb, `forget` is a common English
-                        # verb, and tool phrases like `file system` /
-                        # `knowledge base` / `deep think` come up all the
-                        # time in philosophical / meta conversations. The
-                        # false positive cascaded into a full "SYSTEM ALERT:
-                        # output the XML!" injection that trapped the model
-                        # in an execute-tool-call loop even when the user
-                        # was just chatting (see 23:09 log: user asked
-                        # about consciousness, reply mentioned "structured
-                        # execution via tools", guard fired, Turn 2 tried
-                        # to call execute and truncated).
-                        #
-                        # New rule: fire only when BOTH
-                        #   (a) the tool name matches with word boundaries
-                        #       (so `executed` / `executive` / `execution`
-                        #       don't match `execute`), AND
-                        #   (b) an explicit intent marker ("I'll", "let me",
-                        #       "running", "calling", "using") sits within
-                        #       ~12 words of the tool name — casual mention
-                        #       ("execute is a common English verb") does
-                        #       not have this pattern, a real tool-promise
-                        #       ("Let me execute that now") does.
-                        if clean_ui and not force_final_response and not is_final_generation:
-                            tool_names = list(self.available_tools.keys()) if hasattr(self, 'available_tools') else []
-                            clean_ui_lower = clean_ui.lower()
-                            # Intent markers the model uses when it actually
-                            # means to run a tool. Kept narrow on purpose —
-                            # over-broad markers (e.g. "will", "can") would
-                            # reintroduce false positives on prose.
-                            _intent_pattern = re.compile(
-                                r"\b(?:i['’]?ll|i\s+will|i\s+am\s+going\s+to|"
-                                r"let\s+me|let's|gonna|"
-                                r"now\s+(?:i['’]?m\s+)?(?:running|calling|using|executing|"
-                                r"invoking|firing)|"
-                                r"running|calling|invoking|firing\s+off|executing\s+(?:the|a))\b",
-                                re.IGNORECASE,
-                            )
-                            has_intent = bool(_intent_pattern.search(clean_ui_lower))
-
-                            mentioned_tools = []
-                            if has_intent:
-                                for t in tool_names:
-                                    # Word-boundary match on both the raw
-                                    # `tool_name` and the space-separated
-                                    # form `tool name` so `file_system` is
-                                    # caught in either shape without
-                                    # matching `file` alone.
-                                    pat_underscore = rf"\b{re.escape(t)}\b"
-                                    pat_spaced = rf"\b{re.escape(t.replace('_', ' '))}\b"
-                                    if re.search(pat_underscore, clean_ui_lower) or (
-                                        "_" in t and re.search(pat_spaced, clean_ui_lower)
-                                    ):
-                                        mentioned_tools.append(t)
-
-                            if mentioned_tools and not has_run_tools:
-                                is_valid_final = "```" in clean_ui or bool(re.search(r'\b(SUCCESS|DONE|COMPLETE|ERROR)\b', clean_ui.upper()))
-                                if not is_valid_final and len(clean_ui.split()) < 100:
-                                    pretty_log("Agent Parser", f"Caught conversational filler without XML ({mentioned_tools[0]}).", level="WARNING", icon=Icons.WARN)
-                                    messages.append(msg)
-                                    messages.append({"role": "user", "content": f"SYSTEM ALERT: You provided conversational text mentioning the tool `{mentioned_tools[0]}`, but you DID NOT output the actual XML `<tool_call>` block! Do not narrate your actions. Output the XML `<tool_call>` immediately."})
-                                    execution_failure_count += 1
-                                    continue
-
-                        # TRAILING-PROMISE GUARD (2026-07-14). The filler
-                        # guard above only fires when a TOOL NAME is
-                        # mentioned; a mid-repair turn that finalized with
-                        # "…That's what's causing the error. Let me fix it."
-                        # sailed through (observed live: the reply shipped, the
-                        # fix never ran, and the user believed it had). Fire
-                        # when the reply's LAST sentence promises imminent
-                        # action after a working turn: steer ONCE to either DO
-                        # the action now or state plainly that it was NOT
-                        # done. `has_run_tools` keeps pure conversation exempt;
-                        # "let me know…" is explicitly excluded.
-                        if (clean_ui and not pending_promise_steer_fired
-                                and not force_final_response
-                                and not is_final_generation
-                                and not force_stop
-                                and has_run_tools):
-                            _last_sentence = _ends_with_action_promise(clean_ui)
-                            if _last_sentence:
-                                pending_promise_steer_fired = True
-                                pretty_log(
-                                    "Pending-Promise Guard",
-                                    f"Final reply ends promising an action "
-                                    f"({_last_sentence[:80]!r}) — steering to "
-                                    f"act-or-admit (once).",
-                                    level="WARNING", icon=Icons.WARN,
-                                )
-                                messages.append(msg)
-                                messages.append({
-                                    "role": "user",
-                                    "content": (
-                                        "SYSTEM ALERT: Your reply ENDS by "
-                                        f"promising an action ({_last_sentence[:120]!r}). "
-                                        "The turn ends when you reply — nothing "
-                                        "runs afterwards. Either output the "
-                                        "tool_call(s) and DO it NOW, or rewrite "
-                                        "your final sentence to state plainly "
-                                        "that this was NOT done and what "
-                                        "remains for the user to ask for."
-                                    ),
-                                })
-                                continue
-
-                        # Conversational fallback removed for smarter models.
-                        if not clean_ui and not force_final_response and not is_final_generation:
-                            pretty_log("Agent Parser", "Model stalled after thinking. Forcing retry.", level="WARNING", icon=Icons.WARN)
-                            messages.append(msg)
-                            messages.append({"role": "user", "content": "SYSTEM ALERT: You generated a thought process but stopped abruptly without outputting a valid XML <tool_call> or a response to the user. DO NOT STOP. If you need to use a tool, output the required XML <tool_call> block. If the task is fully complete, provide your final response to the user."})
-                            execution_failure_count += 1
-                            continue
-
-                        user_request_context = last_user_content.lower()
-                        # §4BE: an IMPERATIVE directive, not a keyword
-                        # mention. See `_has_meta_task_directive` for the
-                        # measurement that forced this (59/59 false
-                        # positives; the nudge's own text asserts the user
-                        # gave instructions, so a keyword match made it a
-                        # lie and the model wrote a junk lesson to comply).
-                        has_meta_intent = _has_meta_task_directive(
-                            user_request_context)
-                        meta_tools_called = any(t in raw_tools_called for t in ["learn_skill", "update_profile", "create_skill", "manage_skills"])
-                        # Read-only SURFACE tools discharge the meta-task
-                        # nudge: if the user asks "what have you learned
-                        # today" the right answer is `list_lessons`, not a
-                        # bogus `learn_skill` write. Before this exemption
-                        # the nudge kept firing for 3-5 extra turns after
-                        # `list_lessons` returned, and the model eventually
-                        # caved and wrote a deduplicated no-op skill just
-                        # to silence it (production trace 15:17, request
-                        # 5C: 6 turns / 73s for one read-only query).
-                        read_only_meta_tools_called = any(
-                            t in raw_tools_called
-                            for t in ["list_lessons", "recall", "manage_skills"]
-                        )
-                        if read_only_meta_tools_called:
-                            meta_tools_called = True
-
-                        meta_tools_available = any(t in self.available_tools for t in ["learn_skill", "update_profile", "create_skill", "manage_skills"])
-                        # Self-play (and any isolated simulation) sets
-                        # `suppress_meta_task_nudges` to skip this check —
-                        # the nudge is a production-mode feature that
-                        # pushes the agent to record skills/profile updates
-                        # after a real user task, and it has no place
-                        # inside a throwaway simulation where all memory
-                        # writes are blocked anyway.
-                        suppress_nudge = getattr(self, "suppress_meta_task_nudges", False)
-                        # ⚠ FIRE ONCE (§4BE round 2). The condition can only
-                        # be discharged by CALLING a meta tool, so a model
-                        # that correctly declines stays armed and is re-nudged
-                        # on every finalisation — up to 4× — with its drafted
-                        # reply discarded each time. Live req 32a8101d: the
-                        # model declined twice ("there's no explicit learning
-                        # or profile instruction in their message") and caved
-                        # on turn 4, minting the junk lesson. The rewritten
-                        # message invites declining, which would have made
-                        # that pressure WORSE without this latch: now correct
-                        # refusal ends the loop exactly as compliance does.
-                        if _meta_nudge_fired:
-                            has_meta_intent = False
-                        if not suppress_nudge and has_meta_intent and meta_tools_available and not meta_tools_called and turn < 4:
-                            _meta_nudge_fired = True
-                            pretty_log("Checklist Nudge", "Enforcing meta-task compliance", icon=Icons.SHIELD)
-                            messages.append({"role": "user", "content": (
-                                "REMINDER: the user's request appears to ask you to RECORD "
-                                "something (a lesson, a skill, or a profile fact) and no "
-                                "recording tool has run this turn. If that reading is right, "
-                                "call 'learn_skill' or 'update_profile' now. If it is NOT — "
-                                "the user only mentioned skills/lessons in passing, or asked "
-                                "you to show or define one — say so in your reply and finish "
-                                "normally; do NOT invent a lesson to satisfy this reminder."
-                            )})
-                            continue
-
-                        if ui_content:
-                            ui_content = ui_content.replace("\r", "")
-                            if final_ai_content and not final_ai_content.endswith("\n\n"):
-                                final_ai_content += "\n\n"
-                            final_ai_content += ui_content
-
-                        # --- VERIFIER-GATE AUTO-REPAIR (in-loop re-entry) ---
-                        # We're at the normal-success finalisation (model
-                        # produced a final answer with no further tool calls).
-                        # Verify it HERE so a high-confidence REFUTED verdict
-                        # (or finalising on an unverified mutation) can trigger
-                        # a bounded repair: inject the critique and `continue`
-                        # the turn loop so the agent FIXES the issue instead of
-                        # shipping a noted-but-wrong answer. The verdict is
-                        # cached for the post-loop gate (no double LLM call on
-                        # the clean path). Gated to clean first-pass successes
-                        # (`execution_failure_count == 0`, `not force_stop`) so
-                        # error/abort answers — which exit via other breaks —
-                        # are never "repaired".
-                        if (repair_round < self._MAX_VERIFIER_REPAIRS
-                                and not force_stop
-                                and execution_failure_count == 0):
-                            # Async-critic mode skips the BLOCKING verdict (it
-                            # stays deferred to the post-loop gate, off the
-                            # critical path) — but NOT the unverified-mutation
-                            # check, which is a pure predicate over this turn's
-                            # tool records (no LLM call, no latency). The
-                            # 2026-07-04 chess hunt showed why: with
-                            # --critic-nodes on, this whole block was skipped,
-                            # so SIX consecutive turns finalised on file writes
-                            # that were never run — every crash (module
-                            # shadowing, IndexError, NameError, hallucinated
-                            # API) shipped to the user, who became the test
-                            # harness. Now async mode still forces the bounded
-                            # "actually RUN it" re-entry on untested writes.
-                            #
-                            # Defensive like the post-loop gate: a verifier
-                            # error (or a misconfigured/non-async verifier in
-                            # tests) must NEVER crash or block finalisation —
-                            # on any failure we simply skip the repair and ship.
-                            _do_repair = False
-                            _directive = ""
-                            _crit = ""
-                            _refuted = False
-                            _unverified = False
-                            # ⚠ captured ABOVE the whole async/sync verdict
-                            # chain — every _compute_verifier_verdict call in
-                            # it threads this. (The first placement sat inside
-                            # the async branch alone; the sync branch raised
-                            # UnboundLocalError, which the defensive except
-                            # dutifully swallowed into "skip the repair" —
-                            # eight tests caught it because two verifier
-                            # passes became one.) On overrun the spawned task
-                            # runs post-semaphore, where the global belongs to
-                            # whoever runs next.
-                            _rv_pid = self._captured_project_id()
-                            try:
-                                from .verifier import VerifyVerdict as _VV
-                                if self._critic_async_enabled():
-                                    # The deterministic mutation guard fires
-                                    # regardless (LLM-free): an untested write
-                                    # always forces the "actually RUN it"
-                                    # re-entry. ACTION-preferred selection
-                                    # (§4BC round 2): a trailing task-table
-                                    # must not shadow the write before it —
-                                    # under the evidence view the guard was
-                                    # silently disabled on write-then-
-                                    # bookkeeping turns, and the repair
-                                    # await was skipped on mixed turns.
-                                    _lt = (_find_substantive_tool_for_verifier(
-                                        tools_run_this_turn,
-                                        include_informational_bookkeeping=False)
-                                        or _find_substantive_tool_for_verifier(
-                                            tools_run_this_turn))
-                                    _unverified = _is_unverified_mutation(_lt)
-                                    # #18: bounded verdict await at loop-exit.
-                                    # The critic runs on the OFF-HOST model, so
-                                    # this wait costs the MAIN slot nothing — and
-                                    # it lets a REFUTED answer be REPAIRED in-loop
-                                    # instead of shipping with only a next-turn
-                                    # note (the production gap under
-                                    # GHOST_CRITIC_ASYNC=1). Only when the last
-                                    # tool is substantive and the mutation guard
-                                    # didn't already trip; on timeout we hand the
-                                    # still-running task to the late-verdict
-                                    # handler (its side effects — correction
-                                    # stash, poisoned-lesson scrub — land when
-                                    # the verdict does) and mark the verdict
-                                    # cache as "skipped" so the post-loop gate
-                                    # doesn't spawn a SECOND full verdict for
-                                    # the same turn on the already-contended
-                                    # worker.
-                                    _rbudget = self._critic_repair_await_budget()
-                                    # §4BC: bookkeeping-evidence turns skip the
-                                    # BLOCKING await (pure defer — verdict still
-                                    # lands via the late handler); see
-                                    # _should_await_repair_verdict.
-                                    if _should_await_repair_verdict(
-                                            _rbudget, _lt, _unverified):
-                                        try:
-                                            _vtask = _glog.spawn_task(
-                                                self._compute_verifier_verdict(
-                                                    tools_run_this_turn=tools_run_this_turn,
-                                                    messages=list(messages),
-                                                    final_ai_content=final_ai_content,
-                                                    last_user_content=last_user_content,
-                                                    lc=lc,
-                                                    req_id=req_id,
-                                                    trajectory_id=current_trajectory_id,
-                                                    project_id=_rv_pid,
-                                                ))
-                                            _vdone, _ = await asyncio.wait(
-                                                {_vtask}, timeout=_rbudget)
-                                            if _vtask in _vdone:
-                                                _vr, _lt = _vtask.result()
-                                                # Cache so the post-loop gate
-                                                # reuses it (no double compute
-                                                # on the common landed path).
-                                                # 3rd element (§ R1 A-F4): a
-                                                # fingerprint of the TEXT this
-                                                # verdict judged, so finalize
-                                                # can detect its own scrub/
-                                                # smooth/hoist moved the reply
-                                                # and recompute instead of
-                                                # stamping a verdict for text
-                                                # the user never receives.
-                                                _verifier_verdict_cache = (
-                                                    _vr, _lt,
-                                                    hash(final_ai_content))
-                                                _verdict_is_fresh = True
-                                                _refuted = (
-                                                    _vr is not None
-                                                    and _vr.verdict == _VV.REFUTED
-                                                    and _vr.confidence >= 0.7
-                                                )
-                                            else:
-                                                self._attach_late_verdict_handler(
-                                                    _vtask, current_trajectory_id,
-                                                    _stable_conv_fp,
-                                                    project_id=_rv_pid,
-                                                    n_tools=len(
-                                                        tools_run_this_turn or []),
-                                                )
-                                                _verifier_verdict_cache = (
-                                                    None, _lt,
-                                                    hash(final_ai_content))
-                                                _verdict_is_fresh = True
-                                                # §4BF R2 triage bit 2: the
-                                                # verdict EXISTS but missed
-                                                # the await window — for
-                                                # enrolled bench turns this
-                                                # separates "starved by
-                                                # latency" (fix the budget)
-                                                # from "no verdict possible"
-                                                # (toolless final) in the
-                                                # tts_bon abort triage.
-                                                try:
-                                                    if _experiments_mod.arm_for(
-                                                            self.context,
-                                                            "tts_bon", req_id):
-                                                        _experiments_mod.mark_trigger(
-                                                            self.context, req_id,
-                                                            "verify_late_pending",
-                                                            True)
-                                                except Exception:  # noqa: BLE001
-                                                    pass
-                                        except Exception as _await_exc:
-                                            logger.debug(
-                                                "async verdict await skipped: %s: %s",
-                                                type(_await_exc).__name__, _await_exc,
-                                            )
-                                elif _find_substantive_tool_for_verifier(
-                                        tools_run_this_turn,
-                                        include_informational_bookkeeping=False,
-                                ) is None:
-                                    # SYNC mode + no action tool (§4BC scope
-                                    # guard, round-2 MAJOR-3): pre-§4BC this
-                                    # inline await early-returned with no LLM
-                                    # call (last_tool was None); under the
-                                    # widened evidence gate a bookkeeping-only
-                                    # listing turn would now pay a full
-                                    # BLOCKING verify_claim here. Keep sync
-                                    # mode at the old behavior — cache the old
-                                    # (None, None) result shape so the
-                                    # post-loop gate reuses it and stays on
-                                    # the quiet "bookkeeping-only" skip line.
-                                    _verifier_verdict_cache = (None, None)
-                                    _verdict_is_fresh = True
-                                else:
-                                    _vr, _lt = await self._compute_verifier_verdict(
-                                        project_id=_rv_pid,
-                                        tools_run_this_turn=tools_run_this_turn,
-                                        messages=messages,
-                                        final_ai_content=final_ai_content,
-                                        last_user_content=last_user_content,
-                                        lc=lc,
-                                        req_id=req_id,
-                                        trajectory_id=current_trajectory_id,
-                                    )
-                                    # § R2 C-1: the SYNC branch (the code
-                                    # default) stamped a 2-tuple, silently
-                                    # bypassing the A-F4 fingerprint gate —
-                                    # stamp the judged-text fingerprint here
-                                    # too.
-                                    _verifier_verdict_cache = (
-                                        _vr, _lt, hash(final_ai_content))
-                                    _verdict_is_fresh = True
-                                    _refuted = (
-                                        _vr is not None
-                                        and _vr.verdict == _VV.REFUTED
-                                        and _vr.confidence >= 0.7
-                                    )
-                                    # No verdict, an unconvincing (<0.7)
-                                    # CONFIRMED — e.g. one capped because the
-                                    # WEB-EXEC probe couldn't run — OR an
-                                    # UNCERTAIN (which escalation tier-routing
-                                    # now mints routinely for gloss-downgraded
-                                    # refutes, 2026-08-06) is not good enough
-                                    # to finalise on an untested write: force
-                                    # the "actually RUN it" re-entry,
-                                    # mirroring the async path's
-                                    # pure-predicate behaviour.
-                                    _unverified = (
-                                        (_vr is None
-                                         or _vr.verdict == _VV.UNCERTAIN
-                                         or (_vr.verdict == _VV.CONFIRMED
-                                             and _vr.confidence < 0.7))
-                                        and _is_unverified_mutation(_lt)
-                                    )
-                                if _refuted:
-                                    _crit = (
-                                        "; ".join(_vr.issues[:3]) if _vr.issues
-                                        else (_vr.reasoning
-                                              or "the answer was not supported by the evidence")
-                                    )
-                                    _directive = _render_refute_directive(
-                                        _crit,
-                                        shape_only=GhostAgent._delivery_shape_only(_vr),
-                                        # The CURRENT request: the repair turn is
-                                        # exactly where 2422eb25 lost track of it.
-                                        pending_request=last_user_content,
-                                    )
-                                    _do_repair = True
-                                elif _unverified:
-                                    _crit = "unverified mutation (untested write)"
-                                    _directive = (
-                                        "SYSTEM ALERT — you finalised on an UNVERIFIED change: "
-                                        "the last action was a file write/replace that was never "
-                                        "executed or rendered, so it is unconfirmed. Actually RUN "
-                                        "or preview it now (execute it, or screenshot the rendered "
-                                        "result) and confirm it works, THEN give your final answer."
-                                    )
-                                    _do_repair = True
-                            except Exception as _rep_exc:
-                                logger.debug(
-                                    "verifier auto-repair check skipped: %s: %s",
-                                    type(_rep_exc).__name__, _rep_exc,
-                                )
-                                _do_repair = False
-                            # §4F Phase 3b: adaptive best-of-N on the
-                            # verifier's WOBBLE BAND (GHOST_TTS_ADAPTIVE_BON,
-                            # default OFF). Only when NOT repairing — hard
-                            # REFUTED keeps the repair path, so the two
-                            # regeneration mechanisms never interact. Any
-                            # failure inside keeps the original answer.
-                            if not _do_repair:
-                                try:
-                                    from . import tts as _tts_mod
-                                    _cvr = (_verifier_verdict_cache
-                                            or (None, None))[0]
-                                    _bon_arm = _experiments_mod.arm_for(
-                                        self.context, "tts_bon", req_id)
-                                    if _bon_arm:
-                                        # §4BF R2 (rules review MAJ-8): the
-                                        # starvation-triage observable. The
-                                        # abort rule must distinguish "no
-                                        # verdict existed at the decision
-                                        # point" from "verdicts exist,
-                                        # rarely wobble" — without a durable
-                                        # stamp both read as silence and the
-                                        # rule is unfalsifiable. ⚠ SCOPE
-                                        # (R3): stamped only on finals that
-                                        # REACH this gate — clean first-pass
-                                        # successes (no execution failures,
-                                        # not force-stopped, repair budget
-                                        # unspent). Exits that never reach
-                                        # it carry NO stamps and form the
-                                        # rule's fourth, trigger-INELIGIBLE
-                                        # bucket: the BoN decision point
-                                        # never existed there, so stamping
-                                        # would claim a decision that did
-                                        # not happen.
-                                        # Own guard (R3 MIN): a stamp
-                                        # failure must never eat the
-                                        # wobble/BoN path below.
-                                        try:
-                                            _experiments_mod.mark_trigger(
-                                                self.context, req_id,
-                                                "verify_in_window",
-                                                _cvr is not None)
-                                        except Exception:  # noqa: BLE001
-                                            pass
-                                    if _tts_mod.wobble_band(_cvr):
-                                        # §4BF flip (ii): the bench-scoped
-                                        # tts_bon arm decides for ENROLLED
-                                        # turns (today: text-graded bench
-                                        # attempts — live turns never carry
-                                        # this spec); the env default decides
-                                        # for everyone else. Trigger stamped
-                                        # on BOTH arms (presence = the wobble
-                                        # condition; value = treatment ran),
-                                        # so the report's TRIGGERED block is
-                                        # the wobble-band subset.
-                                        if _bon_arm:
-                                            _run_bon = (
-                                                _bon_arm
-                                                == _experiments_mod.TREATMENT)
-                                            _experiments_mod.mark_trigger(
-                                                self.context, req_id,
-                                                "tts_bon_fired", _run_bon)
-                                        else:
-                                            _run_bon = (
-                                                _tts_mod.adaptive_bon_enabled())
-                                        if _run_bon:
-                                            final_ai_content, _ = (
-                                                await self._adaptive_bon_final(
-                                                    messages=messages,
-                                                    final_ai_content=final_ai_content,
-                                                    last_user_content=last_user_content,
-                                                    model=model,
-                                                ))
-                                except Exception as _bon_exc:
-                                    logger.debug(
-                                        "adaptive BoN skipped: %s: %s",
-                                        type(_bon_exc).__name__, _bon_exc)
-                            if _do_repair:
-                                _directive += _REPAIR_STANDALONE_SUFFIX
-                                messages.append(msg)
-                                messages.append({"role": "user", "content": _directive})
-                                repair_round += 1
-                                force_final_response = False
-                                if _refuted:
-                                    # REFUTED: discard the WHOLE accumulated
-                                    # narration, not just this turn's tail.
-                                    # The wrong claim often entered in an
-                                    # EARLIER turn's working narration (req
-                                    # 92a968fc: turn 6 said "All 7 tasks
-                                    # completed", turn 7 got refuted — the
-                                    # turn-start rewind kept turn 6's line
-                                    # and the shipped reply contradicted
-                                    # itself, 7 vs 6/6). The directive
-                                    # already demands a clean STANDALONE
-                                    # reply, so the repair turn restates
-                                    # whatever still matters.
-                                    final_ai_content = ""
-                                else:
-                                    # UNVERIFIED: prior narration isn't
-                                    # wrong, just untested — discard exactly
-                                    # this turn's contribution so the
-                                    # verified answer replaces the
-                                    # unverified one.
-                                    final_ai_content = (final_ai_content or "")[:_final_len_at_turn_start]
-                                _verdict_is_fresh = False
-                                _verifier_verdict_cache = None
-                                pretty_log(
-                                    "Verifier Gate",
-                                    f"{'REFUTED' if _refuted else 'UNVERIFIED'} → "
-                                    f"auto-repair round {repair_round}/"
-                                    f"{self._MAX_VERIFIER_REPAIRS}: {_crit[:100]}",
-                                    icon=Icons.VERIFIER_LAB, level="WARNING",
-                                )
-                                continue
-
-                        # Internal requests never feed smart memory (same
-                        # rationale as the streaming-path gate above).
-                        from .autonomous_activity import (
-                            is_internal_request as _is_int_req_m2)
-                        if self.context.args.smart_memory > 0.0 and last_user_content and not forget_was_called and not last_was_failure and not _is_int_req_m2(req_id):
-                            recent_arc = _build_memory_arc(
-                                messages, final_ai_content,
-                                tools_run=tools_run_this_turn)
-                            if getattr(self.context, 'journal', None):
-                                await self._journal_append_safe('smart_memory', {'text': recent_arc, 'model': model})
-                        break
-
-                    # #5 step 2: the tool guard/dispatch/result pipeline lives in
-                    # _dispatch_and_process_tool_batch (verbatim extraction against
-                    # TurnState). The try/finally copy-back mirrors the method's own
                     # finally-repack: even if a tool path raises, this frame's locals
                     # match what the inline code would have left behind.
                     _ts = TurnState(
@@ -25079,7 +26358,6 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             if 'messages' in locals(): del messages
             if 'tools_run_this_turn' in locals(): del tools_run_this_turn
             if 'sandbox_state' in locals(): del sandbox_state
-            if 'data' in locals(): del data
 
             pretty_log("Request Finished", special_marker="END")
             request_id_context.reset(token)
@@ -25477,25 +26755,57 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         except Exception:  # noqa: BLE001
             pass
 
-    def _reply_shape_refutation(self, final_ai_content: str, request_text: str = ""):
+    #: `VerifyResult.reasoning` of the §4GH narration-only shape refute — the
+    #: tool-turn path keys its "no claim → no judge" exit on it.
+    _NARRATION_ONLY_REASONING = "reply-shape check (working narration only, no answer)"
+    _NO_ANSWER_REASONING = "reply-shape check (forced-final fallback, no answer)"
+    #: Mechanical refutes of a reply that makes NO claim: no judge is
+    #: consulted for them (nothing to weigh, nothing for an escalation to
+    #: overturn) and the in-loop auto-repair does not fire on them (the
+    #: repair directive asks for the same answer in a better form — there
+    #: is no answer; the forced-final retry/fallback already ran).
+    _NO_CLAIM_REASONINGS = frozenset({_NARRATION_ONLY_REASONING, _NO_ANSWER_REASONING})
+
+    @classmethod
+    def _verdict_is_no_claim(cls, v) -> bool:
+        return getattr(v, "reasoning", None) in cls._NO_CLAIM_REASONINGS
+
+    def _reply_shape_refutation(self, final_ai_content: str, request_text: str = "",
+                                tools_run=None):
         """A REFUTED verdict when the reply is not an answer by SHAPE (§4FN:
         `core/reply_shape_check`), or `None`. Never confirms. Computed for
         every turn that has a verifier attached — tool or not — because the
         finalize fallback pasted as the reply is wrong regardless of
         evidence; on tool turns it is applied as an OVERRIDE ahead of the
-        ground-truth checks, not as an early return."""
+        ground-truth checks, not as an early return. Two shapes: the raw
+        tool dump (§4FN) and, since §4GH, working narration only after
+        tools ran — a reply with no claim, which no judge (and no
+        escalation of a judge) gets to confirm."""
         try:
-            from .reply_shape_check import refute_raw_tool_dump
-            from .reply_smoothing import strip_system_notes
+            from .reply_shape_check import (refute_narration_only,
+                                            refute_no_answer_fallback,
+                                            refute_raw_tool_dump)
+            from .reply_smoothing import count_real_tools, strip_system_notes
             claim = strip_system_notes(final_ai_content or "")
-            issues = refute_raw_tool_dump(claim, request_text or "")
+            issues = refute_no_answer_fallback(claim)
+            reasoning = self._NO_ANSWER_REASONING
+            if not issues:
+                issues = refute_raw_tool_dump(claim, request_text or "")
+                reasoning = "reply-shape check (raw tool output pasted as the answer)"
+            if not issues:
+                _names = [str(r.get("name") or "") for r in (tools_run or [])
+                          if isinstance(r, dict) and not r.get("_synthetic")]
+                issues = refute_narration_only(
+                    claim, n_real_tools=count_real_tools(tools_run or []),
+                    tool_names=_names)
+                reasoning = self._NARRATION_ONLY_REASONING
             if not issues:
                 return None       # ⚠ NOT a pass — nothing to say
             from .verifier import VerifyResult, VerifyVerdict
             return VerifyResult(
                 verdict=VerifyVerdict.REFUTED,
                 confidence=0.9,
-                reasoning="reply-shape check (raw tool output pasted as the answer)",
+                reasoning=reasoning,
                 issues=list(issues),
             )
         except Exception as exc:  # noqa: BLE001 — a checker must not break a turn
@@ -28514,6 +29824,11 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 "trajectory stash for correction lookup skipped: %s: %s",
                 type(e).__name__, e,
             )
+        # The row exists now: replay any late verdict that arrived before
+        # it (2026-09-13) — the deferred `_backfill_trajectory_outcome`
+        # call runs with the row in the cache, so the corpus write, the
+        # calibration re-label and the lesson flush all land.
+        self._replay_deferred_late_backfill(getattr(traj, "id", None))
 
         # Selfhood capture (proposal item #1 + #2): write a first-person
         # experiential record sharing the trajectory id. Distinct from

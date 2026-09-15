@@ -1,4 +1,5 @@
 import asyncio
+import errno as _errno
 import hashlib
 import os
 import re
@@ -295,6 +296,603 @@ def write_text_nofollow(path: Path, text: str, *, encoding: str = "utf-8") -> No
             "regular file (FIFO, socket or device node).")
     with os.fdopen(fd, "w", encoding=encoding) as fh:
         fh.write(text)
+
+
+def write_text_nofollow_in_dir(dir_path: Path, name: str, text: str, *,
+                               encoding: str = "utf-8") -> None:
+    """Write ``text`` to ``dir_path/name`` refusing to follow a symlink at
+    EITHER component (§4GI, 2026-09-13).
+
+    `write_text_nofollow` covers the final component only; its docstring
+    says a model-controlled PARENT must be resolved separately. The
+    run-output spill (`docker._spill_run_output`) writes a fixed name
+    (`run_N.log`, the counter is announced to the model) into a fixed
+    directory (`.ghost_runs`) — both under the bind mount, so the model
+    can replace the DIRECTORY with a symlink and every later spill lands
+    wherever it points. Opening the directory with O_DIRECTORY|O_NOFOLLOW
+    and the file relative to that fd (`dir_fd`) makes both checks atomic:
+    a symlink at the directory fails with ELOOP, a non-directory with
+    ENOTDIR, a symlink at the name with ELOOP, and a FIFO/device is
+    refused after fstat of the open fd. ``name`` must be a bare filename.
+    """
+    if not name or "/" in name or name in (".", ".."):
+        raise ValueError(f"Security Error: refusing to write '{name}' — not a bare filename")
+    dflags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        dfd = os.open(str(dir_path), dflags)
+    except OSError as e:
+        raise ValueError(
+            f"Security Error: refusing to write into '{dir_path}' — it is a "
+            f"symbolic link or not a directory ({e.__class__.__name__}: {e})") from e
+    try:
+        flags = (os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                 | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        try:
+            fd = os.open(name, flags, 0o666, dir_fd=dfd)
+        except OSError as e:
+            raise ValueError(
+                f"Security Error: refusing to write '{dir_path / name}' — it is a "
+                f"symbolic link or an unwritable path ({e.__class__.__name__}: {e})") from e
+    finally:
+        _close_quietly(dfd)
+    try:
+        import stat as _stat
+        _regular = _stat.S_ISREG(os.fstat(fd).st_mode)
+    except OSError as e:
+        _close_quietly(fd)
+        raise ValueError(f"Security Error: cannot stat '{dir_path / name}': {e}") from e
+    if not _regular:
+        _close_quietly(fd)
+        raise ValueError(
+            f"Security Error: refusing to write '{dir_path / name}' — it is not a "
+            "regular file (FIFO, socket or device node).")
+    with os.fdopen(fd, "w", encoding=encoding) as fh:
+        fh.write(text)
+
+
+#: Every traversal below is `dir_fd`-relative. Without these the fallback
+#: would be a path-based walk, i.e. the very TOCTOU this module exists to
+#: close — so the helpers REFUSE rather than degrade (fail closed).
+#: `os.lstat` is NOT in `supports_dir_fd` — the dir_fd-relative lstat is
+#: `os.stat(..., follow_symlinks=False)`, which is. Checking the wrong
+#: name made every call refuse; the FIFO test caught it, and the TOCTOU
+#: repro had been passing VACUOUSLY on the refusal until then.
+_DIR_FD_OK = ({os.open, os.stat, os.readlink, os.symlink}
+              <= getattr(os, "supports_dir_fd", set()))
+
+
+def _require_dir_fd(what: str) -> None:
+    if not _DIR_FD_OK:
+        raise ValueError(
+            f"Security Error: refusing to {what} — this platform has no "
+            "dir_fd support, so a symlink swapped in mid-walk could not be "
+            "refused atomically.")
+
+
+#: Conditions that are never about ONE entry: the filesystem is full, the
+#: destination is read-only, or the quota is spent. A per-entry guard that
+#: swallows these turns a total failure into a PARTIAL success (§4GK round 6).
+#: ⚠ DESCRIPTOR PRESSURE IS TRANSIENT AND SELF-INFLICTED (§4GK round 7).
+#: EMFILE/ENFILE were added here in round 6 alongside the genuinely fatal
+#: conditions — but they are not the same kind of thing. The filesystem being
+#: full or read-only will not clear on its own; running short of descriptors
+#: clears the moment the walk that consumed them finishes. Treating it as
+#: fatal made `tool_copy_file` answer a bare `"Error: [Errno 24] …"` string
+#: (not even a `ToolOutcome`, so no world-changed or idempotency accounting)
+#: over a destination tree with 0 of 10 files — and the overwrite guard then
+#: refused the retry with "destination already exists", which is exactly the
+#: half-copy-blocks-the-retry failure rounds 4 and 5 closed. It also raises
+#: BEFORE the stub-unlink, bypassing round 5's "NOT COPIED MUST MEAN NOT
+#: PRESENT" rule. They belong with the per-entry conditions, recorded and
+#: retried, not with the ones that end the copy.
+_COPY_FATAL_ERRNOS = frozenset({_errno.ENOSPC, _errno.EROFS, _errno.EDQUOT})
+
+#: Descriptor exhaustion is not a "this entry was swapped" condition: a guard
+#: that treats it as one silently truncates the traversal (§4GK round 4).
+_FD_EXHAUSTED_ERRNOS = frozenset({_errno.EMFILE, _errno.ENFILE})
+
+
+def _open_dir_nofollow(name, dir_fd=None):
+    """Open a directory, REFUSING a symlink at that component. Returns the
+    fd. Relative to ``dir_fd`` when given, which is what makes the check and
+    the use the SAME syscall: the parent is already an open fd, so the path
+    to it cannot be re-pointed between them."""
+    flags = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+             | getattr(os, "O_NOFOLLOW", 0))
+    return os.open(name, flags, dir_fd=dir_fd) if dir_fd is not None else os.open(name, flags)
+
+
+def read_text_nofollow(name, *, dir_fd=None, encoding: str = "utf-8",
+                       errors: str = "replace", max_bytes: int = 0,
+                       offset: int = 0) -> str:
+    """`Path.read_text` that refuses a symlink at the final component, and —
+    given ``dir_fd`` — at every component (§4GJ round 3).
+
+    `os.walk(followlinks=False)` only declines to DESCEND a linked
+    directory; a linked FILE is still listed and `read_text` follows it, so
+    the idle project readers were reading whatever the model pointed at with
+    no race at all. Pass the ``dir_fd`` yielded by `walk_nofollow` and the
+    read is atomic with respect to the whole path.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    if dir_fd is not None:
+        _require_dir_fd("read a file inside a model-writable tree")
+        fd = os.open(name, flags, dir_fd=dir_fd)
+    else:
+        fd = os.open(str(name), flags)
+    try:
+        import stat as _stat
+        st = os.fstat(fd)
+        if not _stat.S_ISREG(st.st_mode):
+            raise ValueError(
+                f"Security Error: refusing to read '{name}' — not a regular file.")
+        # ⚠ HEAD, NOT TAIL (§4GK round 4). This used to `lseek` to
+        # `st.st_size - max_bytes` and return the END of the file. Its only
+        # capped caller — the workspace tidy's referenced-media scan — uses
+        # the head idiom ("read cap+1, skip if longer"), so for any file over
+        # the cap it scanned the last 512 KB and never saw an `<img src=…>`
+        # in the head: the asset counted as unreferenced and the idle sweep
+        # DELETED it, against that function's own "a false DELETE breaks the
+        # build". Nothing wanted the tail; `read_bytes_nofollow_fd`, the
+        # sibling written later, already reads the head.
+        #
+        # `offset` (§4GK round 6) lets a caller stream a large file in bounded
+        # windows — the workspace tidy's basename scan reads a whole bundle
+        # that way rather than being forced to choose between an incomplete
+        # answer and an unbounded read.
+        if offset:
+            os.lseek(fd, int(offset), os.SEEK_SET)
+        chunks = []
+        _left = int(max_bytes) if max_bytes > 0 else -1
+        while True:
+            b = os.read(fd, (1 << 20) if _left < 0 else min(1 << 20, _left))
+            if not b:
+                break
+            chunks.append(b)
+            if _left >= 0:
+                _left -= len(b)
+                if _left <= 0:
+                    break
+    finally:
+        _close_quietly(fd)
+    return b"".join(chunks).decode(encoding, errors)
+
+
+def read_bytes_nofollow_fd(name, *, dir_fd=None, max_bytes: int = 0) -> bytes:
+    """`read_text_nofollow`'s bytes twin: open `name` relative to `dir_fd`
+    with ``O_NOFOLLOW`` and return its bytes. Used by consumers that hash
+    rather than decode (the leaf loop's workspace snapshot). Raises OSError
+    when the final component is a symlink — the caller skips it.
+    """
+    import stat as _stat
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    if dir_fd is None:
+        fd = os.open(str(name), flags)
+    else:
+        _require_dir_fd("read a model-writable tree")
+        fd = os.open(name, flags, dir_fd=dir_fd)
+    # ⚠ OWNERSHIP, not a try/finally (§4GK round 4). The first version wrapped
+    # the `with os.fdopen(fd, closefd=True)` in `except BaseException: os.close(fd)`.
+    # A read that raises mid-stream (EIO) then closed the SAME fd twice — the
+    # exact defect the sibling writer documents at length above: between the
+    # two closes another thread can be handed that fd number and the second
+    # close shuts down an unrelated file. Ownership transfers at `fdopen`, so
+    # the manual close must cover only the window BEFORE it.
+    try:
+        st = os.fstat(fd)
+        if not _stat.S_ISREG(st.st_mode):
+            raise ValueError(f"{name}: not a regular file")
+        fh = os.fdopen(fd, "rb", closefd=True)
+    except BaseException:
+        _close_quietly(fd)
+        raise
+    with fh:
+        return fh.read(max_bytes) if max_bytes else fh.read()
+
+
+def write_bytes_nofollow_rel(root: Path, rel: str, data: bytes) -> None:
+    """Write ``data`` to ``root/rel`` without following a symlink at ANY
+    component of ``rel``, creating intermediate directories as needed
+    (§4GK round 5).
+
+    `write_text_nofollow_in_dir` covers a fixed single-level name; this is
+    its nested twin, for a caller that restores a whole relative path.
+
+    ⚠ WHY IT EXISTS. `dream._restore_mocks` rewrote a self-play snapshot
+    with `target.parent.mkdir(parents=True); target.write_bytes(blob)` on a
+    tree the SOLVER controls between the snapshot and the restore. Replace
+    `data/x.csv` with a link to any host file and the restore overwrites
+    that file with bytes the challenge chose — a write through a planted
+    link, the class §4GJ closed for readers and left open for this writer
+    (`the-sibling-one-revision-behind`). The pre-validator restore runs with
+    no purge at all, so nothing removes the link first.
+
+    Each component is opened ``O_DIRECTORY|O_NOFOLLOW`` relative to its
+    parent's descriptor, so check and use are one syscall and the parent
+    cannot be re-pointed underneath it. Raises ``OSError`` when any
+    component is a link — the caller skips that entry.
+    """
+    _require_dir_fd("write into a model-writable tree")
+    parts = [p for p in str(rel).replace(os.sep, "/").split("/") if p and p != "."]
+    if not parts or ".." in parts:
+        raise ValueError(f"refusing to restore {rel!r} — not a contained relative path")
+    dfd = _open_dir_nofollow(str(root))
+    try:
+        for comp in parts[:-1]:
+            try:
+                os.mkdir(comp, 0o755, dir_fd=dfd)
+            except FileExistsError:
+                pass
+            try:
+                nxt = _open_dir_nofollow(comp, dir_fd=dfd)
+            except OSError as exc:
+                if exc.errno not in (_errno.ELOOP, _errno.ENOTDIR):
+                    raise
+                # ⚠ AN INTERMEDIATE COMPONENT IS A PLANTED LINK (§4GK round 6).
+                # The first version applied the unlink-and-retry to the FINAL
+                # component only, so `rm -rf data && ln -s /host/dir data` left
+                # the link in place and the entry simply unrestored — and the
+                # pre-validator restore runs with NO purge, so the validator
+                # then read HOST bytes the solver chose, presented as the
+                # pristine mock. The fix had converted a write-through into a
+                # read-through and still reported success. Unlinking a symlink
+                # removes the link, never its target; the snapshot is the truth
+                # for everything under this root.
+                os.unlink(comp, dir_fd=dfd)
+                os.mkdir(comp, 0o755, dir_fd=dfd)
+                nxt = _open_dir_nofollow(comp, dir_fd=dfd)
+            _close_quietly(dfd)
+            dfd = nxt
+        flags = (os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                 | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            fd = os.open(parts[-1], flags, 0o644, dir_fd=dfd)
+        except OSError as exc:
+            if exc.errno != _errno.ELOOP:
+                raise
+            # The final component is a LINK the model planted. Unlinking a
+            # symlink removes the link, never its target, and the snapshot
+            # is by definition the truth here — so drop it and write the
+            # real file, rather than failing the restore and leaving the
+            # planted link in place for the next attempt to write through.
+            os.unlink(parts[-1], dir_fd=dfd)
+            fd = os.open(parts[-1], flags, 0o644, dir_fd=dfd)
+        # ⚠ OWNERSHIP, NOT A CATCH-ALL (§4GK round 6). This writer was born
+        # with the exact defect its sibling `read_bytes_nofollow_fd`
+        # documents twenty lines above: `os.fdopen(closefd=True)` takes the
+        # descriptor, and the `with` closes it on the way out even when the
+        # body raised — so a manual close in the handler closes that
+        # descriptor NUMBER a second time, landing on whatever the kernel has
+        # since reissued. Measured: 4 writers x 400 restores against 4
+        # unrelated readers closed 172 of their open files out from under
+        # them. The manual close covers only the window BEFORE ownership
+        # transfers.
+        try:
+            fh = os.fdopen(fd, "wb", closefd=True)
+        except BaseException:
+            _close_quietly(fd)
+            raise
+        with fh:
+            fh.write(data)
+    finally:
+        _close_quietly(dfd)
+
+
+def walk_nofollow(base: Path):
+    """`os.walk` for a tree the sandbox controls: never descends through a
+    symlinked directory and never LISTS a symlinked file (§4GJ round 3).
+
+    Yields ``(dirpath, filenames, dir_fd)``. ``dirpath`` is the logical path
+    (every component was opened ``O_NOFOLLOW``, so it is also the real one)
+    and ``filenames`` holds regular files only. ``dir_fd`` is an open
+    descriptor for ``dirpath`` — pass it to `read_text_nofollow` to make the
+    read atomic. **It is closed when the generator advances**, so read what
+    you need before the next iteration; a consumer that stashes it is using
+    a closed fd, not a stale one.
+
+    Depth-first, sorted, and it never follows a mount-point loop because a
+    symlinked directory is simply not descended.
+    """
+    _require_dir_fd("walk a model-writable tree")
+    # Yield paths under the CALLER's `base`, not its realpath: callers do
+    # `.relative_to(base)` and on macOS `/var/…` resolves to `/private/var/…`,
+    # which raised ValueError. Safety does not depend on the reported string —
+    # every component below is opened O_NOFOLLOW through the parent's fd.
+    base = Path(base)
+    try:
+        # ⚠ THE TOP IS NOT RESOLVED, AND A REFUSAL IS LOUD (§4GK round 5).
+        #
+        # Round 4 opened `os.path.realpath(str(base))` here, borrowing
+        # `copytree_nofollow`'s justification — but not its PRECONDITION. That
+        # helper's caller ran the path through `_get_safe_path`, which
+        # resolves AND contains; `walk_nofollow`'s callers do not.
+        # `project_advancer._gather_project_files` and
+        # `project_research.reconcile_research_dir` build
+        # `<sandbox>/projects/<pid>` themselves and gate only on `is_dir()`,
+        # which follows a link. So the model could `rm -rf` its project
+        # directory, replace it with a link to the host's home, and the walk
+        # would read host files and report their paths as if they were inside
+        # the project. Reproduced: an `id_rsa` outside the sandbox came back
+        # through the idle project reader. Resolve-then-contain is the pattern
+        # for a trusted root; a helper that is not told the root must simply
+        # not follow.
+        #
+        # The problem round 4 was fixing was real though: an O_NOFOLLOW
+        # refusal used to `return`, yielding an EMPTY generator that every
+        # consumer read as "this tree has no files". Refusing LOUDLY keeps
+        # the containment and removes the ambiguity.
+        top = _open_dir_nofollow(str(base))
+    except OSError as exc:
+        if exc.errno in _FD_EXHAUSTED_ERRNOS:
+            raise
+        if exc.errno in (_errno.ELOOP, _errno.ENOTDIR):
+            raise ValueError(
+                f"Security Error: refusing to walk {base!r} — its final "
+                "component is a symlink, so the tree it names is not the "
+                "one the caller asked for.") from exc
+        return
+    stack = [(base, top)]
+    try:
+        while stack:
+            dirpath, dfd = stack.pop()
+            try:
+                names = sorted(os.listdir(dfd))
+                files, subdirs = [], []
+                for name in names:
+                    try:
+                        st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+                    except OSError:
+                        continue
+                    import stat as _stat
+                    # The stat above is `follow_symlinks=False`, so a symlink is
+                    # NEITHER S_ISDIR nor S_ISREG: it is dropped by the positive
+                    # tests below and never listed or entered. An explicit
+                    # `S_ISLNK: continue` stood here and was deleted as dead —
+                    # its mutant survived the §4GJ round-3 battery (R2).
+                    if _stat.S_ISDIR(st.st_mode):
+                        subdirs.append(name)
+                    elif _stat.S_ISREG(st.st_mode):
+                        files.append(name)
+                yield dirpath, files, dfd
+                for name in reversed(subdirs):
+                    try:
+                        stack.append((dirpath / name, _open_dir_nofollow(name, dir_fd=dfd)))
+                    except OSError as exc:
+                        # ⚠ RUNNING OUT OF DESCRIPTORS IS NOT "IT WAS SWAPPED"
+                        # (§4GK round 4). EMFILE/ENFILE are OSError too, so the
+                        # bare `continue` below turned exhaustion into a walk that
+                        # returned a SUBSET of the tree with no exception and no
+                        # log — the snapshot then reported "the attempt changed no
+                        # files" and the ZIP shipped incomplete as a success.
+                        if exc.errno in _FD_EXHAUSTED_ERRNOS:
+                            raise
+                        continue                      # swapped for a link/file mid-walk: skip it
+            finally:
+                _close_quietly(dfd)
+    finally:
+        # ⚠ THE FRONTIER, NOT JUST THE CURRENT FRAME (§4GK round 4). Sub-
+        # directories are opened and queued BEFORE the generator suspends, so
+        # a consumer that leaves the loop early — `break` at a max_files cap,
+        # `return`, or a raise — ran only the INNER finally and orphaned every
+        # descriptor still queued here, for the life of the process. Measured:
+        # 240 descriptors leaked across five capped walks of a 60-directory
+        # tree, and the idle project reader breaks at 12 files on every tick.
+        for _dirpath, _fd in stack:
+            _close_quietly(_fd)
+        stack.clear()
+
+
+def copytree_nofollow(src: Path, dest: Path, root: Path, *, ignore=None,
+                      dirs_exist_ok: bool = False) -> list:
+    """Copy a tree the sandbox controls without ever following a symlink.
+    Returns the list of skipped entries (each a short reason string).
+
+    §4GI used `shutil.copytree(symlinks=True, ignore=…)`. That is TOCTOU by
+    construction and was reproduced: `copytree` decides symlink-vs-directory
+    from the **cached `os.DirEntry`** of the parent's `scandir`, and the
+    `ignore` callback runs once per directory BEFORE its entries are copied.
+    Swap a directory for a symlink in that window — a `nohup`'d loop or a
+    promoted job is the model's version — and the recursive call re-scans
+    the path, follows the link, and copies the host tree behind it. A host
+    private key landed in the copy on the second attempt while the function
+    returned normally.
+
+    This walk is `dir_fd`-relative instead: each child is opened
+    ``O_NOFOLLOW`` **relative to its parent's open fd**, so the check and
+    the use are one syscall and the parent cannot be re-pointed underneath
+    it. An entry swapped between `lstat` and `open` fails the open and is
+    SKIPPED, never followed. Non-regular files (FIFO, socket, device) are
+    skipped with a reason instead of raising `shutil.Error` mid-tree.
+
+    ``root`` bounds which symlinks are RECREATED: a link resolving outside
+    it is dropped, so the copy carries no escape hatch either. ``ignore``
+    has `shutil.copytree`'s signature ``(dirpath, names) -> set``.
+
+    Residual, accepted: the TOP-level ``src`` is opened without
+    ``O_NOFOLLOW`` because the caller resolved it through `_get_safe_path`,
+    which deliberately follows a link that stays inside the sandbox (pinned
+    by the top-level control test). Everything below it is refused.
+    """
+    _require_dir_fd("copy a model-writable tree")
+    import stat as _stat
+    src_real = Path(os.path.realpath(str(src)))
+    dest = Path(dest)
+    root_real = Path(os.path.realpath(str(root)))
+    skipped: list = []
+
+    def _escapes(dirpath: Path, name: str, dfd: int) -> bool:
+        try:
+            target = os.readlink(name, dir_fd=dfd)
+        except OSError:
+            return True
+        real = Path(os.path.realpath(str(dirpath / target) if not os.path.isabs(target)
+                                     else target))
+        return not (real == root_real or root_real in real.parents)
+
+    def _copy_dir(dirpath: Path, dfd: int, dst: Path) -> None:
+        names = sorted(os.listdir(dfd))
+        ignored = set(ignore(str(dirpath), list(names))) if ignore is not None else set()
+        # ⚠ THE DESTINATION-SIDE GUARD MUST COVER THE DIRECTORY TOO (§4GK
+        # round 5). Round 4 wrapped only the regular-file write, so
+        # `os.makedirs` here and the recursive descent below still aborted
+        # the whole tree on the first unexpected OSError — which is what the
+        # fix claimed to stop. Reproduced with a 120-level deep workspace
+        # (`mkdir d; cd d` in a loop, trivially model-reachable, and the walk
+        # handles it fine): ENAMETOOLONG killed every copy of that workspace
+        # at 45 levels, `tool_copy_file` returned a bare error over the
+        # half-copy, and its own overwrite guard then refused the retry.
+        try:
+            os.makedirs(dst, exist_ok=dirs_exist_ok)
+        except OSError as e:
+            # ⚠ THE TOP-LEVEL DIRECTORY IS NOT "AN ENTRY" (§4GK round 6).
+            # Round 5 moved this inside a per-entry guard so one unreachable
+            # path could not end the whole copy — correct for a CHILD, wrong
+            # for the destination root and wrong for a whole-filesystem fault.
+            # Measured through the real tool: nothing was copied, the
+            # destination did not exist, and the model was told "Copied 'tree'
+            # to 'out/copy'" as a PARTIAL with world-changed credit and an
+            # idempotency record. A copy that produced no destination is a
+            # failure, and so is ENOSPC/EROFS/EDQUOT at any depth.
+            if dst == dest or e.errno in _COPY_FATAL_ERRNOS:
+                raise
+            skipped.append(f"{dirpath}: directory could not be created in the "
+                           f"copy ({e.__class__.__name__}) — its contents were "
+                           "not copied")
+            return
+        for name in names:
+            if name in ignored:
+                continue
+            try:
+                st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+            except OSError:
+                skipped.append(f"{dirpath / name}: vanished")
+                continue
+            if _stat.S_ISLNK(st.st_mode):
+                if _escapes(dirpath, name, dfd):
+                    skipped.append(f"{dirpath / name}: symlink escaping the sandbox")
+                    continue
+                try:
+                    _target = os.readlink(name, dir_fd=dfd)
+                except OSError as e:
+                    skipped.append(f"{dirpath / name}: {e.__class__.__name__}")
+                    continue
+                if os.path.isabs(_target):
+                    # ⚠ AN ABSOLUTE TARGET INSIDE `root` STILL NAMES THE
+                    # SOURCE (§4GK round 4). `_escapes` asks only "does this
+                    # resolve inside root", which an absolute link within the
+                    # tree satisfies — so it was recreated VERBATIM, and the
+                    # copy held a live write channel back into the original.
+                    # Reproduced through `_fork_memory_dir`, whose docstring
+                    # promises the replay cannot write to the real store: a
+                    # write through the copied alias changed the production
+                    # skill file. A relative target is safe because it re-
+                    # resolves against its own directory inside the COPY.
+                    skipped.append(f"{dirpath / name}: absolute symlink "
+                                   "(recreating it would point back at the source)")
+                    continue
+                try:
+                    os.symlink(_target, dst / name)
+                except OSError as e:
+                    skipped.append(f"{dirpath / name}: {e.__class__.__name__}")
+                continue
+            if _stat.S_ISDIR(st.st_mode):
+                try:
+                    cfd = _open_dir_nofollow(name, dir_fd=dfd)
+                except OSError:
+                    # swapped for a symlink (or a file) since the lstat
+                    skipped.append(f"{dirpath / name}: not a directory when opened")
+                    continue
+                try:
+                    # ⚠ NO `except OSError` HERE, AND THAT IS DELIBERATE
+                    # (§4GK round 6, R2). Round 5 added one as a belt beside
+                    # the `os.makedirs` guard above — and no mutant could kill
+                    # it, because nothing reaches it: a non-fatal failure at
+                    # any depth is already recorded and RETURNED by that
+                    # guard, and a fatal errno is re-raised by both. A guard
+                    # that cannot be distinguished from its own absence is
+                    # dead code, and the protocol's rule for a proven
+                    # equivalent mutant is to delete the code rather than
+                    # carry a line the battery can only ever report green on.
+                    _copy_dir(dirpath / name, cfd, dst / name)
+                finally:
+                    _close_quietly(cfd)
+                continue
+            if not _stat.S_ISREG(st.st_mode):
+                skipped.append(f"{dirpath / name}: not a regular file "
+                               "(FIFO, socket or device node)")
+                continue
+            try:
+                fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                             | getattr(os, "O_NONBLOCK", 0), dir_fd=dfd)
+            except OSError:
+                skipped.append(f"{dirpath / name}: not a regular file when opened")
+                continue
+            try:
+                fst = os.fstat(fd)
+                if not _stat.S_ISREG(fst.st_mode):
+                    skipped.append(f"{dirpath / name}: not a regular file when opened")
+                    continue
+                # ⚠ ONE BAD DESTINATION ENTRY MUST NOT ABORT THE TREE
+                # (§4GK round 4). The destination-side `open`/`chmod` sat
+                # outside any per-entry guard, unlike the source-side opens,
+                # so a single unwritable target or an over-long name raised
+                # straight out — where `shutil.copytree` collected such
+                # errors and carried on. `tool_copy_file` then left a HALF
+                # COPY on disk and its own overwrite guard refused the
+                # retry: "destination already exists. Delete or rename it."
+                try:
+                    with open(dst / name, "wb") as out:
+                        while True:
+                            b = os.read(fd, 1 << 20)
+                            if not b:
+                                break
+                            out.write(b)
+                    os.chmod(dst / name, _stat.S_IMODE(fst.st_mode))
+                    os.utime(dst / name, (fst.st_atime, fst.st_mtime))
+                except OSError as e:
+                    if e.errno in _COPY_FATAL_ERRNOS:
+                        raise
+                    # ⚠ "NOT COPIED" MUST MEAN NOT PRESENT (§4GK round 5). The
+                    # guard wraps the source read AND the destination write, so
+                    # a failure part-way through left a TRUNCATED file at the
+                    # destination while reporting the entry as not copied — and
+                    # the fork/clone `copied = sum(... is_file())` counted it.
+                    # Reproduced with an EIO injected on the second chunk: a
+                    # 1 MB file where the source had 3 MB. Remove the stub, so
+                    # the report and the destination agree.
+                    try:
+                        os.unlink(dst / name)
+                    except OSError:
+                        pass
+                    skipped.append(f"{dirpath / name}: could not be written to "
+                                   f"the copy ({e.__class__.__name__})")
+                    continue
+            finally:
+                _close_quietly(fd)
+        # ⚠ THE DIRECTORY'S OWN MODE IS RESTORED LAST (§4GK round 5).
+        # `shutil.copytree` preserved directory mode bits and mtimes; the
+        # dir-fd rewrite took the umask default, so a fork of a chmod'd tree
+        # came back with different permissions than its source. The first
+        # version of that fix stamped the mode right after `os.makedirs` —
+        # which chmods the destination to the source's mode BEFORE writing
+        # its children, so copying a RELEASED (read-only, a-w) project
+        # workspace created 0o500 directories and then could not write a
+        # single file into them: the fork came out empty. Post-order is the
+        # only correct order, and `shutil` does the same. Best-effort: a
+        # destination we cannot stamp is not a reason to fail the copy.
+        try:
+            _src_stat = os.fstat(dfd)
+            os.chmod(dst, _stat.S_IMODE(_src_stat.st_mode))
+            os.utime(dst, (_src_stat.st_atime, _src_stat.st_mtime))
+        except OSError:
+            pass
+
+    top = os.open(str(src_real), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        _copy_dir(src_real, top, dest)
+    finally:
+        _close_quietly(top)
+    return skipped
 
 
 def _get_safe_path(sandbox_dir: Path, filename: str, *, allow_root: bool = True) -> Path:
@@ -1488,6 +2086,14 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
         # for .py files — other extensions get the original error.
         ext = str(filename).split('.')[-1].lower()
         if ext == "py" and _looks_like_complete_python_module(str(old_text)):
+            # ⚠ BOUND BEFORE THE TRY (§4GJ). The handler below reads
+            # `_wrote` to decide whether the file was touched, but the two
+            # steps that precede the assignment can raise: `_get_safe_path`
+            # on a path escape, and `extract_code_from_markdown` on
+            # malformed input. Either one turned the handler itself into a
+            # `NameError` — the caller got an unhandled exception instead of
+            # the SYSTEM INSTRUCTION the branch exists to return.
+            _wrote = False
             try:
                 path = _get_safe_path(sandbox_dir, filename)
                 # Only strip markdown fences if they're actually present;
@@ -3108,14 +3714,21 @@ async def tool_list_files(sandbox_dir: Path, memory_system=None, path: str = Non
                     line = f"  {root_prefix}{f}"
 
                     # --- REPO MAP: Extract AST Signatures for Python files ---
-                    if f.endswith('.py'):
+                    # §4GI: a symlinked .py is listed by name only — reading
+                    # it would parse (and print the signatures of) whatever
+                    # host file the sandbox pointed it at.
+                    if f.endswith('.py') and not path_.is_symlink():
                         try:
                             # stat() must stay inside the try: a broken
                             # symlink or a file deleted between os.walk and
                             # here raises OSError, which would otherwise
                             # abort the ENTIRE listing.
                             if path_.stat().st_size < 100000:
-                                code = path_.read_text(errors='ignore')
+                                # §4GJ round 3: O_NOFOLLOW rather than the
+                                # `is_symlink()` pre-check §4GI added — the
+                                # check and the read were two syscalls, so a
+                                # swap between them still read the target.
+                                code = read_text_nofollow(path_, errors='ignore')
                                 parsed = ast.parse(code)
                                 sigs = []
                                 for node in parsed.body:
@@ -3694,10 +4307,43 @@ async def tool_copy_file(src_name: str, dest_name: str, sandbox_dir: Path):
                 f"rename it first if you intended to overwrite."
             )
         dest_path.parent.mkdir(parents=True, exist_ok=True)
+        # §4GI: never follow a symlink the sandbox planted — nested links
+        # are recreated as links (or dropped when they escape the root),
+        # never materialised as the host files behind them.
+        _skipped = []
         if src_path.is_dir():
-            await asyncio.to_thread(shutil.copytree, str(src_path), str(dest_path))
+            # ⚠ THE MODEL IS TOLD WHAT DID NOT COME ACROSS (§4GK round 4).
+            # `skipped` was discarded, so a copy that silently dropped an
+            # escaping symlink, a FIFO or an unreadable subtree still answered
+            # "SUCCESS: Copied 'tree' to 'copy'." — and the model then worked
+            # from a destination it believes is complete. Verified: a source
+            # holding one regular file, one escaping link and one FIFO copied
+            # one file and reported plain success.
+            _skipped = await asyncio.to_thread(
+                copytree_nofollow, src_path, dest_path, sandbox_dir) or []
         else:
-            await asyncio.to_thread(shutil.copy2, str(src_path), str(dest_path))
+            # `src_path` already went through `_get_safe_path`, which RESOLVES
+            # a link, so `follow_symlinks=False` is unobservable HERE (its
+            # mutant is equivalent — §4GI battery); it stays because the AST
+            # enumeration holds every copy in this file to the same rule, so a
+            # future copy site that does not resolve first cannot follow.
+            await asyncio.to_thread(shutil.copy2, str(src_path), str(dest_path),
+                                    follow_symlinks=False)
+        if _skipped:
+            # A half-landed write is `ToolOutcome.partial`, never a bare
+            # string that merely starts with "PARTIAL:" — the package-wide
+            # contract enumeration caught exactly that here (§4GK round 5):
+            # a bare string coerces to OK, so the world-changed credit, the
+            # idempotency record and the strike decay all read it as a
+            # clean copy.
+            return ToolOutcome.partial(
+                f"Copied '{src_name}' to '{dest_name}', but "
+                f"{len(_skipped)} entr(ies) were NOT copied — "
+                f"{'; '.join(_skipped[:5])}"
+                f"{'…' if len(_skipped) > 5 else ''}. The destination is "
+                "incomplete; symlinks that leave the sandbox, device "
+                "nodes and unreadable entries are never copied.",
+                world_changed=True, reason_code="copy_incomplete")
         return f"SUCCESS: Copied '{src_name}' to '{dest_name}'."
     except ValueError as ve:
         return str(ve)

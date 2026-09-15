@@ -229,60 +229,147 @@ class TestEveryDeclarationIsTheRightOne:
             assert "ToolOutcome.rejected" in r, r
         assert OutcomeStatus.REJECTED
 
-    def test_the_truncating_write_flag_is_armed_before_the_write(self):
+    async def test_the_truncating_write_flag_is_armed_before_the_write(
+            self, tmp_path, monkeypatch):
         """`Path.write_text` opens with 'w' — truncate first, write second —
         so an OSError raised BY the write left the flag False and took the
         "nothing was touched" arm: a DECLARED rejection over a half-written
         file, with the `failed(world_changed=True)` arm written for exactly
-        that case unreachable."""
-        import ghost_agent.tools.file_system as F
+        that case unreachable.
 
-        src = inspect.getsource(F)
-        i = src.index("_wrote = True")
-        j = src.index("path.write_text", i - 400)
-        assert i < j, (
-            "`_wrote` is armed AFTER the call that truncates the file")
+        §4GJ: was `src.index("_wrote = True") < src.index("path.write_text")`.
+        Driven now: the auto-promote path with a write that raises ENOSPC.
+        Fails in the pre-fix tree, where the flag is set after the call and
+        the outcome is REJECTED/`auto_promote_failed_before_write`."""
+        from ghost_agent.tools.file_system import (
+            _looks_like_complete_python_module, tool_replace_text)
+        from ghost_agent.tools.outcome import OutcomeStatus
 
-    def test_a_rolled_back_replace_does_not_claim_a_mutation(self):
+        (tmp_path / "mod.py").write_text("x = 1\n")
+        # must satisfy `_looks_like_complete_python_module`: parses, a
+        # top-level import, a top-level def, >= 4 non-blank lines, >= 60 chars
+        module = (
+            "import os\n"
+            "import sys\n"
+            "\n"
+            "\n"
+            "def separator():\n"
+            "    return os.sep\n"
+            "\n"
+            "\n"
+            "def where():\n"
+            "    return sys.executable\n"
+        )
+        assert _looks_like_complete_python_module(module)
+
+        def _boom(self, *a, **k):
+            raise OSError(28, "No space left on device")
+        monkeypatch.setattr(Path, "write_text", _boom)
+
+        # no `replace_with` + a complete module => the auto-promote branch
+        out = await tool_replace_text("mod.py", module, None, tmp_path)
+        assert out.status is OutcomeStatus.FAILED, out.status
+        assert out.world_changed is True, (
+            "a write that truncated the file first was reported as "
+            "'nothing was touched'")
+        assert out.reason_code == "auto_promote_write_failed", out.reason_code
+
+    async def test_a_rolled_back_replace_does_not_claim_a_mutation(
+            self, tmp_path):
         """The guard can roll the whole edit back and return REJECTED;
         relabelling that PARTIAL with `world_changed=True` fires
         `strikes.note_world_changed()` and wipes the loop-breaker's memory on
-        a call that touched nothing."""
-        import ghost_agent.tools.file_system as F
+        a call that touched nothing.
 
-        src = inspect.getsource(F)
-        i = src.index("some_replace_blocks_failed")
-        window = src[i - 900:i + 200]
-        assert "is_rejection" in window, (
-            "a rolled-back multi-block replace still declares a mutation")
+        §4GJ: was `"is_rejection" in src[i-900:i+200]` around the
+        `some_replace_blocks_failed` literal — a character window that moves
+        with any edit. Driven now: one block lands and breaks the syntax (so
+        the guard rolls the whole write back) while a second block fails to
+        match (so `errors` is non-empty, the PARTIAL arm's trigger). Fails in
+        the pre-fix tree, which returned PARTIAL/`world_changed=True` over a
+        file that never changed."""
+        from ghost_agent.tools.file_system import tool_replace_text
+        from ghost_agent.tools.outcome import OutcomeStatus
+
+        target = tmp_path / "mod.py"
+        original = "def a():\n    return 1\n\n\ndef b():\n    return 2\n"
+        target.write_text(original)
+        payload = (
+            "<<<< SEARCH\n"
+            "    return 1\n"
+            "====\n"
+            "    return (1\n"          # lands, and breaks the parse
+            ">>>>\n"
+            "<<<< SEARCH\n"
+            "NOT PRESENT ANYWHERE\n"   # fails => `errors` non-empty
+            "====\n"
+            "whatever\n"
+            ">>>>\n"
+        )
+        res = await tool_replace_text("mod.py", payload, None, tmp_path)
+
+        assert target.read_text() == original, "the rollback did not restore"
+        assert res.status is not OutcomeStatus.PARTIAL, (
+            "a rolled-back edit was relabelled PARTIAL")
+        assert res.changed_the_world is False, (
+            "a rolled-back multi-block replace still declares a mutation — "
+            "this fires strikes.note_world_changed() over an untouched file")
 
     def test_the_supervisor_declares_its_launch_failures(self):
         """Three paths spawn a process and then fail; every other `Error:`
         return is a validation refusal that launched nothing. Declaring the
-        three is what lets the wrapper treat the rest as refusals."""
+        three is what lets the wrapper treat the rest as refusals.
+
+        §4GJ: was five `needle in src` greps (a comment mentioning a code
+        would have satisfied them). Now the reason codes are collected from
+        the AST of the actual `ToolOutcome.*(...)` keyword arguments."""
         import ghost_agent.sandbox.services as S
 
-        src = inspect.getsource(S)
-        for needle in ("service_launch_failed", "service_pid_unknown",
-                       "service_exited_immediately", "service_failed_to_bind",
-                       "service_port_hijacked"):
-            assert needle in src, f"{needle} declaration missing"
+        declared = {
+            kw.value.value
+            for n in ast.walk(ast.parse(inspect.getsource(S)))
+            if isinstance(n, ast.Call)
+            and "ToolOutcome." in ast.unparse(n.func)
+            for kw in n.keywords
+            if kw.arg == "reason_code" and isinstance(kw.value, ast.Constant)
+        }
+        for code in ("service_launch_failed", "service_pid_unknown",
+                     "service_exited_immediately", "service_failed_to_bind",
+                     "service_port_hijacked"):
+            assert code in declared, f"{code} is no longer declared"
 
     def test_browser_refusals_and_post_execution_failures(self):
         import ghost_agent.tools.browser as B
 
-        src = inspect.getsource(B.tool_browser)
-        # every pre-execution refusal goes through _reject
-        for needle in ("_reject(f\"Refused navigation", "_reject(f\"Refused goto",
-                       "_reject(str(ve))"):
-            assert needle in src, f"a refusal still arms the guard: {needle}"
-        # ...and _err can say the runner already ran
-        assert "world_changed=ran" in src, (
+        # §4GJ: the three `needle in src` greps became AST queries over the
+        # same tree — a comment quoting `_reject(...)` satisfied the greps.
+        tree = ast.parse(inspect.getsource(B.tool_browser).lstrip())
+        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
+
+        refusals = [n for n in calls
+                    if isinstance(n.func, ast.Name) and n.func.id == "_reject"]
+        assert len(refusals) >= 3, (
+            "the pre-execution refusals no longer go through `_reject` — "
+            "a refusal that arms the world-changed guard is a phantom edit")
+
+        # `_err` must be able to say the runner ALREADY ran: it takes a `ran`
+        # argument, and at least one call site passes it True.
+        errs = [n for n in calls
+                if isinstance(n.func, ast.Name) and n.func.id == "_err"]
+        assert any(kw.arg == "ran" and getattr(kw.value, "value", None) is True
+                   for n in errs for kw in n.keywords), (
             "`_err` declares 'nothing changed' for failures that happen "
             "AFTER the runner navigated, clicked and filled")
-        assert "ran=True" in src
+        err_def = next(f for f in ast.walk(ast.parse(
+            inspect.getsource(B).lstrip()))
+            if isinstance(f, ast.FunctionDef) and f.name == "_err")
+        assert any(
+            kw.arg == "world_changed" and isinstance(kw.value, ast.Name)
+            and kw.value.id == "ran"
+            for n in ast.walk(err_def) if isinstance(n, ast.Call)
+            for kw in n.keywords), (
+            "`_err` no longer forwards `ran` as its world-changed verdict")
         # interact reports what actually happened
-        tree = ast.parse(src.lstrip())
         # the TEST, not the body: the guard is
         # `if _interact_status == "ok": return _txt`, whose body never
         # mentions the variable at all.
@@ -316,11 +403,21 @@ class TestEveryDeclarationIsTheRightOne:
         looked like coverage."""
         import ghost_agent.core.bus as BUS
 
-        src = inspect.getsource(BUS)
-        i = src.index("async def _skill()")
-        window = src[i:i + 1400]
-        assert "_written" in window and "if _written" in window, (
-            "the skill leg discards `learn_lesson`'s answer")
+        # §4GJ: was a 1400-char window after `async def _skill()`. The AST
+        # finds the leg wherever it moves, and asks the real question: is
+        # `learn_lesson`'s ANSWER bound, and does the result branch on it?
+        leg = next(f for f in ast.walk(ast.parse(inspect.getsource(BUS)))
+                   if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))
+                   and f.name == "_skill")
+        bound = {t.id for n in ast.walk(leg) if isinstance(n, ast.Assign)
+                 and "learn_lesson" in ast.unparse(n.value)
+                 for t in n.targets if isinstance(t, ast.Name)}
+        assert bound, "the skill leg discards `learn_lesson`'s answer"
+        consulted = {n.id for n in ast.walk(leg)
+                     if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+        assert bound & consulted, (
+            "`learn_lesson`'s answer is bound and never read — the leg "
+            "reports ok whenever nothing escaped")
 
     def test_the_enveloped_execute_refusals_declare(self):
         """`_format_error` wraps a refusal in `--- EXECUTION RESULT ---`, and
@@ -329,9 +426,17 @@ class TestEveryDeclarationIsTheRightOne:
         case could not fire. 27 live rows."""
         import ghost_agent.tools.execute as E
 
-        src = inspect.getsource(E)
-        for needle in ("inline_shell_form_rejected", "shell_command_rejected"):
-            assert needle in src, needle
+        # §4GJ: two `needle in src` greps -> the declared reason codes,
+        # read off the AST of the actual outcome constructions.
+        declared = {
+            kw.value.value
+            for n in ast.walk(ast.parse(inspect.getsource(E)))
+            if isinstance(n, ast.Call)
+            for kw in n.keywords
+            if kw.arg == "reason_code" and isinstance(kw.value, ast.Constant)
+        }
+        for code in ("inline_shell_form_rejected", "shell_command_rejected"):
+            assert code in declared, f"{code} is no longer declared"
 
     def test_no_skill_creation_failure_is_a_bare_string(self):
         """Eight `Skill creation failed:` heads match no predicate in the
@@ -363,10 +468,19 @@ class TestTheInstrumentsAgain:
         OPEN — 7 of 8 non-OK shapes PASSED, and passing marks a task DONE."""
         import ghost_agent.core.build_gates as G
 
-        src = inspect.getsource(G.smoke_gate)
-        i = src.index("re.search(r'SMOKE_RESULT" if "re.search(r'SMOKE_RESULT"
-                      in src else "SMOKE_RESULT")
-        assert "shell_failed" in src[:i], (
+        # §4GJ: was a `src.index("SMOKE_RESULT")` split with a fallback
+        # needle. The property is an ORDER over two real nodes, so ask the
+        # AST for their line numbers inside the function itself.
+        gate = next(f for f in ast.walk(ast.parse(
+            inspect.getsource(G.smoke_gate).lstrip()))
+            if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)))
+        shell = [n.lineno for n in ast.walk(gate)
+                 if isinstance(n, ast.Attribute) and n.attr == "shell_failed"]
+        parse = [n.lineno for n in ast.walk(gate)
+                 if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                 and "SMOKE_RESULT" in n.value]
+        assert shell and parse, (shell, parse)
+        assert min(shell) < min(parse), (
             "the gate reaches its fail-open branch without ever asking the "
             "exit code")
 
@@ -390,10 +504,17 @@ class TestTheInstrumentsAgain:
     def test_the_eval_instrument_passes_the_tool_name(self):
         import ghost_agent.eval.behavioral as B
 
-        src = inspect.getsource(B)
-        assert "_action_failed" in src and 't.get("name")' in src, (
-            "a third predicate, and tool-name-blind: `execute` judged by the "
+        # §4GJ: two greps -> the AST. `_action_failed` must be CALLED (not
+        # merely mentioned), and it must be passed the tool's name.
+        tree = ast.parse(inspect.getsource(B))
+        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                 and getattr(n.func, "id", "") == "_action_failed"]
+        assert calls, (
+            "the shared predicate is not called — `execute` is judged by the "
             "generic sniffer, 61 REJECTED refusals missed")
+        assert any('"name"' in ast.unparse(a) or "'name'" in ast.unparse(a)
+                   for c in calls for a in c.args), (
+            "`_action_failed` is called tool-name-blind")
 
     def test_canonicality_is_per_operation(self):
         from ghost_agent.tools.memory import _bus_canonical_failed as f

@@ -12,6 +12,11 @@ from ..memory.scratchpad import Scratchpad
 from ..memory.temporal import anchor as _anchor_temporal
 from .outcome import ToolOutcome
 
+#: Trailing path separators to strip from a model-supplied target. A literal
+#: `"/" + os.sep` is `"//"` on POSIX — `rstrip` takes a CHARACTER SET, so the
+#: duplicate was a no-op tell that the argument was misread as a suffix.
+_PATH_SEPS = "".join(dict.fromkeys("/" + os.sep))
+
 logger = logging.getLogger("GhostAgent")
 
 # Strong references to in-flight fire-and-forget graph-extraction tasks.
@@ -102,6 +107,23 @@ _FORGET_PROTECTED_TYPES = [
 ]
 
 
+#: How a bus leg SAYS it did not write. Two vocabularies, one meaning: the
+#: leg raised ("error: …"), or the store declined the write and said so
+#: ("refused: …" — `MemoryBus._vector` emits that for `VectorMemory`'s own
+#: `ADD_REFUSALS`).
+#:
+#: ⚠ THE SECOND WORD WAS INVISIBLE TO ITS ONLY CLASSIFIER (§4GK round 6).
+#: Round 5 taught `add()` to answer a refusal and the bus to report it, and
+#: both classifiers here still keyed on `startswith("error")` alone — so
+#: `_bus_write_failures` answered `[]` and `_bus_canonical_failed` answered
+#: False for a write the store had explicitly declined. Measured: for
+#: `insert_fact` the vector leg IS the canonical store, so a refused write
+#: reported SUCCESS to the user and disarmed the verifier's
+#: unverified-mutation gate on top. A producer and its consumer have to be
+#: read together or the new status is decoration.
+_BUS_FAILURE_PREFIXES = ("error", "refused")
+
+
 def _bus_write_failures(report) -> list:
     """Subsystem entries in a `publish_fact` report that actually FAILED
     (skip/dedup are normal outcomes). The bus swallows exceptions into the
@@ -112,7 +134,7 @@ def _bus_write_failures(report) -> list:
         return []
     return sorted(
         f"{k}: {v}" for k, v in report.items()
-        if isinstance(v, str) and v.startswith("error"))
+        if isinstance(v, str) and v.startswith(_BUS_FAILURE_PREFIXES))
 
 
 #: Legs whose failure means the write did NOT happen. The vector and graph
@@ -154,7 +176,7 @@ def _bus_canonical_failed(report, kind: str = "") -> bool:
         # unknown operation: every named canonical leg counts
         legs = tuple({l for v in _CANONICAL_BUS_LEGS.values() for l in v})
     return any(
-        isinstance(v, str) and v.startswith("error")
+        isinstance(v, str) and v.startswith(_BUS_FAILURE_PREFIXES)
         and str(k).lower() in legs
         for k, v in report.items())
 
@@ -1299,7 +1321,7 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
     # `file_system.py` documents `sandbox/` as an observed live model shape.
     # Decide the shape FIRST, from the raw string.
     _raw_target = str(target).strip()
-    _probe = _raw_target.rstrip("/" + os.sep)
+    _probe = _raw_target.rstrip(_PATH_SEPS)
     target_names_a_path = ("/" in _probe.lstrip("/")
                            or os.sep in _probe.lstrip(os.sep))
     # Computed here, used by BOTH sweeps. They were written separately and
@@ -1319,7 +1341,7 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
     # the slash in `clean_target`, so the disk half matched `notes` as a bare
     # topic and deleted five files while the profile and graph halves matched
     # nothing at all — one call, two different targets.
-    clean_target = _raw_target.rstrip("/" + os.sep) or _raw_target
+    clean_target = _raw_target.rstrip(_PATH_SEPS) or _raw_target
     while clean_target.startswith("./"):
         clean_target = clean_target[2:]
     clean_target = clean_target.lstrip("/")
@@ -2391,8 +2413,6 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
 
     elif action == "reset_all":
         if not memory_system: return "Error: Memory system is disabled."
-        deleted = 0
-        failed_batches = 0
         # OFF THE EVENT LOOP, and without materialising the store.
         # `collection.get()` with no `include` returns every document body
         # and metadata blob — live, ~8k rows including 7k manual chunks —
@@ -2403,95 +2423,112 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
         _lock = (memory_system._get_lock()
                  if hasattr(memory_system, "_get_lock") else _NullCM())
 
-        def _enumerate():
-            # ids AND metadatas in ONE scan. `include=["metadatas"]` returns
-            # both (chroma always sends ids), so the orphan count below
-            # describes exactly the rows this call is about to delete. Two
-            # separate `get()`s meant the count came from a different
-            # snapshot than the delete — rows landing between them produced
-            # a note about documents that were never removed.
-            try:
-                with _lock:
-                    return memory_system.collection.get(include=["metadatas"])
-            except TypeError:
-                # Older chroma clients reject the kwarg.
-                with _lock:
-                    return memory_system.collection.get()
+        def _wipe():
+            """Enumerate, delete, reset the catalogues — ONE critical
+            section, off the event loop (§4GJ).
+
+            The lock used to be taken per step: once for the scan, once per
+            delete batch, and NOT AT ALL for the library reset, which ran
+            last. An ingest landing after the snapshot therefore survived
+            the wipe (its rows were not in the snapshot) while the unlocked
+            reset erased its catalogue line — the row lived, its index line
+            did not, and `ingest_document`'s dedup then refused to re-ingest
+            a document `list_docs` could not see. Holding the lock across
+            the whole sequence makes that interleaving impossible rather
+            than unlikely; the wipe is an explicit operator action, so
+            blocking concurrent memory writers for its duration is the
+            correct trade.
+            """
+            deleted = 0
+            failed_batches = 0
+            orphaned: dict = {}
+            with _lock:
+                # ids AND metadatas in ONE scan. `include=["metadatas"]`
+                # returns both (chroma always sends ids), so the orphan
+                # count below describes exactly the rows this call is about
+                # to delete. Two separate `get()`s meant the count came
+                # from a different snapshot than the delete — rows landing
+                # between them produced a note about documents that were
+                # never removed.
+                try:
+                    snapshot = memory_system.collection.get(include=["metadatas"])
+                except TypeError:
+                    # Older chroma clients reject the kwarg.
+                    snapshot = memory_system.collection.get()
+
+                all_ids = snapshot.get("ids", []) or []
+                # What this wipe ORPHANS, counted from the SAME snapshot.
+                # `reset_all` deletes the `document` / `episode` / `skill` /
+                # `acquired_skill` rows `_FORGET_PROTECTED_TYPES` protects,
+                # because each has a record in ANOTHER store this does not
+                # touch. `forget` refuses to create that asymmetry;
+                # `reset_all` creates it by design, so it has to say so —
+                # but only about rows that actually went.
+                # Types positionally aligned with `all_ids`. Defensive
+                # because the shape is the client's: a metadatas list
+                # shorter than ids, a None entry, or a non-dict entry
+                # (which raised AttributeError straight out of the tool,
+                # deleting nothing and returning no error string).
+                metas = snapshot.get("metadatas") or []
+                types: list = []
+                for i in range(len(all_ids)):
+                    m = metas[i] if i < len(metas) else None
+                    types.append(m.get("type") if isinstance(m, dict) else None)
+                incomplete = len(metas) < len(all_ids)
+
+                for i in range(0, len(all_ids), 500):
+                    batch = all_ids[i:i + 500]
+                    try:
+                        memory_system.collection.delete(ids=batch)
+                        deleted += len(batch)
+                        # Count orphans only for rows that actually went.
+                        # The first version emitted the note from a pre-scan
+                        # regardless of outcome: with every batch failing it
+                        # reported "this removed the vector rows for 600
+                        # document…" having removed nothing.
+                        for t in types[i:i + 500]:
+                            if t in _FORGET_PROTECTED_TYPES:
+                                orphaned[t] = orphaned.get(t, 0) + 1
+                    except Exception as e:
+                        failed_batches += 1
+                        __import__("logging").getLogger("GhostAgent").warning(
+                            f"reset_all batch {i // 500} failed: {e}"
+                        )
+
+                # Atomic catalogue reset, INSIDE the same critical section.
+                # NOT when ANY batch failed: emptying the catalogues while
+                # rows survive leaves the store and its indexes disagreeing
+                # — exactly what the message means by "left in place", and
+                # ingest dedups on the library, so an un-listed surviving
+                # document can neither be queried nor re-ingested without
+                # duplicating it.
+                if not failed_batches:
+                    # Both sidecars, together: a wiped document that keeps
+                    # its outline serves that structure to the next
+                    # same-named ingest until the ingest finishes (§4FO).
+                    # `isinstance(Path)` rather than `hasattr`: a store
+                    # whose catalogue path is not a real path (a stub) has
+                    # no catalogue to reset.
+                    for attr, empty in (("library_file", "[]"),
+                                        ("outlines_file", "{}")):
+                        path = getattr(memory_system, attr, None)
+                        if not isinstance(path, Path):
+                            continue
+                        try:
+                            tmp = path.with_suffix(path.suffix + ".tmp")
+                            tmp.write_text(empty)
+                            os.replace(tmp, path)
+                        except Exception as e:
+                            __import__("logging").getLogger("GhostAgent").warning(
+                                f"reset_all {attr} reset failed: {e}")
+            return deleted, failed_batches, orphaned, incomplete
 
         try:
-            _snapshot = await asyncio.to_thread(_enumerate)
+            deleted, failed_batches, orphaned, report_note_incomplete = (
+                await asyncio.to_thread(_wipe))
         except Exception as e:
             return f"Error: failed to enumerate vector store: {e}"
-        all_ids = _snapshot.get("ids", []) or []
 
-        # What this wipe ORPHANS, counted from the SAME snapshot.
-        # `reset_all` deletes the `document` / `episode` / `skill` /
-        # `acquired_skill` rows `_FORGET_PROTECTED_TYPES` protects, because
-        # each has a record in ANOTHER store this does not touch. `forget`
-        # refuses to create that asymmetry; `reset_all` creates it by
-        # design, so it has to say so — but only about rows that actually
-        # went (see the delete loop, which drops the count for a failed
-        # batch).
-        # Types positionally aligned with `all_ids`. Defensive because the
-        # shape is the client's: a metadatas list shorter than ids, a None
-        # entry, or a non-dict entry (which raised AttributeError straight
-        # out of the tool, deleting nothing and returning no error string).
-        _metas = _snapshot.get("metadatas") or []
-        _types: list = []
-        for _i in range(len(all_ids)):
-            _m = _metas[_i] if _i < len(_metas) else None
-            _types.append(_m.get("type") if isinstance(_m, dict) else None)
-        if len(_metas) < len(all_ids):
-            report_note_incomplete = True
-        else:
-            report_note_incomplete = False
-
-        def _delete(batch):
-            # UNDER THE VECTOR LOCK, like every other writer in vector.py and
-            # like both forget sweeps. Without it a concurrent ingest that
-            # started after the snapshot survived the wipe while the
-            # unlocked library reset erased its catalogue entry — the row
-            # lived, its index line did not, and the tool reported a clean
-            # "Wiped clean".
-            with _lock:
-                memory_system.collection.delete(ids=batch)
-
-        orphaned: dict = {}
-        for i in range(0, len(all_ids), 500):
-            batch = all_ids[i:i + 500]
-            try:
-                await asyncio.to_thread(_delete, batch)
-                deleted += len(batch)
-                # Count orphans only for rows that actually went. The first
-                # version emitted the note from a pre-scan regardless of
-                # outcome: with every batch failing it reported "this
-                # removed the vector rows for 600 document…" having removed
-                # nothing.
-                for t in _types[i:i + 500]:
-                    if t in _FORGET_PROTECTED_TYPES:
-                        orphaned[t] = orphaned.get(t, 0) + 1
-            except Exception as e:
-                failed_batches += 1
-                __import__("logging").getLogger("GhostAgent").warning(
-                    f"reset_all batch {i // 500} failed: {e}"
-                )
-        # Atomic library reset using the same pattern as the index helper.
-        # NOT when every batch failed: emptying the index while 8k rows
-        # survive leaves the store and its catalogue disagreeing, and the
-        # message says the entries were "left in place".
-        # ANY failed batch, not just total failure. With one batch of two
-        # failing, 500 rows survived and the catalogue was still emptied —
-        # exactly the disagreement this guard exists to prevent, and the
-        # message says the entries were "left in place". Ingest dedups on
-        # the library, so an un-listed surviving document can neither be
-        # queried nor re-ingested without duplicating.
-        if hasattr(memory_system, "library_file") and not failed_batches:
-            try:
-                tmp = memory_system.library_file.with_suffix(memory_system.library_file.suffix + ".tmp")
-                tmp.write_text("[]")
-                os.replace(tmp, memory_system.library_file)
-            except Exception as e:
-                __import__("logging").getLogger("GhostAgent").warning(f"reset_all library reset failed: {e}")
         if kwargs.get("graph_memory"):
             try:
                 await asyncio.to_thread(kwargs.get("graph_memory").wipe_all)

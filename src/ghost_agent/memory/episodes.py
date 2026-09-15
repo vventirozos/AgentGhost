@@ -25,6 +25,17 @@ from ..utils.helpers import get_utc_timestamp
 logger = logging.getLogger("GhostAgent")
 
 
+def _doc_key(text) -> str:
+    """The comparison key for "is this episode's text already indexed?".
+
+    ONE function, used on both sides of that question — the stored document
+    and the episode's would-be document. It exists because the two sides
+    were normalised differently and the mismatch made the boot reconcile
+    re-ingest the same episode forever (see `reconcile_vector_index`).
+    """
+    return str(text or "").strip()
+
+
 class EpisodicMemory:
     """SQLite-backed episodic memory with vector-searchable triggers.
 
@@ -314,13 +325,30 @@ class EpisodicMemory:
             self._ingest_episode_vector(
                 episode_id, trigger, lesson, vector_memory,
             )
+            # §4GJ: a FAILED twin-delete used to be swallowed whole. The
+            # episode row is already committed and gone, so the vector
+            # outlives it forever — episodes are excluded from
+            # `_prune_if_needed`, so nothing else ever reaps them, and the
+            # episodic recall tier maps those hits back to rows that are not
+            # there. Say so; `VectorMemory.reconcile_indexes` is the reaper.
+            _orphaned = []
             for vid in evicted_ids:
                 forget = getattr(vector_memory, "forget_episode", None)
-                if callable(forget):
-                    try:
-                        forget(vid)
-                    except Exception:
-                        pass
+                if not callable(forget):
+                    continue
+                try:
+                    # A store that predates the bool return (a stub, an old
+                    # proxy) returns None — treated as "ran", as before.
+                    if forget(vid) is False:
+                        _orphaned.append(vid)
+                except Exception as _fe:  # noqa: BLE001 — never fail a commit
+                    _orphaned.append(vid)
+                    logger.debug("forget_episode(%s) raised: %s", vid, _fe)
+            if _orphaned:
+                logger.warning(
+                    "%d evicted episode(s) kept their vector twin (%s) — "
+                    "orphans until the next memory reconcile",
+                    len(_orphaned), ", ".join(str(v) for v in _orphaned[:10]))
         # Episode commits were silent (audit A8). Episodes land every turn, so
         # the ordinary commit stays DEBUG; a LESSON-BEARING episode is a real
         # learning event and gets durable INFO — named, with the outcome.
@@ -349,6 +377,14 @@ class EpisodicMemory:
         first; this trades a small recall edge case for not flooding the index
         with near-duplicate embeddings, matching the store's own dedup
         contract in :meth:`VectorMemory.add`.
+
+        That collision is not confined to episodes: the same id is produced
+        by ANY writer storing the same text. `VectorMemory.add` refuses to
+        reclassify a row owned by another type rather than let this ingest
+        relabel a user's memory as an episode (which the episode reaper then
+        deleted — §4GJ round 4), so an episode whose text is already taken
+        simply gets no twin, loudly. `reconcile_vector_index` asks
+        `stored_type` first so it does not retry that forever.
         """
         add_fn = getattr(vector_memory, "add", None)
         if not callable(add_fn):
@@ -390,6 +426,85 @@ class EpisodicMemory:
             text = f"{text} :: {lesson}".strip(" :")
         return text
 
+    def _reap_cross_generation_twins(self, vector_memory, twins_by_ep,
+                                     live_doc_by_id, complete: bool) -> int:
+        """Delete twin rows that claim a LIVE episode id while holding text
+        that belongs to no live episode. Never raises; returns how many went.
+
+        ⚠ THE ONE ORPHAN THE VECTOR REAPER STRUCTURALLY CANNOT SEE (§4GK
+        round 6). `VectorMemory._reconcile_episode_vectors` decides by id
+        alone: an id above the live set's high-water mark is deferred, an id
+        below it and absent is reaped. After a REBUILD of this store (db
+        deleted, `INTEGER PRIMARY KEY AUTOINCREMENT` restarts at 1) the old
+        generation's twins carry ids the new generation re-issues — so old
+        episode #1's twin has `ep in live`: never deferred, never reaped,
+        permanently masquerading as new episode #1's twin. A semantic hit on
+        the OLD text then maps recall to the WRONG episode row, and it never
+        self-heals.
+
+        Two conditions make a row PROVABLY that, using only the pairing this
+        method already has in hand:
+
+        * its text is not the document of the episode it names, and
+        * its text is not the document of ANY live episode — so it cannot be
+          a live twin wearing stale metadata (that case is reported and left:
+          re-ingesting its real owner flips the label back, which
+          `reconcile_vector_index` does on this same pass).
+
+        ``complete`` says the episode read was not truncated by its LIMIT.
+        Without it "no live episode has this text" would only mean "none of
+        the ones we read", and this deletes. An incomplete sweep reports and
+        deletes nothing — the standing rule for this whole pass.
+        """
+        collection = getattr(vector_memory, "collection", None)
+        delete_fn = getattr(collection, "delete", None) if collection is not None else None
+        live_docs = {d for d in live_doc_by_id.values() if d}
+        victims, mislabeled = [], []
+        for ep, twins in (twins_by_ep or {}).items():
+            if ep not in live_doc_by_id:
+                # A twin naming a DEAD (or out-of-window) episode is the
+                # plain-orphan population, and that one has an owner already.
+                continue
+            for rid, dk in twins:
+                if not rid or not dk or dk == live_doc_by_id.get(ep):
+                    continue
+                if dk in live_docs:
+                    mislabeled.append(ep)
+                    continue
+                victims.append((rid, ep))
+        if mislabeled:
+            logger.info(
+                "Episode vector reconcile: %d twin row(s) carry another live "
+                "episode's text under episode_id %s — re-ingesting the real "
+                "owner relabels the shared row; nothing deleted.",
+                len(mislabeled), sorted(set(mislabeled))[:5])
+        if not victims:
+            return 0
+        if not complete:
+            logger.warning(
+                "Episode vector reconcile: %d twin row(s) claim a live "
+                "episode id while holding text no episode in this window "
+                "has (an id re-used after a store rebuild) — NOT deleted, "
+                "because the episode read hit its LIMIT and 'no live episode "
+                "has this text' is unproven. Recall may map those hits to "
+                "the wrong episode.", len(victims))
+            return 0
+        if not callable(delete_fn):
+            return 0
+        try:
+            delete_fn(ids=[rid for rid, _ep in victims])
+        except Exception as exc:  # noqa: BLE001 — housekeeping never raises
+            logger.warning("Episode vector reconcile: cross-generation twin "
+                           "delete failed: %s", exc)
+            return 0
+        logger.warning(
+            "Episode vector reconcile: deleted %d vector twin(s) left over "
+            "from a PREVIOUS generation of this store — each claimed a live "
+            "episode id (%s) while holding text no live episode has, so a "
+            "semantic hit on it resolved to the wrong episode.",
+            len(victims), ", ".join(f"#{ep}" for _rid, ep in victims[:5]))
+        return len(victims)
+
     def reconcile_vector_index(self, vector_memory, limit: int = None) -> int:
         """Re-ingest episodes whose vector twin GENUINELY failed to embed —
         and, crucially, SKIP episodes that only lack an own-id twin because
@@ -407,8 +522,11 @@ class EpisodicMemory:
         present → dedup-covered (skip, report separately); absent → a real
         hole (re-ingest).
 
-        Not called from inside this module — intended for a boot / maintenance
-        hook owned by the caller (agent.py).
+        Not called from inside this module: the caller is the BOOT hook in
+        `main.py` (search `reconcile_vector_index`), which runs it once per
+        start. Named here because a docstring that says only "intended for a
+        caller" reads as an unwired loop to the next reader — one did, in the
+        §4GJ review — and this project has a standing memory about those.
         """
         if vector_memory is None:
             return 0
@@ -426,13 +544,37 @@ class EpisodicMemory:
             return 0
         if not isinstance(existing, dict):
             return 0
-        indexed_ids = set()
-        for meta in (existing.get("metadatas") or []):
+        # Every twin row, keyed by the episode it CLAIMS, carrying its own
+        # row id and text — the pairing is the evidence the id-collision
+        # check below needs, and it costs nothing extra: this read already
+        # asked for metadatas and documents.
+        _row_ids = existing.get("ids") or []
+        _metas = existing.get("metadatas") or []
+        _docs = existing.get("documents") or []
+        twins_by_ep: Dict[int, List[Tuple[Any, str]]] = {}
+        for _i, meta in enumerate(_metas):
             try:
-                indexed_ids.add(int((meta or {}).get("episode_id")))
+                _ep = int((meta or {}).get("episode_id"))
             except (TypeError, ValueError):
                 continue
-        indexed_docs = {str(d).strip() for d in (existing.get("documents") or []) if d}
+            twins_by_ep.setdefault(_ep, []).append((
+                _row_ids[_i] if _i < len(_row_ids) else None,
+                _doc_key(_docs[_i] if _i < len(_docs) else ""),
+            ))
+        # ⚠ BOTH SIDES OF THIS COMPARISON THROUGH THE SAME NORMALISER (§4GJ
+        # round 5). This set was built with `.strip()` while the episode's
+        # own document below was tested UNSTRIPPED, and `_episode_document`
+        # strips only `" :"` — so an episode whose lesson ends in "\n"
+        # (ordinary model output) never matched the row it was already
+        # dedup'd onto. Reproduced with two episodes sharing a trigger: each
+        # boot read one as "genuinely missing a twin", logged that alarm,
+        # re-ingested it, and `add` dedup'd it back onto the SAME md5 row
+        # while flipping that row's `episode_id` to the other episode —
+        # forever, alternating. Combined with the vector reaper's snapshot
+        # arm, whichever episode did not currently own the row lost its twin
+        # outright. A dedup-covered episode IS reachable through the shared
+        # entry, which is the whole point of the check.
+        indexed_docs = {_doc_key(d) for d in (existing.get("documents") or []) if d}
         with self._lock:
             with closing(sqlite3.connect(self.db_path)) as conn:
                 rows = conn.execute(
@@ -440,16 +582,75 @@ class EpisodicMemory:
                        ORDER BY timestamp DESC LIMIT ?""",
                     (int(limit),),
                 ).fetchall()
+        # ⚠ AN OWN-ID TWIN MUST ALSO HOLD THAT EPISODE'S TEXT (§4GK round 6).
+        # Episode ids are `INTEGER PRIMARY KEY AUTOINCREMENT`, so a REBUILT
+        # store (db deleted, sequence restarts at 1) re-issues ids the old
+        # twins still carry. The vector reaper cannot see those: old episode
+        # #1's twin names a LIVE id, so it is never deferred by the watermark
+        # and never reaped as an orphan — it simply masquerades as new
+        # episode #1's twin forever, and a semantic hit on the OLD text maps
+        # recall to the WRONG episode row. This method had the same blind
+        # spot from the other side: it counted the id as indexed, so the new
+        # episode was never re-ingested and never got a twin of its own.
+        #
+        # The pairing is the proof, and it needs no second store: a row that
+        # claims episode N while holding text that is not episode N's
+        # document is not episode N's twin, whatever its metadata says.
+        live_doc_by_id = {}
+        for _r in rows:
+            try:
+                live_doc_by_id[int(_r[0])] = _doc_key(
+                    self._episode_document(_r[1] or "", _r[2] or ""))
+            except (TypeError, ValueError):
+                continue
+        # A row whose TEXT we cannot read (no document came back) counts as
+        # covering its id, exactly as before: unknown is not proof, and the
+        # rule here is the same one the whole pass runs on.
+        indexed_ids = {
+            ep for ep, twins in twins_by_ep.items()
+            if any((not dk) or dk == live_doc_by_id.get(ep)
+                   for _rid, dk in twins)
+        }
+        # (Ids OUTSIDE this window need no rule here — `indexed_ids` is only
+        # ever tested against `rows`, and every row is in `live_doc_by_id`.
+        # The reaper below is where the window matters, and it takes the
+        # completeness of this read as an argument.)
+        self._reap_cross_generation_twins(
+            vector_memory, twins_by_ep, live_doc_by_id,
+            complete=len(rows) < int(limit))
         no_own_twin = [r for r in rows if int(r[0]) not in indexed_ids]
-        genuine, dedup_covered = [], 0
+        genuine, dedup_covered, shadowed = [], 0, []
+        # Ids are md5(TEXT), so an episode's document can already be owned by
+        # a row of another type — a user memory whose text equals this
+        # episode's `trigger :: lesson`. `VectorMemory.add` now REFUSES to
+        # reclassify such a row (it used to overwrite the metadata whole,
+        # turning a `type=fact` memory into a `type=episode` one that the
+        # reaper then deleted). Refused is the right answer, but this method
+        # runs at every boot, unattended: without asking first it would
+        # re-drive that refusal forever and report a hole that can never be
+        # repaired.
+        type_probe = getattr(vector_memory, "stored_type", None)
         for ep_id, trigger, lesson in no_own_twin:
             doc = self._episode_document(trigger or "", lesson or "")
             # A too-short doc is never embedded (see _ingest_episode_vector's
             # len<5 guard), so it's not a repairable hole either.
-            if len(doc) < 5 or doc in indexed_docs:
+            if len(doc) < 5 or _doc_key(doc) in indexed_docs:
                 dedup_covered += 1
-            else:
-                genuine.append((ep_id, trigger, lesson))
+                continue
+            owner = type_probe(doc) if callable(type_probe) else None
+            if owner and owner != "episode":
+                shadowed.append((ep_id, owner))
+                continue
+            genuine.append((ep_id, trigger, lesson))
+        if shadowed:
+            logger.warning(
+                "Episode vector reconcile: %d episode(s) share their exact "
+                "text with a memory of another type (%s) — NOT re-ingested, "
+                "because overwriting that row would hand someone else's "
+                "memory to the episode reaper. Those episodes stay reachable "
+                "by the substring fallback only.",
+                len(shadowed),
+                ", ".join(f"#{e}→{t}" for e, t in shadowed[:5]))
         if not genuine:
             if dedup_covered:
                 logger.info(
@@ -1042,3 +1243,62 @@ class EpisodicMemory:
         with self._lock:
             with closing(sqlite3.connect(self.db_path)) as conn:
                 return conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0]
+
+    def live_episode_ids(self):
+        """Every live episode id, or None when the store cannot be read.
+
+        The complete set, deliberately unbounded by any LIMIT: its consumer
+        (`VectorMemory.reconcile_indexes`) deletes the vector rows whose
+        `episode_id` is NOT in it, so a truncated set would read live
+        episodes as orphans. None means "could not prove anything" and skips
+        that arm entirely — an empty set is a real, different answer (an
+        episode store that HELD episodes and no longer does, whose every
+        episode vector IS an orphan).
+
+        ⚠ Which is why the `except → None` guard was not enough (§4GJ round
+        4). `__init__` CREATES the schema, so the likeliest way this store
+        goes empty — `episodic_memory.db` deleted, relocated, or pointed at
+        a new memory dir — produces an empty TABLE, not an error: the guard
+        cannot fire, the answer is `set()`, and the reaper reads every
+        episode vector as an orphan. Measured: a fresh store answered
+        `set()` and 3 of 3 episode vectors were deleted. The vector twins
+        are the only semantic-recall copy of an episode's trigger and
+        lesson, so that is not a cache being dropped.
+
+        The discriminator is the AUTOINCREMENT high-water mark. `id INTEGER
+        PRIMARY KEY AUTOINCREMENT` gives the table a `sqlite_sequence` row
+        the first time anything is inserted, and DELETE does not remove it —
+        so "empty with a sequence" is a store that emptied (a real, provable
+        `set()`), and "empty with no sequence" is a store that never held an
+        episode at all, which proves nothing about the vectors. Say None.
+
+        The complement of `reconcile_vector_index`, which repairs the other
+        direction (a live episode whose vector twin never landed)."""
+        try:
+            with self._lock:
+                with closing(sqlite3.connect(self.db_path)) as conn:
+                    ids = {int(r[0]) for r in
+                           conn.execute("SELECT id FROM episodes").fetchall()}
+                    if ids:
+                        return ids
+                    try:
+                        seq = conn.execute(
+                            "SELECT seq FROM sqlite_sequence WHERE name = ?",
+                            ("episodes",)).fetchone()
+                    except sqlite3.Error:
+                        # No `sqlite_sequence` at all — a schema this method
+                        # does not recognise. Unproven, so: None.
+                        seq = None
+                    if not seq:
+                        logger.warning(
+                            "live_episode_ids: the episode table is empty and "
+                            "has never held a row (%s) — this is a FRESH or "
+                            "rebuilt store, not an emptied one, so the "
+                            "episode-vector reconcile is skipped rather than "
+                            "reaping every twin", self.db_path)
+                        return None
+                    return set()
+        except Exception as e:  # noqa: BLE001 — unreadable ≠ empty
+            logger.warning("live_episode_ids failed (%s); the episode-vector "
+                           "reconcile will be skipped, not run blind", e)
+            return None

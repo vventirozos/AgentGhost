@@ -356,9 +356,16 @@ class TestTheNewlyMigratedProducers:
         import ghost_agent.tools.search as S
         from ghost_agent.tools.outcome import ToolOutcome
 
-        src = inspect.getsource(S)
-        assert src.count("FACT CHECK PARTIAL") >= 2
-        for node in ast.walk(ast.parse(src)):
+        # §4GJ: `src.count("FACT CHECK PARTIAL") >= 2` counted comments too.
+        # The AST counts the RETURNS that carry the head, which is the
+        # property: every such head is a declared PARTIAL.
+        tree = ast.parse(inspect.getsource(S))
+        heads = [n for n in ast.walk(tree)
+                 if isinstance(n, ast.Return) and n.value is not None
+                 and "FACT CHECK PARTIAL" in ast.unparse(n.value)]
+        assert len(heads) >= 2, (
+            f"the FACT CHECK PARTIAL returns are gone ({len(heads)} left)")
+        for node in ast.walk(tree):
             if isinstance(node, ast.Return) and node.value is not None:
                 u = ast.unparse(node.value)
                 if "FACT CHECK PARTIAL" in u:
@@ -398,12 +405,22 @@ class TestTheNewlyMigratedProducers:
         cancelled — do not re-dispatch them"."""
         import ghost_agent.tools.swarm as SW
 
-        src = inspect.getsource(SW)
-        assert "swarm_await_still_running" in src, (
+        # §4GJ: two `needle in src` greps -> the AST. The property is that
+        # the still-running branch constructs an UNRESOLVED outcome carrying
+        # that reason code — a comment naming either satisfied the greps.
+        unresolved = [
+            n for n in ast.walk(ast.parse(inspect.getsource(SW)))
+            if isinstance(n, ast.Call)
+            and ast.unparse(n.func).endswith("ToolOutcome.unresolved")
+        ]
+        assert unresolved, (
             "the still-running branch is a PARTIAL again — that is a "
-            "failure verdict for work explicitly still in flight"
-        )
-        assert "ToolOutcome.unresolved" in src
+            "failure verdict for work explicitly still in flight")
+        assert any(kw.arg == "reason_code"
+                   and getattr(kw.value, "value", None)
+                   == "swarm_await_still_running"
+                   for n in unresolved for kw in n.keywords), (
+            "the still-running outcome lost its reason code")
 
     @pytest.mark.asyncio
     async def test_a_write_that_lands_but_does_not_parse_is_partial(

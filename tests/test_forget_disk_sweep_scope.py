@@ -491,33 +491,62 @@ async def test_a_partly_failed_wipe_does_not_empty_the_catalogue():
 
 
 @pytest.mark.asyncio
-async def test_reset_all_holds_the_vector_lock():
-    """Every writer in vector.py and both forget sweeps take
-    `_get_lock()`; these two did not. A concurrent ingest that started after
-    the snapshot survived the wipe while the unlocked library reset erased
-    its catalogue entry — the row lived, its index line did not, and the
-    tool reported a clean "Wiped clean"."""
+async def test_reset_all_holds_the_vector_lock_across_the_WHOLE_wipe(tmp_path):
+    """Every writer in vector.py and both forget sweeps take `_get_lock()`;
+    these did not.
+
+    ⚠ THIS PIN USED TO ASSERT `held.count("in") >= 2` — i.e. it demanded the
+    DEFECT (§4GJ): per-step acquisitions, with the catalogue reset running
+    after the last `__exit__` and under no lock at all. An ingest landing
+    after the snapshot survived the wipe while the unlocked reset erased its
+    catalogue entry — the row lived, its index line did not. The property is
+    not "the lock is taken more than once", it is "no store touch and no
+    catalogue write happens outside a lock span", which the old shape
+    FAILS."""
     from ghost_agent.tools.memory import tool_knowledge_base
 
-    mem, _ = _reset_memsys([("1", "fact")])
-    held = []
+    events = []
+    mem = MagicMock()
+    mem.collection.get = lambda **kw: (events.append("scan"),
+                                       {"ids": ["1"], "metadatas": [{"type": "fact"}]})[1]
+    mem.collection.delete = lambda ids=None: events.append("delete")
+    lib = tmp_path / "library_index.json"
+    lib.write_text('["doc.pdf"]')
+    mem.library_file = lib
+    del mem.outlines_file
 
     class _Lock:
         def __enter__(self):
-            held.append("in")
+            events.append("in")
             return self
 
         def __exit__(self, *a):
-            held.append("out")
+            # The catalogue's state AT LOCK RELEASE is what proves the reset
+            # ran inside the span: pre-fix it ran after this point, so the
+            # file still read '["doc.pdf"]' here.
+            events.append("catalogue" if lib.read_text() == "[]" else "out-stale")
+            events.append("out")
             return False
 
     mem._get_lock = lambda: _Lock()
     await tool_knowledge_base(action="reset_all", memory_system=mem)
 
-    assert held.count("in") >= 2, (
-        "the enumeration and the delete batches must both run under the "
-        "vector lock"
-    )
+    assert lib.read_text() == "[]", "the catalogue was not reset at all"
+    assert "catalogue" in events, (
+        f"the catalogue was reset OUTSIDE the lock span — the §4GJ defect: {events}")
+    # Every store touch sits strictly between one `in` and its `out`.
+    depth = 0
+    for ev in events:
+        if ev == "in":
+            depth += 1
+        elif ev == "out":
+            depth -= 1
+        elif ev in ("scan", "delete"):
+            assert depth > 0, f"{ev!r} ran outside the vector lock: {events}"
+    assert events.count("in") == 1, (
+        f"the wipe must be ONE critical section, not {events.count('in')} — "
+        f"a writer interleaving between them is the whole defect: {events}")
+    assert events[0] == "in" and events[-1] == "out", events
 
 
 @pytest.mark.asyncio

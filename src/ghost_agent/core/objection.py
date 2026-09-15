@@ -334,16 +334,22 @@ _VERSION_RE = re.compile(
 # matching: a false absence-match routes to rule 2, which can only
 # dismiss by FINDING the atoms or uphold by proving them absent — both
 # strictly safer than rule 1's arithmetic on an omission complaint.
+#: ⚠ Tracks `verifier._ABSENCE_ISSUE_RE`'s grammar (§4GR): an adverb
+#: between the negation and its verb ("not explicitly in", "not clearly
+#: mentioned") and a PLURAL subject ("they do not appear") are the same
+#: complaint. "not only" is excluded — it is the opposite claim.
+_NEG_ADV = r"(?:(?!only\b)\w+ly\s+)?"
 _ABSENCE_RE = re.compile(
-    r"not (?:in|present|found|mentioned|supported|stated|listed|shown|"
+    r"not " + _NEG_ADV + r"(?:in|present|found|mentioned|supported|stated|"
+    r"listed|shown|confirmed|"
     r"included|provided|reflected|given)"
     r"|unsupported|unsubstantiated"
     r"|no (?:mention|evidence|record|trace|reference)"
     r"|absent from|missing from|\b(?:is|are|was|were) missing"
-    r"|does not (?:appear|include|contain|mention|state|show|list|"
-    r"provide|give)"
-    r"|doesn't (?:appear|include|contain|mention|state|show|list|"
-    r"provide|give)"
+    r"|do(?:es)? not " + _NEG_ADV + r"(?:appear|include|contain|mention|state|"
+    r"show|list|provide|give)"
+    r"|doesn't " + _NEG_ADV + r"(?:appear|include|contain|mention|state|show|"
+    r"list|provide|give)"
     r"|\bomits?\b|\bomitted\b|\bomission\b"
     r"|fails? to (?:mention|state|include|note|report|provide|show)"
     r"|never (?:mentions?|mentioned|states?|stated|gives?|given|"

@@ -158,7 +158,7 @@ def test_agent_wires_context_manager_before_prune():
     summarization _prune_context."""
     import inspect
     from ghost_agent.core.agent import GhostAgent
-    src = inspect.getsource(GhostAgent.handle_chat)
+    src = inspect.getsource(GhostAgent.handle_chat) + inspect.getsource(GhostAgent._run_internal_turn)
     i_cm = src.index("_get_context_manager().compress_if_needed")
     i_prune = src.index("await self._prune_context(messages")
     assert i_cm < i_prune, "compression must run BEFORE the summarization prune"

@@ -1,8 +1,11 @@
 import atexit
 import itertools
+import json
 import pytest
 import os
 import shutil
+import signal
+import subprocess
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, AsyncMock
@@ -567,6 +570,174 @@ def _isolate_optim_activation_counters():
     yield
 
 
+# ── Detached job reaper (§4GV, 2026-09-14) ──────────────────────────────────
+#
+# WHY THIS EXISTS, measured: four `sh -c 'while :; do echo …; sleep 0.2; done'`
+# loops were found alive on this machine, reparented to init, the oldest
+# SIXTEEN DAYS old, each burning a tenth of a core since. They are sandbox-job
+# fixtures: the suite spawns real host processes through a `setsid` shim so
+# the job is its own process-group leader, and a test that dies before its
+# `_cleanup` — a crash, a timeout, an interrupted run — leaves the group
+# orphaned with nothing left that knows it exists. §4GQ taught `_cleanup` to
+# sweep EVERY registry row rather than only the running ones; that stops new
+# leaks from tests that finish, and can reach nothing that escaped before it.
+#
+# ⚠ PROVENANCE, NOT PATTERN. The obvious sweep — kill anything whose command
+# line looks like a busy loop — is the "guard the thing, not a proxy" trap
+# with a process table for a blast radius. This reaps ONLY pids the shim
+# itself recorded, and only when the live process still carries the argv that
+# was recorded with it: pid reuse is otherwise a licence to kill a stranger.
+# ⚠ ONE REGISTRY PER SESSION PROCESS, named by its OWNER's pid (§4GZ).
+# A single shared file looked simpler and was a cross-worker kill switch:
+# `tests/test_sandbox_job_promotion.py` writes rows for jobs that are STILL
+# RUNNING, and under `-n 6 --dist loadfile` that file runs in one worker while
+# another worker finishes, reaps every row it can see — killing the first
+# worker's live jobs mid-test — and unlinks the file, destroying the rows for
+# anything it could not kill. Measured: the registry carries 4 live rows
+# within 4 seconds of that file starting.
+JOB_REGISTRY = (Path(tempfile.gettempdir())
+                / f"ghost-test-detached-jobs-{os.getpid()}.jsonl")
+#: Every session's registry, this one included. The start-of-run sweep needs
+#: to see the files a CRASHED earlier run left behind, which carry a
+#: different owner pid.
+JOB_REGISTRY_GLOB = "ghost-test-detached-jobs-*.jsonl"
+
+
+def _owner_pid(path) -> int:
+    """The pid in a registry filename, or 0 when it does not carry one."""
+    try:
+        return int(str(Path(path).stem).rsplit("-", 1)[1])
+    except (IndexError, ValueError):
+        return 0
+
+
+def _owner_is_alive(path) -> bool:
+    """Is the session process that owns this registry still running?
+
+    ⚠ The exact question, not a proxy for it. The obvious substitute — "is
+    the file older than N minutes" — is wrong in both directions: a live
+    worker that has not spawned a job for N minutes looks abandoned, and two
+    runs back to back look live. Pid reuse can only make this answer YES for
+    a dead owner, which merely DELAYS a sweep; it can never turn a live
+    worker's jobs into kill targets. (Row-level argv identity still guards
+    every individual kill.)"""
+    pid = _owner_pid(path)
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:                  # EPERM: alive, owned by someone else
+        return True
+
+
+def _live_command(pid: int) -> str:
+    """The live process's argv as one string, or "" when it is gone."""
+    try:
+        out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=10)
+    except Exception:  # noqa: BLE001
+        return ""
+    return (out.stdout or "").strip()
+
+
+def _same_process(recorded_argv, live_cmd: str) -> bool:
+    """Is the process now at that pid the one the shim recorded?
+
+    `ps` prints the argv space-joined and unquoted, so compare against the
+    recorded argv normalised the same way. Two factors (the pid AND the
+    command) is what makes a reuse collision implausible rather than merely
+    unlikely."""
+    if not live_cmd or not recorded_argv:
+        return False
+    def _norm(t):
+        return " ".join(str(t).replace("'", "").replace('"', "").split())
+    return _norm(" ".join(recorded_argv)) == _norm(live_cmd)
+
+
+def reap_detached_jobs(registry: Path = None) -> int:
+    """Kill the process GROUPS this suite's shim recorded and still owns.
+
+    Returns how many groups were signalled. Never raises: a reaper that
+    breaks a test run is worse than the leak it cleans up.
+    """
+    registry = Path(registry or JOB_REGISTRY)
+    try:
+        rows = [json.loads(line) for line in
+                registry.read_text().splitlines() if line.strip()]
+    except (OSError, ValueError):
+        return 0
+    killed = 0
+    for row in rows:
+        try:
+            pid, pgid = int(row["pid"]), int(row["pgid"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not _same_process(row.get("argv"), _live_command(pid)):
+            continue                       # gone, or someone else's pid now
+        try:
+            if os.getpgid(pid) == pgid:    # still its own group leader
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                os.kill(pid, signal.SIGKILL)
+            killed += 1
+        except OSError:
+            continue
+    try:
+        registry.unlink()
+    except OSError:
+        pass
+    return killed
+
+
+def reap_abandoned_registries() -> int:
+    """Reap every registry whose owning session process is gone.
+
+    This is the "inherited stray" half: the four sixteen-day-old loops were
+    left by runs that died, and their rows live in files nobody will ever
+    open again. A registry whose owner is STILL ALIVE belongs to a sibling
+    worker running right now and is never touched — its jobs are that
+    worker's to finish with."""
+    killed = 0
+    try:
+        candidates = list(Path(tempfile.gettempdir()).glob(JOB_REGISTRY_GLOB))
+    except OSError:
+        return 0
+    for path in candidates:
+        if path == JOB_REGISTRY or _owner_is_alive(path):
+            continue
+        killed += reap_detached_jobs(path)
+    return killed
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _reap_detached_sandbox_jobs():
+    """Reap at BOTH ends of the session: at the start because the leak that
+    motivated this had already happened (and no run since would have noticed),
+    at the end because this run's own crash is the next one.
+
+    ⚠ What makes this safe under `-n 6` is the OWNER GUARD, not the timing.
+    Both ends sweep abandoned registries (a dead owner's rows are fair game
+    whenever they are noticed — a run that outlives a crashed sibling should
+    clean up after it) and this session's own. Neither end ever touches a
+    registry whose owning process is still alive: that is a sibling worker
+    mid-run, and the single shared file that had no such guard was measured
+    killing its live jobs. A §4GZ mutant that moved the abandoned sweep into
+    teardown survived the battery for exactly this reason — it was a safe
+    variant, not a defect, so it was adopted rather than pinned against."""
+    os.environ["GHOST_TEST_JOB_REGISTRY"] = str(JOB_REGISTRY)
+    before = reap_abandoned_registries() + reap_detached_jobs(JOB_REGISTRY)
+    if before:
+        print(f"\n[conftest] reaped {before} detached job group(s) left by an "
+              f"earlier run")
+    yield
+    after = reap_abandoned_registries() + reap_detached_jobs(JOB_REGISTRY)
+    if after:
+        print(f"\n[conftest] reaped {after} detached job group(s) from this run")
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _no_mock_path_residue():
     """Session safety net: fail loudly if any test splattered a mock-derived
@@ -644,8 +815,10 @@ def make_streaming_resp(status=200, body="", content_type="text/html",
       green).
     * httpx:  client.stream(...) async-ctx → resp.aiter_bytes() (async)
     The SYNC iter_content is a TRIPWIRE, not a working drain: no async fetch
-    path may ever call it, and sync-Session tests (darkweb) build their own
-    response objects. A bytes-returning sync mock here is what kept the suite
+    path may ever call it — and since §4GM (2026-09-14) there is no sync
+    curl_cffi path left to build a response for: the darkweb onion fetch
+    moved to AsyncSession because the sync streaming path aborts the process
+    inside libcurl. A bytes-returning sync mock here is what kept the suite
     green through the 2026-07-28 breakage.
     """
     from unittest.mock import MagicMock, AsyncMock

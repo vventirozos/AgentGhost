@@ -56,6 +56,22 @@ def _handle_chat_ast():
     raise AssertionError("handle_chat not found in the agent module")
 
 
+def _turn_loop_asts():
+    """`handle_chat` AND the regions extracted out of its turn loop.
+
+    ⚠ A PIN THAT NAMES ONE FUNCTION FOLLOWS THE CODE OR DIES (§4GS). The
+    internal consumer moved into `_run_internal_turn` (step 4b) and the
+    client-SSE branch into `_stream_final_generation` (4a); a check that
+    walks only `handle_chat` reports "not found" — which reads as a broken
+    pin, not as a moved guard.
+    """
+    src = Path(inspect.getfile(GhostAgent)).read_text(encoding="utf-8")
+    want = ("handle_chat", "_run_internal_turn", "_stream_final_generation")
+    return [n for n in ast.walk(ast.parse(src))
+            if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef))
+            and n.name in want]
+
+
 def _assigns_payload_tools(node) -> bool:
     """True if `node`'s subtree assigns to `payload["tools"]`."""
     for sub in ast.walk(node):
@@ -362,15 +378,17 @@ class TestFinalGenerationCannotDispatch:
     def _drop_guard(self):
         """The `if ... and tool_calls:` statement that drops calls on a
         text-only turn, located in handle_chat by its log message."""
-        for node in ast.walk(_handle_chat_ast()):
-            if not isinstance(node, ast.If):
-                continue
-            for sub in ast.walk(node.test):
-                if isinstance(sub, ast.Name) and sub.id == "tool_calls":
-                    for c in ast.walk(node):
-                        if (isinstance(c, ast.Constant) and isinstance(c.value, str)
-                                and "Dropping %d tool_call(s)" in c.value):
-                            return node
+        for fn in _turn_loop_asts():
+            for node in ast.walk(fn):
+                if not isinstance(node, ast.If):
+                    continue
+                for sub in ast.walk(node.test):
+                    if isinstance(sub, ast.Name) and sub.id == "tool_calls":
+                        for c in ast.walk(node):
+                            if (isinstance(c, ast.Constant)
+                                    and isinstance(c.value, str)
+                                    and "Dropping %d tool_call(s)" in c.value):
+                                return node
         raise AssertionError("the force-final tool_call drop guard was not found")
 
     def test_drop_guard_uses_the_wider_predicate(self):

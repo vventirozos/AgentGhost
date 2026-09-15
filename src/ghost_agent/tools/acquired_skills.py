@@ -345,23 +345,81 @@ class AcquiredSkillManager:
             # if the content actually changed. Re-embedding identical skill
             # text was bloating the vector store on every replan.
             if self.memory_system and not content_unchanged:
-                # Drop any previous embedding for this name first — re-saving
-                # a skill with edited content used to stack a fresh embedding
-                # on top of the old one, so semantic routing counted the same
-                # skill once per historical edit. No-op for brand-new skills.
-                try:
-                    self.memory_system.collection.delete(
-                        where={"$and": [{"name": name}, {"type": "acquired_skill"}]}
+                # ⚠ ASK WHETHER THE WRITE CAN LAND BEFORE DESTROYING WHAT IT
+                # REPLACES (§4GK round 6 — the same shape as `smart_update`,
+                # fixed there in the same round). `ADD_REFUSALS` had been
+                # wired into the REPAIR call sites (the backfill below,
+                # `heal_missing_twins`) and NOT into this one, which is the
+                # only one that DELETES first: the drop below ran, then
+                # `add()` refused the replacement because the description's
+                # exact text is already owned by another population — and
+                # the skill vanished from semantic routing while this method
+                # logged "SKILL ACQUIRED — Permanently learned new tool" and
+                # returned True. The registry entry survives, so the skill
+                # is still callable by name; it is simply unfindable by the
+                # router that is supposed to suggest it.
+                #
+                # So probe first. A refusal keeps the OLD embedding (stale
+                # text, right name — routing still reaches the skill) rather
+                # than trading a working row for one that cannot be written.
+                _refused = None
+                _desc = description or ""
+                if len(_desc) < 5:
+                    # `add()`'s other refusal: too short to embed.
+                    _refused = "text too short to embed"
+                else:
+                    _owner = None
+                    try:
+                        _owner = self.memory_system.stored_type(_desc)
+                    except Exception:  # noqa: BLE001 — a probe (and an older
+                        # store may not have one), never a gate
+                        _owner = None
+                    # A STRING or nothing: a stubbed memory system answers a
+                    # mock, and a mock is a test asserting the delegation,
+                    # not a store reporting an owner.
+                    if isinstance(_owner, str) and _owner and _owner != "acquired_skill":
+                        _refused = f"the text is already stored as type={_owner!r}"
+                if _refused:
+                    logger.warning(
+                        "Skill '%s': its description will NOT embed (%s) — the "
+                        "previous embedding is KEPT rather than deleted for a "
+                        "replacement that cannot land; semantic routing keeps "
+                        "the older description.", name, _refused)
+                    pretty_log(
+                        "Skill Index",
+                        f"'{name}' description NOT re-embedded ({_refused}); "
+                        f"the existing embedding is kept",
+                        level="WARNING", icon=Icons.WARN,
                     )
-                except Exception as e:
-                    logger.warning(f"Failed to drop stale embedding for skill '{name}': {e}")
-                from ..utils.helpers import get_utc_timestamp
-                self.memory_system.add(
-                    description,
-                    {"type": "acquired_skill", "name": name,
-                     "timestamp": get_utc_timestamp()}
-                )
-                
+                else:
+                    # Drop any previous embedding for this name first — re-saving
+                    # a skill with edited content used to stack a fresh embedding
+                    # on top of the old one, so semantic routing counted the same
+                    # skill once per historical edit. No-op for brand-new skills.
+                    try:
+                        self.memory_system.collection.delete(
+                            where={"$and": [{"name": name}, {"type": "acquired_skill"}]}
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to drop stale embedding for skill '{name}': {e}")
+                    from ..utils.helpers import get_utc_timestamp
+                    _r = self.memory_system.add(
+                        description,
+                        {"type": "acquired_skill", "name": name,
+                         "timestamp": get_utc_timestamp()}
+                    )
+                    # Belt and braces: the probe answers about the store as
+                    # it was a moment ago, `add()` answers about the write
+                    # that just happened.
+                    _refusals = getattr(self.memory_system, "ADD_REFUSALS", ())
+                    if isinstance(_refusals, (tuple, list)) and _r in _refusals:
+                        logger.warning(
+                            "Skill '%s': the store REFUSED the description "
+                            "embedding (%s) — the skill is callable by name but "
+                            "invisible to semantic routing until the colliding "
+                            "row is resolved.", name, _r)
+
+
             logger.info(f"Successfully saved acquired skill: {name}")
             pretty_log("SKILL ACQUIRED", f"Permanently learned new tool: {name}", icon=Icons.MEM_SAVE)
             return True
@@ -613,11 +671,22 @@ class AcquiredSkillManager:
             done = 0
             for name, info in missing:
                 try:
-                    self.memory_system.add(
+                    # §4GK round 6: a refused write (a duplicate-id collision
+                    # that would reclassify an existing row's type) used to be
+                    # indistinguishable from a success, so `done` counted
+                    # twins that never landed and the next backfill found the
+                    # same ones missing again.
+                    _r = self.memory_system.add(
                         info.get("description") or name,
                         {"type": "acquired_skill", "name": name,
                          "timestamp": get_utc_timestamp()},
                     )
+                    _refusals = tuple(getattr(self.memory_system, "ADD_REFUSALS", None) or ())
+                    if _refusals and _r in _refusals:
+                        logger.warning(
+                            "acquired-skill backfill: the store REFUSED the "
+                            "twin for %r (%s) — not counting it done", name, _r)
+                        continue
                     done += 1
                 except Exception as e:  # noqa: BLE001 — per-skill isolation
                     logger.warning(

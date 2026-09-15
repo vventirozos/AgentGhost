@@ -47,7 +47,9 @@ RunnerCallable = Callable[..., Union[str, Dict[str, Any], Awaitable[Any]]]
 def _ghost_version() -> str:
     """Best-effort package version. Never fatal."""
     try:
-        from .. import __version__  # type: ignore[attr-defined]
+        # Optional by design: the package ships no __version__, so this
+        # import is EXPECTED to fail and the except below is the real path.
+        from .. import __version__  # type: ignore[attr-defined]  # pylint: disable=no-name-in-module
         return str(__version__)
     except Exception:
         return "unknown"

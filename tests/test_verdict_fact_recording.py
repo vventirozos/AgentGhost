@@ -436,7 +436,9 @@ class TestTheWriterActuallyRuns:
         # the merged mechanical exit forwards its override CHAIN as the route
         # ("reply-shape", "turn-state" or "reply-shape+turn-state", §4FY);
         # memory-claim keeps its literal
-        assert sum("'override'" in r for r in routes) == 1 and sum("'memory-claim'" in r for r in routes) == 1, routes
+        # §4GH (2026-09-13): a SECOND override-chain exit — the tool-turn
+        # "narration only → no judge" refute — forwards its chain the same way
+        assert sum("'override'" in r for r in routes) == 2 and sum("'memory-claim'" in r for r in routes) == 1, routes
 
     def test_a_repaired_turn_keeps_BOTH_rows_with_seq_ordering(self, tmp_path):
         """An auto-repaired turn verifies twice. Both rows are real
@@ -568,7 +570,8 @@ class TestTheStampIsWiredAtTheChokePoint:
                 if "_record_verdict_instruments" in seg and node.name != "_record_verdict_instruments":
                     callers.append(node.name)
         # one recorder, called only from the verdict computation — at the
-        # tool-turn choke point AND at both tool-free exits: the merged
+        # tool-turn choke point, the tool-turn narration-only exit (§4GH),
+        # AND at both tool-free exits: the merged
         # mechanical exit (reply-shape + turn-state through one merge, §4FY
         # review) and memory-claim (§4FN round 4 M1)
         assert owners == ["_record_verdict_instruments"], owners
@@ -577,7 +580,8 @@ class TestTheStampIsWiredAtTheChokePoint:
                   and n.name == "_compute_verifier_verdict")
         n_calls = sum(1 for c in ast.walk(fn) if isinstance(c, ast.Call)
                       and getattr(c.func, "attr", "") == "_record_verdict_instruments")
-        assert n_calls == 3, n_calls
+        # 3 → 4 in §4GH: the tool-turn narration-only exit records too
+        assert n_calls == 4, n_calls
 
     def test_recording_can_never_fail_a_turn(self):
         """A durable write on the answer path must be strictly optional.

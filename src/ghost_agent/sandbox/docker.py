@@ -596,7 +596,29 @@ class DockerSandbox:
         # mount were confirmed good microseconds-to-seconds ago. Skip the
         # 3-round-trip probe entirely. invalidate_ready() (called on any exec
         # failure) resets the stamp, so a broken container never rides the TTL.
-        if self._ready_is_fresh():
+        # A container WE cut off its network must be recreated even when the
+        # readiness TTL is fresh (§4GJ round 3): the cut-off leaves the
+        # container perfectly able to run commands, so `mark_ready` keeps
+        # stamping it and the check below the short-circuit was never reached
+        # — it stayed cut off for the life of the TTL, and every refreshing
+        # command extended that. Guarded on the in-memory state so the hot
+        # path costs one attribute read, not a docker round-trip: only a
+        # container this process blocked can be cut off with a fresh stamp,
+        # and one inherited from a previous process has no stamp at all.
+        # ⚠ SKIP THE TTL, DO NOT RECREATE HERE (§4GK round 4). Round 3 called
+        # `_recreate_if_cut_off()` at this point, and that STRICTLY BROKE the
+        # working path: the call nulls `self.container` and stamps
+        # `_cut_off_at`, arming the 300 s backoff. The container is then
+        # re-adopted by name a few lines below, and the SECOND
+        # `_recreate_if_cut_off()` — the one that sits after the adopt and
+        # before the readiness check, where it can actually reach the
+        # remove-and-provision branch — is suppressed by the backoff its own
+        # earlier twin just wrote. Net effect: the container stayed cut off,
+        # `_egress_state` was downgraded to "" (= never attempted), and that
+        # disarmed both the tool-side refusal and the `_execute_impl` belt.
+        # Reproduced. All this line ever needed to do is decline the TTL
+        # short-circuit so the real path below runs.
+        if not self._cut_off and self._ready_is_fresh():
             return
 
         # Track whether this call did any actual work. Most invocations are
@@ -618,6 +640,10 @@ class DockerSandbox:
         except self.NotFound:
             pass
 
+        # §4GI R3: a container that was cut off its network (this or a
+        # previous generation) is recreated so enforcement can be retried —
+        # a resumed cut-off container can never bootstrap Tor. Backed off.
+        self._recreate_if_cut_off()
         if not (self.container and self._is_container_ready()):
             # Before destroying + reprovisioning: if the container merely
             # STOPPED (e.g. an RSS-watchdog restart called close(remove=False),
@@ -899,6 +925,20 @@ class DockerSandbox:
                 # the previous generation no longer apply.
                 self._env_verified = False
                 self._tor_attempted = False
+                # ⚠ AND NEITHER DOES THE CUT-OFF (§4GK round 6). `_cut_off`
+                # was raised by `_block_egress_hard` and lowered ONLY by
+                # `_recreate_if_cut_off` — which returns early when the
+                # container is gone, when it is not actually cut off, or while
+                # its 300 s backoff stands. So if the container died or was
+                # removed inside that window (RSS watchdog, orphan sweep, a
+                # readiness false negative) and was provisioned fresh here,
+                # the flag stayed True against a healthy attached container
+                # and every later command declined the readiness TTL — round
+                # 4's "the TTL disabled for the life of the process" defect,
+                # reached by another route. This is the arm-on-N-needs-a-
+                # recorded-DONE class: the raise had one clearer, and it was
+                # not on every path that ends the condition.
+                self._cut_off = False
 
                 for _ in range(10):
                     if self._is_container_ready(): break
@@ -1223,10 +1263,182 @@ class DockerSandbox:
             pretty_log("Sandbox Ready", "Environment Ready.", icon=Icons.OK)
 
     #: "enforced" | "blocked" (rules in, Tor not verified) | "unavailable"
-    #: (host networking / no iptables) | "" (not attempted yet). Read by
-    #: get_stats() and the health report.
+    #: (host networking / no iptables) | "" (not attempted yet).
+    #:
+    #: ⚠ ITS ONLY READERS ARE IN THIS FILE AND `egress_gate` (§4GK round 4).
+    #: This comment used to say "Read by get_stats() and the health report" —
+    #: neither is true: `get_stats()` returns `container.stats()` and never
+    #: touches it, and no reader exists outside the two modules. A docstring
+    #: that names consumers which do not exist is how a silently-dead state
+    #: flag survives a review; this flag was one, for a whole section.
     _egress_state = ""
     _egress_exit_ip = ""
+
+    def egress_enforcement_attempted(self) -> bool:
+        """§4GI R3: False until `_enforce_egress_once` has run for THIS
+        container generation. The tool-side gate must not read an
+        un-attempted state as "unavailable": enforcement runs inside
+        `execute()` (`ensure_running`), so before the first call the state
+        is simply unknown — refusing there re-created the §4DD outage
+        (a lazily rebuilt sandbox refused every command forever)."""
+        return bool(self._egress_state)
+
+    def egress_is_enforced_or_blocked(self) -> bool:
+        """§4GI: True when the sandbox cannot reach the internet directly —
+        Tor-only rules are in ("enforced"/"blocked"), or the container was
+        cut off its network because they could not be. False means DIRECT
+        egress is possible (host networking, or a cut-off that itself
+        failed): a caller under `--mandatory-tor` must refuse to run
+        network-capable work. Reads state only; never blocks."""
+        return self._egress_state in ("enforced", "blocked")
+
+    def _block_egress_hard(self, why: str) -> None:
+        """Fail closed BY CONSTRUCTION when the Tor-only rules could not be
+        established (§4GI): disconnect the container from every docker
+        network it is attached to, so the state is "blocked", not "direct".
+        Before this, every such branch logged an ERROR, set
+        `_egress_state = "unavailable"`, and left the sandbox serving
+        `execute`/browser calls with cleartext egress — a flag nothing read.
+        Never raises; the one branch that cannot be closed (a disconnect
+        that itself fails) stays "unavailable" and is logged at CRITICAL."""
+        nets = []
+        networks_reported = False
+        try:
+            self.container.reload()
+            _ns = (self.container.attrs or {}).get("NetworkSettings")
+            networks_reported = isinstance(_ns, dict) and "Networks" in _ns
+            nets = list(((_ns or {}).get("Networks") or {}).keys())
+        except Exception:  # noqa: BLE001 — attrs may be stubbed
+            nets = []
+        if not nets and not networks_reported:
+            nets = ["bridge"]          # attrs did not say: assume the default network
+        if not nets:
+            # Already cut off (a previous generation's disconnect persists
+            # across docker stop/start): nothing to disconnect, and trying
+            # "bridge" would raise "not connected" and read as unavailable
+            # (R3 review). Blocked by construction; the next ensure_running
+            # recreates the container (backoff below).
+            self._set_egress_state("blocked")
+            self._cut_off = True
+            self._cut_off_at = time.time()
+            pretty_log("Sandbox Egress",
+                       f"{why} — the container has NO network attached "
+                       "(already cut off): blocked; will recreate the sandbox "
+                       "to retry enforcement.", level="ERROR", icon=Icons.FAIL)
+            return
+        failed = []
+        for name in nets:
+            try:
+                self.client.networks.get(name).disconnect(self.container, force=True)
+            except Exception as exc:  # noqa: BLE001
+                failed.append(f"{name}: {type(exc).__name__}: {exc}")
+        if failed:
+            self._set_egress_state("unavailable", "cut_off_failed")
+            pretty_log(
+                "Sandbox Egress",
+                f"{why} — AND the container could not be cut off its network "
+                f"({'; '.join(failed)[:200]}). Sandbox egress may be DIRECT: "
+                "refuse network work until the sandbox is recreated.",
+                level="CRITICAL", icon=Icons.FAIL,
+            )
+            return
+        self._set_egress_state("blocked")
+        self._cut_off = True
+        self._cut_off_at = time.time()
+        pretty_log(
+            "Sandbox Egress",
+            f"{why} — the container was DISCONNECTED from {', '.join(nets)}: "
+            "no network at all rather than direct egress (fail-closed by "
+            "construction; the sandbox is recreated to retry, at most every "
+            f"{int(self._CUT_OFF_RECREATE_BACKOFF_S)}s).",
+            level="ERROR", icon=Icons.FAIL,
+        )
+
+    #: A cut-off container is recreated (fresh network, enforcement retried)
+    #: on the next ensure_running, but not more often than this — a
+    #: persistent iptables fault would otherwise re-provision on every call.
+    _CUT_OFF_RECREATE_BACKOFF_S = 300.0
+    _cut_off_at = 0.0
+    #: ⚠ "CUT OFF" IS NOT "BLOCKED" (§4GK round 5). `_egress_state == "blocked"`
+    #: is ALSO the HEALTHY state written the moment the iptables rules load,
+    #: and two branches then return leaving it there for the life of the
+    #: container ("Tor is not running as debian-tor", "Tor did not bootstrap
+    #: within the timeout"). Round 4's readiness guard keyed on that string,
+    #: so in those regimes the readiness TTL was disabled on EVERY command —
+    #: turning a once-per-8s docker probe into a per-command one, and raising
+    #: the number of chances to hit `_is_container_ready`'s DESTRUCTIVE false
+    #: negative (which force-removes the container and reprovisions, killing
+    #: in-flight work) from once per TTL to once per command, forever. The
+    #: live log shows that regime really occurs. This flag names the actual
+    #: condition — we disconnected this container — and nothing else.
+    _cut_off = False
+    #: Which branch left the state "unavailable" — the tools' refusal names
+    #: it, because the two have different remedies (§4GJ).
+    _egress_unavailable_reason = ""
+
+    def _set_egress_state(self, state: str, reason: str = "") -> None:
+        """THE egress-state transition. The reason travels WITH the state
+        (§4GJ round 3): it used to be written at one branch and never
+        cleared, so a later disconnect-failure inherited the host-networking
+        remedy ("set GHOST_SANDBOX_NETWORK=bridge") — advice that does
+        nothing for a container whose disconnect failed. Every write goes
+        through here; `tests/test_4gi_review_round2.py` enumerates the class
+        and fails on a bare assignment."""
+        self._egress_state = state
+        self._egress_unavailable_reason = reason if state == "unavailable" else ""
+
+    @staticmethod
+    def _container_cut_off(container) -> bool:
+        """True when the container has no docker network attached — the
+        state `_block_egress_hard` leaves behind, which docker persists
+        across stop/start (R3 review: nothing recreated it)."""
+        try:
+            container.reload()
+            attrs = container.attrs or {}
+            mode = str(((attrs.get("HostConfig") or {}).get("NetworkMode")) or "")
+            if mode == "host":
+                return False
+            ns = attrs.get("NetworkSettings")
+            # Docker always reports the `Networks` map; a container whose
+            # attrs do not carry it (a stub, a half-inspected object) is NOT
+            # evidence of a cut-off — reading absence as "cut off" sent every
+            # test fake down the provisioning path (R3 round 2).
+            if not isinstance(ns, dict) or "Networks" not in ns:
+                return False
+            return not (ns.get("Networks") or {})
+        except Exception:  # noqa: BLE001 — attrs may be stubbed
+            return False
+
+    def _cut_off_recreate_due(self, now=None) -> bool:
+        now = time.time() if now is None else now
+        return (now - float(self._cut_off_at or 0.0)) >= self._CUT_OFF_RECREATE_BACKOFF_S
+
+    def _recreate_if_cut_off(self) -> bool:
+        """Drop a cut-off container so `_ensure_running_impl` provisions a
+        fresh one (fresh network, enforcement retried). True when it did.
+        Backed off by `_CUT_OFF_RECREATE_BACKOFF_S` so a persistent fault
+        does not re-provision on every call."""
+        if (self.container is not None and self._container_cut_off(self.container)
+                and self._cut_off_recreate_due()):
+            pretty_log("Sandbox Egress",
+                       "the container has no network attached (cut off) — "
+                       "recreating it to retry Tor-only enforcement",
+                       level="WARNING", icon=Icons.WARN)
+            self._cut_off_at = time.time()
+            self._set_egress_state("")
+            self._cut_off = False
+            # A recreate is a NEW CONTAINER GENERATION, and enforcement is
+            # per-generation: without this reset `_enforce_egress_once` is a
+            # no-op on the replacement and it comes up with no Tor rules at
+            # all. Every other generation boundary (resume, create) already
+            # resets it; this one did not (§4GK round 4).
+            self._tor_attempted = False
+            self.container = None
+            # Belt: `_ready_is_fresh` also requires a container, but making the
+            # stamp stale here means the ordering holds even if that changes.
+            self.invalidate_ready()
+            return True
+        return False
 
     def _container_network_mode(self) -> str:
         try:
@@ -1261,24 +1473,30 @@ class DockerSandbox:
         """
         from . import tor_egress as _te
         if self._container_network_mode() == "host":
-            self._egress_state = "unavailable"
+            self._set_egress_state("unavailable", "host_networking")
+            # §4GJ: name the CAUSE, once, at boot, at the level an operator
+            # reads — and name a remedy that can actually be applied. This is
+            # a CONFIGURATION state, not a transient fault: the container
+            # cannot be cut off (it IS the host's namespace), so every
+            # network-capable tool call is refused from here on, and telling
+            # the operator to "recreate the sandbox" (the other unavailable
+            # branch's advice) would be useless.
             pretty_log(
                 "Sandbox Egress",
                 "host networking: the sandbox shares the host's network namespace, "
-                "transparent Tor enforcement is NOT applied (rules here would rewrite "
-                "the host's traffic). Sandbox egress is DIRECT.",
-                level="WARNING", icon=Icons.WARN,
+                "so transparent Tor enforcement is NOT applied (rules here would "
+                "rewrite the host's traffic) and the container cannot be cut off. "
+                "Under --mandatory-tor every sandbox execute/browser call will be "
+                "REFUSED until this is changed: set GHOST_SANDBOX_NETWORK=bridge "
+                "and recreate the sandbox.",
+                level="CRITICAL", icon=Icons.FAIL,
             )
             return
         try:
             if self._exec_run("sh -c 'command -v iptables && command -v tor'")[0] != 0:
-                self._egress_state = "unavailable"
-                pretty_log(
-                    "Sandbox Egress",
+                self._block_egress_hard(
                     "iptables or tor missing in the image — Tor-only egress NOT enforced "
-                    "(provisioning incomplete; the v9 image carries both).",
-                    level="ERROR", icon=Icons.FAIL,
-                )
+                    "(provisioning incomplete; the v9 image carries both)")
                 return
             self._exec_run(_te.write_torrc_cmd(), user="root")
             self._exec_run(_te.start_tor_cmd(), user="root")
@@ -1286,16 +1504,12 @@ class DockerSandbox:
             # container has no NET_ADMIN of its own.
             code, out = self._exec_run(_te.apply_rules_cmd(), privileged=True)
             if code != 0:
-                self._egress_state = "unavailable"
-                pretty_log(
-                    "Sandbox Egress",
+                self._block_egress_hard(
                     f"iptables rules could not be loaded (exit {code}: "
                     f"{(out or b'').decode('utf-8', 'replace')[:160]}) — Tor-only egress "
-                    "NOT enforced; sandbox egress is DIRECT.",
-                    level="ERROR", icon=Icons.FAIL,
-                )
+                    "NOT enforced")
                 return
-            self._egress_state = "blocked"
+            self._set_egress_state("blocked")
             if self._exec_run(_te.tor_running_as_expected_cmd())[0] != 0:
                 pretty_log(
                     "Sandbox Egress",
@@ -1324,20 +1538,68 @@ class DockerSandbox:
             code, out = self._exec_run(_te.verify_cmd(), deadline_s=60.0)
             is_tor, ip = _te.parse_tor_check((out or b"").decode("utf-8", "replace"))
             if is_tor:
-                self._egress_state = "enforced"
+                self._set_egress_state("enforced")
                 self._egress_exit_ip = ip
                 pretty_log("Sandbox Egress", f"Tor-only egress ENFORCED — the sandbox exits via {ip}",
                            icon=Icons.OK)
             elif is_tor is False:
-                # Impossible by construction unless the rules were bypassed:
-                # say it as loudly as it deserves.
-                self._egress_state = "blocked"
+                # ⚠ CORROBORATE BEFORE ACTING (§4GK round 5). Round 4 made this
+                # branch destructive — it disconnects the container now and the
+                # recreate removes and reprovisions it 300 s later, taking every
+                # in-sandbox service and every promoted job with it — while the
+                # trigger stayed ONE answer from a third-party endpoint. That
+                # endpoint is measurably unreliable for this sandbox (the live
+                # log carries 6 unusable answers against 143 enforcements), and
+                # the branch is also reached from the RESUME path, whose whole
+                # purpose is to preserve those services. A single re-probe costs
+                # one exec and removes the transient false positive; two
+                # independent requests both answering "not Tor" is a leak.
+                _code2, _out2 = self._exec_run(_te.verify_cmd(), deadline_s=60.0)
+                _is_tor2, _ip2 = _te.parse_tor_check(
+                    (_out2 or b"").decode("utf-8", "replace"))
+                # ⚠ ONLY AN EXPLICIT "YES, TOR" CLEARS A MEASURED LEAK
+                # (§4GK round 6). The first version cleared on anything that
+                # was not an explicit second `false` — so an exec that never
+                # ran, a timeout, an infra error or an HTML challenge on the
+                # SECOND request turned a confirmed direct exit back into
+                # "enforced", and logged that the first answer was the bad one.
+                # The rule the docstring states is "two independent requests
+                # both answering not-Tor is a leak"; its negation is "a second
+                # request that AGREES it is Tor", not "anything else". The
+                # cited base rate (6 unusable answers in 143 enforcements) is
+                # exactly the probability of masking a real leak.
+                if _code2 == 0 and _is_tor2 is True:
+                    self._set_egress_state("enforced")
+                    self._egress_exit_ip = _ip2 or ip
+                    pretty_log(
+                        "Sandbox Egress",
+                        f"the first verification answered IsTor=false (IP {ip}) but the "
+                        f"re-check did not agree ({_is_tor2!r}) — treating the first answer "
+                        "as a bad response from the check endpoint, NOT as a leak. The "
+                        "rules are loaded; egress stays enforced.",
+                        level="WARNING", icon=Icons.WARN,
+                    )
+                    return
+                # ⚠ A MEASURED LEAK MUST BE CLOSED, NOT LABELLED (§4GK round 4).
+                # This branch used to call `_set_egress_state("blocked")` — which
+                # writes a STRING and touches no network. `egress_is_enforced_or_blocked`
+                # then answered True, `egress_gate.network_refusal` returned None,
+                # and `execute`/`browser` kept running network work through a
+                # container that had just been PROVEN to reach the internet
+                # directly with the host's IP. That is the fail-open §4GI exists
+                # to close, in its worst form: the state said "blocked" while the
+                # measurement said "direct". `_block_egress_hard` disconnects the
+                # container for real and is the same remedy every other
+                # rules-not-established branch already used.
                 pretty_log(
                     "Sandbox Egress",
                     f"LEAK: a plain request from the sandbox reached the internet directly "
-                    f"(IsTor=false, IP {ip}) despite the rules — investigate before using the sandbox.",
-                    level="ERROR", icon=Icons.FAIL,
+                    f"(IsTor=false, IP {ip}) despite the rules — cutting the container off now; "
+                    "investigate before using the sandbox.",
+                    level="CRITICAL", icon=Icons.FAIL,
                 )
+                self._block_egress_hard(
+                    f"a plain request from the sandbox reached the internet directly (IP {ip})")
             else:
                 pretty_log(
                     "Sandbox Egress",
@@ -1346,11 +1608,16 @@ class DockerSandbox:
                     "enforced-unverified; re-checked on the next container generation.",
                     level="WARNING", icon=Icons.WARN,
                 )
-                self._egress_state = "enforced"
+                self._set_egress_state("enforced")
         except Exception as exc:  # noqa: BLE001 — never take a turn down
-            self._egress_state = self._egress_state or "unavailable"
-            pretty_log("Sandbox Egress", f"enforcement step raised ({type(exc).__name__}: {exc}) — "
-                       f"state={self._egress_state!r}", level="ERROR", icon=Icons.FAIL)
+            if self._egress_state in ("enforced", "blocked"):
+                pretty_log("Sandbox Egress", f"enforcement step raised ({type(exc).__name__}: {exc}) — "
+                           f"state={self._egress_state!r}", level="ERROR", icon=Icons.FAIL)
+            else:
+                # the rules never landed: cut the network rather than leave it direct
+                self._block_egress_hard(
+                    f"enforcement step raised before the rules landed "
+                    f"({type(exc).__name__}: {exc})")
 
     def _chromium_binary_present(self) -> bool:
         """Check that Playwright's Chromium `headless_shell` is actually
@@ -1416,9 +1683,23 @@ class DockerSandbox:
                 type(self)._spill_counter_seeded = True
             type(self)._spill_counter += 1
             name = f"run_{type(self)._spill_counter}.log"
-            path = spill_dir / name
             capped = text[: 10 * 1024 * 1024]  # 10 MB hard ceiling
-            path.write_text(capped, encoding="utf-8", errors="replace")
+            # §4GI (2026-09-13): a FIXED name in a FIXED directory under the
+            # bind mount, and the counter is announced to the model — the
+            # §4DX class docker.py had missed. `mkdir(exist_ok=True)` passes
+            # through a symlinked `.ghost_runs`, and `write_text` followed a
+            # planted `run_{N+1}.log`. The dir-fd writer refuses a symlink at
+            # either component atomically; on refusal the spill is simply
+            # not made (the caller keeps the truncated inline output).
+            from ..tools.file_system import write_text_nofollow_in_dir
+            try:
+                write_text_nofollow_in_dir(
+                    spill_dir, name, capped.encode("utf-8", "replace").decode("utf-8"))
+            except ValueError as ve:
+                pretty_log("Sandbox Spill",
+                           f"refused to spill run output: {ve}",
+                           level="WARNING", icon=Icons.WARN)
+                return None
             return f".ghost_runs/{name}"
         except Exception as e:
             logger.debug(f"run-output spill failed (non-critical): {e}")
@@ -1501,6 +1782,14 @@ class DockerSandbox:
             # the container dies in the tiny gap before exec_run below,
             # the normal error path surfaces it.
             self.ensure_running()
+            # §4GI R3: the belt at the layer where enforcement has DEFINITELY
+            # run — the tool-side gate sees only the state before this call.
+            if (getattr(self, "tor_proxy", None) and getattr(self, "_egress_state", "")
+                    and not self.egress_is_enforced_or_blocked()):
+                from .egress_gate import _refusal_text
+                pretty_log("Sandbox Egress", "refusing command — egress unavailable",
+                           level="ERROR", icon=Icons.SHIELD)
+                return _refusal_text(self), 1, None
 
             # Promotable runs are supervised by sandbox/jobs.py, which owns
             # the budget itself (it has to still be holding the process when
@@ -1614,6 +1903,13 @@ class DockerSandbox:
             #   - default (rg/find/browser via sandbox_manager.execute): the
             #     legacy 256 KB head+tail, no spill, so those callers are
             #     unchanged.
+            # pylint: disable=possibly-used-before-assignment
+            # Both names are bound on every path into this read: the job
+            # branch unpacks them, and in the else branch `_streamed` is the
+            # guard — it is only True after the streamed call assigned both,
+            # and `if not _streamed` binds them from the buffered exec
+            # otherwise. pylint cannot follow the flag across the two
+            # statements (§4GJ triage).
             output = ""
             if stdout_bytes:
                 from ..utils.text_truncate import truncate_head_tail

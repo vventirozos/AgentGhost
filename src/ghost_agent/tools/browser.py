@@ -72,6 +72,85 @@ _BROWSER_PROFILE_LOCK = asyncio.Lock()
 _MAX_TEXT_CHARS = 64 * 1024  # ~16k tokens — more than enough for LLM reasoning
 
 
+def _wallclock_ceiling_s() -> int:
+    """The ONE wall-clock ceiling for a browser call (§4GI, 2026-09-13).
+
+    `timeout_ms` is model-supplied and was unclamped, and `interact`
+    multiplied it by the action count: `timeout_ms=3600000`, or 60 actions
+    at the default 30 s, held `_BROWSER_PROFILE_LOCK` for up to an hour and
+    queued every other conversation's browser call behind it. `execute`
+    caps at 600 s; so does this. Env-overridable (`GHOST_BROWSER_WALLCLOCK_S`),
+    floored at 60 s so the subprocess slack below stays meaningful."""
+    try:
+        v = int(os.environ.get("GHOST_BROWSER_WALLCLOCK_S", "600"))
+    except (TypeError, ValueError):
+        v = 600
+    return max(60, v)
+
+
+#: Slack the subprocess gets over the in-runner timeout, so a genuinely hung
+#: browser produces a runner-level error rather than a sandbox-level kill.
+_SUBPROCESS_SLACK_S = 30
+
+
+def _bounded_subprocess_timeout(effective_timeout_ms: int) -> int:
+    """Seconds the sandbox exec may wait: the runner budget plus slack,
+    never below 60 s and NEVER above the ceiling. Every exec of the runner
+    goes through this (pinned by an AST enumeration)."""
+    want = max(60, (int(effective_timeout_ms) // 1000) + _SUBPROCESS_SLACK_S)
+    return min(_wallclock_ceiling_s(), want)
+
+
+def _clamp_runner_timeout_ms(timeout_ms: int) -> int:
+    """The in-runner budget for ONE op (or an interact total), kept under
+    the ceiling minus the slack so the runner always times out before the
+    sandbox kills it."""
+    cap_ms = max(1000, (_wallclock_ceiling_s() - _SUBPROCESS_SLACK_S) * 1000)
+    return max(1000, min(int(timeout_ms), cap_ms))
+
+
+#: Below this many seconds left, a RETRY is not worth issuing: it cannot
+#: finish, and a doomed exec only burns the remainder and returns exit 124.
+_MIN_EXEC_S = 15
+#: Never starve a single interact action below this, however many there are.
+_MIN_ACTION_MS = 5000
+
+
+def _call_deadline(now: float = None) -> float:
+    """The ONE deadline for a whole browser call, retries included (§4GI
+    round 3). §4GI clamped each exec to the ceiling but shared nothing
+    between them: the two retry sites re-used the FULL `subprocess_timeout`,
+    so one measured `navigate` issued 600 + 600 + 600 = 1800 s of wall clock
+    for a single tool call while holding `_BROWSER_PROFILE_LOCK`."""
+    return (time.monotonic() if now is None else now) + _wallclock_ceiling_s()
+
+
+def _remaining_s(deadline: float, now: float = None) -> float:
+    return deadline - (time.monotonic() if now is None else now)
+
+
+def _exec_timeout_for(deadline: float, want_s: int, now: float = None) -> int:
+    """Seconds this exec may wait: its own budget, never past the call
+    deadline. 0 means DO NOT ISSUE IT — the caller skips the attempt."""
+    rem = _remaining_s(deadline, now)
+    if rem < _MIN_EXEC_S:
+        return 0
+    return max(1, int(min(int(want_s), rem)))
+
+
+def _runner_action_timeout_ms(runner_total_ms: int, n_actions: int) -> int:
+    """The PER-ACTION in-runner budget, divided so the runner's worst case
+    (n actions x per-action) fits the total it was given.
+
+    §4GI gave the runner a per-action `timeout_ms` and no total: 30 actions
+    at 30 s is 900 s of runner against a 600 s exec cap, so `timeout -k 5s`
+    SIGTERMed the sequence mid-flow — exit 124, no `[BROWSER_OK]`, and the
+    model could not tell which actions had landed. Dividing is strictly
+    better than being killed: "action 17 timed out" is a diagnosis."""
+    n = max(1, int(n_actions))
+    return max(_MIN_ACTION_MS, int(runner_total_ms) // n)
+
+
 def _safe_int(v, default: int) -> int:
     """int() an LLM-supplied value without letting a non-numeric string
     (e.g. timeout_ms="30s") raise out of the tool."""
@@ -489,10 +568,32 @@ def analyze_screenshot_render(host_path, sample_max: int = 200):
             f"settle_ms), re-capture, or honestly report it is still broken."
         )
     else:
-        verdict = "has_content"
+        # NOT "the frame contains visual content" — that sentence was an
+        # assertion this instrument cannot support, and it was believed.
+        # Live (2026-09-15): a Telegram share overlay — a gradient with a
+        # 3-button pill and nothing else — scored 13% dominant / 182
+        # colours and was reported HAS_CONTENT; the turn spent three
+        # screenshot+vision rounds re-confirming an empty frame and then
+        # filed the answer it was looking for as "not obtained".
+        #
+        # Every pixel statistic was measured against a labelled set and
+        # none separates the two populations: the overlay's edge density
+        # (0.011) is HIGHER than a correctly rendered desktop UI's
+        # (0.009), so a tighter pixel rule would fail good pages. The
+        # probe can only ever detect the UNIFORM case, so it now reports
+        # its numbers and says what it does not know, rather than
+        # certifying a render. (§4CM: when a proxy cannot carry the
+        # property, drop the gate and report the number.)
+        verdict = "indeterminate"
         note = (
             f"{dominant_pct:.0%} dominant colour across {distinct} distinct "
-            f"colours — the frame contains visual content."
+            f"colours — NOT blank, but this check cannot confirm the content "
+            f"you wanted is present (page chrome on a background scores the "
+            f"same as a full page). Confirm from DOM_TEXT_CHARS below or by "
+            f"reading the image; if the page loads its content lazily, a bare "
+            f"screenshot captures the pre-render state — re-take it with "
+            f"settle_ms, or run goto → sleep → screenshot in ONE "
+            f"operation='interact' actions list."
         )
     return {
         "dominant_pct": round(dominant_pct, 3),
@@ -715,7 +816,7 @@ async def tool_browser(
     # a non-numeric timeout_ms/max_chars would otherwise raise ValueError out
     # of the tool. max_chars is also CLAMPED so a huge value can't flood the
     # model context with a whole page (the _MAX_TEXT_CHARS ceiling was dead).
-    timeout_ms = _safe_int(timeout_ms, 30000)
+    timeout_ms = _clamp_runner_timeout_ms(_safe_int(timeout_ms, 30000))
     if max_chars is not None:
         max_chars = max(256, min(_safe_int(max_chars, _MAX_TEXT_CHARS), _MAX_TEXT_CHARS))
 
@@ -778,6 +879,14 @@ async def tool_browser(
     # caller runs with tor_proxy=None. `_runner_first_url` is the same
     # host/runner "which URL is dialed first" resolver the SSRF pre-flight
     # already uses below — reuse it here so both guards agree.
+    # §4GI: the sandbox's egress must be Tor-only or cut off before the
+    # browser runs — same predicate as `execute`.
+    from ..sandbox.egress_gate import network_refusal as _egress_refusal
+    _egress_block = _egress_refusal(sandbox_manager)
+    if _egress_block is not None:
+        pretty_log("Sandbox Egress", "refusing browser — egress unavailable",
+                   level="ERROR", icon=Icons.SHIELD)
+        return _egress_block
     _proxy_decision_url = _runner_first_url(operation, url, actions, sandbox_dir)
     tor_proxy = _resolve_egress_proxy(tor_proxy, _proxy_decision_url or url)
 
@@ -925,6 +1034,38 @@ async def tool_browser(
                    icon=Icons.TOOL_BROWSER, level="WARNING")
         return _err(_dead, hint=None)
 
+    # ONE deadline for this call, retries included (§4GI round 3). Set
+    # BEFORE the payload is built, because the in-runner per-action budget
+    # is derived from it: the runner must finish inside the exec window
+    # rather than be SIGTERMed mid-sequence.
+    _deadline = _call_deadline()
+
+    # For interact, the wall-clock the sequence wants grows with the action
+    # count — a 30-action flow at the per-action default needs far more than
+    # the one-shot budget. That WANT is what sizes the exec; the ceiling then
+    # caps it, and the per-action budget is divided to fit what survives.
+    effective_timeout_ms = int(timeout_ms)
+    _n_actions = max(1, len(sanitised_actions or [])) if operation == "interact" else 1
+    if operation == "interact":
+        effective_timeout_ms = max(
+            effective_timeout_ms,
+            int(timeout_ms) * _n_actions,
+        )
+
+    # Give the subprocess some slack over the in-runner timeout so an
+    # actually-hung browser produces a runner-level error, not a
+    # sandbox-level kill that swallows diagnostics.
+    subprocess_timeout = _bounded_subprocess_timeout(effective_timeout_ms)
+    # What the runner may spend in total, and therefore per action. For a
+    # single op this is just the clamped per-op budget; for interact it is
+    # the total divided by the action count (never below _MIN_ACTION_MS).
+    _runner_total_ms = max(1000, (subprocess_timeout - _SUBPROCESS_SLACK_S) * 1000)
+    _runner_timeout_ms = (
+        _runner_action_timeout_ms(_runner_total_ms, _n_actions)
+        if operation == "interact"
+        else min(int(timeout_ms), _runner_total_ms)
+    )
+
     payload = _build_op_payload(
         op=operation,
         url=url,
@@ -933,7 +1074,7 @@ async def tool_browser(
         wait_until=wait_until,
         full_page=full_page,
         max_chars=max_chars,
-        timeout_ms=timeout_ms,
+        timeout_ms=_runner_timeout_ms,
         tor_proxy=tor_proxy,
         actions=sanitised_actions,
         stop_on_error=stop_on_error,
@@ -944,30 +1085,12 @@ async def tool_browser(
         allowed_local_ports=_svc_ports,
     )
 
-    # For interact, the timeout budget grows with the number of actions —
-    # a 30-action sequence with default per-action 30s needs substantially
-    # more than the one-shot default. Cap generously (per-action * count)
-    # but never drop below the single-op budget.
-    effective_timeout_ms = int(timeout_ms)
-    if operation == "interact":
-        effective_timeout_ms = max(
-            effective_timeout_ms,
-            # Rough budget: each action gets the base timeout. Bound the
-            # overall subprocess wait accordingly so a 10-action flow
-            # doesn't get guillotined mid-sequence.
-            int(timeout_ms) * max(1, len(sanitised_actions or [])),
-        )
-
     pretty_log("Browser", f"{operation} {url or selector or ''}".strip(), icon=Icons.TOOL_BROWSER)
 
     cmd = (
         f"python3 -u {_BROWSER_RUNNER_FILENAME} "
         f"{shlex.quote(json.dumps(payload))}"
     )
-    # Give the subprocess some slack over the in-runner timeout so an
-    # actually-hung browser produces a runner-level error, not a
-    # sandbox-level kill that swallows diagnostics.
-    subprocess_timeout = max(60, (effective_timeout_ms // 1000) + 30)
     # When project-scoped, run from /workspace/projects/<id> so the runner
     # (written into the scoped dir as `.browser_runner.py`) is found by its
     # relative name. Passed ONLY when set, so managers without a `workdir`
@@ -977,8 +1100,28 @@ async def tool_browser(
         # Serialize on the shared profile dir — concurrent Chromium launches
         # on one user-data-dir crash each other (see _BROWSER_PROFILE_LOCK).
         async with _BROWSER_PROFILE_LOCK:
+            # ⚠ `or 1` INVERTED THE SENTINEL (§4GK round 4). `_exec_timeout_for`
+            # returns 0 to mean "do NOT issue this exec"; both retry sites
+            # honour it and say so. Here it became a ONE-SECOND exec, which
+            # cannot launch Chromium — the model got "runner exit 124", which
+            # reads as "the site timed out", plus a failure strike, and paid a
+            # doomed browser launch for it. The deadline starts before the
+            # profile lock is taken, and that lock serialises every browser
+            # call agent-wide, so arriving here with a spent budget is the
+            # ordinary queued case, not an edge one.
+            _first_t = _exec_timeout_for(_deadline, subprocess_timeout)
+            if not _first_t:
+                pretty_log("Browser", f"{operation}: skipped — the call's "
+                           "wall-clock budget was spent before the browser "
+                           "could start (queued behind another browser call)",
+                           icon=Icons.WARN, level="WARNING")
+                return _err("the call's wall-clock budget was spent before the "
+                            "browser could start — retry as a fresh call, or "
+                            "raise GHOST_BROWSER_WALLCLOCK_S", ran=False)
             output, exit_code = await asyncio.to_thread(
-                sandbox_manager.execute, cmd, timeout=subprocess_timeout, **_wd_kw
+                sandbox_manager.execute, cmd,
+                timeout=_first_t,
+                **_wd_kw
             )
     except Exception as e:
         pretty_log("Browser Failed", f"{operation}: {type(e).__name__}: {e}",
@@ -1001,15 +1144,23 @@ async def tool_browser(
                    "after settle",
                    icon=Icons.RETRY, level="WARNING")
         await asyncio.sleep(1.5)
-        try:
-            async with _BROWSER_PROFILE_LOCK:
-                output, exit_code = await asyncio.to_thread(
-                    sandbox_manager.execute, cmd,
-                    timeout=subprocess_timeout, **_wd_kw
-                )
-            ok, parsed = _parse_runner_output(output or "")
-        except Exception as e:
-            logger.debug("TargetClosedError retry failed: %s", e)
+        _retry_t = _exec_timeout_for(_deadline, subprocess_timeout)
+        if not _retry_t:
+            pretty_log("Browser Retry",
+                       "skipped the launch-race retry — the call's wall-clock "
+                       "budget is spent (a doomed exec only burns the "
+                       "remainder and returns exit 124)",
+                       icon=Icons.RETRY, level="WARNING")
+        else:
+            try:
+                async with _BROWSER_PROFILE_LOCK:
+                    output, exit_code = await asyncio.to_thread(
+                        sandbox_manager.execute, cmd,
+                        timeout=_retry_t, **_wd_kw
+                    )
+                ok, parsed = _parse_runner_output(output or "")
+            except Exception as e:
+                logger.debug("TargetClosedError retry failed: %s", e)
 
     # Degraded-milestone navigate retry (2026-07-18). Over Tor a slow exit
     # circuit stalls subresources and even `domcontentloaded` can miss the
@@ -1032,15 +1183,22 @@ async def tool_browser(
             f"python3 -u {_BROWSER_RUNNER_FILENAME} "
             f"{shlex.quote(json.dumps(retry_payload))}"
         )
-        try:
-            async with _BROWSER_PROFILE_LOCK:
-                output, exit_code = await asyncio.to_thread(
-                    sandbox_manager.execute, retry_cmd,
-                    timeout=subprocess_timeout, **_wd_kw
-                )
-            ok, parsed = _parse_runner_output(output or "")
-        except Exception as e:
-            logger.debug("navigate commit-retry failed: %s", e)
+        _retry_t = _exec_timeout_for(_deadline, subprocess_timeout)
+        if not _retry_t:
+            pretty_log("Browser Retry",
+                       "skipped the commit-milestone retry — the call's "
+                       "wall-clock budget is spent",
+                       icon=Icons.RETRY, level="WARNING")
+        else:
+            try:
+                async with _BROWSER_PROFILE_LOCK:
+                    output, exit_code = await asyncio.to_thread(
+                        sandbox_manager.execute, retry_cmd,
+                        timeout=_retry_t, **_wd_kw
+                    )
+                ok, parsed = _parse_runner_output(output or "")
+            except Exception as e:
+                logger.debug("navigate commit-retry failed: %s", e)
     if ok and operation not in ("interact", "close"):
         # A successful load clears this host's strike streak, which is
         # what makes the count CONSECUTIVE rather than cumulative.
@@ -1121,18 +1279,47 @@ async def tool_browser(
         # and `_mark_onion_dead("")` is a no-op; the interact scan is
         # what records the real host.
         _mark_onion_dead(_nav_url, str(parsed))
+        # A FAILING re-fetch is the loop most worth interrupting, and the
+        # success-only counter could not see it: the 2026-09-15 Revolut
+        # turn hit one Telegram post five times (one of them a selector
+        # error that returned here, before the counter) and the nudge
+        # never fired. Count the attempt, and put the nudge in the hint —
+        # the failure hint is the text the model actually reads next.
+        _fail_nav_note = ""
+        if workspace_model is not None and getattr(workspace_model, "enabled", False):
+            try:
+                # Same key preference as the success path below, or the
+                # two would split on a redirect — the very thing the
+                # canonical key exists to prevent. An interact failure
+                # can still carry a final_url; an atomic one cannot, and
+                # falls back to the URL that was asked for.
+                _fail_url = ""
+                if isinstance(parsed, dict):
+                    _fail_url = parsed.get("url") or parsed.get("final_url") or ""
+                _fail_url = _fail_url or _nav_url
+                if _fail_url:
+                    _fail_nav_note = workspace_model.record_navigation(_fail_url) or ""
+            except Exception:  # noqa: BLE001 — never mask the real failure
+                _fail_nav_note = ""
         _onion_note = _dead_onion_notice(_nav_url)
         if _onion_note:
             # An onion that failed at the Tor layer needs a DIFFERENT next
             # action, not the generic browser advice below — "raise the
             # timeout / use interact" is wrong here and is what invited the
             # identical retry that produced this fix.
+            # No repeat-nudge here on purpose: a host reaches this branch
+            # on its SECOND Tor-layer failure (that is when it is declared
+            # dead), and from the third fetch onward the pre-flight skip
+            # short-circuits before the runner runs — so the count can
+            # never reach the nudge threshold on this path. Threading it
+            # through anyway was dead code that no mutant could falsify.
             return _err(f"Runner failed (exit {exit_code}): {parsed}", ran=True,
                         hint=_onion_note)
         return _err(
             f"Runner failed (exit {exit_code}): {parsed}",
             ran=True,
             hint=(
+                ((_fail_nav_note + " ") if _fail_nav_note else "") +
                 "If this is a navigation timeout, try wait_until='domcontentloaded' "
                 "or raise timeout_ms. If a CLICK timed out or its selector was "
                 "not found: each atomic op reloads the page in a fresh context, "
@@ -1235,10 +1422,26 @@ async def tool_browser(
                 )
         except Exception:
             pass
+        # The DOM-side half of the render question: pixels cannot tell a
+        # loaded page from page chrome, a near-empty innerText can. A
+        # number, not a verdict — a canvas/chart page legitimately has none.
+        dom_line = ""
+        _dom_chars = parsed.get("dom_text_chars")
+        if isinstance(_dom_chars, int):
+            dom_line = f"\nDOM_TEXT_CHARS: {_dom_chars}"
+            if _dom_chars < 200:
+                dom_line += (
+                    " — the page carried almost no text at capture time. For a "
+                    "TEXT page that means it had not rendered yet (lazy media, "
+                    "an overlay, a consent wall): re-take with settle_ms=3000, "
+                    "or run goto → sleep → screenshot in one "
+                    "operation='interact' actions list. For a canvas/game/chart "
+                    "page zero text is normal — read the image instead."
+                )
         return (
             f"{header}\nURL: {parsed.get('url')}\n"
             f"SAVED: {host_rel}\n"
-            f"DOWNLOAD: /api/download/{host_rel}{js_diag}{render_line}"
+            f"DOWNLOAD: /api/download/{host_rel}{js_diag}{render_line}{dom_line}"
             f"{_pre_interaction_line(parsed)}"
         )
     if operation == "close":
