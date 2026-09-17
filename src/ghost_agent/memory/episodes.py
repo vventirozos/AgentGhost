@@ -49,7 +49,15 @@ class EpisodicMemory:
     """
 
     MAX_EPISODES = 500
-    MAX_ACTIONS_PER_EPISODE = 20
+    # §4HI (2026-09-16): 20 → 60. Measured: 31 of 404 stored episodes were
+    # capped, the median one losing 44% of its actions, and the elided
+    # MIDDLE is where a long research run does its reading (ep:402 lost 6
+    # of its 10 substantive page reads, ep:403 4 of 7) — the part the agent
+    # expands on the next run of the same task. Each action's result is
+    # already capped at 1,000 chars and `expand` renders ~300 chars per
+    # action, so a 60-action episode is ≤60 KB stored and ≤18 KB on an
+    # explicit expand; nothing hydrates it unasked.
+    MAX_ACTIONS_PER_EPISODE = 60
 
     # Action truncation keeps the HEAD *and* the TAIL. The whole point of this
     # module is "I tried X, it failed because Z, so I switched to W" — the

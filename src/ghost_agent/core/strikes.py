@@ -222,6 +222,7 @@ class StrikeLedger:
     def __init__(self) -> None:
         self.failure_sigs: dict = {}
         self.action_sigs: dict = {}
+        self._batch_seen = None  # §4HP: set once begin_batch() is called
         self.persistent_failure_seen: bool = False
         self.persistent_warned_sigs: set = set()
         self.consecutive_clean_successes: int = 0
@@ -277,9 +278,30 @@ class StrikeLedger:
 
     # -- no-progress path --------------------------------------------------
 
+    def begin_batch(self) -> None:
+        """§4HP (2026-09-16, req 1234e131): one tool batch is ONE observation
+        per (tool, target, result). The model listed the same URL twice in a
+        four-call batch; both calls succeeded with identical text and
+        ``note_action`` counted them as "repeated 2x with no new info" — a
+        loop the model never took, since it had not SEEN the first result
+        when it issued the second. The forced text-only conclusion then
+        barred the plan's last step (write the report). Called at the top
+        of each batch; a duplicate signature inside the batch is not noted
+        again. Historically 5 of 63 2x trips were this shape."""
+        self._batch_seen = set()
+
     def note_action(self, fname, target, result_fp, threshold: int = 3):
         """Record a successful action's (tool, target, result) fingerprint.
-        Returns ``(signature, count, tripped)``."""
+        Returns ``(signature, count, tripped)``. Inside a batch (see
+        :meth:`begin_batch`) a repeated signature is reported with its
+        current count and never trips."""
+        key = (fname, str(target or ""), result_fp)
+        seen = getattr(self, "_batch_seen", None)
+        if seen is not None:
+            if key in seen:
+                sig = f"{fname or '?'}|{target or ''}|{result_fp or ''}"
+                return sig, self.action_sigs.get(sig, 0), False
+            seen.add(key)
         return note_repeated_action(
             self.action_sigs, fname, target, result_fp, threshold
         )

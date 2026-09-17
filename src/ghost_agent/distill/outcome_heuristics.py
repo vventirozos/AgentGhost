@@ -25,7 +25,16 @@ Signals (each is independent; any one triggers promotion):
      observable progress (no successful navigations between them).
      N defaults to 4. Signals "agent is stuck clicking the same
      thing", which was the dominant failure mode in the 2026-04-26
-     webOS session.
+     webOS session. A navigation is any non-failed call that LOADS A
+     NEW PAGE: ``navigate``/``goto``, an ``interact`` whose actions
+     goto, or — §4HE (2026-09-15) — any op carrying a top-level
+     ``url`` that differs from the last one loaded (``extract_text``
+     with ``url=`` is how the agent reads a page; 14 such reads of 14
+     different articles with ``selector='body'`` were labelled "stuck
+     clicking the same thing", and the reflection built on that label
+     told the agent to use non-body selectors "to stay under the
+     threshold"). Re-reading the SAME url with the same selector still
+     counts.
 
   3. The same tool returned the same normalized error message N or
      more times. N defaults to 3. Signals "agent is not learning
@@ -151,6 +160,13 @@ _TOOL_ERROR_PREFIX_RE = re.compile(
     r"^\s*(?:error|\[error\]|failed|exception)[:\-]?\s*",
     re.IGNORECASE,
 )
+
+
+#: Same pattern as `tools.tool_failure._BLOCKED_HEAD_RE` — kept inline
+#: because this module imports only `.schema` (the corpus reader must not
+#: pull the tools package); `tests/test_blocked_pages_are_not_strikes.py`
+#: pins the two against each other.
+_BLOCKED_HEAD_RE = re.compile(r"STATUS:\s*BLOCKED\b")
 
 
 def _normalize_tool_error(s: str) -> str:
@@ -292,6 +308,10 @@ def _looks_like_tool_error(result: str) -> bool:
             # pre-dating the search-op normalization; labelling them
             # ok is CORRECT, so no marker was added.)
             "replace rejected",
+            # §4HH: a browser fetch that answered 4xx/5xx or a bot
+            # challenge is reported `STATUS: BLOCKED (…)` — a page the
+            # agent did NOT read, so not a success and not progress.
+            "status: blocked",
         )
     )
 
@@ -568,6 +588,7 @@ def classify_chat_outcome(
         max_repeat = 0
         worst_sel = ""
         seen: dict = {}
+        last_url = ""
         for tc in traj.tool_calls:
             if (tc.name or "").lower() != "browser":
                 continue
@@ -576,7 +597,18 @@ def classify_chat_outcome(
             result = getattr(tc, "result", "") or ""
             if op in ("navigate", "goto") and not _looks_like_tool_error(result):
                 seen.clear()  # observable progress — restart the window
+                last_url = str(args.get("url") or "")
                 continue
+            # §4HE: a url-bearing op (extract_text / screenshot / … with
+            # url=) loads that page before it acts — a NEW url that did
+            # not fail is the same observable progress as a navigate.
+            # Cleared BEFORE tallying this call's own selector, so the
+            # same-page re-read (same url, same selector, N times) still
+            # accumulates.
+            url = str(args.get("url") or "")
+            if url and url != last_url and not _looks_like_tool_error(result):
+                seen.clear()
+                last_url = url
             actions = [s for s in (args.get("actions") or []) if isinstance(s, dict)]
             # The live tool's multi-step shape is op="interact" with the
             # navigation INSIDE the actions list ({"action": "goto", …});
@@ -620,6 +652,12 @@ def classify_chat_outcome(
     error_counts: dict = {}
     for tc in traj.tool_calls or []:
         if not _tool_call_failed(tc):
+            continue
+        # §4HN: a page the SITE refused (`STATUS: BLOCKED`, §4HH) is not
+        # "the same error repeated" — four paywalls in one research turn
+        # are four sites' decisions. Live (a91c3e16) they labelled a
+        # verifier-confirmed run FAILED.
+        if _BLOCKED_HEAD_RE.search(str(getattr(tc, "result", "") or "")[:240]):
             continue
         sig = getattr(tc, "error", "") or _normalize_tool_error(getattr(tc, "result", "") or "")
         key = (tc.name or "", sig)

@@ -517,6 +517,18 @@ class ReplanBridge:
             record["action"] = "noop:info"
             self._revisions.append(record)
             return  # silent — audit lives in `self._revisions`
+        # §4HN (2026-09-16): a RESOURCE event is log-only. The only thing
+        # this bridge can do with one is reset the active project task to
+        # PENDING with "CPU 96%" as its failure reason — wrong on a box
+        # where the LLM server pins the CPU at 90–100% whenever it
+        # generates. Measured: 1,051 resource warnings in the log, zero of
+        # them ever revised a task (none coincided with an active task);
+        # the actuator was a latent hazard, not a feature. Loop and anomaly
+        # events keep the revision path.
+        if event.kind == "resource":
+            record["action"] = "noop:resource_log_only"
+            self._revisions.append(record)
+            return
         if plan is None or task_id is None:
             record["action"] = "noop:no_plan"
             self._revisions.append(record)

@@ -77,6 +77,22 @@
   <div class="note"><strong>Tests:</strong> <code>tests/test_strike_ledger.py</code> (behaviour, incl. the world-changed reset) and <code>tests/test_core_loop_defect_fixes.py</code> (turn-loop wiring). The no-progress / not-found breakers it feeds are covered by <code>tests/test_no_progress_loop_breaker.py</code> and <code>tests/test_not_found_loop_breaker.py</code>; batch dedup and the dispatch-side reset by <code>tests/test_dispatch_pipeline_extraction.py</code>.</div>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+
+  <h2 id="4hp-batch">A doubled call in one batch is not a loop <span class="tag">2026-09-16 &sect;4HP</span></h2>
+  <p>
+    Live (req <code>1234e131</code>): turn 9 issued four parallel <code>browser</code> calls with one URL listed twice. Both succeeded with
+    identical text, and the no-progress breaker (threshold 2, keyed <code>tool | target | result-fingerprint</code>) read them as
+    "repeated 2x with no new info" and forced the text-only conclusion &mdash; barring the plan's last step (write the report and PDF).
+    The model attempted the write anyway; the call was scrubbed and &sect;4HF's retry delivered the report inline. A no-progress loop is
+    re-observing <em>after</em> seeing the result; two calls in one batch never saw each other. 5 of the 63 historical 2x trips were this shape.
+  </p>
+  <p>
+    <code>StrikeLedger.begin_batch()</code> opens a per-batch set; the turn loop calls it once at the top of each results batch.
+    <code>note_action</code> reports a signature already noted in the current batch with its current count and <code>tripped=False</code>,
+    without advancing it. The same signature in the <em>next</em> batch still counts (a genuine cross-turn repeat trips as before), a
+    different target or a different result is its own observation, <code>note_world_changed</code> still forgets everything, and a caller
+    that never opens a batch keeps the old counting. Pinned in <code>tests/test_breaker_batch_duplicates.py</code>.
+  </p>
 </main>
 </body>
 </html>

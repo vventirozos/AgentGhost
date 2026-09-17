@@ -40773,3 +40773,1415 @@ suite green three times consecutively: **22,425 / 22,425 / 22,426 passed, 66 ski
 `tests/test_search_relevance_floor.py`, `tests/test_tool_failure_hint_stripping.py`,
 `tests/test_workspace_nav_canonical.py`, `tests/test_render_check_honesty.py`,
 `tests/test_governor_checkpoint_scrub.py`.
+
+## §4HB — Re-evaluation of the rerun (6a7882f5) and the chain behind "not OCR'd" (2026-09-15)
+
+**Trigger.** Operator reran the request after §4HA deployed → *"re-evaluate"* → five findings →
+*"fix all defects, usual verification protocol."*
+
+**R0 scope.** Property: a finding a turn actually established must be reachable by the next turn
+that asks the same question, and no cheaper judge may erase it. Threat model: trusted — the
+verdict/escalation ledgers, the vector store, the trajectory corpus (this process writes them);
+untrusted — cheap-tier verifier prose, search-engine bodies, graph edges (mined from model
+output), the model's own tool arguments. Out of scope: the reflector's lesson wording, the
+verifier's date-arithmetic on ranges (noted, not fixed here), the model choosing the wrong PNG
+from a listing, the malformed-call slip itself (only its cost).
+
+**What the rerun showed.** F2 (hint stripping) fired on 4/4 browser errors (old→RETRYABLE
+'timeout', new→unknown). F1/F3/F4/F5/F6 had no triggering event, each verified rather than
+assumed. Reply cleaner (5.6 k vs 11.6 k), written to disk, one genuinely new lead ranked
+correctly. And §5 STILL said the sender field "has not been OCR'd".
+
+**The chain, traced end to end (every link measured):**
+1. 09-14 turn `14af0b6b` READ the notification card and reported it shows no sender field. Turn
+   gate: CONFIRMED 0.92, confirm-escalation UPHELD by the strong model.
+2. Sixty seconds later a LATE cheap-tier pass REFUTED at 0.90 — escalation outcome
+   `unavailable` (the strong model never answered) — on two wrong reasons: "Sep 12" vs the
+   requested "11-12 September" (a date INSIDE the range), and "the notification text is present"
+   offered as contradicting "no sender is displayed" (a non-sequitur). The cheap refute overrode
+   the strong CONFIRM by recency alone; outcome flipped ok→failed; lessons scrubbed.
+3. The reflector then wrote a lesson (episode 374) asserting the agent "failed to state that no
+   sender is visible" — which is exactly what it HAD stated. A false verdict manufactured a false
+   lesson.
+4. The vector memory for that turn stores ONLY the request text (460 chars). `recall` on 09-15
+   found it at distance 0.20 — the right memory — and rendered the QUESTION; the answer lives in
+   episode 374, and the renderer emits `EVIDENCE REFS` only from `source_refs`, never from
+   `episode_id`, so the drill-down route was never offered.
+5. The graph tier inserted 15 edges at the TOP of that recall — 14 sharing no content word with
+   the query (July news headlines, the operator's family profile), matched through the year token.
+   Corpus: 111 of 336 graph edges shown (33%) share no non-numeric content word with their query.
+
+Also measured: my own earlier claim that the recall labels were "miscalibrated" was WRONG — the
+score is an L2 distance and 0.18 IS a strong match; retracted here. Torch "format may have
+drifted" (WARNING on every miss): fetched the engine over Tor — the 1.8 KB page says
+"No documents match your query", Xapian Omega's zero-hit phrasing, absent from `_NO_HITS_RE`.
+Malformed `replace` (124 s, 20% of the turn): 51/423 corpus replace calls hit the same
+rejection; 8 of the 13 followed by a write were FRAGMENTS (6–64% of the file), so widening the
+`.py` auto-promote is unsafe — the cost is the regenerated payload, not the rejection.
+
+**Seven fixes shipped (§4HB).**
+
+1. **Precedence, not recency, at the late verdict** (`core/verifier.py`, `core/agent.py`).
+   `record_escalation` sets a task-scoped contextvar BEFORE its own gates; wrappers on
+   `_escalate_refute`/`_escalate_confirm` stamp the outcome onto `VerifyResult.escalation` — one
+   path for all 18 ledger sites, with an `ast` enumeration that fails if a site ever records an
+   outcome in neither `ESCALATION_STRONG_ADJUDICATED` nor `ESCALATION_NOT_ADJUDICATED`. The
+   recorder memoises strong-adjudicated verdicts per trajectory and writes an additive
+   `escalation` key to the sidecar; `_record_late_verdict` withholds a late REFUTE whose
+   escalation was `unavailable` when a strong CONFIRMED already stands — kept as a measurement,
+   applied to nothing. Narrow by design: a strong-adjudicated refute still applies; no prior
+   strong verdict → unchanged.
+2. **recall offers the episode's answer** (`tools/memory.py`): a hit carrying `episode_id`
+   renders `EVIDENCE REFS: ep:<id>`, arming the existing `expand` affordance.
+3. **Graph edges filtered per edge** (`tools/memory.py`): kept only on a folded, non-numeric
+   content-word overlap with the query; the section is omitted when nothing survives.
+4. **Omega's zero-hit phrasing** (`tools/darkweb_search.py`): "No documents match" is a no-hits
+   answer; the real page is a fixture.
+5. **Deterministic browser errors name their route** (`tools/browser_routes.py`, new — split out
+   so `browser.py` stays under its size gate): HTTP2 protocol error → different source;
+   context destroyed → `interact` + `networkidle` + settle. Circuit errors deliberately absent.
+6. **Held payload on a rejected replace** (`tools/file_system.py`): the rejected `content` is
+   held by resolved path (single slot, 8 slots, 10-min TTL) and redeemed by name with
+   `content='<<HELD>>'` — once, path-bound, whole-payload match. The `.py` auto-promote is
+   untouched; the hold is only for what it rejects.
+7. **Retraction scrubs the vector twin by trigger** (`memory/skills.py`): the JSON pass knows the
+   triggers it removed; the vector pass now deletes by them too. On the live store the false
+   lesson's twin had an EMPTY `source_trajectory_id` — the id-keyed delete alone would have left
+   it retrievable, which is what the corpus shows had been happening.
+
+**Data repaired.** Trajectory `97b402e8` → `passed` via an `operator_overlay` row; the false
+lesson retracted from playbook AND vector store through the project's own API (archived first,
+`skills_pruned_archive.jsonl`), 0 vector twins left.
+
+**Not done, and why.** The verifier's date arithmetic on ranges ("Sep 12" ∈ "11-12 September")
+— a judge defect in its own right, noted for a verifier round. The model picking `post363.png`
+over `post363b.png` from a listing — no mechanical handle. My own earlier claim that the recall
+labels were miscalibrated — WRONG (L2 distance; 0.18 is a strong match), retracted in the docs
+and here.
+
+**R8 — defects found inside this round's own fixes: five.**
+1. My first stamp-test bound the ContextVar at import; three sibling files `importlib.reload`
+   the verifier, so the binding went stale and the test failed only in the full sweep
+   (memory: reload-contaminates-the-session). Resolved through the module at call time.
+2. The memo's CALL SITE was unpinned — the battery's one survivor. Every test drove
+   `_note_strong_verdict` directly; `_record_verdict_instruments` could have dropped the call
+   unnoticed. Pinned at the call site.
+3. The `**kwargs` wrappers hid the impl's keyword-only parameters from the lint gate; rewritten
+   with explicit mirrored signatures, which also keeps a caller's keyword mistake loud.
+4. `_hold_rejected_content(…, content)` tripped the "every result classifier reads the status"
+   enumeration by parameter NAME; it is a payload, not a result — renamed, which is also truer.
+5. Two pre-existing retraction pins asserted `delete` called exactly once; the contract is now
+   two deletes. Migrated (the whole reader set), not accommodated.
+
+**CONVERGED — mutation score 100% (35/35), 0 survivors**, controls correct in the same phase
+(NOOP SURVIVED, KNOWNBAD KILLED); per fix G1 13/13, G2 3/3, G3 5/5, G4 2/2, G5 3/3, G6 7/7,
+retraction 2/2. R3: the §4HA battery re-run after this round's edits to `browser.py` and
+`agent.py` — **45/45**, still 100%. Enumerations seen to fire: the outcome-vocabulary walk, the
+route-table parametrisation, the episode-ref/graph pins. Full suite green twice consecutively:
+**22,475 passed, 66 skipped, 0 failed** (8:36, 9:51). Docs: `docs/core/verifier.html`,
+`docs/tools/memory_tools.html`, `docs/tools/darkweb_search.html`, `docs/tools/file_system.html`,
+`docs/tools/browser.html`. Pins: `tests/test_verifier_late_precedence.py`,
+`tests/test_recall_episode_refs_and_graph_filter.py`, `tests/test_darkweb_no_hits_phrasings.py`,
+`tests/test_browser_deterministic_routes.py`, `tests/test_file_system_held_content.py`,
+`tests/test_skills_retraction_vector_twin.py`.
+
+## §4HC — The planner that evicted its own context, and the judge that could not see the disqualifier (2026-09-15)
+
+**Trigger.** Operator reran (c16679f1), asked *"check if we messed up with caching"* → diagnosis:
+not the cache, the planner arm → *"fix all defects, usual verification protocol."*
+
+**R0 scope.** Property: a main turn's prompt prefix must survive an interleaved planner call on
+the single slot, and a judge must be shown the evidence that contradicts the claim it is judging.
+Threat model: trusted — our own prompt assembly, the server log, the recorded trajectory;
+untrusted — planner JSON, OCR text, the model's claims and tool arguments. Out of scope: the
+vision model's OCR accuracy (it dropped "un-" from "unauthorised"), the model mistaking a
+recipient for a sender — only their consequences (the verifier passing it; the report carrying
+it), the experiment arm assignment itself.
+
+**Measured before writing.** Server log, paired prefill/context per request: planner OFF
+(6a7882f5) — 10 main turns, 48,745 tokens prefilled in 99 s, median 88% reuse. Planner ON
+(c16679f1) — 11 main turns prefilled 24k→44k EACH (~397,000 tokens, ~510 s, ~6% reuse) alternating
+with 10 planner calls on 55–81k-token contexts. Six RAM-cache evictions in the window: not
+thrash — the planner's prompt is a DIFFERENT system prompt with the transcript re-serialized
+(`agent.py:25179`), sharing ~1k template tokens with the main prompt, and the main state does
+not come back from the RAM cache after the swap. `sys h=` identical across all three runs;
+stable-prefix hash constant across all 15 turns. Not the cache.
+
+**Five fixes shipped (§4HC).**
+
+1. **Prefix-aligned planner** (`core/agent.py`): the loop snapshots each main request's rendered
+   messages + tools + history length; from turn 2 the planner sends exactly those messages plus
+   one trailing instruction (planning prompt, "NEW SINCE YOUR LAST PLAN" delta transcript,
+   transient block), carrying the same `tools` with `tool_choice="none"`. Planner and main now
+   ride one KV lineage. Turn 1 keeps the legacy shape.
+2. **Truncation diagnosis by `finish_reason`** (`core/agent.py`): "TRUNCATED at max_tokens" only
+   when the response says `length`; otherwise "MALFORMED (finish_reason=…, not a cap hit)". A
+   real cap hit arms a one-turn "changed tasks only" steer (the tree merges by id).
+3. **Evidence packer, external-first** (`core/agent.py`): deep window 40; self-authored
+   positional slots yield to overlapping externals (newest kept); IDF-weighted overlap; near-dup
+   suppression at Jaccard 0.5. Replayed on the recorded turn: the digest carries "The sender is
+   still unnamed."
+4. **`find` reads a glob in `path` as the pattern** (`tools/file_system.py`): 7/7 corpus cases.
+5. **Data repair**: report §3/§4 rewritten to what the evidence supports (the InfoCert address
+   is the RECIPIENT; the sender is unnamed; the Italian-agency detail is rumour), the OCR-inverted
+   "authorized" corrected, the PDF regenerated in place (6 pages, same filename). Pre-repair copy
+   in the scratchpad.
+
+**Not done, and why.** The vision model dropping "un-" from "unauthorised" and the model reading a
+recipient as a sender are model defects; only their consequences were fixed. The planner's plan
+size (80 real cap hits at 25–37k chars, 3% of calls) is bounded by the one-turn steer, not by a
+contract change to always-delta plans — that alters planner behaviour under a live experiment
+arm. `-np 2` on the server was not touched.
+
+**R8 — defects found inside this round's own fixes: five, all vacuous pins caught by the
+battery.** (1) The delta-transcript pin matched a file name that `planner_transient`'s "Last
+Tool Output" also carries. (2) The "malformed reply" pin used a reply the tolerant extractor
+PARSES, so the salvage path never ran. (3) Therefore the `finish_reason`-not-read mutant survived
+too. (4) The "newest stays" pin's newest item overlapped the claim, so the pull re-added it after
+the mutant displaced it. (5) The "pull prefers external" pin had the yield consume every external
+before the pull ran. Plus one pre-existing source-text pin (`inspect.getsource` on the exact
+call text) migrated, not accommodated.
+
+**CONVERGED — mutation score 100% (25/25), 0 survivors**, controls correct (NOOP SURVIVED,
+KNOWNBAD KILLED); per fix H1 11/11, H2 2/2, H3 9/9, H4 3/3. R3: rounds one and two re-run after
+this round's edits — **45/45 and 35/35**. Full suite green twice consecutively: **22,499 passed,
+66 skipped, 0 failed** (7:38, 7:44). Docs: `docs/core/agent.html`, `docs/core/verifier.html`,
+`docs/tools/file_system.html`. Pins: `tests/test_planner_prefix_alignment.py`,
+`tests/test_planner_truncation_diagnosis.py`, `tests/test_evidence_packer_external_first.py`,
+`tests/test_file_system_find_glob_path.py`.
+
+**§4HC round 2 — the rerun (552a1ffd) and the defect inside the alignment (2026-09-15).**
+Operator asked why the stream showed "planner monologue — No thought provided." Server-side the
+alignment held: main turns at 70–95% reuse (7–10k prefilled on 46–61k contexts) vs ~6% before;
+379 s wall — the fastest of five runs; the corrected report file untouched and the delivered
+reply now states the InfoCert address is the RECIPIENT. But four of five aligned planner replies
+were XML `<tool_call>` blocks: the main persona answered the trailing planning instruction,
+`json_object` did not hold under it, and the reply parsed to `{}` → empty plan, four turns
+unplanned. Reproduced offline in 10 s on a minimal aligned payload; on the same payload a JSON
+SCHEMA requiring the four plan keys gave a full plan in 11 s (a trailing system message is
+rejected by the template). Shipped: `_PLANNER_REPLY_SCHEMA` on the aligned call only; the
+delta transcript capped at 2,500 chars/message (live tails were 37–50k chars); a log line that
+names a tool-call-shaped planner reply. R8: two more defects inside my own pins — the delta-cap
+pin passed under the mock's 8k `max_context` (default cap 560 < 2,500, so the uncapped mutant
+survived) and a spec went stale on the edited call. **CONVERGED — round three 31/31 (H5 6/6),
+rounds one and two re-run 45/45 and 35/35**, controls correct; full suite green twice:
+**22,503 passed, 66 skipped, 0 failed** (9:59, 9:44). Pins appended to
+`tests/test_planner_prefix_alignment.py`; docs `docs/core/agent.html`.
+
+## §4HD — The reply that opened with its own to-do, and the message that named the wrong room (2026-09-15)
+
+**Trigger.** Operator cleared the sandbox and reran (9b6b8757) → re-evaluation → *"fix all
+defects, usual verification protocol."*
+
+**R0 scope.** Property: a delivered reply must not open with an announcement of work the reply
+then reports done; a tool's "not found" message must name the directory it actually searched.
+Threat model: trusted — the reply text is ours to trim, the sandbox path is ours to describe;
+untrusted — the model's prose (a beat can look like content). Out of scope: the model fusing an
+attacker's Italian-PEC claim with a remembered address (third occurrence, model-side; only the
+file is repaired), the planner-schema fix's live verification (control arm again).
+
+**Measured.** Search floor fired twice live (yahoo junk rejected); the HTTP2 route stopped the
+identical retry that the previous run made; a real 30 s timeout stayed transient. Judge
+UNCERTAIN 0.7 on the re-derived lead (was CONFIRMED 0.95) — the disqualifying source was never
+fetched this turn, so no packer could have shown it. 123 of 1,133 substantial user replies open
+with a paragraph carrying a mid-paragraph agent-voice beat followed by more content.
+
+**R1 — fixes.**
+
+*I1 — the beat before the delivery (`core/reply_smoothing.py`, pass 3).* The delivered reply
+opened "The Telegram post 363 snapshot returned the channel feed. Let me extract the
+notification quote…" above "The investigation is complete." Three rules stood down — not
+paragraph-initial (pass 1), a lone beat (pass 1b), not restated (the §4GO evidence test) — and
+none asked whether the NEXT paragraph delivers. New pass, sentence-level: a non-first
+"Let me / I'll / I will" sentence (optional "Now"/"Next," lead) is cut from a surviving
+paragraph whose next delivered paragraph opens with a heading, bold, "the investigation/task/
+report… is complete/done/finished/ready", "Here's", "Done", "Summary", "Results", "Findings" or
+"Bottom line". Sentence spans are removed from the original text, so line breaks survive.
+Audited on 999 delivered multi-paragraph replies: 31 hits, every one read; two were not beats
+and are excluded by shape (a quoted passage the model was citing; a labelled `**…**` section),
+three the first draft cut were addressed to the user ("Let me grab the latest headlines for
+you.") and fall under the §4GH addressed/offer vocabulary; a colon-terminated beat is a lead-in
+and never cut (the splitter breaks at ':' for exactly that); "Let's"/"I need to" are not openers
+(corpus: the model reasoning, not announcing work). After exclusions 29 hits, all stale beats,
+13 at paragraph 0 and 16 deeper — so the pass runs on every non-final paragraph, not the first.
+
+*I2 — the message that named the wrong room (`tools/file_system._missing_file_message`).* Said
+"does not exist in the current project's sandbox … a DIFFERENT project/session" for every
+directory. New `_sandbox_where` names the place — "the sandbox root (/workspace, no project
+workspace is active)" or "the project workspace 'projects/<id>/'" — using the same detection as
+`project_download_prefix`, `_outer_root_files_hint` and the path heal; the EMPTY sentence no
+longer re-names it; the stale-hint sentence allows for a file that was here and was removed.
+
+*I3 — data.* The 19:01 rewrite of the report (15,138 bytes) carried the InfoCert address as
+"Exact sender address" in the summary table, §3.5, §4, §5, §6 and the bottom line while its own
+§4 caveat said it was Revolut's Milan-branch PEC. Fifteen edits: the address is Revolut's own
+PEC inbox — the recipient — sender address and government domain "not established"; Italy stays
+the attacker-attributed candidate at 55–60%. Pre-repair copy kept in the session scratchpad.
+
+**R2/R3 — battery.** Round four: 38 mutants + 2 controls, I1 32/32, I2 6/6, **100%, 0
+survivors**, NOOP SURVIVED, KNOWNBAD KILLED. Rounds one, two and three re-run after this round's
+edits: **46/46, 36/36, 32/32**, controls correct. Enumeration seen to fire: the AST sweep for the
+old wording caught my own docstring before it caught anything else.
+
+**R8 — defects found inside this round's own fixes: five.** (1) **The pass ran FIRST.** My
+first draft trimmed beats before passes 1/1b so "later passes see the trimmed text". The
+ordering mutant survived, and constructing the world that separates the two orders showed the
+draft re-opened §4GO: the last member of the 7b2da5be beat run, trimmed to its observation, is
+no longer a trailing beat, 1b stands down, and "The extract_text on single=1 gave the same
+capped preview." opens the reply again. The pass now runs LAST on the kept sequence, and "next"
+means the next DELIVERED paragraph — pinned both ways. (2) The first draft re-defined
+`_SENTENCE_SPLIT_RE` (a colon-splitting twin of the §4GO splitter), silently changing
+`_trailing_beat`; renamed. (3) The first draft split and re-joined sentences with spaces —
+a hard-wrapped paragraph would have been re-flowed and a line-broken list mangled; span removal
+instead, pinned. (4) Two exclusion mutants (quote, markup) survived because the test blocks
+carried two protections each (`*"…"*` is quoted AND list-marked); the offer mutant survived
+because the test offer carried "you". Each got an input only that guard protects. (5) The
+EMPTY line re-named the directory the previous sentence had just named; the AST pin's first
+catch was my own docstring. (6) The first full-suite run failed one §4GO pin,
+`test_a_lone_beat_whose_finding_is_never_repeated_is_kept`: it asserted the whole paragraph
+byte-equal when its stated property is that the FINDING stays — the beat sentence beside it is
+exactly what this round cuts. Migrated to assert the observation and the delivery survive and
+the beat does not; the other 19 §4GO pins, including the run that must go whole, passed as is.
+
+**CONVERGED — mutation score 100% (38/38), 0 survivors**, controls correct; R3 46/46, 36/36,
+32/32. Full suite green twice consecutively after the last edit: **22,549 passed, 66 skipped,
+0 failed** (7:59, 10:32 — a third attempt in between was killed at 70% by host memory pressure,
+not by a test). Docs: `docs/core/agent.html` (§4HD), `docs/tools/file_system.html`. Pins:
+`tests/test_smoother_beat_before_delivery.py` (39), `tests/test_missing_file_message_names_directory.py`
+(7). Memory: `new-pass-runs-on-the-survivors`.
+
+**Not done, and why.** The model fusing the attacker's PEC claim with a remembered address is
+the third occurrence and remains model-side; the file is repaired, the reply is not re-issued.
+The planner json_schema fix is still unverified live (three control-arm runs in a row).
+
+## §4HE — The label that taught the agent to game it, and the hand-off pass 3 left behind (2026-09-15)
+
+**Trigger.** Operator reran (5fa6aa97) after the §4HD deploy → re-evaluation → *"fix all
+defects"* (protocol note: the R0 below was written after the first fix landed, not before —
+recorded as the round's own slip).
+
+**Read-out of 5fa6aa97.** 725 s, 17 main turns, 41 tools, `use_planning` CONTROL for the fourth
+run in a row (the json_schema fix stays unverified live). Cache healthy: 3–8k prefilled per turn
+on 32–90k contexts. Content right: the reply names both visible addresses as Revolut's OWN
+inboxes and says the sender is not established; verifier CONFIRMED 0.95, upheld. Three defects:
+(1) **the turn was recorded FAILED** — `outcome_heuristics` signal 2, "browser selector 'body'
+used 14× in one turn", on fourteen `extract_text(url=…)` reads of fourteen DIFFERENT articles; the
+same label on 4d2098c2 (09-13) seeded a reflection whose plan said to use "non-body selectors to
+stay under the threshold", and the selfhood narrative repeated "I used the body selector seven
+times and the verifier just went, too many" — the instrument teaching the agent to game the
+instrument. (2) **The reply opened with three stacked one-liners** — "I have enough to
+finalize." / "The investigation is complete." / "The investigation is complete. Here's the
+forensic synthesis." — two iterations' hand-offs; pass 3 cut their beats as designed and left the
+declarations. (3) **The held write was never redeemed**: `replace` without `replace_with` was
+rejected and the 18,875-char payload held with its one-line route; the model re-read the file,
+the no-progress breaker steered it to "the mutating action" in the abstract, and it delivered
+with nothing written (the file still lacks the KELA section the reply describes).
+
+**R0 scope.** Property: a research turn that reads N different pages is not "stuck clicking the
+same thing"; a delivered reply does not open with content-free hand-offs the next paragraph
+makes redundant; a breaker steer names the exact pending write when the tool holds one.
+Threat model: trusted — trajectory labels feed distillation, retro-negatives and self-play, so a
+false FAILED is label noise with consequences; untrusted — model prose (a short paragraph before
+a delivery is nearly always a lead-in or heading: 356 on the corpus). Out of scope: the model's
+choice not to redeem after the hint (model-side; the steer is the system's lever), the reflection
+and narrative already written from the 4d2098c2 label (narrative left as history; the frontier
+entry removed as data repair).
+
+**R1 — fixes.** *J1* (`distill/outcome_heuristics.py`): a non-failed browser call carrying a
+top-level `url` different from the last one loaded clears signal 2's window, exactly as
+`navigate` does; `navigate` now records its url so a same-page re-read after it still
+accumulates. Replayed on all 8 corpus trajectories the signal had labelled: the six same-page
+thrash cases (1 distinct url each) stay FAILED; 4d2098c2 (13 urls) and 0a435424 (14) no longer
+fire. *J2* (`core/reply_smoothing.py`): after the pass-3 trim, a surviving paragraph before a
+delivery is dropped whole when it is content-free (no URL/number/code/emphasis/quote/list) and
+either contained verbatim in the next delivered paragraph or a single readiness declaration
+("I have enough…", "I now have…", "I've gathered sufficient…", "That's enough"); a bare `---`
+between hand-off and delivery is looked through. Measured on 1,000 replies: 5 drops, all
+hand-offs (the live pair, 45675adf, 44723cc9, 193a1054); none of the 356 lead-ins/headings.
+*J3* (`tools/file_system.held_content_chars` + the read/write steer in `agent.py`): when
+file_system holds a payload for the looping path, the steer's first item is the redemption call
+itself — `file_system(operation='write', path=…, content='<<HELD>>')` — with the size. *Data:*
+operator_overlay 0a435424 → passed; the frontier `reflection_failures` entry carrying the
+"body selector used 7×" diagnosis removed (pre-repair copy in the session scratchpad).
+
+**R2/R3 — battery.** Round five: 26 mutants + 2 controls, J1 5/5, J2 16/16, J3 5/5, **100%,
+0 survivors**, NOOP SURVIVED, KNOWNBAD KILLED. Rounds one–four re-run after this round's edits:
+46/46, 36/36, 32/32, 38/38 (three round-4 specs re-anchored on the moved pass 3, then killed).
+
+**R8 — defects found inside this round's own fixes: five.** (1) Three first-pass survivors,
+each a pin that carried two protections or none: the navigate-then-re-read pin cleared an
+already-empty window (re-shaped as navigate + three url-less reads + one url-bearing read of the
+same page, which only the remembered url separates); the markup guard in the hand-off test was
+shadowed by the list guard (`**` is a list marker — pinned with "## Results" contained in
+"## Results by source"); the 160-char bound had no pin (a long readiness sentence that
+summarises evidence). (2) The hand-off's "everything dropped → return original" guard was DEAD:
+the final block is never a candidate, so the output can never be empty — removed, and the
+final-block rule pinned instead. (3) The end-to-end steer pin read an earlier test's steer out
+of the shared mock-context history and passed for the wrong reason — the capture is now "what
+this drive appended". (4) The hold store is module-global and keyed by resolved path: the
+second pin inherited the first's hold until an autouse fixture cleared it. (5) Protocol: R0
+was written after the first fix, not before.
+
+**CONVERGED.** Full suite green twice consecutively after the last edit: **22,580 passed, 66
+skipped, 0 failed** (7:42, 7:46). Docs: `docs/core/agent.html` (§4HE),
+`docs/tools/file_system.html`. Pins: `tests/test_outcome_heuristic_url_reads_are_progress.py`
+(5), `tests/test_smoother_empty_handoff.py` (21), `tests/test_loop_breaker_names_held_write.py`
+(4). Memory: `the-instrument-teaches-the-agent-to-game-it`. Still open: the planner json_schema
+fix has now missed the treatment arm four runs running; the report file lacks the KELA section
+the reply describes (model-side; the steer is the lever and is now specific).
+
+## §4HF — The plan said "deliver" and the state said "execute" (2026-09-15)
+
+**Trigger.** Operator reran (69fb588e) after the §4HE deploy → re-evaluation → *"fix all
+defects"*. First live run on the `use_planning` TREATMENT arm since §4HC.
+
+**Read-out.** 920 s wall (first answer token at 869 s), 10 main turns, 35 tools, streamed to the
+web client. **The §4HC alignment holds live:** 10 planner calls, 10 real monologues (no "No
+thought provided", no tool-call-shaped replies), main AND planner turns at 70–90% KV reuse
+(7–14k prefilled on 37–77k contexts; c16679f1 was ~6%). The planner costs ~35 s/turn (plan
+generation 15–20 s + 13–33 s prefill of its 31k-char delta tail). Content was on track — the
+turn-9 plan read "sender is still unnamed by Revolut … Revolut's own PEC inbox is … I have
+enough to finalize the report … move to task_5 (compile and deliver)". **What shipped:** seven
+paragraphs of working narration ("Strong material on the Italy theory… Now running parallel:…")
+and a note that a tool call did not run. Verifier REFUTED 0.9.
+
+**Cause.** The turn-10 plan set `required_tool: "none"` (deliver) with `next_action_id:
+task_5`. `is_final_generation` is `force_final_response OR required_tool == "none"`, so the turn
+was STREAMED as the final answer — but the dynamic-state instruction keyed on `next_action_id`
+alone and told the model to "Execute the tool(s) required for the FOCUS TASK". It did: a
+web_search call, in the final stream, scrubbed live and noted. And the retry §4GH built for a
+forced final that produces no answer lives on the internal path only; §4GH recorded the
+streamed final as out of scope ("text already on the client cannot be retried").
+
+**R0 scope.** Property: the instruction the model reads names the same mode the loop runs the
+turn in; a streamed final that produced no answer gets the same one retry the internal path
+gets, on the same stream. Threat model: trusted — the retry is a second generation on our own
+open stream; untrusted — the model's retry may be narration again (fallback), or carry inline
+`<think>` (stripped). Out of scope: the planner's tail size (31k chars/turn — a cost, measured,
+not a defect), the smoother's silence on "Now running…" beats (they are restated by the answer
+the retry now produces).
+
+**R1 — fixes.** *L1* (`agent.py`, the plan → dynamic-state block): the text-only instruction
+fires on `next_action_id == none OR required_tool == none`, names the focus task as the delivery
+when both are set, sets `force_final_response`, and logs the route; the execute instruction is
+reserved for a plan that names a tool. *L2* (`agent.py`, `_stream_final_generation`, after the
+partial-scrub note and before the held [DONE]): when this turn's own scrubbed text is empty or
+narration AND it tried to call a tool, or the whole body is narration (the §4GH predicate), one
+non-streamed retry with `_FORCED_FINAL_ANSWER_DIRECTIVE` — `tools` kept with
+`tool_choice=none` so the KV head survives — appended to the live stream as one chunk and to
+the durable record; a retry that is narration again ships the §4GH honest fallback (last
+evidence); an exception in the retry costs nothing but the answer. Never after the all-consumed
+scrub fallback, a severed stream or an upstream abort.
+
+**R2/R3 — battery.** Round six: 19 mutants + 2 controls, L1 4/4, L2 15/15, **100%, 0
+survivors**, NOOP SURVIVED, KNOWNBAD KILLED; one first-pass survivor (the retry's inline
+`<think>` strip had no pin) bought its pin. Rounds one–five re-run after this round's edits:
+46/46, 36/36, 32/32, 38/38, 26/26.
+
+**R8 — defects found inside this round's own fixes: three.** (1) The first planner-instruction
+pins never reached the planner: a conversational-looking request is classified before the plan
+runs, so all three passed vacuously green on "no planner ran" — re-shaped on a task-shaped
+request with an explicit "the planner ran" assertion. (2) The retry's inline-think strip shipped
+unpinned (battery). (3) The §R4-fixes incremental-scrub pin bounded `_MODULE_SCRUB_RE.sub` calls
+at ≤4 per stream; the retry decision adds exactly one end-of-stream sub — the bound moved to 5
+with the reason, the naive revert (~42) still fails it.
+
+**CONVERGED.** Full suite green twice consecutively after the last edit: **22,592 passed, 66
+skipped, 0 failed** (7:42, 7:46). Docs: `docs/core/agent.html` (§4HF). Pins:
+`tests/test_planner_final_instruction_agrees.py` (3), `tests/test_stream_forced_final_retry.py`
+(9). Verified live this round without a fix: the §4HC planner alignment + json_schema (10/10 real
+plans, 70–90% reuse). Open: the planner tail is 31k chars/turn (13–33 s prefill per plan) — a
+cost to revisit, not a defect; the report file still lacks the KELA section (model-side).
+
+## §4HG — The checkpoint answers that never left the streamed reply (2026-09-16)
+
+**Trigger.** Operator reran (095beab8) after the §4HF deploy → re-evaluation → *"fix all
+defects"* (R0 written before any edit this time).
+
+**Read-out.** Treatment arm (planner + risk_steer + fs_batch + verify_depth). 755 s wall, first
+answer token at 708 s, 9 turns, 18 tools; the agent opened by recalling and expanding its own
+prior episodes (ep:398/399/401/403), read the KELA extraction, wrote the report file (13,809
+chars — sender "NOT PUBLICLY EXPOSED", the visible address named as Revolut's own receiving
+domain), read it back, and the plan said Focus: none → a real streamed answer. Verifier
+CONFIRMED 0.9, upheld. §4HF's L1 did not need to fire (next_action none, the historical route);
+L2 did not need to fire (the final was an answer). Verified live: the §4HD not-found message
+("does not exist in the sandbox root … no project workspace is active") on the first read.
+**Two defects, both in what the user saw above the answer:** (1) the reply opened with the
+risk-governor checkpoint answer — "**CONFIRMED (observed):** … **ASSUMED (not yet
+confirmed):** … The smallest distinguishing check: … One targeted search, then STOP." — the
+§4HA shape, recorded at its iteration, and never dropped: `drop_checkpoint_segments` runs in
+`_finalize_and_return` only, and this reply streamed (the web UI); the record kept it too
+(4,368 chars). (2) The second checkpoint answer — "The distinguishing check (…) has now run
+twice with no new agency name surfaced, and the two primary Italian sources … are blocked. I have
+enough to deliver. Writing the final forensic report." — was not recognised as one: the
+markers cover directive 1 (CONFIRMED/ASSUMED), directive 2 as "single/smallest … check" and
+directive 3 as "no new information/enough rounds/stopped producing/reporting the partial";
+this answer echoed the steer's other words — "distinguish", "no new … surfaced", "run twice".
+
+**R0 scope.** Property: a recorded checkpoint answer leaves the delivered reply on BOTH delivery
+paths; the shape test recognises an answer to any of the three directives in the steer's own
+vocabulary. Threat model: trusted — the segments are exact substrings the loop recorded, and
+the stream prefix is ours until the first chunk is emitted; untrusted — ordinary prose that
+happens to say "confirmed" (the ≥2-marker rule and the structural gate stay). Out of scope: the
+smoother's silence on gerund beats ("Writing the final forensic report."), which this fix
+removes as part of the checkpoint segment rather than by a new narration shape; the planner's
+tail size.
+
+**R1 — fixes.** *M1* (`agent.py`, the `is_final_generation and stream_response` branch): the
+recorded checkpoint segments are dropped from `final_ai_content` BEFORE the stream prefix is
+built, with `drop_checkpoint_segments(…, keep_if_empty=False)` — on the stream the answer
+follows on the wire, so a prefix that was only checkpoint answers becomes empty (finalize keeps
+its refusal to empty a reply; both pinned). *M2* (`reply_smoothing._CHECKPOINT_MARKERS`): four
+markers, each a phrase of the steer text and each bounded to its context — "distinguish… check/
+assumption/alternative", "no new … surfaced/found/information/evidence/leads/results", "run/ran
+… once/twice/N times", "I have enough to deliver/finalize/answer/report/conclude";
+`risk.STEER_DIRECTIVE_TERMS` pins "distinguish" and "no new information" at the producer.
+Measured on 8,831 delivered paragraphs: +5 recognised, every one a checkpoint answer (b1facf05,
+71ecaa14, 193a1054, c7cfd673 ×2); the two-marker rule stays.
+
+**R2/R3 — battery** (harness relocated to `~/Data/AI/.mutation-battery`; the session scratchpad
+was retired). Round seven: 15 mutants + 2 controls, M1 7/7, M2 8/8, **100%, 0 survivors**,
+controls correct. Rounds one–six re-run: 46/46 (one round-1 spec re-anchored on the new
+`keep_if_empty` tail, then killed), 36/36, 32/32, 38/38, 26/26, 19/19.
+
+**R8 — defects found inside this round's own fixes: three.** (1) The first stream-path pin
+could not reach the streamed final: a streamed request streams EVERY main turn, so a
+`chat_completion` mock that carried the tool call was never consulted — the fake had to speak
+the stream dialect (an XML call inside a content chunk). (2) The drop then did nothing: the
+finalize-path helper refuses to empty the text, and on the stream the prefix WAS the segment —
+the `keep_if_empty` flag is that finding. (3) Two bounded-context mutants survived because the
+prose pins carried one marker each; paired with a real marker they kill.
+
+**CONVERGED.** Full suite green twice consecutively after the last edit: **22,606 passed, 66
+skipped, 0 failed** (10:16, 8:05). Docs: `docs/core/agent.html` (§4HG). Pins:
+`tests/test_governor_checkpoint_stream_path.py` (14). Verified live this round without a fix:
+the §4HD not-found wording, the §4HC planner alignment (second treatment run), a real streamed
+answer with the report file written and consistent with the reply. Open: the planner tail size.
+
+## §4HH — The blocked page that read as OK (2026-09-16)
+
+**Trigger.** Operator: *"new request: 7ee072f2"* → re-evaluation → fixes (R0 before edits).
+
+**Read-out.** Control arm for the planner, risk_steer/fs_batch/verify_depth TREATMENT,
+non-streamed. **407 s — the fastest of the eight runs**, 8 turns, 21 tools. The agent recalled
+and expanded its own prior episodes first, searched, hit the governor at step 6, answered the
+checkpoint, read three pages, wrote a NEW report file (`revolut_sept2026_forensic_report.md`),
+delivered. Verified live: §4HA/§4HG's checkpoint drop on the finalize path ("dropped 2
+risk-governor checkpoint answer(s)" — the second one is the §4HG marker set), the smoother
+(4,712 → 4,380), FILE-ARTIFACT clean. Late verdict CONFIRMED 0.95 → backfilled passed.
+
+**The world moved.** Reporting dated 15 Sep (FT, relayed by shattered.io, tech-insider.org,
+cryptobriefing.com) now names the compromised government domain — `pec.interno.it`, Italy's
+Ministry of the Interior (Viminale), a Prefettura di Reggio Calabria mailbox, ~300 stolen PEC
+webmail logins — and the reply's attribution moved from "Italy 55–60%, sender unnamed" to
+"Italy 85%, Ministry of Interior 75%, `pec.interno.it` 80%, exact mailbox still not named",
+with the single-lead and attacker-claim layers ranked as such. Reasonable under the brief.
+
+**The defect.** The reply lists FT (15 Sep) and KELA among its sources and the model's own
+reasoning reads "6. FT (15 Sep 2026): … tied to PEC under domain pec.interno.it" as if read.
+Neither was: `ft.com` returned a 403 "Security Verification" page (LENGTH 554) and
+`kelacyber.com` a 403 "Just a moment…" challenge (LENGTH 0) — and the browser tool labelled
+both **STATUS: OK**. `op_extract_text` discards the `page.goto` response status (`op_navigate`
+captures it and the formatter prints HTTP_STATUS under an OK header). Everything the reply
+attributes to FT came from shattered.io's account of the FT story. Measured on the corpus: 75 of
+584 browser OK results (12.8%) were challenge or 4xx pages — 39 by title ("Just a moment",
+"Attention Required", "403 Forbidden", "Access Denied", "Security Verification"), 36 by a
+console 401/403/429/503 on the document. Also seen: the reply spells the domain `pec.inteno.it`
+twice (model slip; the file too — noted, not fixed).
+
+**R0 scope.** Property: a fetch that returned a bot challenge, a paywall wall or a 4xx/5xx
+document is reported as BLOCKED, never OK, with the reason and the instruction not to cite the
+page as read. Threat model: trusted — the runner sees the main response status and the page
+title; untrusted — a real article titled "Access Denied" (bounded: a 4xx status is blocked
+regardless; a challenge title only with a near-empty body). Out of scope: recognising a source
+named in prose ("FT (15 Sep)") against the blocked fetches — no reliable string to match; the
+verifier's judgement of provenance (it saw a page labelled OK).
+
+**R1 — fix (N1).** `browser_runner.op_extract_text` and `op_screenshot` now keep the
+document's response status (`op_navigate` always did); `browser_routes.blocked_page_reason`
+decides at the formatter: 401/403/407/429/451/503 → blocked ("bot challenge" when the title or
+a `__cf_chl` url says so, else "access refused"), any other 4xx/5xx → blocked, a challenge
+TITLE only with a body under 2,000 chars. A blocked fetch is `STATUS: BLOCKED (HTTP 403 — bot
+challenge)` + HINT (do not cite as read; a retry will not pass; use a secondary source and
+attribute to it), keeps its text visible, and is returned as a DECLARED `ToolOutcome.failed`
+(`world_changed=False`, `reason_code=browser_blocked`) — the strike ledger, the no-progress
+window and the corpus label read the outcome, and a plain string coerces to ok. The corpus
+sniffer knows the header; the retry classifier files it FATAL.
+
+**R2/R3 — battery.** Round eight: 18 mutants + 2 controls, **100%, 0 survivors**, controls
+correct. Rounds one–seven re-run: 46/46, 36/36, 32/32, 38/38, 26/26, 19/19, 15/15.
+
+**R8 — defects found inside this round's own fixes: three.** (1) The first AST enumeration
+tested `".goto(" in src` — a source-text pin the ratchet rejected; now a walk over `ast.Call`.
+(2) The first blocked results were plain strings: the header said BLOCKED and `ToolOutcome.
+coerce` said ok, so the loop would have booked a clean success — the declared outcome is that
+finding. (3) The "title anchored" mutant survived: under `re.match` the `^\s*` anchor only
+differs for leading whitespace — pinned with a whitespace-led title.
+
+**CONVERGED.** Full suite green twice consecutively after the last edit: **22,625 passed, 66
+skipped, 0 failed** (7:48, 7:45). Docs: `docs/tools/browser.html` (§4HH). Pins:
+`tests/test_browser_blocked_page.py` (19). Not done: the model's `pec.inteno.it` misspelling
+(twice in the reply and the file) and its citing of FT/KELA as read — model-side; the tool
+now tells it plainly which fetches it did not read.
+
+## §4HI — Two old guardrails, measured: the governor's steer goes off, the episode cap goes up (2026-09-16)
+
+**Trigger.** Operator, after 7ee072f2: *"given that these are pretty old and that the agent has
+been much improved since … are these 2 really beneficial? or actually hurtful?"* → measured →
+*"do a"* (switch the steer off; raise the cap; the instrument re-tune is deferred as (b)).
+
+**Measured — the risk governor.** Live A/B `risk_steer` (n=588 enrolled, 44 triggered = 7.5%):
+on triggered turns failure_rate control 0.45 (n=20) vs treatment 0.38 (n=21), n_steps 14.3 vs
+13.6, duration 537 vs 468 s — no power after two months, nothing to act on. The "42% failure
+rate at this depth" it quotes is the §4H curve (Jun–Jul, 342 rows); re-derived with the
+corrections overlay: Jun–Jul steps 6–7 = 0.32, Aug = 0.09 (n=11), Sep too thin (12+ = 0.23,
+n=13, vs the curve's 0.61). The module's own note says depth alone cannot cross the threshold;
+`turn_risk` replayed on 7ee072f2's turn 6: depth 0.42, pressure 0, **effort struggle 1.00**
+(eleven `web_search` calls in a row = three turns of four parallel queries; `effort_component`
+saturates both "sprawl" and "spin" on tool NAMES), score 0.51 → steer. Six varied tools score
+0.34. On a research task it fires at step 6 by construction — the §4HE class (an instrument
+keyed on a tool-name shape research legitimately produces). Cost: a checkpoint answer per
+steered turn (which polluted replies until §4HA/§4HG) and a "one check, then STOP" nudge at
+step 6 of tasks whose good runs take 8–17 steps (095beab8 obeyed: one search, then delivered).
+
+**Measured — the episode action cap.** 31 of 404 stored episodes are capped; the median capped
+episode loses 44% of its actions. The agent reuses them (095beab8 and 7ee072f2 opened by
+expanding ep:369/374/399/403; the planner called it "rich, converging evidence"). The middle is
+where the reading happens: ep:403 elided 4 of 7 substantive page reads, ep:402 6 of 10. What the
+cap saves: each action's result is already capped at 1,000 chars and `expand` renders ~300
+chars per action — a 45-action episode is ~45 KB in SQLite and ~13 KB on an explicit expand;
+nothing hydrates it automatically.
+
+**R0 scope.** (a) only: `GHOST_RISK_STEER=0` in the launcher (the experiment stays enrolled but
+its trigger is never marked, so the triggered-subset readout freezes at 44 until the steer is
+re-armed — recorded, not hidden), and `MAX_ACTIONS_PER_EPISODE` 20 → 60 with head-5/tail
+semantics kept beyond it. Threat model: trusted — config; untrusted — none. Out of scope: (b),
+the effort-term re-tune and the depth curve refresh (a separate round, measured first).
+
+**R1 — changes.** `GHOST_RISK_STEER=0` exported by `~/Data/AI/bin/start-ghost-agent.sh` with the
+measurement in the comment (the boot line reads `steer=OFF`; verified at restart);
+`EpisodicMemory.MAX_ACTIONS_PER_EPISODE` 20 → 60. The launcher is outside the repo and a text
+pin on it would be exactly what the ratchet rejects, so the steer's state is verified LIVE at
+each restart, not by the suite.
+
+**R2/R3 — battery.** Round nine: 7 mutants + 2 controls (cap 20/59/61, no truncation, head-only,
+no marker, head-zero), **100%**, controls correct. Rounds one–eight re-run: all clean. Pins:
+`tests/test_episode_cap_keeps_the_middle.py` (3 — a 41-action run stored whole; 60 whole / 61
+truncated; the expanded view carries every read); the four truncation pins in
+`tests/test_episodes_recall_fixes.py` migrated to 70 actions (70 − 5 − 54 = 11 elided).
+
+**CONVERGED.** Full suite green twice consecutively after the last edit: **22,628 passed, 66
+skipped, 0 failed** (10:17, 9:17). Docs: `docs/core/risk.html` (§4HI), `docs/memory/episodes.html`.
+Deferred as (b): re-tune `effort_component` to count repeated IDENTICAL work (tool + args) and
+refresh the depth curve from Aug–Sep, measured on the corpus first; then re-arm the steer.
+
+## §4HJ — Rerun 1 of the operator's loop (6afaf940): the working log over the size bound (2026-09-16)
+
+**Trigger.** Operator: *"restart the agent and rerun the revolut request … re-evaluate until it's
+all good, do as many rounds of restart–rerun–evaluate–fix as needed."* Rerun 1 was sent by me
+as the web client would (user origin, streamed) after the §4HI restart.
+
+**Read-out of 6afaf940.** 845 s, 9 turns, 23 tools; treatment arm (planner on), **no risk
+governor** (steer OFF — verified by absence). No page fetches at all this run: search snippets
++ one `deep_research` (6 of 8 sources loaded) + darkweb_search; the report went to a markdown
+file and a 4-page PDF. Content hedged and correct in shape (Italy/Viminale/PEC ~60%, exact
+mailbox "not publicly exposed", attacker claims as rumour); verdict UNCERTAIN 0.7 (no primary
+source read). Two wasted turns: `manage_projects status` (25 s) and a `report_pdf` with
+`source_files` naming a file it had not written yet (the error names the unreadable file and
+lists what exists — adequate). **The record's defect:** the treated reply still opens with
+three working-log paragraphs ("I have good coverage. Key candidate emerging: … Let me run
+targeted searches…", "The picture is sharpening: … Let me validate…", "I have strong
+consolidated evidence. Let me run a final batch…") above "The investigation is complete." Each
+is a trailing-beat paragraph the reply demonstrably restates (`_restated_anywhere_later` True on
+all three) — kept only because each is over `_MAX_NARRATION_CHARS` (314/426/304 chars), the
+bound that protects long content paragraphs. Corpus: 11 such paragraphs, every trailing beat in
+them stale. A gerund-beat rule ("Running focused searches.") was measured and NOT built: 3 of 6
+corpus hits were prose ("Running narrative:", "Writing this answer is living evidence").
+
+**R0 scope.** Property: an over-bound trailing-beat paragraph that the reply restates loses its
+beat sentence(s) and keeps its observation (sentence-level, the §4HD/§4GO line). Threat model:
+trusted — the paragraph's own text; untrusted — a long paragraph whose last sentence opens like
+a beat but is content (guarded as pass 3 guards it: offers, addressed-to-user, colon lead-ins).
+Out of scope: the live stream (the web UI shows the prefix as progress by the §4FV decision),
+the model's `report_pdf` misuse and the `manage_projects` detour.
+
+**R1 — fix (P1).** Pass 1c inside pass 1: after the whole-drop test declines, a trailing-beat
+paragraph the rest of the reply restates loses its beat sentence(s) (`_strip_trailing_beat_
+sentences`: peeled from the end while the last sentence is a beat, a temporal lead stripped
+first, never past an offer, whitespace preserved) and keeps its observation. The readiness
+vocabulary learned the research turns' residue ("I have strong consolidated evidence.", "I have
+good coverage."; corpus +6, all readiness). Replayed on the raw 6afaf940 stream: 5,330 → 4,072
+chars; the three paragraphs keep their findings and lose their beats.
+
+**R2/R3 — battery.** Round ten: 11 mutants + 2 controls, **11/11 killed**, controls correct.
+Rounds one–nine re-run clean (round 5's four readiness mutants re-anchored on the widened
+regex — one had become equivalent because "sufficient" now lives in two alternatives; it drops
+both and dies).
+
+**R8 — defects found inside this round's own fixes: three.** (1) **The KNOWNBAD control
+survived the first battery**: every 1c pin had put the beat paragraph directly before the
+delivery opener, where pass 3 already cuts the beat — 1c never executed and eleven green pins
+proved nothing. Each pin now puts an observation paragraph between the two (the live shape,
+three deep above the opener). (2) 1c's explicit size bound was a dead guard: a paragraph under
+the bound with the same evidence is dropped whole by `_is_narration` first; removed. (3) The
+first offer pin ended the paragraph ON the offer, which `_trailing_beat` already excludes — the
+guard inside the peel is reachable only with a beat after the offer; pinned that way. Plus two
+fixtures on the restatement knife edge (0.50/0.49) moved to 0.8.
+
+**CONVERGED.** Full suite green twice consecutively after the last edit: **22,639 passed, 66
+skipped, 0 failed** (10:00, 7:55). Docs: `docs/core/agent.html` (§4HJ). Pins:
+`tests/test_smoother_overbound_trailing_beat.py` (11). Next: restart, rerun 2.
+
+## §4HK — Rerun 2 (1e9b6f34): the planner's tree mistaken for a project (2026-09-16)
+
+**Read-out.** 784 s, 7 turns, 22 tools; treatment arm, governor off. The §4HH classifier fired
+live (theblock.co → `STATUS: BLOCKED (HTTP 403 — bot challenge)`, one fatal strike, no retry).
+The report is the fullest of the series: Italy → Viminale → `pec.interno.it` → an exact
+prefettura mailbox from an Italian blog relaying "Korra"'s X screenshots — ranked
+attacker-sourced at ~50%, overall ~60%, with an evidence table typed firsthand/secondhand/
+rumour, the mechanism sub-type left open, a timeline, competing theories, dark-web pointers
+marked low-confidence, and every source dated. Verdict UNCERTAIN 0.7 (3-sample, 2 agree) — the
+honest reading of a ~60% attribution. The §4HJ trim held: the record's opener is now three
+observation lines, no beats. **One defect:** two `manage_projects(action='task_update')` calls
+→ "no active project" — the model tried to mark the PLANNER's `task_3`/`task_4` done as if the
+plan were a tracked project, then wrote "The project context was lost" into the reply. Rerun 1
+had the same confusion (`manage_projects status`). The plan render says "PLAN: … FOCUS TASK:
+task_3" and nothing says whose tree it is; 2 of the 6 treatment-arm runs so far did this.
+
+**R0 scope.** Property: the plan the loop shows the model names itself as the planner's private
+tree, not a tracked project, so the model does not spend a turn on `manage_projects` for it.
+Threat model: trusted — our own prompt text. Out of scope: the three observation lines above the
+answer (findings by the smoother's design), the model reading rerun 1's report file instead of
+writing a new one (no claim about the file was made this time).
+
+**R1 — fix (Q1).** `_PLAN_IS_NOT_A_PROJECT_NOTE` appended to the rendered plan block: the
+planner's private working tree, re-planned every turn, not a tracked project; do not call
+`manage_projects` for it; just do the FOCUS TASK. Rides only with a rendered plan.
+
+**R2/R3 — battery.** Round eleven: 3 mutants + 2 controls, 3/3 killed (the "unconditional"
+mutant needed re-anchoring on the enclosing `if` — its first form did not compile). Rounds
+one–ten re-run clean. Pins: two more in `tests/test_planner_final_instruction_agrees.py` (5).
+
+**CONVERGED.** Full suite green twice consecutively after the last edit: **22,641 passed, 66
+skipped, 0 failed** (10:15, 8:18). Docs: `docs/core/agent.html` (§4HK). Next: restart, rerun 3.
+
+## §4HL — Rerun 3 (de95699d): clean (2026-09-16)
+
+**Read-out.** 802 s, 5 turns, 20 tools; treatment arm, governor off, cap 60, pass 1c, plan
+note. **The record opens with the answer** — "The investigation is complete. Here is the
+forensic synthesis." — no working-log prefix, no checkpoint answers, no hand-offs; the smoother
+had nothing to treat. No `manage_projects` detour (§4HK held). §4HH fired live again
+(cybernews → BLOCKED, one fatal strike, no retry); the §4HB HTTP2 route fired on
+pasqualepillitteri.it. One model-side slip: an identical `web_search` re-issued once (the
+no-progress breaker caught it at 2×). Content against the brief: Italy 70%
+(strongly supported), Prefettura di Reggio Calabria 55% and `pec.interno.it` 55% (plausible,
+single-source, named as such), exact sender "not definitively exposed" 40%; evidence chain
+typed and ranked, technical validation (a `dig` on the PEC provider, the mechanism sub-types
+distinguished as the brief asked), timeline, competing theories all ranked rumour, unknowns,
+OSINT + dark-web source list with the null dark-web result stated, and a closing line naming
+the one artefact that would settle attribution. Verdict **CONFIRMED 0.85, upheld**.
+
+**Loop closed.** Three reruns after §4HI: each found one wrapper defect (§4HJ, §4HK) and none
+in the findings; the third found none. Eleven review rounds in the series (§4HA–§4HK), every
+battery converged, every fix verified live on a later run. Still open by choice: the live web-UI
+stream shows working narration as progress (the §4FV decision; the record is what is smoothed);
+(b) the governor's effort-term re-tune before re-arming; the planner tail size (~28–35k chars
+per plan).
+
+## §4HM — Host CPU signal off (config only, 2026-09-16)
+
+**Trigger.** Operator asked what the `metacog host severity=warning metric=cpu observed=96.00`
+lines are for → measured → *"change config-only: --metacog-cpu-high 100 in the launcher."*
+
+**Measured.** `HostTelemetry` polls psutil at 1 Hz; a signal is logged, counted, and bridged to
+the trigger bus, whose only consumer (`ReplanBridge`) would reset the ACTIVE PROJECT TASK to
+PENDING with "resource/warning: CPU 96%" as the failure reason. Nothing reads the snapshot
+buffer; `check_health` samples psutil itself. Whole log: 2,995 host-signal lines (1,944 info,
+1,051 warning), **zero** resource-triggered replans ever (the two actionable bridge lines in
+the log's lifetime were loop triggers, both rejected) — every warning was a silent
+`noop:no_plan`. The CPU threshold was the default 85% on a box where llama-server pins the CPU
+at 90–100% while generating (the RAM side had already been raised to 98/300 for the same
+reason). Benefit: none measurable. Latent harm: the actuator fires on inference if a project
+task is active at that moment.
+
+**Change.** `--metacog-cpu-high 101` in the launcher (the operator said 100; the compare is
+`>=` and psutil reported `observed=100.00` three times in the log, so 100 would still fire —
+101 cannot). The RAM floor (`--metacog-mem-floor-mb 300`, a real OOM guard given `/health` lies
+under Metal OOM) stays. Verified live at restart: the boot line reports the thresholds, and no
+`metric=cpu` host signal after it. Deferred: deleting the resource→`request_revision` path in
+the bridge (a host signal must never touch a project task) — a small code round if wanted.
+
+## §4HN — A host signal must never touch a project task; the planner tail carries only what the prefix lacks (2026-09-16)
+
+**Trigger.** Operator: *"do 1 and 3. usual verification protocol."* (items from the post-series
+list: remove the resource→replan actuator; shrink the planner tail).
+
+**Measured — item 1.** `ReplanBridge._on_event` treats every `warning`/`critical` event alike:
+`resource` events (host CPU/RAM/disk) reach `request_revision(active_task, "resource/warning:
+CPU 96%")` exactly as loop events do. In the log's lifetime: 1,051 resource warnings, zero
+revisions from them (no project task was active at the time), two revisions attempted in total,
+both from loop triggers. The actuator is unreachable today only by the §4HM threshold; the
+code path remains, and `tests/test_triggers.py` PINS that a critical resource event revises the
+task — the behaviour to remove has a green test.
+
+**Measured — item 3.** The aligned planner tail on de95699d: 42,282 / 38,579 / 28,179 / 34,799 /
+26,598 chars per turn (≈7–14k tokens re-prefilled per plan, 13–33 s). Its composition: the
+planner system prompt (4,104), the delta gist (≤2,500/msg × 4–5 msgs ≈ 10k), then blocks the
+SHARED PREFIX already carries in full — the user request (5,112 — the prefix's first user
+message), `Last Tool Output` (the last two results at up to 84,000 chars each; the prefix holds
+the tool messages verbatim and the delta already gists them: the single largest block, 10–18k
+on turn 2), SCRAPBOOK and SANDBOX STATE (the main dynamic state, in the prefix's last user
+message, ≤6k) — plus the plan JSON pretty-printed (indent=2), the tool name list and the
+temporal anchor. Turn 1 (no prefix) needs all of it; turns 2+ do not.
+
+**R0 scope.** Item 1: a `resource` event is log-only in the bridge (recorded `noop:resource_
+log_only`, never `request_revision`, never counted as a replan attempt); loop/anomaly events
+unchanged; the §4HM launcher flag stays as belt-and-braces. Item 3: on the ALIGNED path (turn
+2+) the tail drops the user request, Last Tool Output, SCRAPBOOK and SANDBOX STATE, and
+compacts the plan JSON; the legacy turn-1 shape is untouched; the "Planner Prefix" log line
+reports the tail's composition so the cut is measurable live. Threat model: trusted — our own
+prompt text and bridge; untrusted — none. Out of scope: the delta per-message cap (2,500 stays;
+re-measure after this cut), the planner prompt's own length, removing the host poller.
+
+**Protocol amendment (operator, 2026-09-16).** R7's "full suite green twice" is retired: the full
+suite runs ONCE, after all changes of a round are in; until then only localized tests (the
+round's pins, their sibling files, the battery). Applies from §4HN onward.
+
+**R1 — fixes.** *Item 1* (`triggers.ReplanBridge._on_event`): a `resource` event of any severity
+is recorded `noop:resource_log_only` (audit keeps the task id) and never reaches
+`request_revision` nor the replan-attempt counter; loop/anomaly unchanged. *Item 3*
+(`agent.py`, aligned planner branch): the turn-2+ tail is planner prompt · delta gist · cap
+note · prior lessons · tool list · temporal anchor (now saying the request, scrapbook and tool
+results are above) · plan JSON compacted (`separators=(",", ":")`); the user request, `Last Tool
+Output`, SCRAPBOOK and SANDBOX STATE are gone from it; turn 1 unchanged; the "Planner Prefix"
+line reports `prompt · delta · plan · tools`.
+
+**R2/R3 — battery.** Round twelve: 13 mutants + 2 controls (item 1: 4/4, item 3: 9/9),
+**100%**, controls correct. Rounds one–eleven re-run clean. Pins:
+`tests/test_planner_tail_composition.py` (6), `tests/test_triggers.py` (+1); migrated:
+`test_triggers.py` (the tree-indirection pin now uses a loop event — its resource event was
+the behaviour removed), `test_metacog_log_polish.py` (the silent-noop action string),
+`test_planner_prefix_alignment.py` (the delta pin split on a heading the tail no longer has).
+
+**R8 — defects inside this round's own work: one.** The first "materially shorter" pin compared
+the turn-2 tail against the turn-1 user message — turn 1's system prompt is a separate message
+and its planner runs before any tool result, so the comparison was apples to oranges and failed
+against the fix; re-shaped as a bound the old composition cannot meet (prompt + one delta gist +
+3.5k, against a 6k result the old shape repeated in full).
+
+**CONVERGED.** Full suite green (once, per the amended R7): **22,648 passed, 66 skipped,
+0 failed** (10:13). Docs: `docs/core/triggers.html` (§4HN), `docs/core/agent.html` (§4HN tail).
+Live verification next: restart, one treatment-arm rerun, read the tail sizes off the
+"Planner Prefix" lines and the per-plan prefill off the llama-server log.
+
+**Live check, and the defect it found (a91c3e16).** The measuring rerun landed on the planner's
+CONTROL arm — no aligned tail to measure (the arm is a hash of the request id; the next run uses
+a pre-picked treatment id). My waiter watched for a "stream drained" line a control-arm run never
+emits (its final goes through finalize), so it idled after the run had finished: 549 s, the
+fastest of the series, verifier CONFIRMED 0.90 upheld. **R8 (inside §4HH):** four paywalled
+sites answered `STATUS: BLOCKED`, and because §4HH made that a DECLARED failure they (a) landed
+on the strike ledger — "Strike 4/6 (fatal)" — and (b) tripped outcome-heuristic signal 3 —
+"tool 'browser' returned the same error 4× in one turn" — so a correct, confirmed run was
+labelled FAILED. A refused site is the site's decision, not the agent ignoring feedback. Fix:
+`tool_failure.is_blocked_page_result` (head-only, one authority; the corpus reader keeps a
+twin pattern pinned equal, since it must not import the tools package); the strike block logs
+"Blocked Page — site refused (not a strike)" and increments neither ledger; signal 3 skips
+BLOCKED results. The outcome stays declared-failed for the record and the no-progress window
+(§4HH's point). Overlay `5e4ba97e → passed`. Battery round thirteen: 6 mutants + 2 controls,
+6/6 (one anchor rebuilt from the source after two escaping slips). Pins:
+`tests/test_blocked_pages_are_not_strikes.py` (7).
+
+**CONVERGED (addendum).** Rounds one–twelve re-run clean after the strike/signal-3 fix; full
+suite green once: **22,655 passed, 66 skipped, 0 failed** (9:16). Docs: `docs/tools/browser.html`
+(§4HN correction). Next: restart; one treatment-arm rerun on a pre-picked request id to read
+the tail sizes and per-plan prefill.
+
+**Live verification (11a466ff, treatment arm by a pre-picked request id).** 652 s wall (the
+three previous treatment runs: 845, 784, 802 s), 7 turns, 21 tools, no governor, no blocked
+pages (one HTTP2 error → one strike, correctly), reply opens with the answer, Italy → Prefettura
+di Reggio Calabria → `pec.interno.it` → the circulated mailbox at ~78% with the request ref,
+7-page PDF. **Tail sizes from the new log line:** 15,680 / 18,387 / 19,507 / 17,865 / 18,303 /
+9,235 / 8,583 chars (prompt 4,104 · delta 7.6–11.4k · plan ~1.8k · tools 1,516) against
+42,282 / 38,579 / 28,179 / 34,799 / 26,598 on de95699d — the delta gist is now the tail's
+largest block, the fixed parts 7.4k. **Not settled:** the llama-side per-plan prefill did not
+fall proportionally by my order-based pairing of `prompt eval` rows (planner-shaped calls still
+6–12k tokens on some turns), and that pairing is unreliable on a shared server log; attributing
+prefill per call needs the llama task id logged beside each LLM call. Recorded as the next
+measurement, not claimed either way. Item 1 verified by absence: no resource-triggered
+revision is possible; the bridge's audit records `noop:resource_log_only`.
+
+**Found by the live check, NOT fixed in this round (out of its scope — proposed as §4HO).** The
+11a466ff reply was LATE REFUTED 0.80 with escalation "unavailable" (strong verdict empty; 26 of
+85 escalations since 09-07 ended that way). The refute's two issues: "Prot. 54934/2026 not found
+in the evidence" — the number IS in this turn's tool 15 (a web_search result); the packer's
+4,000-char digest carried five items (deep_research whose head is a SOURCE-FAILURES notice and a
+blocked KELA fetch, three searches, the report_pdf receipt) at ~800 chars each and never
+reached tool 15 — the §4HC class on a 21-tool run where the budget, not the ranking, is the
+limit. And "78% not derived from the evidence" — a refute of the model's own stated confidence,
+an estimate, not an evidence claim. The label was backfilled to failed and the lessons scrubbed;
+overlay `5e02d713 → passed`. Candidates for §4HO: scale the digest budget with the tool count
+(or per-item minimum + claim-pull priority over positional slots); teach the claim judge that a
+stated confidence is not a factual claim; find why one escalation in four returns nothing.
+
+## §4HO — The refute nobody checked: the strong judge ran out of tokens thinking (2026-09-16)
+
+**Trigger.** Operator: *"proceed with §4HO"* (the verifier findings from §4HN's live check).
+
+**Measured.** Escalations since 09-07: refute escalations reached the strong model 28 times and
+were OVERTURNED 24 of them (86%, 4 upheld); 17 more refutes ended "unavailable" (plus 9
+confirm-side), every one on the `strong is None` path — no exception logged ("Verifier LLM call
+failed" appears 8× in the log, all on shutdowns), no other request in flight (25 of 26). Replayed
+the exact escalation prompt for 11a466ff on the main model with the verifier's settings —
+single-prompt path (`_main_two_stage_enabled()` is OFF by §4BK), thinking ON, `max_tokens`
+2,048: **`finish_reason=length`, 8,065 chars of `<think>`, zero content** → `_parse_json` → `{}`
+→ `_build_verify_result` → None → "unavailable"; the cheap REFUTED (80%) stood, the label was
+backfilled failed, the lessons scrubbed. Same prompt, thinking OFF: 3 s, CONFIRMED 0.85,
+parseable. The packer: the 4,000-char digest for that 21-tool turn held five items at ~800
+chars — a deep_research whose head is a SOURCE-FAILURES notice and a blocked KELA fetch, three
+searches, the report_pdf receipt — and never reached tool 15, where "Prot. 54934/2026" sits; the
+judge refuted the number as "not in the evidence". The prompt: "specific facts … that appear in
+NO tool output are fabrications" read the reply's own "Confidence ≈ 78%" as such a fact.
+
+**R0 scope.** (1) The strong claim judgement on the main model runs with thinking OFF (the
+measured difference: an answer in 3 s vs no answer in 43 s), and an empty or `length`-cut strong
+reply is logged as such at WARNING with the cause; the escalation record carries it. (2) The
+evidence budget scales with the turn's candidate count (floor per quoted item), the claim-pull
+takes a slot before the positional newest-N, and a candidate whose head is a coverage/failure
+notice or a BLOCKED page cannot occupy a slot while a substantive candidate remains;
+`verify_claim`'s own cap follows the budget. (3) One sentence in the claim prompt: a stated
+confidence, ranking or probability is the agent's assessment — judged only for contradiction
+with the evidence, never as a fabricated fact. Threat model: trusted — our prompts and packer;
+untrusted — the judge's output (parsed as before). Out of scope: the cheap judge's own
+accuracy (the escalation exists for that), the two-stage-on-MAIN leg (§4BK's decision).
+
+**R1 — fixes.** *(1) The strong judge answers.* `verifier._call_llm`: the last-resort MAIN call,
+when it is the strong judge (`force_main` on the classic prompt — the two-stage `json_only`
+payloads already carried it), appends `/no_think` and sends `chat_template_kwargs=
+{"enable_thinking": false}`; `GHOST_VERIFY_MAIN_NO_THINK=0` restores thinking. Every main answer
+stashes `self._last_main_call = {finish_reason, content_chars}` (a stash, not a new kwarg — the
+verifier is duck-typed over test stubs with the old signature; the first patch added
+`route_out=` to the call and TypeError'd 6 stubs, R8 below). An empty answer logs at WARNING
+("main-model judge returned NO content (finish_reason=length, force_main=True)").
+`_escalate_refute_impl` resets the stash before the strong call and the `strong is None`
+branch — silent while 17 refutes died in it — now logs WARNING "refute escalation unavailable
+— strong judge returned no verdict (strong_none:length:0c); cheap REFUTED (0.80) stands
+UNCHECKED" and records the cause in the ledger row's `rebuttal` field.
+*(2) The digest reaches the source.* `agent._evidence_candidates` is the one enumeration
+(pulled out of the packer); `_evidence_budget_for(tools_run)` → 600 chars/candidate clamped to
+[4,000, 12,000] and 3/4/5/6 items for ≤6/≤12/≤20/more; the verdict site passes both to
+`_collect_verifier_evidence`; `_EVIDENCE_BUDGET_WEIGHTS` gained the 5- and 6-item tuples. A
+candidate whose head is `STATUS: BLOCKED` (`_evidence_is_dead`, head 240 chars) takes no
+positional slot while a live one exists (`picked = (_live or candidates)[:max_items]`).
+`verify_claim`'s cap is `_EVIDENCE_BUDGET_MAX` (was a literal 4000 — it re-truncated the
+packer's digest). **Narrowed from R0:** the "coverage/failure notice" head (deep_research's
+SOURCE-FAILURES preamble) is NOT demoted — that output carries substantive findings beneath the
+notice, and demoting it would hide them; only the refused page is dead. "The claim-pull takes a
+slot before positional" needed no change: §4HC's yield already gives a self-authored positional
+slot to the pulled external, and with 6 slots on the 21-tool turn tool 15 is reached (pinned).
+*(3) A stated confidence is an assessment.* One bullet each in `_VERIFY_CLAIM_PROMPT` (step 2),
+`_VERIFY_ADJUDICATE_PROMPT` ("support" suspects) and `_VERIFY_ENUMERATE_PROMPT` (the "value"
+class): the agent's own confidence/probability/ranking is its assessment, never a fabricated
+fact, judged only for contradiction.
+Pins: `tests/test_strong_judge_answers.py` (26) — A: no-think on force_main only, kill switch;
+B: empty answer warns + stash; C: escalation cause in ledger + WARNING, stale stash not reported,
+answering judge still overturns; D: budget/items table (8 points), bookkeeping not counted,
+tool 15 of 21 reaches the digest under the scaled budget and not under the flat one, AST pin on
+the verdict site (max_items/budget bound from `_evidence_budget_for` over the same list), BLOCKED
+never takes a slot from a live candidate / all-dead still packs / head-only, verify_claim cap =
+packer max; E: the three prompts. Docs: `docs/core/verifier.html` §4HO, `docs/core/agent.html`
+packer row. Memory: `escalation-is-not-the-weak-link` addendum.
+
+**R2 — mutation battery round 14** (`~/Data/AI/.mutation-battery/specs14.py`, 29 specs, pins
+= `tests/test_strong_judge_answers.py`): **27/27 non-control mutants KILLED**, NOOP SURVIVED,
+KNOWNBAD KILLED. Families: A no-think guard (removed / always / ignores force_main / kill-switch
+ignored / inverted / template kwargs dropped) 6/6; B empty-answer stash + warning (dropped /
+guard removed / always) 3/3; C escalation cause (stash reset removed / no "unparsed" fallback /
+rebuttal not recorded / WARNING demoted) 4/4; D digest (budget flat / items flat / items
+off-by-one / counts everything / max shrunk / site items literal / site budget literal / dead
+demotion removed / dead no fallback / dead whole-text / claim cap flat) 11/11; E prompt lines
+(claim / adjudicate / enumerate dropped) 3/3.
+
+**R3 — rounds 1–13 re-run on the §4HO tree:** every mutant KILLED, NOOP SURVIVED in all 13
+rounds (round 6 re-run once, see R8). Lint gate + pin-quality ratchet: 67 passed with the new
+file.
+
+**R8 — defects inside this round's own work.** (a) The first escalation patch passed a new
+`route_out=` kwarg into `_call_llm`; six test stubs replace that method with the old signature
+→ TypeError inside the try → the except branch would have recorded "unavailable" with the
+exception text — the very shape being fixed. Replaced with the `_last_main_call` stash. (b) A
+harness self-inflicted wound: the battery tree was re-synced with one `rsync --delete src/
+tests/ tree/`, which dumped both into the tree root and deleted everything else there —
+including `pytest.ini` (`asyncio_mode = auto`). Round 14 and rounds 1–5/7–13 were unaffected
+(their tests carry explicit `@pytest.mark.asyncio`; their NOOP controls survived), but round 6
+holds one unmarked async test, so its NOOP was KILLED and its 20 kills were harness kills. The
+control caught it ([[mutation-battery-tiers-and-controls]]); config restored, round 6 re-run:
+20/20 KILLED, NOOP SURVIVED. (c) The bookkeeping pin first named `task_update`, which is not in
+`_BOOKKEEPING_TOOL_NAMES` (`manage_tasks` is) — the pin failed on the fixed code and was
+corrected before it could pass vacuously. (d) R0's "coverage/failure-notice head is dead" was
+narrowed to BLOCKED only (R1) — the notice-headed deep_research output IS evidence.
+
+**CONVERGED (§4HO).** Suite after all changes: 22,680 passed / 1 failed / 66 skipped (470 s) —
+the failure was `test_verifier_two_stage.py::test_two_stage_truncates_slots_like_classic_path`,
+a pin of the literal 4000-char `verify_claim` cap that §4HO replaced by `_EVIDENCE_BUDGET_MAX`
+(not in the localized family); migrated to the constant (test-only), 49 passed with the §4HO
+family. Restarted 16:18:53 (pid 69276, 51 s, bytecode fresh, `steer=OFF`). Treatment-arm rerun
+`1234e131` (16:19:04): 32 tool calls (18 search, 13 browser, 1 darkweb), 721 s to the final
+turn, stream drained at 1,070 s; reply = a 12,982-char forensic report (Italy / `gov.it` PEC /
+Prefecture of Reggio Calabria as an unconfirmed reporting claim; exact sender "not publicly
+confirmed"; ranked; "what I could NOT determine" list). Late verdict UNCERTAIN 0.70 (critic,
+2/2 self-consistency) — no refute, so the §4HO escalation path was not exercised live; the
+digest size is not logged per run; by the pinned rule a 32-candidate turn packs 12,000 chars / 6 items. One new defect
+surfaced → §4HP.
+
+## §4HP — A doubled call in one batch is not a loop (2026-09-16)
+
+**Trigger.** Rerun `1234e131` (§4HO's live check). Turn 9 issued FOUR parallel `browser`
+calls — kelacyber (BLOCKED 403), gncrypto.news, ilfoglio.it, gncrypto.news again. Both
+gncrypto fetches returned identical text; the no-progress breaker (threshold 2, key
+`tool|target|result-fingerprint`) logged "repeated 2x with no new info — forcing a grounded
+conclusion" and set `force_final_response` for turn 10. The plan's focus was task_6 (write
+report.md + PDF); the model tried the write on the tool-less turn, the call was scrubbed ("[A
+tool call in this reply could not be parsed and was NOT executed]" reached the user), and §4HF's
+L2 retry (184 s) produced the report inline. The deliverable is acceptable as an answer; the
+trigger is wrong: a loop is re-observing AFTER seeing the result, and two calls in one batch
+never saw each other. Log census: 63 "repeated 2x" trips, **5 within one batch**, 58 across
+turns (real).
+
+**R0 scope.** `StrikeLedger.begin_batch()` + in-batch dedupe in `note_action` (a repeated
+signature inside the batch is reported at its current count, never advanced, never tripped);
+the turn loop opens a batch where `_batch_world_changed` is initialised. Unchanged: cross-batch
+repeats, the read/write exemption, the ≥3/≥5 hard stops, `note_world_changed`, legacy callers
+that never open a batch. Out of scope: de-duplicating the EXECUTION of identical calls in a
+batch (the second fetch is wasted but harmless), and keeping tools on a forced conclusion when
+the plan's next step is a write (§4HF's retry already recovers the answer).
+
+**R1.** `strikes.py`: `begin_batch()`, `_batch_seen` on the ledger, `note_action` dedupe;
+`agent.py`: `strikes.begin_batch()` after `_batch_world_changed = False`. Pins:
+`tests/test_breaker_batch_duplicates.py` (7): doubled call counts once; next batch still trips;
+different target / different result are their own observations; legacy counting without
+`begin_batch`; `note_world_changed` still forgets; AST pin that the turn loop opens the batch
+before noting. Breaker family (6 files) 117 passed. Docs: `docs/core/strikes.html` §4HP.
+
+**R2 — mutation battery round 15** (`specs15.py`, 11 specs, pins = `test_breaker_batch_duplicates.py`
++ `test_loopbreaker_fruitless_probe.py` + `test_strike_ledger.py`): **8/9 non-control mutants
+KILLED** (site not opened / batch never armed / dedupe ignores target / ignores result /
+duplicate trips / duplicate advances / batch never reset / legacy path dedupes), NOOP SURVIVED,
+KNOWNBAD KILLED. Survivor `P-world-changed-keeps-batch` (`note_world_changed` also nulls the
+batch set) is EQUIVALENT at the consumer: `_batch_world_changed` already discards every
+no-progress trip in that batch, and the next batch re-arms the set — no pin written for it
+([[mutation-equivalent-is-corpus-relative]]).
+
+**R3 — rounds 1–14 re-run on the §4HP tree:** every mutant KILLED, NOOP SURVIVED in all 14
+rounds. Lint gate + pin-quality ratchet: 67 passed.
+
+**R7 — suite after all changes:** 22,687 passed / 1 failed / 66 skipped (517 s). The failure
+was `test_native_tool_call_flood.py::test_a_healthy_repeat_batch_still_dispatches`, a negative
+control whose "exactly 4 dispatches" silently relied on the within-batch trip: its fake model
+emits four identical calls EVERY turn, so before §4HP the breaker fired inside batch 1 and turn 2
+was tool-less; now batch 1 dispatches in full and the breaker trips on the second identical
+batch — 8 dispatches, `Loop Breaker … repeated 2x` present, no flood line. Pin migrated
+(test-only; 26 passed with the §4HP pins). Restarted 17:17:00 (pid 94859, 21 s, bytecode fresh,
+`steer=OFF`); treatment-arm rerun `3d3e0681` posted for the live check.
+
+**CONVERGED (§4HP).** Rerun `3d3e0681` (17:17:11, treatment arm): 25 tool calls (12 search,
+7 browser, 3 file_system, 2 darkweb, 1 report_pdf), no loop-breaker fire, 1,001 s to the final
+turn, drained at 1,053 s. Deliverable: `revolut-breach-report.md` (19,195 chars; the model's
+`replace` without `replace_with` was rejected and REDEEMED by a `write` — §4HE) + 8-page PDF,
+FILE-ARTIFACT clean; reply 5,315 chars naming Italy / Prefettura di Reggio Calabria (alleged) /
+`pec.interno.it` / sender mailbox (reached the client unredacted) with 82% overall and an
+unknowns list. **§4HO exercised live:** the cheap critic REFUTED at 0.90 ("generalizes the
+domain from the specific evidence showing entilocali.prefrc@…"), the strong judge ANSWERED and
+OVERTURNED → CONFIRMED 0.90 in 30 s, ledger `outcome=overturned`, late verdict backfilled →
+passed — the exact shape that ended "unavailable" 17 times before. One residue → §4HQ.
+
+## §4HQ — The hand-off in the third person (2026-09-16)
+
+**Trigger.** Rerun `3d3e0681`'s treated record kept "The report is complete and verified
+against all constraints." directly above "The investigation is complete. Here's the forensic
+summary." §4HE drops a one-sentence content-free hand-off before a delivery when it is
+contained in the next paragraph OR is a readiness declaration — and the readiness vocabulary
+was first-person only ("I have enough…"). The third-person sentence also matches the
+delivery-opener shape, so pass 3 took it for the delivery. Corpus (Aug–Sep, 5,358 paragraphs):
+the third-person single-sentence shape occurs twice, both hand-offs before a delivery (one
+already caught by containment), zero false positives.
+
+**R0 scope.** One alternative in `_READINESS_RE` ("the investigation/task/analysis/report/
+work/research … is/are … complete/done/finished/ready"); every other §4HE guard (≤160 chars,
+one sentence, no content/markup/list/fence, next block is a delivery) unchanged. Out of scope:
+the 364-char "The investigation is essentially complete. I have comprehensive data from …"
+paragraph above it — it carries the domain correction and is kept by design.
+
+**R1.** `reply_smoothing.py` `_READINESS_RE` + alternative. Pins appended to
+`tests/test_smoother_empty_handoff.py` (5): the live shape drops the hand-off and keeps the
+observation + opener; with content kept; not before a delivery kept; two sentences kept;
+`treat_reply` on the live record shape. Smoother family 109 passed.
+
+**R2 — mutation battery round 16** (`specs16.py`, 8 specs, pins = the smoother hand-off /
+beat / trailing-beat files): **5/6 non-control mutants KILLED** (third-person alternative
+removed / multi-sentence allowed / content guard removed / delivery guard removed / length bound
+dropped), NOOP SURVIVED, KNOWNBAD KILLED. Survivor `Q-search-not-match` (`_READINESS_RE.search`
+for `.match`) is EQUIVALENT: the pattern is `^`-anchored as a whole.
+
+**R3 — rounds 1–15 re-run on the §4HQ tree:** clean except what the new alternative itself
+changed (R8). Lint gate + pin-quality ratchet: 67 passed.
+
+**R8 — defects inside this round's own work.** (a) The appended §4HQ pins re-used the module
+names `_OPENER`/`_BODY` at the bottom of `test_smoother_empty_handoff.py`, shadowing the §4HE
+constants above them — the §4HE live-reply pin then compared against MY opener and failed;
+renamed `_Q_*`. (b) Three battery specs anchored on the §4HJ alternative as the regex's LAST
+line (`…sources?)\b)",`) and reported HARNESS_ERROR once §4HQ appended after it: re-anchored in
+place (`specs5` J2-readiness-drops-sufficient, `specs10` P1-readiness-widening-dropped /
+P1-readiness-any-noun) — each still matches the source once and still differs from it. (c)
+`J2-containment-dropped` (round 5) SURVIVED after §4HQ: its pin used "The investigation is
+complete." above the opener, which the third-person readiness trigger now drops WITHOUT
+containment — the pin had stopped distinguishing. A first migration ("Here is the forensic
+synthesis." as a verbatim prefix of the next block) also survived: another pass drops a
+verbatim prefix. Measured against a containment-disabled copy of the module: "The domain
+question is settled." contained MID-paragraph in the delivered block is dropped by the real
+module and kept by the mutant — the pin now uses that; round 5 re-run KILLED
+([[pin-must-fail-somewhere]], [[mutation-equivalent-is-corpus-relative]]).
+
+**R7 — suite after all changes:** 22,693 passed / 0 failed / 66 skipped (486 s). Restarted
+18:22:12 (pid 21176, 30 s, bytecode fresh, `steer=OFF`); treatment-arm rerun `f055ffa2` posted for
+the live check.
+
+**CONVERGED (§4HQ).** Rerun `f055ffa2` (18:22:19, treatment arm): 16 turns, 50 tool calls
+(30 search, 16 browser, 1 darkweb_search, 1 darkweb_research, 1 file_system, 1 report_pdf),
+1,706 s to the final turn, drained at 1,773 s — longer than the two earlier reruns (1,070 /
+1,053 s) on search volume alone (two search waves returned "no winner"; no breaker, no scrub,
+no forced-final retry). Deliverable: `workspace/revolut-breach-report.md` (20,016 chars) + 8-page
+PDF, FILE-ARTIFACT clean. Reply 4,380 chars, opens "Investigation complete. Here's the forensic
+synthesis." straight into the report — no beat or hand-off above the delivery (record treated
+4,917 → 4,428); attribution Italy / `pec.interno.it` / Prefettura di Reggio Calabria with split
+confidences (75–80% domain, 55–60% office + address) and an explicit "not officially confirmed";
+the sender mailbox reached the client unredacted. Verdict: CONFIRMED 0.95 (high-stakes confirm
+escalation — main model upheld), late verdict backfilled → passed.
+
+Three rounds this session, three reruns: §4HO (strong judge answers; digest scales; confidence
+is an assessment) → `1234e131` surfaced §4HP (a doubled call in one batch tripped the breaker)
+→ `3d3e0681` exercised §4HO live (cheap refute OVERTURNED by an answering strong judge) and
+surfaced §4HQ (third-person hand-off) → `f055ffa2` clean. Stop rule met: every battery round
+1–16 at 100% (two documented equivalents), enumerations fire, suite green once after the last
+change.
+
+## §4HR — Dead weight in the search race sizes every failed wave (2026-09-16)
+
+**Trigger.** Operator: *"do 1 and 2. usual verification protocol."* — item 1 was proposed as
+"two engines failing over Tor stretched the last rerun to 1,773 s". **Measured, the premise was
+half wrong.** Seven days (09-09→09-16), 509 won waves: yandex 386 (median 2.3 s), yahoo 77,
+brave 43, duckduckgo 3, **mojeek 0, google 0**. 56 no-winner waves: mojeek conn-error 46 +
+timeout 7; yandex conn-error 45 + timeout 7 (circuit-dependent — it wins 76% of the time and
+wave 1 on fresh circuits recovered 46 wins); whole searches ending ZERO: 2. A no-winner wave
+costs a **median 18 s whatever its kind** (n=56): the wave ends when its LAST engine gives up,
+and mojeek — the July 2026 "reliable slow winner" whose 18 s budget sizes the deadline — now
+runs to its ceiling every time and never wins. On rerun `f055ffa2` the two failed waves cost
+~40 s of the extra ~700 s; the rest was search VOLUME (30 searches vs 12–18) — model behaviour,
+not the engines.
+
+**R0 scope.** Retire mojeek and google from `_RACE_ENGINES` (0/509 in 7 days each; the
+July measurement was 42 probes); derive the wave deadline from the raced set
+(`max(_engine_timeout(e)) + grace` → 16 s, was 22 s) so a wave of fast failures ends when its
+last engine does. Unchanged: the per-engine circuit racing, the fast/slow timeout tiers (the
+slow tier stays for re-adding an engine), waves 0/1 + reformulation, the relevance floor, the
+cache. Out of scope: search volume per task (the model's fan-out is a planner/steer question,
+not a tool one) and the darkweb engines (their own breaker, §onion-engine-survey).
+
+## §4HS — Instruments the last session could not read (2026-09-16)
+
+**Trigger.** Item 2 of the same request. Two things were inferred from pinned rules instead of
+read off the run: the verdict digest's size/items (journal §4HO CONVERGED: "not logged per
+run") and the strong judge's `finish_reason`/content length on escalations that DID answer
+(only the `unavailable` branch records it, as `rebuttal`).
+
+**R0 scope.** (a) One INFO line at the verdict site: `evidence digest — N item(s) of K
+candidate(s), M chars (budget B, ≤I items)`, produced by a helper the site calls. (b)
+`record_escalation(..., strong_call={finish_reason, content_chars})` writes `strong_finish` /
+`strong_chars` on every row produced by `_escalate_refute_impl`, `_resolve_rebuttal` and
+`_escalate_confirm_impl`; the confirm path resets the stash before its strong call like the
+refute path does. No behaviour change on any verdict.
+
+**§4HR R1.** `search.py`: `_RACE_ENGINES = ("duckduckgo", "yandex", "brave", "yahoo")` with the
+seven-day census in the comment; `_race_wave_deadline()` = max raced engine timeout + grace,
+used at the wave. Pins `tests/test_search_race_deadline.py` (6): deadline derives from the raced
+set (7/3 → 8, not 99+1); the live deadline is the fast tier; no raced engine carries the slow
+budget; a wave of fast failures ends when its last engine does (<2 s with a 5 s tier); the wave
+uses the derived deadline, not the constant (a 1.2 s late engine loses to a 0.3 s derived
+deadline). Migrated: `test_search_engine_race.py` (slow-but-valid engine → yandex; "5 empty" →
+`len(_RACE_ENGINES) - 1`; the wedged-engine pin also patches the fast tier),
+`test_search_tor_hardening.py` (the set, plus mojeek/google NOT in), `test_search_tor_timeout.py`
+(google out of the fast-tier loop). Search family 124 passed. Docs: `docs/tools/search.html` §4HR.
+
+**§4HS R1.** `verifier.py`: `record_escalation(strong_call=…)` → `strong_finish`/`strong_chars`
+(absent when not given or empty); all 18 sites in the three methods pass
+`getattr(self, "_last_main_call", None)` (AST-located, patched by line); confirm impl resets the
+stash before `retry()`. `agent.py`: `_EVIDENCE_LABEL_RE` + `_log_evidence_digest(...)` called at
+the verdict site with the packed evidence and the scaled budget/items. Pins
+`tests/test_escalation_instruments.py` (9): row fields written/omitted; an answered refute
+escalation through the real `_call_llm` carries `stop`/len; the confirm path reports ITS call
+(stale stash not reported); AST — every site passes `strong_call`; digest line counts only
+candidate labels, logs nothing for an empty digest, counts the packer's candidates, and the
+verdict site calls it on `claim_evidence`/`_ev_budget`/`_ev_items`. Verifier family 322 passed.
+Docs: `docs/core/verifier.html` §4HS.
+
+**R2 — mutation battery round 17** (`specs17.py`, 18 specs, pins = the two new files + the
+race/hardening/timeout files + `test_strong_judge_answers.py`): **16/16 non-control mutants
+KILLED** after one pin was added (R8), NOOP SURVIVED, KNOWNBAD KILLED. §4HR: site uses the
+constant / helper min / no grace / helper constant / mojeek re-added / yandex dropped — 6/6.
+§4HS: row fields dropped / chars zero / fields always / confirm reset removed / overturned site
+unwired / digest counts any label / counts all tools / never logs / logs empty / site call
+removed — 10/10. Lint gate + pin-quality ratchet: 67 passed.
+
+**R8.** `S-confirm-reset-removed` SURVIVED the first pass: the confirm-path pin drove the retry
+through the real `_call_llm`, which overwrites the stash, so the reset was unobservable.
+The reset matters exactly when the retry never reaches the main route — added the pin (stale
+stash + a retry that raises → the `unavailable` row carries NO strong fields); mutant KILLED
+([[pin-must-fail-somewhere]]).
+
+**R3 — rounds 1–16 re-run on the §4HR/§4HS tree:** every mutant KILLED, NOOP SURVIVED in all
+16 rounds; the two documented equivalents (`P-world-changed-keeps-batch`, `Q-search-not-match`)
+survive as before.
+
+**R7 — suite after all changes:** 22,708 passed / 0 failed / 66 skipped (488 s). Restarted
+19:47:26 (pid 47333, 99 s, bytecode fresh, `steer=OFF`); treatment-arm rerun `5c777fce` posted for
+the live check (wave deadline, engine set, digest line, strong-call row fields).
+
+**CONVERGED (§4HR + §4HS).** Rerun `5c777fce` (19:47:34, treatment arm): 55 tool calls (30
+search, 13 browser, 5 execute for DNS/MX validation, 2 darkweb, 1 vision, file writes), 2,296 s
+to the final turn, drained at 2,365 s. Deliverable: `/workspace/revolut-breach-report.md`
+(16,560 chars) + 9-page PDF; reply 2,655 chars opening with the delivery (record 4,537 → 2,685),
+Italy / `pec.interno.it` / Prefettura di Reggio Calabria at 78% with the office flagged as
+press-sourced and denied by the prefecture. Verdict CONFIRMED 0.85 (high-stakes confirm
+escalation upheld). **Both instruments read live:** `evidence digest — 6 item(s) of 40
+candidate(s), 11848 chars (budget 12000, ≤6 items)`; ledger row `strong_finish="stop",
+strong_chars=662` on the upheld confirm. **§4HR live:** won waves 30, no-winner waves 8, durations [0, 1, 7, 12, 12, 12, 12, 13] (max 13 s; was a median 18 s) — a bad
+evening for circuits (yandex conn-error on every failed wave, a new `DecodeError` shape on
+brave/yahoo) and the price of a loss is now the fast tier, not mojeek's budget.
+
+**Open, not in scope here:** search VOLUME per task keeps growing across reruns (32 → 25 → 50
+→ 55 tool calls; 1,070 → 1,053 → 1,773 → 2,365 s) — the model is fanning out more searches and
+now DNS probes on the same request. That is a planner/steer question (when is the evidence
+enough?), to be measured on the corpus before touching anything.
+
+## Verification on DIFFERENT requests + the flagged items (2026-09-16, evening)
+
+**Trigger.** Operator: *"verify your changes, use different requests to verify your changes"*,
+then *"when you are done, fix the items you flagged"*. Three requests unlike the Revolut one,
+posted as the web client (`~/Data/AI/.mutation-battery/send.py`, `reqs/A|B|C.txt`):
+- **A** (`1cc63597`, factual lookup — latest PostgreSQL release): 149 s, one search (yahoo, wave
+  0), digest line `1 item(s) of 1 candidate(s), 3998 chars (budget 4000, ≤3 items)`, CONFIRMED
+  0.95, backfilled → passed; 524-char answer. Nit: asked for the URL it "actually read", it
+  cited postgresql.org from the search snippet without opening the page (recorded, not fixed —
+  a judge-saw-the-echo shape on a 1-tool turn).
+- **B** (`8dd93eda`, sandbox coding deliverable — events.log + count_days.py + run): 333 s,
+  file_system ×2 + execute, digest `3 item(s) of 3 candidate(s), 375 chars`, FILE-ARTIFACT clean
+  2/2, LATE CONFIRMED 100%, backfilled → passed; the reply carries the file, the script and the
+  exact output (7/6/6/6 = 25 over 4 days, sorted). No breaker, no scrub, no forced-final.
+- **C** (`d121dcc6`, multi-source pricing comparison): see below.
+
+**Flagged item 1 — "search volume keeps growing" — MEASURED, NOT A DEFECT.** Every Revolut
+rerun's queries were distinct (8/18/12/30/30 distinct, 0 repeats, 0 zero-result searches) and
+the request itself enumerates a dozen query combinations. The 2,296 s of `5c777fce` split as
+planner 790 s (34%) + main generation 1,094 s (48%) + tool batches 373 s (16%) over 24 turns —
+per-turn LLM cost, not searches. The planner's share is the question the live `use_planning`
+A/B already asks: n=549 (278/271), failure_rate control 0.156 vs treatment 0.193 (no power;
+an improvement verdict needs ~324/arm), n_steps 4.26 vs 2.79, duration 117 vs 90 s (all turns),
+147 vs 143 s (triggered) — no verdict either way yet. Nothing to change on evidence this thin;
+the instrument is running and needs ~130 more turns per arm.
+
+**Flagged item 2 — the `DecodeError` wave shape → §4HU.** Census: 2 on 09-14, 5 on 09-16
+(yahoo 4, brave 3, yandex 1), all `DecodeError('Body collection error: …')` from primp — a
+body the client could not collect over one circuit. It sat in the unknown `error` category, so
+the terse line printed a repr wall. **R0/R1:** `_failure_category` maps "decodeerror" /
+"body collection error" → `conn-error`; no other wave behaviour changes. Pins in
+`tests/test_search_race_deadline.py` (3 messages incl. one without the class name; unknown
+errors keep their category; the terse line says `yahoo conn-error`, no repr, no URL).
+**R2 — round 18** (`specs18.py`, 5 specs): 3/3 non-control KILLED after one pin sample was
+replaced (R8: my "connection reset" sample matched the OLD `connect` clause, so the
+one-spelling mutant survived; "bad chunk length" isolates the new clause), NOOP SURVIVED,
+KNOWNBAD KILLED.
+
+**Request C** (`d121dcc6`, Hetzner vs DigitalOcean entry plans): 547 s, 2 searches (yandex,
+wave 0) + 8 browser, 6 turns. Answer honest: DigitalOcean verified from the live pricing page
+(HTTP 200, `$4.00/mo` line quoted), Hetzner explicitly NOT verified with the reason. Three
+findings: (1) Hetzner's "Heray" gate answered HTTP 200 / TITLE "Security Check" / 211 chars /
+URL `/_ray/pow` and passed §4HH as a normal page five times; the model re-navigated, the
+no-progress breaker fired ("repeated 2x") and forced the conclusion → **§4HV** below. (2) The
+cheap judge REFUTED, the truncation guard saw the digest cut 51% (10 candidates, budget 6,000,
+5 packed) and downgraded to UNCERTAIN 0.50 without a strong call (`truncation_guard`,
+`cut51%`) — the designed safety; 4 such rows since 09-07 (cuts 34–86%). Measured, not changed:
+the corpus reply p50 is 383 chars, p90 3,018, so the guard is rare. (3) My own §4HS line said
+"≤4 items" while 5 were packed — the positional cap plus the claim pull; wording fixed to
+"positional ≤4 + claim pull" (pin updated).
+
+## §4HV — A challenge served as HTTP 200 (2026-09-16)
+
+**R0.** `blocked_page_reason` keys on 4xx statuses, then on a title list + URL markers for
+legacy/200 results under 2,000 chars. The Heray page (200, "Security Check", 211 chars,
+`/_ray/pow`) matched none. Corpus (September, 321 browser results): the proposed title/URL
+additions hit exactly the 5 Hetzner results, zero false positives. Scope: the two regexes,
+word-bounded; nothing else in the route.
+
+**R1.** `browser_routes.py`: `_CHALLENGE_TITLE_RE` += `security check\b` / `checking that you
+are not a robot` / `robot check\b` / `human verification` / `captcha\b`; `_CHALLENGE_URL_RE`
++= `/_ray/pow\b`. Pins (`tests/test_browser_blocked_page.py`): the Heray shape → "bot
+challenge / interstitial (Security Check)"; the rewritten URL alone; the robot-check title; a
+SHORT "Security Checklist for Kubernetes" (1,500 chars — the length bound would not save it)
+and "Security Check-in Procedures …" stay readable. Docs: `docs/tools/browser.html` §4HV.
+
+**§4HV R2 — mutation battery round 19** (`specs19.py`, 7 specs): **5/5 non-control mutants
+KILLED** (title additions removed / "security check" unbounded / robot line removed / URL
+addition removed / length bound dropped), NOOP SURVIVED, KNOWNBAD KILLED.
+
+**R3 — rounds 1–18 re-run on the §4HV tree:** every mutant KILLED, NOOP SURVIVED in all rounds;
+the two documented equivalents survive as before. **R8:** `specs8` `N1-cf-url-ignored` anchored
+on the old `_CHALLENGE_URL_RE` line and reported HARNESS_ERROR once §4HV widened it — re-anchored
+in place (the mutant still blanks the whole URL pattern; now killed by the cf pins AND the
+`/_ray/pow` pin). Lint gate + pin-quality ratchet: 67 passed.
+
+**Request D** (`503e94c5`, "open hetzner.com/cloud/server and read the cheapest shared plan's
+price; if unreadable say so"): 169 s, browser ×2, 3 turns. This time the exit passed the Heray
+gate (HTTP 200, real title) — the page's prices render client-side and the text showed
+"max/mo." placeholders, so the model screenshotted (turn 2) and on turn 3 the PLANNER routed
+the turn `required_tool=none` (delivery) although its own monologue said the prices were still
+placeholders; §4HF's L1 hard-forced text-only; the model (rightly) called `vision_analysis`; the
+stream scrub consumed the whole reply; §4HF's L2 retry was gated OFF for exactly that case
+("that case already emits its own fallback sentence"); the canned "I prepared a tool call but
+this turn was routed as text-only … please rephrase — run vision_analysis" shipped as the
+WHOLE answer; the verifier skipped it ("empty claim after think-strip"); outcome unknown. →
+**§4HW**. Census: plan-none-with-focus turns 2 since §4HF; full-scrub fallbacks 7 all-time
+(intended: vision_analysis 2, news_headlines, system_utility, browser, web_search,
+manage_projects) — rare, so the fix is the fallback path, not the planner route.
+
+## §4HW — A scrub that ate the whole reply is the no-answer case (2026-09-16)
+
+**R0.** The full-scrub fallback sentence is not an answer; §4HF's retry exists for "a tool
+call on a text-only turn". Scope: defer the sentence behind the retry (answer → honest §4GH
+evidence fallback → sentence only if the retry machinery itself produced nothing); the
+task-closed sentence ("✅ Task complete…") stays immediate with no retry; the durable record
+carries the answer, not the scrubbed markup; the sentence gets one home
+(`reply_shape_check.FALLBACK_HEADS["text_only"]`) and is refuted by the no-answer arm so a
+shipped one is labelled as the non-answer it is. Out of scope: making the planner's
+`required_tool=none` advisory (2 turns since §4HF; revisit if the fallback recurs).
+
+**R1.** `agent.py` stream path: `_scrub_fallback_deferred`; the L2 gate admits the deferred
+case; after the retry block the record is `prefix + retry` and the sentence ships only on
+`elif _scrub_fallback_deferred` (retry produced nothing); `_scrub_fallback_message` reads the
+head from `reply_shape_check`. `reply_shape_check.py`: `FALLBACK_HEADS["text_only"]`,
+`_NO_ANSWER_HEAD_RE` matches either head, the raw-dump head list excludes it. Pins:
+`test_stream_forced_final_retry.py` — the old "keeps the existing scrub fallback only" pin
+REVERSED with the live reason; pure tool call → one retry, one reply, no sentence, record
+without markup; second miss → the §4GH evidence fallback; task-closed → sentence immediate, no
+retry; retry raises → sentence as last resort, [DONE] intact. `test_forced_final_no_answer.py`
+— the sentence is refuted by `refute_no_answer_fallback`, the task-closed one is not.
+Stream + forced-final + shape families 282 passed.
+
+**§4HW R2 — mutation battery round 20** (`specs20.py`, 9 specs, pins = stream retry +
+forced-final + finalize-stream files): **7/7 non-control mutants KILLED** (never deferred /
+gate back to the old exclusion / record keeps markup / last resort removed / head not in the
+no-answer arm / sentence drifts from its home / task-closed also deferred), NOOP SURVIVED,
+KNOWNBAD KILLED.
+
+**§4HW R3 — rounds 1–19 re-run:** every mutant KILLED, NOOP SURVIVED in all rounds; the two
+documented equivalents survive as before. **R8:** two §4HF specs (`specs6`) anchored on the L2
+gate line: `L2-retry-always` re-anchored to the new gate and re-run KILLED;
+`L2-fires-after-scrub-fallback` — the mutant that made L2 fire after a full scrub — IS now the
+shipped behaviour (its pin was reversed with the live reason), so it is retired from the
+round rather than re-anchored ([[mutation-equivalent-is-corpus-relative]]). Lint gate +
+pin-quality ratchet: 67 passed.
+
+**§4HW R7 — suite after all changes:** 22,720 passed / 2 failed / 66 skipped (482 s). Both
+failures were pre-§4HW pins of the canned sentence (`test_streaming_scrub_behavioral.py`: the
+handle_chat-level "stream emits the fallback text" and the source-text "agent.py says
+wasn't executed"); migrated to the §4HW contract (the retry's answer reaches the client before
+[DONE] and the sentence does not ship; the sentence's home is
+`reply_shape_check.FALLBACK_HEADS["text_only"]`, read by agent.py) — test-only, 14 passed with
+the stream-retry pins. Restarted 22:26:35 (pid 99593, 24 s, bytecode fresh). Live checks posted: D
+again (`abb8fdb7`) and E (`96a886cb`, screenshot + vision read of wikipedia.org).
+
+**CONVERGED (§4HU + §4HV + §4HW) — live checks on the fixed tree.**
+- **D again** (`abb8fdb7`, Hetzner cheapest shared plan): 280 s, browser ×2 + vision_analysis,
+  4 turns — the planner routed the vision turn WITH tools this time, the reply names
+  "Cost-Optimized from €5.99/mo (marked not available)" and "Regular Performance from
+  €11.99/mo" as the cheapest available; a cheap REFUTE ("extraneous CPX12 example") was
+  OVERTURNED by a strong judge that answered (`strong_finish=stop`, 435 chars) → CONFIRMED 0.90
+  → passed. Digest line: `3 item(s) of 3 candidate(s), 3997 chars (budget 4000, positional ≤3 +
+  claim pull)`. Residue (not chased): one "Let me screenshot…" beat survives above a delivery
+  paragraph that does not start with an opener.
+- **E** (`96a886cb`, screenshot + vision read of wikipedia.org): 148 s, browser + vision, 3
+  turns, direct answer (10 languages, 7,237,000+ English articles), VISUAL CONFIRMED 95%,
+  CONFIRMED 1.00 → passed.
+- §4HW's deferred path itself was not exercised live in these two runs (the planner did not
+  mis-route this time); it is pinned on the stream harness with the live shape.
+
+Session tally: verification on five different requests (A factual, B coding, C comparison, D
+page read, E vision), one flagged item measured and closed without code (search volume →
+per-turn LLM cost; `use_planning` A/B needs ~130 more turns/arm), four rounds shipped
+(§4HU DecodeError = conn-error; §4HV HTTP-200 challenge pages; §4HW the scrub sentence behind
+the retry; plus the §4HS wording fix), every battery round 1–20 at 100% with two documented
+equivalents and one retired mutant, suite green once per round, agent on pid 99593.
+
+## §4HX — The delivery that opens with a status sentence (2026-09-16)
+
+**Trigger.** Operator: *"fix the residues. usual verification protocol."* Residue 1 (rerun
+`abb8fdb7`): "…Let me screenshot and read the actual prices." survived above "The page loaded
+and read fine. Here's what's shown on …". Every §4HD–§4HQ pass keys "the next block opens by
+delivering" on `_DELIVERY_OPENER_RE.match(next_block)` — the paragraph's FIRST sentence. Corpus
+(Aug–Sep): 148 paragraphs put the opener in their SECOND sentence after a short status ("Fixed.
+Here's what was wrong…", "Both files are read. Here's the comparison.", "I've completed the
+comparison. Here's the full report."), and 10 of them follow a trailing-beat paragraph that
+the passes therefore left standing.
+
+**R0 scope.** One predicate, `_opens_by_delivering(block)`: the first sentence matches the
+opener, OR the first sentence is a short status (≤80 chars) and the second matches. Every
+consumer of the opener test routes through it; the passes themselves are unchanged (pass 3 still
+removes only mid-beat sentences, §4HE still requires a one-sentence content-free hand-off).
+
+## §4HY — A source "actually read" that was never opened (2026-09-16)
+
+**Trigger.** Residue 2 (request A, `1cc63597`): asked for "the official source URL you
+actually read", the reply cited postgresql.org "— the homepage announcement states: …" after
+ONE web_search and no page load; the judge CONFIRMED 0.95 from the snippet (the echo, §4HC's
+shape on a one-tool turn). Corpus: 1 such turn in 654 tool turns (this one); "I read <url>"
+with no fetch: 0.
+
+**R0 scope.** A mechanical check in `reply_shape_check` (the arithmetic-before-opinion tier):
+when the request asks for a source the agent read/opened/visited, the reply cites a URL as its
+source, and NO page-loading tool (browser / deep_research / darkweb_research) ran this turn →
+one issue naming the URL, merged like the other mechanical refutes (repairable: open the page
+or say it was not read). Nothing fires without all three.
+
+**§4HX R1.** `reply_smoothing.py`: `_STATUS_SENTENCE_MAX = 80`, `_opens_by_delivering(block)`;
+both opener consumers (`_is_empty_handoff`, `_strip_beats_before_delivery`) route through it.
+Pins `tests/test_smoother_status_then_opener.py` (5): the three corpus shapes and the old
+first-sentence shape are deliveries; a long first sentence / no opener / empty are not; the
+live beat is cut and its observation kept; `treat_reply` on the live record; the §4HE hand-off
+above a status-then-opener delivery is dropped too.
+
+**§4HY R1.** `reply_shape_check.py`: `_READ_ASK_RE`, `_URL_RE`, `PAGE_LOADING_TOOLS`
+(browser / deep_research / darkweb_research), `refute_unread_source(reply, request,
+tool_names)`; `agent._reply_shape_refutation` consults it after the raw-dump check and before
+narration-only, with the turn's tool names computed once. Pins
+`tests/test_unread_source_refute.py` (10): the live shape names the URL; any page-loading tool
+clears it; no ask / no URL → nothing; three ask phrasings; the fetcher set excludes the
+searchers; the mechanical site refutes the live shape before any judge and stays silent with a
+browser call. Smoother + shape + judge families 365 passed.
+
+**R2 — mutation battery round 21** (`specs21.py`, 14 specs, pins = the two new files + the
+hand-off / beat-before-delivery / forced-final files): **12/12 non-control mutants KILLED**
+(§4HX: second-sentence clause removed / status unbounded / any sentence counts / pass 3 not
+routed / hand-off not routed; §4HY: ask never or always matches / search counts as a load /
+load check removed / URL not required / site call removed / site passes no names), NOOP
+SURVIVED, KNOWNBAD KILLED. **R8:** `X-any-sentence-counts` survived the first pass — the pins
+only had openers in sentence 1 or 2; added the buried-third-sentence case (exactly one status
+sentence is the rule); `X-pass3-not-routed` was a harness anchor missing the `return block`
+line — re-anchored. Both KILLED on re-run.
+
+**R3 — rounds 1–20 re-run on the §4HX/§4HY tree:** every mutant KILLED, NOOP SURVIVED; the two
+documented equivalents survive. **R8:** three earlier specs anchored the "next block delivers"
+gate line that §4HX routed through `_opens_by_delivering` (`specs4` I1-no-delivery-gate,
+`specs5` J2-no-delivery-gate, `specs16` Q-delivery-guard-removed) → HARNESS_ERROR; re-anchored
+in place, all three KILLED on re-run. Lint gate + pin-quality ratchet: 67 passed.
+
+**R7 — suite after all changes:** 22,738 passed / 0 failed / 66 skipped (505 s). Restarted
+00:13:54 (pid 26353, 18 s, bytecode fresh). Live re-checks posted: A again (`e4c2fb2e`, the
+"source you actually read" ask) and D again (`709c0384`, the status-then-opener delivery).

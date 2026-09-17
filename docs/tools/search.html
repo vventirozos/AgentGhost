@@ -182,6 +182,31 @@
   <h2 id="4gk">Round 4: the failure marker was unanchored <span class="tag">2026-09-13 &sect;4GK</span></h2>
   <p>A source block is a header line followed by the page's text, and a fetch failure writes <code>Error:</code> as the first line of that body. The rule asked only whether the string appeared <em>anywhere</em> in the block &mdash; which includes the page's own text. A successful fetch of a page quoting <code>Error: division by zero</code> &mdash; a tutorial, a bug report, a log excerpt, exactly the material research is pointed at &mdash; counted as a failed source; with a single URL that makes the success count zero, so the "nothing fetched is a failure" rule booked a complete report as a FAILED action, fired the strike ledger, and told the model no source could be fetched. The onion sibling spelled the loose rule while its own cache gate, thirty lines away in the same function, used the anchored one &mdash; two parsers disagreeing about one run. There is now a single authority and both call it.</p>
   <p>A cached onion report also returned a bare string, dropping the partial-coverage status: the same query answered a clean OK from cache minutes after answering partial. The status is re-derived from the coverage banner the cached text already carries.</p>
+
+  <h2 id="4hr">Dead weight in the race sized every failed wave <span class="tag">2026-09-16 &sect;4HR</span></h2>
+  <p>
+    Seven days of live waves (09-09&rarr;09-16, 509 wins): yandex 386 (median 2.3 s), yahoo 77, brave 43, duckduckgo 3, <strong>mojeek 0,
+    google 0</strong>. mojeek &mdash; the July 2026 "reliable slow winner" whose 18 s budget sized the wave deadline &mdash; conn-errored or
+    timed out in 53 of the 56 no-winner waves. Because a wave ends only when its <em>last</em> engine gives up, every failed wave cost a
+    median 18 s (n=56) while the actual winners answer in 2&ndash;3 s. <code>yandex conn-error</code> in 45 of those waves is circuit-dependent
+    (it wins 76% of the time; wave 1 on fresh circuits recovered 46 wins) and is left alone.
+  </p>
+  <p>
+    mojeek and google are retired from <code>_RACE_ENGINES</code> (a ticket that never wins is not a ticket); the wave deadline is now
+    <code>_race_wave_deadline()</code> = the slowest <em>raced</em> engine's timeout + grace (12 + 4 s, was 18 + 4), so a wave of fast failures
+    ends when its last engine does. The slow tier in <code>_DDGS_ENGINE_TIMEOUT</code> stays for re-adding an engine after a fresh per-exit
+    measurement. Pinned in <code>tests/test_search_race_deadline.py</code>. Not changed: search <em>volume</em> per task &mdash; on the run that
+    prompted this the two failed waves cost ~40 s of a ~700 s excess; the rest was 30 searches.
+  </p>
+
+  <h2 id="4hu">A body the client could not collect is a circuit failure <span class="tag">2026-09-16 &sect;4HU</span></h2>
+  <p>
+    Seven failed waves on 09-14/16 printed <code>yahoo error: DecodeError: DecodeError('Body collection error:</code> &mdash; primp's
+    body-collection failure (a truncated or garbled body over one Tor circuit), left in the unknown <code>error</code> category and
+    therefore shown as a repr wall in the terse line. <code>_failure_category</code> now maps <code>DecodeError</code> / "body collection
+    error" to <code>conn-error</code>; nothing else about the wave changes (the next wave already rides fresh circuits). Pinned in
+    <code>tests/test_search_race_deadline.py</code>.
+  </p>
 </main>
 </body>
 </html>

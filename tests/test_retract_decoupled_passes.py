@@ -53,9 +53,11 @@ def test_vector_scrub_runs_when_json_match_found(tmp_path):
 
     removed = sm.retract_lessons_from_trajectory("tid-1", memory_system=ms)
     assert removed == 1
-    ms.collection.delete.assert_called_once_with(
-        where={"source_trajectory_id": "tid-1"}
-    )
+    # §4HB: two deletes now — the id-keyed one this pin exists for, plus a
+    # trigger-keyed one for twins that never carried the id.
+    ms.collection.delete.assert_any_call(where={"source_trajectory_id": "tid-1"})
+    ms.collection.delete.assert_any_call(where={"trigger": {"$in": ["x"]}})
+    assert ms.collection.delete.call_count == 2
 
 
 def test_vector_scrub_runs_even_when_json_has_zero_matches(tmp_path):

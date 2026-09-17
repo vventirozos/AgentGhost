@@ -109,7 +109,11 @@ class TestIncrementalMechanism:
         # § R5: lower bound too — an import-time alias that dodges the
         # monkeypatch would leave the counter at 0 while a naive revert runs
         # elsewhere; the pin must prove the counted pattern IS the live one.
-        assert 1 <= counter.sub_calls <= 4, (
+        # §4HF (2026-09-15): the streamed forced-final retry runs ONE more
+        # sub after the chunk loop (this turn's scrubbed text decides
+        # whether to retry) — a per-stream cost, not per-chunk, so the
+        # bound moves by exactly one and the naive revert (~42) still fails.
+        assert 1 <= counter.sub_calls <= 5, (
             f"sub ran {counter.sub_calls}x — incremental mechanism reverted "
             f"or the counted pattern is not the live one?")
 

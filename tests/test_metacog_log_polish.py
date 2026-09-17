@@ -238,8 +238,9 @@ class TestReplanNoopSuppression:
         assert replan_calls == [], (
             f"expected silent noop, got {len(replan_calls)} log calls"
         )
-        # Audit still captured though
-        assert bridge.revisions[-1]["action"] == "noop:no_plan"
+        # Audit still captured though (§4HN: a resource event is log-only
+        # whatever the plan state, so the audit names THAT, not the plan)
+        assert bridge.revisions[-1]["action"] == "noop:resource_log_only"
 
     @pytest.mark.asyncio
     async def test_info_severity_does_not_emit_log(self):

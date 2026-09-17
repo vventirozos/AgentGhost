@@ -117,8 +117,12 @@ def _actions(n, fail_at=None):
 # 1. Action truncation keeps the RESOLUTION
 # ---------------------------------------------------------------------------
 
+# §4HI (2026-09-16): the cap moved 20 → 60, so a 40-action run is now stored
+# whole (that is the point — the middle of a long research run is where the
+# reading happens). The truncation pins use 70 actions; 70 − 5 head − 54 tail
+# = 11 elided.
 def test_truncation_keeps_the_tail_not_just_the_head(em):
-    actions = _actions(40)
+    actions = _actions(70)
     actions[-1] = {"tool": "final_fix", "args": {}, "result": "RESOLVED",
                    "success": True}
     ep_id = em.record_episode(trigger="long task", actions=actions,
@@ -137,18 +141,18 @@ def test_truncation_keeps_the_tail_not_just_the_head(em):
 
 
 def test_truncation_marker_records_how_much_was_dropped(em):
-    ep_id = em.record_episode(trigger="long task", actions=_actions(40),
+    ep_id = em.record_episode(trigger="long task", actions=_actions(70),
                               success=True)
     stored = em.get_episode(ep_id)["actions"]
     marker = [a for a in stored
               if a["tool_name"] == EpisodicMemory.TRUNCATION_MARKER_TOOL][0]
-    assert "21" in marker["tool_args"]  # 40 - 5 head - 14 tail = 21 elided
+    assert '"elided": 11' in marker["tool_args"]  # 70 - 5 head - 54 tail = 11 elided
     assert marker["success"] == 1       # never counts as a failed action
 
 
 def test_truncation_warns_on_the_live_stream(em, caplog):
     with caplog.at_level(logging.WARNING, logger="GhostAgent"):
-        em.record_episode(trigger="long task", actions=_actions(40), success=True)
+        em.record_episode(trigger="long task", actions=_actions(70), success=True)
     assert any("exceed the cap" in r.getMessage()
                for r in caplog.records if r.levelno >= logging.WARNING)
 
@@ -247,7 +251,7 @@ def test_recoveries_empty_when_nothing_is_relevant(em):
 def test_truncation_marker_is_not_a_failed_action(em):
     """A truncated-but-clean episode must not be mislabelled a recovery."""
     em.record_episode(trigger="very long clean run of the exporter",
-                      actions=_actions(40), outcome="ok", success=True)
+                      actions=_actions(70), outcome="ok", success=True)
     recoveries = em.search_recoveries("long clean exporter run")
     assert recoveries[0]["recovery_evidence"] != "failed_action"
 

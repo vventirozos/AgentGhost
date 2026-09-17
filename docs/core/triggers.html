@@ -60,6 +60,11 @@
     <li><b>critical</b> — same as warning, but caller policies may also halt new tool dispatch until the trigger clears.</li>
   </ul>
 
+  <h2 id="4hn">A resource event is log-only <span class="tag">2026-09-16 &sect;4HN</span></h2>
+  <p>
+    <code>ReplanBridge._on_event</code> used to treat every <code>warning</code>/<code>critical</code> event alike, so a host signal ("CPU 96%") reached <code>request_revision(active_task, "resource/warning: CPU 96%")</code> exactly as a loop event does — the active <em>project task</em> reset to PENDING with the host's CPU load as its failure reason. Measured over the log's lifetime: 1,051 resource warnings, zero revisions from them (none coincided with an active task), two revision attempts in total, both from loop triggers. On a box where the LLM server pins the CPU at 90–100% whenever it generates, the actuator was a latent hazard, not a feature; §4HM had made it unreachable by threshold (<code>--metacog-cpu-high 101</code>), this makes it impossible. A <code>resource</code> event of any severity is now recorded as <code>noop:resource_log_only</code> (the audit still names the task) and never counted as a replan attempt; loop and anomaly events keep the revision path. Pinned in <code>tests/test_triggers.py</code>; battery §4HN 4/4.
+  </p>
+
   <h2>2026-07-27 audit fixes</h2>
   <ul>
     <li><strong>LoopDetected fired on benign work and burned the active task's revision budget (MED, closed).</strong> The dispatch loop called <code>RepetitionCounter.observe(fname)</code> — keyed on the tool NAME alone, and counting successes — so three consecutive reads of <em>different</em> files tripped the detector. Each trip published a loop event, and with metacog live the <code>ReplanBridge</code> knocked the IN_PROGRESS task back to PENDING, stamped a spurious failure reason and incremented <code>revision_count</code>; after three benign trips the <code>MAX_REVISIONS</code> cap was exhausted and a <em>real</em> failure could no longer request a revision. Observation is now keyed on tool + args-hash, so only an identically-argued repeat counts.</li>

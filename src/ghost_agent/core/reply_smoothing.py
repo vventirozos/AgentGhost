@@ -17,7 +17,7 @@ client changes):
 * Callers gate on multi-tool turns — a single-tool or conversational
   reply is never touched.
 * Fenced code blocks are atomic and never dropped.
-* Only three shapes are ever removed, all non-final:
+* Only four shapes are ever removed, all non-final:
     1. connective working narration — a short paragraph opening with an
        agent-voice beat ("Let me…", "I'll…", "Good, …"), or with a
        temporal lead ("Now…", "Next,…") that a later paragraph RESTATES
@@ -28,7 +28,11 @@ client changes):
     3. a stale announcement — a short paragraph that says work is IN
        PROGRESS ("… Now ingesting into the knowledge base.") when a later
        paragraph reports that same work as DONE and RESTATES the
-       paragraph's content (2026-09-09).
+       paragraph's content (2026-09-09);
+    4. a beat SENTENCE inside a surviving paragraph whose next delivered
+       paragraph opens by delivering ("… Let me extract the quote." →
+       "The investigation is complete.") — the sentence goes, the
+       observation beside it stays (§4HD, 2026-09-15).
 * Fail-open: anything unmatched stays; if smoothing would empty the
   reply it returns the original.
 """
@@ -151,6 +155,36 @@ def _trailing_beat(block: str) -> bool:
     if m:
         last = last[m.end():].lstrip()
     return bool(_BEAT_RE.match(last))
+
+
+def _strip_trailing_beat_sentences(block: str) -> str:
+    """Remove the agent-voice beat sentence(s) a paragraph ENDS on, keeping
+    everything before them and the paragraph's own whitespace (§4HJ).
+    Sentences are peeled from the end while the last one is a beat — a
+    temporal lead is decoration ("Now let me …") — and never an offer to
+    the user. Returns ``block`` unchanged when nothing qualifies or when
+    the whole paragraph is beats (that is pass 1's decision, not this one's).
+    """
+    text = block.strip()
+    starts = [0] + [m.end() for m in _SENTENCE_SPLIT_RE.finditer(text)]
+    if len(starts) < 2:
+        return block
+    keep = len(starts)
+    while keep > 1:
+        a = starts[keep - 1]
+        b = starts[keep] if keep < len(starts) else len(text)
+        last = text[a:b].strip()
+        if _OFFER_RE.match(last):
+            break
+        m = _TEMPORAL_LEAD_RE.match(last)
+        core = last[m.end():].lstrip() if m else last
+        if not _BEAT_RE.match(core):
+            break
+        keep -= 1
+    if keep == len(starts):
+        return block
+    out = text[:starts[keep]].rstrip()
+    return out if out else block
 
 
 def _is_narration(block: str, later_blocks: List[str] = ()) -> bool:
@@ -441,6 +475,23 @@ _CHECKPOINT_MARKERS = (
                r"\bstopped producing\b", re.IGNORECASE),
     re.compile(r"\breporting the (?:honest )?partial\b|"
                r"\bhonest partial answer\b|\bwhat is blocked\b", re.IGNORECASE),
+    # §4HG (2026-09-16, req 095beab8): the second answer of a steered turn
+    # — the STOP declaration after the check ran — echoed the steer's
+    # OTHER words: "The distinguishing check (…) has now run twice with no
+    # new agency name surfaced … I have enough to deliver." Zero of the
+    # markers above matched it and it shipped as the reply's second
+    # paragraph. Each pattern below is a phrase of the steer text itself
+    # (`risk.STEER_DIRECTIVE_TERMS` pins "distinguish" and "no new
+    # information" at the producer). Measured on 8,831 delivered
+    # paragraphs: +5 recognised, every one a checkpoint answer.
+    re.compile(r"\bdistinguish(?:ing)?\b[^.\n]{0,60}\b(?:check|assumption|alternative)\b",
+               re.IGNORECASE),
+    re.compile(r"\bno new\b[^.\n]{0,40}\b(?:surfaced|found|information|info|evidence|"
+               r"facts?|leads?|results?)\b", re.IGNORECASE),
+    re.compile(r"\b(?:run|ran|been run|searched|tried)\s+(?:once|twice|three times|"
+               r"\d+ times|\w+ times)\b", re.IGNORECASE),
+    re.compile(r"\bi have enough to (?:deliver|finali[sz]e|answer|report|conclude)\b",
+               re.IGNORECASE),
 )
 
 # Two distinct directives must be answered before a segment is treated as
@@ -461,13 +512,17 @@ def is_governor_checkpoint_answer(text: str) -> bool:
     return hits >= _CHECKPOINT_MIN_MARKERS
 
 
-def drop_checkpoint_segments(text: str, segments) -> str:
+def drop_checkpoint_segments(text: str, segments, *, keep_if_empty: bool = True) -> str:
     """Remove recorded checkpoint answers from an assembled reply.
 
     Exact-substring removal of segments the turn loop recorded, so
     nothing is matched by resemblance. Fail-open in both directions: a
     segment that is no longer present (a later stage rewrote it) is
-    skipped, and if removal would leave nothing the original is returned.
+    skipped, and if removal would leave nothing the original is returned
+    — unless ``keep_if_empty`` is False (§4HG): on the STREAM path the
+    text is the prefix of interim paragraphs and the answer follows it on
+    the wire, so a prefix that was nothing but checkpoint answers should
+    become empty rather than ship.
     """
     if not text or not segments:
         return text
@@ -483,7 +538,9 @@ def drop_checkpoint_segments(text: str, segments) -> str:
             continue
         out = out.replace(seg, "", 1)
     out = re.sub(r"\n{3,}", "\n\n", out).strip()
-    return out if out else text
+    if not out and keep_if_empty:
+        return text
+    return out
 
 
 def strip_system_notes(text: str) -> str:
@@ -601,6 +658,157 @@ def _is_answer_block(block: str) -> bool:
     return not (_BEAT_RE.match(s) or _trailing_beat(s))
 
 
+# §4HD (2026-09-15) — a beat INSIDE a paragraph that precedes the delivery.
+# Live (req 9b6b8757) the delivered reply opened "The Telegram post 363
+# snapshot returned the channel feed. Let me extract the notification
+# quote…" and the next paragraph began "The investigation is complete."
+# Three rules looked and stood down: the beat was not at paragraph start
+# (`_BEAT_RE`); it was a LONE beat (§4GO's run rule); nothing later
+# restated it (the temporal/trailing-beat rule). Nothing asked the one
+# question that settles it — does the NEXT paragraph deliver? A beat that
+# announces work immediately before the reply declares the work done is
+# stale by construction; no restatement evidence is needed.
+#
+# Sentence-level, never the paragraph: §4GO's concern — the observation
+# beside a lone beat may be the only place a finding appears — stays
+# intact ("The extract_text on single=1 gave the same capped preview." is
+# kept; "Let me take a full-page screenshot…" goes). Whitespace is
+# preserved, so a line-broken paragraph is not re-flowed.
+#
+# Measured on 999 delivered replies (≥400 chars, multi-paragraph): 31
+# paragraphs, every one audited. Two were NOT beats, and the exclusions
+# below are theirs: a quoted passage the model was CITING ("*"I've been
+# thinking about recursion… I'll create it, test it…"*") and a labelled
+# section ("**Next session:** When you wake me up next… I'll evaluate…").
+# Three more the first draft cut were addressed to the user ("Let me grab
+# the latest headlines for you.", "I'll coach you in real-time — every
+# move…") and are answers; the §4GH vocabulary (`_NARRATION_ADDRESSED_RE`,
+# `_OFFER_RE`) already names that class. A colon-terminated beat is a
+# lead-in ("Let me be clear: …") and is never cut, which is why this
+# sentence splitter — unlike `_SENTENCE_SPLIT_RE` above — breaks at ':'.
+# "Let's …" and "I need to …" are NOT openers here: on the corpus they
+# were the model reasoning ("I need to recapture to maintain material
+# equality"), not announcing tool work.
+_MID_BEAT_RE = re.compile(
+    r"^(?:now\s+|next,?\s+)?(?:let me|i'll|i will)\b", re.IGNORECASE)
+_DELIVERY_OPENER_RE = re.compile(
+    r"^\s*(?:#{1,3}\s|\*\*|"
+    r"the (?:investigation|task|analysis|report|work|research)\b[^.\n]{0,40}"
+    r"\b(?:is|are)\b[^.\n]{0,20}\b(?:complete|done|finished|ready)|"
+    r"here(?:'s| is| are)\b|done\b|summary\b|results?\b|findings\b|bottom line\b)",
+    re.IGNORECASE)
+_BEAT_SENT_SPLIT_RE = re.compile(r"(?<=[.!?:])\s+")
+# §4HX (2026-09-16, req abb8fdb7): a delivery may open with ONE short status
+# sentence before the opener — "Fixed. Here's what was wrong…", "Both files
+# are read. Here's the comparison.", "The page loaded and read fine. Here's
+# what's shown…". Corpus (Aug–Sep): 148 such paragraphs, 10 of them after a
+# trailing-beat paragraph the passes then left standing.
+_STATUS_SENTENCE_MAX = 80
+
+
+def _opens_by_delivering(block: str) -> bool:
+    """Does ``block`` open by delivering — its first sentence is an opener,
+    or a short status sentence is followed by one? The single predicate
+    every "next block delivers" test uses."""
+    text = (block or "").strip()
+    if not text:
+        return False
+    if _DELIVERY_OPENER_RE.match(text):
+        return True
+    sents = [x for x in _BEAT_SENT_SPLIT_RE.split(text) if x.strip()]
+    return (len(sents) >= 2 and len(sents[0]) <= _STATUS_SENTENCE_MAX
+            and bool(_DELIVERY_OPENER_RE.match(sents[1])))
+_QUOTED_RE = re.compile(r'["“”]')
+_MARKUP_START_RE = re.compile(r"^\s*[*_>#]")
+
+
+def _is_mid_beat(sentence: str) -> bool:
+    s = sentence.strip()
+    return (bool(_MID_BEAT_RE.match(s))
+            and not s.endswith(":")
+            and not _OFFER_RE.match(s)
+            and not _NARRATION_ADDRESSED_RE.search(s))
+
+
+# §4HE (2026-09-15, req 5fa6aa97) — what pass 3 leaves behind. The delivered
+# reply opened with three stacked one-liners: "I have enough to finalize." /
+# "The investigation is complete." / "The investigation is complete. Here's
+# the forensic synthesis." — two iterations' worth of hand-off, each a
+# readiness declaration plus a beat, then the real opener. Pass 3 cut the
+# beats (as designed) and left the declarations, which are not findings:
+# one is a verbatim sentence of the very next paragraph, the other says
+# only that the model is ready to deliver. A surviving paragraph before a
+# delivery is dropped WHOLE when it carries no content (no URL, number,
+# code, emphasis, quote, list) and is either (a) contained verbatim in the
+# next delivered paragraph, or (b) a single readiness declaration. Measured
+# on 1,000 delivered replies: 356 short paragraphs precede a delivery and
+# nearly all are lead-ins or headings ("Here's what I changed:", "## ⚡
+# Performance") — the rule must not touch those, so containment and the
+# readiness vocabulary are the ONLY two triggers; the corpus hits are the
+# live pair and one "I now have all three sources." A bare horizontal rule
+# between a paragraph and the delivery is looked through.
+_READINESS_RE = re.compile(
+    r"^(?:i(?:'ve| have)(?: now)?(?: gathered| got| collected)? "
+    r"(?:enough|sufficient|everything|all (?:the|of|three|four|five)|what i need)\b|"
+    r"i now have\b|that(?:'s| is) enough\b|"
+    # §4HJ: the residue pass 1c leaves — "I have strong consolidated
+    # evidence." / "I have good coverage." — a readiness declaration in
+    # the vocabulary of the research turns.
+    r"i(?:'ve| have)(?: now)? (?:\w+ ){0,2}?(?:strong|solid|good|consolidated|confirmed|"
+    r"enough|sufficient) (?:\w+ ){0,2}?(?:evidence|coverage|data|material|sources?)\b|"
+    # §4HQ (2026-09-16, req 3d3e0681): the same declaration in the third
+    # person — "The report is complete and verified against all
+    # constraints." — a one-sentence, content-free hand-off that also
+    # matches the delivery-opener shape, so pass 3 took it for the
+    # delivery and left it standing. Two matches in 5,358 corpus
+    # paragraphs (Aug–Sep), both hand-offs before a delivery.
+    r"the (?:investigation|task|analysis|report|work|research)\b[^.\n]{0,40}"
+    r"\b(?:is|are)\b[^.\n]{0,20}\b(?:complete|done|finished|ready)\b)",
+    re.IGNORECASE)
+_HRULE_RE = re.compile(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$")
+
+
+def _is_empty_handoff(block: str, next_block: str) -> bool:
+    """Is ``block`` a content-free hand-off that the next delivered
+    paragraph makes redundant? See the §4HE note above."""
+    if not _opens_by_delivering(next_block or ""):  # §4HX
+        return False
+    text = block.strip()
+    if (not text or len(text) > 160 or _has_fence(text)
+            or _MARKUP_START_RE.match(text) or _LIST_START_RE.match(text)
+            or _NARRATION_CONTENT_RE.search(text)):
+        return False
+    if text in next_block:
+        return True
+    sents = [x for x in _BEAT_SENT_SPLIT_RE.split(text) if x.strip()]
+    return (len(sents) == 1 and bool(_READINESS_RE.match(text))
+            and not _NARRATION_ADDRESSED_RE.search(text))
+
+
+def _strip_beats_before_delivery(block: str, next_block: str) -> str:
+    """Drop the non-first agent-voice beat sentences of ``block`` when
+    ``next_block`` opens by delivering. Returns ``block`` unchanged unless
+    every condition holds. Removes sentence SPANS from the original text,
+    so the paragraph's own line breaks survive."""
+    if not _opens_by_delivering(next_block or ""):  # §4HX
+        return block
+    if (_has_fence(block) or _QUOTED_RE.search(block)
+            or _MARKUP_START_RE.match(block) or _LIST_START_RE.match(block)):
+        return block
+    text = block.strip()
+    starts = [0] + [m.end() for m in _BEAT_SENT_SPLIT_RE.finditer(text)]
+    if len(starts) < 2:
+        return block
+    pieces = []
+    for n, a in enumerate(starts):
+        b = starts[n + 1] if n + 1 < len(starts) else len(text)
+        if n and _is_mid_beat(text[a:b]):
+            continue
+        pieces.append(text[a:b])
+    out = "".join(pieces).rstrip()
+    return out if out and out != text else block
+
+
 def smooth_reply(text: str) -> str:
     """Remove working narration and superseded summary groups from an
     accumulated multi-turn reply. See module docstring for the rules."""
@@ -618,6 +826,27 @@ def smooth_reply(text: str) -> str:
         if (_is_narration(blocks[i], blocks[i + 1:])
                 or _is_stale_announcement(blocks[i], blocks[i + 1:])):
             drop[i] = True
+            continue
+        # Pass 1c (§4HJ, 2026-09-16, req 6afaf940) — the working log over
+        # the size bound. A trailing-beat paragraph the reply RESTATES is
+        # kept whole above `_MAX_NARRATION_CHARS` (the bound protects long
+        # content paragraphs), so "I have good coverage. Key candidate
+        # emerging: Italy (…). Let me run targeted searches to confirm…"
+        # (314 chars) shipped above "The investigation is complete." with
+        # its restatement test already True. Corpus: 11 such paragraphs,
+        # every trailing beat in them stale. Same evidence pass 1b needs
+        # (restated by the rest of the reply), same cut pass 3 makes
+        # (the beat sentence goes, the observation stays). No size test
+        # here: a paragraph under the bound with this evidence was
+        # already dropped whole by `_is_narration` above, so only the
+        # over-bound ones reach this line (the battery found the explicit
+        # bound to be a dead guard).
+        stripped = blocks[i].strip()
+        if (not _has_fence(stripped)
+                and not _LIST_START_RE.match(stripped) and _trailing_beat(stripped)
+                and _restated_anywhere_later(
+                    stripped, [b for b in blocks[i + 1:] if not _has_fence(b)])):
+            blocks[i] = _strip_trailing_beat_sentences(blocks[i])
 
     # Pass 1b — a RUN of work beats (§4GO). A trailing-beat paragraph that
     # fails its own restatement test is kept on its own: one observation
@@ -679,7 +908,32 @@ def smooth_reply(text: str) -> str:
     kept = [b for b, d in zip(blocks, drop) if not d]
     if not kept:
         return text
-    return "\n\n".join(kept)
+
+    # Pass 3 — a beat inside a SURVIVING paragraph that precedes the
+    # delivery (§4HD). Deliberately last, on the kept sequence: passes 1
+    # and 1b judge the paragraph as written ("obs. Let me X." restated
+    # later, or sitting in a run of beats, goes WHOLE — the observation is
+    # part of the working log), and only what they keep is trimmed. Run
+    # first, this pass would turn the last member of a beat run into a
+    # one-sentence observation that 1b no longer recognises, and the
+    # 7b2da5be fragment ("The extract_text on single=1 gave the same
+    # capped preview.") would ship as the reply's opening line. "Next"
+    # means the next DELIVERED paragraph — a dropped beat between the
+    # observation and the delivery does not shield it, and neither does a
+    # bare horizontal rule (§4HE). What the trim leaves is then judged
+    # once more: a content-free hand-off the delivery makes redundant
+    # goes whole (§4HE, `_is_empty_handoff`).
+    out: List[str] = []
+    for i, block in enumerate(kept[:-1]):
+        j = i + 1
+        while j < len(kept) - 1 and _HRULE_RE.match(kept[j]):
+            j += 1
+        trimmed = _strip_beats_before_delivery(block, kept[j])
+        if _is_empty_handoff(trimmed, kept[j]):
+            continue
+        out.append(trimmed)
+    out.append(kept[-1])          # the final block is never a candidate
+    return "\n\n".join(out)
 
 
 # ---------------------------------------------------------------------------

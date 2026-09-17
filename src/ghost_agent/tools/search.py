@@ -50,7 +50,16 @@ _JUNK_DOMAINS = [
 #          `https://wt.wikipedia.org/...`, which doesn't exist: always a
 #          ConnectError.
 #        * grokipedia — typeahead API, 0/6 on real queries.
-_RACE_ENGINES: Tuple[str, ...] = ("mojeek", "duckduckgo", "yandex", "brave", "google", "yahoo")
+# §4HR (2026-09-16): mojeek and google RETIRED from the race. Seven days of
+# live waves (09-09→09-16, 509 wins): yandex 386, yahoo 77, brave 43,
+# duckduckgo 3, mojeek 0, google 0. mojeek — the July "reliable slow
+# winner" — conn-errored or timed out in 53 of the 56 no-winner waves and,
+# because a wave ends only when its LAST engine gives up, its 18 s budget
+# made every failed wave cost a median 18 s while the actual winners answer
+# in 2-3 s. A ticket that never wins is not a ticket. Re-add an engine only
+# with a fresh per-exit measurement; the slow tier in _DDGS_ENGINE_TIMEOUT
+# stays for that.
+_RACE_ENGINES: Tuple[str, ...] = ("duckduckgo", "yandex", "brave", "yahoo")
 # Legacy comma-joined form (kept for callers/docs that referenced the old
 # single-call multi-backend constant).
 _TOR_BACKENDS = ",".join(_RACE_ENGINES)
@@ -414,7 +423,13 @@ def _failure_category(msg: str) -> str:
     if "timed out" in m or "timeout" in m:
         return "timeout"
     if ("connect" in m or "requesterror" in m or "ssl" in m
-            or "error sending request" in m):
+            or "error sending request" in m
+            # §4HU (2026-09-16): primp's "DecodeError('Body collection
+            # error: …')" — the exit served a body the client could not
+            # collect (truncated/garbled over the circuit). A circuit
+            # failure, not an unknown error: seven waves on 09-14/16 printed
+            # it as a repr wall in the terse line.
+            or "decodeerror" in m or "body collection error" in m):
         return "conn-error"
     return "error"
 
@@ -423,6 +438,15 @@ def _failure_category(msg: str) -> str:
 # plus a small grace for thread scheduling; a wedged thread must never make
 # the caller wait forever.
 _RACE_WAVE_GRACE = 4
+
+
+def _race_wave_deadline() -> float:
+    """§4HR: the wave deadline is sized off the engines actually RACED —
+    the slowest raced engine's ddgs timeout plus grace — not off the slow
+    tier constant. With mojeek retired that is 12 + 4 s, was 18 + 4."""
+    if not _RACE_ENGINES:
+        return _DDGS_TOR_TIMEOUT + _RACE_WAVE_GRACE
+    return max(_engine_timeout(e) for e in _RACE_ENGINES) + _RACE_WAVE_GRACE
 
 # Dedicated pool for race threads. Cancelling a loser only cancels the
 # asyncio wrapper — the thread runs its ddgs call to completion (up to the
@@ -641,7 +665,7 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
     # Several searches can race concurrently in one agent turn; the query
     # tag on every wave log line keeps their interleaved output readable.
     qtag = truncate_query(query, 28)
-    deadline = _DDGS_TOR_TIMEOUT + _RACE_WAVE_GRACE
+    deadline = _race_wave_deadline()  # §4HR
     pending = set(tasks)
     failures: List[Tuple[str, str]] = []
     timed_out = False

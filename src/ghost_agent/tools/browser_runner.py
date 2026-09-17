@@ -566,7 +566,11 @@ async def op_extract_text(op):
         # context, there's no "current page" to carry over across ops.
         # The LLM's ergonomic expectation (Step N continues where
         # Step N-1 left off) is honoured via the last_url sidecar.
-        await page.goto(url, wait_until=wait_until)
+        # §4HH: keep the DOCUMENT's response status — a 403 challenge page
+        # read as STATUS: OK for 12.8% of corpus fetches because this op
+        # threw the response away (op_navigate never did).
+        resp = await page.goto(url, wait_until=wait_until)
+        status = resp.status if resp else None
         if selector:
             el = await page.query_selector(selector)
             if not el:
@@ -586,6 +590,7 @@ async def op_extract_text(op):
         _write_last_url(op["profile_dir"], final_url)
         return {
             "url": final_url,
+            "status": status,
             "title": await page.title(),
             "text": text,
             "truncated": truncated,
@@ -697,7 +702,8 @@ async def op_screenshot(op):
     click_center = bool(op.get("click_center"))
 
     async def run(page):
-        await page.goto(url, wait_until=wait_until)
+        resp = await page.goto(url, wait_until=wait_until)
+        status = resp.status if resp else None   # §4HH: the document's status
         # Interaction-gated content (e.g. a pointer-lock WebGL game that only
         # starts rendering after a click, or a scene that needs a beat to
         # paint) is invisible to a bare goto→shoot. settle_ms waits for the
@@ -715,7 +721,12 @@ async def op_screenshot(op):
         await page.screenshot(path=out_path, full_page=full_page)
         final_url = page.url
         _write_last_url(op["profile_dir"], final_url)
-        result = {"path": out_path, "url": final_url, "used_last_url": used_fallback}
+        result = {"path": out_path, "url": final_url, "status": status,
+                  "used_last_url": used_fallback}
+        try:
+            result["title"] = await page.title()
+        except Exception:
+            pass
         # How much TEXT was on the page at capture time. The pixel-side
         # render check cannot tell a rendered page from page chrome on a
         # gradient (measured: a Telegram share overlay and a correctly

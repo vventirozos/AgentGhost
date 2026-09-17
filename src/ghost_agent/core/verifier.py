@@ -503,6 +503,18 @@ def _escalate_code_refute_enabled() -> bool:
 #     (the req 03b96c28 class: a fabrication backfilled to `passed`).
 
 
+def _main_no_think_enabled() -> bool:
+    """§4HO (2026-09-16): the strong claim judgement on the MAIN model runs
+    with thinking OFF. Measured on the 11a466ff escalation prompt (16.7k
+    chars): thinking ON at the verifier's 2,048-token cap → finish_reason
+    length, 8,065 chars of <think>, ZERO content → no verdict → the cheap
+    REFUTE stood; thinking OFF → 3 s, CONFIRMED 0.85, parseable. 17 refute
+    escalations since 09-07 ended that way while 24 of the 28 that got an
+    answer were overturned. GHOST_VERIFY_MAIN_NO_THINK=0 restores thinking."""
+    return os.getenv("GHOST_VERIFY_MAIN_NO_THINK", "1").strip().lower() not in (
+        "0", "false", "off", "no")
+
+
 def _overturn_quote_enabled() -> bool:
     """Rebuttal-burden overturn contract (A).
 
@@ -927,14 +939,59 @@ def _escalation_log_path() -> Optional[Path]:
     return Path(home) / "system" / "verifier" / _ESCALATION_LOG_FILENAME
 
 
+# §4HB — every outcome `record_escalation` can be handed, split by ONE
+# question: did a judge stronger than the cheap tier actually adjudicate?
+# "upheld"/"overturned"/"replaced_uncertain" = the main model answered;
+# "mechanically_*" = an arithmetic/string proof decided it. Everything in
+# the second set means the cheap verdict stands UNJUDGED — the strong
+# model errored, was withheld, or the tier router downgraded without a
+# call. A consumer deciding whether a verdict may override another reads
+# this table, never the strings. `tests/test_verifier_late_precedence.py`
+# walks every outcome literal in the escalation functions and fails if
+# one is missing from BOTH sets.
+ESCALATION_STRONG_ADJUDICATED = frozenset({
+    "upheld", "overturned", "replaced_uncertain",
+    "mechanically_upheld", "mechanically_dismissed",
+})
+ESCALATION_NOT_ADJUDICATED = frozenset({
+    "unavailable", "withheld", "downgraded",
+})
+ESCALATION_OUTCOMES = ESCALATION_STRONG_ADJUDICATED | ESCALATION_NOT_ADJUDICATED
+
+# The outcome of the most recent `record_escalation` call in THIS task.
+# Set before the ledger's own gates (disabled log, no req_id) so the
+# in-process stamp does not depend on whether the row was written. Scoped
+# per asyncio task by contextvars, so two concurrent verifications never
+# read each other's outcome.
+import contextvars as _contextvars
+_LAST_ESCALATION_OUTCOME: "_contextvars.ContextVar[str]" = _contextvars.ContextVar(
+    "ghost_verifier_last_escalation_outcome", default="")
+
+
+def _stamp_escalation(result, outcome: str):
+    """Write the escalation outcome onto the verdict that is being returned."""
+    if result is not None and outcome:
+        try:
+            result.escalation = str(outcome)
+        except Exception:  # noqa: BLE001 — a stamp must never eat a verdict
+            pass
+    return result
+
+
 def record_escalation(*, kind: str, route: str, outcome: str,
                       cheap_verdict: str = "",
                       cheap_confidence: Optional[float] = None,
                       strong_verdict: str = "",
                       final_confidence: Optional[float] = None,
                       rebuttal: str = "",
+                      strong_call: Optional[Dict[str, Any]] = None,
                       trace: Optional[Dict[str, Any]] = None) -> bool:
     """Append one escalation event to the ledger. Returns True iff written.
+    ``strong_call`` — §4HS: the strong judge's ``{finish_reason,
+                  content_chars}`` as stashed by ``_call_llm`` (see
+                  ``_last_main_call``), written as ``strong_finish`` /
+                  ``strong_chars`` so an answered escalation is as readable
+                  as an unavailable one.
 
     ``kind``    — "refute" | "confirm" (which direction escalated).
     ``route``   — "claim" | "code" (which verifier entry point produced it).
@@ -967,6 +1024,12 @@ def record_escalation(*, kind: str, route: str, outcome: str,
 
     Never raises — a diagnostic write must not break a verdict.
     """
+    # §4HB: stamp FIRST, before any gate below can return early — the
+    # in-process outcome must not depend on whether the ledger is on.
+    try:
+        _LAST_ESCALATION_OUTCOME.set(str(outcome or ""))
+    except Exception:  # noqa: BLE001
+        pass
     try:
         if not _escalation_log_enabled():
             return False
@@ -995,6 +1058,12 @@ def record_escalation(*, kind: str, route: str, outcome: str,
         # ledger consumer tolerates extra keys.
         if rebuttal:
             rec["rebuttal"] = str(rebuttal)[:32]
+        if isinstance(strong_call, dict) and strong_call:
+            rec["strong_finish"] = str(strong_call.get("finish_reason") or "")[:16]
+            try:
+                rec["strong_chars"] = int(strong_call.get("content_chars") or 0)
+            except (TypeError, ValueError):
+                rec["strong_chars"] = 0
         if cheap_confidence is not None:
             rec["cheap_confidence"] = round(float(cheap_confidence), 3)
         if final_confidence is not None:
@@ -1164,6 +1233,16 @@ class VerifyResult:
     # 0.7 consumption gate (see _escalate_confirm). The mirror-image watch
     # metric to `escalated_overturn` — and, like it, in-process only.
     confirm_withheld: bool = False
+    # §4HB: the OUTCOME of the last escalation that touched this verdict —
+    # one of ESCALATION_OUTCOMES, or "" when none was attempted. Stamped by
+    # the `_escalate_*` wrappers from the contextvar `record_escalation`
+    # sets, so every one of the 18 ledger sites feeds it through ONE path.
+    # It is what lets a consumer tell a STRONG-adjudicated verdict from a
+    # cheap one that merely failed to escalate: live, a late cheap REFUTE
+    # with escalation "unavailable" erased a strong-upheld CONFIRMED by
+    # recency alone (req 14af0b6b), and nothing downstream could see the
+    # difference.
+    escalation: str = ""
     # Two-stage path only: the forced-identification suspects that stage 2
     # adjudicated ([{"quote","check","reason"}, ...]). None on the classic
     # single-stage path so downstream dict shapes are unchanged there.
@@ -1253,6 +1332,7 @@ Check, in order:
    - But DERIVED facts are SUPPORTED — the evidence need not restate them word-for-word. Paraphrase; arithmetic, rounding and unit conversion (49152 bytes → "48 KB"); ordering and superlatives ("latest"/"largest" = the max of what the evidence lists); a classification the evidence itself marks ("19 is Beta" ⇒ the newest STABLE is 18.4); and counts over listed items are all supported. Only a fact with NO basis in any output is a fabrication.
    - You do NOT know today's date and cannot judge whether the evidence is CURRENT. "Not verifiable as the latest right now" / "that date is in the future" / "may be stale" are NEVER grounds for REFUTED — the tool output is a fresh snapshot from this turn.
    - SUBJECTIVE characterizations of data that IS in the evidence are supported, not fabrications: "warm and clear" summarizing 27°C / 0% cloud, "fast" for 12ms, "large" for 3.2GB. A qualitative gloss is REFUTED only when it CONTRADICTS the evidence (calling -5°C "warm"), never merely because the adjective itself does not appear in any tool output.
+   - The agent's OWN stated confidence, probability or ranking ("Confidence ≈ 78%", "strongly supported", "rumour", "~60%") is its ASSESSMENT of the evidence, not a fact taken from a tool: it is never a fabrication and never needs to appear in any output. Judge it only for contradiction — "confirmed" on something no output supports is a problem; a percentage is not.
 3. **Constraint satisfaction.** If the user's wording included explicit constraints on the form of the answer ("just the code", "in one sentence", "as JSON", "list only the names"), does the CLAIM satisfy them? A CLAIM that plainly reports the task could NOT be done (a tool failed, a file is missing or unreadable, access was denied) and does not pretend otherwise is judged on its honesty, never on the requested form — the format binds an answer, not a failure report; refuting it teaches the agent that an invented value in the right shape scores better than the truth.
 
 Bookkeeping is not a verdict: the state of any project/task ledger appearing in the EVIDENCE ("all tasks done", "project complete", "nothing left to do") is NEVER by itself grounds for REFUTED. If the USER REQUEST is an operational ask (restart/check/fix/show/run something) and the CLAIM reports doing exactly that with evidence support, it is on-topic and confirmable regardless of what the ledger says about completion. (Live failure this rule pins: user asked to restart a service; the agent restarted it; the judge refuted with "the project is already complete" — wrong.)
@@ -1272,7 +1352,7 @@ Respond ONLY with a JSON object:
 # default-No prior swallow real signal; commanding "name the weakest parts"
 # extracts it. False positives are expected and fine here: stage 2 exists
 # to dismiss them.
-_VERIFY_ENUMERATE_PROMPT = """You are auditing an agent's reply. Do NOT decide whether the reply is acceptable overall — that is a later pass. Your ONLY job is forced identification: name the fragments of the reply that are MOST LIKELY to be wrong. Every reply, even a perfect one, has weakest parts; you MUST name EXACTLY 3 of them, and at least one MUST be a specific checkable fact (a number, name, date, price, or event) quoted from the reply — cross-check every such fact against the EVIDENCE word by word before choosing.
+_VERIFY_ENUMERATE_PROMPT = """You are auditing an agent's reply. Do NOT decide whether the reply is acceptable overall — that is a later pass. Your ONLY job is forced identification: name the fragments of the reply that are MOST LIKELY to be wrong. Every reply, even a perfect one, has weakest parts; you MUST name EXACTLY 3 of them, and at least one MUST be a specific checkable fact (a number, name, date, price, or event — a value the agent reports FROM a tool, not its own confidence score or ranking label) quoted from the reply — cross-check every such fact against the EVIDENCE word by word before choosing.
 
 CLAIM (the agent's reply to the user):
 {claim}
@@ -1316,6 +1396,7 @@ For EACH suspect, decide against the EVIDENCE whether it is a REAL problem or a 
 - DERIVED facts are SUPPORTED — the evidence does NOT have to restate them word-for-word. Before calling a "support" suspect real, ask: can I reach it from the evidence by ordinary reasoning? If yes it is a FALSE ALARM. This covers: paraphrase; arithmetic, rounding and unit conversion (49152 bytes → "48 KB"; 3600s → "1 hour"); ordering and superlatives ("latest"/"newest"/"largest"/"highest" = the max of what the evidence lists); a classification the evidence itself marks ("19 is Beta" ⇒ the newest STABLE is 18.4); and counts or totals over listed items. Only a fact with NO basis in any output — an invented number, version, name or date — is a fabrication.
 - You do NOT know today's date and cannot judge whether the evidence is CURRENT. "Not verifiable as the latest right now", "that date is in the future", or "the evidence may be stale" are NEVER grounds for REFUTED: the agent's tool output is by definition a fresh snapshot taken this turn. Judge the claim only against what the EVIDENCE says.
 - SUBJECTIVE characterizations of data present in the evidence are FALSE ALARMS: "warm and clear" summarizing 27°C / 0% cloud, "fast" for 12ms, "large" for 3.2GB. A qualitative gloss is REAL only when it CONTRADICTS the evidence (calling -5°C "warm"), never merely because the adjective appears in no tool output. (Live failure this rule pins: a weather reply was refuted for "'warm and clear' not directly supported by the objective data" and had to be overturned on escalation.)
+- The agent's OWN stated confidence, probability or ranking ("Confidence ≈ 78%", "strongly supported", "rumour") is its ASSESSMENT, not a fact from a tool: a "support" suspect built on such a number is a FALSE ALARM unless the label contradicts the evidence ("confirmed" for something no output supports).
 - "alignment" suspects are REAL only if the reply as a whole answers a different question than the USER REQUEST. If the USER REQUEST is empty or whitespace, alignment suspects are automatically FALSE ALARMS. A reply that answers the request and adds extra detail is NOT misaligned.
 - "constraint" suspects are REAL only if the USER REQUEST explicitly states that constraint in its own wording — and NEVER when the CLAIM plainly reports that the task could not be done (a tool failed, a file is missing or unreadable, access was denied) without pretending otherwise: the format binds an answer, not a failure report, and refuting the report teaches the agent that an invented value in the right shape scores better than the truth. (Live failure this rule pins: "reply with just the number" for a file that did not exist; the honest "I can't access that file" was refuted and the repair answered "0".)
 - "artifact" suspects are REAL only if the quoted noise is actually present in the CLAIM text.
@@ -2005,17 +2086,37 @@ class Verifier:
         # back all-prelude/no-JSON (see the docstring above); the
         # timeout, not the token budget, is the containment.
         try:
+            if force_main and not json_only and _main_no_think_enabled():
+                # §4HO: the strong judge must ANSWER, not deliberate past
+                # its cap (see _main_no_think_enabled).
+                payload["messages"][0]["content"] = (
+                    payload["messages"][0]["content"] + "\n\n/no_think")
+                payload["chat_template_kwargs"] = {"enable_thinking": False}
             result = await self.llm_client.chat_completion(
                 payload, **_bounded_fallback_kwargs(self.llm_client))
-            text = (
-                result.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-            )
+            _choice = (result.get("choices") or [{}])[0] if isinstance(result, dict) else {}
+            text = (_choice.get("message") or {}).get("content", "") or ""
             if route_out is not None:
                 # "main" whether or not force_main asked for it: the SAMPLER
                 # needs to know this landed on the single foreground slot.
                 route_out["route"] = "main"
+            # §4HO: the escalation site reads these to name WHY a strong
+            # judge produced no verdict (stashed, not a new kwarg — the
+            # verifier is duck-typed over stubs with the old signature).
+            self._last_main_call = {"finish_reason": _choice.get("finish_reason"),
+                                    "content_chars": len(text)}
+            if not text.strip():
+                # §4HO: a silent nothing is how 17 refutes went un-adjudicated.
+                try:
+                    from ..utils.logging import Icons, pretty_log
+                    pretty_log(
+                        "Verifier",
+                        f"main-model judge returned NO content "
+                        f"(finish_reason={_choice.get('finish_reason')}, "
+                        f"force_main={force_main}) — no verdict from this call",
+                        icon=Icons.VERIFIER_LAB, level="WARNING")
+                except Exception:  # noqa: BLE001 — logging never eats a verdict
+                    pass
             return self._parse_json(text)
         except Exception as exc:
             logger.warning("Verifier LLM call failed: %s", exc)
@@ -2629,7 +2730,8 @@ class Verifier:
         """
         # Head+tail packing, not a blunt cut — see pack_claim's rationale.
         claim_t = pack_claim(claim)
-        evidence_t = evidence[:4000]
+        from .agent import _EVIDENCE_BUDGET_MAX as _ev_max   # §4HO: one cap, the packer's
+        evidence_t = evidence[:_ev_max]
         context_t = context[:1000]
         result = None
         _vote_rec: dict = {}
@@ -2845,6 +2947,43 @@ class Verifier:
             return result
 
     async def _escalate_refute(self, result: Optional[VerifyResult],
+                               claim: str, evidence: str, context: str, *,
+                               route: str = "claim", retry=None,
+                               trace: Optional[Dict[str, Any]] = None
+                               ) -> Optional[VerifyResult]:
+        """§4HB wrapper: run the escalation, then stamp its OUTCOME on the
+        verdict being returned. One implementation for all 18 ledger
+        sites: `record_escalation` sets a task-scoped contextvar, and the
+        wrapper reads it once the body is done — a new outcome literal
+        cannot bypass this without also bypassing the ledger. The
+        signature mirrors the impl exactly so a caller's keyword mistake is
+        still caught here, not swallowed by a `**kwargs`."""
+        token = _LAST_ESCALATION_OUTCOME.set("")
+        try:
+            out = await self._escalate_refute_impl(
+                result, claim, evidence, context, route=route, retry=retry,
+                trace=trace)
+            outcome = _LAST_ESCALATION_OUTCOME.get()
+        finally:
+            _LAST_ESCALATION_OUTCOME.reset(token)
+        return _stamp_escalation(out, outcome)
+
+    async def _escalate_confirm(self, result: Optional[VerifyResult], *,
+                                high_stakes: bool, retry, route: str = "claim",
+                                trace: Optional[Dict[str, Any]] = None
+                                ) -> Optional[VerifyResult]:
+        """§4HB wrapper — see `_escalate_refute`."""
+        token = _LAST_ESCALATION_OUTCOME.set("")
+        try:
+            out = await self._escalate_confirm_impl(
+                result, high_stakes=high_stakes, retry=retry, route=route,
+                trace=trace)
+            outcome = _LAST_ESCALATION_OUTCOME.get()
+        finally:
+            _LAST_ESCALATION_OUTCOME.reset(token)
+        return _stamp_escalation(out, outcome)
+
+    async def _escalate_refute_impl(self, result: Optional[VerifyResult],
                                claim: str, evidence: str,
                                context: str, *, route: str = "claim",
                                retry=None,
@@ -2919,7 +3058,7 @@ class Verifier:
                     logger.info(
                         "Verifier objection check: refute PROVEN real — "
                         "no escalation spent (%s)", "; ".join(_why)[:160])
-                    record_escalation(
+                    record_escalation(strong_call=getattr(self, "_last_main_call", None),
                         kind="refute", route=route,
                         outcome="mechanically_upheld",
                         cheap_verdict=result.verdict.value,
@@ -2969,7 +3108,7 @@ class Verifier:
                     # the claim true, and the affirmative check can
                     # only cap, never flip.
                     _conf = result.confidence
-                    record_escalation(
+                    record_escalation(strong_call=getattr(self, "_last_main_call", None),
                         kind="refute", route=route,
                         outcome="mechanically_dismissed",
                         cheap_verdict=result.verdict.value,
@@ -3028,7 +3167,7 @@ class Verifier:
                 "Verifier tier-routing: UNANCHORED refute DOWNGRADED to "
                 "UNCERTAIN without escalation (issues: %s)",
                 "; ".join(result.issues or [])[:140])
-            record_escalation(
+            record_escalation(strong_call=getattr(self, "_last_main_call", None),
                 kind="refute", route=route, outcome="downgraded",
                 cheap_verdict=result.verdict.value,
                 cheap_confidence=result.confidence,
@@ -3073,6 +3212,7 @@ class Verifier:
                 if strong is None:
                     prompt = _VERIFY_CLAIM_PROMPT.format(
                         claim=claim, evidence=evidence, context=context)
+                    self._last_main_call = {}
                     data = await self._call_llm(prompt, temperature=0.1,
                                                 force_main=True)
                     strong = self._build_verify_result(data)
@@ -3094,25 +3234,37 @@ class Verifier:
                     icon=Icons.VERIFIER_LAB, level="WARNING")
             except Exception:  # noqa: BLE001 — logging must never eat the verdict
                 pass
-            record_escalation(
+            record_escalation(strong_call=getattr(self, "_last_main_call", None),
                 kind="refute", route=route, outcome="unavailable",
                 cheap_verdict=result.verdict.value,
                 cheap_confidence=result.confidence, trace=trace)
             return result
         if strong is None:
-            # A call was spent and produced nothing parseable. Recorded, not
-            # dropped: 2 of 14 live main-model code-path replays came back
-            # empty at the classic 2048-token budget, and an escalation that
-            # silently no-ops is indistinguishable from one that never ran.
-            record_escalation(
+            # §4HO: say WHY, at WARNING, and put the cause in the ledger —
+            # this branch was silent while a quarter of refute escalations
+            # ended here.
+            _ro_l = getattr(self, "_last_main_call", None) or {}
+            _cause = (f"strong_none:{_ro_l.get('finish_reason') or 'unparsed'}"
+                      f":{_ro_l.get('content_chars', '?')}c")
+            try:
+                from ..utils.logging import Icons, pretty_log
+                pretty_log(
+                    "Verifier",
+                    f"refute escalation unavailable — strong judge returned no "
+                    f"verdict ({_cause}); cheap REFUTED ({result.confidence:.2f}) "
+                    "stands UNCHECKED",
+                    icon=Icons.VERIFIER_LAB, level="WARNING")
+            except Exception:  # noqa: BLE001
+                pass
+            record_escalation(strong_call=getattr(self, "_last_main_call", None),
                 kind="refute", route=route, outcome="unavailable",
                 cheap_verdict=result.verdict.value,
-                cheap_confidence=result.confidence, trace=trace)
+                cheap_confidence=result.confidence, rebuttal=_cause, trace=trace)
             return result
         if strong.verdict == VerifyVerdict.REFUTED:
             logger.info("Verifier escalation: main model CONFIRMED the "
                         "refute — verdict stands.")
-            record_escalation(
+            record_escalation(strong_call=getattr(self, "_last_main_call", None),
                 kind="refute", route=route, outcome="upheld",
                 cheap_verdict=result.verdict.value,
                 cheap_confidence=result.confidence,
@@ -3131,7 +3283,7 @@ class Verifier:
                 "— replaced without conviction. Original issues: %s",
                 "; ".join(result.issues or [])[:160])
             strong.escalation_replaced = True
-            record_escalation(
+            record_escalation(strong_call=getattr(self, "_last_main_call", None),
                 kind="refute", route=route, outcome="replaced_uncertain",
                 cheap_verdict=result.verdict.value,
                 cheap_confidence=result.confidence,
@@ -3143,7 +3295,7 @@ class Verifier:
             "model says %s. Original issues: %s",
             strong.verdict.value, "; ".join(result.issues or [])[:160])
         strong.escalated_overturn = True
-        record_escalation(
+        record_escalation(strong_call=getattr(self, "_last_main_call", None),
             kind="refute", route=route, outcome="overturned",
             cheap_verdict=result.verdict.value,
             cheap_confidence=result.confidence,
@@ -3173,7 +3325,7 @@ class Verifier:
         try:
             if not isinstance(data, dict) or not str(
                     data.get("verdict") or "").strip():
-                record_escalation(
+                record_escalation(strong_call=getattr(self, "_last_main_call", None),
                     kind="refute", route=route, outcome="unavailable",
                     cheap_verdict=cheap.verdict.value,
                     cheap_confidence=cheap.confidence,
@@ -3208,7 +3360,7 @@ class Verifier:
                 logger.info("Verifier escalation: main model CONFIRMED the "
                             "refute under the rebuttal contract — verdict "
                             "stands.")
-                record_escalation(
+                record_escalation(strong_call=getattr(self, "_last_main_call", None),
                     kind="refute", route=route, outcome="upheld",
                     cheap_verdict=cheap.verdict.value,
                     cheap_confidence=cheap.confidence,
@@ -3221,7 +3373,7 @@ class Verifier:
                 logger.info("Verifier escalation: overturn REFUSED "
                             "(non-CONFIRMED rebuttal verdict %r) — refute "
                             "stands.", verdict)
-                record_escalation(
+                record_escalation(strong_call=getattr(self, "_last_main_call", None),
                     kind="refute", route=route, outcome="upheld",
                     cheap_verdict=cheap.verdict.value,
                     cheap_confidence=cheap.confidence,
@@ -3293,7 +3445,7 @@ class Verifier:
                     "Verifier escalation: overturn REFUSED (%s rebuttal) "
                     "— refute stands. Issues: %s", refusal,
                     "; ".join(cheap.issues or [])[:140])
-                record_escalation(
+                record_escalation(strong_call=getattr(self, "_last_main_call", None),
                     kind="refute", route=route, outcome="upheld",
                     cheap_verdict=cheap.verdict.value,
                     cheap_confidence=cheap.confidence,
@@ -3324,7 +3476,7 @@ class Verifier:
                 "model says %s (rebuttal: %s). Original issues: %s",
                 strong.verdict.value, rebuttal_kind,
                 "; ".join(cheap.issues or [])[:160])
-            record_escalation(
+            record_escalation(strong_call=getattr(self, "_last_main_call", None),
                 kind="refute", route=route, outcome="overturned",
                 cheap_verdict=cheap.verdict.value,
                 cheap_confidence=cheap.confidence,
@@ -3335,14 +3487,14 @@ class Verifier:
         except Exception as exc:  # noqa: BLE001
             logger.debug("rebuttal resolution failed (refute stands): %s",
                          exc)
-            record_escalation(
+            record_escalation(strong_call=getattr(self, "_last_main_call", None),
                 kind="refute", route=route, outcome="unavailable",
                 cheap_verdict=cheap.verdict.value,
                 cheap_confidence=cheap.confidence,
                 rebuttal="unparseable", trace=trace)
             return cheap
 
-    async def _escalate_confirm(self, result: Optional[VerifyResult], *,
+    async def _escalate_confirm_impl(self, result: Optional[VerifyResult], *,
                                 high_stakes: bool,
                                 retry, route: str = "claim",
                                 trace: Optional[Dict[str, Any]] = None
@@ -3388,18 +3540,19 @@ class Verifier:
         # Snapshot BEFORE the withheld branch caps it, so the ledger records
         # what the cheap judge actually said, not the capped value.
         cheap_confidence_before = float(result.confidence)
+        self._last_main_call = {}  # §4HS: the row must describe THIS strong call
         try:
             strong = await retry()
         except Exception as exc:
             logger.debug("Verifier confirm-escalation failed (keeping "
                          "original verdict): %s", exc)
-            record_escalation(
+            record_escalation(strong_call=getattr(self, "_last_main_call", None),
                 kind="confirm", route=route, outcome="unavailable",
                 cheap_verdict=result.verdict.value,
                 cheap_confidence=cheap_confidence_before, trace=trace)
             return result
         if strong is None:
-            record_escalation(
+            record_escalation(strong_call=getattr(self, "_last_main_call", None),
                 kind="confirm", route=route, outcome="unavailable",
                 cheap_verdict=result.verdict.value,
                 cheap_confidence=cheap_confidence_before, trace=trace)
@@ -3407,7 +3560,7 @@ class Verifier:
         if strong.verdict == VerifyVerdict.CONFIRMED:
             logger.info("Verifier escalation: main model CONFIRMED the "
                         "high-stakes pass — verdict stands.")
-            record_escalation(
+            record_escalation(strong_call=getattr(self, "_last_main_call", None),
                 kind="confirm", route=route, outcome="upheld",
                 cheap_verdict=result.verdict.value,
                 cheap_confidence=cheap_confidence_before,
@@ -3431,7 +3584,7 @@ class Verifier:
               f"{strong.verdict.value}), so it is not execution-backed; "
               f"confidence capped.]"
         ).strip()
-        record_escalation(
+        record_escalation(strong_call=getattr(self, "_last_main_call", None),
             kind="confirm", route=route, outcome="withheld",
             cheap_verdict=VerifyVerdict.CONFIRMED.value,
             cheap_confidence=cheap_confidence_before,

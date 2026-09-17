@@ -128,6 +128,18 @@ steer  ⟺  step ≥ 6  AND  score ≥ 0.50
     <code>introspect action='experiments'</code> reads it.
   </p>
 
+  <h2 id="4hi">The answer, two months on: the steer is OFF <span class="tag">2026-09-16 &sect;4HI</span></h2>
+  <p>
+    Read off the experiment on the operator's question ("are these still beneficial, or hurtful?"). <code>risk_steer</code>: n=588 enrolled, 44 triggered (7.5%). On triggered turns, failure_rate control 0.45 (n=20) vs treatment 0.38 (n=21); n_steps 14.3 vs 13.6; duration 537 vs 468 s — no power, and nothing to act on after two months. Two findings settled it without waiting for 30/arm:
+  </p>
+  <ul>
+    <li><strong>The number it quotes is stale.</strong> "42% failure rate at this depth" is the §4H curve (Jun–Jul, 342 rows). Re-derived with the corrections overlay: Jun–Jul steps 6–7 = 0.32, Aug = 0.09 (n=11), Sep too thin to say (12+ = 0.23, n=13, against the curve's 0.61). The depth term is an offset by this page's own admission; it cannot cross the threshold alone.</li>
+    <li><strong>The term that fires it reads research as struggle.</strong> <code>turn_risk</code> replayed on req 7ee072f2's turn 6: depth 0.42, failure pressure 0, effort struggle <strong>1.00</strong> — eleven <code>web_search</code> calls in a row (three turns of four parallel queries) saturate both halves of <code>effort_component</code>, which only sees tool <em>names</em>. Six varied tools score 0.34. On an OSINT task the steer fires at step 6 by construction — the same class as §4HE's selector heuristic — and its "one check, then STOP" nudged a task whose good runs take 8–17 steps to wrap up (095beab8 obeyed: one search, then delivered). Its checkpoint answers polluted delivered replies until §4HA/§4HG.</li>
+  </ul>
+  <p>
+    <code>GHOST_RISK_STEER=0</code> is now exported by the launcher (the boot line reads <code>steer=OFF</code>). The experiment stays enrolled but its trigger is never marked, so the triggered-subset readout freezes at 44 until the steer is re-armed. Re-arming waits on (b): re-tune the effort term to count repeated <em>identical</em> work (same tool + same arguments, the no-progress signature the loop breaker already computes) rather than same-name runs, and refresh the depth curve — measured on the corpus first. The offline triage ranking below is a separate switch and stays on.
+  </p>
+
   <h2>Offline half — triage ranking (§4H item 2)</h2>
   <p>
     Reflection used to take the first <code>max_failures</code> failed trajectories in corpus
@@ -146,7 +158,7 @@ steer  ⟺  step ≥ 6  AND  score ≥ 0.50
   <div class="scroll"><table>
     <thead><tr><th>Env</th><th>Effect</th></tr></thead>
     <tbody>
-      <tr><td><code>GHOST_RISK_STEER=0</code></td><td>Live steer off outright (beats the arm assignment).</td></tr>
+      <tr><td><code>GHOST_RISK_STEER=0</code></td><td>Live steer off outright (beats the arm assignment). <strong>Set by the launcher since §4HI (2026-09-16).</strong></td></tr>
       <tr><td><code>GHOST_EXPERIMENTS=0</code></td><td>Every request on the control path — also disables the steer, and stops all arm stamping.</td></tr>
       <tr><td><code>GHOST_TRIAGE_RANKING=0</code></td><td>Reflection reverts to chronological selection.</td></tr>
     </tbody>

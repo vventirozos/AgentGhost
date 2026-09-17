@@ -226,6 +226,11 @@ _JS_SHELL_MAX_BYTES = 32 * 1024
 _NO_HITS_RE = re.compile(
     r"(?:could\s*n[o']?t|did\s+not|didn't|unable\s+to)\s+find"
     r"|no\s+(?:results?|matches|hits)\b"
+    # §4HB: Xapian Omega's zero-hit line — torch's CGI. Fetched over Tor
+    # 2026-09-15: every torch "empty" was a 1.7–1.9 KB page reading
+    # "No documents match your query", reported as "format may have
+    # drifted" at WARNING on every miss because this phrasing was absent.
+    r"|no\s+documents?\s+match"
     r"|nothing\s+(?:was\s+)?found"
     r"|0\s+results?\s+found",
     re.IGNORECASE,

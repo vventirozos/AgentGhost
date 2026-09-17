@@ -931,6 +931,14 @@ def _take_pending_lesson_sign(context, trajectory_id):
     return pend.pop(trajectory_id)
 
 
+# ── The planner's tree is not a project (§4HK, 2026-09-16) ───────────────────
+_PLAN_IS_NOT_A_PROJECT_NOTE = (
+    "(This PLAN is the planner's private working tree, re-planned every turn "
+    "— it is NOT a tracked project and its task ids are not project tasks. "
+    "Do NOT call manage_projects to update, query or close these tasks; "
+    "just do the FOCUS TASK.)"
+)
+
 # ── The forced final that produced no answer (§4GH, 2026-09-13) ─────────────
 _FORCED_FINAL_ANSWER_DIRECTIVE = (
     "SYSTEM ALERT: this is the FINAL turn — tools are OFF and your last output "
@@ -1384,7 +1392,145 @@ def _turn_had_tool_failure(tools_run: Optional[list]) -> bool:
 # 4-way split exists for the claim-relevance path (an older evidence-
 # bearing output pulled in alongside the newest three).
 _EVIDENCE_BUDGET_WEIGHTS = ([1.0], [0.65, 0.35], [0.5, 0.3, 0.2],
-                            [0.4, 0.25, 0.2, 0.15])
+                            [0.4, 0.25, 0.2, 0.15],
+                            [0.32, 0.22, 0.18, 0.15, 0.13],
+                            [0.28, 0.2, 0.16, 0.14, 0.12, 0.1])
+
+# §4HO (2026-09-16, req 11a466ff) — the budget follows the turn. A fixed
+# 4,000 chars over three positional slots plus one pull gave a 21-tool
+# research turn five items at ~800 chars each — a deep_research whose head
+# is a SOURCE-FAILURES notice and a blocked fetch, three searches, the PDF
+# receipt — and never reached the search result that carried the number
+# the judge then refuted as "not in the evidence". Scale with the number
+# of substantive candidates (a floor per quoted item), more slots on wide
+# turns, and never let a page the site refused take a slot while a live
+# candidate remains. `verify_claim` caps at the same maximum.
+_EVIDENCE_BUDGET_MIN = 4000
+_EVIDENCE_BUDGET_MAX = 12000
+_EVIDENCE_BUDGET_PER_CANDIDATE = 600
+_EVIDENCE_ITEMS_MAX = 6
+_EVIDENCE_DEAD_HEAD_RE = re.compile(r"STATUS:\s*BLOCKED\b")
+
+
+def _evidence_is_dead(tool) -> bool:
+    """A candidate whose head says the site refused the fetch (§4HH)."""
+    return bool(_EVIDENCE_DEAD_HEAD_RE.search(str((tool or {}).get("content", ""))[:240]))
+
+
+def _evidence_budget_for(tools_run) -> tuple:
+    """(budget_chars, max_items) for this turn's evidence digest."""
+    n = len(_evidence_candidates(tools_run))
+    budget = max(_EVIDENCE_BUDGET_MIN,
+                 min(_EVIDENCE_BUDGET_MAX, _EVIDENCE_BUDGET_PER_CANDIDATE * n))
+    items = 3 if n <= 6 else 4 if n <= 12 else 5 if n <= 20 else _EVIDENCE_ITEMS_MAX
+    return budget, items
+
+_EVIDENCE_LABEL_RE = re.compile(r"(?m)^\[([^\]\n]{1,80})\] ")
+
+
+def _log_evidence_digest(claim_evidence: str, tools_run, budget: int, max_items: int) -> str:
+    """§4HS: one INFO line saying what the judge was handed — items packed
+    out of how many candidates, chars against the budget. Returns the line
+    (empty when there was nothing to pack). Labels are counted only for
+    names that are actually candidates, so a body line that happens to
+    start with "[x] " is not an item."""
+    text = str(claim_evidence or "")
+    if not text.strip():
+        return ""
+    cands = _evidence_candidates(tools_run)
+    names = {str(t.get("name", "tool"))[:80] for t in cands}
+    n_items = sum(1 for m in _EVIDENCE_LABEL_RE.finditer(text) if m.group(1) in names)
+    # max_items bounds the POSITIONAL picks; the claim pull (§4GW/§4HC) may
+    # add one more, so the line names the rule rather than a false ceiling.
+    line = (f"evidence digest — {n_items} item(s) of {len(cands)} candidate(s), "
+            f"{len(text)} chars (budget {budget}, positional ≤{max_items} + claim pull)")
+    try:
+        from ..utils.logging import Icons, pretty_log
+        pretty_log("Verifier", line, icon=Icons.VERIFIER_LAB)
+    except Exception:  # noqa: BLE001 — an instrument never breaks a verdict
+        pass
+    return line
+
+
+# §4HC — how far back the claim-relevance scan may look. Ten was the
+# whole window; a research turn runs 30+ tools and its sources sit early.
+_EVIDENCE_DEEP_WINDOW = 40
+
+# Token-set Jaccard above which two outputs are the SAME evidence twice.
+# Measured on the live turn: same-image OCR pairs 0.69 and 0.60, every
+# genuinely different pair below 0.30 — 0.5 sits in open water.
+_EVIDENCE_DUP_JACCARD = 0.5
+
+# Tools whose output comes from OUTSIDE the agent's own writes. Anything
+# else (file_system, report_pdf, workspace, manage_projects, …) may be the
+# deliverable echoing itself and ranks BELOW these for the claim pull —
+# still eligible, so a turn with no external tool behaves as before.
+_EXTERNAL_EVIDENCE_TOOLS = frozenset({
+    "browser", "web_search", "darkweb_search", "deep_research", "execute",
+    "vision_analysis", "news_headlines", "query_document", "knowledge_base",
+    "database", "postgres_admin", "recall", "system_utility",
+})
+
+
+def _evidence_is_external(tool) -> bool:
+    name = str((tool or {}).get("name", "")).lower().strip()
+    return name.replace("-", "_").replace(" ", "_") in _EXTERNAL_EVIDENCE_TOOLS
+
+
+def _claim_overlap_scorer(claim_tokens, candidates):
+    """Score a candidate by the claim tokens it shares, each weighted by
+    how RARE that token is across this turn's candidates (log N/df).
+
+    Raw overlap counts ranked every source alike on "revolut", "breach",
+    "government" — words in all 38 outputs of the live turn — so four
+    near-identical OCRs of one card out-scored the one browser extraction
+    that carried the claim's distinctive strings ("legalmail", "InfoCert",
+    "Milan") and the sentence refuting it. A judge needs the source the
+    claim's DISTINCTIVE content came from; rarity is what points at it.
+    Same lesson as the §4AP BM25 fallback: a match without IDF matches
+    everything. Returns ``(score_fn, raw_overlap_fn, near_duplicate_fn)``.
+    """
+    import math
+    toks = [(_claim_tokens(str(t.get("content", ""))[:6000])) for t in candidates]
+    n = max(1, len(toks))
+    df = {}
+    for ts in toks:
+        for w in (claim_tokens & ts):
+            df[w] = df.get(w, 0) + 1
+    weight = {w: math.log((n + 1) / (df.get(w, 0) + 1)) + 0.05 for w in claim_tokens}
+    by_id = {id(t): ts for t, ts in zip(candidates, toks)}
+
+    def score(tool) -> float:
+        ts = by_id.get(id(tool))
+        if ts is None:
+            ts = _claim_tokens(str(tool.get("content", ""))[:6000])
+        return sum(weight.get(w, 0.0) for w in (claim_tokens & ts))
+
+    def raw(tool) -> int:
+        ts = by_id.get(id(tool))
+        if ts is None:
+            ts = _claim_tokens(str(tool.get("content", ""))[:6000])
+        return len(claim_tokens & ts)
+
+    def near_duplicate(tool, others) -> bool:
+        """True when `tool` re-states an already-picked item. Two OCRs of
+        one image sat at Jaccard 0.69 / 0.60 in the live turn and every
+        genuinely different pair under 0.30 — a second copy of the same
+        evidence buys the judge nothing and costs a slot."""
+        ts = by_id.get(id(tool))
+        if ts is None:
+            ts = _claim_tokens(str(tool.get("content", ""))[:6000])
+        for o in others:
+            os_ = by_id.get(id(o))
+            if os_ is None:
+                os_ = _claim_tokens(str(o.get("content", ""))[:6000])
+            union = len(ts | os_)
+            if union and len(ts & os_) / union >= _EVIDENCE_DUP_JACCARD:
+                return True
+        return False
+
+    return score, raw, near_duplicate
+
 
 _EVIDENCE_CLAIM_STOPWORDS = frozenset({
     "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with",
@@ -1659,6 +1805,45 @@ def _project_ledger_evidence(context, tools_run: Optional[list],
             "constraints] " + " || ".join(blocks))[:cap]
 
 
+def _evidence_candidates(tools_run: Optional[list]) -> list:
+    """The substantive tool outputs of a turn, newest first, bounded by the
+    deep window — the packer's candidate set, shared with the budget rule
+    so both count the same things (§4HO)."""
+    candidates: list = []
+    for tool in reversed(tools_run or []):
+        if not tool:
+            continue
+        if tool.get("_synthetic"):
+            continue
+        name = str(tool.get("name", "")).lower().strip()
+        collapsed = name.replace("-", "_").replace(" ", "_")
+        if collapsed in _BOOKKEEPING_TOOL_NAMES:
+            # INFORMATIONAL bookkeeping output IS evidence (2026-07-25
+            # audit): the verifier refuted "Two lessons learned" and "All 9
+            # tasks complete" — both TRUE — because list_lessons/task_list
+            # outputs were excluded here, so the judge literally could not
+            # see the data behind the claim. Keep excluding the short
+            # state-change confirmations (the 2026-04-19 blast radius:
+            # `{"exited": …}` in the evidence slot guarantees a REFUTED),
+            # but pack substantial read output and error text. Since §4BC
+            # (2026-08-12) the run-gate shares this predicate — informational
+            # bookkeeping output also RUNS the verifier — with ONE remaining
+            # divergence, id_linkage: short confirmations CARRYING a 12-hex
+            # id are linkage evidence once the verifier is already running
+            # (2026-07-25: the verifier refuted a correct close because the
+            # task_update result naming task d8a307dd196f was under the
+            # length bar, so it "compared" the task id against the PROJECT
+            # id and called the mismatch an error), but a bare id
+            # confirmation must not summon the judge on its own.
+            _c = tool.get("content", "")
+            if not _bookkeeping_informational(_c, id_linkage=True):
+                continue
+        candidates.append(tool)  # newest-first
+        if len(candidates) >= _EVIDENCE_DEEP_WINDOW:  # bounded deep window for the claim scan
+            break
+    return candidates
+
+
 def _collect_verifier_evidence(tools_run: Optional[list],
                                max_items: int = 3,
                                budget: int = 4000,
@@ -1698,41 +1883,35 @@ def _collect_verifier_evidence(tools_run: Optional[list],
     substantive tool exists — callers fall back / skip exactly as the
     single-tool path does.
     """
-    candidates: list = []
-    for tool in reversed(tools_run or []):
-        if not tool:
-            continue
-        if tool.get("_synthetic"):
-            continue
-        name = str(tool.get("name", "")).lower().strip()
-        collapsed = name.replace("-", "_").replace(" ", "_")
-        if collapsed in _BOOKKEEPING_TOOL_NAMES:
-            # INFORMATIONAL bookkeeping output IS evidence (2026-07-25
-            # audit): the verifier refuted "Two lessons learned" and "All 9
-            # tasks complete" — both TRUE — because list_lessons/task_list
-            # outputs were excluded here, so the judge literally could not
-            # see the data behind the claim. Keep excluding the short
-            # state-change confirmations (the 2026-04-19 blast radius:
-            # `{"exited": …}` in the evidence slot guarantees a REFUTED),
-            # but pack substantial read output and error text. Since §4BC
-            # (2026-08-12) the run-gate shares this predicate — informational
-            # bookkeeping output also RUNS the verifier — with ONE remaining
-            # divergence, id_linkage: short confirmations CARRYING a 12-hex
-            # id are linkage evidence once the verifier is already running
-            # (2026-07-25: the verifier refuted a correct close because the
-            # task_update result naming task d8a307dd196f was under the
-            # length bar, so it "compared" the task id against the PROJECT
-            # id and called the mismatch an error), but a bare id
-            # confirmation must not summon the judge on its own.
-            _c = tool.get("content", "")
-            if not _bookkeeping_informational(_c, id_linkage=True):
-                continue
-        candidates.append(tool)  # newest-first
-        if len(candidates) >= 10:  # bounded deep window for the claim scan
-            break
+    candidates = _evidence_candidates(tools_run)
     if not candidates:
         return ""
-    picked = candidates[:max_items]  # positional newest-N (legacy behaviour)
+    # §4HO: positional slots go to LIVE candidates; a refused page (STATUS:
+    # BLOCKED) is quoted only when nothing else is there.
+    _live = [t for t in candidates if not _evidence_is_dead(t)]
+    picked = (_live or candidates)[:max_items]  # positional newest-N
+    # §4HC: the positional picks keep the NEWEST item unconditionally (it
+    # is where a failure gets attributed), but a later positional slot
+    # holding a SELF-AUTHORED output ("SUCCESS: Applied 1 SEARCH block",
+    # a PDF confirmation) yields to the best not-yet-picked EXTERNAL output
+    # that overlaps the claim. Live, all three positional slots were the
+    # deliverable's own write receipts: they proved the file was written and
+    # nothing about whether what it said was true.
+    if claim_text and len(picked) > 1:
+        _ct0 = _claim_tokens(claim_text)
+        if _ct0:
+            _score0, _raw0, _dup0 = _claim_overlap_scorer(_ct0, candidates)
+            _ext_pool = sorted(
+                ((_score0(t), i, t) for i, t in enumerate(candidates)
+                 if _evidence_is_external(t) and t not in picked and _raw0(t) > 1),
+                key=lambda x: (-x[0], x[1]))
+            _ext_pool = [t for _, _, t in _ext_pool]
+            for slot in range(1, len(picked)):
+                if not _evidence_is_external(picked[slot]):
+                    while _ext_pool and _dup0(_ext_pool[0], picked):
+                        _ext_pool.pop(0)
+                    if _ext_pool:
+                        picked[slot] = _ext_pool.pop(0)
     # Claim-conditioned pull: an OLDER output whose text overlaps the claim
     # (≥2 significant tokens) is the evidence the claim leans on — add the
     # best such item as a 4th slot rather than letting a failed retry or a
@@ -1741,12 +1920,27 @@ def _collect_verifier_evidence(tools_run: Optional[list],
     if claim_text and len(candidates) > max_items:
         ct = _claim_tokens(claim_text)
         if ct:
-            best, best_score = None, 1
-            for tool in candidates[max_items:]:
-                overlap = len(ct & _claim_tokens(
-                    str(tool.get("content", ""))[:6000]))
-                if overlap > best_score:
-                    best, best_score = tool, overlap
+            # §4HC: rank by (EXTERNAL origin, overlap), not overlap alone.
+            # Overlap alone systematically selects the agent's OWN writes:
+            # the tool that shares the most tokens with a report is the
+            # file_system op that wrote that report. Live (req c16679f1)
+            # the three newest items and the claim-pulled fourth were all
+            # the deliverable echoing itself, while the browser extraction
+            # — whose text read "That is Revolut receiving and answering.
+            # The sender is still unnamed." — scored 64 to the report's 89
+            # and sat eleven tools back, outside the old 10-deep window.
+            # The judge CONFIRMED at 0.95. An external source that
+            # overlaps the claim is evidence; the claim's own echo is not.
+            _score, _raw, _dup = _claim_overlap_scorer(ct, candidates)
+            best, best_key = None, (False, 0.0)
+            for tool in candidates:
+                if tool in picked:
+                    continue
+                if _raw(tool) <= 1 or _dup(tool, picked):
+                    continue
+                key = (_evidence_is_external(tool), _score(tool))
+                if key > best_key:
+                    best, best_key = tool, key
             if best is not None and len(picked) < len(_EVIDENCE_BUDGET_WEIGHTS):
                 picked.append(best)
                 claim_pulled = best
@@ -3553,6 +3747,26 @@ def _planner_cap_from_env(raw) -> int:
     return max(_PLANNER_CAP_FLOOR, v)
 
 
+# §4HC — the shape the ALIGNED planner reply must take. Keys only, values
+# free: the schema exists to forbid a tool call in JSON clothing, not to
+# shape the plan. `tree_update` stays an open object so a partial (changed-
+# tasks-only) tree after a cap hit is still valid.
+_PLANNER_REPLY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "thought": {"type": "string"},
+        "tree_update": {"type": "object"},
+        "next_action_id": {"type": "string"},
+        "required_tool": {"type": "string"},
+    },
+    "required": ["thought", "tree_update", "next_action_id", "required_tool"],
+}
+
+# §4HC — per-message cap for the aligned planner's "new since your last
+# plan" transcript. 2,500 chars keeps a tool result's head and shape;
+# the transient block's "Last Tool Output" carries the newest one anyway.
+_PLANNER_DELTA_CHARS_PER_MSG = 2500
+
 _PLANNER_MAX_TOKENS = _planner_cap_from_env(
     os.getenv("GHOST_PLANNER_MAX_TOKENS", _PLANNER_CAP_DEFAULT))
 
@@ -3661,7 +3875,8 @@ def _scrub_fallback_message(intended: str, task_closed: bool) -> str:
             "run the remaining tasks, or give new direction."
         )
     tool = intended or "the command"
-    msg = "I prepared a tool call but this turn was routed as text-only, so it wasn't executed."
+    from .reply_shape_check import FALLBACK_HEADS as _heads   # §4HW: one home
+    msg = _heads["text_only"]
     if intended:
         msg += f" (Intended tool: `{intended}`.)"
     msg += f" Please rephrase your request — for example, `run {tool}` — or try again."
@@ -5066,20 +5281,30 @@ def _has_bare_json_braces(t: str) -> bool:
     return '{' in _INLINE_CODE_RE.sub('', t or "")
 
 
-def salvage_truncated_plan(plan_content: str) -> tuple:
-    """Recover what survives a planner response cut off at max_tokens.
+def salvage_truncated_plan(plan_content: str, finish_reason: str = "length") -> tuple:
+    """Recover what survives a planner response that did not parse.
 
     Returns ``(salvaged_json, whole_tree_or_None)``. The caller must use the
     second value for ``tree_update`` and NEVER ``salvaged_json['tree_update']``
     — see ``_complete_object_for_key`` for why the repaired one lies.
+
+    ``finish_reason`` decides what the log SAYS (§4HC). The old message named
+    one cause — "TRUNCATED at max_tokens" — for every unbalanced reply, and a
+    brace count is not a finish reason: live (req c16679f1) a 3,647-char reply
+    with one unescaped quote inside a string was reported as a token-cap cut.
+    The corpus had 4 such of 84; the other 80 were real cap hits at 25–37k
+    chars. The salvage is the same either way; the diagnosis is not.
 
     Lives at module level so the decision is testable on its own; the planner
     is 6k lines into `handle_chat` and nothing there could be pinned.
     """
     salvaged = _repair_truncated_json(plan_content[plan_content.find('{'):])
     whole_tree = _complete_object_for_key(plan_content, "tree_update")
+    _cause = ("TRUNCATED at max_tokens" if str(finish_reason or "") == "length"
+              else f"MALFORMED (finish_reason={finish_reason or 'unknown'}, "
+                   "not a cap hit)")
     logger.warning(
-        "Planner output TRUNCATED at max_tokens "
+        f"Planner output {_cause} "
         f"({len(plan_content)} chars, {_unclosed_braces(plan_content)} "
         f"unclosed): salvaged {sorted(salvaged.keys()) or 'nothing'}; "
         "tree_update " + ("INTACT (kept)" if whole_tree else
@@ -6221,9 +6446,12 @@ class GhostAgent:
             if len(w) >= min_word_len
         }
 
-    def _get_recent_transcript(self, messages: List[Dict[str, Any]]) -> str:
+    def _get_recent_transcript(self, messages: List[Dict[str, Any]],
+                               char_limit: Optional[int] = None) -> str:
         msg_limit = max(40, int(self.context.args.max_context / 500))
-        char_limit = max(500, int(self.context.args.max_context * 3.5 * 0.02))
+        if char_limit is None:
+            char_limit = max(500, int(self.context.args.max_context * 3.5 * 0.02))
+        char_limit = max(200, int(char_limit))
 
         recent_transcript = ""
         transcript_msgs = [m for m in messages if m.get("role") in ["user", "assistant", "tool"]][-msg_limit:]
@@ -12169,7 +12397,8 @@ class GhostAgent:
                                 sc_drawn: Optional[int] = None,
                                 route: str = "",
                                 override: str = "",
-                                skipped_removable=None) -> None:
+                                skipped_removable=None,
+                                escalation: str = "") -> None:
         """Append one verdict record beside the trajectory log.
 
         Deliberately NOT written into the trajectory's `extra`: the
@@ -12236,6 +12465,12 @@ class GhostAgent:
                         "sc_n": sc_n, "sc_agree": sc_agree,
                         "sc_drawn": sc_drawn}),
                     **({} if not route else {"route": route}),
+                    # §4HB: which judge produced this — a strong-adjudicated
+                    # verdict or a cheap one that failed to escalate. Without
+                    # it the sidecar cannot answer "did a cheap late refute
+                    # override a strong confirm", the exact question that
+                    # took log archaeology to ask. Additive key.
+                    **({} if not escalation else {"escalation": escalation}),
                 }) + "\n")
         except Exception as e:  # noqa: BLE001 — never fail a turn
             # LOUD, not debug: this is the only durable record of the
@@ -12431,12 +12666,14 @@ class GhostAgent:
         _claim_src = strip_system_notes(str(final_ai_content or ""))
         ledger_block = _project_ledger_evidence(
             self.context, tools_run_this_turn)
+        _ev_budget, _ev_items = _evidence_budget_for(tools_run_this_turn)  # §4HO
         claim_evidence = _collect_verifier_evidence(
             tools_run_this_turn,
-            budget=(4000 - len(ledger_block) - 1) if ledger_block else 4000,
+            max_items=_ev_items,
+            budget=(_ev_budget - len(ledger_block) - 1) if ledger_block else _ev_budget,
             claim_text=_claim_src) or tool_output
         if ledger_block:
-            _room = 4000 - len(ledger_block) - 1
+            _room = _ev_budget - len(ledger_block) - 1
             # Through the marked slicer, not a bare `[:_room]`: this is
             # the SAME silent-head-cut defect the packer just fixed,
             # one line later (fresh-eye MINOR, 2026-08-06). The digest
@@ -12447,6 +12684,7 @@ class GhostAgent:
                 (_slice_evidence_body(claim_evidence, _room, _claim_src)
                  + "\n" + ledger_block)
                 if _room > 0 else ledger_block)
+        _log_evidence_digest(claim_evidence, tools_run_this_turn, _ev_budget, _ev_items)  # §4HS
         # HIGH-STAKES flag for the CONFIRM escalation. Computed HERE — the
         # single place every verdict is produced (finalize gate, in-loop
         # auto-repair, and the streamed late-verdict path all funnel through
@@ -13142,9 +13380,51 @@ class GhostAgent:
                         # therefore no treatment, and without this they are
                         # indistinguishable from turns the treatment simply
                         # failed to help.
-                        route=str(verify_route))
+                        route=str(verify_route),
+                        escalation=str(getattr(v_result, "escalation", "") or ""))
+                    # §4HB: remember which trajectories a STRONG judge has
+                    # ruled on, so a later cheap verdict that could not be
+                    # escalated cannot erase that ruling by recency alone.
+                    self._note_strong_verdict(str(trajectory_id), v_result)
         except Exception as _vf_exc:   # recording must never fail a turn
             logger.debug("verdict recording skipped: %s", _vf_exc)
+
+    # §4HB — bounded memo: trajectory_id -> verdict value, only for verdicts
+    # a judge stronger than the cheap tier adjudicated (see
+    # verifier.ESCALATION_STRONG_ADJUDICATED). Same process, minutes apart:
+    # the turn gate writes it, the late pass reads it.
+    _STRONG_VERDICT_MEMO_MAX = 256
+
+    def _note_strong_verdict(self, trajectory_id: str, v_result) -> None:
+        if not trajectory_id or v_result is None:
+            return
+        try:
+            from .verifier import ESCALATION_STRONG_ADJUDICATED
+        except Exception:  # noqa: BLE001
+            return
+        if str(getattr(v_result, "escalation", "") or "") not in ESCALATION_STRONG_ADJUDICATED:
+            return
+        _verdict = getattr(v_result, "verdict", None)
+        _vs = str(getattr(_verdict, "value", _verdict) or "")
+        if not _vs:
+            return
+        memo = getattr(self, "_strong_verdict_memo", None)
+        if memo is None:
+            memo = {}
+            self._strong_verdict_memo = memo
+        # pop+reinsert = evict by recency, never mid-flight (the same bound
+        # discipline as the workspace nav counter).
+        memo.pop(trajectory_id, None)
+        memo[trajectory_id] = _vs
+        while len(memo) > self._STRONG_VERDICT_MEMO_MAX:
+            oldest = next(iter(memo))
+            if oldest == trajectory_id:
+                break
+            memo.pop(oldest, None)
+
+    def _strong_verdict_for(self, trajectory_id: str) -> str:
+        memo = getattr(self, "_strong_verdict_memo", None) or {}
+        return str(memo.get(str(trajectory_id or ""), "") or "")
 
 
     @staticmethod
@@ -15100,6 +15380,36 @@ class GhostAgent:
                 self._record_withheld_verdict(
                     trajectory_id,
                     "passed" if v_result.verdict == VerifyVerdict.CONFIRMED else "failed",
+                    "; ".join(str(x) for x in (getattr(v_result, "issues", None) or []))[:500])
+            return
+        # §4HB — PRECEDENCE, not recency. A late REFUTE whose escalation came
+        # back "unavailable" is a CHEAP-tier opinion nobody stronger has
+        # checked. If a strong-adjudicated CONFIRMED already stands for this
+        # trajectory, that ruling wins: the cheap refute is kept as a
+        # MEASUREMENT (the machine/human pair still needs it) and withheld
+        # from every consequence — no outcome flip, no lesson scrub, no
+        # correction banner. Live: req 14af0b6b read the notification card
+        # and correctly reported it shows no sender; turn gate CONFIRMED
+        # 0.92, strong model upheld; sixty seconds later an unescalated
+        # cheap REFUTED 0.90 ("Sep 12" vs "11-12 September" — inside the
+        # range) flipped it to failed, scrubbed its lessons, and the
+        # reflector wrote a lesson asserting the agent had NOT said what it
+        # said. Two later reruns re-hunted the answered question.
+        # Scoped deliberately: no prior strong verdict → unchanged today.
+        if (v_result.verdict == VerifyVerdict.REFUTED
+                and str(getattr(v_result, "escalation", "") or "") == "unavailable"
+                and self._strong_verdict_for(trajectory_id) == VerifyVerdict.CONFIRMED.value):
+            pretty_log(
+                "Verifier",
+                f"late cheap REFUTED ({v_result.confidence:.0%}) for trajectory "
+                f"{str(trajectory_id)[:8]} WITHHELD — its escalation was "
+                f"unavailable and a strong-model CONFIRMED already stands; "
+                f"kept as a measurement only",
+                level="WARNING", icon=Icons.VERIFIER_LAB,
+            )
+            if v_result.confidence >= 0.7:
+                self._record_withheld_verdict(
+                    trajectory_id, "failed",
                     "; ".join(str(x) for x in (getattr(v_result, "issues", None) or []))[:500])
             return
         if v_result.confidence >= 0.7:
@@ -17475,6 +17785,11 @@ class GhostAgent:
                 # depended on the model's emission order rather than on what
                 # actually happened.
                 _batch_world_changed = False
+                # §4HP: the SAME call twice in ONE batch is a duplicate, not
+                # a re-observation — the breaker counts it once (req 1234e131:
+                # a doubled URL in a 4-call batch forced the conclusion turn
+                # and barred the report write).
+                strikes.begin_batch()
 
                 # We reached the parallel-execution path, which means
                 # at least one tool call parsed cleanly this turn.
@@ -18869,11 +19184,35 @@ class GhostAgent:
                                 "Do NOT issue another search of this document."
                             )})
                         elif _readwrite_loop:
+                            # §4HE: when the tool is holding a write the model
+                            # already composed (a `replace` rejected for a
+                            # missing `replace_with`, payload held 10 min), the
+                            # steer names THAT write — "call the mutating
+                            # action" in the abstract was followed by another
+                            # read and then a delivery with nothing written
+                            # (req 5fa6aa97).
+                            _held_line = ""
+                            if _afname == "file_system" and _atarget:
+                                try:
+                                    from ..tools.file_system import (
+                                        held_content_chars as _held_chars,
+                                        project_scoped_sandbox as _pss)
+                                    _hc = _held_chars(_pss(self.context)[0], str(_atarget))
+                                except Exception:  # noqa: BLE001 — a steer must never raise
+                                    _hc = 0
+                                if _hc:
+                                    _held_line = (
+                                        f"0. REDEEM THE HELD WRITE: the {_hc}-char content of your "
+                                        f"rejected 'replace' for '{_atarget}' is still HELD — call "
+                                        f"file_system(operation='write', path='{_atarget}', "
+                                        "content='<<HELD>>') NOW. That IS the change; do not "
+                                        "resend the text and do not read the file again.\n")
                             messages.append({"role": "user", "content": (
                                 f"SYSTEM ALERT: You have run '{_afname}'{_tgt_desc} {_acnt} "
                                 "times and gotten the SAME result — re-reading produces NO new "
                                 "information. You already have the current state; it is "
                                 "AUTHORITATIVE. Do ONE of these NOW instead:\n"
+                                + _held_line +
                                 "1. GATHER NEW EVIDENCE: probe the thing you are theorizing "
                                 "about — `execute` a curl/run of the exact URL/command/code in "
                                 "question and read the actual response, instead of predicting "
@@ -18928,7 +19267,8 @@ class GhostAgent:
                     # `fname` only if no capture site fired.
                     _fail_fname = failed_fname or fname
                     # Classify the failure to route to the right budget
-                    from ..tools.tool_failure import classify_tool_failure, FailureClass, format_failure_context, summarize_multi_op_outcomes
+                    from ..tools.tool_failure import (classify_tool_failure, FailureClass, format_failure_context,
+                                                      summarize_multi_op_outcomes, is_blocked_page_result)
                     # ONE expression, two uses. The class and the
                     # diagnostic must describe the same text: the
                     # preview can be a 60-char head (the execute
@@ -18949,7 +19289,17 @@ class GhostAgent:
                     # mixed successes and failures across >=2 calls).
                     multi_op_summary = summarize_multi_op_outcomes(op_outcomes)
 
-                    if failure_class == FailureClass.RETRYABLE:
+                    if is_blocked_page_result(failure_text):
+                        # §4HN: the site refused — no strike on either
+                        # ledger. The result is still a declared failure
+                        # (corpus label, no-progress window), and the hint
+                        # already told the model to use a secondary source.
+                        pretty_log("Blocked Page",
+                                   f"{_fail_fname} — site refused the fetch (not a strike) -> "
+                                   f"{last_error_preview[:100]}",
+                                   icon=Icons.WARN, level="WARNING")
+                        diagnostic_msg = format_failure_context(failure_text, failure_class)
+                    elif failure_class == FailureClass.RETRYABLE:
                         transient_failure_count += 1
                         # §LOG-5b: WARNING — these strike lines are the
                         # turn's primary "what broke" record, and at INFO
@@ -23573,6 +23923,11 @@ class GhostAgent:
                 # the list holds the answers finalize must not deliver.
                 self.context._risk_steer_fired = False
                 self.context._governor_checkpoint_segments = []
+                # §4HC: the previous main request's head, for planner prefix
+                # alignment. Per request — a stale head from another
+                # conversation would share nothing and cost a full prefill.
+                self.context._planner_prefix = None
+                self.context._planner_cap_hit = False
                 self.context._offproject_steer_done = False
                 # Edit-run futility tracking: basename -> {writes, runs} for
                 # code files this request. See the futility breaker in the
@@ -25118,10 +25473,90 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             f"{_tuned_prefix}\n\n{PLANNING_SYSTEM_PROMPT}"
                             if _tuned_prefix else PLANNING_SYSTEM_PROMPT
                         )
-                        planner_messages = [
-                            {"role": "system", "content": _planner_system},
-                            {"role": "user", "content": f"### RECENT CONVERSATION:\n{recent_transcript}\n\n{planner_transient.strip()}"}
-                        ]
+                        # §4HC — PREFIX-ALIGNED planner. The legacy shape
+                        # (its own system prompt + the transcript re-serialised)
+                        # shares ~1k template tokens with the main prompt, so on
+                        # the single slot every main turn that followed a
+                        # planner call re-prefilled its whole context: measured
+                        # 24k→44k tokens per turn (~397k, ~510 s) against 3–8k
+                        # with the planner off (req c16679f1 vs 6a7882f5). The
+                        # planner's own context was ALSO larger than the main's
+                        # (55–81k) because the transcript re-serialises every
+                        # tool result at up to 18k chars. From turn 2 the planner
+                        # now sends the previous main request's exact rendered
+                        # messages + one trailing instruction: it rides the KV
+                        # the main call left in the slot, and the next main call
+                        # rides the KV it leaves. Turn 1 keeps the legacy shape
+                        # (no head exists yet).
+                        _pp = getattr(self.context, "_planner_prefix", None)
+                        _aligned = bool(_pp and _pp.get("messages"))
+                        if _aligned:
+                            _since = int(_pp.get("msg_count") or 0)
+                            # §4HN (2026-09-16): the aligned tail carries only
+                            # what the shared prefix LACKS. Measured on
+                            # de95699d: 26–42k chars per plan (7–14k tokens,
+                            # 13–33 s of prefill each turn), of which the user
+                            # request (the prefix's first user message), the
+                            # last two tool outputs at up to 84k chars each
+                            # (the prefix holds every tool message verbatim;
+                            # the delta below gists them) and the scrapbook /
+                            # sandbox blocks (the main dynamic state, in the
+                            # prefix's last user message) were duplicates.
+                            # The plan JSON is compacted; the tool list and
+                            # temporal anchor stay. Turn 1 keeps the full
+                            # transient (no prefix exists yet).
+                            _plan_json_compact = (json.dumps(current_plan_json, separators=(",", ":"))
+                                                  if current_plan_json else "No plan yet.")
+                            _aligned_transient = (
+                                f"{planner_playbook_block}"
+                                f"### AVAILABLE NATIVE TOOLS\n[{available_tools_list}]\n"
+                                "CRITICAL INSTRUCTION: If an action requires a tool, explicitly name the "
+                                "native JSON tool you intend to use. DO NOT plan to write Python scripts "
+                                "for tasks that have a dedicated native tool. If the user is just asking "
+                                "a question or requesting a code/SQL explanation, set \"next_action_id\" "
+                                "to \"none\" and do NOT plan to use a tool.\n\n"
+                                "### TEMPORAL ANCHOR (READ CAREFULLY)\n"
+                                f"You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know "
+                                "what is already DONE. NEVER revert a 'DONE' task back to 'PENDING'. The "
+                                "user request, the scrapbook and every tool result are in the conversation "
+                                "above.\n\n"
+                                f"### CURRENT PLAN (JSON)\n{_plan_json_compact}\n")
+                            # Compact: the delta is a GIST for the planner,
+                            # not the record — the main turn carries the full
+                            # results. At the transcript's default 18k chars
+                            # per message the live tails ran 37–50k chars
+                            # (~11k tokens prefilled per planner call).
+                            _delta_transcript = self._get_recent_transcript(
+                                messages[_since:],
+                                char_limit=_PLANNER_DELTA_CHARS_PER_MSG,
+                            ) or "(nothing new)"
+                            _cap_note = (
+                                "\n### YOUR LAST PLAN WAS CUT AT THE TOKEN CAP\n"
+                                "Emit ONLY the tasks whose status or content changed "
+                                "this turn — the tree merges by task id, so an "
+                                "unchanged task must not be repeated.\n"
+                                if getattr(self.context, "_planner_cap_hit", False) else "")
+                            planner_messages = list(_pp["messages"]) + [{
+                                "role": "user",
+                                "content": (
+                                    f"{_planner_system}\n\n"
+                                    f"### NEW SINCE YOUR LAST PLAN (the conversation "
+                                    f"above is unchanged):\n{_delta_transcript}\n"
+                                    f"{_cap_note}\n{_aligned_transient.strip()}"),
+                            }]
+                            pretty_log(
+                                "Planner Prefix",
+                                f"aligned to the previous main request — "
+                                f"{len(_pp['messages'])} msgs shared, "
+                                f"{len(planner_messages[-1]['content'])}-char tail "
+                                f"(prompt {len(_planner_system)} · delta {len(_delta_transcript)} · "
+                                f"plan {len(_plan_json_compact)} · tools {len(available_tools_list)})",
+                                icon=Icons.BRAIN_PLAN)
+                        else:
+                            planner_messages = [
+                                {"role": "system", "content": _planner_system},
+                                {"role": "user", "content": f"### RECENT CONVERSATION:\n{recent_transcript}\n\n{planner_transient.strip()}"}
+                            ]
 
                         if _PLANNER_NO_THINK:
                             planner_messages[-1]["content"] += "\n\n/no_think"
@@ -25134,6 +25569,30 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             "max_tokens": _PLANNER_MAX_TOKENS,
                             "response_format": {"type": "json_object"}
                         }
+                        if _aligned and _pp.get("tools"):
+                            # The chat template renders `tools` into the HEAD,
+                            # right after the system text; the head only matches
+                            # if the planner carries the same list.
+                            planning_payload["tools"] = _pp["tools"]
+                            planning_payload["tool_choice"] = "none"
+                        if _aligned:
+                            # ⚠ `json_object` does NOT hold under the main
+                            # persona. Live (req 552a1ffd): four of five aligned
+                            # planner calls answered with XML `<tool_call>`
+                            # blocks — the main system prompt's execution mode
+                            # won over a trailing planning instruction, and the
+                            # server let the non-JSON through. `tool_choice:
+                            # "none"` stopped native calls, not the dialect. The
+                            # result parsed to {} → "No thought provided.", an
+                            # empty plan, four turns unplanned. Reproduced
+                            # offline in 10 s; a JSON SCHEMA that REQUIRES the
+                            # plan's keys produced a full plan in 11 s on the
+                            # same payload (a trailing system message is
+                            # rejected by the template outright).
+                            planning_payload["response_format"] = {
+                                "type": "json_schema",
+                                "json_schema": {"name": "plan",
+                                                "schema": _PLANNER_REPLY_SCHEMA}}
                         if _PLANNER_NO_THINK:
                             # Hard switch beside the soft one — vision.py
                             # records that the `/no_think` token alone is not
@@ -25163,6 +25622,16 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 task_label="planner")
                             plan_content = p_data["choices"][0]["message"].get("content", "")
                             plan_json = extract_json_from_text(plan_content)
+                            if not plan_json and "<tool_call>" in str(plan_content or ""):
+                                # Name the failure, not its symptom: the old
+                                # trace was "No thought provided." four turns
+                                # running with no cause in sight.
+                                pretty_log(
+                                    "Planner",
+                                    "reply was a tool call, not a plan — the "
+                                    "execution persona answered the planning "
+                                    "instruction; plan discarded",
+                                    icon=Icons.WARN, level="WARNING")
 
                             # ⚠ TRUNCATION SALVAGE (2026-08-11). The planner
                             # runs with max_tokens=4096 and a big `tree_update`
@@ -25189,10 +25658,24 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             # tree is dropped and a whole one is kept.
                             _plan_truncated = False
                             _whole_tree = None
+                            _finish = ""
+                            try:
+                                _finish = str((p_data.get("choices") or [{}])[0]
+                                              .get("finish_reason") or "")
+                            except Exception:  # noqa: BLE001
+                                _finish = ""
                             if not plan_json and _unclosed_braces(plan_content):
                                 _plan_truncated = True
                                 plan_json, _whole_tree = \
-                                    salvage_truncated_plan(plan_content)
+                                    salvage_truncated_plan(plan_content, _finish)
+                            # §4HC: a REAL cap hit arms a one-turn steer that
+                            # asks the next plan for changed tasks only (the
+                            # tree merges by id). A malformed reply does not.
+                            try:
+                                self.context._planner_cap_hit = bool(
+                                    _plan_truncated and _finish == "length")
+                            except Exception:  # noqa: BLE001
+                                pass
 
                             thought_content = plan_json.get("thought", "No thought provided.")
                             tree_update = plan_json.get("tree_update", {})
@@ -25203,8 +25686,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 tree_update = _whole_tree or {}
                                 pretty_log(
                                     "Planner",
-                                    "output hit the token cap — thought "
-                                    "salvaged; plan tree "
+                                    ("output hit the token cap" if _finish == "length"
+                                     else f"output was malformed JSON (finish_reason="
+                                          f"{_finish or 'unknown'}, not a cap hit)")
+                                    + " — thought salvaged; plan tree "
                                     + ("recovered intact" if _whole_tree else
                                        "was cut, keeping the previous turn's"),
                                     icon=Icons.WARN, level="WARNING")
@@ -25597,10 +26082,41 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         dynamic_state += f"CURRENT SANDBOX STATE:\n{sandbox_state}\n\n"
                     if use_plan and not turn_is_conversational and 'thought_content' in locals() and thought_content:
                         dynamic_state += f"ACTIVE STRATEGY & PLAN:\nTHOUGHT: {thought_content}\nPLAN:\n{task_tree.render()}\nFOCUS TASK: {next_action_id}\n"
+                        # §4HK (2026-09-16, req 1e9b6f34): the tree above is
+                        # the PLANNER's — the model read its task ids as
+                        # tracked-project tasks and spent a turn on
+                        # manage_projects(task_update) → "no active project"
+                        # (2 of the first 6 treatment-arm runs), then told
+                        # the user "the project context was lost".
+                        dynamic_state += (_PLAN_IS_NOT_A_PROJECT_NOTE + "\n")
 
-                        if str(next_action_id).strip().lower() == "none":
-                            dynamic_state += "CRITICAL INSTRUCTION: DO NOT USE TOOLS this turn. Answer the user directly using insights from your THOUGHT.\n"
+                        # §4HF (2026-09-15, req 69fb588e): the instruction
+                        # must follow the SAME predicate that decides the
+                        # turn's mode. `is_final_generation` below is
+                        # `force_final_response OR required_tool == "none"`,
+                        # but this block keyed on `next_action_id` alone —
+                        # so a plan that said "move to task_5 (compile and
+                        # deliver the report)" with required_tool "none"
+                        # was STREAMED as the final answer while the state
+                        # told the model to "Execute the tool(s) required
+                        # for the FOCUS TASK". It did: a search call, in
+                        # the final stream, unparsed — 868 s of work
+                        # delivered as narration plus a note.
+                        _plan_req_tool = str(locals().get("required_tool", "all") or "all").strip().lower()
+                        _plan_focus_none = str(next_action_id).strip().lower() == "none"
+                        if _plan_focus_none or _plan_req_tool == "none":
+                            _focus_note = ("" if _plan_focus_none else
+                                           f" FOCUS TASK {next_action_id} is the delivery itself (required_tool=none).")
+                            dynamic_state += ("CRITICAL INSTRUCTION: DO NOT USE TOOLS this turn. Answer the user "
+                                              "directly using insights from your THOUGHT." + _focus_note + "\n")
                             force_final_response = True
+                            if not _plan_focus_none:
+                                pretty_log(
+                                    "Planner",
+                                    f"plan routes to the final answer via required_tool=none while focusing "
+                                    f"{next_action_id} — the turn is text-only and the state says so",
+                                    icon=Icons.BRAIN_PLAN,
+                                )
                         else:
                             dynamic_state += "CRITICAL INSTRUCTION: Execute the tool(s) required for the FOCUS TASK. You MAY emit MULTIPLE <tool_call> blocks in parallel within this turn when they all serve the same FOCUS TASK (e.g. writing several project files, batching knowledge_base inserts). DO NOT HALLUCINATE TOOL OUTPUTS.\n"
 
@@ -25987,6 +26503,20 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             native_nprobs_ok=not getattr(
                                 self.context, "_nprobs_rejected", False))
 
+                    # §4HC: snapshot this request's rendered head for the NEXT
+                    # turn's planner, so the planner's prompt is this prompt
+                    # plus a tail and rides the KV this call leaves in the
+                    # slot (see the planner site for the measurement).
+                    try:
+                        self.context._planner_prefix = {
+                            "messages": [dict(m) if isinstance(m, dict) else m
+                                         for m in req_messages],
+                            "tools": payload.get("tools"),
+                            "msg_count": len(messages),
+                        }
+                    except Exception:  # noqa: BLE001 — never break the turn
+                        pass
+
                     if is_final_generation and stream_response:
                         payload["stream"] = True
                         # Capture outer variables to prevent NameError when finally block deletes them
@@ -26010,6 +26540,37 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         # so it leads the stream even when there's no other
                         # intermediate text to flush.
                         _corr_banner = self._take_active_correction()
+                        # §4HG (2026-09-16, req 095beab8): the risk-governor
+                        # checkpoint answers recorded during this turn are
+                        # dropped HERE, before the prefix exists — the
+                        # non-stream path drops them in `_finalize_and_return`,
+                        # which a streamed reply never reaches, so the web
+                        # UI opened with "**CONFIRMED (observed):** …" and the
+                        # record kept it. The prefix is ours until the first
+                        # chunk goes out; same rail as finalize (never reduce
+                        # the reply to narration, never empty it).
+                        _ckpt_segs = list(getattr(
+                            self.context, "_governor_checkpoint_segments", None) or [])
+                        if _ckpt_segs and final_ai_content:
+                            try:
+                                from .reply_smoothing import drop_checkpoint_segments as _drop_ckpt
+                                # keep_if_empty=False: the answer follows on the
+                                # wire, so a prefix that was ONLY checkpoint
+                                # answers rightly becomes empty here.
+                                _no_ckpt = _drop_ckpt(final_ai_content, _ckpt_segs,
+                                                      keep_if_empty=False)
+                                if (_no_ckpt != final_ai_content
+                                        and not _is_narration_only_trim(_no_ckpt, final_ai_content)):
+                                    pretty_log(
+                                        "Reply Smoothing",
+                                        f"dropped {len(_ckpt_segs)} risk-governor checkpoint "
+                                        f"answer(s) before the stream: {len(final_ai_content)} → "
+                                        f"{len(_no_ckpt)} chars",
+                                        icon=Icons.BRAIN_SUM,
+                                    )
+                                    final_ai_content = _no_ckpt
+                            except Exception as _ck_exc:  # noqa: BLE001 — never cost the stream
+                                logger.debug("stream checkpoint drop skipped: %s", _ck_exc)
                         _body_prefix = final_ai_content.strip() + "\n\n" if final_ai_content.strip() else ""
                         stream_prefix = _corr_banner + _body_prefix
 
@@ -26784,17 +27345,22 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         try:
             from .reply_shape_check import (refute_narration_only,
                                             refute_no_answer_fallback,
-                                            refute_raw_tool_dump)
+                                            refute_raw_tool_dump,
+                                            refute_unread_source)
             from .reply_smoothing import count_real_tools, strip_system_notes
             claim = strip_system_notes(final_ai_content or "")
+            _names = [str(r.get("name") or "") for r in (tools_run or [])
+                      if isinstance(r, dict) and not r.get("_synthetic")]
             issues = refute_no_answer_fallback(claim)
             reasoning = self._NO_ANSWER_REASONING
             if not issues:
                 issues = refute_raw_tool_dump(claim, request_text or "")
                 reasoning = "reply-shape check (raw tool output pasted as the answer)"
             if not issues:
-                _names = [str(r.get("name") or "") for r in (tools_run or [])
-                          if isinstance(r, dict) and not r.get("_synthetic")]
+                # §4HY: a source "actually read" that no tool ever opened.
+                issues = refute_unread_source(claim, request_text or "", _names)
+                reasoning = "reply-shape check (a source cited as read was never opened)"
+            if not issues:
                 issues = refute_narration_only(
                     claim, n_real_tools=count_real_tools(tools_run or []),
                     tool_names=_names)
@@ -27932,6 +28498,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             # then trained the self-improvement loop on garbage).
             _stream_effective_content = full_content
             _scrub_fallback_emitted = False
+            _scrub_fallback_deferred = False
             if (
                 _stream_scrub_active
                 and full_content.strip()
@@ -27984,8 +28551,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         "finish_reason": None,
                     }],
                 }
-                yield f"data: {json.dumps(_fallback_chunk)}\n\n".encode('utf-8')
                 if _proj_task_closed_this_req:
+                    yield f"data: {json.dumps(_fallback_chunk)}\n\n".encode('utf-8')
                     # Expected: the one-task gate finalized the
                     # turn and dropped the model's attempt to
                     # start the next task. Not a problem — log
@@ -27997,9 +28564,19 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         level="INFO", icon=Icons.BRAIN_PLAN,
                     )
                 else:
+                    # §4HW (2026-09-16, req 503e94c5): a scrub that ate the
+                    # WHOLE reply is the forced-final "no answer" case, not
+                    # a finished reply — the canned "please rephrase … run
+                    # vision_analysis" sentence shipped as the entire answer
+                    # to "open this page and read the price". The sentence
+                    # is DEFERRED: the §4HF retry below answers first; it
+                    # goes out only if the retry machinery itself produced
+                    # nothing.
+                    _scrub_fallback_deferred = True
                     pretty_log(
                         "Stream Scrub Fallback",
-                        f"Scrub consumed entire response (intended={_intended or 'unknown'}); emitted fallback.",
+                        f"Scrub consumed entire response (intended={_intended or 'unknown'}); "
+                        "routing to the forced-final retry before any fallback sentence.",
                         level="WARNING", icon=Icons.WARN,
                     )
 
@@ -28039,6 +28616,103 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     )
             except Exception as _nc_exc:  # noqa: BLE001
                 logger.debug("stream tool-call note skipped: %s", _nc_exc)
+
+            # §4HF (2026-09-15, req 69fb588e) — the forced final that
+            # produced no answer, on the STREAM path. §4GH built the retry
+            # for the internal path and left this one out ("text already
+            # on the client cannot be retried"). It can: the [DONE]
+            # sentinel is held back until the end of this generator, so a
+            # second, tool-less generation can ride the same stream as a
+            # continuation. Live, the planner routed turn 10 as the final
+            # answer, the model streamed "I have enough material to
+            # finalize. Let me do a final verification batch…" plus a
+            # search call, the scrub took the call, and the user got
+            # 868 s of working narration with a note that the step never
+            # ran. Two triggers: this turn's own text is empty/narration
+            # AND it tried to call a tool (the model demonstrably did not
+            # write the answer, whatever the earlier narration carried),
+            # or the whole body is narration (the §4GH predicate). One
+            # retry, non-streamed (one synthetic chunk); the durable
+            # record carries it too. `tools` stay on the payload with
+            # tool_choice=none so the KV prefix survives the retry.
+            _ff_retry_text = ""
+            try:
+                from .reply_smoothing import (
+                    narration_only as _ff_narr,
+                    forced_final_has_no_answer as _ff_no_answer,
+                    unparsed_call_markup_present as _ff_called)
+                _ff_raw_turn = (full_content or "")[len(stream_prefix or ""):]
+                _ff_turn = _MODULE_SCRUB_RE.sub("", _ff_raw_turn).strip()
+                _ff_tried_tool = _ff_called(_ff_raw_turn)
+                _ff_fire = (
+                    _stream_scrub_active
+                    and (not _scrub_fallback_emitted or _scrub_fallback_deferred)  # §4HW
+                    and not loop_detected and not stream_aborted
+                    and ((_ff_tried_tool and (not _ff_turn or _ff_narr(_ff_turn)))
+                         or _ff_no_answer(_ff_turn, stream_prefix or "")))
+                if _ff_fire:
+                    pretty_log(
+                        "Turn Budget",
+                        "streamed final produced NO ANSWER (narration and/or a "
+                        "tool call on a text-only turn) — one non-streamed retry "
+                        "with the answer-now directive, appended to the stream",
+                        level="WARNING", icon=Icons.WARN,
+                    )
+                    _ff_payload = dict(payload)
+                    _ff_payload["stream"] = False
+                    _ff_payload["messages"] = list(payload.get("messages") or []) + [
+                        {"role": "assistant", "content": _ff_raw_turn or "(no answer)"},
+                        {"role": "user", "content": _FORCED_FINAL_ANSWER_DIRECTIVE},
+                    ]
+                    if _ff_payload.get("tools"):
+                        _ff_payload["tool_choice"] = "none"
+                    _ff_data = await self.context.llm_client.chat_completion(
+                        _ff_payload, task_label="forced-final-retry")
+                    _ff_msg = ((_ff_data or {}).get("choices") or [{}])[0].get("message") or {}
+                    _ff_candidate = _MODULE_SCRUB_RE.sub("", str(_ff_msg.get("content") or ""))
+                    _ff_candidate = re.sub(r"<think>.*?</think>", "", _ff_candidate, flags=re.DOTALL).strip()
+                    if _ff_candidate and not _ff_narr(_ff_candidate):
+                        _ff_retry_text = _ff_candidate
+                    else:
+                        pretty_log(
+                            "Turn Budget",
+                            "streamed final produced NO ANSWER twice — appending the "
+                            "honest fallback (last evidence, not the narration)",
+                            level="WARNING", icon=Icons.FAIL,
+                        )
+                        _ff_retry_text = _no_answer_fallback_reply(stream_tools_snapshot)
+            except Exception as _ff_exc:  # noqa: BLE001 — the retry must never cost the stream
+                logger.warning("streamed forced-final retry skipped: %s", _ff_exc)
+                _ff_retry_text = ""
+            if _ff_retry_text:
+                _ff_chunk = {
+                    "id": f"chatcmpl-{req_id}",
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": stream_model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": "\n\n" + _ff_retry_text},
+                        "finish_reason": None,
+                    }],
+                }
+                yield f"data: {json.dumps(_ff_chunk)}\n\n".encode('utf-8')
+                full_content = (full_content or "").rstrip() + "\n\n" + _ff_retry_text
+                _stream_effective_content = full_content
+                if _scrub_fallback_deferred:
+                    # §4HW: the record is the answer, not the scrubbed markup.
+                    _stream_effective_content = (
+                        (stream_prefix.rstrip() + "\n\n" + _ff_retry_text)
+                        if (stream_prefix or "").strip() else _ff_retry_text)
+            elif _scrub_fallback_deferred:
+                # §4HW: the retry machinery itself produced nothing (it raised
+                # or was gated off) — the sentence is the last resort.
+                yield f"data: {json.dumps(_fallback_chunk)}\n\n".encode('utf-8')
+                pretty_log(
+                    "Stream Scrub Fallback",
+                    "forced-final retry produced nothing after a full scrub — emitted the fallback sentence",
+                    level="WARNING", icon=Icons.FAIL,
+                )
 
             # ⚠ THE [DONE] SENTINEL IS NOW RELEASED AT THE VERY END OF THIS
             # GENERATOR (see the release site at the bottom of stream_wrapper).

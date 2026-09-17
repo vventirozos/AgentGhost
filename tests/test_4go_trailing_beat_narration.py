@@ -94,11 +94,20 @@ def test_trailing_beat_shape(block, expect):
 
 def test_a_lone_beat_whose_finding_is_never_repeated_is_kept():
     """One observation plus "Let me fix that" may be the only place a finding
-    appears. The reply must prove it repeats it."""
+    appears. The reply must prove it repeats it.
+
+    §4HD (2026-09-15): the PARAGRAPH stays — that is the property — but the
+    beat SENTENCE inside it is now cut when the next delivered paragraph
+    opens by delivering ("Done."), and this one does. The finding survives;
+    the announcement of work the reply then reports done does not.
+    """
     text = ("The parser rejects nested arrays at depth 3. Let me fix that.\n\n"
             "Done. The service now starts cleanly and the health endpoint "
             "returns 200.")
-    assert rs.smooth_reply(text) == text
+    out = rs.smooth_reply(text)
+    assert out.startswith("The parser rejects nested arrays at depth 3.")
+    assert "Let me fix that." not in out
+    assert out.endswith("returns 200.")
 
 
 def test_a_beat_restated_ACROSS_several_paragraphs_is_dropped():

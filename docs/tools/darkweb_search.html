@@ -228,6 +228,11 @@
   </p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+
+  <h2 id="4hb-omega">"No documents match your query" is a zero-hit answer <span class="tag">2026-09-15 &sect;4HB</span></h2>
+  <p>
+    torch runs Xapian Omega, whose zero-hit page reads <em>No documents match your query</em>. <code>_NO_HITS_RE</code> knew "no results", "no matches", "nothing found" — not that — so every torch miss fell through to the last branch and was reported at WARNING as "the engine's result format may have drifted". Fetched over Tor on 2026-09-15: every "empty" torch response in the log (1.7–1.9&nbsp;KB) is that page. The phrasing is now in the pattern; <code>tests/fixtures/torch_zero_hits_2026-09-15.html</code> is the real body (form token scrubbed) and <code>tests/test_darkweb_no_hits_phrasings.py</code> pins it, together with the requirement that a genuinely unparseable page still reaches the <code>parser</code> branch — that <em>is</em> the drift signal.
+  </p>
 </main>
 </body>
 </html>

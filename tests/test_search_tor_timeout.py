@@ -40,7 +40,7 @@ def test_timeout_clears_mojeek_tor_latency():
 
 def test_mojeek_keeps_full_budget_fast_engines_shorter():
     assert _engine_timeout("mojeek") == _DDGS_TOR_TIMEOUT
-    for eng in ("yahoo", "yandex", "brave", "google", "duckduckgo"):
+    for eng in ("yahoo", "yandex", "brave", "duckduckgo"):
         assert _engine_timeout(eng) == _DDGS_FAST_ENGINE_TIMEOUT
     # An unknown engine falls back to the fast (conservative) ceiling.
     assert _engine_timeout("somenewengine") == _DDGS_FAST_ENGINE_TIMEOUT

@@ -189,7 +189,11 @@ def test_retract_calls_vector_collection_delete_with_where_filter(tmp_path):
 
     class _Coll:
         def delete(self, **kwargs):
-            captured["delete_kwargs"] = kwargs
+            # §4HB: the retraction now issues TWO deletes — by trajectory id,
+            # then by the removed triggers (the twin does not always carry
+            # the id). Keep the id-keyed call, which is what this pin is for.
+            if "source_trajectory_id" in (kwargs.get("where") or {}):
+                captured["delete_kwargs"] = kwargs
 
     class _Mem:
         collection = _Coll()

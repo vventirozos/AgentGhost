@@ -1688,12 +1688,15 @@ class SkillMemory:
             return 0
         removed = 0
         json_failed = False
+        # Bound BEFORE the try: the vector pass reads it, and a JSON pass
+        # that raised before the inner assignment must not turn the
+        # best-effort scrub into a NameError.
+        removed_triggers = []
         try:
             with self._get_lock():
                 playbook = self._load_playbook()
                 kept = []
                 dropped = []
-                removed_triggers = []
                 for entry in playbook:
                     src = (
                         entry.get("source_trajectory_id")
@@ -1743,6 +1746,18 @@ class SkillMemory:
                 coll = getattr(memory_system, "collection", None)
                 if coll is not None and hasattr(coll, "delete"):
                     coll.delete(where={"source_trajectory_id": trajectory_id})
+                    # §4HB: the vector twin does not always carry the id.
+                    # Live: the playbook entry from trajectory 97b402e8 had
+                    # `source_trajectory_id` set and its vector twin had "",
+                    # so this delete removed the JSON lesson and left the
+                    # embedded copy retrievable — the drift the comment
+                    # below calls "recoverable on a later rebuild" is a
+                    # false lesson still surfacing on recall until then.
+                    # The JSON pass knows exactly which TRIGGERS it removed;
+                    # scrub the twins by trigger as well.
+                    _trig = [t for t in removed_triggers if isinstance(t, str) and t]
+                    if _trig:
+                        coll.delete(where={"trigger": {"$in": _trig}})
             except Exception as e:
                 # Vector scrub is best-effort — the JSON playbook is
                 # canonical, and a stale vector entry whose JSON twin

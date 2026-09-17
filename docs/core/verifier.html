@@ -1215,6 +1215,87 @@ PYTHONPATH=src python scripts/verify_bench.py --tier private --two-stage both</p
   <p><code>_written_sources_for_audit</code> called <code>read_text()</code> on a filename the model chose. A turn that writes a 400 MB log and then runs anything would have had that file read whole into the agent's memory — to build a prompt that shows at most 7 kB of it. <code>_read_bounded</code> now reads at most ~2&times;budget: the whole file when it is small, otherwise the head and the tail via one seek, because the excerpt is what the auditor sees and the end of a source file is where the later definitions live. The true size comes from <code>stat()</code>, so the header and the elision marker both describe the FILE rather than the read buffer.</p>
   <p>The same round pinned an interaction §4GW made load-bearing and nobody had asserted: before the change the code lens refuted "no source shown" about half the time, so a turn claiming a file it never wrote had two chances of being caught; it now confirms, which leaves the grounded re-read as the only guard. The pin that existed used a <em>silent</em> lens, and silence is easy to override — the new one has the lens CONFIRM at 0.95 and requires the missing deliverable to win anyway. Battery: <code>scripts/mutate_4gz.py</code>, 9 mutants + both controls, 9/9 that must die, died.</p>
 
+
+  <h2 id="4hb-precedence">A cheap late REFUTE cannot erase a strong CONFIRMED <span class="tag">2026-09-15 &sect;4HB</span></h2>
+  <p>
+    The verdict ledger recorded verdicts by <em>recency</em>. Live (req <code>14af0b6b</code>, trajectory <code>97b402e8</code>): the turn gate CONFIRMED at 0.92 and the confirm-escalation was <strong>upheld by the strong model</strong>; sixty seconds later a late cheap-tier pass REFUTED at 0.90 with escalation outcome <code>unavailable</code> — the strong model never answered — on two wrong reasons ("Sep 12" against a requested "11-12 September", a date <em>inside</em> the range; and "the notification text is present" offered as contradicting "no sender is displayed"). The cheap refute won: outcome flipped ok&rarr;failed, the turn's lessons were scrubbed, and the reflector wrote a lesson asserting the agent had <em>not</em> said the thing it had said. Two reruns then re-hunted an answered question.
+  </p>
+  <p>
+    <strong>Precedence, not recency.</strong> Every escalation site already goes through <code>record_escalation</code>; it now sets a task-scoped contextvar <em>before</em> its own gates (a disabled ledger or a missing <code>req_id</code> must not blind the in-process stamp), and thin wrappers on <code>_escalate_refute</code> / <code>_escalate_confirm</code> stamp the outcome onto the returned <code>VerifyResult.escalation</code> — one path for all eighteen ledger sites. The outcome vocabulary is owned at the producer and split by one question: <code>ESCALATION_STRONG_ADJUDICATED</code> (<code>upheld</code>, <code>overturned</code>, <code>replaced_uncertain</code>, <code>mechanically_*</code>) versus <code>ESCALATION_NOT_ADJUDICATED</code> (<code>unavailable</code>, <code>withheld</code>, <code>downgraded</code>); an <code>ast</code> enumeration fails if a site ever records an outcome in neither set.
+  </p>
+  <p>
+    The recorder (<code>_record_verdict_instruments</code>) memoises the verdict of every strong-adjudicated result per trajectory (bounded, recency-evicted) and writes an additive <code>escalation</code> key to the verdict sidecar, so the question "did a cheap refute override a strong confirm" is answerable from the record rather than by log archaeology. <code>_record_late_verdict</code> then applies the rule, <strong>deliberately narrow</strong>: a late REFUTE whose escalation was <code>unavailable</code>, when a strong-adjudicated CONFIRMED already stands for the trajectory, is <em>withheld from every consequence</em> — no outcome flip, no lesson scrub, no correction banner — and kept as a measurement through <code>_record_withheld_verdict</code>, the same treatment a human label already gets. A strong-adjudicated refute still applies; with no prior strong verdict, today's behaviour is unchanged. Covered by <code>tests/test_verifier_late_precedence.py</code>.
+  </p>
+  <p>
+    <strong>Data repair.</strong> Trajectory <code>97b402e8</code> was restored to <code>passed</code> by an <code>operator_overlay</code> row in <code>trajectories/corrections.jsonl</code>, and the false lesson retracted from both stores through <code>retract_lessons_from_trajectory</code> (archived first). Not fixed here, noted: the verifier's date arithmetic does not understand ranges.
+  </p>
+
+  <h2 id="4hc-evidence">The judge must be shown the source, not the deliverable's echo <span class="tag">2026-09-15 &sect;4HC</span></h2>
+  <p>
+    Live (req <code>c16679f1</code>) the verifier CONFIRMED at 0.95 — upheld by the strong model — a report whose headline lead presented Revolut's <em>own</em> certified-mail inbox as the attacker's sender address. The browser extraction it came from said, in the next sentence, <em>"That is Revolut receiving and answering. The sender is still unnamed."</em> The judge never saw it. Replaying <code>_collect_verifier_evidence</code> on the recorded turn: the candidate window was 10 tools deep and the extraction was 11th newest; the three positional slots were the report's own write receipts ("SUCCESS: Applied 1 SEARCH block"); and the claim-relevance pull ranked by raw token overlap, which the report's own <code>file_system</code> echo (89 shared tokens) wins over the source (64) by construction — the tool that shares the most tokens with a report is the tool that wrote it. Four of four digest items were the claim echoing itself.
+  </p>
+  <p>
+    Four changes, each measured necessary on the recorded turn: the deep window is 40; positional slots holding <em>self-authored</em> output (file writes, PDF receipts) yield to the best not-yet-picked <em>external</em> source that overlaps the claim, the newest item always kept for failure attribution; overlap is weighted by within-turn rarity (log&nbsp;N/df — the §4AP BM25 lesson: a match without IDF matches everything), so a source carrying the claim's <em>distinctive</em> strings out-ranks four near-identical OCRs of one card sharing only "revolut" and "breach"; and near-duplicates are suppressed at token-set Jaccard&nbsp;≥&nbsp;0.5 (same-image OCR pairs sat at 0.69/0.60, every different pair under 0.30). Replayed on the recorded turn the digest now carries the disqualifying sentence. A turn with no external tool packs exactly as before. Covered by <code>tests/test_evidence_packer_external_first.py</code>.
+  </p>
+
+  <h2 id="4ho-strong-judge">The refute nobody checked: the strong judge ran out of tokens thinking <span class="tag">2026-09-16 &sect;4HO</span></h2>
+  <p>
+    Measured over the escalation ledger since 09-07: refute escalations that <em>reached</em> the strong model were overturned 24 of 28 times &mdash;
+    and 17 more ended <code>outcome="unavailable"</code> with no exception anywhere. Every one took the <code>strong is None</code> path: the main
+    model (a thinking model) was asked the classic claim prompt with <code>max_tokens</code> 2,048 and thinking ON, produced ~8,000 chars of
+    <code>&lt;think&gt;</code>, hit <code>finish_reason=length</code> with <strong>zero content</strong>, <code>_parse_json</code> returned <code>{}</code>,
+    <code>_build_verify_result</code> returned None, and the cheap REFUTED (80%) stood &mdash; label backfilled failed, lessons scrubbed. The same prompt
+    with thinking OFF answered CONFIRMED 0.85 in 3 s. Two neighbouring defects on the same turn: the verdict digest (4,000 chars / 5 items over a
+    21-tool turn) never reached tool 15 where the claimed request number sat, so the judge refuted it as "not in the evidence"; and the prompt's
+    "facts that appear in NO tool output are fabrications" read the reply's own <em>Confidence &asymp; 78%</em> as such a fact.
+  </p>
+  <p>
+    <strong>The strong judge answers.</strong> The last-resort MAIN call in <code>_call_llm</code>, when it is the strong judge (<code>force_main</code>,
+    classic prompt &mdash; the two-stage <code>json_only</code> payloads already carried it), appends <code>/no_think</code> and sends
+    <code>chat_template_kwargs={"enable_thinking": false}</code>; <code>GHOST_VERIFY_MAIN_NO_THINK=0</code> restores thinking. Every main answer
+    stashes <code>{finish_reason, content_chars}</code> on the verifier, and an empty answer logs at WARNING (<em>"main-model judge returned NO
+    content (finish_reason=length, force_main=True)"</em>). <code>_escalate_refute</code> resets the stash before its strong call and, when the strong
+    judge returns nothing, logs <em>"refute escalation unavailable &mdash; strong judge returned no verdict (strong_none:length:0c); cheap REFUTED
+    (0.80) stands UNCHECKED"</em> and writes the cause into the ledger row's <code>rebuttal</code> field &mdash; the branch that ate 17 refutes was silent.
+  </p>
+  <p>
+    <strong>The digest reaches the source.</strong> <code>_evidence_budget_for(tools_run)</code> in <a href="agent.html">agent</a> sizes the digest
+    from the turn's candidate count: 600 chars per candidate clamped to [4,000, 12,000]; items 3 / 4 / 5 / 6 for &le;6 / &le;12 / &le;20 / more.
+    Candidates and budget share one enumeration (<code>_evidence_candidates</code>), so bookkeeping confirmations count for neither. A candidate
+    whose head is <code>STATUS: BLOCKED</code> never takes a positional slot while a live one exists (it is quoted only when nothing else is).
+    <code>verify_claim</code>'s own cap is now <code>_EVIDENCE_BUDGET_MAX</code>, so the packer's digest is never re-truncated by the judge.
+  </p>
+  <p>
+    <strong>A stated confidence is an assessment.</strong> The claim, adjudicate and enumerate prompts each carry one sentence: the agent's own
+    confidence, probability or ranking ("Confidence &asymp; 78%", "strongly supported", "rumour") is its assessment of the evidence, never a
+    fabricated fact &mdash; judged only for contradiction ("confirmed" on something no output supports).
+    Pinned in <code>tests/test_strong_judge_answers.py</code>; mutation battery round 14 in the journal (&sect;4HO).
+  </p>
+
+  <h2 id="4hs-instruments">Two instruments the last session could not read <span class="tag">2026-09-16 &sect;4HS</span></h2>
+  <p>
+    <strong>The digest line.</strong> The verdict site now logs <em>"evidence digest &mdash; N item(s) of K candidate(s), M chars (budget B,
+    &le;I items)"</em> (<code>agent._log_evidence_digest</code>), counting only labels that name a packer candidate. Until now the
+    digest's size on a live turn was inferred from the pinned rule.
+  </p>
+  <p>
+    <strong>The strong call on every row.</strong> <code>record_escalation(strong_call=&hellip;)</code> writes <code>strong_finish</code> /
+    <code>strong_chars</code> from the verifier's <code>_last_main_call</code> stash on every row produced by <code>_escalate_refute_impl</code>,
+    <code>_resolve_rebuttal</code> and <code>_escalate_confirm_impl</code> &mdash; an answered escalation is now as readable as an unavailable
+    one (&sect;4HO recorded the cause only on the <code>unavailable</code> branch). The confirm path resets the stash before its strong call, as
+    the refute path already did. No verdict changes. Pinned in <code>tests/test_escalation_instruments.py</code>.
+  </p>
+
+  <h2 id="4hy-unread-source">A source "actually read" that was never opened <span class="tag">2026-09-16 &sect;4HY</span></h2>
+  <p>
+    Req <code>1cc63597</code> asked for "the official source URL you actually read"; the reply cited postgresql.org "&mdash; the announcement
+    states: &hellip;" after one <code>web_search</code> and no page load, and the judge CONFIRMED 0.95 from the snippet (&sect;4HC's echo, on a
+    one-tool turn). Mechanical, before any judge (<code>reply_shape_check.refute_unread_source</code>): when the request asks for a source the
+    agent read/opened/visited, the reply cites a URL as its source, and no page-loading tool (<code>browser</code>, <code>deep_research</code>,
+    <code>darkweb_research</code>) ran this turn, the turn is REFUTED with the URL named and a repairable directive (open the page and quote
+    it, or say it was not read). Corpus: 1 such turn in 654; "I read &lt;url&gt;" with no fetch: 0. Pinned in
+    <code>tests/test_unread_source_refute.py</code>.
+  </p>
 </main>
 </body>
 </html>

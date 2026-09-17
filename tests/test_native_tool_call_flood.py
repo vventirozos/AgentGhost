@@ -333,10 +333,16 @@ async def test_a_healthy_repeat_batch_still_dispatches(agent):
 
     Four byte-identical calls to a non-read-safe tool: below both thresholds,
     so all four must reach the tool exactly as they did before the guard.
+
+    §4HP (2026-09-16): a doubled call INSIDE one batch is no longer a
+    no-progress observation, so the first batch of four dispatches in full
+    and the breaker trips on the SECOND identical batch (the fake model
+    repeats itself every turn) — eight calls reach the tool, not four.
     """
     final, lines, noop, _turns = await _drive(agent, 4)
-    assert noop.call_count == 4
+    assert noop.call_count == 8
     assert "Tool-Call Flood" not in [t for t, _m in lines]
+    assert any(t == "Loop Breaker" and "repeated 2x" in m for t, m in lines)
 
 
 # ── the dispatch backstop ───────────────────────────────────────────────────

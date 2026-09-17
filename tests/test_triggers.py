@@ -268,10 +268,43 @@ async def test_replan_bridge_handles_tree_indirection():
     bridge = ReplanBridge(bus, plan_getter=lambda: plan,
                           current_task_getter=lambda: "t99")
     bridge.attach()
-    await bus.publish(resource_event("ram blew up", metric="ram",
-                                     observed=99, threshold=85,
-                                     severity="critical"))
-    assert plan.tree.calls == [("t99", "resource/critical: ram blew up")]
+    # §4HN (2026-09-16): the indirection is exercised by a LOOP event now —
+    # a resource event is log-only and must never reach request_revision
+    # (see test_replan_bridge_resource_events_are_log_only).
+    await bus.publish(loop_event("spinning", severity="critical"))
+    assert plan.tree.calls == [("t99", "loop/critical: spinning")]
+
+
+@pytest.mark.asyncio
+async def test_replan_bridge_resource_events_are_log_only():
+    """§4HN — FAILS IF: a host signal can still reset the active project
+    task. The only thing the bridge could do with "CPU 96%" was mark the
+    task PENDING with that as its failure reason — wrong on a box where the
+    LLM server pins the CPU whenever it generates. Measured: 1,051 resource
+    warnings in the log, zero revisions from them; the path was a latent
+    hazard. Loop events keep it."""
+    bus = TriggerBus()
+    calls = []
+    counts = []
+
+    class Plan:
+        def request_revision(self, task_id, reason):
+            calls.append((task_id, reason))
+            return True
+
+    bridge = ReplanBridge(bus, plan_getter=lambda: Plan(),
+                          current_task_getter=lambda: "t99",
+                          counter_hook=lambda **kw: counts.append(kw))
+    bridge.attach()
+    for sev in ("warning", "critical"):
+        await bus.publish(resource_event("CPU 96%", metric="cpu", observed=96.0,
+                                         threshold=85.0, severity=sev))
+    assert calls == []
+    assert counts == []                      # never booked as a replan attempt
+    assert [r["action"] for r in bridge.revisions[-2:]] == ["noop:resource_log_only"] * 2
+    assert bridge.revisions[-1]["task_id"] == "t99"   # the audit still names the task
+    await bus.publish(loop_event("spinning", severity="warning"))
+    assert calls == [("t99", "loop/warning: spinning")]
 
 
 # ──────────────────────────────────────────────────────────────────────

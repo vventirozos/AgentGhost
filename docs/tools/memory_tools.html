@@ -536,6 +536,14 @@
   resort for a file that should already exist. The containment refusal (&sect;4DX) is a different branch
   and keeps its own wording &mdash; a refused file must never read as a missing one; both are pinned
   side by side in <code>tests/test_kb_ingest_not_found_message.py</code>.</p>
+
+  <h2 id="4hb-recall">recall: an episode hit offers its answer, and graph edges stay on topic <span class="tag">2026-09-15 &sect;4HB</span></h2>
+  <p>
+    <strong>Episode refs.</strong> The vector store holds only the <em>request</em> text of a past turn (460 characters for the turn that mattered). Live, <code>recall</code> found the 09-14 turn that had read the Revolut notification card at distance 0.20 — the right memory — and rendered the question; the finding lives in episode 374, and the renderer only ever emitted the <code>ep:&lt;id&gt;</code> drill-down for <code>source_refs</code>. A hit carrying <code>episode_id</code> now renders <code>EVIDENCE REFS: ep:&lt;id&gt; — this hit is a past REQUEST; expand it to read what that turn found</code>, which arms the existing <code>knowledge_base(action='expand')</code> affordance. (Correction to the §4HB evaluation: the <code>[HIGH] 0.18</code> labels were <em>right</em> — the score is an L2 distance.)
+  </p>
+  <p>
+    <strong>Graph edges, per edge.</strong> <code>get_neighborhood</code> matches any query word over three characters, so the year token <code>2026</code> pulled in every edge ending in a 2026 date — July news headlines, the operator's family profile — and put fifteen of them at the <em>top</em> of a Revolut recall. Corpus: 111 of 336 graph edges shown (33%) share no non-numeric content word with their query. <code>_graph_edges_on_topic</code> now keeps an edge only if it shares a folded (Unicode, accent-stripped), non-stopword, non-numeric content word with the query; the section is omitted when nothing survives and still leads the result when something does. A query with no content words passes edges through — nothing to judge, nothing rejected. Covered by <code>tests/test_recall_episode_refs_and_graph_filter.py</code>.
+  </p>
 </main>
 </body>
 </html>

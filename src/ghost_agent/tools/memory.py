@@ -1134,6 +1134,48 @@ async def tool_document_outline(filename: str = None, memory_system=None,
 #: Relevance grades in order of goodness (lower rank = better match).
 _RELEVANCE_RANK = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
 
+# §4HB — graph-tier relevance guard. Content words of a query: folded
+# (casefold + NFKD, combining marks stripped, so Greek matches Greek),
+# longer than three characters, not a stopword, and NOT a bare number —
+# a year is a date node's best friend and nobody's topic.
+_GRAPH_STOPWORDS = frozenset("""
+the a an of and or to in for on with by from at is are was were be been
+being as that this these those it its into about over under how what
+when where which who why not no do does did can could should would will
+may might must i you he she they we us our your their his her
+""".split())
+
+
+def _graph_fold(text: str) -> str:
+    import unicodedata
+    folded = unicodedata.normalize("NFKD", (text or "").casefold())
+    return "".join(c for c in folded if not unicodedata.combining(c))
+
+
+def _graph_query_terms(query: str):
+    import re as _re
+    return [w for w in _re.findall(r"\w+", _graph_fold(query), _re.UNICODE)
+            if len(w) > 3 and w not in _GRAPH_STOPWORDS and not w.isdigit()]
+
+
+def _graph_edges_on_topic(query: str, edges):
+    """Keep only edges that share at least one content word with the query.
+
+    Per EDGE, not per section: the live recall had one edge that matched
+    ("REQUESTED" ⊃ "request") and fourteen that matched nothing but the
+    year. With no content words in the query nothing can be judged, and
+    the edges pass through unchanged.
+    """
+    terms = _graph_query_terms(query)
+    if not terms:
+        return list(edges or [])
+    kept = []
+    for e in edges or []:
+        folded = _graph_fold(str(e))
+        if any(t in folded for t in terms):
+            kept.append(e)
+    return kept
+
 
 async def tool_recall(query: str = None, memory_system=None, graph_memory=None, **kwargs):
     if not query:
@@ -1192,6 +1234,19 @@ async def tool_recall(query: str = None, memory_system=None, graph_memory=None, 
             refs = meta.get('source_refs')
             if refs:
                 chunk += f"\nEVIDENCE REFS: {refs}"
+            # §4HB: an EPISODE hit is the REQUEST text of a past turn — the
+            # vector store holds only that (460 chars for the turn that
+            # matters below). What that turn found lives in the episode
+            # record, reachable through `ep:<id>`, and this renderer only
+            # ever offered that route for `source_refs`. Live: a 0.20-distance
+            # hit on "Find the Revolut notification screenshot… say so
+            # explicitly if no sender is visible" was rendered as the question,
+            # and the answer (the card shows no sender field) stayed one
+            # unoffered call away through two reruns.
+            _ep_id = meta.get('episode_id')
+            if _ep_id not in (None, "") and not refs:
+                chunk += (f"\nEVIDENCE REFS: ep:{_ep_id} — this hit is a past "
+                          f"REQUEST; expand it to read what that turn found")
             valid_chunks.append(chunk)
             
     if graph_memory:
@@ -1200,6 +1255,15 @@ async def tool_recall(query: str = None, memory_system=None, graph_memory=None, 
         if words:
             try:
                 edges = await asyncio.to_thread(graph_memory.get_neighborhood, words, 15)
+                # §4HB: keep an edge only if it shares a CONTENT word with
+                # the query. The neighbourhood lookup matches any word over
+                # three characters, so the year token "2026" pulled in every
+                # edge ending in a 2026 date — July news headlines, the
+                # operator's family profile — and put fifteen of them at the
+                # TOP of a Revolut recall. Corpus: 111 of 336 graph edges
+                # shown (33%) share no non-numeric content word with their
+                # query. Guarded at the boundary, whatever the lookup does.
+                edges = _graph_edges_on_topic(query, edges or [])
                 if edges:
                     valid_chunks.insert(0, "### TOPOLOGICAL GRAPH EDGES:\n" + "\n".join(edges))
             except asyncio.CancelledError:

@@ -262,6 +262,10 @@ STEER_DIRECTIVE_TERMS: tuple = (
     "ASSUMED",
     "SINGLE smallest check",
     "STOP",
+    # §4HG: the words the STOP answer echoes ("The distinguishing check …
+    # no new agency name surfaced") — the smoother's markers key on them.
+    "distinguish",
+    "no new information",
 )
 
 

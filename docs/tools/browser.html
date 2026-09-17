@@ -308,6 +308,34 @@ Any claim that content renders is UNSUPPORTED by this screenshot…</code></pre>
 
   <h2 id="4gk">Round 4: the sentinel was inverted at the primary call <span class="tag">2026-09-13 &sect;4GK</span></h2>
   <p>The deadline helper returns zero to mean "do not issue this exec", and both retry sites honour it and say so. The primary site wrote <code>or 1</code>, turning the sentinel into a one-second exec that cannot launch Chromium. The deadline starts before the agent-wide browser profile lock is taken, so a call queued behind another browser call routinely arrives with its budget already spent &mdash; and the model was handed "runner exit 124", which reads as "the site timed out", plus a failure strike, after paying for a doomed launch. The primary site now honours the sentinel and says plainly that the wall-clock budget was spent before the browser could start.</p>
+
+  <h2 id="4hb-routes">Errors an identical retry cannot fix name their next action <span class="tag">2026-09-15 &sect;4HB</span></h2>
+  <p>
+    Live (req <code>6a7882f5</code>): <code>net::ERR_HTTP2_PROTOCOL_ERROR</code> on one site and "Execution context was destroyed" on another were each re-issued unchanged on the very next turn and failed the same way; the generic hint mentions neither. <code>tools/browser_routes.py</code> holds a small table of such errors with the action that can succeed (a different source; <code>interact</code> with <code>networkidle</code> and a settle), and the failure hint carries the route <em>ahead of</em> the generic advice. Circuit-level errors are deliberately absent — a SOCKS failure is one circuit's opinion and is worth a fresh-circuit retry, and the dead-onion memo already owns those. Split into its own module so <code>browser.py</code> stays under its post-extraction size gate. Covered by <code>tests/test_browser_deterministic_routes.py</code>.
+  </p>
+
+  <h2 id="4hh-blocked">The blocked page that read as OK <span class="tag">2026-09-16 &sect;4HH</span></h2>
+  <p>
+    Live (req <code>7ee072f2</code>): <code>ft.com</code> answered a 403 "Security Verification" page (554 chars) and <code>kelacyber.com</code> a 403 "Just a moment…" challenge (0 chars) — both came back <code>STATUS: OK</code>, the model's reasoning then read "FT (15 Sep 2026): … tied to pec.interno.it" as if it had read the FT, and the delivered report listed FT and KELA among its sources. Everything it knew of the FT story came from a secondary site's summary. <code>op_extract_text</code> threw the <code>page.goto</code> response away (<code>op_navigate</code> kept it and the formatter printed <code>HTTP_STATUS</code> under an OK header; <code>op_screenshot</code> never had it). Measured on the corpus: <strong>75 of 584</strong> browser OK results (12.8%) were challenge or 4xx pages.
+  </p>
+  <p>
+    The runner now ships the document's status from all three url-loading ops (pinned by an AST enumeration of every <code>op_*</code> that calls <code>goto</code>), and <code>browser_routes.blocked_page_reason</code> decides at the formatter: a 401/403/407/429/451/503 document is blocked (labelled "bot challenge" when the title or a <code>__cf_chl</code> url says so, else "access refused"), any other 4xx/5xx is blocked, and a challenge <em>title</em> ("Just a moment", "Attention Required", "Access Denied", "Security Verification", …) counts only with a body under 2,000 chars — so a real article that happens to be titled like a wall is still read. A blocked fetch is reported <code>STATUS: BLOCKED (HTTP 403 — bot challenge)</code> with a HINT (do not cite this page as a source you read; a retry will not pass the challenge; use a secondary source that quotes it and attribute to that), keeps the page's own text visible, and is returned as a <em>declared</em> <code>ToolOutcome.failed</code> (<code>world_changed=False</code>, <code>reason_code=browser_blocked</code>) — the strike ledger, the no-progress window and the corpus label read the outcome, and a plain string would coerce to ok. The corpus sniffer recognises the header; the retry classifier files it FATAL (not retried). Covered by <code>tests/test_browser_blocked_page.py</code> (19); battery §4HH 18/18 (one first-pass survivor — the anchored title test is equivalent to the unanchored one under <code>re.match</code> except for leading whitespace — bought its pin).
+  </p>
+  <p>
+    <strong>§4HN correction (2026-09-16, req <code>a91c3e16</code>):</strong> a declared failure also feeds the strike ledger and outcome-heuristic signal 3, and four paywalled sites in one research turn cost 4 of 6 strikes and a FAILED label over a verifier-confirmed reply. A refused site is the site's decision: <code>tool_failure.is_blocked_page_result</code> (head-only) now exempts BLOCKED results from both ledgers ("Blocked Page — site refused (not a strike)") and from signal 3, while the outcome stays declared-failed for the record and the no-progress window. Pinned in <code>tests/test_blocked_pages_are_not_strikes.py</code>; battery 6/6.
+  </p>
+
+  <h2 id="4hv">A challenge served as HTTP 200 <span class="tag">2026-09-16 &sect;4HV</span></h2>
+  <p>
+    Req <code>d121dcc6</code> (a pricing comparison, one of the different-request verifications): Hetzner's "Heray" gate answered
+    <strong>HTTP 200</strong>, TITLE <em>Security Check</em>, 211 chars of "Checking that you are not a robot &hellip; Verifying&hellip;", with
+    the URL rewritten to <code>/_ray/pow</code>. &sect;4HH keyed on 4xx statuses and a title list that lacked this wording, so the page
+    read as a normal fetch five times in one turn; the model re-navigated, the no-progress breaker fired and forced the conclusion.
+    The title pattern now includes <em>security check</em> (word-bounded &mdash; a "Security Checklist" article never matches),
+    <em>checking that you are not a robot</em>, <em>robot check</em>, <em>human verification</em>, <em>captcha</em>; the URL pattern
+    includes <code>/_ray/pow</code>. Corpus (September, 321 browser results): the new patterns hit exactly the five Hetzner results.
+    Pinned in <code>tests/test_browser_blocked_page.py</code>.
+  </p>
 </main>
 </body>
 </html>

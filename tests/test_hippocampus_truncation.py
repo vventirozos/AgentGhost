@@ -230,7 +230,7 @@ def test_planner_feeds_tree_update_from_the_VERIFIED_tree_only():
     catch it. Pins the DECISION, not a spelling: on the truncated path the
     tree must come from the verified value."""
     src = inspect.getsource(_ag.GhostAgent.handle_chat) + inspect.getsource(_ag.GhostAgent._run_internal_turn)
-    assert "salvage_truncated_plan(plan_content)" in src
+    assert "salvage_truncated_plan(plan_content, _finish)" in src  # §4HC: finish_reason rides along
     assert re.search(r'tree_update\s*=\s*_whole_tree\s+or\s+\{\}', src), (
         "the truncated path must assign tree_update from the VERIFIED tree")
     body = src[src.find("_plan_truncated"):]

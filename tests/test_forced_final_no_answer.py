@@ -438,3 +438,16 @@ async def test_no_retry_on_the_last_budget_turn_the_fallback_ships_directly(monk
     assert ctx.llm_client.chat_completion.await_count == 2
     assert out.startswith(rsc.FALLBACK_HEADS["no_answer"]), out[:200]
     assert "Let me close task 1." not in out
+
+
+# ── §4HW — the stream-scrub last-resort sentence is a non-answer too ─────
+def test_the_text_only_scrub_sentence_is_refuted_as_a_no_answer():
+    from ghost_agent.core.reply_shape_check import FALLBACK_HEADS, refute_no_answer_fallback
+    from ghost_agent.core.agent import _scrub_fallback_message
+    reply = _scrub_fallback_message("vision_analysis", False)
+    assert reply.startswith(FALLBACK_HEADS["text_only"])
+    assert refute_no_answer_fallback(reply)
+    assert refute_no_answer_fallback("  " + reply)
+    assert not refute_no_answer_fallback("The cheapest plan is CX22 at €3.79/mo.")
+    # the task-closed sentence is NOT a non-answer
+    assert not refute_no_answer_fallback(_scrub_fallback_message("manage_projects", True))

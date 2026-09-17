@@ -111,6 +111,21 @@ def strip_advisory_sections(error_text: str) -> str:
     return _ADVISORY_BLOCK_RE.sub("\n", error_text)
 
 
+#: §4HN (2026-09-16): a fetch the SITE refused (a 4xx document or a bot
+#: challenge, reported `STATUS: BLOCKED` by the browser tool — §4HH). A
+#: declared failure for the corpus and the no-progress window, but not a
+#: strike and not "the same error repeated": four paywalls in one research
+#: turn are four sites' decisions, not the agent ignoring feedback. Live
+#: (req a91c3e16) they cost 4 of 6 strikes and a FAILED label over a
+#: verifier-confirmed reply.
+_BLOCKED_HEAD_RE = re.compile(r"STATUS:\s*BLOCKED\b")
+
+
+def is_blocked_page_result(text) -> bool:
+    """True when a tool result's head says the site refused the fetch."""
+    return bool(_BLOCKED_HEAD_RE.search(str(text or "")[:240]))
+
+
 def classify_tool_failure(error_text: str) -> Tuple[FailureClass, str]:
     """Classify a tool error string into a failure category.
 

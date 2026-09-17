@@ -6,8 +6,9 @@ import re
 import urllib.parse
 import json
 import shlex
+import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional, Tuple
 import httpx
 from .outcome import ToolOutcome, append_note
 try:
@@ -1399,6 +1400,24 @@ def _outer_root_files_hint(sandbox_dir: Path, limit: int = 8) -> str:
     )
 
 
+def _sandbox_where(sandbox_dir) -> str:
+    """Name the directory a missing-file message is about, as the model
+    addresses it: the project workspace when ``sandbox_dir`` is scoped
+    (``<root>/projects/<id>``), else the sandbox root.
+
+    §4HD (2026-09-15, req 9b6b8757): the message said "the current
+    project's sandbox" for EVERY directory. After the operator cleared the
+    root sandbox, an unscoped read came back "does not exist in the
+    current project's sandbox … a DIFFERENT project/session", and the
+    model — which had no project open — spent a turn reconciling a
+    project it was not in. Same detection as `project_download_prefix`,
+    `_outer_root_files_hint` and the path heal, so all of them agree."""
+    pfx = project_download_prefix(sandbox_dir)
+    if pfx:
+        return f"the project workspace '{pfx}'"
+    return "the sandbox root (/workspace, no project workspace is active)"
+
+
 def _missing_file_message(filename, sandbox_dir) -> str:
     """Loop-breaking 'not found' message for a missing read target.
 
@@ -1427,10 +1446,13 @@ def _missing_file_message(filename, sandbox_dir) -> str:
                 break
     except Exception:
         pass
+    where = _sandbox_where(sandbox_dir)
     if existing:
         listing = "Files that DO exist here: " + ", ".join(existing[:20]) + "."
     else:
-        listing = ("This project's sandbox is currently EMPTY (no files yet)."
+        # Reads directly after "does not exist in <where>." — the place is
+        # already named, so this line must not name it a second time.
+        listing = ("It is currently EMPTY (no files)."
                    + _outer_root_files_hint(sandbox_dir))
     # Title-as-directory catch (2026-08-01): two consecutive live requests
     # read "Mini AI/…" / "Mini AI v2/…" — the model prefixes the PROJECT
@@ -1457,12 +1479,13 @@ def _missing_file_message(filename, sandbox_dir) -> str:
                 f"path). Use the relative path '{_match}'."
             )
     return (
-        f"Error: '{filename}' does not exist in the current project's sandbox."
+        f"Error: '{filename}' does not exist in {where}."
         f"{prefix_hint} "
         f"{listing} The live sandbox is AUTHORITATIVE — if a workspace narrative, "
         f"memory, prior session, or DYNAMIC SYSTEM STATE hint referenced "
-        f"'{filename}', that was a DIFFERENT project/session and does NOT apply "
-        f"here. Do NOT read this path again (it will keep failing). To proceed: "
+        f"'{filename}', it was written in a DIFFERENT project or session (or has "
+        f"since been removed) and does NOT exist here now. Do NOT read this path "
+        f"again (it will keep failing). To proceed: "
         f"CREATE it with file_system(operation='write', filename='{filename}', "
         f"content=…), or pick a file from the list above."
     )
@@ -2007,6 +2030,79 @@ async def tool_read_file(filename: str, sandbox_dir: Path, max_context: int = 81
     except ValueError as ve: return str(ve)
     except Exception as e: return f"Error: {e}"
 
+# §4HB — the payload of a rejected `replace` is HELD so the corrective
+# `write` does not regenerate it. Live (req 6a7882f5): operation='replace'
+# arrived with the whole 13.7 k-char report as `content` and no
+# `replace_with`; rejected (correctly — 8 of 13 such payloads in the corpus
+# were FRAGMENTS, so promoting them would overwrite whole files), then the
+# model produced the same 13.6 k chars again as a write. 124 s, one fifth of
+# the turn, spent on a payload the tool had already received. The hold is
+# keyed by the resolved path, single-slot per path, and expires; the model
+# redeems it by name, so nothing is written the model did not ask to write.
+_HELD_CONTENT_TOKEN = "<<HELD>>"
+_HELD_CONTENT_TTL_S = 600.0
+_HELD_CONTENT_MAX = 8
+_HELD_REPLACE_CONTENT: Dict[str, Tuple[float, str]] = {}
+
+
+def _hold_rejected_content(sandbox_dir: Path, filename: str, payload: str) -> str:
+    """Remember `payload` for `filename`; returns the hold key or ""."""
+    try:
+        key = str(_get_safe_path(sandbox_dir, filename))
+    except Exception:  # noqa: BLE001 — a hold must never mask the rejection
+        return ""
+    if not payload:
+        return ""
+    now = time.monotonic()
+    # Sweep expired and bound the map: a runaway loop of rejections must
+    # not keep an unbounded number of 10-minute payloads alive.
+    for k, (t, _) in list(_HELD_REPLACE_CONTENT.items()):
+        if now - t >= _HELD_CONTENT_TTL_S:
+            _HELD_REPLACE_CONTENT.pop(k, None)
+    _HELD_REPLACE_CONTENT.pop(key, None)
+    _HELD_REPLACE_CONTENT[key] = (now, str(payload))
+    while len(_HELD_REPLACE_CONTENT) > _HELD_CONTENT_MAX:
+        oldest = next(iter(_HELD_REPLACE_CONTENT))
+        if oldest == key:
+            break
+        _HELD_REPLACE_CONTENT.pop(oldest, None)
+    return key
+
+
+def held_content_chars(sandbox_dir, filename: str) -> int:
+    """Size of the un-redeemed hold for ``filename``, 0 if none or expired.
+    A PEEK — nothing is consumed. §4HE (2026-09-15, req 5fa6aa97): after a
+    rejected `replace` the model re-READ the file instead of redeeming,
+    the no-progress breaker steered it to "the mutating action" in the
+    abstract, and it delivered without ever writing. The breaker can now
+    name the exact write that is pending."""
+    try:
+        key = str(_get_safe_path(sandbox_dir, filename))
+    except Exception:  # noqa: BLE001
+        return 0
+    rec = _HELD_REPLACE_CONTENT.get(key)
+    if rec is None or time.monotonic() - rec[0] >= _HELD_CONTENT_TTL_S:
+        return 0
+    return len(rec[1])
+
+
+def _redeem_held_content(sandbox_dir: Path, filename: str) -> Optional[str]:
+    """The held payload for `filename`, consumed on read; None if absent
+    or expired. A hold is redeemed ONCE — a second `<<HELD>>` write for the
+    same path gets a rejection, never a stale replay."""
+    try:
+        key = str(_get_safe_path(sandbox_dir, filename))
+    except Exception:  # noqa: BLE001
+        return None
+    rec = _HELD_REPLACE_CONTENT.pop(key, None)
+    if rec is None:
+        return None
+    t, content = rec
+    if time.monotonic() - t >= _HELD_CONTENT_TTL_S:
+        return None
+    return content
+
+
 async def tool_replace_text(filename: str, old_text: str, new_text: str,
                             sandbox_dir: Path, *, post_edit: bool = False):
     """Targeted edit. ``post_edit`` is the `fs_batch` treatment flag — see
@@ -2168,7 +2264,16 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
                     reason_code="auto_promote_write_failed") if _wrote else \
                     ToolOutcome.rejected(
                         _msg, reason_code="auto_promote_failed_before_write")
-        return ToolOutcome.rejected("SYSTEM INSTRUCTION: You used operation='replace' but forgot to specify 'replace_with'. If you want to rewrite the entire file, use operation='write'. Otherwise, provide 'replace_with'.", reason_code="missing_replace_with")
+        # §4HB: hold the payload so the corrective write can redeem it by
+        # name instead of regenerating it.
+        _held_key = _hold_rejected_content(sandbox_dir, filename, str(old_text))
+        _held_note = (
+            f" Your {len(str(old_text))}-char 'content' is HELD for this path "
+            f"for 10 minutes: to write it as the WHOLE file, call "
+            f"file_system(operation='write', path='{filename}', "
+            f"content='{_HELD_CONTENT_TOKEN}') — do NOT resend the text."
+            if _held_key else "")
+        return ToolOutcome.rejected("SYSTEM INSTRUCTION: You used operation='replace' but forgot to specify 'replace_with'. If you want to rewrite the entire file, use operation='write'. Otherwise, provide 'replace_with'." + _held_note, reason_code="missing_replace_with")
         
     ext = str(filename).split('.')[-1].lower()
     if ext in ["py", "html", "css", "js", "ts", "json", "sh", "yaml", "yml", "csv", "xml"]:
@@ -4678,6 +4783,20 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
             target_path, _batch_start, _batch_end = resolve_batch_entry(
                 _entries[0], sandbox_dir)
 
+    # §4HB: redeem a payload held by a rejected `replace` on this path.
+    if (operation == "write" and target_path
+            and str(final_content or "").strip() == _HELD_CONTENT_TOKEN):
+        _held = _redeem_held_content(sandbox_dir, target_path)
+        if _held is None:
+            return ToolOutcome.rejected(
+                f"SYSTEM INSTRUCTION: no held content for '{target_path}' — "
+                f"a hold lasts 10 minutes and is redeemed once. Send the full "
+                f"'content' explicitly.", reason_code="no_held_content")
+        pretty_log("File Write", f"{target_path}: redeeming held content "
+                   f"({len(_held)} chars) from the rejected replace",
+                   icon=Icons.TOOL_FILE_W)
+        final_content = _held
+
     # If the LLM put the content in 'path' but didn't provide 'content' (common for write)
     if operation == "write" and target_path and not final_content:
         # Check if the LLM accidentally sent the content as the only other parameter
@@ -4699,6 +4818,15 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
         return await tool_file_search(search_target, sandbox_dir, target_path, sandbox_manager)
     if operation == "find":
         search_target = pattern or final_content
+        # §4HC: `find path="*.md"` with no pattern — every one of the 7
+        # corpus rejections had the glob in `path`. A literal directory is
+        # never spelled with `*` or `?`, so the intent is unambiguous: the
+        # glob is the pattern, the directory is the root.
+        _tp = str(target_path or "")
+        if not search_target and _tp and any(ch in _tp for ch in "*?"):
+            search_target, target_path = _tp, "."
+            pretty_log("File Find", f"read the glob {_tp!r} from 'path' as the pattern",
+                       icon=Icons.TOOL_FILE_R)
         if not search_target:
             return ToolOutcome.rejected("SYSTEM INSTRUCTION: The 'pattern' parameter is MANDATORY for find operations (e.g. '*.py').", reason_code="missing_pattern")
         return await tool_find_files(search_target, sandbox_manager, target_path or ".", sandbox_dir=sandbox_dir)

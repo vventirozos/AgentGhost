@@ -41,8 +41,8 @@ async def test_slow_valid_engine_beats_fast_junk_and_errors():
     back the slow engine's results — junk/empty/error must never win."""
     def by_engine(q, **kw):
         engine = kw["backend"]
-        if engine == "mojeek":
-            time.sleep(0.3)  # the measured shape: mojeek slow but real
+        if engine == "yandex":
+            time.sleep(0.3)  # slow but real (§4HR: mojeek retired; the shape is the pin)
             return [{"title": "Real", "body": "b", "href": "http://real-site.com/x"}]
         if engine == "brave":
             return [{"title": "Junk", "body": "b", "href": "http://facebook.com/y"}]
@@ -89,6 +89,7 @@ async def test_wave_deadline_bounds_a_wedged_engine():
     mod, _ = _mock_ddgs_module(hang)
     with patch.dict("sys.modules", {"ddgs": mod}), \
          patch("src.ghost_agent.tools.search._DDGS_TOR_TIMEOUT", 0.2), \
+         patch("src.ghost_agent.tools.search._DDGS_FAST_ENGINE_TIMEOUT", 0.2), \
          patch("src.ghost_agent.tools.search._RACE_WAVE_GRACE", 0.2):
         t0 = time.monotonic()
         results = await _race_search_wave("wedged query", None, 0)
@@ -122,9 +123,9 @@ async def test_failure_log_is_one_terse_categorized_line():
                   if c.kwargs.get("level") == "WARNING"]
     assert len(warn_lines) == 1
     line = warn_lines[0]
-    # Terse: the 5 boring empties are a count, yahoo's transport failure a
+    # Terse: the boring empties are a count, yahoo's transport failure a
     # category — and the whole line stays short.
-    assert "5 empty" in line
+    assert f"{len(_RACE_ENGINES) - 1} empty" in line
     assert "yahoo conn-error" in line
     assert "‹some concurrent query›" in line
     assert "https://" not in line

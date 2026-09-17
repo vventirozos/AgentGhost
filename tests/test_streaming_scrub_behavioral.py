@@ -86,8 +86,12 @@ async def test_empty_scrub_output_produces_fallback(monkeypatch):
 
     async def mock_chat_completion(payload, *a, **kw):
         call_log["chat_completion"] += 1
-        # Only the planner's call goes through chat_completion (it's
-        # non-streaming). Return planner JSON that forces
+        # §4HW: the forced-final retry ALSO goes through chat_completion
+        # (non-streamed); answer it like the model would.
+        if kw.get("task_label") == "forced-final-retry":
+            return {"choices": [{"message": {
+                "content": "Here is your recent activity: nothing notable happened."}}]}
+        # The planner's call. Return planner JSON that forces
         # force_final_response=True on the next turn.
         return {"choices": [{"message": {
             "content": '{"thought":"nothing to do","next_action_id":"none","required_tool":"all"}'
@@ -153,21 +157,26 @@ async def test_empty_scrub_output_produces_fallback(monkeypatch):
     # bytes were yielded. Observed trace: the pretty_log "Scrub consumed
     # entire response" fired but the user's CLI rendered empty — that
     # was [DONE] arriving at index 0 and the fallback at index 1.
+    # §4HW (2026-09-16, req 503e94c5): the whole-reply scrub is the
+    # no-answer case — the forced-final retry answers, and the canned
+    # "prepared a tool call … please rephrase" sentence no longer ships
+    # when the retry produced an answer.
     done_idx = None
-    fallback_idx = None
+    answer_idx = None
     for i, ch in enumerate(raw_chunks_in_order):
         s = ch.decode("utf-8", errors="replace")
         if s.strip() == "data: [DONE]" and done_idx is None:
             done_idx = i
-        if "prepared a tool call" in s and fallback_idx is None:
-            fallback_idx = i
+        if "nothing notable happened" in s and answer_idx is None:
+            answer_idx = i
     assert done_idx is not None, "stream never emitted [DONE]"
-    assert fallback_idx is not None, "stream never emitted the fallback text"
-    assert fallback_idx < done_idx, (
-        f"[DONE] at index {done_idx} arrived BEFORE fallback at index "
-        f"{fallback_idx}. SSE clients close on [DONE] and never see "
+    assert answer_idx is not None, "stream never emitted the retry's answer"
+    assert answer_idx < done_idx, (
+        f"[DONE] at index {done_idx} arrived BEFORE the answer at index "
+        f"{answer_idx}. SSE clients close on [DONE] and never see "
         f"chunks that come after it."
     )
+    assert "prepared a tool call" not in joined
 
 
 def test_source_fallback_is_single_branch_after_direct_summary():
@@ -200,6 +209,9 @@ def test_source_fallback_is_single_branch_after_direct_summary():
     # And the `_tools_already_run` helper was retired alongside it.
     assert "_tools_already_run" not in code
 
-    # The single remaining branch must still say "wasn't executed"
-    # — that's the planner-routed-as-text-only message.
-    assert "wasn't executed" in code
+    # The single remaining branch still says "wasn't executed" — the
+    # sentence now has ONE home (§4HW): reply_shape_check.FALLBACK_HEADS,
+    # which agent.py reads, so the shape check follows any rewording.
+    from ghost_agent.core.reply_shape_check import FALLBACK_HEADS
+    assert "wasn't executed" in FALLBACK_HEADS["text_only"]
+    assert '_heads["text_only"]' in code

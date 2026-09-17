@@ -41,8 +41,12 @@ def test_broken_engines_excluded_and_race_set_wide():
     assert "grokipedia" not in _RACE_ENGINES
     # The wide race set — each of these was observed winning over Tor on
     # at least some circuit.
-    for engine in ("mojeek", "duckduckgo", "yandex", "brave", "google", "yahoo"):
+    for engine in ("duckduckgo", "yandex", "brave", "yahoo"):
         assert engine in _RACE_ENGINES
+    # §4HR (2026-09-16): 0 wins in 509 waves over seven days, and mojeek's
+    # 18 s budget sized every failed wave — retired, see search.py.
+    assert "mojeek" not in _RACE_ENGINES
+    assert "google" not in _RACE_ENGINES
     # Legacy comma-joined constant stays derived from the race set.
     assert _TOR_BACKENDS == ",".join(_RACE_ENGINES)
 

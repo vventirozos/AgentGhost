@@ -43,6 +43,8 @@ from urllib.parse import urlparse as _urlparse
 from ..utils.logging import Icons, pretty_log
 from .file_system import _get_safe_path, _to_container_path
 from .outcome import ToolOutcome
+from .browser_routes import (  # §4HB / §4HH
+    _deterministic_error_route, blocked_page_reason, BLOCKED_PAGE_HINT)
 
 logger = logging.getLogger("GhostAgent")
 
@@ -1315,11 +1317,17 @@ async def tool_browser(
             # through anyway was dead code that no mutant could falsify.
             return _err(f"Runner failed (exit {exit_code}): {parsed}", ran=True,
                         hint=_onion_note)
+        # §4HB: name the next action for errors an IDENTICAL retry cannot
+        # fix, ahead of the generic advice. Live (req 6a7882f5) both of
+        # these were re-issued unchanged on the very next turn and failed
+        # the same way; the generic hint below never mentions either.
+        _specific_route = _deterministic_error_route(str(parsed))
         return _err(
             f"Runner failed (exit {exit_code}): {parsed}",
             ran=True,
             hint=(
                 ((_fail_nav_note + " ") if _fail_nav_note else "") +
+                ((_specific_route + " ") if _specific_route else "") +
                 "If this is a navigation timeout, try wait_until='domcontentloaded' "
                 "or raise timeout_ms. If a CLICK timed out or its selector was "
                 "not found: each atomic op reloads the page in a fresh context, "
@@ -1361,8 +1369,26 @@ async def tool_browser(
     # Pretty-print the success result for the LLM. Keep each op's
     # return shape deterministic so downstream prompts can rely on it.
     header = f"--- BROWSER RESULT ---\nSTATUS: OK\nOP: {operation}"
+    # §4HH: a document that answered 4xx/5xx, or a bot-challenge interstitial
+    # with no article behind it, is a fetch that DID NOT read the page. It
+    # was labelled OK (12.8% of corpus fetches) and the model cited the
+    # sources it never read. The header says BLOCKED, the hint says what to
+    # do; the page's own text stays below so the model can see what it got.
+    _blocked = blocked_page_reason(parsed) if operation in ("navigate", "extract_text", "screenshot") else ""
+    if _blocked:
+        header = (f"--- BROWSER RESULT ---\nSTATUS: BLOCKED ({_blocked})\nOP: {operation}"
+                  f"\nHINT: {BLOCKED_PAGE_HINT}")
     if _nav_suggestion:
         header += f"\nNOTE: {_nav_suggestion}"
+
+    def _declared(text: str):
+        """A blocked fetch is a DECLARED failure: the loop's strike ledger,
+        the no-progress window and the corpus label all read the outcome,
+        not the header, and a plain string would coerce to ok (§4HH)."""
+        if _blocked:
+            return ToolOutcome.failed(text, world_changed=False,
+                                      reason_code="browser_blocked")
+        return text
     js_diag = _format_js_diagnostics(parsed)
 
     def _text_block(p: dict) -> str:
@@ -1379,7 +1405,7 @@ async def tool_browser(
                 f"\n--- PAGE TEXT (capped preview) ---\n{text}")
 
     if operation == "navigate":
-        return (
+        return _declared(
             f"{header}\nURL: {parsed.get('url')}\n"
             f"HTTP_STATUS: {parsed.get('status')}\n"
             f"TITLE: {parsed.get('title')}{js_diag}{_pre_interaction_line(parsed)}"
@@ -1388,8 +1414,9 @@ async def tool_browser(
     if operation == "extract_text":
         body = parsed.get("text", "")
         trunc = " (truncated)" if parsed.get("truncated") else ""
-        return (
-            f"{header}\nURL: {parsed.get('url')}\n"
+        _http = f"\nHTTP_STATUS: {parsed.get('status')}" if parsed.get("status") is not None else ""
+        return _declared(
+            f"{header}\nURL: {parsed.get('url')}{_http}\n"
             f"TITLE: {parsed.get('title')}\n"
             f"LENGTH: {parsed.get('length')}{trunc}{js_diag}\n"
             f"--- TEXT ---\n{body}"
@@ -1438,7 +1465,7 @@ async def tool_browser(
                     "operation='interact' actions list. For a canvas/game/chart "
                     "page zero text is normal — read the image instead."
                 )
-        return (
+        return _declared(
             f"{header}\nURL: {parsed.get('url')}\n"
             f"SAVED: {host_rel}\n"
             f"DOWNLOAD: /api/download/{host_rel}{js_diag}{render_line}{dom_line}"
