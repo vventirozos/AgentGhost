@@ -44605,3 +44605,46 @@ Ledger `--days 1`: 29 rows, binder failed 0, 1 override (2ef4f0a2, the morning's
 1 cap (probe-06e93631), escalation overturned 2 / upheld 3 / truncation_guard 6 — unchanged in
 kind. Open after §4IY: (c) weekly ledger read; (d) year support from raw sources; (e) the packer's
 echo slot; B12; F5; the documented-not-fixed list above.
+**Battery 70 (operator: "run a mutation battery on the post-suite fixes"; 2026-09-20 00:05):** 25
+mutants W1–W25 over the seven repairs, deleted AND inverted — the procedural scrub (any-close-tag,
+blank-line end, unclosed dropped, tag always function, empty span text, next search from the
+opener, close search from 0, case-sensitive close), the opener dialects in both scrubs (bare
+`<tool>` off / any `<tool …>` on / `<function …>` needs `=` / any `<function …>`), the readiness
+tail (end-anchored again / any tail / and-tail with a location), the synthesis verbs, the
+empty-search head (no `ERROR:` / anchored nowhere), the format lookahead (no start-with / every
+"Constraint violation:"). T1 widened with the 13 suites the fixes live in. First run: 19 KILLED,
+**6 SURVIVED** — all pin gaps, none equivalent: W2 the unclosed-to-end rule was pinned only with a
+payload that had no blank line; W6 overlapping spans were invisible to both consumers (one takes a
+bool, the other skips overlaps) → pinned as the non-overlap invariant of `_call_markup_spans`; W8
+an upper-case CLOSE tag swallowed the trailing prose and the pin never looked at the prose; W11/W13
+the `<function …></function>` shape was pinned on the agent's stream path only, never on
+`strip_unparsed_tool_calls`, and never across lines; W20 "…is complete and saved to the Downloads
+folder" had no pin. Six pins added (`test_reply_toolcall_scrub.py`,
+`test_smoother_empty_handoff.py`); rerun: **25/25 KILLED, NOOP SURVIVED.** W7 (close searched from
+0) died by the 90 s timeout — a close tag before the opener sends `pos` backwards; the shipped
+code searches from `m.end()`, so `pos` strictly advances. Test-only edits this step; no source
+changed, no restart.
+
+## §4IZ — The hedge footer cut mid-word (2026-09-20, 00:20–00:50)
+
+Operator: "what's next?" → the recommendation was to leave the verifier alone until the live read
+and fix one isolated, user-visible item: the §4IY memory probe's footer ended `…but that's
+synthetic training, not  (confidence: 40%)`. `UncertaintyTracker.scan_text_for_uncertainty`
+appended `s[:200]` — a hard cut, mid-word, unmarked — and `get_risk_summary` rendered it as an
+assumption. **Fix:** `_hedge_excerpt(sentence, hedge_end)` — a leading connective ("However, ",
+"But ") is dropped and the hedge end re-based; a sentence within the cap is untouched; otherwise
+the cut is the LAST clause boundary (` — `, `; `, `, but/so/although…`) that lies after the hedge
+and within the cap, else the last word boundary after the hedge (never inside the hedge, never
+inside a glued token), a dangling connective/article is stripped and "…" marks the cut. Live
+sentence now renders "I don't have access to current session data without calling a tool — the
+scrapbook shows self-play activity with an access.log challenge running right now…". **Pins:**
+`test_uncertainty_persistence.py::test_scan_text_cuts_a_long_hedge_at_a_clause_boundary_and_marks_it`
+(live sentence, short hedge untouched, word cut with no dangling "and", boundary-before-the-hedge
+ignored, glued token, last-fitting boundary, lead re-base, beyond-cap boundary). **Battery 71:** 11
+mutants H1–H11 (blunt cut back, no lead strip, clause search from 0, first boundary, boundary
+beyond the cap, word cut into the hedge, no ellipsis, dangling connective, cap 100, lead strip
+without re-base, short hedge cut too) — H5 survived first run (the pin's boundaries all fit the
+cap) → pinned with a boundary beyond it; **11/11 KILLED, NOOP SURVIVED.** One pin defect of my
+own on the way: "I assume A —" lost its "A" to the article strip — the pin, not the rule, was
+wrong. Docs: `uncertainty.html`. Out of scope, still documented (M15): the footer quotes back a
+sentence the reply already contains.

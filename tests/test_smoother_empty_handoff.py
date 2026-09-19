@@ -170,6 +170,12 @@ def test_the_declaration_with_content_is_kept():
     withc = "The report is complete: 8 pages, 21 sources, `pec.interno.it` validated."
     out = smooth_reply("\n\n".join([_Q_OBS, withc, _Q_OPENER, _Q_BODY]))
     assert withc in out
+    # §4IY / battery 70 W20: a conjoined tail that says WHERE is content too
+    where = "The report is complete and saved to the Downloads folder."
+    out = smooth_reply("\n\n".join([_Q_OBS, where, _Q_OPENER, _Q_BODY]))
+    assert where in out
+    where2 = "The report is complete and lives in the sandbox now."
+    assert where2 in smooth_reply("\n\n".join([_Q_OBS, where2, _Q_OPENER, _Q_BODY]))
 
 
 def test_the_declaration_not_followed_by_a_delivery_is_kept():

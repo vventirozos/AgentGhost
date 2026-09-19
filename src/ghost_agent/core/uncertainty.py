@@ -61,6 +61,35 @@ class Assumption:
 # Conservative first-person hedge markers. Used to auto-populate the
 # tracker from the agent's own output, so uncertainty is load-bearing
 # even when the LLM never calls the flag_uncertainty tool explicitly.
+_HEDGE_MAX_CHARS = 200
+_HEDGE_CLAUSE_RE = re.compile(r"\s+[—–]\s+|;\s+|,\s+(?:but|so|although|though|while|whereas)\b", re.IGNORECASE)
+_HEDGE_TAIL_WORD_RE = re.compile(r"\s+(?:and|or|but|so|the|a|an|of|to|in|on|with|that|which|is|are|was|were)$", re.IGNORECASE)
+_HEDGE_LEAD_RE = re.compile(r"^(?:however|but|so|also|still|yet|that said|of course|note that)\s*[,:]?\s+", re.IGNORECASE)
+
+
+def _hedge_excerpt(sentence: str, hedge_end: int, cap: int = _HEDGE_MAX_CHARS) -> str:
+    """`sentence` fitted to `cap` chars without cutting a word: the shortest
+    prefix that still contains the hedge (ends at `hedge_end`) and stops at
+    a clause boundary, else the longest word-bounded prefix; an ellipsis
+    marks any cut. A leading connective is dropped first."""
+    lead = _HEDGE_LEAD_RE.match(sentence)
+    if lead:
+        sentence, hedge_end = sentence[lead.end():], max(0, hedge_end - lead.end())
+    if len(sentence) <= cap:
+        return sentence
+    cut = None
+    for b in _HEDGE_CLAUSE_RE.finditer(sentence, hedge_end):
+        if b.start() > cap:
+            break
+        cut = b.start()                          # the LAST clause boundary that fits
+    if cut is None:
+        sp = sentence.rfind(" ", hedge_end, cap)
+        cut = sp if sp > 0 else cap
+    head = sentence[:cut].rstrip(" ,;—–")
+    head = _HEDGE_TAIL_WORD_RE.sub("", head)           # "…valid and…" → "…valid…"
+    return head + "…"
+
+
 _HEDGE_RE = re.compile(
     r"\b(i(?:'m| am) (?:assuming|not sure|not certain|unsure|uncertain)|i assume\b|"
     r"assuming that|i (?:can(?:no|')?t|could not|couldn'?t) (?:verify|confirm)|"
@@ -340,15 +369,23 @@ class UncertaintyTracker:
     def scan_text_for_uncertainty(text: str, *, limit: int = 3) -> List[str]:
         """Best-effort extraction of explicit first-person hedge sentences
         from agent output. Lets the turn loop auto-populate the tracker
-        without depending on the LLM remembering to flag uncertainty."""
+        without depending on the LLM remembering to flag uncertainty.
+
+        A hedge longer than the cap is cut at a clause boundary after the
+        hedge itself (an em dash, a semicolon, a ", but"), else at a word
+        boundary, and the cut is marked — the old ``s[:200]`` shipped
+        "…that's synthetic training, not  (confidence: 40%)" in the footer
+        (probe 2026-09-19). A leading connective ("However, ", "But ") is
+        dropped: the sentence is quoted out of its paragraph."""
         if not text:
             return []
         sentences = re.split(r"(?<=[.!?])\s+", text)
         hits: List[str] = []
         for s in sentences:
             s = s.strip()
-            if s and _HEDGE_RE.search(s):
-                hits.append(s[:200])
+            m = _HEDGE_RE.search(s) if s else None
+            if m:
+                hits.append(_hedge_excerpt(s, m.end()))
             if len(hits) >= limit:
                 break
         return hits

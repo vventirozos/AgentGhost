@@ -223,3 +223,43 @@ async def test_flag_uncertainty_tool_guards():
         action="unknown", uncertainty_tracker=t)  # missing text
     assert "unavailable" in await tool_flag_uncertainty(
         action="unknown", text="x", uncertainty_tracker=None)
+
+
+def test_scan_text_cuts_a_long_hedge_at_a_clause_boundary_and_marks_it():
+    """Probe 2026-09-19: the footer shipped "…that's synthetic training,
+    not  (confidence: 40%)" — `s[:200]` cut mid-word and said nothing."""
+    from ghost_agent.core.uncertainty import _hedge_excerpt, _HEDGE_MAX_CHARS
+    live = ("However, I don't have access to current session data without calling a tool — the scrapbook "
+            "shows self-play activity with an access.log challenge running right now, but that's synthetic "
+            "training, not a user project.")
+    [hit] = UncertaintyTracker.scan_text_for_uncertainty(live)
+    assert hit == ("I don't have access to current session data without calling a tool — the scrapbook shows "
+                   "self-play activity with an access.log challenge running right now…")
+    assert len(hit) <= _HEDGE_MAX_CHARS + 1 and not hit.startswith("However")
+    # a short hedge is untouched (no ellipsis, connective kept out of it only when leading)
+    assert UncertaintyTracker.scan_text_for_uncertainty("I could not verify the upstream schema, but the rest checks out.") == [
+        "I could not verify the upstream schema, but the rest checks out."]
+    # no clause boundary after the hedge: the last WORD boundary, never mid-word, and no dangling connective
+    long_words = "I'm assuming the input file is UTF-8 encoded " + "and every byte of it is valid " * 8 + "which matters."
+    [hit] = UncertaintyTracker.scan_text_for_uncertainty(long_words)
+    assert hit.endswith("valid…") and " and…" not in hit and len(hit) <= _HEDGE_MAX_CHARS + 1
+    # the clause boundary must come AFTER the hedge: a boundary before it never cuts the hedge away
+    early = "The file is large; " + "I'm not sure the parser handles " + "nested arrays " * 20 + "well."
+    [hit] = UncertaintyTracker.scan_text_for_uncertainty(early)
+    assert hit.startswith("The file is large; I'm not sure the parser handles") and hit.endswith("…")
+    # one 300-char token after the hedge: cut right after the hedge, not inside the token
+    assert UncertaintyTracker.scan_text_for_uncertainty("It's unclear " + "x" * 300) == ["It's unclear…"]
+    # the helper alone: the LAST fitting clause boundary wins, the cap is honoured, the lead is dropped
+    s = "But I assume A — B — C — " + "D" * 300
+    out = _hedge_excerpt(s, len("But I assume"))
+    assert out == "I assume A — B — C…"
+    assert _hedge_excerpt("I assume " + "w " * 150, 8).count("…") == 1 and len(_hedge_excerpt("I assume " + "w " * 150, 8)) <= _HEDGE_MAX_CHARS + 1
+    # the word cut never reaches back INTO the hedge (a glued token after it)
+    [hit] = UncertaintyTracker.scan_text_for_uncertainty("It's unclear" + "x" * 300)
+    assert hit.startswith("It's unclearxxx") and hit.endswith("…")
+    # the lead strip re-bases the hedge end: a boundary right after the hedge is still found
+    assert _hedge_excerpt("However, I'm not sure; " + "w " * 150, len("However, I'm not sure")) == "I'm not sure…"
+    # a clause boundary BEYOND the cap does not win: the excerpt never exceeds the cap
+    beyond = "I assume alpha — " + "w " * 120 + "— the tail."
+    out = _hedge_excerpt(beyond, len("I assume"))
+    assert out == "I assume alpha…" and len(out) <= _HEDGE_MAX_CHARS + 1

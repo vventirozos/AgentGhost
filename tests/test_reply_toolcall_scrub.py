@@ -114,6 +114,30 @@ def test_case_insensitive_and_attribute_bearing_tags():
     text = "Ok.\n\n<TOOL_CALL name=\"x\">\n<Function=execute>\n</Function>\n</TOOL_CALL>\n\nDone."
     out = strip_unparsed_tool_calls(text)
     assert "TOOL_CALL" not in out and "Function=" not in out
+    assert out.startswith("Ok.") and "Done." in out          # the upper-case CLOSE tag ends the block (battery 70 W8)
+
+
+def test_4iy_post_suite_scrub_guards_alone():
+    """Battery 70 survivors — the procedural scrub, one guard each."""
+    from ghost_agent.core.reply_smoothing import _call_markup_spans
+    # W2: an unclosed call runs to the END — its payload (a file with blank lines) is not prose
+    text = "Writing the file now.\n\n<tool_call>\n<function=file_system>\n<parameter=content>\n<!DOCTYPE html>\n\n<html lang=\"en\">\n<body>hi</body>"
+    out = strip_unparsed_tool_calls(text)
+    assert "<html" not in out and "<body>" not in out and out.startswith("Writing the file now.")
+    # W6: spans never overlap — a nested block is ONE span, searched past its close
+    spans = _call_markup_spans("a <tool_call>\n<function=x>\n</function>\n</tool_call> b <tool_call>\n</tool_call> c")
+    assert [(sp.start(), sp.end()) for sp in spans] == [(2, 51), (54, 78)]
+    assert all(spans[i].end() <= spans[i + 1].start() for i in range(len(spans) - 1))
+    # W11: any `<function …>` that a `</function>` closes is markup on THIS path too (the r2 leak shape)
+    out = strip_unparsed_tool_calls("abc <function or <this> syntax</function> real answer XYZ")
+    assert "<function" not in out and "real answer XYZ" in out and out.startswith("abc")
+    # W13: …across lines (the lookahead needs DOTALL)
+    out = strip_unparsed_tool_calls("Note:\n<function foo>\nbody line\n</function>\nAfter.")
+    assert "<function" not in out and "body line" not in out and "After." in out
+    # the repr and the prose shapes stay prose
+    for prose in ("…a callable, e.g. <function tool_execute at 0x10c3f2b80>.\n\nCalling it works.",
+                  "Run `ghost <tool name> --help` to see the options."):
+        assert strip_unparsed_tool_calls(prose) == prose
 
 
 def test_the_scrub_composes_with_smoothing():
