@@ -599,3 +599,18 @@ async def test_a_name_in_an_unpacked_external_output_is_not_mechanically_convict
     out2 = await Verifier(llm_client=stub2)._escalate_refute(cheap(), claim, digest, "ctx", trace={"req_id": "r2"},
                                                              raw_sources=digest + "\n[file_system] wrote report.md: Dr. Elin Vasquez verified the result")
     assert out2.verdict is VerifyVerdict.REFUTED and stub2.prompts == [] and _ledger()[-1]["outcome"] == "mechanically_upheld"
+
+
+def test_the_supplement_never_splices_the_agents_own_earlier_reply():
+    """§4IV: `knowledge_base` is an external tool to the packer, but an
+    expanded episode's OUTCOME is the agent's own earlier reply — it must
+    not reach the appeal as a "source line"; the tool excerpts in the same
+    record may."""
+    from tests.test_claim_binding import EPISODE_EV
+    issues = ["The life span 1854–1935 for Σπήλιο Οικονομίδη is not in the evidence."]
+    digest = "[web_search] Ιδρύθηκε το 1883 από τους χημικούς Σπήλιος και Λεόντιος Οικονομίδης"
+    supp = O.raw_source_supplement(issues, digest, EPISODE_EV)
+    assert "1935" not in supp and "OUTCOME" not in supp
+    # a real excerpt in the same record still qualifies
+    supp2 = O.raw_source_supplement(["The name Λεόντιος Οικονομίδης is not in the evidence."], "[web_search] Ιδρύθηκε το 1883", EPISODE_EV)
+    assert "Έλληνας χημικός" in supp2 and "OUTCOME" not in supp2

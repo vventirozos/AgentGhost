@@ -1118,9 +1118,14 @@ def verdict_from_bindings(bindings: List[Binding], *, evidence_truncated: bool,
     withholds = [g for g in findings if g.status == "withhold"]
     if withholds:
         ent_note += "; " + "; ".join(f"{g.kind}: {g.detail}" for g in withholds)
+    echo_rows = list(dict.fromkeys([f.text for f in audit if f.status == "echo"]
+                                   + [e.text for e in entities if e.status == "echo"]))   # a year is both a figure and a year row
+    if echo_rows:
+        ent_note += (f"; {len(echo_rows)} fact(s) rest only on the agent's own earlier words (memory is not a source): "
+                     f"{', '.join(repr(t) for t in echo_rows[:3])}")
     if dropped >= 2 and dropped > n_agree:
         ent_note += f"; {dropped} claim quote(s) were not in the reply"      # a binder that invented most rows
-    withheld = bool(unsupported_entities or unsupported_ids or unsupported_years or withholds
+    withheld = bool(unsupported_entities or unsupported_ids or unsupported_years or withholds or echo_rows
                     or (strict_figures and n_unsupported) or (dropped >= 2 and dropped > n_agree))
     if issues:
         conf = min(0.95, 0.8 + 0.05 * len(issues))
@@ -1269,6 +1274,119 @@ def apply_residual(res: ClaimBindingResult, reply: str, evidence: str, raw_model
                                  findings=res.findings)
 
 
+# ── §4IV: the agent's own words are not evidence ─────────────────────────
+# Probe-4c (§4IT close): asked for the ΧΡΩΠΕΙ founders' dates, the agent ran
+# `recall`, expanded episode ep:434 and restated its OWN earlier reply —
+# "(1854–1935)", "(1866–1912)", both fabricated — and both tiers CONFIRMED
+# the restatement against the episode's `OUTCOME (SUCCESS): …` line, which
+# is that earlier reply verbatim. The judge saw the echo (§4HJ) one store
+# further away. What the agent said before is a claim, not a source: a
+# region of the evidence that is the agent's own earlier words can bind
+# nothing and support nothing; a fact that rests only there is an ECHO — a
+# code-validated withhold (it caps a cheap CONFIRMED like §4IR's name
+# withhold and reaches the user's caveat) and never a refute (restating
+# one's own past is not an invention of this turn: the objection tier reads
+# the evidence unmasked). Shapes: an episode record's OUTCOME body and
+# LESSON line (`knowledge_base(action='expand', ref='ep:N')`), a session
+# expand's `assistant:` lines, a memory arc's `AI:` lines under a `USER:`
+# line, and an earlier assistant reply of this conversation as
+# `_prior_turn_evidence` labels it (`[assistant] … [/assistant]`).
+# a record's header may share its line with the packer's block label ("[knowledge_base] EPISODE 434 [fetch]")
+_EPISODE_HEAD_RE = re.compile(r"(?m)^(?:\[[\w .\-]{1,40}\] )*EPISODE \d+ \[")
+_SESSION_HEAD_RE = re.compile(r"(?m)^(?:\[[\w .\-]{1,40}\] )*SESSION \S+ — ")
+_ECHO_OUTCOME_RE = re.compile(
+    r"(?ms)^OUTCOME \((?:SUCCESS|FAILURE)\): .*?"
+    r"(?=\n(?:LESSON:|[ \t]*\d+\. \w+\(|EPISODE \d+ \[|TRIGGER:|CONTEXT:|\[[\w .\-]{1,40}\] )|\Z)")
+_ECHO_LESSON_RE = re.compile(r"(?m)^LESSON: .*$")
+_ECHO_ASSISTANT_LINE_RE = re.compile(r"(?m)^assistant: .*$")
+_ARC_USER_RE = re.compile(r"(?m)^USER: ")
+_ECHO_AI_RE = re.compile(r"(?ms)^AI: .*?(?=\n(?:USER: |SOURCE: |\[[\w .\-]{1,40}\] |\n)|\Z)")
+_ECHO_PRIOR_ASSISTANT_RE = re.compile(r"(?ms)^\[assistant\] .*?^\[/assistant\]$")
+
+
+def _regions(text: str, head_re: "re.Pattern") -> List[Tuple[int, int]]:
+    """[start, end) of each record opened by `head_re`, closed by the next
+    such header, the next packer block label, or the end."""
+    heads = list(head_re.finditer(text))
+    out: List[Tuple[int, int]] = []
+    for i, h in enumerate(heads):
+        nxt = heads[i + 1].start() if i + 1 < len(heads) else len(text)
+        lbl = _BLOCK_LABEL_RE.search(text, h.end(), nxt)
+        out.append((h.start(), lbl.start() if lbl else nxt))
+    return out
+
+
+def self_echo_spans(text: str) -> List[Tuple[int, int]]:
+    """[start, end) of every region of `text` that is the agent's own earlier
+    words (see the section comment). Empty when there is none."""
+    t = str(text or "")
+    if not t:
+        return []
+    spans: List[Tuple[int, int]] = []
+    for a, b in _regions(t, _EPISODE_HEAD_RE):
+        for rx in (_ECHO_OUTCOME_RE, _ECHO_LESSON_RE):
+            spans += [(m.start(), m.end()) for m in rx.finditer(t, a, b)]
+    for a, b in _regions(t, _SESSION_HEAD_RE):
+        spans += [(m.start(), m.end()) for m in _ECHO_ASSISTANT_LINE_RE.finditer(t, a, b)]
+    if _ARC_USER_RE.search(t):
+        spans += [(m.start(), m.end()) for m in _ECHO_AI_RE.finditer(t)]
+    spans += [(m.start(), m.end()) for m in _ECHO_PRIOR_ASSISTANT_RE.finditer(t)]
+    spans.sort()
+    merged: List[Tuple[int, int]] = []
+    for a, b in spans:
+        if merged and a <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+    return merged
+
+
+def mask_self_echo(text: str) -> str:
+    """Length-preserving: every echo region blanked, so a binder quote cannot
+    snap there and no audit finds support there."""
+    t = str(text or "")
+    spans = self_echo_spans(t)
+    if not spans:
+        return t
+    out = []
+    pos = 0
+    for a, b in spans:
+        out.append(t[pos:a]); out.append(" " * (b - a)); pos = b
+    out.append(t[pos:])
+    return "".join(out)
+
+
+def self_echo_text(text: str) -> str:
+    t = str(text or "")
+    return "\n".join(t[a:b] for a, b in self_echo_spans(t))
+
+
+def _regrade_echo(audit: List["AuditFigure"], entities: List["AuditEntity"], reply: str, echo: str) -> None:
+    """Rows the masked evidence left UNSUPPORTED that the echo text alone
+    supports become status "echo" — in place."""
+    if not echo:
+        return
+    fig_ok = {a.text for a in audit_numbers(reply, echo) + audit_years(reply, echo) + audit_identifiers(reply, echo)
+              if a.status == "supported"}
+    ent_ok = {e.text for e in audit_entities(reply, echo) if e.status == "supported"}
+    for a in audit:
+        if a.status == "unsupported" and a.text in fig_ok:
+            a.status = "echo"
+    for e in entities:
+        if e.status == "unsupported" and e.text in ent_ok:
+            e.status = "echo"
+
+
+def echo_facts(res: Optional["ClaimBindingResult"]) -> List[str]:
+    """The facts of a result that rest only on the agent's own earlier words."""
+    if res is None:
+        return []
+    out = [str(a.text) for a in (res.audit or []) if getattr(a, "status", "") == "echo"]
+    out += [str(e.text) for e in (res.entities or []) if getattr(e, "status", "") == "echo"]
+    seen: set = set()
+    return [x for x in out if not (x in seen or seen.add(x))]
+
+
 def run_binding(reply: str, evidence: str, raw_model_output: Any, *, raw_sources: str = "",
                 evidence_truncated: bool = False, context: str = "",
                 strict_figures: bool = False) -> ClaimBindingResult:
@@ -1276,14 +1394,21 @@ def run_binding(reply: str, evidence: str, raw_model_output: Any, *, raw_sources
     is the ask / conversation the reply answers — an entity or figure named
     there is not the reply's invention."""
     rows = parse_binder_output(raw_model_output)
-    bindings, dropped = bind(reply, evidence, rows)
-    audit = (audit_numbers(reply, evidence, context) + audit_identifiers(reply, evidence, context)
-             + audit_years(reply, evidence, context))
-    entities = audit_entities(reply, evidence, context)
+    # §4IV: the agent's own earlier words (an expanded episode's OUTCOME, a
+    # session's `assistant:` lines, an earlier reply) can bind nothing and
+    # support nothing; what rests only there is an ECHO withhold
+    ev_bind = mask_self_echo(evidence)
+    echo = self_echo_text(evidence) if ev_bind != evidence else ""
+    raw_bind = mask_self_echo(raw_sources) if raw_sources else ""
+    bindings, dropped = bind(reply, ev_bind, rows)
+    audit = (audit_numbers(reply, ev_bind, context) + audit_identifiers(reply, ev_bind, context)
+             + audit_years(reply, ev_bind, context))
+    entities = audit_entities(reply, ev_bind, context)
+    _regrade_echo(audit, entities, reply, echo)
     findings = class_checks(reply, evidence, context)
     # §4IU: life spans — a range attached to the wrong person REFUTES (both
     # quotes below); a range the sources never carry WITHHOLDS like a name
-    for ls in audit_life_spans(reply, evidence, context, raw_sources=raw_sources):
+    for ls in audit_life_spans(reply, ev_bind, context, raw_sources=raw_bind):
         if ls.status == "misattributed":
             findings.append(ClassFinding(
                 "attribution", "refute",
@@ -1803,7 +1928,7 @@ def unsupported_names(res: "ClaimBindingResult", prior_evidence: str = "") -> Li
               if getattr(a, "family", "") == "identifier" and getattr(a, "status", "") == "unsupported"
               and not _LOOPBACK_ID_RE.match(str(a.text or ""))]
     if prior_evidence and names:
-        hay = normalize_for_containment(prior_evidence)
+        hay = normalize_for_containment(mask_self_echo(prior_evidence))     # an earlier reply of ours vouches for nothing
         names = [n for n in names if not _entity_supported(entity_key(n), hay)]
     return names
 
@@ -1821,7 +1946,10 @@ def name_withhold_caps_confirm(res: Optional["ClaimBindingResult"], *, truncatio
         return []
     if not raw_sources and truncation_severity >= truncation_floor:
         return []
-    return unsupported_names(res, (str(prior_evidence or "") + "\n" + str(raw_sources or "")).strip())
+    names = unsupported_names(res, (mask_self_echo(str(prior_evidence or "")) + "\n" + mask_self_echo(str(raw_sources or ""))).strip())
+    # §4IV: a fact that rests only on the agent's own earlier words is the
+    # same validated withhold on a different ground — it caps too
+    return names + [f for f in echo_facts(res) if f not in names]
 
 
 # ── §4IU: a life span attached to the wrong person ───────────────────────
@@ -1942,11 +2070,13 @@ def unverified_facts(res: Optional["ClaimBindingResult"], *, evidence: str, prio
         return []
     if not raw_sources and truncation_severity >= truncation_floor:
         return []                          # a cut DIGEST proves little; the whole sources decide when we have them
-    hay = normalize_for_containment(str(evidence or "") + "\n" + str(prior_evidence or "") + "\n" + str(raw_sources or ""))
+    # §4IV: our own earlier words are not a source — each text masked on its own, so an
+    # unterminated OUTCOME at the end of one cannot swallow the start of the next
+    hay = normalize_for_containment("\n".join(mask_self_echo(str(x or "")) for x in (evidence, prior_evidence, raw_sources)))
     hay_folded = _fold_accents(hay)
     out: List[str] = []
     for a in (res.audit or []):
-        if getattr(a, "status", "") != "unsupported":
+        if getattr(a, "status", "") not in ("unsupported", "echo"):
             continue
         fam, text = getattr(a, "family", ""), str(getattr(a, "text", "") or "")
         if fam == "year" and not _year_in(text, hay):
@@ -1959,7 +2089,7 @@ def unverified_facts(res: Optional["ClaimBindingResult"], *, evidence: str, prio
             if m and not re.search(r"(?<!\d)" + m.group(1).replace("–", r"[ \t]*[–—-][ \t]*") + r"(?!\d)", hay):
                 out.append(f"{m.group(1)} ({m.group(2)})")
     for e in (res.entities or []):
-        if getattr(e, "status", "") != "unsupported":
+        if getattr(e, "status", "") not in ("unsupported", "echo"):
             continue
         text = str(getattr(e, "text", "") or "")
         named = bool(_HONORIFIC_RE.match(text)) or bool(re.fullmatch(r"[A-Z][a-z][\w'’-]*(?:[ \t](?:(?:of|the|for|and|de|von|van|da|di|du|la|le|del|der)[ \t])?[A-Z][a-z][\w'’-]*)+", text))
@@ -2060,21 +2190,60 @@ def ask_content_words(context: str) -> List[str]:
     return out
 
 
+def _script_of(text: str) -> str:
+    """"latin", "greek", "cyrillic" — the script most of the letters are in —
+    or "" when there are no letters."""
+    counts = {"latin": 0, "greek": 0, "cyrillic": 0}
+    for ch in str(text or ""):
+        if not ch.isalpha():
+            continue
+        o = ord(ch)
+        if o < 0x250:
+            counts["latin"] += 1
+        elif 0x370 <= o < 0x400 or 0x1F00 <= o < 0x2000:
+            counts["greek"] += 1
+        elif 0x400 <= o < 0x530:
+            counts["cyrillic"] += 1
+    best = max(counts, key=counts.get)
+    return best if counts[best] else ""
+
+
+def _any_ask_word_in(words: List[str], hay: str) -> bool:
+    hay_words = set(re.findall(r"\w+", hay))
+    for w in words:
+        if w in hay:
+            return True
+        if len(w) >= 6 and any(h[:5] == w[:5] for h in hay_words if len(h) >= 5):
+            return True
+    return False
+
+
 def reply_off_topic(reply: str, context: str) -> Optional[str]:
     """None of the ask's subject words — nor a word sharing its first five
     letters ("moons"/"moon", "restarted"/"restart") — appears in the reply.
     None when the ask has no subject word or the reply carries one; else
-    the words missed. A withhold, never a refute: a reply may paraphrase."""
+    the words missed. A withhold, never a refute: a reply may paraphrase.
+
+    §4IV, across languages: an English ask about "Spilios Oikonomidis" is
+    answered by a Greek reply about "Σπήλιος Οικονομίδης" — the words are
+    compared transliterated as well (the binder's `translit_greek`), and
+    when the ask and the reply are written in different scripts and no
+    word bridges them, a lexical check cannot tell paraphrase from drift
+    and ABSTAINS (None) rather than withhold every cross-language answer
+    (probe-5b, §4IT close: an English ask, a Greek reply, "none of the
+    ask's subject words appears")."""
     words = ask_content_words(context)
     if not words:
         return None
     hay = normalize_for_containment(reply)
-    hay_words = set(re.findall(r"\w+", hay))
-    for w in words:
-        if w in hay:
-            return None
-        if len(w) >= 6 and any(h[:5] == w[:5] for h in hay_words if len(h) >= 5):
-            return None
+    if _any_ask_word_in(words, hay):
+        return None
+    t_words = [translit_greek(w) for w in words]
+    if _any_ask_word_in(t_words, translit_greek(hay)):
+        return None
+    ask_script, reply_script = _script_of(" ".join(words)), _script_of(hay)
+    if ask_script and reply_script and ask_script != reply_script:
+        return None                        # different scripts, no bridge: not decidable by a word test
     return "none of the ask's subject words " + ", ".join(repr(w) for w in words[:4]) + " appears in the reply"
 
 

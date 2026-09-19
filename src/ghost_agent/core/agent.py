@@ -2012,7 +2012,10 @@ def _prior_turn_evidence(messages, tools_run_this_turn) -> str:
                 continue
             if c[:400] in own:
                 continue
-            parts.append(c)
+            # §4IV: an earlier reply of OURS is labelled so the binder's echo
+            # rule can tell it from a tool output — it still proves a fact was
+            # carried over (no absence conviction), it vouches for nothing
+            parts.append(f"[assistant] {c}\n[/assistant]" if m.get("role") == "assistant" else c)
             total += len(c)
             if total >= _PRIOR_EVIDENCE_CHARS:
                 break

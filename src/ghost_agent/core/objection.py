@@ -1767,8 +1767,8 @@ def raw_source_supplement(issues: Sequence[str], evidence: str, raw_sources: str
         from . import claim_binding as cb
     except Exception:  # noqa: BLE001
         return ""
-    raw = str(raw_sources or "")
-    if not raw or not issues:
+    raw = cb.mask_self_echo(str(raw_sources or ""))        # §4IV: an expanded episode's OUTCOME is our own earlier reply
+    if not raw.strip() or not issues:
         return ""
     wanted: List[Tuple[str, bool]] = []
     for issue in issues:

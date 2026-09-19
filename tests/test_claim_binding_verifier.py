@@ -733,3 +733,25 @@ async def test_verify_claim_hands_the_raw_sources_to_the_refute_appeal(monkeypat
     stub2 = _Cheap([cheap_refute])
     r2 = await Verifier(llm_client=stub2).verify_claim(claim, EV1, "weather in Athens?", trace={"req_id": "rs2"})
     assert r2.verdict is VerifyVerdict.REFUTED and len(stub2.prompts) == 1 and r2.escalation == "mechanically_upheld"
+
+
+@pytest.mark.asyncio
+async def test_a_cheap_confirmed_against_the_agents_own_earlier_reply_is_capped(monkeypatch, tmp_path):
+    """§4IV, probe-4c end to end: the digest is an expanded episode whose
+    OUTCOME is the agent's earlier reply; the cheap judge CONFIRMS the
+    restatement against it and the binder's quotes land in the OUTCOME. The
+    binder withholds (echo), the CONFIRMED ships capped, the ledger row says
+    which facts, and the caveat names the spans."""
+    _flags_4ir(monkeypatch)
+    from tests.test_claim_binding import EPISODE_EV, ECHO_REPLY, ECHO_ROWS
+    r = await Verifier(llm_client=_Stub([CLASSIC_CONFIRM, json.dumps(ECHO_ROWS)])).verify_claim(
+        ECHO_REPLY, EPISODE_EV, "|| USER REQUEST: Use the web: who founded ΧΡΩΠΕΙ and when were the founders born?", trace={"req_id": "echo1"})
+    assert r.verdict is VerifyVerdict.CONFIRMED and r.confidence <= V._CONFIRM_WITHHELD_CONF_CAP and r.confirm_withheld is True
+    assert "own earlier words" in r.reasoning
+    row = _ledger(tmp_path)[-1]
+    assert row["decided"] == "incumbent" and row["capped"] == ["1854", "1866", "1935", "1912"]
+    assert r.unverified_facts == ["1854–1935 (Σπήλιο Οικονομίδη)", "1866–1912 (Λεόντιο Οικονομίδη)"]
+    # the same reply over a REAL source line: confirmed, uncapped, no caveat
+    plain = "[web_search] Ιδρύθηκε το 1883 από τους χημικούς Σπήλιος Οικονομίδης (1854–1935) και Λεόντιος Οικονομίδης (1866–1912)"
+    r2 = await Verifier(llm_client=_Stub([CLASSIC_CONFIRM, json.dumps(ECHO_ROWS)])).verify_claim(ECHO_REPLY, plain, "c", trace={"req_id": "echo2"})
+    assert r2.confidence >= 0.9 and not r2.confirm_withheld and r2.unverified_facts == []

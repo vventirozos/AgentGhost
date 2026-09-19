@@ -3177,9 +3177,10 @@ class Verifier:
         incumbent.confidence = min(before, _CONFIRM_WITHHELD_CONF_CAP)
         incumbent.confirm_withheld = True
         incumbent.reasoning = ((incumbent.reasoning or "")
-                               + f" [claim-binding: name(s) in neither evidence nor context — {', '.join(repr(n) for n in names[:3])}"
+                               + f" [claim-binding: fact(s) in neither evidence nor context, or only in the agent's own earlier words — "
+                               f"{', '.join(repr(n) for n in names[:3])}"
                                f" — the pass is not execution-backed; confidence capped.]").strip()
-        logger.warning("claim-binding WITHHELD a cheap CONFIRMED: unsupported name(s) %s — confidence %.2f → %.2f",
+        logger.warning("claim-binding WITHHELD a cheap CONFIRMED: unsupported or echoed fact(s) %s — confidence %.2f → %.2f",
                        names[:3], before, incumbent.confidence)
         record_escalation(kind="confirm", route="claim", outcome="withheld",
                           cheap_verdict=VerifyVerdict.CONFIRMED.value, cheap_confidence=before,

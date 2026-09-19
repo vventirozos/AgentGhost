@@ -1458,3 +1458,95 @@ def test_a_year_is_supported_by_a_year_token_not_by_the_digits_of_a_law_number()
     assert CB.unverified_facts(r, evidence=law) == ["1848"]
     assert CB.unverified_facts(r, evidence=law, raw_sources="[web] Γεννήθηκε το 1848 στο Λειβάρτζι.") == []
 
+
+
+# ── §4IV: the agent's own earlier words are not evidence ─────────────────────
+
+EPISODE_EV = ("[knowledge_base] EPISODE 434 [fetch]\n"
+              "TRIGGER: Use the web: who founded the ΧΡΩΠΕΙ company and in which year, and add the founder's birth and death years.\n"
+              "CONTEXT: tools: web_search → web_search\n"
+              "OUTCOME (SUCCESS): Η **ΧΡΩΠΕΙ** ιδρύθηκε το **1883** από τους αδελφούς **Σπήλιο Οικονομίδη** (1854–1935) και "
+              "**Λεόντιο Οικονομίδη** (1866–1912).\n\n*(Πηγή: Βικιπαίδεια)*\n"
+              "LESSON: cite Wikipedia first\n"
+              "  1. web_search({}) → [ok] ### 1. ΧΡΩΠΕΙ - Βικιπαίδεια Ιδρύθηκε το 1883 από τους χημικούς Σπήλιος και Λεόντιος Οικονομίδης\n"
+              "  2. web_search({}) → [ok] Ο Λεόντιος Οικονομίδης ήταν Έλληνας χημικός")
+ECHO_REPLY = "Η ΧΡΩΠΕΙ ιδρύθηκε το 1883 από τους αδελφούς Σπήλιο Οικονομίδη (1854–1935) και Λεόντιο Οικονομίδη (1866–1912)."
+ECHO_ROWS = {"claims": [{"quote": "1854–1935", "kind": "number", "evidence_quote": "(1854–1935)", "relation": "support"},
+                        {"quote": "ιδρύθηκε το 1883", "kind": "number", "evidence_quote": "Ιδρύθηκε το 1883", "relation": "support"}]}
+
+
+def test_an_expanded_episodes_outcome_is_the_agents_own_reply_and_binds_nothing():
+    """Probe-4c: the agent expanded ep:434 and restated its own earlier
+    (fabricated) life spans; both tiers CONFIRMED against the OUTCOME line,
+    which is that reply verbatim. The OUTCOME body and the LESSON are echo;
+    the TRIGGER (the user's words) and the numbered tool excerpts are not."""
+    spans = CB.self_echo_spans(EPISODE_EV)
+    echo = CB.self_echo_text(EPISODE_EV)
+    assert spans and echo.startswith("OUTCOME (SUCCESS):") and "LESSON: cite Wikipedia first" in echo and "(1854–1935)" in echo
+    masked = CB.mask_self_echo(EPISODE_EV)
+    assert len(masked) == len(EPISODE_EV) and "1935" not in masked and "1912" not in masked
+    assert "TRIGGER: Use the web" in masked and "Ιδρύθηκε το 1883 από τους χημικούς" in masked and "Έλληνας χημικός" in masked
+    r = CB.run_binding(ECHO_REPLY, EPISODE_EV, ECHO_ROWS, context="Use the web: who founded ΧΡΩΠΕΙ")
+    assert r.verdict == "UNCERTAIN"
+    assert [(b.quote, b.outcome) for b in r.bindings] == [("1854–1935", "unbound"), ("ιδρύθηκε το 1883", "agree")]   # the tool excerpt still binds
+    assert "rest only on the agent's own earlier words" in r.reasoning and r.reasoning.count("'1854'") == 1
+    assert CB.echo_facts(r) == ["1854", "1866", "1935", "1912"]
+    # the echo is a validated withhold: it caps a cheap CONFIRMED and reaches the caveat; the spans are not "supported"
+    assert CB.name_withhold_caps_confirm(r, truncation_severity=0.0, truncation_floor=0.25) == ["1854", "1866", "1935", "1912"]
+    assert CB.unverified_facts(r, evidence=EPISODE_EV) == ["1854–1935 (Σπήλιο Οικονομίδη)", "1866–1912 (Λεόντιο Οικονομίδη)"]
+    assert CB.unverified_facts(r, evidence=EPISODE_EV, raw_sources="[knowledge_base] " + EPISODE_EV) == ["1854–1935 (Σπήλιο Οικονομίδη)", "1866–1912 (Λεόντιο Οικονομίδη)"]
+    # …and never a refute: the objection tier reads the evidence unmasked (restating one's own past is not an invention)
+    from ghost_agent.core import objection as O
+    assert O.resolve_issue("The claim cites Σπήλιο Οικονομίδη (1854–1935), which is not in the evidence.", ECHO_REPLY, EPISODE_EV)[0] != O.UPHOLD
+    # without the echo the same evidence confirms: a real source line is not an echo
+    plain = "[web_search] Ιδρύθηκε το 1883 από τους χημικούς Σπήλιος (1854–1935) και Λεόντιος Οικονομίδης (1866–1912)"
+    assert CB.self_echo_spans(plain) == [] and CB.run_binding(ECHO_REPLY, plain, ECHO_ROWS).verdict == "CONFIRMED"
+
+
+def test_the_other_echo_shapes_and_the_non_echo_lookalikes():
+    # a session expand: the assistant's lines are echo, the user's are not
+    sess = "[knowledge_base] SESSION abc — untitled (last 2 messages):\nuser: what year was it founded?\nassistant: It was founded in 1883 by Σπήλιος (1854–1935)."
+    assert CB.self_echo_text(sess) == "assistant: It was founded in 1883 by Σπήλιος (1854–1935)." and "user: what year" in CB.mask_self_echo(sess)
+    # a memory arc: AI lines under a USER line
+    arc = "[recall] SOURCE: Unknown\nRELEVANCE: HIGH (distance 0.2)\nCONTENT: USER: who founded it?\nAI: Σπήλιος Οικονομίδης (1854–1935) founded it.\nUSER: thanks"
+    assert CB.self_echo_text(arc) == "AI: Σπήλιος Οικονομίδης (1854–1935) founded it." and "USER: who founded it?" in CB.mask_self_echo(arc)
+    # an earlier reply of ours in the prior blob, as `_prior_turn_evidence` labels it
+    prior = "[web] tool row 149\n[assistant] Done. Dr. Elin Vasquez signed off in 1935.\n[/assistant]\n[web] another row"
+    assert CB.self_echo_text(prior) == "[assistant] Done. Dr. Elin Vasquez signed off in 1935.\n[/assistant]" and "another row" in CB.mask_self_echo(prior)
+    assert CB.unsupported_names(CB.run_binding("Dr. Elin Vasquez signed off.", "[web] tool row 149", {"claims": []}), prior_evidence=prior) == ["Dr. Elin Vasquez"]
+    # look-alikes are not echo: an OUTCOME line outside an episode record, an "AI:" line with no USER arc
+    assert CB.self_echo_spans("[query_document] Trial report\nOUTCOME (SUCCESS): the trial met its endpoint in 2019\nLESSON: none") == []
+    assert CB.self_echo_spans("[web] Headlines\nAI: the next frontier, says the report") == []
+    assert CB.mask_self_echo("") == "" and CB.self_echo_text("plain text") == ""
+    # the echo alone withholds: every binding agrees with a real excerpt, one name rests only on the OUTCOME
+    ep2 = ("[knowledge_base] EPISODE 12 [grid]\nTRIGGER: count the points\nOUTCOME (SUCCESS): 149 points within 40 km, verified by Dr. Elin Vasquez.\n"
+           "  1. execute({}) → [ok] T1279: within 40km=149 over=0")
+    r = CB.run_binding("149 points within 40 km, verified by Dr. Elin Vasquez.", ep2,
+                       {"claims": [{"quote": "149 points", "kind": "count", "evidence_quote": "within 40km=149", "relation": "support"}]})
+    assert [b.outcome for b in r.bindings] == ["agree"] and r.verdict == "UNCERTAIN" and "'Dr. Elin Vasquez'" in r.reasoning
+    assert CB.echo_facts(r) == ["Dr. Elin Vasquez"]
+    # …and reaches the caveat as a name and as a bare year (no span involved)
+    r2 = CB.run_binding("Dr. Elin Vasquez signed off in 1935.", "[knowledge_base] EPISODE 13 [x]\nTRIGGER: who signed?\nOUTCOME (SUCCESS): Dr. Elin Vasquez signed off in 1935.",
+                        {"claims": []})
+    assert CB.echo_facts(r2) == ["1935", "Dr. Elin Vasquez"] and CB.unverified_facts(r2, evidence="[knowledge_base] EPISODE 13 [x]\nTRIGGER: who signed?\nOUTCOME (SUCCESS): Dr. Elin Vasquez signed off in 1935.") == ["1935", "Dr. Elin Vasquez"]
+
+
+def test_the_topic_check_bridges_scripts_by_transliteration_and_abstains_without_a_bridge():
+    """Probe-5b (§4IT close): an English ask, a Greek reply — "none of the
+    ask's subject words appears in the reply". A lexical test cannot judge
+    across languages: names bridge under transliteration, and with no
+    bridge across two scripts the check abstains instead of withholding."""
+    assert CB.reply_off_topic("Ο Σπήλιος Οικονομίδης ίδρυσε τη ΧΡΩΠΕΙ το 1883.", "Who was Spilios Oikonomidis, the founder of Chropei?") is None
+    assert CB.reply_off_topic("Spilios Oikonomidis founded Chropei in 1883.", "Ποιος ήταν ο Σπήλιος Οικονομίδης;") is None
+    assert CB.reply_off_topic("Ο καιρός στην Αθήνα είναι ηλιόλουστος.", "What is the largest moon of Saturn?") is None       # abstains: different scripts, no bridge
+    assert CB.reply_off_topic("Bananas are yellow.", "What is the largest moon of Saturn?") is not None                     # same script: still a withhold
+    assert CB.reply_off_topic("Οι μπανάνες είναι κίτρινες.", "Ποιο είναι το μεγαλύτερο φεγγάρι του Κρόνου;") is not None   # same script, Greek
+    assert CB.reply_off_topic("Titan is the largest moon of Saturn.", "What is the largest moon of Saturn?") is None
+    # a mostly-Latin reply that names the subject only in Greek: same majority script, so no abstention — the
+    # transliteration bridge is what finds him
+    assert CB.reply_off_topic("He was a chemist; Σπήλιος Οικονομίδης studied in Graz and worked with Baeyer in Munich.",
+                              "Who was Spilios Oikonomidis?") is None
+    assert CB._script_of("Σπήλιος") == "greek" and CB._script_of("Spilios") == "latin" and CB._script_of("1883 — !") == ""
+    r = CB.run_binding("Ο καιρός στην Αθήνα είναι ηλιόλουστος, 34°C.", "[web_search] Athens 34°C sunny", {"claims": []},
+                       context="|| USER REQUEST: What is the weather in Athens?")
+    assert not any(g.kind == "topic" for g in r.findings)

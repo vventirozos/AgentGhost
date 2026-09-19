@@ -44221,3 +44221,89 @@ UNCERTAIN — and the caveat queued for the conversation's next turn reads **"19
 **R8 for the whole review: 3** — the first `_year_in` cut over-reached (corpus caught it); battery
 63 S5 survived until the pin went one call deeper; the first restart's probe found F7/F8, which
 the review's code-read had not (a probe is a reviewer the reader is not).
+
+## §4IV — The agent's own words are not evidence; the topic check across languages (2026-09-19, 20:00–21:00) — R0 scope, written first
+
+Operator: "proceed with a. and b. usual verification protocol." (a) = self-confirmation through the
+agent's own recalled words; (b) = the topic class check across languages.
+
+**R0 (a).** Probe-4c's echo did not come through `recall` itself (its hits are past REQUESTS —
+the user's words) but through `knowledge_base(action='expand', ref='ep:434')`: an EPISODE record
+whose `OUTCOME (SUCCESS): …` line is the agent's earlier reply verbatim, followed by LESSON and the
+numbered tool excerpts. The same shape: a session expand's `assistant:` lines, a memory arc's
+`AI:` lines, and — inside one conversation — an earlier assistant reply in `_prior_turn_evidence`.
+`knowledge_base` and `recall` are EXTERNAL to the packer (§4HC), so the echo ranked as a source,
+the binder's quotes landed in the OUTCOME, and both tiers CONFIRMED (the §4HJ class one store
+away). Design: the agent's own words can bind nothing and support nothing; a fact that rests only
+there is an ECHO — a code-validated withhold (caps a cheap CONFIRMED like §4IR, reaches the
+caveat), never a refute (restating one's own past is not this turn's invention: the objection
+tier reads the evidence unmasked). Out of scope, on purpose: the packer's ranking (the judge's
+opinion is capped either way) and the tool's own output format (the model reads it too — a
+behaviour change).
+**R0 (b).** `reply_off_topic` is a word test; an English ask against a Greek reply shares no word
+by construction. Corpus: 184 topic withholds on 1,524 turns, a visible share cross-language.
+
+**R1.** `core/claim_binding.py`: `self_echo_spans` / `mask_self_echo` / `self_echo_text` (episode
+OUTCOME body + LESSON within `EPISODE N [` records — the header may share its line with one or
+more packer labels; session `assistant:` lines within `SESSION … —` records; `AI:` blocks when a
+`USER:` line exists; `[assistant] … [/assistant]` blocks); `run_binding` binds and audits on the
+masked evidence, `_regrade_echo` flips rows the echo text alone supports to status "echo",
+`verdict_from_bindings` withholds on echo rows (deduped: a year is a figure row and a year row)
+and names them; `echo_facts`; `name_withhold_caps_confirm` returns names + echo facts and masks
+prior/raw; `unsupported_names` masks the prior hay; `unverified_facts` counts echo rows and masks
+digest, prior and raw EACH ON ITS OWN (an unterminated OUTCOME at the end of one text must not
+swallow the next); `audit_life_spans` reads the masked digest/raw. (b): `_script_of` (majority
+script), `_any_ask_word_in`, `reply_off_topic` = direct → transliterated (folds accents) →
+abstain when the scripts differ and nothing bridges. `core/agent.py`: `_prior_turn_evidence`
+labels assistant parts `[assistant] …\n[/assistant]` (tool rows unlabelled, so the newest-first
+pin holds). `core/objection.py`: `raw_source_supplement` masks the raw first (an OUTCOME is never
+a "source line"). `core/verifier.py`: the cap's reasoning/log wording covers echo. Pins:
+`tests/test_claim_binding.py` (+3: the episode shape end to end — spans, mask, unbound quote,
+echo facts, cap, caveat, life spans, no objection conviction, and the plain-source control; the
+other shapes and the look-alikes at LINE START; echo-only withhold and echo year/name in the
+caveat; the topic check incl. the mixed-script reply that needs the translit bridge),
+`tests/test_claim_binding_verifier.py` (+1: cheap CONFIRMED against the echo ships capped,
+ledger `capped` = the four years, caveat = the two spans; the real-source control uncapped),
+`tests/test_4ip_uphold_branch.py` (+1: the supplement never splices an OUTCOME, still splices
+the record's tool excerpt), `tests/test_objection_prior_turn_evidence.py` (+1: the label, the
+order, the mask).
+
+**R2 battery 65** (T1 = the four suites): NOOP SURVIVED, KNOWNBAD KILLED; E1 outcome-not-echo, E2
+lesson, E3 session-assistant, E4 arc-AI, E6 prior-assistant, E8 bind-on-unmasked, E9
+audits-on-unmasked, E10 no-regrade, E12 echo-does-not-cap, E14 caveat-hay-unmasked, E15
+life-spans-on-unmasked, E16 prior-names-hay-unmasked, E17 supplement-splices-echo, E18
+prior-blob-unlabelled, T2 no-abstain-across-scripts, T3 abstain-always — KILLED first run. Five
+SURVIVED first run, all pin defects ([[pin-must-fail-somewhere]]): E5/E7 (the look-alikes had
+"AI:"/"OUTCOME" mid-line after the label, never at line start — both regexes anchor at `^`), E11
+(the pinned verdict was UNCERTAIN for two other reasons — an echo-ONLY case written), E13 (the
+caveat pins listed spans, never an echo year/name row), T1 (abstention covered every cross-script
+case; the translit bridge is distinguishable only on a MIXED-script reply — written). All five
+KILLED on rerun. 
+
+**Acceptance.** cb_replay v38 vs v37: mined 0.062 / 2 false refutes (pre-existing), seed 0.058 /
+0 — bit-identical. Corpus r22 vs r21 (1,525 turns): 0 verdicts moved; 10 reasoning changes read
+one by one — 7 topic withholds dropped (six English asks answered in Greek — "get me the news" /
+Naftemporiki headlines, the Tzaneio turn, the Xiros turn; one Greek pair bridged by accent
+folding: "έρευνα" against a capitalised "ΕΡΕΥΝΑ"), 184 → 177; 2 echo withholds gained — d70b268b
+(probe-4c: "'1866', '1935', '1912' rest only on the agent's own earlier words", both spans now
+"not in the evidence") and 941c9f16 (an OSINT turn whose "363" rested on an expanded episode).
+Docs: `claim_binding.html` §4IV, `verifier.html`, `agent.html`, `objection.html`.
+
+**§4IV close (21:20):** suite ONCE — **23582 passed, 66 skipped, exit=0** → kickstart, pid 24731 →
+44680, health 200 in 10 s. Live probe-06e93631 — the probe-4c shape on purpose: "From your memory
+only (do NOT use the web): who founded ΧΡΩΠΕΙ … founders' birth and death years?" The agent ran
+`recall`, then `knowledge_base(expand)` on ep:434 AND ep:438 (its own two earlier answers) and
+replied "conflicting dates for Σπήλιος (one entry says 1854–1935, another 1848–1894), Λεόντιος
+1866–1912" — an honest report of its own memory, still no source. The cheap judge CONFIRMED at
+1.00 against the expanded episodes; the binder: UNCERTAIN, "6 fact(s) rest only on the agent's own
+earlier words: '1854', '1866', '1935' …"; the cap fired — **CONFIRMED 1.00 → 0.60, confirm
+withheld**, ledger `capped` = ['1854', '1866', '1935', '1848', '1894']; the caveat queued for the
+conversation's next turn: "1935, 1848, 1894, 1866, 1912". Where §4IT's probe-4c shipped a 0.95
+CONFIRMED and no caveat, the same turn now ships UNCERTAIN to every consumer and tells the user.
+Ledger `--days 1`: 23 rows, binder failed 0, REFUTED 1 / CONFIRMED 9 / UNCERTAIN 13, decided by
+binder 1, **CAPPED 1** (this probe — the first live cap). Cosmetic, not fixed tonight (a log
+string; not worth a suite+restart alone): the shadow log line says "unsupported name(s)" for
+capped years — reword to "fact(s)" with the next code change. **Open after §4IV:** (c) the week's
+ledger read; (d) year support from raw sources; (e) the packer still ranks `knowledge_base`/`recall`
+as external for the claim pull — the judge's opinion is capped either way, but a digest slot is
+spent on an echo; measure on the week's rows before changing the ranking.

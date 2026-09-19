@@ -241,3 +241,20 @@ def test_this_turns_own_narration_and_thinking_are_not_prior_evidence():
     assert "1848" not in blob and "1898" not in blob and "comprehensive" not in blob
     # a single-turn conversation has no prior evidence at all
     assert _prior_turn_evidence(messages[3:], []) == ""
+
+
+def test_an_earlier_reply_of_ours_is_labelled_in_the_prior_blob():
+    """§4IV: the blob still carries earlier assistant replies (a fact carried
+    over is not an invention), but labelled, so the binder's echo rule can
+    tell our own words from a tool's."""
+    from ghost_agent.core.agent import _prior_turn_evidence
+    from ghost_agent.core.claim_binding import mask_self_echo
+    messages = [{"role": "user", "content": "q1"},
+                {"role": "tool", "name": "execute", "content": "T1279: within 40km=149"},
+                {"role": "assistant", "content": "Done. 149 points within 40 km, per Dr. Elin Vasquez."},
+                {"role": "user", "content": "q2"}]
+    blob = _prior_turn_evidence(messages, [])
+    assert "[assistant] Done. 149 points within 40 km, per Dr. Elin Vasquez.\n[/assistant]" in blob
+    assert blob.index("[assistant]") < blob.index("T1279")          # newest first, tool rows unlabelled
+    masked = mask_self_echo(blob)
+    assert "Elin Vasquez" not in masked and "within 40km=149" in masked
