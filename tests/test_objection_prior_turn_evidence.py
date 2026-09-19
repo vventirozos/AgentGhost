@@ -219,3 +219,25 @@ def test_verifier_threads_the_keyword_to_both_mechanical_sites():
     wrapper = _function_tree(vf, "_escalate_refute")
     impl_calls = _calls(wrapper, "_escalate_refute_impl")
     assert impl_calls and all(_has_kw(c, "prior_evidence") for c in impl_calls)
+
+
+def test_this_turns_own_narration_and_thinking_are_not_prior_evidence():
+    """§4IU R2 (probe-b83968f4): the list the loop hands over carries THIS
+    turn's assistant messages; the model's `<thinking>` wrote "1848–1898" and
+    the caveat read both years as carried over from the session. Prior means
+    prior TURNS: nothing after the last user message is evidence."""
+    from ghost_agent.core.agent import _prior_turn_evidence
+    messages = [
+        {"role": "user", "content": "who founded it?"},
+        {"role": "assistant", "content": "Earlier answer: founded 1883."},
+        {"role": "tool", "name": "web_search", "content": "[web] ΧΡΩΠΕΙ ιδρύθηκε το 1883"},
+        {"role": "user", "content": "dates of birth and death?"},
+        {"role": "assistant", "content": "<thinking>past episodes say 1848–1898</thinking>", "tool_calls": [{"id": "1"}]},
+        {"role": "tool", "name": "browser", "content": "page: γεννήθηκε περίπου το 1854"},
+        {"role": "assistant", "content": "I now have comprehensive information; drafting 1848–1898."},
+    ]
+    blob = _prior_turn_evidence(messages, [{"name": "browser", "content": "page: γεννήθηκε περίπου το 1854"}])
+    assert "1883" in blob and "Earlier answer" in blob
+    assert "1848" not in blob and "1898" not in blob and "comprehensive" not in blob
+    # a single-turn conversation has no prior evidence at all
+    assert _prior_turn_evidence(messages[3:], []) == ""

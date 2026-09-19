@@ -523,3 +523,79 @@ def test_the_judges_latin_spelling_of_a_greek_name_is_the_replys_name():
     # and the reverse: a judge citing the Greek spelling against a reply that wrote it in Latin
     assert O._written_as_a_name("Δρ. Ελένη Βασκέζ", base + " Dr. Eleni Vaskez confirmed the result.") is True
 
+
+
+# ── §4IU self-review: the absence proof reads the SOURCES, not the packer's selection ──
+
+def test_raw_source_supplement_brings_only_external_lines_the_digest_lacks():
+    """A name in a tool output the packer left out of the 12 KB digest is
+    not an invention. The supplement is the labelled source line(s); the
+    agent's own write receipt or command echo never qualifies (§4HC/§4HJ:
+    the deliverable echoing itself is not evidence)."""
+    issues = ["The claim cites Dr. Elin Vasquez, who is not present in any tool output."]
+    digest = "[web_search] Saturn orbital period 29.46 years"
+    raw = ("[web_search] Saturn orbital period 29.46 years\n"
+           "[browser] Maintainers page — lead: Dr. Elin Vasquez (since 2019)\n"
+           "[file_system] wrote report.md: Dr. Elin Vasquez verified the result\n"
+           "[execute] cat report.md: Dr. Elin Vasquez verified the result\n"
+           "[recall] earlier I said: Dr. Elin Vasquez verified the result\n")
+    supp = O.raw_source_supplement(issues, digest, raw)
+    assert supp.count("\n") == 0 and supp.startswith("[browser — this turn's tool output, not in the digest]") and "lead: Dr. Elin Vasquez" in supp
+    assert "file_system" not in supp and "execute" not in supp and "recall" not in supp
+    # already in the digest → nothing to add; a non-absence issue → nothing; no raw → nothing
+    assert O.raw_source_supplement(issues, digest + "\n[browser] lead: Dr. Elin Vasquez", raw) == ""
+    assert O.raw_source_supplement(["Humidity 28% is stated as 29%."], digest, raw) == ""
+    assert O.raw_source_supplement(issues, digest, "") == ""
+    # only the agent's own outputs carry the name → nothing (the echo trap: its file, its command, its memory)
+    for own in ("[file_system] wrote report.md: Dr. Elin Vasquez verified", "[execute] Dr. Elin Vasquez verified", "[recall] Dr. Elin Vasquez verified"):
+        assert O.raw_source_supplement(issues, digest, own) == "", own
+    # bounded
+    long_raw = "[browser] " + "\n".join(f"line {i}: Dr. Elin Vasquez spoke again" for i in range(200))
+    assert len(O.raw_source_supplement(issues, digest, long_raw)) <= 1500
+
+
+@pytest.mark.asyncio
+async def test_a_name_in_an_unpacked_external_output_is_not_mechanically_convicted(tmp_path, monkeypatch):
+    """End to end: the cheap judge's "not in the evidence" against a digest
+    that lacks the name. Without raw sources the refute is mechanically
+    upheld with no call (the §4IP contract); with the turn's raw sources
+    carrying the name in a web fetch, the spliced line reaches the appeal
+    and the strong judge decides on the sources."""
+    import json
+    from ghost_agent.core.verifier import Verifier, VerifyResult, VerifyVerdict
+    monkeypatch.setenv("GHOST_HOME", str(tmp_path))
+    monkeypatch.setenv("GHOST_VERIFY_OVERTURN_QUOTE", "0")
+    monkeypatch.setenv("GHOST_VERIFY_TWO_STAGE", "0")
+    monkeypatch.delenv("GHOST_VERIFY_ESCALATE_REFUTE", raising=False)
+
+    class _Stub:
+        critic_clients = None
+        worker_clients = [object()]
+        def __init__(self, responses): self.responses = list(responses); self.prompts = []
+        async def chat_completion(self, payload, **_kw):
+            self.prompts.append(payload["messages"][0]["content"])
+            return {"choices": [{"message": {"content": self.responses.pop(0)}}]}
+
+    def _ledger():
+        p = tmp_path / "system" / "verifier" / "escalations.jsonl"
+        return [json.loads(l) for l in p.read_text().splitlines() if l.strip()] if p.exists() else []
+
+    claim = "Saturn takes 29.46 years. The lead maintainer, Dr. Elin Vasquez, verified the result."
+    digest = "[web_search] Saturn orbital period 29.46 years"
+    issue = "The claim cites Dr. Elin Vasquez, who is not present in any tool output."
+    cheap = lambda: VerifyResult(verdict=VerifyVerdict.REFUTED, confidence=0.9, reasoning="cheap", issues=[issue])
+    # no raw sources: protected, zero calls
+    stub0 = _Stub([])
+    out0 = await Verifier(llm_client=stub0)._escalate_refute(cheap(), claim, digest, "ctx", trace={"req_id": "r0"})
+    assert out0.verdict is VerifyVerdict.REFUTED and stub0.prompts == [] and _ledger()[-1]["outcome"] == "mechanically_upheld"
+    # the name sits in an unpacked web fetch: the appeal runs on the spliced evidence
+    raw = digest + "\n[browser] Maintainers page — lead: Dr. Elin Vasquez (since 2019)"
+    stub1 = _Stub([json.dumps({"verdict": "CONFIRMED", "confidence": 0.9, "reasoning": "the page names her", "issues": []})])
+    out1 = await Verifier(llm_client=stub1)._escalate_refute(cheap(), claim, digest, "ctx", trace={"req_id": "r1"}, raw_sources=raw)
+    assert out1.verdict is VerifyVerdict.CONFIRMED and _ledger()[-1]["outcome"] != "mechanically_upheld"
+    assert len(stub1.prompts) == 1 and "not in the digest] Maintainers page — lead: Dr. Elin Vasquez" in stub1.prompts[0]
+    # the same name only in the agent's own file write: still protected, zero calls
+    stub2 = _Stub([])
+    out2 = await Verifier(llm_client=stub2)._escalate_refute(cheap(), claim, digest, "ctx", trace={"req_id": "r2"},
+                                                             raw_sources=digest + "\n[file_system] wrote report.md: Dr. Elin Vasquez verified the result")
+    assert out2.verdict is VerifyVerdict.REFUTED and stub2.prompts == [] and _ledger()[-1]["outcome"] == "mechanically_upheld"

@@ -14,6 +14,7 @@ strong-adjudicated CONFIRMED already stands for that trajectory.
 """
 
 import ast
+import time
 import os
 import sys
 from pathlib import Path
@@ -323,3 +324,61 @@ def test_enumeration_fires_on_an_unknown_outcome():
 def test_enumeration_walks_every_recording_function():
     literals = _outcome_literals_in_escalation_functions()
     assert {"claim_binding", "truncation_guard"} <= literals
+
+
+# ---------------------------------------------------------------- §4IT: the source caveat
+
+def _v_facts(verdict, facts, conf=0.9, escalation="upheld"):
+    r = _v(verdict, conf, escalation)
+    r.unverified_facts = list(facts)
+    return r
+
+
+def test_source_caveat_line_lists_the_facts_and_never_on_a_refuted(monkeypatch):
+    from ghost_agent.core.agent import _source_caveat_line, SOURCE_CAVEAT_HEAD
+    monkeypatch.setenv("GHOST_VERIFY_SOURCE_CAVEAT", "1")
+    line = _source_caveat_line(_v_facts(VerifyVerdict.UNCERTAIN, ["1850", "1925", "Dr. Elin Vasquez"], 0.5, ""))
+    assert line == "_" + SOURCE_CAVEAT_HEAD + "1850, 1925, Dr. Elin Vasquez._"
+    assert _source_caveat_line(_v_facts(VerifyVerdict.CONFIRMED, ["IEEE P2851"])).endswith("IEEE P2851._")
+    assert _source_caveat_line(_v_facts(VerifyVerdict.REFUTED, ["1850"])) == ""            # the correction banner says more
+    assert _source_caveat_line(_v_facts(VerifyVerdict.CONFIRMED, [])) == ""
+    assert _source_caveat_line(None) == ""
+    assert len(_source_caveat_line(_v_facts(VerifyVerdict.CONFIRMED, [str(i) for i in range(1901, 1910)])).split(", ")) == 5
+    monkeypatch.setenv("GHOST_VERIFY_SOURCE_CAVEAT", "0")
+    assert _source_caveat_line(_v_facts(VerifyVerdict.CONFIRMED, ["1850"])) == ""
+
+
+def test_a_late_verdict_queues_a_caveat_that_heads_the_next_reply_as_a_note(agent, monkeypatch):
+    """The streamed reply has left; the caveat rides the correction channel
+    with its own kind and wording — and is not called a correction."""
+    monkeypatch.setenv("GHOST_VERIFY_SOURCE_CAVEAT", "1")
+    agent._pending_corrections = []
+    agent._backfill_trajectory_outcome = MagicMock()
+    agent._record_withheld_verdict = MagicMock()
+    with patch("ghost_agent.core.agent.pretty_log"):
+        agent._record_late_verdict(_v_facts(VerifyVerdict.UNCERTAIN, ["1850", "1925"], 0.5, ""), trajectory_id="t9", conv_fp="conv-A")
+    assert [c.get("kind") for c in agent._pending_corrections] == ["caveat"]
+    # dedup: the same list twice queues once
+    with patch("ghost_agent.core.agent.pretty_log"):
+        agent._record_late_verdict(_v_facts(VerifyVerdict.UNCERTAIN, ["1850", "1925"], 0.5, ""), trajectory_id="t9", conv_fp="conv-A")
+    assert len(agent._pending_corrections) == 1
+    # surfaced on the next turn of THIS conversation, as a note
+    agent._consume_pending_corrections([{"role": "user", "content": "next"}], conv_fp="conv-A")
+    banner = agent._take_active_correction()
+    assert banner.startswith("ℹ️ **On my previous answer:** Not found in the sources I consulted: 1850, 1925.")
+    assert "Correction" not in banner and agent._pending_corrections == []
+    # a REFUTED never queues a caveat; a caveat and a correction render as two lines
+    with patch("ghost_agent.core.agent.pretty_log"):
+        agent._record_late_verdict(_v_facts(VerifyVerdict.REFUTED, ["1850"], 0.9, "upheld"), trajectory_id="t10", conv_fp="conv-B")
+    assert not any(c.get("kind") == "caveat" for c in agent._pending_corrections)
+    agent._pending_corrections = [{"note": "the port was 8103", "conv": "conv-C", "traj": "t11", "ts": time.monotonic()},
+                                  {"note": "Not found in the sources I consulted: 1850.", "conv": "conv-C", "traj": "t11", "ts": time.monotonic(), "kind": "caveat"}]
+    agent._consume_pending_corrections([{"role": "user", "content": "x"}], conv_fp="conv-C")
+    b2 = agent._take_active_correction()
+    assert b2.index("⚠️ **Correction") < b2.index("ℹ️ **On my previous answer:**")
+    monkeypatch.setenv("GHOST_VERIFY_SOURCE_CAVEAT", "0")
+    agent._pending_corrections = []
+    with patch("ghost_agent.core.agent.pretty_log"):
+        agent._record_late_verdict(_v_facts(VerifyVerdict.UNCERTAIN, ["1850"], 0.5, ""), trajectory_id="t12", conv_fp="conv-D")
+    assert agent._pending_corrections == []
+

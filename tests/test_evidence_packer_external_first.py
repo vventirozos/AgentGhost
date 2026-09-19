@@ -151,3 +151,30 @@ def test_the_window_reaches_past_ten_tools():
         + [_t("file_system", _ECHO)]
     ev = A._collect_verifier_evidence(tools, claim_text=_CLAIM)
     assert "[browser]" in ev
+
+
+# ── §4IT: Unicode / year claim tokens, and a second pull by marginal coverage ──
+
+def test_claim_tokens_read_greek_words_and_bare_years():
+    toks = A._claim_tokens("Το 2009 το Ίδρυμα μετακινήθηκε στη συμβολή των οδών Μεραρχίας. PostgreSQL 19 released in 2026.")
+    assert {"2009", "ίδρυμα", "μετακινήθηκε", "μεραρχίας", "postgresql", "2026"} <= toks
+    assert not ({"και", "του", "της", "στη", "των"} & toks)                     # Greek function words are stopwords
+
+
+def test_a_greek_claim_pulls_the_greek_source_and_a_second_pull_covers_the_rest():
+    """The retry (probe-012ca9ec): a 26-tool Greek research turn packed
+    "6 items of 36" and no pull — the tokenizer saw no Greek word and the
+    six positional slots filled the budget table. FAILS IF: Greek words are
+    not claim tokens, or only one item can be pulled, or the table has no
+    room past the positional maximum."""
+    claim = ("Το κτίριο στην Αλκιβιάδου 154 ανήκει στο Ίδρυμα Οικονομίδου. Το 2009 το Ίδρυμα μετακινήθηκε στη "
+             "συμβολή των οδών Μεραρχίας 36 και Ακτής Μουτσοπούλου. Η ΧΡΩΠΕΙ ιδρύθηκε το 1883 από τον Σπήλιο Οικονομίδη στο Λειβάρτζι.")
+    old_a = _t("web_search", "Ίδρυμα Οικονομίδου: το νέο κτίριο βρίσκεται από το 2009 στη συμβολή των οδών Μεραρχίας 36 & Ακτής Μουτσοπούλου")
+    old_b = _t("web_search", "Η ΧΡΩΠΕΙ ιδρύθηκε το 1883 από τον χημικό Σπήλιο Οικονομίδη από το Λειβάρτζι Καλαβρύτων")
+    fillers = [_t("web_search", f"Πειραιάς λιμάνι Αττική αποτέλεσμα αναζήτησης νούμερο {i} χωρίς σχέση") for i in range(20)]
+    tools = [old_a, old_b] + fillers                                    # oldest first; the six newest are fillers
+    budget, items = A._evidence_budget_for(tools)
+    ev = A._collect_verifier_evidence(tools, max_items=items, budget=budget, claim_text=claim)
+    assert "Μεραρχίας 36" in ev and "Λειβάρτζι" in ev                    # both older sources pulled
+    assert ev.count("[web_search]") == items + 2
+

@@ -43872,3 +43872,352 @@ not capped. Ledger report now prints CAPPED (0 today). Read the CAPPED section w
 each morning: each capped row is a fabrication the cheap judge passed or a name the reply knew — the
 second kind is the rule's price, and its rate over a week is the number to hold it to (bench: 3/49
 and 0/34; corpus: 6/166).
+
+## §4IS — The note came first, three times (req 309f45f8, 2026-09-19)
+**Operator:** the reply to the Αλκιβιάδου 154 investigation opened with three copies of
+"[A tool call in this reply could not be parsed and was NOT executed — the step it described did
+not happen.]" — "what are these?"
+**What they are:** the §4FS note. Turn 15 was a loop-breaker forced conclusion (a repeated
+`web_search` with no new info); on that text-only final the model emitted three tool calls in a
+dialect the parser rejected instead of concluding. The stream scrub removed each block live and the
+§4HF forced-final retry (48 s, non-streamed) produced the actual report. So the note is TRUE — those
+three searches did not run — but the loop had already decided to stop; the report is the retry's.
+**Why three (traced):** `system/sessions/b3000b3a….json` persists exactly the streamed deltas
+("".join of what the API sent): `"\n\n\n\n\n\n" + note + "\n\n" + report` — ONE note, preceded by six
+newlines = the three seams the scrubbed blocks left. The CLI concatenates deltas verbatim, so the
+duplication is the CLI's transient Rich Live region redrawing a note-only tail during the 48-second
+wait. A pyte replay of the exact shape reproduced ghost lines only WITHOUT the tty's ONLCR
+translation (an emulation artefact); with it, both shapes render once — so the CLI was left
+untouched (a width-1 tweak was tried and reverted as unverified). The server-side shape was wrong
+regardless: (1) whitespace-only seams before the first visible character are now dropped rather than
+streamed (`_scrub_dropped_lead_ws`, subtracted in the all-consumed test so a pure-calls generation
+still reads as all-consumed); (2) the note is deferred until after the retry's answer — answer
+first, caveat last, the order `_finalize_and_return` delivers; without a retry answer it still goes
+out once; (3) a retry answer that opens the reply carries no leading "\n\n". Pins:
+`test_stream_forced_final_retry.py` (order pin re-pointed — it had asserted note-before-answer —
+plus seams / no-note-on-all-consumed / note-once-without-retry / the model never sees the note).
+**Battery 58: 5 mutants + KNOWNBAD killed, NOOP survived** (S5 killed after the seams pin asserted
+"no note on a calls-only generation"). Docs: agent.html §4IS. Suite/restart: below.
+**§4IS close:** R7 pass 1 — 1 red: `test_scrub_empty_output_fallback_wired`, a legacy source-text
+pin on the all-consumed guard's literal → re-pointed to the new expression. Pass 2 — **23556
+passed, 66 skipped, exit=0** → `launchctl kickstart -k`, health 200. Live streamed probe: the reply
+opens with its first visible character, no leading seams.
+
+**§4IS-b — the retry delivered cleanly and invented two life spans (2026-09-19, 12:00–13:30).**
+Operator: "retry the request, make sure it's all good." Re-run as a streamed probe
+(probe-012ca9ec, 514 s, 26 tools): the reply opens on its first visible character, no note —
+§4IS holds. Content check against the 26 tool outputs: 1883, Νέο Φάληρο 1899, Λειβάρτζι, the ΕΒΕΠ
+presidency, Λεόντιος as co-founder, the 2009 move to 2ας Μεραρχίας 36 & Ακτής Μουτσοπούλου, the
+foundation's full name and the 2018 budget approval — all grounded; **"Σπήλιος (1850–1925)",
+"Κλεομένης (1885–1975)" and "ΧΡΩΠΕΙ operated until the late 2010s" — in NO tool output.** The
+verifier: cheap judge UNCERTAIN 0.7 on an unrelated complaint (not escalated), binder UNCERTAIN on
+three entities (incl. 'Λειβάρτζι Καλαβρύτων') — the years invisible: the number audit drops bare
+years BY DESIGN (§4IM: "bare years dropped" so dates never false-refute), so a fabricated span is not
+even "unsupported". **Fix:** `claim_binding.audit_years` — every bare year in the prose (1800–2999,
+whole token: not an id/dimension/version/ratio/path; not the clock year ±1) looked up verbatim in
+evidence ∪ context; unsupported → WITHHOLD (like identifiers), never refute, never the §4IR cap
+trigger, reasoning "N year(s) not in the evidence: …" (years excluded from the figure count).
+Measured first on the corpus: 7/475 passed turns would carry an unsupported year (several of them
+"1920x1080"/ids my first regex caught → the token rule excludes). Two defects found by the pins and
+the seed replay while shipping: (1) a sentence-final "1870." was rejected by the token rule → the
+lookahead admits a stop not followed by a word char; (2) widening `_is_bare_year` to 1800 (to
+align with the audit) created 2 false refutes on the seed pool — evidence "total_orders 1847
+(prev 1649, +12.0%)" lost its 1847 to the year rule and the reply's 1,847 was refuted against 1649
+— reverted to 1900: an 1800s bare number is a count as often as a year, so it stays a figure AND is
+looked up as a year. Acceptance: mined v32 = v29 bit-identical; seed false-CONFIRM 12 → 11,
+false-REFUTE 0/47; corpus 0 verdicts moved, 0 good confirms lost. On the retried reply the audit
+flags 1850, 1925, 1885, 1975, 2010 (and 2009 — in the raw tool output but not in the packed digest:
+a packer-coverage withhold, not a fabrication). Pins: `test_claim_binding.py` (+1, seven shapes).
+**Battery 59: 8 mutants + KNOWNBAD killed, NOOP survived** (Y4/Y6 killed after a years-only fixture;
+Y7 pins the range revert). Docs: claim_binding.html §4IS-b. Suite/restart: below.
+**§4IS-b close:** full suite ONCE — **23555 passed, 68 skipped, exit=0** → `launchctl kickstart -k`,
+pid 1630 → 21223, health 200. Live probe ("when was ΧΡΩΠΕΙ founded and by whom?"): "1883, by Σπήλιος
+and Λεόντιος Οικονομίδης" — the year audit reads 1883 as supported; both tiers CONFIRMED.
+
+## §4IT — What the sources did not say, and why the packer never saw them (2026-09-19, 13:30–15:30)
+**Operator:** "proceed" (items 1 + 2 after the Αλκιβιάδου retry).
+**R0 (item 2 first — the caveat must not flag what the digest merely lacked).** `_claim_tokens`
+was `[a-zA-Z_][a-zA-Z0-9_]+`: a Greek reply produced NO claim tokens, so the claim pull had nothing
+to match a Greek source on; and §4HO's sixth positional slot on wide turns FILLED the six-row budget
+table, so `len(picked) < len(_EVIDENCE_BUDGET_WEIGHTS)` never held — the original 36-tool turn
+packed "6 items of 36 candidates" with no pull (the log said so all along). The xo.gr item with
+the 2009 move ranked 4th by overlap and never entered the digest.
+**R1 (item 2).** `_CLAIM_TOKEN_RE` = Unicode words of 3+ letters + bare years; Greek function words
+added to `_EVIDENCE_CLAIM_STOPWORDS`; two more rows in `_EVIDENCE_BUDGET_WEIGHTS` (7, 8 items);
+`_EVIDENCE_CLAIM_PULLS = 2` — the second pull chosen by MARGINAL IDF-weighted coverage of claim
+tokens the picked items do not carry, external sources only (the §4HC echo rule; the first pass
+took the deliverable's own write receipt and the packer pin caught it). The retry's digest now
+carries the 2009/Μεραρχίας item (8 items, 11.6 KB): "2009" supported. Corpus replay then showed ONE
+new false refute — the reply's "Πάρνηθος 203" sat in the evidence GLUED ("Πάρνηθος203", pre-§4IO
+ddgs data), was called absent, and was "misreported" against a pagination "1 - 200" two lines down
+→ `_glued_occurrence`: a figure whose exact digits sit glued to letters in the evidence is
+"unsupported", never a misreport (§4IM: glued supports nothing for a binding; it does rule out
+misreported). After: benches v33 = v32 bit-identical; corpus 0 verdicts moved except the original
+Αλκιβιάδου turn REFUTED → UNCERTAIN (the pull now brings its support), good-turn name withholds
+45 → 44.
+**R1 (item 1).** `claim_binding.unverified_facts(res, evidence, prior_evidence, severity, floor,
+limit=5)`: unsupported YEARS, unsupported STANDARDS citations, and unsupported ENTITIES that are
+named (honorific or Latin Title-Case — a Greek capitalised phrase is too often a genitive common
+noun; 'Υπουργείου Πολιτισμού', 'Ιδρύματος Φιλανθρωπίας' never reach the user) AND fully absent (no
+token of the name anywhere in evidence ∪ prior; 'Λειβάρτζι Καλαβρύτων' is partially present →
+excluded); [] on a REFUTED or a cut digest. `VerifyResult.unverified_facts`, attached at the settle
+on both branches (incumbent-decides and binder-decides). Delivery: non-stream — `_finalize_and_return`
+appends one italic line `_Not found in the sources I consulted: …._` AFTER the banner insertion and
+after the verdict was stamped (the judged-text fingerprint is the answer's; the appendix is ours,
+like the §4FS note); stream — `_record_late_verdict` → `_queue_source_caveat` puts a
+`kind="caveat"` entry on the correction queue (dedup by note+conv, TTL/cap as corrections), and
+`_consume_pending_corrections` renders kinds separately: "⚠️ Correction to my previous answer" then
+"ℹ️ On my previous answer: Not found in the sources I consulted: …" — a caveat is not a correction.
+Flag `GHOST_VERIFY_SOURCE_CAVEAT` (ON; read in agent.py; documented). Pins: `test_claim_binding.py`
+(+3), `test_claim_binding_verifier.py` (+1), `test_verifier_late_precedence.py` (+2),
+`test_finalize_stream_pins.py` (+1), `test_evidence_packer_external_first.py` (+2). **Battery 60:
+17 mutants + KNOWNBAD killed, NOOP survived** (five killed only after behavioural pins were added:
+Unicode/year tokens, two pulls, the table rows, the glued guard, partial presence). Suite/restart:
+below.
+**§4IT R2 — the caveat's denominator is the raw sources (15:40–16:10).** First live probe after the
+restart (a question inviting life dates): the reply gave "(1854–1935)" and "(1866–1912)"; the
+binder said "2 year(s) not in the evidence: 1935, 1912"; the caveat list was EMPTY — the digest
+was cut past the floor (`truncation guard` on the verify line), and the floor is right for the
+digest: 1912 was in a tool output the packer left out, 1854/1866 too. The caveat's question is not
+"in the digest?" but "in the sources?" — so `verify_claim` now takes `raw_sources` (the turn's tool
+outputs whole, `_raw_turn_sources`, ≤600 KB; both sites in `_compute_verifier_verdict` pass it,
+enumeration-pinned), threaded to the settle and into `unverified_facts`, whose haystack is digest ∪
+prior ∪ raw and whose truncation floor applies only when no raw sources were given. On the probe's
+own texts: [] → ['1935']. Battery 60b: 5 mutants + KNOWNBAD killed, NOOP survived.
+**§4IT close (16:20):** suite ONCE — **23565 passed, 68 skipped, exit=0** → `launchctl kickstart -k`,
+pid 46706 → 65174, health 200. Three live probes, each instructive: (1) probe-1cbf122a (before the
+raw-sources change): "(1854–1935)" / "(1866–1912)" — binder "1935, 1912 not in the evidence", digest
+cut past the floor, caveat empty → the raw-sources denominator (R2 above); (2) probe-4c: the SAME
+question answered from MEMORY (`recall` returned the agent's own earlier reply, 1935 included), both
+tiers CONFIRMED against that echo — no caveat possible because the "source" carries the year: the
+§4HJ judge-saw-the-echo class in a new coat (the agent's stored prior reply as evidence for the same
+claim); noted as the next verifier question, not opened today; (3) probe-5b (Tzaneio, web only):
+1873 / 1801 / 1864 all in the raw sources → no caveat, correctly; the binder withheld on the class
+topic check ("none of the ask's subject words appears in the reply" — an English ask against a
+Greek reply: a cross-language limit of `ask_content_words`, UNCERTAIN not refuted; noted). The
+caveat line is pinned end-to-end (finalize appendix; late-verdict note); its first live appearance
+will be on the first turn whose reply states what no source carried.
+**Open after §4IT (documented, not started):** (a) memory recall of the agent's own prior reply as
+evidence for the same claim — self-confirmation; (b) the topic class check across languages;
+(c) the week's ledger read (CAPPED rows, "year(s) not in the evidence", caveat lines).
+
+## §4IU — The right verdict on the wrong ground: a life span is attributed, not looked up (req 2ef4f0a2, 2026-09-19, 16:30–17:30)
+
+**Evaluation of the user's re-run.** The reply to "Αλκιβιάδου 154 … who was Οικονομίδης" shipped
+"**Σπήλιος (Σπυρίδων) Οικονομίδης** (1854–1933): ο ιδρυτής της ΧΡΩΠΕΙ" and "**Λεόντιος
+Οικονομίδης** (1866–1944)". The turn's 26 tool outputs carry 1854–1933 exactly once — for *Γεώργιος
+Οικονομίδης του Ιωάννη (1854-1933) ήταν Έλληνας πολιτικός* (a namesake); no source gives the
+industrialist's dates and 1866–1944 appears nowhere. The reply is a fabrication by attribution: two
+real numbers, a real surname, the wrong man. What the verifier did: the binder REFUTED (correct
+label), but its ground was `figure '1854' … the evidence says '1852'` — the number audit's
+near-miss branch, anchored by `lexical_anchor` on a line about Κλεομένης Κλεομένους because the two
+sentences share "αλλά" and "στην"; the correction banner queued for the user's next turn in that
+conversation (TTL 900 s) cites THAT ground. The §4IT caveat did not fire (never on a REFUTED). So:
+right verdict, wrong reason, wrong banner — an [[accidental-ground]] in the live pipeline, and the
+kind of finding that would have flipped to a false CONFIRM had the packer's item order differed.
+Every lookup-based audit (numbers, years, entities) is blind to this fault by construction: both
+years are "in the evidence".
+
+**R0 scope.** (1) Greek function words anchor near-misses — `_ANCHOR_STOP` is English-only. (2) A
+unitless integer in 1800–1899 can be "misreported": `_is_bare_year` is 1900+ (widening it to 1800
+was tried first and produced 2 seed false refutes on `total_orders 1847 (prev 1649)` — the number
+audit's own near-miss branch gets the exclusion instead). (3) No audit checks WHO a life span is
+attached to. (4) The binder task never received the raw tool outputs — the namesake's line was in a
+tool output the packer left out of the digest, so a digest-only attribution audit could only have
+withheld.
+
+**R1 fixes (`core/claim_binding.py`, `core/verifier.py`).** `_ANCHOR_STOP` += 60 Greek function
+words (articles, prepositions, conjunctions, common pronouns). `audit_numbers`: a unitless integer
+with no decimals in 1800–1899 is "unsupported", never "misreported" (a year one digit from another
+man's is not a typo; the year audit owns years). New `audit_life_spans(reply, evidence, context,
+raw_sources)` → `LifeSpanFinding(name, span, status, evidence_name, evidence_line, sentence)`:
+every "*Name* (YYYY–YYYY)" in the prose (bold markers allowed, alias in parentheses = one more token
+of the same person) with 15 ≤ width ≤ 110 ("Top Breakthroughs (2025–2026)" is a period, not a
+life — that corpus finding forced the bounds); the range is searched in digest + request note +
+raw sources; the Title-Case run before each occurrence is compared as transliterated, accent-folded
+token sets — subset either way = same person = supported; a range everywhere attached to a
+different person = **misattributed** → `ClassFinding("attribution","refute", "the reply attaches
+the life span (S) to 'N', but the evidence attaches it to 'E' ('line')")`; found nowhere →
+withhold, and `unverified_facts` lists it as "1866–1944 (Λεόντιος Οικονομίδης)" in place of its
+two bare years (a span subsumes its years). One finding per span (the live reply spelled the name
+twice — found on the acceptance replay of the live turn, fixed, pinned, mutant D1). Plumbing:
+`verify_claim(raw_sources=)` → `_start_claim_binding(raw_sources)` → `_verify_claim_binding` →
+`run_binding(raw_sources=)`; both agent call sites already passed the 600 KB raw text for §4IT.
+Pins: `tests/test_claim_binding.py` (+2: the namesake case incl. same-person/surname-only/Latin/
+period/raw-sources-decide/one-per-span; the year-shaped figure and the Greek anchor pair, with a
+legitimately anchored control pair), `tests/test_claim_binding_verifier.py` (+1: raw sources reach
+the binder task). 307 passed in the two suites.
+
+**R2 battery 61** (`~/Data/AI/.mutation-battery/specs61.py`, T1 = the two binder suites): NOOP
+SURVIVED, KNOWNBAD KILLED; L1 bounds-off, L2 raw-sources-not-searched, L3 misattribution-not-a-
+refute, L4 unsupported-span-does-not-withhold, L5 same-person-called-misattributed, Y1 1800s-
+figure-misreported-again, A1 greek-anchor-stopwords-gone, V1 raw-sources-not-passed-to-binder-
+task, V2 run-binding-without-raw, U1 span-does-not-subsume-years, D1 span-dedupe-gone — all
+KILLED. L6 alias-treated-as-second-person SURVIVED and was equivalent (the alias token is a
+subset either way under L5's rule) → the branch was removed, not the mutant excused. Y1 and A1
+SURVIVED on the first run: the pins reached the guards through inputs that other rules already
+decided ([[pin-must-fail-somewhere]]) — hardened with a pair that shares a REAL content word
+(the surname) and a pair whose only shared words are function words; both KILLED on rerun.
+
+**Acceptance (cache replays, no model).** cb_replay v35 vs v33: mined n=188 clean 60 →
+falseREF 2 (pre-existing, §4IM), false-CONFIRM 8/128 = 0.062; seed n=237 clean 29 → falseREF
+0/47, false-CONFIRM 11/190 = 0.058 — bit-identical. Corpus replay r19 vs r17 (1,512 turns): 0
+verdicts moved, misreported rows 14 → 14. The live turn replayed with its raw sources:
+REFUTED on `attribution: the reply attaches the life span (1854–1933) to 'Σπήλιος (Σπυρίδων)
+Οικονομίδης', but the evidence attaches it to 'Γεώργιος Οικονομίδης του Ιωάννη' ('… (1854-1933)
+ήταν Έλληνας πολιτικός …')`, one finding, caveat empty (REFUTED). Docs:
+`docs/core/claim_binding.html` §4IU, `verifier.html` (signature + §4IU note), `agent.html` §4IU.
+
+**R8 — defects found in my own fixes this round: 5.** (1) `_is_bare_year` → 1800 broke 2 seed
+rows (reverted the same hour); (2) the first life-span audit flagged a period as a life
+(bounds); (3) the alias branch was dead under the subset rule (L6 equivalent → removed);
+(4) Y1/A1 pins did not fail under their mutants (hardened); (5) duplicate finding per span
+(dedupe + D1). Also carried: the earlier acceptance (v34/r18) was taken BEFORE the raw-sources
+plumbing and the bounds — re-run as v35/r19 above ([[suite-once-at-the-end]] applies to
+acceptance too).
+
+**Note for the operator:** the conversation that ran 2ef4f0a2 still holds a queued correction
+banner with the OLD ground ("1854 … the evidence says 1852", TTL 900 s from that turn); it will
+have expired before the next turn unless the conversation is resumed within the window.
+
+**§4IU close (17:35):** suite ONCE — **23568 passed, 68 skipped, exit=0** (+3 = the round's pins) →
+`launchctl kickstart -k`, pid 65174 → 85496, health 200 in 8 s. Live probe-fe8f0841 ("Ποιος ήταν ο
+Σπήλιος Οικονομίδης, ο ιδρυτής της ΧΡΩΠΕΙ; … χρονολογίες γέννησης και θανάτου, αν υπάρχουν στις
+πηγές", 5 web searches, 120 s): the reply headed "Σπήλιος Οικονομίδης (1848–1894)" — the sources
+carry 1894 ("Το 1894 πεθαίνει ο Σπήλιος Οικονομίδης") but 1848 only as "Νόμος 1848/1989" and "De
+Geyter, Pierre, 1848-1932"; the birth year is the model's. Both tiers UNCERTAIN (agree); the
+attribution audit withheld ("life span (1848–1894) of 'Σπήλιος Οικονομίδης' not in the evidence" —
+no namesake in these sources, so no refute, correctly); and the **first live caveat line**
+shipped: "_Not found in the sources I consulted: 1848–1894 (Σπήλιος Οικονομίδης)._" — the span in
+place of its years, 1894/1922 (in the raw sources, absent from the digest) rightly NOT named.
+Ledger `--days 1`: 23 rows, binder failed 0, REFUTED 1 / CONFIRMED 10 / UNCERTAIN 12, decided by
+binder 1 (the 2ef4f0a2 override, whose recorded ground is the OLD "1854 vs 1852" — the row predates
+the fix), CAPPED 0. Observation for the week's read, not opened: `audit_years` grades against the
+digest, so "1894, 1922 not in the evidence" withheld a turn whose raw tool outputs carry both —
+the lost lift is the price of the digest being the judged text; if the ledger shows it often,
+the year audit can take `raw_sources` for SUPPORT (never for refutes) the way the caveat does.
+**Open after §4IU:** (a)–(c) from §4IT unchanged; (d) year support from raw sources, above.
+
+## §4IU R2 — Self-review of the day's changes (2026-09-19, 17:40–19:10)
+
+Operator: "review all your changes". No snapshot exists to diff against (no git, no epoch copy),
+so this was a read of every function the session touched plus its consumers: the binder's new
+audits and their helpers, the verifier's raw-sources plumbing and settle branches, the agent's
+caveat delivery and packer pulls, the objection R7 helpers. Six findings; five fixed under
+protocol, one scoped out (below). All in code written today or at the seams between today's rounds.
+
+**F1 — the year-shape branch swallowed money and comma-grouped counts.** `audit_numbers`' new
+"a unitless 1800s integer is never misreported" test was `not q.unit and q.decimals == 0` — a
+money figure has family "money" and unit "", a count "1,850" has no unit; "€1851" vs "€1850" and
+"1,851" vs "1,850" (typo-shaped, anchored) had silently become "unsupported". Now the exact test
+`_is_bare_year` uses (unitless, no family, no comma). Verified with the live pairs before/after.
+
+**F2 — year support was a bare digit search.** Probe-fe8f0841's birth year 1848 was "supported"
+by "Νόμος 1848/1989" (a law number) — the year audit and the caveat both missed it; only the new
+life-span audit caught the span. `_year_in(tok, hay)`: not the digits of a decimal ("1.2010"), a
+thousands group ("2024,000") or a four-digit slash pair. First cut also rejected "/", ":" and ","
+neighbours — the corpus replay (r20) showed 7 turns losing REAL support: URL path dates
+(`/2015/05/18/`), a restated `app.js:2564:25` line number, "feb 13,2024", a season — narrowed
+(r21: only the law number stays rejected). ⚠ [[verify-cannot-distinguish]] in reverse: the
+replay is what found the over-reach; the benches had been bit-identical under both cuts.
+
+**F3 — life-span names compared as exact tokens.** Greek names inflect: "του Σπήλιου Οικονομίδη
+(1848–1894)" vs the source's "Σπήλιος Οικονομίδης (1848-1894)" shared NO token → "misattributed"
+→ a false REFUTE path; likewise a reply alias ("Σπήλιος (Σπυρίδων) Οικονομίδης") beside a
+source-side junk Title-Case word ("Βικιπαίδεια Σπήλιος Οικονομίδης"). And a range attached to
+nobody ("De Geyter, Pierre, 1848-1932") counted as SUPPORT. Now: `_same_name_tok` (equal, or one
+carries the other's stem — `_tok_supported`'s rule); `_names_relation`: containment either way or
+two shared words = same person; exactly one shared word = namesake (the misattribution shape);
+nothing shared = "other" → withhold, never refute (a translation, an organisation's other name,
+a stranger — code cannot tell); a nameless occurrence votes nothing. Corpus (r20) also showed
+bold markers on the SOURCE side ("**Σπήλιο Οικονομίδη** (1854-1935)") breaking the name capture —
+the old code then said "supported" by accident, the first fix withheld; emphasis is now dropped
+before the name is read (r21: back to the r19 reading, for the right reason).
+
+**F4 — (measured, not changed)** `_glued_occurrence` on 1–2 digit figures could suppress a
+misreport whenever "v5"/"x1" appears anywhere in the evidence. Both benches and the corpus show
+no case; left as a watch item, not a change.
+
+**F5 — the §4IR cap read the digest.** `name_withhold_caps_confirm` tested "in neither evidence
+nor context" against the digest + prior turns; since §4IT the settle holds the raw sources, and
+a name the packer left out capped a correct CONFIRMED (the 9/165 live good confirms). The cap now
+takes `raw_sources` (the whole session's evidence) and its truncation floor is moot with them —
+the caveat's own rule, applied one function over.
+
+**F6 — the objection tier's mechanical uphold read the digest.** The most consequential: "cited
+name absent from intact evidence" → REFUTED, no appeal, no model — tested against the digest plus
+EARLIER turns' evidence; `_prior_turn_evidence` excludes this turn's own outputs by design ("they
+are the digest"), but the digest is 12 KB of up to 600 KB, so a name in an unpacked tool output of
+the same turn was convicted as invented. Fix: `objection.raw_source_supplement(issues, evidence,
+raw_sources)` = the lines of this turn's EXTERNAL tool outputs that carry an atom the judge called
+absent and the digest lacks — external minus `execute` (a `cat` of the agent's own draft) and
+`recall` (its own earlier reply: probe-4c's self-confirmation), never `file_system` — labelled
+"[browser — this turn's tool output, not in the digest] …", ≤1,500 chars. `_escalate_refute_impl`
+appends them to the evidence BEFORE the objection rules run, so the absence proof, the rebuttal
+view and the strong judge read the same augmented evidence; the truncation floor keeps the
+digest's severity. `_raw_turn_sources` now emits `[tool] body` blocks (the packer's label shape;
+`evidence_blocks` reads it back) so the supplement can tell a source from an echo. Live effect: a
+refute of this shape goes to the appeal instead of the no-appeal conviction. ⚠ Not measurable by
+any cache replay (none carries raw sources): the ledger's `mechanically_upheld` share and the
+appeal outcomes on such rows are the instrument.
+
+**Pins.** `tests/test_claim_binding.py` (+1 test, +6 asserts: money/comma misreports; `_year_in`
+law/URL/season/line:col/decimal; inflected, alias+junk, bold-source, nameless, zero-overlap;
+`_names_relation`; cap with raw sources), `tests/test_claim_binding_verifier.py` (+2: raw sources
+reach the cap; `verify_claim` hands them to the refute appeal — the one battery-63 survivor until
+written; labelled-block shape), `tests/test_4ip_uphold_branch.py` (+2: the supplement's source
+filter incl. execute/recall, bound, digest-has-it; end to end mechanically upheld without raw
+sources, appealed on the spliced line with them, still upheld when only the agent's own write
+carries the name).
+
+**R2 batteries.** 62 (binder + cap): NOOP SURVIVED, KNOWNBAD KILLED; M1 money-swallowed, M2
+comma-count-swallowed, M3 year-in-bare-digits, M4 no-slash-pair-lookahead, M4b rejects-url-dates,
+M5 caveat-old-lookup, M6 tokens-equal-only, M7 two-shared-not-same, M8 nameless-supports, M9
+zero-overlap-refutes, M10 source-emphasis-kept, C1 cap-ignores-raw, C2 cap-floor-with-raw, C3
+verifier-cap-not-given-raw — all KILLED. 63 (supplement): S1 own-outputs-vouch, S2
+execute/recall-vouch, S3 splices-when-digest-has-it, S4 never-splices, S5 claim-site-withholds-raw
+(SURVIVED first — the end-to-end pin called `_escalate_refute` directly; a `verify_claim` pin
+written, KILLED), S6 raw-unlabelled, S7 bound-ignored — all KILLED.
+
+**Acceptance.** cb_replay v37 vs v35: mined 8/128 = 0.062 false-CONFIRM, 2/60 false-REFUTE
+(pre-existing); seed 11/190 = 0.058, 0/47 — bit-identical. Corpus r21 vs r19 (1,524 turns): 0
+verdicts moved, 1 reasoning string changed (dedupe keeps the fuller name). The two live turns
+replayed with labelled raw sources: 2ef4f0a2 REFUTED on the attribution; fe8f0841 UNCERTAIN, 1848
+now an unsupported year (was "supported" by the law number), caveat "1848–1894 (Σπήλιος
+Οικονομίδης)" unchanged.
+
+**R8 for the review itself: 2** — the first `_year_in` over-reached (caught by the corpus
+replay, not by a pin); battery 63 S5 survived (the pin was one call too deep).
+
+**§4IU R2 — the post-restart probe (19:20–19:45).** Suite ONCE — **23572 passed, 68 skipped, exit=0**
+→ kickstart, pid 85496 → 6015, health 200 in 10 s. Probe-b83968f4 (the ΧΡΩΠΕΙ founder again, 115 s,
+2 searches + 2 browser pages): this time the agent read the Wikipedia article, and the reply's
+1854 / 1877 / 1892 / 1899 / 1894 are all in the browser output — the binder withheld ("years not in
+the evidence: 1848, 1898, 1854, 1877") against a 3,844-char digest of 11 KB raw (the §4HO budget:
+4 candidates → 4,000 chars), both tiers UNCERTAIN, agree. Two defects the probe exposed, neither
+in today's code, both fixed under protocol (battery 64, all KILLED):
+**F7** — the reply opened with a leaked `<thinking>…</thinking>` block ("past episodes … 1848–1898")
+and NO caveat followed, although 1848 and 1898 are in no source: `_prior_turn_evidence` walked the
+whole message list, which carries THIS turn's assistant messages — the model's narration and
+thinking — so the years the model had just written read as "carried over from the session" and
+the caveat dropped them. Prior now means prior TURNS (nothing after the last user message); the
+same boundary protects the objection tier's "carried over → needs judgement" branch from the
+model's own narration. **F8** — `_THINK_CLOSED_RE` / `_THINK_UNCLOSED_RE` matched `<think\b` and
+`\b` after "think" let `<thinking>` through to the user on both delivery paths (the stream gate
+`_inline_think_open` had matched the prefix since R2 M2; the strip had not). Pins:
+`tests/test_objection_prior_turn_evidence.py` (+1), `tests/test_think_strip_toolcall_mention.py`
+(+1). Observation, not opened: the model's thinking cites "past episodes" for the earlier probe's
+1848 — open item (a), self-confirmation through recalled episodes, is now visible in a thinking
+block as well as in a `recall` result.
+**§4IU R2 close (19:55):** suite ONCE — **23576 passed, 66 skipped, exit=0** → kickstart, pid 6015 →
+24731, health 200 in 8 s. Probe-c519f6dc (the same question, 6 searches, 132 s): no `<thinking>`
+leak (F8 live); the reply again shipped "(1848–1894)" with 1848 nowhere but in "Νόμος 1848/1989";
+the verdict landed LATE (router: hard, depth verification, 72 s past the reply) — both tiers
+UNCERTAIN — and the caveat queued for the conversation's next turn reads **"1905, 1848–1894
+(Σπήλιος Οικονομίδης)"**: the law number no longer supports 1848 (F2 live), the span subsumes it,
+1894 (in the sources) is not named, and 1905 (Baeyer's Nobel, the model's own) is. Ledger `--days
+1`: 21 rows, binder failed 0, REFUTED 1 / CONFIRMED 9 / UNCERTAIN 11, decided by binder 1 (the
+2ef4f0a2 row, pre-fix ground), CAPPED 0; escalations: truncation_guard 4, withheld 2, claim_binding 1.
+**R8 for the whole review: 3** — the first `_year_in` cut over-reached (corpus caught it); battery
+63 S5 survived until the pin went one call deeper; the first restart's probe found F7/F8, which
+the review's code-read had not (a probe is a reviewer the reader is not).

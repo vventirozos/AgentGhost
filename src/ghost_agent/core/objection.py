@@ -1738,6 +1738,77 @@ def resolve_issue(issue: str, claim: str, evidence: str,
     return (UNRESOLVED, "not mechanically decidable")
 
 
+#: Of the packer's external tools, two may hand the agent its OWN words
+#: back: `execute` (a `cat` of the draft it just wrote) and `recall` (its
+#: earlier reply — probe-4c confirmed a fabricated year against that echo).
+#: Neither vouches for an "absent" name.
+_SUPPLEMENT_EXCLUDED_TOOLS = frozenset({"execute", "recall"})
+
+
+def _external_tool(name: str) -> bool:
+    try:
+        from .agent import _evidence_is_external
+        key = str(name or "").lower().strip().replace("-", "_").replace(" ", "_")
+        return key not in _SUPPLEMENT_EXCLUDED_TOOLS and bool(_evidence_is_external({"name": name}))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def raw_source_supplement(issues: Sequence[str], evidence: str, raw_sources: str, *, max_chars: int = 1500) -> str:
+    """Lines from this turn's EXTERNAL tool outputs (web search, page fetch,
+    browser — never the agent's own file writes or command echoes, the
+    §4HC/§4HJ echo trap) that carry an atom the cheap judge called absent
+    and the digest indeed lacks. Labelled with their provenance and
+    appended to the evidence the appeal reads, so "not in the evidence" is
+    judged against the sources rather than the packer's 12 KB selection
+    (§4IU self-review; the §4IT lesson applied to the refute path). ""
+    when nothing qualifies."""
+    try:
+        from . import claim_binding as cb
+    except Exception:  # noqa: BLE001
+        return ""
+    raw = str(raw_sources or "")
+    if not raw or not issues:
+        return ""
+    wanted: List[Tuple[str, bool]] = []
+    for issue in issues:
+        text = str(issue or "")
+        if not _ABSENCE_RE.search(text) or _CLAIMWARD_RE.search(text):
+            continue
+        for a, n in _cited_atoms(text):
+            if (a, n) not in wanted:
+                wanted.append((a, n))
+    if not wanted:
+        return ""
+    c_ev = _canon(_strip_packer_marks(str(evidence or "")))
+    missing = [(a, n) for a, n in wanted
+               if not (_atom_present(a, n, c_ev) or (not n and _name_shaped(a) and _name_present(a, evidence)))]
+    if not missing:
+        return ""
+    out: List[str] = []
+    seen: set = set()
+    used = 0
+    for name, body in cb.evidence_blocks(raw):
+        if not _external_tool(name):
+            continue
+        for line in str(body or "").splitlines():
+            ln = line.strip()
+            if not ln or len(ln) < 4:
+                continue
+            c_ln = _canon(ln)
+            if not any(_atom_present(a, n, c_ln) or (not n and _name_shaped(a) and _name_present(a, ln)) for a, n in missing):
+                continue
+            row = f"[{name} — this turn's tool output, not in the digest] {ln[:300]}"
+            if row in seen:
+                continue
+            seen.add(row)
+            if used + len(row) > max_chars:
+                return "\n".join(out)
+            out.append(row)
+            used += len(row) + 1
+    return "\n".join(out)
+
+
 def resolve_refute(issues: Sequence[str], claim: str, evidence: str,
                    truncation_severity: float = 0.0,
                    prior_evidence: str = "", context: str = ""

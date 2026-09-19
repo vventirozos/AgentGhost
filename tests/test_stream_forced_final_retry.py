@@ -102,10 +102,12 @@ async def test_the_live_shape_gets_its_answer_on_the_same_stream():
     plus a tool call, then [DONE]."""
     client, durable, retries = await _drive([_LIVE_TURN], retry_reply=_ANSWER, prefix=_PREFIX)
     assert len(retries) == 1
-    assert "Forensic Summary" in client and client.rstrip().endswith("securityaffairs.")
+    assert "Forensic Summary" in client and client.rstrip().endswith(UNPARSED_TOOL_CALL_NOTE)
     assert "Forensic Summary" in durable
-    # the client was told the call did not run, and then given the answer
-    assert client.index(UNPARSED_TOOL_CALL_NOTE) < client.index("Forensic Summary")
+    # §4IS (req 309f45f8): the answer first, the caveat last — the order the
+    # non-stream path delivers; the live reply had opened with the note
+    assert client.index("Forensic Summary") < client.index(UNPARSED_TOOL_CALL_NOTE)
+    assert client.count(UNPARSED_TOOL_CALL_NOTE) == 1
 
 
 @pytest.mark.asyncio
@@ -114,6 +116,7 @@ async def test_the_retry_is_told_tools_are_off_and_keeps_the_prefix():
     or forgets the directive / the model's own last output."""
     _, _, retries = await _drive([_LIVE_TURN], retry_reply=_ANSWER, prefix=_PREFIX)
     p = retries[0]
+    assert UNPARSED_TOOL_CALL_NOTE not in p["messages"][-2]["content"]   # the model never sees its own caveat
     assert p.get("stream") is False
     assert p.get("tools") and p.get("tool_choice") == "none"
     assert p["messages"][-1] == {"role": "user", "content": _FORCED_FINAL_ANSWER_DIRECTIVE}
@@ -273,4 +276,38 @@ async def test_a_full_scrub_whose_retry_raises_ships_the_sentence_as_last_resort
         for c in chunks if c.startswith(b"data: ") and c.strip() != b"data: [DONE]")
     assert chunks[-1].strip() == b"data: [DONE]"
     assert "routed as text-only" in client and "vision_analysis" in client
+
+
+# ── §4IS (req 309f45f8): three scrubbed calls opened the reply with six newlines ──
+
+_THREE_CALLS = [
+    "<tool_call>\n<function=web_search>\n<parameter=query>a</parameter>\n</function>\n</tool_call>",
+    "\n\n<tool_call>\n<function=web_search>\n<parameter=query>b</parameter>\n</function>\n</tool_call>",
+    "\n\n<tool_call>\n<function=web_search>\n<parameter=query>c</parameter>\n</function>\n</tool_call>",
+]
+
+
+@pytest.mark.asyncio
+async def test_seams_before_the_first_visible_character_are_not_streamed():
+    """FAILS IF: the scrub streams the whitespace each removed block leaves
+    while nothing visible has gone out yet — the client's reply began with a
+    stack of blank lines and the note; the answer came after."""
+    client, durable, retries = await _drive(_THREE_CALLS, retry_reply=_ANSWER)
+    assert len(retries) == 1
+    assert not client.startswith(("\n", " ")), repr(client[:40])
+    assert client.lstrip().startswith("## Revolut")                      # the answer opens the reply
+    # a generation that was ONLY calls is the all-consumed case: the retry's
+    # answer is the reply and no note is due (nothing the user saw described
+    # a step) — the dropped seams must not make it look partially delivered
+    assert client.count(UNPARSED_TOOL_CALL_NOTE) == 0
+    assert _ANSWER in durable
+
+
+@pytest.mark.asyncio
+async def test_a_partial_scrub_with_no_retry_answer_still_carries_the_note_once():
+    """The note is deferred, not dropped: when the retry machinery yields no
+    answer the note still goes out, exactly once."""
+    partial = "Here is what I found so far.\n\n" + _THREE_CALLS[0]
+    client, _, retries = await _drive([partial], retry_reply="Let me look into that further.")
+    assert client.count(UNPARSED_TOOL_CALL_NOTE) == 1
 

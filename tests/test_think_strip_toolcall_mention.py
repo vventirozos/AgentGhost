@@ -84,3 +84,12 @@ class TestNormalCases:
     def test_multiple_closed_blocks(self):
         raw = '<think>a</think>X<think>b</think>Y'
         assert _strip_think_blocks(raw) == 'XY'
+
+
+def test_a_thinking_block_is_stripped_like_a_think_block():
+    """§4IU R2 (probe-b83968f4): `<thinking>…</thinking>` reached the user —
+    `\\b` after "think" did not match the longer tag; the stream gate already
+    did (prefix match), the strip did not."""
+    assert _strip_think_blocks("<thinking>\nplanning…</thinking>\n\n## Title\nbody") == "\n\n## Title\nbody"
+    assert _strip_think_blocks("<thinking>never closed, then <tool_call><function=x>") == "<tool_call><function=x>"
+    assert _strip_think_blocks("<thinking>never closed at all") == ""

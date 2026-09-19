@@ -45,6 +45,7 @@ from __future__ import annotations
 import functools
 import json
 import math
+import datetime
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -441,6 +442,10 @@ def _is_bare_year(v: float, unit: str, decimals: int, raw: str = "") -> bool:
     """A unitless four-digit integer in the calendar range ("May 6, 2492",
     "in 2026") is a year, not a quantity; "2048 bytes" keeps its unit and
     stays a quantity, and a comma-grouped "2,000" is a count, never a year."""
+    # NOT 1800 (§4IS-b tried it): "total_orders 1847 (prev 1649)" lost its
+    # 1847 to the year rule and the reply's 1,847 was refuted against 1649 —
+    # a bare 1800s number is a count as often as a year, so it stays a
+    # figure here AND is looked up by `audit_years` (1800–2999) as a year.
     return not unit and decimals == 0 and 1900 <= v <= 2999 and "," not in raw
 
 
@@ -595,7 +600,13 @@ _ANCHOR_STOP = frozenset("""
 the a an of and or to in for on with by from at is are was were be been being as that this these
 those it its into about over under how what when where which who why not no do does did can could
 should would will may might must all any some each every has have had than then there here
+και του της των τον την τους τις στο στη στην στον στα στις στους για από με που είναι ήταν
+έχει έχουν αυτό αυτή αυτά ένα μια μία δεν όχι θα να ως πως ότι όπως επίσης ενώ αλλά μετά πριν
+κατά προς υπό ακόμη ακόμα πολύ εδώ εκεί μέσω όταν όπου οποία οποίο οποίος αυτού αυτής
 """.split())
+# ↑ Greek function words (§4IU, req 2ef4f0a2): the anchor matched "στην" between
+# a reply sentence about Σπήλιος and a search line about an army officer, and
+# the misreport rule then refuted his birth year against the officer's.
 
 
 _NEGATION_RE = re.compile(r"\b(?:not|no|never|none|failed|failure|fails|error|errors|cannot|can't|unable|missing|denied|refused|rejected|timed out|timeout|exception|traceback)\b", re.I)
@@ -1095,18 +1106,22 @@ def verdict_from_bindings(bindings: List[Binding], *, evidence_truncated: bool,
     n_agree = sum(1 for b in bindings if b.outcome == "agree")
     n_unbound = sum(1 for b in bindings if b.outcome == "unbound")
     n_unchecked = sum(1 for b in bindings if b.outcome == "unchecked")
-    n_unsupported = sum(1 for f in audit if f.status == "unsupported" and f.family != "identifier")
+    n_unsupported = sum(1 for f in audit if f.status == "unsupported" and f.family not in ("identifier", "year"))
     unsupported_ids = [f.text for f in audit if f.status == "unsupported" and f.family == "identifier"]
     if unsupported_ids:
         ent_note += (f"; {len(unsupported_ids)} identifier(s) not in the evidence: "
                      f"{', '.join(repr(t) for t in unsupported_ids[:3])}")
+    unsupported_years = [f.text for f in audit if f.status == "unsupported" and f.family == "year"]
+    if unsupported_years:
+        ent_note += (f"; {len(unsupported_years)} year(s) not in the evidence: "
+                     f"{', '.join(unsupported_years[:4])}")
     withholds = [g for g in findings if g.status == "withhold"]
     if withholds:
         ent_note += "; " + "; ".join(f"{g.kind}: {g.detail}" for g in withholds)
     if dropped >= 2 and dropped > n_agree:
         ent_note += f"; {dropped} claim quote(s) were not in the reply"      # a binder that invented most rows
-    withheld = bool(unsupported_entities or unsupported_ids or withholds or (strict_figures and n_unsupported)
-                    or (dropped >= 2 and dropped > n_agree))
+    withheld = bool(unsupported_entities or unsupported_ids or unsupported_years or withholds
+                    or (strict_figures and n_unsupported) or (dropped >= 2 and dropped > n_agree))
     if issues:
         conf = min(0.95, 0.8 + 0.05 * len(issues))
         return ClaimBindingResult("REFUTED", conf, issues, bindings, dropped,
@@ -1254,7 +1269,7 @@ def apply_residual(res: ClaimBindingResult, reply: str, evidence: str, raw_model
                                  findings=res.findings)
 
 
-def run_binding(reply: str, evidence: str, raw_model_output: Any, *,
+def run_binding(reply: str, evidence: str, raw_model_output: Any, *, raw_sources: str = "",
                 evidence_truncated: bool = False, context: str = "",
                 strict_figures: bool = False) -> ClaimBindingResult:
     """Pure pipeline from the binder's raw output to the verdict. `context`
@@ -1262,9 +1277,21 @@ def run_binding(reply: str, evidence: str, raw_model_output: Any, *,
     there is not the reply's invention."""
     rows = parse_binder_output(raw_model_output)
     bindings, dropped = bind(reply, evidence, rows)
-    audit = audit_numbers(reply, evidence, context) + audit_identifiers(reply, evidence, context)
+    audit = (audit_numbers(reply, evidence, context) + audit_identifiers(reply, evidence, context)
+             + audit_years(reply, evidence, context))
     entities = audit_entities(reply, evidence, context)
     findings = class_checks(reply, evidence, context)
+    # §4IU: life spans — a range attached to the wrong person REFUTES (both
+    # quotes below); a range the sources never carry WITHHOLDS like a name
+    for ls in audit_life_spans(reply, evidence, context, raw_sources=raw_sources):
+        if ls.status == "misattributed":
+            findings.append(ClassFinding(
+                "attribution", "refute",
+                f"the reply attaches the life span ({ls.span}) to {ls.name!r}, but the evidence attaches it to "
+                f"{ls.evidence_name!r} ({ls.evidence_line[:120]!r})"))
+        elif ls.status == "unsupported":
+            findings.append(ClassFinding("attribution", "withhold",
+                                         f"life span ({ls.span}) of {ls.name!r} not in the evidence"))
     return verdict_from_bindings(bindings, evidence_truncated=evidence_truncated, dropped=dropped,
                                  audit=audit, entities=entities, strict_figures=strict_figures,
                                  findings=findings)
@@ -1381,6 +1408,16 @@ def _reply_states_value(s: Quantity, reply_vals: set) -> bool:
     return any(_round_half_up(rv / f, s.decimals) == _round_half_up(s.value / f, s.decimals) for rv in reply_vals)
 
 
+def _glued_occurrence(fig_text: str, evidence: str) -> bool:
+    """The written figure appears in the evidence with a letter glued to
+    either side (a snippet join, not a different number)."""
+    digits = re.sub(r"[^\d.,]", "", str(fig_text or ""))
+    if not digits or not re.search(r"\d", digits):
+        return False
+    esc = re.escape(digits)
+    return re.search(rf"(?<=[^\W\d_]){esc}(?![\d])|(?<![\d]){esc}(?=[^\W\d_])", str(evidence or "")) is not None
+
+
 def audit_numbers(reply: str, evidence: str, context: str = "") -> List[AuditFigure]:
     """Every prose figure of the reply, graded against the evidence. A figure
     the CONTEXT states (the user's own numbers restated) is supported by it;
@@ -1449,6 +1486,22 @@ def audit_numbers(reply: str, evidence: str, context: str = "") -> List[AuditFig
         # subject rule flagged 12 clean replies; this rule keeps the port
         # 8103/8102 catch and drops the canvas/ball/list-number noise.
         dense = len(extract_quantities(sentence)) >= 3   # coordinates, tables, specs
+        # §4IU: a year-shaped figure (a bare 1800s integer; 1900+ never reach
+        # here) is looked up, never "misreported" — a birth year one digit
+        # from a stranger's is a different year, not a typo (req 2ef4f0a2:
+        # "1854 vs 1852", two different men)
+        if not q.unit and not q.family and q.decimals == 0 and "," not in q.text and 1800 <= q.value <= 1899:
+            out.append(AuditFigure(q.text, q.value, q.family, sentence, "unsupported"))   # same shape test as `_is_bare_year`: "€1850" and "1,850" stay figures
+            continue
+        # §4IT: the figure's own digits GLUED to letters in the evidence
+        # ("Πάρνηθος203" — the pre-§4IO ddgs join) is where the reply took
+        # it from; calling it absent and then a misreport of a pagination
+        # "1 - 200" two lines down refuted a correct address (corpus turn
+        # 45360357). A glued occurrence supports nothing for a binding
+        # (§4IM) but it does rule out "misreported".
+        if _glued_occurrence(q.text, evidence):
+            out.append(AuditFigure(q.text, q.value, q.family, sentence, "unsupported"))
+            continue
         near = [] if dense else [(s, ln) for s, ln in same
                                  if _typo_shaped_disagreement(q.text, s.text) and _near_miss(q, s)
                                  and s.decimals - q.decimals <= 2      # a 14-decimal float is not a misread 380
@@ -1460,6 +1513,58 @@ def audit_numbers(reply: str, evidence: str, context: str = "") -> List[AuditFig
             out.append(AuditFigure(q.text, q.value, q.family, sentence, "misreported", s.text, ln))
             continue
         out.append(AuditFigure(q.text, q.value, q.family, sentence, "unsupported"))
+    return out
+
+
+#: A bare year in prose: four digits in the calendar range, a whole token
+#: (not part of an id, a dimension "1920x1080", a version, a ratio or a
+#: path), outside code and tables. The number audit drops these on purpose
+#: (a year is not a quantity to misreport by rounding); this audit asks a
+#: different question — was the year in the evidence at all?
+_YEAR_TOKEN_RE = re.compile(r"(?<![\w.,/:%#@-])(?:1[89]\d{2}|2[0-9]\d{2})(?!\w)(?![.,/:%#@-]\w)")   # "το 1870." keeps its stop
+
+
+def _year_in(tok: str, hay: str) -> bool:
+    """`tok` occurs in the (normalized) haystack as a year — not as the digits
+    of a decimal ("1.2010"), a thousands group ("2024,000") or a four-digit
+    slash pair ("Νόμος 1848/1989" supported a birth year 1848 on the first
+    live probe). A URL path date ("/2015/05/18/"), a season ("2024/25"), a
+    line:column ("app.js:2564:25" restated as "line 2564") and a dash range
+    ("1848-1932") are the same number the reply took, and count."""
+    return re.search(r"(?<![\d.])(?<!\d/)" + re.escape(tok) + r"(?!\d)(?![.,]\d)(?!/\d{4})", hay) is not None
+
+
+def _clock_years() -> set:
+    """This year and its neighbours: the agent's own calendar, not a fact
+    the evidence needs to carry ("as of 2026", "next year")."""
+    y = datetime.date.today().year
+    return {str(v) for v in (y - 1, y, y + 1)}
+
+
+def audit_years(reply: str, evidence: str, context: str = "") -> List[AuditFigure]:
+    """§4IS-b (req probe-012ca9ec, the Αλκιβιάδου retry): the reply gave the
+    founders life spans — "(1850–1925)", "(1885–1975)" — that appeared in
+    none of 26 tool outputs, and nothing noticed: the number audit drops
+    bare years by design and the cheap judge looked elsewhere. Every bare
+    year in the reply's prose is looked up verbatim in evidence ∪ context;
+    an UNSUPPORTED one withholds a confirm exactly as an unsupported
+    identifier does — never a refute (a year from memory is often right),
+    and never the §4IR cap trigger. Corpus cost before shipping: 7 of 475
+    good turns carried a year the digest lacked, several of them dimensions
+    this token rule excludes."""
+    prose = _mask_non_prose(str(reply or ""))
+    hay = normalize_for_containment(str(evidence or "") + "\n" + str(context or ""))
+    clock = _clock_years()
+    out: List[AuditFigure] = []
+    seen: set = set()
+    for m in _YEAR_TOKEN_RE.finditer(prose):
+        tok = m.group(0)
+        if tok in seen or tok in clock:
+            continue
+        seen.add(tok)
+        sentence = _sentence_at(prose, m.start())
+        status = "supported" if _year_in(tok, hay) else "unsupported"
+        out.append(AuditFigure(tok, float(tok), "year", sentence, status))
     return out
 
 
@@ -1704,16 +1809,171 @@ def unsupported_names(res: "ClaimBindingResult", prior_evidence: str = "") -> Li
 
 
 def name_withhold_caps_confirm(res: Optional["ClaimBindingResult"], *, truncation_severity: float,
-                               truncation_floor: float, prior_evidence: str = "") -> List[str]:
+                               truncation_floor: float, prior_evidence: str = "", raw_sources: str = "") -> List[str]:
     """The names that justify capping a cheap CONFIRMED, or [] when nothing
     does: the binder withheld (UNCERTAIN, no contradiction), at least one
     name/identifier is unsupported across the session, and the digest was
-    not cut past the floor (an absence from a cut digest proves little)."""
+    not cut past the floor (an absence from a cut digest proves little).
+    With the turn's RAW tool outputs (§4IU self-review) the absence is
+    tested against the whole sources — a name the packer left out is not a
+    name the sources lacked — and the digest's floor does not apply."""
     if res is None or res.verdict != "UNCERTAIN":
         return []
-    if truncation_severity >= truncation_floor:
+    if not raw_sources and truncation_severity >= truncation_floor:
         return []
-    return unsupported_names(res, prior_evidence)
+    return unsupported_names(res, (str(prior_evidence or "") + "\n" + str(raw_sources or "")).strip())
+
+
+# ── §4IU: a life span attached to the wrong person ───────────────────────
+# "Name (YYYY–YYYY)" is a fixed convention. Req 2ef4f0a2 wrote "Σπήλιος
+# (Σπυρίδων) Οικονομίδης (1854–1933)"; the sources carried that exact range
+# once — "Γεώργιος Οικονομίδης του Ιωάννη (1854-1933) ήταν πολιτικός" — a
+# namesake. Every lookup-based audit is blind to this: the years exist. The
+# attribution is checkable: the same range in the evidence, attached to a
+# name that shares the family name but not the given name, is a validated
+# contradiction with both quotes. A range attached to a matching name
+# anywhere in the evidence is support; a range found nowhere is left to the
+# year audit (unsupported → withhold).
+_LIFE_SPAN_RE = re.compile(
+    rf"(?P<name>{_TC}(?:[ \t]\({_TC}\))?(?:[ \t]{_TC}){{0,3}})[*_]*[ \t]*[*_]*\((?P<lo>1[5-9]\d{{2}}|20\d{{2}})[ \t]*[–—-][ \t]*(?P<hi>1[5-9]\d{{2}}|20\d{{2}})\)")   # bold markers may sit between the name and the span
+
+
+def _name_tokens(text: str) -> set:
+    return {translit_greek(_fold_accents(t)) for t in re.findall(r"[^\W\d_][\w'’-]{2,}", str(text or "").lower())
+            if t not in _ANCHOR_STOP}
+
+
+def _same_name_tok(a: str, b: str) -> bool:
+    """Two name tokens are the same word when equal or, at six letters or
+    more, when one carries the other's stem (the token minus its last two
+    letters) — Greek names INFLECT: "Σπήλιου Οικονομίδη" (genitive) is
+    "Σπήλιος Οικονομίδης" (the rule `_tok_supported` already uses)."""
+    if a == b:
+        return True
+    return (len(a) >= 6 and b.startswith(a[:-2])) or (len(b) >= 6 and a.startswith(b[:-2]))
+
+
+def _names_relation(rtoks: set, etoks: set) -> str:
+    """"same" — one name is contained in the other (a surname-only or a fuller
+    spelling) or they share two words; "namesake" — exactly one shared word
+    (the family name) beside different given names: the misattribution
+    shape; "other" — nothing shared: a translation, an organisation's other
+    name, or a stranger — code cannot tell which, so it is neither support
+    nor a contradiction."""
+    r_hit = {a for a in rtoks if any(_same_name_tok(a, b) for b in etoks)}
+    e_hit = {b for b in etoks if any(_same_name_tok(a, b) for a in rtoks)}
+    if r_hit == rtoks or e_hit == etoks or len(r_hit) >= 2:
+        return "same"
+    return "namesake" if len(r_hit) == 1 else "other"
+
+
+@dataclass
+class LifeSpanFinding:
+    name: str
+    span: str
+    status: str                 # supported | misattributed | unsupported
+    evidence_name: str = ""
+    evidence_line: str = ""
+    sentence: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"name": self.name, "span": self.span, "status": self.status,
+                "evidence_name": self.evidence_name, "evidence_line": self.evidence_line[:160]}
+
+
+def audit_life_spans(reply: str, evidence: str, context: str = "", raw_sources: str = "") -> List[LifeSpanFinding]:
+    """`raw_sources` — the turn's whole tool outputs when the caller has them:
+    the attribution test is about what the SOURCES say, and the digest is a
+    selection (req 2ef4f0a2: the namesake's line was in a tool output the
+    packer left out)."""
+    prose = _mask_non_prose(str(reply or ""))
+    ev = str(evidence or "") + "\n" + str(context or "") + "\n" + str(raw_sources or "")
+    out: List[LifeSpanFinding] = []
+    seen: set = set()
+    for m in _LIFE_SPAN_RE.finditer(prose):
+        name, lo, hi = m.group("name").strip(), m.group("lo"), m.group("hi")
+        if not (15 <= int(hi) - int(lo) <= 110):
+            continue                       # "Top Breakthroughs (2025–2026)" is a period, not a life
+        span = f"{lo}–{hi}"
+        if span in seen:
+            continue                       # one finding per span: the reply spelling the name twice is one claim
+        seen.add(span)
+        sentence = _sentence_at(prose, m.start())
+        rtoks = _name_tokens(name)             # an alias in parentheses ("(Σπυρίδων)") is one more token of the same person
+        pat = re.compile(rf"(?<!\d){lo}[ \t]*[–—-][ \t]*{hi}(?!\d)")
+        occurrences = list(pat.finditer(ev))
+        if not occurrences:
+            out.append(LifeSpanFinding(name, span, "unsupported", sentence=sentence))
+            continue
+        status, ev_name, ev_line = "unsupported", "", ""
+        for o in occurrences:
+            before = ev[max(0, o.start() - 90):o.start()]
+            line_start = ev.rfind("\n", 0, o.start()) + 1
+            line = ev[line_start:ev.find("\n", o.end()) if ev.find("\n", o.end()) >= 0 else len(ev)]
+            # the name the source attaches to the range: the Title-Case run right before it
+            # (emphasis markers dropped — a bold name in a source is still the name)
+            nm = re.search(rf"({_TC}(?:[ \t](?:{_CONNECT}[ \t])*{_TC}){{0,4}})[ \t]*\(?$",
+                           re.sub(r"[*_]+", " ", before).rstrip(" \t(").rstrip())
+            if not nm:
+                continue                   # a range attached to nobody ("De Geyter, Pierre, 1848-1932") vouches for no one
+            rel = _names_relation(rtoks, _name_tokens(nm.group(1)))
+            if rel == "same":
+                status = "supported"; break
+            if rel == "namesake" and status != "misattributed":
+                status, ev_name, ev_line = "misattributed", nm.group(1), line
+        out.append(LifeSpanFinding(name, span, status, ev_name, ev_line, sentence))
+    return out
+
+
+# ── §4IT: what the sources did not say, for the USER ───────────────────────
+# The withholds above protect the labels; nothing so far told the person
+# reading the reply. The Αλκιβιάδου retry shipped "(1850–1925)" and
+# "(1885–1975)" as facts. `unverified_facts` is the short, defensible list a
+# caveat line can carry: only things the reply states EXACTLY and the whole
+# session's evidence carries NOWHERE — bare years, standards citations, and
+# named people/organisations written with an honorific or in Latin
+# Title-Case (a Greek capitalised phrase is too often a common noun in the
+# genitive to put in front of the user). Never on a digest cut past the
+# floor; never on a REFUTED (that verdict has its own banner).
+def unverified_facts(res: Optional["ClaimBindingResult"], *, evidence: str, prior_evidence: str = "",
+                     truncation_severity: float = 0.0, truncation_floor: float = 0.25, limit: int = 5,
+                     raw_sources: str = "") -> List[str]:
+    if res is None or res.verdict == "REFUTED":
+        return []
+    if not raw_sources and truncation_severity >= truncation_floor:
+        return []                          # a cut DIGEST proves little; the whole sources decide when we have them
+    hay = normalize_for_containment(str(evidence or "") + "\n" + str(prior_evidence or "") + "\n" + str(raw_sources or ""))
+    hay_folded = _fold_accents(hay)
+    out: List[str] = []
+    for a in (res.audit or []):
+        if getattr(a, "status", "") != "unsupported":
+            continue
+        fam, text = getattr(a, "family", ""), str(getattr(a, "text", "") or "")
+        if fam == "year" and not _year_in(text, hay):
+            out.append(text)
+        elif fam == "identifier" and re.match(rf"^{_STANDARD_PREFIX}", text) and normalize_for_containment(text) not in hay:
+            out.append(text)
+    for g in (res.findings or []):
+        if getattr(g, "kind", "") == "attribution" and getattr(g, "status", "") == "withhold":
+            m = re.search(r"\((\d{4}–\d{4})\) of '([^']+)'", str(getattr(g, "detail", "") or ""))
+            if m and not re.search(r"(?<!\d)" + m.group(1).replace("–", r"[ \t]*[–—-][ \t]*") + r"(?!\d)", hay):
+                out.append(f"{m.group(1)} ({m.group(2)})")
+    for e in (res.entities or []):
+        if getattr(e, "status", "") != "unsupported":
+            continue
+        text = str(getattr(e, "text", "") or "")
+        named = bool(_HONORIFIC_RE.match(text)) or bool(re.fullmatch(r"[A-Z][a-z][\w'’-]*(?:[ \t](?:(?:of|the|for|and|de|von|van|da|di|du|la|le|del|der)[ \t])?[A-Z][a-z][\w'’-]*)+", text))
+        if not named:
+            continue
+        key = entity_key(text)
+        toks = [t for t in re.findall(r"[^\W_][\w-]{2,}", key) if t not in _ANCHOR_STOP]
+        if toks and not any(_tok_supported(t, hay, hay_folded) for t in toks):   # NO token anywhere: fully absent
+            out.append(text)
+    spans = [x for x in out if "–" in x]
+    out = [x for x in out if "–" in x or not any(x in sp.split(" ")[0] for sp in spans)]   # a span subsumes its own years
+    seen: set = set()
+    uniq = [x for x in out if not (x in seen or seen.add(x))]
+    return uniq[:limit]
 
 
 # ── §4IN phase 2: the class checks ──────────────────────────────────────

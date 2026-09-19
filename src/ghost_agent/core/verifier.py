@@ -1452,6 +1452,11 @@ class VerifyResult:
     # meaning ("the strong judge overturned the cheap one") so the bench's
     # overturn cells and the escalation audit stay readable.
     binder_decided: bool = False
+    # §4IT: what the reply states that the session's evidence carries nowhere
+    # (years, standards citations, clearly named people/organisations) — the
+    # short list a user-facing caveat may carry. Computed once at the settle,
+    # from the binder's audits; empty on a REFUTED or a cut digest.
+    unverified_facts: List[str] = field(default_factory=list)
     # §4IJ: discrepancies the judge NAMED while confirming (its "conceded"
     # list, or issues on a CONFIRMED) — the verdict was downgraded for them.
     conceded: Optional[List[str]] = None
@@ -2952,6 +2957,7 @@ class Verifier:
                                  deep: bool = False,
                                  trace: Optional[Dict[str, Any]] = None,
                                  prior_evidence: str = "",
+                                 raw_sources: str = "",
                                  ) -> Optional[VerifyResult]:
         """Check whether *claim* is supported by *evidence*.
 
@@ -3004,13 +3010,13 @@ class Verifier:
         context_t = context[:1000]
         if _claim_binding_primary_enabled():
             # §4IM bench arm: the claim-binding verdict alone, no escalation.
-            return await self._verify_claim_binding(claim_t, evidence_t, context_t, trace=trace)
-        cb_task = (self._start_claim_binding(claim_t, evidence_t, context_t, trace=trace)
+            return await self._verify_claim_binding(claim_t, evidence_t, context_t, trace=trace, raw_sources=raw_sources)
+        cb_task = (self._start_claim_binding(claim_t, evidence_t, context_t, trace=trace, raw_sources=raw_sources)
                    if _claim_binding_refute_first_enabled() else None)
         try:
             return await self._verify_claim_incumbent(
                 claim_t, evidence_t, context_t, cb_task, high_stakes=high_stakes, deep=deep, trace=trace,
-                prior_evidence=prior_evidence)
+                prior_evidence=prior_evidence, raw_sources=raw_sources)
         except BaseException:
             # a caller cancellation or an incumbent exception must not leak
             # the binder task (a critic slot, an unwritten row — review §4IN M6)
@@ -3020,7 +3026,8 @@ class Verifier:
 
     async def _verify_claim_incumbent(self, claim_t: str, evidence_t: str, context_t: str,
                                       cb_task: Optional["asyncio.Task"], *, high_stakes: bool, deep: bool,
-                                      trace: Optional[Dict[str, Any]], prior_evidence: str = "") -> Optional[VerifyResult]:
+                                      trace: Optional[Dict[str, Any]], prior_evidence: str = "",
+                                      raw_sources: str = "") -> Optional[VerifyResult]:
         """The incumbent pipeline (two-stage / classic, escalations, guards),
         settled against the binder task at its single exit."""
         result = None
@@ -3086,7 +3093,7 @@ class Verifier:
                                                prior_evidence=prior_evidence)
         result = await self._escalate_refute(
             result, claim_t, evidence_t, context_t,
-            route="claim", trace=trace, prior_evidence=prior_evidence)
+            route="claim", trace=trace, prior_evidence=prior_evidence, raw_sources=raw_sources)
 
         async def _reverify_on_main() -> Optional[VerifyResult]:
             strong = None
@@ -3121,7 +3128,7 @@ class Verifier:
         if cb_task is not None:
             return await self._settle_claim_binding(cb_task, final, trace=trace, high_stakes=high_stakes,
                                                     retry=_reverify_on_main, evidence=evidence_t,
-                                                    prior_evidence=prior_evidence)
+                                                    prior_evidence=prior_evidence, raw_sources=raw_sources)
         if _claim_binding_shadow_enabled():
             self._spawn_claim_binding_shadow(claim_t, evidence_t, context_t, final, trace=trace)
         return final
@@ -3129,7 +3136,7 @@ class Verifier:
     # ── §4IM claim-binding verifier ───────────────────────────────────────
 
     def _start_claim_binding(self, claim: str, evidence: str, context: str, *,
-                             trace: Optional[Dict[str, Any]] = None) -> Optional["asyncio.Task"]:
+                             trace: Optional[Dict[str, Any]] = None, raw_sources: str = "") -> Optional["asyncio.Task"]:
         """Dispatch the binder concurrently with the incumbent pipeline
         (Nova serves four slots; the binder is the faster of the two, so the
         turn waits for nothing). None when there is no running loop."""
@@ -3137,13 +3144,13 @@ class Verifier:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return None
-        task = loop.create_task(self._verify_claim_binding(claim, evidence, context, trace=trace))
+        task = loop.create_task(self._verify_claim_binding(claim, evidence, context, trace=trace, raw_sources=raw_sources))
         task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
         return task
 
     def _cap_confirm_on_name_withhold(self, incumbent: Optional[VerifyResult], cbr: VerifyResult, *,
                                       evidence: str, prior_evidence: str,
-                                      trace: Optional[Dict[str, Any]]) -> List[str]:
+                                      trace: Optional[Dict[str, Any]], raw_sources: str = "") -> List[str]:
         """§4IR: the incumbent's CONFIRMED (≥ the consumption gate) meets a
         binder withhold on a name the whole session never carried → the
         confidence is capped at `_CONFIRM_WITHHELD_CONF_CAP`, the label stays
@@ -3159,7 +3166,8 @@ class Verifier:
             from .agent import evidence_truncation_severity as _sev
             names = cb.name_withhold_caps_confirm(
                 getattr(cbr, "claim_binding", None), truncation_severity=float(_sev(evidence) or 0.0),
-                truncation_floor=_objection._truncation_floor(), prior_evidence=prior_evidence or "")
+                truncation_floor=_objection._truncation_floor(), prior_evidence=prior_evidence or "",
+                raw_sources=raw_sources or "")
         except Exception as exc:  # noqa: BLE001 — the cap never breaks a verdict
             logger.debug("claim-binding name-withhold cap skipped: %s", exc)
             return []
@@ -3179,9 +3187,28 @@ class Verifier:
         _stamp_escalation(incumbent, "withheld")
         return names
 
+    def _unverified_facts(self, cbr: VerifyResult, *, evidence: str, prior_evidence: str,
+                          raw_sources: str = "") -> List[str]:
+        """§4IT: the caveat list, from the binder's audits (see
+        `claim_binding.unverified_facts`); [] on any failure. With the turn's
+        RAW tool outputs the test is complete and the truncation floor does
+        not apply (the digest's cut is the packer's, not the sources')."""
+        try:
+            from . import claim_binding as cb
+            from . import objection as _objection
+            from .agent import evidence_truncation_severity as _sev
+            return cb.unverified_facts(getattr(cbr, "claim_binding", None), evidence=evidence or "",
+                                       prior_evidence=prior_evidence or "", raw_sources=raw_sources or "",
+                                       truncation_severity=float(_sev(evidence or "") or 0.0),
+                                       truncation_floor=_objection._truncation_floor())
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("unverified-facts list skipped: %s", exc)
+            return []
+
     async def _settle_claim_binding(self, cb_task: "asyncio.Task", incumbent: Optional[VerifyResult], *,
                                     trace: Optional[Dict[str, Any]] = None, high_stakes: bool = False,
-                                    retry=None, evidence: str = "", prior_evidence: str = "") -> Optional[VerifyResult]:
+                                    retry=None, evidence: str = "", prior_evidence: str = "",
+                                    raw_sources: str = "") -> Optional[VerifyResult]:
         """Refute-first: a validated REFUTED from the binder is the verdict;
         otherwise the incumbent's stands. Either way the ledger row is
         written from THIS binder call — no second one.
@@ -3225,11 +3252,15 @@ class Verifier:
             decided = "claim_binding"
         if decided == "incumbent":
             capped = self._cap_confirm_on_name_withhold(incumbent, cbr, evidence=evidence,
-                                                       prior_evidence=prior_evidence, trace=trace)
+                                                       prior_evidence=prior_evidence, trace=trace,
+                                                       raw_sources=raw_sources)
             self._write_claim_binding_row(incumbent, cbr, trace=trace, wait_s=wait_s, decided=decided,
                                           capped=capped)
             if incumbent is not None and getattr(incumbent, "claim_binding", None) is None:
                 incumbent.claim_binding = getattr(cbr, "claim_binding", None)   # the rows ride the verdict that ships
+            if incumbent is not None:
+                incumbent.unverified_facts = self._unverified_facts(cbr, evidence=evidence, prior_evidence=prior_evidence,
+                                                                    raw_sources=raw_sources)
             return incumbent
         shipped: VerifyResult = cbr
         if cbr.verdict is VerifyVerdict.CONFIRMED and high_stakes and retry is not None:
@@ -3267,6 +3298,8 @@ class Verifier:
                 incumbent.self_consistency_n, incumbent.self_consistency_agree, incumbent.self_consistency_drawn)
             cbr.escalated_overturn = bool(incumbent.escalated_overturn)     # the incumbent's own history, unchanged
         cbr.binder_decided = binder_own      # the sidecar's "this verdict object is the binder's" (capped or not)
+        cbr.unverified_facts = self._unverified_facts(cbr, evidence=evidence, prior_evidence=prior_evidence,
+                                                      raw_sources=raw_sources)
         return cbr
 
     def _write_claim_binding_row(self, incumbent: Optional[VerifyResult], cbr: Optional[VerifyResult], *,
@@ -3326,7 +3359,7 @@ class Verifier:
             pass
 
     async def _verify_claim_binding(self, claim: str, evidence: str, context: str,
-                                    *, trace: Optional[Dict[str, Any]] = None
+                                    *, trace: Optional[Dict[str, Any]] = None, raw_sources: str = ""
                                     ) -> Optional[VerifyResult]:
         """One cheap-leg quoting call + the mechanical verdict of
         `core.claim_binding`. Returns a VerifyResult whose `issues` name
@@ -3342,7 +3375,7 @@ class Verifier:
             return None
         truncated, strict = bool(_ev_trunc(evidence)), _claim_binding_strict_figures()
         # pure code, but seconds of it on a 12 KB evidence: off the loop
-        res = await asyncio.to_thread(cb.run_binding, claim, evidence, data, evidence_truncated=truncated,
+        res = await asyncio.to_thread(cb.run_binding, claim, evidence, data, evidence_truncated=truncated, raw_sources=raw_sources,
                                       context=context, strict_figures=strict)
         mode = _claim_binding_residual_mode()
         residual = cb.residual_bindings(res) if (mode != "off" and not res.issues) else []
@@ -3520,6 +3553,7 @@ class Verifier:
                                route: str = "claim", retry=None,
                                trace: Optional[Dict[str, Any]] = None,
                                prior_evidence: str = "",
+                               raw_sources: str = "",
                                ) -> Optional[VerifyResult]:
         """§4HB wrapper: run the escalation, then stamp its OUTCOME on the
         verdict being returned. One implementation for all 18 ledger
@@ -3532,7 +3566,7 @@ class Verifier:
         try:
             out = await self._escalate_refute_impl(
                 result, claim, evidence, context, route=route, retry=retry,
-                trace=trace, prior_evidence=prior_evidence)
+                trace=trace, prior_evidence=prior_evidence, raw_sources=raw_sources)
             outcome = _LAST_ESCALATION_OUTCOME.get()
         finally:
             _LAST_ESCALATION_OUTCOME.reset(token)
@@ -3559,6 +3593,7 @@ class Verifier:
                                retry=None,
                                trace: Optional[Dict[str, Any]] = None,
                                prior_evidence: str = "",
+                               raw_sources: str = "",
                                ) -> Optional[VerifyResult]:
         """Confirm a REFUTED verdict on the MAIN model before returning it.
 
@@ -3590,6 +3625,23 @@ class Verifier:
             getattr(client, "worker_clients", None))
         if not cheap_route:
             return result  # main model already judged it
+
+        # §4IU self-review: an "absent" atom that sits in one of THIS turn's
+        # external tool outputs — a page the packer left out of the 12 KB
+        # digest — reaches the appeal as labelled lines appended to the
+        # evidence, so the mechanical absence proof, the rebuttal view and
+        # the strong judge all read the sources, not the selection. The
+        # truncation severity stays the digest's own.
+        evidence_digest = evidence
+        try:
+            _supp = _objection.raw_source_supplement(result.issues, evidence, raw_sources) if raw_sources else ""
+        except Exception as _supp_exc:  # noqa: BLE001 — the splice never costs the appeal
+            logger.debug("raw-source supplement skipped: %s", _supp_exc)
+            _supp = ""
+        if _supp:
+            evidence = evidence + "\n" + _supp
+            logger.info("Verifier appeal: %d raw-source line(s) the digest left out spliced into the evidence",
+                        _supp.count("\n") + 1)
 
         # ── ARITHMETIC BEFORE OPINION (v5, 2026-08-06). Resolve what is
         # mechanically decidable before spending a main-model call on
@@ -3624,7 +3676,7 @@ class Verifier:
             try:
                 from .agent import evidence_truncation_severity as _sev
                 _decision, _why, _unres = _objection.resolve_refute(
-                    result.issues, claim, evidence, _sev(evidence),
+                    result.issues, claim, evidence, _sev(evidence_digest),
                     prior_evidence=prior_evidence, context=context)
                 if _decision == _objection.UPHOLD:
                     logger.info(

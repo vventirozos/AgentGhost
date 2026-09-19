@@ -1269,6 +1269,11 @@ def test_unsupported_names_and_the_cap_predicate():
     assert CB.name_withhold_caps_confirm(res, truncation_severity=0.0, truncation_floor=0.25) == ["Dr. Elin Vasquez", "IEEE P2851"]
     assert CB.name_withhold_caps_confirm(res, truncation_severity=0.3, truncation_floor=0.25) == []      # a cut digest proves little
     assert CB.name_withhold_caps_confirm(None, truncation_severity=0.0, truncation_floor=0.25) == []
+    # the whole sources decide when the caller has them: a name in a tool output the packer left out does not
+    # cap, and the digest's floor is moot (the cut is the packer's, not the sources')
+    raw = "[web] IEEE P2851 draft reviewed by Dr. Elin Vasquez"
+    assert CB.name_withhold_caps_confirm(res, truncation_severity=0.0, truncation_floor=0.25, raw_sources=raw) == []
+    assert CB.name_withhold_caps_confirm(res, truncation_severity=0.3, truncation_floor=0.25, raw_sources="[web] nothing here") == ["Dr. Elin Vasquez", "IEEE P2851"]
     clean = CB.run_binding(NAMES_REPLY, NAMES_EV, rows)
     assert clean.verdict == "CONFIRMED" and CB.name_withhold_caps_confirm(clean, truncation_severity=0.0, truncation_floor=0.25) == []
     # a REFUTED is never "capped" — it is the verdict
@@ -1280,4 +1285,176 @@ def test_unsupported_names_and_the_cap_predicate():
 def test_a_capitalised_opener_after_a_label_or_code_span_is_not_a_name():
     text = "**Acquired Skills** — Two Python scripts for fetching headlines\n\n- `mars_distance.py` — Related Mars distance script\n\nThe Karlsen Institute audited it."
     assert [e.text for e in CB.audit_entities(text, "[x] nothing")] == ["Karlsen Institute"]
+
+
+# ── §4IS-b: a year the evidence never carried withholds a confirm ──────────
+
+CHROPEI_EV = ("[web] ΧΡΩΠΕΙ (1883), δημιούργημα των χημικών Σπήλιου και Λεόντιου Οικονομίδη. "
+              "Το 1899 τέθηκε ο θεμέλιος λίθος στο Νέο Φάληρο.")
+CHROPEI_ROWS = {"claims": [{"quote": "ίδρυσε το 1883", "kind": "date", "evidence_quote": "ΧΡΩΠΕΙ (1883)", "relation": "support"}]}
+
+
+def test_a_fabricated_life_span_withholds_the_confirm():
+    """The Αλκιβιάδου retry (probe-012ca9ec): "(1850–1925)" and "(1885–1975)"
+    in none of 26 tool outputs, and the number audit drops bare years by
+    design. Unsupported years withhold — never refute."""
+    import datetime
+    y = datetime.date.today().year
+    reply = (f"**Σπήλιος Οικονομίδης** (1850–1925): ίδρυσε το 1883 τη ΧΡΩΠΕΙ, εργοστάσιο στο Νέο Φάληρο (1899). "
+             f"Ως το {y} λειτουργεί. Το wallpaper είναι 1920x1080, task f0d5985c1633, έκδοση v2.1999, λόγος 16:2010, "
+             f"`year=1977` στον κώδικα.")
+    audit = CB.audit_years(reply, CHROPEI_EV)
+    assert [(a.text, a.status) for a in audit] == [("1850", "unsupported"), ("1925", "unsupported"), ("1883", "supported"), ("1899", "supported")]
+    r = CB.run_binding(reply, CHROPEI_EV, CHROPEI_ROWS)
+    assert r.verdict == "UNCERTAIN" and "year(s) not in the evidence: 1850, 1925" in r.reasoning
+    assert CB.run_binding("Ίδρυσε το 1883 τη ΧΡΩΠΕΙ, εργοστάσιο στο Νέο Φάληρο (1899).", CHROPEI_EV, CHROPEI_ROWS).verdict == "CONFIRMED"
+    # a year the REQUEST carries is not the reply's invention
+    assert [a.text for a in CB.audit_years("ο πατέρας του πέθανε το 1870.", "")] == ["1870"]          # a sentence-final stop is not a join
+    assert CB.run_binding("Ίδρυσε το 1883 τη ΧΡΩΠΕΙ· ο πατέρας του πέθανε το 1870.", CHROPEI_EV, CHROPEI_ROWS,
+                          context="πότε ίδρυσε τη ΧΡΩΠΕΙ και πότε πέθανε ο πατέρας του (1870);").verdict == "CONFIRMED"
+    # unsupported years are not figures (strict-figures counts them separately) and never a cap trigger
+    assert CB.unsupported_names(r) == ["f0d5985c1633"]
+    # the years ALONE withhold — and are reported as years, not as unfound figures
+    only = CB.run_binding("Ο Σπήλιος Οικονομίδης (1905–1975) ίδρυσε το 1883 τη ΧΡΩΠΕΙ.", CHROPEI_EV, CHROPEI_ROWS)
+    assert only.verdict == "UNCERTAIN" and "year(s) not in the evidence: 1905, 1975" in only.reasoning
+    assert "figure(s) not found" not in only.reasoning
+    assert CB.unsupported_names(only) == []                             # the name IS in the evidence; the years are not a cap trigger
+    # an 1800s bare number is a count as often as a year ("total_orders 1847"): it stays a
+    # figure for the span comparison AND is looked up as a year — never dropped
+    assert [q.text for q in CB.extract_quantities("total_orders 1847 (prev 1649, +12.0%)")] == ["1847", "1649", "+12.0%"]
+    assert CB.run_binding("Last week's orders totalled 1,847.", "[db] total_orders 1847 (prev 1649, +12.0%)",
+                          {"claims": [{"quote": "orders totalled 1,847", "kind": "count", "evidence_quote": "total_orders 1847 (prev 1649, +12.0%)", "relation": "support"}]}).verdict == "CONFIRMED"
+
+
+# ── §4IT: what the sources did not say — the user-facing list ─────────────
+
+def test_unverified_facts_lists_only_exact_defensible_absences():
+    ev = CHROPEI_EV + " Λειβάρτζι."
+    reply = ("**Σπήλιος Οικονομίδης** (1850–1925) από το Λειβάρτζι Καλαβρύτων ίδρυσε το 1883 τη ΧΡΩΠΕΙ (1899 Νέο Φάληρο). "
+             "Το Υπουργείου Πολιτισμού το κήρυξε μνημείο. The lead maintainer, Dr. Elin Vasquez, verified it under IEEE P2851; "
+             "the Karlsen Institute concurred. Open http://127.0.0.1:8100.")
+    res = CB.run_binding(reply, ev, CHROPEI_ROWS)
+    facts = CB.unverified_facts(res, evidence=ev)
+    assert set(facts) == {"1850–1925 (Σπήλιος Οικονομίδης)", "IEEE P2851", "Dr. Elin Vasquez", "Karlsen Institute"}   # the span subsumes its years
+    # a Greek capitalised phrase (a common noun in the genitive as often as a name) and a
+    # partially present entity never reach the user; the loopback address never does
+    assert not any("Πολιτισμού" in f or "Καλαβρύτων" in f or "127.0.0.1" in f for f in facts)
+    assert "Karlsen Institute" not in CB.unverified_facts(res, evidence=ev, prior_evidence="[web] the Karlsen Institute audit")
+    # partially present (one token somewhere) is not "nowhere": not put in front of the user
+    assert "Karlsen Institute" not in CB.unverified_facts(res, evidence=ev + " Karlsen Road is nearby.")
+    assert "Dr. Elin Vasquez" not in CB.unverified_facts(res, evidence=ev + " Vasquez signed.")
+    assert CB.unverified_facts(res, evidence=ev, truncation_severity=0.4) == []          # a cut digest proves little
+    ref = CB.run_binding("There are 9,692 primes below 100000. Dr. Elin Vasquez checked.", "[execute] count: 9592",
+                         {"claims": [{"quote": "9,692 primes", "kind": "count", "evidence_quote": "count: 9592", "relation": "support"}]})
+    assert ref.verdict == "REFUTED" and CB.unverified_facts(ref, evidence="[execute] count: 9592") == []
+    assert len(CB.unverified_facts(res, evidence=ev, limit=2)) == 2
+
+
+def test_a_figure_glued_in_the_evidence_is_not_a_misreport_of_another_line():
+    """Corpus turn 45360357: the reply's "Πάρνηθος 203" sat in the evidence as
+    "Πάρνηθος203" (the pre-§4IO ddgs join); called absent, it was then
+    "misreported" against a pagination "1 - 200" two lines down."""
+    ev = "[web] λεωφοροςπαρνηθος&μοιρωναχαρνες.Πάρνηθος203. Γυμναστήρια\n[browser] White OwlΘρακομακεδόνες,Αχαρνές, Δυτικά Προάστια, Αττική. 1 - 200."
+    reply = "Λεωφ. Πάρνηθος & Μοίρων (Πάρνηθος 203) — Αχαρνές, Θρακομακεδόνες."
+    assert [(a.text, a.status) for a in CB.audit_numbers(reply, ev)] == [("203", "unsupported")]
+    assert [(a.text, a.status) for a in CB.audit_numbers(reply, "[web] Πάρνηθος 200, Αχαρνές Θρακομακεδόνες")] == [("203", "misreported")]
+    assert CB._glued_occurrence("29.45", "orbital period of 29.45years") is True
+    assert CB._glued_occurrence("203", "port 2030") is False
+
+
+# ── §4IU: a life span attached to the wrong person ─────────────────────────
+
+NAMESAKE_EV = ("[web] Γεώργιος Ι. Οικονομίδης - Βικιπαίδεια\nJanuary 14, 2026 - Ο Γεώργιος Οικονομίδης του Ιωάννη (1854-1933) "
+               "ήταν Έλληνας πολιτικός από την Ήπειρο.\n[web] Λεόντιος Οικονομίδης: Γεννήθηκε το 1866 στο Λειβάρτζι. Η ΧΡΩΠΕΙ ιδρύθηκε το 1883.")
+
+
+def test_a_life_span_the_sources_attach_to_a_namesake_is_a_validated_contradiction():
+    """Req 2ef4f0a2: "Σπήλιος (Σπυρίδων) Οικονομίδης (1854–1933)" — the range
+    exists in the sources once, for Γεώργιος Οικονομίδης του Ιωάννη, a
+    politician. Every lookup-based audit is blind to this; the attribution
+    is checkable and carries both quotes."""
+    reply = "- **Σπήλιος (Σπυρίδων) Οικονομίδης** (1854–1933): Ο ιδρυτής της ΧΡΩΠΕΙ.\n- **Λεόντιος Οικονομίδης** (1866–1944): αδελφός του."
+    ls = {f.name: f for f in CB.audit_life_spans(reply, NAMESAKE_EV)}
+    assert ls["Σπήλιος (Σπυρίδων) Οικονομίδης"].status == "misattributed" and ls["Σπήλιος (Σπυρίδων) Οικονομίδης"].evidence_name == "Γεώργιος Οικονομίδης του Ιωάννη"
+    assert ls["Λεόντιος Οικονομίδης"].status == "unsupported"
+    rows = {"claims": [{"quote": "ΧΡΩΠΕΙ", "kind": "status", "evidence_quote": "ΧΡΩΠΕΙ ιδρύθηκε", "relation": "support"}]}
+    r = CB.run_binding(reply, NAMESAKE_EV, rows)
+    assert r.verdict == "REFUTED" and any("attaches the life span (1854–1933)" in i and "Γεώργιος" in i for i in r.issues)
+    # the same person (a subset of tokens either way), a surname-only reply, a Latin name: support
+    assert [f.status for f in CB.audit_life_spans("Ο Γεώργιος Οικονομίδης (1854–1933) ήταν πολιτικός.", NAMESAKE_EV)] == ["supported"]
+    assert [f.status for f in CB.audit_life_spans("Οικονομίδης (1854–1933) was a politician.", NAMESAKE_EV)] == ["supported"]
+    assert [f.status for f in CB.audit_life_spans("Bach (1685–1750) wrote it.", "[web] Johann Sebastian Bach (1685–1750) composed")] == ["supported"]
+    assert [f.status for f in CB.audit_life_spans("Dr. Elin Vasquez (1950–2020) led it.", "[web] Marta Vasquez (1950–2020), chemist")] == ["misattributed"]
+    # a period is not a life; the range found nowhere withholds and reaches the caveat
+    assert CB.audit_life_spans("Top Breakthroughs (2025–2026) were many.", "[web] x") == []
+    r2 = CB.run_binding("**Λεόντιος Οικονομίδης** (1866–1944): αδελφός. ΧΡΩΠΕΙ ιδρύθηκε.", NAMESAKE_EV, rows)
+    assert r2.verdict == "UNCERTAIN" and "life span (1866–1944)" in r2.reasoning
+    assert CB.unverified_facts(r2, evidence=NAMESAKE_EV) == ["1866–1944 (Λεόντιος Οικονομίδης)"]
+    # the raw sources decide when the digest lacks the namesake's line
+    digest = "[web] Λεόντιος Οικονομίδης: Γεννήθηκε το 1866 στο Λειβάρτζι. Η ΧΡΩΠΕΙ ιδρύθηκε το 1883."
+    assert CB.audit_life_spans(reply, digest)[0].status == "unsupported"
+    assert CB.audit_life_spans(reply, digest, raw_sources=NAMESAKE_EV)[0].status == "misattributed"
+    assert CB.run_binding(reply, digest, rows, raw_sources=NAMESAKE_EV).verdict == "REFUTED"
+    # the live reply spelled the name twice ("Σπήλιος (Σπυρίδων) Οικονομίδης" then "Σπήλιος"): ONE finding per span,
+    # so the correction banner does not say the same thing twice
+    twice = reply + "\nΟ Σπήλιος (1854–1933) πέθανε στην Αθήνα."
+    ls2 = CB.audit_life_spans(twice, NAMESAKE_EV)
+    assert [f.span for f in ls2] == ["1854–1933", "1866–1944"]
+    assert sum("attaches the life span (1854–1933)" in i for i in CB.run_binding(twice, NAMESAKE_EV, rows).issues) == 1
+    # self-review of the first cut — the names are compared as WORDS, not exact tokens:
+    # an inflected same person, and a reply alias beside a source-side junk word, are the same person
+    same = "[web] Σπήλιος Οικονομίδης (1848-1894) ήταν χημικός."
+    assert CB.audit_life_spans("Το εργοστάσιο του Σπήλιου Οικονομίδη (1848–1894) έκλεισε.", same)[0].status == "supported"
+    assert CB.audit_life_spans("**Σπήλιος (Σπυρίδων) Οικονομίδης** (1848–1894)", "[web] Βικιπαίδεια Σπήλιος Οικονομίδης (1848-1894)")[0].status == "supported"
+    # a bold name on the SOURCE side is still the name (corpus turn d70b268b: "**Σπήλιο Οικονομίδη** (1854-1935)")
+    assert CB.audit_life_spans("Ο Σπήλιος Οικονομίδης (1854–1935) ίδρυσε.", "[recall] από τους αδελφούς **Σπήλιο Οικονομίδη** (1854-1935) και")[0].status == "supported"
+    assert CB.audit_life_spans("Ο Λεόντιος Οικονομίδης (1854–1935) ίδρυσε.", "[recall] από τους αδελφούς **Σπήλιο Οικονομίδη** (1854-1935) και")[0].status == "misattributed"
+    # a range attached to nobody vouches for no one; a name sharing NOTHING (a translation, an organisation's
+    # other name, a stranger) is neither support nor a contradiction — withhold, never refute
+    nobody = CB.audit_life_spans("Σπήλιος Οικονομίδης (1848–1932) έζησε.", "[web] De Geyter, Pierre, 1848-1932")
+    assert [f.status for f in nobody] == ["unsupported"]
+    assert CB.audit_life_spans("Chropei (1883–1945) made dyes.", "[web] Piraeus Dye Works (1883-1945) made dyes")[0].status == "unsupported"
+    r3 = CB.run_binding("Σπήλιος Οικονομίδης (1848–1932) έζησε. ΧΡΩΠΕΙ ιδρύθηκε.", "[web] De Geyter, Pierre, 1848-1932. ΧΡΩΠΕΙ ιδρύθηκε", rows)
+    assert r3.verdict == "UNCERTAIN" and "life span (1848–1932)" in r3.reasoning
+    assert CB.unverified_facts(r3, evidence="[web] De Geyter, Pierre, 1848-1932. ΧΡΩΠΕΙ ιδρύθηκε") == []   # the range IS in the sources: no caveat
+    assert CB._names_relation({"spilios", "oikonomidis"}, {"georgios", "oikonomidis", "ioanni"}) == "namesake"
+
+
+def test_a_year_shaped_figure_is_never_misreported_and_greek_function_words_do_not_anchor():
+    # the live pair (req 2ef4f0a2): the only words the two sentences share are "αλλά" / "στην"
+    s = "Οι αδελφοί Σπήλιος (1854–1933) και Λεόντιος (1866–1944) καταγράφονται, αλλά οι λεπτομέρειες μένουν στην έρευνα."
+    line = "Ο Κλεομένης Κλεομένους ήταν αξιωματικός, αλλά γεννήθηκε στην Αθήνα το 1852."
+    assert CB.lexical_anchor(s, line) is False
+    assert CB.lexical_anchor("the server restarted cleanly", "restarted ghost-agent at 14:02") is True
+    # and even with a REAL shared word (the surname), a year one digit from another man's is not a typo
+    s2 = "Ο Σπήλιος Οικονομίδης (1854–1933) ίδρυσε τη ΧΡΩΠΕΙ."
+    line2 = "Ο Γεώργιος Οικονομίδης γεννήθηκε το 1852 και έγινε πολιτικός."
+    assert CB.lexical_anchor(s2, line2) is True
+    assert [(a.text, a.status) for a in CB.audit_numbers(s2, "[web] " + line2)] == [("1854", "unsupported")]
+    # the year-shape test is `_is_bare_year`'s: a money figure and a comma-grouped count in 1800–1899 are
+    # still figures, still misreported (self-review: the first cut swallowed both)
+    assert [(a.status, a.evidence_text) for a in CB.audit_numbers("The invoice total was €1851.", "[t] invoice total: €1850")] == [("misreported", "€1850")]
+    assert [(a.status, a.evidence_text) for a in CB.audit_numbers("There were 1,851 orders.", "[t] total_orders 1,850")] == [("misreported", "1,850")]
+
+
+def test_a_year_is_supported_by_a_year_token_not_by_the_digits_of_a_law_number():
+    """Live probe-fe8f0841: the reply's birth year 1848 was 'supported' by
+    "Νόμος 1848/1989" — a law number — so neither the withhold nor the caveat
+    saw it; only the life-span audit did."""
+    law = "[web] Νόμος 1848/1989 (Κωδικοποιημένος)"
+    assert [(a.text, a.status) for a in CB.audit_years("Γεννήθηκε το 1848.", law)] == [("1848", "unsupported")]
+    assert [(a.text, a.status) for a in CB.audit_years("Ψηφίστηκε το 1989.", law)] == [("1989", "unsupported")]
+    # a date's year is a year ("ΦΕΚ 112/Α/8-5-1989"); so are a URL path date, a season and a restated
+    # line:column (corpus replay: all three had been support before and must stay support); a decimal's
+    # or a thousands group's digits are not
+    assert [(a.text, a.status) for a in CB.audit_years("Ψηφίστηκε το 1989.", law + " ΦΕΚ 112/Α/8-5-1989")] == [("1989", "supported")]
+    for ev in ("[web] https://www.coindesk.com/markets/2015/05/18/80000-in-bitcoin", "[web] season 2015/16 table", "[t] error at app.js:2015:25", "[web] posted feb 13,2015 by"):
+        assert [(a.text, a.status) for a in CB.audit_years("It happened in 2015.", ev)] == [("2015", "supported")], ev
+    assert [(a.text, a.status) for a in CB.audit_years("Έφτασε τα 2010.", "[t] value 1.2010 and 2010,000 rows")] == [("2010", "unsupported")]
+    assert [(a.text, a.status) for a in CB.audit_years("Γεννήθηκε το 1848.", "[web] De Geyter, Pierre, 1848-1932")] == [("1848", "supported")]
+    assert [(a.text, a.status) for a in CB.audit_years("Γεννήθηκε το 1848.", "[web] Γεννήθηκε το 1848 στο Λειβάρτζι.")] == [("1848", "supported")]
+    r = CB.run_binding("Γεννήθηκε το 1848 στο Λειβάρτζι.", law, {"claims": []})
+    assert r.verdict == "UNCERTAIN" and "1848" in r.reasoning
+    assert CB.unverified_facts(r, evidence=law) == ["1848"]
+    assert CB.unverified_facts(r, evidence=law, raw_sources="[web] Γεννήθηκε το 1848 στο Λειβάρτζι.") == []
 

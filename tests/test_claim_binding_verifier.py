@@ -635,4 +635,101 @@ async def test_the_cap_respects_prior_evidence_context_truncation_and_loopback(m
     r5 = await Verifier(llm_client=_Stub([CLASSIC_CONFIRM, BINDER_JSON])).verify_claim(
         REPLY + " Certified under IEEE P2851.", EV1, "weather in Athens?", trace={"req_id": "nw9"})
     assert r5.confirm_withheld is True and _ledger(tmp_path)[-1]["capped"] == ["IEEE P2851"]
+    # the name sits in a tool output the packer left out of the digest: the RAW sources reach the cap (§4IU
+    # self-review — the cap was measured at 9/165 live good confirms against the digest alone)
+    r6 = await Verifier(llm_client=_Stub([CLASSIC_CONFIRM, BINDER_JSON])).verify_claim(
+        NAMED_REPLY, EV1, "weather in Athens?", trace={"req_id": "nw10"}, raw_sources="[web] maintainers: Dr. Elin Vasquez (lead)")
+    assert r6.confidence >= 0.9 and not r6.confirm_withheld and "capped" not in _ledger(tmp_path)[-1]
 
+
+# ── §4IT: the shipped verdict carries the caveat list ───────────────────────
+
+@pytest.mark.asyncio
+async def test_the_shipped_verdict_carries_unverified_facts_on_both_settle_branches(monkeypatch, tmp_path):
+    _flags_4ir(monkeypatch, on="0")
+    # incumbent decides: the incumbent object carries the list
+    r = await Verifier(llm_client=_Stub([CLASSIC_CONFIRM, BINDER_JSON])).verify_claim(
+        NAMED_REPLY + " Certified under IEEE P2851 in 1905.", EV1, "weather in Athens?", trace={"req_id": "uf1"})
+    assert r.binder_decided is False and set(r.unverified_facts) == {"Dr. Elin Vasquez", "IEEE P2851", "1905"}
+    # a name an earlier turn's evidence carried is not listed
+    r2 = await Verifier(llm_client=_Stub([CLASSIC_CONFIRM, BINDER_JSON])).verify_claim(
+        NAMED_REPLY, EV1, "weather in Athens?", trace={"req_id": "uf2"}, prior_evidence="[web] Dr. Elin Vasquez leads the team")
+    assert r2.unverified_facts == []
+    # binder decides (a validated REFUTED): never a caveat list
+    r3 = await Verifier(llm_client=_Stub([CLASSIC_CONFIRM, BINDER_JSON])).verify_claim(REPLY + " Dr. Elin Vasquez agreed.", EV2, "c", trace={"req_id": "uf3"})
+    assert r3.verdict is VerifyVerdict.REFUTED and r3.unverified_facts == []
+
+
+@pytest.mark.asyncio
+async def test_the_caveat_is_judged_against_the_raw_sources_not_the_cut_digest(monkeypatch, tmp_path):
+    """Live probe-1cbf122a: the binder said "1935, 1912 not in the evidence"
+    but the digest was cut past the floor, so the caveat stayed empty —
+    right for 1912 (in a tool output the packer left out), wrong for 1935.
+    With the turn's raw outputs the test is complete: no floor, and only the
+    genuinely absent year is named."""
+    _flags_4ir(monkeypatch, on="0")
+    from ghost_agent.core.agent import _slice_evidence_body
+    cut = _slice_evidence_body(EV1 + " " + ("filler " * 400), 400, "")
+    reply = REPLY + " Σπήλιος (1854–1935) και Λεόντιος (1866–1912) ίδρυσαν τη ΧΡΩΠΕΙ."
+    r = await Verifier(llm_client=_Stub([CLASSIC_CONFIRM, BINDER_JSON])).verify_claim(reply, cut, "weather in Athens?", trace={"req_id": "rs1"})
+    assert r.unverified_facts == []                                              # cut digest, no raw sources: proves little
+    r2 = await Verifier(llm_client=_Stub([CLASSIC_CONFIRM, BINDER_JSON])).verify_claim(
+        reply, cut, "weather in Athens?", trace={"req_id": "rs2"},
+        raw_sources=EV1 + " Σπήλιος Οικονομίδης (1854 – 1925). Λεόντιος (1866–1912).")
+    assert r2.unverified_facts == ["1854–1935 (Σπήλιος)"]                       # the span, which subsumes its absent year
+
+
+def test_the_turn_loop_hands_the_raw_tool_outputs_to_every_verify_claim_call():
+    """R1 enumeration: both `verify_claim` sites in `_compute_verifier_verdict`
+    pass `raw_sources=_raw_turn_sources(tools_run_this_turn)` — the caveat's
+    completeness depends on it, and a third site added later must too."""
+    import ast, inspect
+    import ghost_agent.core.agent as agent_mod
+    tree = ast.parse(inspect.getsource(agent_mod))
+    sites = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "verify_claim"]
+    assert len(sites) >= 2
+    for n in sites:
+        kw = {k.arg: ast.unparse(k.value) for k in n.keywords}
+        assert kw.get("raw_sources", "").startswith("_raw_turn_sources("), kw
+    from ghost_agent.core.agent import _raw_turn_sources
+    # labelled blocks in the packer's own shape (§4IU self-review: the appeal's supplement keeps external tools only)
+    assert _raw_turn_sources([{"name": "a", "content": "x"}, {"name": "b", "content": ""}, {"name": "web search", "content": "y"}]) == "[a] x\n[web search] y"
+    from ghost_agent.core.claim_binding import evidence_blocks
+    assert evidence_blocks(_raw_turn_sources([{"name": "browser", "content": "p1\nline2"}, {"name": "file_system", "content": "wrote"}])) == [("browser", "p1\nline2"), ("file_system", "wrote")]
+    assert len(_raw_turn_sources([{"name": "a", "content": "z" * 700_000}])) <= 600_000
+
+
+@pytest.mark.asyncio
+async def test_raw_sources_reach_the_binder_task_for_the_attribution_audit(monkeypatch, tmp_path):
+    _flags_4ir(monkeypatch, on="0")
+    reply = REPLY + " Η θεωρία είναι του Σπήλιου. **Σπήλιος (Σπυρίδων) Οικονομίδης** (1854–1933) την έγραψε."
+    raw = "[web] Ο Γεώργιος Οικονομίδης του Ιωάννη (1854-1933) ήταν Έλληνας πολιτικός."
+    r = await Verifier(llm_client=_Stub([CLASSIC_CONFIRM, BINDER_JSON])).verify_claim(reply, EV1, "weather in Athens?", trace={"req_id": "ls1"}, raw_sources=raw)
+    assert r.verdict is VerifyVerdict.REFUTED and r.binder_decided is True and any("attaches the life span" in i for i in r.issues)
+
+
+
+@pytest.mark.asyncio
+async def test_verify_claim_hands_the_raw_sources_to_the_refute_appeal(monkeypatch, tmp_path):
+    """§4IU self-review, the claim site: `verify_claim(raw_sources=)` must
+    reach `_escalate_refute`, or the mechanical absence proof convicts a
+    name that sits in an unpacked external output (battery 63 S5)."""
+    monkeypatch.setenv("GHOST_VERIFY_ESCALATE_REFUTE", "1")
+    monkeypatch.setenv("GHOST_VERIFY_OVERTURN_QUOTE", "0")
+    cheap_refute = json.dumps({"verdict": "REFUTED", "confidence": 0.9, "reasoning": "r",
+                               "issues": ["The claim cites Dr. Elin Vasquez, who is not present in any tool output."]})
+    strong_ok = json.dumps({"verdict": "CONFIRMED", "confidence": 0.9, "reasoning": "the page names her", "issues": []})
+    claim = REPLY + " The lead maintainer, Dr. Elin Vasquez, verified the result."
+
+    class _Cheap(_Stub):                      # a worker pool: the refute came from a cheap route the appeal escalates FROM
+        worker_clients = [object()]
+    # digest lacks the name, the turn's browser output has it → the appeal runs on the spliced evidence
+    stub = _Cheap([cheap_refute, strong_ok])
+    r = await Verifier(llm_client=stub).verify_claim(claim, EV1, "weather in Athens?", trace={"req_id": "rs1"},
+                                                     raw_sources=EV1 + "\n[browser] Maintainers page — lead: Dr. Elin Vasquez (since 2019)")
+    assert r.verdict is VerifyVerdict.CONFIRMED and len(stub.prompts) == 2
+    assert "not in the digest] Maintainers page — lead: Dr. Elin Vasquez" in stub.prompts[1]
+    # without raw sources the same refute is mechanically upheld: one call, no appeal
+    stub2 = _Cheap([cheap_refute])
+    r2 = await Verifier(llm_client=stub2).verify_claim(claim, EV1, "weather in Athens?", trace={"req_id": "rs2"})
+    assert r2.verdict is VerifyVerdict.REFUTED and len(stub2.prompts) == 1 and r2.escalation == "mechanically_upheld"

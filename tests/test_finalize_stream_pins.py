@@ -380,3 +380,37 @@ async def test_S10_uncertainty_tracker_reset_before_first_stream():
     assert "reset" in script.events, "tracker never reset"
     assert "stream" in script.events
     assert script.events.index("reset") < script.events.index("stream")
+
+
+# ------------------------------------------------------------ §4IT caveat --
+
+async def test_the_source_caveat_is_appended_after_the_answer_on_the_non_stream_path(monkeypatch):
+    """§4IT: a fresh in-loop verdict whose `unverified_facts` name what the
+    sources never carried ends the reply with one italic line; the answer's
+    text and the verdict it was judged on are untouched. Off by flag, and
+    never on a REFUTED."""
+    from ghost_agent.core.verifier import VerifyResult, VerifyVerdict, Verifier
+    from ghost_agent.core.agent import SOURCE_CAVEAT_HEAD
+    monkeypatch.setenv("GHOST_VERIFY_SOURCE_CAVEAT", "1")
+    answer = "Σπήλιος Οικονομίδης (1850–1925) ίδρυσε το 1883 τη ΧΡΩΠΕΙ."
+    tool = {"name": "web_search", "content": "ΧΡΩΠΕΙ (1883) — Σπήλιος Οικονομίδης"}
+    v = VerifyResult(verdict=VerifyVerdict.UNCERTAIN, confidence=0.5, reasoning="r", issues=[])
+    v.unverified_facts = ["1850", "1925"]
+    a = make_fin_agent()
+    a.context.verifier = MagicMock(spec=Verifier); a.context.verifier.llm_client = object()
+    fs = _fs(final_ai_content=answer, tools_run_this_turn=[tool], _verdict_is_fresh=True,
+             _verifier_verdict_cache=(v, tool, hash(answer)))
+    out, _, _ = await a._finalize_and_return(fs)
+    assert out.startswith(answer)
+    assert out.rstrip().endswith("_" + SOURCE_CAVEAT_HEAD + "1850, 1925._")
+    assert out.count(SOURCE_CAVEAT_HEAD) == 1
+    # REFUTED: the correction path owns it — no caveat line
+    v2 = VerifyResult(verdict=VerifyVerdict.REFUTED, confidence=0.9, reasoning="r", issues=["x"]); v2.unverified_facts = ["1850"]
+    out2, _, _ = await a._finalize_and_return(_fs(final_ai_content=answer, tools_run_this_turn=[tool], _verdict_is_fresh=True,
+                                                  _verifier_verdict_cache=(v2, tool, hash(answer))))
+    assert SOURCE_CAVEAT_HEAD not in out2
+    # flag off
+    monkeypatch.setenv("GHOST_VERIFY_SOURCE_CAVEAT", "0")
+    out3, _, _ = await a._finalize_and_return(_fs(final_ai_content=answer, tools_run_this_turn=[tool], _verdict_is_fresh=True,
+                                                  _verifier_verdict_cache=(v, tool, hash(answer))))
+    assert SOURCE_CAVEAT_HEAD not in out3

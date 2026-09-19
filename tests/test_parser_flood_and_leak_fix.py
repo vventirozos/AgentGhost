@@ -333,7 +333,9 @@ class TestStreamingScrubOnFinalGeneration:
         # upstream emitted content, (c) nothing past the prefix reached
         # the client.
         assert "_stream_scrub_active" in src
-        assert "_scrubbed_emitted_len <= len(stream_prefix)" in src
+        # §4IS: "nothing visible past the prefix" — the whitespace seams the
+        # scrub drops before the first visible character are subtracted
+        assert "(_scrubbed_emitted_len - _scrub_dropped_lead_ws) <= len(stream_prefix)" in src
         # The fallback must mention the intended tool when it can
         # extract the name — that's the most useful signal for the
         # user to rephrase with.

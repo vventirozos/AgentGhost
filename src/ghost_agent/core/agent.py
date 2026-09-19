@@ -696,6 +696,32 @@ def prm_skip_level(previous_reason, reason) -> str:
             else "DEBUG")
 
 
+def _source_caveat_enabled() -> bool:
+    """§4IT: GHOST_VERIFY_SOURCE_CAVEAT=0 turns the user-facing caveat off."""
+    return os.getenv("GHOST_VERIFY_SOURCE_CAVEAT", "1").strip().lower() not in ("0", "false", "off", "no")
+
+
+SOURCE_CAVEAT_HEAD = "Not found in the sources I consulted: "
+
+
+def _source_caveat_line(v_result) -> str:
+    """The italic caveat line for a verdict carrying `unverified_facts`, or
+    "" — never for a REFUTED (its correction banner says more), never when
+    the flag is off, at most five items."""
+    if v_result is None or not _source_caveat_enabled():
+        return ""
+    facts = [str(f) for f in (getattr(v_result, "unverified_facts", None) or []) if str(f).strip()]
+    if not facts:
+        return ""
+    try:
+        from .verifier import VerifyVerdict
+        if getattr(v_result, "verdict", None) == VerifyVerdict.REFUTED:
+            return ""
+    except Exception:  # noqa: BLE001
+        pass
+    return "_" + SOURCE_CAVEAT_HEAD + ", ".join(facts[:5]) + "._"
+
+
 def verdict_is_consumable(v_result, last_tool) -> bool:
     """May this verdict drive the note / backfill / retraction?
 
@@ -1482,7 +1508,19 @@ def _turn_had_tool_failure(tools_run: Optional[list]) -> bool:
 _EVIDENCE_BUDGET_WEIGHTS = ([1.0], [0.65, 0.35], [0.5, 0.3, 0.2],
                             [0.4, 0.25, 0.2, 0.15],
                             [0.32, 0.22, 0.18, 0.15, 0.13],
-                            [0.28, 0.2, 0.16, 0.14, 0.12, 0.1])
+                            [0.28, 0.2, 0.16, 0.14, 0.12, 0.1],
+                            # §4IT: two rows past the positional maximum, so the
+                            # claim pull has slots on the widest turns — §4HO's
+                            # sixth positional slot had filled the table and
+                            # switched the pull off exactly where it matters
+                            # (a 36-tool research turn: "6 items of 36", no pull)
+                            [0.25, 0.18, 0.15, 0.13, 0.11, 0.1, 0.08],
+                            [0.22, 0.17, 0.14, 0.12, 0.11, 0.09, 0.08, 0.07])
+#: How many items the claim pull may add past the positional picks, chosen
+#: greedily by MARGINAL coverage — the claim tokens no picked item carries,
+#: IDF-weighted — so the second pull brings the source of a different part
+#: of the answer, not a second copy of the first.
+_EVIDENCE_CLAIM_PULLS = 2
 
 # §4HO (2026-09-16, req 11a466ff) — the budget follows the turn. A fixed
 # 4,000 chars over three positional slots plus one pull gave a 21-tool
@@ -1593,6 +1631,7 @@ def _claim_overlap_scorer(claim_tokens, candidates):
         if ts is None:
             ts = _claim_tokens(str(tool.get("content", ""))[:6000])
         return sum(weight.get(w, 0.0) for w in (claim_tokens & ts))
+    score.weight_of = lambda w: weight.get(w, 0.0)      # §4IT: the marginal pull sums per-token weights
 
     def raw(tool) -> int:
         ts = by_id.get(id(tool))
@@ -1626,7 +1665,20 @@ _EVIDENCE_CLAIM_STOPWORDS = frozenset({
     "i", "you", "your", "have", "has", "had", "now", "then", "will",
     "can", "not", "no", "task", "project", "done", "complete", "completed",
     "successfully", "verified", "user",
+    # Greek function words (§4IT): the tokenizer reads Unicode words now, and
+    # without these every Greek reply overlaps every Greek source on "και/του/της"
+    "και", "του", "της", "των", "τον", "την", "τους", "τις", "στο", "στη", "στην",
+    "στον", "στα", "στις", "στους", "για", "από", "με", "που", "είναι", "ήταν",
+    "έχει", "έχουν", "αυτό", "αυτή", "αυτά", "ένα", "μια", "μία", "δεν", "θα",
+    "να", "ως", "πως", "ότι", "όπως", "επίσης", "ενώ", "αλλά", "μετά", "πριν",
+    "κατά", "προς", "υπό", "ακόμη", "ακόμα", "πολύ", "εδώ", "εκεί", "μέσω",
 })
+
+#: A claim token: a Unicode word of three or more letters (Greek replies
+#: produced NO tokens under the old `[a-zA-Z_]` rule — the claim pull had
+#: nothing to match the source on, req probe-012ca9ec §4IT), or a bare
+#: year — the item that carries the claim's "2009" is the item to pull.
+_CLAIM_TOKEN_RE = re.compile(r"[^\W\d_]\w{2,}|(?<!\d)(?:1[89]|2[0-9])\d{2}(?!\d)")
 
 
 # The inverted-trim guard (2026-07-25) moved to core.reply_smoothing in
@@ -1665,10 +1717,11 @@ def _build_memory_arc(history, ai_text, *, tools_run) -> str:
 
 
 def _claim_tokens(text: str) -> set:
-    """Significant lowercase tokens of a claim, for evidence relevance."""
+    """Significant lowercase tokens of a claim, for evidence relevance:
+    Unicode words of 3+ letters and bare years, minus function words."""
     return {
-        t for t in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]+", (text or "").lower())
-        if len(t) > 2 and t not in _EVIDENCE_CLAIM_STOPWORDS
+        t for t in _CLAIM_TOKEN_RE.findall((text or "").lower())
+        if t not in _EVIDENCE_CLAIM_STOPWORDS
     }
 
 
@@ -1899,6 +1952,36 @@ def _project_ledger_evidence(context, tools_run: Optional[list],
 _PRIOR_EVIDENCE_CHARS = 60_000
 
 
+#: §4IT: the turn's tool outputs, whole and uncut, joined for the caveat's
+#: "nowhere in the sources" test — the packed digest is a 12 KB selection, and
+#: a year the packer left out is not a year the sources lacked. Bounded so a
+#: pathological turn cannot hand the verifier megabytes.
+_RAW_SOURCES_CHARS = 600_000
+
+
+def _raw_turn_sources(tools_run_this_turn) -> str:
+    """Each output as a `[tool] body` block — the packer's own label shape
+    (`claim_binding.evidence_blocks` reads it back), so a consumer can tell
+    an external source from the agent's own write receipt or command echo
+    (§4IU self-review: the appeal splices only EXTERNAL lines)."""
+    parts = []
+    total = 0
+    for t in (tools_run_this_turn or []):
+        try:
+            body = str(t.get("content", "") if isinstance(t, dict) else getattr(t, "content", "") or "")
+            name = str(t.get("name", "") if isinstance(t, dict) else getattr(t, "name", "") or "")
+        except Exception:  # noqa: BLE001
+            continue
+        if not body:
+            continue
+        label = re.sub(r"[^\w .\-]", "_", name)[:40] or "tool"
+        parts.append(f"[{label}] {body}")
+        total += len(body)
+        if total >= _RAW_SOURCES_CHARS:
+            break
+    return "\n".join(parts)[:_RAW_SOURCES_CHARS]
+
+
 def _prior_turn_evidence(messages, tools_run_this_turn) -> str:
     """The session's evidence BEFORE this turn: earlier tool outputs and
     earlier assistant replies, newest first, bounded by
@@ -1912,7 +1995,16 @@ def _prior_turn_evidence(messages, tools_run_this_turn) -> str:
                for t in (tools_run_this_turn or []) if isinstance(t, dict)}
         parts: list = []
         total = 0
-        for m in reversed(list(messages or [])):
+        # §4IU R2 (probe-b83968f4): "prior" is PRIOR TURNS. The list the loop
+        # hands over also carries THIS turn's assistant messages — the model's
+        # narration and `<thinking>` — and a year the model wrote there
+        # ("1848–1898") read as "carried over from the session", silencing the
+        # caveat for exactly the facts it invented. Everything after the last
+        # user message is this turn's own voice, not evidence.
+        msgs = list(messages or [])
+        last_user = max((i for i, m in enumerate(msgs)
+                         if isinstance(m, dict) and m.get("role") == "user"), default=-1)
+        for m in reversed(msgs[:last_user] if last_user >= 0 else msgs):
             if not isinstance(m, dict) or m.get("role") not in ("tool", "assistant"):
                 continue
             c = m.get("content")
@@ -2056,18 +2148,42 @@ def _collect_verifier_evidence(tools_run: Optional[list],
             # The judge CONFIRMED at 0.95. An external source that
             # overlaps the claim is evidence; the claim's own echo is not.
             _score, _raw, _dup = _claim_overlap_scorer(ct, candidates)
-            best, best_key = None, (False, 0.0)
-            for tool in candidates:
-                if tool in picked:
-                    continue
-                if _raw(tool) <= 1 or _dup(tool, picked):
-                    continue
-                key = (_evidence_is_external(tool), _score(tool))
-                if key > best_key:
-                    best, best_key = tool, key
-            if best is not None and len(picked) < len(_EVIDENCE_BUDGET_WEIGHTS):
+            # §4IT: up to `_EVIDENCE_CLAIM_PULLS` items, each the best by the
+            # claim tokens the ALREADY-PICKED items do not carry (the first
+            # pull is the plain overlap ranking; a second pull that re-covers
+            # the same tokens is worth nothing to the judge).
+            _tok_cache = {}
+            def _toks(t):
+                k = id(t)
+                if k not in _tok_cache:
+                    _tok_cache[k] = _claim_tokens(str(t.get("content", ""))[:6000])
+                return _tok_cache[k]
+            pulled = []
+            for _round in range(_EVIDENCE_CLAIM_PULLS):
+                if len(picked) >= len(_EVIDENCE_BUDGET_WEIGHTS):
+                    break
+                covered = set()
+                for t in picked:
+                    covered |= (ct & _toks(t))
+                remaining = ct - covered
+                best, best_key = None, (False, 0.0)
+                for tool in candidates:
+                    if tool in picked:
+                        continue
+                    if _raw(tool) <= 1 or _dup(tool, picked):
+                        continue
+                    marginal = _toks(tool) & remaining
+                    if _round > 0 and (len(marginal) <= 1 or not _evidence_is_external(tool)):
+                        continue                      # nothing new for the judge — or the claim's own echo (§4HC)
+                    sc = _score(tool) if _round == 0 else sum(_score.weight_of(w) for w in marginal)
+                    key = (_evidence_is_external(tool), sc)
+                    if key > best_key:
+                        best, best_key = tool, key
+                if best is None:
+                    break
                 picked.append(best)
-                claim_pulled = best
+                pulled.append(best)
+            claim_pulled = pulled[0] if pulled else None
     if not picked:
         return ""
     picked.reverse()  # chronological: oldest → newest
@@ -5289,7 +5405,11 @@ def _repair_native_tool_calls(tool_calls: list, available_names=None):
 # to the first real tool-call opening (wrapped `<tool_call><function>` or a
 # named `<function …>`), never a bare quoted mention.
 # ============================================================================
-_THINK_CLOSED_RE = re.compile(r'<think\b[^>]*>.*?</think\s*>', re.DOTALL | re.IGNORECASE)
+# `<thinking>` too (§4IU R2, probe-b83968f4): the model wrote a
+# `<thinking>…</thinking>` preamble and `\b` after "think" let it through to
+# the user — the stream gate (`_inline_think_open`) already matched the
+# prefix, the strip did not.
+_THINK_CLOSED_RE = re.compile(r'<think(?:ing)?\b[^>]*>.*?</think(?:ing)?\s*>', re.DOTALL | re.IGNORECASE)
 # The unclosed-think lookahead must also recognize the LESIONED opener
 # shape `<tool_call>function=…` (dropped '<', req 65d8cf76) — otherwise
 # the strip-to-EOS branch swallows the whole call silently (no strike,
@@ -5298,10 +5418,10 @@ _THINK_CLOSED_RE = re.compile(r'<think\b[^>]*>.*?</think\s*>', re.DOTALL | re.IG
 # exact condition (`function…=`), so a bare prose mention of
 # "<tool_call> function" cannot anchor it.
 _THINK_UNCLOSED_RE = re.compile(
-    r'<think\b[^>]*>.*?(?=<tool_call\b[^>]*>\s*<function\b'
+    r'<think(?:ing)?\b[^>]*>.*?(?=<tool_call\b[^>]*>\s*<function\b'
     r'|<tool_call\b[^>]*>\s*function(?:_name)?\s*(?:=|\s+name\s*=)'
     r'|<function\s+name\b|<function\s*=)'
-    r'|<think\b[^>]*>.*$',
+    r'|<think(?:ing)?\b[^>]*>.*$',
     re.DOTALL | re.IGNORECASE,
 )
 
@@ -13295,6 +13415,7 @@ class GhostAgent:
                         trace=_trace,
                         prior_evidence=_prior_turn_evidence(
                             messages, tools_run_this_turn),
+                        raw_sources=_raw_turn_sources(tools_run_this_turn),
                     )
         else:
             with verify_purpose("turn gate"):
@@ -13307,6 +13428,7 @@ class GhostAgent:
                     trace=_trace,
                     prior_evidence=_prior_turn_evidence(
                         messages, tools_run_this_turn),
+                    raw_sources=_raw_turn_sources(tools_run_this_turn),
                 )
         # §4FZ: the judge's own SHAPE refute on an honest inability report
         # is stood down — the same exemption the mechanical tier carries.
@@ -15895,6 +16017,15 @@ class GhostAgent:
                     trajectory_id, "failed",
                     "; ".join(str(x) for x in (getattr(v_result, "issues", None) or []))[:500])
             return
+        # §4IT: the streamed reply has already left; its `unverified_facts`
+        # (years, standards citations, named people/organisations the
+        # session's evidence carried nowhere) surface as a NOTE at the head
+        # of this conversation's next reply — the correction channel, with
+        # its own kind and wording. Not on a REFUTED (its banner says more).
+        try:
+            self._queue_source_caveat(v_result, conv_fp, trajectory_id)
+        except Exception as _qc_exc:  # noqa: BLE001
+            logger.debug("source caveat not queued: %s", _qc_exc)
         if v_result.confidence >= 0.7:
             if v_result.verdict == VerifyVerdict.CONFIRMED:
                 self._backfill_trajectory_outcome(trajectory_id, "passed")
@@ -16036,7 +16167,7 @@ class GhostAgent:
             # surface it unconditionally (only reachable via direct injection;
             # production always enqueues a tagged dict).
             if isinstance(c, str):
-                surface.append(c)
+                surface.append(("correction", c))
                 continue
             if not isinstance(c, dict):
                 continue
@@ -16050,7 +16181,7 @@ class GhostAgent:
             # sides. (Bare-string legacy corrections still surface
             # unconditionally — handled by the isinstance(c, str) path above.)
             if current_fp and conv and conv == current_fp:
-                surface.append(c.get("note", ""))
+                surface.append((c.get("kind", "correction"), c.get("note", "")))
             else:
                 kept.append(c)  # a different conversation — leave it queued
 
@@ -16061,10 +16192,16 @@ class GhostAgent:
         if not surface:
             return messages
 
-        note = "; ".join(n for n in surface if n)
-        self._active_correction = (
-            f"⚠️ **Correction to my previous answer:** {note}\n\n---\n\n"
-        )
+        corrections_ = [n for k, n in surface if n and k != "caveat"]
+        caveats_ = [n for k, n in surface if n and k == "caveat"]
+        banner = ""
+        if corrections_:
+            banner += f"⚠️ **Correction to my previous answer:** {'; '.join(corrections_)}\n\n"
+        if caveats_:
+            # §4IT: a caveat is not a correction — the answer stands; these
+            # items were simply not in the sources it was built from
+            banner += f"ℹ️ **On my previous answer:** {' '.join(caveats_)}\n\n"
+        self._active_correction = banner + "---\n\n"
         pretty_log(
             "Verifier",
             f"surfacing {len(surface)} deferred correction(s) from a prior turn "
@@ -16072,6 +16209,30 @@ class GhostAgent:
             icon=Icons.IDEA,
         )
         return messages
+
+    def _queue_source_caveat(self, v_result, conv_fp, trajectory_id) -> bool:
+        """§4IT: queue the next-turn source caveat for a streamed reply.
+        Returns True iff queued (same queue, `kind="caveat"`, dedup by note)."""
+        from .verifier import VerifyVerdict
+        if v_result is None or not _source_caveat_enabled():
+            return False
+        if getattr(v_result, "verdict", None) == VerifyVerdict.REFUTED:
+            return False
+        facts = [str(f) for f in (getattr(v_result, "unverified_facts", None) or []) if str(f).strip()][:5]
+        if not facts or not conv_fp:
+            return False
+        if not isinstance(getattr(self, "_pending_corrections", None), list):
+            self._pending_corrections = []
+        note = SOURCE_CAVEAT_HEAD + ", ".join(facts) + "."
+        if any(c.get("note") == note and c.get("conv") == conv_fp for c in self._pending_corrections if isinstance(c, dict)):
+            return False
+        self._pending_corrections.append({"note": note, "conv": conv_fp, "traj": str(trajectory_id or ""),
+                                          "ts": time.monotonic(), "kind": "caveat"})
+        if len(self._pending_corrections) > _CORRECTION_MAX:
+            self._pending_corrections = self._pending_corrections[-_CORRECTION_MAX:]
+        pretty_log("Verifier", f"queued a source caveat for this conversation's next reply: {', '.join(facts)}",
+                   icon=Icons.VERIFIER_LAB)
+        return True
 
     def _take_active_correction(self) -> str:
         """Return the staged correction banner and clear it (one-shot, so it
@@ -21029,6 +21190,7 @@ class GhostAgent:
         # autobiographical record (which is born `outcome="unknown"`
         # on the hot path). `(outcome, failure_reason)` or None.
         verifier_backfill: tuple | None = None
+        _caveat_verdict = None          # §4IT: the verdict whose `unverified_facts` the caveat line reads
         try:
             # Heartbeat: the verifier completion can run for a minute
             # on a cold prefill; without refreshing the activity
@@ -21097,6 +21259,7 @@ class GhostAgent:
                     req_id=req_id,
                 )
             from .verifier import VerifyVerdict
+            _caveat_verdict = v_result
             # Consumption guard mirrors the original gate exactly: only
             # annotate / backfill / retract when the verifier was
             # actually applicable (installed, a substantive tool ran,
@@ -21994,6 +22157,23 @@ class GhostAgent:
         # § R1 A-F2: respects an active start-with head via _head_insert.
         final_ai_content = _head_insert(self._take_active_correction(),
                                         final_ai_content or "")
+        # §4IT: what the sources did not say — one italic line after the
+        # answer, from the verdict's `unverified_facts` (years, standards
+        # citations, clearly named people/organisations the whole session's
+        # evidence carries nowhere). Appended AFTER the verdict was stamped
+        # (the judged-text fingerprint above is of the answer, not of this
+        # appendix), never on a REFUTED (its banner says more), never when
+        # the flag is off. The streamed path delivers the same list on the
+        # next turn (`_record_late_verdict`).
+        try:
+            _cav_line = _source_caveat_line(_caveat_verdict)
+            if _cav_line and final_ai_content and _cav_line not in final_ai_content:
+                final_ai_content = final_ai_content.rstrip() + "\n\n" + _cav_line
+                pretty_log("Verifier",
+                           f"source caveat appended: {', '.join(list(getattr(_caveat_verdict, 'unverified_facts', []) or [])[:5])}",
+                           icon=Icons.VERIFIER_LAB)
+        except Exception as _cav_exc:  # noqa: BLE001 — a caveat never costs the reply
+            logger.debug("source caveat skipped: %s", _cav_exc)
 
         # Consolidated TURN OUTCOME — one grep-able summary per turn so a reader
         # (or the operator's eye) gets success/fail + confidence + the tools
@@ -29008,6 +29188,12 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             # what `_scrub_tail_is_open` uses — an inline twin would drift.
             _stream_scrub_pattern = _MODULE_SCRUB_RE
             _scrubbed_emitted_len = len(full_content) if _stream_scrub_active else 0
+            # §4IS: whitespace the scrub leaves where a removed block stood,
+            # BEFORE anything visible has been emitted, is dropped rather than
+            # streamed (req 309f45f8: three scrubbed calls opened the reply
+            # with six newlines). Counted so the "nothing visible emitted"
+            # test below stays honest.
+            _scrub_dropped_lead_ws = 0
             # § R3 A-D3 incremental-scrub state (see the emission block).
             _scrub_view_cache = full_content if _stream_scrub_active else ""
             _scrub_tail_open = False
@@ -29196,6 +29382,12 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     _safe_view = _scrubbed_view[
                         :_emit_safe_end(_scrubbed_view, _scrubbed_emitted_len)]
                     _to_emit = _safe_view[_scrubbed_emitted_len:]
+                    if (_to_emit and not _to_emit.strip()
+                            and (_scrubbed_emitted_len - _scrub_dropped_lead_ws) <= len(stream_prefix or "")):
+                        # a seam before the first visible character: drop it
+                        _scrub_dropped_lead_ws += len(_to_emit)
+                        _scrubbed_emitted_len = len(_safe_view)
+                        _to_emit = ""
                     if _to_emit:
                         _synthetic = {
                             "id": f"chatcmpl-{req_id}",
@@ -29357,7 +29549,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 _stream_scrub_active
                 and full_content.strip()
                 and len(full_content.strip()) > len(stream_prefix.strip())
-                and _scrubbed_emitted_len <= len(stream_prefix)
+                and (_scrubbed_emitted_len - _scrub_dropped_lead_ws) <= len(stream_prefix)
             ):
                 _scrub_fallback_emitted = True
                 _intended = ""
@@ -29448,6 +29640,12 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 # (the prefix was delivered before the scrub existed): not
                 # a <tool_response> echo, not inline code, not the
                 # watchdog's own replan marker (review, 2026-09-09).
+                # §4IS (req 309f45f8): the note is DUE here but yielded after
+                # the forced-final retry below, so an answer that retry
+                # supplies comes first and the caveat last — the order the
+                # non-stream path delivers (`_finalize_and_return` appends
+                # the note at the end).
+                _note_chunk = None
                 if (_stream_scrub_active and not _scrub_fallback_emitted
                         and _ucm_present((full_content or "")[len(stream_prefix or ""):])):
                     _note_chunk = {
@@ -29461,14 +29659,14 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             "finish_reason": None,
                         }],
                     }
-                    yield f"data: {json.dumps(_note_chunk)}\n\n".encode('utf-8')
                     pretty_log(
                         "Reply Scrub",
                         "a tool call in the streamed reply could not be parsed — "
-                        "told the user it did not run",
+                        "telling the user it did not run (after the answer)",
                         level="WARNING", icon=Icons.WARN,
                     )
             except Exception as _nc_exc:  # noqa: BLE001
+                _note_chunk = None
                 logger.debug("stream tool-call note skipped: %s", _nc_exc)
 
             # §4HF (2026-09-15, req 69fb588e) — the forced final that
@@ -29539,6 +29737,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 logger.warning("streamed forced-final retry skipped: %s", _ff_exc)
                 _ff_retry_text = ""
             if _ff_retry_text:
+                # §4IS: no separator when nothing visible went out before it —
+                # the retry's answer then OPENS the reply
+                _ff_nothing_before = (not (stream_prefix or "").strip()
+                                      and (_scrubbed_emitted_len - _scrub_dropped_lead_ws) <= len(stream_prefix or ""))
                 _ff_chunk = {
                     "id": f"chatcmpl-{req_id}",
                     "object": "chat.completion.chunk",
@@ -29546,13 +29748,16 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     "model": stream_model,
                     "choices": [{
                         "index": 0,
-                        "delta": {"content": "\n\n" + _ff_retry_text},
+                        "delta": {"content": ("" if _ff_nothing_before else "\n\n") + _ff_retry_text},
                         "finish_reason": None,
                     }],
                 }
                 yield f"data: {json.dumps(_ff_chunk)}\n\n".encode('utf-8')
                 full_content = (full_content or "").rstrip() + "\n\n" + _ff_retry_text
                 _stream_effective_content = full_content
+                if _note_chunk is not None:
+                    yield f"data: {json.dumps(_note_chunk)}\n\n".encode('utf-8')   # §4IS: caveat after the answer
+                    _note_chunk = None
                 if _scrub_fallback_deferred:
                     # §4HW: the record is the answer, not the scrubbed markup.
                     _stream_effective_content = (
@@ -29567,6 +29772,9 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     "forced-final retry produced nothing after a full scrub — emitted the fallback sentence",
                     level="WARNING", icon=Icons.FAIL,
                 )
+            if _note_chunk is not None:
+                yield f"data: {json.dumps(_note_chunk)}\n\n".encode('utf-8')       # §4IS: no retry answer — the note stands alone
+                _note_chunk = None
 
             # ⚠ THE [DONE] SENTINEL IS NOW RELEASED AT THE VERY END OF THIS
             # GENERATOR (see the release site at the bottom of stream_wrapper).
