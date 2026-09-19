@@ -44594,3 +44594,14 @@ evidence cut), two textual pins converted to AST enumerations (ratchet re-baseli
 digest 7eee106f). **R8 rises to 18.** The §4IX/§4IY touched-suite discipline was the blind spot:
 "the touched suites are green" is not "the suite is green" — the smoothing scrub regression sat
 in a test file none of the four reviewers' slices named.
+**§4IY close (23:45):** suite ONCE after the last edit — **23663 passed, 68 skipped, exit=0** →
+kickstart, pid 25442 → 72294, health 200 in 10 s. Probes: "Reply with exactly: PONG" → `PONG`
+(no verdict, zero tools); Greek date ("στις 17 Αυγούστου", one web_search) → the cheap judge
+refuted, the escalation OVERTURNED to CONFIRMED and the binder shadow agreed CONFIRMED — the date
+mask now speaks Greek, so no "17" reached the figure audit; sandbox http.server on port 8765 →
+"port **8765** … HTTP status **200**", code verifier CONFIRMED 1.00 (the port-in-URL rule
+supports the figure); memory-only question → no verdict, honest "based on my context" answer.
+Ledger `--days 1`: 29 rows, binder failed 0, 1 override (2ef4f0a2, the morning's namesake catch),
+1 cap (probe-06e93631), escalation overturned 2 / upheld 3 / truncation_guard 6 — unchanged in
+kind. Open after §4IY: (c) weekly ledger read; (d) year support from raw sources; (e) the packer's
+echo slot; B12; F5; the documented-not-fixed list above.
