@@ -43,6 +43,8 @@ JUDGE_GROUNDED_ISSUES = [
     "Does not verify 10 functional apps; Does not verify wallpaper changing feature",
     "The agent failed to execute the first command (`echo alpha`) requested by the user.",
     "Stiva's Restaurant is not mentioned in the evidence.",
+    # §4IY: the judge uses the same "Constraint violation:" prefix for CONTENT refutes over project constraints
+    "Constraint violation: the reply names 'NeuroSynth AI' as the vendor, which appears in no evidence and contradicts the project's stated supplier.",
 ]
 HONEST = ("The file `/Users/vasilis/private/secret_ledger.txt` is on your host machine, outside the "
           "sandbox — I can't access absolute macOS paths directly. If you copy it into the sandbox, "

@@ -207,10 +207,15 @@ def test_stream_gate_captures_are_eager():
     fingerprint silently drops every queued correction."""
     src = _agent_source()
     assert "stream_verify_messages = list(messages)" in src
-    assert ("stream_conv_fp = self._conversation_fingerprint(messages)"
-            in src)
+    # §4IY: the stream side takes the turn's STABLE fingerprint — computed
+    # once from the un-pruned history at the top of the turn, the same value
+    # the consume side keys the queued banner by (the pruned loop list gave a
+    # different hash on long conversations).
+    assert "stream_conv_fp = _stable_conv_fp" in src
+    assert "_stable_conv_fp = self._conversation_fingerprint(messages)" in src
     # Captures happen at closure-creation time, i.e. before stream_wrapper.
-    assert (src.index("stream_conv_fp = self._conversation_fingerprint")
+    assert (src.index("_stable_conv_fp = self._conversation_fingerprint(messages)")
+            < src.index("stream_conv_fp = _stable_conv_fp")
             < src.index("async def stream_wrapper"))
 
 

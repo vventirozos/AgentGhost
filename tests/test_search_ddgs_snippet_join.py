@@ -27,8 +27,13 @@ def fresh_state(monkeypatch):
     from ddgs.base import BaseSearchEngine
     original = None
     for klass in BaseSearchEngine.__mro__:
-        if "extract_results" in klass.__dict__ and klass.__dict__["extract_results"] is not S._fixed_extract_results:
-            original = klass.__dict__["extract_results"]
+        cand = klass.__dict__.get("extract_results")
+        # identity is not enough: a `search` module reloaded by another test in this worker
+        # leaves a SECOND `_fixed_extract_results` object installed (§4IW suite run, 1 of 6
+        # today) — recognise the patch by name and home, not by object
+        if cand is not None and not (getattr(cand, "__name__", "") == "_fixed_extract_results"
+                                     or str(getattr(cand, "__module__", "")).startswith("ghost_agent")):
+            original = cand
             break
     if original is None:                                   # already patched in this process: rebuild the original from source
         pytest.skip("original ddgs method not recoverable in this process")

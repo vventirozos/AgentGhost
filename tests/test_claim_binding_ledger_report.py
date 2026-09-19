@@ -143,4 +143,5 @@ def test_report_lists_capped_rows(tmp_path):
     assert summary["counts"]["capped"] == 1 and summary["capped"][0]["capped"] == ["Dr. Elin Vasquez"]
     out = R.render(summary, [])
     assert "CAPPED 1" in out and "Dr. Elin Vasquez" in out
+    assert "own earlier words" in out           # §4IV: the cap's ground includes echo facts, and the daily read says so
 

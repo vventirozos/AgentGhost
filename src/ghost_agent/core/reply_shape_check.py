@@ -70,12 +70,19 @@ _TOOL_FRAMINGS = (
     r"\[sandbox job \d+ finished",
 )
 
+# Case-sensitive since §4IY (fresh-eye review): "Exit code: 137 means the
+# process was killed by SIGKILL" answered "what does exit code 137 mean?" and
+# was refuted as a pasted dump. The EXIT CODE framing must be followed by a
+# line break or the next tool line, and the short fallback heads ("Process
+# finished successfully.") count only with the fallback's own marker or a tool
+# framing after them — the real fallback always carries "### Final Output:".
 _DUMP_HEAD_RE = re.compile(
     r"\A\s*(?:```\w*\s*)?(?:"
     + "|".join([re.escape(h) for k, h in FALLBACK_HEADS.items() if k not in ("no_answer", "text_only")]
-               + [re.escape(FALLBACK_OUTPUT_MARKER)] + list(_TOOL_FRAMINGS))
-    + r")",
-    re.IGNORECASE)
+               + [re.escape(FALLBACK_OUTPUT_MARKER)]
+               + [r"--- EXECUTION RESULT ---", r"--- COMMAND RESULT ---", r"EXIT CODE:\s*-?\d+\s*(?=\n|$|STDOUT|---|\|)", r"\[sandbox job \d+ finished"])
+    + r")")
+_DUMP_BODY_RE = re.compile(r"### Final Output:|--- (?:EXECUTION|COMMAND) RESULT ---|\nEXIT CODE:\s*-?\d+|\nSTDOUT|\nSTDERR")
 #: The §4GH forced-final fallback is refuted by ITS OWN arm (below), not as a
 #: raw dump: a raw-dump refute is repairable ("re-send the same answer in
 #: the right form"), a fallback is the honest end state of a turn that
@@ -118,15 +125,20 @@ def refute_narration_only(reply: str, *, n_real_tools: int,
             "verify; the turn ended before an answer was written"]
 
 
-def refute_raw_tool_dump(reply: str, request: str = "") -> List[str]:
+def refute_raw_tool_dump(reply: str, request: str = "", n_real_tools=None) -> List[str]:
     """One issue when ``reply`` opens as the finalize fallback or a tool's
-    own framing — unless ``request`` asked for the raw output — else []."""
+    own framing — unless ``request`` asked for the raw output — else [].
+    ``n_real_tools`` is accepted for callers that have it; the head shapes
+    themselves decide (a raw dump pasted on a tool-free turn is still a dump)."""
     text = str(reply or "")
     m = _DUMP_HEAD_RE.match(text)
     if not m:
         return []
     if request and _RAW_REQUEST_RE.search(str(request)):
         return []
+    head_txt = m.group(0).strip().strip("`").strip()
+    if head_txt in (FALLBACK_HEADS["success"], FALLBACK_HEADS["failed"], FALLBACK_HEADS["running"]) and not _DUMP_BODY_RE.search(text):
+        return []                          # a sentence the model wrote, not the fallback (no tool framing follows)
     head = m.group(0).strip().strip("`").strip()
     return [f"the reply is raw tool output pasted as the answer (it opens with "
             f"{head[:40]!r}); the request was not answered"]
@@ -136,27 +148,41 @@ def refute_raw_tool_dump(reply: str, request: str = "") -> List[str]:
 #: The request asked for a source the agent READ (opened/visited), not one it
 #: found in a snippet.
 _READ_ASK_RE = re.compile(
-    r"\b(?:actually|really|you)\s+(?:read|opened|visited|fetched|loaded)\b"
-    r"|\bsources?\s+(?:you|that you)\s+(?:read|opened|visited)\b"
+    r"\b(?:actually|really)\s+(?:read|opened|visited|fetched|loaded)\b"
+    r"|\bsources?\s+(?:did\s+)?(?:you|that you)\s+(?:read|opened|visited)\b"
+    r"|\b(?:did|have)\s+you\s+(?:actually\s+|really\s+)?(?:read|open|visit|fetch|load)\b"
     r"|\b(?:read|open|visit)\s+(?:the\s+)?(?:official\s+)?(?:page|site|source|announcement|url)\b",
     re.IGNORECASE)
+# (the bare "you read" alternative went in §4IY: "Can you read the README and tell me…" is not an ask about sources)
 _URL_RE = re.compile(r"https?://[^\s)\]>\"'`]+")
-#: Tools that LOAD a page (a search returns snippets, not the page).
-PAGE_LOADING_TOOLS = frozenset({"browser", "deep_research", "darkweb_research"})
+#: Tools that LOAD a page (a search returns snippets, not the page). `execute`
+#: (curl/wget), `knowledge_base` (ingest_document fetches URLs) and
+#: `fact_check` open pages too (review §4IY).
+PAGE_LOADING_TOOLS = frozenset({"browser", "deep_research", "darkweb_research", "execute", "knowledge_base", "fact_check"})
+SEARCH_TOOLS = frozenset({"web_search", "darkweb_search", "news_headlines"})
+_NOT_OPENED_RE = re.compile(
+    r"\b(?:did\s+not|didn't|could\s+not|couldn't|have\s+not|haven't|was\s+not\s+able\s+to|wasn't\s+able\s+to)\s+(?:actually\s+)?(?:open|read|visit|fetch|load)\b"
+    r"|\b(?:only|just)\s+(?:from\s+)?(?:the\s+)?(?:search\s+)?snippets?\b|\bδεν\s+(?:άνοιξα|διάβασα|μπόρεσα\s+να\s+(?:ανοίξω|διαβάσω))\b",
+    re.IGNORECASE)
 
 
 def refute_unread_source(reply: str, request: str, tool_names=()) -> List[str]:
     """One issue when the request asked for a source the agent actually
-    read, the reply cites a URL as its source, and no page-loading tool ran
-    this turn — the URL came from a search snippet (the echo the judge then
-    confirms). Empty list otherwise — never a pass."""
+    read, a SEARCH ran this turn (the snippet the URL echoes), no
+    page-loading tool ran, the reply cites a URL as its source, and the
+    reply does not itself say the page was not opened. Empty list otherwise
+    — never a pass. A tool-free follow-up ("which sources did you read?")
+    answered from an earlier turn is not this shape (review §4IY)."""
     req = str(request or "")
     if not _READ_ASK_RE.search(req):
         return []
     names = {str(n or "").strip().lower() for n in (tool_names or ())}
-    if names & PAGE_LOADING_TOOLS:
+    if names & PAGE_LOADING_TOOLS or not (names & SEARCH_TOOLS):
         return []
-    m = _URL_RE.search(str(reply or ""))
+    body = str(reply or "")
+    if _NOT_OPENED_RE.search(body):
+        return []
+    m = _URL_RE.search(body)
     if not m:
         return []
     return [f"the request asked for a source the agent actually read, and the reply "

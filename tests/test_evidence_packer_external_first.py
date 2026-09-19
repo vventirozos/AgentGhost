@@ -178,3 +178,46 @@ def test_a_greek_claim_pulls_the_greek_source_and_a_second_pull_covers_the_rest(
     assert "Μεραρχίας 36" in ev and "Λειβάρτζι" in ev                    # both older sources pulled
     assert ev.count("[web_search]") == items + 2
 
+
+
+def test_a_refused_page_never_takes_a_pull_or_swap_slot_while_a_live_source_exists():
+    """Review §4IX: the claim pull and the external swap iterated every
+    candidate, and a `STATUS: BLOCKED` page whose title carried the claim's
+    tokens was pulled as external evidence (§4HO said never)."""
+    from ghost_agent.core.agent import _collect_verifier_evidence
+    tools = [{"name": "web_search", "content": "### 1. Revolut breach — the spoofed gov.example domain was used by the sender " * 3},
+             {"name": "browser", "content": "STATUS: BLOCKED — the site refused the fetch. Title: Revolut breach spoofed domain sender gov.example legalmail InfoCert Milan"},
+             {"name": "web_search", "content": "### 2. TechCrunch: legalmail InfoCert Milan — the sender domain " * 3},
+             {"name": "file_system", "content": "wrote report.md"},
+             {"name": "browser", "content": "Page: Revolut statement — the request came from legalmail InfoCert Milan; sender unnamed " * 2}]
+    ev = _collect_verifier_evidence(tools, max_items=3, budget=4000,
+                                    claim_text="The sender used legalmail InfoCert Milan and a spoofed gov.example domain; Revolut breach confirmed.")
+    assert "STATUS: BLOCKED" not in ev
+    # with nothing live, the dead page is still better than nothing
+    ev2 = _collect_verifier_evidence(tools[1:2], max_items=3, budget=4000, claim_text="legalmail InfoCert Milan")
+    assert "STATUS: BLOCKED" in ev2
+
+
+def test_4iy_reads_are_sources_receipts_yield_and_the_figure_line_survives_the_window():
+    from ghost_agent.core.agent import _collect_verifier_evidence, _slice_evidence_body
+    tools = [{"name": "web_search", "content": "### 1. pool sizing guide — connection pools and timeouts " * 4}, {"name": "web_search", "content": "### 2. db.internal hosts guide " * 4},
+             {"name": "file_system", "content": "# config.py\npool_size = 20\ntimeout = 30\nhost = 'db.internal'"}, {"name": "file_system", "content": "# db.yaml\nreplicas: 3\nregion: eu-west\nbackup: nightly"},
+             {"name": "file_system", "content": "SUCCESS: Applied 1 SEARCH block to report.md"}]
+    ev = _collect_verifier_evidence(tools, max_items=3, budget=4000, claim_text="config.py sets pool_size 20 and timeout 30 against db.internal; db.yaml runs 3 replicas in eu-west with nightly backup.")
+    assert "pool_size = 20" in ev and "replicas: 3" in ev
+    body = ("Revolut Group Holdings Ltd — annual report 2024 overview: revenue, customers, markets, products, compliance, regulation, banking licence " * 12
+            + "\n\nGroup revenue for the year: £3.1bn, up 72%.\n" + "Other notes about people and offices and events. " * 30)
+    assert "£3.1bn" in _slice_evidence_body(body, 1900, "Revolut's 2024 revenue was £3.1bn, up 72%.")
+
+
+def test_4iy_a_read_yields_only_to_an_external_that_out_scores_it_and_numbers_pick_the_window():
+    from ghost_agent.core.agent import _collect_verifier_evidence, _slice_evidence_body
+    claim = "config.py sets pool_size 20 and timeout 30 against db.internal; the replicas run in eu-west with nightly backup."
+    tools = [{"name": "web_search", "content": "### a general guide to nightly backup schedules " * 4},   # shares two claim words, out-scores nothing specific
+             {"name": "file_system", "content": "# config.py\npool_size = 20\ntimeout = 30\nhost = 'db.internal'\nreplicas eu-west nightly backup"},
+             {"name": "file_system", "content": "SUCCESS: Applied 1 SEARCH block to report.md"}]
+    ev = _collect_verifier_evidence(tools, max_items=2, budget=4000, claim_text=claim)     # two slots: the receipt and the read; the guide waits outside
+    assert "pool_size = 20" in ev                       # the read out-scores the guide; it keeps its slot
+    body = ("Overview: the total of the group and its markets and products and services and people and offices " * 20
+            + "\n\nFigure: £3.1bn.\n" + "Other notes about weather and events and travel and food. " * 30)
+    assert "£3.1bn" in _slice_evidence_body(body, 1500, "The total came to £3.1bn.")     # the figure line carries no claim WORD; the header carries "total"

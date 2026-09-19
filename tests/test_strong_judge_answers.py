@@ -293,10 +293,12 @@ class TestVerifyClaimCap:
         monkeypatch.setattr(v, "_call_llm", _cap)
         mx = A._EVIDENCE_BUDGET_MAX
         assert mx > 4000
-        evidence = "e" * (mx - 20) + " INSIDE-MARK " + "f" * 200 + " OUTSIDE-MARK"
+        # §4IY: the cut is marked, so the mark's budget (< 120 chars) comes out of the cap
+        evidence = "e" * (mx - 200) + " INSIDE-MARK " + "f" * 400 + " OUTSIDE-MARK"
         await v.verify_claim("the report names the sender", evidence, "ctx")
         assert "INSIDE-MARK" in seen["prompt"]
         assert "OUTSIDE-MARK" not in seen["prompt"]
+        assert A._EVIDENCE_TRUNCATION_MARK in seen["prompt"]
 
 
 # ── E. the judge is told a stated confidence is an assessment ──────────

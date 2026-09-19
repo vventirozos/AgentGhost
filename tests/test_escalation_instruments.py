@@ -86,7 +86,7 @@ class TestStrongCallOnTheRow:
     async def test_the_confirm_path_describes_its_own_strong_call(self, tmp_path, monkeypatch):
         """The stash is reset before the confirm retry: a stale
         finish_reason from an earlier main call must not be reported."""
-        monkeypatch.setenv("GHOST_VERIFY_CONFIRM_ESCALATION", "1")
+        monkeypatch.setenv("GHOST_VERIFY_ESCALATE_CONFIRM", "1")
         c = _MainClient(_GOOD, "stop")
         v = Verifier(llm_client=c)
         v._last_main_call = {"finish_reason": "length", "content_chars": 0}   # stale
@@ -109,7 +109,7 @@ class TestStrongCallOnTheRow:
         """FAILS IF: the confirm path does not reset the stash before its
         strong call — an `unavailable` row would then describe an EARLIER
         main call as if it were this one."""
-        monkeypatch.setenv("GHOST_VERIFY_CONFIRM_ESCALATION", "1")
+        monkeypatch.setenv("GHOST_VERIFY_ESCALATE_CONFIRM", "1")
         v = Verifier(llm_client=_MainClient(_GOOD, "stop"))
         v._last_main_call = {"finish_reason": "length", "content_chars": 0}   # stale
 

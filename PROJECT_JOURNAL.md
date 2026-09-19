@@ -44307,3 +44307,290 @@ capped years — reword to "fact(s)" with the next code change. **Open after §4
 ledger read; (d) year support from raw sources; (e) the packer still ranks `knowledge_base`/`recall`
 as external for the claim pull — the judge's opinion is capped either way, but a digest slot is
 spent on an echo; measure on the week's rows before changing the ranking.
+
+## §4IW — The reply that only announced the work (req a3ec5024, 2026-09-19, 21:30–22:15)
+
+Operator: "see request a3ec5024, the reply didn't make a lot of sense, why?" The turn (19:12,
+router "hard", temp 1.00, 14 s): the model's thinking said "Let me search for this" four times;
+its output was one Greek narration beat — "Αυτό είναι ενδιαφέρον ερώτημα — δεν το έχω
+συναντήσει μέχρι τώρα. Ας κάνω έρευνα για τον ραβίνο Μορντεχάι Φριζή και τη σχέση του με τον
+"συνέκτη Φριζήρα"." — with NO tool call, and the turn ended: "turn outcome ok · confidence 0.85 ·
+no tools". The user received that announcement (mis-hearing "συλλέκτη" as "συνέκτη"), headed by
+the previous turn's queued caveat ("ℹ️ On my previous answer: …"), and no answer.
+
+**R0.** Three gaps. (1) `reply_smoothing.narration_only` — the §4GH predicate behind the
+forced-final retry and the shape refute — is English-only: "Ας κάνω έρευνα" is not a beat to it.
+(2) It counts ANY quotation as content, so even in English the reply would have passed on the
+user's own phrase quoted back. (3) Nothing covers the ZERO-tool ordinary turn: `refute_narration_
+only` requires ≥1 tool (§4GH's measured scope), the forced-final retry requires a tools-off final;
+an ordinary first turn that stops at the announcement is accepted as the answer. Same class as
+§4IU's anchor stopwords and §4IV's topic check: a lexical guard that speaks one language
+([[lexical-proxy-for-semantic-property]]).
+
+**R1.** `reply_smoothing`: Greek beat openers (ας/θα/πάμε να/επιτρέψτε μου να/πρέπει να/
+χρειάζεται να + Greek lead-ins τώρα/πρώτα/λοιπόν), Greek work verbs (1st person sg/pl stems) and
+the "κάνω έρευνα/έλεγχο/αναζήτηση/επαλήθευση" nouns, "addressed" = also the Greek question mark
+";" and σου/σας/εσύ/εσείς/θέλεις/θέλετε/μπορείς/μπορείτε; a quotation is content only at 40+
+chars. Measured on 1,965 recorded user turns BEFORE wiring: 8 matches, every one an announcement
+that reported nothing (e56439e8, 03405321, 3ba6fb26, 33c86c3c, 1889a2d7, 86480b6f, ff3eea79,
+a3ec5024), 3 zero-tool, 1 with a judge's CONFIRMED (86480b6f — a 31-tool turn that shipped
+narration, the §4GH class itself); 0 passed/approved replies. `agent.py`: `_ANNOUNCED_WORK_
+DIRECTIVE`, `_announced_work_without_acting`, `_work_nudge_used` threaded through
+InternalTurnState (field, read, write-back, pass, read-back, per-request init — six sites), and
+the branch in the non-stream loop's `if not tool_calls:` ahead of the notify steer: ordinary turn
+(not final/forced/stopped), no tool ran this turn, text is narration only, once per request, not
+the last budget turn → append the announcement + the directive as a user-role message, `continue`
+(tools stay on). After a tool ran: unchanged (§4GH refutes). Pins: `tests/test_forced_final_no_
+answer.py` (+3: the Greek beats/answers/questions/long-quote table incl. the a3ec5024 text; the
+zero-tool continuation end to end — the search runs, the answer ships, the directive rides a
+user-role message after the announcement, never the forced-final directive; once per request, a
+real zero-tool answer untouched, an after-tools announcement untouched).
+
+**R2 battery 66** (T1 = forced-final + stream-forced-final suites): NOOP SURVIVED, KNOWNBAD
+KILLED; N1 greek-openers-gone, N2 greek-work-verbs-gone, N4 any-quote-is-content, N5
+nudge-after-tools-too, N6 never-marked-used, N7 announcement-dropped-from-history, N8
+nudge-disabled — KILLED. N3 greek-question-not-addressed SURVIVED first run (the question pin's
+sentence had no beat opener, so the addressed rule was never reached) → two pins with a beat
+opener AND an address ("Θα ψάξω …, αν θέλεις;", "… αν μου πεις το όνομά σου.") → KILLED.
+
+**§4IW close (22:40):** suite ONCE — first run **1 failed / 23591 passed**: `test_search_ddgs_
+snippet_join::test_library_defect_is_real_and_the_patch_fixes_it` found the ddgs method already
+fixed in its worker — a `search` module reloaded by another test had installed a SECOND
+`_fixed_extract_results` object and the fixture's identity check (`is not S._fixed_extract_
+results`) took it for the original ([[reload-contaminates-the-session]]; 1 of 6 suite runs today,
+worker distribution decides). No restart on red. Fixture now recognises the patch by name and
+module, not by object; second run **23592 passed, 66 skipped, exit=0** → kickstart, pid 44680 →
+84685, health 200 in 10 s. Probe-d19a94ba — the a3ec5024 question with its two-turn context: this
+time the model searched from turn 1 (the announcement-only shape did not recur at temp 1.00), ran
+five searches, hit a cheap REFUTED repair and a forced-final retry (§4GH), and shipped a sensible
+answer: no collector nicknamed "Φριζήρας" found, the rabbi is a known YouTuber, three questions back
+to the user. The nudge itself is exercised end to end by the loop pins (a scripted model that
+announces and stops → the directive → the search runs → the answer ships); the live model did
+not offer the shape tonight. Watch: the "the reply only announces work and no tool ran" line in
+the log, and `narration_only` hits on zero-tool turns in the corpus replay.
+
+**§4IV cosmetic (23:00):** the shadow log line ("CAPPED — unsupported name(s)") and the daily
+report's CAPPED header ("a name the session never carried") reworded for echo facts; the report
+wording pinned. Suite ONCE — **23592 passed, 66 skipped, exit=0** → kickstart, health 200.
+
+## §4IX — Fresh-eye review of the day's work, and the fixes (2026-09-19, 23:10–01:30)
+
+Operator: "verify all the changes you did in this session using fresh eye reviewers, let's fix all
+remaining bugs." Three reviewers with no context (general-purpose agents, read-only, no suite, no
+localhost), one per slice: the binder module; the verifier + objection seam; agent.py +
+reply_smoothing. Thirty findings; every one I acted on was re-run here first. The two worst were
+mine from today and LIVE: the Greek narration rule (§4IW) read future-tense statements as work
+beats — after a tool ran that is a mechanical REFUTE of a correct Greek answer — and the appeal
+splice (§4IU R2 F6) let rule 1 uphold a hallucinated counter-figure found on a line spliced for a
+different atom, a REFUTE with no appeal.
+
+**Verifier + objection (reviewer 2).** F1 splice feeds every rule → `supplement=` kwarg, absence
+branch only; rule 1 and total-ungrounding read the digest. F2 cap/caveat/life-span read the whole
+raw → `claim_binding.source_text` (external minus execute/recall, echo-masked) for all three; the
+verifier pin proves an `[execute] cat report.md` / `[file_system]` echo no longer lifts the cap.
+F3 `_tok_supported` substring/open stem → `_word_in` / `_stem_in`. F4 lift over a
+truncation-guarded REFUTED → excluded. F5 splice inert on cut digests → documented (§4BD, safe).
+F6 supplement on the event loop (2.2 s on 600 KB) → `to_thread` + longest-word prefilter. F7 bare
+numbers as supplement atoms → skipped. F8 line head instead of the match window → windowed.
+F9/F10 low, documented.
+**Binder (reviewer 1).** B1 namesake false refutes (romanisation ντ→d, diminutives, short
+genitives, role words) → `_romanisations` ×4, `_GIVEN_NAME_FAMILIES`, `_NAME_ROLE_WORDS`, short-stem
+rule; 13 exhibits now "supported", the real namesake still "misattributed". B2 the packer's claim
+window drops the OUTCOME header → whitelist masking inside EPISODE records. B3 multi-line
+`assistant:` → masked to the next role line. B4 = F2. B5 anchor stopwords (they/their/only/also/…
+είχε/μόνο/κάθε/…). B6 Latin reply vs Greek source → reverse bridge. B7 "2500" vs "2,500" → year
+supported. B8 "ISO 8601"/"ISO-8601" → canonical citation. B9 `apply_residual` unmasked → masked.
+B10 hyphen ranges → read as ranges. B11 cut `[assistant]` block → masked to the end. B12 (names
+that open a sentence never audited) → documented, not changed. Extras: URL mask lookbehind,
+empty-name relation.
+**Agent + smoothing (reviewer 3).** #1/#2 Greek future tense + English prefix verbs → first-person
+endings, `\b`, lead-in/refusal/quoted-glue exemptions, ";" only in a Greek sentence; corpus
+re-measured: the same 8 hits, 0 good replies. #3 the caveat-only banner not a system note → both
+heads in `_CORRECTION_BANNER_RE`. #4 prior-evidence boundary broken by synthetic user-role steers
+→ `last_user_content` boundary. #5 `<thinking>` mentions eaten → backtick guard, unclosed only at
+line start. #6 dead BLOCKED pages pulled/swapped → skipped while a live one exists. #7 quoted glue
+→ content. #8 stream retry think strip → `_strip_think_blocks`. #10 nudge gate → real tools.
+#11 raw cut dropped the newest outputs → newest first, labels counted. #9 (stream conv_fp after a
+prune) pre-existing, not opened.
+
+**Pins:** +11 tests across `test_claim_binding.py` (name variants, echo shapes, lookup rules,
+residual), `test_claim_binding_verifier.py` (truncation-guard lift, source-only cap), `test_4ip_
+uphold_branch.py` (supplement → absence branch only; end to end through `_escalate_refute`),
+`test_forced_final_no_answer.py` (17 narration cases; caveat banner; synthetic rows), `test_
+objection_prior_turn_evidence.py` (real-request boundary), `test_think_strip_toolcall_mention.py`,
+`test_evidence_packer_external_first.py`; 12 existing pins re-pointed from `[web]` to real tool
+labels (the reviewer predicted it) and two six-word-threshold pins re-worded for the new stopwords.
+**R2 battery 67:** 35 mutants, NOOP SURVIVED, KNOWNBAD KILLED; X1 (verifier passes the splice to
+every rule) and X12 (residual unmasked) SURVIVED first run — pins one level too shallow / an
+input with no unchecked binding — both KILLED after end-to-end pins; X36 (nudge gate counts
+synthetic rows) SURVIVED and stays: the unit is pinned, the loop fixture cannot produce a synthetic
+parse row — recorded, not excused. **Acceptance:** cb_replay v39 vs v38 bit-identical (mined
+0.062 / 2 pre-existing false refutes, seed 0.058 / 0); corpus r23 vs r22 0 verdicts moved, 67
+reasoning strings changed — 16 turns gained an unsupported entity (labels like 'Mini Browser',
+'Info Retrieval' that a substring had "supported"), 6 lost one (Latin names bridged to Greek
+sources: Nikitas Kaklamanis, Nikos Pappas, Rena Dourou, Adolf Bayer), 3 gained a topic withhold on
+turns already UNCERTAIN. Docs: `claim_binding.html` §4IX, `objection.html` §4IX, `verifier.html`,
+`agent.html`.
+**R8 (this round, my own fixes): 3** — the first `source_text` broke 12 pins that used `[web]`
+(the fixture label was never a real tool); the residual pin's first input had no unchecked binding;
+the X1 pin tested one call too shallow.
+**§4IX close (01:45):** suite ONCE — **23617 passed, 66 skipped, exit=0** → kickstart, pid 4028 →
+25442, health 200 in 12 s. Probe-33b96add (a Greek answer in the future tense after three web
+tools: "…το Μουσείο Ακρόπολης θα ανοίξει στις 9 π.μ. και το εισιτήριο θα κοστίζει 20 ευρώ."):
+`narration_only` False, no shape refute — the pre-fix rule would have refuted it mechanically;
+verdict UNCERTAIN 0.5 (truncation guard on a cut digest; both tiers agree). Probe-3b6083a5
+("Ο Γιώργος Σεφέρης έζησε από το 1900 έως το 1971."): both tiers CONFIRMED 1.00 against
+English-named sources. Ledger `--days 1` unchanged in kind: binder failed 0, 1 override, 1 cap.
+Open after §4IX: (c) the week's ledger read; (d) year support from raw sources; (e) the packer's
+echo slot; B12 (a name that opens a sentence is never audited — withhold lost only); F5 (the splice
+is inert on a cut digest, by the §4BD design); reviewer 3's #9 (stream conv_fp after an L4 prune —
+pre-existing); X36 pinned at the unit level only.
+
+## §4IY — The wide review: older code not presumed correct (2026-09-19, 02:00–23:30)
+
+Operator, after the second fresh-eye round on the §4IX fixes: "expand your search, dont assume
+that the previous or existing code is absolutely correct." Four more read-only reviewers with no
+context, one per slice, told explicitly that pre-existing code was in scope: the binder module
+end to end; the objection tier + the verifier's refute path; agent.py's evidence plumbing, scrub
+and stream paths; reply_smoothing + turn_state_check + reply_shape_check + outcome_heuristics +
+evidence_gate. With the §4IX second round (3 reviewers on the §4IX fixes) that is seven reports
+and ~100 findings; ~70 acted on, every one re-run here before a fix, the rest documented below.
+**R0 scope:** any finding that changes a verdict, a withhold, a refute banner, a task, a scrub, or a
+stream retry; cosmetic and docstring findings recorded, not chased.
+
+**Binder (`claim_binding.py`).** Quantities: the decimal comma ("4,3", "23,60" → `_num_core`
+atomic thousands emulation, linear on 180 KB), the true minus / hyphen variants folded in
+`normalize_for_containment` too, the left containment boundary ("284 orders" is not in "1,284
+orders"), mass rounds in kg not grams, latitude never swallows a latency, adjacent durations
+merge, `_si_alias` (1000ⁿ byte units), overflow literal is not a figure (OverflowError had taken
+the binder out for the turn), `_with_reply_lead` (a reply's bound/hedge word prepended to a
+residual quote that opens with a figure). Anchors: `lexical_anchor` whole word or 5-stem of a
+6-letter word; `_NAME_STOP` ≠ `_ANCHOR_STOP`; `_disagreement_holds` = one guard chain for `bind`
+and the residual path; residual contradiction needs a polarity clash in one direction only.
+Structure: `_BLOCK_LABEL_RE` (a tool name at line start + space — `[0] OK`, `[edit]` no longer
+split a block), `_ARC_USER_RE` honours `CONTENT: USER:`, `_strip_marks` blanks the packer's own
+marks before binding ("1854 of 1975 chars shown" had vouched for a year), `_ECHO_AI_RE` to the
+next role/source/label line. Names: whole-key word boundaries ("Li Wei" ∉ "Eli Weiss"), the
+caveat's reverse bridge on raw sources, the §4IR floor waiver needs external TEXT, near-spelled
+same-script pairs are the same person, cross-script pairs never "same" by distance alone, std
+citations get an explicit `unsupported` + `continue` (B8 had fallen through to the substring test).
+**Objection.** Rule 1 needs the same quantity (`_same_quantity_plausible`: anchor OR
+`_shared_unit_family` OR typo-shaped); rule 2 stands down on a name variant
+(`_name_variant_present`, `_ORG_WORD_RE`); the supplement prefilters by stems + romanisations,
+opens windows at the match, fills by atom in layers; absence branch only; upheld = the judge's own
+confidence. **Verifier.** Verdict word at the head only; `_parse_json` prefers verdict+confidence;
+`_PLACEHOLDER_ITEM_RE`; `truncation_guard` stamp; lift excludes `escalation_downgraded`; ledger
+keeps the rule's why, `strong_call=None` on mechanical outcomes; rebuttal quote ≥ 60 % verbatim;
+`_slice_evidence_body` cap; splice built via `to_thread`, strong judge sees it, rules see the
+digest; shadow gets `raw_sources`; voted result strong only when main was forced; flag renamed
+`GHOST_VERIFY_ESCALATE_CONFIRM`. **Agent.** `_prior_turn_evidence` exact-head boundary +
+`_STEER_HEAD_RE`; `_raw_turn_sources` newest-first cap, skips `_synthetic` and label-shaped lines;
+packer: reads are sources, receipts yield (`_looks_like_receipt`), claim-number windows keep the
+figure line, 24 000-char dedup, live slots first; `_CALL_OPEN`/`_CALL_CLOSE` conditional-group
+scrub (a `</function>` inside `<tool_call>` closed it early); `_strip_think_blocks` shields
+fences, never crosses a second `<think>`, whitespace before an unclosed one; retry text
+think-stripped before the scrub; strict trivial chat = the phrase IS the message; the work nudge
+counts real tools, once per turn (six InternalTurnState sites); no-claim refute → no banner, no
+task; `_REFUTE_TASK_ARTIFACT_RE` lookahead; `project_id` threaded through the constraint note /
+title / ledger evidence, note ≤ 600 chars; `stream_conv_fp = _stable_conv_fp`. **Smoothing.**
+`narration_only`: Greek first-person endings, whole-word work verbs, `_LEAD_IN_RE` `(?<!\d):` (a
+clock colon is not a lead-in — found by a battery pin, "unavailable after 18:00" had been a beat),
+negated openers, Greek questions, assessment glue before the first beat, guillemets, `_words`
+count digits, parallel-paragraph lead label; `_CORRECTION_BANNER_RE` two heads; `_CALL_MARKUP_RE`
+dialect shapes only; `_READINESS_RE` end-anchored; `strip_system_notes` strips the unparsed-call
+note. **Turn-state / shape / heuristics / gate.** Exact phrase cut at connectors unless quoted;
+two-part skip (caps only); clauses protect e.g./i.e./etc./initials + Greek titles; one-line cap
+needs a reply verb; `_LOCAL_READ_TOOLS` count, browser actions only on a loaded page; `_ACK_RE`
+contractions; `call_args` on content objects; dump heads case-sensitive + body required; unread
+source needs a search this turn, `_NOT_OPENED_RE` stand-down, `_READ_ASK_RE` without bare "you
+read"; `_FAILURE_ACK_RE` Greek + contractions; `_SEARCH_EMPTY_RE` anchored to line start.
+**Drafts reverted during the round:** M14 word-cap slack (contradicts the pinned zero-slack
+design), a generic capitalised-short-token abbreviation rule (broke "Two! Three" counting), a
+two-part skip on any request (killed "Reply with exactly: PONG. Also …"), counting browser
+interact/click as evidence (broke the click-error pin), a tool gate on `refute_raw_tool_dump`
+(broke the tool-free dump chain). **Documented, not fixed:** F5 splice inert on cut digests
+(§4BD); B12 a name that opens a sentence is never audited; B10 a comma-grouped count vouches for a
+range year; M15 a model-authored "Assumptions" note is stripped; R6#11 fingerprint collision on
+identical first messages; R6#13 `_critic_gate_timeout` docstring; R6#14 a visual override can
+replace a strong refute; R6#15 lesson-dedupe re-attribution; P10 vision `images_desc`; reviewer
+#9 generic Greek verbs (προχωρήσω/συνεχίσω); X36 nudge gate pinned at the unit level only; a
+mid-line unclosed `<think>` after a closed block; corpus 931db6e0 (the reply said line 79, the
+listing shows the `====` at line 80 — a line NUMBER is an identifier, not audited; the old refute
+had cited an unrelated "line 59").
+
+**R1 pins:** `test_claim_binding.py` (+5 §4IY tests incl. `test_4iy_each_guard_alone`),
+`test_4ip_uphold_branch.py` (+3), `test_claim_binding_verifier.py` (+3),
+`test_4fy_turn_state_check.py` (+4, 8 correct replies not refuted, the rules still fire),
+`test_forced_final_no_answer.py` (+8), `test_objection_prior_turn_evidence.py`,
+`test_think_strip_toolcall_mention.py`, `test_evidence_packer_external_first.py` (+2),
+`test_4ij_concession_downgrade.py` (`strong_dyn == 2`), `test_parser_flood_and_leak_fix.py` and
+`test_finalize_stream_r4_fixes.py` re-pointed to the conditional-group shapes,
+`test_escalation_instruments.py` (flag rename). **R2 battery 68:** 67 mutants Y1–Y67 + NOOP +
+KNOWNBAD. First run: 17 SURVIVED — every one a pin that a NEIGHBOURING guard satisfied (the minus
+fold pinned through extraction's own fold; the residual guard pinned with a quote sharing no
+subject; the version prefix pinned WITH a bound; the marks pin used a year-shaped figure; "Thomas
+More" never reached `_name_tokens`; the caveat bridge pinned on the digest; the near-spelling pin
+used Dostoevsky — already in the family table; the mid-beat pin, the Greek-titles pin, the
+local-read pin, the receipt pin, the window pin, the digits pin, the labels pin, the trivial-chat
+pin, the retry-order pin). Each re-pinned to reach ONE guard ("pin must fail somewhere"); the
+mid-beat re-pin exposed the `_LEAD_IN_RE` clock-colon defect. Final: **67/67 KILLED, NOOP
+SURVIVED.**
+
+**Acceptance — and three regressions the corpus caught.** cb_replay v40 vs v39 bit-identical
+(mined 0.062 / 2 pre-existing false refutes, seed 0.058 / 0). Corpus r24 vs r23: 7 verdicts moved,
+every one read. Four intended: three garbage refutes dropped (`z-index: 1` vs "1000 pt bonus";
+"50 Top Pizza Europa" vs "40 tips"; the Pinball channel centre 370 vs the ball's current x 372)
+and one real fabrication newly caught — reply a2133301 gave Σπήλιος (Σπυρίδων) Οικονομίδης the
+life span (1854–1933) that every source attaches to Γεώργιος Οικονομίδης του Ιωάννη (the §4IU
+namesake class, live). **Three correct replies newly REFUTED** — the packer's claim-number windows
+now keep the lines the figure audit compares against, and the audit's older weaknesses showed:
+(a) 2b753f78 "στις 15 Αυγούστου" vs a gazzetta dateline "16 Αυγούστου 2026 - 22:17": `_MONTH`
+knew English only → `_GREEK_MONTH` (nominative, genitive, Μάη, 3-letter abbreviations, ±accents,
+bounded: "2 μαρτυρίες" keeps its 2); (b) 8b779b6b "port 8101" vs an unrelated `const PORT =
+8100;` while the browser's own `URL: http://127.0.0.1:8101/` was masked as a URL →
+`_url_occurrence`: a URL-authority port SUPPORTS the figure, any other whole token in a URL/path
+stands the misreport down; (c) ad8c43ca "PostgreSQL 18 release research" vs `research=17`: one
+incidental shared word is not the figure's subject → `_figure_anchor` (a word labelling the reply
+figure — immediate neighbours, one skip, or the label phrase before `:`/`=`/copula — labels the
+evidence figure too, OR two distinct shared content words; `_same_subject_word` = equal / 5-stem
+of 6 / short word + plural). Kept: "port 8103" vs `PORT = 8102`, "meta=335" vs `meta=334`,
+"13-line sample" vs "14 non-empty lines" (needed the plural rule: "line"/"lines"; 9f41238f, a
+real misreport). **Battery 69:** 21 mutants Z1–Z21 + NOOP/KNOWNBAD; six first-run survivors
+re-pinned (month boundary, decimal digits in a URL, digit crossing, 3-letter stem, whole-sentence
+label, stripped-sentence offset); **Z16's survival exposed a real defect** — my `_same_word`
+shadowed the name-inflection `_same_word` defined 600 lines later, so `_figure_anchor` had been
+running the NAME rule ("data" = "date") and r25 was measured against it → renamed
+`_same_subject_word`; final **21/21 KILLED, NOOP SURVIVED.** Final replays: cb_replay v43 vs v39
+bit-identical; corpus r27 vs r23: 57 → 52 REFUTED (6 garbage dropped, 1 fabrication caught, 0
+correct replies refuted); objection pools mined UPHOLD right 28 / wrong 0, seed 29 / 0 (unchanged
+by the tightened rule 1 / rule 2); `narration_only` 6 hits on 1 536 tool-bearing replies, all
+genuine (the "8" of §4IX was the 1 965-user-turn measure). Docs: `claim_binding.html` §4IY,
+`objection.html` §4IY, `verifier.html`, `agent.html`.
+**R8 (defects in my own fixes this round): 11** — `_LEAD_IN_RE` clock colon; the first `_year_in`
+cut over-rejected URL dates / seasons / line:col (corpus r20); B8 std fall-through; `_BLOCK_LABEL_RE`
+split on `[0] OK`; the five reverted drafts above; the `_same_word` name collision; an f-string
+nesting SyntaxError (caught at import). Plus 17 + 6 pin defects (battery first-run survivors) and
+the 3 replay regressions.
+**Full suite (first run, exit=1): 40 failed / 23 622 passed in 13 files — seven REAL regressions
+the touched suites never saw, all from §4IY edits.** (1) `reply_smoothing._CALL_MARKUP_RE`'s
+"unclosed call ends at the next blank line" + any-close-tag end → the schema-compare leak's tail
+(`</parameter></function></tool_call>` and the code after its first blank line) would have shipped
+AGAIN; now procedural `_call_markup_spans` (the SAME tag closes; an unclosed call runs to the end —
+what follows a truncated opener is payload, not prose). (2)/(3) the dialect narrowing dropped the
+bare `<tool>` opener (test_agent_xml_normalization) and any `<function …>` that a `</function>`
+closes (finalize r2) → both restored in `_CALL_OPEN` and `_CALL_OPEN_RE` (the repr and "<tool
+name>" prose stay excluded; the r4 fuzz oracle follows). (4) the end-anchored `_READINESS_RE`
+un-fixed §4HQ ("The report is complete and verified against all constraints." kept) → a conjoined
+tail without a location/destination preposition is still a hand-off, "…is ready in the Downloads
+folder" still content. (5) "Let me synthesize the answer." was no longer a beat (the §4IY work-verb
+requirement) → synthesis verbs added. (6) `evidence_gate._SEARCH_EMPTY_RE` anchored to line start
+missed the LIVE tool's "ERROR: No search results found." — the gate would never have fired on an
+empty search (optional `ERROR:` prefix; pinned on the live phrasing). (7) the "Constraint
+violation:" format lookahead lost "did not start with '…'" (§4FZ corpus text) → start/end-with
+added; the NeuroSynth content case pinned as grounded. Plus a `Dict` annotation without its import
+(lint; local annotations are not evaluated — no runtime effect) and three test doubles updated to
+the new contracts (the vote's `strong=` kwarg, `stream_conv_fp = _stable_conv_fp`, the marked
+evidence cut), two textual pins converted to AST enumerations (ratchet re-baselined DOWN by 3,
+digest 7eee106f). **R8 rises to 18.** The §4IX/§4IY touched-suite discipline was the blind spot:
+"the touched suites are green" is not "the suite is green" — the smoothing scrub regression sat
+in a test file none of the four reviewers' slices named.

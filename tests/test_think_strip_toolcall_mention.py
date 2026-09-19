@@ -93,3 +93,23 @@ def test_a_thinking_block_is_stripped_like_a_think_block():
     assert _strip_think_blocks("<thinking>\nplanning…</thinking>\n\n## Title\nbody") == "\n\n## Title\nbody"
     assert _strip_think_blocks("<thinking>never closed, then <tool_call><function=x>") == "<tool_call><function=x>"
     assert _strip_think_blocks("<thinking>never closed at all") == ""
+
+
+def test_a_mentioned_thinking_tag_is_prose_not_a_block():
+    """Review §4IX: the widened tag ate every prompt-engineering answer."""
+    assert _strip_think_blocks("Claude Code emits `<thinking>` blocks before a tool call. The answer is 42.") == \
+        "Claude Code emits `<thinking>` blocks before a tool call. The answer is 42."
+    assert _strip_think_blocks("Wrap your reasoning in <thinking> tags so the parser drops it.") == \
+        "Wrap your reasoning in <thinking> tags so the parser drops it."
+    assert _strip_think_blocks("Use a `<thinking>` block … after `</thinking>`. The capital of France is Paris.") == \
+        "Use a `<thinking>` block … after `</thinking>`. The capital of France is Paris."
+    assert _strip_think_blocks("prefix\n<thinking>unclosed…") == "prefix\n"
+    assert _strip_think_blocks("<thinking>\nplan</thinking>\n\nAnswer.") == "\n\nAnswer."
+
+
+def test_4iy_think_mentions_fences_and_leading_whitespace():
+    assert _strip_think_blocks("Do not emit <think> blocks.\n<think>real</think>Answer") == "Do not emit <think> blocks.\nAnswer"
+    assert _strip_think_blocks(" <think>leaked…") == "" and _strip_think_blocks("\n  <think>leaked…") == "\n"
+    fenced = "Here is an example:\n\n```\n<think>\nstep 1\n</think>\n```\n\nThe capital is Paris."
+    assert _strip_think_blocks(fenced) == fenced
+    assert _strip_think_blocks("<think>\nplan</think>\n\nAnswer.") == "\n\nAnswer."

@@ -756,6 +756,10 @@ _EV_NOUN = (r"\b(?:evidence|tool[- ]?output|outputs?|digest|logs?|"
 # `not <adverb>ly` is allowed through; `not only` is NOT — "not only in
 # the evidence but also in the reply" is the opposite claim.
 _NEG_ADV = r"(?:(?!only\b)\w+ly\s+)?"
+#: An issue that QUOTES the claim's own absence statement ("the claim says the
+#: key was not found in the output, but the output lists it") reports a
+#: contradiction, not an absence (review §4IY).
+_CLAIM_SAYS_RE = re.compile(r"\b(?:claim|reply|response|agent|answer)\s+(?:says|states|reports|claims|asserts|maintains)\b", re.IGNORECASE)
 _ABSENCE_ISSUE_RE = re.compile(
     r"(?:not " + _NEG_ADV + r"(?:in|present in|found in|mentioned in|shown in|"
     r"listed in|stated in|supported by|corroborated by|confirmed by|"
@@ -901,7 +905,9 @@ def _quote_supported_by_evidence(quote: str, evidence: str) -> bool:
         from difflib import SequenceMatcher
         m = SequenceMatcher(None, nq, ne, autojunk=False)
         match = m.find_longest_match(0, len(nq), 0, len(ne))
-        return match.size >= _MIN_REBUTTAL_QUOTE_CHARS
+        # the verbatim core must be most of the quote (review §4IY: a fabricated 60-char quote
+        # sharing one 15-char run earned an uncapped overturn)
+        return match.size >= _MIN_REBUTTAL_QUOTE_CHARS and match.size >= 0.6 * len(nq)
     except Exception:  # noqa: BLE001
         return False
 
@@ -1253,7 +1259,12 @@ def record_escalation(*, kind: str, route: str, outcome: str,
         # pre-discipline rows and non-overturn outcomes. Additive — every
         # ledger consumer tolerates extra keys.
         if rebuttal:
-            rec["rebuttal"] = str(rebuttal)[:32]
+            rb = str(rebuttal)
+            # a mechanical row is "arithmetic:{issue} → {why}" — keep the WHY (which rule fired),
+            # the issue text is in the verdict row (review §4IY: all 21 live rows read "arithmetic:The claim…")
+            if rb.startswith("arithmetic:") and " → " in rb:
+                rb = "arithmetic:" + rb.split(" → ", 1)[1]
+            rec["rebuttal"] = rb[:96]
         if isinstance(strong_call, dict) and strong_call:
             rec["strong_finish"] = str(strong_call.get("finish_reason") or "")[:16]
             try:
@@ -2086,6 +2097,11 @@ def _logged_verify(kind: str):
     return _decorate
 
 
+_PLACEHOLDER_ITEM_RE = re.compile(
+    r"^\s*(?:none|n/?a|nil|null|-+|no(?:ne)?\s+(?:discrepanc(?:y|ies)|issues?|problems?|concerns?|conflicts?)(?:\s+(?:noticed|found|identified|detected))?)\s*\.?\s*$",
+    re.IGNORECASE)
+
+
 class Verifier:
     """Self-evaluation module that uses LLM introspection to check the agent's
     own work before presenting it to the user."""
@@ -2404,11 +2420,19 @@ class Verifier:
         # (its `{...}` candidates can only parse as dicts).
         # Walk every `{...}` block from the end — some models emit a
         # final JSON after prose; the last parseable one wins.
+        parsed_frags = []
         for candidate in reversed(re.findall(r"\{[\s\S]*?\}", text) or []):
             try:
-                return json.loads(candidate)
+                parsed_frags.append(json.loads(candidate))
             except json.JSONDecodeError:
                 continue
+        # the verdict object over a trailing note's fragment ('{"verdict":"REFUTED",…}\nNote:
+        # {"verdict":"CONFIRMED"}' parsed as CONFIRMED@0.5 — review §4IY)
+        for frag in parsed_frags:
+            if isinstance(frag, dict) and "verdict" in frag and "confidence" in frag:
+                return frag
+        if parsed_frags:
+            return parsed_frags[0]
         # Last-resort greedy match (multi-line JSON with nested braces).
         match = re.search(r'\{[\s\S]*\}', text)
         if match:
@@ -2449,9 +2473,13 @@ class Verifier:
         # null) would otherwise raise out of the verifier (callers don't wrap
         # this) — degrade to UNCERTAIN, and CLAMP confidence to [0,1] (the model
         # sometimes emits 95 meaning 95%).
-        verdict_str = str(data.get("verdict") or "UNCERTAIN").upper()
+        # "REFUTED.", " confirmed ", "REFUTE", "CONFIRMED (partially)": the verdict WORD, not the
+        # whole string (fresh-eye review §4IY: a trailing full stop turned a strong REFUTED into
+        # UNCERTAIN and replaced a correct cheap refute)
+        verdict_str = str(data.get("verdict") or "UNCERTAIN")
+        m_v = re.match(r"\s*(CONFIRMED|REFUTED?|UNCERTAIN)\b", verdict_str, re.IGNORECASE)
         try:
-            verdict = VerifyVerdict(verdict_str)
+            verdict = VerifyVerdict("REFUTED" if m_v and m_v.group(1).upper().startswith("REFUTE") else m_v.group(1).upper()) if m_v else VerifyVerdict.UNCERTAIN
         except ValueError:
             verdict = VerifyVerdict.UNCERTAIN
         try:
@@ -2482,6 +2510,10 @@ class Verifier:
         elif not isinstance(conceded, list):
             conceded = [str(conceded)] if conceded else []
         conceded = [str(c) for c in conceded if str(c or "").strip()]
+        # "None", "N/A", "No discrepancies noticed." are placeholders, not concessions (review §4IY:
+        # they turned a strong CONFIRMED 0.95 into UNCERTAIN 0.6)
+        conceded = [c for c in conceded if not _PLACEHOLDER_ITEM_RE.match(c)]
+        issues = [i for i in issues if not _PLACEHOLDER_ITEM_RE.match(i)]
         reasoning = data.get("reasoning", "")
         named = conceded or (issues if verdict == VerifyVerdict.CONFIRMED else [])
         if (strong and verdict == VerifyVerdict.CONFIRMED and named
@@ -2779,7 +2811,7 @@ class Verifier:
                     adj_prompt, temperature=0.1, force_main=force_main,
                     max_tokens=_STAGE_MAX_TOKENS, json_only=True,
                     route_out=route_out)
-                return self._build_verify_result(raw)
+                return self._build_verify_result(raw, strong=bool(force_main))   # §4IY: the concession downgrade applies to main-model votes too
             except Exception:  # noqa: BLE001 — one bad sample must not kill the vote
                 return None
 
@@ -3006,7 +3038,17 @@ class Verifier:
         # Head+tail packing, not a blunt cut — see pack_claim's rationale.
         claim_t = pack_claim(claim)
         from .agent import _EVIDENCE_BUDGET_MAX as _ev_max   # §4HO: one cap, the packer's
-        evidence_t = evidence[:_ev_max]
+        if len(evidence or "") > _ev_max:
+            # a MARKED cut (review §4IY): the blunt slice left `evidence_truncation_severity` at 0,
+            # so rule 2 and the §4BD guard treated a cut digest as intact and absence UPHOLDs
+            # convicted against evidence the judge never saw
+            try:
+                from .agent import _slice_evidence_body
+                evidence_t = _slice_evidence_body(evidence, _ev_max, claim)
+            except Exception:  # noqa: BLE001
+                evidence_t = evidence[:_ev_max]
+        else:
+            evidence_t = evidence
         context_t = context[:1000]
         if _claim_binding_primary_enabled():
             # §4IM bench arm: the claim-binding verdict alone, no escalation.
@@ -3130,7 +3172,7 @@ class Verifier:
                                                     retry=_reverify_on_main, evidence=evidence_t,
                                                     prior_evidence=prior_evidence, raw_sources=raw_sources)
         if _claim_binding_shadow_enabled():
-            self._spawn_claim_binding_shadow(claim_t, evidence_t, context_t, final, trace=trace)
+            self._spawn_claim_binding_shadow(claim_t, evidence_t, context_t, final, trace=trace, raw_sources=raw_sources)
         return final
 
     # ── §4IM claim-binding verifier ───────────────────────────────────────
@@ -3249,7 +3291,12 @@ class Verifier:
                          # the main model already looked at this claim and would not
                          # confirm it (review §4IP R7 i1): that UNCERTAIN was earned by
                          # the strong judge, not a cheap no-call — never lifted
-                         and getattr(incumbent, "escalation", "") != "replaced_uncertain"))):
+                         and getattr(incumbent, "escalation", "") != "replaced_uncertain"
+                         # §4IX: nor an UNCERTAIN that was a cheap REFUTED softened by the
+                         # truncation guard — the binder confirmed over the same cut digest
+                         # and cannot see what the judge said was missing
+                         and not getattr(incumbent, "truncation_guarded", False)
+                         and not getattr(incumbent, "escalation_downgraded", False)))):
             decided = "claim_binding"
         if decided == "incumbent":
             capped = self._cap_confirm_on_name_withhold(incumbent, cbr, evidence=evidence,
@@ -3349,7 +3396,7 @@ class Verifier:
             what = (f"{cb_v} overrides incumbent {inc_v}" + (f" (appeal: {appeal})" if appeal else "")
                     if decided == "claim_binding"
                     else (f"binder failed ({error}) — incumbent {inc_v} stands" if error
-                          else (f"incumbent {inc_v} CAPPED — unsupported name(s) {list(capped)[:3]}" if capped
+                          else (f"incumbent {inc_v} CAPPED — unsupported or echoed fact(s) {list(capped)[:3]}" if capped
                                 else f"shadow: incumbent {inc_v} vs claim-binding {cb_v}")))
             secs = row.get("binder_s", row.get("wait_s", 0.0))
             pretty_log("Claim Binding",
@@ -3397,7 +3444,7 @@ class Verifier:
 
     def _spawn_claim_binding_shadow(self, claim: str, evidence: str, context: str,
                                     incumbent: Optional[VerifyResult], *,
-                                    trace: Optional[Dict[str, Any]] = None) -> None:
+                                    trace: Optional[Dict[str, Any]] = None, raw_sources: str = "") -> None:
         """Fire-and-forget: run claim-binding beside the incumbent verdict
         and append both to the shadow ledger. Bounded, swallowing, never
         awaited by the caller — the turn's verdict is already decided."""
@@ -3405,7 +3452,7 @@ class Verifier:
             t0 = time.monotonic()
             try:
                 cbr = await asyncio.wait_for(
-                    self._verify_claim_binding(claim, evidence, context, trace=trace),
+                    self._verify_claim_binding(claim, evidence, context, trace=trace, raw_sources=raw_sources),
                     timeout=CLAIM_BINDING_SHADOW_TIMEOUT_S)
             except Exception as exc:  # noqa: BLE001 — shadow never raises
                 logger.warning("claim-binding shadow failed: %s: %s", type(exc).__name__, exc)
@@ -3464,7 +3511,7 @@ class Verifier:
                 return result
             issues = [str(i or "").strip() for i in (result.issues or [])]
             issues = [i for i in issues if i]
-            if not issues or not all(_ABSENCE_ISSUE_RE.search(i)
+            if not issues or not all(_ABSENCE_ISSUE_RE.search(i) and not _CLAIM_SAYS_RE.search(i)
                                      for i in issues):
                 return result
             # ⚠ A provable DISMISS outranks the guard. The guard runs
@@ -3541,7 +3588,7 @@ class Verifier:
                 cheap_confidence=result.confidence,
                 final_confidence=out.confidence,
                 rebuttal=f"cut{severity:.0%}", trace=trace)
-            return out
+            return _stamp_escalation(out, "truncation_guard")     # §4IY: the ledger said truncation_guard, the verdict said "" (never escalated)
         except Exception as exc:  # noqa: BLE001 — never break a verdict
             # WARNING for parity with the escalation-side objection
             # failure: a persistently-broken guard silently hands
@@ -3633,11 +3680,20 @@ class Verifier:
         # evidence, so the mechanical absence proof, the rebuttal view and
         # the strong judge all read the sources, not the selection. The
         # truncation severity stays the digest's own.
+        # §4IX (fresh-eye review): the mechanical rules read the DIGEST plus
+        # the supplement for the absence branch only (`resolve_refute(...,
+        # supplement=)`) — rule 1's numeric anchoring must never see a line
+        # spliced for another issue; the strong judge and the rebuttal view
+        # read the spliced evidence. Built off the loop: 600 KB of raw text
+        # against several names ran two seconds on the event loop.
         evidence_digest = evidence
         try:
-            _supp = _objection.raw_source_supplement(result.issues, evidence, raw_sources) if raw_sources else ""
+            _supp = (await asyncio.to_thread(_objection.raw_source_supplement, result.issues, evidence, raw_sources)
+                     if raw_sources else "")
         except Exception as _supp_exc:  # noqa: BLE001 — the splice never costs the appeal
-            logger.debug("raw-source supplement skipped: %s", _supp_exc)
+            # WARNING, not debug (review §4IY): a persistent bug here silently reopens the §4IU
+            # false-refute class — the refute is mechanically upheld as if no raw sources existed
+            logger.warning("raw-source supplement failed open (the appeal reads the digest only): %s", _supp_exc)
             _supp = ""
         if _supp:
             evidence = evidence + "\n" + _supp
@@ -3677,13 +3733,13 @@ class Verifier:
             try:
                 from .agent import evidence_truncation_severity as _sev
                 _decision, _why, _unres = _objection.resolve_refute(
-                    result.issues, claim, evidence, _sev(evidence_digest),
-                    prior_evidence=prior_evidence, context=context)
+                    result.issues, claim, evidence_digest, _sev(evidence_digest),
+                    prior_evidence=prior_evidence, context=context, supplement=_supp)
                 if _decision == _objection.UPHOLD:
                     logger.info(
                         "Verifier objection check: refute PROVEN real — "
                         "no escalation spent (%s)", "; ".join(_why)[:160])
-                    record_escalation(strong_call=getattr(self, "_last_main_call", None),
+                    record_escalation(strong_call=None,                      # no strong call was made (review §4IY)
                         kind="refute", route=route,
                         outcome="mechanically_upheld",
                         cheap_verdict=result.verdict.value,
@@ -3733,7 +3789,7 @@ class Verifier:
                     # the claim true, and the affirmative check can
                     # only cap, never flip.
                     _conf = result.confidence
-                    record_escalation(strong_call=getattr(self, "_last_main_call", None),
+                    record_escalation(strong_call=None,
                         kind="refute", route=route,
                         outcome="mechanically_dismissed",
                         cheap_verdict=result.verdict.value,
@@ -3792,7 +3848,7 @@ class Verifier:
                 "Verifier tier-routing: UNANCHORED refute DOWNGRADED to "
                 "UNCERTAIN without escalation (issues: %s)",
                 "; ".join(result.issues or [])[:140])
-            record_escalation(strong_call=getattr(self, "_last_main_call", None),
+            record_escalation(strong_call=None,
                 kind="refute", route=route, outcome="downgraded",
                 cheap_verdict=result.verdict.value,
                 cheap_confidence=result.confidence,

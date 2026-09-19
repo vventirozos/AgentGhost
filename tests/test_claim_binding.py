@@ -75,7 +75,7 @@ def test_hallucinated_claim_quote_is_dropped_not_judged():
     ("June2026[update]", []),                                        # glued month-year
     ("anorbitalperiodof 29.45years.Saturnis", []),                   # glued page text: never the prefix "29"
     ("Saturnhas 293moonswithconfirmedorbits", []),
-    ("12,34 and 9.592", [("34", 34.0, ""), ("9.592", 9.592, "")]),  # a decimal-comma figure is not "12"
+    ("12,34 and 9.592", [("12,34", 12.34, ""), ("9.592", 9.592, "")]),  # §4IY: a decimal comma is a decimal point ("4,3" was the figure 3)
     ("between 10 and 29.45years", [("10", 10.0, "")]),               # no range 10–29: an end is never a truncated prefix
     ("spans x=360–380", [("360–380", 360.0, "")]),                 # a range is ONE quantity (low end reported)
     ("canvas is 400×620", [("400", 400.0, ""), ("620", 620.0, "")]),   # × is a dimension separator, not a range
@@ -1271,9 +1271,14 @@ def test_unsupported_names_and_the_cap_predicate():
     assert CB.name_withhold_caps_confirm(None, truncation_severity=0.0, truncation_floor=0.25) == []
     # the whole sources decide when the caller has them: a name in a tool output the packer left out does not
     # cap, and the digest's floor is moot (the cut is the packer's, not the sources')
-    raw = "[web] IEEE P2851 draft reviewed by Dr. Elin Vasquez"
+    raw = "[web_search] IEEE P2851 draft reviewed by Dr. Elin Vasquez"
     assert CB.name_withhold_caps_confirm(res, truncation_severity=0.0, truncation_floor=0.25, raw_sources=raw) == []
-    assert CB.name_withhold_caps_confirm(res, truncation_severity=0.3, truncation_floor=0.25, raw_sources="[web] nothing here") == ["Dr. Elin Vasquez", "IEEE P2851"]
+    assert CB.name_withhold_caps_confirm(res, truncation_severity=0.3, truncation_floor=0.25, raw_sources="[web_search] nothing here") == ["Dr. Elin Vasquez", "IEEE P2851"]
+    # §4IX: only a SOURCE vouches — the agent's own write receipt, a `cat` of its draft, or a recall of its reply do not
+    for own in ("[file_system] wrote report.md: IEEE P2851 draft reviewed by Dr. Elin Vasquez", "[execute] $ cat report.md\nIEEE P2851 … Dr. Elin Vasquez",
+                "[recall] CONTENT: AI: Dr. Elin Vasquez signed off under IEEE P2851"):
+        assert CB.name_withhold_caps_confirm(res, truncation_severity=0.0, truncation_floor=0.25, raw_sources=own) == ["Dr. Elin Vasquez", "IEEE P2851"], own
+    assert CB.source_text("[web_search] a\n[file_system] b\n[execute] c\n[browser] d\n[recall] e") == "[web_search] a\n[browser] d"
     clean = CB.run_binding(NAMES_REPLY, NAMES_EV, rows)
     assert clean.verdict == "CONFIRMED" and CB.name_withhold_caps_confirm(clean, truncation_severity=0.0, truncation_floor=0.25) == []
     # a REFUTED is never "capped" — it is the verdict
@@ -1364,8 +1369,8 @@ def test_a_figure_glued_in_the_evidence_is_not_a_misreport_of_another_line():
 
 # ── §4IU: a life span attached to the wrong person ─────────────────────────
 
-NAMESAKE_EV = ("[web] Γεώργιος Ι. Οικονομίδης - Βικιπαίδεια\nJanuary 14, 2026 - Ο Γεώργιος Οικονομίδης του Ιωάννη (1854-1933) "
-               "ήταν Έλληνας πολιτικός από την Ήπειρο.\n[web] Λεόντιος Οικονομίδης: Γεννήθηκε το 1866 στο Λειβάρτζι. Η ΧΡΩΠΕΙ ιδρύθηκε το 1883.")
+NAMESAKE_EV = ("[web_search] Γεώργιος Ι. Οικονομίδης - Βικιπαίδεια\nJanuary 14, 2026 - Ο Γεώργιος Οικονομίδης του Ιωάννη (1854-1933) "
+               "ήταν Έλληνας πολιτικός από την Ήπειρο.\n[web_search] Λεόντιος Οικονομίδης: Γεννήθηκε το 1866 στο Λειβάρτζι. Η ΧΡΩΠΕΙ ιδρύθηκε το 1883.")
 
 
 def test_a_life_span_the_sources_attach_to_a_namesake_is_a_validated_contradiction():
@@ -1456,7 +1461,8 @@ def test_a_year_is_supported_by_a_year_token_not_by_the_digits_of_a_law_number()
     r = CB.run_binding("Γεννήθηκε το 1848 στο Λειβάρτζι.", law, {"claims": []})
     assert r.verdict == "UNCERTAIN" and "1848" in r.reasoning
     assert CB.unverified_facts(r, evidence=law) == ["1848"]
-    assert CB.unverified_facts(r, evidence=law, raw_sources="[web] Γεννήθηκε το 1848 στο Λειβάρτζι.") == []
+    assert CB.unverified_facts(r, evidence=law, raw_sources="[web_search] Γεννήθηκε το 1848 στο Λειβάρτζι.") == []
+    assert CB.unverified_facts(r, evidence=law, raw_sources="[file_system] wrote: Γεννήθηκε το 1848 στο Λειβάρτζι.") == ["1848"]   # §4IX: our own file is not a source
 
 
 
@@ -1550,3 +1556,306 @@ def test_the_topic_check_bridges_scripts_by_transliteration_and_abstains_without
     r = CB.run_binding("Ο καιρός στην Αθήνα είναι ηλιόλουστος, 34°C.", "[web_search] Athens 34°C sunny", {"claims": []},
                        context="|| USER REQUEST: What is the weather in Athens?")
     assert not any(g.kind == "topic" for g in r.findings)
+
+
+# ── §4IX: fresh-eye review fixes ─────────────────────────────────────────────
+
+def test_life_span_names_match_across_romanisations_diminutives_titles_and_short_stems():
+    """Review §4IX exhibit 1: "exactly one shared word = namesake = REFUTE"
+    convicted the SAME person whenever the given name differed in form."""
+    same = [("Ο Νίκος Καζαντζάκης (1883–1957)", "[web_search] Nikos Kazantzakis (1883–1957) was born"),
+            ("Κωνσταντίνος Καβάφης (1863–1933)", "[web_search] Konstantinos Kavafis (1863–1933)"),
+            ("Γιώργος Σεφέρης (1900–1971)", "[web_search] George Seferis (1900–1971)"),
+            ("Γιώργος Παπανδρέου (1888–1968)", "[web_search] Ο Γεώργιος Παπανδρέου (1888–1968)"),
+            ("Γιάννης Μεταξάς (1871–1941)", "[web_search] Ιωάννης Μεταξάς (1871–1941)"),
+            ("του Νίκου Καζαντζάκη (1883–1957)", "[web_search] Νίκος Καζαντζάκης (1883–1957)"),
+            ("Ίωνα Δραγούμη (1878–1920)", "[web_search] Ίων Δραγούμης (1878–1920)"),
+            ("Ελευθέριος Βενιζέλος (1864–1936)", "[web_search] Eleftherios Venizelos (1864–1936)"),
+            ("Λάμπρος Κατσώνης (1752–1804)", "[web_search] Lambros Katsonis (1752–1804)"),
+            ("Κώστας Καραμανλής (1907–1998)", "[web_search] Κωνσταντίνος Καραμανλής (1907–1998)"),
+            ("Georgios Papandreou (1888–1968)", "[web_search] President Papandreou (1888–1968)"),
+            ("Dr. Elin Vasquez (1950–2020)", "[web_search] Professor Vasquez (1950–2020)"),
+            ("Γεώργιος Παπανδρέου (1888–1968)", "[web_search] Πρωθυπουργός Παπανδρέου (1888–1968)")]
+    for r, e in same:
+        assert CB.audit_life_spans(r + " έζησε.", e)[0].status == "supported", (r, e)
+    # the real namesake, a different surname, and a name of nothing still behave
+    assert CB.audit_life_spans("Σπήλιος (Σπυρίδων) Οικονομίδης (1854–1933) έζησε.", "[web_search] Γεώργιος Οικονομίδης του Ιωάννη (1854-1933) ήταν πολιτικός")[0].status == "misattributed"
+    assert CB.audit_life_spans("Σπήλιος Παπαδόπουλος (1848–1894) έζησε.", "[web_search] Σπήλιος Οικονομίδης (1848-1894)")[0].status == "misattributed"
+    assert CB._names_relation(set(), {"wang", "wei"}) == "other"
+    assert CB._romanisations("Λάμπρος") == ["labros", "lampros", "lambros"] and "kazantzakis" in CB._romanisations("Καζαντζάκης")
+
+
+def test_echo_masking_survives_the_packers_claim_window_and_multiline_shapes():
+    """Review §4IX: the packer's claim window keeps the part of the OUTCOME
+    that overlaps the claim and drops its header; a session's assistant
+    message keeps its newlines; a cut `[assistant]` block loses its closer."""
+    from ghost_agent.core.agent import _slice_evidence_body
+    ep = ("EPISODE 434 [fetch]\nTRIGGER: " + "Use the web: who founded the ΧΡΩΠΕΙ company and add the founders' birth and death years. " * 2
+          + "\nCONTEXT: tools: " + " → ".join(["web_search"] * 40)
+          + "\nOUTCOME (SUCCESS): Η ΧΡΩΠΕΙ ιδρύθηκε το 1883 από τους αδελφούς Σπήλιο Οικονομίδη (1854–1935) και Λεόντιο Οικονομίδη (1866–1912). " * 4
+          + "\n  1. web_search({}) → [ok] ΧΡΩΠΕΙ - Βικιπαίδεια Ιδρύθηκε το 1883")
+    digest = "[knowledge_base] " + _slice_evidence_body(ep, 900, "Σπήλιο Οικονομίδη (1854–1935) ίδρυσε τη ΧΡΩΠΕΙ")
+    assert "…[gap]…" in digest and "(1854–1935)" in digest          # the window keeps the echo, header or not
+    m = CB.mask_self_echo(digest)
+    assert "1935" not in m and "1912" not in m and "TRIGGER: Use the web" in m and "Ιδρύθηκε το 1883" in m and len(m) == len(digest)
+    r = CB.run_binding("Ο Σπήλιος Οικονομίδης (1854–1935) ίδρυσε τη ΧΡΩΠΕΙ το 1883.", digest,
+                       {"claims": [{"quote": "1854–1935", "kind": "number", "evidence_quote": "(1854–1935)", "relation": "support"}]})
+    assert r.verdict == "UNCERTAIN" and [b.outcome for b in r.bindings] == ["unbound"] and "1935" in CB.echo_facts(r)
+    sess = ("[knowledge_base] SESSION abc — untitled (last 2 messages):\nuser: who founded it?\nassistant: The founders were:\n"
+            "- Σπήλιος Οικονομίδης (1854–1935)\n- Λεόντιος Οικονομίδης (1866–1912)\nBoth chemists.\nuser: thanks")
+    ms = CB.mask_self_echo(sess)
+    assert "1935" not in ms and "1912" not in ms and "user: who founded it?" in ms and "user: thanks" in ms
+    cut = "[assistant] Elin Vasquez (1854–1933) founded it.\n[/assis"
+    assert CB.mask_self_echo(cut).strip() == ""
+    # the residual judge reads the masked evidence too
+    ep2 = "[knowledge_base] EPISODE 9 [x]\nTRIGGER: backup?\nOUTCOME (SUCCESS): The nightly backup job was restarted and completed successfully."
+    base = CB.run_binding("The nightly backup job was restarted and completed successfully.", ep2, {"claims": []})
+    res = CB.apply_residual(base, "The nightly backup job was restarted and completed successfully.", ep2,
+                            {"claims": [{"quote": "backup job was restarted", "kind": "status", "evidence_quote": "backup job was restarted", "relation": "support"}]})
+    assert res.verdict != "CONFIRMED"
+
+
+def test_review_4ix_lookup_rules():
+    # anchors: common function words in both languages never anchor a near-miss
+    assert [(a.text, a.status) for a in CB.audit_numbers("They reported 34 cases in total.", "[web_search] They found 35 issues during the audit.")] == [("34", "unsupported")]
+    assert [(a.text, a.status) for a in CB.audit_numbers("Μόνο 34 περιπτώσεις καταγράφηκαν.", "[web_search] Μόνο 35 προβλήματα βρέθηκαν")] == [("34", "unsupported")]
+    assert CB.lexical_anchor("the server restarted cleanly", "restarted ghost-agent at 14:02") is True
+    # a Latin-script reply against a Greek source
+    assert [(e.text, e.status) for e in CB.audit_entities("Kyriakos Mitsotakis announced the measure on Tuesday.", "[web_search] Ο Κυριάκος Μητσοτάκης ανακοίνωσε το μέτρο την Τρίτη.")] == [("Kyriakos Mitsotakis", "supported")]
+    assert [(e.text, e.status) for e in CB.audit_entities("Kyriakos Mitsotakis announced the measure.", "[web_search] Ο Κυριάκος Παπαδόπουλος ανακοίνωσε το μέτρο.")] == [("Kyriakos Mitsotakis", "unsupported")]
+    # names are WORDS: "Mark Stone" is not in "stock market … milestone"; an inflection is ≤3 letters
+    hay = CB.normalize_for_containment("[web_search] Stock market update\n[browser] A milestone for the project")
+    assert CB._entity_supported("mark stone", hay) is False and CB._entity_supported("mark stone", hay + " said mark stone") is True
+    assert CB._entity_supported("δημήτρης γεωργίου", CB.normalize_for_containment("Η παραγωγή δημητριακών στη γεωργία")) is False
+    assert CB._entity_supported("δημήτριο κουφοντίνα", CB.normalize_for_containment("Ο Δημήτρης Κουφοντίνας δήλωσε")) is True
+    # a count written without its thousands comma is not an unsupported year; a hyphen range is a range
+    assert [(a.text, a.status) for a in CB.audit_years("The company has 2500 employees and the file is 2048 bytes.", "[t] It employs 2,500 people. Size: 2,048 bytes.")] == [("2500", "supported"), ("2048", "supported")]
+    assert [(a.text, a.status) for a in CB.audit_years("Ο Σπήλιος Οικονομίδης έζησε 1848-1894 στην Αθήνα.", "[web_search] πέθανε το 1894")] == [("1848", "unsupported"), ("1894", "supported")]
+    # standards citations compare without their spacing
+    assert [(a.text, a.status) for a in CB.audit_identifiers("Dates follow ISO 8601 and RFC 7231; Wi-Fi is IEEE 802.11.", "[web_search] ISO-8601 dates; RFC7231 semantics; IEEE 802.11 radios")] == \
+        [("ISO 8601", "supported"), ("RFC 7231", "supported"), ("IEEE 802.11", "supported")]
+    assert [(a.text, a.status) for a in CB.audit_identifiers("Dates follow ISO 8601.", "[web_search] ISO 9001 certified")] == [("ISO 8601", "unsupported")]
+    # the path mask does not start inside a comma-grouped figure
+    assert [q.text for q in CB.extract_quantities(CB._mask_non_prose("about 1,200/day requests"))] == ["1,200"]
+
+
+def test_the_residual_judge_cannot_validate_a_quote_from_the_agents_own_earlier_words():
+    """Review §4IX: `apply_residual` snapped the residual judge's quote against
+    the UNMASKED evidence, so an unchecked status claim was confirmed by the
+    OUTCOME echo of an expanded episode."""
+    ev = ("[execute] job=backup exit=0\n"
+          "[knowledge_base] EPISODE 9 [x]\nTRIGGER: backup?\nOUTCOME (SUCCESS): The nightly backup job was restarted and completed successfully.")
+    reply = "The nightly backup job was restarted and completed successfully."
+    base = CB.run_binding(reply, ev, {"claims": [{"quote": "completed successfully", "kind": "status", "evidence_quote": "exit=0", "relation": "support"}]})
+    assert [b.outcome for b in base.bindings] == ["unchecked"]
+    res = CB.apply_residual(base, reply, ev, {"claims": [{"quote": "completed successfully", "kind": "status",
+                                                          "evidence_quote": "restarted and completed successfully", "relation": "support"}]})
+    assert res.verdict != "CONFIRMED" and [b.outcome for b in res.bindings] == ["unchecked"]
+    # the same residual quote from a REAL line validates
+    ev2 = "[execute] job=backup exit=0 — restarted and completed successfully"
+    base2 = CB.run_binding(reply, ev2, {"claims": [{"quote": "completed successfully", "kind": "status", "evidence_quote": "exit=0", "relation": "support"}]})
+    res2 = CB.apply_residual(base2, reply, ev2, {"claims": [{"quote": "completed successfully", "kind": "status",
+                                                             "evidence_quote": "restarted and completed successfully", "relation": "support"}]})
+    assert [b.outcome for b in res2.bindings] == ["agree"]
+
+
+# ── §4IY: the wide fresh-eye review (binder core + the §4IX fixes) ───────────
+
+def _rows(q, e, kind="number", rel="support"):
+    return {"claims": [{"quote": q, "kind": kind, "evidence_quote": e, "relation": rel}]}
+
+
+def test_4iy_quantities_decimal_comma_minus_durations_and_linear_regex():
+    import time
+    assert [(q.text, q.value) for q in CB.extract_quantities("Ο μέσος όρος είναι 4,3 βαθμοί.")] == [("4,3", 4.3)]
+    assert [(q.value, q.unit) for q in CB.extract_quantities("3,5 kg")] == [(3500.0, "kg")]
+    assert [q.value for q in CB.extract_quantities("12,5%")] == [12.5] and [q.value for q in CB.extract_quantities("−5°C")] == [-5.0]
+    assert [q.value for q in CB.extract_quantities("1,284 orders")] == [1284.0] and [q.value for q in CB.extract_quantities("12,345.6")] == [12345.6]
+    assert CB.run_binding("Ο μέσος όρος είναι 4,3 βαθμοί.", "[execute] μέσος όρος: 4.3", _rows("4,3 βαθμοί", "μέσος όρος: 4.3")).verdict == "CONFIRMED"
+    assert CB.run_binding("Το προϊόν κοστίζει 23,60 €.", "[web_search] Τιμή: 24,60 €", _rows("23,60 €", "24,60 €")).verdict == "REFUTED"
+    assert CB.run_binding("Tonight it will be 5°C.", "[web_search] Florina tonight: −5°C", _rows("5°C", "−5°C")).verdict != "CONFIRMED"   # the sign is read (it confirmed before)
+    # compound durations are one quantity; "m" after an hour figure is minutes
+    assert [(q.text, q.value, q.family) for q in CB.extract_quantities("The job took 2 hours 30 min to complete.")] == [("2 hours 30 min", 9000.0, "time")]
+    assert [(q.value, q.family) for q in CB.extract_quantities("1h 30m")] == [(5400.0, "time")]
+    assert CB.run_binding("The job took 2 hours 30 min to complete.", "[execute] the job took 2.5 hours total", _rows("2 hours 30 min", "2.5 hours")).verdict == "CONFIRMED"
+    # the thousands alternative and the path mask are linear
+    t0 = time.time(); CB.extract_quantities("[" + ",".join(str(100 + i % 900) for i in range(3000)) + ",42]"); assert time.time() - t0 < 0.5
+    t0 = time.time(); CB.audit_numbers("There are 12 files.", "[execute] " + "-".join(["ab12cd"] * 30000)); assert time.time() - t0 < 1.0
+    # a 309-digit figure is not a figure (the binder used to raise)
+    assert CB.run_binding("2**1024 has 309 digits.", "[execute] " + str(2 ** 1024), {"claims": []}).verdict == "UNCERTAIN"
+
+
+def test_4iy_families_boundaries_and_units():
+    # mass rounds in the claim's unit; decimal byte units agree under 1000ⁿ too
+    assert CB.run_binding("The package weighs 2 kg.", "[web_search] Package weight: 1.95 kg (shipping)", _rows("2 kg", "1.95 kg")).verdict == "CONFIRMED"
+    assert CB.run_binding("The download is 1.5 MB.", "[execute] size: 1500000 bytes", _rows("1.5 MB", "1500000 bytes")).verdict == "CONFIRMED"
+    assert CB.run_binding("The file is 48 KB.", "[execute] 49152 bytes", _rows("48 KB", "49152 bytes")).verdict == "CONFIRMED"
+    assert CB.run_binding("The download is 1.5 MB.", "[execute] size: 1300000 bytes", _rows("1.5 MB", "1300000 bytes")).verdict == "REFUTED"
+    # "284 orders" is not in "1,284 orders"
+    assert CB._whole_token_find("284 orders", "total 1,284 orders") == -1 and CB._whole_token_find("5 kb", "file is 12.5 kb") == -1
+    assert CB._whole_token_find("284 orders", "total 284 orders") == 6
+    assert CB.run_binding("Last week the shop recorded 284 orders.", "[execute] week 28: total 1,284 orders", _rows("284 orders", "284 orders")).verdict != "CONFIRMED"
+    # "lat 250 ms" is latency; a real latitude still implausible
+    assert CB.implausible_value("p99 lat 250 ms") is None and CB.implausible_value("lat 250, lon 30")
+    # a bound/hedge one word before the binder's trimmed quote is read from the reply
+    assert CB.run_binding("The place has over 160 reviews on Google.", "[web_search] Taverna — 4.5 stars, 164 reviews", _rows("160 reviews", "164 reviews")).verdict == "CONFIRMED"
+    assert CB.run_binding("Humidity is around 28% today.", "[web_search] Humidity 29%", _rows("28% today", "Humidity 29%")).verdict == "CONFIRMED"
+    # a 2-part version is the head of a 3-part one; a lower bound is never a misreport target
+    assert [(a.text, a.status) for a in CB.audit_numbers("The project runs on Python 3.12 in the container.", '[read_file] requires-python = ">=3.10"\n[execute] Python 3.12.4')] == [("3.12", "unsupported")]
+    # anchors are words; Greek negation clashes
+    assert CB.lexical_anchor("The server is ready.", "already running the old build") is False
+    assert CB.run_binding("The server is ready.", "[execute] already running the old build", _rows("server is ready", "already running", kind="status")).verdict != "CONFIRMED"
+    assert CB.run_binding("Όλα τα tests πέρασαν επιτυχώς.", "[execute] tests: 3 απέτυχαν, 0 πέρασαν — σφάλμα", _rows("tests πέρασαν επιτυχώς", "3 απέτυχαν, 0 πέρασαν", kind="status")).verdict != "CONFIRMED"
+
+
+def test_4iy_twins_residuals_and_records():
+    # a repeated key under two parents is two records; a real twin still conflicts
+    ev5 = "[read_file] services:\n  api:\n    image: api:latest\n    port: 8080\n  db:\n    image: postgres\n    port: 5432"
+    assert CB.run_binding("The api service listens on port 8080.", ev5, _rows("port 8080", "port: 8080")).verdict == "CONFIRMED"
+    assert CB.run_binding("The port is 8080.", "[execute] port: 8080\n[execute] port: 8081", _rows("port is 8080", "port: 8080")).verdict == "REFUTED"
+    # the residual judge's disagree runs bind's guards; its contradiction needs a clash IN THE SPAN
+    ev = "[web_search] Athens, GR — current conditions: temperature 31°C (feels like 33°C), humidity 44%. Tonight: clear, low 24°C"
+    reply = "It is 31°C right now; Athens tonight drops to 24°C."
+    base = CB.run_binding(reply, ev, _rows("24°C", "", rel="absent"))
+    assert CB.apply_residual(base, reply, ev, _rows("24°C", "Athens, GR — current conditions: temperature 31°C", rel="contradict")).verdict == "UNCERTAIN"
+    ev2 = "[execute] systemctl restart ghost-agent\nservice came back up in 2 s, active (running)"
+    r2 = "Restarted the service; it came back up with no errors."
+    b2 = CB.run_binding(r2, ev2, _rows("came back up with no errors", "", kind="status", rel="absent"))
+    assert CB.apply_residual(b2, r2, ev2, _rows("came back up with no errors", "service came back up in 2 s, active (running)", kind="status", rel="contradict")).verdict == "UNCERTAIN"
+
+
+def test_4iy_labels_arcs_marks_and_names():
+    # a packer label is `[tool_name] `; browser "[0] OK", wiki "[edit]" and "[1] Bien" lines do not split a block
+    raw = ("[web_search] Saturn 29.46 years\n[browser] browser interact: 2 actions, status ok\n--- PER-ACTION RESULTS ---\n  [0] OK goto https://x\n"
+           "  [1] OK extract_text\n      TEXT: Maintainers — lead: Dr. Elin Vasquez (since 2019)\n[browser] Nikos Kazantzakis - Wikipedia\nContents\n[edit]\nNikos (1883–1957) was…\n[1] Bien, Peter\nHe was born in 1883.")
+    assert [n for n, _ in CB.evidence_blocks(raw)] == ["web_search", "browser", "browser"]
+    assert "Elin Vasquez" in CB.source_text(raw) and "born in 1883" in CB.source_text(raw)
+    # the recall arc as emitted: "CONTENT: USER: … ASSISTANT: …" with a multi-paragraph reply
+    arc = "[recall] SOURCE: conversation\nRELEVANCE: HIGH\nCONTENT: USER: who founded ΧΡΩΠΕΙ?\nASSISTANT: Η ΧΡΩΠΕΙ ιδρύθηκε το 1883 από τον Σπήλιο Οικονομίδη (1854–1935).\n\nΔεύτερη παράγραφος 1866.\nAI: third"
+    m = CB.mask_self_echo(arc)
+    assert "1935" not in m and "1866" not in m and "USER: who founded" in m
+    assert CB.run_binding("Η ΧΡΩΠΕΙ ιδρύθηκε από τον Σπήλιο Οικονομίδη (1854–1935).", arc, _rows("1854–1935", "(1854–1935)")).verdict != "CONFIRMED"
+    # the packer's own marks carry no evidence
+    assert [(a.text, a.status) for a in CB.audit_years("Born in 1854.", "[web] text …[PACKER CUT#ed2d35ed: 1854 of 1975 chars shown]")] == [("1854", "unsupported")]
+    # names: whole keys, a small stop set, the reverse bridge in the caveat, the floor gate on SOURCE text
+    assert CB._entity_supported("li wei", "eli weiss said") is False and CB._entity_supported("thomas more", "sir thomas more wrote") is True
+    assert CB._entity_supported("thomas more", "thomas jefferson wrote") is False
+    r = CB.run_binding("Kyriakos Mitsotakis announced it.", "[web_search] Ο Κυριάκος Μητσοτάκης ανακοίνωσε.", {"claims": []})
+    assert CB.unverified_facts(r, evidence="[web_search] Ο Κυριάκος Μητσοτάκης ανακοίνωσε.") == []
+    res = CB.run_binding(NAMES_REPLY + " The lead maintainer, Dr. Elin Vasquez, verified it.", NAMES_EV, _rows("34°C", "Temperature 34°C"))
+    assert CB.name_withhold_caps_confirm(res, truncation_severity=0.3, truncation_floor=0.25, raw_sources="[task_list] 3 tasks open") == []   # no SOURCE text: the floor holds
+    # standards need a left boundary; a phone number is not a year range; "2500" is "2,500"
+    assert [(a.text, a.status) for a in CB.audit_identifiers("Dates follow ISO 8601.", "[web] the piso 8601 room")] == [("ISO 8601", "unsupported")]
+    assert [(a.text, a.status) for a in CB.audit_years("Phone 2101-2345-6789 and lived 1848-1894.", "[t] x")] == [("1848", "unsupported"), ("1894", "unsupported")]
+    # namesakes: a cross-script pair the tables do not know withholds, never refutes; near-spellings and nicknames are the same person
+    same = [("Jimmy Carter (1924–2024) lived.", "[web_search] James Carter (1924–2024)"), ("Jean-Paul Sartre (1905–1980) lived.", "[web_search] Jean Paul Sartre (1905–1980)"), ("Leo Tolstoy (1828–1910) lived.", "[web_search] Lev Tolstoy (1828–1910)")]
+    for r_, e_ in same:
+        assert CB.audit_life_spans(r_, e_)[0].status == "supported", r_
+    for r_, e_ in [("Η Μαρία Κάλλας (1923–1977) ήταν σοπράνο.", "[web_search] Maria Callas (1923–1977) was a soprano"), ("Ο Άλμπερτ Αϊνστάιν (1879–1955) έζησε.", "[web_search] Albert Einstein (1879–1955)")]:
+        assert CB.audit_life_spans(r_, e_)[0].status == "unsupported", r_
+        assert CB.run_binding(r_, e_, {"claims": []}).verdict != "REFUTED"
+    assert CB.audit_life_spans("Λεόντιος Οικονομίδης (1866–1912) έζησε.", "[web_search] Γεώργιος Οικονομίδης (1866-1912)")[0].status == "misattributed"
+
+
+def test_4iy_each_guard_alone():
+    """Pins that reach ONE guard each (battery 68 survivors: a neighbouring
+    guard had saved the earlier inputs)."""
+    # the containment fold reads the true minus (extraction has its own fold)
+    assert CB.normalize_for_containment("−5°C and ‐3") == "-5°c and -3"
+    # the residual disagree guard: a residual quote that SHARES a subject with the span but whose figure stands elsewhere
+    ev = "[web_search] Athens, GR — current conditions: temperature 31°C (feels like 33°C), humidity 44%. Tonight: clear, low 24°C"
+    reply = "It is 31°C right now; Athens tonight drops to 24°C."
+    base = CB.run_binding(reply, ev, _rows("Athens tonight drops to 24°C", "", rel="absent"))
+    assert CB.apply_residual(base, reply, ev, _rows("Athens tonight drops to 24°C", "Athens, GR — current conditions: temperature 31°C", rel="contradict")).verdict == "UNCERTAIN"
+    # the version-prefix guard alone (no bound on the evidence figure)
+    assert [(a.text, a.status) for a in CB.audit_numbers("The project runs on Python 3.12 in the container.", "[read_file] Python 3.10 is the project baseline\n[execute] Python 3.12.4")] == [("3.12", "unsupported")]
+    # an overflowing literal is not extracted at all
+    assert CB.extract_quantities(str(2 ** 1024)) == [] and CB.extract_quantities("count " + str(10 ** 400)) == []
+    # the binder-level mark strip: a FIGURE (not year-shaped) inside the packer's mark
+    assert {a.status for a in CB.run_binding("There are 1854 files.", "[t] listing …[PACKER CUT#ed2d35ed: 1854 of 1975 chars shown]", {"claims": []}).audit if a.text == "1854"} == {"unsupported"}   # a figure row and a year row
+    # names keep "More": the life-span tokens
+    assert any("more" in t for t in CB._name_tokens("Thomas More"))
+    # the caveat's reverse bridge on the RAW sources (the digest lacked the name)
+    r = CB.run_binding("Kyriakos Mitsotakis announced it.", "[web_search] the measure was announced", {"claims": []})
+    assert [e.status for e in r.entities] == ["unsupported"]
+    assert CB.unverified_facts(r, evidence="[web_search] the measure was announced", raw_sources="[web_search] Ο Κυριάκος Μητσοτάκης ανακοίνωσε το μέτρο") == []
+    # a same-script pair with one shared word and a near-spelled other word is the same person
+    assert CB.audit_life_spans("Vangelis Papathanassiou (1943–2022) composed it.", "[web_search] Vangelis Papathanasiou (1943–2022) composed it")[0].status == "supported"
+
+
+def test_4iy_dates_speak_greek_ports_in_urls_and_the_figure_subject():
+    """Corpus replay r24 after the §4IY batch: three correct replies newly
+    REFUTED. (1) "στις 15 Αυγούστου" left a bare 15 that a gazzetta dateline
+    "16 Αυγούστου 2026 - 22:17" misreported — Greek month names are dates.
+    (2) "port 8101" against an unrelated `const PORT = 8100;` while the
+    browser's own `URL: http://127.0.0.1:8101/` had been masked out of the
+    figure lookup. (3) "PostgreSQL 18 release research" against
+    `research=17`: one incidental shared word is not the figure's subject."""
+    def figs(reply, ev):
+        return [(a.text, a.status) for a in CB.audit_numbers(reply, ev)]
+
+    # (1) Greek dates, every spelling: no figure survives the mask
+    for t in ("στις 15 Αυγούστου", "16 Αυγούστου 2026 - 22:17", "3 Μαΐου 2024", "στις 12 ΜΑΪΟΥ", "Αύγουστος 2026",
+              "15 μαρ. 2024", "4 Ιαν", "15 Μάη", "το 3 δεκ", "1 Σεπτεμβρίου"):
+        assert CB.extract_quantities(CB.mask_non_quantities(t)) == [], t
+    assert [q.text for q in CB.extract_quantities(CB.mask_non_quantities("Μαρία έχει 15 βιβλία"))] == ["15"]   # a name that starts like a month is not one
+    reply = 'Οι φίλαθλοι έχουν πει ότι πουλήθηκε "σκόπιμα" στις 15 Αυγούστου.'
+    ev = "[web_search] Γράφει ο Σουντουλίδης 16 Αυγούστου 2026 - 22:17. Η πώληση έγινε σκόπιμα, λένε οι φίλαθλοι."
+    assert figs(reply, ev) == []
+    assert CB.run_binding(reply, ev, {"claims": []}).verdict != "REFUTED"
+
+    # (2) a port in a URL authority states the port; another whole token in a URL/path only stands the misreport down
+    ev2 = "[file_system] const PORT = 8100;\n[browser] STATUS: OK\nURL: http://127.0.0.1:8101/\nHTTP_STATUS: 200"
+    assert figs("- Started the Flask backend server on port 8101", ev2) == [("8101", "supported")]
+    assert CB._url_occurrence("8101", ev2) == ("port", "URL: http://127.0.0.1:8101/")
+    assert figs("- Started the Flask backend server on port 8103", "[file_system] const PORT = 8102;") == [("8103", "misreported")]   # the catch the rule was tuned on
+    assert figs("There are 34 entries", "[web_search] see https://example.org/list/34/ for the 33 entries table") == [("34", "unsupported")]
+    assert CB._url_occurrence("34", "[web_search] see https://example.org/list/34/") == ("token", "[web_search] see https://example.org/list/34/")
+    assert CB._url_occurrence("34", "[web_search] see https://example.org/list/341/ and /x/8934") is None   # whole tokens only
+    assert CB._url_occurrence("8101", "[web_search] http://127.0.0.1:81010/") is None
+    assert CB._url_occurrence("1,847", "[web_search] http://h/1,847") is None                                # a grouped figure never lives in a URL as itself
+
+    # (3) the shared word must be the FIGURE's subject
+    ev3 = "[introspect] Topic clusters: coding=199, meta=103, debugging=29, research=17, data=16"
+    assert figs("- Recent focus: PostgreSQL 18 release research, investment analysis", ev3) == [("18", "unsupported")]
+    assert figs("- Recent focus: PostgreSQL 18 release research", "[web_search] 17 research papers were found") == [("18", "unsupported")]
+    for restated in ("Research events: 18 in the cluster table", "There were 18 research events", "The research cluster count is 18"):
+        assert figs(restated, ev3) == [("18", "misreported")], restated
+    assert figs("- meta=335 in the clusters", "[introspect] Topic clusters: meta=334, coding=241") == [("335", "misreported")]
+    assert figs("Orders total 1,847 this week", "[execute] total_orders 1846 (prev 1649)") == [("1,847", "misreported")]
+    assert figs("Workers: 14 in the pool", '[execute] {"workers": 13, "queue": 4}') == [("14", "misreported")]
+    # two shared content words anchor a figure whose neighbours differ ("13-line" against "lines")
+    assert figs("**sample.log** — a 13-line sample fixture.", "[file_system] wrote sample.log\nFIXTURE-COUNT: 14 non-empty lines in sample fixture") == [("13", "misreported")]
+    # the subject words themselves
+    assert CB._figure_subject_words("Recent focus: PostgreSQL 18 release research", 25, "18") == ["postgresql", "release"]
+    assert CB._figure_subject_words("Research events: 18 in the cluster table", 17, "18") == ["research", "events", "events"]   # one skip: "in the" ends the after-side
+    assert CB._evidence_figure_subject(CB.extract_quantities("research=17, data=16")[0], "[t] Topic clusters: research=17, data=16") == ["topic", "clusters", "research", "research", "data"]
+    # one skip only: "18 of research" reaches research, "18 of the research" and "18 per big research" do not
+    assert CB._neighbour_words("", " of research events") == ["research"]
+    assert CB._neighbour_words("", " of the research events") == []
+    assert CB._neighbour_words("", " per big research") == []
+    assert CB._neighbour_words("on port ", " today") == ["port", "today"]
+    # battery 69 survivors — each guard alone
+    # Z2: the month's trailing boundary — "2 μαρτυρίες" / "3 δεκάδες" are counts, not "2 Μαρ" / "3 Δεκ"
+    assert [q.text for q in CB.extract_quantities(CB.mask_non_quantities("Υπάρχουν 2 μαρτυρίες και 3 δεκάδες φωτογραφίες"))] == ["2", "3"]
+    # Z8: a decimal's digits are not a URL token ("3.5" is not "/35/")
+    assert CB._url_occurrence("3.5", "[t] see https://h/35/") is None
+    assert figs("The score is 3.5 overall", "[t] overall score: 3.6 (see https://h/35/)") == [("3.5", "misreported")]
+    # Z14: a neighbour scan never crosses another figure
+    assert CB._neighbour_words("", " 29 research") == [] and CB._neighbour_words("sizes 1200 ", "") == []
+    # Z16: the stem rule needs a 6-letter word and a 5-letter stem — "postgresql" is not "posts"
+    assert CB._same_subject_word("postgresql", "posts") is False and CB._same_subject_word("research", "researcher") is True
+    assert CB._same_subject_word is not CB._same_word and CB._same_word("Ίων", "Ίωνα")   # the name-inflection test keeps its name and its meaning
+    assert figs("- Recent focus: PostgreSQL 18 release research", "[t] posts=17, data=16") == [("18", "unsupported")]
+    # Z17: the label phrase is the LAST clause, not the whole sentence head
+    assert figs("Focus: research, PostgreSQL version: 18 now", ev3) == [("18", "unsupported")]   # a comma clause, one sentence
+    assert figs("Focus: research, research count: 18 now", ev3) == [("18", "misreported")]
+    # Z19: the subject-word test is the anchor's stem rule, not the name-inflection rule ("researchers" carries "research")
+    assert figs("There were 18 researchers in the group", ev3) == [("18", "misreported")]
+    # a short word and its plural are one subject word ("line"/"lines"); "data"/"date" and "port"/"portal" are not (corpus turn 9f41238f)
+    assert CB._same_subject_word("line", "lines") and CB._same_subject_word("boxes", "box") and CB._same_subject_word("entry", "entries")
+    assert not CB._same_subject_word("data", "date") and not CB._same_subject_word("port", "portal") and not CB._same_subject_word("lines", "lined")
+    assert figs("**`sample.log`** — 13-line sample with one line missing the marker, one missing the number (`+s`), and one missing the UUID.",
+                "[file_system] SUCCESS: Wrote 1704 chars to 'sample.log'. Script-side path (from sandbox cwd): 'sample.log'. | FIXTURE-COUNT: 14 non-empty lines") == [("13", "misreported")]
+    # Z18: the figure offset inside a stripped sentence (the second sentence of a line)
+    assert figs("Done. Server on port 8103 today.", "[file_system] const PORT = 8102;") == [("8103", "misreported")]

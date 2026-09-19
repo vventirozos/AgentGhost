@@ -106,7 +106,7 @@ def render(summary: dict, escalations) -> str:
             for i in (cb.get("issues") or [])[:3]:
                 lines.append(f"    · {_short(i, 220)}")
     if summary.get("capped"):
-        lines.append("\nCAPPED (a cheap CONFIRMED shipped at 0.6 on a name the session never carried — read each: a fabrication or a name the reply knew):")
+        lines.append("\nCAPPED (a cheap CONFIRMED shipped at 0.6 on a fact the session's sources never carried, or that rests only on the agent's own earlier words — read each: a fabrication, an echo, or a fact the reply knew):")
         for r in summary["capped"]:
             lines.append(f"- {str(r.get('ts'))[:19]} req={r.get('trace', {}).get('req_id')} names={r.get('capped')}")
     if summary["failures"]:

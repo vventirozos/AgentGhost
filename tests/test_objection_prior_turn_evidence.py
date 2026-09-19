@@ -258,3 +258,37 @@ def test_an_earlier_reply_of_ours_is_labelled_in_the_prior_blob():
     assert blob.index("[assistant]") < blob.index("T1279")          # newest first, tool rows unlabelled
     masked = mask_self_echo(blob)
     assert "Elin Vasquez" not in masked and "within 40km=149" in masked
+
+
+def test_the_boundary_is_the_real_request_not_a_synthetic_user_role_steer():
+    """Review §4IX: the loop's own steers ride user-role messages, so "before
+    the last user message" re-admitted this turn's narration after a SYSTEM
+    ALERT / the announced-work directive."""
+    from ghost_agent.core.agent import _prior_turn_evidence
+    messages = [{"role": "user", "content": "q1"},
+                {"role": "assistant", "content": "earlier reply 1866"},
+                {"role": "user", "content": "real question about the founders"},
+                {"role": "assistant", "content": "He lived 1848–1898. Let me search."},
+                {"role": "user", "content": "SYSTEM ALERT: your last message only ANNOUNCED work — make the call now."},
+                {"role": "assistant", "content": "searching now 1848"}]
+    blob = _prior_turn_evidence(messages, [], last_user_content="real question about the founders")
+    assert "1866" in blob and "1848" not in blob and "1898" not in blob
+    # without the hint the old rule applies (the last user-role message) — and a client shape whose real
+    # request is a content list still resolves
+    messages[2]["content"] = [{"type": "text", "text": "real question about the founders"}]
+    assert "1848" not in _prior_turn_evidence(messages, [], last_user_content="real question about the founders")
+
+
+def test_4iy_boundary_is_the_exact_request_and_steers_are_skipped():
+    from ghost_agent.core.agent import _prior_turn_evidence
+    q = "how many points did the team score in 1998?"
+    msgs = [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "earlier answer: ~149 points"}, {"role": "user", "content": q},
+            {"role": "assistant", "content": "<thinking>I recall 1848–1898…</thinking>Let me check."}, {"role": "tool", "content": "t"},
+            {"role": "user", "content": f'AUTO-DIAGNOSTIC: … REMINDER — the CURRENT user request you are working on: "{q}". Continue…'}]
+    blob = _prior_turn_evidence(msgs, [], last_user_content=q)
+    assert "149 points" in blob and "1848" not in blob and "Let me check" not in blob
+    # no hint (an image-only request): the newest user message that is not one of our steers
+    assert "1848" not in _prior_turn_evidence(msgs, [], last_user_content="")
+    # a short request that is a substring of a directive is still matched exactly
+    msgs2 = [{"role": "user", "content": "no"}, {"role": "assistant", "content": "first 1911"}, {"role": "user", "content": "SYSTEM ALERT: nothing happened, make the call now"}]
+    assert "1911" not in _prior_turn_evidence(msgs2, [], last_user_content="no")

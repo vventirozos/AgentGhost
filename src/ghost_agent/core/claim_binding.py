@@ -166,6 +166,7 @@ def normalize_for_containment(s: str) -> str:
     # and no-break spaces are folded explicitly.
     s = unicodedata.normalize("NFC", str(s or ""))
     s = s.translate(str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"', "–": "-", "—": "-",
+                                   "\u2212": "-", "\u2010": "-", "\u2011": "-",       # the true minus and hyphens: "−5°C" is negative (review §4IY)
                                    "\u00a0": " ", "\u202f": " ", "\u2009": " "}))
     s = re.sub("[\\u200b\\u200c\\u200d\\ufeff]", "", s)
     return re.sub(r"\s+", " ", s.strip().lower())
@@ -174,7 +175,7 @@ def normalize_for_containment(s: str) -> str:
 def _fold_spaces(text: str) -> str:
     """Length-preserving: no-break / thin spaces become spaces, so a RAW
     line and its normalized snapped window read the same figures."""
-    return str(text or "").translate(str.maketrans({"\u00a0": " ", "\u202f": " ", "\u2009": " "}))
+    return str(text or "").translate(str.maketrans({"\u00a0": " ", "\u202f": " ", "\u2009": " ", "\u2212": "-", "\u2010": "-", "\u2011": "-"}))
 
 
 def _whole_token_find(needle: str, hay: str) -> int:
@@ -187,7 +188,8 @@ def _whole_token_find(needle: str, hay: str) -> int:
         if i < 0:
             return -1
         j = i + len(needle)
-        left_ok = i == 0 or not (hay[i - 1].isalnum() and needle[:1].isalnum())
+        left_ok = (i == 0 or not (hay[i - 1].isalnum() and needle[:1].isalnum())) and not (
+            needle[:1].isdigit() and i >= 2 and hay[i - 1] in ".," and hay[i - 2].isdigit())   # "284 orders" is not in "1,284 orders" (review §4IY)
         right_ok = (j >= len(hay) or not (hay[j].isalnum() and needle[-1:].isalnum())
                     and not (needle[-1:].isdigit() and hay[j] in ".," and j + 1 < len(hay) and hay[j + 1].isdigit()))
         if left_ok and right_ok:
@@ -311,7 +313,20 @@ def _token_bounds(text: str, lo: int, hi: int) -> Tuple[int, int]:
 
 # ── numbers and units ───────────────────────────────────────────────────
 
-_NUM_CORE = r"[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?|[-+]?\d+(?:\.\d+)?"   # "100 200 300" is three figures, not one
+# Three shapes, in this order: thousands-grouped ("1,284", "12,345.6"), a
+# DECIMAL COMMA ("4,3", "23,60" — the Greek and continental spelling; fresh-eye
+# review §4IY: "4,3" lexed as the figure 3 and refuted a correct Greek reply),
+# then a plain figure. The thousands alternative is written as an atomic
+# group (a lookahead captured, then re-matched by backreference) — Python
+# 3.10 has no possessive quantifier and `\d{1,3}(?:,\d{3})+` re-tried every
+# group on a comma-run of mixed widths: a 2,900-element JSON array cost the
+# binder 6 s per digest.
+def _num_core(tag: str) -> str:
+    return (rf"[-+]?\d{{1,3}}(?=(?P<{tag}g>(?:,\d{{3}})+))(?P={tag}g)(?:\.\d+)?"
+            rf"|[-+]?\d+,\d{{1,2}}(?![\d,])"
+            rf"|[-+]?\d+(?:\.\d+)?")
+_NUM_CORE = _num_core("n")   # "100 200 300" is three figures, not one
+_NUM_CORE_LO, _NUM_CORE_HI = _num_core("lo"), _num_core("hi")
 _UNIT_ALT = (r"%|°c|°f|°|tb|gb|mb|kb|kib|mib|gib|bytes?|ms|s|sec|secs|seconds?|min|mins|minutes?|h|hr|hrs|hours?"
              r"|km|m|cm|mm|kg|mg|g|k|million|billion|thousand|bn|mn")
 #: `(?![.,]?\d)` after the figure: a number is never the truncated prefix of
@@ -324,14 +339,14 @@ _UNIT_ALT = (r"%|°c|°f|°|tb|gb|mb|kb|kib|mib|gib|bytes?|ms|s|sec|secs|seconds
 #: leaves behind (14,000 spaces → 7.7 s per call; a 14 KB fenced reply cost
 #: 26 s in the turn — corpus replay §4IN). Same match set.
 _NUM_RE = re.compile(
-    rf"(?:(?P<cur>[€$£])\s*)?(?<![\w.])(?P<num>{_NUM_CORE})(?![.,]?\d)\s*(?P<unit>{_UNIT_ALT})?(?![\w])", re.IGNORECASE)
+    rf"(?:(?P<cur>[€$£])\s*)?(?<![\w.])(?<!\d,)(?P<num>{_NUM_CORE})(?![.,]?\d)\s*(?P<unit>{_UNIT_ALT})?(?![\w])", re.IGNORECASE)   # `(?<!\d,)`: never the tail of "4,3"
 #: A RANGE is one quantity, not two: "spans x=360–380" bound to `ballX: 370`
 #: is agreement (the value lies inside), not a 360-vs-370 contradiction
 #: (mined pool rec-3adeaf27e8, a clean reply refuted). Connectors: a dash,
 #: "to", or "between A and B"; the unit may sit on either endpoint.
 _RANGE_RE = re.compile(
-    rf"(?P<between>\bbetween\s+)?(?:(?P<cur>[€$£])\s*)?(?<![\w.])(?P<lo>{_NUM_CORE})(?:\s*(?P<unit1>{_UNIT_ALT}))?"
-    rf"(?P<conn>(?<!\s)-(?!\s)|\s*[–—]\s*|\s+to\s+|\s+and\s+)(?:(?P<cur2>[€$£])\s*)?(?P<hi>{_NUM_CORE})(?![.,]?\d)\s*(?P<unit>{_UNIT_ALT})?(?![\w])",
+    rf"(?P<between>\bbetween\s+)?(?:(?P<cur>[€$£])\s*)?(?<![\w.])(?<!\d,)(?P<lo>{_NUM_CORE_LO})(?:\s*(?P<unit1>{_UNIT_ALT}))?"
+    rf"(?P<conn>(?<!\s)-(?!\s)|\s*[–—]\s*|\s+to\s+|\s+and\s+)(?:(?P<cur2>[€$£])\s*)?(?P<hi>{_NUM_CORE_HI})(?![.,]?\d)\s*(?P<unit>{_UNIT_ALT})?(?![\w])",
     re.IGNORECASE)
 #: Word/letter multipliers that scale a CURRENCY figure ("€3.4 million" =
 #: "€3.4M" = 3,400,000 money). Without a currency sign "m" stays metres.
@@ -377,8 +392,17 @@ class Quantity:
 #: disagreements on the seed set (pg-orders, weather).
 #: Finite month spellings — a `[a-z]*` wildcard read "3 separate", "2 octets",
 #: "12 decimal", "market 2026" as dates and erased the figures (review §4IN M4).
-_MONTH = (r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?"
-          r"|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?(?![a-z])")
+#: Greek months too — nominative ("Αύγουστος 2026"), the genitive every
+#: written date uses ("15 Αυγούστου"), colloquial "Μάη", the three-letter
+#: abbreviations — with and without accents: "στις 15 Αυγούστου" left a
+#: bare 15 that a gazzetta dateline "16 Αυγούστου 2026 - 22:17" then
+#: "misreported" (corpus turn 2b753f78, §4IY). Lexical guards speak Greek.
+_GREEK_MONTH = (r"(?:[ιί]αν(?:ου[αά]ρ(?:ιος|[ιί]ου))?|φεβ(?:ρου[αά]ρ(?:ιος|[ιί]ου))?|μ[αά]ρ(?:τ(?:ιος|[ιί]ου))?"
+                r"|απρ(?:[ιί]λ(?:ιος|[ιί]ου))?|μ[αά][ιίϊΐ](?:ος|ου)?|μ[αά]η|ιο[υύ]ν(?:ιος|[ιί]ου)?|ιο[υύ]λ(?:ιος|[ιί]ου)?"
+                r"|α[υύ]γ(?:ο[υύ]στ(?:ος|ου))?|σεπτ?(?:[εέ]μβρ(?:ιος|[ιί]ου))?|οκτ(?:[ωώ]βρ(?:ιος|[ιί]ου))?"
+                r"|νο[εέ](?:μβρ(?:ιος|[ιί]ου))?|δεκ(?:[εέ]μβρ(?:ιος|[ιί]ου))?)\.?(?![^\W\d_])")
+_MONTH = (r"(?:(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?"
+          r"|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?(?![a-z])|" + _GREEK_MONTH + ")")
 _DAY = r"\d{1,2}(?!\d)(?:st|nd|rd|th)?"      # "June 2026" has no day: "20" is not one
 _DATE_TIME_RE = re.compile(
     r"(?<!\d)\d{4}-\d{2}-\d{2}(?:[T ]\d{1,2}:\d{2}(?::\d{2})?)?\b|\b\d{1,2}:\d{2}(?::\d{2})?\b"   # (?<!\d): glued "on2026-05-14" is still a date
@@ -452,13 +476,18 @@ def _is_bare_year(v: float, unit: str, decimals: int, raw: str = "") -> bool:
 def _scale(raw: str, unit: str, cur: str) -> Optional[Tuple[float, str, int]]:
     """(value in the family base, family, decimals) for one written figure;
     None when it is not a number or is a bare year."""
-    num_txt = raw.replace(",", "")
+    if re.fullmatch(r"[-+]?\d+,\d{1,2}", str(raw or "")):
+        num_txt = raw.replace(",", ".")      # "4,3" / "23,60": a decimal comma
+    else:
+        num_txt = raw.replace(",", "")
     if len(num_txt.lstrip("-+")) > 1 and num_txt.lstrip("-+").startswith("0") and "." not in num_txt:
         return None                      # "000": a thousands-group remnant left by a mask, never a written figure
     try:
         v = float(num_txt)
     except ValueError:
         return None
+    if not math.isfinite(v):
+        return None                      # a 309-digit print(2**1024) is not a figure (review §4IY: OverflowError took the binder out for the turn)
     decimals = len(num_txt.split(".")[1]) if "." in num_txt else 0
     if _is_bare_year(v, unit, decimals, raw) and not cur:
         return None
@@ -513,13 +542,28 @@ def extract_quantities_with_pos(text: str) -> List[Tuple[Quantity, int]]:
         found.append((Quantity(lo[0], lo[1], max(lo[2], hi[2]), m.group(0).strip(), unit, hi[0]),
                       m.start()))
         masked = _blank(masked, m.start(), m.end())
+    scalars: List[Tuple[Quantity, int, int]] = []
     for m in _NUM_RE.finditer(masked):
         unit, cur = (m.group("unit") or "").lower(), m.group("cur") or ""
+        # "1h 30m": an "m" right after an hour figure is minutes, not metres (review §4IY)
+        if unit == "m" and scalars and scalars[-1][0].family == "time" and masked[scalars[-1][2]:m.start()].strip() in ("", "and"):
+            unit = "min"
         sc = _scale(m.group("num"), unit, cur)
         if sc is None:
             continue
-        found.append((Quantity(sc[0], sc[1], sc[2], m.group(0).strip(), unit,
-                               bound=_bound_at(masked, m.start(), m.end())), m.start()))
+        q = Quantity(sc[0], sc[1], sc[2], m.group(0).strip(), unit, bound=_bound_at(masked, m.start(), m.end()))
+        # a compound duration ("2 hours 30 min") is ONE quantity: merge adjacent time figures
+        # separated by whitespace or "and" when the second's unit is finer (review §4IY)
+        if (scalars and q.family == "time" and scalars[-1][0].family == "time" and q.unit and scalars[-1][0].unit
+                and masked[scalars[-1][2]:m.start()].strip() in ("", "and")
+                and _UNITS.get(q.unit, ("", 0))[1] < _UNITS.get(scalars[-1][0].unit, ("", 0))[1]):
+            prev, pstart, _pend = scalars[-1]
+            merged = Quantity(prev.value + q.value, "time", max(prev.decimals, q.decimals),
+                              masked[pstart:m.end()].strip(), prev.unit, bound=prev.bound)
+            scalars[-1] = (merged, pstart, m.end())
+            continue
+        scalars.append((q, m.start(), m.end()))
+    found.extend((q, st) for q, st, _e in scalars)
     found.sort(key=lambda p: p[1])
     return found
 
@@ -541,7 +585,7 @@ def _compare_factor(claim_q: Quantity, span_q: Quantity) -> float:
     """Figures are compared in the CLAIM's own unit at the claim's decimals:
     "48 KB" vs 49152 bytes → 48.0 vs 48.0; "0.04s" vs "0.041s" → 0.04 vs
     0.04. Unitless and non-convertible families compare raw."""
-    if claim_q.family in ("bytes", "time", "length", "money") and claim_q.family == span_q.family:
+    if claim_q.family and claim_q.family == span_q.family:      # mass too: "2 kg" vs "1.95 kg" rounds in kg, not grams (review §4IY)
         return _claim_unit_factor(claim_q)
     return 1.0
 
@@ -554,6 +598,8 @@ def _scalars_agree(a: float, b: float, *, decimals: int, factor: float, hedged: 
 
 
 def _round_half_up(x: float, decimals: int) -> float:
+    if not math.isfinite(x):
+        return x
     q = 10 ** decimals
     return math.floor(abs(x) * q + 0.5) / q * (1 if x >= 0 else -1)
 
@@ -568,11 +614,34 @@ def _within(lo: float, hi: float, v: float, *, decimals: int, factor: float, hed
     return _round_half_up(lo / factor, decimals) <= rv <= _round_half_up(hi / factor, decimals)
 
 
+_DECIMAL_BYTE_UNITS = {"kb": 1e3, "mb": 1e6, "gb": 1e9, "tb": 1e12}
+
+
+def _si_alias(q: Quantity) -> Optional[Quantity]:
+    """The same figure read with decimal byte units ("1.5 MB" = 1,500,000
+    bytes as well as 1,572,864); kib/mib/gib stay binary (review §4IY)."""
+    if q.family == "bytes" and q.unit in _DECIMAL_BYTE_UNITS:
+        base = _UNITS[q.unit][1]
+        f = _DECIMAL_BYTE_UNITS[q.unit] / base
+        return Quantity(q.value * f, q.family, q.decimals, q.text, q.unit, None if q.hi is None else q.hi * f, q.bound)
+    return None
+
+
 def quantities_agree(claim_q: Quantity, span_q: Quantity, *, hedged: bool) -> bool:
     """Same family (or both unitless) and the span's value ROUNDS to the
     claim's figure at the claim's precision; a hedged claim tolerates
     ±HEDGE_REL_TOL instead. A range agrees with a value inside it, and with
-    a range whose two endpoints agree."""
+    a range whose two endpoints agree. Decimal byte units agree under 1000ⁿ
+    as well as 1024ⁿ."""
+    if _quantities_agree(claim_q, span_q, hedged=hedged):
+        return True
+    for a, b in ((_si_alias(claim_q), span_q), (claim_q, _si_alias(span_q))):
+        if a is not None and b is not None and _quantities_agree(a, b, hedged=hedged):
+            return True
+    return False
+
+
+def _quantities_agree(claim_q: Quantity, span_q: Quantity, *, hedged: bool) -> bool:
     if claim_q.family != span_q.family and claim_q.family and span_q.family:
         return False
     f, d = _compare_factor(claim_q, span_q), claim_q.decimals
@@ -596,7 +665,7 @@ def _claim_unit_factor(q: Quantity) -> float:
     return _UNITS.get(q.unit, ("", 1.0))[1] or 1.0
 
 
-_ANCHOR_STOP = frozenset("""
+_NAME_STOP = frozenset("""
 the a an of and or to in for on with by from at is are was were be been being as that this these
 those it its into about over under how what when where which who why not no do does did can could
 should would will may might must all any some each every has have had than then there here
@@ -604,12 +673,22 @@ should would will may might must all any some each every has have had than then 
 έχει έχουν αυτό αυτή αυτά ένα μια μία δεν όχι θα να ως πως ότι όπως επίσης ενώ αλλά μετά πριν
 κατά προς υπό ακόμη ακόμα πολύ εδώ εκεί μέσω όταν όπου οποία οποίο οποίος αυτού αυτής
 """.split())
+#: The anchor test needs more function words than a NAME does ("Thomas More",
+#: "Bill Such" keep their surnames — review §4IY): the extra ones live here.
+_ANCHOR_STOP = _NAME_STOP | frozenset("""
+they their them theirs only also more most very such same other others after before because during
+while where until since about above below between through against without within around across
+είχε είχαν μόνο κάθε όλοι όλες όλα όλο όλη τότε τώρα άλλο άλλη άλλος άλλοι αυτές αυτοί γιατί χωρίς
+μέσα πάνω κάτω ώστε έτσι εκείνος εκείνη εκείνο μετά πριν επειδή ενώ όμως αφού μέχρι σχεδόν περίπου
+""".split())
+# ↑ review §4IX: "They reported 34 cases" anchored on "They found 35 issues"
 # ↑ Greek function words (§4IU, req 2ef4f0a2): the anchor matched "στην" between
 # a reply sentence about Σπήλιος and a search line about an army officer, and
 # the misreport rule then refuted his birth year against the officer's.
 
 
-_NEGATION_RE = re.compile(r"\b(?:not|no|never|none|failed|failure|fails|error|errors|cannot|can't|unable|missing|denied|refused|rejected|timed out|timeout|exception|traceback)\b", re.I)
+_NEGATION_RE = re.compile(r"\b(?:not|no|never|none|failed|failure|fails|error|errors|cannot|can't|unable|missing|denied|refused|rejected|timed out|timeout|exception|traceback"
+                          r"|δεν|όχι|απέτυχ\w*|αποτυχία|σφάλμα|λάθος|αδύνατ\w*|ανεπιτυχ\w*)\b", re.I)
 
 
 def _polarity_clash(claim_quote: str, span: str) -> bool:
@@ -624,12 +703,15 @@ def lexical_anchor(claim_quote: str, span: str) -> bool:
     words (≥4 chars, not a stopword) occurs in the span — "RECOVERED" is not
     anchored by "required file missing"; "server restarted" is anchored by
     "restarted ghost-agent"."""
-    words = [w for w in re.findall(r"\w+", normalize_for_containment(claim_quote))
+    words = [w for w in re.findall(r"[^\W_]+", normalize_for_containment(claim_quote))
              if len(w) >= 4 and w not in _ANCHOR_STOP]
     if not words:
         return False
     hay = normalize_for_containment(span)
-    return any(w in hay for w in words)
+    # a WORD or a ≥5-letter stem at a word start — "ready" is not in "already", "test" is not in
+    # "latest" (review §4IY: both confirmed a status claim against an unrelated line)
+    hay_words = set(re.findall(r"[^\W_]+", hay))          # "total_orders" carries the word "orders"
+    return any(w in hay_words or (len(w) >= 6 and any(h.startswith(w[:5]) for h in hay_words)) for w in words)
 
 
 def compare_claim_span(claim_quote: str, span: str) -> Tuple[str, str]:
@@ -847,11 +929,14 @@ def find_conflicting_line(evidence: str, span: str, claim_quote: str, *,
     if sum(1 for ln in lines if _skeleton(ln) == home_sk) >= 3:
         return None                    # an enumeration (table rows, "tick 1"… "tick 40", LTS releases): records, not readings
     claim_slots = set(_slots(claim_quote))
+    home_parent = _parent_line(lines, home)
     for ln in lines:
         if ln is home or normalize_for_containment(_strip_label(ln)) == normalize_for_containment(_strip_label(home)):
             continue
         if _skeleton(ln) != home_sk:
             continue
+        if home_parent is not None and _parent_line(lines, ln) != home_parent:
+            continue                   # `port:` under `api:` and under `db:` are two records (review §4IY)
         slots = _slots(ln)
         if len(slots) != len(home_slots):
             continue
@@ -866,6 +951,23 @@ def find_conflicting_line(evidence: str, span: str, claim_quote: str, *,
 
 
 _META_LINE_RE = re.compile(r"^\s*(?:LENGTH|EXIT CODE|HTTP_STATUS|STATUS|TRUNCATED|ELAPSED)\s*:", re.I)
+
+
+def _parent_line(lines: List[str], line: str) -> Optional[str]:
+    """The nearest preceding line with a smaller indentation (a YAML / JSON
+    / TOML parent key), or None when `line` is not indented — then every
+    same-skeleton line is a candidate reading."""
+    indent = len(line) - len(line.lstrip(" \t"))
+    if indent == 0:
+        return None
+    try:
+        idx = next(i for i, ln in enumerate(lines) if ln is line)
+    except StopIteration:
+        return None
+    for prev in reversed(lines[:idx]):
+        if prev.strip() and len(prev) - len(prev.lstrip(" \t")) < indent:
+            return prev.strip()
+    return None
 
 
 def _stated_at_precision(slot: str, reply_slots: set) -> bool:
@@ -903,7 +1005,7 @@ def reply_slots_of(reply: str) -> set:
 # ── implausible labelled values ─────────────────────────────────────────
 
 _LABELLED_RANGES = (
-    (re.compile(r"\b(?:lat|latitude)\b\s*[=:]?\s*([-+]?\d{1,3}(?:\.\d+)?)(?!\d)", re.I), -90.0, 90.0, "latitude"),
+    (re.compile(r"\b(?:lat|latitude)\b\s*[=:]?\s*([-+]?\d{1,3}(?:\.\d+)?)(?!\d)(?!\s*(?:ms|us|µs|s|sec|secs|seconds?|min|minutes?)\b)", re.I), -90.0, 90.0, "latitude"),   # "p99 lat 250 ms" is latency (review §4IY)
     (re.compile(r"\b(?:lon|lng|longitude)\b\s*[=:]?\s*([-+]?\d{1,3}(?:\.\d+)?)(?!\d)", re.I), -180.0, 360.0, "longitude"),
 )
 
@@ -985,6 +1087,23 @@ def parse_binder_output(data: Any) -> List[Dict[str, str]]:
 
 # ── binding + verdict ───────────────────────────────────────────────────
 
+_LEAD_WORD_RE = re.compile(r"(?:\b(?:over|under|above|below|at\s+least|at\s+most|more\s+than|less\s+than|up\s+to|about|approximately|approx\.?|around|roughly|nearly|almost|circa|~|≈)\s*)$", re.I)
+
+
+def _with_reply_lead(quote: str, reply: str) -> str:
+    """The quote with the bound/hedge word that immediately precedes it in
+    the reply, when the quote itself starts with the figure."""
+    q = str(quote or "")
+    if not q or not re.match(r"[-+~≈€$£]?\d", q):
+        return q
+    nr = normalize_for_containment(reply)
+    i = nr.find(normalize_for_containment(q))
+    if i <= 0:
+        return q
+    m = _LEAD_WORD_RE.search(nr[max(0, i - 16):i])
+    return (m.group(0) + q) if m else q
+
+
 def bind(reply: str, evidence: str, rows: List[Dict[str, str]]) -> Tuple[List[Binding], int]:
     """Validate every row against the texts and grade each bound pair.
     Returns (bindings, dropped) — dropped = rows whose claim quote was not
@@ -1014,7 +1133,9 @@ def bind(reply: str, evidence: str, rows: List[Dict[str, str]]) -> Tuple[List[Bi
             continue
         if snapped_span != normalize_for_containment(b.evidence_quote):
             b.evidence_quote = snapped_span            # the evidence's own words
-        outcome, detail, dq, ds = _compare(b.quote, b.evidence_quote)
+        # "over 160 reviews" quoted as "160 reviews", "around 28%" as "28% today": the bound or
+        # hedge sits one word before the quote in the REPLY (review §4IY)
+        outcome, detail, dq, ds = _compare(_with_reply_lead(b.quote, reply), b.evidence_quote)
         compared = outcome
         elsewhere = figure_elsewhere(dq, evidence, hedged=_hedged(b.quote)) if dq is not None else None
         if outcome == "disagree" and elsewhere:
@@ -1223,6 +1344,20 @@ def shares_subject(a: str, b: str) -> bool:
     return False
 
 
+def _disagreement_holds(claim_quote: str, span: str, dq: Optional[Quantity], ds: Optional[Quantity], evidence: str) -> bool:
+    """`bind`'s guard chain for a computed disagreement, in one place: the
+    claim's figure stands nowhere else in the evidence, and the pair shares
+    a subject with a single comparable figure or is typo-shaped (dense
+    records aside)."""
+    if dq is not None and figure_elsewhere(dq, evidence, hedged=_hedged(claim_quote)):
+        return False
+    if lexical_anchor(claim_quote, span) and _single_comparable(dq, span):
+        return True
+    return bool(_typo_shaped_disagreement(claim_quote, span)
+                and (not _dense(dq, span) or _aligned(claim_quote, span))
+                and not _claim_states(claim_quote, ds))
+
+
 def apply_residual(res: ClaimBindingResult, reply: str, evidence: str, raw_model_output: Any, *,
                    evidence_truncated: bool = False, strict_figures: bool = False) -> ClaimBindingResult:
     """Fold the residual judge's validated quotes into the bindings and
@@ -1230,6 +1365,7 @@ def apply_residual(res: ClaimBindingResult, reply: str, evidence: str, raw_model
     names, with a fragment that is in the evidence and shares the claim's
     subject; `absent` and everything unvalidated leave the row unchecked."""
     rows = parse_binder_output(raw_model_output)
+    evidence = mask_self_echo(evidence)              # §4IV/§4IX: the agent's own earlier words validate nothing here either
     pending = residual_bindings(res)
     for r in rows:
         q = normalize_for_containment(r["quote"])
@@ -1251,12 +1387,19 @@ def apply_residual(res: ClaimBindingResult, reply: str, evidence: str, raw_model
         # is a disagreement, review §4IN m2); a contradiction of a status
         # claim needs a polarity clash the model cannot manufacture
         if extract_quantities(target.quote):
-            outcome, _d, _q, _s = _compare(target.quote, span)
+            outcome, _d, dq, ds = _compare(target.quote, span)
             if outcome not in ("agree", "disagree"):
                 target.detail = "residual judge: the claim's figure has no comparable figure in the fragment"
                 continue
+            if outcome == "disagree" and not _disagreement_holds(target.quote, span, dq, ds, evidence):
+                # the same guards `bind` applies (review §4IY: a residual row re-opened the
+                # seed long-weather-1 refute — "24°C tonight" against "current 31°C")
+                target.detail = "residual judge: figures differ but the quotes share no subject, or the claim's figure stands elsewhere"
+                continue
         elif rel == "contradict":
-            if not (_polarity_clash(target.quote, span) or _polarity_clash(span, target.quote)):
+            # a span that contradicts "no errors" must itself carry an error word — the
+            # reversed arm was satisfied by the claim's OWN negation (review §4IY)
+            if not _polarity_clash(target.quote, span):
                 target.detail = "residual judge: contradiction without a polarity clash"
                 continue
             outcome = "disagree"
@@ -1292,16 +1435,26 @@ def apply_residual(res: ClaimBindingResult, reply: str, evidence: str, raw_model
 # line, and an earlier assistant reply of this conversation as
 # `_prior_turn_evidence` labels it (`[assistant] … [/assistant]`).
 # a record's header may share its line with the packer's block label ("[knowledge_base] EPISODE 434 [fetch]")
-_EPISODE_HEAD_RE = re.compile(r"(?m)^(?:\[[\w .\-]{1,40}\] )*EPISODE \d+ \[")
-_SESSION_HEAD_RE = re.compile(r"(?m)^(?:\[[\w .\-]{1,40}\] )*SESSION \S+ — ")
+_EPISODE_HEAD_RE = re.compile(r"(?m)^(?:\[[a-z][\w .\-]{0,39}\] )*EPISODE \d+ \[")
+_SESSION_HEAD_RE = re.compile(r"(?m)^(?:\[[a-z][\w .\-]{0,39}\] )*SESSION \S+ — ")
 _ECHO_OUTCOME_RE = re.compile(
     r"(?ms)^OUTCOME \((?:SUCCESS|FAILURE)\): .*?"
     r"(?=\n(?:LESSON:|[ \t]*\d+\. \w+\(|EPISODE \d+ \[|TRIGGER:|CONTEXT:|\[[\w .\-]{1,40}\] )|\Z)")
 _ECHO_LESSON_RE = re.compile(r"(?m)^LESSON: .*$")
-_ECHO_ASSISTANT_LINE_RE = re.compile(r"(?m)^assistant: .*$")
-_ARC_USER_RE = re.compile(r"(?m)^USER: ")
-_ECHO_AI_RE = re.compile(r"(?ms)^AI: .*?(?=\n(?:USER: |SOURCE: |\[[\w .\-]{1,40}\] |\n)|\Z)")
-_ECHO_PRIOR_ASSISTANT_RE = re.compile(r"(?ms)^\[assistant\] .*?^\[/assistant\]$")
+#: Inside an EPISODE record only these lines are NOT the agent's words: the
+#: header, the user's TRIGGER, the CONTEXT line, the numbered tool excerpts
+#: and the packer's own marks. Everything else — the OUTCOME body with or
+#: without its header, the LESSON, an orphan fragment after a "…[gap]…" —
+#: is echo (fresh-eye review §4IX: the packer's claim window keeps exactly
+#: the part of the OUTCOME that overlaps the claim, header dropped).
+_EPISODE_KEEP_LINE_RE = re.compile(
+    r"^(?:\[[a-z][\w .\-]{0,39}\] )*(?:EPISODE \d+ \[|TRIGGER:|CONTEXT:|[ \t]*\d+\. \w+\(|…\[gap\]…|…\[PACKER CUT|\s*$)")
+#: a session expand's assistant message keeps its newlines: mask to the next role line
+_ECHO_ASSISTANT_LINE_RE = re.compile(r"(?ms)^assistant: .*?(?=\n(?:user|assistant|system|tool): |\n\[[a-z][\w .\-]{0,39}\] |\Z)")
+_ARC_USER_RE = re.compile(r"(?m)^(?:CONTENT: )?USER: ")
+_ECHO_AI_RE = re.compile(r"(?ms)^(?:AI|ASSISTANT): .*?(?=\n(?:CONTENT: )?USER: |\nSOURCE: |\n\[[a-z][\w .\-]{0,39}\] |\Z)")   # multi-paragraph replies too (review §4IY)
+#: a `[assistant]` block cut by the prior-evidence cap loses its closer: mask to the end (the safe direction)
+_ECHO_PRIOR_ASSISTANT_RE = re.compile(r"(?ms)^\[assistant\] .*?(?:^\[/assistant\]$|\Z)")
 
 
 def _regions(text: str, head_re: "re.Pattern") -> List[Tuple[int, int]]:
@@ -1324,8 +1477,12 @@ def self_echo_spans(text: str) -> List[Tuple[int, int]]:
         return []
     spans: List[Tuple[int, int]] = []
     for a, b in _regions(t, _EPISODE_HEAD_RE):
-        for rx in (_ECHO_OUTCOME_RE, _ECHO_LESSON_RE):
-            spans += [(m.start(), m.end()) for m in rx.finditer(t, a, b)]
+        pos = a
+        for line in t[a:b].splitlines(keepends=True):
+            end = pos + len(line)
+            if not _EPISODE_KEEP_LINE_RE.match(line):
+                spans.append((pos, end - (1 if line.endswith("\n") else 0)))
+            pos = end
     for a, b in _regions(t, _SESSION_HEAD_RE):
         spans += [(m.start(), m.end()) for m in _ECHO_ASSISTANT_LINE_RE.finditer(t, a, b)]
     if _ARC_USER_RE.search(t):
@@ -1377,6 +1534,40 @@ def _regrade_echo(audit: List["AuditFigure"], entities: List["AuditEntity"], rep
             e.status = "echo"
 
 
+#: Of the packer's external tools, the two that may hand the agent its OWN
+#: words back (`execute`: a `cat` of the draft it just wrote; `recall`: its
+#: earlier reply). Kept here so the binder and the objection tier share it.
+SOURCE_EXCLUDED_TOOLS = frozenset({"execute", "recall"})
+
+
+def _source_tool(name: str) -> bool:
+    try:
+        from .agent import _evidence_is_external
+    except Exception:  # noqa: BLE001
+        return False
+    key = str(name or "").lower().strip().replace("-", "_").replace(" ", "_")
+    return key not in SOURCE_EXCLUDED_TOOLS and bool(_evidence_is_external({"name": name}))
+
+
+def source_text(raw_sources: str) -> str:
+    """The part of a turn's raw tool output that can vouch for a fact: the
+    EXTERNAL tools' blocks (web, browser, documents, databases…) minus
+    `execute`/`recall`, with the agent's own earlier words masked. Fresh-eye
+    review §4IX: the §4IR cap, the §4IT caveat and the life-span audit read
+    the whole raw string, so an `[execute] cat report.md` or a
+    `[file_system]` write receipt echoing the agent's own draft vouched for
+    a fabricated name — the cap and the caveat vanished. Unlabelled raw text
+    (no packer blocks) is kept as it is: a caller that built it chose it."""
+    raw = str(raw_sources or "")
+    if not raw:
+        return ""
+    blocks = evidence_blocks(raw)
+    if not blocks or all(name == "" for name, _ in blocks):
+        return mask_self_echo(raw)
+    kept = [f"[{name}] {body}" for name, body in blocks if name and _source_tool(name)]
+    return mask_self_echo("\n".join(kept))
+
+
 def echo_facts(res: Optional["ClaimBindingResult"]) -> List[str]:
     """The facts of a result that rest only on the agent's own earlier words."""
     if res is None:
@@ -1397,9 +1588,9 @@ def run_binding(reply: str, evidence: str, raw_model_output: Any, *, raw_sources
     # §4IV: the agent's own earlier words (an expanded episode's OUTCOME, a
     # session's `assistant:` lines, an earlier reply) can bind nothing and
     # support nothing; what rests only there is an ECHO withhold
-    ev_bind = mask_self_echo(evidence)
-    echo = self_echo_text(evidence) if ev_bind != evidence else ""
-    raw_bind = mask_self_echo(raw_sources) if raw_sources else ""
+    ev_bind = _strip_marks(mask_self_echo(evidence))      # the packer's own marks are blanked too (§4IY)
+    echo = self_echo_text(evidence) if self_echo_spans(evidence) else ""
+    raw_bind = source_text(raw_sources) if raw_sources else ""
     bindings, dropped = bind(reply, ev_bind, rows)
     audit = (audit_numbers(reply, ev_bind, context) + audit_identifiers(reply, ev_bind, context)
              + audit_years(reply, ev_bind, context))
@@ -1440,7 +1631,7 @@ _INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
 _HEADING_ORDINAL_RE = re.compile(r"(?m)^(#{1,6}\s+)\d+\.")          # "### 7. Title" numbers a heading, states nothing
 _SOURCE_LINE_RE = re.compile(r"(?m)^\s*\[Source:[^\]\n]*\]?\s*$")   # a citation line's URL carries path dates
 MAX_ANCHOR_LINE_CHARS = 600                                          # a 4 KB single-line JSON blob anchors everything
-_URL_PATH_RE = re.compile(r"(?:https?://|file://|/api/|/workspace/|~/)[^\s)\]>]*|(?<![\w.])(?:[\w.-]+/)+[\w.-]+")
+_URL_PATH_RE = re.compile(r"(?:https?://|file://|/api/|/workspace/|~/)[^\s)\]>]*|(?<![\w.,/-])(?:[\w.-]+/)+[\w.-]+")   # "1,200/day" keeps its 1,200; `(?<!-)` keeps a hyphen run linear (review §4IX/§4IY: 13 s on 180 KB)
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?;\n])\s+")
 
 
@@ -1543,6 +1734,110 @@ def _glued_occurrence(fig_text: str, evidence: str) -> bool:
     return re.search(rf"(?<=[^\W\d_]){esc}(?![\d])|(?<![\d]){esc}(?=[^\W\d_])", str(evidence or "")) is not None
 
 
+def _url_occurrence(fig_text: str, evidence: str) -> Optional[Tuple[str, str]]:
+    """The written figure stands as a whole token inside a URL or path of
+    the evidence — the region `_evidence_line_prose` masks. -> ("port",
+    line) when it is the port of a URL authority ("http://127.0.0.1:8101/"
+    states the port 8101), ("token", line) for any other whole-token
+    occurrence ("/2015/", "/v2/34/"), None otherwise. The masking hid the
+    browser's own `URL: http://127.0.0.1:8101/` from the figure lookup, and
+    an unrelated `const PORT = 8100;` then "misreported" the port (corpus
+    turn 8b779b6b, §4IY)."""
+    digits = re.sub(r"[^\d]", "", str(fig_text or ""))
+    if not digits or digits != re.sub(r"[^\d.,]", "", str(fig_text or "")):
+        return None                                  # a decimal or grouped figure never lives in a URL as itself
+    esc = re.escape(digits)
+    port_re = re.compile(r"^https?://[^/?#\s]*:" + esc + r"(?=[/?#]|$)", re.I)
+    tok_re = re.compile(r"(?<![\w.,])" + esc + r"(?![\w.,])")
+    for ln in str(evidence or "").splitlines():
+        for m in _URL_PATH_RE.finditer(_strip_label(ln)):
+            if port_re.match(m.group(0)):
+                return "port", ln
+            if tok_re.search(m.group(0)):
+                return "token", ln
+    return None
+
+
+_LABEL_TAIL_RE = re.compile(r"(?:[:=]|\b(?:is|are|was|were|of|at|to|equals?|είναι|ήταν|σε|στα|στις|στους)\b)\s*$", re.I)
+
+
+def _content_words(text: str) -> List[str]:
+    return [w for w in re.findall(r"[^\W_]+", normalize_for_containment(text)) if len(w) >= 4 and w not in _ANCHOR_STOP]
+
+
+def _same_subject_word(w: str, k: str) -> bool:
+    """`lexical_anchor`'s word test — equal, or a ≥6-letter word sharing a
+    5-letter stem — plus a short word and its plural ("line"/"lines",
+    "port"/"ports", "box"/"boxes"). NOT the name-inflection `_same_word`
+    further down: a first draft of this rule shadowed that function by name
+    (§4IY R8), and its stem test calls "data" and "date" one word."""
+    if w == k or (len(w) >= 6 and len(k) >= 5 and w[:5] == k[:5]):
+        return True
+    short, long_ = sorted((w, k), key=len)
+    return len(short) >= 3 and long_ in (short + "s", short + "es", short[:-1] + "ies" if short.endswith("y") else "")
+
+
+def _neighbour_words(before_txt: str, after_txt: str) -> List[str]:
+    """The nearest content word on each side of a figure; one stopword or
+    short token may stand between ("port 8103" → port; "18 release
+    research" → release, never research)."""
+    def near(seq: List[str]) -> List[str]:
+        skipped = 0
+        for w in seq:
+            if w.isdigit():
+                break
+            if w in _ANCHOR_STOP or len(w) < 4:
+                skipped += 1
+                if skipped > 1:
+                    break
+                continue
+            return [w]
+        return []
+    return (near(re.findall(r"[^\W_]+", normalize_for_containment(before_txt))[::-1])
+            + near(re.findall(r"[^\W_]+", normalize_for_containment(after_txt))))
+
+
+def _figure_subject_words(sentence: str, off: int, fig_text: str) -> List[str]:
+    """The words that label a figure in its sentence: its immediate
+    neighbours, or every word of the label phrase when the figure follows a
+    colon, an equals sign or a copula ("Research events: 18", "the research
+    count is 18", `research=17`)."""
+    before_txt, after_txt = sentence[:off], sentence[off + len(fig_text):]
+    words = _neighbour_words(before_txt, after_txt)
+    if _LABEL_TAIL_RE.search(before_txt):
+        label = re.split(r"[,;.!?\n(|]", before_txt)[-1]
+        words = _content_words(label) + words
+    return words
+
+
+def _evidence_figure_subject(s: Quantity, line: str) -> List[str]:
+    body = _strip_label(line)
+    m = re.search(r"(?<![\d.,])" + re.escape(s.text) + r"(?!\d|[.,]\d)", body)   # "research=17, data=16": a list comma is not a decimal
+    if m is None:
+        return []
+    return _figure_subject_words(body, m.start(), s.text)
+
+
+def _figure_anchor(sentence: str, off: int, fig_text: str, s: Quantity, line: str) -> bool:
+    """The shared subject word `lexical_anchor` found is the FIGURE's
+    subject: a word labelling the reply figure labels the evidence figure
+    too, or the sentence and the line share two distinct content words. One
+    incidental word is not a subject — "Recent focus: PostgreSQL 18 release
+    research" against `…debugging=29, research=17, data=16` shares
+    "research", but that 18 is a version bound to "PostgreSQL" and the
+    cluster count two words later is another quantity (corpus turn
+    ad8c43ca, a correct briefing refuted, §4IY). "port 8103" against `PORT
+    = 8102` and "a 13-line sample fixture" against "14 non-empty lines in
+    sample fixture" still hold."""
+    ev_words = _evidence_figure_subject(s, line)
+    cl_words = _figure_subject_words(sentence, off, fig_text)
+    if any(_same_subject_word(w, k) for k in ev_words for w in cl_words):
+        return True
+    hay = set(re.findall(r"[^\W_]+", normalize_for_containment(_strip_label(line))))
+    shared = {w for w in _content_words(sentence) if any(_same_subject_word(w, h) for h in hay)}
+    return len(shared) >= 2
+
+
 def audit_numbers(reply: str, evidence: str, context: str = "") -> List[AuditFigure]:
     """Every prose figure of the reply, graded against the evidence. A figure
     the CONTEXT states (the user's own numbers restated) is supported by it;
@@ -1627,12 +1922,24 @@ def audit_numbers(reply: str, evidence: str, context: str = "") -> List[AuditFig
         if _glued_occurrence(q.text, evidence):
             out.append(AuditFigure(q.text, q.value, q.family, sentence, "unsupported"))
             continue
+        if "." in q.text and re.search(r"(?<![\d.])" + re.escape(q.text) + r"\.\d", evidence):
+            out.append(AuditFigure(q.text, q.value, q.family, sentence, "unsupported"))     # "3.12" is the head of "3.12.4" (review §4IY)
+            continue
+        in_url = _url_occurrence(q.text, evidence) if not q.unit else None
+        if in_url:
+            kind, ln = in_url
+            out.append(AuditFigure(q.text, q.value, q.family, sentence, "supported" if kind == "port" else "unsupported",
+                                   q.text if kind == "port" else "", ln if kind == "port" else ""))
+            continue
+        s_start, _s_end = _sentence_span(prose, pos)
+        off = pos - s_start - (len(prose[s_start:pos]) - len(prose[s_start:pos].lstrip()))   # `sentence` is stripped
         near = [] if dense else [(s, ln) for s, ln in same
-                                 if _typo_shaped_disagreement(q.text, s.text) and _near_miss(q, s)
+                                 if _typo_shaped_disagreement(q.text, s.text) and _near_miss(q, s) and not s.bound
                                  and s.decimals - q.decimals <= 2      # a 14-decimal float is not a misread 380
                                  and len(ln) <= MAX_ANCHOR_LINE_CHARS and lexical_anchor(sentence, ln)
                                  and not _reply_states_value(s, reply_vals) and not is_row.get(ln, False)
-                                 and not _in_inline_list(s, ln)]
+                                 and not _in_inline_list(s, ln)
+                                 and _figure_anchor(sentence, off, q.text, s, ln)]
         if near:
             s, ln = min(near, key=lambda p: abs(p[0].value - q.value))
             out.append(AuditFigure(q.text, q.value, q.family, sentence, "misreported", s.text, ln))
@@ -1656,7 +1963,10 @@ def _year_in(tok: str, hay: str) -> bool:
     live probe). A URL path date ("/2015/05/18/"), a season ("2024/25"), a
     line:column ("app.js:2564:25" restated as "line 2564") and a dash range
     ("1848-1932") are the same number the reply took, and count."""
-    return re.search(r"(?<![\d.])(?<!\d/)" + re.escape(tok) + r"(?!\d)(?![.,]\d)(?!/\d{4})", hay) is not None
+    if re.search(r"(?<![\d.])(?<!\d/)" + re.escape(tok) + r"(?!\d)(?![.,]\d)(?!/\d{4})", hay) is not None:
+        return True
+    # "2500 employees" against "2,500 people": the same count, grouped (review §4IX)
+    return len(tok) == 4 and re.search(r"(?<![\d.,])" + re.escape(tok[0]) + "," + re.escape(tok[1:]) + r"(?![\d,])", hay) is not None
 
 
 def _clock_years() -> set:
@@ -1664,6 +1974,15 @@ def _clock_years() -> set:
     the evidence needs to carry ("as of 2026", "next year")."""
     y = datetime.date.today().year
     return {str(v) for v in (y - 1, y, y + 1)}
+
+
+_PACKER_MARK_RE = re.compile(r"…\[PACKER CUT#[0-9a-f]+:\s*\d+\s+of\s+\d+\s+chars shown\]|…\[gap\]…")
+
+
+def _strip_marks(text: str) -> str:
+    """The packer's truncation and gap marks, blanked length-preservingly —
+    their digits ("1854 of 1975 chars shown") supported a year (review §4IY)."""
+    return _PACKER_MARK_RE.sub(lambda m: " " * len(m.group(0)), str(text or ""))
 
 
 def audit_years(reply: str, evidence: str, context: str = "") -> List[AuditFigure]:
@@ -1678,7 +1997,8 @@ def audit_years(reply: str, evidence: str, context: str = "") -> List[AuditFigur
     good turns carried a year the digest lacked, several of them dimensions
     this token rule excludes."""
     prose = _mask_non_prose(str(reply or ""))
-    hay = normalize_for_containment(str(evidence or "") + "\n" + str(context or ""))
+    prose = re.sub(r"(?<=\b(?:1[5-9]|20)\d{2})-(?=(?:1[5-9]|20)\d{2}(?!\d))", "–", prose)   # "1848-1894" is a range; a phone "2101-2345" is not (review §4IX/§4IY)
+    hay = normalize_for_containment(_strip_marks(str(evidence or "")) + "\n" + str(context or ""))
     clock = _clock_years()
     out: List[AuditFigure] = []
     seen: set = set()
@@ -1716,6 +2036,18 @@ def audit_identifiers(reply: str, evidence: str, context: str = "") -> List[Audi
         seen.add(tok)
         sentence = _sentence_at(prose, m.start())
         bare = tok[1:] if tok.startswith("v") and tok[1:2].isdigit() else tok      # "v29.4.0" is "Version 29.4.0"
+        std = re.fullmatch(rf"({_STANDARD_PREFIX})[ \t-]?([a-z]?\d.*)", m.group(0))
+        if std:                                     # "ISO 8601" / "ISO-8601" / "ISO8601" are one citation (review §4IX)
+            std_re = re.compile(r"(?<!\w)" + re.escape(std.group(1).lower()) + r"[ \t-]?" + re.escape(std.group(2).lower()) + r"(?!\w)")   # "piso 8601" is not ISO 8601 (review §4IY)
+            if std_re.search(hay_ev):
+                home = next((ln for ln in ev.splitlines() if std_re.search(ln.lower())), "")
+                out.append(AuditFigure(m.group(0), 0.0, "identifier", sentence, "supported", tok, home))
+                continue
+            if std_re.search(hay_ctx):
+                out.append(AuditFigure(m.group(0), 0.0, "identifier", sentence, "supported", tok, "[context]"))
+                continue
+            out.append(AuditFigure(m.group(0), 0.0, "identifier", sentence, "unsupported"))   # never the substring test: "piso 8601"
+            continue
         if tok in hay_ev or bare in hay_ev:
             home = next((ln for ln in ev.splitlines() if tok in ln.lower()), "")
             twin = find_conflicting_line(ev, _strip_label(home), tok, reply_slots=rslots) if home else None
@@ -1846,30 +2178,64 @@ def _tok_supported(t: str, hay: str, hay_folded: str) -> bool:
     token minus its last two letters, at a word start (corpus replay §4IP
     R7: eight Greek turns gained a withhold, and the objection tier would
     have convicted the inflected spelling as an absent name)."""
-    if t in hay:
+    # a WORD, not a substring (fresh-eye review §4IX: "Mark Stone" was "present"
+    # in "stock MARKet … mileSTONE"); a possessive or plural is the same word
+    if _word_in(t, hay):
         return True
     if re.fullmatch(r"[a-z0-9\-]+", t):
         return False
     tf = _fold_accents(t)
-    if tf in hay_folded:
+    if _word_in(tf, hay_folded):
         return True
-    if len(tf) >= 6 and re.search(r"(?<![^\W_])" + re.escape(tf[:-2]), hay_folded) is not None:
+    if len(tf) >= 6 and _stem_in(tf, hay_folded):
         return True
     # a Greek name in the reply, an English source ("Μητσοτάκης" / "Mitsotakis")
     tl = translit_greek(tf)
-    if tl != tf and (tl in hay_folded or (len(tl) >= 6 and re.search(r"(?<![^\W_])" + re.escape(tl[:-2]), hay_folded))):
+    if tl != tf and (_word_in(tl, hay_folded) or (len(tl) >= 6 and _stem_in(tl, hay_folded))):
         return True
     return False
 
 
+def _word_in(tok: str, hay: str) -> bool:
+    return re.search(r"(?<![^\W_])" + re.escape(tok) + r"(?:['’]s|s|es)?(?![^\W_])", hay) is not None
+
+
+def _stem_in(tok: str, hay: str) -> bool:
+    """The token minus its last two letters, at a word start, followed by an
+    INFLECTION (at most three letters) and a word end — "Δημήτρη-ς" matches
+    "Δημήτρη", "Κουφοντίν-ας" matches "Κουφοντίνα"; "δημητρ-ιακών" (cereals)
+    does not match "Δημήτρης" (review §4IX: the open-ended stem did)."""
+    return re.search(r"(?<![^\W_])" + re.escape(tok[:-2]) + r"[^\W\d_]{0,3}(?![^\W_])", hay) is not None
+
+
 def _entity_supported(key: str, hay: str) -> bool:
-    if key in hay:
+    if key and re.search(r"(?<![^\W_])" + re.escape(key) + r"(?![^\W_])", hay):    # "li wei" is not in "Eli Weiss" (review §4IY)
         return True
-    toks = [t for t in re.findall(r"[^\W_][\w-]{2,}", key) if t not in _ANCHOR_STOP]   # Greek/Cyrillic tokens too
+    toks = [t for t in re.findall(r"[^\W_][\w-]{2,}", key) if t not in _NAME_STOP]   # Greek/Cyrillic tokens too
     if not toks:
         return False
     hay_folded = _fold_accents(hay) if any(not re.fullmatch(r"[a-z0-9\-]+", t) for t in toks) else hay
-    return all(_tok_supported(t, hay, hay_folded) for t in toks)      # "Vasquez, Elin" still covers "Elin Vasquez"
+    if all(_tok_supported(t, hay, hay_folded) for t in toks):      # "Vasquez, Elin" still covers "Elin Vasquez"
+        return True
+    # a Latin-script reply against a Greek source ("Kyriakos Mitsotakis" / "Κυριάκος
+    # Μητσοτάκης", review §4IX): the bridge ran one way only
+    if re.search(r"[α-ω]", hay) and all(re.fullmatch(r"[a-z0-9\-]+", t) for t in toks):
+        hays = [translit_greek(hay), translit_greek_elot(hay),
+                translit_greek(_fold_accents(re.sub(r"(?<=[εα])υ(?=[θκξπστφχ])", "f", hay)))]
+        return all(any(_word_in(t, h) or (len(t) >= 6 and _stem_in(t, h)) for h in hays) for t in toks)
+    return False
+
+
+def _any_name_word_supported(key: str, hay: str, hay_folded: str) -> bool:
+    toks = [t for t in re.findall(r"[^\W_][\w-]{2,}", key) if t not in _NAME_STOP]
+    if not toks:
+        return True
+    if any(_tok_supported(t, hay, hay_folded) for t in toks):
+        return True
+    if re.search(r"[α-ω]", hay) and all(re.fullmatch(r"[a-z0-9\-]+", t) for t in toks):
+        hays = [translit_greek(hay), translit_greek_elot(hay), translit_greek(_fold_accents(re.sub(r"(?<=[εα])υ(?=[θκξπστφχ])", "f", hay)))]
+        return any(_word_in(t, h) or (len(t) >= 6 and _stem_in(t, h)) for t in toks for h in hays)
+    return False
 
 
 def audit_entities(reply: str, evidence: str, context: str = "") -> List[AuditEntity]:
@@ -1944,9 +2310,10 @@ def name_withhold_caps_confirm(res: Optional["ClaimBindingResult"], *, truncatio
     name the sources lacked — and the digest's floor does not apply."""
     if res is None or res.verdict != "UNCERTAIN":
         return []
-    if not raw_sources and truncation_severity >= truncation_floor:
-        return []
-    names = unsupported_names(res, (mask_self_echo(str(prior_evidence or "")) + "\n" + mask_self_echo(str(raw_sources or ""))).strip())
+    src = source_text(raw_sources)
+    if not src.strip() and truncation_severity >= truncation_floor:
+        return []                          # a `[task_list]` row is not "the whole sources" (review §4IY)
+    names = unsupported_names(res, (mask_self_echo(str(prior_evidence or "")) + "\n" + src).strip())
     # §4IV: a fact that rests only on the agent's own earlier words is the
     # same validated withhold on a different ground — it caps too
     return names + [f for f in echo_facts(res) if f not in names]
@@ -1966,33 +2333,153 @@ _LIFE_SPAN_RE = re.compile(
     rf"(?P<name>{_TC}(?:[ \t]\({_TC}\))?(?:[ \t]{_TC}){{0,3}})[*_]*[ \t]*[*_]*\((?P<lo>1[5-9]\d{{2}}|20\d{{2}})[ \t]*[–—-][ \t]*(?P<hi>1[5-9]\d{{2}}|20\d{{2}})\)")   # bold markers may sit between the name and the span
 
 
+#: Title and role words that precede a surname in prose ("President
+#: Papandreou (1888–1968)", "Πρωθυπουργός Παπανδρέου") — not part of the name.
+_NAME_ROLE_WORDS = frozenset("""
+president professor prof dr mr mrs ms sir dame lord lady king queen prince saint st general colonel
+captain major admiral bishop father senator governor mayor minister chancellor judge rabbi imam
+πρόεδρος πρωθυπουργός καθηγητής καθηγητή καθ δρ στρατηγός βασιλιάς βασιλιά άγιος αγίου επίσκοπος πατήρ
+υπουργός υπουργού δήμαρχος δημάρχου βουλευτής ναύαρχος ραβίνος ραβίνου
+""".split())
+#: Greek given names come as a formal form, a diminutive and an English
+#: rendering — one person (fresh-eye review §4IX: "Γιώργος" vs "Γεώργιος
+#: Παπανδρέου" was a namesake and a REFUTE). Keys are transliterated forms,
+#: including the ones `translit_greek`'s digraph rule produces ("konstadinos").
+_GIVEN_NAME_FAMILIES = (
+    ("georgios", "giorgos", "george", "yorgos", "yiorgos"),
+    ("ioannis", "giannis", "yiannis", "yannis", "john", "ioanni", "ianni"),
+    ("nikolaos", "nikos", "nicholas", "nick", "nikolas"),
+    ("konstantinos", "konstadinos", "kostas", "costas", "constantine", "konstantin"),
+    ("emmanouil", "manolis", "emmanuel", "manos"),
+    ("dimitrios", "dimitris", "demetrios", "demetris", "mimis"),
+    ("michail", "michalis", "michael"),
+    ("vasileios", "vasilis", "basil", "vassilis"),
+    ("athanasios", "thanasis", "sakis", "nasos"),
+    ("eleftherios", "lefteris"),
+    ("stylianos", "stelios"),
+    ("spyridon", "spilios", "spyros", "spiros"),
+    ("alexandros", "alekos", "alexander", "alex", "alexis"),
+    ("panagiotis", "takis", "panos", "panayiotis"),
+    ("gerasimos", "makis"),
+    ("christos", "chris", "christodoulos"),
+    ("petros", "peter"),
+    ("pavlos", "paul"),
+    ("andreas", "andrew"),
+    ("antonios", "antonis", "anthony", "adonis"),
+    ("theodoros", "thodoris", "theodore", "thodoros", "theo"),
+    ("stathis", "efstathios", "eustathios"), ("babis", "charalambos", "charalampos"),
+    ("aristotelis", "aristotle", "aris"), ("odysseas", "odysseus", "ulysses"), ("elytis", "elytis"),
+    # English nicknames (review §4IY: "Jimmy Carter" vs "James Carter" was a namesake)
+    ("james", "jim", "jimmy"), ("robert", "bob", "bobby", "rob", "robbie"), ("edward", "ted", "teddy", "ed", "eddie"),
+    ("william", "bill", "billy", "will", "liam"), ("lev", "leo"), ("elizabeth", "liz", "beth", "betty", "eliza"),
+    ("margaret", "maggie", "peggy", "meg"), ("richard", "dick", "rick", "richie"), ("charles", "charlie", "chuck"),
+    ("thomas", "tom", "tommy"), ("joseph", "joe", "joey"), ("michael", "mike", "mick"), ("daniel", "dan", "danny"),
+    ("anthony", "tony"), ("christopher", "chris", "kit"), ("katherine", "kate", "katie", "kathy", "catherine"),
+    ("john", "jack", "johnny"), ("alexander", "alex", "sasha", "xander"), ("benjamin", "ben", "benny"),
+    ("samuel", "sam", "sammy"), ("henry", "harry", "hal"), ("frederick", "fred", "freddie"), ("stephen", "steve", "steven"),
+    ("dostoevsky", "dostoyevsky", "dostoievski"),
+    ("sotirios", "sotiris"),
+    ("evangelos", "vangelis", "evagelos", "vagelis"),
+    ("ilias", "elias"),
+    ("eleni", "helen", "helena"),
+    ("maria", "mary"),
+    ("aikaterini", "katerina", "catherine", "katina"),
+    ("sofia", "sophia"),
+    ("anastasios", "tasos", "anastasis"),
+    ("apostolos", "tolis"),
+)
+_GIVEN_NAME_CANON = {v: fam[0] for fam in _GIVEN_NAME_FAMILIES for v in fam}
+#: A second romanisation — the ELOT one: ντ→nt, μπ→mp, γκ→gk, αυ→au, ευ→eu —
+#: because an English source writes "Kazantzakis" where `translit_greek`
+#: writes "kazadzakis" (review §4IX exhibit 1).
+_GREEK_DIGRAPHS_ELOT = (("ου", "ou"), ("αυ", "au"), ("ευ", "eu"), ("ηυ", "iu"), ("μπ", "mp"), ("ντ", "nt"),
+                        ("γκ", "gk"), ("γγ", "ng"), ("γχ", "nch"), ("τσ", "ts"), ("τζ", "tz"))
+
+
+def translit_greek_elot(text: str) -> str:
+    t = _fold_accents(str(text or "").lower())
+    if not re.search(r"[α-ω]", t):
+        return t
+    for src, dst in _GREEK_DIGRAPHS_ELOT:
+        t = t.replace(src, dst)
+    return t.translate(_GREEK_LETTERS)
+
+
+def _romanisations(word: str) -> List[str]:
+    """Every spelling a source may use for one Greek word: the plain
+    romanisation, the ELOT one, and the phonetic one where αυ/ευ before a
+    voiceless consonant read af/ef ("Ελευθέριος" → eleftherios); a Latin
+    word is itself. A known given name adds its family's canonical form."""
+    w = str(word or "").lower()
+    phon = re.sub(r"(?<=[εα])υ(?=[θκξπστφχ])", "f", w)
+    # mid-word μπ/ντ/γκ read mb/nd/ng in English renderings ("Lambros", "Andonis")
+    mid = re.sub(r"(?<=[α-ωά-ώ])μπ", "mb", re.sub(r"(?<=[α-ωά-ώ])ντ", "nd", re.sub(r"(?<=[α-ωά-ώ])γκ", "ng", phon)))
+    forms = [translit_greek(_fold_accents(w)), translit_greek_elot(w),
+             translit_greek(_fold_accents(phon)), translit_greek(_fold_accents(mid))]
+    out: List[str] = []
+    for f in forms:
+        for v in (f, _GIVEN_NAME_CANON.get(f)):
+            if v and v not in out:
+                out.append(v)
+    return out
+
+
 def _name_tokens(text: str) -> set:
-    return {translit_greek(_fold_accents(t)) for t in re.findall(r"[^\W\d_][\w'’-]{2,}", str(text or "").lower())
-            if t not in _ANCHOR_STOP}
+    """Name words with function words, titles and role words dropped; each
+    word carries all its romanisations (and its given-name family) joined
+    by "|", so any spelling on either side matches."""
+    return {"|".join(_romanisations(t)) for t in re.findall(r"[^\W\d_][\w'’]{2,}", str(text or "").lower())   # "Jean-Paul" is two words
+            if t not in _NAME_STOP and t not in _NAME_ROLE_WORDS}
+
+
+def _same_word(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    if len(a) >= 6 and len(b) >= 6:
+        sa, sb = a[:-2], b[:-2]
+    elif len(a) >= 4 and len(b) >= 4:
+        sa, sb = a[:-1], b[:-1]
+    elif min(len(a), len(b)) >= 3:         # "Ίων" / "Ίωνα": a short name and its one-letter inflection
+        return (a.startswith(b) or b.startswith(a)) and abs(len(a) - len(b)) <= 1
+    else:
+        return False
+    return (b.startswith(sa) and len(b) - len(sa) <= 3) or (a.startswith(sb) and len(a) - len(sb) <= 3)
 
 
 def _same_name_tok(a: str, b: str) -> bool:
-    """Two name tokens are the same word when equal or, at six letters or
-    more, when one carries the other's stem (the token minus its last two
-    letters) — Greek names INFLECT: "Σπήλιου Οικονομίδη" (genitive) is
-    "Σπήλιος Οικονομίδης" (the rule `_tok_supported` already uses)."""
-    if a == b:
-        return True
-    return (len(a) >= 6 and b.startswith(a[:-2])) or (len(b) >= 6 and a.startswith(b[:-2]))
+    """Two name tokens are the same word when equal under either romanisation
+    or when one carries the other's stem with an inflection of at most three
+    letters — Greek names INFLECT ("Σπήλιου Οικονομίδη" is "Σπήλιος
+    Οικονομίδης"), and short names drop one letter ("Νίκου" / "Νίκος")."""
+    return any(_same_word(x, y) for x in a.split("|") for y in b.split("|"))
 
 
-def _names_relation(rtoks: set, etoks: set) -> str:
+def _names_relation(rtoks: set, etoks: set, cross_script: bool = False) -> str:
     """"same" — one name is contained in the other (a surname-only or a fuller
-    spelling) or they share two words; "namesake" — exactly one shared word
-    (the family name) beside different given names: the misattribution
-    shape; "other" — nothing shared: a translation, an organisation's other
-    name, or a stranger — code cannot tell which, so it is neither support
-    nor a contradiction."""
+    spelling), they share two words, or the one unshared word on each side is
+    a near-spelling of the other; "namesake" — exactly one shared word (the
+    family name) beside clearly different given names, in ONE script: the
+    misattribution shape; "other" — nothing shared, or a pair written in two
+    scripts (a romanisation the tables do not know — "Μαρία Κάλλας" / "Maria
+    Callas", "Αϊνστάιν" / "Einstein", fresh-eye review §4IY): a translation,
+    an organisation's other name, or a stranger — code cannot tell which, so
+    it is neither support nor a contradiction."""
+    if not rtoks or not etoks:
+        return "other"                     # a name of stopwords only vouches for nothing
     r_hit = {a for a in rtoks if any(_same_name_tok(a, b) for b in etoks)}
     e_hit = {b for b in etoks if any(_same_name_tok(a, b) for a in rtoks)}
     if r_hit == rtoks or e_hit == etoks or len(r_hit) >= 2:
         return "same"
-    return "namesake" if len(r_hit) == 1 else "other"
+    if len(r_hit) != 1:
+        return "other"
+    if cross_script:
+        return "other"
+    # the same script, one shared word: are the unshared words near-spellings of each other?
+    import difflib
+    ru, eu = [t for t in rtoks if t not in r_hit], [t for t in etoks if t not in e_hit]
+    best = max((difflib.SequenceMatcher(None, x, y).ratio() for a in ru for b in eu
+                for x in a.split("|") for y in b.split("|")), default=0.0)
+    return "same" if best >= 0.7 else "namesake"
 
 
 @dataclass
@@ -2044,7 +2531,8 @@ def audit_life_spans(reply: str, evidence: str, context: str = "", raw_sources: 
                            re.sub(r"[*_]+", " ", before).rstrip(" \t(").rstrip())
             if not nm:
                 continue                   # a range attached to nobody ("De Geyter, Pierre, 1848-1932") vouches for no one
-            rel = _names_relation(rtoks, _name_tokens(nm.group(1)))
+            cross = bool(re.search(r"[α-ωΑ-Ωά-ώ]", name)) != bool(re.search(r"[α-ωΑ-Ωά-ώ]", nm.group(1)))
+            rel = _names_relation(rtoks, _name_tokens(nm.group(1)), cross_script=cross)
             if rel == "same":
                 status = "supported"; break
             if rel == "namesake" and status != "misattributed":
@@ -2068,11 +2556,14 @@ def unverified_facts(res: Optional["ClaimBindingResult"], *, evidence: str, prio
                      raw_sources: str = "") -> List[str]:
     if res is None or res.verdict == "REFUTED":
         return []
-    if not raw_sources and truncation_severity >= truncation_floor:
-        return []                          # a cut DIGEST proves little; the whole sources decide when we have them
+    src = source_text(raw_sources)
+    if not src.strip() and truncation_severity >= truncation_floor:
+        return []                          # a cut DIGEST proves little; the sources decide when we have them
     # §4IV: our own earlier words are not a source — each text masked on its own, so an
-    # unterminated OUTCOME at the end of one cannot swallow the start of the next
-    hay = normalize_for_containment("\n".join(mask_self_echo(str(x or "")) for x in (evidence, prior_evidence, raw_sources)))
+    # unterminated OUTCOME at the end of one cannot swallow the start of the next; the
+    # packer's own marks carry digits ("1854 of 1975 chars shown") and are not evidence (review §4IY)
+    hay = normalize_for_containment(_strip_marks(mask_self_echo(str(evidence or ""))) + "\n" + mask_self_echo(str(prior_evidence or ""))
+                                    + "\n" + src)
     hay_folded = _fold_accents(hay)
     out: List[str] = []
     for a in (res.audit or []):
@@ -2096,8 +2587,10 @@ def unverified_facts(res: Optional["ClaimBindingResult"], *, evidence: str, prio
         if not named:
             continue
         key = entity_key(text)
-        toks = [t for t in re.findall(r"[^\W_][\w-]{2,}", key) if t not in _ANCHOR_STOP]
-        if toks and not any(_tok_supported(t, hay, hay_folded) for t in toks):   # NO token anywhere: fully absent
+        # listed only when NO word of the name is anywhere in the sources ("Karlsen Institute"
+        # beside "Karlsen Road" is a judgement, not a defensible absence) — the per-word test
+        # now carries the Latin→Greek bridge too (review §4IY: a false caveat)
+        if not _any_name_word_supported(key, hay, hay_folded):
             out.append(text)
     spans = [x for x in out if "–" in x]
     out = [x for x in out if "–" in x or not any(x in sp.split(" ")[0] for sp in spans)]   # a span subsumes its own years
@@ -2123,7 +2616,13 @@ class ClassFinding:
         return {"kind": self.kind, "status": self.status, "detail": self.detail[:200]}
 
 
-_BLOCK_LABEL_RE = re.compile(r"(?m)^\s*\[(?P<name>[\w .\-]{1,40})\]\s*")
+# A packer label: `[tool_name] ` — starts with a letter, snake/space/dot/dash,
+# and a SPACE after it. Fresh-eye review §4IY: `[0] OK goto`, `[1] Bien…`,
+# `[edit]` and `[...truncated...]` lines inside browser / wiki / research
+# bodies split a block and dropped everything after them as a non-tool
+# "block" — the cap, the caveat and the appeal lost the page that carried
+# the name. Producers also neutralise label-shaped body lines (§4IY).
+_BLOCK_LABEL_RE = re.compile(r"(?m)^\s*\[(?P<name>[a-z][\w .\-]{0,39})\] (?=\S|\n|$)")
 
 
 def evidence_blocks(evidence: str) -> List[Tuple[str, str]]:

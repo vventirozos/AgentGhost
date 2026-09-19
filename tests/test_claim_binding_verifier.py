@@ -638,8 +638,13 @@ async def test_the_cap_respects_prior_evidence_context_truncation_and_loopback(m
     # the name sits in a tool output the packer left out of the digest: the RAW sources reach the cap (§4IU
     # self-review — the cap was measured at 9/165 live good confirms against the digest alone)
     r6 = await Verifier(llm_client=_Stub([CLASSIC_CONFIRM, BINDER_JSON])).verify_claim(
-        NAMED_REPLY, EV1, "weather in Athens?", trace={"req_id": "nw10"}, raw_sources="[web] maintainers: Dr. Elin Vasquez (lead)")
+        NAMED_REPLY, EV1, "weather in Athens?", trace={"req_id": "nw10"}, raw_sources="[browser] maintainers: Dr. Elin Vasquez (lead)")
     assert r6.confidence >= 0.9 and not r6.confirm_withheld and "capped" not in _ledger(tmp_path)[-1]
+    # §4IX: the same name in the agent's OWN outputs (a write receipt, a `cat` of its draft) vouches for nothing — still capped
+    r7 = await Verifier(llm_client=_Stub([CLASSIC_CONFIRM, BINDER_JSON])).verify_claim(
+        NAMED_REPLY, EV1, "weather in Athens?", trace={"req_id": "nw11"},
+        raw_sources=EV1 + "\n[file_system] wrote report.md: Dr. Elin Vasquez verified\n[execute] $ cat report.md\nDr. Elin Vasquez verified the result.")
+    assert r7.confirm_withheld is True and _ledger(tmp_path)[-1]["capped"] == ["Dr. Elin Vasquez"] and r7.unverified_facts == ["Dr. Elin Vasquez"]
 
 
 # ── §4IT: the shipped verdict carries the caveat list ───────────────────────
@@ -697,13 +702,16 @@ def test_the_turn_loop_hands_the_raw_tool_outputs_to_every_verify_claim_call():
     from ghost_agent.core.claim_binding import evidence_blocks
     assert evidence_blocks(_raw_turn_sources([{"name": "browser", "content": "p1\nline2"}, {"name": "file_system", "content": "wrote"}])) == [("browser", "p1\nline2"), ("file_system", "wrote")]
     assert len(_raw_turn_sources([{"name": "a", "content": "z" * 700_000}])) <= 600_000
+    # §4IX: newest first under the cap — a cut drops the OLDEST output, never the one the answer rests on
+    big = _raw_turn_sources([{"name": "old", "content": "o" * 400_000}, {"name": "new", "content": "n" * 400_000}])
+    assert big.endswith("n" * 1000) and "[new] " in big and len(big) <= 600_000
 
 
 @pytest.mark.asyncio
 async def test_raw_sources_reach_the_binder_task_for_the_attribution_audit(monkeypatch, tmp_path):
     _flags_4ir(monkeypatch, on="0")
     reply = REPLY + " Η θεωρία είναι του Σπήλιου. **Σπήλιος (Σπυρίδων) Οικονομίδης** (1854–1933) την έγραψε."
-    raw = "[web] Ο Γεώργιος Οικονομίδης του Ιωάννη (1854-1933) ήταν Έλληνας πολιτικός."
+    raw = "[web_search] Ο Γεώργιος Οικονομίδης του Ιωάννη (1854-1933) ήταν Έλληνας πολιτικός."
     r = await Verifier(llm_client=_Stub([CLASSIC_CONFIRM, BINDER_JSON])).verify_claim(reply, EV1, "weather in Athens?", trace={"req_id": "ls1"}, raw_sources=raw)
     assert r.verdict is VerifyVerdict.REFUTED and r.binder_decided is True and any("attaches the life span" in i for i in r.issues)
 
@@ -755,3 +763,68 @@ async def test_a_cheap_confirmed_against_the_agents_own_earlier_reply_is_capped(
     plain = "[web_search] Ιδρύθηκε το 1883 από τους χημικούς Σπήλιος Οικονομίδης (1854–1935) και Λεόντιος Οικονομίδης (1866–1912)"
     r2 = await Verifier(llm_client=_Stub([CLASSIC_CONFIRM, json.dumps(ECHO_ROWS)])).verify_claim(ECHO_REPLY, plain, "c", trace={"req_id": "echo2"})
     assert r2.confidence >= 0.9 and not r2.confirm_withheld and r2.unverified_facts == []
+
+
+@pytest.mark.asyncio
+async def test_a_truncation_guarded_refute_is_never_lifted_by_the_binder(monkeypatch, tmp_path):
+    """Review §4IX: the confirm-first lift excluded only `replaced_uncertain`;
+    an UNCERTAIN the truncation guard made out of a cheap REFUTED was lifted
+    to CONFIRMED 0.9 by a binder that read the same cut digest."""
+    monkeypatch.setenv("GHOST_CLAIM_BINDING_REFUTE_FIRST", "1")
+    monkeypatch.setenv("GHOST_CLAIM_BINDING_CONFIRM_FIRST", "1")
+    from ghost_agent.core.agent import _slice_evidence_body
+    cut = _slice_evidence_body(EV1 + " " + ("filler " * 400), 400, "")
+    cheap = json.dumps({"verdict": "REFUTED", "confidence": 0.9, "reasoning": "r", "issues": ["'1,234 readings' is not in the evidence."]})
+    binder = json.dumps({"claims": [{"quote": "34°C", "kind": "number", "evidence_quote": "Temperature 34°C", "relation": "support"},
+                                    {"quote": "28%", "kind": "number", "evidence_quote": "Humidity 28%", "relation": "support"}]})
+    r = await Verifier(llm_client=_Stub([cheap, binder])).verify_claim(REPLY, cut, "weather in Athens?", trace={"req_id": "tg1"})
+    assert r.truncation_guarded is True and r.verdict is VerifyVerdict.UNCERTAIN and not r.binder_decided
+    # the same binder result over an UNCERTAIN the cheap judge produced itself is still lifted
+    plain = json.dumps({"verdict": "UNCERTAIN", "confidence": 0.5, "reasoning": "r", "issues": []})
+    r2 = await Verifier(llm_client=_Stub([plain, binder])).verify_claim(REPLY, EV1, "weather in Athens?", trace={"req_id": "tg2"})
+    assert r2.verdict is VerifyVerdict.CONFIRMED and r2.binder_decided is True
+
+
+# ── §4IY: the wide review of the verifier pipeline ───────────────────────────
+
+def test_4iy_verdict_parsing_and_placeholders():
+    v = Verifier(llm_client=None)
+    for raw, want in [('{"verdict": "REFUTED.", "confidence": 0.9, "issues": ["x"]}', VerifyVerdict.REFUTED), ('{"verdict": " confirmed ", "confidence": 0.9}', VerifyVerdict.CONFIRMED),
+                      ('{"verdict": "REFUTE", "confidence": 0.9}', VerifyVerdict.REFUTED), ('{"verdict": "CONFIRMED (partially)", "confidence": 0.8}', VerifyVerdict.CONFIRMED)]:
+        assert v._build_verify_result(Verifier._parse_json(raw)).verdict is want, raw
+    r = v._build_verify_result(Verifier._parse_json('{"verdict": "CONFIRMED", "confidence": 0.95, "reasoning": "fine", "issues": ["None"], "conceded": ["N/A"]}'), strong=True)
+    assert r.verdict is VerifyVerdict.CONFIRMED and r.confidence == 0.95                        # placeholders are not concessions
+    r2 = v._build_verify_result(Verifier._parse_json('{"verdict": "CONFIRMED", "confidence": 0.95, "conceded": ["the count is 7 not 5"]}'), strong=True)
+    assert r2.verdict is VerifyVerdict.UNCERTAIN                                                  # a real concession still downgrades
+    assert Verifier._parse_json('{"verdict":"REFUTED","confidence":0.9,"issues":["a"]}\nNote: {"verdict":"CONFIRMED"}')["verdict"] == "REFUTED"
+
+
+@pytest.mark.asyncio
+async def test_4iy_guard_stamp_ledger_why_and_marked_cap(monkeypatch, tmp_path):
+    from ghost_agent.core.agent import _slice_evidence_body
+    monkeypatch.setenv("GHOST_VERIFY_ESCALATE_REFUTE", "1")
+
+    class _Cheap(_Stub):
+        worker_clients = [object()]
+    cut = _slice_evidence_body(EV1 + " " + ("filler " * 400), 400, "")
+    cheap = json.dumps({"verdict": "REFUTED", "confidence": 0.9, "reasoning": "r", "issues": ["'1,234 readings' is not in the evidence."]})
+    r = await Verifier(llm_client=_Cheap([cheap, BINDER_JSON])).verify_claim(REPLY + " Based on 1,234 readings.", cut, "weather?", trace={"req_id": "gs1"})
+    assert r.truncation_guarded is True and r.escalation == "truncation_guard"                     # the verdict says what the ledger says
+    # a mechanical uphold's ledger row keeps WHICH rule fired, and records no strong call
+    cheap2 = json.dumps({"verdict": "REFUTED", "confidence": 0.9, "reasoning": "r", "issues": ["The claim cites Dr. Elin Vasquez, who is not present in any tool output."]})
+    r2 = await Verifier(llm_client=_Cheap([cheap2, BINDER_JSON])).verify_claim(NAMED_REPLY, EV1, "weather?", trace={"req_id": "gs2"})
+    row = [e for e in _escalations(tmp_path) if e.get("outcome") == "mechanically_upheld"][-1]
+    assert row["rebuttal"].startswith("arithmetic:cited name absent") and "strong_finish" not in row
+    # the claim-path evidence cap is a MARKED cut
+    from ghost_agent.core.agent import _EVIDENCE_BUDGET_MAX, evidence_truncation_severity
+    big = EV1 + " " + ("word " * (_EVIDENCE_BUDGET_MAX // 2))
+    r3 = await Verifier(llm_client=_Stub([CLASSIC_CONFIRM, BINDER_JSON])).verify_claim(REPLY, big, "weather?", trace={"req_id": "gs3"})
+    assert r3 is not None
+    from ghost_agent.core import agent as A
+    assert evidence_truncation_severity(A._slice_evidence_body(big, _EVIDENCE_BUDGET_MAX, REPLY)) > 0
+
+
+def test_4iy_rebuttal_quote_must_be_mostly_verbatim():
+    ev = "[web_search] Athens now: 34°C, sunny, humidity 28%, wind 13 km/h with gusts to 22 km/h. Source: openweather."
+    assert V._quote_supported_by_evidence("humidity 28%, wind 13 km/h", ev) is True
+    assert V._quote_supported_by_evidence("humidity 28%, wind 40 km/h with gusts to 80 km/h and hail", ev) is False   # one 15-char run is not a quote

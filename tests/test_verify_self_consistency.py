@@ -64,7 +64,7 @@ def _verifier(samples):
     async def _call(*a, **k):
         return {"_i": len(seq)}
 
-    def _build(_raw):
+    def _build(_raw, **_kw):          # §4IY: the vote passes strong=bool(force_main)
         return seq.pop(0) if seq else None
 
     object.__setattr__(v, "_call_llm", _call)
@@ -226,7 +226,7 @@ def test_a_raising_sample_does_not_kill_the_vote():
         return {}
     object.__setattr__(v, "_call_llm", _call)
     object.__setattr__(v, "_build_verify_result",
-                       lambda _raw: seq.pop(0) if seq else None)
+                       lambda _raw, **_kw: seq.pop(0) if seq else None)
     out = _run(v)
     assert out is not None and out.verdict == R
 
@@ -292,7 +292,7 @@ def _counting_verifier(samples, route="critic"):
 
     object.__setattr__(v, "_call_llm", _call)
     object.__setattr__(v, "_build_verify_result",
-                       lambda _raw: seq.pop(0) if seq else None)
+                       lambda _raw, **_kw: seq.pop(0) if seq else None)
     return v, drawn
 
 
@@ -882,7 +882,7 @@ def _clocked_verifier(monkeypatch, samples, per_sample_s, route="worker"):
 
     object.__setattr__(v, "_call_llm", _call)
     object.__setattr__(v, "_build_verify_result",
-                       lambda _raw: seq.pop(0) if seq else None)
+                       lambda _raw, **_kw: seq.pop(0) if seq else None)
     return v, drawn
 
 

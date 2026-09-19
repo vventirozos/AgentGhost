@@ -976,6 +976,40 @@ _FORCED_FINAL_ANSWER_DIRECTIVE = (
 )
 
 
+# §4IW (req a3ec5024, 2026-09-19): the model announced work and ended the
+# turn — "Ας κάνω έρευνα για τον ραβίνο Μορντεχάι Φριζή…" was the WHOLE reply
+# of a zero-tool turn; its thinking said "let me search" four times and
+# emitted no call. The §4GH shape check refutes narration only AFTER tools
+# ran and the forced-final retry only on tools-off turns, so an ordinary
+# first turn that stops at the announcement shipped as the answer. One
+# continuation, tools on: do the work or answer — never narrate.
+_ANNOUNCED_WORK_DIRECTIVE = (
+    "SYSTEM ALERT: your last message only ANNOUNCED work ('Let me search…', "
+    "'I'll check…', 'Ας κάνω έρευνα…') and ended the turn with NO tool call — "
+    "nothing happened, and the user would receive only the announcement. Either "
+    "make the tool call(s) now, or answer directly from what you already know. "
+    "Do NOT describe work you have not done."
+)
+
+
+def _count_real_tools_safe(tools_run) -> int:
+    """`reply_smoothing.count_real_tools` (synthetic parse-error rows are not
+    tools — review §4IX), never raising."""
+    try:
+        from .reply_smoothing import count_real_tools
+        return int(count_real_tools(tools_run or []))
+    except Exception:  # noqa: BLE001
+        return len([t for t in (tools_run or []) if isinstance(t, dict) and not t.get("_synthetic")])
+
+
+def _announced_work_without_acting(this_turn_text: str) -> bool:
+    """The zero-tool no-answer: this turn's own text is nothing but working
+    narration (`reply_smoothing.narration_only`, the §4GH predicate)."""
+    from .reply_smoothing import narration_only, strip_system_notes
+    body = strip_system_notes(str(this_turn_text or "")).strip()
+    return bool(body) and narration_only(body)
+
+
 def _forced_final_has_no_answer(this_turn_text: str, accumulated: str) -> bool:
     """`reply_smoothing.forced_final_has_no_answer` over the model's text
     with the loop's own dropped-mutation note removed first."""
@@ -1598,6 +1632,20 @@ _EXTERNAL_EVIDENCE_TOOLS = frozenset({
 })
 
 
+_RECEIPT_HEAD_RE = re.compile(r"^\s*(?:SUCCESS:|POST-EDIT VIEW|Wrote |Written |Saved |Created |Applied |File (?:written|saved|created)|Deleted |Moved |Copied )", re.IGNORECASE)
+
+
+def _looks_like_receipt(tool) -> bool:
+    """The agent's own write receipt or the deliverable's echo — not a read
+    of a source. A `file_system` READ carries the file's text, not a receipt
+    head (review §4IY)."""
+    name = str((tool or {}).get("name", "")).lower().strip().replace("-", "_").replace(" ", "_")
+    body = str((tool or {}).get("content", ""))
+    if name in ("report_pdf", "workspace", "manage_projects", "workspace_track", "notify_operator"):
+        return True
+    return bool(_RECEIPT_HEAD_RE.match(body[:120]))
+
+
 def _evidence_is_external(tool) -> bool:
     name = str((tool or {}).get("name", "")).lower().strip()
     return name.replace("-", "_").replace(" ", "_") in _EXTERNAL_EVIDENCE_TOOLS
@@ -1617,7 +1665,7 @@ def _claim_overlap_scorer(claim_tokens, candidates):
     everything. Returns ``(score_fn, raw_overlap_fn, near_duplicate_fn)``.
     """
     import math
-    toks = [(_claim_tokens(str(t.get("content", ""))[:6000])) for t in candidates]
+    toks = [(_claim_tokens(str(t.get("content", ""))[:24000])) for t in candidates]      # §4IY: two same-site pages share ~15k of nav
     n = max(1, len(toks))
     df = {}
     for ts in toks:
@@ -1629,14 +1677,14 @@ def _claim_overlap_scorer(claim_tokens, candidates):
     def score(tool) -> float:
         ts = by_id.get(id(tool))
         if ts is None:
-            ts = _claim_tokens(str(tool.get("content", ""))[:6000])
+            ts = _claim_tokens(str(tool.get("content", ""))[:24000])
         return sum(weight.get(w, 0.0) for w in (claim_tokens & ts))
     score.weight_of = lambda w: weight.get(w, 0.0)      # §4IT: the marginal pull sums per-token weights
 
     def raw(tool) -> int:
         ts = by_id.get(id(tool))
         if ts is None:
-            ts = _claim_tokens(str(tool.get("content", ""))[:6000])
+            ts = _claim_tokens(str(tool.get("content", ""))[:24000])
         return len(claim_tokens & ts)
 
     def near_duplicate(tool, others) -> bool:
@@ -1646,11 +1694,11 @@ def _claim_overlap_scorer(claim_tokens, candidates):
         evidence buys the judge nothing and costs a slot."""
         ts = by_id.get(id(tool))
         if ts is None:
-            ts = _claim_tokens(str(tool.get("content", ""))[:6000])
+            ts = _claim_tokens(str(tool.get("content", ""))[:24000])
         for o in others:
             os_ = by_id.get(id(o))
             if os_ is None:
-                os_ = _claim_tokens(str(o.get("content", ""))[:6000])
+                os_ = _claim_tokens(str(o.get("content", ""))[:24000])
             union = len(ts | os_)
             if union and len(ts & os_) / union >= _EVIDENCE_DUP_JACCARD:
                 return True
@@ -1869,7 +1917,7 @@ def _squeeze_evidence_noise(text: str) -> str:
 
 
 def _project_ledger_evidence(context, tools_run: Optional[list],
-                             cap: int = 1000) -> str:
+                             cap: int = 1000, project_id=None) -> str:
     """A LIVE project-ledger snapshot for the verifier's evidence, when the
     turn touched ``manage_projects``.
 
@@ -1898,7 +1946,7 @@ def _project_ledger_evidence(context, tools_run: Optional[list],
     # current_project_id (the autoadvance path pins it deliberately), so
     # snapshotting only `current` could judge claim B against ledger A.
     pids: list = []
-    cur = getattr(context, "current_project_id", None)
+    cur = project_id if project_id else getattr(context, "current_project_id", None)   # the turn's own id when captured (§4IY)
     if cur:
         pids.append(str(cur).lower())
     try:
@@ -1957,6 +2005,8 @@ _PRIOR_EVIDENCE_CHARS = 60_000
 #: a year the packer left out is not a year the sources lacked. Bounded so a
 #: pathological turn cannot hand the verifier megabytes.
 _RAW_SOURCES_CHARS = 600_000
+#: A body line that would read as a packer block label to `claim_binding.evidence_blocks`.
+_LABEL_SHAPED_LINE_RE = re.compile(r"(?m)^(\s*)(\[[a-z][\w .\-]{0,39}\] )")
 
 
 def _raw_turn_sources(tools_run_this_turn) -> str:
@@ -1966,23 +2016,35 @@ def _raw_turn_sources(tools_run_this_turn) -> str:
     (§4IU self-review: the appeal splices only EXTERNAL lines)."""
     parts = []
     total = 0
-    for t in (tools_run_this_turn or []):
+    # newest first under the cap (review §4IX: the cut used to drop the NEWEST
+    # outputs — the ones the final answer usually rests on), then chronological
+    for t in reversed(list(tools_run_this_turn or [])):
         try:
+            if isinstance(t, dict) and t.get("_synthetic"):
+                continue                   # a parse-error / rejected-call row is the loop's, not a source (§4IY)
             body = str(t.get("content", "") if isinstance(t, dict) else getattr(t, "content", "") or "")
             name = str(t.get("name", "") if isinstance(t, dict) else getattr(t, "name", "") or "")
         except Exception:  # noqa: BLE001
             continue
         if not body:
             continue
+        # a body line shaped like a packer label ("[0] OK goto …", "[edit]") would split the block
+        # for every reader of `evidence_blocks` (§4IY): neutralise it
+        body = _LABEL_SHAPED_LINE_RE.sub(lambda m: m.group(1) + "· " + m.group(2), body)
         label = re.sub(r"[^\w .\-]", "_", name)[:40] or "tool"
-        parts.append(f"[{label}] {body}")
-        total += len(body)
-        if total >= _RAW_SOURCES_CHARS:
+        room = _RAW_SOURCES_CHARS - total - len(label) - 4          # "[label] " + the joining newline
+        if room <= 0:
             break
-    return "\n".join(parts)[:_RAW_SOURCES_CHARS]
+        parts.append(f"[{label}] {body[:room]}")
+        total += min(len(body), room) + len(label) + 4
+    parts.reverse()
+    return "\n".join(parts)
 
 
-def _prior_turn_evidence(messages, tools_run_this_turn) -> str:
+_STEER_HEAD_RE = re.compile(r"^\s*(?:SYSTEM ALERT|AUTO-DIAGNOSTIC|SYSTEM ERROR|SYSTEM OBSERVATION|SYSTEM:|\[SYSTEM)", re.IGNORECASE)
+
+
+def _prior_turn_evidence(messages, tools_run_this_turn, last_user_content: str = "") -> str:
     """The session's evidence BEFORE this turn: earlier tool outputs and
     earlier assistant replies, newest first, bounded by
     `_PRIOR_EVIDENCE_CHARS`. This turn's own tool outputs are excluded (they
@@ -2002,8 +2064,30 @@ def _prior_turn_evidence(messages, tools_run_this_turn) -> str:
         # caveat for exactly the facts it invented. Everything after the last
         # user message is this turn's own voice, not evidence.
         msgs = list(messages or [])
-        last_user = max((i for i, m in enumerate(msgs)
-                         if isinstance(m, dict) and m.get("role") == "user"), default=-1)
+        user_idx = [i for i, m in enumerate(msgs) if isinstance(m, dict) and m.get("role") == "user"]
+        last_user = user_idx[-1] if user_idx else -1
+        # §4IX (fresh-eye review): the loop's own steers ride user-role messages
+        # (SYSTEM ALERT, the forced-final and announced-work directives, repair
+        # notes), so "the last user message" is often ours — this turn's
+        # narration then came back as prior evidence. The boundary is the
+        # message that carries the REAL request when the caller knows it.
+        def _text_of(c) -> str:
+            return c if isinstance(c, str) else " ".join(
+                x.get("text", "") for x in (c or []) if isinstance(x, dict) and x.get("type") == "text")
+        real = str(last_user_content or "").strip()[:200]
+        if real:
+            # EXACT head, not containment (review §4IY): the AUTO-DIAGNOSTIC and repair steers
+            # quote the request verbatim, and a short request is a substring of any directive
+            for i in reversed(user_idx):
+                if str(_text_of(msgs[i].get("content")) or "").strip()[:200] == real:
+                    last_user = i
+                    break
+        else:
+            # no hint (an image-only request): the newest user message that is not one of our steers
+            for i in reversed(user_idx):
+                if not _STEER_HEAD_RE.match(str(_text_of(msgs[i].get("content")) or "")):
+                    last_user = i
+                    break
         for m in reversed(msgs[:last_user] if last_user >= 0 else msgs):
             if not isinstance(m, dict) or m.get("role") not in ("tool", "assistant"):
                 continue
@@ -2108,7 +2192,8 @@ def _collect_verifier_evidence(tools_run: Optional[list],
     # §4HO: positional slots go to LIVE candidates; a refused page (STATUS:
     # BLOCKED) is quoted only when nothing else is there.
     _live = [t for t in candidates if not _evidence_is_dead(t)]
-    picked = (_live or candidates)[:max_items]  # positional newest-N
+    _dead = [t for t in candidates if _evidence_is_dead(t)]
+    picked = (_live + _dead)[:max_items] if _live else candidates[:max_items]   # live first, a refused page only in a slot no live one wants (§4IY)
     # §4HC: the positional picks keep the NEWEST item unconditionally (it
     # is where a failure gets attributed), but a later positional slot
     # holding a SELF-AUTHORED output ("SUCCESS: Applied 1 SEARCH block",
@@ -2122,11 +2207,16 @@ def _collect_verifier_evidence(tools_run: Optional[list],
             _score0, _raw0, _dup0 = _claim_overlap_scorer(_ct0, candidates)
             _ext_pool = sorted(
                 ((_score0(t), i, t) for i, t in enumerate(candidates)
-                 if _evidence_is_external(t) and t not in picked and _raw0(t) > 1),
+                 if _evidence_is_external(t) and t not in picked and _raw0(t) > 1
+                 and (not _live or not _evidence_is_dead(t))),        # §4IX: a refused page never takes a slot while a live one exists
                 key=lambda x: (-x[0], x[1]))
             _ext_pool = [t for _, _, t in _ext_pool]
             for slot in range(1, len(picked)):
-                if not _evidence_is_external(picked[slot]):
+                if not _evidence_is_external(picked[slot]) and (
+                        _looks_like_receipt(picked[slot]) or (_ext_pool and _score0(_ext_pool[0]) > _score0(picked[slot]))):
+                    # §4IY: a `file_system` READ of config.py is a source too — only a write receipt
+                    # / echo yields its slot unconditionally; a read yields to an external item
+                    # that out-scores it on the claim
                     while _ext_pool and _dup0(_ext_pool[0], picked):
                         _ext_pool.pop(0)
                     if _ext_pool:
@@ -2159,7 +2249,7 @@ def _collect_verifier_evidence(tools_run: Optional[list],
             def _toks(t):
                 k = id(t)
                 if k not in _tok_cache:
-                    _tok_cache[k] = _claim_tokens(str(t.get("content", ""))[:6000])
+                    _tok_cache[k] = _claim_tokens(str(t.get("content", ""))[:24000])
                 return _tok_cache[k]
             pulled = []
             for _round in range(_EVIDENCE_CLAIM_PULLS):
@@ -2173,11 +2263,11 @@ def _collect_verifier_evidence(tools_run: Optional[list],
                 for tool in candidates:
                     if tool in picked:
                         continue
-                    if _raw(tool) <= 1 or _dup(tool, picked):
+                    if _raw(tool) <= 1 or _dup(tool, picked) or (_live and _evidence_is_dead(tool)):   # §4IX: never pull a dead page over live ones
                         continue
                     marginal = _toks(tool) & remaining
-                    if _round > 0 and (len(marginal) <= 1 or not _evidence_is_external(tool)):
-                        continue                      # nothing new for the judge — or the claim's own echo (§4HC)
+                    if _round > 0 and (len(marginal) <= 1 or (not _evidence_is_external(tool) and _looks_like_receipt(tool))):
+                        continue                      # nothing new for the judge — or the claim's own echo (§4HC; a READ with new coverage still qualifies, §4IY)
                     sc = _score(tool) if _round == 0 else sum(_score.weight_of(w) for w in marginal)
                     key = (_evidence_is_external(tool), sc)
                     if key > best_key:
@@ -2368,8 +2458,11 @@ def _slice_evidence_body(body: str, granted: int, claim_text: str) -> str:
         return body[:max(0, granted)]
     room = granted - mark_budget
     ct = _claim_tokens(claim_text) if claim_text else set()
+    # the claim's figures ("£3.1bn", "29.46", "1,284") — the line that carries THE number the
+    # answer rests on must out-score a token-dense header (fresh-eye review §4IY)
+    cnums = set(re.findall(r"\d[\d,]*(?:\.\d+)?", claim_text or "")) - {"", "0"} if claim_text else set()
     _GAP = "\n…[gap]…\n"
-    if ct and len(body) > room + 200:
+    if (ct or cnums) and len(body) > room + 200:
         head_room = max(40, int(room * 0.6))
         # The separator is part of the budget — subtracting a token 1
         # here overshot `granted` by its full width (caught by the
@@ -2382,7 +2475,7 @@ def _slice_evidence_body(body: str, granted: int, claim_text: str) -> str:
             step = max(80, win_room // 2)
             for i in range(head_room, len(body) - 1, step):
                 seg = body[i:i + win_room]
-                score = len(ct & _claim_tokens(seg))
+                score = len(ct & _claim_tokens(seg)) + 3 * sum(1 for n in cnums if n in seg)
                 # LAST max wins, not first: with `>` the earliest
                 # max-scoring window won and could start early enough
                 # that the decisive literal fell off its end (measured
@@ -4744,14 +4837,26 @@ _SCRUB_TAG_NAMES = ("tool_call", "tool_response", "tool", "function")
 #:
 #: ⚠ `\Z`, never `$`: in non-MULTILINE mode `$` matches just before a
 #: trailing newline, which let the newline escape the scrub.
+#: The call DIALECTS only (§4IY, fresh-eye review): `<tool_call>`, `<tool
+#: name=…>`, `<function=…>` / `<function name=…>` (and `<tool_response>` for
+#: the module copy). "Run `ghost <tool name> --help`" and a repr "<function
+#: tool_execute at 0x…>" in prose were leaks, and everything after them was
+#: deleted. The opening tag captures its name so the close matches by name.
+_CALL_OPEN = (r'<(?:(?P<tc>tool_call)\b[^>]*>|(?P<tn>tool)(?:\s*>|\s+name\s*=[^>]*>)'   # a bare `<tool>` is the old dialect; "<tool name>" in prose is not
+              # `<function=…>` / `<function name=…>`, or ANY `<function …>` that a `</function>` closes
+              # later (the r2 leak fixture); a repr "<function tool_execute at 0x…>" has no close → prose
+              r'|(?P<fn>function)(?:(?:\s*=|\s+name\s*=)[^>]*>|\b[^>]*>(?=.*?</function\b)))')
+#: …closed by the SAME tag (a `</function>` inside a `<tool_call>` block does
+#: not end the block), via conditional groups on the captured opener.
+_CALL_CLOSE = (r'(?(tc)</tool_call\b[^>]*>|(?(tn)</tool\b[^>]*>|(?(fn)</function\b[^>]*>|</tool_response\b[^>]*>)))')
 _UI_SCRUB_RE = re.compile(
-    r'(?<!`)<(tool_call|tool|function)\b[^>]*>.*?(?:</\1\b[^>]*>|\Z)',
+    r'(?<!`)' + _CALL_OPEN + r'.*?(?:' + _CALL_CLOSE + r'|\Z)',
     flags=re.DOTALL | re.IGNORECASE,
 )
 
 _MODULE_SCRUB_RE = re.compile(
-    r'(?<!`)<(tool_call|tool|function|tool_response)\b[^>]*>.*?'
-    r'(?:</\1\b[^>]*>|(?P<eof>\Z))',
+    r'(?<!`)(?:' + _CALL_OPEN + r'|<(?P<tr>tool_response)\b[^>]*>).*?'
+    r'(?:' + _CALL_CLOSE + r'|(?P<eof>\Z))',
     flags=re.DOTALL | re.IGNORECASE,
 )
 
@@ -5412,7 +5517,11 @@ def _repair_native_tool_calls(tool_calls: list, available_names=None):
 # `<thinking>…</thinking>` preamble and `\b` after "think" let it through to
 # the user — the stream gate (`_inline_think_open`) already matched the
 # prefix, the strip did not.
-_THINK_CLOSED_RE = re.compile(r'<think(?:ing)?\b[^>]*>.*?</think(?:ing)?\s*>', re.DOTALL | re.IGNORECASE)
+# `(?<!\x60)`: a backtick-quoted mention ("emits `<thinking>` blocks") is prose
+# about the tag, not a block (fresh-eye review §4IX: the widened tag ate the
+# rest of every prompt-engineering answer). The unclosed shape must OPEN a
+# line — a mid-sentence "<thinking> tags" is a mention too.
+_THINK_CLOSED_RE = re.compile(r'(?<!\x60)<think(?:ing)?\b[^>]*>(?:(?!<think(?:ing)?\b).)*?</think(?:ing)?\s*>', re.DOTALL | re.IGNORECASE)   # never from a mention to a later block's closer (§4IY)
 # The unclosed-think lookahead must also recognize the LESIONED opener
 # shape `<tool_call>function=…` (dropped '<', req 65d8cf76) — otherwise
 # the strip-to-EOS branch swallows the whole call silently (no strike,
@@ -5421,12 +5530,13 @@ _THINK_CLOSED_RE = re.compile(r'<think(?:ing)?\b[^>]*>.*?</think(?:ing)?\s*>', r
 # exact condition (`function…=`), so a bare prose mention of
 # "<tool_call> function" cannot anchor it.
 _THINK_UNCLOSED_RE = re.compile(
-    r'<think(?:ing)?\b[^>]*>.*?(?=<tool_call\b[^>]*>\s*<function\b'
+    r'(?:(?<=\n)|\A)[ \t]*(?<!\x60)<think(?:ing)?\b[^>]*>.*?(?=<tool_call\b[^>]*>\s*<function\b'
     r'|<tool_call\b[^>]*>\s*function(?:_name)?\s*(?:=|\s+name\s*=)'
     r'|<function\s+name\b|<function\s*=)'
-    r'|<think(?:ing)?\b[^>]*>.*$',
+    r'|(?:(?<=\n)|\A)[ \t]*(?<!\x60)<think(?:ing)?\b[^>]*>.*$',
     re.DOTALL | re.IGNORECASE,
 )
+_FENCE_SPAN_RE = re.compile(r"```.*?```", re.DOTALL)
 
 def _head_insert_below_start_with(block: str, reply: str, sw_active_phrase) -> str:
     """§4EC — the `_head_insert` closure of `_finalize_and_return`, extracted so
@@ -5541,9 +5651,18 @@ def _strip_think_blocks(text: str) -> str:
     is no think block (cheap fast-path)."""
     if not isinstance(text, str) or '<think' not in text.lower():
         return text
+    # a block written inside a ``` fence is documentation (review §4IY): shield the fences,
+    # strip, then restore them
+    fences: list = []
+    def _shield(m):
+        fences.append(m.group(0))
+        return f"\x00FENCE{len(fences) - 1}\x00"
+    text = _FENCE_SPAN_RE.sub(_shield, text)
     text = _THINK_CLOSED_RE.sub('', text)
     if '<think' in text.lower():
         text = _THINK_UNCLOSED_RE.sub('', text)
+    for i, f in enumerate(fences):
+        text = text.replace(f"\x00FENCE{i}\x00", f)
     return text
 
 
@@ -6562,6 +6681,7 @@ class InternalTurnState:
     _final_len_at_turn_start: Any = None
     _forced_final_dropped: Any = None
     _forced_final_retry_used: Any = None
+    _work_nudge_used: Any = None
     _meta_nudge_fired: Any = None
     _metacog_logprobs: Any = None
     _origin_token: Any = None
@@ -12157,12 +12277,19 @@ class GhostAgent:
         normalised = normalised.strip()
         if not normalised:
             return False
-        for phrase in cls._STRICT_GREETING_PHRASES:
-            if phrase in normalised:
-                return True
         tokens = normalised.split()
         if not tokens:
             return False
+        for phrase in cls._STRICT_GREETING_PHRASES:
+            if phrase in normalised:
+                # the phrase must BE the message, give or take the allow-listed filler
+                # ("good morning ghost") — "good morning ghost, give me a full briefing"
+                # and "sounds good. show me all projects" ran 1–9 tools and were never
+                # verified (fresh-eye review §4IY: 17 such requests, all outcome unknown)
+                rest = [t for t in normalised.replace(phrase, " ").split() if t not in cls._STRICT_GREETING_TOKENS]
+                if not rest and len(tokens) <= len(phrase.split()) + 3:
+                    return True
+                return False
         # All tokens must be in the allowlist.
         return all(tok in cls._STRICT_GREETING_TOKENS for tok in tokens)
 
@@ -12840,7 +12967,7 @@ class GhostAgent:
             logger.debug("evidence gate skipped", exc_info=True)
             return ""
 
-    def _active_project_constraints(self, limit: int = 5, *,
+    def _active_project_constraints(self, limit: int = 5, *, project_id=None,
                                     request_text: str) -> List[str]:
         """Stored constraints of the ACTIVE (conversation-bound) project —
         ONLY when ``request_text`` is about that project.
@@ -12858,7 +12985,7 @@ class GhostAgent:
         and REQUIRED so no caller can reach the pool ungated — the
         enumeration in `tests/test_4fd_constraint_scoping.py` walks every
         call site."""
-        pid = getattr(self.context, "current_project_id", None)
+        pid = project_id if project_id else getattr(self.context, "current_project_id", None)
         if not pid:
             return []
         try:
@@ -12870,7 +12997,7 @@ class GhostAgent:
             pass
         return self._project_constraints_for(pid, limit)
 
-    def _active_project_title(self, *, request_text: str) -> str:
+    def _active_project_title(self, *, request_text: str, project_id=None) -> str:
         """The ACTIVE project's title — ONLY when ``request_text`` is about
         that project (the same §4FD relevance authority as the constraints).
         §4IP R7: the verifier's request view carried the project's
@@ -12879,8 +13006,10 @@ class GhostAgent:
         Exploration** project") had that name in neither evidence nor
         context, and the objection tier convicted it as an invention. The
         binder counts a context entity as supported; the objection tier
-        treats it as provenance. Never raises."""
-        pid = getattr(self.context, "current_project_id", None)
+        treats it as provenance. Never raises. ``project_id`` — the id the
+        verdict captured at turn start (§4IY: the streamed drain read a
+        concurrent conversation's live id)."""
+        pid = project_id if project_id else getattr(self.context, "current_project_id", None)
         if not pid:
             return ""
         try:
@@ -12899,7 +13028,7 @@ class GhostAgent:
             return ""
 
     def _active_constraint_note(self, limit: int = 5, *,
-                                request_text: str) -> str:
+                                request_text: str, project_id=None) -> str:
         """Explicit user constraints stored on the active project — and its
         title — rendered as a short prefix for the verifier's request view.
         Empty string when no project is active or the request is not about
@@ -12908,8 +13037,8 @@ class GhostAgent:
         REQUEST: `` — the constraints clause only when there are any, the
         title clause only when the record has one; `claim_binding.ask_of`
         reads the request after the LAST ``|| USER REQUEST: ``."""
-        cons = self._active_project_constraints(limit, request_text=request_text)
-        title = self._active_project_title(request_text=request_text)
+        cons = self._active_project_constraints(limit, request_text=request_text, project_id=project_id)
+        title = self._active_project_title(request_text=request_text, project_id=project_id)
         if not cons and not title:
             return ""
         parts = []
@@ -12917,7 +13046,13 @@ class GhostAgent:
             parts.append("ACTIVE PROJECT CONSTRAINTS (user-mandated, MUST hold): " + " | ".join(cons))
         if title:
             parts.append(f"ACTIVE PROJECT: {title}")
-        return " || ".join(parts) + " || USER REQUEST: "
+        note = " || ".join(parts)
+        # the verifier's context is cut at 1000 chars AFTER the request is appended: a long note
+        # pushed the "|| USER REQUEST: " marker past the cut and `ask_of` read the stored
+        # constraints as the current request (review §4IY) — the NOTE is what gets bounded
+        if len(note) > 600:
+            note = note[:597] + "…"
+        return note + " || USER REQUEST: "
 
     def _merge_project_constraints(self, request_constraints, user_text=""):
         """Merge stored project constraints into a request's constraint set.
@@ -13227,7 +13362,7 @@ class GhostAgent:
         # not appended: the call sites truncate context to 1000 chars and a
         # tail-note would be the first thing cut.
         constraint_note = self._active_constraint_note(
-            request_text=last_user_content or "")
+            request_text=last_user_content or "", project_id=project_id)
         request_view = constraint_note + (last_user_content or "")
         v_result = None
         tool_output = str(last_tool.get("content", ""))[:4000]
@@ -13255,7 +13390,7 @@ class GhostAgent:
         from .reply_smoothing import strip_system_notes
         _claim_src = strip_system_notes(str(final_ai_content or ""))
         ledger_block = _project_ledger_evidence(
-            self.context, tools_run_this_turn)
+            self.context, tools_run_this_turn, project_id=project_id)
         _ev_budget, _ev_items = _evidence_budget_for(tools_run_this_turn)  # §4HO
         claim_evidence = _collect_verifier_evidence(
             tools_run_this_turn,
@@ -13417,7 +13552,7 @@ class GhostAgent:
                         deep=_deep,
                         trace=_trace,
                         prior_evidence=_prior_turn_evidence(
-                            messages, tools_run_this_turn),
+                            messages, tools_run_this_turn, last_user_content),
                         raw_sources=_raw_turn_sources(tools_run_this_turn),
                     )
         else:
@@ -13430,7 +13565,7 @@ class GhostAgent:
                     deep=_deep,
                     trace=_trace,
                     prior_evidence=_prior_turn_evidence(
-                        messages, tools_run_this_turn),
+                        messages, tools_run_this_turn, last_user_content),
                     raw_sources=_raw_turn_sources(tools_run_this_turn),
                 )
         # §4FZ: the judge's own SHAPE refute on an honest inability report
@@ -15505,7 +15640,11 @@ class GhostAgent:
         # honest-inability stand-down). Grounded complaints that merely
         # mention the word "constraint" in passing ("missed the explicit
         # instruction to list the files") deliberately do not match.
-        r"|\bconstraint violation\b"
+        # "Constraint violation: …" is a shape complaint only when what follows names a FORMAT — the
+        # judge uses the same prefix for content refutes over project constraints ("…names
+        # 'NeuroSynth AI' which appears in no evidence"; review §4IY), and those must stay content
+        r"|\bconstraint violation\b(?=[^.\n]{0,80}\b(?:json|words?|lines?|sentences?|number|format|bullet|list|length|exactly|just the|only the|one[- ]line|one[- ]word"
+        r"|(?:start|begin|open|end|close|finish) with|prefix|suffix)\b)"     # "did not start with '…'" is a format (§4FZ corpus text)
         r"|\bviolat\w*\s+(?:the\s+|an?\s+)?(?:explicit\s+|user'?s?\s+|stated\s+)*(?:format|output|formatting)?\s*constraint"
         r"|\b(?:explicit|strict)\s+(?:format|output|formatting|json)\s+(?:constraint|instruction|requirement)"
         r"|\bfails?\s+(?:the\s+)?(?:explicit\s+)?(?:format\s+)?constraint\b"
@@ -16071,7 +16210,8 @@ class GhostAgent:
             # Concrete leftovers the refute named become project tasks —
             # the banner tells the USER, this puts the work on the books.
             try:
-                self._file_refute_followup_tasks(v_result, project_id)
+                if not GhostAgent._verdict_is_no_claim(v_result):     # §4IY: "the reply is working narration only" is not a task
+                    self._file_refute_followup_tasks(v_result, project_id)
             except Exception as _fexc:
                 logger.debug("refute follow-up filing skipped: %s: %s",
                              type(_fexc).__name__, _fexc)
@@ -16081,9 +16221,10 @@ class GhostAgent:
             # a monotonic timestamp (for scoping + TTL), and the queue is
             # capped so a busy multi-conversation process can't accumulate an
             # unbounded banner chain.
-            if GhostAgent._delivery_shape_only(v_result):
+            if GhostAgent._delivery_shape_only(v_result) or GhostAgent._verdict_is_no_claim(v_result):
                 # §4FY review: a shape refute (strict JSON, a word cap, a raw
-                # dump) is not a fact to correct later — "Correction to my
+                # dump) — and, since §4IY, a no-claim refute (narration only,
+                # the forced-final fallback) — is not a fact to correct later — "Correction to my
                 # previous answer: the request allowed at most 1 word" tells
                 # the user nothing, and a queue slot it takes evicts a real
                 # correction (the queue keeps the newest 3).
@@ -22805,6 +22946,7 @@ class GhostAgent:
         _final_len_at_turn_start = rs._final_len_at_turn_start
         _forced_final_dropped = rs._forced_final_dropped
         _forced_final_retry_used = rs._forced_final_retry_used
+        _work_nudge_used = rs._work_nudge_used
         _meta_nudge_fired = rs._meta_nudge_fired
         _metacog_logprobs = rs._metacog_logprobs
         _origin_token = rs._origin_token
@@ -23879,6 +24021,24 @@ class GhostAgent:
                 if _ffd_note and _DROPPED_NOTE_HEAD not in (ui_content or ""):
                     ui_content = (ui_content or "").rstrip() + _ffd_note
                     clean_ui = ui_content.strip("` \n\r")
+                # §4IW: an ORDINARY turn (tools on) that ran no tool and ends
+                # on working narration — the model announced the search it
+                # never made. One continuation with the directive; a second
+                # miss ships (the shape check and the caveat see it then).
+                if (clean_ui and not is_final_generation and not force_final_response
+                        and not force_stop and not _count_real_tools_safe(tools_run_this_turn)
+                        and not _work_nudge_used and turn < effective_max_turns - 1
+                        and _announced_work_without_acting(clean_ui)):
+                    _work_nudge_used = True
+                    pretty_log(
+                        "Turn Budget",
+                        "the reply only announces work and no tool ran — one "
+                        "continuation with the do-it-or-answer directive",
+                        level="WARNING", icon=Icons.WARN,
+                    )
+                    messages.append(msg)
+                    messages.append({"role": "user", "content": _ANNOUNCED_WORK_DIRECTIVE})
+                    return "continue"
                 has_img_markdown = bool(re.search(r'!\[.*?\]\(.*?\)', clean_ui))
                 # "browser" belongs here: a screenshot op returns
                 # `DOWNLOAD: /api/download/<name>` — a legitimate
@@ -24538,6 +24698,7 @@ class GhostAgent:
             return "proceed"
         finally:
             rs._forced_final_retry_used = _forced_final_retry_used
+            rs._work_nudge_used = _work_nudge_used
             rs._meta_nudge_fired = _meta_nudge_fired
             rs._repair_reentry_active = _repair_reentry_active
             rs._verdict_is_fresh = _verdict_is_fresh
@@ -25816,6 +25977,7 @@ class GhostAgent:
                 # shipped was the accumulated "Let me now dig into…" narration
                 # of nine turns). Second miss → the honest fallback.
                 _forced_final_retry_used = False
+                _work_nudge_used = False          # §4IW: one continuation when a zero-tool turn ends on an announcement
                 # Mutating tool names dropped on forced-final turns this
                 # request: the honesty note must ride whatever finally ships
                 # (the retry's answer or the fallback), not only the turn
@@ -27541,7 +27703,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         # outer finally before the stream drains. Shallow
                         # copy + eager fingerprint, taken while it's alive.
                         stream_verify_messages = list(messages)
-                        stream_conv_fp = self._conversation_fingerprint(messages)
+                        stream_conv_fp = _stable_conv_fp     # §4IY: the pruned `messages` list gave a different hash on long conversations — the queued banner never surfaced
 
                         # NEW: Capture accumulated intermediate text (like image tags from previous turns)
                         # Prepend any deferred async-verdict correction (banner)
@@ -27666,6 +27828,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         _final_len_at_turn_start=_final_len_at_turn_start,
                         _forced_final_dropped=_forced_final_dropped,
                         _forced_final_retry_used=_forced_final_retry_used,
+                        _work_nudge_used=_work_nudge_used,
                         _meta_nudge_fired=_meta_nudge_fired,
                         _metacog_logprobs=_metacog_logprobs,
                         _origin_token=_origin_token,
@@ -27741,6 +27904,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         _flow = await self._run_internal_turn(_its)
                     finally:
                         _forced_final_retry_used = _its._forced_final_retry_used
+                        _work_nudge_used = _its._work_nudge_used
                         _meta_nudge_fired = _its._meta_nudge_fired
                         _repair_reentry_active = _its._repair_reentry_active
                         _verdict_is_fresh = _its._verdict_is_fresh
@@ -28387,7 +28551,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             issues = refute_no_answer_fallback(claim)
             reasoning = self._NO_ANSWER_REASONING
             if not issues:
-                issues = refute_raw_tool_dump(claim, request_text or "")
+                issues = refute_raw_tool_dump(claim, request_text or "", n_real_tools=count_real_tools(tools_run or []))
                 reasoning = "reply-shape check (raw tool output pasted as the answer)"
             if not issues:
                 # §4HY: a source "actually read" that no tool ever opened.
@@ -29724,8 +29888,11 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     _ff_data = await self.context.llm_client.chat_completion(
                         _ff_payload, task_label="forced-final-retry")
                     _ff_msg = ((_ff_data or {}).get("choices") or [{}])[0].get("message") or {}
-                    _ff_candidate = _MODULE_SCRUB_RE.sub("", str(_ff_msg.get("content") or ""))
-                    _ff_candidate = re.sub(r"<think>.*?</think>", "", _ff_candidate, flags=re.DOTALL).strip()
+                    # think-strip FIRST, then scrub (review §4IY): a `<tool_call>` MENTION inside a closed
+                    # think block ("tools are off, so I must not emit a <tool_call>") was scrubbed to
+                    # end-of-string, the answer with it, and the honest fallback shipped
+                    _ff_candidate = _strip_think_blocks(str(_ff_msg.get("content") or ""))
+                    _ff_candidate = _MODULE_SCRUB_RE.sub("", _ff_candidate).strip()
                     if _ff_candidate and not _ff_narr(_ff_candidate):
                         _ff_retry_text = _ff_candidate
                     else:

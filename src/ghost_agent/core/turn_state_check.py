@@ -152,6 +152,8 @@ _QUESTION_LEAD_RE = re.compile(
     r"^\s*(?:did|does|do|can|could|is|are|was|were|will|would|should|has|have|had)\s+"
     r"(?:they|he|she|it|you|we|i|the|that|this|anyone|someone)\b",
     re.IGNORECASE)
+_TWO_PART_NEXT_RE = re.compile(r"^\s*(?:then|after\s+that|also|next|and\s+then|afterwards|additionally|plus)\b", re.IGNORECASE)
+_TWO_PART_INLINE_RE = re.compile(r",\s*(?:and\s+)?(?:then\s+)?(?:paste|include|attach|list|show|give|add|append|explain|describe|quote)\b", re.IGNORECASE)
 _EXCLUSIVE_MASK_RE = re.compile(r"\b(?:nothing|anything)\s+(?:else|more)\b", re.IGNORECASE)
 _EXCLUSIVE_RE = re.compile(
     r"\b(?:nothing\s+(?:else|more)|only|no\s+(?:other|extra|additional)\s+(?:text|prose|output|words?))\b",
@@ -181,7 +183,8 @@ _WORD_CAP_RES = (
 )
 _LINE_CAP_RES = (
     re.compile(r"\b" + _REPLY_VERB + r"\b[^\n]{0,40}?\b(?:in|as|on)\s+(?:one|a\s+single|1)\s+line\b" + _CAP_TAIL, re.IGNORECASE),
-    re.compile(r"\bone-line\s+(?:summary|confirmation|reply|answer|response|report|status)\b", re.IGNORECASE),
+    re.compile(r"\b" + _REPLY_VERB + r"\b[^\n]{0,40}?\bone-line\s+(?:summary|confirmation|reply|answer|response|report|status)\b"
+               r"|\b(?:give|send)\s+(?:me\s+)?(?:a\s+)?one-line\s+(?:summary|confirmation|reply|answer|response|report|status)\b", re.IGNORECASE),   # "Add a one-line summary comment to main.py" describes the deliverable (review §4IY)
     re.compile(r"(?:^|[,.;:]\s*)one\s+line\s*[.!]?\s*$", re.IGNORECASE),
     re.compile(r"\b(?:at\s+most|no\s+more\s+than|max(?:imum)?(?:\s+of)?|up\s+to)\s+(?P<n>" + _NUM + r")\s+lines\b" + _CAP_TAIL, re.IGNORECASE),
     re.compile(r"\b(?P<n>" + _NUM + r")\s+lines?\s+(?:max|maximum|tops)\b", re.IGNORECASE),
@@ -194,7 +197,7 @@ def _clauses(text: str) -> List[str]:
     """Sentence-level clauses of a request: split on newlines and on
     `.!?` at a real boundary (not inside "3.12" or "x.py")."""
     out: List[str] = []
-    for part in re.split(r"\n+|(?<!\d)(?<![A-Za-z]\.)\.+(?=\s|$)|[!?]+(?=\s|$)", text or ""):
+    for part in re.split(r"\n+|(?<!\d)(?<!\be\.g)(?<!\bi\.e)(?<!\betc)(?<!\bvs)(?<!\bcf)(?<![^\W\d_]\.)(?<!\s[^\W\d_])\.+(?=\s|$)|[!?]+(?=\s|$)", text or ""):
         part = (part or "").strip()
         if part:
             out.append(part)
@@ -217,6 +220,13 @@ def _phrase_set(raw: str) -> Optional[Tuple[str, ...]]:
     capture is not a literal ("<the sha of HEAD>", a nine-word sentence,
     "the name, the price and the URL")."""
     phrase = _EXACT_TAIL_RE.sub("", raw.strip())
+    # "PONG to confirm you're alive", "DONE once the migration has finished",
+    # "yes or no — is the server up?": the phrase ends where the instruction
+    # resumes (fresh-eye review §4IY: the whole clause was the phrase and the
+    # correct one-word reply was refuted) — unless the phrase was quoted
+    quoted = bool(re.match(r"""^\s*["'“‘`]""", phrase)) and bool(re.search(r"""["'”’`]\s*[.!]?\s*$""", phrase.strip()))
+    if not quoted:
+        phrase = re.split(r"\s+(?:to|so|once|when|if|after|before|then|unless|while)\s+|\s*[—–]\s*|\s*\?", phrase, maxsplit=1)[0]
     phrase = phrase.strip().strip("\"'“”‘’`").strip()
     if phrase.endswith((".", "!")) and len(phrase) > 3:
         phrase = phrase[:-1].rstrip()
@@ -243,13 +253,19 @@ def mechanical_constraints(request: str) -> List[Constraint]:
         return out
     try:
         seen = set()
-        for clause in _clauses(text):
+        clauses = _clauses(text)
+        for ci, clause in enumerate(clauses):
             # "NOTHING else" / "anything more" are exclusivity, not the
             # conditional "else" — masked before the skip test
             if _CLAUSE_SKIP_RE.search(_EXCLUSIVE_MASK_RE.sub(" ", clause)):
                 continue
             if _QUESTION_LEAD_RE.match(clause):
                 continue
+            # a two-part request: "In one word, is it safe? Then explain why." /
+            # "tell me in one line whether …, and paste the last 5 log lines" —
+            # the cap governs the first part only (review §4IY)
+            nxt = clauses[ci + 1] if ci + 1 < len(clauses) else ""
+            two_part = bool(_TWO_PART_NEXT_RE.match(nxt) or _TWO_PART_INLINE_RE.search(clause))
             deliverable = bool(_DELIVERABLE_RE.search(clause))
             if "strict_json" not in seen and not deliverable:
                 m = _STRICT_JSON_RES[0].search(clause)
@@ -279,7 +295,7 @@ def mechanical_constraints(request: str) -> List[Constraint]:
                         seen.add("number_only")
                         out.append(Constraint("number_only", None, clause[:120]))
                         break
-            if "word_cap" not in seen and not deliverable:
+            if "word_cap" not in seen and not deliverable and not two_part:
                 for rx in _WORD_CAP_RES:
                     m = rx.search(clause)
                     if m and not _quoted(clause, m.start()):
@@ -288,7 +304,7 @@ def mechanical_constraints(request: str) -> List[Constraint]:
                             seen.add("word_cap")
                             out.append(Constraint("word_cap", n, clause[:120]))
                         break
-            if "line_cap" not in seen and not deliverable:
+            if "line_cap" not in seen and not deliverable and not two_part:
                 for rx in _LINE_CAP_RES:
                     m = rx.search(clause)
                     if m and not _quoted(clause, m.start()):
@@ -296,7 +312,7 @@ def mechanical_constraints(request: str) -> List[Constraint]:
                         seen.add("line_cap")
                         out.append(Constraint("line_cap", n, clause[:120]))
                         break
-            if "sentence_cap" not in seen and not deliverable:
+            if "sentence_cap" not in seen and not deliverable and not two_part:
                 m = _SENTENCE_CAP_RE.search(clause)
                 if m and not _quoted(clause, m.start()):
                     seen.add("sentence_cap")
@@ -372,6 +388,9 @@ def _words(text: str) -> List[str]:
 _ABBREV = frozenset({
     "i.e", "e.g", "etc", "vs", "approx", "dr", "mr", "mrs", "ms", "jr", "sr",
     "no", "st", "fig", "inc", "ltd", "p", "a", "m", "cf", "al", "ca", "esp",
+    "prof", "gen", "sen", "rep", "mt", "corp", "rev", "jan", "feb", "aug", "sept", "sep", "oct", "nov", "dec",
+    # Greek (review §4IY: "9 π.μ. Τρίτη", "κ. Παπαδόπουλου", "Λεωφ. Κηφισίας" split a sentence in four)
+    "π.μ", "μ.μ", "κ", "κα", "λεωφ", "αρ", "σελ", "βλ", "κ.λπ", "κλπ", "δρ", "καθ", "αγ", "οδ", "τηλ", "π.χ", "δηλ",
 })
 
 
@@ -390,7 +409,8 @@ def _sentences(text: str) -> int:
         # an initial ("J."), a dotted pair ("i.e"), a short dotted token —
         # NOT a bare number: "About 26. Roughly" is two sentences, while
         # "Do 1. install" never reaches here (lowercase follows)
-        if tok in _ABBREV or re.fullmatch(r"(?:[a-z]|[a-z]\.[a-z])", tok) or (tok.endswith(".") and len(tok) <= 4):
+        if (tok in _ABBREV or re.fullmatch(r"(?:[^\W\d_]|[^\W\d_]\.[^\W\d_])", tok)
+                or (tok.endswith(".") and len(tok) <= 4)):
             continue
         n += 1
     return max(1, n)
@@ -431,6 +451,8 @@ _ACK_RE = re.compile(
     r"\b(?:could\s*n[o']t|couldn't|cannot|can't|unable|(?:no|zero|0)\s+(?:results?|data|match(?:es)?|information|sources?|hits?)|"
     r"not\s+(?:found|available|able|retrieve)|nothing\s+(?:found|came\s+back|usable|useful)|"
     r"unavailable|failed|blocked|time[d\s-]*out|error|refused|empty|"
+    r"turn(?:ed)?\s+up\s+(?:nothing|anything)|did\s*n[o']t\s+find|didn't\s+find|found\s+nothing|returned\s+nothing|came\s+back\s+blank|"
+    r"was\s*n[o']t\s+able|wasn't\s+able|is\s*n[o']t\s+there|isn't\s+there|does\s*n[o']t\s+(?:seem\s+to\s+)?exist|doesn't\s+(?:seem\s+to\s+)?exist|"
     r"δεν\s+(?:βρήκα|μπόρεσα|βρέθηκ|κατάφερα|υπάρχ|επέστρεψ)|καμία|κανένα|αποτυχ|σφάλμα|αδύνατ|αδυναμ)",
     re.IGNORECASE)
 
@@ -564,6 +586,8 @@ _WEB_TOOLS = frozenset({
     "fact_check", "news_headlines", "browser",
 })
 _BROWSER_READ_OPS = frozenset({"navigate", "extract_text", "get_text", "read", "open", ""})
+_BROWSER_ACTION_OPS = frozenset({"interact", "click", "type", "scroll"})     # count as a read only when the page loaded
+_LOCAL_READ_TOOLS = frozenset({"file_system", "knowledge_base", "query_document", "database", "postgres_admin"})
 _ASSERTIVE_MIN_WORDS = 30
 
 
@@ -584,7 +608,9 @@ def _tool_rows(tools_run: Optional[Iterable[Dict[str, Any]]]) -> List[Dict[str, 
             content = t.get("result")
         rows.append({
             "name": t.get("name"),
-            "arguments": t.get("arguments") or t.get("args") or {},
+            # the live loop keeps the call's arguments on the outcome object (`content.call_args`),
+            # never under "arguments" — the browser-op filter read an empty dict (review §4IY)
+            "arguments": t.get("arguments") or t.get("args") or getattr(t.get("content"), "call_args", None) or {},
             "content": content if isinstance(content, str) else ("" if content is None else str(content)),
             "_synthetic": bool(t.get("_synthetic")),
         })
@@ -607,7 +633,14 @@ def _check_empty_evidence(body: str, rows: List[Dict[str, Any]]) -> Optional[str
         content = str(r.get("content") or "")
         if name == "browser":
             args = r.get("arguments") if isinstance(r.get("arguments"), dict) else {}
-            if str(args.get("operation") or "").lower() not in _BROWSER_READ_OPS:
+            op = str(args.get("operation") or "").lower()
+            if op in _BROWSER_ACTION_OPS:
+                # a click / interact whose page loaded is a read (review §4IY); one that errored is
+                # a failed action, not an absent source
+                if not _BROWSER_HARD_EMPTY_RE.search(content) and len(content.strip()) >= 40:
+                    consulted += 1; substantive += 1
+                continue
+            if op not in _BROWSER_READ_OPS:
                 continue
             # The runtime gate's 40-character page floor is a STEER
             # threshold; for a label it is not evidence of nothing. Replay:
@@ -627,6 +660,13 @@ def _check_empty_evidence(body: str, rows: List[Dict[str, Any]]) -> Optional[str
         empties.extend(a.empty)
     if consulted == 0 or substantive > 0:
         return None
+    # a substantive LOCAL read is evidence too: "the web search didn't turn up anything, so I
+    # answered from requirements.txt" (review §4IY)
+    for r in rows:
+        if str(r.get("name") or "").strip().lower() in _LOCAL_READ_TOOLS and not r.get("_synthetic"):
+            c = str(r.get("content") or "")
+            if len(c.strip()) >= 40 and not re.match(r"\s*(?:Error|SYSTEM ERROR|STATUS:\s*ERROR)", c):
+                return None
 
     class _A:                       # the shape the rest of the check reads
         empty = empties

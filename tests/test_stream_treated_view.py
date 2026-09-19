@@ -192,6 +192,11 @@ async def test_every_consumer_reads_the_scrubbed_reply_and_the_note():
     for name in EXPECTED:
         text = seen[name]
         assert "<tool_call>" not in text and "<function=" not in text, name
+        if name == "hedge_scan":
+            # §4IY: the hedge scan reads the reply through `strip_system_notes`,
+            # which strips this note too — a system note is not the model hedging
+            assert UNPARSED_TOOL_CALL_NOTE not in text and "Saved." in text
+            continue
         assert UNPARSED_TOOL_CALL_NOTE in text, f"{name} lost the note"
 
 

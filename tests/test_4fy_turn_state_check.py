@@ -931,3 +931,54 @@ def test_the_replay_script_counts_a_planted_violation_and_joins_human_labels(tmp
     assert rule_line.group(1).rstrip().endswith("{'passed': 1, '-': 1}")       # by HUMAN label: 'a' only; 'e' unlabelled
     assert "1 fire(s) on a passed / human-approved turn" in out.stdout
     assert "a" * 32 in out.stdout and "b" * 32 not in out.stdout and "e" * 32 not in out.stdout
+
+
+# ── §4IY: the wide review of the mechanical refuters ────────────────────────
+
+@pytest.mark.parametrize("req,reply", [
+    ("reply exactly: PONG to confirm you're alive", "PONG"),
+    ("Reply with exactly: DONE once the migration has finished", "DONE"),
+    ("reply exactly: yes or no — is the server up?", "No"),
+    ("In one word, is it safe to deploy? Then explain why.", "Yes.\n\nThe canary ran for 40 minutes without errors."),
+    ("tell me in one line whether the deploy is green, and paste the last 5 log lines", "Green.\n```\nl1\nl2\nl3\nl4\nl5\n```"),
+    ("Add a one-line summary comment to the top of main.py", "Done — added `# Entry point` as line 1 of main.py.\n\nNothing else in the file changed."),
+    ("Tell me in one sentence what happened.", "Prof. Smith and Prof. Jones co-authored the paper with Dr. Lee."),
+    ("Tell me in one sentence what happened.", "Η συνάντηση έγινε στις 9 π.μ. Τρίτη στο γραφείο του κ. Παπαδόπουλου, Λεωφ. Κηφισίας 12, Μαρούσι."),
+])
+def test_4iy_correct_replies_are_not_refuted(req, reply):
+    assert T.refute_turn_state(request=req, reply=reply) == []
+
+
+def test_4iy_the_rules_still_fire_on_real_violations():
+    assert [r for r, _ in T.refute_turn_state(request="reply exactly: PONG", reply="I think it is PING")] == ["exact"]
+    assert [r for r, _ in T.refute_turn_state(request="Reply with exactly: 'ACK so be it'", reply="nope")] == ["exact"]
+    assert [r for r, _ in T.refute_turn_state(request="reply in one sentence", reply="It rained. Then it stopped. Then it rained again.")] == ["sentence_cap"]
+    assert T._clauses("If you find a definitive source, e.g. the official docs, reply in one sentence.") == ["If you find a definitive source, e.g. the official docs, reply in one sentence"]
+
+
+def test_4iy_empty_evidence_knows_local_reads_and_honest_phrasings():
+    ok = "The web search didn't turn up anything useful, so I answered from requirements.txt: " + "the pinned versions are listed there with their hashes and constraints " * 3
+    rows = [{"name": "web_search", "content": SEARCH_EMPTY}, {"name": "file_system", "content": "requests==2.31\nnumpy==1.26\n" * 10}]
+    assert _rules("what does the project depend on", ok, rows) == []
+    assert _rules("what does the project depend on", ASSERTIVE, [{"name": "web_search", "content": SEARCH_EMPTY}, {"name": "file_system", "content": "Error: not found"}]) == ["empty_evidence"]
+    # a snippet titled "No results found" is a result, not an empty search
+    from ghost_agent.core.evidence_gate import _SEARCH_EMPTY_RE
+    assert not _SEARCH_EMPTY_RE.search("### 1. Kibana — 'No results found' when the index pattern is wrong\nFix the pattern…")
+    assert _SEARCH_EMPTY_RE.search("No search results found for the query.")
+    assert _SEARCH_EMPTY_RE.search("ERROR: No search results found. The internet might be blocking your request.")   # the live tool's phrasing (full suite after §4IY)
+    # a browser interact whose page loaded is a read; the live row shape carries call_args on the content object
+    class _Out(str):
+        pass
+    o = _Out("--- BROWSER RESULT ---\nSTATUS: OK\n" + "page text " * 30); o.call_args = {"operation": "interact"}
+    assert _rules("look it up", ASSERTIVE, [{"name": "web_search", "content": SEARCH_EMPTY}, {"name": "browser", "content": o}]) == []
+
+
+def test_4iy_greek_titles_and_local_reads_alone():
+    # three Greek titles in one sentence: only the abbreviation list keeps it at one
+    assert T.refute_turn_state(request="Tell me in one sentence what happened.",
+                               reply="Ο Δρ. Παπαδόπουλος συνάντησε τον Καθ. Νικολάου στη Λεωφ. Κηφισίας 12 στις 9 π.μ. Τρίτη.") == []
+    # an assertive 30+ word answer from a substantive local read, no acknowledgement phrase
+    ok = ("The project depends on requests 2.31 and numpy 1.26, both pinned in requirements.txt with their hashes, "
+          "and the constraints file adds urllib3 below 2.0 for the older client that the deploy script still imports.")
+    rows = [{"name": "web_search", "content": SEARCH_EMPTY}, {"name": "file_system", "content": "requests==2.31\nnumpy==1.26\nurllib3<2.0\n" * 5}]
+    assert _rules("what does the project depend on", ok, rows) == []

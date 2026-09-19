@@ -121,7 +121,9 @@ def test_only_the_main_model_sites_pass_strong():
                                           for k in c.keywords)]
     plain = [c for c in calls if not any(k.arg == "strong" for k in c.keywords)]
     assert len(strong_true) == 3                       # refute escalation, confirm re-judge, code re-verify
-    assert len(strong_dyn) == 1 and "force_main" in ast.unparse(strong_dyn[0])
+    # the two-stage stage-2 builders — the single sample AND the voted samples (§4IY: the vote
+    # built without the flag, so the concession downgrade skipped main-model votes)
+    assert len(strong_dyn) == 2 and all("force_main" in ast.unparse(c) for c in strong_dyn)
     assert len(plain) >= 3
 
 

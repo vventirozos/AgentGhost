@@ -116,7 +116,19 @@ def _has_fence(block: str) -> bool:
 
 
 def _words(text: str) -> set:
-    return {w.lower() for w in _WORD_RE.findall(text) if len(w) > 2}
+    # digits count (review §4IY: "ghost: disk 81% used, 12 GB free" and "eva: disk 43% used,
+    # 61 GB free" shared every WORD and differed only in figures — the first was deleted)
+    return {w.lower() for w in _WORD_RE.findall(text) if len(w) > 2 or w.isdigit()}
+
+
+_LEAD_LABEL_RE = re.compile(r"^\s*(?:\*\*)?([^\n:*]{1,40}?)(?:\*\*)?\s*:\s+\S")
+
+
+def _lead_label(block: str) -> str:
+    """The label a per-item paragraph opens with ("ghost:", "**Staging:**",
+    "Server A:"), lower-cased, or ""."""
+    m = _LEAD_LABEL_RE.match(block or "")
+    return m.group(1).strip().lower() if m else ""
 
 
 #: Sentence boundary, good enough for "does this paragraph END on a beat?".
@@ -438,8 +450,14 @@ _TRAILING_NOTE_TAIL_RE = re.compile(
 )
 # The correction banner is PREPENDED (see _consume_pending_corrections) with
 # a fixed shape ending in a blank-line-separated rule.
+# Two heads since §4IT: the correction ("⚠️ **Correction to my previous
+# answer:**") and the caveat-only note ("ℹ️ **On my previous answer:**"); a
+# banner may carry both. Fresh-eye review §4IX: the caveat head was NOT
+# stripped, so the verifier read the banner's own years and citations as
+# this reply's claims, re-queued the identical caveat every following turn,
+# and the narration/no-answer checks saw "content" that was ours.
 _CORRECTION_BANNER_RE = re.compile(
-    r"^⚠️ \*\*Correction to my previous answer:\*\* .*?\n\n---\n\n",
+    r"^(?:⚠️ \*\*Correction to my previous answer:\*\*|ℹ️ \*\*On my previous answer:\*\*) .*?\n\n---\n\n",
     re.DOTALL,
 )
 
@@ -555,6 +573,10 @@ def strip_system_notes(text: str) -> str:
         if not m:
             break
         out = out[:m.start()]
+    # the unparsed-call note is ours too (review §4IY: the judge and the binder read it as the
+    # model's words — "artifact: machine noise")
+    if UNPARSED_TOOL_CALL_NOTE in out:
+        out = out.replace("\n\n" + UNPARSED_TOOL_CALL_NOTE, "").replace(UNPARSED_TOOL_CALL_NOTE, "")
     return out.rstrip("\n") if out != text else out
 
 
@@ -581,9 +603,53 @@ def strip_system_notes(text: str) -> str:
 # the durable text on purpose and replayed by the trajectory machinery.
 # Fences: only BALANCED pairs are fences (an unclosed ``` must not shield
 # everything after it); a match that starts inside one is documentation.
-_CALL_MARKUP_RE = re.compile(
-    r"(?<!`)<(tool_call|tool|function)\b[^>]*>.*?(?:</\1\b[^>]*>|\Z)",
-    re.DOTALL | re.IGNORECASE)
+# The call dialects only (review §4IY: "Run `ghost <tool name> --help`" and a
+# repr "<function tool_execute at 0x…>" were "unparsed calls" and the rest of
+# the reply was deleted): `<tool_call>`, `<tool name=…>`, `<function=…>`,
+# `<function name=…>`. A block is closed by the SAME tag that opened it — a
+# `</function>` inside a `<tool_call>` block does not end the block (the
+# §4IY first cut ended at any close tag or blank line and delivered the
+# tail of the schema-compare leak: `</parameter></function></tool_call>`
+# plus the code after its first blank line — full suite). An unclosed call
+# runs to the end of the reply: what follows a truncated opener is the
+# call's payload, not prose.
+_CALL_OPEN_RE = re.compile(
+    r"(?<!`)<(?:(tool_call)\b[^>]*>|(tool)(?:\s*>|\s+name\s*=[^>]*>)|(function)(?:(?:\s*=|\s+name\s*=)[^>]*>|\b[^>]*>(?=.*?</function\b)))",   # a bare `<tool>` is the old dialect; any `<function …>` that a `</function>` closes
+    re.IGNORECASE | re.DOTALL)
+_CALL_CLOSE_RES = {"tool_call": re.compile(r"</tool_call\b[^>]*>", re.IGNORECASE),
+                   "tool": re.compile(r"</tool\b[^>]*>", re.IGNORECASE),
+                   "function": re.compile(r"</function\b[^>]*>", re.IGNORECASE)}
+
+
+class _CallSpan:
+    """The `re.Match` surface `strip_unparsed_tool_calls` reads."""
+    __slots__ = ("_s", "_e", "_t")
+
+    def __init__(self, text: str, start: int, end: int):
+        self._s, self._e, self._t = start, end, text[start:end]
+
+    def start(self) -> int:
+        return self._s
+
+    def end(self) -> int:
+        return self._e
+
+    def group(self, _i: int = 0) -> str:
+        return self._t
+
+
+def _call_markup_spans(text: str) -> List[_CallSpan]:
+    out: List[_CallSpan] = []
+    pos = 0
+    while True:
+        m = _CALL_OPEN_RE.search(text, pos)
+        if m is None:
+            return out
+        tag = "tool_call" if m.group(1) else ("tool" if m.group(2) else "function")
+        c = _CALL_CLOSE_RES[tag].search(text, m.end())
+        end = c.end() if c else len(text)
+        out.append(_CallSpan(text, m.start(), end))
+        pos = end
 _PRESERVED_CALL_RE = re.compile(
     r"<function(?:=|\s+name=[\"']?)replan\b", re.IGNORECASE)
 _BALANCED_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
@@ -603,7 +669,7 @@ def _call_markup_matches(text: str) -> List[re.Match]:
         return []
     fences = _fence_spans(text)
     out = []
-    for m in _CALL_MARKUP_RE.finditer(text):
+    for m in _call_markup_spans(text):
         if any(a <= m.start() < b for a, b in fences):
             continue
         if _PRESERVED_CALL_RE.search(m.group(0)):
@@ -722,12 +788,21 @@ _QUOTED_RE = re.compile(r'["“”]')
 _MARKUP_START_RE = re.compile(r"^\s*[*_>#]")
 
 
+_REASON_RE = re.compile(r"\b(?:because|since|so that|not|never|cannot|can't|won't)\b|\b(?:γιατί|επειδή|δεν|όχι)\b", re.IGNORECASE)
+
+
 def _is_mid_beat(sentence: str) -> bool:
     s = sentence.strip()
     return (bool(_MID_BEAT_RE.match(s))
             and not s.endswith(":")
             and not _OFFER_RE.match(s)
-            and not _NARRATION_ADDRESSED_RE.search(s))
+            and not _NARRATION_ADDRESSED_RE.search(s)
+            # §4IY: a recommendation ("I'll recommend Postgres because…") or a warning
+            # ("I will not be able to recover rows…") opens like a beat and is the answer
+            and bool(_NARRATION_WORK_RE.search(s))
+            and not _REASON_RE.search(s)
+            and not _LEAD_IN_RE.search(s)
+            and not _NEGATED_OPENER_RE.match(s))
 
 
 # §4HE (2026-09-15, req 5fa6aa97) — what pass 3 leaves behind. The delivered
@@ -763,7 +838,12 @@ _READINESS_RE = re.compile(
     # delivery and left it standing. Two matches in 5,358 corpus
     # paragraphs (Aug–Sep), both hand-offs before a delivery.
     r"the (?:investigation|task|analysis|report|work|research)\b[^.\n]{0,40}"
-    r"\b(?:is|are)\b[^.\n]{0,20}\b(?:complete|done|finished|ready)\b)",
+    # §4IY: "…is ready in the Downloads folder" says WHERE — content; the
+    # §4HQ "…is complete and verified against all constraints" conjoins a
+    # second status and stays a hand-off (a conjoined tail without a
+    # location/destination preposition)
+    r"\b(?:is|are)\b[^.\n]{0,20}\b(?:complete|done|finished|ready)\b"
+    r"(?:\s+and\b(?![^.\n]*\b(?:in|at|on|to|under|into|inside|from)\b)[^.\n]{0,60})?\s*[.!]?\s*$)",
     re.IGNORECASE)
 _HRULE_RE = re.compile(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$")
 
@@ -899,6 +979,11 @@ def smooth_reply(text: str) -> str:
             wb = group_words[b]
             if not wb or len(wb) < _SUPERSEDE_MIN_SIZE_RATIO * len(wa):
                 continue
+            # two PARALLEL per-item paragraphs ("ghost: …" / "eva: …", "Staging:" /
+            # "Production:") are two facts, not a restatement (review §4IY)
+            la, lb = _lead_label(blocks[groups[a][0]]), _lead_label(blocks[groups[b][0]])
+            if la and lb and la != lb:
+                continue
             union = len(wa | wb)
             if union and len(wa & wb) / union >= _SUPERSEDE_JACCARD:
                 for k in groups[a]:
@@ -977,15 +1062,26 @@ SMOOTHING_MIN_TOOLS = 2
 # the user and is not a beat. Measured on the live corpus (2026-09-13, 1,878
 # user turns): 0 of 115 human-approved and 0 of 601 verifier-passed replies
 # match; the matches are e57ad0cf itself and eight one-line beats.
+# §4IW (req a3ec5024): the same beat in Greek — "Ας κάνω έρευνα…", "Θα
+# ψάξω…", "Πάμε να δούμε…" — shipped as the whole reply of a zero-tool turn
+# and nothing here saw it; the detector was English-only.
 _NARRATION_BEAT_SENT_RE = re.compile(
-    r"^\s*(?:(?:now|next|then|first|ok(?:ay)?|good|great|perfect|alright)[,\s]+)*"
+    r"^\s*(?:(?:now|next|then|first|ok(?:ay)?|good|great|perfect|alright|τώρα|πρώτα|λοιπόν|εντάξει|ωραία)[,\s]+)*"
     r"(?:let me(?!\s+know)|let'?s(?!\s+say)|i'?ll|i will|i need to|i'?m going to|"
-    r"i am going to|time to|i should|i want to)\b",
+    r"i am going to|time to|i should|i want to"
+    # Greek openers. "θα" / "πρέπει να" / "χρειάζεται να" are person-agnostic
+    # ("Θα ανοίξει το κατάστημα στις 9" states a fact) — they open a beat only
+    # when the work verb below is FIRST person (fresh-eye review §4IX)
+    r"|ας|θα|πάμε να|επιτρέψτε μου να|επίτρεψέ μου να|πρέπει να|χρειάζεται να)\b",
     re.IGNORECASE)
 #: A beat announces WORK: the opener must be followed, in the same sentence,
 #: by a work verb. "Let me be clear: that claim is false.", "I'll be direct:
 #: the file does not exist.", "I will not do that.", "Let's go with option B."
 #: open like beats and are answers (R3 review of §4GH) — none names work.
+#: Whole words (review §4IX: "ready", "market", "address", "OpenAI" and
+#: "Downloads" were work verbs by prefix); the Greek verbs carry their
+#: first-person endings (ψάξω / ψάξουμε), never a bare stem.
+_GREEK_1P = r"(?:ω|ουμε)"
 _NARRATION_WORK_RE = re.compile(
     r"\b(?:search|dig|read|fetch|re-?fetch|check|double-check|look|look up|take a look|"
     r"run|re-?run|try|start|begin|kick off|proceed|continue|investigate|extract|"
@@ -996,20 +1092,59 @@ _NARRATION_WORK_RE = re.compile(
     r"deploy|restart|launch|close|finish|complete|wrap up|mark|save|store|delete|"
     r"remove|add|move|copy|upload|download|send|post|call|compute|calculate|count|"
     r"list|find|locate|identify|compare|handle|process|parse|inspect|trace|debug|"
-    r"resolve|clean|prepare|assemble|compile|make sure|ensure|parallel)\b",
+    r"resolve|clean|prepare|assemble|compile|make sure|ensure|parallel|"
+    # the synthesis verbs of a research turn's hand-off ("Let me synthesize the answer.", corpus 45675adf)
+    r"synthesi[sz]e|consolidate|put together|write up|finali[sz]e|present|deliver|produce|report back"
+    rf"|ψάξ{_GREEK_1P}|αναζητήσ{_GREEK_1P}|ερευνήσ{_GREEK_1P}|ελέγξ{_GREEK_1P}|διαβάσ{_GREEK_1P}|ανοίξ{_GREEK_1P}|"
+    rf"τρέξ{_GREEK_1P}|δοκιμάσ{_GREEK_1P}|εξετάσ{_GREEK_1P}|βρω|βρούμε|δω|δούμε|κοιτάξ{_GREEK_1P}|ρίξ{_GREEK_1P} μια ματιά|"
+    rf"συλλέξ{_GREEK_1P}|επαληθεύσ{_GREEK_1P}|εντοπίσ{_GREEK_1P}|αναλύσ{_GREEK_1P}|συγκρίν{_GREEK_1P}|φέρω|φέρουμε|"
+    rf"κατεβάσ{_GREEK_1P}|γράψ{_GREEK_1P}|φτιάξ{_GREEK_1P}|ξεκινήσ{_GREEK_1P}|συνεχίσ{_GREEK_1P}|προχωρήσ{_GREEK_1P}|"
+    rf"ψάχν{_GREEK_1P}|κάν{_GREEK_1P} (?:μια |μία )?(?:έρευνα|έλεγχο|αναζήτηση|επαλήθευση))\b",
     re.IGNORECASE)
 #: A sentence that asks the user something, addresses them, or asks for
-#: something ("I'm going to need the password…") is an answer.
+#: something ("I'm going to need the password…") is an answer. The Greek
+#: question mark is ";" — read as one only in a sentence written in Greek.
 _NARRATION_ADDRESSED_RE = re.compile(
-    r"\?|\byou\b|\byour\b|\bneed (?:the|a|an|more|some)\b", re.IGNORECASE)
+    r"\?|\byou\b|\byour\b|\bneed (?:the|a|an|more|some)\b"
+    r"|\b(?:σου|σας|σε|εσύ|εσείς|θέλεις|θες|θέλετε|θέτε|μπορείς|μπορείτε)\b", re.IGNORECASE)
+_GREEK_QUESTION_RE = re.compile(r"[α-ωά-ώ][^;\n]*;(?:\s|$)")
+#: A beat that introduces content with a colon ("Let me summarise: the agency
+#: was never named…", "I'll be direct: the tests are failing") is a lead-in
+#: to an answer, not an announcement (review §4IX).
+_LEAD_IN_RE = re.compile(r"(?<!\d):\s*\S.{3,}")     # "I'll list them: a, b, c." is a lead-in too; a clock's "18:00" is not (review §4IY)
+#: What may precede the first beat and still be glue: an assessment or a
+#: readiness remark in the agent's voice ("I have good coverage.", "Good.",
+#: "Αυτό είναι ενδιαφέρον ερώτημα — δεν το έχω συναντήσει."). A yes/no, a
+#: verdict or any other statement before the beat is the answer (review §4IY:
+#: "Yes. I'll check it tomorrow." / "Ναι. Θα το ελέγξω αύριο." were narration).
+_ASSESSMENT_GLUE_RE = re.compile(
+    r"^\s*(?:(?:ok(?:ay)?|good|great|perfect|alright|right|interesting|noted|understood|fair|hmm|well)[,.!:]?\s*$"
+    r"|(?:ok(?:ay)?|good|great|perfect|alright|now|so)[,\s]+"
+    r"|i(?:'ve| have| now have| still have| don't have| do not have)\b|i(?:'m| am) (?:still |now )?(?:mid|in the middle|not (?:sure|certain)|missing)\b"
+    r"|(?:this|that|it)(?:'s| is) (?:an? )?(?:interesting|good|tricky|hard|fair|useful|helpful|odd|strange|unusual|new)\b"
+    r"|(?:αυτό|αυτή) είναι (?:ένα |μια )?(?:ενδιαφέρον|ενδιαφέρουσα|καλή|δύσκολ\w*|περίεργ\w*)\b|ενδιαφέρον\b|ωραία|καλά|εντάξει|λοιπόν|έχω\b|τώρα έχω\b|δεν (?:το )?έχω\b"
+    # a remark about what a TOOL just returned ("The dark-web search returned mostly generic results.",
+    # "The extract_text on single=1 gave the same capped preview.") is the working log, not a finding
+    r"|(?:the|that|this|my|our|η|το|οι)\b[^.!?\n]{0,60}\b(?:search|query|fetch|scan|extract\w*|screenshot|lookup|results?|page|call|command|tool|attempt|αναζήτηση|σελίδα|εντολή)\b"
+    r"[^.!?\n]{0,40}\b(?:returned|gave|came back|yielded|showed|shows|found|failed|timed out|capped|generic|empty|nothing|επέστρεψε|έδωσε|απέτυχε)\b)",
+    re.IGNORECASE)
+#: "I will not delete the production database." is a refusal — an answer.
+_NEGATED_OPENER_RE = re.compile(
+    r"^\s*(?:\w+[,\s]+)*(?:i will|i'?ll|i am going to|i'?m going to|i should|let me|let'?s)\s+(?:not|never)\b", re.IGNORECASE)
 
 
 def _is_work_beat(sentence: str) -> bool:
     return (bool(_NARRATION_BEAT_SENT_RE.match(sentence))
             and bool(_NARRATION_WORK_RE.search(sentence))
-            and not _NARRATION_ADDRESSED_RE.search(sentence))
+            and not _NARRATION_ADDRESSED_RE.search(sentence)
+            and not _GREEK_QUESTION_RE.search(sentence)
+            and not _LEAD_IN_RE.search(sentence)
+            and not _NEGATED_OPENER_RE.match(sentence))
+# A quotation is content when it is long enough to be a finding; a short
+# quoted term is the ask's own phrase echoed back ("… τη σχέση του με τον
+# "συλλέκτη Φριζήρα"" — req a3ec5024 announced work around it and stopped).
 _NARRATION_CONTENT_RE = re.compile(
-    r"https?://|\d{2,}|`|^\s*[-*•]|^\s*\d+[.)]\s|\*\*|[\"“”]|\||!\[|\]\(",
+    r"https?://|\d{2,}|`|^\s*[-*•]|^\s*\d+[.)]\s|\*\*|[\"“”«‘][^\"“”»’\n]{40,}[\"“”»’]|\||!\[|\]\(",   # « » and ‘ ’ are quotes too (review §4IY)
     re.MULTILINE)
 _SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 #: A non-beat sentence in a beat paragraph must be this short to count as
@@ -1027,10 +1162,19 @@ def narration_only(text: str) -> bool:
         if len(b) > _MAX_NARRATION_CHARS or _NARRATION_CONTENT_RE.search(b):
             return False
         sents = [s for s in _SENT_SPLIT_RE.split(b) if s.strip()]
-        if not any(_is_work_beat(s) for s in sents):
+        beats = [_is_work_beat(s) for s in sents]
+        if not any(beats):
             return False
-        if any(len(s) > _NARRATION_GLUE_MAX_CHARS or _NARRATION_ADDRESSED_RE.search(s)
-               for s in sents if not _is_work_beat(s)):
+        # a sentence BEFORE the first beat is an answer ("Yes. I'll check it tomorrow.",
+        # "Ναι. Θα το ελέγξω αύριο." — review §4IY); glue after a beat must be short, not
+        # addressed to the user (a Greek question included) and carry no quotation of its
+        # own however short ('It says "closed until March".' is a finding — review §4IX)
+        first_beat = beats.index(True)
+        if any(not beats[i] and not _ASSESSMENT_GLUE_RE.match(sents[i]) for i in range(first_beat)):
+            return False
+        if any(len(s) > _NARRATION_GLUE_MAX_CHARS or _NARRATION_ADDRESSED_RE.search(s) or _GREEK_QUESTION_RE.search(s)
+               or re.search(r"[\"“”«‘'][^\"“”»’'\n]{1,}[\"“”»’']", s)
+               for i, s in enumerate(sents) if not beats[i]):
             return False
     return True
 

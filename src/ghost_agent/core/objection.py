@@ -58,7 +58,7 @@ it "can only remove work", which is false in both directions and worth
 stating plainly, because it is the whole risk surface:
 
 * a DISMISS returns CONFIRMED *without* the main-model call the old path
-  would have made, at a confidence floor of 0.7 (see `_escalate_refute`).
+  would have made, at the judge's OWN confidence — never lifted (see `_escalate_refute`).
   That is deliberate — a mechanical dismissal is PROVEN, not a soft
   overturn, so it is not subject to `_CONFIRM_WITHHELD_CONF_CAP` — but it
   is a verdict the legacy path never produced;
@@ -83,7 +83,7 @@ import itertools
 import logging
 import os
 import re
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("GhostAgent")
 
@@ -937,9 +937,35 @@ def _same_quantity_plausible(claim_atom: str, ev_atom: str, claim: str, evidence
         # evidence figure ("3 users, so 500") escalates to the judge.
         return False
     sentence = cb._sentence_at(claim_p, occ[0].start())
-    if not cb._dense(qs[0], cb._strip_label(ev_line)):
+    # §4IY (fresh-eye review): two figures are one quantity only when the claim's sentence and the
+    # evidence line SHARE A SUBJECT — a content word or the same unit family. "5 files changed"
+    # vs "3 passed", "17 problems" vs "14 errors", "7 Python files" vs `total 48`, a density vs a
+    # raw count, "about €22" vs "24.60 USD" were all mechanically upheld as contradictions —
+    # exactly the derived/converted class the judge's own prompt protects.
+    ev_plain = cb._strip_label(ev_line)
+    if not (cb.lexical_anchor(sentence, ev_plain) or _shared_unit_family(claim_atom, ev_atom, sentence, ev_plain)
+            or cb._typo_shaped_disagreement(claim_atom, ev_atom)):        # 9,692 vs 9,592: a one-digit slip needs no shared word
+        return False
+    if not cb._dense(qs[0], ev_plain):
         return True
-    return cb._aligned(sentence, cb._strip_label(ev_line))
+    return cb._aligned(sentence, ev_plain)
+
+
+def _shared_unit_family(claim_atom: str, ev_atom: str, sentence: str, ev_line: str) -> bool:
+    """Both figures carry a unit of the same family as WRITTEN in their
+    texts ("21 GB" / "36864 MB", "2 hours" / "80 minutes") — a unit is a
+    subject of its own. Unitless pairs share nothing here."""
+    try:
+        from . import claim_binding as cb
+        def _fam(atom: str, text: str) -> str:
+            for q in cb.extract_quantities(text):
+                if atom == re.sub(r"[^\d.]", "", q.text.split(" ")[0]).rstrip(".") or atom in q.text.replace(",", ""):
+                    return q.family
+            return ""
+        fa, fb = _fam(claim_atom, sentence), _fam(ev_atom, ev_line)
+        return bool(fa and fa == fb)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _claim_figure_supported(raw: str, claim: str, evidence: str) -> bool:
@@ -1080,6 +1106,48 @@ def _name_present(atom: str, evidence: str) -> bool:
         return len(squashed) >= 6 and squashed in re.sub(r"[\s_\-]+", "", hay)
     except Exception:  # noqa: BLE001
         return False
+
+
+_ORG_WORD_RE = re.compile(
+    r"\b(?:ministry|university|institute|organi[sz]ation|agency|bank|port|hospital|company|corporation|council|committee|"
+    r"department|office|authority|association|federation|union|society|foundation|museum|library|school|academy|"
+    r"υπουργείο|πανεπιστήμιο|ινστιτούτο|οργανισμός|οργανισμού|τράπεζα|λιμάνι|νοσοκομείο|εταιρεία|εταιρία|συμβούλιο|επιτροπή|"
+    r"τμήμα|γραφείο|αρχή|ένωση|ίδρυμα|μουσείο|βιβλιοθήκη|σχολή|ακαδημία)\b", re.IGNORECASE)
+
+
+def _name_variant_present(atom: str, evidence: str) -> bool:
+    """A weaker presence than `_name_present`: the name's acronym as a token
+    ("WHO", "NYT"), its surname (last word) as a word, an initials form
+    ("Smith, J." / "J. Smith"), or an evidence written in a script the name
+    is not (a translation the word test cannot see)."""
+    try:
+        from .claim_binding import entity_key, normalize_for_containment, _NAME_STOP
+    except Exception:  # noqa: BLE001
+        return False
+    key = entity_key(atom)
+    toks = [t for t in re.findall(r"[^\W\d_][\w'’-]*", key) if t not in _NAME_STOP]
+    if not toks:
+        return False
+    hay = normalize_for_containment(evidence)
+    latin_name = all(re.fullmatch(r"[a-z'’-]+", t) for t in toks)
+    # a source in the OTHER script may TRANSLATE an organisation ("Ministry of Finance" /
+    # "Υπουργείο Οικονομικών"); a person's name is transliterated, and the word test already
+    # bridges that — so only an organisation-shaped name stands down on script alone
+    org_shaped = bool(_ORG_WORD_RE.search(key)) or len(toks) >= 3
+    if org_shaped and latin_name and re.search(r"[α-ωа-я]", hay):
+        return True
+    if org_shaped and not latin_name and not re.search(r"[α-ωа-я]", hay) and re.search(r"[a-z]{3}", hay):
+        return True
+    if len(toks) >= 2:
+        acronym = "".join(t[0] for t in toks)
+        if re.search(r"(?<![^\W_])" + re.escape(acronym) + r"(?![^\W_])", hay):
+            return True
+    surname = toks[-1]
+    if len(surname) >= 4 and re.search(r"(?<![^\W_])" + re.escape(surname) + r"(?:'s|s)?(?![^\W_])", hay):
+        return True
+    if len(toks) >= 2 and re.search(re.escape(surname) + r",\s*" + re.escape(toks[0][0]) + r"\b|\b" + re.escape(toks[0][0]) + r"\.\s*" + re.escape(surname), hay):
+        return True
+    return False
 
 
 def _name_shaped(atom: str) -> bool:
@@ -1410,8 +1478,16 @@ def _nonassertive_fragment(issue: str, claim: str) -> Optional[str]:
 
 def resolve_issue(issue: str, claim: str, evidence: str,
                   truncation_severity: float = 0.0,
-                  prior_evidence: str = "", context: str = "") -> Tuple[str, str]:
+                  prior_evidence: str = "", context: str = "",
+                  supplement: str = "") -> Tuple[str, str]:
     """Adjudicate ONE objection mechanically. Returns (decision, why).
+
+    ``supplement`` (§4IX) — external source lines the digest left out
+    (`raw_source_supplement`). Read by the ABSENCE branch only: an atom
+    found there is present in the sources. Never by rule 1 — a line
+    spliced for one absent name carried the cheap judge's hallucinated
+    counter-figure for ANOTHER issue and rule 1 upheld it (fresh-eye
+    review: "3 maintainers" vs a "7 years at the lab" on the spliced line).
 
     ``context`` (§4IP R7) is what the verifier was handed beside the
     evidence — the user's request and the project note. A name or figure
@@ -1581,9 +1657,10 @@ def resolve_issue(issue: str, claim: str, evidence: str,
             return (UNRESOLVED,
                     "claim-side omission — whether it matters needs "
                     "judgement")
-        c_ev = _canon(_strip_packer_marks(evidence))
+        ev_abs = evidence + ("\n" + supplement if supplement else "")     # the sources, for THIS branch only
+        c_ev = _canon(_strip_packer_marks(ev_abs))
         found = sum(1 for a, n in atoms if _atom_present(a, n, c_ev)
-                    or (not n and _name_shaped(a) and _name_present(a, evidence)))
+                    or (not n and _name_shaped(a) and _name_present(a, ev_abs)))
         if found == len(atoms):
             # ⚠ ACCEPTED RISK, stated plainly (2026-08-07 review): the
             # evidence string is partially attacker-controllable (web
@@ -1631,6 +1708,13 @@ def resolve_issue(issue: str, claim: str, evidence: str,
         names = [a for a, is_num in atoms if not is_num and _name_shaped(a) and _written_as_a_name(a, claim)]
         if names and all(_names_next_step(a, claim) for a in names):
             return (UNRESOLVED, "cited name is the reply's stated next step, not a fact about the world")
+        if names and any(_name_variant_present(a, ev_abs) for a in names):
+            # §4IY (fresh-eye review): "World Health Organization" vs "WHO", "Jane Smith" vs
+            # "Smith, J.", "Barack Obama" vs "Obama", "Ministry of Finance" vs "Υπουργείο
+            # Οικονομικών" were convicted as inventions — an abbreviation, initials, a
+            # surname-only mention or a source in another script is a judgement call
+            return (UNRESOLVED, "cited name absent as written, but an acronym, initials, its surname or a "
+                                "source in another script may name it — needs judgement")
         if names:
             return (UPHOLD, "cited name absent from intact evidence")
         # …or when the absence is TOTAL: every evidence block is a tool
@@ -1742,16 +1826,32 @@ def resolve_issue(issue: str, claim: str, evidence: str,
 #: back: `execute` (a `cat` of the draft it just wrote) and `recall` (its
 #: earlier reply — probe-4c confirmed a fabricated year against that echo).
 #: Neither vouches for an "absent" name.
-_SUPPLEMENT_EXCLUDED_TOOLS = frozenset({"execute", "recall"})
-
-
 def _external_tool(name: str) -> bool:
     try:
-        from .agent import _evidence_is_external
-        key = str(name or "").lower().strip().replace("-", "_").replace(" ", "_")
-        return key not in _SUPPLEMENT_EXCLUDED_TOOLS and bool(_evidence_is_external({"name": name}))
+        from .claim_binding import _source_tool
+        return _source_tool(name)
     except Exception:  # noqa: BLE001
         return False
+
+
+def _match_window_start(atom: str, line: str, low: str) -> int:
+    try:
+        from . import claim_binding as cb
+        toks = [t for t in re.findall(r"[^\W\d_][\w'’-]{2,}", cb.normalize_for_containment(atom)) if t not in cb._NAME_STOP]
+        folded_line = cb._fold_accents(low)
+        variants = []
+        for t in toks:
+            variants += [cb._fold_accents(t)] + cb._romanisations(t)
+        hays = [folded_line, cb.translit_greek(low), cb.translit_greek_elot(low)]
+        positions = [h.find(v) for v in variants for h in hays if v and h.find(v) >= 0]
+        if positions:
+            return max(0, min(positions) - 150)
+        for st in range(0, max(1, len(line) - 150), 150):
+            if _name_present(atom, line[st:st + 300]) or _atom_present(atom, False, _canon(line[st:st + 300])):
+                return st
+    except Exception:  # noqa: BLE001
+        pass
+    return 0
 
 
 def raw_source_supplement(issues: Sequence[str], evidence: str, raw_sources: str, *, max_chars: int = 1500) -> str:
@@ -1776,18 +1876,32 @@ def raw_source_supplement(issues: Sequence[str], evidence: str, raw_sources: str
         if not _ABSENCE_RE.search(text) or _CLAIMWARD_RE.search(text):
             continue
         for a, n in _cited_atoms(text):
-            if (a, n) not in wanted:
+            # a bare number matches ids, dates and counts on any line (review
+            # §4IX) — and a number's absence is a judgement call anyway (§4IP)
+            if not n and (a, n) not in wanted:
                 wanted.append((a, n))
     if not wanted:
         return ""
     c_ev = _canon(_strip_packer_marks(str(evidence or "")))
     missing = [(a, n) for a, n in wanted
-               if not (_atom_present(a, n, c_ev) or (not n and _name_shaped(a) and _name_present(a, evidence)))]
+               if not (_atom_present(a, n, c_ev) or (_name_shaped(a) and _name_present(a, evidence)))]
     if not missing:
         return ""
-    out: List[str] = []
+    # a cheap gate before the per-line name test (600 KB × names ran 2 s on the
+    # event loop, review §4IX): a line must carry the STEM of the atom's longest word
+    # under some spelling — accent-folded, or any romanisation (review §4IY: the
+    # nominative "Κουφοντίνας" against the genitive "Κουφοντίνα" was dropped here)
+    def _keys_for(a: str) -> List[str]:
+        toks = [t for t in re.findall(r"[^\W\d_][\w'’-]*", cb.normalize_for_containment(a)) if t not in cb._NAME_STOP]
+        toks = [t for t in toks if len(t) >= 3] or toks
+        if not toks:
+            return []
+        t = max(toks, key=len)
+        forms = [cb._fold_accents(t)] + cb._romanisations(t)
+        return [f[:-2] if len(f) >= 6 else f for f in forms if f]
+    keys = {a: _keys_for(a) for a, _n in missing}
+    rows_by_atom: Dict[str, List[str]] = {a: [] for a, _n in missing}
     seen: set = set()
-    used = 0
     for name, body in cb.evidence_blocks(raw):
         if not _external_tool(name):
             continue
@@ -1795,23 +1909,43 @@ def raw_source_supplement(issues: Sequence[str], evidence: str, raw_sources: str
             ln = line.strip()
             if not ln or len(ln) < 4:
                 continue
-            c_ln = _canon(ln)
-            if not any(_atom_present(a, n, c_ln) or (not n and _name_shaped(a) and _name_present(a, ln)) for a, n in missing):
-                continue
-            row = f"[{name} — this turn's tool output, not in the digest] {ln[:300]}"
-            if row in seen:
-                continue
-            seen.add(row)
-            if used + len(row) > max_chars:
-                return "\n".join(out)
-            out.append(row)
-            used += len(row) + 1
+            low = ln.lower()
+            folded, roman, elot = cb._fold_accents(low), cb.translit_greek(low), cb.translit_greek_elot(low)
+            for a, n in missing:
+                ks = keys.get(a) or []
+                if ks and not any(k in folded or k in roman or k in elot for k in ks):
+                    continue
+                if not (_atom_present(a, n, _canon(ln)) or (_name_shaped(a) and _name_present(a, ln))):
+                    continue
+                start = _match_window_start(a, ln, low)
+                row = f"[{name} — this turn's tool output, not in the digest] {ln[start:start + 300]}"
+                if row not in seen:
+                    seen.add(row)
+                    rows_by_atom[a].append(row)
+    # one row per absent atom first, then the rest — so a name repeated on eight lines cannot
+    # crowd out the second name's only line (review §4IY: the verdict depended on page order)
+    out: List[str] = []
+    used = 0
+    ordered: List[str] = []
+    depth = 0
+    while True:
+        layer = [rows[depth] for rows in rows_by_atom.values() if len(rows) > depth]
+        if not layer:
+            break
+        ordered.extend(layer)
+        depth += 1
+    for row in ordered:
+        if used + len(row) > max_chars:
+            continue
+        out.append(row)
+        used += len(row) + 1
     return "\n".join(out)
 
 
 def resolve_refute(issues: Sequence[str], claim: str, evidence: str,
                    truncation_severity: float = 0.0,
-                   prior_evidence: str = "", context: str = ""
+                   prior_evidence: str = "", context: str = "",
+                   supplement: str = ""
                    ) -> Tuple[Optional[str], List[str], List[str]]:
     """Adjudicate a whole REFUTED verdict's issue list.
 
@@ -1832,7 +1966,8 @@ def resolve_refute(issues: Sequence[str], claim: str, evidence: str,
     for issue in items:
         decision, why = resolve_issue(issue, claim, evidence,
                                       truncation_severity,
-                                      prior_evidence=prior_evidence, context=context)
+                                      prior_evidence=prior_evidence, context=context,
+                                      supplement=supplement)
         if decision == UPHOLD:
             return (UPHOLD, [f"{issue} → {why}"], [])
         if decision == DISMISS:

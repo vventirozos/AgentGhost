@@ -393,6 +393,20 @@ _FAILURE_ACK_RE = re.compile(
     | empty\s+(?:result|response|output|set|list|string|file|director)
     | exit\s+code | non-?zero
     | i\s+(?:do\s*n[o']?t|don't)\s+have | i\s+have\s+no
+    # contractions and plain-English shapes the list missed (fresh-eye review §4IY:
+    # "I wasn't able to open it", "The file isn't there", "The page came back blank")
+    | (?:was|were|is|are)\s*n[o']?t\s+(?:able|there|available|reachable|present)
+    | (?:wasn't|weren't|isn't|aren't)\s+(?:able|there|available|reachable|present)
+    | (?:does|did)\s*n[o']?t\s+(?:seem\s+to\s+)?(?:exist|work|load|open|respond)
+    | (?:doesn't|didn't)\s+(?:seem\s+to\s+)?(?:exist|work|load|open|respond)
+    | turn(?:ed)?\s+up\s+(?:nothing|anything|empty) | came\s+back\s+(?:blank|empty|with\s+nothing)
+    | nothing\s+(?:at|came\s+back|there|useful|relevant) | \b[45]\d\d\b(?=\s*(?:error|status|response|$|[.,;)]))
+    | the\s+response\s+was\s+a\s+[45]\d\d
+    # Greek — the operator's language; the turn-state module's own inability vocabulary
+    | δεν\s+(?:υπάρχ\w*|μπόρεσ\w*|βρήκ\w*|βρέθηκ\w*|κατάφερ\w*|επέστρεψ\w*|ανοίγ\w*|άνοιξ\w*|φορτώ\w*|δουλεύ\w*|λειτουργ\w*|απάντησ\w*|είχ\w*\s+πρόσβαση)
+    | \bσφάλμα | \bαποτυχ\w* | \bαδύνατ\w* | \bαδυναμ\w* | \bκαμία\b | \bκανένα\b | \bκανέν\w*\s+αποτέλεσμα
+    | απέτυχ\w* | δεν\s+ήταν\s+δυνατ\w* | μη\s+διαθέσιμ\w* | (?:δεν|μη)\s+προσβάσιμ\w* | (?:χωρίς|δίχως)\s+αποτέλεσμα
+    | \bλάθος\b | \bάγνωστ\w*\s+(?:σφάλμα|αρχείο|εντολή)
     """,
     re.IGNORECASE | re.VERBOSE,
 )

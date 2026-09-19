@@ -389,5 +389,9 @@ async def test_two_stage_truncates_slots_like_classic_path():
     # Evidence: the cut is the PACKER's max (§4HO, 2026-09-16 — a literal
     # 4000 here re-truncated the scaled digest); context keeps its hard cut.
     assert _ev_max > 4000
-    assert "E" * _ev_max in stage1 and "E" * (_ev_max + 1) not in stage1
+    # §4IY: the cut is MARKED (`_slice_evidence_body`), so the mark's own
+    # budget comes out of the cap and the digest never exceeds `_ev_max`
+    from ghost_agent.core.agent import _EVIDENCE_TRUNCATION_MARK
+    assert "E" * (_ev_max - 120) in stage1 and "E" * (_ev_max + 1) not in stage1
+    assert _EVIDENCE_TRUNCATION_MARK in stage1
     assert "X" * 1000 in stage1 and "X" * 1001 not in stage1

@@ -64,7 +64,8 @@ E57AD0CF_REPLY = (
     ("I have good coverage. Let me now dig in.\n\n- Reuters: 12 Sept\n- TechCrunch: same day", False),
     ("Let me read it.\n\nThe page says: \"the request came from a spoofed address\".", False),
     ("Let me check https://example.org first.", False),
-    ("I found 3 sources. Let me summarise: the agency was never named publicly.", True),
+    # §4IX: a beat that introduces content with a colon is a lead-in to an answer, not an announcement
+    ("I found 3 sources. Let me summarise: the agency was never named publicly.", False),
     # a long informative sentence beside a beat is an answer, not glue
     ("The sender used a domain that mimicked an official ministry address and the request "
      "passed the internal checks because verification relied on the display name alone. "
@@ -451,3 +452,223 @@ def test_the_text_only_scrub_sentence_is_refuted_as_a_no_answer():
     assert not refute_no_answer_fallback("The cheapest plan is CX22 at €3.79/mo.")
     # the task-closed sentence is NOT a non-answer
     assert not refute_no_answer_fallback(_scrub_fallback_message("manage_projects", True))
+
+
+# ── §4IW (req a3ec5024): a zero-tool turn that ends on an announcement ───────
+
+@pytest.mark.parametrize("text,expect", [
+    ('Αυτό είναι ενδιαφέρον ερώτημα — δεν το έχω συναντήσει μέχρι τώρα. Ας κάνω έρευνα για τον ραβίνο Μορντεχάι Φριζή και τη σχέση του με τον "συνέκτη Φριζήρα".', True),
+    ("Θα ψάξω στο διαδίκτυο και θα επιστρέψω με στοιχεία.", True),
+    ("Πάμε να δούμε τι λένε οι πηγές.", True),
+    ("Ο Φριζής γεννήθηκε το 1893 στη Χαλκίδα.", False),                    # an answer
+    ("Θέλεις να ψάξω και για τον συλλέκτη;", False),                        # a question to the user (Greek ";")
+    ("Θα ψάξω για τον συλλέκτη, αν θέλεις;", False),                        # a beat opener, but addressed to the user
+    ("Θα ψάξω για τον συλλέκτη αν μου πεις το όνομά σου.", False),           # addressed ("σου")
+    # §4IX fresh-eye review: Greek future tense states facts; "θα/πρέπει να" open a beat only with a FIRST-person work verb
+    ("Θα ανοίξει το κατάστημα στις 9 το πρωί.", False),
+    ("Πρέπει να ελέγξεις τη σύνδεση στο ρούτερ.", False),
+    ("Θα είναι δωρεάν η είσοδος.", False),
+    ("Θα γίνει έρευνα για το θέμα από την αστυνομία.", False),
+    ("Θα βρεις το αρχείο στον φάκελο Downloads.", False),
+    ("Πρέπει να ελέγξω τα logs πρώτα.", True),
+    # …and English work verbs are whole words; a refusal, a colon lead-in and a quoted finding are answers
+    ("I'll be ready at five.", False),
+    ("I should point out the address is wrong.", False),
+    ("Let me be direct: the tests are failing.", False),
+    ("Let me summarize: we agreed to move the deadline to Friday.", False),
+    ("I will not delete the production database.", False),
+    ('Let me check the page. It says "closed until March".', False),
+    ("I'll check the logs; then I'll restart the service.", True),
+    ("Ας κάνω έρευνα: η πηγή λέει \"ο Φριζής υπηρέτησε ως ραβίνος της Χαλκίδας από το 1923\".", False),   # a long quote is a finding
+])
+def test_narration_only_reads_greek_beats_and_short_quotes(text, expect):
+    assert rs.narration_only(text) is expect
+
+
+async def test_a_zero_tool_turn_that_only_announces_work_gets_one_continuation_with_tools_on(monkeypatch):
+    """Req a3ec5024: turn 1 emitted "Ας κάνω έρευνα…" and no tool call; the
+    reply shipped as the answer (the §4GH check refutes narration only after
+    tools ran; the forced-final retry only on tools-off turns). Now: one
+    continuation with the do-it-or-answer directive — tools stay ON, the
+    search the model announced runs, and the answer ships."""
+    from ghost_agent.core.agent import _ANNOUNCED_WORK_DIRECTIVE, _FORCED_FINAL_ANSWER_DIRECTIVE
+    agent, ctx = _agent(monkeypatch, [
+        _resp("Αυτό είναι ενδιαφέρον ερώτημα. Ας κάνω έρευνα για τον ραβίνο Μορντεχάι Φριζή."),   # announced, nothing done
+        _resp("Ψάχνω.", [_tc("c0", "web_search", {"query": "Μορντεχάι Φριζής Φριζήρας"})]),        # the continuation acts
+        _resp("Καμία σχέση: ο Φριζής ήταν ραβίνος της Χαλκίδας· ο Φριζήρας είναι συλλέκτης στην Πάτρα (Reuters)."),
+        _resp("(unreachable)"),
+    ])
+    out, _, _ = await agent.handle_chat(
+        {"messages": [{"role": "user", "content": "έχει καμία σχέση με το συλλέκτη Φριζήρα;"}]}, FakeBgTasks())
+    assert "Καμία σχέση" in out and not rs.narration_only(out)
+    assert agent.available_tools["web_search"].await_count == 1
+    def _msgs(c):
+        p = c.kwargs.get("messages")
+        if p is None and c.args:
+            p = c.args[0].get("messages") if isinstance(c.args[0], dict) else c.args[0]
+        return p
+    payloads = [_msgs(c) for c in ctx.llm_client.chat_completion.call_args_list]
+    assert _ANNOUNCED_WORK_DIRECTIVE in str(payloads[1][-1]["content"])
+    assert all(_FORCED_FINAL_ANSWER_DIRECTIVE not in str(m.get("content")) for p in payloads for m in p)
+    assert all(_ANNOUNCED_WORK_DIRECTIVE not in str(m.get("content")) for m in payloads[0])
+    assert payloads[1][-1].get("role") == "user"   # the directive rides a user-role message, tools still attached
+    assert payloads[1][-2].get("role") == "assistant" and "Ας κάνω έρευνα" in str(payloads[1][-2].get("content"))   # the announcement stays in history
+
+
+async def test_the_announcement_nudge_fires_once_and_a_real_answer_is_untouched(monkeypatch):
+    from ghost_agent.core.agent import _ANNOUNCED_WORK_DIRECTIVE
+    # a second announcement ships (the shape check and the caveat see it then) — no loop
+    agent, ctx = _agent(monkeypatch, [
+        _resp("Let me search for that."),
+        _resp("Let me look it up now."),
+        _resp("(unreachable)"),
+    ])
+    out, _, _ = await agent.handle_chat({"messages": [{"role": "user", "content": "who is the sender?"}]}, FakeBgTasks())
+    assert ctx.llm_client.chat_completion.await_count == 2
+    # a direct answer on a zero-tool turn never sees the directive
+    agent2, ctx2 = _agent(monkeypatch, [_resp("The sender is unknown; the card shows no name."), _resp("(unreachable)")])
+    out2, _, _ = await agent2.handle_chat({"messages": [{"role": "user", "content": "who is the sender?"}]}, FakeBgTasks())
+    assert ctx2.llm_client.chat_completion.await_count == 1 and "unknown" in out2
+    # after a tool ran, an announcement-only reply is the §4GH shape: it ships and the shape check refutes it —
+    # this nudge is for the ZERO-tool turn only
+    agent3, ctx3 = _agent(monkeypatch, [
+        _resp("Let me search.", [_tc("c0", "web_search", {"query": "revolut"})]),
+        _resp("Let me search more specifically for the sender domain."),
+        _resp("(unreachable)"),
+    ])
+    await agent3.handle_chat({"messages": [{"role": "user", "content": "find the sender domain"}]}, FakeBgTasks())
+    for c in ctx3.llm_client.chat_completion.call_args_list:
+        p = c.kwargs.get("messages") or (c.args[0].get("messages") if c.args and isinstance(c.args[0], dict) else c.args[0])
+        assert all(_ANNOUNCED_WORK_DIRECTIVE not in str(m.get("content")) for m in p)
+
+
+def test_the_caveat_only_banner_is_a_system_note():
+    """Review §4IX: `strip_system_notes` knew the correction head only; the
+    caveat-only banner reached the verifier as the reply's own words (its
+    years re-queued the identical caveat every turn) and counted as content
+    for the narration and no-answer checks."""
+    body = "The answer is 42."
+    for head in ("ℹ️ **On my previous answer:** Not found in the sources I consulted: 2019, ISO 9001.\n\n---\n\n",
+                 "⚠️ **Correction to my previous answer:** the count was 7.\n\nℹ️ **On my previous answer:** Not found: 2019.\n\n---\n\n"):
+        assert rs.strip_system_notes(head + body) == body
+    assert rs.narration_only(rs.strip_system_notes("ℹ️ **On my previous answer:** Not found: 2019.\n\n---\n\nLet me search for that.")) is True
+
+
+def test_the_nudge_gate_ignores_synthetic_tool_rows():
+    from ghost_agent.core.agent import _count_real_tools_safe
+    assert _count_real_tools_safe([{"name": "parse_error", "content": "x", "_synthetic": True}]) == 0
+    assert _count_real_tools_safe([{"name": "web_search", "content": "x"}]) == 1
+    assert _count_real_tools_safe(None) == 0
+
+
+# ── §4IY: the wide review — smoothing, shape check, outcome heuristics ──────
+
+def test_4iy_the_smoother_keeps_parallel_paragraphs_recommendations_and_locations():
+    two = "ghost: disk 81% used, 12 GB free.\n\neva: disk 43% used, 61 GB free.\n\nOnly ghost needs attention."
+    assert rs.treat_reply(two, n_real_tools=2) == two
+    both = "**Staging:** deploy succeeded in 41 s.\n\n**Production:** deploy succeeded in 58 s.\n\nBoth are green."
+    assert rs.treat_reply(both, n_real_tools=2) == both
+    rec = "Two options exist for the store. I'll recommend Postgres because the write volume is too high for SQLite.\n\n**Details:**\n- writes: 2k/s"
+    assert "recommend Postgres" in rs.treat_reply(rec, n_real_tools=2)
+    warn = "The last backup ran at 02:00. I will not be able to recover rows written after that point.\n\n**Recovery steps:**\n- restore 02:00"
+    assert "not be able to recover" in rs.treat_reply(warn, n_real_tools=2)
+    ready = "The report is ready in the Downloads folder.\n\n**Summary**\n- 12 pages\n- 3 charts"
+    assert rs.treat_reply(ready, n_real_tools=2) == ready
+    # a real restatement (same lead label, same words) is still superseded
+    dup = "Results: the cache warmed in 40 seconds and every probe passed.\n\nResults: the cache warmed in 40 seconds and every probe passed after the restart."
+    assert rs.treat_reply(dup, n_real_tools=2).count("cache warmed") == 1
+
+
+def test_4iy_call_markup_is_the_dialect_not_any_angle_bracket():
+    prose = "Run `ghost <tool name> --help` to see the options.\n\nThe most useful ones are --json and --quiet.\n\nThat's it."
+    assert rs.strip_unparsed_tool_calls(prose) == prose
+    repr_ = "…a callable, e.g. <function tool_execute at 0x10c3f2b80>.\n\nCalling it works."
+    assert rs.strip_unparsed_tool_calls(repr_) == repr_
+    out = rs.strip_unparsed_tool_calls("Done.\n<tool_call>\n<function=web_search>\n<parameter=q>x</parameter>\n</function>\n</tool_call>\nAfter.")
+    assert "<function=" not in out and "After." in out and rs.UNPARSED_TOOL_CALL_NOTE in out
+    from ghost_agent.core.agent import _UI_SCRUB_RE, _MODULE_SCRUB_RE
+    assert _UI_SCRUB_RE.sub("", prose) == prose and _MODULE_SCRUB_RE.sub("", repr_) == repr_
+    assert _MODULE_SCRUB_RE.sub("", "Done.\n<tool_call>\n<function=web_search>\n<parameter=q>x</parameter>\n</function>\n</tool_call>\nAfter.") == "Done.\n\nAfter."
+    assert rs.strip_system_notes("Answer.\n\n" + rs.UNPARSED_TOOL_CALL_NOTE) == "Answer."
+
+
+@pytest.mark.parametrize("text,expect", [
+    ("Θα ψάξω για τον συλλέκτη. Να προχωρήσω;", False), ('Θα ελέγξω. Λέει «κλειστό μέχρι Μάρτιο».', False),
+    ("Yes. I'll check it tomorrow.", False), ("Ναι. Θα το ελέγξω αύριο.", False), ("Θα ψάξω για τον συλλέκτη, αν θες.", False),
+    ('It says "no". Let me check.', False), ("I'll list them: a, b, c.", False), ("Done. Let me also update the docs.", False),
+    ("The page shows the price is €20. Let me confirm it.", False),
+    ("Let me check. It says closed until March.", True), ("Good. Let me read it.", True),
+    ("The dark-web search returned mostly generic results. Let me nail down the exact email domain with targeted searches.", True),
+    ("Αυτό είναι ενδιαφέρον ερώτημα — δεν το έχω συναντήσει μέχρι τώρα. Ας κάνω έρευνα για τον ραβίνο Μορντεχάι Φριζή.", True),
+])
+def test_4iy_narration_glue_rules(text, expect):
+    assert rs.narration_only(text) is expect, text
+
+
+def test_4iy_shape_refutes_do_not_fire_on_explanations_or_honest_answers():
+    assert rsc.refute_raw_tool_dump("Exit code: 137 means the process was killed by SIGKILL (128+9).", "what does exit code 137 mean?") == []
+    assert rsc.refute_raw_tool_dump("Process finished successfully. 12 rows were migrated and no constraints were violated.", "migrate") == []
+    assert rsc.refute_raw_tool_dump("EXIT CODE: 0 — the build passed", "what was the exit code?") == []
+    assert rsc.refute_raw_tool_dump("Process finished successfully.\n\n### Final Output:\n```text\nok\n```", "run it")
+    assert rsc.refute_raw_tool_dump("EXIT CODE: 0\nSTDOUT:\nok", "run it")
+    U = "PostgreSQL 18.6, per https://www.postgresql.org/about/release/ which I read directly last turn."
+    assert rsc.refute_unread_source(U, "Which sources did you read for this?", []) == []                       # a tool-free follow-up
+    assert rsc.refute_unread_source(U, "Which sources did you read for this?", ["web_search"])                   # the snippet echo
+    assert rsc.refute_unread_source("Headline: 'X'. https://official/page", "open the official page and quote the headline", ["web_search", "execute"]) == []
+    assert rsc.refute_unread_source("No, I did not open the page; I relied on the snippet from https://official/page.", "Did you actually read the page or just the snippet?", ["web_search"]) == []
+    assert rsc.refute_unread_source("The README says X; see https://docs.example/x", "Can you read the README and tell me what the project does?", ["file_system", "web_search"]) == []
+
+
+def test_4iy_failure_acknowledgement_speaks_greek_and_contractions():
+    from ghost_agent.distill.outcome_heuristics import response_acknowledges_failure as f
+    for t in ["Το αρχείο δεν υπάρχει στο sandbox.", "Δεν μπόρεσα να ανοίξω τη σελίδα — επέστρεψε 403.", "Δεν βρήκα τίποτα σχετικό.", "I wasn't able to open it.", "The file isn't there.",
+              "That path doesn't seem to exist on this machine.", "The search didn't turn up anything.", "The page came back blank.", "There's nothing at that URL.", "The response was a 500."]:
+        assert f(t) is True, t
+    for t in ["Η ΧΡΩΠΕΙ ιδρύθηκε το 1883 από τους αδελφούς Οικονομίδη.", "The deploy is green and 12 rows were migrated.", "It rained in 1995 and 2004."]:
+        assert f(t) is False, t
+
+
+def test_4iy_smoother_guards_alone():
+    # same label, short text, different figures: digits are words (a per-disk report, not a restatement)
+    disks = "Disk: 81% used, 12 GB free.\n\nDisk: 43% used, 61 GB free.\n\nOnly the first needs attention."
+    assert rs.treat_reply(disks, n_real_tools=2).count("GB free") == 2
+    # different labels, identical words: the label rule
+    par = "ghost: disk usage is healthy and no action is needed today.\n\neva: disk usage is healthy and no action is needed today.\n\nBoth are fine."
+    assert rs.treat_reply(par, n_real_tools=2).count("disk usage") == 2
+    # a mid-sentence "I'll" with no work verb and no reason word is not a beat
+    avail = "The last backup ran at 02:00. I'll be unavailable after 18:00 today.\n\n**Recovery steps:**\n- restore 02:00"
+    assert "unavailable after 18:00" in rs.treat_reply(avail, n_real_tools=2)
+
+
+def test_4iy_trivial_chat_requires_the_phrase_to_be_the_message():
+    from ghost_agent.core.agent import GhostAgent
+    G = GhostAgent._is_strict_trivial_chat
+    assert G("good morning") and G("good morning ghost") and G("thanks!") and G("thank you so much")
+    assert not G("good morning ghost, give me full briefing") and not G("sounds good. show me all projects")
+    assert not G("awesome, thank you. Next, the minesweeper game doesn't work")
+
+
+def test_4iy_retry_text_is_think_stripped_before_the_scrub():
+    from ghost_agent.core.agent import _strip_think_blocks, _MODULE_SCRUB_RE
+    raw = "<think>Tools are off, so I must not emit a <tool_call> here; just answer.</think>\n\nThe sender domain was gov.example."
+    assert _MODULE_SCRUB_RE.sub("", _strip_think_blocks(raw)).strip() == "The sender domain was gov.example."
+    # the order AT THE SITE, as an AST enumeration: after the retry call, the candidate is
+    # first bound to `_strip_think_blocks(...)` and only then to `_MODULE_SCRUB_RE.sub(...)`
+    import ast, inspect
+    from ghost_agent.core import agent as A
+    tree = ast.parse(inspect.getsource(A))
+    def _calls(node):
+        for c in ast.walk(node.value):
+            if not isinstance(c, ast.Call):
+                continue
+            f = c.func
+            if isinstance(f, ast.Name) and f.id == "_strip_think_blocks":
+                yield "strip"
+            if isinstance(f, ast.Attribute) and f.attr == "sub" and isinstance(f.value, ast.Name) and f.value.id == "_MODULE_SCRUB_RE":
+                yield "scrub"
+    order = []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "_ff_candidate" for t in n.targets):
+            order.extend((k, n.lineno) for k in _calls(n))
+    order.sort(key=lambda t: t[1])
+    assert [k for k, _ in order] == ["strip", "scrub"], order

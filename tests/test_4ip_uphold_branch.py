@@ -397,12 +397,12 @@ def test_total_ungrounding_thresholds_sit_at_six_content_words_on_both_sides():
     """Battery 50's E3 mutated the OLD `>= 4`; the current six-word threshold
     had no boundary pin on either side."""
     five = "Orders totalled several units overnight."                     # 5 Latin content words
-    six = "Orders totalled several units across regions."                 # 6
+    six = "Orders totalled several units overnight nationwide."           # 6 ("across" is a function word since §4IX)
     assert O._total_ungrounding(five, WEATHER_EV) == ""
     assert O._total_ungrounding(six, WEATHER_EV) == "no content word of the reply occurs in the evidence"
-    seven = "Orders totalled several units across northern regions."
-    assert O._total_ungrounding(seven, "[db] rows inserted quickly without errors") == ""                   # 5-word digest
-    assert O._total_ungrounding(seven, "[db] rows inserted quickly without errors reported") == "no content word of the reply occurs in the evidence"
+    seven = "Orders totalled several units overnight nationwide regions."
+    assert O._total_ungrounding(seven, "[db] rows inserted quickly without errors") == ""                   # 4-word digest ("without" is a function word since §4IX)
+    assert O._total_ungrounding(seven, "[db] rows inserted quickly errors reported twice") == "no content word of the reply occurs in the evidence"   # 6
 
 
 def test_a_five_letter_prefix_grounds_an_inflected_word():
@@ -614,3 +614,104 @@ def test_the_supplement_never_splices_the_agents_own_earlier_reply():
     # a real excerpt in the same record still qualifies
     supp2 = O.raw_source_supplement(["The name Λεόντιος Οικονομίδης is not in the evidence."], "[web_search] Ιδρύθηκε το 1883", EPISODE_EV)
     assert "Έλληνας χημικός" in supp2 and "OUTCOME" not in supp2
+
+
+def test_the_supplement_feeds_only_the_absence_branch_and_carries_no_bare_numbers():
+    """Review §4IX: a line spliced for an absent NAME carried the cheap
+    judge's hallucinated counter-figure for another issue, and rule 1 upheld
+    "3 vs 7" mechanically. The supplement is a kwarg the absence branch reads;
+    rule 1 never sees it. Bare numbers are never supplement atoms, and the
+    spliced window sits around the match."""
+    claim = "Saturn takes 29.46 years. The project has 3 maintainers; the lead, Dr. Elin Vasquez, verified the result."
+    digest = "[web_search] Saturn orbital period 29.46 years"
+    issues = ["The claim cites Dr. Elin Vasquez, who is not present in any tool output.", "The claim states 3 maintainers, whereas the evidence shows 7."]
+    raw = digest + "\n[browser] Maintainers page — lead: Dr. Elin Vasquez, 7 years at the lab, joined the maintainers team"
+    supp = O.raw_source_supplement(issues, digest, raw)
+    assert "Dr. Elin Vasquez" in supp
+    assert O.resolve_issue(issues[1], claim, digest, supplement=supp)[0] == O.UNRESOLVED       # rule 1 blind to the splice
+    assert O.resolve_issue(issues[0], claim, digest, supplement=supp)[0] != O.UPHOLD          # the absence branch reads it
+    assert O.resolve_refute(issues, claim, digest, supplement=supp)[0] is None
+    assert O.resolve_issue(issues[0], claim, digest)[0] == O.UPHOLD                             # without it: the §4IP conviction
+    # a number-only absence issue never becomes a supplement atom
+    assert O.raw_source_supplement(["The figure 42 is not in the evidence."], digest, digest + "\n[browser] item 42 of 100, © 2019") == ""
+    # the window follows the match
+    long_line = "x " * 200 + "the lead: Dr. Elin Vasquez, since 2019" + " y" * 50
+    s2 = O.raw_source_supplement(issues[:1], digest, digest + "\n[browser] " + long_line)
+    assert "Dr. Elin Vasquez" in s2 and len(s2) <= 400
+
+
+@pytest.mark.asyncio
+async def test_the_verifier_hands_the_supplement_to_the_absence_branch_only(tmp_path, monkeypatch):
+    """Review §4IX end to end: with the spliced line carrying a counter-figure
+    for a second, numeric issue, the refute must reach the appeal — not be
+    mechanically upheld by rule 1 reading the splice."""
+    import json
+    from ghost_agent.core.verifier import Verifier, VerifyResult, VerifyVerdict
+    monkeypatch.setenv("GHOST_HOME", str(tmp_path))
+    monkeypatch.setenv("GHOST_VERIFY_OVERTURN_QUOTE", "0")
+    monkeypatch.setenv("GHOST_VERIFY_TWO_STAGE", "0")
+    monkeypatch.delenv("GHOST_VERIFY_ESCALATE_REFUTE", raising=False)
+
+    class _Stub:
+        critic_clients = None
+        worker_clients = [object()]
+        def __init__(self, responses): self.responses = list(responses); self.prompts = []
+        async def chat_completion(self, payload, **_kw):
+            self.prompts.append(payload["messages"][0]["content"])
+            return {"choices": [{"message": {"content": self.responses.pop(0)}}]}
+
+    def _ledger():
+        p = tmp_path / "system" / "verifier" / "escalations.jsonl"
+        return [json.loads(l) for l in p.read_text().splitlines() if l.strip()] if p.exists() else []
+
+    claim = "Saturn takes 29.46 years. The project has 3 maintainers; the lead, Dr. Elin Vasquez, verified the result."
+    digest = "[web_search] Saturn orbital period 29.46 years"
+    issues = ["The claim cites Dr. Elin Vasquez, who is not present in any tool output.", "The claim states 3 maintainers, whereas the evidence shows 7."]
+    raw = digest + "\n[browser] Maintainers page — lead: Dr. Elin Vasquez, 7 years at the lab, joined the maintainers team"
+    cheap = VerifyResult(verdict=VerifyVerdict.REFUTED, confidence=0.9, reasoning="cheap", issues=issues)
+    stub = _Stub([json.dumps({"verdict": "CONFIRMED", "confidence": 0.9, "reasoning": "the page names her; 7 is years, not maintainers", "issues": []})])
+    out = await Verifier(llm_client=stub)._escalate_refute(cheap, claim, digest, "ctx", trace={"req_id": "sp1"}, raw_sources=raw)
+    assert _ledger()[-1]["outcome"] != "mechanically_upheld" and len(stub.prompts) == 1
+    assert "not in the digest] Maintainers page" in stub.prompts[0]      # the strong judge still reads the spliced line
+
+
+# ── §4IY: the wide review of the objection tier ─────────────────────────────
+
+def test_4iy_rule_one_needs_the_same_quantity_by_subject():
+    """A derived figure framed as "X, not Y" was mechanically upheld: the two
+    figures must share a subject word, a written unit family, or be a
+    one-digit slip; identifiers stay out of rule 1 as before."""
+    assert O.resolve_issue("claim says 5 files changed, but the evidence only shows 3 passed", "Done — 5 files were changed.", "[execute] a.py b.py c.py d.py e.py\n3 passed")[0] == O.UNRESOLVED
+    assert O.resolve_issue("The claim states 17 problems, whereas the evidence shows 14", "There are 17 problems (14 errors + 3 warnings).", "[execute] grep -c error: 14\ngrep -c warning: 3")[0] == O.UNRESOLVED
+    assert O.resolve_issue("The claim says 7 Python files but the evidence shows 48", "There are 7 Python files.", "[execute] total 48\n-rw a.py")[0] == O.UNRESOLVED
+    assert O.resolve_issue("The claim says 3.9 per km² but the evidence shows 396,960", "Density is about 3.9 per km².", "[web_search] population 396,960; area 103,000 km²")[0] == O.UNRESOLVED
+    # the genuine catches survive: a shared subject, a shared unit family, a one-digit slip
+    assert O.resolve_issue("Claim says 34°C but evidence shows 31°C", "It is 34°C in Athens now.", "[web_search] Athens now: 31°C sunny")[0] == O.UPHOLD
+    assert O.resolve_issue("The log shows 3 errors, not 21 errors as the claim states", "3 errors occurred", "[log] 21 errors")[0] == O.UPHOLD
+    assert O.resolve_issue("Took 2 hours, not 80 minutes", "2 hours", "80 minutes", 0.0)[0] == O.UPHOLD
+    assert O.resolve_issue("The claim states 9,692 primes, but the tool output says 9592.", "There are 9,692 primes below 100,000.", "[execute] count = 9592")[0] == O.UPHOLD
+
+
+def test_4iy_the_name_conviction_stands_down_on_variants():
+    base = "It's currently 34°C in Athens. "
+    for name, fab, ev in [("World Health Organization", "The World Health Organization reported 12 cases.", "[web_search] WHO reported 12 cases"),
+                          ("Jane Smith", "Jane Smith wrote the study.", "[web_search] Smith, J. (2019) wrote the study"),
+                          ("Barack Obama", "Barack Obama signed it.", "[web_search] Obama signed it"),
+                          ("Ministry of Finance", "The Ministry of Finance announced it.", "[web_search] Το Υπουργείο Οικονομικών ανακοίνωσε")]:
+        d = O.resolve_issue(f"The claim cites {name}, but this name is not in the evidence.", base + fab, ev)[0]
+        assert d == O.UNRESOLVED, (name, d)
+    # a Latin person's name against a Greek source is bridged by the word test (present, not a variant)
+    assert O.resolve_issue("The claim cites Kyriakos Mitsotakis, but this name is not in the evidence.", base + "Kyriakos Mitsotakis announced it.", "[web_search] Ο Κυριάκος Μητσοτάκης ανακοίνωσε")[0] != O.UPHOLD
+    # a name absent under every variant is still an invention
+    assert O.resolve_issue("The claim cites Dr. Elin Vasquez, who is not present in any tool output.", base + "Dr. Elin Vasquez verified it.", "[web_search] Saturn orbital period 29.46 years")[0] == O.UPHOLD
+
+
+def test_4iy_supplement_window_prefilter_and_fill_order():
+    digest = "[web_search] Saturn 29.46"
+    line = "Dr. Smith opened the session. " + "x " * 220 + "lead maintainer Elin Vasquez verified the result"
+    s1 = O.raw_source_supplement(["The claim cites Dr. Elin Vasquez, who is not present in any tool output."], digest, digest + "\n[browser] " + line)
+    assert "Elin Vasquez" in s1 and O.resolve_issue("The claim cites Dr. Elin Vasquez, who is not present in any tool output.", "Dr. Elin Vasquez verified.", digest, supplement=s1)[0] != O.UPHOLD
+    assert O.raw_source_supplement(["The name 'Δημήτρης Κουφοντίνας' is not in the evidence."], digest, digest + "\n[browser] Η δήλωση του Δημήτρη Κουφοντίνα χθες")
+    raw = digest + "\n[browser] " + "\n".join(f"line {i}: Dr. Elin Vasquez spoke again at length about the maintainers and the lab and the budget and the plan for the coming year" for i in range(8)) + "\n[browser] Marta Okonkwo chaired the board"
+    s5 = O.raw_source_supplement(["Dr. Elin Vasquez is not in the evidence.", "Marta Okonkwo is not in the evidence."], digest, raw)
+    assert "Okonkwo" in s5 and len(s5) <= 1500

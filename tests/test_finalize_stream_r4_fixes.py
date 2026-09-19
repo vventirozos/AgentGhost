@@ -199,7 +199,8 @@ class TestIncrementalMechanism:
                 # <tool_response> echo (review, 2026-09-09).
                 import re as _re
                 # …and an opening tag needs its '>' to be a tag at all
-                _call_shape = bool(_re.search(r"(?<!`)<(?:tool_call|function|tool)\b[^>]*>", joined, _re.I))
+                # §4IY: call-shaped = the call DIALECTS ("<tool>5 < 7" in prose is not a call)
+                _call_shape = bool(_re.search(r"(?<!`)<(?:tool_call\b[^>]*>|tool(?:\s*>|\s+name\s*=[^>]*>)|function(?:(?:\s*=|\s+name\s*=)[^>]*>|\b[^>]*>(?=.*?</function\b)))", joined, _re.I | _re.S))
                 assert had_note == _call_shape, (
                     f"stream {stream_no}: note {'present' if had_note else 'absent'} "
                     f"but call-shaped markup {'found' if _call_shape else 'absent'}\n"

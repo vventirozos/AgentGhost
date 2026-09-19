@@ -126,9 +126,15 @@ class TestUIScrubWidenedRegex:
         assert len(uses) >= 3, (
             f"expected the shared UI scrub pattern at its definition and at "
             f"both call sites, found {len(uses)} reference(s)")
-        # …and no site rebuilt the literal next to it
-        src = inspect.getsource(agent_mod)
-        assert src.count(r"<(tool_call|tool|function)\b[^>]*>") == 1, (
+        # …and no site rebuilt the literal next to it: the opener is the shared
+        # `_CALL_OPEN` dialect string (tool_call / tool / function=), ASSIGNED
+        # once and concatenated into exactly the two compiled patterns (§4IY —
+        # an AST enumeration, not a text pin)
+        assigns = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                   and any(isinstance(t, ast.Name) and t.id == "_CALL_OPEN" for t in n.targets)]
+        concat_uses = [n for n in ast.walk(tree) if isinstance(n, ast.BinOp)
+                       and any(isinstance(side, ast.Name) and side.id == "_CALL_OPEN" for side in (n.left, n.right))]
+        assert len(assigns) == 1 and len(concat_uses) == 2, (
             "a second copy of the UI scrub literal is back — that is how the "
             "two sites drifted apart in the first place")
 
@@ -182,10 +188,12 @@ class TestStreamingScrubOnFinalGeneration:
         # alternative — which matches both EOS and "just before final
         # `\n`" — allowed a single `\n` to slip through, which was what
         # the user observed as a "blank" reply.
-        assert (
-            r"<(tool_call|tool|function|tool_response)\b[^>]*>.*?"
-        ) in src
-        assert r"(?:</\1\b[^>]*>|\Z)" in src
+        # §4IY: the four dialect shapes, closed by the SAME tag through conditional groups, with
+        # `\Z` (absolute end of string) as the missing-close-tag alternative — pinned by BEHAVIOUR
+        from ghost_agent.core.agent import _MODULE_SCRUB_RE
+        assert _MODULE_SCRUB_RE.sub("", "a <tool_response>echo</tool_response> b") == "a  b"
+        assert _MODULE_SCRUB_RE.sub("", "a <tool_call>\n<function=x>\n</function>\n</tool_call> b") == "a  b"   # the inner close does not end it
+        assert _MODULE_SCRUB_RE.sub("", "a <tool_call>\n<function=x>\nunclosed\n\n") == "a "                  # `\Z`: trailing newlines do not escape
         # Belt-and-suspenders: the OLD `$` alternative must NOT appear
         # alongside the stream-scrub pattern any more.
         assert "</\\1\\b[^>]*>|$)" not in src.replace("|\\Z)", "")
