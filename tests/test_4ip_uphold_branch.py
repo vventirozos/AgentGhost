@@ -474,3 +474,52 @@ def test_rule_one_respects_the_truncation_floor():
     assert O.resolve_issue("The claim says 21 GB used but the evidence shows MemTotal 36864 MB.", "Memory: 21 GB used of 36 GB.",
                            "[execute] MemTotal: 36864 MB", 0.0)[0] == O.UPHOLD
 
+
+def test_the_project_title_in_the_request_view_is_provenance_for_the_objection_tier():
+    """§4IP R7 item 1 end-to-end: the verifier's context now carries
+    `ACTIVE PROJECT: <title>`; a judge complaint that the title is absent
+    from the tool output is a judgement call, not a conviction."""
+    issue = "The project name 'AI Self Awareness Exploration' is not explicitly mentioned in the tool outputs."
+    claim = "Here are the pending items from the **AI Self Awareness Exploration** project: task 4cdc5f063a2e."
+    ev = "[introspect] My 10 most recent experiences: I worked on a health check."
+    ctx = "ACTIVE PROJECT: AI Self Awareness Exploration || USER REQUEST: list the pending tasks"
+    assert O.resolve_refute([issue], claim, ev, 0.0, "", ctx)[0] != O.UPHOLD
+    from ghost_agent.core import claim_binding as cb
+    assert [e.status for e in cb.audit_entities(claim, ev, ctx) if "Awareness" in e.text] == ["supported"]
+
+
+@pytest.mark.parametrize("fab,cite", [
+    ("The methodology was co-signed by Anneli van der Berg of the audit office.", "Anneli van der Berg"),
+    ("A foreword by J. K. Thornwood accompanies the release.", "'J. K. Thornwood'"),
+    ("Η Δρ. Ελένη Βασκέζ επιβεβαίωσε το αποτέλεσμα νωρίτερα σήμερα.", "'Ελένη Βασκέζ'"),
+])
+def test_the_objection_tier_convicts_the_new_name_shapes_and_dismisses_them_when_present(fab, cite):
+    base = "It's currently 34°C and sunny in Athens, with humidity around 28%."
+    ev = "[web_search] Athens — Current conditions: Temperature 34°C. Humidity 28%. Wind: N 13 km/h."
+    issue = f"The claim cites {cite}, which is not present in the evidence."
+    assert O.resolve_issue(issue, base + " " + fab, ev)[0] == O.UPHOLD
+    assert O.resolve_issue(issue, base + " " + fab, ev + "\n[web] " + fab)[0] == O.DISMISS
+
+
+def test_an_inflected_greek_name_present_in_the_source_is_not_convicted():
+    d, why = O.resolve_issue("The name 'Δημήτριο Κουφοντίνα' is not in the evidence.", "Ο Δημήτριο Κουφοντίνα καταδικάστηκε.",
+                             "[web] ο Δημήτρης Κουφοντίνας καταδικάστηκε")
+    assert d == O.DISMISS, (d, why)
+
+
+def test_the_judges_latin_spelling_of_a_greek_name_is_the_replys_name():
+    """Bench class fabrication_names: 19 of 20 Greek-name refutes stayed
+    unresolved because the judge cited "Dr. Eleni Vaskez" and the reply wrote
+    "Δρ. Ελένη Βασκέζ"."""
+    base = "It's currently 34°C and sunny in Athens, with humidity around 28%."
+    ev = "[web_search] Athens — Current conditions: Temperature 34°C. Humidity 28%. Wind: N 13 km/h."
+    claim = base + " Η Δρ. Ελένη Βασκέζ επιβεβαίωσε το αποτέλεσμα νωρίτερα σήμερα."
+    issue = "The claim mentions a confirmation by Dr. Eleni Vaskez, which is not present in any tool output."
+    assert O.resolve_issue(issue, claim, ev)[0] == O.UPHOLD
+    assert O.resolve_issue(issue, claim, ev + "\n[web] Η Δρ. Ελένη Βασκέζ επιβεβαίωσε")[0] == O.DISMISS   # present under the Greek spelling
+    assert O.resolve_issue(issue, claim, ev + "\n[web] Dr. Eleni Vaskez confirmed it")[0] == O.DISMISS  # present under the Latin spelling
+    assert O._written_as_a_name("Dr. Eleni Vaskez", claim) is True
+    assert O._written_as_a_name("Dr. Eleni Vaskez", base) is False
+    # and the reverse: a judge citing the Greek spelling against a reply that wrote it in Latin
+    assert O._written_as_a_name("Δρ. Ελένη Βασκέζ", base + " Dr. Eleni Vaskez confirmed the result.") is True
+

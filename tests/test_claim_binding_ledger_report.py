@@ -132,3 +132,15 @@ def test_learning_health_renders_the_binder_bucket(tmp_path, monkeypatch):
     out = LH.render_learning_health(tmp_path)
     block = out[out.index("VERIFIER ESCALATION"):]
     assert "1 claim-binding" in block and "OTHER" not in block
+
+
+def test_report_lists_capped_rows(tmp_path):
+    p = tmp_path / "ledger.jsonl"
+    row = _row("2026-09-19T09:00:00+00:00", "CONFIRMED", "UNCERTAIN", agree=False)
+    row["capped"] = ["Dr. Elin Vasquez"]
+    p.write_text(json.dumps(row) + "\n" + json.dumps(_row("2026-09-19T09:01:00+00:00", "CONFIRMED", "CONFIRMED", agree=True)) + "\n")
+    summary = R.summarize(R.load_rows(p, None))
+    assert summary["counts"]["capped"] == 1 and summary["capped"][0]["capped"] == ["Dr. Elin Vasquez"]
+    out = R.render(summary, [])
+    assert "CAPPED 1" in out and "Dr. Elin Vasquez" in out
+

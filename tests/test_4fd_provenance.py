@@ -132,7 +132,8 @@ def _agent_with(constraints, origins):
                           _project_work_cmds=[])
     a = SimpleNamespace(context=ctx)
     for name in ("_project_constraints_for", "_active_project_constraints",
-                 "_active_constraint_note", "_request_relevant_to_project"):
+                 "_active_constraint_note", "_request_relevant_to_project",
+                 "_active_project_title"):
         setattr(a, name, getattr(agent_mod.GhostAgent, name).__get__(a))
     return a
 

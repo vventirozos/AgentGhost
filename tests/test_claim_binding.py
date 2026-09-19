@@ -1178,3 +1178,106 @@ def test_a_sentence_ending_in_a_figure_is_its_own_sentence_for_the_audit():
     assert CB._sentence_at(text, text.index("9592")) == "There are 9592 primes below 100000"
     assert CB._sentence_at("Costs 3.50 today. Tomorrow 4.", 3) == "Costs 3.50 today"
 
+
+# ── §4IP R7 item 2: the name shapes the three-template class never measured ──
+
+NAMES_EV = "[web_search] Athens — Current conditions: Temperature 34°C. Humidity 28%. Wind: N 13 km/h."
+NAMES_REPLY = "It's currently 34°C and sunny in Athens, with humidity around 28%."
+
+
+@pytest.mark.parametrize("fab,name", [
+    ("The methodology was co-signed by Anneli van der Berg of the audit office.", "Anneli van der Berg"),   # a RUN of particles
+    ("A foreword by J. K. Thornwood accompanies the release.", "J. K. Thornwood"),                           # initials
+    ("Per A. Lindqvist the figure holds.", "A. Lindqvist"),
+    ("Η Δρ. Ελένη Βασκέζ επιβεβαίωσε το αποτέλεσμα νωρίτερα σήμερα.", "Δρ. Ελένη Βασκέζ"),                  # Greek, honorific
+    ("Ο Αντώνης Κωνσταντάρης το επιβεβαίωσε.", "Αντώνης Κωνσταντάρης"),
+])
+def test_the_entity_audit_sees_particle_initial_and_greek_names(fab, name):
+    ents = CB.audit_entities(NAMES_REPLY + " " + fab, NAMES_EV)
+    assert [(e.text, e.status) for e in ents] == [(name, "unsupported")]
+    # present in the evidence → supported
+    assert [e.status for e in CB.audit_entities(NAMES_REPLY + " " + fab, NAMES_EV + "\n[web] " + fab)] == ["supported"]
+
+
+@pytest.mark.parametrize("text", [
+    "Rising U.S. Tensions dominate the headlines.",          # the tail of a dotted acronym is not initials
+    "The JSON Object and the VALUE line and CPU Usage look fine.",   # labels: all-caps tokens stay out
+    "Καλημέρα Βασίλη. Στην Αθήνα έχει 28°C.",               # a Greek sentence opener is dropped (no word list can vouch for it)
+    "Interpol has since cited the figure.",                  # a single token is not an entity
+    "The result was certified by the IEEE P2851 working group.",
+])
+def test_shapes_that_must_not_become_names(text):
+    assert CB.audit_entities(text, "[x] nothing") == []
+
+
+def test_greek_names_inflect_and_lose_accents_in_capitals():
+    """A reply's "Δημήτριο Κουφοντίνα" against a source's "Δημήτρης
+    Κουφοντίνας" is the same person; a headline in capitals carries no
+    tonos. Whole-token matching made both unsupported — and the objection
+    tier would have convicted the inflected spelling as an absent name."""
+    assert [e.status for e in CB.audit_entities("Ο Δημήτριο Κουφοντίνα καταδικάστηκε.", "[web] ο Δημήτρης Κουφοντίνας καταδικάστηκε")] == ["supported"]
+    assert [e.status for e in CB.audit_entities("Το Εθνικό Λεξικό Κοινής Νεοελληνικής το ορίζει.", "[web] ΕΘΝΙΚΟ ΛΕΞΙΚΟ ΚΟΙΝΗΣ ΝΕΟΕΛΛΗΝΙΚΗΣ — λήμμα")] == ["supported"]
+    # short tokens (no stem to fall back on): only the accent folding can match a capitals headline
+    assert [e.status for e in CB.audit_entities("Ο Νίκος Γκάλης έπαιξε.", "[web] ΝΙΚΟΣ ΓΚΑΛΗΣ: ο θρύλος")] == ["supported"]
+    assert [e.status for e in CB.audit_entities("Η Μαρίας Γκοντσάρεβα μίλησε.", "[web] Athens weather 28°C")] == ["unsupported"]
+    # Latin names get no stem leniency: "vasque" would not stand for "vasquez"
+    assert CB._entity_supported("elin vasquez", "elin vasque led") is False
+    assert CB._entity_supported("karlsen institute", "saturn orbital period") is False
+
+
+def test_greek_names_are_matched_under_their_latin_spelling():
+    """The cheap judge writes "Dr. Eleni Vaskez" for the reply's "Δρ. Ελένη
+    Βασκέζ", and an English source writes "Kyriakos Mitsotakis" for a Greek
+    reply's name: a deterministic Greek→Latin fold ADDS these matches (support
+    / presence only — it never denies one)."""
+    assert CB.translit_greek("Δρ. Ελένη Βασκέζ") == "dr. eleni vaskez"
+    assert CB.translit_greek("Κυριάκος Μητσοτάκης") == "kyriakos mitsotakis"
+    assert CB.translit_greek("Γιώργος Παπανδρέου") == "giorgos papandreou"
+    assert CB.translit_greek("Elin Vasquez") == "elin vasquez"                 # Latin passes through
+    assert [e.status for e in CB.audit_entities("Ο Κυριάκος Μητσοτάκης μίλησε.", "[web] Kyriakos Mitsotakis spoke on Tuesday")] == ["supported"]
+    assert [e.status for e in CB.audit_entities("Ο Κυριάκος Μητσοτάκης μίλησε.", "[web] Athens weather 28°C")] == ["unsupported"]
+
+
+def test_a_standards_citation_is_an_identifier_not_a_name_or_a_figure():
+    """§4IQ: the acronym-body fabrication ("certified by the IEEE P2851
+    working group") was the binder's one remaining false confirm on the new
+    class (6/27 mined). A closed list of citation prefixes + a code is an
+    identifier: looked up verbatim, unsupported withholds, never a refute;
+    capitals only ("en 13" is English), a sentence-final stop may follow."""
+    ids = lambda t: [m.group(0) for m in CB._IDENT_RE.finditer(t)]
+    assert ids("certified by the IEEE P2851 working group.") == ["IEEE P2851"]
+    assert ids("Timestamps follow ISO 8601 and RFC 3339.") == ["ISO 8601", "RFC 3339"]
+    assert ids("See CVE-2024-1234 and ISO-8601 dates") == ["CVE-2024-1234", "ISO-8601"]
+    assert ids("HTTP 403; PID 4412; USD 1500; en 13; bs 12") == []
+    assert [e.text for e in CB.audit_entities("certified by the IEEE P2851 working group.", "[x] y")] == []   # not a NAME
+    r = CB.run_binding(NAMES_REPLY + " The result was certified by the IEEE P2851 working group.", NAMES_EV,
+                       {"claims": [{"quote": "34°C", "kind": "number", "evidence_quote": "Temperature 34°C", "relation": "support"}]})
+    assert r.verdict == "UNCERTAIN" and "IEEE P2851" in r.reasoning
+    r2 = CB.run_binding(NAMES_REPLY + " The result was certified by the IEEE P2851 working group.", NAMES_EV + "\n[web] certified per IEEE P2851",
+                        {"claims": [{"quote": "34°C", "kind": "number", "evidence_quote": "Temperature 34°C", "relation": "support"}]})
+    assert r2.verdict == "CONFIRMED"
+
+
+# ── §4IR: the names that justify capping a cheap CONFIRMED ─────────────────
+
+def test_unsupported_names_and_the_cap_predicate():
+    rows = {"claims": [{"quote": "34°C", "kind": "number", "evidence_quote": "Temperature 34°C", "relation": "support"}]}
+    res = CB.run_binding(NAMES_REPLY + " The lead maintainer, Dr. Elin Vasquez, verified it at http://127.0.0.1:8100 under IEEE P2851.", NAMES_EV, rows)
+    assert res.verdict == "UNCERTAIN"
+    assert CB.unsupported_names(res) == ["Dr. Elin Vasquez", "IEEE P2851"]                       # the loopback address is not a fact
+    assert CB.unsupported_names(res, prior_evidence="[web] Dr. Elin Vasquez signed off") == ["IEEE P2851"]
+    assert CB.name_withhold_caps_confirm(res, truncation_severity=0.0, truncation_floor=0.25) == ["Dr. Elin Vasquez", "IEEE P2851"]
+    assert CB.name_withhold_caps_confirm(res, truncation_severity=0.3, truncation_floor=0.25) == []      # a cut digest proves little
+    assert CB.name_withhold_caps_confirm(None, truncation_severity=0.0, truncation_floor=0.25) == []
+    clean = CB.run_binding(NAMES_REPLY, NAMES_EV, rows)
+    assert clean.verdict == "CONFIRMED" and CB.name_withhold_caps_confirm(clean, truncation_severity=0.0, truncation_floor=0.25) == []
+    # a REFUTED is never "capped" — it is the verdict
+    ref = CB.run_binding("There are 9,692 primes below 100000. Dr. Elin Vasquez checked.", "[execute] count: 9592",
+                         {"claims": [{"quote": "9,692 primes", "kind": "count", "evidence_quote": "count: 9592", "relation": "support"}]})
+    assert ref.verdict == "REFUTED" and CB.name_withhold_caps_confirm(ref, truncation_severity=0.0, truncation_floor=0.25) == []
+
+
+def test_a_capitalised_opener_after_a_label_or_code_span_is_not_a_name():
+    text = "**Acquired Skills** — Two Python scripts for fetching headlines\n\n- `mars_distance.py` — Related Mars distance script\n\nThe Karlsen Institute audited it."
+    assert [e.text for e in CB.audit_entities(text, "[x] nothing")] == ["Karlsen Institute"]
+

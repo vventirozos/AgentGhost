@@ -1067,6 +1067,16 @@ def _claim_binding_confirm_first_enabled() -> bool:
     return os.getenv("GHOST_CLAIM_BINDING_CONFIRM_FIRST", "1").strip().lower() not in ("0", "false", "off", "no")
 
 
+def _claim_binding_name_withhold_enabled() -> bool:
+    """§4IR: a binder withhold on an unsupported NAME or identifier caps a
+    cheap CONFIRMED at the withheld confidence (UNCERTAIN to every consumer,
+    never a refute). Default ON — measured on the paired pools it removed
+    every fabricated-name false confirm (15/15, 10/10, 15/15, 6/6) and 8
+    more, for 5/49 + 0/34 good confirms capped on the benches and 9/165
+    live ones. GHOST_CLAIM_BINDING_NAME_WITHHOLD=0 turns it off."""
+    return os.getenv("GHOST_CLAIM_BINDING_NAME_WITHHOLD", "1").strip().lower() not in ("0", "false", "off", "no")
+
+
 def _claim_binding_residual_mode() -> str:
     """§4IN: which model answers the residual (status / unbound) claims
     under a quote burden — "cheap" (the critic node), "main" (the 35B) or
@@ -3110,7 +3120,8 @@ class Verifier:
                 final.self_consistency_drawn = _vote  # pylint: disable=unpacking-non-sequence
         if cb_task is not None:
             return await self._settle_claim_binding(cb_task, final, trace=trace, high_stakes=high_stakes,
-                                                    retry=_reverify_on_main)
+                                                    retry=_reverify_on_main, evidence=evidence_t,
+                                                    prior_evidence=prior_evidence)
         if _claim_binding_shadow_enabled():
             self._spawn_claim_binding_shadow(claim_t, evidence_t, context_t, final, trace=trace)
         return final
@@ -3130,9 +3141,47 @@ class Verifier:
         task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
         return task
 
+    def _cap_confirm_on_name_withhold(self, incumbent: Optional[VerifyResult], cbr: VerifyResult, *,
+                                      evidence: str, prior_evidence: str,
+                                      trace: Optional[Dict[str, Any]]) -> List[str]:
+        """§4IR: the incumbent's CONFIRMED (≥ the consumption gate) meets a
+        binder withhold on a name the whole session never carried → the
+        confidence is capped at `_CONFIRM_WITHHELD_CONF_CAP`, the label stays
+        CONFIRMED, `confirm_withheld` is set and the escalation ledger gets a
+        `withheld` row (kind confirm) — exactly the contract of the
+        high-stakes withhold, on a different ground. Returns the names."""
+        if (incumbent is None or incumbent.verdict is not VerifyVerdict.CONFIRMED
+                or float(incumbent.confidence or 0.0) < 0.7 or not _claim_binding_name_withhold_enabled()):
+            return []
+        try:
+            from . import claim_binding as cb
+            from . import objection as _objection
+            from .agent import evidence_truncation_severity as _sev
+            names = cb.name_withhold_caps_confirm(
+                getattr(cbr, "claim_binding", None), truncation_severity=float(_sev(evidence) or 0.0),
+                truncation_floor=_objection._truncation_floor(), prior_evidence=prior_evidence or "")
+        except Exception as exc:  # noqa: BLE001 — the cap never breaks a verdict
+            logger.debug("claim-binding name-withhold cap skipped: %s", exc)
+            return []
+        if not names:
+            return []
+        before = float(incumbent.confidence)
+        incumbent.confidence = min(before, _CONFIRM_WITHHELD_CONF_CAP)
+        incumbent.confirm_withheld = True
+        incumbent.reasoning = ((incumbent.reasoning or "")
+                               + f" [claim-binding: name(s) in neither evidence nor context — {', '.join(repr(n) for n in names[:3])}"
+                               f" — the pass is not execution-backed; confidence capped.]").strip()
+        logger.warning("claim-binding WITHHELD a cheap CONFIRMED: unsupported name(s) %s — confidence %.2f → %.2f",
+                       names[:3], before, incumbent.confidence)
+        record_escalation(kind="confirm", route="claim", outcome="withheld",
+                          cheap_verdict=VerifyVerdict.CONFIRMED.value, cheap_confidence=before,
+                          strong_verdict=cbr.verdict.value, final_confidence=incumbent.confidence, trace=trace)
+        _stamp_escalation(incumbent, "withheld")
+        return names
+
     async def _settle_claim_binding(self, cb_task: "asyncio.Task", incumbent: Optional[VerifyResult], *,
                                     trace: Optional[Dict[str, Any]] = None, high_stakes: bool = False,
-                                    retry=None) -> Optional[VerifyResult]:
+                                    retry=None, evidence: str = "", prior_evidence: str = "") -> Optional[VerifyResult]:
         """Refute-first: a validated REFUTED from the binder is the verdict;
         otherwise the incumbent's stands. Either way the ledger row is
         written from THIS binder call — no second one.
@@ -3175,7 +3224,10 @@ class Verifier:
                          and getattr(incumbent, "escalation", "") != "replaced_uncertain"))):
             decided = "claim_binding"
         if decided == "incumbent":
-            self._write_claim_binding_row(incumbent, cbr, trace=trace, wait_s=wait_s, decided=decided)
+            capped = self._cap_confirm_on_name_withhold(incumbent, cbr, evidence=evidence,
+                                                       prior_evidence=prior_evidence, trace=trace)
+            self._write_claim_binding_row(incumbent, cbr, trace=trace, wait_s=wait_s, decided=decided,
+                                          capped=capped)
             if incumbent is not None and getattr(incumbent, "claim_binding", None) is None:
                 incumbent.claim_binding = getattr(cbr, "claim_binding", None)   # the rows ride the verdict that ships
             return incumbent
@@ -3221,7 +3273,8 @@ class Verifier:
                                  trace: Optional[Dict[str, Any]], decided: str,
                                  wait_s: Optional[float] = None, binder_s: Optional[float] = None,
                                  error: str = "", appeal: str = "",
-                                 shipped_confidence: Optional[float] = None) -> None:
+                                 shipped_confidence: Optional[float] = None,
+                                 capped: Optional[List[str]] = None) -> None:
         """One ledger row + one log line for a (incumbent, binder) pair.
         `wait_s` = how long the settled turn waited past the incumbent;
         `binder_s` = the binder's own latency (shadow); `error` = a binder
@@ -3252,6 +3305,9 @@ class Verifier:
             # model's own verdict shipped) or "unavailable"
             row["appeal"] = appeal
             row["shipped_confidence"] = shipped_confidence
+        if capped:
+            # §4IR: the incumbent's CONFIRMED shipped capped on these names
+            row["capped"] = list(capped)[:5]
         record_claim_binding_shadow(row)
         try:
             from ..utils.logging import Icons, pretty_log
@@ -3259,12 +3315,13 @@ class Verifier:
             what = (f"{cb_v} overrides incumbent {inc_v}" + (f" (appeal: {appeal})" if appeal else "")
                     if decided == "claim_binding"
                     else (f"binder failed ({error}) — incumbent {inc_v} stands" if error
-                          else f"shadow: incumbent {inc_v} vs claim-binding {cb_v}"))
+                          else (f"incumbent {inc_v} CAPPED — unsupported name(s) {list(capped)[:3]}" if capped
+                                else f"shadow: incumbent {inc_v} vs claim-binding {cb_v}")))
             secs = row.get("binder_s", row.get("wait_s", 0.0))
             pretty_log("Claim Binding",
                        f"{what} ({', '.join(f'{k} {v}' for k, v in counts.items() if v)}) {secs}s",
                        icon=Icons.VERIFIER_LAB,
-                       level="WARNING" if (decided == "claim_binding" or row["agree"] is False or error) else "INFO")
+                       level="WARNING" if (decided == "claim_binding" or row["agree"] is False or error or capped) else "INFO")
         except Exception:  # noqa: BLE001
             pass
 

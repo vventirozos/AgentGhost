@@ -49,6 +49,7 @@ def _env(monkeypatch, tmp_path):
     monkeypatch.delenv("GHOST_CLAIM_BINDING_SHADOW", raising=False)
     monkeypatch.setenv("GHOST_CLAIM_BINDING_REFUTE_FIRST", "0")   # the shadow pins; refute-first pins set "1"
     monkeypatch.setenv("GHOST_CLAIM_BINDING_CONFIRM_FIRST", "0")  # confirm-first pins set "1" themselves
+    monkeypatch.setenv("GHOST_CLAIM_BINDING_NAME_WITHHOLD", "0")  # §4IR pins set "1" themselves
     monkeypatch.setenv("GHOST_VERIFY_TWO_STAGE", "0")          # one classic call = one queued response
     monkeypatch.setenv("GHOST_VERIFY_ESCALATE_REFUTE", "0")
     monkeypatch.setenv("GHOST_VERIFY_ESCALATE_CONFIRM", "0")
@@ -568,4 +569,70 @@ def test_override_tags_read_binder_decided():
     assert mod.override_tags({"escalation": "withheld", "binder_decided": True}) == ["claim-binding"]
     assert mod.override_tags({"escalation": "claim_binding"}) == ["claim-binding"]
     assert mod.override_tags({"escalation": "upheld"}) == ["(text judge)"]
+
+
+# ── §4IR: a validated name withhold caps a cheap CONFIRMED ─────────────────
+
+NAMED_REPLY = REPLY + " The lead maintainer, Dr. Elin Vasquez, verified the result."
+
+
+def _flags_4ir(monkeypatch, on="1"):
+    monkeypatch.setenv("GHOST_CLAIM_BINDING_REFUTE_FIRST", "1")
+    monkeypatch.setenv("GHOST_CLAIM_BINDING_CONFIRM_FIRST", "1")
+    monkeypatch.setenv("GHOST_CLAIM_BINDING_NAME_WITHHOLD", on)
+
+
+@pytest.mark.asyncio
+async def test_a_name_withhold_caps_a_cheap_confirmed(monkeypatch, tmp_path):
+    _flags_4ir(monkeypatch)
+    r = await Verifier(llm_client=_Stub([CLASSIC_CONFIRM, BINDER_JSON])).verify_claim(NAMED_REPLY, EV1, "weather in Athens?", trace={"req_id": "nw1"})
+    assert r.verdict is VerifyVerdict.CONFIRMED and r.confidence <= V._CONFIRM_WITHHELD_CONF_CAP
+    assert r.confirm_withheld is True and r.escalation == "withheld" and r.binder_decided is False
+    assert "Elin Vasquez" in r.reasoning
+    row = _ledger(tmp_path)[-1]
+    assert row["decided"] == "incumbent" and row["capped"] == ["Dr. Elin Vasquez"]
+    esc = [e for e in _escalations(tmp_path) if e["outcome"] == "withheld"]
+    assert esc and esc[-1]["kind"] == "confirm" and esc[-1]["cheap_verdict"] == "CONFIRMED" and esc[-1]["strong_verdict"] == "UNCERTAIN"
+
+
+@pytest.mark.asyncio
+async def test_the_cap_is_off_by_flag_and_never_fires_without_a_name(monkeypatch, tmp_path):
+    _flags_4ir(monkeypatch, on="0")
+    r = await Verifier(llm_client=_Stub([CLASSIC_CONFIRM, BINDER_JSON])).verify_claim(NAMED_REPLY, EV1, "weather in Athens?", trace={"req_id": "nw2"})
+    assert r.confidence >= 0.9 and not r.confirm_withheld and "capped" not in _ledger(tmp_path)[-1]
+    _flags_4ir(monkeypatch)
+    # binder UNCERTAIN for a figure the model never bound, no name involved → untouched
+    unbound = json.dumps({"claims": [{"quote": "34°C", "kind": "number", "evidence_quote": "Temperature 34°C", "relation": "support"}]})
+    r2 = await Verifier(llm_client=_Stub([CLASSIC_CONFIRM, unbound])).verify_claim(REPLY + " Pressure is 1013 hPa.", EV1, "weather in Athens?", trace={"req_id": "nw3"})
+    assert r2.confidence >= 0.9 and not r2.confirm_withheld
+    # incumbent already below the consumption gate → nothing to cap
+    low = json.dumps({"verdict": "CONFIRMED", "confidence": 0.65, "reasoning": "r", "issues": []})
+    r3 = await Verifier(llm_client=_Stub([low, BINDER_JSON])).verify_claim(NAMED_REPLY, EV1, "weather in Athens?", trace={"req_id": "nw4"})
+    assert r3.confidence == 0.65 and not r3.confirm_withheld
+
+
+@pytest.mark.asyncio
+async def test_the_cap_respects_prior_evidence_context_truncation_and_loopback(monkeypatch, tmp_path):
+    _flags_4ir(monkeypatch)
+    # the name was in an EARLIER turn's evidence → not an invention
+    r = await Verifier(llm_client=_Stub([CLASSIC_CONFIRM, BINDER_JSON])).verify_claim(
+        NAMED_REPLY, EV1, "weather in Athens?", trace={"req_id": "nw5"}, prior_evidence="[web] Dr. Elin Vasquez leads the maintainers")
+    assert r.confidence >= 0.9 and not r.confirm_withheld
+    # the name is in the request / project note → the binder counts it as supported already
+    r2 = await Verifier(llm_client=_Stub([CLASSIC_CONFIRM, BINDER_JSON])).verify_claim(
+        NAMED_REPLY, EV1, "ACTIVE PROJECT: Elin Vasquez audit || USER REQUEST: weather in Athens?", trace={"req_id": "nw6"})
+    assert r2.confidence >= 0.9 and not r2.confirm_withheld
+    # the digest was cut past the floor → an absence proves little
+    from ghost_agent.core.agent import _slice_evidence_body
+    cut = _slice_evidence_body(EV1 + " " + ("filler " * 400), 400, "")     # a tiny grant drops the marker itself; 400 keeps it
+    r3 = await Verifier(llm_client=_Stub([CLASSIC_CONFIRM, BINDER_JSON])).verify_claim(NAMED_REPLY, cut, "weather in Athens?", trace={"req_id": "nw7"})
+    assert r3.confidence >= 0.9 and not r3.confirm_withheld
+    # a loopback address is the agent's own URL convention, not a fact
+    r4 = await Verifier(llm_client=_Stub([CLASSIC_CONFIRM, BINDER_JSON])).verify_claim(
+        REPLY + " Open http://127.0.0.1:8100 to see it.", EV1, "weather in Athens?", trace={"req_id": "nw8"})
+    assert r4.confidence >= 0.9 and not r4.confirm_withheld
+    # …but a hex id / standards citation the session never carried does cap
+    r5 = await Verifier(llm_client=_Stub([CLASSIC_CONFIRM, BINDER_JSON])).verify_claim(
+        REPLY + " Certified under IEEE P2851.", EV1, "weather in Athens?", trace={"req_id": "nw9"})
+    assert r5.confirm_withheld is True and _ledger(tmp_path)[-1]["capped"] == ["IEEE P2851"]
 

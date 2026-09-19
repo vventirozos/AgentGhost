@@ -45,7 +45,8 @@ def _agent(store, pid="7b62e5e533d1"):
     a = A()
     # bind the real methods
     for name in ("_project_constraints_for", "_active_project_constraints",
-                 "_active_constraint_note", "_request_relevant_to_project"):
+                 "_active_constraint_note", "_request_relevant_to_project",
+                 "_active_project_title"):
         setattr(a, name, getattr(agent_mod.GhostAgent, name).__get__(a))
     return a
 
@@ -225,3 +226,42 @@ def test_project_ledger_evidence_says_it_is_not_a_constraint_list():
     block = agent_mod._project_ledger_evidence(Ctx(), [{"name": "manage_projects", "content": "ok 7b62e5e533d1"}])
     assert block.startswith("[project ledger (live) — task titles and statuses, NOT user constraints]")
     assert "recursive thought process" in block
+
+
+# ── §4IP R7: the project's TITLE rides the request view, through the same gate ──
+
+def test_verifier_note_carries_the_project_title_only_for_project_work():
+    """A reply that names the project it reports on had that name in neither
+    evidence nor context; the objection tier convicted it as an invention.
+    The title now rides the note, gated exactly like the constraints."""
+    from ghost_agent.core.claim_binding import ask_of
+    a = _agent(_Store())
+    note = a._active_constraint_note(request_text="proceed with task 5.")
+    assert note.startswith("ACTIVE PROJECT CONSTRAINTS")                 # constraints clause first, unchanged
+    assert "|| ACTIVE PROJECT: Recursive thought cascade || USER REQUEST: " in note
+    assert ask_of(note + "proceed with task 5.") == "proceed with task 5."  # the request reader is unaffected
+    assert a._active_constraint_note(request_text="how's the weather ?") == ""   # off-topic: no title either
+    assert a._active_project_title(request_text="how's the weather ?") == ""
+    assert a._active_project_title(request_text="proceed") == "Recursive thought cascade"
+
+
+def test_title_alone_renders_when_the_project_has_no_constraints():
+    class _Bare(_Store):
+        def get_project(self, pid):
+            return {"id": pid, "title": "  Chess   Game  ", "description": "", "metadata": {}}
+    a = _agent(_Bare())
+    assert a._active_constraint_note(request_text="proceed") == "ACTIVE PROJECT: Chess Game || USER REQUEST: "
+    a2 = _agent(_Bare(), pid=None)
+    assert a2._active_constraint_note(request_text="proceed") == ""
+
+
+def test_title_lookup_never_raises_and_fails_open_on_relevance(monkeypatch):
+    from ghost_agent.core import project_research as pr
+    class _Boom(_Store):
+        def get_project(self, pid):
+            raise RuntimeError("store down")
+    assert _agent(_Boom())._active_project_title(request_text="proceed") == ""
+    a = _agent(_Store())
+    monkeypatch.setattr(pr, "request_relevant_to_project", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+    assert a._active_project_title(request_text="how's the weather ?") == "Recursive thought cascade"   # fail OPEN, like constraints
+

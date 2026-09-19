@@ -1193,6 +1193,34 @@ def fault_fabrication(case: BenchCase, rng: random.Random,
             f"appended fabrication: {fab[:60]}")
 
 
+#: §4IP R7: the fabrication class above is three Latin, two-token, Title-Case
+#: names — every name rule in the binder and the objection tier was measured
+#: against exactly that shape. These are the shapes it never measured: a
+#: lowercase-particle surname, initials, an acronym body, a single-token
+#: organisation, a non-Latin (Greek) name with its honorific. Opt-in
+#: (`_OPT_IN_FAULTS`) so the default pools stay comparable with cached runs.
+FABRICATION_NAME_SHAPES = [
+    ("particle", "The methodology was co-signed by Anneli van der Berg of the audit office."),
+    ("initials", "A foreword by J. K. Thornwood accompanies the release."),
+    ("acronym", "The result was certified by the IEEE P2851 working group."),
+    ("single", "Interpol has since cited the figure in its bulletin."),
+    ("greek", "Η Δρ. Ελένη Βασκέζ επιβεβαίωσε το αποτέλεσμα νωρίτερα σήμερα."),
+]
+
+
+def fault_fabrication_names(case: BenchCase, rng: random.Random,
+                            pool: List[BenchCase]) -> Optional[Tuple[str, str, str, str]]:
+    """Append a fabricated attribution whose NAME SHAPE the three-template
+    class never exercised (see `FABRICATION_NAME_SHAPES`)."""
+    usable = [(k, f) for k, f in FABRICATION_NAME_SHAPES
+              if not any(tok in case.evidence for tok in f.split()[-3:-1])]
+    if not usable:
+        return None
+    kind, fab = rng.choice(usable)
+    return (case.claim.rstrip() + " " + fab, case.evidence, case.context,
+            f"appended fabricated name ({kind}): {fab[:60]}")
+
+
 def fault_wrong_topic(case: BenchCase, rng: random.Random,
                       pool: List[BenchCase], seed: int = 0
                       ) -> Optional[Tuple[str, str, str, str]]:
@@ -1363,7 +1391,11 @@ FAULTS: Dict[str, Tuple[str, Callable]] = {
     "artifact_leak": ("REFUTED", fault_artifact_leak),
     "constraint_violation": ("REFUTED", fault_constraint_violation),
     "evidence_truncation": ("NOT_REFUTED", fault_evidence_truncation),
+    "fabrication_names": ("REFUTED", fault_fabrication_names),
 }
+#: Registered but not part of a default run: a default pool must stay
+#: comparable with every cached run made before the class existed.
+_OPT_IN_FAULTS = frozenset({"fabrication_names"})
 
 
 def _takes_seed(fn) -> bool:
@@ -1413,7 +1445,7 @@ def build_trials(cases: List[BenchCase],
     2026-08-04: 0 of 21 seed cases derive high-stakes from their own clean
     evidence, but 70 of 107 `silent_failure` trials do).
     """
-    names = list(fault_names) if fault_names else list(FAULTS)
+    names = list(fault_names) if fault_names else [n for n in FAULTS if n not in _OPT_IN_FAULTS]
     unknown = [n for n in names if n not in FAULTS]
     if unknown:
         raise ValueError(f"unknown fault(s): {unknown}")
@@ -2111,7 +2143,8 @@ def verify_claim_accepts_high_stakes(verifier) -> bool:
         p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
-_CLAIM_BINDING_LIVE_FLAGS = ("GHOST_CLAIM_BINDING_REFUTE_FIRST", "GHOST_CLAIM_BINDING_CONFIRM_FIRST", "GHOST_CLAIM_BINDING_SHADOW")
+_CLAIM_BINDING_LIVE_FLAGS = ("GHOST_CLAIM_BINDING_REFUTE_FIRST", "GHOST_CLAIM_BINDING_CONFIRM_FIRST", "GHOST_CLAIM_BINDING_SHADOW",
+                             "GHOST_CLAIM_BINDING_NAME_WITHHOLD")
 
 
 class _claim_binding_flags_off:

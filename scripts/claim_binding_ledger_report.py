@@ -63,7 +63,7 @@ def load_rows(path: Path, since: _dt.datetime | None):
 def summarize(rows) -> dict:
     """The counts the daily read needs; pure, for the test."""
     s = collections.Counter()
-    overrides, failures, disagreements = [], [], []
+    overrides, failures, disagreements, capped = [], [], [], []
     for r in rows:
         cb = r.get("claim_binding") or {}
         s["rows"] += 1
@@ -80,7 +80,10 @@ def summarize(rows) -> dict:
         if r.get("decided") == "claim_binding":
             s["decided_by_binder"] += 1
             overrides.append(r)
-    return {"counts": s, "overrides": overrides, "failures": failures, "disagreements": disagreements}
+        if r.get("capped"):
+            s["capped"] += 1                  # §4IR: a cheap CONFIRMED shipped at the withheld confidence
+            capped.append(r)
+    return {"counts": s, "overrides": overrides, "failures": failures, "disagreements": disagreements, "capped": capped}
 
 
 def _short(text, n=160):
@@ -92,7 +95,7 @@ def render(summary: dict, escalations) -> str:
     c = summary["counts"]
     lines = [f"claim-binding ledger: {c['rows']} rows | binder failed {c['binder_failed']} | "
              f"REFUTED {c['binder_REFUTED']} CONFIRMED {c['binder_CONFIRMED']} UNCERTAIN {c['binder_UNCERTAIN']} | "
-             f"agree {c['agree']} disagree {c['disagree']} | DECIDED BY BINDER {c['decided_by_binder']}"]
+             f"agree {c['agree']} disagree {c['disagree']} | DECIDED BY BINDER {c['decided_by_binder']} | CAPPED {c['capped']}"]
     if summary["overrides"]:
         lines.append("\nOVERRIDES (read each one — a live catch or a rule defect):")
         for r in summary["overrides"]:
@@ -102,6 +105,10 @@ def render(summary: dict, escalations) -> str:
                          f"→ binder={cb.get('verdict')}{appeal} ({_short(cb.get('reasoning'), 100)})")
             for i in (cb.get("issues") or [])[:3]:
                 lines.append(f"    · {_short(i, 220)}")
+    if summary.get("capped"):
+        lines.append("\nCAPPED (a cheap CONFIRMED shipped at 0.6 on a name the session never carried — read each: a fabrication or a name the reply knew):")
+        for r in summary["capped"]:
+            lines.append(f"- {str(r.get('ts'))[:19]} req={r.get('trace', {}).get('req_id')} names={r.get('capped')}")
     if summary["failures"]:
         lines.append(f"\nBINDER FAILURES ({len(summary['failures'])}):")
         for r in summary["failures"][:10]:

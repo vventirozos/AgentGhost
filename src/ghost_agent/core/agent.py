@@ -12747,17 +12747,54 @@ class GhostAgent:
             pass
         return self._project_constraints_for(pid, limit)
 
+    def _active_project_title(self, *, request_text: str) -> str:
+        """The ACTIVE project's title — ONLY when ``request_text`` is about
+        that project (the same §4FD relevance authority as the constraints).
+        §4IP R7: the verifier's request view carried the project's
+        constraints but never its NAME, so a reply that said which project it
+        was reporting on ("pending items from the **AI Self Awareness
+        Exploration** project") had that name in neither evidence nor
+        context, and the objection tier convicted it as an invention. The
+        binder counts a context entity as supported; the objection tier
+        treats it as provenance. Never raises."""
+        pid = getattr(self.context, "current_project_id", None)
+        if not pid:
+            return ""
+        try:
+            store = getattr(self.context, "project_store", None)
+            if store is None:
+                return ""
+            try:
+                if not self._request_relevant_to_project(store, pid, request_text or ""):
+                    return ""
+            except Exception:  # noqa: BLE001 — relevance is best-effort, fail OPEN (as the constraints do)
+                pass
+            proj = store.get_project(pid) or {}
+            title = str(proj.get("title") or "").strip()
+            return " ".join(title.split())[:120]
+        except Exception:  # noqa: BLE001
+            return ""
+
     def _active_constraint_note(self, limit: int = 5, *,
                                 request_text: str) -> str:
-        """Explicit user constraints stored on the active project, rendered
-        as a short prefix for the verifier's request view. Empty string when
-        no project is active, the project carries no constraints, or the
-        request is not about the project (§4FD scoping)."""
+        """Explicit user constraints stored on the active project — and its
+        title — rendered as a short prefix for the verifier's request view.
+        Empty string when no project is active or the request is not about
+        the project (§4FD scoping). Shape: ``ACTIVE PROJECT CONSTRAINTS
+        (user-mandated, MUST hold): a | b || ACTIVE PROJECT: <title> || USER
+        REQUEST: `` — the constraints clause only when there are any, the
+        title clause only when the record has one; `claim_binding.ask_of`
+        reads the request after the LAST ``|| USER REQUEST: ``."""
         cons = self._active_project_constraints(limit, request_text=request_text)
-        if not cons:
+        title = self._active_project_title(request_text=request_text)
+        if not cons and not title:
             return ""
-        return ("ACTIVE PROJECT CONSTRAINTS (user-mandated, MUST hold): "
-                + " | ".join(cons) + " || USER REQUEST: ")
+        parts = []
+        if cons:
+            parts.append("ACTIVE PROJECT CONSTRAINTS (user-mandated, MUST hold): " + " | ".join(cons))
+        if title:
+            parts.append(f"ACTIVE PROJECT: {title}")
+        return " || ".join(parts) + " || USER REQUEST: "
 
     def _merge_project_constraints(self, request_constraints, user_text=""):
         """Merge stored project constraints into a request's constraint set.

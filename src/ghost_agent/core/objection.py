@@ -1035,7 +1035,12 @@ def _claim_entity_keys(claim: str) -> frozenset:
     of "written as a name" for both tiers."""
     try:
         from . import claim_binding as cb
-        return frozenset(cb.entity_key(e.text) for e in cb.audit_entities(claim, ""))
+        keys = set()
+        for e in cb.audit_entities(claim, ""):
+            k = cb.entity_key(e.text)
+            keys.add(k)
+            keys.add(cb.translit_greek(k))      # the judge writes "Dr. Eleni Vaskez" for the reply's "Δρ. Ελένη Βασκέζ"
+        return frozenset(keys)
     except Exception:  # noqa: BLE001
         return frozenset()
 
@@ -1052,7 +1057,8 @@ def _written_as_a_name(atom: str, claim: str) -> bool:
         key = cb.entity_key(str(atom or "").strip().strip("'\"“”‘’ "))
     except Exception:  # noqa: BLE001
         return False
-    return bool(key) and key in _claim_entity_keys(str(claim or ""))
+    keys = _claim_entity_keys(str(claim or ""))
+    return bool(key) and (key in keys or cb.translit_greek(key) in keys)
 
 
 def _name_present(atom: str, evidence: str) -> bool:
@@ -1062,10 +1068,13 @@ def _name_present(atom: str, evidence: str) -> bool:
     `chess_coach:` and "Net Mon" in `netmon.service` (review §4IP R5 M1/M2
     — a correct attribution was convicted with no appeal)."""
     try:
-        from .claim_binding import _entity_supported, entity_key, normalize_for_containment
+        from .claim_binding import _entity_supported, entity_key, normalize_for_containment, translit_greek
         key = entity_key(atom)
         hay = normalize_for_containment(evidence)
         if _entity_supported(key, hay):
+            return True
+        # the judge's Latin spelling of a Greek name in the source, or the reverse
+        if _entity_supported(translit_greek(key), translit_greek(hay)):
             return True
         squashed = re.sub(r"[\s_\-]+", "", key)
         return len(squashed) >= 6 and squashed in re.sub(r"[\s_\-]+", "", hay)

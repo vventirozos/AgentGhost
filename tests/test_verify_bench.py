@@ -402,3 +402,19 @@ def test_render_report_md_has_headline_and_table():
     assert "TPR (catch rate)" in md
     assert "| fact_swap | REFUTED |" in md
     assert "## two_stage_on" in md
+
+
+# ── §4IP R7 item 2: the opt-in fabrication_names class ─────────────────────
+
+def test_fabrication_names_is_registered_but_not_in_a_default_run():
+    from ghost_agent.eval import verify_bench as B
+    assert B.FAULTS["fabrication_names"][0] == "REFUTED"
+    case = B.BenchCase(case_id="c1", claim="It is 34°C in Athens.", evidence="[web] Athens 34°C", context="weather?")
+    default_faults = {t.fault for t in B.build_trials([case], seed=0)}
+    assert "fabrication" in default_faults and "fabrication_names" not in default_faults
+    named = [t for t in B.build_trials([case], seed=0, fault_names=["fabrication_names"]) if t.fault == "fabrication_names"]
+    assert len(named) == 1 and named[0].expected == "REFUTED" and named[0].claim.startswith(case.claim)
+    assert any(named[0].claim.endswith(f) for _k, f in B.FABRICATION_NAME_SHAPES)
+    kinds = {k for k, _f in B.FABRICATION_NAME_SHAPES}
+    assert kinds == {"particle", "initials", "acronym", "single", "greek"}
+

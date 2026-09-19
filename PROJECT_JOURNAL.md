@@ -43721,3 +43721,154 @@ v28 = v26 bit-identical on both cached pools; corpus 0 turns moved; cache replay
 judge prompts. Open (documented, not blocking): render the active project TITLE in the verifier's
 request view; the fabrication bench class is three injected names; `objection_replay.py` passes no
 cut severity.
+
+## §4IQ — Closing the §4IP leftovers: the project title and the names the bench never measured (2026-09-19, morning) — R0 scope, written first
+**Operator:** "proceed with the remaining tasks, let's finish this today. usual verification protocol."
+**R0 scope.** (1) The verifier's request view carried the active project's CONSTRAINTS but never its
+TITLE (`_active_constraint_note`, agent.py) — a reply that named the project it reported on had
+that name in neither evidence nor context; §4IP R7 saw the objection tier convict it. Readers of the
+note: `verify_claim`'s context (agent.py:13069 only), `claim_binding.ask_of` (reads after the LAST
+`|| USER REQUEST: `), the §4FD pins (`test_4fd_constraint_scoping.py` binds a method subset onto a
+bare object; `test_project_constraints.py` pins `endswith("USER REQUEST: ")` and `""` off-topic).
+(2) The bench's fabrication class = three Latin two-token Title-Case names; the binder's
+`_ENTITY_RE` (`_TC = [A-Z][a-z]…`, one connector, no initials) and therefore the objection tier's
+`_name_shaped`/`_written_as_a_name` were blind to particle runs, initials, Greek/Cyrillic; acronym
+bodies and single tokens are excluded by design (labels, the agent's own node names). (3) The
+scratch `objection_replay.py` passed no cut severity and no context.
+**R1.** (1) `GhostAgent._active_project_title(request_text=)` — the store's `title`, ONLY when the
+request is about the project (the same `_request_relevant_to_project` gate, fail-OPEN on a
+relevance error like the constraints, never raises); `_active_constraint_note` renders
+`ACTIVE PROJECT CONSTRAINTS (…): a | b || ACTIVE PROJECT: <title> || USER REQUEST: ` — constraints
+clause first (the `startswith` pin holds), title clause only when the record has one, `ask_of`
+unaffected. Pins: gate/shape/fail-open/no-project (`test_4fd_constraint_scoping.py` +3), end-to-end
+through `resolve_refute` and `audit_entities` (`test_4ip_uphold_branch.py`). (2) `_UC`/`_LC` =
+Latin + Greek + Cyrillic; `_HONORIFIC` + Δρ/Καθ/κ/κα; `_CONNECT` + των/του/της and a RUN of
+connectors; `_INITIALS` = `([UC]\. ){1,3}` with a mandatory space and `(?<![.\w])` (the tail of
+"U.S." is not initials); `_LEADING_RE` + Greek articles/honorifics for `entity_key`;
+`_entity_supported` tokens `[^\W_][\w-]{2,}` with `_tok_supported`: non-Latin tokens compared
+accent-FOLDED (a capitals headline has no tonos) and at ≥6 letters on the stem minus two letters at
+a word start (Greek inflection: "Δημήτριο Κουφοντίνα" ← "Δημήτρης Κουφοντίνας"); Latin tokens keep
+whole-token matching; `_trim_sentence_initial` drops a non-Latin opener (it used to raise —
+`re.match(...).group` on None — the safe direction is to drop). Bench: opt-in class
+`fabrication_names` (`FABRICATION_NAME_SHAPES`: particle / initials / acronym / single / greek;
+`_OPT_IN_FAULTS` keeps it out of default runs so every cached pool stays comparable). Pins:
+`test_claim_binding.py` (+3 parametrised), `test_4ip_uphold_branch.py` (+2), `test_verify_bench.py`
+(+1). (3) `objection_replay.py` recovers the cut severity from the marker and passes the context.
+**Corpus replay (1,512 turns) after (2):** 0 verdicts moved; 8 turns gained an entity withhold —
+read one by one: every one a name the reply added that the digest did not carry ("Κ. Μητσοτάκης",
+"Μαρίας Γκοντσάρεβα", "Picasso of the Spanish", a different dictionary than the source's; one
+glued-snippet case from the pre-§4IO ddgs defect) — the audit doing its job, UNCERTAIN not REFUTED.
+Two variants that first showed as withholds ("Δημήτριο Κουφοντίνα", "ΕΘΝΙΚΟ ΛΕΞΙΚΟ" in capitals,
+"U.S. Tensions" as initials) drove the stem, the accent folding and the lookbehind.
+**R2 — battery 54: 15 mutants + KNOWNBAD all killed, NOOP survived** (E4 no-accent-folding survived
+the first pass because the stem rule rescued the long-token fixture → a short-token capitals pin;
+four spec anchors regenerated from the file's own lines; P1 rewritten as `if False` because deleting
+the gate left an empty `try`). Pools after (3): mined UPHOLD right 28/0, seed 29/0 (unchanged).
+**Measurement of the new class:** a fresh cache-WRITE run of `fabrication_names` on both pools
+(mined cases 29–89 + seed; clean + fault per case) is running; its live verdicts are the PRE-fix
+binder (the process started before the entity change: `rec-31244579f5 fabrication_names →
+CONFIRMED 1.00`), the cache replay with the current code is the number that counts — appended below.
+**§4IQ R3 — what the class measured (2026-09-19, 07:53–08:00).** The cache-WRITE run finished
+(mined 124 trials / 329 cached responses, seed 58 / 151; both exit=0) and replayed from cache
+with 0 misses. ⚠ The run script did not set `GHOST_CLAIM_BINDING_PRIMARY`, and benches pin the
+three live binder flags off — so w1/r1 measure the INCUMBENT (cheap judge + escalation), not the
+binder, and pre-fix = post-fix bit-for-bit (the entity change touches only the binder and the
+objection tier). What it says about the incumbent on the new class: false-CONFIRM@.7 15/60 mined
+(0.250), 6/29 seed (0.207); by shape (mined, n≈27/27/4/2): the cheap judge CONFIRMS a fabricated
+Greek attribution 9/27 and an acronym body 4/27, catches particle/initials mostly. **Objection tier
+on the class's cheap refutes** (`objection_replay.py`, after teaching it to build the opt-in class's
+trials): mined UPHOLD right 4/48, wrong 0, unresolved 43; seed 4/23. Reading the unresolved issues
+found the reason: **the judge TRANSLITERATES** — it cites "Dr. Eleni Vaskez" for the reply's
+"Δρ. Ελένη Βασκέζ", so the atom's entity key never met the reply's Greek key; acronym bodies (24
+mined) are unresolved by design (an "RFC 7231" the agent knows from memory must not be an
+"absent name"); three seed issues were the judge echoing the fabricated sentence verbatim with no
+absence vocabulary (a judge call). **Fix:** `claim_binding.translit_greek` — accents folded, Greek
+digraphs then letters mapped to their usual Latin spelling, Latin unchanged — tried on BOTH sides
+in `_tok_supported` (a Greek reply's name against an English source: "Μητσοτάκης" / "Mitsotakis"),
+in the objection tier's claim-entity key set and `_written_as_a_name`, and in `_name_present`; it
+only ever ADDS a match. After: class upholds mined 4 → 11 (0 wrong), seed 4 → 6 (0 wrong); pools
+mined 28/0, seed 29/0 unchanged; corpus 0 verdicts moved, 1 entity newly supported ("Έκτωρ
+Κουφοντίνας" ← the source's "Έκτορας Κουφοντίνας"). Pins: `test_claim_binding.py` (+1),
+`test_4ip_uphold_branch.py` (+1, both directions). **Battery 55: 5 mutants + KNOWNBAD killed, NOOP
+survived** (T5 killed after the reverse-direction pin — a judge citing the Greek spelling against a
+Latin-written reply). The binder's OWN arm on the class (`GHOST_CLAIM_BINDING_PRIMARY=1`, cache
+write, ~20 s/trial) is running; its per-shape numbers close this entry.
+**§4IQ R4 — the binder's own arm on the class (2026-09-19, 08:30–08:50).** `GHOST_CLAIM_BINDING_PRIMARY=1`,
+cache write (mined 122 responses, seed 58), replayed from cache after each change with 0 misses.
+Pre-fix binder (p1 — the process started after the entity change, so this IS post-entity-shape):
+false-CONFIRM@.7 on `fabrication_names` **6/60 mined (0.100), 0/29 seed**; by shape (mined):
+greek 0/27 confirmed (23 withheld, 4 REFUTED), initials 0/4, particle 0/2 — the entity shape works —
+and **acronym 6/27 CONFIRMED@.7**, the shape deliberately kept out of the entity regex. A standards
+citation ("IEEE P2851", "ISO 8601", "RFC 3339", "CVE-2024-1234") is an IDENTIFIER, not a name and
+not a figure: `_IDENT_RE` gained a closed-list alternative (`_STANDARD_PREFIX`, capitals only via
+`(?-i:…)` — "en 13" is English; a sentence-final stop may follow the code), so it is looked up
+verbatim and UNSUPPORTED withholds a confirm — never a refute, so an "RFC 7231" the agent knows from
+memory costs at most a withheld confirm. After (p2): **false-CONFIRM 0/60 mined, 0/29 seed**; the
+clean arm unchanged (mined 16 confirmed / 42 withheld / the 2 known true-positive refutes; seed
+14/15/0). The binder's REFUTEDs on the class are the sentence-cap / number-only class checks (the
+appended sentence really breaks a one-sentence request) plus the known `<tool_call` artifact case —
+right label, right ground. Corpus replay after the identifier rule: 0 verdicts moved, 0 new
+identifier withholds (no standards citation in 1,512 replies lacks support). Pins:
+`test_claim_binding.py` (+1). **Battery 56: 3 mutants + KNOWNBAD killed, NOOP survived.**
+**§4IQ totals:** incumbent on the class (w1/r1, judge + escalation): false-CONFIRM 0.250 mined /
+0.207 seed — the cheap judge confirms 9/27 Greek and 4/27 acronym fabrications; objection tier on
+its cheap refutes 4→11 / 4→6 right, 0 wrong (transliteration); binder on the class 0.100→0.000 /
+0.000. Live composite = refute-first + lift-only: on a fabricated name the binder's withhold blocks
+a LIFT; the incumbent's own CONFIRMED still ships (the binder refutes only validated
+contradictions, by design) — the class's remaining exposure is the cheap judge's, adjudicated by
+the main model. Batteries this section: 54 (15/15), 55 (5/5), 56 (3/3). **R8 for §4IQ: 5** (the
+transliteration gap, the acronym-body confirm, `objection_replay` building only default faults,
+the run script without PRIMARY, the missing severity/context in the replay scorer).
+**§4IQ close (2026-09-19 ~08:50):** full suite ONCE after the last edit — **23548 passed, 66
+skipped, exit=0** → `launchctl kickstart -k`, pid 1141 → 39646, health 200. Live probe (a Greek
+name through the web path, origin probe): reply "Kyriakos Mitsotakis … since July 2019"; verifier
+row incumbent CONFIRMED / binder CONFIRMED (2 claims bound, the name supported by the source),
+decided incumbent. Ledger report clean. Memory: claim-binding-verifier-4im updated. **The §4IP
+leftovers are closed:** project title in the request view; particle / initials / Greek names +
+transliteration + standards citations in the audits; the replay scorer reads the pipeline's inputs.
+
+## §4IR — A validated name withhold outranks a cheap CONFIRMED (2026-09-19, 09:10–10:00) — R0 scope, written first
+**Operator:** "proceed with 1, usual verification protocol" — the measured question left by §4IQ.
+**R0.** Live composite = refute-first + lift-only: on a fabricated name the binder WITHHOLDS (UNCERTAIN;
+by design it refutes only validated contradictions) and the incumbent's CONFIRMED ships. The binder's
+withhold is code-validated (name in neither evidence nor context); the cheap judge's confirm is an
+opinion. Candidate rule: cap such a CONFIRMED at `_CONFIRM_WITHHELD_CONF_CAP` (0.6 — the high-stakes
+withhold's contract: label stays, `confirm_withheld`, no refute). Data: four paired pools with both
+verdicts per trial (incumbent D3 / binder v28 mined; D / v28 seed; §4IQ r1 / p2 both pools) joined on
+(case_id, fault) — `scratchpad/withhold_cap_table.py` (rule fires iff incumbent CONFIRMED@≥.7 ∧ binder
+UNCERTAIN with "named entit(y|ies)/identifier(s) not in the evidence"); the 1,512-turn corpus replay
+rows (live `verifier_verdict` beside the binder's withhold kinds).
+**Measurement (before any code):** mined — incumbent false confirms 55, rule removes 23 (fabrication
+15/15, fact_swap 4, omitted 4), caps 5/49 good; seed — removes 10/57 (fabrication 10/10), caps 0/34;
+§4IQ class — removes 15/15 and 6/6, caps 4/49 and 0/28; corpus — 9 of 165 live good CONFIRMEDs
+(5.5%): news-source names in truncated digests, terms the reply knew, the agent's own project title
+×3. Reading the five mined costs: two were an ENTITY-SHAPE slip — a Title-Case dictionary word after a
+bold label / code span and an em dash ("**Acquired Skills** — Two Python", "`mars_distance.py` —
+Related Mars") was not treated as clause-initial, so not trimmed; one was `127.0.0.1` (the agent's
+own URL convention); two genuine (a technical term, a product name from knowledge).
+**R1.** `claim_binding.unsupported_names(res, prior_evidence)` (unsupported entities + non-loopback
+unsupported identifiers, minus any an earlier turn's evidence carried — §4HZ) and
+`name_withhold_caps_confirm(res, truncation_severity, truncation_floor, prior_evidence)` (only on a
+binder UNCERTAIN, never past the truncation floor); `Verifier._cap_confirm_on_name_withhold` at the
+incumbent-decides branch of `_settle_claim_binding`: incumbent CONFIRMED ≥ 0.7 → confidence capped,
+`confirm_withheld`, reasoning appended, WARNING log, escalation-ledger `withheld` row (kind confirm,
+strong_verdict UNCERTAIN), `_stamp_escalation(incumbent, "withheld")` (not strong → never memoised),
+shadow row `capped=[names]`, log "incumbent CONFIRMED CAPPED — unsupported name(s)". Flag
+`GHOST_CLAIM_BINDING_NAME_WITHHOLD` default ON; conftest and `_CLAIM_BINDING_LIVE_FLAGS` pin it off.
+`_settle_claim_binding` takes `evidence` + `prior_evidence`. Entity trim: the sentence-start test
+strips `—–-:•` too. Ledger report: CAPPED count + section. Pins: `test_claim_binding_verifier.py`
+(+3: cap contract with both ledgers; flag off / no name / below the gate; prior evidence / context /
+truncation / loopback / a standards citation), `test_claim_binding.py` (+2), ledger report (+1).
+**R2 — battery 57: 11 mutants + KNOWNBAD killed, NOOP survived; 57b: 2/2** (V5 and L1 rewritten as
+`pass` — deleting the only statement of an `if` body does not compile). **Re-measured after the
+trim fix (cache replays v29 / p3, 0 misses):** mined removes 22/55, caps 3/49 (the table still
+counts `127.0.0.1`, which the rule excludes); seed 10/57, 0/34; class 15/15 + 6/6, caps 3/49 +
+0/28; corpus 0 verdicts moved, 20 turns lost a false entity, live good CONFIRMEDs capped 9 → 6/166
+with the truncation gate (3 of them the project title the §4IQ request view now supplies). Shipped.
+**§4IR close (2026-09-19 ~10:35):** full suite ONCE — **23554 passed, 66 skipped, exit=0** →
+`launchctl kickstart -k`, pid 39646 → 62347, health 200. Live probe (weather, origin probe): reply
+"26.8°C, winds 6.1 km/h"; verifier row incumbent CONFIRMED / binder CONFIRMED, decided incumbent,
+not capped. Ledger report now prints CAPPED (0 today). Read the CAPPED section with the overrides
+each morning: each capped row is a fabrication the cheap judge passed or a name the reply knew — the
+second kind is the rule's price, and its rate over a week is the number to hold it to (bench: 3/49
+and 0/34; corpus: 6/166).

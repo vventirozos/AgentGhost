@@ -404,10 +404,18 @@ def mask_dates(text: str) -> str:
 #: of three or more parts, a hex id carrying both letters and digits (task
 #: ids, hashes), a UUID. `127.0.0.2` read as 127.0 hid a swapped last octet
 #: (mined rec-ca993114e7); as a token it is looked up verbatim.
+#: A standards citation ("IEEE P2851", "ISO 9001", "RFC 7231", "IEEE 802.11",
+#: "CVE-2024-1234") is an identifier, not a name and not a figure: looked up
+#: verbatim, UNSUPPORTED withholds a confirm, a same-skeleton twin refutes.
+#: A closed list of citation prefixes — the acronym-body fabrication the
+#: §4IQ bench class injects was the binder's one remaining false confirm
+#: (6/27 mined), and the entity audit must not admit acronyms (labels).
+_STANDARD_PREFIX = r"(?-i:IEEE|ISO|IEC|RFC|ANSI|ASTM|ITU|ETSI|NIST|DIN|CVE|EN|BS|JIS|PEP)"   # capitals only ("en 13" is English)
 _IDENT_RE = re.compile(
     r"\b\d{1,3}(?:\.\d{1,3}){3}\b"
     r"|\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"
     r"|\bv?\d+(?:\.\d+){2,}\b"
+    rf"|\b{_STANDARD_PREFIX}[ \t-]?[A-Z]?\d{{2,}}(?:[.:-]\d+)*(?!\w)(?!\.\w)"     # a sentence-final stop may follow
     r"|\b(?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{8,}\b", re.IGNORECASE)
 
 
@@ -1503,15 +1511,22 @@ def audit_identifiers(reply: str, evidence: str, context: str = "") -> List[Audi
 # UNSUPPORTED: CONFIRMED is withheld (the evidence does not cover the
 # reply), never a refute (the reply may know it; phase 2 decides).
 
-_TC = r"[A-Z][a-z][\w'’-]*"
-_CONNECT = r"(?:of|the|for|and|de|von|van|da|di|du|la|le|del|der)"
-_HONORIFIC = r"(?:Dr|Prof|Mr|Mrs|Ms|Sir|Dame|Lord|Lady)\.?"
+#: A Title-Case token: Latin, Greek or Cyrillic capital + lowercase (§4IP R7:
+#: the audit was blind to every non-Latin name). All-caps tokens stay out
+#: ("VALUE line", "JSON object" are labels), as do single tokens.
+_UC = r"A-ZΑ-ΩΆ-ΏА-ЯЁ"
+_LC = r"a-zα-ωά-ώϊϋΐΰа-яё"
+_TC = rf"[{_UC}][{_LC}][\w'’-]*"
+_CONNECT = r"(?:of|the|for|and|de|von|van|da|di|du|la|le|del|der|των|του|της)"
+_HONORIFIC = r"(?:Dr|Prof|Mr|Mrs|Ms|Sir|Dame|Lord|Lady|Δρ|Καθ|κ|κα)\.?"
+_INITIALS = rf"(?:[{_UC}]\.[ \t]){{1,3}}"       # "J. K. Thornwood", "A. Lindqvist" — a space after each initial ("U.S. Tensions" is not a name)
 _SP = r"[ \t]{1,2}"            # masked code/URLs leave long runs of spaces: never bridge them
 _ENTITY_RE = re.compile(
     rf"\b(?:{_HONORIFIC}{_SP}{_TC}(?:{_SP}{_TC})*"
-    rf"|{_TC}(?:{_SP}(?:{_CONNECT}{_SP})?{_TC})+)")
+    rf"|(?<![.\w]){_INITIALS}{_TC}"                      # not the tail of "U.S."
+    rf"|{_TC}(?:{_SP}(?:{_CONNECT}{_SP})*{_TC})+)")       # a RUN of connectors: "Anneli van der Berg"
 _HONORIFIC_RE = re.compile(rf"^{_HONORIFIC}\s")
-_LEADING_RE = re.compile(r"^(?:the|dr|prof|mr|mrs|ms|sir|dame|lord|lady)\.?\s+", re.I)
+_LEADING_RE = re.compile(r"^(?:the|dr|prof|mr|mrs|ms|sir|dame|lord|lady|δρ|καθ|κ|κα|η|ο|το|τον|την)\.?\s+", re.I)
 _SKIP_LINE_RE = re.compile(r"^\s*(?:#|\||\*\*[^*]+\*\*\s*$|>)")
 _BOLD_LEADIN_RE = re.compile(r"(?m)^\s*(?:[-*•]\s*)?\*\*[^*\n]{1,60}\*\*:?")   # "**All Systems Online** — …": a label, not a name
 _FIRST_TOKEN_RE = re.compile(rf"^{_TC}(?:{_SP}{_CONNECT})?{_SP}")
@@ -1536,7 +1551,10 @@ def _trim_sentence_initial(text: str) -> str:
     m = _FIRST_TOKEN_RE.match(text)
     if not m:
         return text
-    first = re.match(r"[A-Za-z'’-]+", text).group(0).lower()
+    fm = re.match(r"[A-Za-z'’-]+", text)
+    if fm is None:
+        return text[m.end():]              # a non-Latin opener: no word list can vouch for it — drop it (the safe direction)
+    first = fm.group(0).lower()
     words = _dictionary()
     if words and first not in words:
         return text
@@ -1560,11 +1578,68 @@ def entity_key(text: str) -> str:
     return re.sub(r"'s$", "", k).strip()
 
 
+def _fold_accents(text: str) -> str:
+    """Combining marks dropped: a Greek headline in capitals carries no tonos
+    ("ΕΘΝΙΚΟ ΛΕΞΙΚΟ" lower-cases to "εθνικο", the reply writes "εθνικό")."""
+    return "".join(ch for ch in unicodedata.normalize("NFD", text) if unicodedata.category(ch) != "Mn")
+
+
+#: Greek → Latin, the way a judge or an English source writes a Greek name
+#: ("Δρ. Ελένη Βασκέζ" → "dr. eleni vaskez", "Μητσοτάκης" → "mitsotakis").
+#: Digraphs first, then letters; accents folded before. Used only to ADD a
+#: match (a name found under transliteration is supported / present) —
+#: never to deny one.
+_GREEK_DIGRAPHS = (("ου", "ou"), ("αυ", "av"), ("ευ", "ev"), ("ηυ", "iv"), ("μπ", "b"), ("ντ", "d"),
+                   ("γκ", "g"), ("γγ", "ng"), ("γχ", "nch"), ("τσ", "ts"), ("τζ", "tz"))
+_GREEK_LETTERS = str.maketrans({
+    "α": "a", "β": "v", "γ": "g", "δ": "d", "ε": "e", "ζ": "z", "η": "i", "θ": "th", "ι": "i", "κ": "k",
+    "λ": "l", "μ": "m", "ν": "n", "ξ": "x", "ο": "o", "π": "p", "ρ": "r", "σ": "s", "ς": "s", "τ": "t",
+    "υ": "y", "φ": "f", "χ": "ch", "ψ": "ps", "ω": "o"})
+
+
+def translit_greek(text: str) -> str:
+    """Lower-cased, accent-folded, Greek letters mapped to their usual Latin
+    spelling; Latin text passes through unchanged."""
+    t = _fold_accents(str(text or "").lower())
+    if not re.search(r"[α-ω]", t):
+        return t
+    for src, dst in _GREEK_DIGRAPHS:
+        t = t.replace(src, dst)
+    return t.translate(_GREEK_LETTERS)
+
+
+def _tok_supported(t: str, hay: str, hay_folded: str) -> bool:
+    """One name token in the haystack. A Greek/Cyrillic token INFLECTS
+    ("Δημήτριο Κουφοντίνα" in the reply, "Δημήτρης Κουφοντίνας" in the
+    source) and loses its accents in capitals, so a non-Latin token is
+    compared accent-folded and, at six or more letters, on its stem — the
+    token minus its last two letters, at a word start (corpus replay §4IP
+    R7: eight Greek turns gained a withhold, and the objection tier would
+    have convicted the inflected spelling as an absent name)."""
+    if t in hay:
+        return True
+    if re.fullmatch(r"[a-z0-9\-]+", t):
+        return False
+    tf = _fold_accents(t)
+    if tf in hay_folded:
+        return True
+    if len(tf) >= 6 and re.search(r"(?<![^\W_])" + re.escape(tf[:-2]), hay_folded) is not None:
+        return True
+    # a Greek name in the reply, an English source ("Μητσοτάκης" / "Mitsotakis")
+    tl = translit_greek(tf)
+    if tl != tf and (tl in hay_folded or (len(tl) >= 6 and re.search(r"(?<![^\W_])" + re.escape(tl[:-2]), hay_folded))):
+        return True
+    return False
+
+
 def _entity_supported(key: str, hay: str) -> bool:
     if key in hay:
         return True
-    toks = [t for t in re.findall(r"[a-z0-9][\w-]{2,}", key) if t not in _ANCHOR_STOP]
-    return bool(toks) and all(t in hay for t in toks)      # "Vasquez, Elin" still covers "Elin Vasquez"
+    toks = [t for t in re.findall(r"[^\W_][\w-]{2,}", key) if t not in _ANCHOR_STOP]   # Greek/Cyrillic tokens too
+    if not toks:
+        return False
+    hay_folded = _fold_accents(hay) if any(not re.fullmatch(r"[a-z0-9\-]+", t) for t in toks) else hay
+    return all(_tok_supported(t, hay, hay_folded) for t in toks)      # "Vasquez, Elin" still covers "Elin Vasquez"
 
 
 def audit_entities(reply: str, evidence: str, context: str = "") -> List[AuditEntity]:
@@ -1584,7 +1659,10 @@ def audit_entities(reply: str, evidence: str, context: str = "") -> List[AuditEn
             text = m.group(0)
             abs_pos = start + m.start()
             s_start, s_end = _sentence_span(prose, abs_pos)
-            if prose[s_start:abs_pos].strip(" \t*_") == "":            # opens its sentence
+            # opens its sentence — or its clause after a bold label / code span and a
+            # dash or colon ("**Acquired Skills** — Two Python scripts", "`x.py` — Related
+            # Mars script"): the opener's capital is punctuation, not a name (§4IR)
+            if prose[s_start:abs_pos].strip(" \t*_—–-:•") == "":
                 text = _trim_sentence_initial(text)
                 if not _ENTITY_RE.fullmatch(text):
                     continue
@@ -1595,6 +1673,47 @@ def audit_entities(reply: str, evidence: str, context: str = "") -> List[AuditEn
             status = "supported" if _entity_supported(key, hay) else "unsupported"
             out.append(AuditEntity(text.strip(), prose[s_start:s_end].strip(), status))
     return out
+
+
+# ── §4IR: a validated name withhold outranks a cheap CONFIRMED ──────────
+# The binder never refutes on an unsupported name (it might be a name the
+# agent knows), but its withhold is CODE-validated — the name is in neither
+# the evidence nor the request/project note — while the incumbent's CONFIRMED
+# on the same reply is an opinion. Measured on the paired pools (§4IR): the
+# cheap judge confirmed every fabricated-name trial the binder withheld on
+# (15/15 mined, 10/10 seed; the §4IQ class 15/15 + 6/6) and 8 more
+# fact-swap/omission trials; the price was 5/49 mined and 0/34 seed good
+# confirms, 9/165 live ones. The rule caps such a CONFIRMED at the withheld
+# confidence — UNCERTAIN to every consumer, never a refute.
+_LOOPBACK_ID_RE = re.compile(r"^(?:127\.\d{1,3}\.\d{1,3}\.\d{1,3}|0\.0\.0\.0|localhost)$", re.I)
+
+
+def unsupported_names(res: "ClaimBindingResult", prior_evidence: str = "") -> List[str]:
+    """The names and identifiers the binder found in NEITHER evidence nor
+    context — minus any an earlier turn's evidence carried (§4HZ: a proof of
+    invention is against the whole session) and minus loopback addresses
+    (the agent's own URL convention, not a fact about the world)."""
+    names = [e.text for e in (res.entities or []) if getattr(e, "status", "") == "unsupported"]
+    names += [a.text for a in (res.audit or [])
+              if getattr(a, "family", "") == "identifier" and getattr(a, "status", "") == "unsupported"
+              and not _LOOPBACK_ID_RE.match(str(a.text or ""))]
+    if prior_evidence and names:
+        hay = normalize_for_containment(prior_evidence)
+        names = [n for n in names if not _entity_supported(entity_key(n), hay)]
+    return names
+
+
+def name_withhold_caps_confirm(res: Optional["ClaimBindingResult"], *, truncation_severity: float,
+                               truncation_floor: float, prior_evidence: str = "") -> List[str]:
+    """The names that justify capping a cheap CONFIRMED, or [] when nothing
+    does: the binder withheld (UNCERTAIN, no contradiction), at least one
+    name/identifier is unsupported across the session, and the digest was
+    not cut past the floor (an absence from a cut digest proves little)."""
+    if res is None or res.verdict != "UNCERTAIN":
+        return []
+    if truncation_severity >= truncation_floor:
+        return []
+    return unsupported_names(res, prior_evidence)
 
 
 # ── §4IN phase 2: the class checks ──────────────────────────────────────

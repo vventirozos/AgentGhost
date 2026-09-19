@@ -57,6 +57,7 @@ for _live_var, _live_default in (
         # turns each mode on explicitly.
         ("GHOST_CLAIM_BINDING_REFUTE_FIRST", "0"),
         ("GHOST_CLAIM_BINDING_CONFIRM_FIRST", "0"),
+        ("GHOST_CLAIM_BINDING_NAME_WITHHOLD", "0"),
         ("GHOST_CLAIM_BINDING_SHADOW", "0"),
 ):
     os.environ[_live_var] = _live_default
