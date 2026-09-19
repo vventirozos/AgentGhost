@@ -47,6 +47,117 @@ def note_repeated_failure(sigs: dict, fname, error, threshold: int = 3):
     return sig, count, count >= threshold
 
 
+#: §4IB — the execute-loop class the breaker could not see (req 21b295ef,
+#: 2026-09-17). Twenty turns of `Grid('reduced_gg, npoints=127')` variants,
+#: every run printing the same `cannot build grid without 'type'` — and
+#: every run EXIT 0, because the model's own try/except printed the error.
+#: `note_failure` never saw a failure; `note_action` skips `execute` (it is
+#: a mutating tool); and even keyed on the result, the output carried a
+#: catalog dump of MEMORY ADDRESSES that differed on every run, so no two
+#: results would ever have shared a fingerprint. The signal is the ERROR
+#: LINE with the volatile tokens normalised out, keyed on the command HEAD
+#: (the program that ran), not the heredoc that changed a little each turn.
+_VOLATILE_RES = (
+    (re.compile(r"0x[0-9a-fA-F]{4,}"), "0xADDR"),
+    (re.compile(r"\b[0-9a-f]{16,}\b"), "HEX"),
+    (re.compile(r"\b\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?\b"), "TIME"),
+    (re.compile(r"\b\d{4}-\d{2}-\d{2}\b"), "DATE"),
+    (re.compile(r"\b(?:pid|PID)[ =:]+\d+\b"), "pid=N"),
+    (re.compile(r"/tmp/[\w.\-]+"), "/tmp/X"),
+    # The model's own `print(f"ERR: {spec!r} -> {e}")` puts the THING IT
+    # TRIED inside quotes — the one part that changes per attempt while the
+    # error stays the same. Quoted literals collapse.
+    (re.compile(r"'[^'\n]{0,200}'"), "'…'"),
+    (re.compile(r'"[^"\n]{0,200}"'), '"…"'),
+)
+_ERROR_LINE_RE = re.compile(
+    r"(?:Traceback \(most recent call last\)|\b[A-Za-z]*(?:Error|Exception)\b|"
+    r"\bcannot\b|\bfailed\b|\bfailure\b|No module named|No such file|not found|"
+    r"\bKilled\b|\bERR[:\s]|\bexit(?:\s*code)?\s*[=:]\s*[1-9]|EXIT CODE:\s*[1-9])",
+    re.IGNORECASE,
+)
+#: The target suffix the dispatch pipeline keys the execute same-error
+#: class under (`"<head> (same error)"`); `note_world_changed` keeps those.
+SAME_ERROR_TARGET_SUFFIX = "(same error)"
+
+
+def is_same_error_signature(sig: str) -> bool:
+    """True for a `note_action` signature (`tool|target|fp`) of the execute
+    same-error class."""
+    parts = str(sig or "").split("|", 2)
+    return len(parts) == 3 and parts[1].endswith(SAME_ERROR_TARGET_SUFFIX)
+
+
+#: Soft steer after this many same-error runs of one command head …
+EXECUTE_SAME_ERROR_STEER = 3
+#: … and a forced report (not an abort marker) after this many.
+EXECUTE_SAME_ERROR_HARD_STOP = 5
+
+
+def normalise_volatile(text: str) -> str:
+    """Collapse the tokens that change on every run of the same failure —
+    memory addresses, long hex ids, clock times, dates, pids, temp names —
+    so two prints of one error compare equal. Digits that carry meaning
+    (a count, a line number) are kept."""
+    out = str(text or "")
+    for rx, rep in _VOLATILE_RES:
+        out = rx.sub(rep, out)
+    return out
+
+
+def error_line(output: str) -> str:
+    """The LAST line of a tool result that names a failure, or "" when no
+    line does (a clean result is not an error, however long). Last, not
+    first: a traceback opens with its header and ends with the exception
+    that matters; a probe script prints its verdict after its attempts."""
+    found = ""
+    lines = [ln.strip() for ln in str(output or "").splitlines() if ln.strip()]
+    for s in lines:
+        if _ERROR_LINE_RE.search(s):
+            found = s[:240]
+    if found:
+        return found
+    # A DECLARED failure (a `ToolOutcome` whose status is not ok/unresolved
+    # — a refusal, a failed run) is an error whatever its prose says: its
+    # first line is the failure it names. Read the status, never only the
+    # text (the outcome-consumers R3 rule).
+    _st = getattr(output, "status", None)
+    _sv = getattr(_st, "value", _st)
+    if _sv is not None and str(_sv) not in ("ok", "unresolved") and lines:
+        return lines[0][:240]
+    return ""
+
+
+#: The first exception NAME on an error line (`RuntimeError`, `SpecError`,
+#: `eckit.SpecError`, `ModuleNotFoundError`). §4IE: the model's probe
+#: harnesses label each attempt UNQUOTED — `dict npts=31: ERR RuntimeError:
+#: SpecError: [pl]` / `ERR  dict nxacc=16: RuntimeError: SpecError: [pl]` —
+#: so 20 runs of one dead end fingerprinted as 20 different errors and the
+#: same-error breaker never fired (probe ifs18371…, 36 executes, no steer).
+#: The error IS the exception and what follows it; the label is the thing
+#: that was tried.
+_EXC_TOKEN_RE = re.compile(r"\b[A-Za-z_][\w.]*(?:Error|Exception)\b")
+
+
+def exception_signature(line: str) -> str:
+    """`line` from its first exception name onward; the whole line when it
+    names none (a `No module named x` / `not found` line has no label to
+    strip and stays as it is)."""
+    m = _EXC_TOKEN_RE.search(str(line or ""))
+    return str(line or "")[m.start():] if m else str(line or "")
+
+
+def error_line_fingerprint(output: str) -> str:
+    """Fingerprint of the result's error line under `normalise_volatile`
+    and `exception_signature`; "" when the result has no error line. This
+    — not the whole output — is what an `execute` run is counted under."""
+    line = error_line(output)
+    if not line:
+        return ""
+    norm = re.sub(r"\s+", " ", exception_signature(normalise_volatile(line))).strip().lower()
+    return hashlib.sha1(norm.encode("utf-8", "ignore")).hexdigest()[:12]
+
+
 def action_result_fingerprint(result: str) -> str:
     """Whitespace-normalised fingerprint of a tool result.
 
@@ -324,8 +435,17 @@ class StrikeLedger:
         breaker. Counts restart from zero; the abort backstop still
         protects against endless edit→observe cycles because each fresh
         observation run needs threshold repeats WITHOUT an intervening
-        write to trip again, and the turn cap bounds the whole loop."""
-        self.action_sigs.clear()
+        write to trip again, and the turn cap bounds the whole loop.
+
+        §4IG: the execute SAME-ERROR class is exempt. Its count grows only
+        when the SAME error line recurs, and the live pattern is precisely
+        write-probe → run → same error → write-probe → run … (probe
+        ifs19450…: 6 identical `SpecError: [pl]` runs, each preceded by a
+        new probeN.py, never counted past 2). A rewrite that produced the
+        same error is not progress; a rewrite that fixed it produces a
+        different line and never increments the old signature."""
+        self.action_sigs = {k: v for k, v in self.action_sigs.items()
+                            if is_same_error_signature(k)}
 
     @property
     def decay_frozen(self) -> bool:

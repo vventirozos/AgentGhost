@@ -310,6 +310,10 @@ def test_verifier_digest_covers_objection_py():
     assert "objection.py" in names, (
         "objection.py decides UPHOLD/DISMISS before the escalation runs — it "
         "moves verdicts directly and must be fingerprinted")
+    # §4IP review: objection.py delegates its shape rules to the binder and the
+    # all-failed uphold to the outcome sniffer — both move verdicts now
+    assert {"claim_binding.py", "outcome_heuristics.py"} <= names
+    assert all(Path(p).exists() for p in paths), "a fingerprinted path that does not exist certifies nothing"
 
 
 def test_editing_objection_py_changes_the_verifier_digest(tmp_path):

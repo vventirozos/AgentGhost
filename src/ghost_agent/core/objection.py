@@ -78,6 +78,7 @@ path (`verify_code_output`), and it sits behind
 
 from __future__ import annotations
 
+import functools
 import itertools
 import logging
 import os
@@ -370,7 +371,9 @@ _ABSENCE_RE = re.compile(
 # shape for the +++/--- pair.
 _ARTIFACT_MARKERS = ("@@", "<<<<", ">>>>", "\x1b[",
                      "<tool_call", "<parameter=", "<arg_key>")
-_DIFF_HEADER_RE = re.compile(r"(?m)^(\+\+\+|---)[ \t]\S")
+# A diff header names a FILE ("--- a/foo.py", "+++ /dev/null"); a banner
+# ("--- SYSTEM HEALTH DIAGNOSTICS ---") is prose (corpus replay §4IN).
+_DIFF_HEADER_RE = re.compile(r"(?m)^(\+\+\+|---)[ \t](?=a/|b/|/dev/null|\S*[\w-]\.\w{1,6}\b)\S")
 _FENCED_BLOCK_RE = re.compile(r"```.*?```", re.S)
 # Inline code spans are FLAGGED presentation exactly like fences
 # (round-2 M3: "the hunk header `@@ -1,3 +1,3 @@` marks…" was convicted
@@ -785,6 +788,208 @@ def _canon(s: str) -> str:
     return s
 
 
+_NEXT_STEP_OPENER_RE = re.compile(
+    r"^\W*(?:moving on to|next(?: up)?[:,]?\s|up next|now (?:i(?:'|’)?ll|i will|let me)|then i(?:'|’)?ll|i(?:'|’)?ll (?:now |next )?)",
+    re.IGNORECASE)
+
+
+def _names_next_step(atom: str, claim: str) -> bool:
+    """The claim sentence that carries the name OPENS as a stated next step
+    ("Moving on to the next one: **Meta-Emotion Test**"): the name is the
+    reply's own plan, not a fact about the world the evidence could carry
+    (rule 4's shape, applied to the name branch — review §4IP R7 M2)."""
+    try:
+        from . import claim_binding as cb
+    except Exception:  # noqa: BLE001
+        return False
+    core = str(atom or "").strip().strip("'\"“”‘’ ")
+    text = str(claim or "")
+    m = re.search(re.escape(core), text)
+    if not m:
+        return False
+    sentence = cb._sentence_at(text, m.start()).lstrip("*_#>- \t")
+    return bool(_NEXT_STEP_OPENER_RE.match(sentence))
+
+
+def _evidence_all_failed(evidence: str) -> bool:
+    try:
+        from . import claim_binding as cb
+        return bool(cb.evidence_all_failed(evidence))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _reports_failure(claim: str) -> bool:
+    """The reply tells the user something went wrong — the shared detector
+    the outcome rule uses (`response_acknowledges_failure`)."""
+    try:
+        from ..distill.outcome_heuristics import response_acknowledges_failure
+        return bool(response_acknowledges_failure(str(claim or "")))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _total_ungrounding(claim: str, evidence: str) -> str:
+    """Why an absence is total, or "" when it is not: every evidence block a
+    tool failure / empty retrieval, or no content word of the claim in the
+    evidence at all. Delegates the block reading to `core.claim_binding`."""
+    try:
+        from . import claim_binding as cb
+    except Exception:  # noqa: BLE001
+        return ""
+    if not cb.evidence_blocks(evidence):
+        return ""                                   # absence from NOTHING proves nothing (an empty digest)
+    if cb.evidence_all_failed(evidence):
+        # silent_failure means the reply is SILENT about the failure; a reply
+        # that reports it ("python3 itself fails with 1", "the fetch didn't
+        # work, so I couldn't get the page") is not convicted — the turn
+        # loop's own honest-failure detector decides what "reports" means
+        # (review §4IP R7 M3: a negation regex missed contractions and
+        # failure verbs)
+        if not cb._NEGATION_RE.search(str(claim or "")) and not _reports_failure(claim):
+            return "every evidence block is a tool failure"
+        return ""
+    hay = cb.normalize_for_containment(evidence)
+    def _latin_content(text: str) -> list:
+        return [w for w in re.findall(r"\w+", cb.normalize_for_containment(text))
+                if len(w) >= 4 and w not in cb._ANCHOR_STOP and w not in cb._ASK_FRAMING and not w.isdigit()
+                and re.fullmatch(r"[a-z][a-z0-9_-]*", w)]
+    words = _latin_content(claim)
+    # a short or non-Latin reply cannot prove it — and neither can a digest
+    # that carries no Latin words of its own (a Greek source, a numbers-only
+    # command output): absence of shared words is then by construction
+    # (review §4IP R7 M4)
+    if len(words) >= 6 and len(_latin_content(evidence)) >= 6:
+        if any(w in hay or (len(w) >= 6 and w[:5] in hay) for w in words):
+            return ""
+        # a figure, clock or date the evidence also states is grounding too:
+        # "The current host time is Thu Jul 30 13:07:12 UTC 2026" against the
+        # same string in `[execute]` shares no ≥4-letter word; "has 7 lines"
+        # against `STDOUT: 7` is grounded by the 7 standing whole
+        c_ev = _canon(_strip_packer_marks(evidence))
+        tokens = set(re.findall(r"\d[\d:.,-]*\d|\d", cb.normalize_for_containment(claim)))
+        if any((len(t) >= 2 and t in hay) or _number_present(t, c_ev) for t in tokens):
+            return ""
+        return "no content word of the reply occurs in the evidence"
+    return ""
+
+
+def _same_quantity_plausible(claim_atom: str, ev_atom: str, claim: str, evidence: str) -> bool:
+    """False when the pair cannot be one quantity misreported: either
+    figure is written inside a clock/date token wherever it occurs, or the
+    evidence figure's line is a dense record (three or more same-family
+    figures) that the claim's sentence does not align with. Delegates the
+    shape rules to `core.claim_binding` so there is one definition of "same
+    quantity". Lookups run on comma-stripped text (the atoms are); a figure
+    that cannot be located is UNPROVEN, never plausible (review §4IP R5 M5:
+    a struct literal with thousands separators bypassed the guard)."""
+    try:
+        from . import claim_binding as cb
+    except Exception:  # noqa: BLE001
+        return False
+    def _plain(text: str) -> str:
+        return re.sub(r"(?<=\d),(?=\d)", "", str(text or ""))
+    claim_p, ev_p = _plain(claim), _plain(evidence)
+    def _occurrences(tok: str, text: str):
+        return list(re.finditer(r"(?<![\w.])" + re.escape(tok) + r"(?![\w])", text))
+    def _clockish(tok: str, text: str) -> bool:
+        """EVERY occurrence of the figure sits inside a clock or date token
+        ("18:38", "15:36:58Z", "2026-07-30"); a count that also appears in
+        a clock elsewhere is still a count (review m2)."""
+        occ = _occurrences(tok, text)
+        if not occ:
+            return False
+        for m in occ:
+            window_lo, window_hi = max(0, m.start() - 12), m.end() + 12
+            window = text[window_lo:window_hi]
+            inside = False
+            for dm in list(cb._DATE_TIME_RE.finditer(window)) + list(re.finditer(r"\d{1,2}:\d{2}(?::\d{2})?", window)):
+                a, b = window_lo + dm.start(), window_lo + dm.end()
+                if a <= m.start() and m.end() <= b:
+                    inside = True
+                    break
+            if not inside:
+                return False
+        return True
+    if _clockish(claim_atom, claim_p) or _clockish(ev_atom, ev_p):
+        return False
+    ev_line = next((ln for ln in ev_p.splitlines() if _occurrences(ev_atom, ln)), "")
+    if not ev_line:
+        return False                       # cannot locate the evidence figure: unproven
+    try:
+        from ..distill.outcome_heuristics import _looks_like_tool_error
+        if _looks_like_tool_error(cb._strip_label(ev_line)):
+            return False                   # "HTTP 403 Forbidden": a status, not the value of anything
+    except Exception:  # noqa: BLE001
+        pass
+    qs = cb.extract_quantities(claim_atom)
+    if not qs:
+        return False
+    occ = _occurrences(claim_atom, claim_p)
+    if not occ:
+        return False                       # cannot locate the claim figure: unproven
+    if _occurrences(ev_atom, claim_p):
+        # the counter-figure is a CLAIM figure too: the reply knows both
+        # numbers, so they are two quantities of its own ("15 tasks total
+        # (10 done, 5 pending)", "28°C now, 18°C tonight", "9,592 primes …
+        # 0.04 seconds" quoted whole) — the binder's `_claim_states` rule
+        # (review §4IP R6 cache replay, R7 m1). A projection that quotes the
+        # evidence figure ("3 users, so 500") escalates to the judge.
+        return False
+    sentence = cb._sentence_at(claim_p, occ[0].start())
+    if not cb._dense(qs[0], cb._strip_label(ev_line)):
+        return True
+    return cb._aligned(sentence, cb._strip_label(ev_line))
+
+
+def _claim_figure_supported(raw: str, claim: str, evidence: str) -> bool:
+    """The binder's agreement rule applied to the anchoring step: the claim
+    figure, read WITH its unit and precision where the claim writes it,
+    agrees with some evidence quantity — rounding at the claim's precision
+    ("0.04 seconds" ← `elapsed = 0.041s`), unit conversion ("about 212 KB"
+    ← `total 217,088 bytes`). Such a figure is SUPPORTED, not
+    claim-exclusive, and cannot be the convicting side of a numeric
+    contradiction. Exact presence is checked by the caller; this is
+    `core.claim_binding.quantities_agree`, one definition of agreement
+    (review §4IP R6 cache replay: two constraint complaints quoting a whole
+    reply were upheld as "9,592 vs 0.04" and "14 vs 212")."""
+    try:
+        from . import claim_binding as cb
+    except Exception:  # noqa: BLE001
+        return False
+    def _plain(text: str) -> str:
+        return re.sub(r"(?<=\d),(?=\d)", "", str(text or ""))
+    tok = _plain(raw)
+    claim_p = _plain(claim)
+    m = re.search(r"(?<![\w.])" + re.escape(tok) + r"(?![\w])", claim_p)
+    if not m:
+        return False
+    s_start, s_end = cb._sentence_span(claim_p, m.start())
+    sentence = claim_p[s_start:s_end]
+    off = m.start() - s_start
+    # the quantity AT the figure's position (a range covers both of its
+    # ends; a prefix match read "20" as "200 users" and never found a
+    # range's high end — review §4IP R7 M1)
+    cqs = [q for q, pos in cb.extract_quantities_with_pos(sentence) if pos <= off < pos + len(q.text)]
+    if not cqs:
+        return False
+    hedged = cb._hedged(sentence)
+    try:
+        evs = cb.extract_quantities(evidence)[:600]
+    except Exception:  # noqa: BLE001
+        return False
+    for cq in cqs[:2]:
+        for eq in evs:
+            if eq.family != cq.family:
+                continue                   # the binder compares within a family: 60 is not "1 min"
+            try:
+                if cb.quantities_agree(cq, eq, hedged=hedged):
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+    return False
+
+
 def _cited_atoms(issue: str) -> List[Tuple[str, bool]]:
     """The concrete things an absence complaint says are missing, as
     (atom, is_number): quoted fragments and bare numbers."""
@@ -798,7 +1003,97 @@ def _cited_atoms(issue: str) -> List[Tuple[str, bool]]:
     # filtered, leaving only the substring-matched quote.
     atoms += [(raw.replace(",", ""), True)
               for _v, raw, _u in _numbers_with_units(issue) if raw.strip()]
+    # §4IP: the judge rarely quotes a fabricated NAME ("The claim cites Dr.
+    # Elin Vasquez, but this name is not present") — an unquoted Title-Case
+    # run of two or more words is a cited name too. Reuses the binder's
+    # entity shape (core.claim_binding) so there is one definition.
+    try:
+        from .claim_binding import _ENTITY_RE, _trim_sentence_initial
+        quoted = {a.lower() for a, _n in atoms}
+        names = []
+        for m in _ENTITY_RE.finditer(issue):
+            at_sentence_start = m.start() == 0 or bool(re.search(r"[.!?;:]\s*$", issue[:m.start()]))
+            name = (_trim_sentence_initial(m.group(0)) if at_sentence_start else m.group(0)).strip()
+            name = name.strip("'\u2019\"")   # a closing quote glued to the last token (the run regex admits ’ inside)
+            if len(name.split()) >= 2 and name.lower() not in quoted and not _ISSUE_FRAMING_RE.fullmatch(name):
+                names.append((name, False))
+        atoms = names + atoms                 # a name is never truncated away behind a run of numbers
+    except Exception:  # noqa: BLE001
+        pass
     return atoms[:25]
+
+
+#: Title-Case runs the judge writes that are framing, not names.
+_ISSUE_FRAMING_RE = re.compile(r"(?i)(?:the )?(?:claim|evidence|tool output|user request|reply|answer)s?(?: \w+)?")
+
+
+@functools.lru_cache(maxsize=64)
+def _claim_entity_keys(claim: str) -> frozenset:
+    """The names the BINDER lists in this reply (`audit_entities` with no
+    evidence): its prose mask skips headings, bold lead-in labels, code and
+    tables, and trims a sentence-initial dictionary word — one definition
+    of "written as a name" for both tiers."""
+    try:
+        from . import claim_binding as cb
+        return frozenset(cb.entity_key(e.text) for e in cb.audit_entities(claim, ""))
+    except Exception:  # noqa: BLE001
+        return frozenset()
+
+
+def _written_as_a_name(atom: str, claim: str) -> bool:
+    """The REPLY wrote it as a proper noun: the atom is one of the entities
+    the binder's own audit lists for the claim. "All Tests Passed" cited
+    by the judge against "all tests passed" is a status the judge
+    capitalised; `**Memory Usage**: 21 GB` is a bold label the binder
+    masks; "## Next Steps" is a heading; "Karlsen Institute" in "the
+    Karlsen Institute audited it" is a name (review §4IP R5 M4, R7 M2)."""
+    try:
+        from . import claim_binding as cb
+        key = cb.entity_key(str(atom or "").strip().strip("'\"“”‘’ "))
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(key) and key in _claim_entity_keys(str(claim or ""))
+
+
+def _name_present(atom: str, evidence: str) -> bool:
+    """A NAME is present when the binder's entity test finds it: honorific
+    and possessive stripped, tokens matched in any order, so "Karlsen
+    Institute's" is found in "the Karlsen Institute", "Chess Coach" in
+    `chess_coach:` and "Net Mon" in `netmon.service` (review §4IP R5 M1/M2
+    — a correct attribution was convicted with no appeal)."""
+    try:
+        from .claim_binding import _entity_supported, entity_key, normalize_for_containment
+        key = entity_key(atom)
+        hay = normalize_for_containment(evidence)
+        if _entity_supported(key, hay):
+            return True
+        squashed = re.sub(r"[\s_\-]+", "", key)
+        return len(squashed) >= 6 and squashed in re.sub(r"[\s_\-]+", "", hay)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _name_shaped(atom: str) -> bool:
+    """A quoted or cited fragment that NAMES something: after the honorific
+    and possessive are stripped, two or more Title-Case words in the
+    binder's entity shape — not a date/clock, not a path or dotted
+    identifier, not a quoted sentence, not a status label in capitals."""
+    a = str(atom or "").strip().strip("'\"“”‘’ ")
+    if not a:
+        return False
+    try:
+        from .claim_binding import _DATE_TIME_RE, _ENTITY_RE
+    except Exception:  # noqa: BLE001
+        return False
+    if _DATE_TIME_RE.search(a):
+        return False
+    core = re.sub(r"^(?:the|dr|prof|mr|mrs|ms|sir|dame|lord|lady)\.?\s+", "", a, flags=re.I)
+    core = re.sub(r"['’]s?$", "", core).strip()
+    # the binder's entity shape decides — a Title-Case run of two or more
+    # words with connectors: it admits no sentence punctuation, no all-caps
+    # token, no single token, no digits (the guards this once listed
+    # separately were implied by it — review §4IP R7 instruments)
+    return bool(_ENTITY_RE.fullmatch(core))
 
 
 def _number_present(atom: str, canon_text: str) -> bool:
@@ -830,8 +1125,11 @@ def _number_present(atom: str, canon_text: str) -> bool:
     canonical form — `'800'` is still refused inside `'1800'`.
     """
     a = re.escape(_canon(atom).lstrip("+-"))
+    # `(?!\.?\d)` refuses "28" inside "28.5"; a trailing ".0" is the SAME
+    # whole number ("94%" is present where the evidence writes "94.0%" —
+    # corpus replay §4IP R5: the health digest's every percentage).
     return bool(re.search(
-        rf"(?<![\d.])(?<![A-Za-z][\-–])(?<![A-Za-z][\-–] ){a}(?!\.?\d)",
+        rf"(?<![\d.])(?<![A-Za-z][\-–])(?<![A-Za-z][\-–] ){a}(?:\.0+(?!\d))?(?!\.?\d)",
         canon_text))
 
 
@@ -1102,8 +1400,23 @@ def _nonassertive_fragment(issue: str, claim: str) -> Optional[str]:
 
 
 def resolve_issue(issue: str, claim: str, evidence: str,
-                  truncation_severity: float = 0.0) -> Tuple[str, str]:
-    """Adjudicate ONE objection mechanically. Returns (decision, why)."""
+                  truncation_severity: float = 0.0,
+                  prior_evidence: str = "", context: str = "") -> Tuple[str, str]:
+    """Adjudicate ONE objection mechanically. Returns (decision, why).
+
+    ``context`` (§4IP R7) is what the verifier was handed beside the
+    evidence — the user's request and the project note. A name or figure
+    that came from there is not an invention (the binder counts context
+    as support); the absence rule treats it like prior evidence.
+
+    ``prior_evidence`` (§4HZ) is the session's EARLIER evidence — tool
+    outputs and replies from turns before this one. An absence proof is a
+    proof against the whole session, not against this turn's digest: a
+    figure the agent computed last turn and repeats now ("~149 points") is
+    absent from THIS turn's evidence and was UPHELD as "invented" (req
+    30419cf0), and the auto-repair stripped a true number. When the cited
+    atom is found in prior evidence the rule returns UNRESOLVED — carried
+    over, not proven either way — so the strong judge decides."""
     text = str(issue or "").strip()
     if not text:
         return (UNRESOLVED, "empty issue")
@@ -1122,10 +1435,35 @@ def resolve_issue(issue: str, claim: str, evidence: str,
     has_contrast = bool(_CONTRAST_RE.search(text)) and not is_absence
     nums = _numbers_with_units(text)
 
+    # ── 0. Machine noise DEMONSTRABLY in the claim (rule 3's uphold half,
+    # hoisted). A literal string test outranks every reading of the
+    # judge's sentence: "extraneous artifact markers '7.' and '1.5'" on a
+    # reply torn by merge markers was upheld as the numeric pair 7-vs-1.5
+    # and, once that accidental ground closed, escalated to the overturner
+    # (§4IP R6 seed replay). The dismiss half stays below: an issue that
+    # alleges noise the claim does not carry may still state a real
+    # numeric dispute.
+    _present = _claim_noise_markers(claim)
+    if _present and (_is_noise_allegation(text) or _ARTIFACT_WORD_RE.search(text)):
+        return (UPHOLD,
+                f"machine noise literally present in the claim: "
+                f"{_present[0]!r}")
+
     # ── 1. Numeric dispute stated inside the objection itself.
     if len(nums) >= 2 and has_contrast:
         if _has_label_digits(text):
             return (UNRESOLVED, "version-labelled numbers need judgement")
+        total = _total_ungrounding(claim, evidence) if _evidence_all_failed(evidence) else ""
+        if total:
+            # every block a tool failure and the reply silent about it: the
+            # right ground, before an HTTP status can be read as the
+            # counter-figure ("30.6°C vs 403" — review §4IP R7 instruments M2)
+            return (UPHOLD, f"cited figures unsupported and {total}")
+        if truncation_severity >= _truncation_floor():
+            # a claim-side figure absent from a CUT digest may sit in the cut:
+            # not claim-exclusive, not provable (review §4IP R7 instruments M2)
+            return (UNRESOLVED,
+                    f"numeric mismatch, but {truncation_severity:.0%} of the evidence was cut")
         related_pair = None
         contra_pairs = []
         gray = 0
@@ -1172,8 +1510,8 @@ def resolve_issue(issue: str, claim: str, evidence: str,
                 atom_a, atom_b = ra.replace(",", ""), rb.replace(",", "")
                 in_cl = {atom_a: _number_present(atom_a, c_claim),
                          atom_b: _number_present(atom_b, c_claim)}
-                in_ev = {atom_a: _number_present(atom_a, c_ev),
-                         atom_b: _number_present(atom_b, c_ev)}
+                in_ev = {atom_a: _number_present(atom_a, c_ev) or _claim_figure_supported(ra, claim, evidence),
+                         atom_b: _number_present(atom_b, c_ev) or _claim_figure_supported(rb, claim, evidence)}
                 # ⚠ ASYMMETRIC anchoring (round-2 refinement of the
                 # exclusive-anchoring fix): the CLAIM-side figure must be
                 # claim-EXCLUSIVE (in the claim, NOT in the evidence) —
@@ -1190,6 +1528,19 @@ def resolve_issue(issue: str, claim: str, evidence: str,
                 # one.
                 for x, y in ((atom_a, atom_b), (atom_b, atom_a)):
                     if in_cl[x] and not in_ev[x] and in_ev[y]:
+                        # §4IP: two figures are a contradiction only when
+                        # they denote ONE quantity. A clock or date is not
+                        # a quantity ("18:38" vs "15:36:58Z" is a timezone);
+                        # an evidence figure inside a dense record the
+                        # claim's sentence does not align with is another
+                        # record ("ball x=365" vs `plunger = { x: 375, … }`)
+                        # — the binder's own authority on "same quantity"
+                        # (core.claim_binding), reused here.
+                        if not _same_quantity_plausible(x, y, claim, evidence):
+                            return (UNRESOLVED,
+                                    f"numeric mismatch ({ra} vs {rb}) across "
+                                    f"different records or clock-shaped — "
+                                    f"needs judgement")
                         return (UPHOLD,
                                 f"numeric contradiction beyond rounding "
                                 f"({ra} vs {rb}, claim-side figure "
@@ -1222,7 +1573,8 @@ def resolve_issue(issue: str, claim: str, evidence: str,
                     "claim-side omission — whether it matters needs "
                     "judgement")
         c_ev = _canon(_strip_packer_marks(evidence))
-        found = sum(1 for a, n in atoms if _atom_present(a, n, c_ev))
+        found = sum(1 for a, n in atoms if _atom_present(a, n, c_ev)
+                    or (not n and _name_shaped(a) and _name_present(a, evidence)))
         if found == len(atoms):
             # ⚠ ACCEPTED RISK, stated plainly (2026-08-07 review): the
             # evidence string is partially attacker-controllable (web
@@ -1248,7 +1600,48 @@ def resolve_issue(issue: str, claim: str, evidence: str,
             return (UNRESOLVED,
                     f"absent, but {truncation_severity:.0%} of the evidence "
                     f"was cut")
-        return (UPHOLD, "cited fact absent from intact evidence")
+        if prior_evidence or context:
+            # A proof of INVENTION needs every cited atom absent from the
+            # whole session; one atom found in an earlier turn — or in the
+            # request / project note the verifier was handed — is enough
+            # to make this a judgement call, not a conviction.
+            c_prior = _canon(_strip_packer_marks(prior_evidence) + "\n" + str(context or ""))
+            if any(_atom_present(a, n, c_prior) for a, n in atoms):
+                return (UNRESOLVED,
+                        "cited fact is absent from THIS turn's evidence but "
+                        "present in an earlier turn's or in the request/project "
+                        "context — carried over, needs judgement")
+        # §4IP: an ABSENCE proves an invention only when what is absent is a
+        # NAME — a quoted multi-word, capitalised phrase ("Dr. Elin Vasquez",
+        # "Meridian Prize"), the shape of an appended attribution. A derived
+        # figure, a computed date, a converted unit, a single status word or
+        # identifier ("'Jul 30, 2026'", "x=370", "'RECOVERED'", "'livetest'")
+        # absent from the evidence is a judgement, not a contradiction: five
+        # of the incumbent's eight clean refutes on the mined pool were this
+        # branch convicting exactly those (§4IP R0).
+        names = [a for a, is_num in atoms if not is_num and _name_shaped(a) and _written_as_a_name(a, claim)]
+        if names and all(_names_next_step(a, claim) for a in names):
+            return (UNRESOLVED, "cited name is the reply's stated next step, not a fact about the world")
+        if names:
+            return (UPHOLD, "cited name absent from intact evidence")
+        # …or when the absence is TOTAL: every evidence block is a tool
+        # failure (a success reported over an error — silent_failure), or
+        # not one content word of the reply occurs in the evidence (a reply
+        # about something else entirely — wrong_topic). One derived figure
+        # missing among grounded ones is neither.
+        total = _total_ungrounding(claim, evidence)
+        if total:
+            return (UPHOLD, f"cited fact absent and {total}")
+        # A "competing figure" rule (an anchored line with a different figure
+        # for the same subject) was tried here and REMOVED after the corpus
+        # replay (§4IP R5): it fired on 27% of judged-fine turns that carried
+        # an absent figure — more than on failed turns — and 50 of 52 read
+        # fires were two different quantities ("36.9 GB" vs the used-memory
+        # figure on the same line, "94%" memory vs "10.4%" CPU). An absent
+        # figure with a different figure nearby is the 35B's judgement call.
+        return (UNRESOLVED,
+                "cited atoms absent, but none is a name — a derived figure, "
+                "date or status is a judgement call")
 
     # ── 3. Machine-noise allegation — is the noise literally there?
     # Added after the v5 arm measured artifact_leak catches at 0/4: the
@@ -1274,9 +1667,8 @@ def resolve_issue(issue: str, claim: str, evidence: str,
     # `_claim_noise_markers` finds them, a bare artifact word is accepted as
     # the allegation. `_claim_noise_markers` is itself the conservative half
     # (fences stripped, diff-header shape required) and is unchanged.
-    _present = _claim_noise_markers(claim)
     if _is_noise_allegation(text) or (_present and _ARTIFACT_WORD_RE.search(text)):
-        if _present:
+        if _present:                       # unreachable since rule 0; kept as the rule's own statement
             return (UPHOLD,
                     f"machine noise literally present in the claim: "
                     f"{_present[0]!r}")
@@ -1338,7 +1730,8 @@ def resolve_issue(issue: str, claim: str, evidence: str,
 
 
 def resolve_refute(issues: Sequence[str], claim: str, evidence: str,
-                   truncation_severity: float = 0.0
+                   truncation_severity: float = 0.0,
+                   prior_evidence: str = "", context: str = ""
                    ) -> Tuple[Optional[str], List[str], List[str]]:
     """Adjudicate a whole REFUTED verdict's issue list.
 
@@ -1358,7 +1751,8 @@ def resolve_refute(issues: Sequence[str], claim: str, evidence: str,
     dismissed = 0
     for issue in items:
         decision, why = resolve_issue(issue, claim, evidence,
-                                      truncation_severity)
+                                      truncation_severity,
+                                      prior_evidence=prior_evidence, context=context)
         if decision == UPHOLD:
             return (UPHOLD, [f"{issue} → {why}"], [])
         if decision == DISMISS:

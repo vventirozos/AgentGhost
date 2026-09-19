@@ -195,10 +195,17 @@ def test_turn_loop_has_else_clause_with_banner():
             it = ast.get_source_segment(src, node.iter) or ""
             if "effective_max_turns" in it:
                 assert node.orelse, "turn loop lost its else clause"
-                seg = "\n".join(
-                    ast.get_source_segment(src, n) or "" for n in node.orelse)
-                assert "[TURN BUDGET EXHAUSTED]" in seg
-                assert "NOT a finished result" in seg
+                # §4IC: the banner text moved into `budget_exhausted_note`;
+                # the else clause must route through it, and the helper
+                # must still say what this pin always demanded.
+                calls = [c for n in node.orelse for c in ast.walk(n)
+                         if isinstance(c, ast.Call)
+                         and getattr(c.func, "id", "") == "budget_exhausted_note"]
+                assert calls, "turn loop's else clause no longer builds the budget banner"
+                note = agent_mod.budget_exhausted_note(
+                    40, report_forced=False, project_active=False)
+                assert "[TURN BUDGET EXHAUSTED]" in note
+                assert "NOT a finished result" in note
                 found = True
     assert found
 

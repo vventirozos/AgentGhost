@@ -178,7 +178,16 @@ def test_both_shell_call_sites_go_through_the_one_wrapper():
     assert 'f"bash -c {shlex.quote(' not in src, \
         "a raw bash -c is built somewhere that bypasses pipefail"
     assert src.count("_bash_c(") >= 3          # definition + both call sites
-    assert src.count("_normalise_pipe_exit(") >= 3
+    # §4HZ: pipe forgiveness now runs INSIDE the one normaliser
+    # (`_normalise_exit` = pipe rule + self-reported status). The pipe rule
+    # has exactly one caller — that normaliser — and the normaliser reaches
+    # every adoption site (the AST enumeration lives in
+    # tests/test_execute_self_reported_exit.py).
+    # definition + its two calls INSIDE `_normalise_exit` (the shell's code,
+    # then the echoed `$?`) — no adoption site calls it directly. The
+    # adoption sites themselves are enumerated by AST in
+    # tests/test_execute_self_reported_exit.py.
+    assert src.count("_normalise_pipe_exit(") == 3
 
 
 def test_the_wrapper_sets_pipefail_and_still_runs_the_command():

@@ -164,9 +164,15 @@ def test_memo_records_only_strong_adjudicated_verdicts(agent):
     assert agent._strong_verdict_for("a") == ""
     assert agent._strong_verdict_for("b") == ""
     assert agent._strong_verdict_for("c") == ""
-    for good in ESCALATION_STRONG_ADJUDICATED:
+    for good in ESCALATION_STRONG_ADJUDICATED - {"claim_binding"}:
         agent._note_strong_verdict("k-" + good, _v(VerifyVerdict.CONFIRMED, 0.9, good))
         assert agent._strong_verdict_for("k-" + good) == "CONFIRMED", good
+    # §4IP R7 i2: "claim_binding" is strong for the REFUTED it validates, not
+    # for a CONFIRMED (the absence of a contradiction, figures possibly unbound)
+    agent._note_strong_verdict("k-cb-r", _v(VerifyVerdict.REFUTED, 0.9, "claim_binding"))
+    agent._note_strong_verdict("k-cb-c", _v(VerifyVerdict.CONFIRMED, 0.9, "claim_binding"))
+    assert agent._strong_verdict_for("k-cb-r") == "REFUTED"
+    assert agent._strong_verdict_for("k-cb-c") == ""
 
 
 def test_memo_is_bounded_and_evicts_the_oldest(agent):
@@ -285,8 +291,9 @@ def _outcome_literals_in_escalation_functions():
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        if not node.name.startswith(("_escalate_", "_resolve_rebuttal")):
-            continue
+        # §4IP R7 i7: every function that records an outcome, not a name
+        # prefix — `_settle_claim_binding` (claim_binding) and
+        # `_guard_truncated_absence` (truncation_guard) were unwalked
         for call in ast.walk(node):
             if isinstance(call, ast.Call) and getattr(call.func, "id", "") == "record_escalation":
                 for kw in call.keywords:
@@ -311,3 +318,8 @@ def test_every_outcome_literal_is_classified():
 def test_enumeration_fires_on_an_unknown_outcome():
     """R7.2 — the enumeration must be able to go red."""
     assert {"upheld", "made_up_outcome"} - ESCALATION_OUTCOMES == {"made_up_outcome"}
+
+
+def test_enumeration_walks_every_recording_function():
+    literals = _outcome_literals_in_escalation_functions()
+    assert {"claim_binding", "truncation_guard"} <= literals

@@ -348,18 +348,136 @@ def _rel_tokens(query: str) -> List[str]:
             if len(w) > 2 and w not in _REL_STOPWORDS]
 
 
-def _results_are_off_topic(query: str, results: List[Dict]) -> bool:
-    """True when NOT ONE content word of the query appears anywhere in the
-    batch — the signature of an engine answering a different question.
+# ── §4IL: distinctive-token relevance ──────────────────────────────────
+# The batch rule below ("any content word anywhere") let an engine that
+# answered a DIFFERENT question win the wave whenever one common word
+# overlapped: "How to get help in Windows" for `eckit Grid reduced_gg spec
+# format nxacc pl python`, "Doha - Wikipedia" for `Χρυσοί Σκούφοι Βραβεία
+# Γαστρονομίας`, NHL standings for a Revolut-breach query. Replayed over 786
+# recorded searches (2026-08/09): 52 batches (6.6%) were such answers, and
+# the shared word was `format`, `best`, `search`, a year. The signal is the
+# query's DISTINCTIVE tokens — the leading content word (the subject),
+# anything with a digit or underscore, and any word not in the system
+# dictionary (stem-aware) — matched per result, substring or fuzzy.
+# Years are never distinctive; a query with no distinctive token falls
+# back to the batch rule. Results are RE-RANKED (on-topic first), never
+# dropped: liveness is not relevance, but a blurb that lacks the subject
+# word may still be the page.
+_DICT_PATHS = ("/usr/share/dict/words",)
+_DICT_WORDS: Optional[frozenset] = None
+_YEAR_RE = re.compile(r"(?:19|20)\d\d")
+# Query-framing words that carry no subject when they LEAD the query.
+_WEAK_LEADING = frozenset("""
+best top number one list find latest new current cheap good great
+compare comparison review reviews guide tutorial example examples
+""".split())
+_STEM_SUFFIXES = (("ies", "y"), ("es", ""), ("s", ""), ("ing", ""), ("ed", ""),
+                  ("ers", ""), ("er", ""), ("ly", ""))
+_FUZZY_MIN_TOKEN = 6
+_FUZZY_RATIO = 0.8
 
-    Conservative by construction: any single hit passes, and a query with
-    fewer than ``_REL_MIN_QUERY_TOKENS`` content words is never judged.
+
+def _dict_words() -> frozenset:
+    """The system word list, loaded once; empty when the host has none
+    (then only digit/underscore/leading tokens are distinctive)."""
+    global _DICT_WORDS
+    if _DICT_WORDS is None:
+        words = set()
+        for path in _DICT_PATHS:
+            try:
+                with open(path, encoding="utf-8", errors="ignore") as fh:
+                    words.update(w.strip().lower() for w in fh if w.strip())
+            except OSError:
+                continue
+        _DICT_WORDS = frozenset(words)
+    return _DICT_WORDS
+
+
+def _in_dictionary(tok: str) -> bool:
+    words = _dict_words()
+    if not words:
+        return False
+    if tok in words:
+        return True
+    for suf, rep in _STEM_SUFFIXES:
+        if tok.endswith(suf) and len(tok) - len(suf) >= 3 and (tok[:-len(suf)] + rep) in words:
+            return True
+    return False
+
+
+def distinctive_tokens(query: str) -> List[str]:
+    """The query's subject-bearing tokens (folded): the leading content word
+    unless it is query framing, any token with a digit or underscore, and
+    any token the dictionary does not know. Years never count."""
+    out: List[str] = []
+    lead_pending = True                    # the first NON-year content word
+    for tok in _rel_tokens(query):
+        if _YEAR_RE.fullmatch(tok):
+            continue
+        is_lead, lead_pending = lead_pending, False
+        if (is_lead and tok not in _WEAK_LEADING) or re.search(r"[\d_]", tok) \
+                or not _in_dictionary(tok):
+            out.append(tok)
+    return out
+
+
+def result_on_topic(result: Dict, dist: List[str]) -> bool:
+    """True when the result's title/body/url carries a distinctive token —
+    as a substring of the flattened folded text, or (tokens of
+    ``_FUZZY_MIN_TOKEN``+ chars) within ``_FUZZY_RATIO`` of one of its
+    words, so a one-letter typo in the query still finds its page."""
+    if not dist:
+        return True
+    hay = _rel_fold(f"{result.get('title') or ''} {result.get('body') or ''} "
+                    f"{result.get('href') or result.get('url') or ''}")
+    flat = re.sub(r"\W+", "", hay, flags=re.UNICODE)
+    if any(tok in flat for tok in dist):
+        return True
+    long_toks = [t for t in dist if len(t) >= _FUZZY_MIN_TOKEN]
+    if not long_toks:
+        return False
+    import difflib
+    words = {w for w in re.findall(r"\w+", hay, re.UNICODE) if len(w) >= 5}
+    return any(difflib.SequenceMatcher(None, t, w).ratio() >= _FUZZY_RATIO
+               for t in long_toks for w in words)
+
+
+def rank_on_topic(query: str, results: List[Dict]) -> List[Dict]:
+    """Stable partition: results carrying a distinctive token first, the
+    rest after, order preserved within each half. Nothing is dropped."""
+    dist = distinctive_tokens(query)
+    if not dist:
+        return list(results or [])
+    hit = [r for r in results or [] if result_on_topic(r, dist)]
+    miss = [r for r in results or [] if not result_on_topic(r, dist)]
+    return hit + miss
+
+
+def _results_are_off_topic(query: str, results: List[Dict]) -> bool:
+    """True when the batch answers a different question: NO result carries
+    a distinctive token of the query (§4IL) — or, for a query with no
+    distinctive token, NOT ONE content word appears anywhere in the batch.
+
+    Conservative by construction: a query with fewer than
+    ``_REL_MIN_QUERY_TOKENS`` content words is never judged.
     """
     tokens = _rel_tokens(query)
     if len(tokens) < _REL_MIN_QUERY_TOKENS:
         return False
     if not results:
         return False
+    dist = distinctive_tokens(query)
+    if dist:
+        # Judge only rows that carry text (the same rule as the fallback
+        # below): bare `{"href": …}` rows are not evidence of irrelevance.
+        texty = [r for r in results
+                 if f"{r.get('title') or ''}{r.get('body') or ''}".strip()]
+        prose = "".join(f"{r.get('title') or ''} {r.get('body') or ''}" for r in texty)
+        if not texty or len(prose.strip()) < _REL_MIN_RESULT_CHARS:
+            return False
+        # …but a bare row's URL slug can still carry the subject (pinned by
+        # test_search_relevance_floor::test_url_alone_can_carry_the_match).
+        return not any(result_on_topic(r, dist) for r in results)
     # Judge only what carries text. Absence of a snippet is not evidence
     # of irrelevance (found by the suite: several harnesses drive the
     # race with bare `{"href": ...}` rows, and condemning those would
@@ -607,6 +725,73 @@ _PER_URL_TIMEOUT_S = env_float("GHOST_PER_URL_S", 80.0)
 # capped by what is worth reading, not by what the worker could have read.
 _RAW_FALLBACK_CHARS = 10_000
 
+# ── ddgs snippet whitespace (§4IO) ───────────────────────────────────────
+# ddgs 9.x `BaseSearchEngine.extract_results` STRIPS every `text()` node of a
+# result and joins them with no separator, so the whitespace a page had
+# around each <b>highlight</b> is destroyed: "Saturn <b>orbits</b> the Sun"
+# arrives as "Saturnorbitsthe Sun" — titles and bodies, every engine (Yandex
+# highlights most, so it showed there first). Live cost: the verifier's
+# figure parser saw "29.45years" and "293moons" (2026-09-18, §4IM), the
+# judge and the user read glued prose. The join is replaced at runtime,
+# once, and ONLY while the library still carries the defective idiom — a
+# release that fixes or restructures it leaves this patch inert (logged).
+_DDGS_DEFECT_IDIOM = ('parts = (x.strip() for x in item.xpath(value))',
+                      'data = " ".join("".join(parts).split())')
+_ddgs_patch_state: Dict[str, Any] = {"applied": None}
+
+
+def _fixed_extract_results(self, html_text: str):
+    """`BaseSearchEngine.extract_results` with the nodes' own whitespace
+    kept: join the raw text() nodes, THEN collapse runs."""
+    html_text = self.pre_process_html(html_text)
+    tree = self.extract_tree(html_text)
+    results = []
+    for item in tree.xpath(self.items_xpath):
+        result = self.result_type()
+        for key, value in self.elements_xpath.items():
+            parts = item.xpath(value)
+            data = " ".join("".join(str(x) for x in parts).split())
+            setattr(result, key, data)
+        results.append(result)
+    return results
+
+
+def _patch_ddgs_snippet_join() -> bool:
+    """Apply the join fix once. True when the patched method is in place
+    (now or earlier); False when the installed library no longer carries
+    the defective idiom — then nothing is touched."""
+    if _ddgs_patch_state["applied"] is not None:
+        return bool(_ddgs_patch_state["applied"])
+    try:
+        import inspect as _inspect
+        from ddgs.base import BaseSearchEngine
+        src = _inspect.getsource(BaseSearchEngine.extract_results)
+        if all(idiom in src for idiom in _DDGS_DEFECT_IDIOM):
+            BaseSearchEngine.extract_results = _fixed_extract_results
+            _ddgs_patch_state["applied"] = True
+        else:
+            _ddgs_patch_state["applied"] = False
+    except Exception as exc:  # noqa: BLE001 — a missing patch degrades text, never search
+        _ddgs_patch_state["applied"] = False
+        _ddgs_patch_state["error"] = f"{type(exc).__name__}: {exc}"[:120]
+        logger.debug("ddgs snippet join patch skipped: %s", exc)
+    try:
+        if _ddgs_patch_state["applied"]:
+            pretty_log("ddgs search", "snippet whitespace join patched (ddgs strips text() nodes)",
+                       icon=Icons.TOOL_SEARCH)
+        elif _ddgs_patch_state.get("error"):
+            pretty_log("ddgs search", "snippet join patch NOT applied: could not inspect the installed ddgs "
+                       f"({_ddgs_patch_state['error']}) — verify snippets read whole", icon=Icons.TOOL_SEARCH,
+                       level="WARNING")
+        else:
+            pretty_log("ddgs search", "snippet join patch NOT applied: installed ddgs no longer carries "
+                       "the stripped-join idiom — verify snippets read whole", icon=Icons.TOOL_SEARCH,
+                       level="WARNING")
+    except Exception:  # noqa: BLE001
+        pass
+    return bool(_ddgs_patch_state["applied"])
+
+
 async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
                             max_results: int = 20) -> List[Dict]:
     """Race ALL engines in parallel, each on its OWN Tor circuit; the first
@@ -621,6 +806,7 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
     lands; a fully-blocked wave costs at most the ddgs timeout + grace.
     """
     from ddgs import DDGS
+    _patch_ddgs_snippet_join()
 
     def _run_engine(engine: str, proxy: Optional[str]) -> List[Dict]:
         _eng_timeout = _engine_timeout(engine)
@@ -702,6 +888,7 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
                             level="WARNING", icon=Icons.WARN)
                         failures.append((engine, "off-topic"))
                         continue
+                    valid = rank_on_topic(query, valid)          # §4IL: on-topic first
                     pretty_log("DDGS Search",
                                f"{engine} won wave {wave} in {time.monotonic() - t0:.1f}s "
                                f"({len(valid)} results) ‹{qtag}›", icon=Icons.TOOL_SEARCH)

@@ -120,6 +120,9 @@
   <p><strong>Prerequisite-gated scheduling.</strong> <code>next_ready_leaf()</code> skips any leaf whose <code>depends_on</code> prerequisites are not all DONE (unknown/stale dep ids are treated as satisfied so a bad reference can't deadlock the plan). <code>decompose(task_id, subtasks, sequential=True)</code> chains each subtask to the previous via <code>depends_on</code>, so the autoadvancer runs them strictly in order; <code>sequential=False</code> (default) leaves every subtask independently eligible, the historical behaviour.</p>
   <p>Covered by <code>tests/test_project_mgmt_fixes.py</code>.</p>
 
+  <h2>The DONE guard protects a task, not an id (§4HZ, 2026-09-17)</h2>
+  <p><code>load_from_json</code> merges by id and refuses to move a DONE node backwards. System 3's crisis pivot emits a <em>fresh</em> tree that reuses <code>task_1..task_N</code> for different work; the guard, keyed on the id, kept the old DONE while the description was overwritten — so "install ecmwf-api" was born DONE and the next planner monologue read <em>"task_1 (install ecmwf-api) is DONE, task_2 (upgrade pip + retry) is DONE"</em> for steps that never ran (request <code>d594668e</code>, both crisis interventions neutralised this way). The guard now holds only while the node is recognisably the same task: <code>same_task(old, new)</code> — token-set Jaccard ≥ <code>SAME_TASK_JACCARD</code> (0.6), so a rewording ("check GRIB tooling" → "check GRIB tooling is installed") keeps its DONE and a replacement ("check GRIB tooling" → "install ecmwf-api") adopts the incoming status (an INFO line names the re-described id). Pins: <code>tests/test_tasktree_redescribed_id.py</code>.</p>
+
   <h2>Plan-gate hardening (2026-07-20)</h2>
   <p>Three-stack review fixes — the plan gate is live now, so malformed planner output has to be survivable, human gates have to be enforceable, and a triggered replan has to actually write.</p>
   <ul>

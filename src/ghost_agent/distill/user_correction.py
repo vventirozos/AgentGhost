@@ -103,6 +103,73 @@ _CORRECTION_RE = re.compile(
 )
 
 
+# ---------- Signal C: negated-clause rebuttal (§4IA, 2026-09-17) ------
+#
+# THE LIVE MISS. "eckit is not internal and you can request gribs from mars
+# as a public user" corrected a reply that had said "eckit is ECMWF's
+# internal C++ library". No anchored phrase (Signal A) and no rephrase of
+# the prior request (Signal B: Jaccard 0.1) — the turn stayed `passed` until
+# the human clicked 👎 forty minutes later. The shape is a NEGATED CLAUSE
+# whose subject AND object both come from the assistant's reply: the user
+# is denying something the reply asserted.
+#
+# Measured over 1490 consecutive live turn pairs (2026-07-07..09-17): 24
+# candidates (1.6%), of which roughly a third are genuine corrections and
+# the rest are birthdays ("leonidas was born march …"), questions ("at what
+# date is mars …"), tests and philosophy. So this is a CANDIDATE gate for
+# the judge (`adjudication_prompt`), never a promoter: a rebuttal clause
+# promotes only when a judge rules `corrects=true`. Cost: ~1 judge call per
+# 62 turns on top of Signal A's 1 per 100.
+#: ⚠ Every alternative here NEGATES. A first draft listed the bare copulas
+#: (`is|are|was|were`) with an optional `not` after them, so "the ball is
+#: going straight up" and "leonidas was born march" were "negated clauses"
+#: — the corpus count above was taken with that draft and was inflated;
+#: the pin `test_plain_copula_is_not_a_negation` holds the line.
+_NEGATION = (
+    r"(?:(?:is|are|was|were)\s+not|isn['’]?t|aren['’]?t|wasn['’]?t|weren['’]?t|"
+    r"does\s+not|doesn['’]?t|do\s+not|don['’]?t|did\s+not|didn['’]?t|"
+    r"has\s+not|hasn['’]?t|have\s+not|haven['’]?t|cannot|can['’]?t|"
+    r"should\s+not|shouldn['’]?t|never)"
+)
+_REBUTTAL_CLAUSE_RE = re.compile(
+    r"(?P<subj>[A-Za-z][\w\-\.]*(?:\s+[A-Za-z][\w\-\.]*){0,3})\s+"
+    + _NEGATION +
+    r"\s+(?P<obj>[A-Za-z][\w\-\.]*(?:\s+[A-Za-z][\w\-\.]*){0,4})",
+    re.IGNORECASE,
+)
+#: How far into the message a rebuttal clause is looked for. A correction
+#: opens with its point; a clause buried in paragraph four is commentary.
+REBUTTAL_SCAN_CHARS = 600
+
+
+def rebuttal_clause(current_user_text, prev_assistant_response) -> Optional[str]:
+    """The first clause of the form ``<subject> <negation> <object>`` whose
+    subject and object content tokens BOTH appear in the assistant's prior
+    reply — i.e. a denial of something the reply said. ``None`` otherwise
+    (also for empty / non-string input). Pure."""
+    cur = current_user_text if isinstance(current_user_text, str) else ""
+    rep = prev_assistant_response if isinstance(prev_assistant_response, str) else ""
+    if not cur or not rep:
+        return None
+    reply_tokens = _content_tokens(rep)
+    if not reply_tokens:
+        return None
+    for m in _REBUTTAL_CLAUSE_RE.finditer(cur[:REBUTTAL_SCAN_CHARS]):
+        subj = _content_tokens(m.group("subj"))
+        obj = _content_tokens(m.group("obj"))
+        if subj and obj and (subj & reply_tokens) and (obj & reply_tokens):
+            return m.group(0)
+    return None
+
+
+def is_correction_candidate(current_user_text, prev_assistant_response) -> bool:
+    """THE cheap gate in front of the judge: an anchored correction phrase
+    (Signal A) OR a rebuttal clause against the reply (Signal C). One
+    authority — the caller must not keep a private copy of either test."""
+    return (has_correction_phrase(current_user_text)
+            or rebuttal_clause(current_user_text, prev_assistant_response) is not None)
+
+
 def has_correction_phrase(text) -> bool:
     """Signal A on its own — does this message OPEN like a correction?
 
@@ -408,6 +475,12 @@ def classify_user_correction(
             signals.append(f"rephrase(jaccard={overlap:.2f})")
             confidence += 0.45
 
+    # Signal C — a negated clause denying something the REPLY said (§4IA).
+    _clause = rebuttal_clause(cu, prev_assistant_response)
+    if _clause:
+        signals.append(f"rebuttal({_clause[:60]})")
+        confidence += 0.35
+
     # Cap at 1.0 for downstream consumers that treat this as a
     # probability.
     if confidence > 1.0:
@@ -416,13 +489,19 @@ def classify_user_correction(
     # ⚠ ASK THE VERDICT ONCE. When a judge ruled, the lexical test is not
     # consulted at all — two authorities on one question is how a promotion
     # gets granted by whichever signal happened to fire.
+    #
+    # §4IA: a rebuttal clause (Signal C) is corroborated ONLY by a judge.
+    # Without one it never promotes — measured a third precise on its own,
+    # and a false lesson poisons retrieval where a missed one merely waits
+    # for the biological backstop.
     _rephrased = any(s.startswith("rephrase") for s in signals)
+    _opened = "phrase" in signals
     if contradicts is None:
-        _corroborated = _rephrased
+        _corroborated = _opened and _rephrased
     else:
         _corroborated = bool(contradicts)
         signals.append(f"adjudicated({'yes' if contradicts else 'no'})")
-    is_correction = ("phrase" in signals) and _corroborated
+    is_correction = (_opened or bool(_clause)) and _corroborated
 
     # Affirmation veto — only consulted when both signals fired, so the
     # common paths pay nothing. A clear affirmation with no negative

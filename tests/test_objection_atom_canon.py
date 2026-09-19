@@ -103,4 +103,7 @@ def test_a_genuinely_absent_grouped_figure_still_upholds():
     claim = "Iceland's population is about 396,960."
     ev = "Population (2025 estimate): 372,520 people."
     d, why = O.resolve_issue("396,960 is not in the evidence", claim, ev)
-    assert d == O.UPHOLD, why
+    # §4IP R5: an absent FIGURE beside a different one is a judgement call
+    # (a "competing figure" rule fired on 27% of judged-fine live turns and
+    # was removed) — judged absent, escalated, never dismissed
+    assert d == O.UNRESOLVED and "absent" in why, why

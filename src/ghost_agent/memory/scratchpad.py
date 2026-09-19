@@ -14,6 +14,12 @@ logger = logging.getLogger("GhostAgent")
 # Default TTL: 24 hours (in seconds)
 _DEFAULT_TTL = 86400
 
+import re as _re  # noqa: E402 — one pattern, kept beside the constant it serves
+#: §4IC — the turn-loop checkpoint keys (`_checkpoint_t15`, `_checkpoint_t30`).
+#: Request-scoped by definition; purged at every load, whatever scope they
+#: were written under, because no request survives a process boot.
+TURN_CHECKPOINT_RE = _re.compile(r"^_checkpoint_t\d+$")
+
 # Cap on the value echoed back by `set()`. The return string is handed
 # straight to the model (tools/memory.py `remember`), so echoing a multi-KB
 # swarm result doubled it into the context for zero information gain — the
@@ -117,6 +123,21 @@ class Scratchpad:
                 # Purge expired entries
                 conn.execute("DELETE FROM scratchpad WHERE accessed_at < ?", (cutoff,))
                 conn.commit()
+                # §4IC: a turn checkpoint belongs to ONE request, and no
+                # request survives a process boot — whatever scope it was
+                # written under (the pre-§4IC writes had none), it must not be
+                # served to the next request's prompt. Purged at load.
+                try:
+                    stale = [k for (k,) in conn.execute("SELECT key FROM scratchpad")
+                             if TURN_CHECKPOINT_RE.match(str(k or ""))]
+                    for k in stale:
+                        conn.execute("DELETE FROM scratchpad WHERE key = ?", (k,))
+                    if stale:
+                        conn.commit()
+                        logger.info("scratchpad: dropped %d stale turn checkpoint(s) at load: %s",
+                                    len(stale), ", ".join(stale[:6]))
+                except Exception as _pe:  # noqa: BLE001 — a purge must not block the load
+                    logger.debug("scratchpad checkpoint purge skipped: %s", _pe)
                 cursor = conn.execute(
                     "SELECT key, value, accessed_at, namespace FROM scratchpad "
                     "ORDER BY accessed_at ASC"

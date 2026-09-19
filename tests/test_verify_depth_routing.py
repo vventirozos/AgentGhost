@@ -217,7 +217,8 @@ class TestDepthReachesTheCheapLegOnly:
         import ast
         import inspect
         import textwrap
-        src = textwrap.dedent(inspect.getsource(V.Verifier.verify_claim))
+        # §4IN: the incumbent pipeline body lives in `_verify_claim_incumbent`
+        src = textwrap.dedent(inspect.getsource(V.Verifier._verify_claim_incumbent))
         calls = [c for c in ast.walk(ast.parse(src)) if isinstance(c, ast.Call)
                  and getattr(c.func, "attr", "") == "_verify_claim_two_stage"]
         kws = [{k.arg: k.value for k in c.keywords} for c in calls]

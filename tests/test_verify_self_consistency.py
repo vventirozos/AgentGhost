@@ -510,7 +510,8 @@ class TestTheVoteSurvivesTheEscalationLadder:
         import ast
         import inspect
         import textwrap
-        src = textwrap.dedent(inspect.getsource(Verifier.verify_claim))
+        # §4IN: the incumbent pipeline body lives in `_verify_claim_incumbent`
+        src = textwrap.dedent(inspect.getsource(Verifier._verify_claim_incumbent))
         tree = ast.parse(src)
         lines = {}
         for node in ast.walk(tree):

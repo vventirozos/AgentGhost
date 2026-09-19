@@ -50,6 +50,14 @@ for _live_var, _live_default in (
         # POSTs one must not become the operator's face.
         ("GHOST_UI_PREFS_FILE",
          os.path.join(_LIVE_ISOLATION_DIR, "ui_prefs.json")),
+        # §4IM: the claim-binding verifier runs beside the incumbent on every
+        # verify_claim (refute-first) and, when that is off, as a shadow —
+        # one extra binder call the hundreds of call-counting verifier pins
+        # never queued. Off suite-wide; tests/test_claim_binding_verifier.py
+        # turns each mode on explicitly.
+        ("GHOST_CLAIM_BINDING_REFUTE_FIRST", "0"),
+        ("GHOST_CLAIM_BINDING_CONFIRM_FIRST", "0"),
+        ("GHOST_CLAIM_BINDING_SHADOW", "0"),
 ):
     os.environ[_live_var] = _live_default
 

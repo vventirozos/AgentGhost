@@ -354,9 +354,21 @@ class TestStreamedFinalizePath:
         import inspect
         from ghost_agent.core import agent as agent_mod
         src = inspect.getsource(agent_mod)
-        assert src.count("self._record_turn_trajectory(") == 2, (
-            "a third trajectory record site appeared — it must route "
+        # finalize, the streamed drain, and (§4IB) the aborted-turn
+        # recorder — all three call the ONE function where the rule lives.
+        assert src.count("self._record_turn_trajectory(") == 3, (
+            "a fourth trajectory record site appeared — it must route "
             "through the same consolidation")
+        import ast
+        # a separate read for the tree: the ratchet counts a source string
+        # used both textually and parsed as textual in ALL its uses
+        tree = ast.parse(inspect.getsource(agent_mod))
+        callers = {fn.name for fn in ast.walk(tree)
+                   if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+                   for c in ast.walk(fn)
+                   if isinstance(c, ast.Call)
+                   and getattr(c.func, "attr", "") == "_record_turn_trajectory"}
+        assert "_record_aborted_turn" in callers
 
     def test_late_confirmed_is_withheld(self, capsys):
         agent, col = _agent()

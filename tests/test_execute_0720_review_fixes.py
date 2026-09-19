@@ -61,12 +61,25 @@ async def test_timeout_kill_surfaces_124_with_note(tmp_path):
     assert m and m.group(1) == "124"
 
 
-async def test_sigkill_137_gets_killed_note(tmp_path):
+async def test_sigkill_137_gets_killed_note(tmp_path, monkeypatch):
+    """§4HZ split this pin in two. A 137 that lands at the budget is the
+    `timeout -k` kill and keeps the timed-out note; a 137 seconds after
+    launch is the OOM killer and says so (the mock returns instantly, so
+    the elapsed time here is ~0 s — the OOM world). The budget world is
+    reached by shrinking the budget under the elapsed time."""
+    from ghost_agent.tools import execute as ex
     mgr = _mock_mgr(returns=("", 137))
     result = await tool_execute(command="python3 big_job.py",
                                 sandbox_dir=tmp_path, sandbox_manager=mgr)
     assert "EXIT CODE: 137" in result
+    assert "out of memory, not the time limit" in result
+    assert "timed out / killed" not in result
+    monkeypatch.setattr(ex, "_EXEC_TIMEOUT_S", 0)   # elapsed ≥ budget − margin
+    result = await tool_execute(command="python3 big_job.py",
+                                sandbox_dir=tmp_path, sandbox_manager=mgr)
+    assert "EXIT CODE: 137" in result
     assert "timed out / killed" in result
+    assert "out of memory" not in result
 
 
 async def test_script_branch_threads_real_exit_code(tmp_path):

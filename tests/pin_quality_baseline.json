@@ -114,7 +114,7 @@
     "test_finalize_extraction.py": 3,
     "test_foreground_yield.py": 13,
     "test_foresight.py": 5,
-    "test_futility_breaker_trio.py": 7,
+    "test_futility_breaker_trio.py": 6,
     "test_gate_contract_conformance.py": 5,
     "test_gepa_autonomy_phase01.py": 2,
     "test_gepa_autonomy_phase3.py": 8,
@@ -275,5 +275,5 @@
     "test_workspace_cleanup_deletion_guards.py": 1,
     "test_workspace_tidy.py": 3
   },
-  "total_textual": 1341
+  "total_textual": 1340
 }

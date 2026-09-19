@@ -24,6 +24,15 @@ from pathlib import Path
 
 import pytest
 
+def _judged_absent(res):
+    """§4IP: an absent FIGURE is no longer a mechanical conviction — it is
+    judged absent and escalated. What these pins guard (boundary-anchored
+    presence, claimward grammar, the truncation floor) shows as "absent and
+    not DISMISSED, not excused by truncation"."""
+    decision, why = res[0], res[1]
+    return decision != "dismiss" and "absent" in why and "some cited facts present" not in why and "was cut" not in why
+
+
 from ghost_agent.core.verifier import (
     Verifier, VerifyResult, VerifyVerdict,
     _overturn_quote_enabled, _tier_routing_enabled,
@@ -756,9 +765,8 @@ def test_objection_check_absence_uses_the_real_evidence():
     # The judge said it is missing; it is right there → false alarm.
     assert resolve_issue("Humidity around 28% is not in the evidence.",
                          "c", ev)[0] == DISMISS
-    # Genuinely absent from INTACT evidence → proven real.
-    assert resolve_issue("The 91% figure is not in the evidence.",
-                         "c", ev)[0] == UPHOLD
+    # Genuinely absent from INTACT evidence → judged absent (§4IP: a figure escalates, a name convicts).
+    assert _judged_absent(resolve_issue("The 91% figure is not in the evidence.", "c", ev))
     # Absent, but the packer cut most of the digest → needs judgement.
     assert resolve_issue("The 91% figure is not in the evidence.",
                          "c", ev, truncation_severity=0.6)[0] == "unresolved"
@@ -767,8 +775,8 @@ def test_objection_check_absence_uses_the_real_evidence():
 async def test_proven_refute_skips_the_main_model_entirely(tmp_path):
     stub = _RebuttalStub([])          # any call would raise IndexError
     v = Verifier(llm_client=stub)
-    cheap = _refuted(["The 91% figure is not in the evidence."])
-    out = await v._escalate_refute(cheap, "claim",
+    cheap = _refuted(["The claim cites Dr. Elin Vasquez, who is not in the evidence."])
+    out = await v._escalate_refute(cheap, "Dr. Elin Vasquez confirmed 28% humidity.",
                                    "[web] Athens: 34°C, humidity 28%", "ctx",
                                    trace={"req_id": "t1"})
     assert out is cheap                       # protected, verdict intact
@@ -891,9 +899,8 @@ def test_truncation_threshold_tracks_the_verifier_constant(monkeypatch):
     monkeypatch.setenv("GHOST_VERIFY_TRUNCATION_MIN_SEVERITY", "0.6")
     assert objection._truncation_floor() == 0.6
     # Just under the floor the absence rule may still uphold.
-    assert objection.resolve_issue(
-        "Humidity 28% is not in the evidence", "", "nothing", 0.5)[0] == \
-        objection.UPHOLD
+    assert _judged_absent(objection.resolve_issue(
+        "Humidity 28% is not in the evidence", "", "nothing", 0.5))
 
 
 def test_packer_marker_is_not_searchable_evidence(monkeypatch):
@@ -963,8 +970,14 @@ def test_unit_conversion_requires_written_units():
         "Uses 48 MB, but the evidence says 50,331,648 bytes",
         "48 MB", "50,331,648 bytes", 0.0)[0] == o.DISMISS
     # Written units that do NOT convert: a real contradiction.
+    assert o.resolve_issue("Took 2 hours, not 80 minutes",
+                           "2 hours", "80 minutes", 0.0)[0] == o.UPHOLD
+    # …but ON the rounding boundary the binder's precision rule (§4IP R6:
+    # `quantities_agree` decides claim-exclusivity) reads "2 hours" as a
+    # fair integer-hour statement of 90 minutes — the judge decides, not
+    # the mechanical tier
     assert o.resolve_issue("Took 2 hours, not 90 minutes",
-                           "2 hours", "90 minutes", 0.0)[0] == o.UPHOLD
+                           "2 hours", "90 minutes", 0.0)[0] == o.UNRESOLVED
 
 
 def test_round_shaped_match_is_not_proof_beyond_the_error_budget():
@@ -1054,7 +1067,7 @@ def test_number_presence_is_boundary_anchored():
         ("The 800 number is not present in the evidence", "altitude 1,800 m"),
         ("The 28 degrees figure is not in the evidence", "28.5C measured"),
     ):
-        assert o.resolve_issue(issue, "", ev, 0.0)[0] == o.UPHOLD, issue
+        assert _judged_absent(o.resolve_issue(issue, "", ev, 0.0)), issue
     # PRESENT: comma-grouped and unit-glued spellings.
     for issue, ev in (
         ("The population figure 396,960 is not in the evidence",
@@ -1452,13 +1465,11 @@ def test_quoted_digit_atoms_are_boundary_matched():
     """R2-C4: '"8 GB"' was "present" in "18 GB" via substring + the
     digit-unit glue; the real absence catch was erased."""
     from ghost_agent.core import objection as o
-    assert o.resolve_issue('The size "8 GB" is not in the evidence',
-                           "uses 8 GB of RAM",
-                           "the server has 18 GB installed",
-                           0.0)[0] == o.UPHOLD
-    assert o.resolve_issue('The figure "3 users" is not in the evidence',
-                           "3 users", "13 users signed up",
-                           0.0)[0] == o.UPHOLD
+    assert _judged_absent(o.resolve_issue('The size "8 GB" is not in the evidence',
+                                          "uses 8 GB of RAM",
+                                          "the server has 18 GB installed", 0.0))
+    assert _judged_absent(o.resolve_issue('The figure "3 users" is not in the evidence',
+                                          "3 users", "13 users signed up", 0.0))
 
 
 def test_claimward_omissions_route_to_the_claim():
@@ -1480,10 +1491,9 @@ def test_identifier_digits_are_not_presence():
     """R2-M1: blanket hyphen collapse turned "SHA-256" into "sha 256"
     and the absence rule "found" a cited 256 inside a checksum name."""
     from ghost_agent.core import objection as o
-    assert o.resolve_issue(
+    assert _judged_absent(o.resolve_issue(
         "The claim's 256 MB cache figure is not stated in the evidence",
-        "cache: 256 MB", "checksums use SHA-256; no cache data",
-        0.0)[0] == o.UPHOLD
+        "cache: 256 MB", "checksums use SHA-256; no cache data", 0.0))
     # …while letter-letter hyphens still meet their spaced spelling.
     assert o.resolve_issue(
         "The phrase “partly-cloudy” is not in the evidence",
@@ -1527,10 +1537,21 @@ def test_claim_exclusive_anchoring_convicts_quoted_evidence_swaps():
     evidence number and contradicts it. The claim-side figure must be
     claim-exclusive; the evidence-side figure need only be present."""
     from ghost_agent.core import objection as o
-    assert o.resolve_issue(
+    # §4IP R7: a counter-figure the claim itself writes is, by the binder's
+    # `_claim_states` rule, a second quantity of the reply ("15 total (10
+    # done, 5 pending)", "28°C now, 18°C tonight") — the projection shape
+    # below is the same shape, so it escalates to the judge instead of being
+    # convicted with no call. Claim-exclusivity of the 500 still holds
+    # (it is not DISMISSED).
+    d, why = o.resolve_issue(
         "the reply states 500 users but the evidence shows 3",
         "The evidence says 3 users, so with projections we have 500 users",
-        "3 users registered", 0.0)[0] == o.UPHOLD
+        "3 users registered", 0.0)
+    assert d == o.UNRESOLVED and "different records" in why
+    # a claim that does NOT write the evidence figure is convicted
+    assert o.resolve_issue(
+        "the reply states 500 users but the evidence shows 3",
+        "With projections we have 500 users", "3 users registered", 0.0)[0] == o.UPHOLD
     # The hallucination shield survives: 500 in NEITHER text.
     assert o.resolve_issue(
         "The claim states 500 users, whereas the evidence shows 3 users",
@@ -1604,12 +1625,12 @@ def test_claimward_regex_does_not_bridge_to_evidence_verbs():
     got = o.resolve_issue(
         "The claim states 55% humidity but the evidence omits it.",
         "Athens humidity 55%", "[web] Athens humidity 28%", 0.0)
-    assert got[0] == o.UPHOLD          # evidence-side absence, proven real
+    assert _judged_absent(got)         # evidence-side absence, judged absent (§4IP R5: escalates)
     # Passive voice of the same bridge.
     got2 = o.resolve_issue(
         "the claim's figure of 28% is omitted by the evidence",
         "humidity 28%", "[web] wind only", 0.0)
-    assert got2[0] == o.UPHOLD
+    assert _judged_absent(got2)               # routed to the evidence side (§4IP: a figure escalates)
     # Genuinely claim-ward complaints still route to the claim.
     assert o.resolve_issue(
         "The reply omits the humidity figure of 28%",
@@ -1781,8 +1802,7 @@ def test_claimward_agent_test_names_the_evidence_not_the_preposition():
     for issue in ("The claim's figure of 28% is omitted from the tool "
                   "output.",
                   "The 28% figure was left out of the evidence"):
-        assert o.resolve_issue(issue, "humidity 28%", "[web] wind only",
-                               0.0)[0] == o.UPHOLD, issue
+        assert _judged_absent(o.resolve_issue(issue, "humidity 28%", "[web] wind only", 0.0)), issue
     # A user-agent "by" stays claimward → materiality → unresolved.
     assert o.resolve_issue(
         "The reply omits the 3 risks listed by the user.",
@@ -1837,9 +1857,8 @@ def test_absence_re_present_tense_full_verb_set():
     assert o.resolve_issue("the evidence never provides the 28% figure",
                            "", "[web] humidity 28% today",
                            0.0)[0] == o.DISMISS
-    assert o.resolve_issue("the evidence never lists the 91% figure",
-                           "", "[web] humidity 28% only",
-                           0.0)[0] == o.UPHOLD
+    assert _judged_absent(o.resolve_issue("the evidence never lists the 91% figure",
+                                          "", "[web] humidity 28% only", 0.0))
 
 
 # ── Round-5 regressions (2026-08-07): the claimward grammar split.
@@ -1876,8 +1895,7 @@ def test_claimward_grammar_splits_active_from_passive():
         "the claim's 55% figure was omitted, without explanation, from "
         "the evidence",
     ):
-        assert o.resolve_issue(issue, "humidity 55%", "[web] wind only",
-                               0.0)[0] == o.UPHOLD, issue
+        assert _judged_absent(o.resolve_issue(issue, "humidity 55%", "[web] wind only", 0.0)), issue
 
     # F4: active-verb source-preps stay claimward at ANY distance.
     for issue in ("the reply omits the figure of 28% that the evidence "
@@ -1892,9 +1910,9 @@ def test_claimward_grammar_splits_active_from_passive():
     assert o.resolve_issue(
         "The claim omitted the 28% humidity from its summary",
         "Athens 34C", "[web] humidity 28%", 0.0)[0] == o.UNRESOLVED
-    assert o.resolve_issue(
+    assert _judged_absent(o.resolve_issue(
         "the claim's figure of 28% is omitted by the evidence",
-        "humidity 28%", "[web] wind only", 0.0)[0] == o.UPHOLD
+        "humidity 28%", "[web] wind only", 0.0))
 
 
 def test_guard_verb_first_branch_refuses_claim_nouns():
@@ -1933,9 +1951,9 @@ async def test_dismiss_direction_ships_off(tmp_path, monkeypatch):
     # UPHOLD keeps working with the dismiss direction off.
     stub2 = _RebuttalStub([])
     v2 = Verifier(llm_client=stub2)
-    cheap = _refuted(["The 91% figure is not in the evidence."])
+    cheap = _refuted(["The claim cites Dr. Elin Vasquez, who is not in the evidence."])
     out2 = await v2._escalate_refute(
-        cheap, "claim", "[web] Athens: 34C, humidity 28%", "ctx",
+        cheap, "Dr. Elin Vasquez confirmed 28% humidity.", "[web] Athens: 34C, humidity 28%", "ctx",
         trace={"req_id": "t2"})
     assert out2 is cheap
     assert stub2.prompts == []

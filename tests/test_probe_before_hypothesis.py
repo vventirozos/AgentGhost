@@ -52,8 +52,10 @@ class TestCallSiteWiring:
         src = self._src()
         idx = src.index("_noprogress_trip is not None and not force_stop")
         # window widened 1400 → 2800 (§4GH, 2026-09-13): the browser
-        # navigate-without-extract case sits between the trip and the tiers
-        window = src[idx:idx + 2800]
+        # navigate-without-extract case sits between the trip and the tiers;
+        # → 6000 (§4IB, 2026-09-17): the execute same-error steer/report
+        # branches sit between them too
+        window = src[idx:idx + 6000]
         assert "_acnt >= _hard_n" in window
         assert "READWRITE_HARD_STOP" in window
         assert "else 3" in window

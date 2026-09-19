@@ -178,6 +178,8 @@ _MODEL_PATTERNS = [
     re.compile(r"arithmetic (error|mistake)|miscalculat\w*", re.IGNORECASE),
     re.compile(r"misread (the|a)|misinterpret\w*", re.IGNORECASE),
     re.compile(r"contradict(ed|s) (itself|the evidence)", re.IGNORECASE),
+    # §4IN claim-binding issue shapes: a validated contradiction between the reply's words and the evidence
+    re.compile(r"is contradicted by the evidence|the evidence says|reports one of two evidence values|validated contradiction", re.IGNORECASE),
     re.compile(r"despite (correct|complete) (context|evidence)", re.IGNORECASE),
     re.compile(r"refus(ed|al)", re.IGNORECASE),
 ]

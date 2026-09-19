@@ -1,0 +1,1743 @@
+"""§4IM — the claim-binding verifier: verdicts computed from validated quotes.
+
+WHY (measured, §4IJ, six bench arms on seed + live-derived cases). The
+incumbent judge asks two models for an OPINION and returns one. The cheap
+model false-refutes a third of clean replies ("not supported" on vibes); the
+strong model — the agent's own — confirms contradictions it can plainly see
+("a minor issue"). Every re-weighting of the two opinions (rules, objections
+block, concession downgrade, rebuttal burden, forced suspects, judge swaps)
+moved at most a tenth of the false-confirm rate and always at a clean-side
+cost. The structure was the defect.
+
+WHAT. One cheap-leg call does QUOTING work, which small models do reliably
+and which code can check:
+
+    reply  ──►  checkable claims, each a VERBATIM quote of the reply
+    evidence ─► for each claim, the evidence span that supports or
+                contradicts it, VERBATIM
+
+Code then validates every quote by normalized containment (a claim that is
+not in the reply, a span that is not in the evidence, is dropped — never a
+verdict), compares claim and span (numbers normalised for units, rounding
+and hedges), scans the evidence for a second line with the same skeleton
+and a different value (CONFLICTING EVIDENCE — the omitted-contradiction
+class), flags labelled values that cannot be (a latitude of 128°), and
+computes the verdict:
+
+    REFUTED    ⇐ at least one VALIDATED contradiction / conflict / implausible
+                 value on a checkable claim (the issue names both quotes)
+    CONFIRMED  ⇐ every checkable claim bound to an agreeing span
+    UNCERTAIN  ⇐ otherwise (unbound load-bearing claims are counted, not
+                 refuted, in phase 1; truncated evidence is never a refute)
+
+A subjective gloss or a derived summary is not a checkable claim, so it
+cannot be refuted: the "beautiful Saturday afternoon" class of fake refute
+is impossible by construction. A validated disagreement refutes whatever
+the strong model's mood: the "34°C beside 35°C", "5 PNGs beside seven",
+"RECOVERED beside missing" class of laundered confirm is impossible by
+construction. The failure mode of everything else is UNCERTAIN.
+
+Pure functions throughout (the LLM call is injected) so every rule has a
+table test; the orchestration lives in `Verifier._verify_claim_binding`.
+"""
+from __future__ import annotations
+
+import functools
+import json
+import math
+import re
+import unicodedata
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+# ── contract ────────────────────────────────────────────────────────────
+
+CLAIM_KINDS = ("number", "count", "date", "name", "file", "status", "other")
+#: Kinds whose absence from the evidence is load-bearing (counted in phase
+#: 1, a candidate refute in phase 2). "other" is prose the model chose to
+#: list; it is checked when bound and ignored when not.
+LOAD_BEARING_KINDS = ("number", "count", "date", "name", "file", "status")
+RELATIONS = ("support", "contradict", "absent")
+
+MAX_CLAIMS = 8
+MIN_QUOTE_CHARS = 4
+#: Prompt guidance for the model; the parser never CUTS a quote to these —
+#: a span sliced at 160 chars lost the "Tonight: low 24°C" that carried the
+#: claim's figure and left the current temperature to disagree with (seed
+#: long-weather-1, a fake refute). Oversized quotes are validated whole and
+#: only dropped beyond the hard sanity caps below.
+MAX_QUOTE_CHARS = 240
+MAX_SPAN_CHARS = 160
+HARD_QUOTE_CAP = 1200
+HARD_SPAN_CAP = 2000
+
+#: Hedge words that widen the numeric tolerance from "rounds to the same
+#: figure at the claim's precision" to ±`HEDGE_REL_TOL`.
+HEDGE_WORDS = ("~", "about", "approximately", "approx", "around", "roughly",
+               "nearly", "almost", "close to", "circa", "≈")
+HEDGE_REL_TOL = 0.05
+
+CLAIM_BINDING_PROMPT = """You are a claim binder. You do NOT judge the reply. You quote.
+
+REPLY (the agent's answer to the user):
+{claim}
+
+EVIDENCE (the tool outputs the reply was built from, each prefixed with [tool_name]):
+{evidence}
+
+USER REQUEST:
+{context}
+
+Step 1 — list the reply's CHECKABLE claims: every specific number, count, date, name, file/path, status ("succeeded", "started", "recovered", "all tasks done") or other verifiable statement. Each claim is an EXACT, VERBATIM fragment of the REPLY (copy it character for character, 4–240 characters). Do not list subjective phrasing ("beautiful", "fast", "clean"), advice, or plans. At most {max_claims} claims, most load-bearing first.
+
+Step 2 — for EACH claim, quote the EVIDENCE span (exact, verbatim, at most 160 characters, from one place) that most directly SUPPORTS or CONTRADICTS it, and say which. If the evidence states two different values for the same thing, quote the one that DIFFERS from the claim and mark it "contradict". If nothing in the evidence bears on the claim, write an empty evidence_quote and relation "absent". Never paraphrase a quote; never invent one.
+
+Respond ONLY with a MINIFIED single-line JSON object — no code fences, no prose before or after, no extra keys. Your response MUST start with {{ and contain no newlines:
+{{"claims":[{{"quote":"exact reply fragment","kind":"number|count|date|name|file|status|other","evidence_quote":"exact evidence fragment or empty","relation":"support|contradict|absent"}}]}}"""
+
+
+@dataclass
+class Binding:
+    quote: str
+    kind: str
+    evidence_quote: str
+    relation: str                 # the model's stated relation (a hint only)
+    valid_claim: bool = False     # quote ⊂ reply
+    valid_span: bool = False      # evidence_quote ⊂ evidence
+    outcome: str = "unbound"      # agree | disagree | conflict | implausible | unbound | unchecked
+    detail: str = ""              # human-readable reason for disagree/conflict/implausible
+    residual: bool = False        # §4IN: outcome set by the residual judge's validated quote
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"quote": self.quote, "kind": self.kind, "evidence_quote": self.evidence_quote,
+                "relation": self.relation, "valid_claim": self.valid_claim,
+                "valid_span": self.valid_span, "outcome": self.outcome, "detail": self.detail,
+                "residual": self.residual}
+
+
+@dataclass
+class ClaimBindingResult:
+    verdict: str                  # CONFIRMED | REFUTED | UNCERTAIN
+    confidence: float
+    issues: List[str]
+    bindings: List[Binding] = field(default_factory=list)
+    dropped: int = 0              # model rows whose claim quote was not in the reply
+    reasoning: str = ""
+    audit: List[Any] = field(default_factory=list)   # AuditFigure rows (the number audit)
+    entities: List[Any] = field(default_factory=list)   # AuditEntity rows (the named-entity audit)
+    findings: List[Any] = field(default_factory=list)   # ClassFinding rows (artifact / constraint / evidence / topic)
+
+    def counts(self) -> Dict[str, int]:
+        c: Dict[str, int] = {}
+        for b in self.bindings:
+            c[b.outcome] = c.get(b.outcome, 0) + 1
+            if b.residual:
+                c[f"residual_{b.outcome}"] = c.get(f"residual_{b.outcome}", 0) + 1
+        c["dropped"] = self.dropped
+        for f in self.audit:
+            key = f"audit_{f.status}"
+            c[key] = c.get(key, 0) + 1
+        for e in self.entities:
+            key = f"entity_{e.status}"
+            c[key] = c.get(key, 0) + 1
+        for g in self.findings:
+            key = f"class_{g.kind}"
+            c[key] = c.get(key, 0) + 1
+        return c
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"verdict": self.verdict, "confidence": self.confidence, "issues": list(self.issues),
+                "bindings": [b.to_dict() for b in self.bindings], "dropped": self.dropped,
+                "audit": [f.to_dict() for f in self.audit],
+                "entities": [e.to_dict() for e in self.entities],
+                "findings": [g.to_dict() for g in self.findings],
+                "counts": self.counts(), "reasoning": self.reasoning}
+
+
+# ── quote validation ────────────────────────────────────────────────────
+
+def normalize_for_containment(s: str) -> str:
+    """Case + whitespace + Unicode folding (NFKC, zero-widths stripped, curly
+    quotes/dashes straightened) — the same folding the rebuttal-burden
+    validator uses, so "verbatim" tolerates typographic punctuation."""
+    # NFC, not NFKC: NFKC turns "2⁵" into "25" and "½" into "1⁄2" — figures
+    # that were never written (review §4IN m6). Typographic quotes, dashes
+    # and no-break spaces are folded explicitly.
+    s = unicodedata.normalize("NFC", str(s or ""))
+    s = s.translate(str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"', "–": "-", "—": "-",
+                                   "\u00a0": " ", "\u202f": " ", "\u2009": " "}))
+    s = re.sub("[\\u200b\\u200c\\u200d\\ufeff]", "", s)
+    return re.sub(r"\s+", " ", s.strip().lower())
+
+
+def _fold_spaces(text: str) -> str:
+    """Length-preserving: no-break / thin spaces become spaces, so a RAW
+    line and its normalized snapped window read the same figures."""
+    return str(text or "").translate(str.maketrans({"\u00a0": " ", "\u202f": " ", "\u2009": " "}))
+
+
+def _whole_token_find(needle: str, hay: str) -> int:
+    """Index of an occurrence of `needle` in `hay` that does not split a
+    token — "the count is 12" is NOT in "the count is 120 files", "port
+    810" is not in "port 8100" (review §4IN M3). -1 when none."""
+    start = 0
+    while True:
+        i = hay.find(needle, start)
+        if i < 0:
+            return -1
+        j = i + len(needle)
+        left_ok = i == 0 or not (hay[i - 1].isalnum() and needle[:1].isalnum())
+        right_ok = (j >= len(hay) or not (hay[j].isalnum() and needle[-1:].isalnum())
+                    and not (needle[-1:].isdigit() and hay[j] in ".," and j + 1 < len(hay) and hay[j + 1].isdigit()))
+        if left_ok and right_ok:
+            return i
+        start = i + 1
+
+
+def quote_in(quote: str, text: str, *, min_chars: int = MIN_QUOTE_CHARS) -> bool:
+    """Normalized containment on whole tokens with a minimum length — a
+    fragment shorter than `min_chars` cannot anchor anything."""
+    nq = normalize_for_containment(quote)
+    if len(nq) < min_chars:
+        return False
+    return _whole_token_find(nq, normalize_for_containment(text)) >= 0
+
+
+#: Snapping: the model's quote is a LOCATOR; the validated text is the
+#: source's own. A quote that is not a verbatim substring but matches a
+#: window of the text at this ratio or better (a dropped word, a changed
+#: article, a trimmed clause end) is replaced by that window, so every rule
+#: downstream still runs on text that exists. Below the ratio: unbound.
+#: Mined pool, 60 clean replies: 56 "found no evidence span" rows before
+#: snapping — the E4B finds the passage and does not copy it exactly.
+SNAP_MIN_RATIO = 0.9
+SNAP_MIN_CHARS = 12          # a short quote matches too many windows to be a locator
+
+
+SNAP_MAX_WINDOWS = 60        # bound the work: a saturated quote on a 12k evidence blocked the loop for seconds
+
+
+def _snap_tokens_match(nq: str, cand: str) -> bool:
+    """The window is the quote's own field, not a neighbour's: the same
+    alphabetic tokens (labels may not drift — "channel x" is not "channel
+    y", review §4IN m7) and at most one differing numeric token (a misquoted
+    figure: the real text wins)."""
+    strip = lambda x: re.sub(r"°[a-z]\b", "°", x)          # "36°c": the unit letter is part of the figure
+    ta, tb = re.findall(r"[a-z]+", strip(nq)), re.findall(r"[a-z]+", strip(cand))
+    if sorted(ta) != sorted(tb):
+        return False
+    na, nb = re.findall(r"\d+(?:\.\d+)?", nq), re.findall(r"\d+(?:\.\d+)?", cand)
+    if len(na) != len(nb):
+        return False
+    diff = [(x, y) for x, y in zip(na, nb) if x != y]
+    return len(diff) == 0 or (len(diff) == 1 and len(diff[0][0]) == len(diff[0][1]))   # 29→28, never 12→120
+
+
+def snap_quote(quote: str, text: str) -> Optional[str]:
+    """The normalized window of `text` the quote denotes: the quote itself
+    (widened to whole tokens) when it is a verbatim substring, else the
+    best window around the quote's rarest long token when it matches at
+    ≥ SNAP_MIN_RATIO with the same labels; None otherwise."""
+    import difflib
+    nq = normalize_for_containment(quote)
+    nt = normalize_for_containment(text)
+    if len(nq) < MIN_QUOTE_CHARS:
+        return None
+    i = _whole_token_find(nq, nt)
+    if i >= 0:
+        a, b = _token_bounds(nt, i, i + len(nq))
+        return nt[a:b].strip()
+    if len(nq) < SNAP_MIN_CHARS:
+        return None
+    toks = re.findall(r"[a-z0-9][\w.-]{3,}", nq)
+    if not toks:
+        return None
+    # the rarest present token anchors; its positions are capped, rarest first
+    tok = min(set(toks), key=lambda t: (nt.count(t) or 10 ** 6, -len(t)))
+    if nt.count(tok) == 0:
+        return None
+    off = nq.find(tok)
+    L = len(nq)
+    positions: List[int] = []
+    start = 0
+    while len(positions) < SNAP_MAX_WINDOWS // 3:
+        j = nt.find(tok, start)
+        if j < 0:
+            break
+        positions.append(j)
+        start = j + 1
+    best, best_ratio = None, 0.0
+    for j in positions:
+        for lo in (j - off - 4, j - off, j - off + 4):
+            lo = max(0, lo)
+            for span_len in (L, int(L * 0.9), int(L * 1.1)):
+                a, b = _token_bounds(nt, lo, min(len(nt), lo + span_len))
+                cand = nt[a:b]
+                if not cand or not _snap_tokens_match(nq, cand):
+                    continue
+                sm = difflib.SequenceMatcher(None, nq, cand, autojunk=False)
+                if sm.quick_ratio() < SNAP_MIN_RATIO:
+                    continue
+                ratio = sm.ratio()
+                if ratio > best_ratio:
+                    best, best_ratio = cand, ratio
+                    if ratio >= 0.999:
+                        return best.strip()
+    if best is None or best_ratio < SNAP_MIN_RATIO:
+        return None
+    return best.strip()
+
+
+def _token_bounds(text: str, lo: int, hi: int) -> Tuple[int, int]:
+    """Widen [lo, hi) to whole tokens: a window that cuts "36°c" to "3",
+    "12.75" to "12", "1,000" to "1" or "-5" to "5" would mint a figure that
+    was never written."""
+    while lo > 0 and text[lo - 1].isalnum() and lo < len(text) and text[lo].isalnum():
+        lo -= 1
+    if lo > 0 and text[lo - 1] in "-+€$£" and lo < len(text) and text[lo].isdigit():
+        lo -= 1
+    while 0 < hi < len(text):
+        if text[hi - 1].isalnum() and text[hi].isalnum():
+            hi += 1
+        elif text[hi - 1].isdigit() and text[hi] in ".," and hi + 1 < len(text) and text[hi + 1].isdigit():
+            hi += 2                                            # cross the separator AND take the digit
+        else:
+            break
+    while hi < len(text) and (text[hi] in "%°" or (text[hi - 1] == "°" and text[hi].isalpha())):
+        hi += 1                                                # a unit glued to its figure: "36°c", "28%"
+    return lo, hi
+
+
+# ── numbers and units ───────────────────────────────────────────────────
+
+_NUM_CORE = r"[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?|[-+]?\d+(?:\.\d+)?"   # "100 200 300" is three figures, not one
+_UNIT_ALT = (r"%|°c|°f|°|tb|gb|mb|kb|kib|mib|gib|bytes?|ms|s|sec|secs|seconds?|min|mins|minutes?|h|hr|hrs|hours?"
+             r"|km|m|cm|mm|kg|mg|g|k|million|billion|thousand|bn|mn")
+#: `(?![.,]?\d)` after the figure: a number is never the truncated prefix of
+#: a longer one. Glued page text ("orbitalperiodof 29.45years", the space
+#: collapsed by the extractor) made the engine back off "29.45" (blocked by
+#: the "y") to "29" — a figure that was never written, refuting a correct
+#: "26"→ see the date rule (live row 2026-09-18, the Saturn probe).
+#: `(?:(?P<cur>[€$£])\s*)?` — NOT `(?P<cur>[€$£])?\s*`: an unconditional `\s*`
+#: before the figure backtracks O(n²) over the space run a masked code fence
+#: leaves behind (14,000 spaces → 7.7 s per call; a 14 KB fenced reply cost
+#: 26 s in the turn — corpus replay §4IN). Same match set.
+_NUM_RE = re.compile(
+    rf"(?:(?P<cur>[€$£])\s*)?(?<![\w.])(?P<num>{_NUM_CORE})(?![.,]?\d)\s*(?P<unit>{_UNIT_ALT})?(?![\w])", re.IGNORECASE)
+#: A RANGE is one quantity, not two: "spans x=360–380" bound to `ballX: 370`
+#: is agreement (the value lies inside), not a 360-vs-370 contradiction
+#: (mined pool rec-3adeaf27e8, a clean reply refuted). Connectors: a dash,
+#: "to", or "between A and B"; the unit may sit on either endpoint.
+_RANGE_RE = re.compile(
+    rf"(?P<between>\bbetween\s+)?(?:(?P<cur>[€$£])\s*)?(?<![\w.])(?P<lo>{_NUM_CORE})(?:\s*(?P<unit1>{_UNIT_ALT}))?"
+    rf"(?P<conn>(?<!\s)-(?!\s)|\s*[–—]\s*|\s+to\s+|\s+and\s+)(?:(?P<cur2>[€$£])\s*)?(?P<hi>{_NUM_CORE})(?![.,]?\d)\s*(?P<unit>{_UNIT_ALT})?(?![\w])",
+    re.IGNORECASE)
+#: Word/letter multipliers that scale a CURRENCY figure ("€3.4 million" =
+#: "€3.4M" = 3,400,000 money). Without a currency sign "m" stays metres.
+_MONEY_MULT = {"k": 1e3, "thousand": 1e3, "m": 1e6, "mn": 1e6, "million": 1e6,
+               "bn": 1e9, "billion": 1e9}
+
+#: unit → (family, factor to the family's base)
+_UNITS: Dict[str, Tuple[str, float]] = {
+    "b": ("bytes", 1.0), "byte": ("bytes", 1.0), "bytes": ("bytes", 1.0),
+    "kb": ("bytes", 1024.0), "kib": ("bytes", 1024.0),
+    "mb": ("bytes", 1024.0 ** 2), "mib": ("bytes", 1024.0 ** 2),
+    "gb": ("bytes", 1024.0 ** 3), "gib": ("bytes", 1024.0 ** 3),
+    "tb": ("bytes", 1024.0 ** 4),
+    "ms": ("time", 0.001), "s": ("time", 1.0), "sec": ("time", 1.0), "secs": ("time", 1.0),
+    "second": ("time", 1.0), "seconds": ("time", 1.0),
+    "min": ("time", 60.0), "mins": ("time", 60.0), "minute": ("time", 60.0), "minutes": ("time", 60.0),
+    "h": ("time", 3600.0), "hr": ("time", 3600.0), "hrs": ("time", 3600.0),
+    "hour": ("time", 3600.0), "hours": ("time", 3600.0),
+    "mm": ("length", 0.001), "cm": ("length", 0.01), "m": ("length", 1.0), "km": ("length", 1000.0),
+    "%": ("percent", 1.0), "°c": ("temp_c", 1.0), "°": ("degrees", 1.0), "°f": ("temp_f", 1.0),
+    "mg": ("mass", 0.001), "g": ("mass", 1.0), "kg": ("mass", 1000.0),
+    "k": ("thousand", 1000.0),
+}
+
+
+@dataclass(frozen=True)
+class Quantity:
+    value: float          # in the family's base unit (or raw when unitless); a range's LOW end
+    family: str           # "" when unitless
+    decimals: int         # decimals the text carried (for rounding comparisons)
+    text: str
+    unit: str = ""        # the unit token as written, lowercased ("kb", "min", "million")
+    hi: Optional[float] = None   # a range's HIGH end (same base unit); None for a scalar
+    bound: str = ""       # "lower" ("over 160", "160+", "at least"), "upper" ("under", "up to", "at most"), "" exact
+
+    @property
+    def is_range(self) -> bool:
+        return self.hi is not None
+
+
+#: Date and clock tokens are not quantities: `2026-07-07` would otherwise
+#: read as 2026, −7, −7 and `14:20` as 14 and 20 — both produced fake
+#: disagreements on the seed set (pg-orders, weather).
+#: Finite month spellings — a `[a-z]*` wildcard read "3 separate", "2 octets",
+#: "12 decimal", "market 2026" as dates and erased the figures (review §4IN M4).
+_MONTH = (r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?"
+          r"|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?(?![a-z])")
+_DAY = r"\d{1,2}(?!\d)(?:st|nd|rd|th)?"      # "June 2026" has no day: "20" is not one
+_DATE_TIME_RE = re.compile(
+    r"(?<!\d)\d{4}-\d{2}-\d{2}(?:[T ]\d{1,2}:\d{2}(?::\d{2})?)?\b|\b\d{1,2}:\d{2}(?::\d{2})?\b"   # (?<!\d): glued "on2026-05-14" is still a date
+    r"|\b\d{1,2}[/.]\d{1,2}[/.]\d{2,4}\b"
+    # month-name dates and ranges: "Feb 27-28, 2025", "March 14, 2026",
+    # "September 8th, 2040", "28 February 2025", "Feb 28 - Mar 1, 2026"
+    rf"|\b{_MONTH}\s+{_DAY}(?:\s*[-–]\s*(?:{_MONTH}\s+)?{_DAY})?(?:,?\s*\d{{4}})?"
+    rf"|\b{_DAY}\s+{_MONTH}(?:,?\s*\d{{4}})?"
+    # month + year, no day ("as of June 2026", glued "June2026[update]")
+    rf"|\b{_MONTH}\s*\d{{4}}\b"
+    # a decade ("the 2000s", "the 1990s") is neither a year nor 2000 seconds
+    r"|\b(?:1[89]|20)\d0s\b"
+    # relative time ("OTD 20 years ago", "posted 3 hours ago") is a date
+    # anchored to the source's own unknown "now" — never "the" value a reply
+    # figure misreads (corpus replay §4IP R6: "a 24-year span" vs "20 years
+    # ago", protected until then only by a list number in the sentence)
+    r"|\b\d+(?:[.,]\d+)?\s*(?:sec(?:ond)?s?|min(?:ute)?s?|h(?:ou)?rs?|days?|weeks?|wks?|months?|years?|yrs?|decades?)\s+ago\b",
+    re.IGNORECASE)
+def mask_dates(text: str) -> str:
+    return _DATE_TIME_RE.sub(lambda m: " " * len(m.group(0)), str(text or ""))
+
+
+#: Identifiers are tokens, not quantities: an IPv4 address, a dotted version
+#: of three or more parts, a hex id carrying both letters and digits (task
+#: ids, hashes), a UUID. `127.0.0.2` read as 127.0 hid a swapped last octet
+#: (mined rec-ca993114e7); as a token it is looked up verbatim.
+_IDENT_RE = re.compile(
+    r"\b\d{1,3}(?:\.\d{1,3}){3}\b"
+    r"|\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"
+    r"|\bv?\d+(?:\.\d+){2,}\b"
+    r"|\b(?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{8,}\b", re.IGNORECASE)
+
+
+def mask_identifiers(text: str) -> str:
+    return _IDENT_RE.sub(lambda m: " " * len(m.group(0)), str(text or ""))
+
+
+#: `grep -n` / `cat -n` line numbers ("173:const channel = …", "  42\tfoo",
+#: "12| bar") are evidence FORMAT, not figures.
+_LINE_NUMBER_RE = re.compile(r"(?m)^[ \t]*\d{1,6}(?:[:|→]|\t| {2,})")
+
+
+def mask_line_numbers(text: str) -> str:
+    return _LINE_NUMBER_RE.sub(lambda m: " " * len(m.group(0)), str(text or ""))
+
+
+def mask_non_quantities(text: str) -> str:
+    # dates and clocks first: "12:30 meeting" is a clock, not line 12
+    return mask_identifiers(mask_line_numbers(mask_dates(text)))
+
+
+def _is_bare_year(v: float, unit: str, decimals: int, raw: str = "") -> bool:
+    """A unitless four-digit integer in the calendar range ("May 6, 2492",
+    "in 2026") is a year, not a quantity; "2048 bytes" keeps its unit and
+    stays a quantity, and a comma-grouped "2,000" is a count, never a year."""
+    return not unit and decimals == 0 and 1900 <= v <= 2999 and "," not in raw
+
+
+def _scale(raw: str, unit: str, cur: str) -> Optional[Tuple[float, str, int]]:
+    """(value in the family base, family, decimals) for one written figure;
+    None when it is not a number or is a bare year."""
+    num_txt = raw.replace(",", "")
+    if len(num_txt.lstrip("-+")) > 1 and num_txt.lstrip("-+").startswith("0") and "." not in num_txt:
+        return None                      # "000": a thousands-group remnant left by a mask, never a written figure
+    try:
+        v = float(num_txt)
+    except ValueError:
+        return None
+    decimals = len(num_txt.split(".")[1]) if "." in num_txt else 0
+    if _is_bare_year(v, unit, decimals, raw) and not cur:
+        return None
+    if cur:
+        return v * _MONEY_MULT.get(unit, 1.0), "money", decimals
+    fam, factor = _UNITS.get(unit, ("", 1.0))
+    if unit in ("million", "billion", "thousand", "bn", "mn"):
+        return v * _MONEY_MULT[unit], "", decimals
+    if fam == "thousand":        # "12k" is a unitless 12000
+        return v * factor, "", decimals
+    return v * factor, fam, decimals
+
+
+def _blank(text: str, start: int, end: int) -> str:
+    return text[:start] + " " * (end - start) + text[end:]
+
+
+_LOWER_BOUND_RE = re.compile(r"(?:\bover|\bmore than|\bat least|\babove|\bexceed(?:s|ing)?|\bupwards of|>=?|≥)\s*$", re.I)
+_UPPER_BOUND_RE = re.compile(r"(?:\bunder|\bless than|\bfewer than|\bat most|\bbelow|\bup to|\bno more than|\bwithin|<=?|≤)\s*$", re.I)
+
+
+def _bound_at(text: str, start: int, end: int) -> str:
+    """A figure's bound marker from its immediate context: the words before
+    it ("over 160", "at least 3") or a "+" right after it ("160+"). A bound
+    is not a measurement — "Over 160+ reviews" against "164 reviews" is
+    agreement, never a misreport (corpus replay)."""
+    before = text[max(0, start - 16):start]
+    after = text[end:end + 1]
+    if after == "+" or _LOWER_BOUND_RE.search(before):
+        return "lower"
+    if _UPPER_BOUND_RE.search(before):
+        return "upper"
+    return ""
+
+
+def extract_quantities_with_pos(text: str) -> List[Tuple[Quantity, int]]:
+    """Every quantity in `text` with its character offset, ranges first
+    (a range's endpoints are never also reported as two scalars)."""
+    masked = mask_non_quantities(_fold_spaces(text))
+    found: List[Tuple[Quantity, int]] = []
+    for m in _RANGE_RE.finditer(masked):
+        conn = m.group("conn").strip().lower()
+        if conn == "and" and not m.group("between"):
+            continue                                   # "5 and 7 tasks" — two figures, not a range
+        u1, u2 = (m.group("unit1") or "").lower(), (m.group("unit") or "").lower()
+        if u1 and u2 and u1 != u2:
+            continue
+        unit, cur = (u2 or u1), (m.group("cur") or m.group("cur2") or "")
+        lo, hi = _scale(m.group("lo"), unit, cur), _scale(m.group("hi"), unit, cur)
+        if lo is None or hi is None or lo[1] != hi[1] or lo[0] > hi[0]:
+            continue
+        found.append((Quantity(lo[0], lo[1], max(lo[2], hi[2]), m.group(0).strip(), unit, hi[0]),
+                      m.start()))
+        masked = _blank(masked, m.start(), m.end())
+    for m in _NUM_RE.finditer(masked):
+        unit, cur = (m.group("unit") or "").lower(), m.group("cur") or ""
+        sc = _scale(m.group("num"), unit, cur)
+        if sc is None:
+            continue
+        found.append((Quantity(sc[0], sc[1], sc[2], m.group(0).strip(), unit,
+                               bound=_bound_at(masked, m.start(), m.end())), m.start()))
+    found.sort(key=lambda p: p[1])
+    return found
+
+
+def extract_quantities(text: str) -> List[Quantity]:
+    return [q for q, _ in extract_quantities_with_pos(text)]
+
+
+_HEDGE_RE = re.compile(r"(?<![\w/])~\s*\d|≈\s*\d|\b(?:about|approximately|approx|around|roughly|nearly|almost|circa)\b|\bclose to\b", re.I)
+
+
+def _hedged(text: str) -> bool:
+    """A hedge WORD, or "~"/"≈" right before a figure — "~/Data" and
+    "roundabout" are not hedges."""
+    return bool(_HEDGE_RE.search(str(text or "")))
+
+
+def _compare_factor(claim_q: Quantity, span_q: Quantity) -> float:
+    """Figures are compared in the CLAIM's own unit at the claim's decimals:
+    "48 KB" vs 49152 bytes → 48.0 vs 48.0; "0.04s" vs "0.041s" → 0.04 vs
+    0.04. Unitless and non-convertible families compare raw."""
+    if claim_q.family in ("bytes", "time", "length", "money") and claim_q.family == span_q.family:
+        return _claim_unit_factor(claim_q)
+    return 1.0
+
+
+def _scalars_agree(a: float, b: float, *, decimals: int, factor: float, hedged: bool) -> bool:
+    if hedged:
+        base = max(abs(a), abs(b), 1e-9)
+        return abs(a - b) / base <= HEDGE_REL_TOL
+    return _round_half_up(b / factor, decimals) == _round_half_up(a / factor, decimals)
+
+
+def _round_half_up(x: float, decimals: int) -> float:
+    q = 10 ** decimals
+    return math.floor(abs(x) * q + 0.5) / q * (1 if x >= 0 else -1)
+
+
+def _within(lo: float, hi: float, v: float, *, decimals: int, factor: float, hedged: bool) -> bool:
+    """`v` lies inside [lo, hi] at the given precision (a hedged claim widens
+    the range by HEDGE_REL_TOL of its magnitude)."""
+    if hedged:
+        tol = HEDGE_REL_TOL * max(abs(lo), abs(hi), 1e-9)
+        return lo - tol <= v <= hi + tol
+    rv = _round_half_up(v / factor, decimals)
+    return _round_half_up(lo / factor, decimals) <= rv <= _round_half_up(hi / factor, decimals)
+
+
+def quantities_agree(claim_q: Quantity, span_q: Quantity, *, hedged: bool) -> bool:
+    """Same family (or both unitless) and the span's value ROUNDS to the
+    claim's figure at the claim's precision; a hedged claim tolerates
+    ±HEDGE_REL_TOL instead. A range agrees with a value inside it, and with
+    a range whose two endpoints agree."""
+    if claim_q.family != span_q.family and claim_q.family and span_q.family:
+        return False
+    f, d = _compare_factor(claim_q, span_q), claim_q.decimals
+    if claim_q.bound == "lower" and not span_q.is_range:
+        return span_q.value >= claim_q.value
+    if claim_q.bound == "upper" and not span_q.is_range:
+        return span_q.value <= claim_q.value
+    if claim_q.is_range and span_q.is_range:
+        return (_scalars_agree(claim_q.value, span_q.value, decimals=d, factor=f, hedged=hedged)
+                and _scalars_agree(claim_q.hi, span_q.hi, decimals=d, factor=f, hedged=hedged))
+    if claim_q.is_range:
+        return _within(claim_q.value, claim_q.hi, span_q.value, decimals=d, factor=f, hedged=hedged)
+    if span_q.is_range:
+        return _within(span_q.value, span_q.hi, claim_q.value, decimals=d, factor=f, hedged=hedged)
+    return _scalars_agree(claim_q.value, span_q.value, decimals=d, factor=f, hedged=hedged)
+
+
+def _claim_unit_factor(q: Quantity) -> float:
+    if q.family == "money":
+        return _MONEY_MULT.get(q.unit, 1.0)
+    return _UNITS.get(q.unit, ("", 1.0))[1] or 1.0
+
+
+_ANCHOR_STOP = frozenset("""
+the a an of and or to in for on with by from at is are was were be been being as that this these
+those it its into about over under how what when where which who why not no do does did can could
+should would will may might must all any some each every has have had than then there here
+""".split())
+
+
+_NEGATION_RE = re.compile(r"\b(?:not|no|never|none|failed|failure|fails|error|errors|cannot|can't|unable|missing|denied|refused|rejected|timed out|timeout|exception|traceback)\b", re.I)
+
+
+def _polarity_clash(claim_quote: str, span: str) -> bool:
+    """A status claim and a span that shares its subject but carries a
+    failure/negation word the claim does not ("All tests passed" against
+    "3 failed, 0 passed", review §4IN m1) — code cannot call that agreement."""
+    return bool(_NEGATION_RE.search(span)) and not _NEGATION_RE.search(claim_quote)
+
+
+def lexical_anchor(claim_quote: str, span: str) -> bool:
+    """A non-numeric claim is anchored to its span when one of its content
+    words (≥4 chars, not a stopword) occurs in the span — "RECOVERED" is not
+    anchored by "required file missing"; "server restarted" is anchored by
+    "restarted ghost-agent"."""
+    words = [w for w in re.findall(r"\w+", normalize_for_containment(claim_quote))
+             if len(w) >= 4 and w not in _ANCHOR_STOP]
+    if not words:
+        return False
+    hay = normalize_for_containment(span)
+    return any(w in hay for w in words)
+
+
+def compare_claim_span(claim_quote: str, span: str) -> Tuple[str, str]:
+    """-> (outcome, detail) for a bound pair. A claim carrying quantities:
+    "agree" when every claim quantity finds an agreeing span quantity,
+    "disagree" when one matches a span quantity's family but not its value.
+    A claim without quantities: "agree" when lexically anchored to the span,
+    else "unchecked" — code cannot grade a status word; the model's opinion
+    is not a verdict."""
+    outcome, detail, _q, _s = _compare(claim_quote, span)
+    return outcome, detail
+
+
+def _compare(claim_quote: str, span: str) -> Tuple[str, str, Optional[Quantity], Optional[Quantity]]:
+    """`compare_claim_span` plus the claim figure that disagreed and the span
+    figure it was measured against (None otherwise), for the guards in
+    `bind`."""
+    cq = extract_quantities(claim_quote)
+    if not cq:
+        if lexical_anchor(claim_quote, span) and not _polarity_clash(claim_quote, span):
+            return "agree", "", None, None
+        return "unchecked", "no comparable figure", None, None
+    sq = extract_quantities(span)
+    if not sq:
+        return "unchecked", "span carries no quantity", None, None
+    hedged = _hedged(claim_quote)
+    supported = 0
+    for q in cq:
+        # comparable = the same unit family; a unit-bearing claim figure is
+        # never compared with a bare number ("4TB" is not "289.90")
+        comparable = [s for s in sq if s.family == q.family]
+        if not comparable:
+            continue                                   # unknown, not a contradiction
+        if any(quantities_agree(q, s, hedged=hedged) for s in comparable):
+            supported += 1
+            continue
+        near = [s for s in comparable if _near_miss(q, s)]
+        if not near:
+            continue                                   # a different figure of the same family (a bound, a core count)
+        best = min(near, key=lambda s: abs(s.value - q.value))
+        return "disagree", f"claim says {q.text!r}, evidence says {best.text!r}", q, best
+    if supported:
+        return "agree", "", None, None
+    return "unchecked", "no claim figure had a comparable evidence figure", None, None
+
+
+def _claim_states(claim_quote: str, span_fig: Optional[Quantity]) -> bool:
+    """The span figure the disagreement was measured against is one the
+    CLAIM states itself ("the ball at x=365 … left of the wall at x=360"
+    bound to `channel = { x: 360 }`): the claim knows both numbers, so its
+    other figure is another quantity, not a misreading (mined
+    rec-ebc239c1ca, clean). Only THAT figure — "100" near "76" in a list of
+    bumper values must not trip it."""
+    if span_fig is None:
+        return False
+    return _slot_text(span_fig) in {_slot_text(c) for c in extract_quantities(claim_quote)}
+
+
+def _dense(q: Optional[Quantity], text: str) -> bool:
+    """Three or more figures of the claim figure's family in one text — a
+    record (a struct literal, coordinates, a spec line)."""
+    if q is None:
+        return False
+    return sum(1 for s in extract_quantities(text) if s.family == q.family) >= 3
+
+
+def _aligned(claim_quote: str, span: str) -> bool:
+    """The claim's non-numeric skeleton is the span's, contains it, or is
+    contained in it (a near-verbatim repetition — the vision description
+    the reply copied with one figure swapped; "meta=335" against "Topic
+    clusters: meta=334, coding=241, …"). In a dense span only an aligned
+    claim's one-digit slip singles out a quantity: "ball: x=365, y=560,
+    r=8" against `const plunger = { x: 375, y: 560, w: 12, h: 40, … }` is
+    two records, not one misread (mined rec-ebc239c1ca, clean)."""
+    import difflib
+    a, b = _skeleton(claim_quote), _skeleton(span)
+    if not a or not b:
+        return False
+    if a in b or b in a:
+        return True
+    return difflib.SequenceMatcher(None, a, b, autojunk=False).ratio() >= 0.8
+
+
+def _single_comparable(q: Optional[Quantity], span: str) -> bool:
+    """A shared subject word settles WHICH figure the claim's corresponds
+    to only when the span carries exactly one figure of that family:
+    "center the ball in the channel (x=372)" bound to `const channel = { x:
+    360, w: 20 }` shares "channel" and still compares a centre with a left
+    edge (mined rec-ebc239c1ca, a clean reply refuted). Several comparable
+    figures need a typo-shaped pair instead."""
+    if q is None:
+        return False
+    return sum(1 for s in extract_quantities(span) if s.family == q.family) == 1
+
+
+def figure_elsewhere(q: Quantity, evidence: str, *, hedged: bool) -> Optional[str]:
+    """The evidence line, other than the bound span, that carries a figure
+    AGREEING with the claim's — the binder bound the wrong reading ("35°C"
+    bound to "temperature 34°C" while the same tool printed "feels like
+    35°C"). None when no line agrees."""
+    for ln in str(evidence or "").splitlines():
+        if any(quantities_agree(q, s, hedged=hedged) for s in extract_quantities(_strip_label(ln))):
+            return ln.strip()
+    return None
+
+
+def _typo_shaped_disagreement(claim_quote: str, span: str) -> bool:
+    """True when some claim figure and a same-family span figure, written
+    in the claim's unit at the claim's precision, have the same length and
+    differ in exactly one digit — the shape of a swapped or misread digit
+    rather than of two different quantities."""
+    def one_digit_apart(x: float, y: float, f: float, dec: int) -> bool:
+        a, b = f"{abs(x) / f:.{dec}f}", f"{abs(y) / f:.{dec}f}"
+        if sum(ch.isdigit() for ch in a) < 2:
+            return False                   # a single digit is one digit away from every other digit
+        return len(a) == len(b) and a != b and sum(p != r for p, r in zip(a, b)) == 1
+
+    for q in extract_quantities(claim_quote):
+        f = _claim_unit_factor(q)
+        for sq in extract_quantities(span):
+            if sq.family != q.family or sq.is_range != q.is_range:
+                continue                   # a scalar is never a misread range
+            if sq.decimals != q.decimals and q.family not in ("bytes", "time", "length", "money", "mass"):
+                continue                   # a misread digit keeps the written shape: "19" is not a slip of "17.10" (corpus replay)
+            if q.is_range:
+                # one endpoint equal, the other a digit off: "20–25" vs "20–26"
+                same_lo = f"{q.value / f:.{q.decimals}f}" == f"{sq.value / f:.{q.decimals}f}"
+                same_hi = f"{q.hi / f:.{q.decimals}f}" == f"{sq.hi / f:.{q.decimals}f}"
+                if ((same_lo and one_digit_apart(q.hi, sq.hi, f, q.decimals))
+                        or (same_hi and one_digit_apart(q.value, sq.value, f, q.decimals))):
+                    return True
+                continue
+            if one_digit_apart(q.value, sq.value, f, q.decimals):
+                return True
+    return False
+
+
+def _near_miss(q: Quantity, s: Quantity) -> bool:
+    """A span figure close enough to the claim's to be the SAME quantity
+    misreported (34 vs 35, 9,692 vs 9,592, 19 KB vs 18,433 B) rather than a
+    different quantity that happens to share a family (a bound of 100,000
+    beside a count of 9,592; 10 cores beside a load of 1.61)."""
+    if q.is_range != s.is_range:
+        return False                       # a value outside a range is unknown, never a misreport of it
+    def close(x: float, y: float) -> bool:
+        x, y = abs(x), abs(y)
+        if x == 0 or y == 0:
+            return x == y
+        return max(x, y) / min(x, y) <= 1.5
+    if q.is_range:
+        return close(q.value, s.value) and close(q.hi, s.hi)
+    return close(q.value, s.value)
+
+
+# ── conflicting evidence (skeleton scan) ────────────────────────────────
+
+_PACKER_LABEL_RE = re.compile(r"^\s*\[[\w .\-]{1,40}\]\s*")
+
+
+def _strip_label(line: str) -> str:
+    """The evidence packer opens a tool's first line with `[tool_name] `; a
+    second row of the same output carries no label. Compare bodies."""
+    return _PACKER_LABEL_RE.sub("", str(line or ""), count=1)
+
+
+def _skeleton(line: str) -> str:
+    body = normalize_for_containment(_strip_label(line))
+    body = _LINE_NUMBER_RE.sub("#", _DATE_TIME_RE.sub("#", _IDENT_RE.sub("#", body)))
+    return re.sub(r"\s+", " ", _NUM_RE.sub("#", body)).strip()
+
+
+def _slot_text(q: Quantity) -> str:
+    return f"{q.value:.10g}" + (f"-{q.hi:.10g}" if q.is_range else "")
+
+
+def _slots(text: str) -> List[str]:
+    """The line's values in order — identifiers, dates, clocks and line
+    numbers as tokens, quantities as normalized numbers — so two readings
+    of one field compare slot by slot. Every token the skeleton wildcards
+    is a slot: two rows of an hourly forecast ("14:00 31°C" / "15:00 32°C")
+    differ in TWO slots and are two records, not one field read twice
+    (review §4IN M1 — a live false refute class)."""
+    body = _fold_spaces(_strip_label(text))
+    found: List[Tuple[int, str]] = [(m.start(), m.group(0).lower()) for m in _IDENT_RE.finditer(body)]
+    no_ids = mask_identifiers(body)
+    found += [(m.start(), m.group(0).lower()) for m in _DATE_TIME_RE.finditer(no_ids)]
+    found += [(m.start(), m.group(0).strip().lower()) for m in _LINE_NUMBER_RE.finditer(mask_dates(no_ids))]
+    found += [(pos, _slot_text(q)) for q, pos in extract_quantities_with_pos(body)]
+    return [t for _, t in sorted(found)]
+
+
+def find_conflicting_line(evidence: str, span: str, claim_quote: str, *,
+                          reply_slots: Optional[set] = None) -> Optional[str]:
+    """Another evidence line with the SAME non-numeric skeleton as the
+    bound span's line and a DIFFERENT value where the claim's figure sits —
+    two readings of one field. None when the evidence has no such line, and
+    None when the reply states the twin's value too (`reply_slots`): a reply
+    listing both project ids reports two records, it omits nothing."""
+    ev = str(evidence or "")
+    nspan = normalize_for_containment(span)
+    if not nspan:
+        return None
+    lines = [ln for ln in ev.splitlines() if ln.strip()]
+    home = next((ln for ln in lines if nspan in normalize_for_containment(ln)), None)
+    if home is None:
+        return None
+    home_sk = _skeleton(home)
+    home_slots = _slots(home)
+    if not home_slots or home_sk.count("#") == 0:
+        return None
+    if not re.search(r"[a-z]{3}", home_sk):
+        return None                    # a bare-number line (a chart's DOM dump) names no field
+    if _META_LINE_RE.match(_strip_label(home)):
+        return None                    # a per-block packer/tool meta line repeats across blocks
+    if sum(1 for ln in lines if _skeleton(ln) == home_sk) >= 3:
+        return None                    # an enumeration (table rows, "tick 1"… "tick 40", LTS releases): records, not readings
+    claim_slots = set(_slots(claim_quote))
+    for ln in lines:
+        if ln is home or normalize_for_containment(_strip_label(ln)) == normalize_for_containment(_strip_label(home)):
+            continue
+        if _skeleton(ln) != home_sk:
+            continue
+        slots = _slots(ln)
+        if len(slots) != len(home_slots):
+            continue
+        diff = [i for i, (x, y) in enumerate(zip(home_slots, slots)) if x != y]
+        # ONE slot differs and it is the slot the claim reported: two readings
+        # of one field. Rows of a table differ in most slots — not a conflict.
+        if len(diff) == 1 and home_slots[diff[0]] in claim_slots:
+            if reply_slots is not None and (slots[diff[0]] in reply_slots or _stated_at_precision(slots[diff[0]], reply_slots)):
+                continue
+            return ln.strip()
+    return None
+
+
+_META_LINE_RE = re.compile(r"^\s*(?:LENGTH|EXIT CODE|HTTP_STATUS|STATUS|TRUNCATED|ELAPSED)\s*:", re.I)
+
+
+def _stated_at_precision(slot: str, reply_slots: set) -> bool:
+    """The twin's value is one the reply states at ITS precision: 1.414 for
+    1.4142135623730951 (corpus replay: the phi row)."""
+    try:
+        v = float(slot)
+    except ValueError:
+        return False
+    for r in reply_slots:
+        try:
+            rv = float(r)
+        except ValueError:
+            continue
+        dec = len(r.split(".")[1]) if "." in r else 0
+        if _round_half_up(v, dec) == _round_half_up(rv, dec):
+            return True
+    return False
+
+
+def reply_slots_of(reply: str) -> set:
+    """Every value the reply states (identifiers and figures; a range counts
+    as itself AND as each end), for the reports-both guard of the conflict
+    scan."""
+    out: set = set()
+    for text in (reply, _mask_non_prose(reply)):
+        for t in _slots(text):
+            out.add(t)
+            if "-" in t.lstrip("-"):
+                lo, hi = t.lstrip("-").split("-", 1)
+                out.update({("-" if t.startswith("-") else "") + lo, hi})
+    return out
+
+
+# ── implausible labelled values ─────────────────────────────────────────
+
+_LABELLED_RANGES = (
+    (re.compile(r"\b(?:lat|latitude)\b\s*[=:]?\s*([-+]?\d{1,3}(?:\.\d+)?)(?!\d)", re.I), -90.0, 90.0, "latitude"),
+    (re.compile(r"\b(?:lon|lng|longitude)\b\s*[=:]?\s*([-+]?\d{1,3}(?:\.\d+)?)(?!\d)", re.I), -180.0, 360.0, "longitude"),
+)
+
+
+def implausible_value(text: str) -> Optional[str]:
+    for rx, lo, hi, label in _LABELLED_RANGES:
+        for m in rx.finditer(str(text or "")):
+            try:
+                v = float(m.group(1))
+            except ValueError:
+                continue
+            if v < lo or v > hi:
+                return f"{label} {m.group(1)} is outside [{lo:g}, {hi:g}]"
+    return None
+
+
+# ── parsing the model's rows ────────────────────────────────────────────
+
+_ROW_RE = re.compile(r"\{[^{}]*\}")
+
+
+def _salvage_rows(text: str) -> List[Dict[str, Any]]:
+    """A payload cut mid-list (token cap) still yields every COMPLETE row:
+    decode an object at each `{` with the JSON decoder itself, so a quote
+    that contains braces (`cfg = {a: 1}`) survives (review §4IN nit)."""
+    out: List[Dict[str, Any]] = []
+    t = str(text or "")
+    dec = json.JSONDecoder()
+    i = t.find("{")
+    while i >= 0:
+        try:
+            obj, end = dec.raw_decode(t, i)
+        except Exception:  # noqa: BLE001
+            i = t.find("{", i + 1)
+            continue
+        if isinstance(obj, dict) and obj.get("quote"):
+            out.append(obj)
+            i = t.find("{", i + max(1, end - i))
+        elif isinstance(obj, dict) and isinstance(obj.get("claims"), list):
+            out.extend(r for r in obj["claims"] if isinstance(r, dict) and r.get("quote"))
+            i = t.find("{", i + max(1, end - i))
+        else:
+            i = t.find("{", i + 1)
+    return out
+
+
+def parse_binder_output(data: Any) -> List[Dict[str, str]]:
+    """Coerce the binder's JSON into rows; tolerate a str payload (whole or
+    truncated), a list payload, missing fields and unknown kinds/relations."""
+    if isinstance(data, str):
+        s = data.strip()
+        try:
+            data = json.loads(s[s.index("{"):s.rindex("}") + 1])
+        except Exception:  # noqa: BLE001 — truncated or fenced: salvage complete rows
+            data = {"claims": _salvage_rows(s)}
+    rows = data.get("claims") if isinstance(data, dict) else data
+    out: List[Dict[str, str]] = []
+    if not isinstance(rows, list):
+        return out
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        q = str(r.get("quote") or "").strip()
+        if not q:
+            continue
+        kind = str(r.get("kind") or "other").strip().lower()
+        rel = str(r.get("relation") or "absent").strip().lower()
+        span = str(r.get("evidence_quote") or "").strip()
+        if len(q) > HARD_QUOTE_CAP or len(span) > HARD_SPAN_CAP:
+            continue                                   # not a quote, a dump
+        out.append({"quote": q,
+                    "kind": kind if kind in CLAIM_KINDS else "other",
+                    "evidence_quote": span,
+                    "relation": rel if rel in RELATIONS else "absent"})
+        if len(out) >= MAX_CLAIMS:
+            break
+    return out
+
+
+# ── binding + verdict ───────────────────────────────────────────────────
+
+def bind(reply: str, evidence: str, rows: List[Dict[str, str]]) -> Tuple[List[Binding], int]:
+    """Validate every row against the texts and grade each bound pair.
+    Returns (bindings, dropped) — dropped = rows whose claim quote was not
+    in the reply (a hallucinated claim is not a claim)."""
+    bindings: List[Binding] = []
+    dropped = 0
+    rslots = reply_slots_of(reply)
+    for r in rows:
+        b = Binding(r["quote"], r["kind"], r["evidence_quote"], r["relation"])
+        snapped_claim = snap_quote(b.quote, reply)
+        b.valid_claim = snapped_claim is not None
+        if not b.valid_claim:
+            dropped += 1
+            continue
+        if snapped_claim != normalize_for_containment(b.quote):
+            b.quote = snapped_claim                    # the reply's own words, not the model's rendering
+        imp = implausible_value(b.quote)
+        if imp:
+            b.outcome, b.detail = "implausible", imp
+            bindings.append(b)
+            continue
+        snapped_span = snap_quote(b.evidence_quote, evidence) if b.evidence_quote else None
+        b.valid_span = snapped_span is not None
+        if not b.valid_span:
+            b.outcome = "unbound"
+            bindings.append(b)
+            continue
+        if snapped_span != normalize_for_containment(b.evidence_quote):
+            b.evidence_quote = snapped_span            # the evidence's own words
+        outcome, detail, dq, ds = _compare(b.quote, b.evidence_quote)
+        compared = outcome
+        elsewhere = figure_elsewhere(dq, evidence, hedged=_hedged(b.quote)) if dq is not None else None
+        if outcome == "disagree" and elsewhere:
+            # the claim's own figure stands in another evidence line: the
+            # reply may be reporting THAT reading and the binder bound the
+            # wrong one — not a contradiction, not a confirmation
+            outcome, detail = "unchecked", f"figures differ ({detail}) but the evidence also states {elsewhere[:120]!r}"
+        elif (outcome == "disagree"
+                and not (lexical_anchor(b.quote, b.evidence_quote) and _single_comparable(dq, b.evidence_quote))
+                and not (_typo_shaped_disagreement(b.quote, b.evidence_quote)
+                         and (not _dense(dq, b.evidence_quote) or _aligned(b.quote, b.evidence_quote))
+                         and not _claim_states(b.quote, ds))):
+            # The figures differ but the two quotes share no subject word and
+            # the figures are not a one-digit slip of each other — most
+            # likely two different quantities ("tonight drops to 24°C" bound
+            # to "current conditions: temperature 31°C", seed long-weather-1;
+            # "All 7 tasks finished" bound to "batch ran 5 task(s)" while the
+            # ledger listed seven, mined rec-a6e2b9b9b6). The model's
+            # `relation` label is an opinion and never turns this into a
+            # verdict: a disagreement needs a shared subject or a typo-shaped
+            # pair (9,692 vs 9,592; 2027 vs 2026; 22 GB vs 21 GB).
+            outcome, detail = "unchecked", f"figures differ ({detail}) but the quotes share no subject, or the span carries several comparable figures"
+        if outcome == "agree" and b.relation == "contradict":
+            # code and model disagree (the figures match, the model says
+            # they conflict) — not a verdict either way in phase 1
+            outcome, detail = "unchecked", "model says contradict, figures agree"
+        elif outcome == "agree":
+            conflict = find_conflicting_line(evidence, b.evidence_quote, b.quote, reply_slots=rslots)
+            if conflict:
+                outcome, detail = "conflict", f"evidence also states: {conflict[:160]!r}"
+        elif compared == "unchecked" and b.relation == "contradict":
+            # the model says the span contradicts but neither side carries a
+            # figure code can compare (a status word) — recorded for the
+            # shadow read-through, never a verdict in phase 1
+            outcome, detail = "unchecked", "model-stated contradiction without a comparable figure"
+        b.outcome, b.detail = outcome, detail
+        bindings.append(b)
+    return bindings, dropped
+
+
+def verdict_from_bindings(bindings: List[Binding], *, evidence_truncated: bool,
+                          dropped: int = 0, audit: Optional[List["AuditFigure"]] = None,
+                          entities: Optional[List["AuditEntity"]] = None,
+                          strict_figures: bool = False,
+                          findings: Optional[List["ClassFinding"]] = None
+                          ) -> ClaimBindingResult:
+    """The mechanical verdict (see the module docstring). `audit` rows from
+    `audit_numbers`: a MISREPORTED figure is a validated contradiction (it
+    refutes); UNSUPPORTED figures are counted in the reasoning only —
+    derived counts and conversions live there (phase 2 decides). `entities`
+    rows from `audit_entities`: a named entity the evidence and context
+    never mention WITHHOLDS a confirm (the evidence does not cover the
+    reply) and never refutes (the reply may know it); so does an unsupported
+    identifier, and — with `strict_figures` — an unsupported figure."""
+    audit = list(audit or [])
+    entities = list(entities or [])
+    findings = list(findings or [])
+    unsupported_entities = [e.text for e in entities if e.status == "unsupported"]
+    ent_note = (f"; {len(unsupported_entities)} named entit{'y' if len(unsupported_entities) == 1 else 'ies'} "
+                f"not in the evidence: {', '.join(repr(t) for t in unsupported_entities[:3])}") if unsupported_entities else ""
+    issues: List[str] = []
+    for b in bindings:
+        if b.outcome == "disagree" and b.residual:
+            issues.append(f"claim {b.quote!r} is contradicted by the evidence: {b.evidence_quote!r}")
+        elif b.outcome == "disagree":
+            issues.append(f"claim {b.quote!r} vs evidence {b.evidence_quote!r}: {b.detail}")
+        elif b.outcome == "conflict":
+            issues.append(f"claim {b.quote!r} reports one of two evidence values — {b.detail}")
+        elif b.outcome == "implausible":
+            issues.append(f"claim {b.quote!r}: {b.detail}")
+    for g in findings:
+        if g.status == "refute":
+            # a constraint issue is spelled exactly as the turn loop's own
+            # mechanical tier spells it ("word_cap: …"), so every reader that
+            # recognises a delivery-shape refute (never a project task, never
+            # a correction banner, the reshape directive) recognises this one
+            # (review §4IN consumer M2)
+            issues.append(g.detail if g.kind == "constraint" else f"{g.kind}: {g.detail}")
+    seen_texts = {b.quote for b in bindings if b.outcome in ("disagree", "conflict")}
+    seen_twins = {b.detail for b in bindings if b.outcome == "conflict"}
+    for f in audit:
+        if f.status == "misreported" and not any(f.text in q for q in seen_texts):
+            issues.append(f"figure {f.text!r} in {f.sentence[:100]!r} — the evidence says {f.evidence_text!r} "
+                          f"({f.evidence_line[:100]!r})")
+        elif f.status == "conflicted" and not any(f.evidence_line[:80] in d for d in seen_twins):
+            seen_twins.add(f.evidence_line)
+            issues.append(f"figure {f.text!r} in {f.sentence[:100]!r} reports one of two evidence values — "
+                          f"the evidence also states {f.evidence_line[:120]!r}")
+    n_agree = sum(1 for b in bindings if b.outcome == "agree")
+    n_unbound = sum(1 for b in bindings if b.outcome == "unbound")
+    n_unchecked = sum(1 for b in bindings if b.outcome == "unchecked")
+    n_unsupported = sum(1 for f in audit if f.status == "unsupported" and f.family != "identifier")
+    unsupported_ids = [f.text for f in audit if f.status == "unsupported" and f.family == "identifier"]
+    if unsupported_ids:
+        ent_note += (f"; {len(unsupported_ids)} identifier(s) not in the evidence: "
+                     f"{', '.join(repr(t) for t in unsupported_ids[:3])}")
+    withholds = [g for g in findings if g.status == "withhold"]
+    if withholds:
+        ent_note += "; " + "; ".join(f"{g.kind}: {g.detail}" for g in withholds)
+    if dropped >= 2 and dropped > n_agree:
+        ent_note += f"; {dropped} claim quote(s) were not in the reply"      # a binder that invented most rows
+    withheld = bool(unsupported_entities or unsupported_ids or withholds or (strict_figures and n_unsupported)
+                    or (dropped >= 2 and dropped > n_agree))
+    if issues:
+        conf = min(0.95, 0.8 + 0.05 * len(issues))
+        return ClaimBindingResult("REFUTED", conf, issues, bindings, dropped,
+                                  reasoning=f"{len(issues)} validated contradiction(s) between the reply's own words and the evidence",
+                                  audit=audit, entities=entities, findings=findings)
+    if not bindings:
+        return ClaimBindingResult("UNCERTAIN", 0.4, [], bindings, dropped,
+                                  reasoning="no checkable claim survived validation"
+                                  + (f"; {n_unsupported} figure(s) not found in the evidence" if n_unsupported else "")
+                                  + ent_note, audit=audit, entities=entities, findings=findings)
+    if n_unbound == 0 and n_unchecked == 0 and n_agree >= 1 and not withheld:
+        # CONFIRMED means every checkable claim was bound to an agreeing
+        # span. An "unchecked" row (a status word code cannot grade, or the
+        # model and the figures disagreeing) is exactly what a residual
+        # judge exists for — it keeps the verdict at UNCERTAIN, never a
+        # confirm on the model's word. An entity the evidence never names
+        # (mined pool: 11/60 fabrications confirmed — "Dr. Elin Vasquez
+        # verified…", "won the Meridian Prize", the appended sentence the
+        # binder never listed) withholds the confirm the same way.
+        return ClaimBindingResult("CONFIRMED", 0.9, [], bindings, dropped,
+                                  reasoning=f"all {n_agree} checkable claim(s) bound to agreeing evidence"
+                                  + (f"; {n_unsupported} figure(s) not found in the evidence" if n_unsupported else ""),
+                                  audit=audit, entities=entities, findings=findings)
+    parts = []
+    if n_unbound:
+        parts.append(f"{n_unbound} claim(s) found no evidence span"
+                     + (" (evidence truncated)" if evidence_truncated else ""))
+    if n_unchecked:
+        parts.append(f"{n_unchecked} claim(s) code could not grade")
+    if n_unsupported:
+        parts.append(f"{n_unsupported} figure(s) not found in the evidence")
+    if withheld and n_agree >= 1 and not n_unbound and not n_unchecked:
+        parts.append(f"all {n_agree} checkable claim(s) agree")
+    return ClaimBindingResult("UNCERTAIN", 0.5, [], bindings, dropped,
+                              reasoning="; ".join(parts) + ent_note, audit=audit, entities=entities,
+                              findings=findings)
+
+
+def render_prompt(claim: str, evidence: str, context: str) -> str:
+    return CLAIM_BINDING_PROMPT.format(claim=claim, evidence=evidence, context=context or "(none)",
+                                       max_claims=MAX_CLAIMS)
+
+
+# ── §4IN: the residual judge with a quote burden ────────────────────────
+# What code could not grade — a status word, a claim whose span the binder
+# never found — goes to a model ONCE, with the burden reversed: it may not
+# say "unsupported"; it must copy the evidence fragment that bears on each
+# claim, and code accepts a relation only when that fragment is really in
+# the evidence AND shares a subject word with the claim. A "contradict" that
+# passes both is a refute with both quotes in the issue; a "support" that
+# passes both is an agree; anything else stays unchecked.
+
+RESIDUAL_PROMPT = """You are a claim binder for RESIDUAL claims. You do NOT judge the reply. You quote.
+
+USER REQUEST:
+{context}
+
+REPLY (the agent's answer):
+{claim}
+
+EVIDENCE (tool outputs):
+{evidence}
+
+RESIDUAL CLAIMS (fragments of the reply that code could not check):
+{claims}
+
+For EACH residual claim, copy the ONE evidence fragment that most directly SUPPORTS or CONTRADICTS it — verbatim, no paraphrase, no ellipsis, at most {max_span} characters. "contradict" only when the fragment states the opposite about the SAME thing (the same file, task, service, quantity). "support" only when the fragment states what the claim states. If the evidence says nothing about the claim: relation "absent" and an empty evidence_quote. Never invent a fragment.
+
+Return MINIFIED single-line JSON only (no newlines, no code fences):
+{{"claims":[{{"quote":"<the residual claim, verbatim>","evidence_quote":"<exact evidence fragment or empty>","relation":"support|contradict|absent"}}]}}"""
+
+
+def render_residual_prompt(claim: str, evidence: str, context: str, residual_quotes: List[str]) -> str:
+    listed = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(residual_quotes))
+    return RESIDUAL_PROMPT.format(claim=claim, evidence=evidence, context=context or "(none)",
+                                  claims=listed, max_span=MAX_SPAN_CHARS)
+
+
+def residual_bindings(res: ClaimBindingResult) -> List[Binding]:
+    return [b for b in res.bindings if b.outcome in ("unchecked", "unbound") and not b.residual]
+
+
+def shares_subject(a: str, b: str) -> bool:
+    """A content word (≥4 letters, not a stopword) common to both texts,
+    exactly or by a shared five-letter stem ("restarted"/"restart",
+    "moons"/"moon"). The subject link the residual judge's quote must have."""
+    wa = [w for w in re.findall(r"\w+", normalize_for_containment(a)) if len(w) >= 4 and w not in _ANCHOR_STOP]
+    wb = {w for w in re.findall(r"\w+", normalize_for_containment(b)) if len(w) >= 4 and w not in _ANCHOR_STOP}
+    for w in wa:
+        if w in wb:
+            return True
+        if len(w) >= 6 and any(len(v) >= 5 and v[:5] == w[:5] for v in wb):
+            return True
+    return False
+
+
+def apply_residual(res: ClaimBindingResult, reply: str, evidence: str, raw_model_output: Any, *,
+                   evidence_truncated: bool = False, strict_figures: bool = False) -> ClaimBindingResult:
+    """Fold the residual judge's validated quotes into the bindings and
+    recompute the verdict. A row is accepted only for a residual claim it
+    names, with a fragment that is in the evidence and shares the claim's
+    subject; `absent` and everything unvalidated leave the row unchecked."""
+    rows = parse_binder_output(raw_model_output)
+    pending = residual_bindings(res)
+    for r in rows:
+        q = normalize_for_containment(r["quote"])
+        target = next((b for b in pending if normalize_for_containment(b.quote) == q
+                       or (len(q) >= SNAP_MIN_CHARS and (q in normalize_for_containment(b.quote)
+                                                         or normalize_for_containment(b.quote) in q))), None)
+        if target is None:
+            continue
+        rel, span = r["relation"], r["evidence_quote"]
+        span = snap_quote(span, evidence) if (rel in ("support", "contradict") and span) else None
+        if span is None:
+            target.detail = target.detail or "residual judge: no validated fragment"
+            continue
+        if not shares_subject(target.quote, span):
+            target.detail = "residual judge: fragment shares no subject with the claim"
+            continue
+        # figures on either side are compared by code and override the
+        # model's relation ("Copied 5 files" supported by "7 files copied"
+        # is a disagreement, review §4IN m2); a contradiction of a status
+        # claim needs a polarity clash the model cannot manufacture
+        if extract_quantities(target.quote):
+            outcome, _d, _q, _s = _compare(target.quote, span)
+            if outcome not in ("agree", "disagree"):
+                target.detail = "residual judge: the claim's figure has no comparable figure in the fragment"
+                continue
+        elif rel == "contradict":
+            if not (_polarity_clash(target.quote, span) or _polarity_clash(span, target.quote)):
+                target.detail = "residual judge: contradiction without a polarity clash"
+                continue
+            outcome = "disagree"
+        else:
+            if _polarity_clash(target.quote, span):
+                target.detail = "residual judge: support with a polarity clash"
+                continue
+            outcome = "agree"
+        target.evidence_quote, target.valid_span, target.residual = span, True, True
+        target.outcome = outcome
+        target.detail = f"residual judge: {rel}, validated"
+        pending = [b for b in pending if b is not target]
+    return verdict_from_bindings(res.bindings, evidence_truncated=evidence_truncated, dropped=res.dropped,
+                                 audit=res.audit, entities=res.entities, strict_figures=strict_figures,
+                                 findings=res.findings)
+
+
+def run_binding(reply: str, evidence: str, raw_model_output: Any, *,
+                evidence_truncated: bool = False, context: str = "",
+                strict_figures: bool = False) -> ClaimBindingResult:
+    """Pure pipeline from the binder's raw output to the verdict. `context`
+    is the ask / conversation the reply answers — an entity or figure named
+    there is not the reply's invention."""
+    rows = parse_binder_output(raw_model_output)
+    bindings, dropped = bind(reply, evidence, rows)
+    audit = audit_numbers(reply, evidence, context) + audit_identifiers(reply, evidence, context)
+    entities = audit_entities(reply, evidence, context)
+    findings = class_checks(reply, evidence, context)
+    return verdict_from_bindings(bindings, evidence_truncated=evidence_truncated, dropped=dropped,
+                                 audit=audit, entities=entities, strict_figures=strict_figures,
+                                 findings=findings)
+
+
+# ── §4IM phase 1.5: the deterministic number audit ───────────────────────
+# The binder lists at most MAX_CLAIMS quotes; on a 2,000-character reply
+# the perturbed figure is often not among them (mined pool: fact_swap 2/9
+# caught vs the judge's 4/9). Numbers do not need a model to be found: every
+# figure in the reply is extracted here (code fences, inline code, URLs and
+# paths masked; dates masked; bare years dropped) and checked against every
+# figure in the evidence with the same unit / rounding / hedge rules. A
+# figure with an agreeing evidence figure is SUPPORTED; one with only a
+# near-miss whose evidence line shares a subject word with the reply
+# sentence (or a typo-shaped pair) is MISREPORTED — a validated
+# contradiction; anything else is UNSUPPORTED (counted, never a verdict in
+# phase 1: derived counts and conversions live there).
+
+_CODE_FENCE_RE = re.compile(r"```.*?```", re.S)
+_INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+_HEADING_ORDINAL_RE = re.compile(r"(?m)^(#{1,6}\s+)\d+\.")          # "### 7. Title" numbers a heading, states nothing
+_SOURCE_LINE_RE = re.compile(r"(?m)^\s*\[Source:[^\]\n]*\]?\s*$")   # a citation line's URL carries path dates
+MAX_ANCHOR_LINE_CHARS = 600                                          # a 4 KB single-line JSON blob anchors everything
+_URL_PATH_RE = re.compile(r"(?:https?://|file://|/api/|/workspace/|~/)[^\s)\]>]*|(?<![\w.])(?:[\w.-]+/)+[\w.-]+")
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?;\n])\s+")
+
+
+@dataclass
+class AuditFigure:
+    text: str
+    value: float
+    family: str
+    sentence: str
+    status: str            # supported | misreported | conflicted | unsupported
+    evidence_text: str = ""
+    evidence_line: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"text": self.text, "status": self.status, "evidence_text": self.evidence_text,
+                "evidence_line": self.evidence_line[:160], "sentence": self.sentence[:160]}
+
+
+def _mask_non_prose(text: str) -> str:
+    t = _CODE_FENCE_RE.sub(lambda m: " " * len(m.group(0)), str(text or ""))
+    t = _INLINE_CODE_RE.sub(lambda m: " " * len(m.group(0)), t)
+    t = _HEADING_ORDINAL_RE.sub(lambda m: m.group(1) + " " * (len(m.group(0)) - len(m.group(1))), t)
+    return _URL_PATH_RE.sub(lambda m: " " * len(m.group(0)), t)
+
+
+def _evidence_line_prose(ln: str) -> str:
+    """An evidence line with URLs/paths masked and citation lines blanked —
+    the reply side was masked, the evidence side was not, so a URL path date
+    ("…/2013/08/28/when-do…") refuted "25 centuries" (corpus replay)."""
+    if _SOURCE_LINE_RE.match(ln):
+        return ""
+    return _URL_PATH_RE.sub(lambda m: " " * len(m.group(0)), ln)
+
+
+# a '.' is a decimal point only BETWEEN digits ("3.5"); a sentence that ends
+# in a figure ("below 100,000. The sieve…") still ends (review §4IP R6: the
+# old `(?<!\d)` merged it with the next sentence, so every sentence-level
+# rule read two statements as one)
+_SENT_END_RE = re.compile(r"[.!?;](?!\d)|\n")
+
+
+#: An abbreviation's stop is not a sentence end ("approx. 29 users" keeps its
+#: hedge; "Dr. Vasquez", "e.g. 5", "v. 2"). Length-preserving mask, applied
+#: before the split (review §4IP R7 m2).
+_ABBREV_RE = re.compile(r"\b(?:approx|ca|cf|e\.g|i\.e|etc|vs|v|dr|mr|mrs|ms|prof|st|no|fig|inc|ltd|jr|sr|min|max|avg|est)\.(?=\s)", re.IGNORECASE)
+
+
+def _sentence_span(text: str, pos: int) -> Tuple[int, int]:
+    """[start, end) of the sentence around `pos`; a '.' between digits is a
+    decimal point and an abbreviation's stop is not a sentence end."""
+    text = _ABBREV_RE.sub(lambda m: m.group(0).replace(".", " "), text)   # every stop of "e.g." / "i.e."
+    start = 0
+    for m in _SENT_END_RE.finditer(text, 0, pos):
+        start = m.end()
+    m_end = _SENT_END_RE.search(text, pos)
+    return start, (m_end.start() if m_end else len(text))
+
+
+def _sentence_at(text: str, pos: int) -> str:
+    start, end = _sentence_span(text, pos)
+    return text[start:end].strip()
+
+
+_LIST_BEFORE_RE = re.compile(r"\d\s*(?:,|/|\bor\b|\band\b)\s*$")
+_LIST_AFTER_RE = re.compile(r"^\s*(?:,|/|\bor\b|\band\b)\s*\d")
+
+
+def _in_inline_list(s: Quantity, line: str) -> bool:
+    """The evidence figure is one item of an in-line list ("version 13 or
+    15", "100, 150, 75"): one of several, never "the" field a reply figure
+    misreads (corpus replay: "PostgreSQL 19" against "…version13 or 15")."""
+    body = normalize_for_containment(line)
+    tok = normalize_for_containment(s.text)
+    i = body.find(tok)
+    while i >= 0:
+        before, after = body[max(0, i - 12):i], body[i + len(tok):i + len(tok) + 12]
+        if _LIST_BEFORE_RE.search(before) or _LIST_AFTER_RE.match(after):
+            return True
+        i = body.find(tok, i + 1)
+    return False
+
+
+def _reply_states_value(s: Quantity, reply_vals: set) -> bool:
+    """The reply states the evidence figure — exactly, or at the evidence
+    figure's own precision ("18.4" states the "18" of "PostgreSQL 18"; the
+    corpus replay refuted "PostgreSQL 19" against that heading)."""
+    if s.value in reply_vals:
+        return True
+    f = _claim_unit_factor(s)          # compare in the figure's WRITTEN unit: 508 ms vs 509 ms, not 0.508 vs 0.509 at 0 decimals
+    return any(_round_half_up(rv / f, s.decimals) == _round_half_up(s.value / f, s.decimals) for rv in reply_vals)
+
+
+def audit_numbers(reply: str, evidence: str, context: str = "") -> List[AuditFigure]:
+    """Every prose figure of the reply, graded against the evidence. A figure
+    the CONTEXT states (the user's own numbers restated) is supported by it;
+    a supported figure whose evidence line has a same-skeleton twin differing
+    only in that slot is CONFLICTED — the omitted-contradiction class caught
+    without the binder having listed the claim (mined Pinball cases: the
+    binder quoted `ballX` while the twin row changed `ballY`)."""
+    prose = _mask_non_prose(reply)
+    masked = mask_non_quantities(prose)
+    ev_lines = [ln for ln in str(evidence or "").splitlines() if ln.strip()]
+    ev_figs: List[Tuple[Quantity, str]] = []
+    for ln in ev_lines:
+        for q in extract_quantities(_evidence_line_prose(_strip_label(ln))):
+            ev_figs.append((q, ln))
+    ctx_figs: List[Tuple[Quantity, str]] = []
+    for ln in str(context or "").splitlines():
+        for q in extract_quantities(ln):
+            ctx_figs.append((q, ln))
+    reply_figs = extract_quantities_with_pos(masked)
+    reply_vals = {q.value for q, _ in reply_figs} | {q.hi for q, _ in reply_figs if q.is_range}
+    rslots = reply_slots_of(reply)
+    # a line whose skeleton repeats is a ROW of a table or series: one of
+    # many records, never "the" field a reply figure misreads (review §4IN
+    # M2: an honest average over a 30-row latency table was refuted by the
+    # one row a digit away, 154/300 random tables)
+    sk_counts: Dict[str, int] = {}
+    for ln in ev_lines:
+        sk = _skeleton(ln)
+        sk_counts[sk] = sk_counts.get(sk, 0) + 1
+    is_row = {ln: sk_counts.get(_skeleton(ln), 0) >= 2 for ln in ev_lines}
+    out: List[AuditFigure] = []
+    for q, pos in reply_figs:
+        sentence = _sentence_at(prose, pos)
+        hedged = _hedged(sentence)
+        same = [(s, ln) for s, ln in ev_figs if s.family == q.family]
+        agreeing = [(s, ln) for s, ln in same if quantities_agree(q, s, hedged=hedged)]
+        if agreeing:
+            # the twin scan needs a figure that can single out a field: a bare
+            # "1" agrees with "EXIT CODE: 1" and conflicts with the next
+            # command's "EXIT CODE: 0" (mined rec-1b3e3e95e1, clean). Every
+            # agreeing line is scanned — the twin of the SECOND agreeing line
+            # went unseen (mined rec-e93e72ff85: 64,378 beside 64,377).
+            twin_pair = None
+            if sum(ch.isdigit() for ch in q.text) >= 2:
+                for s, ln in agreeing:
+                    twin = find_conflicting_line(evidence, _strip_label(ln), q.text, reply_slots=rslots)
+                    if twin:
+                        twin_pair = (s, twin)
+                        break
+            if twin_pair:
+                out.append(AuditFigure(q.text, q.value, q.family, sentence, "conflicted", twin_pair[0].text, twin_pair[1]))
+            else:
+                s, ln = agreeing[0]
+                out.append(AuditFigure(q.text, q.value, q.family, sentence, "supported", s.text, ln))
+            continue
+        in_ctx = [(s, ln) for s, ln in ctx_figs if s.family == q.family and quantities_agree(q, s, hedged=hedged)]
+        if in_ctx:
+            s, ln = in_ctx[0]
+            out.append(AuditFigure(q.text, q.value, q.family, sentence, "supported", s.text, "[context] " + ln))
+            continue
+        # MISREPORTED needs all three: a typo-shaped pair (one digit apart at
+        # the reply's precision), a subject word shared by the reply sentence
+        # and the evidence line, and an evidence figure the reply never
+        # states itself (a reply that says both 400 and 440 is talking about
+        # two things). Measured on 60 live replies: the looser near-miss +
+        # subject rule flagged 12 clean replies; this rule keeps the port
+        # 8103/8102 catch and drops the canvas/ball/list-number noise.
+        dense = len(extract_quantities(sentence)) >= 3   # coordinates, tables, specs
+        near = [] if dense else [(s, ln) for s, ln in same
+                                 if _typo_shaped_disagreement(q.text, s.text) and _near_miss(q, s)
+                                 and s.decimals - q.decimals <= 2      # a 14-decimal float is not a misread 380
+                                 and len(ln) <= MAX_ANCHOR_LINE_CHARS and lexical_anchor(sentence, ln)
+                                 and not _reply_states_value(s, reply_vals) and not is_row.get(ln, False)
+                                 and not _in_inline_list(s, ln)]
+        if near:
+            s, ln = min(near, key=lambda p: abs(p[0].value - q.value))
+            out.append(AuditFigure(q.text, q.value, q.family, sentence, "misreported", s.text, ln))
+            continue
+        out.append(AuditFigure(q.text, q.value, q.family, sentence, "unsupported"))
+    return out
+
+
+def audit_identifiers(reply: str, evidence: str, context: str = "") -> List[AuditFigure]:
+    """Every identifier token in the reply (IPs, dotted versions, hex ids,
+    UUIDs — inline code included, since that is where ids live), looked up
+    verbatim in evidence ∪ context; a supported one is checked for a
+    same-skeleton twin. Rows carry family "identifier"; an UNSUPPORTED
+    identifier withholds a confirm, a CONFLICTED one refutes."""
+    # code fences masked, URLs and inline code KEPT: `http://127.0.0.1:8100`
+    # and `/api/download/<id>.png` are where identifiers live (mined
+    # rec-83da54be2d: the IP twin went unseen because the URL was masked)
+    prose = _CODE_FENCE_RE.sub(lambda m: " " * len(m.group(0)), str(reply or ""))
+    ev = str(evidence or "")
+    hay_ev = normalize_for_containment(ev)
+    hay_ctx = normalize_for_containment(str(context or ""))
+    out: List[AuditFigure] = []
+    seen: set = set()
+    rslots = reply_slots_of(reply)
+    for m in _IDENT_RE.finditer(prose):
+        tok = m.group(0).lower()
+        if tok in seen:
+            continue
+        seen.add(tok)
+        sentence = _sentence_at(prose, m.start())
+        bare = tok[1:] if tok.startswith("v") and tok[1:2].isdigit() else tok      # "v29.4.0" is "Version 29.4.0"
+        if tok in hay_ev or bare in hay_ev:
+            home = next((ln for ln in ev.splitlines() if tok in ln.lower()), "")
+            twin = find_conflicting_line(ev, _strip_label(home), tok, reply_slots=rslots) if home else None
+            out.append(AuditFigure(m.group(0), 0.0, "identifier", sentence,
+                                   "conflicted" if twin else "supported", tok, twin or home))
+        elif tok in hay_ctx or bare in hay_ctx:
+            out.append(AuditFigure(m.group(0), 0.0, "identifier", sentence, "supported", tok, "[context]"))
+        else:
+            out.append(AuditFigure(m.group(0), 0.0, "identifier", sentence, "unsupported"))
+    return out
+
+
+# ── §4IM phase 2a: the named-entity audit ───────────────────────────────
+# A fabricated sentence usually carries no figure: "The lead maintainer,
+# Dr. Elin Vasquez, verified the result", "It also won the Meridian Prize",
+# "independently confirmed by the Karlsen Institute". The binder lists at
+# most MAX_CLAIMS quotes and rarely picks the appended sentence, so every
+# listed claim agrees and the reply is CONFIRMED (mined pool: 11/60). A
+# proper name does not need a model to be found either: every Title-Case
+# run of two or more words (connectors allowed) and every honorific-led
+# name in the reply's prose — headings, table rows, code, URLs excluded —
+# is looked up in the evidence and the context. Absent from both, it is
+# UNSUPPORTED: CONFIRMED is withheld (the evidence does not cover the
+# reply), never a refute (the reply may know it; phase 2 decides).
+
+_TC = r"[A-Z][a-z][\w'’-]*"
+_CONNECT = r"(?:of|the|for|and|de|von|van|da|di|du|la|le|del|der)"
+_HONORIFIC = r"(?:Dr|Prof|Mr|Mrs|Ms|Sir|Dame|Lord|Lady)\.?"
+_SP = r"[ \t]{1,2}"            # masked code/URLs leave long runs of spaces: never bridge them
+_ENTITY_RE = re.compile(
+    rf"\b(?:{_HONORIFIC}{_SP}{_TC}(?:{_SP}{_TC})*"
+    rf"|{_TC}(?:{_SP}(?:{_CONNECT}{_SP})?{_TC})+)")
+_HONORIFIC_RE = re.compile(rf"^{_HONORIFIC}\s")
+_LEADING_RE = re.compile(r"^(?:the|dr|prof|mr|mrs|ms|sir|dame|lord|lady)\.?\s+", re.I)
+_SKIP_LINE_RE = re.compile(r"^\s*(?:#|\||\*\*[^*]+\*\*\s*$|>)")
+_BOLD_LEADIN_RE = re.compile(r"(?m)^\s*(?:[-*•]\s*)?\*\*[^*\n]{1,60}\*\*:?")   # "**All Systems Online** — …": a label, not a name
+_FIRST_TOKEN_RE = re.compile(rf"^{_TC}(?:{_SP}{_CONNECT})?{_SP}")
+
+
+@functools.lru_cache(maxsize=1)
+def _dictionary() -> frozenset:
+    try:
+        with open("/usr/share/dict/words", encoding="utf-8", errors="ignore") as fh:
+            return frozenset(w.strip().lower() for w in fh if w.strip())
+    except OSError:
+        return frozenset()
+
+
+def _trim_sentence_initial(text: str) -> str:
+    """"Ask Elin Vasquez's team", "Per the Karlsen Institute": a capitalised
+    common word opening a sentence is not part of the name that follows.
+    Without a word list every opener is dropped (the safe direction: a
+    missed entity withholds nothing, a joined one mislabels)."""
+    if _HONORIFIC_RE.match(text):
+        return text
+    m = _FIRST_TOKEN_RE.match(text)
+    if not m:
+        return text
+    first = re.match(r"[A-Za-z'’-]+", text).group(0).lower()
+    words = _dictionary()
+    if words and first not in words:
+        return text
+    return text[m.end():]
+
+
+@dataclass
+class AuditEntity:
+    text: str
+    sentence: str
+    status: str            # supported | unsupported
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"text": self.text, "status": self.status, "sentence": self.sentence[:160]}
+
+
+def entity_key(text: str) -> str:
+    """The comparable form of a name: folded, honorific / leading article
+    dropped, possessive trimmed."""
+    k = _LEADING_RE.sub("", normalize_for_containment(text))
+    return re.sub(r"'s$", "", k).strip()
+
+
+def _entity_supported(key: str, hay: str) -> bool:
+    if key in hay:
+        return True
+    toks = [t for t in re.findall(r"[a-z0-9][\w-]{2,}", key) if t not in _ANCHOR_STOP]
+    return bool(toks) and all(t in hay for t in toks)      # "Vasquez, Elin" still covers "Elin Vasquez"
+
+
+def audit_entities(reply: str, evidence: str, context: str = "") -> List[AuditEntity]:
+    """Every named entity in the reply's prose, graded against evidence ∪
+    context."""
+    prose = _BOLD_LEADIN_RE.sub(lambda m: " " * len(m.group(0)), _mask_non_prose(reply))
+    hay = normalize_for_containment(str(evidence or "") + "\n" + str(context or ""))
+    out: List[AuditEntity] = []
+    seen: set = set()
+    pos = 0
+    for line in prose.splitlines(keepends=True):
+        start = pos
+        pos += len(line)
+        if _SKIP_LINE_RE.match(line) or not line.strip():
+            continue
+        for m in _ENTITY_RE.finditer(line):
+            text = m.group(0)
+            abs_pos = start + m.start()
+            s_start, s_end = _sentence_span(prose, abs_pos)
+            if prose[s_start:abs_pos].strip(" \t*_") == "":            # opens its sentence
+                text = _trim_sentence_initial(text)
+                if not _ENTITY_RE.fullmatch(text):
+                    continue
+            key = entity_key(text)
+            if len(key) < 5 or key in seen:
+                continue
+            seen.add(key)
+            status = "supported" if _entity_supported(key, hay) else "unsupported"
+            out.append(AuditEntity(text.strip(), prose[s_start:s_end].strip(), status))
+    return out
+
+
+# ── §4IN phase 2: the class checks ──────────────────────────────────────
+# Four failure classes the binder cannot see through quotes, decided the
+# same way — by code, from things that are checkable — and reusing the
+# detectors the turn loop already trusts. Two REFUTE (a validated defect
+# in the reply's own text), two WITHHOLD a confirm (the reply may honestly
+# report a failed tool or paraphrase the topic; neither is a contradiction).
+
+@dataclass
+class ClassFinding:
+    kind: str              # artifact | constraint | evidence | topic
+    status: str            # refute | withhold
+    detail: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"kind": self.kind, "status": self.status, "detail": self.detail[:200]}
+
+
+_BLOCK_LABEL_RE = re.compile(r"(?m)^\s*\[(?P<name>[\w .\-]{1,40})\]\s*")
+
+
+def evidence_blocks(evidence: str) -> List[Tuple[str, str]]:
+    """The packer's `[tool] body` blocks as (tool name, body); a body with
+    no label is one block named ""."""
+    text = str(evidence or "")
+    marks = list(_BLOCK_LABEL_RE.finditer(text))
+    if not marks:
+        return [("", text)] if text.strip() else []
+    out: List[Tuple[str, str]] = []
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+        body = text[m.end():end].strip()
+        if body:
+            out.append((m.group("name").strip().lower(), body))
+    return out
+
+
+def _block_failed_or_empty(name: str, body: str) -> bool:
+    """One block is a failure (the shared tool-error sniffer — status when
+    the body carries one, prose rules otherwise) or an empty retrieval (the
+    turn's evidence gate, for the tools it knows). Never a third vocabulary."""
+    from ..distill.outcome_heuristics import _looks_like_tool_error
+    if _looks_like_tool_error(body):
+        return True
+    if not body.strip() or body.strip().lower() in ("(empty output)", "(no output)", "no results", "no results found."):
+        return True
+    try:
+        from .evidence_gate import assess_turn_evidence
+        a = assess_turn_evidence([{"name": name, "content": body}])
+        return a.consulted > 0 and a.substantive == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def evidence_all_failed(evidence: str) -> bool:
+    """Every evidence block is a tool failure or an empty retrieval —
+    nothing a success claim could rest on. Delegates per block to the shared
+    sniffer and the evidence gate."""
+    blocks = evidence_blocks(evidence)
+    if not blocks:
+        return False
+    return all(_block_failed_or_empty(name, body) for name, body in blocks)
+
+
+_ASK_FRAMING = frozenset("""
+please tell show give find list answer question explain describe help want need know like would could
+should make write check look search user assistant think just also really very much many
+whats yourself reply nothing else your quick ghost hello thanks
+""".split())
+
+
+def ask_content_words(context: str) -> List[str]:
+    """The ask's subject words: content words of four letters or more that
+    are neither stopwords nor question framing ("please tell me"), in
+    order, deduplicated."""
+    seen: set = set()
+    out: List[str] = []
+    for w in re.findall(r"\w+", normalize_for_containment(context)):
+        if len(w) < 4 or w in _ANCHOR_STOP or w in _ASK_FRAMING or w.isdigit() or w in seen:
+            continue
+        seen.add(w)
+        out.append(w)
+    return out
+
+
+def reply_off_topic(reply: str, context: str) -> Optional[str]:
+    """None of the ask's subject words — nor a word sharing its first five
+    letters ("moons"/"moon", "restarted"/"restart") — appears in the reply.
+    None when the ask has no subject word or the reply carries one; else
+    the words missed. A withhold, never a refute: a reply may paraphrase."""
+    words = ask_content_words(context)
+    if not words:
+        return None
+    hay = normalize_for_containment(reply)
+    hay_words = set(re.findall(r"\w+", hay))
+    for w in words:
+        if w in hay:
+            return None
+        if len(w) >= 6 and any(h[:5] == w[:5] for h in hay_words if len(h) >= 5):
+            return None
+    return "none of the ask's subject words " + ", ".join(repr(w) for w in words[:4]) + " appears in the reply"
+
+
+_ASK_MARKER = "|| USER REQUEST: "
+
+
+def ask_of(context: str) -> str:
+    """The CURRENT request inside the verifier's context. The turn loop hands
+    `verify_claim` `constraint_note + request` ("ACTIVE PROJECT CONSTRAINTS
+    (user-mandated, MUST hold): … || USER REQUEST: <text>"); the mechanical
+    constraint and topic checks must read ONLY the request — reading the
+    note is the §4FD constraint-bleed the turn-loop tier deliberately avoids
+    (review §4IN consumer M1). The full context stays for the entity and
+    figure audits, where a value named in the note is not the reply's
+    invention."""
+    c = str(context or "")
+    i = c.rfind(_ASK_MARKER)
+    return c[i + len(_ASK_MARKER):] if i >= 0 else c
+
+
+def class_checks(reply: str, evidence: str, context: str = "") -> List[ClassFinding]:
+    ask = ask_of(context)
+    out: List[ClassFinding] = []
+    try:
+        from .objection import _claim_noise_markers
+        marks = _claim_noise_markers(reply)
+    except Exception:  # noqa: BLE001
+        marks = []
+    if marks:
+        out.append(ClassFinding("artifact", "refute",
+                                "machine noise in the reply: " + ", ".join(repr(m) for m in marks[:3])))
+    try:
+        from .turn_state_check import refute_turn_state
+        for rule, msg in refute_turn_state(request=ask, reply=str(reply or "")):
+            if rule != "empty_evidence":                 # tools_run is not visible here; see `evidence_all_failed`
+                out.append(ClassFinding("constraint", "refute", f"{rule}: {msg}"))
+    except Exception:  # noqa: BLE001
+        pass
+    if evidence_all_failed(evidence):
+        out.append(ClassFinding("evidence", "withhold", "every evidence block is a tool failure"))
+    off = reply_off_topic(reply, ask)
+    if off:
+        out.append(ClassFinding("topic", "withhold", off))
+    return out
+

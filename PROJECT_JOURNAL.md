@@ -42185,3 +42185,1539 @@ in place, all three KILLED on re-run. Lint gate + pin-quality ratchet: 67 passed
 **R7 — suite after all changes:** 22,738 passed / 0 failed / 66 skipped (505 s). Restarted
 00:13:54 (pid 26353, 18 s, bytecode fresh). Live re-checks posted: A again (`e4c2fb2e`, the
 "source you actually read" ask) and D again (`709c0384`, the status-then-opener delivery).
+
+## §4HZ — The kill that read as a timeout, the echo that read as success (2026-09-17)
+
+**Trigger.** Operator: *"examine requests 0e6cf008 d594668e 30419cf0 — what deficiencies,
+weaknesses or bugs did these expose?"*, then *"proceed"*. Three user turns, 48 min, 121 LLM
+calls, ~6.3M tokens in. `0e6cf008` ("which IFS reduced-Gaussian grid points are over Oxford —
+plot them") delivered an INVENTED grid formula (a regular grid with the wrong counts; colatitude
+used as latitude, so the tool output literally listed `lat 128.2280 … 3.2 km from Oxford`), the
+reply cherry-picked the sane rows, the code verifier CONFIRMED 0.90 (cheap 1.0 + strong upheld),
+corpus `passed`, calibration 1.0. `30419cf0` ("show me the PNG; did you use eckit?") gave a bold
+code span for a path and restated the formula — human 👎. `d594668e` (a correction: "eckit is not
+internal and you can request gribs from MARS as a public user") burned 40/40 turns — human 👎.
+The only instrument that caught the error was the user. Analysis note: memory
+`ifs-grid-trio-2026-09-17`.
+
+**R0 scope.** Property: *a sandbox run's outcome, a plan node's status, a pre-flight class, an
+absence proof and a "show me" reply each say what actually happened.* Threat model: the model's
+own shell idioms and re-plans are untrusted inputs to the harness; tool output is ground truth.
+Out of scope this round: the judge's inability to notice impossible evidence (lat 128°) or rows a
+reply OMITTED; the lexical user-correction detector missing "X is not Y"; the budget-exhausted
+`outcome=unknown` (§4EE decision stands); the model's stale ECMWF knowledge; the §4HC planner
+repeat rate (measured below, needs a recorded-prompt replay — separate round).
+
+**R1 — seven classes, one implementation each.**
+1. `tools/execute.py` — exit 137 was always "(timed out / killed after 600s)". `_kill_is_oom(code,
+   elapsed)` (137 more than `_OOM_KILL_MARGIN_S`=30 s under the budget) + `_format_error(…,
+   elapsed_s=_dt)` name the OOM killer and the `GHOST_SANDBOX_MEM` cap with memory advice; the
+   banner avoids "timeout" so `tool_failure` does not book it RETRYABLE. Live: 137 after 4 s → 4
+   turns of timing imports.
+2. `tools/execute.py` — `cmd; echo "exit=$?"` laundered tracebacks / `Killed` / pip failures into
+   "execution ok" (strike counter 4/6→1/6; System 3's recovery booked a success; 8 of the day's 30
+   ok-lines, 2.1% since 08-04). `_self_reported_exit` adopts the echoed status when the command
+   contains `$?` (last echo wins) or bash's own `line N: <pid> Killed` (→137); `_normalise_exit` =
+   pipe rule → self-report → pipe rule again on the echoed code (under pipefail `$?` is the
+   pipeline's raw status). All four model-shell adoption sites route through it.
+3. `tools/execute.py` — `cd /tmp &&` was silently stripped (`/tmp` EXISTS; the same request wrote
+   there). `tmp` removed from the class; the strip is now announced in the tool result on both
+   exit paths.
+4. `core/planning.py` — the DONE guard keyed on the node id: System 3's re-plan reused `task_1..5`,
+   descriptions were overwritten, statuses kept → new tasks born DONE ("task_1 (install
+   ecmwf-api) is DONE"), both crisis interventions neutralised. `same_task()` (token Jaccard ≥
+   `SAME_TASK_JACCARD` 0.6) — a rewording keeps the guard, a replacement adopts its own status.
+5. `core/foresight.py` — the execute class was the first token: `cd /workspace && python3 …` →
+   `execute|cmd:cd` (n=603, an OPEN gate; a `schema_diff.py` precedent deferred the plot script
+   twice). `command_head()` skips env assigns, `cd …&&`/`set …;`, `timeout [opts] N`, `sudo -u`,
+   `env`, `nohup`, `nice -n` …
+6. `core/objection.py` + `core/verifier.py` + `core/agent.py` — the absence proof searched THIS
+   turn's digest only; "~149 points" computed one turn earlier was UPHELD as invented and the
+   auto-repair stripped a true number. `prior_evidence` (agent `_prior_turn_evidence`: earlier
+   tool outputs + replies, 60k chars newest first, this turn excluded, never shown to a judge)
+   threads `verify_claim → _guard_truncated_absence / _escalate_refute(_impl) → resolve_refute →
+   resolve_issue`; any cited atom present earlier → UNRESOLVED (never DISMISS).
+7. `core/prompts.py` — the live `SYSTEM_PROMPT` DISPLAYING IMAGES rule carried only the
+   prohibition; the affirmative `![Image](/api/download/f.png)` sentence lived in
+   `SPECIALIST_SYSTEM_PROMPT` (coding subsystem — NOT, as the first analysis said, the compiled
+   probe prompt), which a main turn never sees. The model's thinking quoted the prohibition as its
+   reason. The live rule now says SHOW it, names the four non-displays, keeps the prohibition.
+Pins (7 files, 118 tests): `test_execute_oom_vs_timeout.py`, `test_execute_self_reported_exit.py`
+(real bash + the container's literal strings + AST enumeration of adoption sites),
+`test_execute_cd_strip_tmp.py`, `test_tasktree_redescribed_id.py`,
+`test_foresight_command_head.py`, `test_objection_prior_turn_evidence.py` (+ AST enumeration of
+every `resolve_refute` / claim-route `verify_claim` caller), `test_prompt_image_display_affirmative.py`
+(+ cross-surface: app.js still renders `/api/download/` images). Updated: `test_execute_pipefail`
+topology pin, `test_execute_0720_review_fixes` 137 pin (split into OOM / budget worlds). Docs:
+tools/execute, core/planning, core/foresight, core/imagination, core/objection, core/prompts.
+
+**R2 — mutation battery round 22** (`specs22.py`, 42 non-control mutants, pins = the 7 new files +
+pipefail / 0720 / foresight / open-audit / 4ff): **42/42 KILLED**, NOOP SURVIVED, KNOWNBAD KILLED
+(Z1–Z5 exit-137, S1–S9 self-report incl. each adoption site, C1–C3 cd-strip, T1–T5 TaskTree,
+F1–F5 head, O1–O5 objection, V1–V5 verifier threading, A1–A4 agent blob/calls, P1–P2 prompt).
+**R6:** the first two passes reported 19/19 KILLED with the NOOP *also* killed — the battery tree
+lacked `scripts/` (test_foresight imports the backtest) and then `interface/` (six open-audit
+pins); the results were discarded (`results22.invalid-*.jsonl`), the tree completed, baseline
+249 passed, and only then were verdicts read. A battery whose no-op dies has measured its own
+tree.
+
+**R3 — round 21 re-run on the §4HZ tree:** 12/12 KILLED, NOOP SURVIVED.
+
+**R8 — defects found inside this round's own fixes (5):** (a) `_normalise_exit` first applied the
+self-report AFTER pipe forgiveness only — under pipefail the echoed `$?` of `… | head -1; echo
+"exit=$?"` is the SIGPIPE'd producer's code, so an early-closed pipe became a failure; caught by
+the real-bash pin, fixed by forgiving the echoed code by the same rule. (b) the OOM banner said
+"not a timeout" — `_RETRYABLE_PATTERNS` matches `timeout` on the banner line, so an OOM would have
+been a transient retry; caught by reading the classifier before the pin existed. (c) `nice -n 10
+./build.sh` classed as `cmd:10` — wrapper value-options table added. (d) the analysis misattributed
+the affirmative image rule to `SYSTEM_PROMPT_COMPILED`; it is in `SPECIALIST_SYSTEM_PROMPT` —
+pinned both ways so the record stays checkable. (e) after the pin migration the adoption-site enumeration checked a SET OF NAMES — two heals share `_re_code`, so deleting the root-retry normalisation was vouched for by the remap's; `S6-root-retry-unnormalised` SURVIVED the migrated battery. Re-written per SITE (a normalisation must sit between the adoption and the next adoption of the same name) — KILLED on re-run. Five defects inside this round's own work.
+
+**Measured, not fixed (open).** Byte-identical consecutive planner monologues per day: 0–2.6%
+through 09-14, **7.6% / 2.9% / 9.7%** on 09-15/16/17 — a step change at §4HC (prefix-aligned
+planner; temperature 0.0; the delta DOES contain the new tool result — Turn 3 of `0e6cf008`
+repeated Turn 2 verbatim right after the exit-137). Mechanism unproven; needs a recorded planner
+prompt replayed. Also: 1,564 macOS AppleDouble `._*` sidecars (163-byte `com.apple.provenance`
+stubs, dated 08-29…09-16 23:41, none created by this session's writes) sat under src/tests/docs
+and broke the two `*.py`-globbing enumeration tests; deleted. Their producer is unknown.
+
+**R7 — suite after all changes:** first run 22,847 passed / **1 failed** — `test_pin_quality_ratchet::
+test_source_text_pins_never_grow`: the new pins carried 14 source-text assertions (R4 mechanised).
+Migrated to behavioural / PARSED pins (the tree, never the text); battery re-run on the migrated
+tree → `S6` survived (R8-e above), enumeration re-written per site, **42/42 KILLED**, NOOP
+SURVIVED. Final suite: **22,850 passed / 0 failed / 66 skipped (459 s)**. Restarted 12:57:04
+(`launchctl kickstart -k`, pid 56796 → 10453, 17 s, one listener, health ok).
+
+**Live re-checks (origin=probe, restarted agent):** A `false; echo "exit=$?"` → `EXIT CODE: 1`
+(was 0 · "execution ok"). B `bytearray(6*1024**3)` → `EXIT CODE: 137 (KILLED after 1s — far under
+the 600s budget: out of memory, not the time limit)` + the OOM hint naming the 4g cap (was "timed
+out / killed after 600s"). C `cd /tmp && pwd` → `/tmp` (was rewritten to /workspace).
+
+## §4IA — The plan that did not read the result, the correction that denied the reply, and the row the judge never looks for (2026-09-17)
+
+**Trigger.** Operator: *"proceed with the rest, usual verification protocol"* — the three items §4HZ
+left open.
+
+**R0 scope.** (1) planner: a plan emitted after a NEW tool result must be conditioned on it — measured
+by the byte-identical consecutive-monologue rate; (2) correction detector: a message that denies
+something the reply asserted must at least reach the judge; (3) verifier bench: "the evidence also
+says otherwise and the reply left it out" must be a measured fault class. Threat model: the model's
+own text (plans, replies) and the user's messages are untrusted inputs to lexical gates; a judge's
+verdict decides promotions. Out of scope: a judge-prompt change (needs a benched A/B — the bench class
+is the prerequisite, shipped here); the planner mechanism itself (no recorded prompt to replay).
+
+**Measurement first.** Byte-identical planner pairs: 0–2.6%/day through 09-14 → 7.6 / 2.9 / 9.7% on
+09-15/16/17 (§4HC). Every one of the 15 repeats since 09-15 followed a tool that RAN (file write,
+execution ok, browser, exit-137) — never an empty-delta deferral; temperature 0.0; the delta gist DID
+carry the result. Rebuttal-clause candidates over 1490 consecutive live pairs (grouped by SESSION
+FILE — the `session_id` field is per request; probes skipped): 7 (0.5%), five genuine incl. the live
+one. Judge on the new fault: **0 / 23 caught** (29 seed cases, clean 29/29 CONFIRMED at 0.983, faulted
+23/23 CONFIRMED at 0.963; judge+escalation, critic→main, two-stage on).
+
+**R1.**
+1. `agent.py` — `build_aligned_planner_tail()`: the delta and a one-line POINTER to the newest tool
+   result come LAST, after the plan JSON (recency). Name-only pointer: the §4HN composition pins hold
+   the tail to one copy of each result and a per-message cap, and a duplicated 600-char head broke both
+   (R8-a). `planner_repeat_needs_reask()` + `planner_repeat_steer()`: a thought byte-identical to the
+   previous turn's, with ≥1 new tool row and budget left (`_PLANNER_REPEAT_MAX_ASKS`=3/request),
+   re-asks once naming the result; adopted only if the thought changed. `Planner Repeat` log line =
+   the instrument. Pins `tests/test_planner_verbatim_repeat.py` (14).
+2. `distill/user_correction.py` — Signal C `rebuttal_clause(current, prev_reply)`: `<subject>
+   <negation> <object>` with both sides' content tokens in the reply, first 600 chars;
+   `is_correction_candidate()` = phrase OR clause is THE gate `_adjudicate_correction` uses (it had a
+   private copy of half of it); a clause promotes only on `contradicts=True`, A+B unchanged. Pins
+   `tests/test_user_correction_rebuttal.py` (18).
+3. `eval/verify_bench.py` — `fault_omitted_contradiction` (claim kept; the evidence line carrying a
+   claim number is copied with the number perturbed and appended as a second row of the same tool,
+   packer label stripped; expected REFUTED). Pins `tests/test_verify_bench_omitted_contradiction.py`.
+4. (found during the round) `agent.py` `_journal_append_safe`: **probes were teaching through the
+   hippocampus journal** — the §4HZ re-check probes were consolidated at 13:01 into a playbook lesson
+   ("Execute a specific shell command and return the exit code verbatim" — quarantined via
+   `/api/lessons/quarantine`) and a journal-challenge candidate. §4FB's list did not include the
+   finalize-time `post_mortem`/`smart_memory` appends. Gated at the one writer
+   (`turn_origin == ORIGIN_PROBE` → dropped); AST pin holds `journal.append` to that function. Pins
+   `tests/test_probe_journal_never_teaches.py` (9).
+Docs: core/agent (planner tail + §4IA + probe journal), core/verifier (Signal C; fault library entry
+pending the number above → added).
+
+**R2 — mutation battery round 23** (`specs23.py`, 29 non-control mutants; pins = the 4 new files +
+planner tail/prefix, user_correction, correction_adjudication, 4ee, failure_report, verify_bench,
+escalation_discipline, probe_origin): **29/29 KILLED**, NOOP SURVIVED, KNOWNBAD KILLED (PT1–4 tail,
+PG1–7 guard/steer/site order, RC1–9 clause/gate/promotion, BF1–5 fault, PJ1–4 probe journal).
+
+**R8 — defects inside this round's own work (4):** (a) the first tail put a 600-char copy of the
+newest result at the end — duplicated content, broke three §4HN pins; replaced by a name-only
+pointer. (b) the first rebuttal regex listed the bare copulas (`is|are|was|were` + optional `not`)
+so "the ball is going straight up" and "leonidas was born march" were rebuttals — the first corpus
+count (24, 1.6%) was taken with that draft; negation-only regex → 7 (0.5%). Caught by my own fixture.
+(c) two planner pins were source-text (`src.index` order) — the ratchet rejected them; re-written on
+the AST. (d) the journal-bypass enumeration matched only `journal.append` on a bare Name — mutant
+`PJ4` (`self.context.journal.append`) SURVIVED; widened to any `.journal.append` chain, KILLED.
+
+**Open.** The planner mechanism: the instrument is live; read the `Planner Repeat` rate and the daily
+identical-pair rate over the next days (baseline 0–2.6%). The judge's omitted-row blindness is now a
+0/23 number on a checked-in fault class — the next verifier round is a judge-prompt A/B on it.
+Unexplained: a graceful `system shutdown` at 13:02:10 (pid 10453 → 10821), five minutes after the
+§4HZ deploy; no trigger in the durable log (not launchd's KeepAlive, which SIGKILLs; not the epoch
+swap, which does not restart). Noted, not chased.
+
+**R7 — suite after all changes:** **22,898 passed / 0 failed / 66 skipped (456 s)**. Restarted 13:43:29
+(`launchctl kickstart -k`, pid 29956 → 48584, 11 s, one listener, health ok). No live re-check is
+possible for the planner guard (a natural verbatim repeat is needed) — the `Planner Repeat` line and
+the daily identical-pair rate are the read-out; the probe-journal gate is verified by its pins and
+by the absence of new `auto-learning` lines after probe turns from here on.
+
+## §4IB — The vanished turn, and the same error twenty times under exit 0 (2026-09-17)
+
+**Trigger.** Operator: *"examine request 21b295ef"* → *"fix everything, usual verification
+protocol"*. The request (the §4HZ ask plus "use eckit") ran 40 turns / 1800.0 s / ~100 LLM calls
+and left nothing: `request finished` 0.4 s after the last `llm request`, no reply, no trajectory,
+no calibration row, no cause. Inside it: turns 19–39 (~20 min) re-ran `Grid('reduced_gg,
+npoints=127')` variants, every run printing the same `cannot build grid without 'type'`, every
+run exit 0 (the script's own try/except printed `ERR: {spec!r} -> {e}`); 1753 of the 1800 s were
+LLM time (planner mean 19 s, main 26 s per turn at 85+ messages); a `file_system read` of a header
+`find` had just listed came back "does not exist"; the strike line for the first probe showed an
+`ls` listing while the ModuleNotFoundError sat at its tail. Sandbox check: this eckit build's
+`Grid(...)` raises for every spec shape (dict → `'str' object is not callable`; string →
+SpecError) — the task was infeasible with the demanded library, and the agent never said so.
+
+**R0 scope.** Property: *a turn that ends — by cancel, disconnect, timeout or shutdown — leaves
+the same record a finished turn does; a command that fails the same way N times is a loop
+whatever its exit code; a plan repeated in substance is a repeat; a real file outside the
+workspace is reported as outside.* Threat model: the model's own scripts (exit codes, printed
+errors, quoted attempts) and prompts are untrusted inputs to every counter; `/workspace` is the
+jail. Out of scope: the proxy's 1800 s ceiling itself (a client policy; the agent now records the
+cut), latency (§4HC territory), the mid-drain disconnect (the drain generator has no messages to
+record — noted), and the model's library knowledge.
+
+**Measurement first.** Vanished turns since 09-01 (corrected census — `extra.req_id` is the FULL
+id; match by prefix): 21 of 229 user requests have no trajectory row; ~14 are sub-10 s rejections,
+the rest are `463111ad` (2953 s, cut mid-LLM-call at turn 10), `4aff8c07` (227 s), `6d9651ea`
+(113 s), `21b295ef` (1800 s) and two (`4e2b7f7d`, `319d0b37`) that never logged "finished" — a
+process restart. Consecutive planner-thought Jaccard over 548 pairs since 09-10: median 0.29,
+p90 0.60, ≥0.9 in 4.6% — almost all inside the known loops (d594668e ×6, 552a1ffd ×3, 21b295ef ×3
+at 0.96/0.97/0.97; 0 byte-identical in that request, so the §4IA guard never fired).
+
+**R1 — five classes.**
+1. `agent.py` `_record_aborted_turn(req_id, reason, …)` — writes the finished-turn row with the
+   partial output + `[ATTEMPT_ABORTED_TURN] Turn aborted: <reason>` (rule 1 of
+   `outcome_heuristics` files it FAILED — no new outcome path) and one `Turn Aborted` log line.
+   Called from `except TurnCancelled` (before its return), from a NEW `except
+   asyncio.CancelledError` in `handle_chat` (records, re-raises bare), and from `main.py`'s
+   lifespan shutdown for every registry turn still running (`reason="process shutdown"`).
+2. `strikes.py` + `agent.py` — the execute same-error class. `error_line()` (LAST failure-naming
+   line), `normalise_volatile()` (0x addresses, ≥16-hex ids, times, dates, pids, /tmp names,
+   and the QUOTED attempt), `error_line_fingerprint()`; the execute branch counts exit-0 results
+   that carry an error line under `execute | <command_head> (same error) | fp`
+   (`EXECUTE_SAME_ERROR_STEER`=3 → SYSTEM ALERT: change approach or report the blocker;
+   `EXECUTE_SAME_ERROR_HARD_STOP`=5 → `force_final_response` with a report instruction — a
+   report, not an abort marker). `note_action` had skipped `execute` as mutating.
+3. `agent.py` `planner_thoughts_repeat()` — byte-identical OR token-Jaccard ≥
+   `PLANNER_REPEAT_JACCARD` 0.9 with both sides ≥ 20 tokens; `planner_repeat_needs_reask` routes
+   through it.
+4. `file_system.py` `outside_workspace_message()` — an absolute path outside `/workspace` /
+   `/sandbox` (segment-matched) is reported OUTSIDE with the `execute cat/sed/grep` form;
+   consulted first by `_missing_file_message`, the one helper every read-family op uses.
+5. `agent.py` `failure_preview()` — the strike line previews the last failure-naming line (a
+   traceback's exception), else the tail; the STDOUT/STDERR site uses it.
+Pins (5 files, 61 tests): `test_aborted_turn_record.py`, `test_execute_same_error_breaker.py`,
+`test_planner_near_duplicate.py`, `test_file_system_outside_workspace.py`,
+`test_strike_failure_preview.py`; `test_probe_before_hypothesis` window widened (the two new
+consumer branches sit inside it). Docs: core/strikes (new section), core/agent (§4IB aborted
+turn + near-duplicate line), tools/file_system.
+
+**R2 — mutation battery round 24** (`specs24.py`, 31 non-control mutants; pins = the 5 new files +
+planner_verbatim, no_progress, strike_ledger, fruitless_probe, batch_duplicates,
+missing_file_message, not_found_loop_breaker, sessions_and_cancel, probe_before_hypothesis,
+core_loop_defect_fixes): **31/31 KILLED**, NOOP SURVIVED, KNOWNBAD KILLED. **R8 — three survived the
+first pass, all pin defects:** `X1-branch-removed` (the AST pin saw the calls, not that the `if`
+gating them was `exit_code_val == 0`), `X6-exec-hard-n-generic` (no pin on the tier override),
+`P3-min-tokens-dropped` (my "short" fixtures were below the Jaccard threshold anyway — a 19-token
+pair at exactly 0.90 is the world the floor exists for). Re-pinned, KILLED on re-run; a fourth
+slip — the first X1 fix took `owners[0]` (the outermost enclosing `if`) — broke the baseline
+(NOOP died) and was caught by running the control again before reading verdicts.
+
+**R3 — round 23 re-run on the §4IB tree:** 28/28 KILLED after re-anchoring `PG1`/`PG4` (both had
+anchored the guard line §4IB routed through `planner_thoughts_repeat`; HARNESS_ERROR → re-anchored →
+KILLED), NOOP SURVIVED.
+
+**R8 (cont.) — two suite-level enumerations caught this round's own code on the first full run:**
+`test_streamed_record_site_uses_the_shared_function` (a third `_record_turn_trajectory` caller —
+the aborted-turn recorder; the pin now admits exactly three, all routing through the one function)
+and `test_every_result_classifier_reads_the_status` (outcome-consumers R3): `error_line`,
+`error_line_fingerprint` and `failure_preview` judged a result by prose alone. Fixed the way the rule
+wants — a declared non-ok status names its failure on its first line whatever the wording — and
+pinned (`ToolOutcome.rejected` with no error-shaped word still yields a line; `ok` does not).
+Process slip: the restart after that first run was chained on the suite command instead of gated
+on its exit code, so the agent briefly ran with two enumeration pins red (the code was correct;
+the pins were, too). Re-run and restart follow.
+
+**R7 — suite after all changes:** first run 22,950 passed / **2 failed** (the two enumeration pins
+above — both real: a third record site, three prose-only classifiers); fixed; final run **22,954
+passed / 0 failed / 66 skipped (460 s)**. Restarted 15:24:24 (`launchctl kickstart -k`, pid 71303 →
+89512, 13 s, one listener, health ok) — this time gated on the suite's exit code.
+**Live re-checks (origin=probe, restarted agent):** a `file_system read` of `/etc/hostname` → "OUTSIDE
+the sandbox workspace … `cat '/etc/hostname'`" (was "does not exist in the sandbox root"); a streamed
+turn whose client closed the connection at 25 s → `turn aborted — probe-disc3e5011: cancelled: client
+disconnected or process shutdown — recording the partial turn` and a trajectory row (`failed`,
+`[ATTEMPT_ABORTED_TURN] …`, 1 step, 25 s) where 21b295ef left nothing. The execute same-error steer
+and the near-duplicate re-ask need a natural loop to fire; their `Loop Breaker` / `Planner Repeat`
+lines are the read-out.
+
+## §4IC — The checkpoint that outlived its request, and breakers with no second tier (2026-09-17)
+
+**Trigger.** Request `3a2afac2` (the IFS reduced-gaussian-grid / Oxford ask, re-sent an hour after
+`21b295ef`) opened with "let me pick up where I left off … the checkpoint mentions eckit.grid" and
+ignored its own working script in /workspace. Root cause: the turn-15/turn-30 checkpoints of
+`21b295ef` were written to the scratchpad with NO namespace, SQLite-persisted, and rendered into
+every later request's DYNAMIC SYSTEM STATE. The same log showed the edit-churn and futility breakers
+steering twice and then watching the loop continue to turn 40, where the budget banner shipped
+narration as the answer; the derived mood then read the restart-aborted `3cb143fc` row as "3 of my
+last 5 verdict-bearing turns failed"; and the `System Shutdown` line said only "draining" for the
+third unexplained SIGTERM of the day.
+
+**R0 scope (written first).** (1) Turn checkpoints are request-scoped (`req:<id>`), cleared in
+`handle_chat`'s `finally`, and any `_checkpoint_t*` key is purged at scratchpad load. (2) The last
+turn of a budget > 3 is a RESERVED report turn: tools off, `blocker_report_alert("turn budget")`,
+and the exhaustion banner distinguishes "[TURN BUDGET REACHED] … my report" from "[TURN BUDGET
+EXHAUSTED] … NOT a finished result"; the ledger promise appears only when a project is active.
+(3) Edit-churn and futility breakers get a second tier: after the steers are spent
+(`EDIT_CHURN_REPORT_AFTER_STEERS`, `FUTILITY_REPORT_WRITES=6/RUNS=4`) the loop stops and reports
+once. (4) `autobiographical.recent_verdicts` skips rows an abort produced (`ABORTED_ROW_MARKS`).
+(5) `main.shutdown_line` reports uptime and in-flight turns. Out of scope: judge omitted-row
+blindness (bench round), SIGTERM sender identity, breaker tiers for other tools.
+
+**R1 fix classes.** `core/agent.py`: `request_checkpoint_namespace`, `GhostAgent._clear_request_checkpoints`
+(called unconditionally at the top level of the `finally`), `last_turn_needs_report`,
+`budget_exhausted_note`, `edit_churn_decision`, `futility_tier`, `blocker_report_alert`; the loop-top
+reservation, the churn/futility call sites, the natural-exhaustion `else`. `memory/scratchpad.py`:
+`TURN_CHECKPOINT_RE` + load-time purge. `selfhood/autobiographical.py`: `is_aborted_record`.
+`main.py`: `_BOOT_MONO`, `shutdown_line`. Tests: `test_scratchpad_request_checkpoints.py`,
+`test_reserved_report_turn.py`, `test_breaker_second_tier.py`, `test_mood_ignores_aborted_rows.py`,
+`test_shutdown_line.py`; `test_futility_breaker_trio.py` banner pin re-routed through the helper.
+Docs: memory/scratchpad (§4IC paragraph), core/agent (new section + §4IC follow-ups).
+
+**R2 battery round 25** (`~/Data/AI/.mutation-battery/specs25.py`, 13 files, `-k "not idle_phase"`
+cut a mutant from ~150 s to ~5 s KILLED / 49 s SURVIVED): NOOP SURVIVED, KNOWNBAD KILLED,
+**27/27 KILLED** — C1–C6 checkpoints, T1–T7 report turn/banner, E1–E4 churn, F1–F4 futility,
+M1–M3 mood, D1–D3 shutdown line. Two survivors on the first pass, both real findings:
+`C2-finally-does-not-clear` (`if False:` fence around the clear inside the `finally`) survived an
+AST pin that only checked the call existed → the clear moved into `_clear_request_checkpoints`
+with a behavioural pin (real Scratchpad, two request scopes, the broken/absent scratchpad paths)
+plus an AST pin that the `finally` calls it at top level with `req_id`; and `T3-min-turn-dropped`
+was an EQUIVALENT mutant — `turn == max-1` with `max > REPORT_TURN_MIN_TURN` already implies
+`turn ≥ MIN`, so the floor clause was dead and is deleted; T3 now drops the `max > MIN` guard
+and dies on the short-budget row.
+**R3:** round 24 re-run on the §4IC tree — 30/30 KILLED, NOOP SURVIVED. **R4:** ratchet baseline
+re-written (1340 textual pins / 261 files; digest `afe48028…82a6d5`), `tests/test_pin_quality_ratchet.py`
+green; no new source-text pins (the diary-marks pin reads `_record_aborted_turn`'s AST constants).
+**R8 own defects:** the loop-top Edit anchor and a leftover `break` + `for … in [(_bn,_rec)]`
+scaffold in the futility refactor (caught by compile + `test_futility_breaker_trio`); wrong diary
+class name in the first mood test; the ratchet digest is a two-line constant (regex replace
+silently failed once); the AST-only finally pin (above). R7 first pass: 1 failed / 23002 passed — the churn report tier logged under the steer's
+`Edit Churn` title and the steer-count pin read it as a third steer; the stop tier now logs
+`Edit Churn Stop` (distinct title per the logging convention); suite re-run after that edit.
+
+**§4IC live check (2026-09-17, after restart, pid 40778):** the IFS/Oxford ask re-sent as probe
+`ifs17585…`: no foreign checkpoint in the prompt (the model's only "checkpoint" mention was its own
+turn-30 snapshot); execute same-error breaker at +46 s; futility steer +222 s; futility REPORT tier
++362 s; reserved turn 40 delivered a structured report (tools off) — the reply was honest about the
+missing plot. Verdict: the §4IC mechanisms fired; the request still failed, for the reasons in §4ID.
+
+## §4ID — A loop a breaker closed stays closed (2026-09-17)
+
+**Trigger (probe `ifs17585…`, 917 s, 42 tool calls, outcome failed).** The futility report tier
+forced a final at turn 30; the forced final missed twice (turn 31 emitted a tool call; turn 32 spent
+170 s producing 24,855 chars of deliberation about whether "tools are OFF" applied — parser
+truncation, `Dropping 2 tool_call(s)`), so the honest fallback was about to ship. Then the verifier
+gate: `UNVERIFIED → auto-repair round 1/1: unverified mutation (untested write)` — the last tool was
+the very write that tripped the breaker — `force_final_response = False`, and turns 33–39 rewrote
+and reran the same `probe.py` four more times until the reserved turn 40. The contradiction is
+structural: the breaker says "the write is the churn, stop"; the gate says "the write is untested,
+go run it". Two more defects in the same trace: (a) §4IC never reset `_futility_report_done` per
+request (sticky on `self.context` → after one report the tier could not fire again in the process's
+lifetime — my own defect, one round old); (b) the agent guessed `{"type": "reduced_gg", …}` spec
+spellings for 42 steps and never ran one `search` or read the catalog, while
+`eckit.geo.Grid({"grid": "N320"})` works in the sandbox (`to_latlons()` → (lats, lons) in degrees,
+checked with `docker exec`) — the task was feasible; the report then invented "256 points, roughly
+15–20 over Oxford" for code it never ran.
+
+**R0 scope.** (1) `context._breaker_forced_final` raised at the three sites that close the loop
+(futility report tier, edit-churn report tier, reserved report turn); the gate tests it as an
+`elif` BEFORE the untested-write repair branch and logs `Verifier Gate — … no repair round`; the
+outcome backfill (finalised on an untested write → failed) is untouched — a label, not a re-entry.
+(2) Per-request reset of `_futility_report_done` and the new flag beside `_futility_steer_done`.
+(3) Futility steer step 4: STOP guessing an API's spelling — `search` the docs / print `help()` /
+catalog — or compute the result another way. (4) `blocker_report_alert` clause (4): no predicted
+outputs or counts; untested code is labelled UNTESTED, never "the fix"/"the complete solution".
+Out of scope: the forced-final turn that narrates 24 k chars (the honest fallback already covers
+it); the late verifier's CONFIRMED 0.85 on the report (honest-failure rule; the invented count is a
+judge-bench item); the model's choice not to search (steered, not enforced).
+
+**R1.** `core/agent.py` sites as above. Tests: `tests/test_breaker_closed_loop_stays_closed.py`
+(per-site AST pins that the flag is raised in the SAME body as the breaker's own marker; the gate
+guard is the `orelse` parent of the repair branch and sets `_do_repair = False`; per-request resets;
+alert clause; futility steer text and report-tier flag driven live through
+`_dispatch_and_process_tool_batch`). Docs: core/agent (§4ID section).
+**R2 battery round 26** (`specs26.py`, 7 files): NOOP SURVIVED, KNOWNBAD KILLED, **11/11 KILLED** —
+S1–S3 (a site drops the flag), G1–G3 (gate ignores the flag / still repairs / polarity inverted),
+R1–R2 (a reset dropped), A1 (alert clause), F1–F2 (steer lookup step, wrong tool name). One
+first-pass survivor, `G3-gate-after-repair` (`not getattr(…)` — the guard would skip the repair for
+every ORDINARY request and hand the breaker-closed loop to the repair branch): the AST pin had
+checked that the guard READS the flag, not its polarity; it now asserts the flag read is not under a
+`Not` and the test is an `and`. **R3:** round 25 re-run — 27/27 KILLED after re-anchoring `F4` (the
+flag line now sits between its two anchor lines). **R4:** no source-text pins (ratchet green).
+**R8:** dedenting `handle_chat`'s source for `ast.parse` fails on its multi-line strings — the pins
+locate functions in the module tree instead; the sticky `_futility_report_done` (above).
+**R7:** full suite once after the last edit — 23013 passed, 66 skipped, exit 0 (the §4IC suite
+before it: 23003 after the `Edit Churn Stop` retitle). Restart gated on exit=0: pid 40778 → new
+listener; the IFS/Oxford ask re-sent as a probe for the second review round (result below).
+
+**§4ID live check (2026-09-17, pid 60753, probe `ifs18371…`, 1059 s, 39 steps):** the report was
+honest and prediction-free (no invented counts; "code never ran" said plainly; three concrete
+unblocks); no gate re-opened anything; the reserved turn 40 delivered. Still no plot — see §4IE.
+
+## §4IE — The error is the exception, not the label in front of it (2026-09-17)
+
+**Trigger (probe `ifs18371…`).** 36 `execute` runs, most of them probe harnesses printing one line
+per attempt — `dict npts=31: ERR RuntimeError: SpecError: [pl]`, `ERR  dict nxacc=16: RuntimeError:
+SpecError: [pl]`, `ERR  str shorthand: RuntimeError: SpecError: [Grid: …]` — all exit 0, all one dead
+end. The labels are UNQUOTED (§4IB's quoted-literal collapse never applied), so every run
+fingerprinted as a new error: no steer at 3, no report at 5, no futility breaker either (only two
+writes, to two different basenames; the rest were inline `python -c`/heredoc runs). Then turns 31–38
+were eight `find / … 2>/dev/null` variants, each exit 1 (an unreadable directory somewhere under
+/), each FAILURE-bannered and struck although the paths they printed were valid — up to 166 s per
+turn. The task remained feasible and untried: `Grid({"grid": "N320"})`. Neither run issued one
+`search`. Late verdict CONFIRMED 0.60 (honest-failure rule) — by design.
+
+**R0 scope.** (1) `strikes.exception_signature`: the error line from its first exception name
+onward (`_EXC_TOKEN_RE`); `error_line_fingerprint` hashes that; lines naming no exception stay
+whole. (2) `execute._normalise_find_exit` inside `_normalise_exit`: exit 1 forgiven only for a
+last-command `find` with stderr discarded, non-empty output and no `find:` line; exit 2 never.
+(3) The same-error steer's option (a) opens with "LOOK THE API UP … `search` the library's
+documentation … help()". Out of scope: forcing a search (steer, not gate); the futility breaker's
+per-basename key (the inline probes are the same-error breaker's job, now that it can see them);
+the trajectory outcome `unknown` written before the deferred verdict (the late handler's job).
+
+**R1.** `core/strikes.py`, `tools/execute.py`, `core/agent.py` (steer text). Tests:
+`tests/test_same_error_probe_labels.py` — five live labelled lines share one fingerprint, three
+different exceptions stay three, `exception_signature` table, the ledger trips at the threshold on
+the live sequence, a 10-row `_normalise_exit` table for find (forgiven / printed nothing / `find:`
+line / stderr visible / exit 2 / find not last / non-find), the steer's constants read from the
+dispatch method's AST. Docs: core/strikes, tools/execute, core/agent.
+**R2 battery round 27** (`specs27.py`, 7 files): NOOP SURVIVED, KNOWNBAD KILLED, **11/11 KILLED**
+first pass — X1–X4 (signature = whole line / fingerprint skips it / any-word token / message
+dropped), N1–N6 (forgiveness unwired / ignores the stderr discard / forgives empty output / forgives
+`find:` errors / forgives any non-zero / reads the first command not the last), S1 (steer clause).
+**R3:** round 26 re-run — 11/11 KILLED. **R4:** ratchet green (the steer pin reads the dispatch
+method's AST constants; first draft had a textual `getsource` use and was rejected — rewritten).
+**R8:** first ledger pin called a module-level `note_action` that does not exist (the method is on
+`StrikeLedger`, returns `(sig, count, tripped)`).
+**R7:** full suite once after the last edit — 23033 passed, 66 skipped, exit 0. Restart gated on
+exit=0: pid 60753 → new listener; the IFS/Oxford ask re-sent as a probe for the third review round.
+
+**§4IE live check (2026-09-17, pid 80247, probe `ifs19101…`, 1182 s, 38 tool calls):** futility
+steer turn 11 (`probe5.py`), same-error steer turn 32 (the three dead ends alternated, so the count
+took longer), no `find` banners. Then turn 38 hit the thinking cap and turn 40 — the reserved
+report turn — hit it again: reply = the bare abort marker. See §4IF.
+
+## §4IF — The report turn does not think (2026-09-17)
+
+**Trigger (probe `ifs19101…`).** Turn 40/40, tools off, alert in place. The model's thinking: "I
+have one more turn where I can use tools … the system_state_update says the task is pending. Let
+me try to actually complete it" — 246 thinking chunks, 7.5 min, 42,624 chars of spec-spelling
+derivation, killed by the n-gram guard; as the second cap of the attempt the loop breaker shipped
+`[ATTEMPT_ABORTED_THINKING_LOOP] …` as the whole reply, and the §4ER thumbs-ask footer was
+appended under it. Every mechanism upstream did its job; the report itself never got written.
+
+**R0 scope.** (1) `report_turn_payload`: on a breaker-forced / reserved final, thinking off by
+both switches (`chat_template_kwargs.enable_thinking=False`, `/no_think` on a COPY of the last
+user message); only when `is_final_generation and context._breaker_forced_final`. (2) A thinking
+loop or tool-call flood on a forced final ships `forced_final_loop_fallback(_no_answer_fallback_reply(…))`
+— evidence first, the abort marker as a trailer (the outcome heuristics' regex still matches);
+`force_stop`, break. (3) `blocker_report_alert`: the pending task state / turns-left hint is
+expected; do not plan, do not think it through, write the report. (4) `reply_carries_abort_marker`
+guards the thumbs ask. Out of scope: the n-gram guard's 42 k-char trip point on that turn (it
+fired at 2 k chars on turn 38 — the detector is content-dependent; with thinking off the turn
+never gets there); the model's disregard of "tools are OFF" (now it has no thinking to disregard
+it in).
+
+**R1.** `core/agent.py` only. Tests: `tests/test_report_turn_no_think.py` (payload behaviour incl.
+history untouched + idempotence; the site under the two-name guard, preceding the `LLM Request`
+log; the fallback's order and the consumer's regex; the guarded thinking-loop branch precedes the
+reset path, stops and breaks; the alert wording; the footer guard by AST). Docs: core/agent.
+**R2 battery round 28** (`specs28.py`, 5 files): NOOP SURVIVED, KNOWNBAD KILLED, **13/13 KILLED**
+first pass — P1–P5 (flag not set / no soft switch / edits history / site unconditional / site
+removed), L1–L4 (forced-final loop retries / fallback drops the marker / marker first / not
+stopping), A1 (alert clause), T1–T2 (footer on aborts / loose marker regex). **R3:** round 27
+re-run — 11/11 KILLED. **R4:** ratchet green. **R8:** none this round.
+**R7:** full suite once after the last edit — 23046 passed, 66 skipped, exit 0. Restart gated on
+exit=0: pid 80247 → new listener; the IFS/Oxford ask re-sent as a probe for the fourth review round.
+
+**§4IF live check (2026-09-17, pid 99743, probe `ifs19450…`, 1401 s, 42 tool calls):** report turn
+logged `thinking OFF`; no thinking-loop abort; the model finally switched to computing the grid
+directly with numpy (`oxford_grid2.py`, turn 36 of 40 — the right move, four turns too late). The
+reply was still narration ("Let me fix that.") + a dropped `execute`: see §4IG.
+
+## §4IG — A rewrite that reproduces the error is not progress (2026-09-17)
+
+**Trigger (probe `ifs19450…`).** Offline replay of the run through `command_head` + the ledger
+trips at the 3rd identical `SpecError: [pl]` (6 in total) — live it never fired, because every run
+followed a NEW probe file and `StrikeLedger.note_world_changed` (every successful write) cleared
+`action_sigs`, same-error class included. The futility breaker was blind for the same reason in a
+different key: probe6.py … probe19.py (14 files) + oxford_grid2.py, one write each under the literal
+basename. The reserved report turn (turn 40, thinking off) answered "…The error is that `leggauss`
+returns a tuple. Let me fix that." + an `execute` call: dropped; `narration_only` passed the prose
+on its one factual sentence; last turn → no retry → the narration shipped with the dropped-call
+note.
+
+**R0 scope.** (1) `note_world_changed` keeps `is_same_error_signature` keys
+(`SAME_ERROR_TARGET_SUFFIX`); everything else still resets. (2) `futility_key` (basename,
+lower-cased, trailing digits/underscores/dashes stripped from the stem) at the write site;
+`futility_keys_in_command` at the run site. (3) `last_turn_needs_report` reserves TWO turns
+(report at max−2, retry at max−1); the `Turn Budget` line says so. (4) On a breaker-forced final,
+a dropped tool call (`_dropped_this_turn`) counts as NO ANSWER → the §4GH retry directive, then
+the honest fallback. Out of scope: `narration_only`'s tolerance of one factual sentence (the
+dropped-call rule covers the live shape without touching a shared classifier); the model's
+40-turn detour before the numpy route.
+
+**R1.** `core/strikes.py`, `core/agent.py`; tests `tests/test_same_error_survives_writes.py` (ledger
+survives writes while the plain observation is forgotten; signature table; `futility_key` table +
+command keys; the steer fires across probe6/7/8 through the live dispatch; two-turn reserve; the
+dropped-flag/no-answer AST pin) and the `test_reserved_report_turn.py` table (rows moved to
+max−2, a max−1 row now False). Docs: core/strikes, core/agent.
+**R2 battery round 29** (`specs29.py`, 8 files): NOOP SURVIVED, KNOWNBAD KILLED, **9/9 KILLED**
+first pass — W1–W3 (write clears the same-error count / clears nothing / loose signature test),
+K1–K3 (no digit strip / run side matches the literal blob / write side keys the raw basename), R1
+(report back on the last turn), D1–D2 (dropped flag never set / clause removed). **R3:** round 28
+re-run 13/13 KILLED; round 25's report-turn slice re-anchored to the two-turn reserve (T1, T3) and
+re-run — T1, T2, T4 KILLED; T3 (budget floor dropped) SURVIVED once the reserve moved to max−2: no
+table row had `turn == max−2` under a short budget, so the floor clause was untested — rows `(1, 3)`
+and `(0, 2)` added, T3 KILLED. **R4:** ratchet green. **R8:** the journal line above was written
+before the slice finished (claim before fact) — corrected here.
+**R7:** full suite once after the last edit — 23073 passed, 66 skipped, exit 0. Restart gated on
+exit=0: pid 99743 → new listener; the IFS/Oxford ask re-sent as a probe for the fifth review round.
+
+**§4IG live check (2026-09-17, pid 20925, probe `ifs20294…`, 1662 s, 34 tool calls):** the model
+switched to computing the grid with numpy at turn 16, ran one `web_search` (the look-it-up steer
+landed), and at turn 32 `oxford_grid.py` saved `/workspace/oxford_grid.png` (61 KB — verified in
+the container; the geometry is wrong, colatitudes and a fixed longitude, but it is a plot). Then it
+looped on a point-count formula against invented "known values": n-gram kill at turn 29 and turn
+34 → second cap → bare `[ATTEMPT_ABORTED_THINKING_LOOP]` as the whole reply, six turns unspent.
+No thumbs footer (§4IF F4 held). See §4IH.
+
+## §4IH — A thinking loop is a reason to stop deriving, not to discard the evidence (2026-09-17)
+
+**Trigger.** Above. The two-cap rule (2026-04-17) was written for self-play, where a stuck solver
+should be abandoned; on a live request it threw away everything the request had produced.
+
+**R0 scope.** At `thinking_cap_events >= 2`: with a turn left (`second_cap_reports`), close the
+loop as a breaker — `force_final_response`, `_breaker_forced_final`, `blocker_report_alert("thinking
+loop")`, continue — so the next turn is the §4IF no-think report turn; on the last turn ship
+`forced_final_loop_fallback(_no_answer_fallback_reply(…))` (evidence first, marker trailer). The
+bare-marker literal leaves that branch. Out of scope: the CROSS_TURN_LOOP breaker's bare marker
+(it reads reasoning openings; a no-think report turn has none, so it cannot fire there); the
+model's invented reference values (a grounding failure the loop steer already names).
+
+**R1.** `core/agent.py`. Tests: `tests/test_second_cap_reports.py` — arithmetic table; AST of the
+branch (report sub-branch sets/raises/alerts/continues; fallthrough ships the fallback, stops,
+breaks; no bare-marker literal); three `handle_chat` runs with a fake LLM that HONOURS
+`enable_thinking` (report turn ships the report — no marker; report turn that goes back to work →
+§4IG dropped-call rule → retry → honest fallback, 4 calls; second cap on the last turn → fallback
+with marker, 2 calls). The existing `test_thinking_cap_escalation.py` still passes (its fake
+ignores the flag, so the report turn loops and the §4IF branch ships the marker within 3 turns).
+Docs: core/agent.
+**R2 battery round 30** (`specs30.py`, 6 files): NOOP SURVIVED, KNOWNBAD KILLED, **7/7 KILLED**
+first pass — C1–C2 (report never / always), C3 (off-by-one on the last turn), C4 (flag not
+raised), C5 (no alert), C6 (fallthrough back to the bare marker), C7 (report turn keeps tools).
+**R3:** round 29 re-run 9/9 KILLED. **R4:** ratchet green. **R8:** first looping-report test fed
+`<think>` to a no-think payload — an unrealistic fake (the guards read reasoning, which a no-think
+turn has none of); replaced by the tools-off-ignored chain.
+**R7:** full suite once after the last edit — 23084 passed, 66 skipped, exit 0. Restart gated on
+exit=0: pid 20925 → new listener; the IFS/Oxford ask re-sent as a probe for the sixth review round.
+
+**§4IH live check (2026-09-17, pid 40837, probe `ifs21133…`, 354 s, 24 steps):** the whole
+breaker ladder fired, in order and fast: futility steer turn 14; same-error steer turn 22 (the
+model ran a `web_search` — the Tor engines returned "How to get help in Windows" for "eckit Grid
+reduced_gg spec format"); futility REPORT tier turn 23 → `report turn — thinking OFF`; report turn
+and retry both emitted narration + a `file_system` call → dropped (§4IG) → honest fallback; verifier
+gate did NOT re-open (§4ID); REFUTED mechanically, corpus row failed, correction queued. No
+thinking loops, no abort marker. The reply was the problem: see §4II.
+
+## §4II — When the model will not write the report, the system writes the digest (2026-09-17)
+
+**Trigger.** The shipped reply, in full: "I ran out of this turn's budget … Last evidence gathered
+(`file_system` on probe.py): SUCCESS: Wrote 936 chars to 'probe.py'." — after 24 steps, seven
+distinct errors, four files on disk. `_no_answer_fallback_reply` quoted the LAST substantive tool,
+and the last tool was the write the breaker stopped. The model's non-compliance on the report turn
+(tool schemas already absent; the tool-call habit comes from 23 turns of history) is not something
+another sentence of alert fixes; the fallback's quality is under our control.
+
+**R0 scope.** `evidence_digest(tools_run, ask=)`: the ask; files left in place (`_fs_path_ledger` —
+deleted scratch files not named); distinct errors with counts (`exception_signature` over
+`normalise_volatile` — labelled variants collapse); the last CLEAN evidence-tool output; tools run
+with counts; caps (12 files, 5 errors, 700-char output); empty when nothing ran; synthetic rows
+skipped. `_no_answer_fallback_reply(tools_run, ask=)` ships it under the §4GH head (still refuted
+by the shape check as a non-answer — by design) with "the task is NOT finished". The ask is passed
+at all four sites. Out of scope: the web-search quality (a Tor engine-relevance problem, separate);
+making the model comply on the report turn (three alerts, thinking off, schemas absent — the
+digest is the floor when it does not).
+
+**R1.** `core/agent.py`. Tests: `tests/test_evidence_digest.py` — live-shaped rows (12 records:
+writes, a delete, labelled SpecError variants, a clean run, a web search) → every section,
+`×3` for the three labels, scratch.py absent, the last clean output is a clean one; empty/synthetic;
+caps; the fallback carries the digest under the head and is still `refute_no_answer_fallback`.
+The existing `test_forced_final_no_answer.py` pins (head, own arm, not raw dump) still pass. Docs:
+core/agent.
+**R2 battery round 31** (`specs31.py`, 5 files): NOOP SURVIVED, KNOWNBAD KILLED, **9/9 KILLED** —
+G1 (no ask), G2 (files not retired), G3 (errors not collapsed), G4 (an errored run counted as
+clean), G5 (synthetic rows counted), G6 (no tool counts), G7–G8 (fallback drops the digest / the
+head), G9 (the call sites drop the ask — 3-site mutant). One first-pass survivor, G9: no test drove
+the fallback THROUGH the loop and read the ask; the two `handle_chat` runs in
+`test_second_cap_reports.py` now assert "You asked: …" in the final, and an AST pin requires
+`ask=` at every `_no_answer_fallback_reply(` call. That exposed a gap in the fix itself: with no tool
+record (every call dropped) the fallback took the empty branch and lost the ask — the empty branch
+now carries it too. **R3:** round 30 re-run 7/7 KILLED after re-anchoring C6 (its anchor gained
+`ask=`). **R4:** ratchet green. **R8:** the G9 gap above; the first digest test expected the
+oxford run as "last clean" with a later web search in the rows (the search IS the last clean tool).
+**R7:** full suite once after the last edit — 23090 passed, 66 skipped, exit 0. Restart gated on
+exit=0: pid 40837 → new listener; the IFS/Oxford ask re-sent as a probe for the seventh review round.
+
+**§4II live check — the loop closes (2026-09-17, pid 59971, probe `ifs21382…`, 218 s, 7 steps):**
+the model read its own `oxford_grid2.py` from the previous run, fixed the numpy `min` bug, ran it,
+checked the PNG with `vision_analysis`, and answered with a table and the plot inline
+(`![…](/api/download/oxford_grid.png)` — served, 257 KB); verifier CONFIRMED 0.90, FILE-ARTIFACT
+clean; no breaker needed. Seven rounds took the request from 15–28 min failures (foreign
+checkpoint in the prompt; gate re-opening a breaker-closed loop; unlabelled same-error runs; the
+report turn thinking 42 k chars; bare abort markers; rewrites under new names; the write
+confirmation as the "report") to a completed, verified, plotted reply in under four minutes.
+
+**What the loop did NOT fix, stated plainly.** The answer is scientifically wrong: the script's
+longitudes are radians labelled as degrees (both panels span 0–6.28 "deg"; the "zoom" is not a
+zoom; the nearest point is "86 km away on a ~10 km grid", a contradiction in the reply's own
+numbers). The judge CONFIRMED it at 0.90 with the contradiction IN its evidence (the vision
+digest's "x-axis −1 to 6" for a global grid; the 10 km / 86 km pair). That is the known verifier
+gap (`omitted_contradiction` bench 0/23, §4IB notes): a bench-driven judge round, not a loop fix.
+Also cosmetic: one working beat from turn 5 ("The bug is `min(a, 1.0)` … Fixing to `np.minimum`.")
+survived smoothing at the head of the reply — the smoother is deliberately conservative ("The bug
+is …" is an answer for a debugging ask); left as is.
+
+## §4IJ — The judge: a fact in the output does not rescue a claim the output also contradicts (2026-09-17)
+
+**Trigger.** Two shapes, one blind spot. (1) Bench fault `omitted_contradiction` (§4IA): CONFIRMED
+23/23 at mean 0.96; stage 1 often NAMED the conflict ("Evidence shows two different temperatures:
+34°C and 35°C") and stage 2 dismissed it — its "support" rule read "REAL only if the fact appears
+in NO tool output or directly contradicts one", so a value present in the output passed even when
+the same output said otherwise. (2) Probe `ifs21382…`: "~10 km nominal resolution" beside "nearest
+grid point ~86 km away", both printed by the reply's own script (radians labelled as degrees),
+CONFIRMED 0.90 — and the vision digest in its evidence said the "global" plot's x-axis ran −1..6.
+
+**R0 scope.** Prompt rules in all three judge prompts: CONFLICTING EVIDENCE (two values for the
+SAME quantity; claim reports one silently → REAL; explicit not-a-conflict list: load averages,
+different items, different times, another file's size) and INTERNAL CONTRADICTION (two claim
+statements that cannot both be true → REAL even when each number is in an output). Stage 1 names
+both shapes as "support" suspects; stage 2's "starting point, not a boundary" paragraph lists them.
+Both adjudicate rules pinned in `_REQUIRED_RULE_MARKERS` (a tuned template that sheds one is
+rejected). No mechanical detector — a lexical proxy for "same quantity" is exactly the class the
+journal warns against; the judge is the right reader. Measurement = the bench, paired A/B, all
+fault classes (FPR on `clean` and the other REFUTED classes must not move against us), plus the
+live re-test of the IFS ask.
+
+**R1.** `core/verifier.py` (three prompt constants + markers). Tests:
+`tests/test_4ij_judge_conflict_rules.py` (both rules in both deciding stages; stage 1 carries the
+shapes not the verdict rules; the not-a-conflict guard wording; markers pinned + a shed template
+rejected + the live resolver serves them; the extra-problems paragraph; templates still
+format-probe). Docs: core/verifier (§4IJ section). **R2 battery round 32** (`specs32.py`, 5
+files): NOOP SURVIVED, KNOWNBAD KILLED, **11/11 KILLED** first pass — J1–J3 (adjudicate rules /
+FPR guard dropped), J4–J5 (markers unpinned), J6–J7 (enumerate shapes dropped), J8 (paragraph
+reverted), J9–J10 (single-stage rules dropped), J11 (marker check disabled). **R4:** ratchet green.
+
+**§4IJ part 2 — the escalation sees the cheap judge's objections.** Arm A read-out (237 trials, all
+fault classes, old templates by digest): cheap judge REFUTED fabrication 27/29, fact_swap 16/23,
+omitted_contradiction 10/23, wrong_topic 29/29; the classic re-judgement on the MAIN model
+overturned 22, 15, 9 and 14 of them — 94 overturns, 15 rescues (all 10 clean false refutes among
+them), 79 damage. Overall TPR 0.337, clean FPR 0/29. Arm B (rules only): cheap omitted catch 10→16,
+final 1→2; TPR 0.379; FPR 1/29; overturns 93 (13 rescues / 80 damage). The strong judge was asked
+the claim prompt FROM SCRATCH and never saw what the cheap one had found. Shipped
+`claim_prompt_with_objections` (PRIOR AUDIT block before the checks; objections framed as claims
+to check, no quote burden, no forced suspects), used at the escalation site under
+`GHOST_VERIFY_ESCALATION_OBJECTIONS` (provenance-visible). Pins
+`tests/test_4ij_escalation_objections.py`; battery round 33 8/8 KILLED (site ignores flag, block
+after the checks, objections dropped, braces unescaped, fallback dropped, "trust it" wording,
+provenance blind, flag inverted). Arm C = rules + objections, running.
+
+**§4IJ part 3 — a CONFIRMED that names a discrepancy is not a confirm.** Direct probes of the main
+model: the run-7 reply → "the only minor issue is a slightly loose '~10 km spacing'
+characterization given the nearest point is 86 km away, but this does not refute the core answer"
+→ CONFIRMED 0.9, issues []; the weather omitted case → "two evidence rows report 34°C and 35°C …
+the CLAIM picked 34°C without noting the disagreement" → CONFIRMED 0.95 with that sentence IN
+`issues`; with the objections block → "a duplicate/rounding variant of the same reading … silently
+reporting 34°C is acceptable". The judge writes the problem and confirms over it. Mechanical, on
+the judge's own output: both deciding prompts ask for a structured `conceded` list;
+`_build_verify_result` (one authority — pinned by AST: no site builds a VerifyResult from judge
+JSON directly) turns CONFIRMED + (conceded or issues) into UNCERTAIN capped at
+`_CONFIRM_WITHHELD_CONF_CAP`; REFUTED/UNCERTAIN untouched; blanks ignored;
+`GHOST_VERIFY_CONCESSION_DOWNGRADE` (provenance-visible). Arm A: 12 CONFIRMED-with-issues
+overturns, all fault trials, 0 clean. Pins `tests/test_4ij_concession_downgrade.py`; the 1166-test
+verifier/escalation/judge set green; battery round 34 11/11 KILLED; R3 round 33 8/8. Arm D = all
+three, queued after C.
+
+**§4IJ R2 — the bench (paired, 237 trials/arm, seed 0, seed cases only; templates by digest):**
+
+| | A base | B rules | C +objections | D +concession (SHIPPED) |
+|---|---|---|---|---|
+| TPR | 0.337 | 0.379 | 0.421 | **0.463** |
+| false-CONFIRM @≥0.7 | 0.653 | 0.621 | 0.568 | **0.300** |
+| clean refuted | 0/29 | 1/29 | 1/29 | 1/29 |
+| clean → UNCERTAIN | 0 | 0 | 0 | 3/29 |
+| omitted_contradiction confirmed ≥0.7 | 22/23 | 21 | 21 | **10/23** |
+| fabrication / fact_swap confirmed ≥0.7 | 24 / 22 | 26 / 20 | 26 / 18 | **10 / 7** |
+| overturns rescues / damage | 15/79 | 13/80 | 13/64 | 4/8 (+8/44 → UNCERTAIN) |
+
+D's clean cost (3 UNCERTAIN): the strong judge, shown a cheap objection, filed a correct rounding
+(0.041→0.04 s), the 1/5/15-min load averages and an inference under `conceded`. **Arm E (probed
+on the exact trials, not benched):** a second `dismissed` bin for false alarms — the three clean
+cases came back CONFIRMED with empty `conceded` … and so did the weather omitted case ("a
+duplicate/rounding variant", filed under dismissed) and the run-7 IFS reply (the 10 km / 86 km
+contradiction no longer mentioned at all). Any bin the model may use to confirm, it uses. E
+reverted; D's contract shipped (template digests claim `298d4d47…`, adjudicate `6ac4a3eb…`,
+enumerate `d0db9e4f…` = arm D's provenance). **D first cut** (concession applied to the cheap judge
+too) was stopped at 42 trials: 3/6 clean UNCERTAIN with no second opinion; the main model probed on
+the same six conceded nothing → strong-only (`_build_verify_result(strong=True)` at the two
+force_main classic sites, `strong=bool(force_main)` in two-stage stage 2; the cheap path and the
+code route untouched). Battery round 34 re-run on the final tree with D1/D5 re-anchored and two new
+mutants (cheap also downgraded; escalation site not strong): 13/13 KILLED; rounds 33 and 32 re-run
+clean. **Live cost to watch:** ~10% of clean turns whose cheap refute is overturned now land
+UNCERTAIN (unverified, no correction, no scrub) instead of CONFIRMED — the calibration corpus loses
+those positives; `GHOST_VERIFY_CONCESSION_DOWNGRADE=0` restores.
+**§4IJ live check 1 (pid 16508, probe `ifs04160…`, 696 s, 38 steps) → the CODE route.** The reply
+(a report: "lat=128.11° lon=180.00° → 87.3 km", eckit route "unconfirmed") was judged `verify code —
+CONFIRMED 0.75` — the code-output prompt, outside the three prompts changed above. Extended:
+`_VERIFY_CODE_PROMPT` gained the contradiction / IMPOSSIBLE VALUES / two-values rule under its
+plausibility check and the `conceded` field; its main re-verify passes `strong=True`. Probed on the
+run-7 and run-8 replies on the main model: run 7 → UNCERTAIN 0.6 (conceded: the 10-row/"nearest"
+mismatch and the 86-km note), run 8 → UNCERTAIN 0.6 (issues: "Nearest-point latitudes (~128°) and
+lon=180° are implausible for points ~87 km from Oxford" — with CONFIRMED, i.e. exactly the
+confirm-over-a-named-problem shape). NOT benched (no code-route bench cases); same kill switch.
+Battery round 34 re-run with D14–D16 (code rule dropped / code `conceded` dropped / code re-verify
+not strong): 16/16 KILLED. Docs: core/verifier (code-route paragraph).
+**R7 (§4IJ):** full suite — first pass 1 failed (new docs table without the `.scroll` wrapper);
+second pass 11 failed, all in `tests/test_4ij_concession_downgrade.py`: enum IDENTITY asserts
+(`verdict is VerifyVerdict.CONFIRMED`) with another verifier test reloading the module in the same
+worker — the reload-contamination class; asserts now compare `.value`. Third pass: 23130 passed,
+66 skipped, exit 0. Restart gated on exit=0: pid 16508 → new listener (the §4IJ judge incl. the code
+route). The IFS ask re-sent as run 9 — the second live run under the new judge.
+**§4IJ live check 2 (pid 53476, probe `ifs04495…`, 1418 s, 43 tool calls):** the model spent the
+whole budget on eckit this time — it even fetched `ReducedGaussian.cc` (the grep shows the real
+spec key: `spec.get_long_vector("pl")`) but never built the grid and never took the numpy route;
+same-error steer ×3 (heads `python3`, then `for`), report turn + retry both emitted tool calls
+(dropped) → the §4II digest shipped (files, five distinct errors with counts, last clean output,
+`execute ×32, file_system ×11`) → REFUTED mechanically as the non-answer it is. No claim, so the
+new judge was not exercised; the judge's effect on this ask is the offline probe above (run-7 and
+run-8 replies → UNCERTAIN 0.6 on both routes, previously CONFIRMED 0.90 / 0.75). Run-to-run
+variance of the model's strategy on this ask is the dominant term now (218 s answered-wrong vs
+1418 s budget-exhausted), not the pipeline.
+
+## §4IK — The same-error count is keyed on the error, not the command head (2026-09-18)
+
+**Trigger (probe `ifs04495…`, run 9).** `SpecError: [pl]` ×4 under head `python3`, ×3 under head
+`for` — two signatures, two steers, no 5-run report tier. **R0.** Key the execute same-error class
+on `SAME_ERROR_TARGET_SUFFIX` alone; heads recorded in `strikes.exec_error_heads` as an annotation
+for the log line and the steer/report text (which keep the error line). Out of scope: the
+no-progress class (keyed per target by design). **R1.** `core/agent.py` (site + two texts). Tests:
+`tests/test_same_error_keyed_on_error.py` — five mixed-head runs through the live dispatch: steer at
+the 3rd, report (tools off) at the 5th, both texts carry `SpecError: [pl]` and both heads; the
+ledger holds one `execute|(same error)|<fp>` signature; AST pin on the key. **R2 battery round 35:**
+NOOP SURVIVED, KNOWNBAD KILLED, 5/5 KILLED (keyed on head again / heads not recorded / trip target
+head / steer drops the error line / heads annotation dropped). **R3:** rounds 29 and 27 re-run —
+9/9 and 11/11 KILLED. **R4:** ratchet green. Docs: core/strikes. **R8:** first pin ran a 6th call
+past the hard stop and read a second report alert (the harness ignores `force_final_response`);
+sequence bounded at the 5th.
+
+## §4IL — An engine that answers a different question does not win the wave (2026-09-18)
+
+**Trigger.** Run 6's look-it-up search: `web_search("eckit Grid reduced_gg spec format nxacc pl
+python")` → "How to get help in Windows - Microsoft Support". The batch rule passed it on the shared
+word *format*. Replay over 798 recorded searches (2026-08/09): 53 batches (6.6%) were engines
+answering a different question (Doha / Control Panel / Domino's / NHL / XVideos …), every one with
+a common word in common and no distinctive token of the query. **R0.** `distinctive_tokens` (first
+non-year content word unless query framing; digit/underscore tokens; words the system dictionary,
+stem-aware, does not know), `result_on_topic` (substring on title+body+URL, or fuzzy ≥0.8 for 6+
+char tokens), `rank_on_topic` (stable partition, nothing dropped), and the wave's off-topic check
+over them with the bare-row and prose-floor guards kept; no-distinctive queries keep the batch
+rule. Out of scope: engine choice, Tor circuits, reformulation. **R1.** `tools/search.py`. Tests:
+`tests/test_search_distinctive_relevance.py` (token table incl. Greek, plurals, years, weak
+leading words; the live Windows batch — with the second row that shares *format* — off-topic and
+rescued by one eckit hit; typo via fuzzy only; short tokens never fuzzy; bare rows + URL slug; stable
+re-rank drops nothing; fallback batch rule; AST: the wave re-ranks its winner before returning).
+Corpus replay of the shipped functions: 53/798 off-topic (6.6%), 90 re-ranked (11.3%), 655
+untouched. **R2 battery round 36:** NOOP SURVIVED, KNOWNBAD KILLED, 12/12 KILLED after two
+first-pass survivors — R5 (fuzzy path removed: the typo pin also matched by substring on a second
+token → one-token query) and R9 (distinctive rule bypassed: the Windows pin's batch had no shared
+word → added the live second row). **R4:** ratchet green. Docs: tools/search. **R8:** the first
+distinctive rule made the LEADING token index 0 — a leading year pushed the subject to index 1
+("2025 Tempi road crash" → no subject); fixed to the first non-year token.
+**R7 (§4IK, §4IL):** §4IK suite 23132 passed → restart (pid 56521 → 77884); §4IL suite 23147 passed →
+restart (pid 77884 → new listener). Both live.
+**§4IL live check (pid 96124, probe `srch…`):** "what is the eckit-geo Grid spec key for a reduced
+Gaussian grid" → nine searches (the ask said once — instruction-following, out of scope), every wave
+won with on-topic results, answer "`pl`" with an ECMWF source URL — the fact runs 2–9 never found.
+No off-topic rejection fired in this probe (engines were on-topic); the rejection path is covered by
+the corpus replay (53/798) and the pins.
+
+**§4IJ R2 on real replies — mined pool (2026-09-18).** 60 live-derived "presumed-good" cases
+(`--skip-cases 29 --max-cases 60`, faults omitted/fabrication/fact_swap + clean = 188 trials), paired:
+
+| mined pool | B' rules only | D' rules+objections+concession |
+|---|---|---|
+| TPR | 0.461 | 0.516 |
+| false-CONFIRM @≥0.7 | 0.523 | 0.398 |
+| clean refuted / UNCERTAIN / confirmed≥.7 (n=60) | 6 / 0 / 53 | **12 / 7 / 40** |
+| omitted confirmed≥.7 (n=34) | 29 | 19 |
+| fact_swap confirmed≥.7 (n=34) | 21 | 13 |
+| fabrication refuted (n=60) | 44 | 39 |
+
+The twelve clean refutes, read one by one: five TRUE catches the July judge confirmed ("RECOVERED"
+with the file missing; service "started" on a port in use; "All 7 tasks finished" vs "5 DONE"; "5
+PNGs" vs seven listed; "ball launch works" on an HTTP 200); three rescues D' gained over B'; four
+FALSE — the strong judge, shown the cheap objection, upheld a gloss ("A beautiful Saturday
+afternoon ☀️ is unsupported"), two truncated-evidence objections, one over-read constraint. The
+seven UNCERTAINs are mostly false concessions (philosophical elaboration "not requested"; a
+rebuttal filed under `conceded`). **Decision (the Aug-06/§4BK precedent: a configuration that
+loses the balanced gate on the live population is not the default):** `GHOST_VERIFY_ESCALATION_OBJECTIONS`
+default → OFF (it is the source of the false REFUTES, which are punitive); the concession
+downgrade stays ON (UNCERTAIN only). The seed-set gain of the objections block (TPR +0.04 at FPR 0)
+did not replicate on real replies. Arm D'' (concession only, objections off) running on the same 188
+trials to measure the shipped default. Caveat on the label: mined "clean" = not refuted by the
+July judge, so the clean column is disagreement with the incumbent, not ground truth — hence the
+read-through. Pin updated (`test_flag_parsing`: unset → False); docs: core/verifier.
+**R7 (objections default OFF):** 23147 passed, exit 0 → restart (pid 96124 → new listener). Live
+judge = rules in all prompts + strong-only concession downgrade; objections block off (flag).
+**§4IJ mined pool, arm D'' = the SHIPPED default (rules + strong-only concession, objections off),
+188 trials paired with B' and D':** TPR 0.469 (B' 0.461, D' 0.516); false-CONFIRM@≥0.7 **0.422**
+(B' 0.523, D' 0.398); clean refuted/UNCERTAIN/confirmed≥.7 **8/7/45** (B' 6/0/53, D' 12/7/40);
+omitted confirmed≥.7 22 (29/19); fact_swap 15 (21/13). The concession path never emits REFUTED
+(the +2 clean refutes vs B' are strong-judge run-to-run variation); of the 7 clean UNCERTAINs at
+least two are legitimate ("5 PNGs" vs seven listed; "all systems running smoothly" beside tasks
+that didn't land). **Decision: keep** — a 0.10 drop in actionable false confirms for ~13% of clean
+positives moving to UNCERTAIN, no new punitive refutes. This is the ceiling of re-weighting the
+two judges' opinions; the next step is structural (claim extraction → quote-validated evidence
+binding → mechanical verdict; strong model only on residual claims; shadow mode + human labels
+first) — proposed to the operator 2026-09-18, awaiting go-ahead.
+
+## §4IM — Claim-binding verifier, phase 1 (2026-09-18) — R0 scope, written first
+
+**Problem (measured §4IJ, six arms, seed + mined):** the judge takes two model OPINIONS and returns
+one: the cheap E4B false-refutes 31–39% of clean replies; the strong 35B confirms contradictions it
+can see ("minor"), and it is the agent's own model. Re-weighting the opinions (rules, objections,
+concession, rebuttal burden, forced suspects, judge swaps) moves ≤0.1 of false-confirm at a clean
+cost every time. Operator decision: solve it structurally.
+
+**Design:** verdicts computed from VALIDATED QUOTES, not opinions.
+1. One cheap-leg call lists the reply's checkable claims as verbatim quotes (kind: number | count |
+   date | name | file | status | other) and, for each, the evidence span that supports or
+   contradicts it, verbatim. 2. Code validates both quotes by normalized containment (claim ⊂ reply,
+   span ⊂ evidence; the rebuttal-burden validator) — a quote that is not there is dropped, never a
+   verdict. 3. Code compares claim ↔ span: numbers normalised (units bytes/KB/MB/GB/TB, ms/s/min/h,
+   m/km, %, °C; rounding to the claim's precision; "~/about/approximately" tolerance) → agree /
+   disagree; a validated DISAGREEMENT is a contradiction. 4. Skeleton scan: for a supported numeric
+   claim, another evidence line with the same non-numeric skeleton and a different value at the same
+   slot = CONFLICTING EVIDENCE (the omitted-contradiction class, mechanically). 5. Implausible
+   labelled values (latitude ∉ [−90, 90], longitude ∉ [−180, 360]) in a claim = contradiction.
+   6. Verdict: REFUTED iff ≥1 validated contradiction/conflict/implausible on a checkable claim
+   (issues carry the exact pair); CONFIRMED iff every checkable claim bound and agreeing;
+   UNCERTAIN otherwise (unbound load-bearing claims are COUNTED, not refuted, in phase 1; truncated
+   evidence → never a refute). Glosses and derived prose are not checkable claims → never refuted.
+
+**Phase 1 (this round):** module `core/claim_binding.py` (pure, testable), `Verifier._verify_claim_binding`
+(cheap route, one call, json_only), flags `GHOST_CLAIM_BINDING_PRIMARY` (default OFF — the bench arm:
+`verify_claim` returns the claim-binding verdict alone) and `GHOST_CLAIM_BINDING_SHADOW` (default
+ON — live: after the incumbent verdict, a bounded background task runs claim-binding and appends
+{trace, incumbent, cb, claims, bindings, agree} to `system/verifier/claim_binding_shadow.jsonl`;
+no consumer reads it). Bench arm CB on the seed set (8 faults) and the mined pool (60 cases, 4
+faults) against D''. Tests + battery + docs + this entry. **Out of scope (phase 2):** unsupported-
+claim refutes (fabrication) — after the shadow/bench show the unbound rate on clean; residual claims
+to the 35B with a quote burden; consumer switch class by class (mechanical contradictions first);
+retiring the escalation for covered classes; a human-labelled live set from the shadow
+disagreements. **Non-goals:** judging quality/adequacy — that is where the fake refutes came from.
+
+**§4IM R1 (phase 1 built, 2026-09-18).** `core/claim_binding.py`: `CLAIM_BINDING_PROMPT` ("You do NOT
+judge the reply. You quote."), `parse_binder_output` (str/fenced/truncated payloads; complete rows
+salvaged; quotes never cut — the parser's 160-char slice was itself a fake-refute source: it dropped
+the "Tonight: low 24°C" tail and left the current temperature to disagree with), `quote_in`
+(normalized containment, min 4 chars), `extract_quantities` (units bytes/time/length/%/°C, thousands
+separators, "12k", currency with word multipliers €3.4 million = €3.4M; dates, clocks, month-name
+dates/ranges masked; bare years dropped), `quantities_agree` (rounding at the claim's precision in
+the claim's unit; hedge ±5%), `compare_claim_span` (per figure: supported / unknown / near-miss
+disagree; families never cross; a disagreement needs the model's "contradict", a shared subject
+word, or a typo-shaped pair), `find_conflicting_line` (same skeleton, packer label stripped, exactly
+ONE differing slot and it is the claim's — table rows are records), `implausible_value` (lat/lon
+ranges), `lexical_anchor` for figure-less claims, `verdict_from_bindings` (REFUTED iff a validated
+disagree/conflict/implausible; CONFIRMED iff every row agrees; UNCERTAIN otherwise — unchecked and
+unbound rows never confirm on the model's word). Phase 1.5, same day: `audit_numbers` — every prose
+figure of the reply (code fences, inline code, URLs/paths masked) graded against every evidence
+figure with no model: supported / misreported (typo-shaped AND ratio ≤1.5 AND shared subject AND
+the evidence figure absent from the reply AND not a dense ≥3-figure sentence AND not a
+high-precision float) / unsupported (counted only). Measured offline on every seed and mined trial
+while tuning: the looser near-miss rule flagged 12/60 live clean replies; the shipped rule flags
+1/60 (a 3-digit coordinate) and 0/29 seed clean, catching fact_swap 4/23 seed, 5/34 mined by itself.
+`Verifier._verify_claim_binding` (one json_only cheap call, `critic_max_tokens=1024` — every other
+json_only caller keeps 512), `_spawn_claim_binding_shadow` (fire-and-forget, 90 s bound, no row
+when the binder call fails), `record_claim_binding_shadow`, flags `GHOST_CLAIM_BINDING_PRIMARY`
+(off) / `GHOST_CLAIM_BINDING_SHADOW` (on), both in bench provenance. Tests:
+`tests/test_claim_binding.py` (73: every rule a table, incl. the live shapes that were fake refutes
+during tuning), `tests/test_claim_binding_verifier.py` (11). Docs: `docs/core/claim_binding.html`
+(new page; linked from the reference index and core/verifier). **R2 battery round 37: NOOP
+SURVIVED, KNOWNBAD KILLED, 48/48 KILLED** across five sharpening passes (survivors → pins: span
+validation, unit conversion, unchecked-confirms, anchor stopwords, cross-family comparison, single-
+digit typo, ratio, reply-mentions-figure, currency multiplier); one equivalent mutant removed
+(same skeleton + same numbers = identical line, skipped earlier). **R8:** three bench restarts
+were mine — v2 (eager per-figure disagreement: "9,592 primes below 100,000" refuted on the bound),
+v3 (the parser cut spans), v4/v5 (month-name dates read as figures) — each found by reading the
+first clean refute of the previous run, which is the loop the protocol prescribes.
+
+**§4IM R2 measurement — mined pool, paired (60 clean + 60 fabrication + 34 fact_swap + 34
+omitted; same cases, seed 0; ref/unc/conf).** B' incumbent: clean 6/0/54, fabrication 44/0/16,
+fact_swap 11/1/22, omitted 4/1/29 — false-CONFIRM@.7 over faults 64/128 = 0.500, median 25.2 s.
+D'' shipped rules: clean 8/7/45, fabrication 43/3/14, fact_swap 11/6/17, omitted 6/5/23 — 49/128 =
+0.383, 25.4 s. **Claim binding v6 (binder + number audit):** clean 2/41/17, fabrication 3/46/11,
+fact_swap 13/18/3, omitted 9/17/8 — **22/128 = 0.172, median 9.4 s.** Read: fact_swap and omitted
+refuted MORE than the judge (13 vs 11, 9 vs 6) with a quarter of the wrong confirms (3 vs 17, 8 vs
+23); fabrication is the open class (0 refutes by design in phase 1; 11 confirms); clean confirms
+fell 45→17 (the coverage cost — "unchecked" statuses and unbound prose). **The 2 clean refutes,
+read (both rule defects, neither a genuine contradiction):** rec-3adeaf27e8 "the launcher channel
+spans x=360–380" bound to `ballX: 370` — a RANGE whose endpoints were compared as two bare figures,
+with `inLauncher` as the shared subject; rec-a6e2b9b9b6 "All 7 tasks finished" bound as *contradict*
+to "Autonomous batch ran 5 task(s)" while the ledger line listed seven DONE tasks — the disagreement
+counted on the model's `relation` label alone, i.e. the model's opinion re-entering the verdict
+through the one door the design left open. **v7 rules (shipped):** (a) `_RANGE_RE` — "A–B", "A to
+B", "between A and B", unit on either end, descending pairs and "and" without "between" excluded,
+year spans dropped; a range is one `Quantity(value=lo, hi=hi)`; inside → agree, outside → unknown,
+range-vs-range endpoints may disagree; `_typo_shaped_disagreement`/`_near_miss` range-aware (a
+scalar is never a misread range); `audit_numbers` iterates `extract_quantities_with_pos` so
+endpoints are never audited as two figures. (b) The model's `contradict` is never sufficient: a
+disagreement needs a shared subject word or a typo-shaped pair, full stop. (c) `figure_elsewhere`:
+when the claim's figure agrees with a figure in ANY other evidence line ("35°C" bound to
+"Temperature 34°C" while the tool also printed "feels like 35°C"), the binder bound the wrong
+reading → unchecked, whatever the relation and even when typo-shaped (UNCERTAIN is the honest
+verdict; the reply may be reporting that other reading). **Phase 2a (built after v7 launched,
+measured by cache replay):** `audit_entities` — every Title-Case run ≥2 words (connectors allowed)
+and honorific-led name in the reply's prose (headings/table rows/quotes/code/URLs excluded;
+sentence-opening dictionary words trimmed; masked regions never bridged) looked up in evidence ∪
+context as a phrase or as tokens in any order; an unsupported entity WITHHOLDS CONFIRMED and never
+refutes. Motivation: all 11 confirmed fabrications were an appended figure-less sentence ("Dr. Elin
+Vasquez verified…", "won the Meridian Prize", "Karlsen Institute") the binder never listed.
+`Verifier._verify_claim_binding` now passes the context. **Instrument:** the bench response cache
+(`--cache-mode write` on v7, `read` after) — the binder prompt depends only on reply/evidence/
+context, so rule changes replay in seconds; the hour of model calls is paid once per prompt. Tests:
+`test_claim_binding.py` 73→109 (+range table, range compare rows, launcher case, seven-tasks case,
+figure-elsewhere incl. hedge, entity shapes, context path, withhold-not-refute), verifier pins +1
+(context reaches the audit). **Battery round 38: NOOP SURVIVED, KNOWNBAD KILLED, 27/27 KILLED**
+after three survivors became pins (R11 both-ends-differ is not typo-shaped; L3 the elsewhere guard
+honours the hedge; E8 names either side of masked code never merge). Docs: claim_binding.html
+(ranges, "when figures differ", both audits, the replay workflow).
+
+**§4IM R3 — v7 live (cache write) and the v8 replays, mined pool (ref/unc/conf).** v7 live:
+clean 0/44/16, fabrication 1/47/12, fact_swap 12/16/6, omitted 8/17/9 — false-CONFIRM 27/128 =
+0.211, 9.5 s. Clean refutes 0 (the goal of v7). Read the fault-side confirms: four fact_swap
+confirms carried the swapped figure as an *unsupported* audit figure (dense sentence / no anchor);
+`127.0.0.1→127.0.0.2` was invisible (dotted tokens read as 127.0 both ways); the Pinball omitted
+rows were confirmed because the binder quoted `ballX` while the injected twin changed `ballY` — the
+reply reports 560 too, only the audit sees it, and the audit had no twin scan. **v8 (code only,
+replayed from the cache in 4 s — 192 hits / 0 misses):** identifiers (`_IDENT_RE`: IPv4, dotted
+versions ≥3 parts, hex ids with letters+digits, UUIDs) masked from quantities and audited as
+tokens (`audit_identifiers`; inline code included; unsupported → withhold, twin → refute);
+`_skeleton`/`_slots` treat identifiers as slots; the twin scan runs on every audited supported
+figure; context figures count as supported; `strict_figures` option. First replay: false-CONFIRM
+0.062, omitted 18/34, fabrication 0 confirmed — and **3 clean refutes**, all from the widened
+scan: `projects/7b62…/PROJECT_MAP.md` vs `projects/9009…/` (the reply lists BOTH projects — two
+records, nothing omitted) and a bare "1" agreeing with `EXIT CODE: 1` beside the next command's
+`EXIT CODE: 0` (×2). Fixes: the reports-both guard (`reply_slots_of`, on both the bound-claim and
+the audit paths; a range counts as each end too — found by battery survivor T4) and a two-digit
+floor for audit twins. **v8c final, mined:** clean **0**/44/16, fabrication 1/59/**0**, fact_swap
+12/17/5, omitted **16**/14/4 — **false-CONFIRM 9/128 = 0.070** (incumbent 0.500, shipped judge
+0.383). Strict figures: 0.055 for one clean confirm — left OFF (`GHOST_CLAIM_BINDING_STRICT_FIGURES`,
+in provenance). Tests: test_claim_binding 109→123, verifier pins +2 (flag default, flag reaches the
+verdict). **Battery round 39: NOOP SURVIVED, KNOWNBAD KILLED, 24/24 KILLED** (survivors → pins: S3
+range slot keeps both ends, T4/T5 reply slots reach both scan sites). Docs updated (identifiers,
+twin scan, guards, strict flag, the paired numbers). Seed replay + R7 follow.
+
+**§4IM R3 — seed set, v8c replay (237 trials; ref/unc/conf; judge D = shipped rules in brackets).**
+clean 0/13/16 [1/3/25]; fact_swap 10/9/4 [5/11/7]; omitted 12/4/7 [1/12/10]; fabrication 0/29/0
+[5/14/10]; artifact_leak 0/11/18 [4/4/21]; constraint_violation 0/11/17 [21/0/7];
+evidence_truncation 0/8/10 [1/8/9]; silent_failure 1/28/0 [24/4/1]; wrong_topic 1/27/1 [28/0/1].
+Median 5.3 s [20.3 s]. **Read:** on the classes the binder is built for — a stated figure or
+identifier that the evidence contradicts, a second reading the reply omitted, an entity the
+evidence never names — it beats the judge on both sides at once (more refutes, no clean refutes,
+no laundered confirms). On constraint violations, artifact leaks, truncation, silent failures and
+wrong topic it CONFIRMS what it cannot check (17/28 constraint violations confirmed): those are not
+checkable claims and were never in scope — the judge's 21/28 and 28/29 there are exactly the
+classes the incumbent keeps. **This fixes the shape of the consumer switch:** claim binding decides
+REFUTED (a validated contradiction ends the question; no escalation, no laundering) and CONFIRMED is
+only "the stated facts hold" — never a licence to skip the class checks. Refute-first switch =
+next step, after the live shadow ledger has been read (R7 restart turns it on).
+
+**§4IM R7 (first full suite after phase 1+2 — 6 reds, 2 causes, both fixed).** (1)
+`test_verify_bench::test_run_bench_report_shape_and_env_hygiene`: 8 calls for 4 trials — the
+live-default SHADOW fired inside the bench arm: a second binder call per trial the arm never asked
+for (doubles calls, skews elapsed, pollutes the response cache; my own bench scripts had exported
+`GHOST_CLAIM_BINDING_SHADOW=0`, which is why the runs were clean — a phase-1 regression that only
+the suite could see). `run_bench` now forces the shadow off for the run unless the operator set the
+flag explicitly, records it in provenance and restores the env; pinned both ways. (2) five
+`test_claim_binding_verifier` pins compared enum IDENTITY (`is VerifyVerdict.X`) — the reload trap
+([[reload-contaminates-the-session]]): green alone, red under `-n 8`. Now `.value`. Suite re-run
+follows; restart gated on exit=0.
+**R7 result:** 23293 passed, 66 skipped, exit=0 → `launchctl kickstart -k`, pid 21286 → 81567, health
+200, "system ready". **First live rows:** a file-count probe went down the CODE route (`verify code
+… turn gate`) — the binder hooks `verify_claim` only, by design. The PostgreSQL-version probe:
+incumbent cheap judge REFUTED a correct answer → escalation OVERTURNED → CONFIRMED 0.95 in 32.3 s,
+two calls; claim binding CONFIRMED 0.9 in 11.9 s: 9/9 audited figures supported (18, 18.6, 17.11,
+16.15, 15.19, 14.24, 19, 3), the release date bound, "PostgreSQL About Page" a supported entity.
+The ledger row is the program in one line.
+
+**§4IM phase 2b — the first consumer switch: refute-first (shipped, default ON).** Nova serves 4
+slots (checked `/props`), so `_start_claim_binding` dispatches the binder as a task BEFORE the
+incumbent's first call and `_settle_claim_binding` awaits it at `verify_claim`'s single exit: a
+validated REFUTED is the verdict (`escalation="claim_binding"`, `escalated_overturn` when the
+incumbent had confirmed, the incumbent's cheap snapshot copied so the replay scorer keeps its
+fields); CONFIRMED/UNCERTAIN leave the incumbent's verdict — the binder never overturns a refute
+and never confirms a class it cannot check (constraints, leaks, truncation, silent failure, wrong
+topic keep their judge; seed table above). Binder failure decides nothing. Every settled pair
+writes one ledger row (`decided` = claim_binding | incumbent) from the same call — the shadow
+spawner now only runs when the switch is off, and both share `_write_claim_binding_row`.
+`VerifyResult.claim_binding` carries the ClaimBindingResult (no shared-attribute race between
+concurrent verifications). Flag `GHOST_CLAIM_BINDING_REFUTE_FIRST` (default ON, =0 → shadow), in
+bench provenance; `run_bench` holds BOTH claim-binding flags at 0 unless the operator exported
+them; `tests/conftest.py` sets both to 0 suite-wide (the hundreds of call-counting verifier pins
+never queued a binder response) and `test_claim_binding_verifier.py` turns each mode on
+explicitly. Why default ON rather than "read the shadow first": the switch only acts on a
+validated REFUTED, the class measured at 0/60 (mined) and 0/29 (seed) clean refutes against the
+incumbent's 8 and 1 — leaving it off would have been a built-but-unwired loop
+([[built-but-unwired-loops]]); every override is a WARNING log line and a ledger row with both
+quotes, so a rule defect on live traffic is readable the day it happens. Tests: +6 refute-first
+pins (override + snapshot + row; every other verdict left alone; binder failure; off → shadow;
+AST concurrency order: start < incumbent < settle, one await, settle guarded on the task not the
+flag) + flag defaults + provenance. **Battery round 40: NOOP SURVIVED, KNOWNBAD KILLED, 19/19
+KILLED** (switch F1–F15, bench hygiene B1–B4). Docs: claim_binding.html (flag table, phase 2
+status, the first live row). Suite once more, then restart.
+**R7:** 23302 passed, exit=0 → restart, pid 81567 → 2042, health 200. **The first live override
+was a FALSE REFUTE (probe cb1530245f933a, Saturn's period + moons).** Incumbent CONFIRMED 1.0; binder
+REFUTED on two "misreported" figures: `26` in "as of June 2026" vs `29` from the Yandex snippet
+"anorbitalperiodof 29.45years". Neither figure exists: (1) `_DATE_TIME_RE` knew "June 20, 2026" but
+not "June 2026" — its day pattern ate "20" and left "26"; (2) the snippet's words are glued (Yandex
+via ddgs strips inline tags without spaces — upstream, third-party) and `_NUM_RE`, blocked by the
+"y" of "29.45years", backed off to "29", a number never written; 26 vs 29 was then typo-shaped,
+near-miss, "Saturn"-anchored, and the draft under verification did not yet say "29 years" (the
+final reply did — the agent repaired after the refute; the reports-both guard fired offline on the
+final text, not on the draft). Cost: one repair pass, ~15 s, a reworded and still-correct reply —
+exactly the failure mode the program exists to remove, on its first live outing. **Fixes:** `_DAY`
+= `\d{1,2}(?!\d)`; a month+year alternative (`June 2026`, glued `June2026`); `(?![.,]?\d)` after
+every figure and range end — a number is never the truncated prefix of a longer one ("12,34" is
+not 12; glued "293moons"/"29.45years" yield nothing rather than something false — glued evidence
+can neither support nor refute). Pins: the live row verbatim (audit = ["29.45", "293"], no
+issues), five extract-table rows. **Battery round 41: NOOP SURVIVED, KNOWNBAD KILLED, 4/4 KILLED**
+(P5 month-year-space is equivalent: a glued year is a bare year and is dropped either way).
+Replay v9 from the caches: mined 0.070 / seed 0.274, 0 clean refutes — unchanged. **Lesson (see
+[[the-fix-is-the-least-reviewed-code]]):** the two parsers were exercised by 188+237 cached trials
+and never met a month-year date or a glued snippet; the live population produces both on the first
+turn. Every `decided=claim_binding` ledger row is to be read the day it lands.
+
+## §4IN — Claim-binding phase 2: confirm-side coverage, residual judge, confirm-first (2026-09-18) — R0 scope, written first
+
+**Where §4IM left it.** Refute-first is live: the binder decides REFUTED for validated
+contradictions; everything else is the incumbent's. The incumbent's own failure that remains is the
+CLEAN FALSE REFUTE (8/60 mined after escalation; the live PostgreSQL row) — it can only go away
+when the binder's CONFIRMED is trustworthy enough to override a refute. On the seed set the binder
+confirms what it cannot check: constraint violations 17/28, artifact leaks 18/29, silent failures
+0/29 confirmed but 28 UNCERTAIN, wrong topic 1/29 confirmed. (Correction to the R3 table: the
+`evidence_truncation` class expects NOT_REFUTED — its 10/18 confirms were RIGHT; the paired script
+counted every non-clean confirm as false. Fixed: per-trial `expected`.)
+
+**What already exists and is reused, not rebuilt.** `objection._claim_noise_markers` (artifact
+leak, fence-aware, measured); `turn_state_check.mechanical_constraints` + `refute_turn_state`
+(§4FY: word/line/sentence caps, strict JSON, exact phrase, number-only, empty retrievals — refute-only,
+corpus-measured, live in the turn loop); `tools.search.distinctive_tokens` / `result_on_topic`
+(§4IL, dictionary-based). The alignment ("does the reply answer the ask") check is a judge PROMPT
+rule in the incumbent — opinion, the one class that genuinely needs a model.
+
+**Deliverables.**
+1. `claim_binding.class_checks(reply, evidence, context)` → findings, wired into `run_binding` /
+   `verdict_from_bindings`: (a) artifact markers in the reply → REFUTED, the marker quoted; (b) a
+   mechanical constraint of the ask violated by the reply's shape → REFUTED (the §4FY message
+   verbatim); (c) every evidence block a failure body (`evidence_all_failed`) → CONFIRMED withheld;
+   (d) the ask has distinctive tokens and the reply carries none → CONFIRMED withheld. (c) and (d)
+   never refute: a reply may honestly report the failure or paraphrase the topic.
+2. Residual judge with a quote burden (`GHOST_CLAIM_BINDING_RESIDUAL` = off | cheap | main): only
+   the `unchecked`/`unbound` claims, only when nothing has refuted yet; the model must return, per
+   claim, the evidence fragment and support|contradict|absent; code validates the span ⊂ evidence
+   AND shares a subject word with the claim; a validated contradict refutes (both quotes in the
+   issue), a validated support agrees, anything else stays unchecked. Both models benched from the
+   response cache (the residual call is cached like the binder's).
+3. Confirm-first (`GHOST_CLAIM_BINDING_CONFIRM_FIRST`, default OFF until measured): a binder
+   CONFIRMED with nothing withheld is the verdict even when the incumbent refuted. Gate: per-class
+   false-CONFIRM (with `expected`) ≤ the incumbent's on EVERY class and clean confirms above the
+   incumbent's; otherwise it stays a ledger column.
+4. Bench: `expected`-aware paired table; a `--residual` provenance flag. Tests (tables + through-the-
+   loop), batteries per round, docs (claim_binding.html), suite once, restart gated on exit=0.
+
+**Non-goals.** Refuting UNSUPPORTED claims (an absence is not a contradiction; UNCERTAIN by
+design); reading stored project constraints (the §4FD bleed); replacing the turn-loop state tier.
+
+**§4IN R1 (built 2026-09-18).** (1) `class_checks` in `core/claim_binding.py`, wired into
+`run_binding`/`verdict_from_bindings` as `ClassFinding` rows: artifact → refute
+(`objection._claim_noise_markers`, reused), constraint → refute (`turn_state_check.refute_turn_state`
+reused; `empty_evidence` excluded there because `tools_run` is not visible), evidence → withhold
+(`evidence_all_failed`: every `[tool]` block a failure body), topic → withhold (`reply_off_topic`:
+none of the ask's content words, framing and stopwords removed, nor a five-letter stem in the reply
+— the first cut borrowed §4IL's *distinctive* tokens and withheld a clean weather reply because
+"Athens" is a dictionary word; the ask's subject words are the right vocabulary here). One
+generalisation in §4FY's parser: `_CAP_TAIL` admits a trailing "only"/"please" ("with a single
+word only", "three words only please") — ordinary English shapes, not the injector's string. **Seed
+replay (code-only, from the cache):** artifact 0 → 29/29 refuted, constraint 0 → 23/28, false-CONFIRM
+over the REFUTED-expected classes 0.247 → **0.063** (judge 0.300), false-REFUTE over NOT_REFUTED
+0/47 (judge 2/47), clean confirms 16 → 15. **Mined replay:** false-CONFIRM 0.070 → 0.062; two
+"clean" refutes appeared and both are TRUE POSITIVES the July judge had confirmed — rec-082924e010
+leaks a `<tool_call>` block into the reply, rec-2c4a1ae106 answers "tell me in one sentence" with
+three. (2) The residual judge: `RESIDUAL_PROMPT` / `render_residual_prompt` / `residual_bindings` /
+`shares_subject` / `apply_residual`; `Verifier._verify_claim_binding` makes the second call only
+when `GHOST_CLAIM_BINDING_RESIDUAL` ∈ {cheap, main}, nothing has refuted and residual rows exist
+(`force_main` for main; the binder's cap). Being benched now (v11, cache write: binder calls hit,
+residual calls new). (3) `GHOST_CLAIM_BINDING_CONFIRM_FIRST` (default OFF) in
+`_settle_claim_binding`: a binder CONFIRMED overrides a non-CONFIRMED incumbent; `escalated_overturn`
+now means "the incumbent said otherwise". **Joint incumbent×binder table (pre-residual):** seed —
+confirm-first would LAUNDER 7 (incumbent not-CONFIRMED, binder CONFIRMED, expected REFUTED: the 2
+constraint misses, fact_swap/omitted confirms) and RESCUE 2 (long-files-1 clean + its truncation
+twin); mined — launder 1, rescue 0. The incumbent's 8 mined clean false refutes all sit in the
+binder's UNCERTAIN (clean confirms 15/60): the gate fails today; the residual judge is the lever,
+and the flag stays OFF until the post-residual joint table passes it. Tests: class checks (+9 incl.
+the two mined true positives), residual (+10 module, +4 verifier), confirm-first (+3), §4FY tail
+(+2). **Batteries: 42 = NOOP SURVIVED, KNOWNBAD KILLED, 28/28 KILLED** (K4 empty-evidence-in-findings
+is equivalent by construction — `tools_run` never reaches the class checks; K9 stem, R1 on-subject
+invented fragment became pins), **43 = 6/6 KILLED**. Docs: claim_binding.html (class checks,
+residual judge, flags, corrected seed numbers).
+
+**§4IN R2 — the residual judge measured, and what the measurement exposed (2026-09-18).** Cheap
+(E4B) residual on the mined pool, live (v11cheap): clean confirms 15 → 18, one new clean refute,
+one new omitted confirm, median +4 s. Read: of 86 residual rows on clean replies (56 "found no
+evidence span", 30 "code could not grade") the cheap model resolved TWO — its fragments are
+paraphrases, not quotes, and validation rightly rejects them. Two defects surfaced by the read,
+both fixed and pinned: the identifier audit had inherited the number audit's URL mask, so the
+reply's only IP (`http://127.0.0.1:8100`) was never audited (mined rec-83da54be2d, the IP twin
+confirmed); and a word-anchored disagreement compared a centre with a left edge because "channel"
+was shared (rec-ebc239c1ca) → a shared word decides only when the span carries ONE comparable
+figure. (Also learned: `--cache-mode write` re-samples the binder live and overwrites the cache; the
+v10→v11 deltas include binder sampling. Replays since are `read` on the v11 cache.) **The bottleneck
+is quoting fidelity, so: snapping** (`snap_quote`): the model's quote is a locator; a window of the
+source around its rarest token matching at ≥ 0.9 replaces it, widened to whole tokens (a first cut
+minted "feels like 3" from "36°c"); < 12 chars never snapped. Replayed: clean confirms 16 → 20,
+fact_swap 14 → 16 — and one clean refute, the pinball geometry case again, in two shapes: the
+binder bound the BALL's coordinates to the PLUNGER's struct (a typo-shaped 365/375 among six
+figures) and a claim that itself stated both 365 and 360 was refuted for 365 vs 360. Four rule
+rounds to close it without losing the true catches: a dense-span guard on the bind path halved
+fact_swap recall (16 → 8: the vision description the reply copied with ONE bumper value swapped is
+dense AND unambiguous); a whole-reply "states both" guard cost the same (the injector swaps one
+occurrence; the unswapped twin elsewhere in the reply is an inconsistency to refute, not a licence);
+the shipped rule: in a dense span a typo-shaped pair decides only when the claim's skeleton ALIGNS
+with the span's (equal / contained / ratio ≥ 0.8 — the copied description, "meta=335" in "meta=334,
+coding=241, …"), never across two records; and the CLAIM-level states-both guard, specific to the
+span figure the disagreement was measured against (any near-miss let "100" beside "76" trip it).
+Plus: `grep -n` line-number prefixes masked (the "173:" made a two-figure span dense), clocks masked
+before line numbers ("12:30 meeting" is a clock), twin scan over every agreeing line (rec-e93e72ff85:
+64,378 beside the SECOND agreeing line). **v20, replayed on both pools (residual off):** mined clean
+2/39/19 (both refutes the true positives), fact_swap 15/34, omitted 18/34, false-CONFIRM 0.062; seed
+clean 0/14/15, false-CONFIRM 0.058, false-REFUTE 0/47. Tests: +15 (snapping table, token bounds,
+line numbers, aligned/dense/states-both, identifier-in-URL, second-line twin, residual snapping).
+**Battery round 44: NOOP SURVIVED, KNOWNBAD KILLED, 19/19 KILLED** (S3/S7/T1 survivors → pins; L2
+retired — the lookahead it mutated was removed as equivalent once clocks mask first). Docs updated.
+The 35B residual arm is still running on the mined pool; the decision on the residual mode and on
+confirm-first follows its table.
+
+**§4IN R3 — decision (2026-09-18).** Residual modes replayed under the final v20 rules, mined pool
+(the 35B arm's 39 new residual prompts were live; everything else cached): OFF clean 19 confirmed,
+false-CONFIRM 0.062, fact_swap 15/34; CHEAP 21 / 0.062 / 15; MAIN **29** / 0.070 / 16 — the 35B
+quotes well enough to lift clean confirms by ten (incumbent 45) at one more false confirm; the E4B's
+fragments are paraphrases and validation rightly drops them. **Confirm-first gate: FAILS in every
+mode** — launder 2–3, rescue 0. Read the incumbent's 8 mined clean refutes: about half are RIGHT
+(the mined "clean" label is the July judge's, not ground truth — rec-082924e010 "running on port
+8103" while manage_services shows it exited, rec-08f9e8496e "live" after a TargetClosedError,
+rec-939fe2c7b2 an unsupported "RECOVERED", rec-6c1d324b1e "position is now correct" beside
+ballX=387.88) and the binder is correctly UNCERTAIN on them; the other half are absence or vibes
+complaints ("'Jul 30, 2026' is not explicitly stated", the ball-365-vs-plunger-375 confusion the
+binder itself made and shed, a timezone) on long replies with unbound claims — a CONFIRMED override
+is the wrong instrument for those; the rebuttal burden on the incumbent's issues is, and it is out
+of this program's scope. **Shipped:** class checks and snapping (always on); `GHOST_CLAIM_BINDING_
+RESIDUAL` default off (main measured; turn on the day a consumer reads the binder's CONFIRMED);
+`GHOST_CLAIM_BINDING_CONFIRM_FIRST` default off (gate on record); refute-first stays on. Bench
+provenance carries all five flags. R7 follows.
+**R7, first pass: 2 reds, both real guards.** `test_every_ghost_flag_read_in_src_is_documented` —
+`GHOST_CLAIM_BINDING_CONFIRM_FIRST` was read in src and absent from docs/ (row added, with the gate
+result). `test_every_result_classifier_reads_the_status` — `evidence_all_failed` judged tool
+results by prose alone, the third-copy anti-pattern that guard exists to catch; it now delegates per
+block to `outcome_heuristics._looks_like_tool_error` (status when the body carries one, prose rules
+otherwise) and to `evidence_gate.assess_turn_evidence` (empty retrievals), with `evidence_blocks`
+carrying the tool name. Tables unchanged on replay (mined 0.062 / seed 0.058, silent_failure 28/29
+withheld). **Battery round 45: NOOP SURVIVED, KNOWNBAD KILLED, 5/5 KILLED.** Suite once more.
+
+**§4IN R4–R6 — the review round (2026-09-18), operator: "do you need to verify your changes? … does
+the new system integrate correctly with the self-learning system?"** Three fresh-eye read-only
+reviewers, one lens each: (A) consumers of VerifyResult and the self-learning readers; (B) the new
+code itself; (C) a replay of the model-free checks over the recorded trajectory corpus (1,508
+tool-bearing turns, evidence rebuilt through the live packer, no model). **R8 count: 27 defects in
+this program's own code — 10 MAJOR** (A: 4, B: 6), 13 MINOR, plus 4 nits; every one fixed and
+pinned, plus 2 more defects the battery found INSIDE the fixes (a unit bug in the precision guard
+that would have masked every same-unit ms/KB misreport; a states-both guard tripped by any
+near-miss). **The four the suite could never have seen:** (A-M1) `verify_claim`'s context is
+`constraint_note + request` → the class checks re-created the §4FD constraint-bleed (a stored
+project constraint → 0.85 REFUTED → failed label → lesson scrub) → `ask_of` reads only the request
+for the mechanical and topic checks; (B-M1) `_skeleton` wildcarded clocks/dates while `_slots`
+dropped them → two rows of an hourly forecast were "one field read twice" → REFUTED through
+refute-first; (B-M3) substring containment validated a truncated prefix ("the count is 12" ⊂
+"…120 files") → a false CONFIRM; (B-M5) the number regex backtracked O(n²) over a masked code
+fence — 26 s inside a turn. **The corpus replay is the instrument that mattered:** on 491 recorded
+turns the system had judged fine, the model-free checks alone refuted 18 — 14 FALSE (enumerations
+15, bare-number DOM lines 6, meta lines 3, "19" vs "17.10", URL path dates, "over 160+", "2000s",
+a "---" banner read as a diff header, product versions) and 4 true. After the round: **0 false, 4
+true** (three STRICT-JSON violations, one 13-vs-14 line count); p99 latency 346 ms → 63 ms, max
+26.3 s → 1.1 s. Rules the corpus forced (each pinned as the live shape): ≥3 same-skeleton lines or
+a per-block meta line never twin; a figure in an in-line list is never "the" field; a misread keeps
+its written shape (decimals equal); evidence URLs/citation lines carry no figures; lines >600 chars
+anchor nothing; bounds agree on their side (and a lower bound IS refuted by a smaller value — a
+first guard that said otherwise was removed); the reply states a figure at that figure's own
+precision and unit; heading ordinals, decades, "000" remnants and NBSP thousands are not figures;
+NFC not NFKC; a status claim agrees only without a polarity clash; the residual judge's relation
+never overrides code on figures and needs a polarity clash to contradict. Integration fixes:
+binder-decided verdicts write `record_escalation(outcome="claim_binding")` and set `binder_decided`
+(`escalated_overturn` keeps its meaning; `"claim_binding"` joins ESCALATION_STRONG_ADJUDICATED);
+constraint issues spelled as the turn loop's tier spells them and `^artifact:` added to the
+shape-only vocabulary (the repair directive, no task, no banner); `run_trials` pins the live flags
+for EVERY caller (the optimizer and objection replay had been measuring the binder); the ledger
+needs a live `req_id`, rotates, records binder failures as rows (WARNING, not DEBUG); the binder task
+is cancelled when the caller cancels; `run_binding` runs in `asyncio.to_thread`; `_last_claim_
+binding` deleted; `verdict_override_report` tags binder rows; failure-dimension patterns know the
+binder's phrasing; objection's diff-header rule needs a file-shaped operand. Bench (final): mined
+clean 2 TPs / false-CONFIRM 0.062 / fact_swap 13 / omitted 15 (the enumeration guard costs 3 of
+18 — accepted: it removed 7 of the 14 live false refutes); seed false-CONFIRM 0.068, false-REFUTE
+0/47. Tests: test_claim_binding 130→228, verifier pins +8, bench +1, three verify_claim AST pins
+re-pointed at `_verify_claim_incumbent`. **Battery round 46: NOOP SURVIVED, KNOWNBAD KILLED, 45/45
+KILLED** (S2 equivalent — the slots carry the clock either way; B2 removed as wrong). **Lesson,
+again ([[fix-is-the-least-reviewed-code]], [[review-by-replaying-consumers]]):** 4 mutation
+batteries and 425 cached bench trials passed over every one of these; the recorded-corpus replay
+found them in 60 seconds because it ran the readers over the population, not the diff.
+
+## §4IO — ddgs snippet whitespace (2026-09-18)
+
+**Scope (operator: "fix 2").** Web-search snippets arrive with glued words ("Saturnorbitsthe Sun",
+"anorbitalperiodof 29.45years"), first seen in the §4IM live false refute. **Cause (not Yandex):**
+`ddgs 9.11.4 BaseSearchEngine.extract_results` does `parts = (x.strip() for x in item.xpath(value));
+" ".join("".join(parts).split())` — every `text()` node stripped, joined with nothing — so the
+whitespace a page has around each `<b>` highlight is destroyed, in titles and bodies, for every
+engine; Yandex highlights most and wins 386/509 waves, so it showed there. Reproduced on a synthetic
+item: `Saturn <b>orbits</b> the Sun at <b>9.59 AU</b>` → `Saturnorbitsthe Sun at9.59 AU`. **Fix:**
+`tools/search._patch_ddgs_snippet_join()` — called once before the first `DDGS(...)` — replaces the
+method with the same extraction and a join that keeps the nodes' whitespace and collapses runs
+after; applied ONLY while the installed library's source carries the defective idiom (a fixed or
+restructured release leaves it inert, WARNING logged), idempotent, never raises into search.
+Site-packages untouched ([[macos27-dyld-rejects-fortran-so]]: a pip reinstall re-breaks in-place
+patches). Tests: `tests/test_search_ddgs_snippet_join.py` (5: the defect reproduced, the fix, the
+guard on a foreign implementation, node-boundary semantics, call-site order). **Battery round 47:
+NOOP SURVIVED, KNOWNBAD KILLED, 6/6 KILLED.** Docs: tools/search.html. Note: the §4IM parsers keep
+their glued-text defences (a glued figure supports nothing and refutes nothing) — this fix removes
+the cause, not the guard.
+
+## §4IP — The incumbent's fake refutes: the uphold branch (2026-09-18) — R0 scope, written first
+
+**Property under review.** An incumbent REFUTED that ships must rest on a contradiction the
+evidence's own text supports. An ABSENCE is not a contradiction (the §4IM principle that made the
+binder trustworthy); a numeric pair is a contradiction only when both figures denote the same
+quantity.
+
+**Where the fake refutes come from (measured, not remembered).** Of the incumbent's 8 clean
+refutes on the mined pool (§4IN R3), FIVE are `objection_upheld=True`: `objection.resolve_issue`'s
+UPHOLD branch kept the cheap judge's REFUTED and suppressed the 35B escalation — the branch the
+module's own docstring calls its whole risk surface. The three that escalated are genuine refutes.
+The five: rule 2 (absence → "cited fact absent from intact evidence" → UPHOLD) convicted a derived
+date ("'Jul 30, 2026' is not explicitly stated" — today + one week), a computed coordinate ("x=365
+and radius 8 are fabricated as they are not in the tool output"), and a status word ("'RECOVERED' is
+not supported"); rule 1 (numeric contrast, claim-exclusive figure) convicted "ball x=365 vs plunger
+x=375" (two records — the same confusion the binder shed in §4IN) and "18:38 vs 15:36:58Z" (a
+clock, a timezone). The same rule 2 is what catches the bench's fabrications (appended attribution
+sentences whose atoms are NAMES) — the fix must keep that.
+
+**Threat model.** Absence upholds on numeric / date / clock / single-status atoms; numeric upholds
+across two records or on clock-shaped tokens; any change that costs the fabrication catch or the
+artifact catch.
+
+**Deliverables.** (1) Offline replay instrument: every bench trial with a cheap REFUTED (D2 mined +
+D seed results carry `cheap_issues`; cases carry claim/evidence) re-resolved through
+`resolve_refute` → decision by fault × expected, old vs new rules — the measurement before and after.
+(2) Rule 2: the absence UPHOLD applies to NAME-shaped atoms only (a quoted multi-word or capitalised
+phrase); numeric, date/clock and single-word status atoms absent from the evidence are UNRESOLVED
+(escalate — a derived count, a converted unit, a computed date, a status is a judgement, not an
+invention). (3) Rule 1: reuse the binder's authority on "same quantity" — no uphold when the
+evidence-side figure sits in a dense record the claim sentence does not align with
+(`claim_binding._dense` / `_aligned`), and never on clock/date-shaped figures. (4) Pins as tables
+(the five live shapes verbatim, the fabrication shapes that must still uphold), battery, the
+objection module's docs, this entry; suite once; restart gated. (5) Then re-measure the confirm-first
+gate (§4IN item 2) with the incumbent's refutes cleaned. **Non-goals:** the escalation prompt, the
+cheap judge, the dismiss branch.
+
+**§4IP R1/R2 (2026-09-18).** Instrument first: `scratchpad/objection_replay.py` re-resolves every
+trial with a cheap REFUTED in the recorded bench runs (D2 mined 109 trials, D seed 157) through
+`resolve_refute` with the trials rebuilt by `build_trials` (same seed) — the module's decisions
+without a model call. Baseline reproduced the incumbent's ledger exactly: mined UPHOLD right 15 /
+WRONG 5, seed 27 / 2. **Reading the rights exposed the accidental catch:** the fabrication upholds
+convicted the trial's derived date or figure, not the appended name — the judge does not quote
+"Dr. Elin Vasquez", so `_cited_atoms` saw nothing citable and the uphold came from "'Jul 30, 2026'
+is not explicitly stated" on the same reply. **Rules:** (1) `_name_shaped` — an absence upholds when
+a NAME is absent (multi-word, capitalised, not date/clock, not a path or dotted identifier); unquoted
+Title-Case names become cited atoms via the binder's `_ENTITY_RE`, framing ("The claim", "Tool
+Output") excluded; (2) `_total_ungrounding` — every evidence block a tool failure
+(`claim_binding.evidence_all_failed`) or no content word of the reply in the evidence → the
+silent_failure / wrong_topic proofs (a first cut without it lost 6 + 10 right upholds on seed); (3)
+`_competing_figure` — an absent figure with an anchored evidence line carrying a same-family,
+non-agreeing, NEAR-MISS figure the claim's sentence does not itself state (Iceland 396,960 vs
+372,520 stays a catch; "~149 points" vs an HTTP "→ 200" behind a URL-anchored line, and "x=370" vs a
+port 8100, do not — URL masking and the ratio bound came from those two); (4)
+`_same_quantity_plausible` — the numeric uphold needs figures that are not inside clock/date tokens
+(the first `_clockish` fired on a date merely NEAR the figure: 17.7 vs 16.7 light-minutes) and an
+evidence figure not in a dense record unaligned with the claim's sentence (`claim_binding._dense`,
+`_aligned`). **Final replay:** mined UPHOLD right 28 / wrong 0 (fabrication 6 → 25, for the right
+reason), seed right 31 / wrong 0 (silent_failure 6, wrong_topic 8 kept), dismissals unchanged.
+Sidecar: `issues[:3]` (clipped) and `binder_decided` ride `system/verdicts/<day>.jsonl`. Tests:
+`tests/test_4ip_uphold_branch.py` (26: the five live shapes, fabrication quoted and unquoted,
+total absence, competing figure, clocks, records, name shapes, framing), four §4HZ pins rewritten
+to the new semantics (an absent figure escalates), sidecar +1. **Battery round 48: NOOP SURVIVED,
+KNOWNBAD KILLED, 20/20 KILLED** (N2 equivalent — a numeric atom has no letter tokens). Docs:
+objection.html. Live check: the five formerly-upheld cases re-run through the incumbent (all
+faults) — result below.
+**Live check (the five formerly-upheld cases, all faults, incumbent alone):** every fake refute
+gone (clean → 2 CONFIRMED, 3 UNCERTAIN). Composite with the binder (refute-first, binder REFUTED
+wins) on the 16 paired trials: OLD 5 false refutes / 9 caught / 2 missed → NEW **0 false refutes** /
+4 caught / 7 missed. The lost catches were the accidental ones — those fault trials had been
+refuted for the derived date, not the injected fault — and once the mechanical uphold no longer
+immunises them the 35B escalation launders several (the §4IJ finding, unchanged). A right label
+for a wrong reason is what a system that learns from its reasons must not keep. Full mined-pool
+incumbent re-run (D3) started in the background for the pool-level number; ship on the five-case
+and offline evidence, append D3 when it lands.
+**R7 pass 1: 11 reds, all in `test_escalation_discipline.py` — pins of the OLD semantics** ("an
+absent figure → UPHOLD" as the observable for boundary matching, claimward grammar and the
+truncation floor). Two of them were real catches the first cut lost: "55% humidity" against "28%
+humidity" (a unit ties the quantity type — the near-miss bound now applies to unitless figures
+only) and "3 users" against "13 users signed up" (the same word after both figures ties it —
+`_same_following_word`). The other nine keep their subject with the observable "judged absent,
+never DISMISSED, never excused" (`_judged_absent`); the two main-model-skip pins use a NAME absence.
+Final replay: mined UPHOLD right 30 / wrong 0, seed 32 / 0. Battery 48 re-run with the new
+signals: 23/23 KILLED (C7 following-word equality became a pin).
+**R7 pass 2:** 23448 passed, exit=0 → restart, pid 13710 → 52620, health 200. **Item 3 (the ledger
+habit) as a deliverable:** `scripts/claim_binding_ledger_report.py` — the ledger's first reader
+(rows, agreement, binder failures, every binder-decided verdict with its issues, the escalation
+outcomes of the window); `tests/test_claim_binding_ledger_report.py` (3); **battery round 49: NOOP
+SURVIVED, KNOWNBAD KILLED, 5/5 KILLED**; docs: claim_binding.html "Reading the ledger". Today's
+read: 12 rows, 2 overrides (both the Saturn parse bug, fixed), 5 incumbent-CONFIRMED / binder-
+UNCERTAIN disagreements, no failures.
+
+**§4IP R3 — the pool-level number and the confirm-first decision (2026-09-18).** D3 = the incumbent
+with the cleaned uphold branch on the full mined pool (188 trials, live): clean refuted **8 → 2**,
+both escalated and genuine (rec-082924e010, a service that exited under a "started" claim;
+rec-ae8fd9aae4, a click the evidence shows succeeded); clean confirms 45 → 49; the accidental fault
+catches went with the fake reason — fabrication 43 → 39, fact_swap 11 → 9, omitted 6 → 5. **The
+LIVE composite (binder REFUTED wins, else the incumbent):** clean refuted 9 → 3, all three genuine
+(the two binder true positives plus rec-ae8fd9aae4) — i.e. clean false refutes ≈ 6/60 → 0/60;
+fabrication 43 → 39, fact_swap 18 → 16, omitted 18 → 16 caught; composite false-CONFIRM 0.305 →
+0.352. The trade is 8 fewer catches per 128 injected faults — every one of them a right label for a
+wrong reason — against ~10% of clean turns no longer refuted, corrected, scrubbed and labelled
+failed. **Confirm-first gate on D3: LAUNDER 0 / RESCUE 0 / LIFT 1** → passes; flipped ON (it almost
+never fires; the ledger shows both verdicts when it does; conftest and `run_trials` pin it off for
+tests and benches; provenance carries it). Battery 43 re-run on the flipped default: 7/7 KILLED
+(G6 retired — its line became `binder_decided` in §4IN). Docs: claim_binding.html flag table.
+
+
+**§4IP R5 — the second fresh-eye round on the post-review batch (2026-09-18, evening).** Three
+lenses again (code / mechanism / consumers), on §4IO, §4IP, confirm-first, the sidecar, the ledger
+report. Lens A+B (received first): `_name_shaped` was "any quoted multi-word fragment with one
+capital" — 'A beautiful sunny Monday!' convicted a byte-correct weather reply; `_total_ungrounding`
+4/4 false on live shapes (empty digest = "absence from nothing", a reply that REPORTS the failure,
+a shared figure, cross-script replies with zero Latin words); `_competing_figure` fired on 27% of
+judged-fine turns with an absent figure (a lexical proxy for "same subject") → REMOVED;
+`_same_quantity_plausible` looked up comma-grouped struct literals it could not find and called
+them plausible; `_clockish` fired on a count that also sat in a clock; presence tests were the
+module's own `_canon` substring while the SHAPE was the binder's. Fixed: `_name_shaped` = honorific/
+possessive stripped → entity-shape fullmatch, no sentence punctuation, no all-caps token;
+`_written_as_a_name` (the words occur capitalised in the CLAIM — a judge's Title-Case quote of a
+lower-case status is not a name; a judge-invented/expanded name is in neither text);
+`_name_present` = the binder's `entity_key`/`_entity_supported` or squashed spelling
+(`chess_coach`), scoped to name-shaped atoms (unscoped it dismissed `"8 GB"` inside `18 GB`);
+`_total_ungrounding` = non-empty digest AND (all-failed ∧ reply not reporting failure) OR (≥6 Latin
+content words ∧ zero shared word ∧ zero shared figure); `_same_quantity_plausible` on comma-stripped
+text, unlocatable = unproven = False, clock only when EVERY occurrence is inside a clock/date;
+`_cited_atoms` names first (never truncated behind a run of numbers), sentence-opener trimmed at any
+sentence start, `_ISSUE_FRAMING_RE`. Pins: `tests/test_4ip_uphold_branch.py` (+13), fixtures
+lengthened to the six-word threshold. Battery 50: NOOP survived, KNOWNBAD + E1–E5/U1/Y1 killed;
+P1/P2 HARNESS_ERROR (spec escaping) → re-run as 50b from the file's own line: 2/2 killed.
+
+**§4IP R6 — the consumer lens (received last) + the bench-cache replay (2026-09-18, night).**
+**M1 (real, live-dangerous): confirm-first bypassed both the high-stakes withhold and the
+mechanical-uphold protection.** `_settle_claim_binding` ran AFTER `_escalate_confirm` and its
+condition was "incumbent not CONFIRMED", so a binder CONFIRMED (0.9, strict-figures OFF, so a figure
+the binder never bound could be wrong) overrode a REFUTED the main model UPHELD, a REFUTED the
+objection tier PROVED, and shipped uncapped on a failed-tool turn — rule 3 of
+`resolve_turn_outcome` then turned the structural FAILED into PASSED and `_note_strong_verdict`
+memoised it as STRONG. The joint table's own definitions settled the fix: the measured gain was
+LIFT (incumbent UNCERTAIN → CB CONFIRMED) = 1, RESCUE (over a REFUTED) = 0. Now: lift over
+UNCERTAIN/None only, never over a REFUTED; on `high_stakes` the lifted CONFIRMED goes through
+`_escalate_confirm` like any cheap CONFIRMED (upheld → the main model's verdict ships with the
+binder's rows attached; withheld → capped 0.6; unavailable → stands), one escalation-ledger row per
+shipped verdict (the appeal's own row suppresses the `claim_binding` row), `binder_decided` = "the
+shipped object is the binder's" (distinct from `escalation` now). Pins: lift-only, never-over-
+REFUTED ×2 (adjudicated and not), the high-stakes triple (`tests/test_claim_binding_verifier.py`).
+**M2/M3/m4 were already closed by R5** (the reviewer read the 23:12 file; every shape re-probed on
+the current code: weather gloss / honest negative / plan sentence → UNRESOLVED, "Dr Elin Vasquez"
+present → DISMISS, invented or expanded name → not a name). **m5** glued closing quote in the
+unquoted-name pass → stripped. **m6** `learning_health` had no `claim_binding` bucket (every binder
+decision rendered "OTHER — vocabulary drift, investigate") → bucket + render line;
+`escalation_audit --outcome flips` selects on the verdict change itself (a binder lift files as
+kind=confirm/outcome=claim_binding, invisible to `overturned`). **m7** the bench provenance
+fingerprint did not hash `claim_binding.py` (the exact 2026-08-09 blind spot, one file over) →
+added with `outcome_heuristics.py`. **m8** sidecar docstring/pin updated for the issue strings. The
+live-ledger discrepancy (2 shadow overrides, 0 escalation rows) is the timeline: both overrides
+predate the row's code.
+**The bench-cache replay** (`scratchpad/uphold_cache_measure.py`: every classic cheap-judge REFUTED
+in `system/eval/verify_bench_cache`, 564 refutes / 1,164 prompts, through `resolve_issue`) found
+two more false upholds the pools never showed: **"9,592 vs 0.04"** and **"14 vs 212"** — a judge
+complaining about LENGTH quotes the whole two-figure reply, rule 1 pairs the two claim figures, the
+asymmetric anchoring lets the one that is also in the evidence be the "counter-figure", and the
+other is "claim-exclusive" only because 0.04 ≠ 0.041 and 212 KB ≠ 217,088 bytes by exact match.
+Two rules, both the binder's authority: (1) claim-exclusivity = NOT `claim_figure_supported`
+(`claim_binding.quantities_agree` with the claim's own unit and precision — rounding and unit
+conversion are support); (2) a counter-figure that is itself a claim figure must share the
+disputed figure's SENTENCE (the one-sentence "the evidence says 3 users, so we have 500" still
+convicts). Rule 2 exposed a binder-wide defect: `_SENT_END_RE` treated any '.' after a digit as a
+decimal point, so "below 100,000. The sieve…" never split — fixed to stops BETWEEN digits only. The
+old "2 hours vs 90 minutes" control sat exactly on the half-up boundary (the binder reads "2 hours"
+as a fair integer-hour statement of 1.5 h, so it would not refute that reply and the tier must not
+protect a refute of it) → moved off the boundary (80 minutes) with the boundary pinned UNRESOLVED.
+The seed replay then showed the merge-marker case (`7.\n<<<<<<< SEARCH … 1.5`) had been upheld on
+the accidental ground "7 vs 1.5" → the demonstrable-noise uphold (rule 3's literal string test) is
+hoisted above rule 1. The corpus replay showed one new binder false refute ("a 24-year span" vs
+"OTD 20 years ago") — protected until then only by the list number "2." making its sentence
+"dense" → relative time ("N units ago") masked with the dates. Cache after: 95 upholds = 69 injected
+names + 14 all-failed + 8 no-overlap + 3 humidity 20-vs-29 + 1 merge marker; none of the fifteen
+false shapes. Pools: mined UPHOLD right 28/0, seed 29/0. Binder acceptance v27 = v26 bit-identical
+(mined false-CONFIRM 0.062, seed 0.068, false-REFUTE 0/47); corpus 0 turns moved vs R5. Batteries
+51 (22: NOOP survived, KNOWNBAD + 20 killed), 51b (2/2), 51c (2/2 after fixing a BADCOMPILE mutant),
+50b (2/2). Docs: objection.html §4IP rewritten for the two-shape rule; claim_binding.html flag table
++ "The second round". **R8 (defects in this program's own code found by this round): 10** — M1,
+m5, m6×2, m7, the two cache-replay pairing defects, the sentence-end regex, the boundary control,
+the accidental noise ground, the relative-time gap. Suite/restart: below, after the third
+fresh-eye round the operator asked for ("make sure I find the verifier finished and bug free").
+
+**§4IP R7 — the third fresh-eye round (2026-09-19, 00:00–01:30; operator: "re-review all changes,
+make sure all the instruments and producers are correct … unattended").** Three reviewers again.
+**Code lens (4 MAJOR, all verified by execution):** M1 `_claim_figure_supported` matched the claim
+quantity by TEXT PREFIX ("20" → "200 users"; a range's high end never matched, so "between 21 and
+25°C" vs a 22°C forecast was UPHELD although `quantities_agree` says the range contains it) and
+compared across families (unitless 60 "supported" by `1 min`) → the quantity AT the figure's
+position (`extract_quantities_with_pos`, a range covers both ends) within the same family. M2
+`_written_as_a_name` (Title-Case words present in the claim) convicted bold lead-in labels
+(`**Memory Usage**: 21 GB`), headings and greetings the BINDER'S `audit_entities` deliberately
+masks → one definition: the atom's `entity_key` must be among the binder's entities for the claim
+(`_claim_entity_keys`, lru-cached). M3 the all-failed guard read "the reply reports the failure" as
+`_NEGATION_RE`, which misses "didn't work, so I couldn't", "crashed", "errored out" — an honest
+failure report got a PROTECTED refute → the turn loop's own `response_acknowledges_failure`
+decides. M4 the no-overlap branch fired on a correct English reply over a Greek digest or a
+numbers-only command output (no shared Latin word by construction) → the digest must carry ≥6
+Latin content words too. **MINOR** m1: R6's same-sentence exception convicted every compound
+figure ("15 total (10 done, 5 pending)" → "15 vs 5"; "28°C now, 18°C tonight") — the binder's
+`_claim_states` rule wins: a counter-figure the claim writes anywhere is a second quantity; the
+single projection fixture ("3 users, so 500") now escalates (old pin R2-M4 re-pointed with the
+boundary documented). m2 abbreviations split the hedge away ("approx. 29 users" → misreported)
+→ `_ABBREV_RE` mask in `_sentence_span` (length-preserving; every stop of "e.g."). m3 the
+same-sentence flow pin was vacuous at the call site → re-pinned with the perturbed 0.09 figure.
+m4 leniency gaps accepted and documented (particle names, space-grouped thousands, relative-time
+misreports). **Integration lens (0 MAJOR, 7 MINOR, path table of every settle branch verified):**
+i1 the lift overrode an UNCERTAIN the main model itself produced (`replaced_uncertain`) and
+re-asked the same judge on high stakes → excluded from the lift; i2 a binder CONFIRMED lift was
+memoised STRONG (`_note_strong_verdict` keys on the set that contains `claim_binding`), so a later
+cheap "unavailable" REFUTED would have been withheld → skip when claim_binding ∧ not REFUTED; i3
+the shadow row was written BEFORE the appeal (a withheld lift read as a plain binder decision) →
+written after, with `appeal` + `shipped_confidence`, rendered by the report; i4 `--outcome flips`
+over-selected (5 withheld + 1 replaced_uncertain on the live ledger) → shipped-verdict outcomes only,
+help text fixed; i5 `verdict_override_report.override_tags` ignored `binder_decided` → reads it; i6
+docs said "never `escalated_overturn`" while the copy is deliberate → docs fixed; i7 the outcome-
+literal walker only walked `_escalate_*` → every function that calls `record_escalation`,
+`truncation_guard` classified NOT_ADJUDICATED. Pins: `test_4ip_uphold_branch.py` (+9),
+`test_claim_binding_verifier.py` (+4), `test_verifier_late_precedence.py` (+1, memo pin re-pointed),
+`test_claim_binding_ledger_report.py` (flips control). **Battery 52: 18 mutants — NOOP survived,
+KNOWNBAD + 16 killed; two survived on the first pass for INSTRUMENT reasons:** L1's pin passed
+vacuously in the batch because a sibling file reloads the verifier and the pin's monkeypatch set the
+verdict with the collection-time `VerifyVerdict` member (identity fails in `_settle_claim_binding`,
+so no lift could happen with or without the mutant — memory reload-contaminates-the-session) →
+the module's live enum + a ledger assertion that the binder DID confirm; T3 had no short-reply
+fixture against a long digest → added. **Replays after R7:** pools mined 28/0, seed 29/0; cache 94
+upholds (the one lost all-failed uphold is "3 services are currently failing: …" on empty evidence,
+which the failure detector now reads as a report → escalates); corpus 0 turns moved, 0 withhold
+changes; bench v28 = v27 bit-identical. Docs: objection.html (name = binder's list, failure
+detector, digest guard, counter-figure rule, known limits), claim_binding.html (flag table +
+"third round"). **R8 this round: 13** (4 code MAJOR + 3 code MINOR + 7 integration − 1 doc-only
++ the two vacuous pins). Instruments lens: below.
+
+**§4IP R7 — the instruments lens (2026-09-19, 01:00–02:30).** The third reviewer audited the
+MEASUREMENTS. **M1 (verified):** the grounded half of `_total_ungrounding` — "words shared with the
+digest → not total" — had no pin: every absent-figure fixture had 2–5 content words and was
+satisfied by the short-reply guard, so a scratch mutant deleting the overlap check survived all ten
+pin files; battery 50's E3 had mutated the OLD `>= 4` text. Pinned with a 13-content-word grounded
+weather reply + one absent figure (UNRESOLVED), boundary pins at 5 vs 6 on both sides, a prefix-
+grounding pin ("restarted" ← "restart"). **M2 (verified): the cache replay covered 564 of 2,797
+cached cheap refutes** — it keyed on the CLASSIC preamble; the two-stage ADJUDICATE prompt (the
+live default) had 2,233 refutes never replayed, plus 517 responses silently skipped on JSON parse.
+The instrument now covers both, counts skips, reports per-REFUTE (the pipeline's unit) beside
+per-issue, and recovers the packer's cut severity from the marker text (the production parser
+honours only its own nonce, so a cached marker read 0). On the adjudicate population it found: a
+project name the reply took from its own project state ("AI Self Awareness Exploration") and a
+task name that was the reply's stated next step ("Moving on to the next one: **Meta-Emotion
+Test**") upheld as inventions; rule 1 convicting "21 GB used vs MemTotal 36864 MB" at cut severity
+0.42 (the truncation floor gated rule 2 only); and silent-failure trials upheld as "30.6°C vs 403"
+— right label, an HTTP status as the counter-figure. Fixes: `context` (request + project note) is
+provenance for the absence rule like prior evidence (`resolve_refute`/`resolve_issue` take
+`context`; the verifier passes it); a name whose claim sentence opens as a next step
+(`_names_next_step`, rule 4's shape) is not a fact; rule 1 applies the truncation floor and, on
+all-failed evidence with a silent reply, decides on THAT ground before any pairing; a counter-figure
+on a tool-error line (`_looks_like_tool_error`) is the value of nothing. **M3 (verified):** the
+sentence-opener trim was pinned in the PRESENT direction only (passes with the trim off) → pinned
+the catch; the expanded/invented-name rule had never been pinned → pinned; the squashed-spelling
+branch of `_name_present` was satisfied by `_entity_supported` in every fixture → pinned with a
+hyphenated and a camel-cased atom. **MINOR:** `_name_shaped`'s four guards were dead code implied by
+`_ENTITY_RE.fullmatch` → removed; learning_health's render line, `--outcome flips` with nothing
+to show, rows without a parseable `ts` (now dropped inside a `--days` window, listed by `--all`) and
+`_home()` pinned; the sidecar keyword pin now checks the VALUES come from the verdict; two
+false-CONFIRM definitions in the journal — `paired_table.py` counts CONFIRMED@≥0.7, `joint_table.py`
+and the "0.305 → 0.352" composite count every CONFIRMED (at ≥0.7 the composite is 0.273 → 0.305);
+docs: six flags not two, the shadow row's real keys, a failed binder writes an error row, the
+adjudicate population, mutant counts corrected, verifier.html's phase-1 paragraph replaced. Noted,
+not changed: the fabrication class is three injected names (no particle/acronym/non-Latin name was
+ever measured); `objection_replay.py` passes no cut severity and raw claims (0/266 decisions differ
+today). **Known gap (documented in claim_binding.html):** a project TITLE reaches neither the
+evidence nor the request view unless an earlier turn's tool output carried it — the two mined
+upholds on it are a bench-population artefact in live terms (prior evidence), but the honest fix is
+to render the active project's title in the verifier's request view; deferred. **Battery 53: 17
+mutants — NOOP survived, KNOWNBAD + 15 killed, 1 documented equivalent** (S1 `fullmatch`→`search`
+is masked by `_written_as_a_name`, which requires the binder's entity list); G2 killed only after
+its fixture stopped sharing the whole word "service" with the tool LABEL. Replays after: pools
+mined 28/0, seed 29/0; corpus exposure 0/495; cache per-refute upholds classic 87 / adjudicate 347
+(323 issue-level upholds on injected names or merge markers; the rest read: injected faults of the
+other classes, plus the two project-title cases above). **R8 (instruments part): 8** (M1, M2 ×3
+rule defects + the instrument itself, M3 ×3) — bringing R7's total to 21. Full suite, restart,
+live probe: next.
+**R7 close (2026-09-19 ~02:45):** full suite ONCE after the last edit — **23525 passed, 66 skipped,
+exit=0** → `launchctl kickstart -k`, pid 73714 → 1141, health 200. Live probe (weather turn, origin
+probe): reply "20.3°C with 71% humidity", verifier row incumbent CONFIRMED / binder CONFIRMED,
+agree, decided incumbent, wait 0.0 s. `claim_binding_ledger_report.py --days 1`: 14 rows, binder
+failed 0, DECIDED BY BINDER 2 (both the historical Saturn parse bug, fixed 09-18 morning), 5
+incumbent-CONFIRMED / binder-UNCERTAIN disagreements. Memory: claim-binding-verifier-4im updated,
+accidental-ground + replay-population-is-the-store written, MEMORY.md trimmed under its size
+limit. **State for the morning:** every finding of all three R7 lenses fixed, pinned and mutated
+(batteries 52: 16/16, 53: 15/15 + 1 documented equivalent); pools mined 28/0, seed 29/0; binder
+v28 = v26 bit-identical on both cached pools; corpus 0 turns moved; cache replay now covers both
+judge prompts. Open (documented, not blocking): render the active project TITLE in the verifier's
+request view; the fabrication bench class is three injected names; `objection_replay.py` passes no
+cut severity.

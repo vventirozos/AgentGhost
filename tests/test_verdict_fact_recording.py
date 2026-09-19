@@ -405,6 +405,32 @@ class TestTheWriterActuallyRuns:
                                   route="code_output")
         assert self._rows(tmp_path)[0]["route"] == "code_output"
 
+    def test_the_issues_reach_disk_clipped_and_are_forwarded(self, tmp_path):
+        """§4IP. 53 recorded REFUTED verdicts carried no issue text, so the
+        review of the incumbent's uphold branch could only replay bench
+        pools. The first three issues, clipped, ride the sidecar; a
+        binder-decided verdict says so."""
+        import ast
+        import inspect
+        from pathlib import Path
+        import ghost_agent.core.agent as m
+        a = self._agent(tmp_path)
+        a._record_verdict_sidecar("traj-i", "REFUTED", 0.9,
+                                  issues=["x" * 400, "second", "third", "fourth"], binder_decided=True)
+        row = self._rows(tmp_path)[0]
+        assert row["issues"] == ["x" * 240, "second", "third"] and row["binder_decided"] is True
+        a._record_verdict_sidecar("traj-j", "CONFIRMED", 0.9)
+        assert "issues" not in self._rows(tmp_path)[1] and "binder_decided" not in self._rows(tmp_path)[1]
+        tree = ast.parse(Path(m.__file__).read_text())
+        rec = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_record_verdict_instruments")
+        call = next(c for c in ast.walk(rec) if isinstance(c, ast.Call) and getattr(c.func, "attr", "") == "_record_verdict_sidecar")
+        kw = {k.arg: k.value for k in call.keywords}
+        assert "issues" in kw and "binder_decided" in kw
+        # the values come from the VERDICT, not constants (review §4IP R7 instruments)
+        src = ast.unparse(kw["issues"]) + " " + ast.unparse(kw["binder_decided"])
+        assert "v_result" in ast.unparse(kw["issues"]) and "v_result" in ast.unparse(kw["binder_decided"]), src
+        assert "binder_decided" in ast.unparse(kw["binder_decided"]) and "issues" in ast.unparse(kw["issues"])
+
     def test_the_route_is_FORWARDED_from_the_verdict_path(self):
         """The other end of that wire — the half that was missing."""
         import ast
@@ -478,12 +504,20 @@ class TestTheWriterActuallyRuns:
         assert not (tmp_path / "verdicts").exists()
 
     def test_it_records_only_the_verdict_and_a_number(self, tmp_path):
-        """No reasoning text, no claim, no evidence — this file
-        accumulates unattended for weeks."""
+        """A CONFIRMED row is the verdict and a number — no reasoning text,
+        no claim, no evidence; this file accumulates unattended for weeks.
+        (Since §4IP a REFUTED row also carries up to three issue strings of
+        ≤240 chars, which quote the claim and evidence fragments they name —
+        the replay key for `objection.resolve_refute`; unredacted on disk is
+        the project's standing policy.)"""
         a = self._agent(tmp_path)
         a._record_verdict_sidecar("traj-z", "CONFIRMED", 0.5)
         assert set(self._rows(tmp_path)[0]) == {
             "trajectory_id", "verdict", "confidence", "at", "seq"}
+        a._record_verdict_sidecar("traj-z", "REFUTED", 0.9, issues=["x" * 500, "b", "c", "d"], binder_decided=True)
+        row = self._rows(tmp_path)[1]
+        assert set(row) == {"trajectory_id", "verdict", "confidence", "at", "seq", "issues", "binder_decided"}
+        assert [len(i) for i in row["issues"]] == [240, 1, 1]
 
 
 class TestTheStampIsWiredAtTheChokePoint:

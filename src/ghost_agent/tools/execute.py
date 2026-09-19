@@ -143,6 +143,127 @@ def _released_shell_block(project_store, command: str):
 _EXEC_TIMEOUT_S = 600
 _TIMEOUT_KILL_CODES = (124, 137, 143)
 
+#: §4HZ — exit 137 is SIGKILL, and two hands send it: `timeout -k 5s` once
+#: the budget expired, and the kernel OOM killer at any moment. The hint used
+#: to name the timeout for both. Live (req 0e6cf008): a plot script died with
+#: 137 after FOUR SECONDS, was told it "timed out / killed after 600s", and
+#: the model spent four turns timing imports before guessing memory. A 137
+#: that lands this many seconds before the budget cannot be the timeout.
+_OOM_KILL_MARGIN_S = 30
+
+
+def _kill_is_oom(exit_code, elapsed_s) -> bool:
+    """True when an exit-137 kill happened too early to be the budget kill."""
+    try:
+        return (int(exit_code) == 137 and elapsed_s is not None
+                and float(elapsed_s) < _EXEC_TIMEOUT_S - _OOM_KILL_MARGIN_S)
+    except (TypeError, ValueError):
+        return False
+
+
+def _sandbox_mem_limit() -> str:
+    """The container memory cap the OOM hint names (same env the sandbox
+    layer reads at container creation — one truth, not a second constant)."""
+    return os.environ.get("GHOST_SANDBOX_MEM", "4g")
+
+
+#: §4HZ — the model's own status echo. `cmd; echo "exit=$?"` (and the
+#: `=== exit: $? ===` banner variant) makes the LAST command an `echo`, so
+#: bash reports 0 and the tool logged "execution ok" over a traceback, an
+#: OOM `Killed`, and a failed `pip install` (req d594668e: the strike
+#: counter fell from 4/6 to 1/6 on one such line, and System 3's chosen
+#: "capture the full output" recovery was booked as a success). The echo
+#: itself is the exact signal: the command text contains `$?` and the output
+#: contains the number it printed.
+_SELF_REPORTED_EXIT_RE = re.compile(
+    r"(?im)\bexit(?:\s*(?:code|status))?\s*[=:]\s*(\d{1,3})\b")
+#: bash's own job-status line for a SIGKILLed child (`bash: line 1:  807
+#: Killed  python3 x.py`). Printed by the shell, not by the program, so it
+#: is never data the command happened to echo.
+_BASH_KILLED_RE = re.compile(r"(?m)^bash: line \d+:\s+\d+ Killed\b")
+
+
+def _self_reported_exit(command: str, exit_code, output: str = "") -> int:
+    """Adopt the exit status the run REPORTED when the shell's is 0.
+
+    Two shapes, both literal:
+      * the command contains ``$?`` and the output carries an
+        ``exit=N`` / ``exit code: N`` line with N != 0 — the program's own
+        status, echoed by the command that laundered it (the LAST such line
+        wins: a multi-probe script reports each probe, and the trailing
+        echo is the one summarising the run);
+      * bash's ``bash: line N: <pid> Killed`` job message — a SIGKILL the
+        shell itself reported (→ 137).
+    A command that never echoes ``$?`` is untouched: ``cat crash.log``
+    printing "exit=1" is data, not a status.
+    """
+    try:
+        code = int(exit_code or 0)
+    except (TypeError, ValueError):
+        return exit_code
+    if code != 0:
+        return code
+    text = str(output or "")
+    if "$?" in str(command or ""):
+        reported = [int(m.group(1)) for m in _SELF_REPORTED_EXIT_RE.finditer(text)]
+        if reported and reported[-1] != 0 and reported[-1] <= 255:
+            return reported[-1]
+    if _BASH_KILLED_RE.search(text):
+        return 137
+    return 0
+
+
+def _normalise_exit(command: str, exit_code, output: str = "") -> int:
+    """THE exit-code normaliser for a sandbox run — pipe forgiveness first
+    (§4GE), then the self-reported status (§4HZ). Every adoption of a
+    sandbox result in the command path goes through here; the enumeration in
+    `tests/test_execute_self_reported_exit.py` fails when one does not."""
+    code = _normalise_find_exit(command,
+                                _normalise_pipe_exit(command, exit_code, output), output)
+    reported = _self_reported_exit(command, code, output)
+    if reported == code:
+        return code
+    # The echoed `$?` is the PIPELINE's raw status under pipefail, so an
+    # early-closed `… | head -N; echo "exit=$?"` reports 141/120/1 for a
+    # producer that was merely SIGPIPE'd. The self-report gets the same
+    # forgiveness the shell's own code got, by the same rule.
+    return _normalise_pipe_exit(command, reported, output)
+
+
+#: §4IE: `find … 2>/dev/null` exits 1 whenever ANY directory under its root
+#: was unreadable — with stderr discarded that status carries nothing the
+#: model can act on, and the paths it printed are valid. The FAILURE banner
+#: it earned read as "the command failed": probe ifs18371… re-ran eight
+#: `find / …` variants in a row (turns 31–38, up to 166 s each), each
+#: banner-flagged, each a strike. Forgiven ONLY when the last command of the
+#: line is a `find` whose stderr is discarded and something was printed.
+_FIND_QUIET_RE = re.compile(r"^\s*find\b.*2>\s*/dev/null", re.S)
+
+
+def _last_simple_command(command: str) -> str:
+    """The last `;`/`&&`/`||`-separated command, minus a trailing pipe tail
+    of pure filters (`| head`, `| sort`, `| grep -v …` keep find's status
+    under pipefail only when THEY fail)."""
+    tail = re.split(r";|&&|\|\|", str(command or ""))[-1]
+    segs = [s.strip() for s in tail.split("|")]
+    return segs[0] if segs else ""
+
+
+def _normalise_find_exit(command: str, exit_code, output: str = "") -> int:
+    try:
+        code = int(exit_code or 0)
+    except (TypeError, ValueError):
+        return exit_code
+    if code != 1:
+        return code
+    if not _FIND_QUIET_RE.match(_last_simple_command(command)):
+        return code
+    if not str(output or "").strip():
+        return code
+    if re.search(r"^find: ", str(output or ""), re.M):
+        return code
+    return 0
+
 
 #: "The DOWNSTREAM of a pipe closed early", not "the command failed".
 #: Without this, turning pipefail on would report every `… | head -N` that
@@ -702,9 +823,30 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
     # program failure, so the model re-ran identical >=10-min commands.
     # The annotation rides AFTER the digits: downstream parsers match
     # `EXIT CODE:\s*(\d+)` and must keep working.
-    def _format_error(msg, hint=None, exit_code=1):
+    def _format_error(msg, hint=None, exit_code=1, elapsed_s=None):
         _code_note = ""
-        if exit_code in _TIMEOUT_KILL_CODES:
+        if _kill_is_oom(exit_code, elapsed_s):
+            # §4HZ: a 137 this far under the budget is the OOM killer. Say
+            # so — and say "memory", because the timeout advice (fewer
+            # iterations, checkpoint) does nothing for a peak-memory kill.
+            # ⚠ No "timeout"/"timed out" on THIS line: the strike classifier
+            # (`tool_failure._RETRYABLE_PATTERNS`) reads the banner and would
+            # book an OOM as a transient retry; the hint block below is
+            # stripped before classification, the code note is not.
+            _code_note = (f" (KILLED after {float(elapsed_s):.0f}s — far under the "
+                          f"{_EXEC_TIMEOUT_S}s budget: out of memory, not the time limit)")
+            _t_hint = (
+                f"Exit 137 after only {float(elapsed_s):.0f}s means the kernel "
+                f"OOM killer stopped the process — the sandbox is capped at "
+                f"{_sandbox_mem_limit()} of memory — NOT the {_EXEC_TIMEOUT_S}s "
+                f"timeout, and NOT slowness: timing imports or the computation "
+                f"will not explain it. Re-running the identical command will "
+                f"die the same way. Reduce PEAK MEMORY: process in chunks, "
+                f"avoid full-grid meshgrid/broadcast temporaries, subsample "
+                f"before plotting, `del` large arrays you are done with, or "
+                f"use float32.")
+            hint = f"{_t_hint}\n\n{hint}" if hint else _t_hint
+        elif exit_code in _TIMEOUT_KILL_CODES:
             _code_note = f" (timed out / killed after {_EXEC_TIMEOUT_S}s)"
             _t_hint = (
                 f"Exit {exit_code} means the process was KILLED — most "
@@ -755,15 +897,26 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
         # explicit ✗ negative examples) still produced occasional leaks.
         # Cleaner to fix at the tool level: detect the pattern, strip it,
         # log a warning so the operator sees it, and run the rest from the
-        # real CWD. /workspace is always the correct destination, so this
-        # auto-fix can never be wrong.
+        # real CWD.
+        #
+        # ⚠ §4HZ: `/tmp` is NOT in this list any more — it EXISTS in the
+        # container (the same request wrote /tmp/mars.json and downloaded to
+        # /tmp/grig_test.grib through it), so `cd /tmp && python3 x.py` was
+        # a correct command silently rewritten to run from /workspace, and
+        # the model concluded "the cd didn't take effect in the sandbox
+        # shell" (req d594668e, 3 turns). The old comment's "this auto-fix
+        # can never be wrong" was wrong for exactly that entry. And the
+        # rewrite is now TOLD to the model in the result, not only to the
+        # operator's log: a silent rewrite reads as a broken shell.
         _cd_strip_pattern = re.compile(
-            r'^\s*cd\s+/(?:sandbox|home(?:/\w+)?|root|app|tmp|usr/src|opt)'
+            r'^\s*cd\s+/(?:sandbox|home(?:/\w+)?|root|app|usr/src|opt)'
             r'(?:/[^\s&;]*)?\s*&&\s*',
             re.IGNORECASE,
         )
+        _cd_note = ""
         _stripped = _cd_strip_pattern.sub('', command, count=1)
         if _stripped != command:
+            _cd_dir = command[:len(command) - len(_stripped)].strip().rstrip("&").strip()
             pretty_log(
                 "CWD Auto-fix",
                 f"Stripped invalid `cd` prefix; running from /workspace. "
@@ -771,6 +924,11 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                 level="WARNING", icon=Icons.SHIELD,
             )
             command = _stripped
+            _cd_note = (
+                f"\n[SYSTEM NOTE: the leading `{_cd_dir} &&` was REMOVED before "
+                f"running — that directory does not exist in the sandbox — and "
+                f"the command ran from /workspace instead. Use paths relative "
+                f"to /workspace.]")
 
         # Inline `-c` handling. Inline `python -c "<body>"` / `bash -c
         # "<body>"` is a recurring failure source: bash quote-escaping mangles
@@ -1078,7 +1236,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
             label=command[:120],
             project_id=_project_id_from_workdir(container_workdir),
             spill_large_output=True, **_workdir_kw)
-        exit_code = _normalise_pipe_exit(command, exit_code, output)
+        exit_code = _normalise_exit(command, exit_code, output)
         # Root fallback for project-scoped commands. When a project is active
         # the command runs from /workspace/projects/<id>, but the model may
         # reference a file that lives at the sandbox ROOT — e.g. one it wrote
@@ -1122,6 +1280,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                 _fh_out, _fh_code = await asyncio.to_thread(
                     sandbox_manager.execute, cmd_str, timeout=_EXEC_TIMEOUT_S,
                     spill_large_output=True, workdir=_proj_wd)
+                _fh_code = _normalise_exit(command, _fh_code, _fh_out)
                 if _fh_code == 0 or not _looks_like_file_not_found(_fh_out):
                     output, exit_code = _fh_out, _fh_code
                     output = (output or "") + (
@@ -1164,7 +1323,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                     sandbox_manager.execute,
                     _bash_c(_remapped), timeout=_EXEC_TIMEOUT_S,
                     spill_large_output=True, **_workdir_kw)
-                _re_code = _normalise_pipe_exit(_remapped, _re_code, _re_out)
+                _re_code = _normalise_exit(_remapped, _re_code, _re_out)
                 if _re_code == 0 or not _looks_like_file_not_found(_re_out):
                     output, exit_code = _re_out, _re_code
                     # Teach on EVERY adopted remap, not just clean exits.
@@ -1187,6 +1346,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                 _re_out, _re_code = await asyncio.to_thread(
                     sandbox_manager.execute, cmd_str, timeout=_EXEC_TIMEOUT_S,
                     spill_large_output=True)
+                _re_code = _normalise_exit(command, _re_code, _re_out)
                 # Same adoption guard as the two heals above: a scoped
                 # script that RAN and then died on a missing data file
                 # matches the file-not-found signature too, and adopting
@@ -1288,11 +1448,11 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
             return _append_note(
                 _format_error(
                     output or f"Process failed (Exit {exit_code}) with no output.",
-                    exit_code=exit_code,
-                ), _host_proc_note)
+                    exit_code=exit_code, elapsed_s=_dt,
+                ), _host_proc_note + _cd_note)
 
         return (f"--- COMMAND RESULT ---\nEXIT CODE: {exit_code}\n"
-                f"STDOUT/STDERR:\n{output}{_host_proc_note}")
+                f"STDOUT/STDERR:\n{output}{_host_proc_note}{_cd_note}")
 
     is_ephemeral = False
     if content and not filename and not command:

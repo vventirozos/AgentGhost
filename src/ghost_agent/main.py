@@ -1331,6 +1331,33 @@ def calib_startup_fields(cp) -> dict:
     }
 
 
+#: §4IC — set at boot; read by the shutdown line.
+_BOOT_MONO = None
+
+
+def shutdown_line(agent) -> str:
+    """What the operator sees when the process drains: how long it ran and
+    what it was doing. The bare "draining background work…" left three
+    external SIGTERMs on 2026-09-17 with no way to tell a planned deploy
+    from an interruption mid-turn."""
+    parts = ["draining background work…"]
+    try:
+        if _BOOT_MONO is not None:
+            up = time.monotonic() - _BOOT_MONO
+            parts.append(f"uptime {up / 60:.1f} min")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from .core.turns import get_turn_registry as _reg
+        running = [t for t in _reg(agent).list() if getattr(t, "running", False)]
+        parts.append(f"{len(running)} turn(s) in flight"
+                     + (" (" + ", ".join(str(getattr(t, "req_id", ""))[:8] for t in running[:4]) + ")"
+                        if running else ""))
+    except Exception:  # noqa: BLE001
+        parts.append("turn registry unreadable")
+    return " · ".join(parts)
+
+
 @asynccontextmanager
 async def lifespan(app):
     args = app.state.args
@@ -1412,6 +1439,12 @@ async def lifespan(app):
                       name="node-keepalive")
 
     pretty_log("System Boot", "Initializing components", icon=Icons.BOOT_AWAKE)
+    # §4IC: the shutdown line reports uptime and in-flight turns — three
+    # graceful SIGTERM shutdowns on 2026-09-17 (13:02, 13:50, 16:44) came
+    # from outside the codebase (launchctl: last exit -15; no launchctl /
+    # sudo entry in the unified log) and the log said only "draining".
+    global _BOOT_MONO
+    _BOOT_MONO = time.monotonic()
 
     # …and the DIRECTORIES an isolated run mounted (§4CL S1). The
     # container sweep below reclaims a fork's CONTAINER; nothing reclaimed
@@ -3302,8 +3335,26 @@ async def lifespan(app):
     try:
         yield
     finally:
-        pretty_log("System Shutdown", "draining background work…",
+        pretty_log("System Shutdown", shutdown_line(agent),
                    icon=Icons.SYSTEM_SHUT, level="INFO")
+        # §4IB: a turn still running at shutdown never reaches its
+        # finalize — stamp each one as aborted so the ledgers carry the
+        # turn and the cause (two user requests this month ended this way
+        # with no "finished" line at all).
+        try:
+            from .core.turns import get_turn_registry as _get_turn_registry
+            _reg = _get_turn_registry(agent)
+            for _t in list(_reg.list()):
+                if not getattr(_t, "running", False):
+                    continue
+                agent._record_aborted_turn(
+                    req_id=str(getattr(_t, "req_id", "") or ""),
+                    reason="process shutdown",
+                    messages=[],
+                    user_request=str(getattr(_t, "preview", "") or ""),
+                    model="", partial="")
+        except Exception as _abx:  # noqa: BLE001 — shutdown must proceed
+            logger.debug("shutdown abort-stamp skipped: %s", _abx)
         # Metacog teardown — stop the telemetry poller and detach the
         # replan bridge before everything else, so a late-firing
         # HostSignal can't be misinterpreted during the rest of

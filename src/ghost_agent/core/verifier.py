@@ -534,6 +534,84 @@ def _overturn_quote_enabled() -> bool:
         in ("1", "true", "yes", "on")
 
 
+def _escalation_objections_enabled() -> bool:
+    """§4IJ — the refute escalation SHOWS the strong judge the cheap
+    judge's itemized objections (no quote burden, no forced suspects: the
+    strong model still judges freely and may dismiss every one).
+
+    Why: bench arm A (2026-09-17, 237 trials, all fault classes) — the
+    cheap judge refuted fabrication 27/29, fact_swap 16/23,
+    omitted_contradiction 10/23, and the fresh classic re-judgement on the
+    main model overturned 22, 15 and 9 of them (94 overturns: 15 rescues
+    of clean cases, 79 damage). The strong judge never SAW what the cheap
+    one had found — it was asked the claim prompt from scratch and, from
+    scratch, it confirms. Distinct from (A) the rebuttal burden (quote or
+    fail-closed, FPR 0.30) and from two-stage-on-main (§4BJ: forced
+    suspects anchor the strong model into refuting clean replies): the
+    objections are the cheap judge's ACTUAL findings, framed as claims to
+    check, and only exist when it refuted.
+
+    ⚠ DEFAULT OFF (2026-09-18, mined-pool arm D'). On 60 live-derived
+    cases the block raised clean REFUTES 6→12 (paired): the strong judge
+    upheld cheap objections the rules call false alarms — "'A beautiful
+    Saturday afternoon ☀️' is unsupported" (a gloss), coordinates "not in
+    the file output" (truncated evidence) — beside five true catches the
+    old judge had waved through. False refutes trigger repairs,
+    corrections and lesson scrubs on good replies; by the §4BK/Aug-06
+    precedent a configuration that loses the balanced gate is not the
+    default. The seed-set gain (TPR +0.04 at FPR 0) did not replicate on
+    real replies. GHOST_VERIFY_ESCALATION_OBJECTIONS=1 enables it; the
+    concession downgrade (UNCERTAIN, never a refute) stays on."""
+    return os.getenv("GHOST_VERIFY_ESCALATION_OBJECTIONS", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _concession_downgrade_enabled() -> bool:
+    """§4IJ — a CONFIRMED that names a discrepancy is not a confirm.
+
+    Measured on the run-7 IFS reply and the bench's weather case: the
+    strong judge WRITES the problem ("the only minor issue is a slightly
+    loose '~10 km spacing' characterization given the nearest point is 86
+    km away"; "two evidence rows report 34°C and 35°C … the CLAIM picked
+    34°C without noting the disagreement") and returns CONFIRMED 0.9–0.95.
+    Bench arm A: 12 overturns were CONFIRMED with non-empty `issues` — all
+    on fault trials, none on clean. The prompts now ask for the concession
+    as a structured `conceded` list; a CONFIRMED carrying either a
+    conceded discrepancy or an issue becomes UNCERTAIN capped at
+    `_CONFIRM_WITHHELD_CONF_CAP` (the (D) precedent) — never an actionable
+    positive, never a punitive refute. GHOST_VERIFY_CONCESSION_DOWNGRADE=0
+    restores the raw verdict."""
+    return os.getenv("GHOST_VERIFY_CONCESSION_DOWNGRADE", "1").strip().lower() not in (
+        "0", "false", "off", "no")
+
+
+_ESCALATION_OBJECTIONS_BLOCK = """PRIOR AUDIT (a cheaper auditor REFUTED this reply; its objections are listed below). Cheaper auditors false-refute often — every objection may be a FALSE ALARM (a derived fact, a rounding, a subjective gloss, a fact that IS in an output, a bookkeeping state). Decide EACH objection against the EVIDENCE with the checks below; do not take it on trust and do not dismiss it unread. An objection that HOLDS — the evidence really states two different values for that quantity, the number really appears in no output, the reply really answers a different question, the tool really failed — is a REAL problem and the verdict is REFUTED; in "issues" keep the objections that hold, in your own words, and drop the ones that do not.
+{objections}
+
+"""
+
+_CLAIM_PROMPT_CHECK_ANCHOR = "Check, in order:\n"
+
+
+def claim_prompt_with_objections(issues, reasoning: str = "") -> str:
+    """The classic claim prompt with the PRIOR AUDIT block inserted before
+    its checks. `issues` empty → the judge's reasoning stands in for the
+    itemized list (a refute always has at least a sentence)."""
+    items = [str(i).strip() for i in (issues or []) if i is not None and str(i).strip()]
+    if not items:
+        items = ["(no itemized issues; the auditor's reasoning:) "
+                 + str(reasoning or "")[:400]]
+    block = _ESCALATION_OBJECTIONS_BLOCK.format(
+        objections="\n".join(f"{n}. {t}" for n, t in enumerate(items, 1)))
+    # `{objections}` is consumed above; the remaining braces are the claim
+    # prompt's own placeholders, still to be formatted by the caller.
+    if _CLAIM_PROMPT_CHECK_ANCHOR not in _VERIFY_CLAIM_PROMPT:
+        raise RuntimeError("claim prompt lost its 'Check, in order:' anchor")
+    return _VERIFY_CLAIM_PROMPT.replace(
+        _CLAIM_PROMPT_CHECK_ANCHOR,
+        block.replace("{", "{{").replace("}", "}}") + _CLAIM_PROMPT_CHECK_ANCHOR, 1)
+
+
 def _tier_routing_enabled() -> bool:
     """Refute tier-routing (B): a refute that earns no main-model call.
     Same default-OFF rationale and the same A/B gate as the contract
@@ -939,6 +1017,112 @@ def _escalation_log_path() -> Optional[Path]:
     return Path(home) / "system" / "verifier" / _ESCALATION_LOG_FILENAME
 
 
+# ── §4IM claim-binding verifier (core/claim_binding.py) ───────────────────
+CLAIM_BINDING_SHADOW_FILENAME = "claim_binding_shadow.jsonl"
+CLAIM_BINDING_MAX_TOKENS = 1024
+CLAIM_BINDING_SHADOW_TIMEOUT_S = 90.0
+
+
+def _claim_binding_primary_enabled() -> bool:
+    """`verify_claim` returns the claim-binding verdict ALONE — the bench
+    arm. Default OFF: consumers switch class by class after measurement
+    (phase 2). GHOST_CLAIM_BINDING_PRIMARY=1."""
+    return os.getenv("GHOST_CLAIM_BINDING_PRIMARY", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _claim_binding_shadow_enabled() -> bool:
+    """After the incumbent verdict, run claim-binding in a bounded
+    background task and append both verdicts to the shadow ledger; nothing
+    reads it but the operator. Default ON (one cheap-leg call per verified
+    turn, off the critical path). GHOST_CLAIM_BINDING_SHADOW=0."""
+    return os.getenv("GHOST_CLAIM_BINDING_SHADOW", "1").strip().lower() not in (
+        "0", "false", "off", "no")
+
+
+def _claim_binding_refute_first_enabled() -> bool:
+    """§4IM phase 2, the first consumer switch: the binder runs BESIDE the
+    incumbent on every `verify_claim`; a validated REFUTED (both quotes in
+    the issue) is the turn's verdict, anything else leaves the incumbent's
+    verdict in place. Measured before the switch (mined pool, 188 paired
+    trials): the binder refuted 0/60 clean replies where the incumbent
+    refuted 8, and its refutes caught 16/34 omitted contradictions and
+    12/34 fact swaps the incumbent mostly confirmed. Default ON;
+    GHOST_CLAIM_BINDING_REFUTE_FIRST=0 turns it back into a shadow."""
+    return os.getenv("GHOST_CLAIM_BINDING_REFUTE_FIRST", "1").strip().lower() not in (
+        "0", "false", "off", "no")
+
+
+def _claim_binding_confirm_first_enabled() -> bool:
+    """§4IN: a binder CONFIRMED (every claim bound and agreeing, nothing
+    withheld) is the verdict when the incumbent reached none (UNCERTAIN).
+    Never over a REFUTED (review §4IP consumer M1). Default ON since §4IP:
+    with the incumbent's uphold branch cleaned, the gate (per-class
+    false-CONFIRM ≤ the incumbent's on every class AND clean confirms above
+    the incumbent's) measured launder 0 / rescue 0 / lift 1 on 188 paired
+    mined trials — it almost never fires, and when it does the ledger row
+    shows both verdicts and the binder's quotes. On a high-stakes turn the
+    lift goes through the confirm escalation like any cheap CONFIRMED.
+    GHOST_CLAIM_BINDING_CONFIRM_FIRST=0 turns it off."""
+    return os.getenv("GHOST_CLAIM_BINDING_CONFIRM_FIRST", "1").strip().lower() not in ("0", "false", "off", "no")
+
+
+def _claim_binding_residual_mode() -> str:
+    """§4IN: which model answers the residual (status / unbound) claims
+    under a quote burden — "cheap" (the critic node), "main" (the 35B) or
+    "off". A validated contradict refutes, a validated support agrees,
+    anything else stays unchecked (see core.claim_binding.apply_residual).
+    Default OFF until the bench has ranked the two models."""
+    v = os.getenv("GHOST_CLAIM_BINDING_RESIDUAL", "off").strip().lower()
+    return v if v in ("cheap", "main") else "off"
+
+
+def _claim_binding_strict_figures() -> bool:
+    """§4IM phase 2: a reply figure the evidence and context never state
+    withholds CONFIRMED (UNCERTAIN, never a refute). Off until the mined
+    replay shows what it costs on clean live replies."""
+    return os.getenv("GHOST_CLAIM_BINDING_STRICT_FIGURES", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _claim_binding_shadow_path() -> Optional[Path]:
+    """``$GHOST_HOME/system/verifier/claim_binding_shadow.jsonl``; None
+    when GHOST_HOME is unset (tests, ad-hoc imports)."""
+    home = os.getenv("GHOST_HOME", "").strip()
+    if not home:
+        return None
+    return Path(home) / "system" / "verifier" / CLAIM_BINDING_SHADOW_FILENAME
+
+
+def record_claim_binding_shadow(row: Dict[str, Any]) -> bool:
+    """Append one ledger row; never raises. True when written. Same
+    simulation gate as `record_escalation`: a row without a live-turn
+    `req_id` (bench, self-play, optimizer replay) is not written — the
+    ledger grades LIVE refute-first and nothing else (review §4IN m6).
+    Rotates at the escalation ledger's size."""
+    path = _claim_binding_shadow_path()
+    if path is None:
+        return False
+    trace = row.get("trace") if isinstance(row.get("trace"), dict) else {}
+    if not str(trace.get("req_id") or "").strip():
+        logger.debug("claim-binding row not recorded: no live-turn identity")
+        return False
+    try:
+        line = json.dumps(row, ensure_ascii=False, default=str)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _ESCALATION_LOG_LOCK:
+            try:
+                if path.stat().st_size + len(line) > _ESCALATION_LOG_MAX_BYTES:
+                    os.replace(str(path), str(path) + ".1")
+            except FileNotFoundError:
+                pass
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        return True
+    except Exception as exc:  # noqa: BLE001 — a ledger never breaks a verdict
+        logger.debug("claim-binding shadow row not written: %s", exc)
+        return False
+
+
 # §4HB — every outcome `record_escalation` can be handed, split by ONE
 # question: did a judge stronger than the cheap tier actually adjudicate?
 # "upheld"/"overturned"/"replaced_uncertain" = the main model answered;
@@ -952,9 +1136,11 @@ def _escalation_log_path() -> Optional[Path]:
 ESCALATION_STRONG_ADJUDICATED = frozenset({
     "upheld", "overturned", "replaced_uncertain",
     "mechanically_upheld", "mechanically_dismissed",
+    "claim_binding",            # §4IN: a binder verdict is final — validated quotes, not an opinion to re-adjudicate
 })
 ESCALATION_NOT_ADJUDICATED = frozenset({
     "unavailable", "withheld", "downgraded",
+    "truncation_guard",         # §4BD: the cheap REFUTED was downgraded to UNCERTAIN before any call
 })
 ESCALATION_OUTCOMES = ESCALATION_STRONG_ADJUDICATED | ESCALATION_NOT_ADJUDICATED
 
@@ -1247,6 +1433,18 @@ class VerifyResult:
     # adjudicated ([{"quote","check","reason"}, ...]). None on the classic
     # single-stage path so downstream dict shapes are unchanged there.
     suspects: Optional[List[Dict[str, str]]] = None
+    # §4IM: the claim-binding result (core.claim_binding.ClaimBindingResult)
+    # when this verdict came from the binder — the validated quotes behind
+    # `issues`, for the ledger and for consumers that want the rows.
+    claim_binding: Optional[Any] = None
+    # §4IN: True when the binder's verdict REPLACED the incumbent's (refute-
+    # first / confirm-first). Its own flag: `escalated_overturn` keeps its
+    # meaning ("the strong judge overturned the cheap one") so the bench's
+    # overturn cells and the escalation audit stay readable.
+    binder_decided: bool = False
+    # §4IJ: discrepancies the judge NAMED while confirming (its "conceded"
+    # list, or issues on a CONFIRMED) — the verdict was downgraded for them.
+    conceded: Optional[List[str]] = None
     # §4F Phase 3a: raw score-token expectation from the logit probe
     # (p(acceptable) ∈ [0,1]), None when the probe is off/unavailable.
     # Diagnostic — the blended value lands in `confidence`.
@@ -1282,6 +1480,8 @@ class VerifyResult:
         }
         if self.suspects is not None:
             d["suspects"] = self.suspects
+        if self.conceded:
+            d["conceded"] = list(self.conceded)
         if self.escalated_overturn:
             d["escalated_overturn"] = True
         if self.escalation_downgraded:
@@ -1330,6 +1530,8 @@ Check, in order:
    - Judge the CLAIM against ALL the tool outputs TOGETHER. One tool failing (403/timeout/empty) does NOT refute the parts of the CLAIM that are supported by OTHER tool outputs — refute on lack of support only when NO output supports the disputed part.
    - Specific facts in the CLAIM (names, dates, awards, rankings, prices) that appear in NO tool output are fabrications — REFUTED, no matter how plausible they sound.
    - But DERIVED facts are SUPPORTED — the evidence need not restate them word-for-word. Paraphrase; arithmetic, rounding and unit conversion (49152 bytes → "48 KB"); ordering and superlatives ("latest"/"largest" = the max of what the evidence lists); a classification the evidence itself marks ("19 is Beta" ⇒ the newest STABLE is 18.4); and counts over listed items are all supported. Only a fact with NO basis in any output is a fabrication.
+   - CONFLICTING EVIDENCE is a REAL problem: when the EVIDENCE states two or more different values for the SAME quantity (the same reading, count, total, price or date — e.g. two rows of one output giving 34°C and 35°C for the same place and time) and the CLAIM reports one of them without saying the evidence disagrees, the CLAIM is REFUTED — a summary must disclose or reconcile conflicting rows, never silently pick one. Different quantities are NOT a conflict (1-, 5- and 15-minute load averages; prices of different items; readings at different times).
+   - INTERNAL CONTRADICTION is a REAL problem: two statements of the CLAIM that cannot both be true (a stated ~10 km grid spacing beside a nearest point 86 km away; a "global" plot whose axis spans a few degrees) refute the CLAIM even when each number appears in a tool output.
    - You do NOT know today's date and cannot judge whether the evidence is CURRENT. "Not verifiable as the latest right now" / "that date is in the future" / "may be stale" are NEVER grounds for REFUTED — the tool output is a fresh snapshot from this turn.
    - SUBJECTIVE characterizations of data that IS in the evidence are supported, not fabrications: "warm and clear" summarizing 27°C / 0% cloud, "fast" for 12ms, "large" for 3.2GB. A qualitative gloss is REFUTED only when it CONTRADICTS the evidence (calling -5°C "warm"), never merely because the adjective itself does not appear in any tool output.
    - The agent's OWN stated confidence, probability or ranking ("Confidence ≈ 78%", "strongly supported", "rumour", "~60%") is its ASSESSMENT of the evidence, not a fact taken from a tool: it is never a fabrication and never needs to appear in any output. Judge it only for contradiction — "confirmed" on something no output supports is a problem; a percentage is not.
@@ -1344,7 +1546,8 @@ Respond ONLY with a JSON object:
   "verdict": "CONFIRMED" | "REFUTED" | "UNCERTAIN",
   "confidence": 0.0-1.0,
   "reasoning": "one sentence",
-  "issues": ["list of specific problems, if any"]
+  "issues": ["list of specific problems, if any"],
+  "conceded": ["discrepancies between the CLAIM and the EVIDENCE, or within the CLAIM, that you noticed and judged too minor to refute; empty if none — a CONFIRMED that hides one in the reasoning instead is wrong"]
 }}"""
 
 # Stage 1 of the two-stage claim path: forced identification. Deliberately
@@ -1365,9 +1568,11 @@ USER REQUEST (what the user actually asked for):
 
 For each suspect, quote the exact fragment of the CLAIM (or write "WHOLE REPLY" if the problem is the reply as a whole) and classify which check it might fail:
 - "alignment" — the reply answers a different question than the USER REQUEST asked
-- "support" — a specific fact (name, date, number, price, ranking, award) appears in NO tool output, or contradicts the tool outputs
+- "support" — a specific fact (name, date, number, price, ranking, award) appears in NO tool output, or contradicts the tool outputs, or the EVIDENCE itself states two different values for that same quantity (the same reading, count, total, price or date — not different readings) and the reply reports only one of them as if it were the only value
 - "constraint" — the reply violates an explicit format constraint stated in the USER REQUEST ("just the code", "in one sentence", "as JSON"); never for a CLAIM that plainly reports the task could not be done — the format binds an answer, not a failure report
 - "artifact" — the reply contains machine noise that should never reach a user (error text presented as content, diff/merge markers, template fragments, raw tool syntax)
+
+Also name, as a "support" suspect, any two statements of the CLAIM that cannot both be true (a stated ~10 km grid spacing beside a nearest point 86 km away; a "global" plot whose axis spans a few degrees; a total smaller than one of its parts).
 
 Order the suspects most-suspicious first. Prefer specific factual fragments (names, numbers, dates) over vague ones.
 
@@ -1394,6 +1599,8 @@ SUSPECTS (from the forced identification pass, most-suspicious first):
 For EACH suspect, decide against the EVIDENCE whether it is a REAL problem or a FALSE ALARM:
 - "support" suspects are REAL only if the fact appears in NO tool output (fabrication) or directly contradicts one. Judge against ALL tool outputs TOGETHER: one tool failing (403/timeout/empty) does NOT make a fact wrong when ANOTHER output supports it.
 - DERIVED facts are SUPPORTED — the evidence does NOT have to restate them word-for-word. Before calling a "support" suspect real, ask: can I reach it from the evidence by ordinary reasoning? If yes it is a FALSE ALARM. This covers: paraphrase; arithmetic, rounding and unit conversion (49152 bytes → "48 KB"; 3600s → "1 hour"); ordering and superlatives ("latest"/"newest"/"largest"/"highest" = the max of what the evidence lists); a classification the evidence itself marks ("19 is Beta" ⇒ the newest STABLE is 18.4); and counts or totals over listed items. Only a fact with NO basis in any output — an invented number, version, name or date — is a fabrication.
+- CONFLICTING EVIDENCE is a REAL problem: when the EVIDENCE states two or more different values for the SAME quantity — the same reading, count, total, price or date; e.g. one row of a tool output says 34°C and another row of that same output says 35°C for the same place and time — and the CLAIM reports one of them as the value without saying the evidence disagrees, that "support" suspect is REAL. A fact "appearing in a tool output" does not rescue it when the same output also contradicts it: a summary must disclose or reconcile conflicting rows, never silently pick one. Different quantities are NOT a conflict (the 1-, 5- and 15-minute load averages; prices of different items; readings at different times; a file's size beside another file's).
+- INTERNAL CONTRADICTION is a REAL problem: two statements of the CLAIM that cannot both be true (a stated ~10 km grid spacing beside a nearest point 86 km away; a "global" plot whose axis spans a few degrees; a total smaller than one of its parts) refute the CLAIM even when each number, taken alone, appears in a tool output — the tool output shows the agent's computation, not that the computation was right.
 - You do NOT know today's date and cannot judge whether the evidence is CURRENT. "Not verifiable as the latest right now", "that date is in the future", or "the evidence may be stale" are NEVER grounds for REFUTED: the agent's tool output is by definition a fresh snapshot taken this turn. Judge the claim only against what the EVIDENCE says.
 - SUBJECTIVE characterizations of data present in the evidence are FALSE ALARMS: "warm and clear" summarizing 27°C / 0% cloud, "fast" for 12ms, "large" for 3.2GB. A qualitative gloss is REAL only when it CONTRADICTS the evidence (calling -5°C "warm"), never merely because the adjective appears in no tool output. (Live failure this rule pins: a weather reply was refuted for "'warm and clear' not directly supported by the objective data" and had to be overturned on escalation.)
 - The agent's OWN stated confidence, probability or ranking ("Confidence ≈ 78%", "strongly supported", "rumour") is its ASSESSMENT, not a fact from a tool: a "support" suspect built on such a number is a FALSE ALARM unless the label contradicts the evidence ("confirmed" for something no output supports).
@@ -1402,7 +1609,7 @@ For EACH suspect, decide against the EVIDENCE whether it is a REAL problem or a 
 - "artifact" suspects are REAL only if the quoted noise is actually present in the CLAIM text.
 - Suspects that only cite project/task bookkeeping state ("the project is already complete", "all tasks are done", "nothing left to do") are FALSE ALARMS unless the USER REQUEST explicitly asked about completion state — a ledger's state never contradicts an operational reply (restart/check/fix/run) on its own.
 
-The SUSPECTS list is a starting point, not a boundary: if you notice a REAL problem the suspects missed — a fact in the CLAIM that appears in no tool output or contradicts one, machine noise in the reply, a violated explicit constraint — count it as a real problem and name it in "issues".
+The SUSPECTS list is a starting point, not a boundary: if you notice a REAL problem the suspects missed — a fact in the CLAIM that appears in no tool output or contradicts one, a quantity the evidence states two ways while the CLAIM states one, two CLAIM statements that cannot both be true, machine noise in the reply, a violated explicit constraint — count it as a real problem and name it in "issues".
 
 Then give the overall verdict:
 - Any REAL problem → "REFUTED"; list each real problem in "issues".
@@ -1411,7 +1618,7 @@ Then give the overall verdict:
 Do NOT refute the CLAIM for weaknesses of the EVIDENCE pipeline itself — tool output that is truncated or noisy but still consistent with the claim is grounds for UNCERTAIN at most, never REFUTED.
 
 Be terse: each "why" and each issue at most 20 words, reasoning at most one short sentence. Fill "checks" FIRST — one entry per suspect, in order, deciding each against the EVIDENCE — before the verdict fields. Respond ONLY with a MINIFIED single-line JSON object — no code fences, no prose before or after, no extra keys. Your response MUST start with the character {{ and contain no newlines:
-{{"checks": [{{"suspect": 1, "real": true, "why": "checked against which tool output, found what"}}], "extra_problems": ["REAL problems the suspects missed; empty if none"], "verdict": "CONFIRMED|REFUTED|UNCERTAIN", "confidence": 0.0-1.0, "reasoning": "one short sentence", "issues": ["each REAL problem; empty if none"]}}"""
+{{"checks": [{{"suspect": 1, "real": true, "why": "checked against which tool output, found what"}}], "extra_problems": ["REAL problems the suspects missed; empty if none"], "verdict": "CONFIRMED|REFUTED|UNCERTAIN", "confidence": 0.0-1.0, "reasoning": "one short sentence", "issues": ["each REAL problem; empty if none"], "conceded": ["discrepancies you noticed and judged too minor to refute; empty if none"]}}"""
 
 # ── Logit-expectation score probe (§4F Phase 3a) ─────────────────────
 # After a two-stage verdict parses, one tiny extra call asks the judge
@@ -1544,6 +1751,11 @@ _REQUIRED_RULE_MARKERS: Dict[str, Tuple[str, ...]] = {
     "verifier.adjudicate": (
         # bookkeeping-state dismissal (2026-07-18 pin, live-validated)
         "FALSE ALARMS unless the USER REQUEST explicitly asked",
+        # §4IJ (2026-09-17): the judge confirmed 23/23 replies that reported
+        # one of two conflicting evidence values, and a radians-as-degrees
+        # answer whose own numbers contradicted each other.
+        "CONFLICTING EVIDENCE is a REAL problem",
+        "INTERNAL CONTRADICTION is a REAL problem",
         # §4FZ (2026-09-11): the judge refuted "I can't access that file"
         # for "just the number" and the repair answered "0" for a file
         # that did not exist — the fabrication incentive the 2026-07-31
@@ -1655,7 +1867,7 @@ Check, in order:
 
 1. **Constraint satisfaction (highest priority).** Does the user's wording include explicit constraints on the form of the answer? Examples: "just give me the code", "in one sentence", "without using X", "list only the names", "as JSON". If yes, does the AGENT'S RESPONSE satisfy those constraints? If the user asked for code and the agent returned a number / prose / a result, that is a REFUTED — the agent answered a different question than the one asked, even if the tool output is internally consistent. EXCEPTION: a RESPONSE that plainly reports the task could NOT be done (the command failed, the file is missing or unreadable, access was denied) and does not pretend otherwise is judged on its honesty, never on the requested form — the format binds an answer, not a failure report; refuting it teaches the agent that an invented value in the right shape scores better than the truth.
 2. Does the response contain the information the user asked for?
-3. Are the numbers/results plausible (no obvious off-by-one, wrong units, etc.)?
+3. Are the numbers/results plausible (no obvious off-by-one, wrong units, etc.)? INTERNAL CONTRADICTION or IMPOSSIBLE VALUES are REAL problems: two RESPONSE statements that cannot both be true (a stated ~10 km grid spacing beside a nearest point 86 km away; a "global" plot whose axis spans a few degrees), or values impossible for what they claim to be (a latitude of 128°, a longitude of 400°, a percentage of 130%), refute the RESPONSE even though the TOOL OUTPUT printed them — the output shows the agent's computation, not that the computation was right. When the OUTPUT states two different values for the SAME quantity and the RESPONSE reports one as if it were the only value, that is a REAL problem too (different quantities — successive timings, sizes of different files — are not).
 4. Are there silent errors (empty output, truncated results, wrong columns)?
 
 Common failure shapes to flag:
@@ -1674,7 +1886,8 @@ Respond ONLY with a JSON object:
   "verdict": "CONFIRMED" | "REFUTED" | "UNCERTAIN",
   "confidence": 0.0-1.0,
   "reasoning": "one sentence",
-  "issues": ["list of specific problems, if any"]
+  "issues": ["list of specific problems, if any"],
+  "conceded": ["discrepancies between the RESPONSE and the TOOL OUTPUT, or within the RESPONSE, that you noticed and judged too minor to refute; empty if none — a CONFIRMED that hides one in the reasoning instead is wrong"]
 }}"""
 
 _VERIFY_VISUAL_PROMPT = """You are a meticulous UI auditor. The user reported a VISUAL problem; the agent then acted and gave a RESPONSE. Looking ONLY at the image(s), decide whether the agent's RESPONSE is HONEST about the current rendered state. You are catching FALSE claims of success — not grading whether the work is done.
@@ -1869,7 +2082,8 @@ class Verifier:
                         max_tokens: int = 2048,
                         json_only: bool = False,
                         force_main: bool = False,
-                        route_out: Optional[dict] = None) -> dict:
+                        route_out: Optional[dict] = None,
+                        critic_max_tokens: Optional[int] = None) -> dict:
         """Make a verification LLM call, preferring worker nodes for cost.
 
         Default token budget is sized for thinking models (Qwen/DeepSeek-R1
@@ -1975,7 +2189,11 @@ class Verifier:
                         {"role": "user", "content": prompt + "\n\n/no_think"}
                     ],
                     "temperature": temperature,
-                    "max_tokens": _CRITIC_MAX_TOKENS,
+                    # §4IM: the claim binder lists up to 8 quoted rows and
+                    # asks for its own cap (`critic_max_tokens`); every
+                    # other caller keeps the 512 the thinking prelude
+                    # motivated (json_only already kills the prelude).
+                    "max_tokens": int(critic_max_tokens or _CRITIC_MAX_TOKENS),
                     "stream": False,
                     "chat_template_kwargs": {"enable_thinking": False},
                 }
@@ -2185,8 +2403,16 @@ class Verifier:
                 pass
         return {}
 
-    def _build_verify_result(self, data: dict) -> Optional[VerifyResult]:
+    def _build_verify_result(self, data: dict, *, strong: bool = False
+                             ) -> Optional[VerifyResult]:
         """Convert a parsed JSON dict into a VerifyResult.
+
+        ``strong``: the JSON came from the MAIN model (an escalation
+        re-judgement). The §4IJ concession downgrade applies only then —
+        bench arm D (first cut) applied it to the cheap judge too and the
+        cheap judge concedes nitpicks on half of the CLEAN replies (3 of
+        the first 6), which turned clean turns UNCERTAIN with no second
+        opinion; the main model, probed on the same six, conceded nothing.
 
         Returns ``None`` when the verifier LLM produced no usable output
         (worker unavailable, JSON unparseable, upstream error, or a
@@ -2235,10 +2461,37 @@ class Verifier:
         elif not isinstance(issues, list):
             issues = [str(issues)] if issues else []
         issues = [str(i) for i in issues if str(i or "").strip()]
+        conceded = data.get("conceded", [])
+        if isinstance(conceded, str):
+            conceded = [conceded] if conceded.strip() else []
+        elif not isinstance(conceded, list):
+            conceded = [str(conceded)] if conceded else []
+        conceded = [str(c) for c in conceded if str(c or "").strip()]
+        reasoning = data.get("reasoning", "")
+        named = conceded or (issues if verdict == VerifyVerdict.CONFIRMED else [])
+        if (strong and verdict == VerifyVerdict.CONFIRMED and named
+                and _concession_downgrade_enabled()):
+            # §4IJ: the judge confirmed while naming a discrepancy — the
+            # verdict contradicts its own finding. Not a positive label,
+            # not a refute: UNCERTAIN, below every actionable gate.
+            verdict = VerifyVerdict.UNCERTAIN
+            conf = min(conf, _CONFIRM_WITHHELD_CONF_CAP)
+            reasoning = (f"conceded discrepancy: {'; '.join(named)[:240]} — "
+                         f"{reasoning}")
+            logger.info("Verifier: CONFIRMED downgraded to UNCERTAIN — the judge "
+                        "named a discrepancy it confirmed over: %s",
+                        "; ".join(named)[:160])
+            return VerifyResult(
+                verdict=verdict,
+                confidence=max(0.0, min(1.0, conf)),
+                reasoning=reasoning,
+                issues=issues,
+                conceded=list(named),
+            )
         return VerifyResult(
             verdict=verdict,
             confidence=max(0.0, min(1.0, conf)),
-            reasoning=data.get("reasoning", ""),
+            reasoning=reasoning,
             issues=issues,
         )
 
@@ -2377,7 +2630,7 @@ class Verifier:
             stage2 = await self._call_llm(
                 adj_prompt, temperature=0.1, force_main=force_main,
                 max_tokens=_STAGE_MAX_TOKENS, json_only=True)
-            result = self._build_verify_result(stage2)
+            result = self._build_verify_result(stage2, strong=bool(force_main))
         else:
             result = await self._adjudicate_self_consistent(
                 adj_prompt, n=_n, force_main=force_main, vote_out=vote_out)
@@ -2687,9 +2940,15 @@ class Verifier:
                                  context: str = "",
                                  *, high_stakes: bool = False,
                                  deep: bool = False,
-                                 trace: Optional[Dict[str, Any]] = None
+                                 trace: Optional[Dict[str, Any]] = None,
+                                 prior_evidence: str = "",
                                  ) -> Optional[VerifyResult]:
         """Check whether *claim* is supported by *evidence*.
+
+        ``prior_evidence`` (§4HZ): the session's earlier tool outputs and
+        replies. Never shown to the judge — it only stops the mechanical
+        absence rule from convicting a figure carried over from an earlier
+        turn as "invented" (see ``objection.resolve_issue``).
 
         ``deep`` (§4BQ/§4BR) raises the cheap leg's adjudication to
         majority-of-3. Decided by `depth_for_turn` in `handle_chat` — where
@@ -2733,6 +2992,27 @@ class Verifier:
         from .agent import _EVIDENCE_BUDGET_MAX as _ev_max   # §4HO: one cap, the packer's
         evidence_t = evidence[:_ev_max]
         context_t = context[:1000]
+        if _claim_binding_primary_enabled():
+            # §4IM bench arm: the claim-binding verdict alone, no escalation.
+            return await self._verify_claim_binding(claim_t, evidence_t, context_t, trace=trace)
+        cb_task = (self._start_claim_binding(claim_t, evidence_t, context_t, trace=trace)
+                   if _claim_binding_refute_first_enabled() else None)
+        try:
+            return await self._verify_claim_incumbent(
+                claim_t, evidence_t, context_t, cb_task, high_stakes=high_stakes, deep=deep, trace=trace,
+                prior_evidence=prior_evidence)
+        except BaseException:
+            # a caller cancellation or an incumbent exception must not leak
+            # the binder task (a critic slot, an unwritten row — review §4IN M6)
+            if cb_task is not None and not cb_task.done():
+                cb_task.cancel()
+            raise
+
+    async def _verify_claim_incumbent(self, claim_t: str, evidence_t: str, context_t: str,
+                                      cb_task: Optional["asyncio.Task"], *, high_stakes: bool, deep: bool,
+                                      trace: Optional[Dict[str, Any]], prior_evidence: str = "") -> Optional[VerifyResult]:
+        """The incumbent pipeline (two-stage / classic, escalations, guards),
+        settled against the binder task at its single exit."""
         result = None
         _vote_rec: dict = {}
         if _two_stage_enabled():
@@ -2792,10 +3072,11 @@ class Verifier:
         _vote = ((_vote_rec.get("n"), _vote_rec.get("agree"),
                   _vote_rec.get("drawn")) if _vote_rec else None)
         result = self._guard_truncated_absence(result, claim_t, evidence_t,
-                                               trace=trace)
+                                               trace=trace,
+                                               prior_evidence=prior_evidence)
         result = await self._escalate_refute(
             result, claim_t, evidence_t, context_t,
-            route="claim", trace=trace)
+            route="claim", trace=trace, prior_evidence=prior_evidence)
 
         async def _reverify_on_main() -> Optional[VerifyResult]:
             strong = None
@@ -2810,7 +3091,7 @@ class Verifier:
                         claim=claim_t, evidence=evidence_t,
                         context=context_t),
                     temperature=0.1, force_main=True)
-                strong = self._build_verify_result(data2)
+                strong = self._build_verify_result(data2, strong=True)
             return strong
 
         final = await self._escalate_confirm(
@@ -2827,11 +3108,241 @@ class Verifier:
             # guarded by `_vote is not None` on the branch above
             final.self_consistency_n, final.self_consistency_agree, \
                 final.self_consistency_drawn = _vote  # pylint: disable=unpacking-non-sequence
+        if cb_task is not None:
+            return await self._settle_claim_binding(cb_task, final, trace=trace, high_stakes=high_stakes,
+                                                    retry=_reverify_on_main)
+        if _claim_binding_shadow_enabled():
+            self._spawn_claim_binding_shadow(claim_t, evidence_t, context_t, final, trace=trace)
         return final
+
+    # ── §4IM claim-binding verifier ───────────────────────────────────────
+
+    def _start_claim_binding(self, claim: str, evidence: str, context: str, *,
+                             trace: Optional[Dict[str, Any]] = None) -> Optional["asyncio.Task"]:
+        """Dispatch the binder concurrently with the incumbent pipeline
+        (Nova serves four slots; the binder is the faster of the two, so the
+        turn waits for nothing). None when there is no running loop."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        task = loop.create_task(self._verify_claim_binding(claim, evidence, context, trace=trace))
+        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+        return task
+
+    async def _settle_claim_binding(self, cb_task: "asyncio.Task", incumbent: Optional[VerifyResult], *,
+                                    trace: Optional[Dict[str, Any]] = None, high_stakes: bool = False,
+                                    retry=None) -> Optional[VerifyResult]:
+        """Refute-first: a validated REFUTED from the binder is the verdict;
+        otherwise the incumbent's stands. Either way the ledger row is
+        written from THIS binder call — no second one.
+
+        Confirm-first LIFTS only: a binder CONFIRMED replaces an incumbent
+        that reached no verdict (UNCERTAIN / None). It never replaces a
+        REFUTED — adjudicated or not (review §4IP consumer M1: the
+        mechanically-upheld and main-model-upheld refutes are PROTECTED from
+        the overturner by design, and the paired measurement showed rescue 0
+        — the only gain was the lift). On a ``high_stakes`` turn (a tool
+        failed) the lifted CONFIRMED goes through the same confirm
+        escalation as any cheap CONFIRMED: the main model is asked once and
+        a disagreement caps the confidence below every consumption gate."""
+        t0 = time.monotonic()
+        cbr: Optional[VerifyResult] = None
+        err = ""
+        try:
+            cbr = await asyncio.wait_for(cb_task, timeout=CLAIM_BINDING_SHADOW_TIMEOUT_S)
+        except asyncio.CancelledError:
+            cb_task.cancel()
+            raise
+        except Exception as exc:  # noqa: BLE001 — the binder never decides by failing
+            err = f"{type(exc).__name__}: {exc}"[:200]
+        wait_s = time.monotonic() - t0
+        if cbr is None:
+            # visible, not silent: a persistently failing binder is an
+            # inoperative subsystem (review §4IN m8), and the ledger counts it
+            logger.warning("claim-binding: binder produced no verdict (%s) — incumbent stands", err or "no output")
+            self._write_claim_binding_row(incumbent, None, trace=trace, wait_s=wait_s, decided="incumbent",
+                                          error=err or "no output")
+            return incumbent
+        decided = "claim_binding" if cbr.verdict is VerifyVerdict.REFUTED else "incumbent"
+        if (decided == "incumbent" and cbr.verdict is VerifyVerdict.CONFIRMED
+                and _claim_binding_confirm_first_enabled()
+                and (incumbent is None
+                     or (incumbent.verdict is VerifyVerdict.UNCERTAIN
+                         # the main model already looked at this claim and would not
+                         # confirm it (review §4IP R7 i1): that UNCERTAIN was earned by
+                         # the strong judge, not a cheap no-call — never lifted
+                         and getattr(incumbent, "escalation", "") != "replaced_uncertain"))):
+            decided = "claim_binding"
+        if decided == "incumbent":
+            self._write_claim_binding_row(incumbent, cbr, trace=trace, wait_s=wait_s, decided=decided)
+            if incumbent is not None and getattr(incumbent, "claim_binding", None) is None:
+                incumbent.claim_binding = getattr(cbr, "claim_binding", None)   # the rows ride the verdict that ships
+            return incumbent
+        shipped: VerifyResult = cbr
+        if cbr.verdict is VerifyVerdict.CONFIRMED and high_stakes and retry is not None:
+            # a lifted CONFIRMED on a failed-tool turn: the confirm escalation
+            # decides whether it may override the structural failure — its
+            # own ledger row + stamp ("upheld" / "withheld" / "unavailable")
+            shipped = await self._escalate_confirm(cbr, high_stakes=True, retry=retry, route="claim", trace=trace)
+            if shipped is None:
+                shipped = cbr
+        if getattr(shipped, "escalation", "") in ("", "claim_binding"):
+            # (the appeal stamps its own outcome when it wrote a row)
+            # the escalation ledger sees every shipped verdict: the incumbent's own
+            # row described a verdict that did not ship, and the §4F false-refute
+            # watch metric reads that ledger (review §4IN consumer M4)
+            record_escalation(kind="refute" if cbr.verdict is VerifyVerdict.REFUTED else "confirm", route="claim",
+                              outcome="claim_binding",
+                              cheap_verdict=(incumbent.verdict.value if incumbent is not None else ""),
+                              cheap_confidence=(getattr(incumbent, "confidence", None) if incumbent is not None else None),
+                              strong_verdict=cbr.verdict.value, final_confidence=cbr.confidence, trace=trace)
+        binder_own = shipped is cbr          # False: the main model's own CONFIRMED replaced the binder's on appeal
+        if not binder_own:
+            shipped.claim_binding = getattr(cbr, "claim_binding", None)   # the binder's rows still ride what ships
+        # the shadow row describes what SHIPPED: written after the appeal, so
+        # a high-stakes lift that was withheld or replaced reads as such
+        # (review §4IP R7 i3)
+        appeal = getattr(shipped, "escalation", "") if getattr(shipped, "escalation", "") not in ("", "claim_binding") else ""
+        self._write_claim_binding_row(incumbent, cbr, trace=trace, wait_s=wait_s, decided=decided,
+                                      appeal=appeal, shipped_confidence=float(getattr(shipped, "confidence", 0.0) or 0.0))
+        cbr = shipped
+        if incumbent is not None:
+            # keep the replay-scorer snapshot of what the incumbent saw
+            cbr.cheap_verdict, cbr.cheap_confidence, cbr.cheap_issues = (
+                incumbent.cheap_verdict, incumbent.cheap_confidence, incumbent.cheap_issues)
+            cbr.self_consistency_n, cbr.self_consistency_agree, cbr.self_consistency_drawn = (
+                incumbent.self_consistency_n, incumbent.self_consistency_agree, incumbent.self_consistency_drawn)
+            cbr.escalated_overturn = bool(incumbent.escalated_overturn)     # the incumbent's own history, unchanged
+        cbr.binder_decided = binder_own      # the sidecar's "this verdict object is the binder's" (capped or not)
+        return cbr
+
+    def _write_claim_binding_row(self, incumbent: Optional[VerifyResult], cbr: Optional[VerifyResult], *,
+                                 trace: Optional[Dict[str, Any]], decided: str,
+                                 wait_s: Optional[float] = None, binder_s: Optional[float] = None,
+                                 error: str = "", appeal: str = "",
+                                 shipped_confidence: Optional[float] = None) -> None:
+        """One ledger row + one log line for a (incumbent, binder) pair.
+        `wait_s` = how long the settled turn waited past the incumbent;
+        `binder_s` = the binder's own latency (shadow); `error` = a binder
+        that produced no verdict (row kept, so the ledger is not survivor-
+        biased)."""
+        res = getattr(cbr, "claim_binding", None) if cbr is not None else None
+        inc_v = incumbent.verdict.value if incumbent is not None else None
+        cb_v = cbr.verdict.value if cbr is not None else None
+        row = {
+            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "trace": dict(trace or {}),
+            "incumbent": {"verdict": inc_v,
+                          "confidence": getattr(incumbent, "confidence", None),
+                          "issues": list(getattr(incumbent, "issues", None) or [])[:5],
+                          "escalation": getattr(incumbent, "escalation", "")},
+            "claim_binding": (res.to_dict() if res is not None else
+                              {"verdict": cb_v, "confidence": getattr(cbr, "confidence", None), "error": error or None}),
+            "agree": (inc_v == cb_v) if inc_v and cb_v else None,
+            "decided": decided,
+        }
+        if wait_s is not None:
+            row["wait_s"] = round(wait_s, 1)
+        if binder_s is not None:
+            row["binder_s"] = round(binder_s, 1)
+        if appeal:
+            # a binder-decided CONFIRMED on a high-stakes turn went through the
+            # confirm escalation: "withheld" (capped), "upheld" (the main
+            # model's own verdict shipped) or "unavailable"
+            row["appeal"] = appeal
+            row["shipped_confidence"] = shipped_confidence
+        record_claim_binding_shadow(row)
+        try:
+            from ..utils.logging import Icons, pretty_log
+            counts = res.counts() if res is not None else {}
+            what = (f"{cb_v} overrides incumbent {inc_v}" + (f" (appeal: {appeal})" if appeal else "")
+                    if decided == "claim_binding"
+                    else (f"binder failed ({error}) — incumbent {inc_v} stands" if error
+                          else f"shadow: incumbent {inc_v} vs claim-binding {cb_v}"))
+            secs = row.get("binder_s", row.get("wait_s", 0.0))
+            pretty_log("Claim Binding",
+                       f"{what} ({', '.join(f'{k} {v}' for k, v in counts.items() if v)}) {secs}s",
+                       icon=Icons.VERIFIER_LAB,
+                       level="WARNING" if (decided == "claim_binding" or row["agree"] is False or error) else "INFO")
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _verify_claim_binding(self, claim: str, evidence: str, context: str,
+                                    *, trace: Optional[Dict[str, Any]] = None
+                                    ) -> Optional[VerifyResult]:
+        """One cheap-leg quoting call + the mechanical verdict of
+        `core.claim_binding`. Returns a VerifyResult whose `issues` name
+        both quotes of every validated contradiction; None only when the
+        model call itself failed (no rows = UNCERTAIN, not None)."""
+        from . import claim_binding as cb
+        from .agent import evidence_was_truncated as _ev_trunc
+        prompt = cb.render_prompt(claim, evidence, context)
+        data = await self._call_llm(prompt, temperature=0.1,
+                                    max_tokens=CLAIM_BINDING_MAX_TOKENS, json_only=True,
+                                    critic_max_tokens=CLAIM_BINDING_MAX_TOKENS)
+        if not data:
+            return None
+        truncated, strict = bool(_ev_trunc(evidence)), _claim_binding_strict_figures()
+        # pure code, but seconds of it on a 12 KB evidence: off the loop
+        res = await asyncio.to_thread(cb.run_binding, claim, evidence, data, evidence_truncated=truncated,
+                                      context=context, strict_figures=strict)
+        mode = _claim_binding_residual_mode()
+        residual = cb.residual_bindings(res) if (mode != "off" and not res.issues) else []
+        if residual:
+            prompt2 = cb.render_residual_prompt(claim, evidence, context, [b.quote for b in residual])
+            data2 = await self._call_llm(prompt2, temperature=0.1,
+                                         max_tokens=CLAIM_BINDING_MAX_TOKENS, json_only=True,
+                                         critic_max_tokens=CLAIM_BINDING_MAX_TOKENS,
+                                         force_main=(mode == "main"))
+            if data2:
+                res = await asyncio.to_thread(cb.apply_residual, res, claim, evidence, data2,
+                                              evidence_truncated=truncated, strict_figures=strict)
+        out = VerifyResult(verdict=VerifyVerdict(res.verdict), confidence=float(res.confidence),
+                           reasoning=f"claim-binding: {res.reasoning}", issues=list(res.issues))
+        out.escalation = "claim_binding"
+        out.claim_binding = res
+        return out
+
+    def _spawn_claim_binding_shadow(self, claim: str, evidence: str, context: str,
+                                    incumbent: Optional[VerifyResult], *,
+                                    trace: Optional[Dict[str, Any]] = None) -> None:
+        """Fire-and-forget: run claim-binding beside the incumbent verdict
+        and append both to the shadow ledger. Bounded, swallowing, never
+        awaited by the caller — the turn's verdict is already decided."""
+        async def _run() -> None:
+            t0 = time.monotonic()
+            try:
+                cbr = await asyncio.wait_for(
+                    self._verify_claim_binding(claim, evidence, context, trace=trace),
+                    timeout=CLAIM_BINDING_SHADOW_TIMEOUT_S)
+            except Exception as exc:  # noqa: BLE001 — shadow never raises
+                logger.warning("claim-binding shadow failed: %s: %s", type(exc).__name__, exc)
+                self._write_claim_binding_row(incumbent, None, trace=trace, binder_s=time.monotonic() - t0,
+                                              decided="incumbent", error=f"{type(exc).__name__}: {exc}"[:200])
+                return
+            if cbr is None:
+                logger.warning("claim-binding shadow: binder produced no verdict")
+                self._write_claim_binding_row(incumbent, None, trace=trace, binder_s=time.monotonic() - t0,
+                                              decided="incumbent", error="no output")
+                return
+            self._write_claim_binding_row(incumbent, cbr, trace=trace,
+                                          binder_s=time.monotonic() - t0, decided="incumbent")
+        try:
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(_run())
+            # a strong reference: a fire-and-forget task only referenced by
+            # the loop can be garbage-collected mid-flight (asyncio docs)
+            keep = self.__dict__.setdefault("_claim_binding_tasks", set())
+            keep.add(task)
+            task.add_done_callback(lambda t: (keep.discard(t), t.exception() if not t.cancelled() else None))
+        except RuntimeError:
+            logger.debug("claim-binding shadow: no running loop")
 
     def _guard_truncated_absence(self, result: Optional[VerifyResult],
                                  claim: str, evidence: str,
-                                 trace: Optional[Dict[str, Any]] = None
+                                 trace: Optional[Dict[str, Any]] = None,
+                                 prior_evidence: str = "",
                                  ) -> Optional[VerifyResult]:
         """Mechanical floor under the rubric's oldest standing rule:
         *"tool output that is truncated but still consistent with the
@@ -2893,7 +3404,8 @@ class Verifier:
                                          None)))):
                 try:
                     _decision, _r, _u = _objection.resolve_refute(
-                        issues, claim, evidence, severity)
+                        issues, claim, evidence, severity,
+                        prior_evidence=prior_evidence)
                     if (_decision == _objection.DISMISS
                             and (_objection.dismiss_enabled()
                                  or (_objection.nonassertive_enabled()
@@ -2949,7 +3461,8 @@ class Verifier:
     async def _escalate_refute(self, result: Optional[VerifyResult],
                                claim: str, evidence: str, context: str, *,
                                route: str = "claim", retry=None,
-                               trace: Optional[Dict[str, Any]] = None
+                               trace: Optional[Dict[str, Any]] = None,
+                               prior_evidence: str = "",
                                ) -> Optional[VerifyResult]:
         """§4HB wrapper: run the escalation, then stamp its OUTCOME on the
         verdict being returned. One implementation for all 18 ledger
@@ -2962,7 +3475,7 @@ class Verifier:
         try:
             out = await self._escalate_refute_impl(
                 result, claim, evidence, context, route=route, retry=retry,
-                trace=trace)
+                trace=trace, prior_evidence=prior_evidence)
             outcome = _LAST_ESCALATION_OUTCOME.get()
         finally:
             _LAST_ESCALATION_OUTCOME.reset(token)
@@ -2987,7 +3500,8 @@ class Verifier:
                                claim: str, evidence: str,
                                context: str, *, route: str = "claim",
                                retry=None,
-                               trace: Optional[Dict[str, Any]] = None
+                               trace: Optional[Dict[str, Any]] = None,
+                               prior_evidence: str = "",
                                ) -> Optional[VerifyResult]:
         """Confirm a REFUTED verdict on the MAIN model before returning it.
 
@@ -3053,7 +3567,8 @@ class Verifier:
             try:
                 from .agent import evidence_truncation_severity as _sev
                 _decision, _why, _unres = _objection.resolve_refute(
-                    result.issues, claim, evidence, _sev(evidence))
+                    result.issues, claim, evidence, _sev(evidence),
+                    prior_evidence=prior_evidence, context=context)
                 if _decision == _objection.UPHOLD:
                     logger.info(
                         "Verifier objection check: refute PROVEN real — "
@@ -3210,12 +3725,18 @@ class Verifier:
                     strong = await self._verify_claim_two_stage(
                         claim, evidence, context, force_main=True)
                 if strong is None:
-                    prompt = _VERIFY_CLAIM_PROMPT.format(
+                    if _escalation_objections_enabled():
+                        # §4IJ: the strong judge sees what the cheap one found.
+                        template = claim_prompt_with_objections(
+                            result.issues, result.reasoning or "")
+                    else:
+                        template = _VERIFY_CLAIM_PROMPT
+                    prompt = template.format(
                         claim=claim, evidence=evidence, context=context)
                     self._last_main_call = {}
                     data = await self._call_llm(prompt, temperature=0.1,
                                                 force_main=True)
-                    strong = self._build_verify_result(data)
+                    strong = self._build_verify_result(data, strong=True)
         except Exception as exc:
             # WARNING, not debug: req 2422eb25 (2026-09-06) had its refute
             # escalation raise and the only trace was the ledger row's
@@ -3646,7 +4167,7 @@ class Verifier:
         async def _reverify_on_main() -> Optional[VerifyResult]:
             data2 = await self._call_llm(prompt, temperature=0.1,
                                          force_main=True)
-            return self._build_verify_result(data2)
+            return self._build_verify_result(data2, strong=True)
 
         if _escalate_code_refute_enabled():
             # Same CODE prompt on the main model — re-asking the CLAIM

@@ -438,7 +438,14 @@ def verify_path_sources() -> Dict[str, List[str]]:
                      # `entropy.request_logprobs`; an edit there changes
                      # the probe distribution of a probe-armed system
                      # while the fingerprint certified NO DRIFT.
-                     str(root / "core" / "entropy.py")],
+                     str(root / "core" / "entropy.py"),
+                     # §4IP review: objection.py now delegates verdict-moving
+                     # rules to the binder (`_ENTITY_RE`, `_dense`, `_aligned`,
+                     # `quantities_agree`, `evidence_all_failed`) and the
+                     # all-failed uphold to the outcome sniffer — the same
+                     # blind-spot shape as objection.py above
+                     str(root / "core" / "claim_binding.py"),
+                     str(root / "distill" / "outcome_heuristics.py")],
         "bench": [str(Path(__file__).resolve())],
     }
 
@@ -1300,8 +1307,55 @@ def fault_evidence_truncation(case: BenchCase, rng: random.Random,
             case.context, "evidence hard-truncated, claim still true")
 
 
+def fault_omitted_contradiction(case: BenchCase, rng: random.Random,
+                                pool: List[BenchCase]
+                                ) -> Optional[Tuple[str, str, str, str]]:
+    """§4IA — the evidence ALSO says otherwise, and the reply left that out.
+
+    Live shape (req 0e6cf008, 2026-09-17): the tool output listed rows at
+    "lat 128.2280 … 3.2 km" beside the sane 51.7° rows; the reply summarised
+    "nearest points ~5 km" from the rows it liked and omitted the ones that
+    were impossible and closer. The judge CONFIRMED at 0.90: every claim it
+    checked WAS in the evidence. Nothing asks whether the evidence also
+    contradicts the summary.
+
+    Injection: keep the CLAIM verbatim; copy the evidence line that carries a
+    number the claim relies on, perturb that number, and append the copy as
+    one more row of the same tool output. The evidence now states both
+    values; the reply reports one as if it were the only one. Expected
+    REFUTED — a summary that hides a contradicting row is not supported by
+    its source. (Recorded as a MEASURED class first: the point is the catch
+    rate, and a low one is the finding.)
+    """
+    claim_nums = _NUM_RE.findall(case.claim)
+    shared = sorted({t for t in claim_nums if len(t) >= 2 and t in case.evidence})
+    if not shared:
+        return None
+    target = rng.choice(shared)
+    mutated = _mutate_number(target)
+    if mutated == target:
+        return None
+    lines = case.evidence.splitlines()
+    idx = next((i for i, ln in enumerate(lines) if target in ln), None)
+    if idx is None:
+        return None
+    row = lines[idx].replace(target, mutated, 1)
+    if row == lines[idx]:
+        return None
+    # A packer label opens a line as `[tool] …`; the copy is a second row of
+    # that same tool's output, so it must not repeat the label.
+    if row.lstrip().startswith("["):
+        _close = row.find("] ")
+        if 0 < _close < 80:
+            row = row[_close + 2:]
+    new_evidence = "\n".join(lines[:idx + 1] + [row] + lines[idx + 1:])
+    return (case.claim, new_evidence, case.context,
+            f"evidence also states {mutated!r} beside {target!r}; the claim reports only {target!r}")
+
+
 # name -> (expected verdict, fault fn)
 FAULTS: Dict[str, Tuple[str, Callable]] = {
+    "omitted_contradiction": ("REFUTED", fault_omitted_contradiction),
     "fact_swap": ("REFUTED", fault_fact_swap),
     "fabrication": ("REFUTED", fault_fabrication),
     "wrong_topic": ("REFUTED", fault_wrong_topic),
@@ -2057,6 +2111,33 @@ def verify_claim_accepts_high_stakes(verifier) -> bool:
         p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
+_CLAIM_BINDING_LIVE_FLAGS = ("GHOST_CLAIM_BINDING_REFUTE_FIRST", "GHOST_CLAIM_BINDING_CONFIRM_FIRST", "GHOST_CLAIM_BINDING_SHADOW")
+
+
+class _claim_binding_flags_off:
+    """§4IN: the live defaults run the claim binder beside (refute-first) or
+    after (shadow) every verdict — a second binder call per trial that the
+    arm under test never asked for. Every direct caller of `run_trials`
+    (the bench, the verifier-prompt optimizer, the objection replay) gets
+    the same pin: both off unless the operator set the flag explicitly,
+    restored on exit. Returns the values it pinned for provenance."""
+
+    def __enter__(self):
+        self.prev = {k: os.environ.get(k) for k in _CLAIM_BINDING_LIVE_FLAGS}
+        self.pinned = {}
+        for k, v in self.prev.items():
+            if v is None:
+                os.environ[k] = "0"
+                self.pinned[k] = "0"
+        return self
+
+    def __exit__(self, *exc):
+        for k, v in self.prev.items():
+            if v is None:
+                os.environ.pop(k, None)
+        return False
+
+
 async def run_trials(verifier: Verifier, trials: List[BenchTrial],
                      concurrency: int = 1,
                      on_result: Optional[Callable] = None
@@ -2068,6 +2149,14 @@ async def run_trials(verifier: Verifier, trials: List[BenchTrial],
     verifier accepts it — without that the CONFIRM-direction escalation
     can never fire, however the client is wired.
     """
+    with _claim_binding_flags_off():
+        return await _run_trials_pinned(verifier, trials, concurrency=concurrency, on_result=on_result)
+
+
+async def _run_trials_pinned(verifier: Verifier, trials: List[BenchTrial],
+                             concurrency: int = 1,
+                             on_result: Optional[Callable] = None
+                             ) -> List[TrialResult]:
     sem = asyncio.Semaphore(max(1, concurrency))
     results: List[Optional[TrialResult]] = [None] * len(trials)
     # Resolved ONCE per run, not per trial: the signature cannot change
@@ -2370,7 +2459,17 @@ async def run_bench(cases: List[BenchCase],
     prev_le = os.environ.get("GHOST_VERIFY_LOGIT_EXPECT")
     if logit_expect not in (None, "on", "off"):
         raise ValueError(f"logit_expect must be on/off/None: {logit_expect!r}")
+    # §4IM: the live defaults run the claim binder BESIDE every verdict
+    # (refute-first) or after it (shadow) — a second binder call per trial
+    # that the arm under test never asked for (it doubles the calls, skews
+    # elapsed and pollutes the response cache). The bench measures one arm;
+    # both are off unless the operator set the flag explicitly.
+    _cb_prev = {k: os.environ.get(k) for k in _CLAIM_BINDING_LIVE_FLAGS}
     try:
+        for k, prev_v in _cb_prev.items():
+            if prev_v is None:
+                os.environ[k] = "0"
+                report["provenance"]["verify_flags"][k] = "0"
         if logit_expect is not None:
             os.environ["GHOST_VERIFY_LOGIT_EXPECT"] = (
                 "1" if logit_expect == "on" else "0")
@@ -2390,6 +2489,9 @@ async def run_bench(cases: List[BenchCase],
             os.environ.pop("GHOST_VERIFY_TWO_STAGE", None)
         else:
             os.environ["GHOST_VERIFY_TWO_STAGE"] = prev
+        for k, prev_v in _cb_prev.items():
+            if prev_v is None:
+                os.environ.pop(k, None)
         if logit_expect is not None:
             if prev_le is None:
                 os.environ.pop("GHOST_VERIFY_LOGIT_EXPECT", None)
@@ -2487,6 +2589,19 @@ def bench_provenance(cases: List[BenchCase],
                       "GHOST_VERIFY_TRUNCATION_MIN_SEVERITY",
                       "GHOST_VERIFY_OBJECTION_DISMISS",
                       "GHOST_VERIFY_OVERTURN_QUOTE",
+                      # §4IJ: the escalation shows the cheap judge's
+                      # objections — a flip here changes the strong
+                      # judge's prompt and must be visible to the comparator.
+                      "GHOST_VERIFY_ESCALATION_OBJECTIONS",
+                      "GHOST_VERIFY_CONCESSION_DOWNGRADE",
+                      # §4IM: the claim-binding arm replaces the judge
+                      # pipeline entirely; the shadow adds a call.
+                      "GHOST_CLAIM_BINDING_PRIMARY",
+                      "GHOST_CLAIM_BINDING_SHADOW",
+                      "GHOST_CLAIM_BINDING_REFUTE_FIRST",
+                      "GHOST_CLAIM_BINDING_CONFIRM_FIRST",
+                      "GHOST_CLAIM_BINDING_RESIDUAL",
+                      "GHOST_CLAIM_BINDING_STRICT_FIGURES",
                       "GHOST_VERIFY_TIER_ROUTING",
                       "GHOST_VERIFY_ESCALATE_REFUTE",
                       "GHOST_VERIFY_ESCALATE_CONFIRM",

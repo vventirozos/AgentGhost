@@ -305,6 +305,9 @@ class _FixedVerdictStub:
 
 async def test_run_bench_report_shape_and_env_hygiene(monkeypatch):
     monkeypatch.setenv("GHOST_VERIFY_TWO_STAGE", "1")
+    monkeypatch.delenv("GHOST_CLAIM_BINDING_SHADOW", raising=False)        # the live defaults (all ON)
+    monkeypatch.delenv("GHOST_CLAIM_BINDING_REFUTE_FIRST", raising=False)
+    monkeypatch.delenv("GHOST_CLAIM_BINDING_CONFIRM_FIRST", raising=False)
     stub = _FixedVerdictStub(json.dumps(
         {"verdict": "CONFIRMED", "confidence": 0.9,
          "reasoning": "r", "issues": []}))
@@ -321,8 +324,43 @@ async def test_run_bench_report_shape_and_env_hygiene(monkeypatch):
     assert len(arm["trials"]) == report["n_trials"]
     # env restored to what the caller had set
     assert os.environ["GHOST_VERIFY_TWO_STAGE"] == "1"
-    # single-stage arm => exactly one LLM call per trial
+    # single-stage arm => exactly one LLM call per trial: the §4IM shadow
+    # binder never runs inside a bench arm the operator did not ask for
     assert stub.calls == report["n_trials"]
+    assert report["provenance"]["verify_flags"]["GHOST_CLAIM_BINDING_SHADOW"] == "0"
+    assert report["provenance"]["verify_flags"]["GHOST_CLAIM_BINDING_REFUTE_FIRST"] == "0"
+    assert "GHOST_CLAIM_BINDING_SHADOW" not in os.environ          # restored: all were unset before
+    assert "GHOST_CLAIM_BINDING_REFUTE_FIRST" not in os.environ
+    assert "GHOST_CLAIM_BINDING_CONFIRM_FIRST" not in os.environ
+    assert report["provenance"]["verify_flags"]["GHOST_CLAIM_BINDING_CONFIRM_FIRST"] == "0"
+
+
+async def test_run_trials_pins_the_live_flags_for_every_direct_caller(monkeypatch):
+    """§4IN consumer M3: the verifier-prompt optimizer and the objection
+    replay call `run_trials` directly; with the live default the binder
+    would decide REFUTED-expected trials the candidate prompt never saw."""
+    monkeypatch.setenv("GHOST_VERIFY_TWO_STAGE", "0")                     # one classic call per trial
+    monkeypatch.setenv("GHOST_VERIFY_ESCALATE_CONFIRM", "0")
+    monkeypatch.delenv("GHOST_CLAIM_BINDING_REFUTE_FIRST", raising=False)
+    monkeypatch.delenv("GHOST_CLAIM_BINDING_SHADOW", raising=False)
+    stub = _FixedVerdictStub(json.dumps({"verdict": "CONFIRMED", "confidence": 0.9, "reasoning": "r", "issues": []}))
+    from ghost_agent.eval.verify_bench import build_trials, run_trials
+    trials = build_trials([WEATHER], fault_names=["silent_failure"], seed=1)
+    out = await run_trials(Verifier(llm_client=stub), trials)
+    assert len(out) == len(trials) and stub.calls == len(trials)          # one incumbent call per trial, no binder
+    assert "GHOST_CLAIM_BINDING_REFUTE_FIRST" not in os.environ           # restored
+
+
+async def test_run_bench_keeps_an_explicit_shadow_flag(monkeypatch):
+    monkeypatch.setenv("GHOST_VERIFY_TWO_STAGE", "1")
+    monkeypatch.setenv("GHOST_CLAIM_BINDING_SHADOW", "1")
+    monkeypatch.setenv("GHOST_CLAIM_BINDING_REFUTE_FIRST", "0")
+    stub = _FixedVerdictStub(json.dumps(
+        {"verdict": "CONFIRMED", "confidence": 0.9, "reasoning": "r", "issues": []}))
+    report = await run_bench([WEATHER], Verifier(llm_client=stub), arms=["two_stage_off"],
+                             fault_names=["silent_failure"], seed=1)
+    assert os.environ["GHOST_CLAIM_BINDING_SHADOW"] == "1"         # the operator's choice survives
+    assert report["provenance"]["verify_flags"]["GHOST_CLAIM_BINDING_SHADOW"] == "1"
 
 
 async def test_run_bench_unknown_arm_raises():

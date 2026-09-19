@@ -152,6 +152,8 @@ def test_a_request_that_does_not_constrain_the_reply_yields_no_constraint(req):
     ("Say hello in exactly two words.", ["word_cap"]),
     ("Summarise it in no more than 20 words.", ["word_cap"]),
     ("Summarise it, 20 words max.", ["word_cap"]),
+    ("What's the weather in Athens? Answer with a single word only.", ["word_cap"]),   # trailing "only"
+    ("Reply in three words only please.", ["word_cap"]),
     ("List your acquired skills. Just the names, one line.", ["line_cap"]),
     ("Confirm in one line.", ["line_cap"]),
     ("tell me in one line whether any events appear", ["line_cap"]),

@@ -137,7 +137,7 @@ _QUESTION_BEFORE_RE = re.compile(r"\b(?:explain|why|what|how)\b", re.IGNORECASE)
 _REPLY_VERB = r"(?:reply|respond|answer|output|return|say|confirm|tell\s+me|summari[sz]e|report|state)"
 #: What may follow a cap phrase for it to be the whole clause's point:
 #: end, punctuation, a comparative tail, or the question it introduces.
-_CAP_TAIL = (r"(?=\s*(?:[.!?,;:)\]]|$)|\s+or\s+(?:fewer|less)\b|\s+(?:max|maximum|tops)\b|"
+_CAP_TAIL = (r"(?=\s*(?:[.!?,;:)\]]|$)|\s+or\s+(?:fewer|less)\b|\s+(?:max|maximum|tops|only|please)\b|"
              r"\s+(?:whether|what|which|who|how|why|from|based|using|about)\b)")
 
 _STRICT_JSON_RES = (

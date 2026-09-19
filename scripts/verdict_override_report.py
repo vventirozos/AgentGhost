@@ -27,6 +27,11 @@ def override_tags(row: dict) -> list:
     ``"reply-shape+web-exec"`` is two tags; no override is the text judge."""
     raw = str(row.get("override") or "").strip()
     if not raw:
+        # §4IN: a binder-decided verdict is not the text judge's (§4IP R7:
+        # `binder_decided` is the signal — a high-stakes lift may file
+        # escalation=withheld|unavailable and still be the binder's object)
+        if row.get("binder_decided") or str(row.get("escalation") or "") == "claim_binding":
+            return ["claim-binding"]
         return ["(text judge)"]
     return [t for t in (p.strip() for p in raw.split("+")) if t]
 

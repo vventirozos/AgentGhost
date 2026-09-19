@@ -285,6 +285,74 @@ def call_target(tool: str, op: str, args: Any) -> str:
     return str(t or "")
 
 
+#: §4HZ — shell prefixes that carry no identity of their own. The class of
+#: an execute call was its FIRST token, so `cd /workspace && python3 x.py`
+#: filed under `cmd:cd` beside every other command that happened to start
+#: with a directory change (n=603, an OPEN pre-flight gate). Live (req
+#: 0e6cf008) that bucket's precedent — a `schema_diff.py` traceback — deferred
+#: an unrelated plot script twice in a row. The head is the program that
+#: RUNS, after `cd … &&`, `timeout [opts] N`, `sudo`, `env`, `nohup`, …
+_HEAD_WRAPPERS = frozenset({"sudo", "env", "nohup", "nice", "time", "exec",
+                            "command", "builtin", "stdbuf", "unbuffer"})
+_HEAD_SEPARATORS = ("&&", "||", ";", "|")
+_DURATION_RE = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
+
+
+def command_head(command: str) -> str:
+    """The token that names what a shell command RUNS — skipping env
+    assignments, `cd <dir> &&`/`;` prefixes, `set …;`, `timeout [-k N] N`,
+    and bare wrappers (`sudo -n -u user`, `env`, `nohup`, `nice`, …).
+    Returns "" when nothing runs (only assignments / a bare `cd`)."""
+    toks = str(command or "").split()
+    i, n = 0, len(toks)
+    guard = 0
+    while i < n and guard < 64:
+        guard += 1
+        tok = toks[i]
+        if _ENV_ASSIGN_RE.match(tok):
+            i += 1
+            continue
+        low = tok.lower().rstrip(";")
+        if low in ("cd", "set", "export", "source", "."):
+            # Skip to the next separator, then past it.
+            i += 1
+            while i < n and toks[i] not in _HEAD_SEPARATORS and not toks[i].endswith(";"):
+                i += 1
+            i += 1
+            continue
+        if tok in _HEAD_SEPARATORS:
+            i += 1
+            continue
+        if low == "timeout":
+            i += 1
+            # options (`-k 5s`, `--signal=KILL`, `-s TERM`) then the duration
+            while i < n and toks[i].startswith("-"):
+                needs_val = toks[i] in ("-k", "-s", "--kill-after", "--signal")
+                i += 2 if needs_val else 1
+            if i < n and _DURATION_RE.match(toks[i]):
+                i += 1
+            continue
+        if low in _HEAD_WRAPPERS:
+            i += 1
+            while i < n and toks[i].startswith("-"):
+                # `sudo -u user`, `nice -n 10`, `env -u VAR` take a value;
+                # `sudo -n`, `-E`… do not.
+                needs_val = toks[i] in _WRAPPER_VALUE_OPTS.get(low, ())
+                i += 2 if needs_val else 1
+            continue
+        return tok.rstrip(";")
+    return ""
+
+
+#: Wrapper options that consume the NEXT token as their value.
+_WRAPPER_VALUE_OPTS = {
+    "sudo": frozenset({"-u", "-g", "--user", "--group", "-C", "-h", "--host"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "env": frozenset({"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}),
+    "stdbuf": frozenset({"-i", "-o", "-e"}),
+}
+
+
 def target_class(tool: str, op: str, target: str) -> str:
     """Coarse class of a call's primary target: the file extension, the
     URL scheme, the command head for ``execute``, or "" when the target
@@ -300,13 +368,7 @@ def target_class(tool: str, op: str, target: str) -> str:
     if m:
         return f"scheme:{m.group(1)}"
     if tool == "execute" or op in ("execute", "run", "command"):
-        # Skip leading VAR=value assignments so `FOO=1 python3 x.py`
-        # classifies by the real command, not the env prefix.
-        head = ""
-        for tok in t.split():
-            if not _ENV_ASSIGN_RE.match(tok):
-                head = tok
-                break
+        head = command_head(t)
         return f"cmd:{Path(head).name[:24]}" if head else ""
     m = _EXT_RE.search(t.split()[0] if " " not in t[:80] else t)
     # All-digit "extensions" are version/IP fragments ("v1.2",

@@ -1,6 +1,7 @@
 # src/ghost_agent/core/planning.py
 
 import json
+import re
 import uuid
 from enum import Enum
 from typing import List, Dict, Optional, Any, Callable
@@ -66,6 +67,27 @@ def _human_gate_reason(postconditions: Any) -> Optional[str]:
     return enforce_human_gate(
         {"postconditions": _coerce_str_list(postconditions)}
     )
+
+
+#: §4HZ — how alike two descriptions must be for a reused task id to count
+#: as the SAME task. Token-set Jaccard: a planner rewording ("check GRIB
+#: tooling" → "check GRIB tooling is installed") stays the same task and
+#: keeps the DONE guard; a replacement ("check GRIB tooling" → "install
+#: ecmwf-api") is a new task under an old id and takes its own status.
+SAME_TASK_JACCARD = 0.6
+_TASK_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def same_task(old_desc: Any, new_desc: Any) -> bool:
+    """True when two task descriptions name the same work (see
+    ``SAME_TASK_JACCARD``). An empty side compares equal only to an empty
+    side — a node whose description was never set is not "the same task"
+    as whatever is written into it next."""
+    a = set(_TASK_WORD_RE.findall(str(old_desc or "").lower()))
+    b = set(_TASK_WORD_RE.findall(str(new_desc or "").lower()))
+    if not a or not b:
+        return not a and not b
+    return len(a & b) / len(a | b) >= SAME_TASK_JACCARD
 
 
 @dataclass
@@ -532,12 +554,25 @@ class TaskTree:
             if node_id in self.nodes:
                 # Update existing node
                 node = self.nodes[node_id]
-                node.description = desc
                 # ANTI-REGRESSION GUARD: Don't allow DONE tasks to revert.
                 # Log a warning when we reject a regression so downstream
                 # operators can spot planner confusion (the previous silent
                 # `pass` made this invisible).
-                if node.status == TaskStatus.DONE and status != TaskStatus.DONE:
+                #
+                # ⚠ §4HZ: the guard protects a TASK, not an id. A re-plan
+                # (System 3's crisis pivot) emits a fresh tree that reuses
+                # `task_1..task_N` for DIFFERENT work; keying the guard on
+                # the id kept the OLD status while the description was
+                # overwritten, so "install ecmwf-api" was born DONE and the
+                # next planner monologue read "task_1 (install ecmwf-api) is
+                # DONE" for a step that never ran (req d594668e, twice —
+                # both crisis interventions neutralised). The guard now holds
+                # only while the node is recognisably the same task
+                # (`same_task`); a re-described id adopts the incoming status.
+                _same = same_task(node.description, desc)
+                node.description = desc
+                if (node.status == TaskStatus.DONE and status != TaskStatus.DONE
+                        and _same):
                     import logging as _logging
                     _logging.getLogger("GhostAgent").warning(
                         "TaskTree: rejected status regression for node %r (%s → %s)",
@@ -545,6 +580,14 @@ class TaskTree:
                         status.name if hasattr(status, 'name') else status,
                     )
                 else:
+                    if node.status == TaskStatus.DONE and status != TaskStatus.DONE:
+                        import logging as _logging
+                        _logging.getLogger("GhostAgent").info(
+                            "TaskTree: node %r was re-described (%r → %r) — a new "
+                            "task under a reused id; adopting its status %s",
+                            node_id, node.description[:60], desc[:60],
+                            status.name if hasattr(status, 'name') else status,
+                        )
                     node.status = status
                 # Update extended fields
                 node.dependency_type = dep_type

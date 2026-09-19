@@ -184,8 +184,13 @@ def main() -> int:
     ap.add_argument("--outcome", default="overturned",
                     help="filter: overturned|upheld|withheld|unavailable|"
                          "downgraded|replaced_uncertain|truncation_guard|"
-                         "mechanically_upheld|mechanically_dismissed|all "
-                         "(default overturned — the population in question)")
+                         "mechanically_upheld|mechanically_dismissed|"
+                         "claim_binding|flips|all "
+                         "(default overturned — the population in question; "
+                         "`flips` = every row whose SHIPPED verdict differs "
+                         "from the cheap one (overturned, replaced_uncertain, "
+                         "claim_binding) — a binder decision files as "
+                         "outcome=claim_binding, not overturned)")
     ap.add_argument("--kind", default="all", help="refute|confirm|all")
     ap.add_argument("--route", default="all", help="claim|code|all")
     ap.add_argument("--limit", type=int, default=20,
@@ -206,15 +211,27 @@ def main() -> int:
               "instrument.", file=sys.stderr)
         return 1
 
+    _FLIP_OUTCOMES = {"overturned", "replaced_uncertain", "claim_binding"}
+
+    def _flipped(r: Dict[str, Any]) -> bool:
+        # the SHIPPED verdict differs from the cheap one: only these
+        # outcomes ship the strong side ("withheld" ships the cheap
+        # CONFIRMED capped; "upheld" ships the cheap verdict)
+        if str(r.get("outcome") or "") not in _FLIP_OUTCOMES:
+            return False
+        cheap, strong = str(r.get("cheap_verdict") or ""), str(r.get("strong_verdict") or "")
+        return bool(strong) and cheap != strong
+
     def _keep(r: Dict[str, Any]) -> bool:
         return (
-            (args.outcome == "all" or r.get("outcome") == args.outcome)
+            (args.outcome == "all" or (args.outcome == "flips" and _flipped(r))
+             or r.get("outcome") == args.outcome)
             and (args.kind == "all" or r.get("kind") == args.kind)
             and (args.route == "all" or r.get("route") == args.route)
         )
 
     sel = [r for r in rows if _keep(r)]
-    if not sel and args.outcome != "all":
+    if not sel and args.outcome not in ("all", "flips"):
         # ⚠ A filter matching NOTHING must say whether the value even
         # exists (§4L Lens-C MINOR-3): the outcome vocabulary grew 5 new
         # strings in a month, and a typo'd/stale --outcome silently

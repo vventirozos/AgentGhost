@@ -1418,6 +1418,36 @@ def _sandbox_where(sandbox_dir) -> str:
     return "the sandbox root (/workspace, no project workspace is active)"
 
 
+#: §4IB — absolute container paths this tool CAN reach. Anything else that
+#: starts with "/" is a real file `execute` may have just listed, and this
+#: tool must say "outside", not "does not exist" (req 21b295ef: a header
+#: under /usr/local/lib/python3.11/site-packages was reported non-existent
+#: one turn after `find` printed it — a strike and a wasted turn).
+_INSIDE_ABS_PREFIXES = ("/workspace", "/sandbox")
+
+
+def outside_workspace_message(filename) -> str:
+    """The message for an absolute path that lies outside the sandbox
+    workspace, or "" when the path is relative / inside. One home: every
+    missing-file branch reads it through `_missing_file_message`."""
+    raw = str(filename or "").strip()
+    if not raw.startswith("/"):
+        return ""
+    norm = raw.replace("\\", "/")
+    for pfx in _INSIDE_ABS_PREFIXES:
+        if norm == pfx or norm.startswith(pfx + "/"):
+            return ""
+    return (
+        f"Error: '{raw}' is OUTSIDE the sandbox workspace. file_system reads "
+        f"only files under /workspace (and the project workspaces inside it); "
+        f"a path that `execute`, `ls` or `find` printed under /usr, /etc, "
+        f"/opt, /home, /root or site-packages is real in the container but "
+        f"this tool cannot open it. Read it with execute instead: "
+        f"`cat '{raw}'` or `sed -n '1,120p' '{raw}'` (or `grep -n <pattern> "
+        f"'{raw}'` to find the part you need)."
+    )
+
+
 def _missing_file_message(filename, sandbox_dir) -> str:
     """Loop-breaking 'not found' message for a missing read target.
 
@@ -1430,6 +1460,9 @@ def _missing_file_message(filename, sandbox_dir) -> str:
     model's favour-of-reality: the live sandbox is authoritative, lists
     what actually exists, and gives a concrete exit (create it, or pick a
     real file). Best-effort directory scan; never raises."""
+    _outside = outside_workspace_message(filename)
+    if _outside:
+        return _outside
     existing = []
     try:
         import os

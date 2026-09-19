@@ -824,6 +824,7 @@ def _escalation_health(ledger_path: Path) -> Dict[str, Any]:
                   "unavailable": 0, "downgraded": 0,
                   "replaced_uncertain": 0, "truncation_guard": 0,
                   "mechanically_upheld": 0, "mechanically_dismissed": 0,
+                  "claim_binding": 0,          # §4IN/§4IP: the binder's validated verdict shipped over the incumbent's
                   "n": 0})
         outcome = str(rec.get("outcome") or "").strip()
         if outcome in slot:
@@ -2904,6 +2905,9 @@ def render_learning_health(memory_dir, args: Any = None) -> str:
             if s.get("replaced_uncertain"):
                 extra += (f", {s['replaced_uncertain']} replaced-uncertain "
                           f"(strong judge punted)")
+            if s.get("claim_binding"):
+                extra += (f", {s['claim_binding']} claim-binding "
+                          f"(validated quotes decided, no appeal)")
             if s.get("other"):
                 # §4L R2 NEW-6: the counter existed but the renderer
                 # omitted it — vocabulary drift invisible again, one
