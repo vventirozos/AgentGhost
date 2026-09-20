@@ -190,7 +190,14 @@ class TestBootPrecedence:
         return _forms_js() + extract_js_function(_js("matrix_graph.js"), "resolveInitialForm")
 
     def test_the_servers_record_beats_this_browsers(self, resolver):
-        assert eval_js(resolver, "resolveInitialForm('lattice', 'cube', 'vortex')") == "lattice"
+        assert eval_js(resolver, "resolveInitialForm('descent', 'cube', 'vortex')") == "descent"
+
+    def test_retired_names_fall_through_to_the_default(self, resolver):
+        # 2026-09-20: `lattice` became `cube`, `embedding` and the old cube
+        # left. A server/browser record of a retired name must land on the
+        # default (which IS the renamed lattice), never on a blank face.
+        for retired in ("lattice", "embedding", "stack", "horizon"):
+            assert eval_js(resolver, f"resolveInitialForm('{retired}', '{retired}', 'cube')") == "cube", retired
 
     def test_local_storage_is_the_fallback(self, resolver):
         for server_value in ("null", "undefined", "''", "'bogus'", "42", "{}"):

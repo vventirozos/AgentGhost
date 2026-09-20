@@ -102,17 +102,19 @@ class TestDialects:
                 for (const v of allowed) if (!Object.values(DIALECTS).some(d => d[k] === v)) unused.push(k + '=' + v);
             return unused;
         })()""")
-        # 'xz' stays as the vocabulary's ring-breath option; nothing else may dangle.
-        assert out == ["radialAxis=xz"], out
+        # 'xz' stays as the vocabulary's ring-breath option; 'all' and
+        # 'contract' were embedding's (removed 2026-09-20) and stay declared
+        # for the next form that breathes or contracts. Nothing else may dangle.
+        assert out == ["radialAxis=all", "radialAxis=xz", "read=contract"], out
 
     def test_dialects_are_actually_different(self, graph_js):
         out = eval_js(self._env(graph_js), "new Set(Object.values(DIALECTS).map(d => JSON.stringify(d))).size")
-        assert out >= 4, "the table exists but most forms speak the same grammar"
+        assert out >= 3, "the table exists but most forms speak the same grammar"
 
     def test_crystals_do_not_breathe(self, graph_js):
-        out = eval_js(self._env(graph_js), """[DIALECTS.lattice.radialAxis, DIALECTS.cube.radialAxis,
-            DIALECTS.descent.radialAxis, DIALECTS.vortex.read, DIALECTS.lattice.verify, DIALECTS.cube.verify]""")
-        assert out == ["none", "none", "y", "thicken", "align", "align"]
+        out = eval_js(self._env(graph_js), """[DIALECTS.cube.radialAxis,
+            DIALECTS.descent.radialAxis, DIALECTS.vortex.read, DIALECTS.cube.verify]""")
+        assert out == ["none", "y", "thicken", "align"]
 
     def test_scalars_are_derived_from_the_current_dialect_each_frame(self, graph_nc):
         i = graph_nc.index("const DIAL = dialectFor(FORMS[formIndex]);")
@@ -124,11 +126,9 @@ class TestDialects:
             assert line in body, line
 
     @pytest.mark.parametrize("form,anchor,needles", [
-        ("vortex", "tunnelFlow += (1 / 60) * (0.008", ["gaitFlow", "gaitThicken"]),
-        ("lattice", "const alignMul = 1.0 - TUNE.alignGain * gaitAlign;", ["alignMul", "gaitFlash", "gaitFlow"]),
-        ("embedding", "embT += (1 / 60) * (0.24", ["gaitFlow"]),
+        ("vortex", "tunnelFlow += (dtF / 60) * (0.008", ["gaitFlow", "gaitThicken"]),
+        ("cube", "const alignMul = 1.0 - TUNE.alignGain * gaitAlign;", ["alignMul", "gaitFlash", "gaitFlow"]),
         ("descent", "const lr = 1.6 * (0.55", ["gaitFlow"]),
-        ("cube", "const tk = time * (0.7 + 1.4 * Sk", ["gaitFlow", "gaitAlign"]),
     ])
     def test_each_branch_speaks_its_dialect(self, graph_nc, form, anchor, needles):
         i = graph_nc.index(anchor)

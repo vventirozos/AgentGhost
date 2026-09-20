@@ -76,7 +76,7 @@ def test_lookat_singularity_handled(graph_js):
     # 2026-09-11: the x/y target carries the composer GAZE (gazeX, gazeY
     # fading with the dive); the z target is unchanged.
     assert re.search(
-        r"camera\.lookAt\(gazeX, gazeY \* \(1\.0 - dive\), \(FORM === 'cube' \? -[\d.]+ : -3\.5\) \* dive\)",
+        r"camera\.lookAt\(gazeX, gazeY \* \(1\.0 - dive\) - _lookDrop \* dive, \(_partial \? -[\d.]+ : -3\.5\) \* dive\)",
         graph_js)
     assert "camera.lookAt(0, 0, 0);" not in graph_js
 
@@ -101,7 +101,7 @@ def test_interior_enrichment_present(graph_js):
     assert "MOTE_COUNT = IS_MOBILE ? 150 : 400" in graph_js
     assert "motesMesh.visible = dive > 0.01" in graph_js
     assert "PROXIMITY_SQ * (1.0 + dive * 0.15)" in graph_js
-    assert "time += 0.005 * (1.0 + dive * 0.6)" in graph_js
+    assert "const tStep = 0.005 * (1.0 + dive * 0.6)" in graph_js   # dt-scaled since 2026-09-20
     # Scale boost deliberately trimmed — the swell dilutes local density
     # exactly when the camera is closest (the original emptiness bug).
     assert "dive * 0.55" in graph_js

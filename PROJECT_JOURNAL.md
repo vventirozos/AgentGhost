@@ -44648,3 +44648,92 @@ cap) → pinned with a boundary beyond it; **11/11 KILLED, NOOP SURVIVED.** One 
 own on the way: "I assume A —" lost its "A" to the article strip — the pin, not the rule, was
 wrong. Docs: `uncertainty.html`. Out of scope, still documented (M15): the footer quotes back a
 sentence the reply already contains.
+
+## §4JA — The face's motion contract, executed: seven defects, lattice dive (2026-09-20, 08:20–10:10)
+
+Operator: "the faces of the webUI are sometimes moving erratic and the 'zoom to action' doesn't
+always work right, investigate all faces (especially lattice) and fix any defects." The render loop
+(`matrix_graph.js animate()`) had never been EXECUTED under test — every face pin was a text pin or
+a builder run — so step one was the instrument: a node harness with a ~60-line THREE stub (seeded
+RNG, fake rAF with timestamps, positions read back through `InstancedMesh.setMatrixAt`, the camera
+projection re-derived from `lookAt`) that measures the largest per-node move per frame (designed
+wraps > 1 unit counted apart) and projects each form's "action" to screen space. Seven defects,
+all measured before and after:
+1. **Frame-locked stepping, all forms.** Every increment/ease was per 60fps frame — the face ran at
+   the DISPLAY's rate (2× on ProMotion, ½× throttled) and lurched on dropped frames (the streaming
+   markdown re-render). Six seconds after a reply the camera sat at z 3.6/4.75/5.0 at 30/60/120Hz.
+   Fix: `animate(ts)` → `dtF` (elapsed in 60fps-frame units, clamped 0.25–3), `ease(k)`/`decay(r)`
+   exponentiated, `tStep`/`dtF/60` increments; identical at 60Hz; 30/60/120 now agree to 3 dp.
+   Pause drops the stamp so resume steps one frame.
+2. **`time × (rate + k·drive)` phases** — lattice runners, cube churn, cube heart spin — jump by
+   `time × Δrate` on every drive change and `time` only grows: after 3 min a log line sent the
+   runners across the grid (p95 4.1/frame, follow-up 0.90); the cube 17× more violent after 10 min
+   (0.48 vs 0.027). Integrated: `latticeRunnerFlow`, per-complexity `c.churn`/`c.spin`. → 0.011/0.019.
+3. **Lattice zoom-to-action.** Full dive to 1.3 INSIDE the grid (cell ≈ near-fade = "random dots")
+   with the attention kernel projecting OFF SCREEN (1.24, 1.72). Now the cube's treatment:
+   focus-translated onto the post-tumble kernel, partial dive `LATTICE_DIVE_Z 2.7`, swell 0.18,
+   near-still heading (own tumble; the wander peaked at ~40% of it). Kernel at (0.01, 0.05), both
+   device classes.
+4. **Cube re-arm teleport.** Re-pick gated on `cubeS < 0.4` but the translation is `dive × anchor`
+   and the dive lingers ~9s past that — a follow-up message jumped the cube 0.3–1.0 in one frame.
+   Gate adds `dive < 0.005`. 0.98 → 0.009.
+5. **Descent trail** sampled every 3rd frame → 20Hz lurch (head still 2 frames in 3). Per-frame ring
+   of 120 (an interpolated read was tried, proven equivalent by the battery, deleted). Jerk 0.080 → 0.019.
+6. **Embedding tail snap** — the tail lagged `s·0.10` and the flight wrapped at 97%: 0.126 every
+   arrival. Flight stretched by `EMB_TAIL_LAG` (head lands at 0.91 and holds; focus uses the same
+   parameter); ignition contraction eased (`embTight`), glow still flashes.
+7. **Idle twitch** wrote its 6–14s as `0.03 × s` on a 0.3/s clock → every ~1.5s, one-frame 0.08
+   pops. `0.3 × s`, chance × dtF, `twitchAmp` eased attack. Cube idle pops 8/min → 0.
+Plus descent framing: the hover lift put the bead at screen y −0.6 (under the phone composer);
+look target pitches with the dive (`_lookDrop 0.75`) → −0.25. Vortex untouched in kind (camera
+never moves; far-field expansion exempt from the per-frame cap). **Live (Playwright/swiftshader
+~20fps = dtF clamped at 3):** zero JS errors on all six forms, 5s turn reaches immersion 0.97 at
+wall-clock speed, lattice z 2.71 / cube 3.11 / rest 1.31. **Pins:**
+`tests/test_interface_face_motion_2026_09_20.py` — 16, ALL executed: the 7 defects on the new
+file, pause→resume, 4 negative controls on `matrix_graph.js.bak-20260920-preframetime` (the
+instrument must SEE each defect); the module's four mechanism text pins were deleted when the
+§4GJ ratchet flagged the new file (+1) — the battery already killed every mutant by an executed
+pin, so they were redundant under R4; 9 older pins reworded (tStep, ease/decay, form-aware
+lookAt, the pause harness declares `_lastFrameTs`, version 12.6). Interface suite 617 passed / 2
+skipped. Docs: `docs/interfaces/web_server.html` "Face motion contract, executed". Cache-bust
+app/matrix_graph 12.6 (manifest refreshed). The lesson worth keeping: a phase written as
+`clock × variable_rate` is a defect that grows with uptime — "sometimes erratic" was the operator
+seeing it on long-lived tabs and on displays that were not 60Hz.
+**Battery 72 (R2/R3 on the fixes; 09:50):** 18 whole-file mutants of `matrix_graph.js` written
+OUTSIDE `interface/static` (`GHOST_FACE_GRAPH` override in the executed pins) — frame clock off,
+`ease()`→k, `tStep` without dtF, the three `time × rate` phases restored, re-arm gate dropped,
+lattice focus zeroed / dive 1.3 / full swell / wander branch, trail every 3rd frame, tail lag
+unstretched, ignition snap, twitch `0.03×` and one-frame pop, level descent look, pause keeping
+its stamp. First run 18/19 with one SURVIVOR — trail interpolation (M09), proven EQUIVALENT (with a
+sample per frame the index shift alone is one bead-step per frame) → deleted, not kept; five
+mutants were killed by TEXT pins only under `-x` → executed kills added (six follow-up cycles so
+the cube re-pick cannot dodge by re-drawing the same anchor; `clock` in `getDebugState` compared
+across 30/60/120Hz; lattice scale/heading at full dive; descent band tightened to −0.35…−0.02
+after the level look measured −0.37…−0.60 across seeds; a pause→resume scenario). **Final
+(re-run after the text pins were deleted): 18/18 KILLED, every mutant by ≥1 EXECUTED pin, NOOP
+SURVIVED.** Full suite ONCE after the last edit: 23690 passed / 66 skipped / 1 failed — the one
+failure was the ratchet on the new file's text pins (fixed by deleting them; ratchet + module
+re-run green). Defects found inside this round's
+own fixes: 1 (the equivalent interpolation — dead code, R7).
+
+## §4JB — Face roster: lattice → cube (default); embedding + monolith deleted (2026-09-20, 10:20–10:50)
+
+Operator: "delete the cube and embedding faces. rename lattice to cube, make it default." Roster
+`cube, vortex, descent, empty`; `cube` = the weight-tensor grid formerly `lattice`, now the default
+(`FORMS.indexOf('cube')`; vortex had been default since 07-28). Deleted the embedding form and the
+monolith cube outright — builders, state (`emb*`, `_cubeCx`, `cubeS`…), animate branches, dialects,
+`LINK_MULT` rows, picker hints, the `noteRecall` embedding case (≈300 lines; matrix_graph.js 2580 →
+2283). Engine renames: `CUBE_N/A/DIVE_Z`, `cubeRunnerFlow`, `_cubeFx/y/z`, `_buildCube`. Retired
+names in a stored pref fall through to the default via the existing roster check in
+`resolveInitialForm` — the operator's live `.ghost_ui_prefs.json` held `lattice` and the page booted
+into `cube` (headless, zero JS errors, picker: cube active / "weight tensor"). Server validation is
+charset-only → untouched. Dialect vocabulary keeps `radialAxis=all` + `read=contract` declared
+(the dangling-value pin lists them). Pins: forms_ai (roster, default, absences, both builders
+executed), dialects/signals/prefs reworded, `test_retired_names_fall_through_to_the_default`,
+motion pins on cube/vortex/descent (controls keep the backup's names); 4 version pins → 12.7.
+Interface suite + ratchet: 643 passed / 2 skipped. Spot battery on the rename: **9/9 KILLED, NOOP
+SURVIVED**. Docs: web_server.html roster section. Restore point `matrix_graph.js.bak-20260920-preroster`.
+**Follow-up (10:55):** operator "make cube dive a bit closer, it feels too far" → `CUBE_DIVE_Z` 2.7 → 2.2
+(kernel ≈ ¼ of the half-height, centred (0.02, 0.06), depth 2.2 clears the 0.3–1.4 near-fade; both
+device classes), pin updated, live-verified (camZ 2.22 at full dive), cache-bust 12.8. Interface suite
+574 passed / 2 skipped.

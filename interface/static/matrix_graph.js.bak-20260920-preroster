@@ -132,12 +132,12 @@ let huePhase = 0.0;      // bounded thermal oscillation (see hueDrift)
 let vortexTravel = 0.0;
 let tunnelFlow = 0.0;
 let vortexSpin = 0.0;
-// cube: the charge runners' integrated travel. Their progress used to
+// lattice: the charge runners' integrated travel. Their progress used to
 // be `time * speed * (1 + 1.5 * drive + …)` — a phase that JUMPS by
 // `time × Δdrive` whenever the drive envelope moves, and `time` only
 // grows, so an hour into a session every log line sent the runners
 // zipping across the grid (2026-09-20). Integrated per frame instead.
-let cubeRunnerFlow = 0.0;
+let latticeRunnerFlow = 0.0;
 // v4 (operator): expansion flow. Contraction (matter streaming edges→
 // center) reads as moving BACKWARD; a black-hole fall needs the hole
 // AHEAD and the walls expanding outward past the viewer. The singularity
@@ -153,6 +153,16 @@ const VORTEX_KOUT = 2.6;      // exponential expansion — self-similarity knob
 const VORTEX_COS = 0.60, VORTEX_SIN = 0.80;   // cone half-angle
 
 // ── AI-form state (2026-07-29) ─────────────────────────────────────
+// embedding: the query comet's flight state. From/to are cluster
+// indices; embT is eased 0..1 along a bezier whose control point is
+// pushed outward so the flight arcs through the void between concepts.
+let embFrom = 0, embTo = 1, embT = 0.5;
+const embExcite = [];        // per-cluster recall glow, decays ~2s
+const embTight = [];         // eased copy of embExcite for the GEOMETRY:
+                             // the glow may flash on, the contraction
+                             // must not snap (it was a one-frame 30%
+                             // radius jump of the whole cluster)
+let _embCenters = [];        // rebuilt by _buildEmbedding
 // descent: the optimizer bead. True gradient descent on the (moving)
 // loss surface — velocity, damping, soft walls, stuck-kick.
 let beadX = 0.4, beadZ = 0.3, beadVX = 0.0, beadVZ = 0.0;
@@ -165,6 +175,15 @@ const beadTrail = [];        // recent (x,z) surface points, newest first
 // sampled once per 60fps-frame of wall time.
 const BEAD_TRAIL_LEN = 120;
 let _descTick = 0;           // accumulated dtF; one sample per whole unit
+// cube: the resident complexities (anchors rebuilt with the form) and
+// the active mutation's strength. Growth is driven by the USER turn
+// (mirrors vortexTravel — ambient work only adds restlessness), decay
+// is a slow organic taming after completion.
+let _cubeCx = [];            // [{ax,ay,az, r0, ph}]
+let cubeActive = 0;          // index of the mutating complexity
+let cubeS = 0.0;             // active mutation strength 0..1
+let _cubePrevTurn = false;   // rising-edge detector for picking anchor
+
 let errorState = 0.0;
 let targetErrorState = 0.0;
 let workingState = 0.0;
@@ -201,35 +220,36 @@ let hueDrift = 0.0;
 // The shader-side counterpart is the uOrganic uniform.
 const CALM = PREFERS_REDUCED_MOTION ? 0.35 : 1.0;
 
-// ── Forms (roster trimmed 2026-09-12, again 2026-09-20) ───────────
+// ── Forms (roster trimmed 2026-09-12) ─────────────────────────────
 // Interchangeable body plans over ONE motion engine (the asymmetric
 // _pulseShape propulsion, hot core, flinch, thermal anatomy):
-//   cube      — the weight tensor (the form called `lattice` until
-//               2026-09-20): a tumbling crystal grid; diagonal
-//               activation waves heat the sites they cross; a hot
-//               attention kernel drifts the volume, bending the grid
-//               toward itself; charge runners ride the axes. DEFAULT.
 //   vortex    — a black hole ahead of the viewer; self-similar
 //               expansion flow, accretion ring, dark shadow.
+//   lattice   — the weight tensor: a tumbling crystal grid; diagonal
+//               activation waves heat the sites they cross; a hot
+//               attention kernel drifts the volume, bending the grid
+//               toward itself; charge runners ride the axes.
+//   embedding — latent space: cold concept clusters on slow orbits; a
+//               hot query comet streaks cluster→cluster, and each
+//               arrival IGNITES the recalled cluster.
 //   descent   — the loss landscape: an undulating terrain sheet, cold
 //               ridges / warm valleys; the optimizer bead rolls
 //               downhill trailing heat, kicked to explore again
 //               whenever it settles (and on error flinches).
+//   cube      — the infinite monolith: a large dark cube with a FEW
+//               resident alien complexities quietly deforming it from
+//               inside; a user turn wakes one, which spreads like an
+//               infection, running crimson, and tames on completion.
 //   empty     — no face.
 // Removed 2026-09-12 at the operator's request: abyssal, horizon,
 // cortex, stack, conversation, toolgraph (and the auto mode + face lab).
-// Removed 2026-09-20 (operator): embedding, and the old `cube` (the
-// infinite monolith with resident complexities); `lattice` took the
-// name `cube` and became the default.
 // The header's form button opens a picker built from this roster; the
 // choice persists (server-side + localStorage).
-const FORMS = ['cube', 'vortex', 'descent', 'empty'];
-// Default form: CUBE (operator pick, 2026-09-20; vortex was the default
-// from 2026-07-28). The form the operator last picked overrides it —
-// resolved by `resolveInitialForm` below; a stored name that left the
-// roster (`lattice`, `embedding`, the old `cube` — the last resolves to
-// THIS cube) falls through to the default.
-let formIndex = FORMS.indexOf('cube');
+const FORMS = ['vortex', 'lattice', 'embedding', 'descent', 'cube', 'empty'];
+// Default form: VORTEX (operator pick, 2026-07-28 — superseded horizon
+// after the black-hole iteration). The form the operator last picked
+// overrides it — resolved by `resolveInitialForm` below.
+let formIndex = FORMS.indexOf('vortex');
 
 // Which form to boot into (2026-09-05). Precedence, highest first:
 //   1. the SERVER's record of the last form picked ANYWHERE — server.py
@@ -383,9 +403,11 @@ export const DIALECT_VALUES = Object.freeze({
     verify: ['still', 'align'],
 });
 export const DIALECTS = Object.freeze({
-    cube:         { radialAxis: 'none', search: 'plane', read: 'settle',   tool: 'flash',  write: 'flow', verify: 'align' },
     vortex:       { radialAxis: 'none', search: 'ring',  read: 'thicken',  tool: 'kick',   write: 'flow', verify: 'still' },
+    lattice:      { radialAxis: 'none', search: 'plane', read: 'settle',   tool: 'flash',  write: 'flow', verify: 'align' },
+    embedding:    { radialAxis: 'all',  search: 'ring',  read: 'contract', tool: 'kick',   write: 'flow', verify: 'still' },
     descent:      { radialAxis: 'y',    search: 'plane', read: 'settle',   tool: 'kick',   write: 'flow', verify: 'still' },
+    cube:         { radialAxis: 'none', search: 'plane', read: 'settle',   tool: 'flash',  write: 'flow', verify: 'align' },
     empty:        { radialAxis: 'none', search: 'sweep', read: 'settle',   tool: 'kick',   write: 'wave', verify: 'still' },
 });
 const _DIALECT_DEFAULT = DIALECTS.vortex;
@@ -775,8 +797,10 @@ void main() {
 function _buildAnatomy() {
     basePositions.length = 0;
     const f = FORMS[formIndex];
-    if (f === 'cube') _buildCube();
+    if (f === 'lattice') _buildLattice();
+    else if (f === 'embedding') _buildEmbedding();
     else if (f === 'descent') _buildDescent();
+    else if (f === 'cube') _buildCube();
     else if (f === 'empty') _buildEmpty();
     else _buildVortex();
 }
@@ -874,30 +898,27 @@ function _buildVortex() {
     }
 }
 
-// Form F — CUBE (named `lattice` until 2026-09-20): the weight tensor.
-// A slowly tumbling crystal grid, cell edge tuned just under the
-// (form-tightened) link radius so ONLY axis-neighbors weave — a literal
-// wireframe tensor, the first angular silhouette. Cold at the corners,
-// warming toward the middle; diagonal activation waves and a drifting
-// hot attention kernel do the living.
-const CUBE_N = IS_MOBILE ? [4, 5, 5] : [6, 6, 6];
-const CUBE_A = IS_MOBILE ? 0.80 : 0.72;   // cell edge
+// Form F — LATTICE: the weight tensor. A slowly tumbling crystal grid,
+// cell edge tuned just under the (form-tightened) link radius so ONLY
+// axis-neighbors weave — a literal wireframe tensor, the first angular
+// silhouette. Cold at the corners, warming toward the middle; diagonal
+// activation waves and a drifting hot attention kernel do the living.
+const LATTICE_N = IS_MOBILE ? [4, 5, 5] : [6, 6, 6];
+const LATTICE_A = IS_MOBILE ? 0.80 : 0.72;   // cell edge
 // Dive (2026-09-20): the immersion dive used to plunge to the GLOBAL
 // 1.3 — straight into the grid's interior, cell edge ≈ the camera's
 // near-fade, "random dots" — while the attention kernel, the form's
 // only hot focus, wandered ±0.85 off the origin and projected OFF
-// SCREEN at full dive (measured: screen (1.24, 1.72)). It now gets the
-// old monolith's treatment: focus-translated onto the kernel's
+// SCREEN at full dive (measured: screen (1.24, 1.72)). The lattice now
+// gets the cube's treatment: focus-translated onto the kernel's
 // post-tumble position and a PARTIAL dive — close enough to watch the
-// kernel bend the grid, never inside the dot cloud. 2.7 → 2.2 (operator,
-// 2026-09-20: "feels too far"); the kernel fills ~a quarter of the
-// half-height, and its depth still clears the near-fade band (0.3–1.4).
-const CUBE_DIVE_Z = 2.2;
-function _buildCube() {
-    const [NX, NY, NZ] = CUBE_N;
+// kernel bend the grid, never inside the dot cloud.
+const LATTICE_DIVE_Z = 2.7;
+function _buildLattice() {
+    const [NX, NY, NZ] = LATTICE_N;
     const SITES = NX * NY * NZ;
     const RUNNERS = Math.min(IS_MOBILE ? 12 : 20, NODE_COUNT - SITES - 8);
-    const spanOf = (m) => ((m - 1) / 2) * CUBE_A;
+    const spanOf = (m) => ((m - 1) / 2) * LATTICE_A;
     let n = 0;
     for (let ix = 0; ix < NX; ix++)
         for (let iy = 0; iy < NY; iy++)
@@ -910,9 +931,9 @@ function _buildCube() {
                     Math.abs(iz - (NZ - 1) / 2) / Math.max((NZ - 1) / 2, 1));
                 basePositions.push({
                     kind: 0,
-                    gx: (ix - (NX - 1) / 2) * CUBE_A,
-                    gy: (iy - (NY - 1) / 2) * CUBE_A,
-                    gz: (iz - (NZ - 1) / 2) * CUBE_A,
+                    gx: (ix - (NX - 1) / 2) * LATTICE_A,
+                    gy: (iy - (NY - 1) / 2) * LATTICE_A,
+                    gz: (iz - (NZ - 1) / 2) * LATTICE_A,
                     // Diagonal wave phase 0..1 across the volume.
                     wp: (ix + iy + iz) / (NX + NY + NZ - 3),
                     seed0: 0.20 - shell * 0.16 + Math.random() * 0.02,
@@ -924,7 +945,7 @@ function _buildCube() {
     // face to face (size-tapered at the faces so the wrap hides).
     for (let k = 0; k < RUNNERS; k++, n++) {
         const axis = Math.floor(Math.random() * 3);
-        const cell = (m) => (Math.floor(Math.random() * m) - (m - 1) / 2) * CUBE_A;
+        const cell = (m) => (Math.floor(Math.random() * m) - (m - 1) / 2) * LATTICE_A;
         basePositions.push({
             kind: 1,
             dx: axis === 0 ? 1 : 0, dy: axis === 1 ? 1 : 0, dz: axis === 2 ? 1 : 0,
@@ -956,6 +977,73 @@ function _buildCube() {
         nodeSeeds[n] = 0.58 + Math.random() * 0.04;
         n++;
     }
+}
+
+// Form H — EMBEDDING: latent space. Cold concept clusters anchored on
+// jittered octahedral directions (≥ ~80° apart, so with the tightened
+// link radius clusters can never cross-link — the void between
+// concepts stays void), each with its own slow orbit and internal
+// swirl. The hot query comet streaks cluster→cluster doing recall.
+const EMB_CLUSTERS = IS_MOBILE ? 5 : 6;
+const EMB_TAIL_LAG = 0.10;   // comet tail lag, in flight-parameter units
+function _buildEmbedding() {
+    const DIRS = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+    _embCenters = [];
+    embExcite.length = 0;
+    for (let c = 0; c < EMB_CLUSTERS; c++) {
+        const d = DIRS[c];
+        const R = 1.50 + Math.random() * 0.25;
+        _embCenters.push({
+            bx: d[0] * R + (Math.random() - 0.5) * 0.30,
+            by: d[1] * R + (Math.random() - 0.5) * 0.30,
+            bz: d[2] * R + (Math.random() - 0.5) * 0.30,
+            oa: Math.random() * Math.PI * 2,          // orbit phase
+            ow: 0.04 + Math.random() * 0.03,          // orbit rate
+            or: 0.10 + Math.random() * 0.08,          // orbit radius
+            spin: 0.08 + Math.random() * 0.07,        // internal swirl
+        });
+        embExcite.push(0);
+    }
+    const QUERY = IS_MOBILE ? 10 : 16;
+    const CL_TOTAL = NODE_COUNT - QUERY;
+    const per = Math.floor(CL_TOTAL / EMB_CLUSTERS);
+    let n = 0;
+    for (let c = 0; c < EMB_CLUSTERS; c++) {
+        const count = c === EMB_CLUSTERS - 1
+            ? CL_TOTAL - per * (EMB_CLUSTERS - 1) : per;
+        for (let b = 0; b < count; b++, n++) {
+            const th = Math.random() * Math.PI * 2;
+            const ph = Math.acos(2 * Math.random() - 1);
+            basePositions.push({
+                kind: 0, ci: c,
+                dx: Math.sin(ph) * Math.cos(th),
+                dy: Math.cos(ph),
+                dz: Math.sin(ph) * Math.sin(th),
+                r0: 0.42 * Math.cbrt(Math.random()),
+                jit: Math.random() * Math.PI * 2,
+                // Per-cluster temperature: distinct concepts sit at
+                // slightly different colds.
+                seed0: 0.04 + c * 0.024 + Math.random() * 0.03,
+            });
+            nodeSeeds[n] = basePositions[n].seed0;   // reheated on recall
+        }
+    }
+    while (n < NODE_COUNT) {   // the query comet (head → tail)
+        const qi = n - CL_TOTAL;
+        const QN = NODE_COUNT - CL_TOTAL;
+        basePositions.push({
+            kind: 1,
+            s: qi / Math.max(QN - 1, 1),
+            rr: 0.05 + Math.random() * 0.06,
+            jit: Math.random() * Math.PI * 2,
+            sz: 1.0,
+        });
+        nodeSeeds[n] = 0.60 - (qi / Math.max(QN, 1)) * 0.16;
+        n++;
+    }
+    embFrom = 0;
+    embTo = EMB_CLUSTERS > 1 ? 1 : 0;
+    embT = 0.0;
 }
 
 // Form I — DESCENT: the loss landscape. A tilted terrain sheet whose
@@ -1002,6 +1090,118 @@ function _buildDescent() {
     beadStill = 0; beadTrail.length = 0;
 }
 
+// Form J — CUBE: the infinite monolith. A large dark grid — bigger
+// cell edge than lattice, spanning past the view so the eye never
+// finds a boundary — holding a FEW resident alien complexities:
+// localized regions where incommensurate sine fields quietly deform
+// the grid (not many; just enough to be interesting). One of them is
+// the MUTATION: on a user turn it grows (aggressively but not fast),
+// spreading through an irregular per-node boundary like an infection,
+// re-weaving links as displaced nodes tear and rejoin, running
+// crimson at its heart while the rest of the cube stays cold dark
+// blue. The immersion dive is focus-translated onto it (same lesson
+// as descent/embedding), so the camera rides INTO the mutation as it
+// evolves; on completion it tames and the cube re-knits.
+const CUBE_N = IS_MOBILE ? [5, 5, 4] : [6, 6, 6];
+// Cell edge trimmed 0.88 → 0.80 (v2, operator: "the cube is not
+// clear"): the whole silhouette must FIT the view so it reads as a
+// monolith, not an endless field.
+const CUBE_A = IS_MOBILE ? 0.85 : 0.80;
+const CUBE_CX_COUNT = IS_MOBILE ? 2 : 3;
+// Partial dive for this form: the point is WATCHING the mutation
+// spread across the grid, not being inside a cloud of dots — the
+// camera closes to ~3.1 (vs the global 1.3) and the swell is gentled.
+const CUBE_DIVE_Z = 3.1;
+function _buildCube() {
+    const [NX, NY, NZ] = CUBE_N;
+    const SITES = NX * NY * NZ;
+    // Resident complexities: random interior anchors, kept apart so
+    // they read as separate organisms living in the grid.
+    _cubeCx = [];
+    const spans = [
+        ((NX - 1) / 2) * CUBE_A * 0.6,
+        ((NY - 1) / 2) * CUBE_A * 0.6,
+        ((NZ - 1) / 2) * CUBE_A * 0.6,
+    ];
+    for (let k = 0; k < CUBE_CX_COUNT; k++) {
+        let ax = 0, ay = 0, az = 0;
+        for (let attempt = 0; attempt < 24; attempt++) {
+            ax = (Math.random() * 2 - 1) * spans[0];
+            ay = (Math.random() * 2 - 1) * spans[1];
+            az = (Math.random() * 2 - 1) * spans[2];
+            const ok = _cubeCx.every(c =>
+                Math.hypot(ax - c.ax, ay - c.ay, az - c.az) > 1.4);
+            if (ok) break;
+        }
+        _cubeCx.push({
+            ax, ay, az,
+            r0: 0.50 + Math.random() * 0.15,      // idle influence radius
+            ph: Math.random() * Math.PI * 2,       // personality phase
+            // Integrated motion phases (2026-09-20). The churn and the
+            // heart's spin were `time × (rate + k·Sk)` — a phase that
+            // jumps by `time × ΔSk` as the mutation grows or tames, so
+            // the longer the page had been open the more violently a
+            // turn made the mutation vibrate (17× worse after ten
+            // minutes, measured). Advanced per frame at the CURRENT
+            // rate instead, one clock per complexity.
+            churn: 0.0,
+            spin: 0.0,
+        });
+    }
+    cubeActive = 0;
+    cubeS = 0.0;
+    _cubePrevTurn = false;
+
+    let n = 0;
+    for (let ix = 0; ix < NX; ix++)
+        for (let iy = 0; iy < NY; iy++)
+            for (let iz = 0; iz < NZ; iz++, n++) {
+                // How many axes sit on the cube's surface: 0 interior,
+                // 1 face, 2 edge, 3 corner. The WIREFRAME SILHOUETTE is
+                // what makes the monolith legible (v2): edge and corner
+                // nodes render larger, tracing the cube's outline.
+                const onFace =
+                    (ix === 0 || ix === NX - 1 ? 1 : 0)
+                    + (iy === 0 || iy === NY - 1 ? 1 : 0)
+                    + (iz === 0 || iz === NZ - 1 ? 1 : 0);
+                basePositions.push({
+                    kind: 0,
+                    gx: (ix - (NX - 1) / 2) * CUBE_A,
+                    gy: (iy - (NY - 1) / 2) * CUBE_A,
+                    gz: (iz - (NZ - 1) / 2) * CUBE_A,
+                    // Darker than lattice — a monolith, not a machine.
+                    seed0: 0.03 + onFace * 0.025 + Math.random() * 0.012,
+                    sz: onFace >= 2 ? 1.3 : onFace === 1 ? 1.0 : 0.85,
+                    // Per-node spread threshold: the mutation's boundary
+                    // is IRREGULAR (some nodes resist, some succumb
+                    // early) — that irregularity is what reads organic.
+                    gate: 0.80 + Math.random() * 0.35,
+                    jit: Math.random() * Math.PI * 2,
+                });
+                nodeSeeds[n] = basePositions[n].seed0;   // reheated per frame
+            }
+    // Each complexity's visible HEART: a small tangle of nodes orbiting
+    // its anchor — CRIMSON already at rest (v2, operator: "the
+    // mutations must be red"), burning brighter as its mutation grows.
+    while (n < NODE_COUNT) {
+        const ci = (n - SITES) % CUBE_CX_COUNT;
+        const th = Math.random() * Math.PI * 2;
+        const phv = Math.acos(2 * Math.random() - 1);
+        const rr = 0.06 + 0.16 * Math.cbrt(Math.random());
+        basePositions.push({
+            kind: 2, ci,
+            dx: Math.sin(phv) * Math.cos(th),
+            dy: Math.cos(phv),
+            dz: Math.sin(phv) * Math.sin(th),
+            rr,
+            jit: Math.random() * Math.PI * 2,
+            sz: 0.8,
+        });
+        nodeSeeds[n] = 0.54 + Math.random() * 0.04;      // reheated per frame
+        n++;
+    }
+}
+
 // ── Form switching ─────────────────────────────────────────────────
 export function getForm() { return FORMS[formIndex]; }
 
@@ -1044,12 +1244,13 @@ export function noteToolCall() {
 }
 
 // A memory / knowledge-base hit: a comet from the periphery ignites one
-// node. Cross-form.
+// node. Cross-form (the embedding form already had its own).
 export function noteRecall() {
     recallSpark = 1.0;
     recallNode = Math.floor(Math.random() * NODE_COUNT);
     const th = Math.random() * Math.PI * 2, ph = Math.acos(2 * Math.random() - 1);
     recallDir = [Math.sin(ph) * Math.cos(th), Math.cos(ph), Math.sin(ph) * Math.sin(th)];
+    if (FORMS[formIndex] === 'embedding' && embExcite.length) embExcite[embTo] = 1.0;
     return recallNode;
 }
 
@@ -1419,7 +1620,7 @@ export function getDebugState() {
         phase, gait: { ...gait }, toolPulse, recallSpark, verdict, verdictEnv,
         backgroundBusy, moodHue, gazeY, errorKind, errorKindEnv,
         dialect: dialectFor(FORMS[formIndex]), gaitFlow, gaitThicken, gaitFlash, gaitAlign,
-        dtF, clock: time, cubeRunnerFlow, twitchAmp,
+        dtF, clock: time, latticeRunnerFlow, cubeActive, cubeS, twitchAmp,
     };
 }
 
@@ -1628,15 +1829,15 @@ function animate(ts) {
     const baseScale = 0.9 * breathe * (1.0 + dive * 0.55);
     // The vortex's journey is the CAMERA's — swelling the scene under it
     // would double-transform the funnel, so the swell is neutralized.
-    // The cube gets a GENTLED swell: the point of its dive is watching
-    // the attention kernel work the grid, not entering a cloud — full
-    // swell dissolved the silhouette into dots.
+    // The cube gets a GENTLED swell (v2): the point of its dive is
+    // watching the mutation spread across the monolith, not entering a
+    // cloud — full swell dissolved the silhouette into dots.
     // Verdict release: a stop EXHALES (one soft swell that lets go); the
     // background breath is a second, slower rhythm under everything.
     const exhale = verdict === 'stop' ? TUNE.exhale * Math.sin(Math.PI * (1.0 - verdictEnv)) * verdictEnv : 0;
     const bgBreath = TUNE.bgBreath * backgroundBusy * Math.sin(time * 0.31 + 0.9);
     const sceneScale = (FORM === 'vortex' ? 0.9 * breathe
-        : FORM === 'cube' ? 0.9 * breathe * (1.0 + dive * 0.18)
+        : (FORM === 'cube' || FORM === 'lattice') ? 0.9 * breathe * (1.0 + dive * 0.18)
         : baseScale) * (1.0 + exhale + bgBreath);
     scene.scale.set(sceneScale, sceneScale, sceneScale);
 
@@ -1653,13 +1854,15 @@ function animate(ts) {
             scene.rotation.z = vortexSpin * 0.22;
             scene.position.x = 0.05 * Math.sin(time * 0.031);
             scene.position.y = _bob * 0.5;
-        } else if (FORM === 'cube') {
-            // Cube: near-still heading — its OWN slow tumble is the
+        } else if (FORM === 'cube' || FORM === 'lattice') {
+            // Monolith: near-still heading — its OWN slow tumble is the
             // motion. The full heading wander compounded with the
-            // focus-translation release into an "erratic zoom-out" (the
-            // old monolith, v2), and it kept the silhouette from ever
-            // settling into a readable cube; the wander peaked at ~40%
-            // of the tumble rate — nothing the eye will miss.
+            // focus-translation release into the "erratic zoom-out"
+            // (v2), and it also kept the silhouette from ever settling
+            // into a readable cube. The lattice joined this branch when
+            // it gained its own focus translation (2026-09-20): it too
+            // tumbles on its own, and its wander peaked at ~40% of the
+            // tumble rate — nothing the eye will miss.
             scene.rotation.y = 0.09 * Math.sin(time * 0.029);
             scene.rotation.x = 0.05 * Math.sin(time * 0.021 + 0.7);
             scene.rotation.z = 0.02 * Math.sin(time * 0.017 + 2.0);
@@ -1692,11 +1895,13 @@ function animate(ts) {
         camera.lookAt(camera.position.x * 0.35, camera.position.y * 0.35,
             VORTEX_APEX_Z);
     } else {
-        // Cube: PARTIAL dive only — close enough to watch the attention
-        // kernel work the grid, never inside the cloud ("zoom is too
-        // much... just shows random dots").
-        const _partial = FORM === 'cube';
-        const _diveZ = _partial ? CUBE_DIVE_Z : CAMERA_DIVE_Z;
+        // Cube (v2) and lattice (2026-09-20): PARTIAL dive only — close
+        // enough to watch the mutation / the attention kernel work the
+        // grid, never inside the cloud ("zoom is too much... just shows
+        // random dots").
+        const _partial = FORM === 'cube' || FORM === 'lattice';
+        const _diveZ = FORM === 'cube' ? CUBE_DIVE_Z
+            : FORM === 'lattice' ? LATTICE_DIVE_Z : CAMERA_DIVE_Z;
         camera.position.z = CAMERA_REST_Z - (CAMERA_REST_Z - _diveZ) * dive;
         // Look-target blend: at rest the camera studies the origin; deep in
         // the cloud it must look FORWARD through it instead — near the
@@ -1829,8 +2034,8 @@ function animate(ts) {
             }
         }
         instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
-    } else if (FORM === 'cube') {
-        // ── CUBE: the weight tensor tumbles slowly while diagonal
+    } else if (FORM === 'lattice') {
+        // ── LATTICE: the weight tensor tumbles slowly while diagonal
         //    activation waves sweep it (riding the shared pulse clock),
         //    heating the sites they cross; the hot attention kernel
         //    drifts a Lissajous through the volume, bending nearby grid
@@ -1843,11 +2048,11 @@ function animate(ts) {
         const kz = 0.85 * Math.cos(time * 0.067 + 0.6);
         const waveGain = 0.16 + 0.22 * drive + 0.15 * flinch;
         const alignMul = 1.0 - TUNE.alignGain * gaitAlign;   // verify: the grid snaps true
-        // Runner travel is INTEGRATED (see cubeRunnerFlow): same rate
+        // Runner travel is INTEGRATED (see latticeRunnerFlow): same rate
         // law as before, stepped per frame instead of multiplied into
         // the ever-growing clock.
-        cubeRunnerFlow += tStep * (1.0 + 1.5 * drive + 2.0 * gaitFlow);
-        // Dive focus (2026-09-20, the descent lesson):
+        latticeRunnerFlow += tStep * (1.0 + 1.5 * drive + 2.0 * gaitFlow);
+        // Dive focus (2026-09-20, the descent/embedding/cube lesson):
         // the kernel's POST-TUMBLE position is subtracted from every
         // node, dive-weighted, so the camera's partial dive lands ON the
         // attention kernel — the form's hot focus — instead of the grid
@@ -1855,9 +2060,9 @@ function animate(ts) {
         // the tumble are both continuous, so the follow never jumps.
         const _kx1 = kx * lc1 + kz * ls1;
         const _kz1 = -kx * ls1 + kz * lc1;
-        const _cubeFx = dive * _kx1;
-        const _cubeFy = dive * (ky * lc2 - _kz1 * ls2);
-        const _cubeFz = dive * (ky * ls2 + _kz1 * lc2);
+        const _latFx = dive * _kx1;
+        const _latFy = dive * (ky * lc2 - _kz1 * ls2);
+        const _latFz = dive * (ky * ls2 + _kz1 * lc2);
         for (let i = 0; i < NODE_COUNT; i++) {
             const bp = basePositions[i];
             let x, y, z;
@@ -1875,7 +2080,7 @@ function animate(ts) {
                 nodeSeeds[i] = Math.min(0.60,
                     bp.seed0 + w * waveGain + 0.28 * kAtt * (1.0 + gaitFlash * TUNE.flashGain));
             } else if (bp.kind === 1) {
-                const t = _fract(bp.d0 + cubeRunnerFlow * bp.speed);
+                const t = _fract(bp.d0 + latticeRunnerFlow * bp.speed);
                 const p = -bp.span + t * 2 * bp.span;
                 // Taper at the faces so the wrap hides off-grid.
                 bp.sz = 0.85 * Math.min(1, 8 * Math.min(t, 1 - t) + 0.10);
@@ -1893,9 +2098,105 @@ function animate(ts) {
             const x1 = x * lc1 + z * ls1;
             const z1 = -x * ls1 + z * lc1;
             currentPositions[i].set(
-                x1 - _cubeFx,
-                y * lc2 - z1 * ls2 - _cubeFy,
-                y * ls2 + z1 * lc2 - _cubeFz);
+                x1 - _latFx,
+                y * lc2 - z1 * ls2 - _latFy,
+                y * ls2 + z1 * lc2 - _latFz);
+        }
+        instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
+    } else if (FORM === 'embedding') {
+        // ── EMBEDDING: concept clusters drift on slow orbits with
+        //    gentle internal swirl; the query comet flies an outward
+        //    bezier arc cluster→cluster (faster while the agent is
+        //    busy). Arrival IGNITES the recalled cluster — it flares
+        //    hot and tightens, then cools back over ~2s.
+        const cc = [];
+        if (embTight.length !== _embCenters.length) {
+            embTight.length = 0;
+            for (let c = 0; c < _embCenters.length; c++) embTight.push(0);
+        }
+        for (let c = 0; c < _embCenters.length; c++) {
+            const e = _embCenters[c];
+            const a = e.oa + time * e.ow;
+            cc.push([
+                e.bx + e.or * Math.sin(a),
+                e.by + e.or * 0.6 * Math.sin(a * 1.31 + 1.2),
+                e.bz + e.or * Math.cos(a * 0.83),
+            ]);
+            embExcite[c] *= decay(0.985);
+            // The glow ignites in one frame (a flash reads right); the
+            // cluster's contraction follows it over ~6 frames — the
+            // instant 30% radius snap was a visible pop (2026-09-20).
+            embTight[c] += (embExcite[c] - embTight[c]) * ease(0.22);
+        }
+        embT += (dtF / 60) * (0.24 + 0.60 * drive + 0.4 * flinch + 0.8 * gaitFlow) * CALM;
+        if (embT >= 1.0) {
+            embExcite[embTo] = 1.0;
+            embFrom = embTo;
+            let next = Math.floor(Math.random() * _embCenters.length);
+            if (next === embFrom) next = (next + 1) % _embCenters.length;
+            embTo = next;
+            embT = 0.0;
+        }
+        const A = cc[embFrom] || [0, 0, 0], B = cc[embTo] || [0, 0, 0];
+        // Control point pushed outward: the flight arcs through the
+        // void between concepts instead of cutting through the origin.
+        const CXx = (A[0] + B[0]) * 0.5 * 1.75;
+        const CXy = (A[1] + B[1]) * 0.5 * 1.75;
+        const CXz = (A[2] + B[2]) * 0.5 * 1.75;
+        // Dive focus (2026-07-29 operator report, descent's sibling
+        // fix): the immersion dive zooms toward the scene ORIGIN, and
+        // embedding's origin is DELIBERATELY empty void between the
+        // clusters. While diving, translate the whole space so the
+        // QUERY HEAD sits at the origin — a user turn rides the recall
+        // flight itself. Weighted by `dive`, so at rest nothing moves;
+        // the head's path is continuous (bezier, and each new flight
+        // starts where the last one landed), so the follow never jumps.
+        // The head's flight parameter is stretched by the tail lag (see
+        // the comet below) so head and focus agree frame for frame.
+        const _ehT = Math.min(1, embT * (1.0 + EMB_TAIL_LAG));
+        const _ehE = _ehT * _ehT * (3 - 2 * _ehT);
+        const _ehU = 1 - _ehE;
+        const _embFx = dive * (_ehU * _ehU * A[0] + 2 * _ehU * _ehE * CXx + _ehE * _ehE * B[0]);
+        const _embFy = dive * (_ehU * _ehU * A[1] + 2 * _ehU * _ehE * CXy + _ehE * _ehE * B[1]);
+        const _embFz = dive * (_ehU * _ehU * A[2] + 2 * _ehU * _ehE * CXz + _ehE * _ehE * B[2]);
+        for (let i = 0; i < NODE_COUNT; i++) {
+            const bp = basePositions[i];
+            let x, y, z;
+            if (bp.kind === 0) {
+                const ex = embExcite[bp.ci] || 0;
+                const C = cc[bp.ci] || [0, 0, 0];
+                const sp = time * _embCenters[bp.ci].spin * CALM;
+                const cs = Math.cos(sp), sn = Math.sin(sp);
+                const ox = bp.dx * cs + bp.dz * sn;
+                const oz = -bp.dx * sn + bp.dz * cs;
+                const r = bp.r0 * (1.0 - 0.30 * (embTight[bp.ci] || 0))
+                    * (1.0 + 0.06 * pulseAmp
+                        * _pulseShape(_fract(pulsePhase - bp.ci * 0.13)));
+                x = C[0] + ox * r + 0.015 * CALM * Math.sin(time * 1.0 + bp.jit);
+                y = C[1] + bp.dy * r + 0.015 * CALM * Math.sin(time * 0.8 + bp.jit * 2.0);
+                z = C[2] + oz * r;
+                nodeSeeds[i] = Math.min(0.58, bp.seed0 + 0.40 * ex);
+            } else {
+                // Query comet: head leads, tail nodes trail along the
+                // same flight path with a slight lag. The flight is
+                // stretched by the lag (2026-09-20): the tail used to be
+                // only ~97% of the way when embT wrapped to the next
+                // flight, so every arrival SNAPPED the tail onto the
+                // cluster (0.08–0.13 unit jumps). Now the head lands at
+                // embT ≈ 0.91 and holds while the tail catches up, and
+                // the wrap finds every node already at B.
+                const tl = Math.max(0, Math.min(1, embT * (1.0 + EMB_TAIL_LAG) - bp.s * EMB_TAIL_LAG));
+                const e = tl * tl * (3 - 2 * tl);
+                const u = 1 - e;
+                x = u * u * A[0] + 2 * u * e * CXx + e * e * B[0]
+                    + bp.rr * Math.sin(time * 2.1 + bp.jit * 3.0);
+                y = u * u * A[1] + 2 * u * e * CXy + e * e * B[1]
+                    + bp.rr * Math.cos(time * 1.7 + bp.jit * 2.0);
+                z = u * u * A[2] + 2 * u * e * CXz + e * e * B[2]
+                    + bp.rr * Math.sin(time * 1.9 + bp.jit * 5.0);
+                bp.sz = 1.0 - bp.s * 0.5;
+            }
+            currentPositions[i].set(x - _embFx, y - _embFy, z - _embFz);
         }
         instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
     } else if (FORM === 'descent') {
@@ -1990,6 +2291,134 @@ function animate(ts) {
                 x - _descFx,
                 y * TC - z * TS - 0.15 - _descFy,
                 y * TS + z * TC - _descFz);
+        }
+        instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
+    } else if (FORM === 'cube') {
+        // ── CUBE: the infinite monolith. The grid barely moves — the
+        //    LIFE is in the resident complexities, each an alien sine
+        //    field quietly warping its neighborhood. A user turn wakes
+        //    one (the mutation): it grows aggressively-but-not-fast,
+        //    spreads through each node's own irregular gate, churns
+        //    faster as it strengthens, runs crimson at its heart — and
+        //    the dive translation carries the camera into it. On
+        //    completion it tames over ~6s and the cube re-knits.
+        const _turnOn = userTurnState > 0.5;
+        // New turn while calm: a (possibly different) complexity wakes.
+        // Mid-decay re-arms keep the SAME one — the heat must never
+        // teleport. `dive < 0.005` (2026-09-20): the dive translation is
+        // `dive × anchor`, and the dive lingers ~9s after cubeS has
+        // tamed below 0.4 — a follow-up message in that window used to
+        // re-pick the anchor and TELEPORT the whole cube by up to
+        // dive × |Δanchor| (≈1 unit, measured) in a single frame.
+        if (_turnOn && !_cubePrevTurn && cubeS < 0.4 && dive < 0.005) {
+            cubeActive = Math.floor(Math.random() * _cubeCx.length);
+        }
+        _cubePrevTurn = _turnOn;
+        if (_turnOn) {
+            cubeS += (1.0 - cubeS) * ease(0.014);   // ~5s to full presence
+        } else if (cubeS > 0.001) {
+            // Taming tail slowed 0.988 → 0.9935 (v2): the spring-back
+            // must pace the ~10s dive-out — nodes releasing faster than
+            // the camera retreats was the "erratic zoom-out".
+            cubeS *= decay(0.9935);
+        } else {
+            cubeS = 0.0;
+        }
+        // Stately monolith tumble — slower than lattice.
+        const ka1 = time * 0.030 * CALM, ka2 = time * 0.019 * CALM;
+        const kc1 = Math.cos(ka1), ks1 = Math.sin(ka1);
+        const kc2 = Math.cos(ka2), ks2 = Math.sin(ka2);
+        // Dive focus: the ACTIVE complexity's post-tumble position —
+        // the camera rides into the mutation, not a generic corner
+        // (the descent/embedding lesson applied from birth).
+        const _A = _cubeCx[cubeActive] || { ax: 0, ay: 0, az: 0 };
+        const _awx = _A.ax * kc1 + _A.az * ks1;
+        const _awz1 = -_A.ax * ks1 + _A.az * kc1;
+        const _awy = _A.ay * kc2 - _awz1 * ks2;
+        const _awz = _A.ay * ks2 + _awz1 * kc2;
+        const kfx = dive * _awx, kfy = dive * _awy, kfz = dive * _awz;
+        // Per-complexity integrated phases (see _buildCube): the churn
+        // and the heart's spin advance at their CURRENT rate each frame.
+        for (let k = 0; k < _cubeCx.length; k++) {
+            const c = _cubeCx[k];
+            const Sk = k === cubeActive ? cubeS : 0;
+            c.churn += tStep * (0.7 + 1.4 * Sk + 1.0 * gaitFlow);
+            c.spin += tStep * (0.35 + 1.3 * Sk) * CALM;
+        }
+        for (let i = 0; i < NODE_COUNT; i++) {
+            const bp = basePositions[i];
+            let x, y, z;
+            if (bp.kind === 0) {
+                x = bp.gx; y = bp.gy; z = bp.gz;
+                let heat = 0;
+                for (let k = 0; k < _cubeCx.length; k++) {
+                    const c = _cubeCx[k];
+                    const Sk = k === cubeActive ? cubeS : 0;
+                    // Idle life (v2): each complexity is ALREADY a slow
+                    // red organism — swelling and shrinking on its own
+                    // rhythm — and the active one adds the mutation on
+                    // top. S_total drives radius, motion and heat alike.
+                    const St = 0.22 + 0.12 * Math.sin(time * 0.11 + c.ph) + Sk;
+                    const edge = c.r0 * (0.8 + 1.5 * St) * bp.gate;
+                    const dx = bp.gx - c.ax, dy = bp.gy - c.ay, dz = bp.gz - c.az;
+                    const d = Math.hypot(dx, dy, dz);
+                    if (d > edge + 0.4) continue;
+                    const w = 1 - d / (edge + 0.4);
+                    const wS = w * w;
+                    const amp = (0.06 + 0.30 * St) * wS * CALM
+                        * (1 + 0.5 * flinch) * (1.0 - TUNE.alignGain * gaitAlign);
+                    // The mutation churns FASTER as it strengthens (and
+                    // while the reply streams, in the 'flow' dialect) —
+                    // c.churn integrates that rate.
+                    const tk = c.churn;
+                    // SPATIALLY COHERENT field (v2, "random dots" fix):
+                    // phases keyed to grid POSITION at low frequency, so
+                    // neighbors move together — waves rippling through
+                    // flesh — with only a whisper of per-node texture.
+                    x += amp * (Math.sin(tk * 0.9 + bp.gy * 1.9 + bp.gz * 1.3 + c.ph)
+                        + 0.15 * Math.sin(tk * 1.7 + bp.jit * 3.0));
+                    y += amp * (Math.sin(tk * 0.75 + bp.gz * 1.7 + bp.gx * 1.1 + c.ph * 2.0)
+                        + 0.15 * Math.sin(tk * 1.5 + bp.jit * 5.0));
+                    z += amp * (Math.sin(tk * 0.6 + bp.gx * 1.5 + bp.gy * 1.4 + c.ph * 3.0)
+                        + 0.15 * Math.sin(tk * 1.3 + bp.jit * 7.0));
+                    // ACCRETION, gentled 0.55 → 0.35 (v2): enough to
+                    // knit the mutation visibly denser, small enough
+                    // that its release can never read erratic.
+                    const pull = 0.35 * Sk * w;
+                    x -= dx * pull;
+                    y -= dy * pull;
+                    z -= dz * pull;
+                    // RED that reads as a spreading REGION: the heat
+                    // front rides the same envelope as the deformation,
+                    // so wherever the flesh moves, it is red — idle
+                    // cores sit visibly crimson, the mutation drives
+                    // the front outward across the grid.
+                    heat += wS * (0.30 + 0.34 * St);
+                }
+                nodeSeeds[i] = Math.min(0.60, bp.seed0 + heat);
+            } else {
+                // Complexity heart: a small orbiting tangle — violet at
+                // rest, swelling and running crimson as ITS mutation
+                // grows.
+                const c = _cubeCx[bp.ci] || _cubeCx[0] || { ax: 0, ay: 0, az: 0, ph: 0 };
+                const Sk = bp.ci === cubeActive ? cubeS : 0;
+                const sp = c.spin + bp.jit;
+                const cs = Math.cos(sp), sn = Math.sin(sp);
+                const r = bp.rr * (1 + 1.1 * Sk + 0.5 * gaitFlash * TUNE.flashGain)
+                    * (1 + 0.10 * Math.sin(time * 0.9 + bp.jit * 2.0));
+                const ox = bp.dx * cs + bp.dz * sn;
+                const oz = -bp.dx * sn + bp.dz * cs;
+                x = c.ax + ox * r;
+                y = c.ay + bp.dy * r * (1 + 0.3 * Math.sin(time * 0.7 + bp.jit));
+                z = c.az + oz * r;
+                nodeSeeds[i] = Math.min(0.62,
+                    0.52 + 0.08 * Sk + 0.03 * Math.sin(time * 0.8 + bp.jit));
+            }
+            const x1 = x * kc1 + z * ks1;
+            const z1 = -x * ks1 + z * kc1;
+            const y2 = y * kc2 - z1 * ks2;
+            const z2 = y * ks2 + z1 * kc2;
+            currentPositions[i].set(x1 - kfx, y2 - kfy, z2 - kfz);
         }
         instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
     } else {
@@ -2092,13 +2521,19 @@ function animate(ts) {
     // this only accepts more pairs, bounded by MAX_LINES).
     // Per-form link-radius² multipliers: the vortex reads best DENSE
     // (1.5× weaves the funnel membrane tighter — "a bit more dense");
-    // the AI forms need TIGHTER radii — the cube so only axis-neighbors
-    // weave (a clean wireframe tensor, no diagonals), descent so the
-    // terrain reads as a mesh surface, not a solid (the mobile sheet is
-    // sparser, hence the wider radius).
+    // the AI forms need TIGHTER radii — lattice so only axis-neighbors
+    // weave (a clean wireframe tensor, no diagonals), embedding so
+    // clusters can never cross-link (the void between concepts stays
+    // void), descent so the terrain reads as a mesh surface, not a
+    // solid (the mobile sheet is sparser, hence the wider radius).
     const LINK_MULT = {
         vortex: 1.5,
-        cube: 0.45,
+        lattice: 0.45,
+        // Cube: neighbors-only like lattice but on the BIGGER cell edge
+        // (0.88/0.95); mutation displacement deliberately exceeds the
+        // link slack so the grid visibly tears and re-weaves around it.
+        cube: 0.62,
+        embedding: 0.62,
         // Descent radius must cover a grid step across the WORST-CASE
         // analytic slope of _lossH (all terms aligned), or the sheet
         // tears momentarily on steep ridges — computed invariant pinned

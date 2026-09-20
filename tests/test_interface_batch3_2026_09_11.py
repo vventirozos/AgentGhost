@@ -465,15 +465,16 @@ class TestFacePausesWhenHidden:
     def _run(self, graph_js, expr, renderer="{}"):
         fn = extract_js_function(graph_js, "setAnimationPaused").replace("export function", "function")
         return eval_js(f"""
-let animationFrameId = 7, renderer = {renderer}, _animationPaused = false;
+let animationFrameId = 7, renderer = {renderer}, _animationPaused = false, _lastFrameTs = 123;
 const cancelled = [], started = [];
 globalThis.cancelAnimationFrame = (id) => cancelled.push(id);
 function animate() {{ started.push(1); animationFrameId = 9; }}
 """ + fn, expr)
 
     def test_pause_cancels_the_frame_and_resume_restarts_it(self, graph_js):
-        out = self._run(graph_js, "[setAnimationPaused(true), animationFrameId, cancelled, setAnimationPaused(false), started.length, animationFrameId]")
-        assert out == [False, None, [7], True, 1, 9]
+        out = self._run(graph_js, "[setAnimationPaused(true), animationFrameId, cancelled, _lastFrameTs, setAnimationPaused(false), started.length, animationFrameId]")
+        # pausing also drops the frame stamp so the first resumed frame steps one frame (2026-09-20)
+        assert out == [False, None, [7], None, True, 1, 9]
 
     def test_resume_before_init_does_not_start_a_loop_without_a_renderer(self, graph_js):
         out = self._run(graph_js, "[setAnimationPaused(true), setAnimationPaused(false), started.length]", renderer="null")
@@ -484,7 +485,7 @@ function animate() {{ started.push(1); animationFrameId = 9; }}
         assert out == [True, 0], "a running loop was started a second time (two frames per tick)"
 
     def test_the_loop_guards_itself_and_visibility_drives_it(self, graph_js):
-        i = graph_js.index("function animate() {")
+        i = graph_js.index("function animate(ts) {")   # rAF timestamp since 2026-09-20
         assert graph_js[i:i + 120].count("if (_animationPaused) { animationFrameId = null; return; }") == 1
         assert "document.addEventListener('visibilitychange', () => setAnimationPaused(!!document.hidden))" in graph_js
 
@@ -588,6 +589,6 @@ def test_touched_modules_bumped():
     index = (_STATIC / "index.html").read_text()
     app = (_STATIC / "app.js").read_text()
     ws = (_STATIC / "workspace.js").read_text()
-    assert "app.js?v=12.5" in index
-    assert "workspace.js?v=8.6" in app and "matrix_graph.js?v=12.5" in app
+    assert "app.js?v=12.8" in index
+    assert "workspace.js?v=8.6" in app and "matrix_graph.js?v=12.8" in app
     assert "sessions.js?v=7.9" in ws and "status.js?v=7.4" in ws

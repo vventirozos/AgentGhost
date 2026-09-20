@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=12.5';
+import * as matrixGraphFace from './matrix_graph.js?v=12.8';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -3232,11 +3232,9 @@ if (fullscreenBtn) {
 // jumps straight to it. Falls back to the old cycle if the face module
 // predates getForms/setForm (stale cache).
 const FACE_FORM_HINTS = {
+    cube: 'weight tensor',
     vortex: 'black hole',
-    lattice: 'weight tensor',
-    embedding: 'latent space',
     descent: 'loss landscape',
-    cube: 'infinite monolith',
     empty: 'no face',
 };
 const faceFormBtn = document.getElementById('face-form-btn');

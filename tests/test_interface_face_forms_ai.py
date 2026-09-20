@@ -1,15 +1,16 @@
-"""Regression guard for the four AI face forms (2026-07-29).
+"""Regression guard for the AI face forms (2026-07-29; roster 2026-09-20).
 
 The 2026-07-28 alien forms (abyssal/horizon/cortex/vortex/empty) gained
 four AI-native siblings — the machine's own internals as anatomy, over
 the SAME motion engine:
 
-    lattice   — the weight tensor: tumbling crystal grid, diagonal
-                activation waves, a drifting hot attention kernel.
-    stack     — the transformer: tapering layer-rings, hot residual
-                column, token packets climbing and rippling each layer.
-    embedding — latent space: cold concept clusters, hot query comet
-                doing recall (arrival ignites the cluster).
+    cube      — the weight tensor (named `lattice` until 2026-09-20, when
+                the operator deleted embedding and the old monolith
+                `cube`, gave the lattice this name and made it the
+                DEFAULT): tumbling crystal grid, diagonal activation
+                waves, a drifting hot attention kernel.
+    stack     — the transformer (removed 2026-09-12).
+    embedding — latent space (removed 2026-09-20).
     descent   — the loss landscape: evolving terrain sheet, optimizer
                 bead rolling true gradient descent, stuck-kicks.
 
@@ -45,10 +46,11 @@ def graph_js() -> str:
 # ── presence + cycle order ─────────────────────────────────────────
 
 def test_ai_form_builders_present(graph_js):
-    for builder in ("_buildLattice", "_buildEmbedding",
-                    "_buildDescent", "_buildCube"):
+    for builder in ("_buildCube", "_buildDescent"):
         assert builder in graph_js, f"missing {builder}"
         assert f"{builder}()" in graph_js, f"{builder} never dispatched"
+    for gone in ("_buildLattice", "_buildEmbedding", "_cubeCx", "embExcite"):
+        assert gone not in graph_js, f"{gone} is back (removed 2026-09-20)"
 
 
 def test_forms_array_contents_and_order(graph_js):
@@ -56,11 +58,14 @@ def test_forms_array_contents_and_order(graph_js):
     assert m, "FORMS array missing"
     names = re.findall(r"'(\w+)'", m.group(1))
     # 2026-09-12 (operator): abyssal, horizon, cortex, stack, conversation
-    # and toolgraph removed; 'empty' stays last.
-    assert names == ["vortex", "lattice", "embedding", "descent", "cube", "empty"]
+    # and toolgraph removed. 2026-09-20 (operator): embedding and the old
+    # cube removed, lattice renamed cube and made the DEFAULT (listed
+    # first); 'empty' stays last.
+    assert names == ["cube", "vortex", "descent", "empty"]
     # 'empty' last: cycling INTO it disperses the face beyond the screen
-    # edges and the NEXT cycle materializes vortex from the void.
+    # edges and the NEXT cycle materializes the default from the void.
     assert names[-1] == "empty"
+    assert "let formIndex = FORMS.indexOf('cube');" in graph_js, "cube is the default"
 
 
 # ── name-based dispatch (the index comparisons broke on growth) ────
@@ -76,15 +81,17 @@ def test_link_multiplier_map(graph_js):
     m = re.search(r"const LINK_MULT = \{(.*?)\};", graph_js, re.DOTALL)
     assert m, "per-form link multiplier map missing"
     body = m.group(1)
-    for key in ("vortex", "lattice", "embedding", "descent"):
+    for key in ("vortex", "cube", "descent"):
         assert re.search(rf"\b{key}:", body), f"LINK_MULT.{key} missing"
+    for gone in ("lattice", "embedding"):
+        assert not re.search(rf"\b{gone}:", body), f"LINK_MULT.{gone} outlived its form"
 
 
 def test_new_forms_reheat_seeds_per_frame(graph_js):
-    # lattice (wave+kernel heat), embedding (recall ignition), descent
-    # (height+bead heat) and cube all rewrite nodeSeeds per frame — each
-    # must flag the attribute upload, like vortex already does.
-    assert graph_js.count("aSeed.needsUpdate = true") >= 5
+    # cube (wave+kernel heat) and descent (height+bead heat) rewrite
+    # nodeSeeds per frame — each must flag the attribute upload, like
+    # vortex already does (plus the setForm upload).
+    assert graph_js.count("aSeed.needsUpdate = true") >= 4
 
 
 # ── geometry invariants (computed from the shipped constants) ──────
@@ -95,13 +102,13 @@ def _const(graph_js, pattern):
     return float(m.group(1))
 
 
-def test_lattice_links_neighbors_but_not_diagonals(graph_js):
+def test_cube_links_neighbors_but_not_diagonals(graph_js):
     """The tensor must read as a clean wireframe grid: cell edge under
     the link radius, face diagonal over it — no diagonal mush."""
     prox = _const(graph_js, r"const PROXIMITY_SQ = ([\d.]+)")
-    mult = _const(graph_js, r"lattice: ([\d.]+)")
-    edge = _const(graph_js, r"const LATTICE_A = IS_MOBILE \? [\d.]+ : ([\d.]+)")
-    edge_mobile = _const(graph_js, r"const LATTICE_A = IS_MOBILE \? ([\d.]+)")
+    mult = _const(graph_js, r"cube: ([\d.]+)")
+    edge = _const(graph_js, r"const CUBE_A = IS_MOBILE \? [\d.]+ : ([\d.]+)")
+    edge_mobile = _const(graph_js, r"const CUBE_A = IS_MOBILE \? ([\d.]+)")
     radius = math.sqrt(prox * mult)
     for a in (edge, edge_mobile):
         assert a < radius, f"cell edge {a} must link (radius {radius:.3f})"
@@ -132,57 +139,6 @@ def test_descent_mesh_holds_on_slopes(graph_js):
             f"radius {radius:.3f}: the sheet would tear")
 
 
-def test_cube_links_neighbors_but_not_diagonals(graph_js):
-    """The monolith must read as a clean giant grid: cell edge under the
-    link radius, face diagonal over it — on BOTH device classes."""
-    prox = _const(graph_js, r"const PROXIMITY_SQ = ([\d.]+)")
-    mult = _const(graph_js, r"cube: ([\d.]+)")
-    edge = _const(graph_js, r"const CUBE_A = IS_MOBILE \? [\d.]+ : ([\d.]+)")
-    edge_mobile = _const(graph_js, r"const CUBE_A = IS_MOBILE \? ([\d.]+)")
-    radius = math.sqrt(prox * mult)
-    for a in (edge, edge_mobile):
-        assert a < radius, f"cell edge {a} must link (radius {radius:.3f})"
-        assert a * math.sqrt(2) > radius, (
-            f"face diagonal {a * math.sqrt(2):.3f} must NOT link")
-
-
-def test_cube_mutation_contract(graph_js):
-    """The operator's concept, pinned: a FEW resident complexities; a
-    USER turn (not ambient work) wakes exactly one; growth is eased
-    (aggressive but not instant), decay is a slow taming; the spread
-    boundary is per-node irregular; the dive focuses on the ACTIVE
-    mutation's post-tumble position."""
-    # Few complexities — "not many, just enough to be interesting".
-    n_desk = _const(graph_js, r"const CUBE_CX_COUNT = IS_MOBILE \? \d+ : (\d+)")
-    assert 2 <= n_desk <= 4
-    # Driven by the user turn, mirroring the vortex pattern.
-    assert "userTurnState > 0.5" in graph_js and "_cubePrevTurn" in graph_js
-    # Eased growth + SLOW taming tail (v2: release must pace the ~10s
-    # dive-out or the zoom-out reads erratic).
-    assert "cubeS += (1.0 - cubeS) * 0.014" in graph_js
-    assert "cubeS *= 0.9935" in graph_js
-    # Mid-decay re-arms keep the same anchor — heat must never teleport.
-    assert "cubeS < 0.4" in graph_js
-    # Irregular organic spread boundary (per-node gate).
-    assert "gate:" in graph_js and "* bp.gate" in graph_js
-    # Mutation churns faster as it strengthens (and, since 2026-09-11, while
-    # the reply streams — the cube's 'flow' dialect).
-    assert "time * (0.7 + 1.4 * Sk + 1.0 * gaitFlow)" in graph_js
-    # v2: idle complexities are already-red slow organisms (S_total
-    # carries an idle breath), and the displacement field is SPATIALLY
-    # coherent (position-keyed phases — neighbors move together).
-    assert "0.22 + 0.12 * Math.sin" in graph_js
-    assert "bp.gy * 1.9" in graph_js, "coherent field must key on position"
-    # Dive rides INTO the active mutation (focus-translate lesson) but
-    # only PARTIALLY — watch the spread, never enter the dot cloud.
-    assert "dive * _awx" in graph_js
-    assert "CUBE_DIVE_Z = 3.1" in graph_js
-    # The monolith silhouette: edge/corner nodes render larger.
-    assert "onFace" in graph_js
-    # Crimson stays capped on the thermal ring's red stop.
-    assert "Math.min(0.60, bp.seed0 + heat)" in graph_js
-
-
 # ── behavioral micro-pins ──────────────────────────────────────────
 
 def test_descent_is_actual_gradient_descent(graph_js):
@@ -192,28 +148,21 @@ def test_descent_is_actual_gradient_descent(graph_js):
         "velocity update must subtract the gradient (descent, not ascent)"
 
 
-def test_embedding_recall_ignition(graph_js):
-    assert "embExcite[embTo] = 1.0" in graph_js, "arrival must ignite"
-    assert re.search(r"embExcite\[c\] \*= 0\.9", graph_js), "glow must decay"
-    # Octahedral anchors: with the tightened link radius this is what
-    # guarantees clusters never cross-link.
-    assert "[1, 0, 0], [-1, 0, 0], [0, 1, 0]" in graph_js
-
-
 def test_dive_centers_on_the_form_focus(graph_js):
     """2026-07-29 operator report: 'descent usually zooms into an
     uninteresting location when busy.' The immersion dive targets the
-    scene ORIGIN — for descent a generic terrain patch, for embedding
-    the deliberately-empty void between clusters. Both forms must
-    translate their space (dive-weighted) so the dive rides the form's
-    hot focus: the optimizer bead / the query comet."""
+    scene ORIGIN — for descent a generic terrain patch, for the cube the
+    grid centre with the attention kernel off screen (2026-09-20). Both
+    forms translate their space (dive-weighted) so the dive rides the
+    form's hot focus: the optimizer bead / the attention kernel. (The
+    executed pins live in test_interface_face_motion_2026_09_20.py.)"""
     # descent: bead world position subtracted, dive-weighted, with the
     # +0.30 lift so the camera hovers over the surface.
     assert "const _descFx = dive * beadX" in graph_js
     assert "- _descFx" in graph_js and "- _descFy" in graph_js
-    # embedding: query-head bezier position subtracted, dive-weighted.
-    assert "const _embFx = dive *" in graph_js
-    assert "- _embFx" in graph_js and "- _embFy" in graph_js
+    # cube: the kernel's post-tumble position subtracted, dive-weighted.
+    assert "const _cubeFx = dive *" in graph_js
+    assert "- _cubeFx" in graph_js and "- _cubeFy" in graph_js
 
 
 def test_form_picker_menu(graph_js):
@@ -229,17 +178,19 @@ def test_form_picker_menu(graph_js):
     assert "face-form-menu" in app_js
     assert "cycleForm()" in app_js, "stale-cache fallback must remain"
     # Every shipped form carries a hint line in the picker.
-    for name in ("vortex", "lattice", "embedding", "descent", "cube", "empty"):
+    for name in ("cube", "vortex", "descent", "empty"):
         assert re.search(rf"\b{name}: '", app_js), f"hint missing for {name}"
+    for gone in ("lattice", "embedding"):
+        assert not re.search(rf"\b{gone}: '", app_js), f"hint for removed form {gone}"
     css = (_STATIC / "style.css").read_text(encoding="utf-8")
     assert "#face-form-menu" in css
     assert ".face-form-item.active" in css
 
 
 def test_wrap_fades_hide_respawns(graph_js):
-    # Lattice runners wrap; they must taper size at the wrap ends (bp.sz
-    # mutation) so respawns don't pop on screen. (The stack's packets,
-    # the other wrapper, left with the form on 2026-09-12.)
+    # The cube's runners wrap; they must taper size at the wrap ends
+    # (bp.sz mutation) so respawns don't pop on screen. (The stack's
+    # packets, the other wrapper, left with the form on 2026-09-12.)
     assert graph_js.count("Math.min(t, 1 - t)") >= 1
 
 
@@ -262,16 +213,12 @@ const basePositions = [];
 const nodeSeeds = new Float32Array(NODE_COUNT);
 const VORTEX_APEX_Z = -2.0, VORTEX_LMIN = 0.55, VORTEX_KOUT = 2.6;
 const VORTEX_COS = 0.60, VORTEX_SIN = 0.80;
-let embFrom = 0, embTo = 1, embT = 0.5;
-const embExcite = []; let _embCenters = [];
 let beadX = 0, beadZ = 0, beadVX = 0, beadVZ = 0, beadStill = 0;
 const beadTrail = []; let _descTick = 0;
-let _cubeCx = []; let cubeActive = 0, cubeS = 0, _cubePrevTurn = false;
-const FORMS = ['vortex', 'lattice', 'embedding', 'descent', 'cube', 'empty'];
+const FORMS = ['cube', 'vortex', 'descent', 'empty'];
 let formIndex = 0;
 {section}
-const builders = [_buildVortex, _buildLattice, _buildEmbedding, _buildDescent,
-    _buildCube, _buildEmpty];
+const builders = [_buildCube, _buildVortex, _buildDescent, _buildEmpty];
 for (const fn of builders) {{
     basePositions.length = 0;
     fn();

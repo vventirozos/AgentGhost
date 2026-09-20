@@ -112,7 +112,7 @@ class TestFacePureHelpers:
                      "fireIdleTwitch", "ghost_face_auto", "ghost_face_tune"):
             assert gone not in graph_nc, f"{gone} is back"
         m = re.search(r"const FORMS = \[(.*?)\];", graph_nc, re.DOTALL)
-        assert re.findall(r"'(\w+)'", m.group(1)) == ["vortex", "lattice", "embedding", "descent", "cube", "empty"]
+        assert re.findall(r"'(\w+)'", m.group(1)) == ["cube", "vortex", "descent", "empty"]
 
 
 class TestFaceRenderWiring:
@@ -125,7 +125,9 @@ class TestFaceRenderWiring:
             "gaits must be applied BEFORE the reorganisation blend or a form switch snaps")
 
     def test_stillness_slows_time_and_the_pulse_clock(self, graph_nc):
-        assert "time += 0.005 * (1.0 + dive * 0.6) * motionMul;" in graph_nc
+        # dt-scaled since 2026-09-20 (tStep = the clock advance this frame).
+        assert "const tStep = 0.005 * (1.0 + dive * 0.6) * motionMul * dtF;" in graph_nc
+        assert "time += tStep;" in graph_nc
         assert "* (PREFERS_REDUCED_MOTION ? 0.5 : 1.0) * motionMul;" in graph_nc
         i = graph_nc.index("const still = Math.min(1.0, Math.max(")
         body = graph_nc[i:i + 300]
@@ -150,7 +152,7 @@ class TestFaceRenderWiring:
         assert "verdict === 'pass'" in body
 
     def test_gaze_moves_the_look_target_not_the_camera(self, graph_nc):
-        assert "camera.lookAt(gazeX, gazeY * (1.0 - dive)," in graph_nc
+        assert "camera.lookAt(gazeX, gazeY * (1.0 - dive) - _lookDrop * dive," in graph_nc
         assert "targetGazeY = active ? -TUNE.gazeY : 0.0;" in graph_nc
 
     def test_verdict_stop_exhales_and_background_breathes_the_scale(self, graph_nc):
@@ -171,7 +173,7 @@ class TestFaceRenderWiring:
         i = graph_nc.rindex("    if (FORM === 'vortex') {", 0, j)
         chain = graph_nc[i:j]
         branches = re.findall(r"\} else if \(FORM === '(\w+)'\)", chain)
-        assert branches == ["lattice", "embedding", "descent", "cube"], branches
+        assert branches == ["cube", "descent"], branches   # 2026-09-20 roster
         assert "} else if (FORM === 'empty')" not in chain, "empty is the trailing else now"
 
 
@@ -269,7 +271,7 @@ let _turnVerdict = null, _lastRecallAt = 0;
         assert 'id="face-tooltip"' not in html
         i = app_nc.index("const FACE_FORM_HINTS = {")
         hints = app_nc[i:app_nc.index("};", i)]
-        assert re.findall(r"(\w+): ", hints) == ["vortex", "lattice", "embedding", "descent", "cube", "empty"]
+        assert re.findall(r"(\w+): ", hints) == ["cube", "vortex", "descent", "empty"]
         ws = strip_js_comments((_STATIC / "workspace.js").read_text(encoding="utf-8"))
         pal = strip_js_comments((_STATIC / "palette.js").read_text(encoding="utf-8"))
         assert "facelab" not in ws and "faceLab" not in ws and "faceLab" not in pal and "Face lab" not in pal
@@ -336,6 +338,6 @@ def test_touched_modules_bumped():
     index = (_STATIC / "index.html").read_text()
     app = (_STATIC / "app.js").read_text()
     ws = (_STATIC / "workspace.js").read_text()
-    assert "app.js?v=12.5" in index and "style.css?v=6.4" in index
-    assert "matrix_graph.js?v=12.5" in app and "workspace.js?v=8.6" in app
+    assert "app.js?v=12.8" in index and "style.css?v=6.4" in index
+    assert "matrix_graph.js?v=12.8" in app and "workspace.js?v=8.6" in app
     assert "status.js?v=7.4" in ws and "palette.js?v=7.2" in ws
