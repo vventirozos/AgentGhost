@@ -3259,20 +3259,35 @@ async def tool_list_lessons(context, scope: str = "today", limit: int = 20, **kw
         limit_int = 20
 
     if scope_norm == "self_play_only":
-        lessons = skill_memory.list_lessons(scope="all", source="self_play", limit=limit_int)
+        _q = dict(scope="all", source="self_play")
         header_scope = "self-play lessons"
     else:
-        lessons = skill_memory.list_lessons(scope=scope_norm, limit=limit_int)
+        _q = dict(scope=scope_norm, source="")
         header_scope = {
             "today": "lessons learned today",
             "week":  "lessons learned in the last 7 days",
             "all":   "all lessons learned so far",
         }[scope_norm]
+    lessons = skill_memory.list_lessons(limit=limit_int, **_q)
 
     if not lessons:
         return f"No {header_scope} yet."
 
-    lines = [f"## {len(lessons)} {header_scope}:"]
+    # R2-6 (2026-09-20): the header printed the PAGE length as the count —
+    # "## 100 all lessons learned so far:" over a 198-lesson store, and the
+    # agent answered "how many lessons do you have?" with 100. A truncated
+    # listing must say so and say of what; `count_lessons` is the total
+    # behind the same filter. (`getattr`: a stub memory may predate it.)
+    _count_fn = getattr(skill_memory, "count_lessons", None)
+    try:
+        total = int(_count_fn(**_q)) if callable(_count_fn) else len(lessons)
+    except Exception:  # noqa: BLE001 — a header must never fail the tool
+        total = len(lessons)
+    if total > len(lessons):
+        lines = [f"## {total} {header_scope} — showing the {len(lessons)} most "
+                 f"recent (limit={limit_int}, max 100; the total is {total}):"]
+    else:
+        lines = [f"## {len(lessons)} {header_scope}:"]
     for i, lesson in enumerate(lessons, 1):
         ts = lesson.get("timestamp") or ""
         when = ""

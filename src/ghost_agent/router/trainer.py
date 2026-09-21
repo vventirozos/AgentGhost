@@ -58,6 +58,15 @@ BOOTSTRAP_MAX_TRAJECTORIES = 20000
 class RouterTrainerReport:
     fit_succeeded: bool = False
     bail_reason: str = ""
+    # A bail is one of two things and the idle phase must not guess which
+    # from the prose: a DECISION (unchanged corpus, too few samples, gate
+    # not cleared — the loop ran and correctly did nothing) or an EXCEPTION
+    # (labeling/fit/bootstrap raised — the loop is broken). The heartbeat
+    # stamps `declined` for the first and `failed` for the second; before
+    # 2026-09-20 (R1-1) it stamped NEITHER for an in-trainer bail, so the
+    # liveness view printed `✗ DEAD router_train` every day for a loop that
+    # was running hourly and declining an 89%-unchanged corpus.
+    exception: bool = False
     n_samples: int = 0
     easy: int = 0
     hard: int = 0
@@ -379,6 +388,7 @@ class RouterTrainer:
             pairs = label_trajectories(list(trajectories))
         except Exception as e:
             report.bail_reason = f"labeling failed: {e}"
+            report.exception = True
             return report
 
         if len(pairs) < self.min_trajectories:
@@ -605,6 +615,7 @@ class RouterTrainer:
             clf.gate_report_ = gate_ev
         except Exception as e:
             report.bail_reason = f"fit failed: {e}"
+            report.exception = True
             return report
 
         # §4O R2 MAJOR-1: reject an INVERTED model AT THE SOURCE — before
@@ -719,4 +730,5 @@ def bootstrap_router(
         logger.warning("router bootstrap-train failed (staying pass-through): %s", e)
         report.fit_succeeded = False
         report.bail_reason = f"bootstrap exception: {e}"
+        report.exception = True
         return None, report

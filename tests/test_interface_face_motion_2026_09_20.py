@@ -99,14 +99,14 @@ export class WebGLRenderTarget { constructor() {} }
 export const HalfFloatType = 1, RGBAFormat = 2, SRGBColorSpace = 3, AdditiveBlending = 4;
 export class BufferAttribute { constructor(array, itemSize) { this.array = array; this.itemSize = itemSize; this.needsUpdate = false; } }
 export class InstancedBufferAttribute extends BufferAttribute {}
-export class BufferGeometry { constructor() { this.attributes = {}; } setAttribute(n, a) { this.attributes[n] = a; } setDrawRange() {} dispose() {} }
+export class BufferGeometry { constructor() { this.attributes = {}; this.drawRange = { start: 0, count: 0 }; } setAttribute(n, a) { this.attributes[n] = a; } setDrawRange(s, c) { this.drawRange = { start: s, count: c }; } dispose() {} }
 export class PlaneGeometry extends BufferGeometry {}
 export class ShaderMaterial { constructor(o) { Object.assign(this, o); } dispose() {} }
 export class InstancedMesh extends Object3D {
   constructor(geometry, material, count) { super(); this.geometry = geometry; this.material = material; this.count = count; this.instanceMatrix = { needsUpdate: false }; this.captured = new Array(count); globalThis.__imesh = this; }
   setMatrixAt(i, m) { const c = this.captured[i] || (this.captured[i] = { p: new Vector3(), s: 0 }); c.p.copy(m.position); c.s = m.scale.x; }
 }
-export class LineSegments extends Object3D { constructor(g, m) { super(); this.geometry = g; this.material = m; } }
+export class LineSegments extends Object3D { constructor(g, m) { super(); this.geometry = g; this.material = m; globalThis.__lines = this; } }
 export class Points extends Object3D { constructor(g, m) { super(); this.geometry = g; this.material = m; } }
 """
 _COMPOSER_STUB = "export class EffectComposer { constructor() {} addPass() {} render() {} setSize() {} }\n"
@@ -135,7 +135,7 @@ Math.random = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 
 
 export const face = await import('./matrix_graph.js');
 face.init();
-export const scene = globalThis.__scene, camera = globalThis.__camera, imesh = globalThis.__imesh;
+export const scene = globalThis.__scene, camera = globalThis.__camera, imesh = globalThis.__imesh, lines = globalThis.__lines;
 export function setHz(hz) { frameMs = 1000 / hz; }
 export function advanceClock(ms) { nowMs += ms; }
 export function tick(n = 1) {
@@ -256,7 +256,24 @@ const a = face.getDebugState(); const camA = camera.position.z;
 face.setUserTurn(false); face.setWorkingState(false); face.noteVerdict('stop');
 tick(F(6));
 const b = face.getDebugState();
-emit({ hz, immA: a.immersion, camA, immB: b.immersion, camB: camera.position.z, actB: b.activity, rotB: scene.rotation.y, clockB: b.clock });
+emit({ hz, immA: a.immersion, camA, immB: b.immersion, camB: camera.position.z, actB: b.activity, rotB: scene.rotation.y, clockB: b.clock, flowB: b.cube2Flow || 0 });
+""",
+    "cube2": r"""
+import { face, tick, run, snapshot, camera, lines, emit } from './harness.mjs';
+face.setForm('cube2'); tick(240);
+const N = snapshot().filter(p => p && p.x < 9000).length;
+const idle = run(1800);
+const f0 = face.getDebugState().cube2Flow;
+const on = run(600, { 0: () => { face.setUserTurn(true); face.setWorkingState(true); } });
+const f1 = face.getDebugState().cube2Flow;
+const off = run(600, { 0: () => { face.setUserTurn(false); face.setWorkingState(false); face.noteVerdict('stop'); } });
+const f2 = face.getDebugState().cube2Flow;
+const sum = (st, k) => st.reduce((m, s) => m + s[k], 0);
+const camMoved = [...idle, ...on, ...off].some(() => camera.position.z !== 5.0);
+emit({ nodes: N, visibleWraps: sum(idle, 'wraps') + sum(on, 'wraps') + sum(off, 'wraps'),
+       idleSpikes: idle.filter(s => s.max > 0.05).length,
+       idleRate: (f0 - 0) / 30, turnRate: (f1 - f0) / 10, offRate: (f2 - f1) / 10,
+       lines: lines.geometry.drawRange.count / 2, camZ: camera.position.z, camMoved });
 """,
     "pause": r"""
 import { face, tick, advanceClock, emit } from './harness.mjs';
@@ -268,16 +285,16 @@ tick(1);
 emit({ running, resumed, dtFirst: face.getDebugState().dtF });
 """,
     "focus": r"""
-import { face, tick, run, snapshot, camera, scene, toWorld, project, centroid, range, emit } from './harness.mjs';
+import { face, tick, run, snapshot, camera, scene, lines, toWorld, project, centroid, range, emit } from './harness.mjs';
 const form = face.getForm();
 tick(240);
 run(480, { 0: () => { face.setUserTurn(true); face.setWorkingState(true); } });
 const snap = snapshot();
-const idxs = form === 'descent' ? [225] : range(236, 250);   // kernel / bead / vortex embers
+const idxs = form === 'descent' ? [225] : form === 'cube2' ? range(96, 123) : range(236, 250);   // kernel (v3: after 12 shells' corners) / bead / embers
 const c = centroid(snap, idxs);
 const pr = project(toWorld(c));
 emit({ form, sx: pr.sx, sy: pr.sy, depth: pr.depth, camZ: camera.position.z, immersion: face.getDebugState().immersion,
-       scale: scene.scale.x, rotY: scene.rotation.y });
+       scale: scene.scale.x, rotY: scene.rotation.y, lines: lines.geometry.drawRange.count / 2, flow: face.getDebugState().cube2Flow || 0 });
 """,
 }
 
@@ -364,7 +381,7 @@ def test_descent_tail_glides(lab):
 # D1 — frame-rate invariance (executed at 30 / 60 / 120 Hz)
 # ═══════════════════════════════════════════════════════════════════════════
 
-@pytest.mark.parametrize("form", ["cube", "descent"])
+@pytest.mark.parametrize("form", ["cube", "cube2", "descent"])
 def test_same_wall_clock_state_at_30_60_and_120hz(lab, form):
     rs = {hz: _run(lab["new"], "framerate", form, FACE_HZ=hz) for hz in (30, 60, 120)}
     # immersion/camera/activity are ease-driven; the scene heading is
@@ -374,6 +391,8 @@ def test_same_wall_clock_state_at_30_60_and_120hz(lab, form):
         assert max(vals) - min(vals) < 0.03, (key, vals)
     clocks = [rs[hz]["clockB"] for hz in (30, 60, 120)]
     assert max(clocks) - min(clocks) < 0.05, clocks           # 16s ≈ 4.8 clock units everywhere
+    flows = [rs[hz]["flowB"] for hz in (30, 60, 120)]
+    assert max(flows) - min(flows) < 0.02, flows              # cube2's birth clock too
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -408,6 +427,30 @@ def test_resume_after_a_pause_steps_one_frame(lab):
     r = _run(lab["new"], "pause", "vortex")
     assert r["running"] is False and r["resumed"] is True, r
     assert r["dtFirst"] == 1.0, r
+
+
+def test_cube2_infinite_cube_contract(lab):
+    """The experiment's contract (2026-09-20): nested shells wrap from
+    huge back to tiny ONLY while faded out (a visible node never jumps),
+    the birth rate is the swallow (idle ≈ a shell per 4s, a user turn
+    ≈ one per 0.7s, easing back after), the shells are drawn as explicit
+    polylines (12 edges × 6 segments × shells) and the camera never moves."""
+    r = _run(lab["new"], "cube2", "cube2")
+    assert r["visibleWraps"] == 0, r
+    assert r["idleSpikes"] == 0, r
+    assert 0.018 < r["idleRate"] < 0.035, r
+    assert r["turnRate"] > 3 * r["idleRate"], r
+    assert r["offRate"] < r["turnRate"], r
+    # v3 (2026-09-21): 24 line-only shells × (72 edge + 72 ruling) segments + ≤184 ties + 54 kernel edges
+    assert 20 * 144 + 54 <= r["lines"] <= 24 * 144 + 23 * 8 + 54, r
+    assert r["camZ"] == 5.0 and r["camMoved"] is False, r
+
+
+def test_cube2_kernel_sits_on_the_view_axis(lab):
+    r = _run(lab["new"], "focus", "cube2")
+    assert abs(r["sx"]) < 0.15 and abs(r["sy"]) < 0.15, r
+    assert abs(r["camZ"] - 5.0) < 1e-9, r
+    assert r["lines"] >= 20 * 144 + 54, r
 
 
 def test_vortex_camera_never_moves(lab):

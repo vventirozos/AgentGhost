@@ -187,6 +187,7 @@
 
   <p>Ghost's live log is designed to be watched, which historically made it the largest cleartext sink in the system — everything the agent handled scrolled past in the clear. So <strong>redaction is on by default</strong>: secrets, API keys, <code>.onion</code> addresses, home directory paths and personal details are masked in both the console stream and the log file.</p>
   <p>Pass <code>--no-redact-logs</code> when you're debugging and need to see the raw content. Don't leave it on.</p>
+  <p><strong>What the redactor recognises</strong> (<code>distill/redact.py</code>): key <em>shapes</em> (AWS, GitHub, Slack, OpenAI/Anthropic/Stripe/Google keys, JWTs, bearer headers, PEM blocks), <em>assignments</em> (<code>password=</code>, <code>api_key:</code>, JSON <code>"token": "…"</code>, connection-URI passwords, credential query parameters), and &mdash; since 2026-09-20 &mdash; the <em>spoken</em> form an operator actually types into chat: &ldquo;the wifi password is Zebra-Qu1lt-8817&rdquo;, &ldquo;my passphrase was …&rdquo;, &ldquo;API token: …&rdquo;. A live probe had carried three secrets through one turn; the two key-shaped ones were masked and the spoken one landed verbatim in the log and a trajectory. The spoken rule fires only when the value looks like a secret (8+ characters with both a letter and a digit), so &ldquo;the password is wrong&rdquo; and &ldquo;the token is expired&rdquo; stay readable.</p>
 
   <h2>Sensible defaults, in one place</h2>
   <ul>

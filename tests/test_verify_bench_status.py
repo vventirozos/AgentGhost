@@ -346,3 +346,25 @@ def test_a_changed_leg_is_reported_and_demands_a_full_rebench(tmp_path):
     legs = [d for d in out["drift"] if d["component"] == "escalation.leg"]
     assert legs and legs[0]["was"] == "worker" and legs[0]["now"] == "critic"
     assert "full live re-bench" in out["verdict"]
+
+
+# ── §4JE (2026-09-20): the oracle fingerprints the tree the way a bench run sees it ──
+
+def test_oracle_fingerprint_carries_the_bench_pinned_claim_binding_flags(monkeypatch):
+    """`run_trials` pins GHOST_CLAIM_BINDING_{REFUTE_FIRST,CONFIRM_FIRST,SHADOW,
+    NAME_WITHHOLD} to "0" (§4IN) and stamps them into provenance. The oracle
+    used to snapshot the raw shell env ("<unset>") and report three drifted
+    flags against every baseline recorded after §4IN — the first one did.
+    World where this fails: `current_fingerprint` without the pin."""
+    from ghost_agent.eval.verify_bench import BenchCase
+    for k in ("GHOST_CLAIM_BINDING_REFUTE_FIRST", "GHOST_CLAIM_BINDING_CONFIRM_FIRST",
+              "GHOST_CLAIM_BINDING_SHADOW", "GHOST_CLAIM_BINDING_NAME_WITHHOLD"):
+        monkeypatch.delenv(k, raising=False)
+    cases = [BenchCase(case_id="c", claim="x", evidence="y", context="z")]
+    flat = VBS.current_fingerprint(cases)
+    for k in ("GHOST_CLAIM_BINDING_REFUTE_FIRST", "GHOST_CLAIM_BINDING_CONFIRM_FIRST", "GHOST_CLAIM_BINDING_SHADOW"):
+        assert flat.get(f"verify_flags.{k}") == "0", (k, flat.get(f"verify_flags.{k}"))
+    # a baseline recorded from a bench run compares as NO DRIFT on those flags
+    old = dict(flat)
+    drift, _unknown = VBS.compare(old, VBS.current_fingerprint(cases))
+    assert not [d for d in drift if d["component"].startswith("verify_flags.GHOST_CLAIM_BINDING")]

@@ -321,6 +321,58 @@ def result_is_rejection(text) -> bool:
     return bool(_REJECTION_RE.match(str(text or "")))
 
 
+# ── the exit code of an execute-SHAPED result ─────────────────────────────
+#
+# Five readers ran an UNANCHORED `EXIT CODE:\s*(\d+)` over the whole body
+# (distill/outcome_heuristics, project_advancer ×2, registry,
+# composed_skills) while the turn loop's own rule (core/agent.py, the
+# "Process finished successfully." fix) already demanded a LINE-ANCHORED
+# banner with execution framing. Measured 2026-09-20 (R4-1): a
+# `manage_projects` status payload that QUOTES a past build — one JSON line
+# holding `… --- EXECUTION RESULT --- EXIT CODE: 1 STDOUT/STDERR: …` — was
+# booked as a failed manage_projects call by the corpus readers (3 of 2,005
+# clean rows), feeding false failures to the learners. The turn loop's rule
+# read the same rows correctly. One implementation now; 711/711 genuine
+# execute results in the same corpus carry the banner at the START of a
+# line, so no real exit code is lost. The anchor alone is the rule — an
+# execution-framing requirement was tried and dropped: a pasted log carries
+# the framing too, so it excluded nothing the anchor does not, while it
+# contradicted eight existing pins of the contract (`"boom\nEXIT CODE: 127"`
+# IS a failure).
+_EXEC_EXIT_LINE_RE = re.compile(r"(?m)^[ \t]*EXIT CODE:[ \t]*(\d+)")
+_SANDBOX_JOB_EXIT_RE = re.compile(r"\[sandbox job [^\]]*EXIT CODE:[ \t]*(\d+)")
+_EXEC_FRAMING = ("STDOUT/STDERR:", "--- EXECUTION RESULT ---",
+                 "--- COMMAND RESULT ---")
+
+
+def exec_exit_code(text, *, require_framing: bool = False):
+    """The exit code (int) of an execute-shaped result, else ``None``.
+
+    Execute-shaped = the sandbox-job form ``[sandbox job … EXIT CODE: N]``,
+    or an ``EXIT CODE: N`` banner at the START of a line. A payload that
+    merely quotes such a banner inside a JSON string (one line, mid-line)
+    or a sentence ("the log says EXIT CODE: 3") is not an execution result
+    and reads ``None`` — the caller then falls through to its other evidence.
+
+    ``require_framing=True`` is the turn loop's stricter contract for the
+    USER-FACING fallback head (§4EC `TestExitBannerShape`): a non-execute
+    tool's bare ``EXIT CODE: 1`` with no execution framing must not tell the
+    user the command FAILED. The corpus/registry sniffers keep the
+    anchor-only rule — eight of their pins say ``"boom\nEXIT CODE: 127"`` is
+    a failure, and for a label that is the right call.
+    """
+    s = str(text or "")
+    m = _SANDBOX_JOB_EXIT_RE.search(s)
+    if m is not None:
+        return int(m.group(1))
+    m = _EXEC_EXIT_LINE_RE.search(s)
+    if m is None:
+        return None
+    if require_framing and not any(f in s for f in _EXEC_FRAMING):
+        return None
+    return int(m.group(1))
+
+
 def result_is_failure(text) -> bool:
     """Does this tool result read as a failure to the turn loop?
 

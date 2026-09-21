@@ -44737,3 +44737,832 @@ SURVIVED**. Docs: web_server.html roster section. Restore point `matrix_graph.js
 (kernel ≈ ¼ of the half-height, centred (0.02, 0.06), depth 2.2 clears the 0.3–1.4 near-fade; both
 device classes), pin updated, live-verified (camZ 2.22 at full dive), cache-bust 12.8. Interface suite
 574 passed / 2 skipped.
+
+## §4JC — cube2, the infinite cube (EXPERIMENT; 2026-09-20, 11:00–12:00)
+
+Operator: a new face "similar to cube but the depth of the cube will seem infinite… call it cube2…
+experiment first… distinct, organic, much better… ask me questions". Asked three: perspective
+(→ nested cubes on an endless zoom), turn motion (→ flow surges, camera never moves), rest energy
+(→ calm). Built: 11/5 wireframe cube shells on one exponential depth axis (`L = 0.08·e^(4.6·d)`),
+born hot inside a 14-node kernel, blooming outward past the camera, wrapping only while faded out
+(new `aLineFade` line attribute + node-size taper over the last fifth of the phase — a cube's back
+face can never leave a 21:9 frame, so the wrap had to be a fade, not a pop). Shells are explicit
+6-segment polylines (`_emitCube2Edges`, `_c2Pt`) — their nodes skip the O(n²) web (`_noProx`).
+Organic: self-similar wobble in unit-cube coords (align dialect flattens it), birth-pull toward the
+kernel, 0.7 rad z-twist across the depth (a spiral), outward-propagating breath, jittered phases,
+wobble re-rolled at wrap, dust riding the expansion. `cube2Flow`/`cube2Travel` = the vortex's
+engagement law (idle a shell per ~4s, a turn one per ~0.7s, no reset, no camera travel). First
+render read faint and too straight → `C2_LINE_GAIN` 1.8, wobble 0.045→0.07, corner nodes 1.0,
+twist 0.55→0.7. Pins: roster/builders/hints/dialects/chain reworded for the roster; executed
+`test_cube2_infinite_cube_contract` (visible wraps 0, idle spikes 0, rate law, line count bounded
+both ways, camera fixed) + kernel-on-axis + 30/60/120Hz incl. the birth clock; spot battery 6/6
+KILLED, NOOP SURVIVED. Interface suite + ratchet 617 passed / 2 skipped. Docs: web_server.html.
+Version 12.9. Default stays `cube`; the operator decides whether cube2 stays.
+
+## §4JD — Verification rounds: five methods over the core systems (2026-09-20, 13:00–17:30) — R0 scope, written first
+
+Operator: *"verification rounds to ensure everything in this agent works correctly … proceed
+with all rounds that don't require bench, we'll do these during night."* The plan (given first):
+per core system, the method that matches its failure mode — M1 static gate, M2 liveness ("does
+the mechanism RUN in the deployed config and WRITE its artifact"), M3 oracle bench (deferred to
+the night), M4 consumer replay (the corpus through every reader, real input types), M5 live E2E
+(harnesses + bounded probe-origin prompts) — with one rule over all: show the instrument can
+fail before trusting that it passed.
+
+**R0.** Property: every core system that claims to be live has a fresh output artifact, every
+declared-off toggle is declared (not silently dead), every live harness is green with cleanup
+verified, and every reader of one input tells one story. Threat model: trusted — the tree, the
+data dir, the launcher; untrusted — tool results, the model's replies, my own probes (audited
+before any claim). Out of scope: the oracle benches (round 3, night), the sandbox PROMOTION
+path (needs a >600 s command), performance, the face.
+
+### Round 0 — instruments
+Full suite 23,681 passed / 0 failed / 68 skipped (9:36, `-n 6 --dist loadfile`). The 68 are all
+deliberate: 48 parametrized cells of `test_4ee_label_pins.py` that skip by construction (the
+impossible cells of an R5 table), 17 legacy removed-feature skips, 3 condition-guarded — the
+"65 skipped, unexamined" note from 09-03 is closed. Lint gate 0 (183 in baseline). Live process
+(started 00:20) is newer than every `src/` file, so the tree under test is the tree running.
+Probe audit: my first "last 24 h" log filter admitted ~57k UNDATED legacy lines (`HH:MM:SS -`)
+because they sort after `2026-…` as strings — the "24 FATAL embedder/store mismatch errors" it
+produced were from July. Redone by line number. This log has two line formats; filter by line
+number or anchor `^2026-`.
+
+### Round 1 — liveness (M2)
+`/api/health` ok, memory loaded, watchdog alive, breaker closed. Activity ledger 7 d: calibration
+149, dream 111, skills_auto 111, self_play 90, bench 63, imagine_gate 44, reflection 23,
+postmortem 6, negative_controls 1 (weekly, due). The orchestrator's own `idle cycle — ran …`
+lines (660 cycles / 7 d) show EVERY registered sub-phase running: autoadvance 250, dream 205,
+calibration 149, narratives 149, reflection 114, skills-auto/store-hygiene/stale-questions 111,
+postmortem 97, **router 97**, tidy 88, self-play 68, bench 63, gepa-judge 7, gepa-optimizer 4.
+Every "dormant" ledger phase has its gate: project = ON_DEMAND with 0 open tasks (projects.db:
+2 DONE, 2 RELEASED, 40/40 tasks DONE); workspace_tidy / open_questions / native_tool_repair =
+ON_OUTPUT and the sub-phase runs; prm_train GATED and says why hourly; scheduled_task with
+`scheduler_jobs=0`. The four OFF toggles (MCTS turn-start, selfhood prefix, metacog arbiter,
+risk steer) are all surfaced in `/api/health toggle.*` and in learning_health as CONSUMER DEAD —
+declared, not dead. Self-consistency vote: 78 September draws, 75 voted, 3 degraded (the two
+WARNINGs) — operative. True 24 h ERROR count: 1 (a self-play validator disagreeing with its own
+setup, by design).
+
+**R1-1 (instrument lies — false DEAD alarm).** learning_health / `introspect learning` printed
+`✗ DEAD router_train 0/24h 0/7d` daily. The phase enters hourly; the trainer declines INSIDE
+`RouterTrainer.run` ("labelled corpus is 89% the same … the deployed model stays") →
+`fit_succeeded=False` → agent.py `else: logger.debug(bail)` → **no** `_record_idle_attempt`.
+Only `declined` suppresses the alarm; the 2026-08-30 fix stamped it at the OUTER exact-
+fingerprint skip, which never fires on a corpus that grows by ~23 real turns a day. One-path fix
+shipped half ([[one-path-fix-ships-half]]). The existing executed-path test accepted `entered`
+as a valid outcome, so it was green in both worlds (R4: fixtures where the worlds agree).
+**Fix:** `RouterTrainerReport.exception` set at every `except` site (AST pin: a handler that
+sets `bail_reason` without it fails); the in-trainer bail stamps `declined`/`failed` by that
+flag; a sanity-rejected model stamps `failed`. Pins: three executed-path tests (bailing,
+raising, insane-model trainers → DECLINED/FAILED/FAILED), two consumer tests (the liveness view
+does NOT alarm on a decline, DOES on an exception), the two AST pins rewritten from "exactly one
+declined" (the defect's shape) to ordering (entered once before the gate; every decline/fail
+after it; conditional outcomes resolved to their literal branches).
+
+### Round 2 — live E2E (M5)
+- `functional_live_test.py` --core 26/26, full 32/32. `metacognition_functional_test.py`
+  28/29 → **R2-1** the harness still expected a resource event to revise the plan (§4HN made it
+  log-only); fixed to expect 2 revisions + the audited noop. **R2-2** its live turns lacked
+  `X-Ghost-Origin: probe` (predates §4FB) — a test run that TAUGHT the agent; header added,
+  `origin=probe` confirmed in the log. **R2-3** `selfhood_functional_test.py` sent no
+  `X-Ghost-Key` (predates the 07-13 rollout): 403 on every turn; fixed. Then 17/18: **R2-4** its
+  §C asked the agent an open-ended question and expected the wake-up prefix to have surfaced
+  an injected open question — the prefix is OFF live (§4EU); now reads the toggle from
+  `/api/health` and routes the check through `introspect` when OFF, and cleans up the injected
+  question/thread/mood (it never had). **R2-5** its `--skip` ignored unknown keys silently (the
+  docstring names keys the map does not have), so §G ran and corrupted+restored the LIVE
+  state.json under a running agent; keys validated, §G gated behind `--corrupt-live-state`.
+- Per-tool probes (18 tools, "reply only X" contracts, tools read back from the log by request
+  id): 18/18 PASS, expected tool ran every time, 0 tool failures. Browser through Tor → TOR.
+  `report_pdf`'s claimed `/api/download/…pdf` fetched: 89 KB, `%PDF-1.7`. **R2-6** `list_lessons`
+  answered "100" for the playbook size (store: 198): the tool caps the page at 100 and its
+  header printed `## {len(page)} …` as the count ([[a-count-is-not-a-search]]). Fix:
+  `SkillMemory.count_lessons()`; the header says "of N … showing the 100 most recent" when
+  truncated. Enumeration of the class in tools/: one site.
+- Egress, both surfaces, both directions. Sandbox (docker exec): direct TCP/HTTP/UDP-DNS all
+  "succeed" in 0.00 s — a transparent Tor redirect; `check.torproject.org/api/ip` with NO proxy
+  → `{"IsTor":true,"IP":185.181.60.204}`; iptables unreadable even as `-u 0`. Agent process
+  (scratch): control connect OK → guard installed → `MandatoryTorError` → loopback allowed →
+  Tor liveness OK → uninstalled → connects again. PASS.
+- Interfaces: :8080 → 401 (healthy signature); launchd agent/client/slackbot all running,
+  slack `.err` quiet since boot.
+- Redaction injection (one probe turn, three secrets): AWS-shape and OpenAI-shape redacted;
+  **R2-7** "the office wifi password is Zebra-Qu1lt-8817" landed verbatim in ghost-agent.log
+  and a trajectory — every rule wanted `=`/`:`; an operator types "is". Fix: `prose_secret`
+  rule after the assignment rules, firing only on secret-shaped values (8+ chars, letter AND
+  digit); 9 negatives pin "the password is wrong" / "token was refreshed at 10:42" /
+  "the token is v2 now" untouched.
+- Sandbox job lifecycle: a 100 s command FINISHED inside the call — promotion happens at budget
+  expiry (600 s) for commands past the 90 s eligibility floor, so the promotion path was NOT
+  exercised. Deferred (the boot log shows 9 promoted jobs from 08-22, so the path has run).
+
+### Round 4 — consumer replay (M4)
+September corpus: 153 files, 745 trajectories, 2,331 non-probe calls, 326 recorded failures
+(`error` = a lowercased copy of a banner-marked result). FIRST TABLE WAS A PROBE ERROR — I fed
+strings and dicts; live readers receive `ToolOutcome(safe_res, status=…)` and the corpus readers
+take `ToolCall` objects (`getattr(tc,"error")`), so the dict path read 0/326. With the real
+types: `outcome_heuristics.tool_call_failed` 326/326, `foresight.offline_call_failed` 326/326,
+false-fail 3/2,005. **R4-1** those 3: `manage_projects` status/get/switch payloads that QUOTE
+a past build (`"note": "build FAILED: … --- EXECUTION RESULT --- EXIT CODE: 1 STDOUT/STDERR: …"`
+on one JSON line) — the prose sniffer's `EXIT CODE:\s*(\d+)` was unanchored. The class:
+seven readers searched wide (outcome_heuristics, project_advancer ×2, registry,
+composed_skills, the turn loop's hint scan, acquired_skills' TDD gate) while the turn loop's own
+"Process finished successfully." rule already demanded a line-anchored banner. Fix: one helper
+`tools/tool_failure.exec_exit_code()` (sandbox-job form, or `EXIT CODE: N` at line start) used
+by all of them. An execution-FRAMING requirement was tried and dropped: 8 existing pins say
+`"boom\nEXIT CODE: 127"` is a failure, and a pasted log carries framing too, so it excluded
+nothing the anchor does not. After: 326/326 caught, **0/2,005** false failures, and every
+string-path reader agrees on the 25 clean manage_projects rows. Pins: each reader on one input
+(R5 table), a package walk that fails on any unanchored search outside the helper (it found the
+hint scan and the TDD gate the instant it was written — R1 working as designed; the three
+execute-by-name sites are exempt because their input IS execute's output), and a positive
+control for the walker.
+
+### Round 5 — mutation on the day's fixes
+Whole-file mutants on a scratch copy, one per run, the killer never named (the fix's full pin
+set runs with `-x`), `py_compile` first, tree restored and diffed after: **16/16 killed**, NOOP
+control SURVIVED, KNOWNBAD control DIED, tree clean. By fix — R1-1: drop the in-trainer decline
+stamp / exception→declined / drop the rejected-model stamp / trainer forgets `exception` on fit
+failure (4/4). R2-7: unregister the prose rule / drop the digit, length, alpha requirements
+(4/4). R4-1: helper loses the anchor / outcome_heuristics, registry, project_advancer verify,
+composed_skills each reverted to the unanchored search (5/5). R2-6: header always the page
+length / `count_lessons` counts a default page (2/2). Files changed: core/agent.py (2 stamps,
+hint scan, fallback-head rule), router/trainer.py, distill/redact.py, tools/tool_failure.py,
+distill/outcome_heuristics.py, core/project_advancer.py, tools/registry.py,
+tools/composed_skills.py, tools/acquired_skills.py, tools/memory.py, memory/skills.py;
+scripts/functional_live_test.py, scripts/metacognition_functional_test.py,
+scripts/selfhood_functional_test.py (§C rewritten through `self_state`), new
+scripts/tool_probes_live.py; tests: test_idle_attempt_heartbeat.py (+6, 2 AST pins rewritten),
+test_distill_redact.py (+13), new test_exec_exit_code_anchored_r41.py (19),
+test_self_play_loop_and_lessons.py (+5).
+
+### Docs
+`docs/core/autonomous_activity.html` (the second decline site), `docs/tools/tool_failure.html`
+(`exec_exit_code`), `docs/tools/memory_tools.html` + `docs/memory/skills.html` (header = total,
+`count_lessons`), `docs/safety.html` (what the redactor recognises, the spoken form).
+
+### Honesty (R8)
+Defects found inside this round's own work: 7 — the undated-line log filter, the dict-vs-
+`ToolCall` replay input, the framing requirement that contradicted 8 pins, a fixture whose
+"FAILED:" sat inside the sniffer's 120-char head window (unlike the corpus rows), a text-pin
+enumeration the ratchet rejected, a helper that erased the §4EC framing contract for the
+user-facing head, and an unused import. None reached a claim; three were caught by the suite. NOT done: round 3 (benches; night), the promotion path, a `scripts/` home for the
+per-tool probe driver (it lives in the session scratchpad), and no re-bench oracle was run.
+**Suite, once, after all changes: the first full run (23,724 passed) failed 3 — all three were
+the tree's own ratchets catching this round's work: the pin-quality ratchet rejected the R4-1
+enumeration as a source-text pin (rewritten as an AST walk with an ancestor-`If` exemption and
+a planted-site positive control); §4EC `TestExitBannerShape` pinned that a NON-execute tool's
+unframed `EXIT CODE: 1` must not drive the user-facing FAILED head — so the helper carries two
+strictness levels (`require_framing=True` for the fallback head, anchor-only for the label
+sniffers), both pinned; and the lint gate found `registry.py`'s `import re` now unused. The
+fix-to-the-fix got its own battery: 3/3 killed with controls. Final run: **23,728 passed / 0
+failed / 66 skipped** (9:14; the 68→66 delta is the condition-guarded ddgs pair, which ran).
+Defects found inside this round's own fixes, final count: 7.**
+
+### §4JD addendum — deploy confirmed, night round prepared (2026-09-20, 14:27–15:00)
+
+Operator restarted the agent (pid 92225 → 51191, 14:27:00; one process; both Tor gates declared
+at boot). Two fixes proven live by probe turns: `list_lessons` heads with the total (203 —
+the store grew from 198 during the day), a spoken secret lands as `wifi password is
+<REDACTED>` (0 literal hits). **R1-1 confirmed live at 14:44:03**: the router phase ticked,
+the trainer declined ("88% the same"), `idle_attempts.json` reads `declined`, and
+learning_health prints "all periodic loops fired within the alarm window" — the daily
+`✗ DEAD router_train` is gone.
+
+**Round 3 prepared, not launched** — `scripts/night_bench_round.py` (+ `tests/test_night_
+bench_round.py`, 10 pins on the real instrument strings). Sequential stages: oracle
+(`verify_bench_status`: STALE tonight — 6 components incl. 3 rendered prompts, pool 58 = 58,
+no case drift) → offline read-only instruments (all rehearsed today: escalation audit 40
+overturn cards / 307 rows; turn_state_replay 0 false refutes on 389 turns; claim-binding
+ledger 80 rows, 4 binder overrides; router backtest **FLAT** (spread 0.066 < 0.1) — a real
+answer; label-noise: verifier decides 42.9% of the live label, 20.9% of skill-prune's victim
+set noise-decided; GEPA: no live artifact, both checks) → verifier re-bench (private tier,
+critic leg, escalated arm, two-stage on, `--cache-mode read`, the launcher's verify env)
+gated by `preflight_longrun` with a LIVE 1-case smoke → IF bench full bank ×2 through the
+live agent (probe origin) → SUMMARY.md with balanced via `verify_bench_compare`'s own helpers,
+the paired McNemar comparison against the 08-09 baseline with the oracle's drifted components
+declared, per-fault catch rates, route health. Rehearsal caught a defect in the gate itself:
+the smoke replayed from cache in 3 s and MEASURED would have cleared a 2.4 h run with a
+4-minute ETA — the smoke is now `--cache-mode write` (always live) and a smoke with zero live
+calls refuses the launch. Live smoke: 134 s/case, 20 calls → **ETA 1.7–3.2 h** for 58 cases;
+IF bench ≈3 h; whole night ≈5–7.5 h. Not in the round, by design: `dream_replay_validate`
+(8 h to certify an engine gated OFF) and the sandbox promotion path (a daytime probe).
+
+### §4JD addendum 2 — the run that would have been wasted, and the arming (2026-09-20, 15:00–15:16)
+
+Operator: *"first and foremost ensure that this run won't be wasted and start it."* Checked
+against the box, not assumed: sleep prevented (caffeinate, `sleep 0`); 679 GB free; both judge
+endpoints answer a real generation (Nova 0.5 s, main 1.1 s — `/health` lies under Metal
+pressure, so a generation is the witness); the runner detaches (pgid == pid, ppid 1); `python
+-u`, per-stage logs, `status.json`, `progress.json`; 58 cases / 244 turns bounded; markers +
+response cache resumable; live smoke 134 s/case measured.
+
+**The one that would have wasted it: the main model has ONE slot (`-np 1`).** At night a
+self-play turn can hold it past the 90 s escalation bound (`GHOST_VERIFY_FALLBACK_TIMEOUT`),
+the verifier then lets the cheap verdict stand (`unavailable`), and — measured with the main
+model pointed at a DEAD port — `results.json` reported `route_health clean: true`, both
+escalation directions `live: true`, no trial errors and a TPR identical to the live run. The
+only trace was a console line. The instrument could not distinguish a contended night from a
+result, in either direction (an unanswered escalation reads as a catch on refute-expected
+faults and as a false alarm on clean ones). Fix in `eval/verify_bench.py`: the trial row
+carries the verifier's own `escalation_outcome` stamp, `escalation_events` counts
+`escalation_unavailable` (+ a histogram), and `route_health.clean` is false when the strong
+model never answered. Dead-main smoke now: `escalation_unavailable: 4, clean: False`; live:
+`0`, `upheld: 4`. An unanswered call leaves no cache entry (dead pass 16 hits / 4 misses / 0
+writes), so a `read` re-pass replays everything answered and re-asks only those — the runner
+loops on that (≤4 passes) and the summary refuses to call a contaminated number comparable.
+Pins: 4 (row, events, unclean, clean-counterweight) + the exact-dict events pin extended;
+mutants 3/3 killed with controls; suite 23,742 / 0 / 66. Docs: verifier.html.
+
+**Armed 15:15:58, pid 72822, own session, sleeping until 23:00** →
+`system/eval/night_rounds/2026-09-20/`. Expected: offline ~1 min, verifier 1.7–3.2 h (+ re-passes
+if the slot was contended), IF bench ~3 h; `SUMMARY.md` by ~05:00–06:30.
+
+### §4JD addendum 3 — started early, Slack bot unloaded (2026-09-20, 15:18–15:24)
+
+Operator: *"don't wait for 23:00, stop the slack bot so we won't have any traffic and start it
+now."* Parked 23:00 run killed (pid 72822). Slack bot unloaded with `sudo launchctl bootout
+system/com.local.ghost-slackbot` (KeepAlive would have respawned a plain kill; pid 62930 gone,
+`launchctl print` → not loaded). **Re-enable when the round is done:**
+`sudo launchctl bootstrap system /Library/LaunchDaemons/com.local.ghost-slackbot.plist`.
+Round launched 15:21:17, pid 73133, own session → `system/eval/night_rounds/2026-09-20/`.
+Oracle STALE (6 drifted), offline audits done in 20 s, live smoke 131 s/case (20 live calls),
+preflight CLEARED, verifier pass 1 launched 15:23:47 (ETA 95–190 min), IF bench follows.
+
+### §4JD addendum 4 — verifier re-bench result (2026-09-20, 18:39; read 19:00)
+
+Pass 1 clean: 476 trials / 58 cases, 988 cheap-leg calls, 0 failures, **0 escalations
+unavailable** (the unloaded Slack bot and the idle agent kept the single main slot free; no
+re-pass needed), 195.7 min. Balanced (all trials) 0.7819 — below the 08-09 CI; **paired on the
+433 shared trials: 0.813 → 0.810, McNemar 53/38, p = 0.14, NO DIFFERENCE RESOLVED**. The unpaired
+shortfall is the new `omitted_contradiction` class (8/43). Two mechanisms inside the shared
+universe, both in `night_rounds/2026-09-20/VERIFIER_READ.md`: (1) the CHEAP judge's artifact_leak
+sensitivity fell 48/58 → 26/58 (32 leaks confirmed before any escalation) — three rendered prompts
+changed since 08-09 and §4Z's capacity-ceiling signature fits; (2) escalation destroys fact_swap
+(35→16) and omitted_contradiction (24→8) catches via 38 damaging overturns plus 40
+`replaced_uncertain` outcomes. False alarms improved (clean 7→3, truncation 5→3). Not adopted as
+baseline (fault library changed); daytime review candidates listed in the read. IF bench
+launched 18:39:30, preflight cleared.
+
+### §4JD addendum 5 — round closed (2026-09-20, 21:08–21:12)
+
+IF bench stopped at 191/244 turns on the operator's call ("we are basically waiting for no good
+reason") — three bands were at ceiling for both arms and the hard band could not resolve.
+Scored from the ledger, paired McNemar per band: easy 42/42 vs 40/42 (p=0.50), tool 15/16 vs
+15/16 (p=1.0), deep 12/12 vs 12/12, hard 18/25 vs 20/25 (p=0.73); all 87/95 vs 87/95, 6/6
+discordant, p=1.0; 0 narration beats, 0 tool-syntax leaks, 0 errors. **NO DIFFERENCE between
+the hand-written and compiled system prompt** — §4GJ's ceiling prediction holds on the full
+bank's easy/tool/deep bands; the hard band sits ~75% for both. Round's `SUMMARY.md` written
+21:08:41 (IF section spliced from the ledger, since a killed bench writes no summary.json).
+Slack bot re-bootstrapped 21:12 (pid 7746). Round 3 done: verifier (no resolved change; two
+mechanisms to review in VERIFIER_READ.md), IF (no difference), offline audits (turn-state 0
+false refutes, router FLAT, claim-binding 4 overrides, GEPA nothing live, label-noise 42.9%
+verifier-decided).
+
+### §4JD addendum 6 — the open items, closed (2026-09-20, 21:14–21:55)
+
+Operator: *"proceed with all open items."* All non-bench items from the plan, against the live
+agent (Slack back up; probe turns for tools, real turns for the memory path):
+
+- **Sandbox promotion path — PASS, both branches.** A SILENT 650 s command is killed at the
+  600 s budget ("produced no output and did no I/O for 120s — killed", exit 124, the agent
+  replied KILLED honestly). A command emitting output every 5 s is promoted at the 90 s floor
+  ("still running at 90s — promoted to background job job-08952c13"), the turn returns in
+  154 s, the registry row appears, the job log carries the nonce, `jobs collect` returns
+  `promo_213556`, the job settles `done` exit 0. My first model ("promotion at budget expiry")
+  was wrong; the liveness criterion decides. Verified property, not a defect: turns are
+  SERIALIZED (agent.py:7007, Semaphore(1), `/api/turns` shows the queue) — one long tool call
+  parks every other conversation until it returns; promotion is the release valve.
+- **Memory cross-surface table (R5) — profile, facts, graph AGREE** (written through the agent;
+  read from the store on disk AND from the agent in a fresh conversation): profile file 0 s,
+  vector store 1 s, graph 190 s to consolidate. Journal: the turns landed in
+  `memory_journal.json` and drained on the idle window. Cleanup through `/api/memory/delete`
+  (refuses an ambiguous match — 409, correct), graph sqlite, profile file; the drain and the
+  read turns re-minted 1 fragment / 7 triplets / 1 profile entry from the conversation text
+  (extraction by design), swept: residue 0/0/0.
+- **Three mirrors — AGREE.** The activity ledger read by my own count, `learning_health`'s
+  reader and `introspect`'s tail-reader: 8 phases, 74 records in 24 h, 0 disagreements
+  (introspect's tail caps at 1,000 records and reports `truncated`).
+- **Deliverables census (§4CG) — 56/58 registered file artifacts exist.** The 2 phantoms
+  (`cascade_analysis.md`, `cascade_evidence.py`, project 7b62e5e533d1) were registered
+  2026-07-28, before the §4CG/§4CJ gate; the agent itself noticed that day. 0 artifacts have
+  been registered since the gate, so it has had nothing to act on.
+- **Remaining tool families — 5/5 PASS**: vision_analysis on a synthetic red/black image
+  ("Red circle"), delegate → jobs lifecycle (`bg_213848` collected), image_generation (remote
+  node; the claimed `/gen_3410ae69.png` exists, 624×624 PNG, 322 KB), darkweb_search (12
+  results via Tor), deep_research (1889). Probe artifacts removed.
+
+What remains from the whole exercise is review work, not verification: the verifier's two
+mechanisms (VERIFIER_READ.md) and the untested-by-data §4CG gate.
+
+## §4JE — Verifier review: the artifact_leak loss and the escalation's replaced_uncertain cost (2026-09-20, 22:00–) — R0 scope, written first
+
+**Trigger.** Round 3's clean re-bench (§4JD add. 4): paired vs 08-09 no resolved difference, but
+two class-level mechanisms — the CHEAP judge's artifact_leak catch fell 48/58 → 26/58 before any
+escalation, and the escalation destroys fact_swap (35→16) and omitted_contradiction (24→8)
+catches through 38 damaging overturns + 40 `replaced_uncertain` outcomes.
+
+**R0.** Property: on the private bench, private tier, critic leg, escalated arm, (1) the cheap
+judge refutes artifact_leak at the August level (≥40/58 pre-escalation) and (2) a cheap REFUTED
+that carries a validated contradiction is not replaced by a strong UNCERTAIN — both WITHOUT
+raising the false-alarm rate on `clean` / `evidence_truncation` above tonight's (3/58, 3/45),
+measured PAIRED against tonight's run (`verify_bench_compare`, `--cache-mode read` so unchanged
+calls replay; route health must be clean). Threat model: trusted — the checked-in case set,
+the response cache, the bench code; untrusted — judge and strong-model outputs, and the three
+prompt templates changed since 08-09 (§4IM–§4IY). Out of scope: the absolute level of the new
+omitted_contradiction class, the strong model itself, the IF bench, the router, anything the
+oracle lists as UNCOMPARABLE. Instruments: `--faults artifact_leak` (58 trials) and
+`--faults fact_swap,clean,evidence_truncation` slices per candidate, then the full 476 once.
+
+### §4JE — result, deploy, baseline (2026-09-20 22:00 – 2026-09-21 00:31)
+
+**Diagnosis from the cache.** The response cache stores requests, so the August rendered prompts
+were recoverable: the adjudicate template had LOST its artifact-scan clause ("Additionally, scan
+the raw CLAIM for unflagged formatting artifacts (diff markers like `<<<<<<<`…)") in a September
+edit while growing 4,982 → 7,064 chars. (A) restored it verbatim. (B) every `replaced_uncertain`
+on a refute-expected fault was a §4IJ concession downgrade whose concession named the SAME
+figures the cheap judge refuted on — the strong model agreed the discrepancy existed and called a
+last-digit swap "valid rounding"; `conceded_figures_disagree()` now upholds the refute when the
+binder's `quantities_agree` says the claim's figure does not agree with the evidence's at the
+claim's precision (closest same-family claim/other pair in the concession decides; rounding,
+units, hedges agree; clock times, versions, hex IDs are not quantities). Both went through the
+objection layer's blind spot deliberately: presence of the swapped figure elsewhere in a long
+evidence is NOT a disqualifier (long-weather-1).
+
+**Measured (full 476, private/critic/escalated, cache-mode read; 3 re-passes).** Paired against
+the pre-fix night run: **balanced 0.782 → 0.811, refute +0.056, non-refute unchanged (0.9417 →
+0.9417), 27 wrong→right vs 5 right→wrong, McNemar p = 0.0001 — NEW BETTER.** Paired against the
+08-09 baseline on the 433 shared trials: 0.813 → 0.842, refute exactly back at August (0.7424 →
+0.7424), non-refute +0.058, p = 0.60 — the regression is gone and the false-alarm gain kept.
+Attribution per trial (strong calls replay from cache): A is the win — cheap-judge artifact_leak
+26 → 45/58 (August 48), final 10 → **25/58** (= August); B fired on 3 fact_swap trials
+(replaced → upheld) while the new prompt cost 3 cheap catches on the same class (net 0); the
+remaining replacements are versions / clock times / hex IDs or a different discrepancy —
+correctly out of B's reach. Route health: 1 of 979 cheap-leg calls (long-files-1/fabrication)
+deterministically exceeds the 45 s bound with the longer prompt and falls through to main (main
+REFUTED — correct; production-equivalent); named in the baseline's `forced` field.
+
+**Instruments fixed on the way (3).** The response cache STORED empty replies
+(`finish_reason=length`) and replayed them as fall-throughs forever — `ResponseCache.put` now
+skips a chat reply with blank content (fail-open on non-chat shapes; pins both ways). The oracle
+fingerprinted the raw shell env while `run_trials` pins the claim-binding live flags to "0" —
+every baseline recorded after §4IN would have read 3 drifted flags; `current_fingerprint()`
+applies the same pin (behavioural pin). `scripts/record_verifier_baseline.py` records a run the
+§4T way using the oracle's interval function and the compare tool's scoring (one formula each),
+preserves the previous file, refuses an unclean run unless `--force '<reason>'`.
+
+**Pins / mutation / suite.** `tests/test_4je_conceded_corroboration.py` (15: rendered-template
+clause, helper both ways, escalation executed both ways), cache (+7), oracle (+1); batteries
+7/7 killed with controls, twice (the refactor after two lint findings — unused import,
+`best[0]` — re-mutated). Suite 23,767 / 0 / 66. Docs: verifier.html §4JE.
+
+**Deployed 2026-09-21 00:30:06** (pid 51191 → 60544, one process, gates declared, no src file
+newer than the process). **Baseline recorded** `system/eval/verifier_incumbent_baseline.json`:
+balanced **0.8114**, 95% CI [0.7786, 0.8441] (±0.0327), n = 103 non-refute / 373 refute,
+previous preserved as `verifier_incumbent_baseline.2026-08-09.json`; oracle under the prod
+verify env: **NO DRIFT**. R8: defects inside this round's own work — 5 (the evidence-exclusion
+pairing rule that would have gone silent on the escaping shape; a fixture placing "FAILED:" in
+the sniffer's head window; the `clean` non-fault in a `--faults` list that cost 20 min; two lint
+findings). Not done: a candidate to recover the 3 fact_swap cheap catches the longer prompt cost
+(§4Z ceiling — every clause costs something else).
+
+## §4JF — Counterfactual regressions must reproduce, and quarantine must have a way back (2026-09-21, 00:45–) — R0 scope, written first
+
+**Trigger.** Operator: *"sometimes I get a notification … counterfactual regression … quarantined
+lesson(s) … why does this happen?"* Measured on `system/counterfactual/results.jsonl`: 416
+replays — 386 stable-pass, 9 generalized, 8 still-failing, **7 regressions (6 in 30 d)**; a ~2%
+regression rate against a ~98%-pass pool is the band model variance alone produces (§4CM D4b's
+`p·(1−p)`). Those 7 quarantined 32 lessons; **25 of the playbook's 27 quarantined lessons today
+are from this mechanism** (12.6% of 198). **None of the 7 challenges was ever replayed again** —
+every history is exactly `('regression',)` — and quarantine has no path back: one unlucky run
+buries ~4–5 lessons permanently.
+
+**R0.** Property: a lesson is quarantined by the counterfactual loop only for a regression that
+REPRODUCED (two failed replays of the same past-SUCCESS challenge), the operator is notified only
+then, and a later passing replay of that challenge lifts the quarantines it imposed (and only
+those). Threat model: trusted — the challenge ledger and validators (real ground truth), the
+results ledger; untrusted — a single sim outcome (the model's variance). Out of scope: the
+dreamer/sim machinery, the replay gate (learning-fingerprint), other quarantine sources
+(mirror audit etc.), the notification transport. Cost bound: a candidate re-replay is one more
+sim per rare regression; regressed challenges become re-eligible at lowest priority, bounded.
+
+### §4JF — shipped (2026-09-21, 00:45–08:55)
+
+`core/counterfactual.py`: a past-SUCCESS → FAILURE replay is `regression-candidate` (info,
+nothing quarantined, front of the next batch; `should_replay()` yields to a pending candidate —
+the second replay measures the first one's variance, not a new state); the reproducing failure
+is `regression` (quarantines, `REGRESSION_CONFIRM_FAILURES = 2`); a confirmed regression is
+re-eligible at lowest priority for `MAX_REGRESSION_RECHECKS = 2` (a failed recheck spends budget
+and reports "the quarantine stands"); a pass lifts what the ledger says this loop quarantined for
+that challenge via the new `SkillMemory.unquarantine_lesson(trigger, reason_contains=…)` (scoped
+by the imposing reason; the episode stays on the row as `unquarantined_from`). Results rows carry
+`restored`. **Every counterfactual row is info-severity** — operator, 08:40: "I don't wanna
+wake up in the middle of the night because the agent had a regression"; 6 of the 8 notify pushes
+in the last 30 d were this line. Pins: tests/test_counterfactual.py 36 (candidate → confirm →
+lift, bounded rechecks, no push ever, scoped lift; the four pre-existing single-replay tests now
+confirm first); battery 8/8 killed with controls; suite 23,772 / 0 / 68. Docs: dream_cycle.html.
+Deployed 08:50:40 (pid 20063). R8: 4 defects inside this round's own work — a gate that parked
+every candidate until the next lesson landed, a fixture indexing the playbook by position (the
+store prepends), rechecks that never spent their budget, and a failed recheck that re-alarmed.
+The 7 historical regressions are re-eligible; their 25 buried lessons return if the challenges
+pass.
+
+## §4JG — The three leftovers (2026-09-21, 09:00–)
+
+**1. Phantom deliverables.** The two pre-gate rows (`cascade_analysis.md`, `cascade_evidence.py`,
+project 7b62e5e533d1, registered 2026-07-28 10:00:43, never written — the agent noticed that
+day) deleted from `task_artifacts` after a backup (`projects.db.pre-4jg-20260921.bak`). Census:
+56 registered, 0 missing.
+
+**2. The compiled system prompt — RETIRED.** The full banded IF bank (2026-09-20, 95 pairs on
+the live agent): 87/95 vs 87/95, McNemar 6/6, p = 1.0; easy/tool/deep at ceiling for both, hard
+18/25 vs 20/25 (p = 0.73); 0 narration beats, 0 tool-syntax leaks either arm. Removed:
+`SYSTEM_PROMPT_COMPILED` (prompts.py, 30 lines, tombstone comment left), the probe-only branch
+of `GhostAgent._select_system_prompt` (the method stays as the one seam a future A/B reattaches
+to; `body` accepted and ignored so the call site is unchanged), the `X-Ghost-Prompt-Variant`
+route header, the bench's second arm (`--variants` default `control`; any other name is refused
+with the reason). Pins: `tests/test_4ff_prompt_variant.py` rewritten as pins of the deletion
+(constant absent; no body selects another prompt, executed under a probe id; the live turn still
+goes through the seam; the bench refuses `compiled`), `test_prompt_image_display_affirmative.py`
+now asserts the rule lives in the main prompt. Pin-quality baseline regenerated downward
+(2 fewer text pins, digest updated). Docs: prompts.html §compiled marked RETIRED with the numbers.
+
+**3. The 6 fact_swap cheap catches the longer prompt cost (§4Z ceiling).** Pre-fix → A+B, the
+cheap judge flipped 6 fact_swap REFUTED → CONFIRMED (30→31, 3.8→3.9, 26.6→26.7, 3117→3118,
+2773→2774, 48,112→48,113) — reasoning turned to "fully supported": it stopped checking exact
+figures — and 2 the other way. Candidate C: remove the two "(Live failure this rule pins: …)"
+parentheticals from the ADJUDICATE template — 337 chars of narration written for humans and
+shipped to the judge; every rule and example verbatim; the incidents recorded in a comment above
+the template. Template 7,353 → 7,016 chars. Full 476-trial bench launched 09:2x, paired against
+the A+B run; adopt only with no loss anywhere.
+
+### §4JG — closed (2026-09-21, 10:15)
+
+**3, result.** Candidate C (the two "(Live failure this rule pins: …)" narrations out of the
+adjudicate template, −337 chars): full 476 paired vs the deployed A+B run — balanced 0.8114 →
+0.8065, refute IDENTICAL (0.6810 → 0.6810), non-refute −0.0097 (clean 3 → 4), 19 right→wrong vs
+18 wrong→right, **p = 1.0, NO DIFFERENCE**. The cheap judge did sharpen (cheap catches fact_swap
+31→34, artifact_leak 45→49, omitted_contradiction 21→25 — the §4Z ceiling holds at the judge)
+and the escalation layer absorbed every gain (fabrication final 51→46, the rest ±1). The
+pipeline number is insensitive to the judge's prompt length at this size; the residual
+fact_swap cost lives in the escalation, not in the prompt. **Reverted** (rule: adopt only with no
+loss anywhere). Closed, not owed.
+
+**Baseline re-recorded** from a `read` replay of the A+B run under the deployed verifier digest
+(the lint rename had moved `code.verifier` after the 21:04 record): bit-identical (0 discordant,
+0.8114 ±0.0327) and this time route health CLEAN with no `--force` — the `long-files-1` cheap
+call answered. Previous record preserved as `verifier_incumbent_baseline.2026-09-20.json`;
+oracle NO DRIFT. `tests/test_if_bench_bank.py` runner test rewritten for the single arm (the
+failed call is `passed: None` with its error, scored as nothing; McNemar None). Suite 23,775 /
+0 / 68. **Deployed 10:1x** (pid 20063 → 64574, one listener, no src newer than the process).
+R8: 2 defects in this section's own work — the revert script matched a sentence shared by three
+templates (aborted before writing, redone span-limited), and the baseline drift I had left
+behind by recording before the lint rename.
+
+## §4JH — Conceded corroboration for opaque tokens: versions, clock times, identifiers (2026-09-21, 10:20–) — R0 scope, written first
+
+**Trigger.** §4JE's rule B arbitrates a corroborated concession with the binder's arithmetic, so
+it cannot act where the disputed values are not quantities. The night bench's remaining
+`replaced_uncertain` on refute-expected faults are exactly those: `7.1.5` vs `7.1.6` (a kernel
+version the strong model conceded "the claim states 7.1.6 … no evidence supports 7.1.6" and
+still went UNCERTAIN), `14:02:11` vs `14:03` ("minor rounding/approximation"), task/project ids
+`4cdc5f063a2e` vs `4cdc5f064a2e` ("likely a minor transcription error"). An exact identifier
+that both judges name as differing is a disagreement by definition — there is no rounding of a
+version string or a hex id — and a clock time rounds only at the claim's own precision.
+
+**R0.** Property: a strong UNCERTAIN born of a §4IJ concession that names the SAME opaque
+tokens the cheap judge refuted on — a version string, a clock time, a hex identifier — is
+upheld when the claim's token ≠ the evidence's token (exact for versions/ids; at the claim's
+precision for times); never when the concession is about a different discrepancy, never when
+the token appears on both sides, never on prose. Threat model as §4JE. Out of scope: dates in
+words, URLs, file paths, anything the two judges did not both name. Measured on the full 476 by
+`read` replay (every strong call is cached: the rule is post-hoc, attribution is exact), paired
+against the recorded baseline; adopt only with no loss on `clean` / `evidence_truncation`.
+
+### §4JH — shipped (2026-09-21, 10:20–11:10)
+
+`conceded_tokens_disagree()` — three opaque families (version `\d+(\.\d+){2,3}`, clock
+`\d{1,2}:\d{2}(:\d{2})?`, hex id ≥8 chars with a letter AND a digit), exact identity as the
+arbiter, a clock time at the claim's own precision; closest same-family claim/other pair in the
+concession decides; consulted after the binder in the UNCERTAIN branch. Pins: +13 in
+`tests/test_4je_conceded_corroboration.py` (four real shapes upheld; seven silences — same
+minute, different discrepancy, both sides, no tokens, a decimal is not a version, digits-only is
+not an id, no cheap issue; executed both ways). Battery 5/5 killed with controls, re-run after a
+pylint `best[0]` refactor. **Measured by full replay (1,287 hits / 0 misses — the rule is the
+only variable):** 4 trials replaced → upheld, all expected REFUTED, 0 the other way, false alarms
+identical; fact_swap 16 → 19/43, omitted_contradiction 8 → 9/43; balanced 0.8114 → 0.8167
+(4:0 discordant, p = 0.125 — not resolvable alone, adopted on the no-loss rule). Suite 23,788 /
+0 / 68. Deployed 11:0x (pid 64574 → 7989). Baseline re-recorded AFTER the last edit from a
+replay under the deployed digest: **0.8167 ±0.0326**, previous preserved as
+`verifier_incumbent_baseline.2026-09-21.json`, oracle NO DRIFT. Remaining `replaced_uncertain`
+on refute-expected faults are concessions about a DIFFERENT discrepancy than the cheap judge's
+— out of both rules' reach by design.
+
+## §4JI — The announcement that restated the request (2026-09-21, 11:30–) — R0 scope, written first
+
+**Trigger.** Operator: "look at request e69cab30, the reply was 'Background activity while you
+were away: … --- Ας κάνω πιο στοχευμένες αναζητήσεις για τα τρία συγκεκριμένα στοιχεία που
+αναφέρεις — το νομικό κατώφλι των 23.125.000 δρχ, … και την απόφαση του Ελεγκτικού για ζημιά
+23.100.000 δρχ.' what went wrong there?" Log trace: 12 turns, 36 `web_search` calls, 677 s; the
+searches returned off-topic results throughout (a retrieval gap for a Greek legal specific — not
+a guard's fault, left as observed); the no-progress breaker forced a grounded conclusion at
++562 s; turn 12 = the announcement above + three dropped tool calls; the async verifier came back
+LATE UNCERTAIN (60%) — informational. The digest banner on top is expected (the regression row
+predates §4JF's info-severity demotion).
+
+**R0.** Property: a forced or zero-tool final whose text is nothing but an announcement of work
+is a NO ANSWER even when it restates the user's own request — the request's figures are echoes,
+"the items you mention" points back at the request, and "searches"/"κάνω πιο στοχευμένες
+αναζητήσεις" name work; and every breaker that forces a final arms `_breaker_forced_final` so a
+tool call on that final is the §4IG no-answer. Threat model: a real answer that re-uses the
+request's figures (must NOT flip), narration that contributes a NEW figure (must not flip), a
+question or request to the user (still addressed), the §4IX controls (person-agnostic "θα" over a
+fact, a refusal). Measured on the recorded corpus (2,922 replies, banners peeled to the loop's
+view) before shipping. Out of scope: the search capability itself; `is_narration_only_trim`'s
+smoother-internal caller (no request in scope; the un-threaded verdict is the fail-safe one).
+
+### §4JI — shipped (2026-09-21, 11:30–12:20)
+
+Three guards passed the sentence, each for its own reason, and the English twin ("Let me do more
+targeted searches for the three specific items you mention — the legal threshold of 23,125,000
+drachmas…") failed identically — an ECHO gap, not a language gap:
+
+1. **`_NARRATION_CONTENT_RE` `\d{2,}`** — the two figures copied from the request made the
+   announcement "content". `reply_smoothing._mask_request_echoes(block, request)` blanks every
+   figure present verbatim in the request before the content check; the request is threaded
+   through `narration_only(text, request=)`, `forced_final_has_no_answer(…, request)`,
+   `is_narration_only_trim(…, request)`, `reply_shape_check.refute_narration_only(…, request=)`,
+   and the agent's `_forced_final_has_no_answer` / `_announced_work_without_acting`; the three
+   loop call sites pass `last_user_content` (forced-final decision, zero-tool work nudge) and
+   `request_text` (shape refutation). A caller that passes no request gets the pre-§4JI verdict.
+2. **`_NARRATION_WORK_RE`** — "κάνω πιο στοχευμένες αναζητήσεις" matched nothing (the rule was
+   `κάνω [μια] αναζήτηση` singular, directly after the verb); "searches" ≠ "search". Now up to
+   three words between κάνω and the noun, singular AND plural with either accent (αναζήτηση /
+   αναζητήσεις, έλεγχο / ελέγχους, επαλήθευση / επαληθεύσεις), `search(?:es)?`.
+3. **`_NARRATION_ADDRESSED_RE`** — "the items you mention" read as addressed; "you" + a
+   reporting verb (mention/asked/said/sent/gave/…) is a back-reference; a question, "your" and
+   "you" as the agent of future work remain an address.
+4. **Six breaker sites** set `force_final_response = True` without `_breaker_forced_final`:
+   the no-progress hard stop (the e69cab30 breaker), the never-extracted navigate, the §4IB
+   same-error report, the Failure Cap, the Think-Loop Halt, the blocked-preflight stop. All arm
+   it now (10 armed sites); the four non-breaker forced finals (one-task latch, latch repair
+   round, no-tool disclaimer, planner "no tool") are enumerated by their enclosing condition in
+   the pin — a new unlisted site fails it.
+
+**Measured:** shipped regexes on 2,922 recorded replies — 8 narration-only without the request,
+9 with it; the one new hit is e69cab30 itself. Each widening alone: W1 (echo mask) 0 new, W2
+(work nouns) 1 new = e69cab30, W3 (back-reference) 0 new.
+
+Pins: `tests/test_4ji_request_echo_narration.py` (17: shipped sentence + English twin with and
+without the request, real answer re-using the figures, narration contributing a new figure, the
+mask's bounds, noun forms + modifier bound, back-reference exemption + controls, every wrapper,
+the three call sites by AST, `handle_chat` end to end with the latch forcing the final — pre-fix
+the echo shipped, now the directive fires once and the answer ships — the breaker enumeration,
+and the no-progress breaker run to its hard stop through `_dispatch_and_process_tool_batch` with
+the flag checked before and after). Docs: `docs/core/agent.html#4ji`, `docs/core/verifier.html`.
+
+**Battery §4JI: 22 mutants + 2 controls, 22/22 killed** (mask dropped / masks everything /
+ignores the request; each wrapper and each call site un-threaded; each regex reverted or
+over-widened; the four flag sites reachable by anchor). R8: one first-pass survivor — the Greek
+modifier bound `{0,3}` → `{0,30}` — exposed a VACUOUS pin: its control sentence carried "σας" and
+was rejected as addressed, never by the bound. The repaired control ("Ας κάνω ό,τι μπορώ ώστε να
+προχωρήσει η αναζήτηση.") then exposed a SECOND defect in my own widening: the stems I wrote
+(`αναζητήσ\w*`) had lost the singular "αναζήτηση" (the accent moves), so `κάνω μια αναζήτηση`
+— the §4IW form — was no longer a beat. Fixed with both-vowel stems, four singular/plural pins,
+a stem-reverting mutant; re-run 4/4 with controls. Two defects in my own fix, both found by the
+battery, neither by the pins as first written.
+
+Suite ONCE after all changes: 23,807 passed / 0 failed / 66 skipped (8:49). Lint OK (183 baseline), pin
+ratchet 38/38. Deployed 2026-09-21 14:13 via `launchctl kickstart -k` (pid 7989 → 29163, one listener,
+health ok, 0 src files newer than the process).
+
+## §4JJ — The search loop that never opens a result (2026-09-21, 14:30–) — R0 scope, written first
+
+**Trigger.** Operator: "what's next?" → "proceed with all steps" on the proposal: (1) measure
+search yield on the corpus, (2) a search-yield breaker if the data supports it, (3) retrieval
+probes for non-English niche asks. September: 38 requests ran 10+ searches, median 200–424 s,
+almost none passed; §4JI fixed what ships at the END of such a loop, nothing about the loop.
+
+**R0.** Property under test: "consecutive web searches with no result opened" predicts a request
+that ends with nothing, and an intervention at that point shortens the loop without costing the
+answers that search-heavy requests synthesise from snippets. Threat model: a stop that cuts a
+later productive search; a steer that teaches the model to open irrelevant pages to satisfy it
+(the instrument teaches gaming). Decision rule pre-stated: no guard without a measured true
+positive its false positives do not swamp (§4FH); anything the corpus cannot settle ships only
+behind a randomized arm.
+
+### §4JJ — shipped (2026-09-21, 14:30–15:40)
+
+**Step 1 — yield measured (Aug+Sep, 75 requests with ≥4 searches; 899 searches).** A search is
+productive when one of its results is later opened or cited in the final: 289/899. Median wasted
+tail 5 searches. The behavioural run (consecutive searches, no page opened) separates the
+population by LENGTH, not outcome: every request that ended with nothing (6/75) had a run ≥10 —
+and so did 26 that answered from snippets (4972a574 found "Νεράκια" at search 54/54; 86fa4719,
+the sibling of e69cab30, reached an honest "could not confirm" at search 22). Sweep of a hard
+stop at N consecutive unproductive searches: N=8 fires in 43/61, cuts a later productive search
+in 4. **A stop is NOT supported.** Also found while reading the endings: 882f477c shipped 268
+chars of pure narration ("firm up the 1995 video") that `narration_only` passes because "1995"
+is a figure — a beat naming a TARGET, left as a known limit of the §4GH content rule.
+
+**Step 2 — a steer, behind an arm.** `StrikeLedger.note_search_yield` (web_search extends the
+run; `SEARCH_OPEN_TOOLS` = browser/deep_research reset it; other tools leave it);
+`SEARCH_YIELD_STEER = 10` in strikes.py (the corpus-derived value, stated once); the site sits
+before the no-progress breaker in `_dispatch_and_process_tool_batch`, counts the batch in call
+order, fires once per request, consults `experiments.arm_for("search_yield_steer")`, stamps
+`search_yield_steer_fired` on both arms, and on treatment appends ONE SYSTEM ALERT — open the
+one result most likely to hold the answer, or answer from the snippets naming what could not be
+confirmed — tools KEPT. Spec in `DEFAULT_SPECS` AND in `system/experiments.json` (wholesale
+replacement — §4BR; backup `.bak-20260921-*`). Kill: delete the entry or GHOST_EXPERIMENTS=0.
+
+**Step 3 — retrieval probed over Tor** (12 recorded Greek queries, region the only variable,
+same race/circuits/filters as the tool): wt-wt vs gr-el — waves won 9/12 → 11/12,
+strict-on-topic 87 → 98, .gr 80 → 95, key-figure hits 31 → 45. Modest: yandex (region-blind)
+won nearly every wave in both regions; duckduckgo and brave, the engines that READ the region,
+returned nothing over Tor almost always. Shipped `tools/search.region_for_query` → `gr-el` for
+Greek script (a preference, never a filter). The e69cab30 facts surfaced from NO engine in either
+region — a query with "23.125.000" returns pressure washers and Russian car ads; the number is
+read as a model number. The failure is the index, not the configuration: reaching the honest
+conclusion at search 10 instead of 22–36 is the available win.
+
+Pins: `tests/test_4jj_search_yield_steer.py` (8; treatment/control/no-arm executed through the
+dispatch pipeline with distinct queries so the no-progress breaker stays silent),
+`tests/test_4jj_search_region.py` (10; the wave passes the mapped region to every engine through
+the race test's DDGS double). Docs: `agent.html#4jj`, `experiments.html` (table row),
+`tools/search.html#4jj`.
+
+**Battery §4JJ: 14 mutants + 2 controls, 14/14 killed.** R8: one first-pass survivor — dropping
+the polytonic block from the Greek-script regex — was an EQUIVALENT mutant (every Greek word
+carries a basic-block letter; my "polytonic" test case also carried "τρένο"); the regex was
+simplified to the basic block rather than a contrived pin written. Second time today a control
+sentence carried a second reason (§4JI's "σας"): write the control so ONLY the property under
+test can reject it.
+
+Suite ONCE after all changes: 23,823 passed / 0 failed / 68 skipped (9:15). Lint OK (183 baseline),
+pin ratchet 38/38. Deployed 2026-09-21 17:05 (pid 29163 → 55553, one listener, health ok, 0 src files
+newer than the process); the live registry loads 9 specs incl. `search_yield_steer`, not degraded.
+
+### §4JJ addendum — a year inside a beat names a target (2026-09-21, 17:20–17:45)
+
+Operator: "proceed if it's a simple fix". Measured first: masking years inside beat sentences
+alone flipped 0 of 2,933 replies — 882f477c was ALSO blocked by "firm up" not being a work verb.
+Both together: +1 = 882f477c, nothing else. Shipped `_mask_beat_years` (a year blanked only in a
+sentence that is a beat once the year is gone; "It was 2023." stays content; a non-year 4-digit
+figure stays content) and "firm up" / "pin down" as work verbs. Pins +2 (tests/test_4jj_search_
+yield_steer.py). Battery 5 + 2 controls, 5/5 — R8: the any-four-digits mutant survived first
+pass because my non-year control was "23.100.000" (dotted, never a 4-digit run); pinned with
+"1187" / "4521". Known, accepted: "Let me verify — it was 2023." (a finding inside a beat
+sentence, dash-joined) would now read as narration; not seen in the corpus.
+
+Addendum suite ONCE: 23827 passed, 66 skipped, 44 warnings. Deployed 2026-09-21 17:22 (pid 55553 → 74865, one listener, health ok, 0 src newer).
+
+
+## §4JK — Three face defects found by driving the loop (2026-09-21, 17:50–19:10)
+
+**Trigger.** Operator: "switch gears to the webUI, search for defects in the faces and also make
+suggestions making cube2 face (much) more interesting."
+
+**R0.** Method = the §4JA harness (THREE stub + fake rAF, the REAL `animate()` under node) pointed
+at what the 09-20 pins never measured: 20 min of uptime per form (the `time × variable` class),
+frame-rate invariance 30/60/120, every form-switch pair at rest and mid-turn with a switch-back
+mid-blend (NaN / negative size / over-budget / jumps), the line budget under a user turn per gait,
+the mobile + reduced-motion builds, and a headless swiftshader render of every form on the live
+UI (shader errors, pixel stats rest vs turn). Threat model for each fix: the negative control (the
+pre-fix backup) must FAIL the same pin.
+
+**Clean:** frame-rate invariance (accumulators within 0.5% across 30/60/120 Hz, all forms); 40
+switch pairs (0 NaN, 0 negative sizes, 0 over-budget); mobile/reduced builds fill NODE_COUNT; no
+shader errors; cube / cube2 / descent uptime flat (descent's turn p95 wanders 0.035–0.055 with the
+bead's chaotic state, not uptime — checked at 0/11/21/32 min).
+
+**Defects (all fixed, version 13.0):**
+- F1 vortex line cap: 11,942 links vs MAX_LINES 10,000 (mobile 2,944 vs 2,500) on a user turn —
+  capped 64% of frames (91% under read/thicken); pairs dropped by node INDEX → the last-built region
+  bare, count flickering across the cap; the recall comet undrawable. Fix: 12,000 / 3,000 headroom
+  + `_linkBudget` feedback (overflow → radius² ×0.97 next frame; under 92% → ÷0.99; floor 0.45).
+  After: capped 0.3–3% (transient), budget 0.61 under thicken, back to 1.0 at rest.
+- F2 vortex differential swirl `vortexSpin × (0.9 − 0.4·dOut)` — spin×depth = the §4JA class in
+  disguise: idle p95 0.0085 → 0.1127 after 20 min (13×), turn p95 0.20 → 0.998 (teleports), 16,694
+  spike frames. Fix: per-node integrated `bp.swirl += _vortexSpinStep × (0.9 − 0.4·dOut)`. After:
+  idle 0.0094 → 0.0099, 0 spikes.
+- F3 camera-static forms (vortex, cube2, empty) took five dive couplings built for a camera moving
+  INTO the cloud: bloom ×0.5, line dim ×0.7, motes, clock ×1.6, proximity ×1.15 — the vortex's busy
+  state was DIMMER than idle (bloom 0.50 vs 0.57; headless mean 6.6 → 6.3 on a turn). Fix:
+  `camDive` = 0 for them. After: 6.2 → 7.3. ⚠ Taste change for the operator: the busy vortex is
+  brighter than they have seen it since 07-28 — flagged in the report.
+
+Pins: `tests/test_interface_face_defects_2026_09_21.py` (8 executed, backup as negative control,
+15 s). Battery 7 + 2 controls, 7/7 killed. Five older text pins updated (camDive, budget factor,
+v13.0). Docs: `docs/interfaces/web_server.html#4jk`. Restore point
+`matrix_graph.js.bak-20260921-prevortexfix`. cube2 suggestions delivered to the operator as a
+menu (the §4JC memory: ask before building on cube2).
+
+## §4JL — cube2 v2: the seven upgrades (2026-09-21, 19:10–20:30)
+
+**Trigger.** Operator: "fix them all" on the cube2 menu (§4JK report). cube2 is thereby KEPT.
+
+**Measured before:** cube2 idle vs busy pixel-identical (lit 4.2% both; vortex 11.7 → 13.2%).
+
+Shipped (all inside the contract: camera never moves, two poles, structure not brightness):
+(1) ties — 8 corner lines between consecutive shells in depth order, wrap pair skipped; (2) torsion
+wave — kernel spin integrated (`c2KernelSpin` 0.10 idle / +0.5 turn / +0.8 tool), newborn shells
+inherit it FOLDED to ±45° (`_wrapQuarter`: a cube's 4-fold symmetry — my first cut folded to ±π
+and consecutive shells folded their ties over; the 0.7π cap that followed was still the wrong
+frame) and unwind at 0.997/frame; (3) runners — per-edge packet phases, tool-call burst on uPulseT
++ corner flash; (4) heat wave on the breath clock, stronger on a turn; (5) the search ring lights
+the LINES (uLineSweep cube2-only, reach 7; ring width grows with radius, warmth ×0.7 — the first
+render lit the whole near shell because that one shell is most of the screen); (6) a 3×3×3
+lattice kernel with 54 explicit edges, no proximity pass at all in cube2; (7) verdict grammar:
+pass collapses the wobble + fast unwind, refute shudders at 45 Hz, stop = the shared exhale.
+
+Executed under the harness: lines 720 + 72 + 54; kernel 0.10 → 0.54 rad/s on a turn; twists ≤ 45°
+on 8/10 shells during a turn; seeds 0.59 → 0.62; 12 packet phases; tool → gaitFlash 0.48, corners
+×1.29; pass → wob 0.07 → 0.013, twists ×0.69 in 60 frames; refute → shudder; 8-min uptime flat
+(idle p95 0.026 → 0.022), 0 NaN, 0 visible wraps. Live swiftshader renders reviewed at rest /
+turn / search / tool: 0 console errors; busy now reads as a twisted, kernel-hot tunnel.
+
+Pins: `tests/test_interface_face_cube2_v2_2026_09_21.py` (11). Battery 15 + 2 controls, 15/15.
+Older cube2 pins moved to the v2 layout (line bounds, kernel at 200..226); versions 13.1 in six
+files; hint "infinite cube". Restore point `matrix_graph.js.bak-20260921-precube2v2`. Docs
+`web_server.html#4jl`.
+
+### §4JM — cube2 v3: a corridor, a stream, a hot kernel (2026-09-21, 20:30–21:30)
+
+Operator on v2: "barely looks any different … functionally better but kinda boring." True: the
+seven upgrades were mechanisms; the RENDER was still hairline frames, ten shells, one glacial
+speed, a muted kernel. What the vortex has that reads as alive — density, a hot focal point,
+continuous varied flow — cube2 had none of. v3: shells are LINE-ONLY so the stack is 24 deep (12
+mobile), corner nodes on every other shell; a "+" ruling on every face; the 127 freed nodes are a
+STREAM riding the expansion at spread speeds (0.7–1.8×) on a spiral, hot→cold, tapered; an
+integrated roll of the corridor (0.02 idle / 0.06 turn rad/s); uCenterDim 0 for cube2 (the
+vortex's crimson-keeper was muting cube2's one hot thing), kernel ×1.15 / edges ×2.0. Lit
+fraction 4.2% → 7.9% rest / 9.6% turn; mean 3.1 (still the darkest face). Lines 3,694.
+
+Pins moved to the v3 layout (+3: stream outward + spread beyond the birth-pull, scene roll =
+accumulator, centre-dim; the text control replaced by an executed one — the pin ratchet had
+rejected 4 text pins in the v2 module, rightly). Battery 8 + 2 controls, 8/8 after two vacuous
+pins: the speed-spread pin passed on the birth-pull's noise (filter r > 1.5); the roll pin read
+the accumulator, not the scene. R8: the same mistake twice today — "measure the effect where it
+lands, not the variable that should cause it". Version 13.2. Restore point `.bak-20260921-precube2v3`.
+
+Suite ONCE after §4JK–§4JM (face defects + cube2 v2 + v3): 2 failed, 23847 passed, 65 skipped, 44 warnings. Lint OK. The web UI serves statics from disk — no restart; version 13.2.
+
+R8 (§4JM): the first full suite found 2 failures the face suites had not — the builder-fill pin executes
+each builder in ISOLATION and `_c2StreamCount` was declared outside the builders section (ReferenceError).
+Moved next to `_c2KernelBase`. Re-run: 23847 passed, 67 skipped, 45 warnings.
+
+
+## §4JN — Rule 5, LANGUAGE (2026-09-21, 21:40–)
+
+**Trigger.** Operator: "while speaking to the agent in English, the agent sometimes translates my
+search to Greek, why?" → "add the prompt line and re-measure".
+
+**Measured (July–Sep, `scripts/measure_reply_language.py`):** English requests that searched:
+18/167 (10.8%) issued a Greek-script query — all Greece-local subjects; the model's own retrieval
+judgment (profile: Athens; "jiujitsu north athens" in English → Missouri/Tbilisi/Athens GA, next
+query Greek). No rule, hint, lesson or code asks for it. Failure modes: proper names TRANSLATED
+("Anatolia College" → "Ανατολικό Σχολείο"), mixed-script queries 46/983 (4.7%). Reply drift:
+14/2,112 English requests (0.66%, prose lines; quoted headlines excluded) answered mostly in
+Greek; EL→EN 2/47. NO language rule existed in SYSTEM_PROMPT, and the trivial-chat path's own
+prompt had none either ("hello there" → "Γεια σου!", b2f61b94).
+
+**Shipped:** SYSTEM_PROMPT rule 5 LANGUAGE (reply in the user's language; search in the language
+that finds the sources; never translate a proper name; one script per query); the trivial-chat
+prompt: "in the language the user wrote in". Pins: `tests/test_reply_language_rule_2026_09_21.py`
+(7: the rule in the model's system message on BOTH prompt paths via a real handle_chat — the first
+pin used "hello there" and found the lite prompt had no rule, which is how the second gap was
+found — and the classifier on the counted shapes). Docs `core/prompts.html#4jn`. Re-measure with
+`--since 2026-09-21` once traffic accumulates; the query switch is not the target, the translated
+names / mixed scripts / reply drift are.
+
+Suite ONCE: 23,854 / 0 / 67. Deployed 2026-09-21 21:50 (pid 74865 → 80190, one listener). Live re-measure
+(3 probes, English asks on Greek-local subjects that had drawn Greek replies/queries before): Tzaneio →
+reply 0% Greek prose (was 100% Greek), one single-script Greek query; Koufontinas father → 2% (the name
+in parentheses), one EN + one GR query, each single-script; jiujitsu north Athens → 0%. Corpus re-measure:
+`scripts/measure_reply_language.py --since 2026-09-22` (day granularity; the rule went live late on
+09-21) against the recorded baseline: query switch 10.8%, mixed-script 4.7%, EN→EL reply drift 0.66%.
+
+
+## §4JO — Retrieval for Greek-local asks: the engine survey and the encyclopedic supplement (2026-09-21, 22:20–23:20)
+
+**Trigger.** Operator: "go with 1" (retrieval for Greek-local asks, the gap under e69cab30).
+
+**Survey (2026-07-08 method, 17 recorded Greek queries × 2 circuits, gr-el):** yandex 30/34, 2.3 s
+median (the only real Greek ticket; reads "23.125.000" as a model number); bing 25/34 with the SAME
+pages at 17.9 s median (10–31 s) — as a race member it would re-create the §4HR failed-wave cost,
+and with the fast-tier timeout it answers within 12 s in ~1/3 of its successes: a ~25% ticket for
+yandex's 12% failures, not worth a fifth thread — left out; google 0/34, mojeek 0/34 (dead, as
+§4HR found). ddgs's `wikipedia` backend (title prefix, limit 1): 6/34 — 0/24 on long queries, 3/5
+short proper nouns on both circuits, 100% reachable. el.wikipedia FULL-TEXT search over Tor
+(curl_cffi, ~1 s): the proper nouns AND the Tempi paraphrase; nothing on the long figure queries;
+loose junk on "Αλκιβιάδου 154" ("Γερμανική εισβολή…") — hence a SUBJECT rule.
+
+**Shipped:** `wiki_supplement_wanted` (Greek script, ≤6 content words), `_wiki_lookup` (search +
+intro extracts, capped 700, own circuit, race pool), `wiki_article_on_topic` (the leading content
+word must appear — the §4IL any-token rule passes every Greek word), `merge_wiki_first`, the
+launch-with-the-wave / await-after-a-win (≤6 s) / alone-when-the-web-fails integration in
+`tool_search_ddgs`. Latency: the lookup runs 4–5 s in parallel with a 2–3 s wave → a Greek
+proper-noun search costs ~2 s more; a Latin or long query costs nothing.
+
+Pins: `tests/test_search_wiki_supplement_2026_09_21.py` (12). Battery 10 + 2 controls, 10/10.
+Docs `tools/search.html#4jo`. Honest scope: this answers the Koufontinas / Tzaneio / Μιχαήλ Βόδα
+class (who/what is X); it does not find the 1990s drachma threshold — no engine indexed it.

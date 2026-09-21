@@ -186,9 +186,10 @@ def _step_result_ok(result_str: str) -> bool:
     from ..sandbox.jobs import is_promoted_result
     if is_promoted_result(s):
         return False
-    m = re.search(r"EXIT CODE:\s*(\d+)", s)
-    if m:
-        return m.group(1) == "0"
+    from .tool_failure import exec_exit_code as _exec_exit_code
+    _code = _exec_exit_code(s)  # R4-1: execute-shaped only, line-anchored
+    if _code is not None:
+        return _code == 0
     # "SYSTEM INSTRUCTION:" and "REJECTED:" are file_system's hard-failure
     # prefixes (missing params, replace block not found, syntax-regression
     # rollback) — they used to count as SUCCESSES here, inflating macro

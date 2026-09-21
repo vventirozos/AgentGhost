@@ -63,7 +63,7 @@ def test_bloom_damped_while_inside(graph_js):
     # quads — bloom must scale down with the dive, not up. Deepened
     # 0.35→0.5 plus per-line diveDim after operator feedback
     # ("too bright"): additive line stacking was the brightness driver.
-    assert "(1.0 - 0.5 * dive)" in graph_js
+    assert "(1.0 - 0.5 * camDive)" in graph_js   # camDive: the camera-static forms opt out (2026-09-21)
     assert "float diveDim = 1.0 - 0.30 * uDive;" in graph_js
 
 
@@ -99,9 +99,9 @@ def test_interior_enrichment_present(graph_js):
     # skipped entirely at rest), a thicker proximity web, and faster
     # data pulses inside.
     assert "MOTE_COUNT = IS_MOBILE ? 150 : 400" in graph_js
-    assert "motesMesh.visible = dive > 0.01" in graph_js
-    assert "PROXIMITY_SQ * (1.0 + dive * 0.15)" in graph_js
-    assert "const tStep = 0.005 * (1.0 + dive * 0.6)" in graph_js   # dt-scaled since 2026-09-20
+    assert "motesMesh.visible = camDive > 0.01" in graph_js
+    assert "PROXIMITY_SQ * (1.0 + camDive * 0.15)" in graph_js
+    assert "const tStep = 0.005 * (1.0 + camDive * 0.6)" in graph_js   # dt-scaled since 2026-09-20; camDive since 09-21
     # Scale boost deliberately trimmed — the swell dilutes local density
     # exactly when the camera is closest (the original emptiness bug).
     assert "dive * 0.55" in graph_js

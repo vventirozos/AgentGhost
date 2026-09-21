@@ -56,6 +56,11 @@ class Runner:
         headers = {
             "Content-Type": "application/json",
             "User-Agent": "ghost-functional-test",
+            # §4FB: a DIAGNOSTIC turn. Without this the three live-LLM
+            # turns below enrol in experiment arms, feed the learners and
+            # are recorded as real user turns — a test run that teaches
+            # the agent it is being tested. Found 2026-09-20 (R2-2).
+            "X-Ghost-Origin": "probe",
         }
         if auth:
             headers["X-Ghost-Key"] = self.key

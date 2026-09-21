@@ -54,6 +54,17 @@ DEFAULT_BATCH_LIMIT = 2
 # Inconclusive replays (infra aborts, solver aborts, empty status) may be
 # retried, but only this many times before the challenge is dropped quietly.
 MAX_INCONCLUSIVE_ATTEMPTS = 3
+# §4JF: a past-SUCCESS → FAILURE replay is a regression CANDIDATE until it
+# reproduces. Measured 2026-09-21: 7 regressions in 416 replays (~2%) against
+# a ~98%-pass pool — the band a single unlucky sim produces by variance —
+# and every one quarantined ~4–5 lessons with no way back (25 of the
+# playbook's 27 quarantined lessons). One failure asks for a second replay;
+# two failures quarantine and notify; a later PASS lifts what this loop
+# quarantined for that challenge. Confirmed regressions stay re-eligible
+# (lowest priority, bounded) so the lift can actually happen.
+REGRESSION_CONFIRM_FAILURES = 2
+MAX_REGRESSION_RECHECKS = 2
+VERDICT_CANDIDATE = "regression-candidate"
 
 # --- Learning-state replay gate (2026-07-27 log eval) ---------------------
 # A replay measures the CURRENT lessons/skills state against a past
@@ -122,6 +133,18 @@ def should_replay() -> Tuple[bool, str]:
     if not _gate_enabled():
         return True, "gate disabled (GHOST_COUNTERFACTUAL_GATE=0)"
     root = _root()
+    # §4JF: a pending regression CANDIDATE is owed its reproducing replay
+    # whether or not the learning state moved — the second replay measures
+    # the first one's variance, not a new state. Without this the gate
+    # parked every candidate until the next lesson landed, and a lesson's
+    # fate waited on unrelated learning.
+    if root is not None:
+        try:
+            streak, rechecks, _ = _regression_state(root)
+            if any(n >= 1 for cid, n in streak.items() if cid not in rechecks):
+                return True, "a regression candidate is owed its reproducing replay"
+        except Exception:  # noqa: BLE001
+            pass
     if root is None:
         return True, "no GHOST_HOME"
     fp = learning_fingerprint()
@@ -205,19 +228,57 @@ def _read_jsonl(path: Path) -> List[dict]:
 def _replay_state(root: Path) -> tuple:
     """(concluded challenge ids, per-challenge inconclusive attempt counts)
     from the results ledger. An inconclusive replay does not conclude a
-    challenge — it earns a retry, bounded by MAX_INCONCLUSIVE_ATTEMPTS."""
+    challenge — it earns a retry, bounded by MAX_INCONCLUSIVE_ATTEMPTS.
+    §4JF: neither does a regression CANDIDATE (it earns the reproducing
+    replay), and a confirmed regression is re-eligible for a bounded number
+    of rechecks so a later pass can lift its quarantines."""
     done: set = set()
     attempts: Dict[str, int] = {}
     for r in _read_jsonl(root / "results.jsonl"):
         cid = r.get("challenge_id")
         if not cid:
             continue
-        if r.get("verdict") == "inconclusive":
+        v = r.get("verdict")
+        if v == "inconclusive":
             attempts[cid] = max(attempts.get(cid, 0) + 1,
                                 int(r.get("attempts") or 0))
+        elif v == VERDICT_CANDIDATE:
+            done.discard(cid)          # pending its reproducing replay
+        elif v == "regression":
+            done.discard(cid)          # re-eligible, bounded by _regression_state
         else:
             done.add(cid)
     return done, attempts
+
+
+def _regression_state(root: Path) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, List[str]]]:
+    """Per challenge: consecutive failed replays since the last pass
+    (candidate streak), confirmed-regression recheck count, and the lessons
+    this loop quarantined for it (from the ledger — never re-derived)."""
+    streak: Dict[str, int] = {}
+    rechecks: Dict[str, int] = {}
+    quarantined: Dict[str, List[str]] = {}
+    for r in _read_jsonl(root / "results.jsonl"):
+        cid = r.get("challenge_id")
+        if not cid:
+            continue
+        v = r.get("verdict")
+        if v == VERDICT_CANDIDATE:
+            streak[cid] = streak.get(cid, 0) + 1
+        elif v == "regression":
+            streak[cid] = streak.get(cid, 0) + 1
+            if cid in rechecks:
+                rechecks[cid] += 1          # a failed recheck spends budget
+            else:
+                rechecks[cid] = 0           # the confirming failure opens the budget
+            quarantined.setdefault(cid, []).extend(r.get("quarantined") or [])
+        elif v in ("stable-pass", "generalized"):
+            streak[cid] = 0
+            if cid in rechecks:
+                rechecks[cid] += 1
+        elif v == "still-failing" and cid in rechecks:
+            rechecks[cid] += 1
+    return streak, rechecks, quarantined
 
 
 def load_replay_candidates(limit: int = DEFAULT_BATCH_LIMIT) -> List[dict]:
@@ -229,11 +290,21 @@ def load_replay_candidates(limit: int = DEFAULT_BATCH_LIMIT) -> List[dict]:
         return []
     challenges = _read_jsonl(root / "challenges.jsonl")
     done, attempts = _replay_state(root)
-    fresh = [c for c in challenges
-             if c.get("id") and c["id"] not in done
-             and attempts.get(c["id"], 0) < MAX_INCONCLUSIVE_ATTEMPTS
-             and _normalize_status(c.get("status")) is not None]
-    return fresh[:max(0, int(limit))]
+    streak, rechecks, _ = _regression_state(root)
+    eligible = [c for c in challenges
+                if c.get("id") and c["id"] not in done
+                and attempts.get(c["id"], 0) < MAX_INCONCLUSIVE_ATTEMPTS
+                and _normalize_status(c.get("status")) is not None]
+    # §4JF ordering: a pending candidate gets its reproducing replay FIRST
+    # (a lesson's fate hangs on it), fresh challenges next, and confirmed
+    # regressions last — re-eligible only while their recheck budget holds.
+    pending = [c for c in eligible
+               if streak.get(c["id"], 0) >= 1 and c["id"] not in rechecks]
+    fresh = [c for c in eligible
+             if c["id"] not in rechecks and streak.get(c["id"], 0) == 0]
+    recheck = [c for c in eligible
+               if c["id"] in rechecks and rechecks[c["id"]] < MAX_REGRESSION_RECHECKS]
+    return (pending + fresh + recheck)[:max(0, int(limit))]
 
 
 def classify(original: str, replay: str) -> str:
@@ -252,7 +323,8 @@ def classify(original: str, replay: str) -> str:
 
 def record_result(*, challenge_id: str, original: str, replay: str,
                   verdict: str, quarantined: Optional[list] = None,
-                  attempts: Optional[int] = None) -> None:
+                  attempts: Optional[int] = None,
+                  restored: Optional[list] = None) -> None:
     root = _root()
     if root is None:
         return
@@ -265,6 +337,8 @@ def record_result(*, challenge_id: str, original: str, replay: str,
             "verdict": verdict,
             "quarantined": list(quarantined or []),
         }
+        if restored:
+            rec["restored"] = list(restored)
         if attempts is not None:
             rec["attempts"] = int(attempts)
         with _LOCK:
@@ -351,19 +425,44 @@ async def run_counterfactual_batch(dreamer, context,
                               attempts=attempts.get(cand["id"], 0) + 1)
                 _report(context, cand, replay_status, verdict, quarantined)
                 continue
+            restored: List[str] = []
+            recheck_failed = False
             if verdict == "generalized":
                 summary["generalized"] += 1
             elif verdict == "regression":
-                summary["regressions"] += 1
-                quarantined = _quarantine_replay_lessons(context, cand,
-                                                         dreamer)
-                summary["quarantined"].extend(quarantined)
+                # §4JF: reproduce before quarantining. The first failed
+                # replay of a past SUCCESS is a CANDIDATE — recorded, info-
+                # level, the challenge stays eligible and goes to the front
+                # of the next batch. Only the reproducing failure quarantines
+                # and notifies.
+                _streak, _rechecks, _ = _regression_state(_root())
+                if cand["id"] in _rechecks:
+                    # a failed RECHECK of a confirmed regression: the
+                    # quarantine stands, nothing new to quarantine, and the
+                    # operator already heard — info, not a second alarm.
+                    recheck_failed = True
+                    summary["rechecks_failed"] = summary.get("rechecks_failed", 0) + 1
+                elif _streak.get(cand["id"], 0) + 1 < REGRESSION_CONFIRM_FAILURES:
+                    verdict = VERDICT_CANDIDATE
+                    summary["candidates"] = summary.get("candidates", 0) + 1
+                else:
+                    summary["regressions"] += 1
+                    quarantined = _quarantine_replay_lessons(context, cand,
+                                                             dreamer)
+                    summary["quarantined"].extend(quarantined)
             else:
                 summary["stable"] += 1
+            if verdict in ("stable-pass", "generalized"):
+                # A pass lifts what THIS loop quarantined for THIS challenge
+                # (the ledger says what that was; nothing is re-derived).
+                restored = _restore_replay_lessons(context, cand)
+                if restored:
+                    summary["restored"] = summary.get("restored", []) + restored
             record_result(challenge_id=cand["id"], original=cand["status"],
                           replay=replay_status, verdict=verdict,
-                          quarantined=quarantined)
-            _report(context, cand, replay_status, verdict, quarantined)
+                          quarantined=quarantined, restored=restored)
+            _report(context, cand, replay_status, verdict, quarantined,
+                    restored=restored, recheck_failed=recheck_failed)
         # Stamp the gate only after a DECISIVE replay: an inconclusive-only
         # batch (infra aborts) measured nothing, so its retries must stay
         # eligible regardless of whether lessons changed. Fingerprint is
@@ -413,22 +512,57 @@ def _quarantine_replay_lessons(context, cand, dreamer=None) -> List[str]:
     return out
 
 
-def _report(context, cand, replay_status, verdict, quarantined) -> None:
-    """One activity-ledger line per replay; regressions are
-    notify-severity (they reach Slack + the chat banner)."""
+def _restore_replay_lessons(context, cand) -> List[str]:
+    """§4JF: the challenge passed again — lift the quarantines THIS loop
+    imposed for THIS challenge, read from the results ledger's `quarantined`
+    lists. Only lessons whose quarantine reason still names the challenge
+    are touched: a lesson re-quarantined since by another mechanism keeps
+    that quarantine."""
+    out: List[str] = []
     try:
-        from .autonomous_activity import (
-            get_activity_log, SEVERITY_INFO, SEVERITY_NOTIFY,
-        )
+        sm = getattr(context, "skill_memory", None)
+        root = _root()
+        if sm is None or root is None:
+            return out
+        _, _, quarantined = _regression_state(root)
+        needle = f"challenge {cand.get('id')}"
+        for trig in dict.fromkeys(quarantined.get(cand.get("id"), [])):
+            n = sm.unquarantine_lesson(trig, reason_contains=needle)
+            if n:
+                out.append(trig)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("counterfactual restore skipped: %s", e)
+    return out
+
+
+def _report(context, cand, replay_status, verdict, quarantined,
+            restored=None, recheck_failed=False) -> None:
+    """One activity-ledger line per replay, ALL info-severity (2026-09-21,
+    §4JF, operator: "I don't wanna wake up in the middle of the night
+    because the agent had a regression"). A confirmed regression is not
+    actionable at 3 a.m.: the quarantine has already acted, and the review
+    waits for `introspect learning` or the morning digest — the ledger row
+    carries the challenge and the quarantined lessons either way. Nothing
+    from this loop reaches Slack or the chat banner any more."""
+    try:
+        from .autonomous_activity import get_activity_log, SEVERITY_INFO
         log = get_activity_log(context)
         if log is None:
             return
-        sev = SEVERITY_NOTIFY if verdict == "regression" else SEVERITY_INFO
+        sev = SEVERITY_INFO
         msg = (f"counterfactual {verdict}: challenge {cand.get('id')} "
                f"({cand.get('cluster') or 'no-cluster'}) "
                f"{cand.get('status')}→{replay_status}")
+        if verdict == VERDICT_CANDIDATE:
+            msg += " — will be replayed again before any lesson is quarantined"
+        elif verdict == "regression" and recheck_failed:
+            msg += " — recheck still failing; the quarantine stands"
+        elif verdict == "regression":
+            msg += " (reproduced on a second replay)"
         if quarantined:
             msg += f"; quarantined lesson(s): {', '.join(quarantined[:3])}"
+        if restored:
+            msg += f"; quarantine lifted on: {', '.join(restored[:3])}"
         log.record("self_play", msg, severity=sev)
     except Exception as e:  # noqa: BLE001
         logger.debug("counterfactual report skipped: %s", e)

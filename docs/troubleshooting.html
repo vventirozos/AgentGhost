@@ -52,6 +52,17 @@
     <dd><code>false</code> means the background loop died. Ghost still answers, but it has stopped consolidating memory and learning. Nothing will tell you this — it just goes quiet.</dd>
   </dl>
 
+  <h3>Beyond the two fields: the live verification harnesses</h3>
+  <p>Health says <em>something</em> is serving. Four scripts under <code>scripts/</code> ask whether the parts work, against the running agent (all read the key from <code>~/Data/AI/.ghost_api_key</code>, all send their LLM turns as diagnostics that never teach, except the selfhood one, which tests the recording path itself):</p>
+  <ul>
+    <li><code>functional_live_test.py</code> — API, auth, malformed input, sessions, workspace save, then three live turns (<code>--core</code> skips the turns).</li>
+    <li><code>tool_probes_live.py</code> — one bounded "reply with only X" prompt per tool family, checked mechanically, with the tool that actually ran read back from the log.</li>
+    <li><code>selfhood_functional_test.py</code> — capture, tool-using turn, the state thread through the <code>self_state</code> tool, narrative, stress, unity. Section G corrupts the live <code>state.json</code> and needs <code>--corrupt-live-state</code>.</li>
+    <li><code>metacognition_functional_test.py</code> — the metacognition modules composed with stubbed I/O; no agent needed.</li>
+  </ul>
+  <p>For the idle loops, <code>scripts/learning_health.py</code> (or <code>introspect action='learning'</code>) is the liveness screen: every registered phase, what its zero means, and a <code>✗ DEAD</code> only for a periodic loop whose heartbeat has not declined recently.</p>
+  <p>The <em>judgment</em> systems — the verifier, the router, the claim binder, escalation — are scored against known truth by the oracle benches, which take hours and belong to the night: <code>scripts/night_bench_round.py --launch --start-at 23:00</code> arms them detached (staleness oracle → read-only audits → verifier re-bench under the production env, gated by <code>preflight_longrun.py</code> with a live timed smoke → the instruction-following bench through the live agent → <code>SUMMARY.md</code> with the paired comparison against the recorded baseline and the route health, so a contention-degraded night is not read as a verifier regression). Nothing in it writes to the agent's data or promotes a baseline; adopting a new baseline is the operator's morning decision.</p>
+
   <h2>It won't start</h2>
 
   <h3>"REFUSING TO START … no API key configured"</h3>

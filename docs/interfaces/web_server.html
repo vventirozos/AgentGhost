@@ -1282,7 +1282,80 @@
   of the frame's half-height at full dive, still centred (screen (0.02, 0.06)) and still clear of the
   near-fade band; executed pin updated, cache-bust 12.8.</p>
 
+  <h2>cube2 — the infinite cube (EXPERIMENT, 2026-09-20)</h2>
+  <p>Operator: <em>"create a new face. it will be similar to cube but the depth of the cube will seem
+  infinite. call it cube2, lets experiment with it first before deciding if we'll keep it. try to make
+  it distinct, organic, and if possible much better than the current cube."</em> Three choices were put
+  to the operator first and picked: <strong>nested cubes on an endless zoom</strong> (over a corridor or
+  a fogged deep block), <strong>flow surges while the camera never moves</strong> (the vortex contract,
+  over a camera dive), and <strong>calm at rest</strong>. It sits in the roster next to cube
+  (<code>cube, cube2, vortex, descent, empty</code>); the default stays cube.</p>
+  <p><strong>Anatomy.</strong> <code>C2_SHELLS</code> (11 desktop / 5 mobile) wireframe cube shells
+  share one exponential depth axis: a shell at phase <code>d ∈ [0,1)</code> has half-size
+  <code>L = C2_L0·e^(C2_K·d)</code> (0.08 → 8.0), is born tiny and hot inside the kernel, grows outward
+  past the camera and wraps — node size and edge alpha taper to zero over the last fifth
+  (<code>sh.fade</code>, a new <code>aLineFade</code> line attribute), so the wrap is never a pop even on a
+  21:9 screen where a cube's back face can never leave the frame. Each shell carries 8 corner + 12
+  mid-edge NODES; its 12 edges are drawn as 6-segment polylines by <code>_emitCube2Edges</code> through
+  the same <code>_c2Pt</code> the nodes use (a wireframe cube's edges span far more than any proximity
+  radius at the outer scales, so those nodes are excluded from the O(n²) web via <code>_noProx</code>;
+  only the 14-node kernel tangle links by proximity). Organic: a self-similar wobble field evaluated in
+  unit-cube coordinates (a shell keeps its curved shape as it grows; <code>verify: 'align'</code> flattens
+  it), shells born where the kernel is and centring as they grow (<code>pull = e^(−L/0.6)</code>), a
+  slow z-twist with depth (<code>C2_TWIST</code> 0.7 rad across the whole recession — a spiral), the
+  pulse breath propagating outward, jittered shell phases (a metronomic recession read as machined),
+  a fresh wobble personality on every wrap, and 16 cool dust motes riding the expansion inside the
+  cubes for parallax. Thermal: shells hot at birth cooling to blue outward; the kernel flares on a
+  user turn and on a tool call (<code>tool: 'flash'</code>).</p>
+  <p><strong>Motion contract.</strong> <code>cube2Flow</code> is the swallow: idle ≈ a new shell every
+  ~4s (0.026 phase/s), ambient work a touch faster, a user turn ≈ one every ~0.7s (<code>cube2Travel</code>
+  eases in/out exactly like <code>vortexTravel</code>, gulping with the pulse); completion is a pure
+  intensity morph — no reset, no camera travel (<code>camera.position.z = CAMERA_REST_Z</code>, look at
+  the origin). No swell; near-still heading (the cube branch). Frame-time scaled like everything else.</p>
+  <p><strong>Verified.</strong> Executed pins (<code>test_cube2_infinite_cube_contract</code>,
+  <code>test_cube2_kernel_sits_on_the_view_axis</code>, the 30/60/120Hz run incl. <code>cube2Flow</code>):
+  a visible node never wraps, idle is spike-free, the turn rate is &gt; 3× idle and eases back, the
+  line count is the explicit edges plus the kernel tangle only, the camera never moves; both device
+  classes fill exactly NODE_COUNT. Spot battery: 6/6 mutants killed (taper off, shells back in the
+  proximity web, camera dives, no surge, no explicit edges, frame-locked flow), no-op survived. Live
+  (swiftshader): zero JS errors, idle and turn screenshots reviewed — the wireframe got a
+  <code>C2_LINE_GAIN</code> 1.8 and wobble 0.07 after the first render read faint and too straight.
+  Picker hint "infinite cube (experiment)". Restore point <code>matrix_graph.js.bak-20260920-precube2</code>.
+  Cache-bust: app/matrix_graph 12.9.</p>
+
+  <h2 id="4jk">Three face defects found by driving the loop (2026-09-21, §4JK)</h2>
+  <p>Operator: "search for defects in the faces". The §4JA harness (THREE stub, fake rAF, the real <code>animate()</code> under node) was pointed at what the 09-20 pins never measured: twenty minutes of uptime per form, the line budget under a user turn, and the dive couplings on the forms whose camera never moves. Frame-rate invariance (30/60/120 Hz), every form-switch pair at rest and mid-turn (no NaN, no negative size, no over-budget), the mobile and reduced-motion builds and a headless render of every form (no shader errors) all came back clean. Three did not:</p>
+  <ul>
+    <li><strong>F1 — the vortex overflowed the line buffer on every user turn.</strong> 11,942 qualifying links on desktop (2,944 mobile) against <code>MAX_LINES</code> 10,000 / 2,500: capped in 64% of turn frames, 91% under the read gait's <em>thicken</em>. The emitter kept the first pairs by node index and silently dropped the rest — the last-built stream region lost its web exactly during the surge, and the count flickered across the cap frame to frame (the recall comet could not draw either). Now: headroom (12,000 / 3,000) plus a link <strong>budget</strong> (<code>_linkBudget</code>): an overflow frame tightens the link radius 3% for the next frame, an under-budget frame relaxes it 1%, floor 0.45 — the web thins uniformly to fit, nothing is dropped by position. Measured after: capped frames 0.3–3%, budget dips to 0.61 under thicken and relaxes fully at rest.</li>
+    <li><strong>F2 — the vortex's swirl grew with uptime.</strong> The stream's differential rotation was <code>vortexSpin × (0.9 − 0.4·dOut)</code>: the ever-growing spin angle times a factor that changes as the node flows outward — the §4JA <code>time × variable</code> class in disguise (spin × depth). Every frame a node's angle jumped by <code>0.4 × vortexSpin × ΔdOut</code>: nothing on a fresh page, idle motion 13× after 20 minutes, node teleports on a user turn after an hour (p95 0.998 units/frame). Each stream node now integrates its own swirl at its current depth factor (<code>bp.swirl += _vortexSpinStep × factor</code>). After: idle p95 0.0094 → 0.0099 over 20 minutes, zero spike frames (was 16,694).</li>
+    <li><strong>F3 — the camera-static forms took the dive's interior couplings.</strong> The scene swell was neutralised for vortex and cube2 long ago; five other couplings were not: bloom ×0.5, line dim ×0.7 (<code>uDive</code>), the interior motes, the clock ×1.6 and the proximity ×1.15. Net effect: the vortex's busy state was <em>dimmer</em> than idle (bloom 0.50 vs 0.57 — the surge the comments promise was being cancelled; headless mean brightness fell 6.6 → 6.3 on a turn). <code>camDive</code> is now 0 for vortex, cube2 and empty and the five couplings read it; the diving forms (cube, descent) are unchanged. After: vortex 6.2 → 7.3 on a turn. <em>Taste note for the operator:</em> the busy vortex is now visibly brighter than it has been since 2026-07-28 — the code's stated intent, but a change to what you have been looking at.</li>
+  </ul>
+  <p>Pins: <code>tests/test_interface_face_defects_2026_09_21.py</code> (8, executed; the pre-fix backup <code>matrix_graph.js.bak-20260921-prevortexfix</code> is the negative control for each defect). Battery: 7 mutants + 2 controls, 7/7 killed. Version 13.0. Text pins in five older modules were updated to the new shapes (<code>camDive</code>, the budget factor, the version).</p>
+
+  <h2 id="4jl">cube2 v2 — the seven upgrades (2026-09-21, §4JL)</h2>
+  <p>Operator, on the suggestions: "fix them all". Headless measurement had said why cube2 read flat: idle and busy were pixel-identical (lit 4.2% both; the vortex goes 11.7 → 13.2%) — nested wireframes with nothing happening <em>on</em> them. All seven shipped, inside the standing contract (camera never moves, two-pole palette, brightness is not the mechanism):</p>
+  <ol>
+    <li><strong>Ties.</strong> The 8 corners of each shell joined to the corners of the next shell out (consecutive in depth order; the wrap pair skipped). Nested frames become one tunnel receding to the kernel.</li>
+    <li><strong>Torsion wave.</strong> The kernel spins on an integrated angle (<code>c2KernelSpin</code>: 0.10 rad/s idle, +0.5 on a user turn, a kick on a tool call). A newborn shell inherits the kernel's angle <em>folded to ±45°</em> — a cube's own 4-fold symmetry (<code>_wrapQuarter</code>) — and unwinds toward the stack (<code>C2_TW_DECAY</code> 0.997/frame). Bounded by construction: never an accumulator carried into a per-shell factor (the §4JA/§4JK class); the 8-minute uptime pin holds it flat.</li>
+    <li><strong>Runners.</strong> Every edge carries its own packet phase (the line shader's travelling charge marched every edge in lock-step before — invisible as motion); a tool call bursts the packets (<code>uPulseT</code> += 0.6·toolPulse) and flashes the corners (×1.6).</li>
+    <li><strong>Heat wave.</strong> Shells hottest at birth, cooling as they grow, with a pulse of warmth racing outward on the breath clock — amplitude 0.10·(0.35 + engagement), plus 0.08·engagement at the kernel end.</li>
+    <li><strong>Scan.</strong> The search gait's ring now lights the <em>lines</em> it crosses (<code>uLineSweep</code> = 1 for cube2 only, <code>uSweepReach</code> 7 — the stack is deeper than 2.4; other forms keep 2.4 and nodes only). Ring width grows with radius; warmth 0.7 of the node sweep's — a passing highlight on the shell it crosses, not a fill (the first render lit the whole near shell red because that one shell covers most of the screen).</li>
+    <li><strong>Kernel.</strong> A 3×3×3 lattice (2×2×2 mobile) tumbling on the spin, 54 explicit edges, no proximity tangle — so nothing in cube2 runs the O(n²) pass. Ten shells (was eleven) make room for it; the kernel starts at node 200.</li>
+    <li><strong>Verdict grammar.</strong> Pass: the wobble collapses (×0.15) and the inherited twists unwind fast (0.975/frame) — the stack crystallises; refute: a 45 Hz shudder on the wobble dying with the verdict envelope; stop: the shared scene-scale exhale.</li>
+  </ol>
+  <p>Lines: 720 shell + ≤72 tie + 54 kernel = 846 (mobile 360 + ≤32 + 12). Pins: <code>tests/test_interface_face_cube2_v2_2026_09_21.py</code> (11, executed through the loop: line composition, kernel spin idle/turn, bounded inherited twist, busy hotter than idle, 12 distinct packet phases, corner flash, pass/refute grammar, scan uniforms cube2-only, no NaN / wrap / teleport, 8-minute uptime, and the pre-v2 backup as a text control). Battery: 15 mutants + 2 controls, 15/15 killed. Version 13.1; picker hint "infinite cube" (no longer an experiment). Restore point <code>matrix_graph.js.bak-20260921-precube2v2</code>.</p>
+  <h2 id="4jm">cube2 v3 — a corridor, a stream, a hot kernel (2026-09-21, §4JM)</h2>
+  <p>Operator, on v2: "barely looks any different … functionally better but kinda boring". Fair: the render was hairline frames with a lot of empty space, ten shells (a shallow corridor), one glacial speed for everything, and a kernel muted by the centre-dim built for the vortex. What makes the vortex feel alive — a dense structure, a hot focal point, continuous <em>varied</em> flow — cube2 had none of. v3:</p>
+  <ul>
+    <li><strong>A 24-deep corridor (12 mobile).</strong> Shell edges are explicit lines and never needed nodes; the shells are now line-only, corner nodes ride every other shell, and the stack is 24 frames converging on the kernel (spacing 1.21×).</li>
+    <li><strong>Rulings.</strong> A "+" on every face — bent by the same wobble field — so a shell reads as a paneled data-cube, not a hollow frame (0.55 of the edge weight; desktop only).</li>
+    <li><strong>The stream.</strong> The 127 nodes the shells freed are matter born at the kernel riding the same exponential expansion, each grain at its own speed (0.7–1.8× — streams shear), on a spiral about the axis (0.9 rad over a life), hot at birth and cooling outward, tapered like a shell. The vortex's swallow, inside the cube.</li>
+    <li><strong>The roll.</strong> The corridor screws inward: an integrated roll of the scene about the view axis, 0.02 rad/s idle (a turn in five minutes), 0.06 on a user turn.</li>
+    <li><strong>The kernel is the focal point.</strong> <code>uCenterDim</code> 0 for cube2 (it was 0.30 — the dim that keeps the vortex's pile-up crimson was muting cube2's one hot thing); kernel nodes ×1.15, lattice edges ×2.0.</li>
+  </ul>
+  <p>Measured: headless lit fraction 4.2% → 7.9% at rest, 9.6% on a user turn (cube: 7.3%; vortex: 11.7%); mean brightness 3.1 — still the darkest face, structure not light. Lines 3,456 shell+ruling + ≤184 tie + 54 kernel = 3,694 (mobile 676). Uptime, NaN, wrap and teleport pins unchanged and green; the roll and the kernel spin are integrated, the inherited twist folded to ±45°. Pins: <code>tests/test_interface_face_cube2_v2_2026_09_21.py</code> (13 — the v2 pins moved to the v3 layout, plus the stream's outward flow and speed spread beyond the birth-pull, the scene roll matching its accumulator, the centre-dim, and the pre-v2 backup as an executed control). Battery: 8 mutants + 2 controls, 8/8 killed — after two first-pass survivors bought their pins (the speed-spread pin had been satisfied by the birth-pull's noise; the roll pin had read the accumulator, not the scene). Version 13.2. Restore point <code>matrix_graph.js.bak-20260921-precube2v3</code>.</p>
   <footer><a href="../index.html">← Back to index</a></footer>
+
 </main>
 </body>
 </html>

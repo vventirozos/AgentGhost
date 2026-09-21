@@ -1498,9 +1498,10 @@ def _looks_like_failure(output: str) -> bool:
     from ..sandbox.jobs import is_promoted_result as _promoted
     if _promoted(s):
         return True
-    _m = _re.search(r"EXIT CODE:\s*(\d+)", s)
-    if _m:
-        return _m.group(1) != "0"
+    from ..tools.tool_failure import exec_exit_code as _exec_exit_code
+    _code = _exec_exit_code(s)  # R4-1: execute-shaped only, line-anchored
+    if _code is not None:
+        return _code != 0
     if "[SYSTEM ERROR]" in s or "Critical Tool Error" in s:
         return True
     first = s.splitlines()[0].strip().lower()
@@ -1564,10 +1565,11 @@ def classify_verify_result(output) -> str:
     from ..sandbox.jobs import is_promoted_result
     if is_promoted_result(s):
         return "inconclusive"
-    m = re.search(r"EXIT CODE:\s*(\d+)", s)
-    if m is None:
+    from ..tools.tool_failure import exec_exit_code as _exec_exit_code
+    _code = _exec_exit_code(s)  # R4-1: the execute banner, not a quoted one
+    if _code is None:
         return "inconclusive"  # no exit code at all — not proof of anything
-    if m.group(1) != "0":
+    if _code != 0:
         return "fail"
     if "[SYSTEM ERROR]" in s or "Critical Tool Error" in s:
         return "fail"

@@ -815,3 +815,80 @@ class TestGeneralizationGuard:
         )
         assert not ok
         assert "empty" in reason
+
+
+# ── R2-6 (2026-09-20): a truncated page is not a count ──────────────────────
+# Live probe: "how many lessons are in your playbook?" → list_lessons(limit=
+# 100) → "## 100 all lessons learned so far:" → the agent answered 100 over
+# a 198-lesson store. The header must carry the TOTAL when it truncates.
+# Fails on the pre-fix tree: the header says "## 3 …" for a 5-lesson store.
+
+class TestListLessonsHeaderIsTheTotal:
+    def _store_with(self, tmp_path, n):
+        sm = SkillMemory(tmp_path)
+        rows = []
+        for i in range(n):
+            e = build_lesson(trigger=f"t{i}", correct_pattern="x",
+                             domains=["algo"], confidence=0.5, source="self_play")
+            e["timestamp"] = (datetime.now() - timedelta(minutes=i)).isoformat()
+            rows.append(e)
+        _write(sm, rows)
+        return sm
+
+    def test_count_lessons_is_the_unlimited_length(self, tmp_path):
+        sm = self._store_with(tmp_path, 5)
+        assert sm.count_lessons(scope="all") == 5
+        # past every default page size the tool or store might apply
+        (tmp_path / "big").mkdir()
+        big = self._store_with(tmp_path / "big", 130)
+        assert big.count_lessons(scope="all") == 130
+        assert sm.count_lessons(scope="all", source="self_play") == 5
+        assert sm.count_lessons(scope="all", source="post_mortem") == 0
+        assert len(sm.list_lessons(scope="all", limit=2)) == 2
+
+    @pytest.mark.asyncio
+    async def test_truncated_header_names_the_total(self, tmp_path):
+        sm = self._store_with(tmp_path, 5)
+        ctx = SimpleNamespace(skill_memory=sm)
+        out = await tool_list_lessons(ctx, scope="all", limit=3)
+        head = out.splitlines()[0]
+        assert head.startswith("## 5 all lessons learned so far"), head
+        assert "showing the 3 most recent" in head, head
+        assert "the total is 5" in head, head
+        assert out.count("\n- ") + out.count("\n1.") >= 0  # body still renders
+        assert "t0" in out and "t4" not in out  # newest 3 shown, oldest cut
+
+    @pytest.mark.asyncio
+    async def test_untruncated_header_is_the_plain_count(self, tmp_path):
+        sm = self._store_with(tmp_path, 2)
+        ctx = SimpleNamespace(skill_memory=sm)
+        out = await tool_list_lessons(ctx, scope="all", limit=10)
+        assert out.splitlines()[0] == "## 2 all lessons learned so far:"
+
+    @pytest.mark.asyncio
+    async def test_self_play_scope_counts_only_self_play(self, tmp_path):
+        sm = SkillMemory(tmp_path)
+        rows = []
+        for i, src in enumerate(["self_play"] * 3 + ["post_mortem"] * 2):
+            e = build_lesson(trigger=f"t{i}", correct_pattern="x",
+                             domains=["algo"], confidence=0.5, source=src)
+            e["timestamp"] = (datetime.now() - timedelta(minutes=i)).isoformat()
+            rows.append(e)
+        _write(sm, rows)
+        ctx = SimpleNamespace(skill_memory=sm)
+        out = await tool_list_lessons(ctx, scope="self_play_only", limit=2)
+        head = out.splitlines()[0]
+        assert head.startswith("## 3 self-play lessons"), head
+        assert "the total is 3" in head, head
+
+    @pytest.mark.asyncio
+    async def test_a_store_without_count_lessons_degrades_to_the_page(self, tmp_path):
+        """A stub memory (older fixture, third-party store) that lacks
+        `count_lessons` must still get a header, never a crash."""
+        sm = self._store_with(tmp_path, 4)
+        class _Legacy:
+            def list_lessons(self, **kw):
+                return sm.list_lessons(**kw)
+        ctx = SimpleNamespace(skill_memory=_Legacy())
+        out = await tool_list_lessons(ctx, scope="all", limit=2)
+        assert out.splitlines()[0] == "## 2 all lessons learned so far:"

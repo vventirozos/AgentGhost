@@ -46,7 +46,7 @@ def graph_js() -> str:
 # ── presence + cycle order ─────────────────────────────────────────
 
 def test_ai_form_builders_present(graph_js):
-    for builder in ("_buildCube", "_buildDescent"):
+    for builder in ("_buildCube", "_buildCube2", "_buildDescent"):
         assert builder in graph_js, f"missing {builder}"
         assert f"{builder}()" in graph_js, f"{builder} never dispatched"
     for gone in ("_buildLattice", "_buildEmbedding", "_cubeCx", "embExcite"):
@@ -61,7 +61,9 @@ def test_forms_array_contents_and_order(graph_js):
     # and toolgraph removed. 2026-09-20 (operator): embedding and the old
     # cube removed, lattice renamed cube and made the DEFAULT (listed
     # first); 'empty' stays last.
-    assert names == ["cube", "vortex", "descent", "empty"]
+    # 2026-09-20 (later): cube2, the infinite-cube EXPERIMENT, sits next
+    # to cube while the operator decides whether to keep it.
+    assert names == ["cube", "cube2", "vortex", "descent", "empty"]
     # 'empty' last: cycling INTO it disperses the face beyond the screen
     # edges and the NEXT cycle materializes the default from the void.
     assert names[-1] == "empty"
@@ -81,7 +83,7 @@ def test_link_multiplier_map(graph_js):
     m = re.search(r"const LINK_MULT = \{(.*?)\};", graph_js, re.DOTALL)
     assert m, "per-form link multiplier map missing"
     body = m.group(1)
-    for key in ("vortex", "cube", "descent"):
+    for key in ("vortex", "cube", "cube2", "descent"):
         assert re.search(rf"\b{key}:", body), f"LINK_MULT.{key} missing"
     for gone in ("lattice", "embedding"):
         assert not re.search(rf"\b{gone}:", body), f"LINK_MULT.{gone} outlived its form"
@@ -91,7 +93,7 @@ def test_new_forms_reheat_seeds_per_frame(graph_js):
     # cube (wave+kernel heat) and descent (height+bead heat) rewrite
     # nodeSeeds per frame — each must flag the attribute upload, like
     # vortex already does (plus the setForm upload).
-    assert graph_js.count("aSeed.needsUpdate = true") >= 4
+    assert graph_js.count("aSeed.needsUpdate = true") >= 5
 
 
 # ── geometry invariants (computed from the shipped constants) ──────
@@ -178,7 +180,7 @@ def test_form_picker_menu(graph_js):
     assert "face-form-menu" in app_js
     assert "cycleForm()" in app_js, "stale-cache fallback must remain"
     # Every shipped form carries a hint line in the picker.
-    for name in ("cube", "vortex", "descent", "empty"):
+    for name in ("cube", "cube2", "vortex", "descent", "empty"):
         assert re.search(rf"\b{name}: '", app_js), f"hint missing for {name}"
     for gone in ("lattice", "embedding"):
         assert not re.search(rf"\b{gone}: '", app_js), f"hint for removed form {gone}"
@@ -215,10 +217,10 @@ const VORTEX_APEX_Z = -2.0, VORTEX_LMIN = 0.55, VORTEX_KOUT = 2.6;
 const VORTEX_COS = 0.60, VORTEX_SIN = 0.80;
 let beadX = 0, beadZ = 0, beadVX = 0, beadVZ = 0, beadStill = 0;
 const beadTrail = []; let _descTick = 0;
-const FORMS = ['cube', 'vortex', 'descent', 'empty'];
+const FORMS = ['cube', 'cube2', 'vortex', 'descent', 'empty'];
 let formIndex = 0;
 {section}
-const builders = [_buildCube, _buildVortex, _buildDescent, _buildEmpty];
+const builders = [_buildCube, _buildCube2, _buildVortex, _buildDescent, _buildEmpty];
 for (const fn of builders) {{
     basePositions.length = 0;
     fn();

@@ -395,47 +395,49 @@ def test_the_runner_records_the_failed_call_and_keeps_it_out_of_the_rates(
         tmp_path, monkeypatch):
     """R5, the consumer half: `score_call` returning None only helps if
     `main` stops counting the row. Drives the real runner with `_chat`
-    replaced — no agent, no network.
+    replaced — no agent, no network. Single arm since §4JG (the compiled
+    variant is retired): the failed repeat is recorded with its error and
+    scored as NOTHING — neither a pass nor a fail — so the pass rate is over
+    the calls that actually answered, and there is no McNemar to fake.
 
-    World where it fails: the pre-round-4 loop, where the timed-out control
-    call scores False, the pair is counted, and `compiled` banks a
-    discordant win it never earned (c_second_only == 1).
+    World where it fails: the pre-round-4 loop, where a timed-out call
+    scored False and dragged the rate down as if the agent had failed.
     """
+    calls = []
+
     def fake_chat(text, variant, rid, timeout=400.0):
-        if variant == "control":
+        calls.append(variant)
+        if len(calls) == 1:
             raise TimeoutError("the read operation timed out")
         return {"reply": "68", "seconds": 1.0, "usage": {}}
 
     monkeypatch.setattr(ifb, "_chat", fake_chat)
     monkeypatch.setattr(sys, "argv", [
-        "if_bench.py", "--items", "num-1", "--repeats", "1",
+        "if_bench.py", "--items", "num-1", "--repeats", "2",
         "--out", str(tmp_path)])
 
     ifb.main()
 
     rows = [json.loads(l) for l
             in next(tmp_path.glob("*.jsonl")).read_text().splitlines() if l.strip()]
-    by_variant = {r["variant"]: r for r in rows}
-    assert by_variant["control"]["passed"] is None
-    assert by_variant["control"]["error"], "the failure was not recorded"
-    assert by_variant["compiled"]["passed"] is True
+    assert [r["variant"] for r in rows] == ["control", "control"]
+    failed, ok = sorted(rows, key=lambda r: r["rep"])
+    assert failed["passed"] is None and failed["error"], "the failure was not recorded"
+    assert ok["passed"] is True and not ok["error"]
     # every row carries the RUN stamp — `rep` alone is not unique across
     # invocations, which is what collapsed two ledgers in the combiner
     assert len({r["run"] for r in rows}) == 1 and all(r["run"] for r in rows)
 
     summary = json.loads(next(tmp_path.glob("*.summary.json")).read_text())
-    assert summary["errors"] == {"control": 1, "compiled": 0}
-    assert summary["scored"] == {"control": 0, "compiled": 1}
-    assert summary["pass_rate"] == {"compiled": 1.0}, \
-        "a variant with no scored call has no pass rate to report"
-    assert summary["pairs"] == 0 and summary["unpaired"] == 1
-    assert summary["mcnemar"]["c_second_only"] == 0, \
-        "a timeout on the other arm handed compiled a free discordant win"
-    # the band still appears even though it produced no pair — a band that
-    # only ERRORED must not vanish from the report
-    assert summary["by_band"]["easy"] == {
-        "pairs": 0, "errors": 1, "pass_rate": {"compiled": 1.0},
-        "mcnemar": {"b_first_only": 0, "c_second_only": 0, "p": 1.0}}
+    assert summary["errors"] == {"control": 1}
+    assert summary["scored"] == {"control": 1}
+    assert summary["pass_rate"] == {"control": 1.0}, \
+        "the timed-out call must not be scored as a failure"
+    assert summary["mcnemar"] is None, "one arm has nothing to pair"
+    # the band still appears and carries the error — a band that only
+    # ERRORED must not vanish from the report
+    assert summary["by_band"]["easy"]["errors"] == 1
+    assert summary["by_band"]["easy"]["pass_rate"] == {"control": 1.0}
 
 
 # ── §4GJ round 4: the number family can see a decimal point ──────────────

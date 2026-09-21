@@ -310,6 +310,21 @@ READWRITE_HARD_STOP = 5
 # pinned in tests/test_4fh_mutation_breaker_retracted.py.
 
 
+# §4JJ (2026-09-21): the search-yield STEER. Req e69cab30 ran 36 web
+# searches without opening a single result and shipped nothing after 677 s;
+# the no-progress breaker keys on an IDENTICAL query, and 36 different
+# useless queries trip nothing until the turn cap. Measured on Aug+Sep (75
+# requests with >=4 searches): every request that ended with nothing had a
+# run of >=10 consecutive un-opened searches — but so did 26 that answered
+# from snippets. So this is a steer with the tools KEPT, never a stop, and
+# it ships behind the `search_yield_steer` randomized arm: the corpus cannot
+# say whether an earlier nudge helps or hurts the answerers, only live
+# traffic can. One steer per request; the existing caps remain the stops.
+SEARCH_YIELD_STEER = 10
+#: Tools whose call OPENS a search result (reset the un-opened run).
+SEARCH_OPEN_TOOLS = frozenset({"browser", "deep_research"})
+
+
 def is_readwrite_loop_exempt(fname) -> bool:
     """True if a no-progress READ loop on ``fname`` must NOT force a text-only
     final response, because the same tool is how the agent performs the
@@ -337,8 +352,22 @@ class StrikeLedger:
         self.persistent_failure_seen: bool = False
         self.persistent_warned_sigs: set = set()
         self.consecutive_clean_successes: int = 0
+        # §4JJ: consecutive web searches with no result opened since; the
+        # steer fires once per request when the run reaches SEARCH_YIELD_STEER.
+        self.search_run: int = 0
+        self.search_yield_steered: bool = False
 
     # -- failure path ------------------------------------------------------
+
+    def note_search_yield(self, fname) -> int:
+        """§4JJ: advance the un-opened search run for one dispatched call —
+        a `web_search` extends it, a SEARCH_OPEN_TOOLS call resets it, any
+        other tool leaves it. Returns the run after the call."""
+        if fname == "web_search":
+            self.search_run += 1
+        elif fname in SEARCH_OPEN_TOOLS:
+            self.search_run = 0
+        return self.search_run
 
     def reset_clean_streak(self) -> None:
         """Break the consecutive-clean-success streak. Called on ANY failure

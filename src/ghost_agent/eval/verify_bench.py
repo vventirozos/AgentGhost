@@ -246,9 +246,33 @@ class ResponseCache:
         self.hits += 1
         return data.get("response")
 
+    @staticmethod
+    def is_empty_reply(response: Any) -> bool:
+        """A reply with no content is the INSTRUMENT failing (a thinking
+        judge that spent its budget before the JSON — `finish_reason=
+        length`, §4HO), not a verdict. Cached, it replays as a fall-through
+        forever: the 2026-09-20 A+B re-pass hit 1286 cached calls and still
+        reported `route_empty_replies: 1` — the empty reply had been stored
+        and no `read` pass could ever clear it."""
+        try:
+            if not isinstance(response, dict) or "choices" not in response:
+                return False          # not a chat reply — not this check's call
+            choices = response.get("choices")
+            if not isinstance(choices, list):
+                return False
+            if not choices:
+                return True
+            msg = (choices[0] or {}).get("message") or {}
+            return not str(msg.get("content") or "").strip()
+        except Exception:  # noqa: BLE001
+            return False
+
     def put(self, key: str, base_url: str, body: Dict[str, Any],
             response: Dict[str, Any]) -> None:
         if self.mode == "off" or not self.path:
+            return
+        if self.is_empty_reply(response):
+            self.skipped_empty = getattr(self, "skipped_empty", 0) + 1
             return
         f = self._file(key)
         f.parent.mkdir(parents=True, exist_ok=True)
@@ -710,6 +734,15 @@ class TrialResult:
     escalation_downgraded: bool = False
     truncation_guarded: bool = False
     escalation_replaced: bool = False
+    # The verifier's OWN word for what the escalation did on this trial
+    # (`VerifyResult.escalation`: overturned / upheld / withheld /
+    # unavailable / …, "" when no escalation ran). Read off the verdict, not
+    # inferred. Added 2026-09-20 (§4JD night prep): with the main model
+    # DEAD the report still said route_health clean, directions live and
+    # TPR identical — `unavailable` was visible only on the console. With a
+    # single main-model slot, a night of self-play would have turned
+    # timeouts into "catches" and nothing in results.json could tell.
+    escalation_outcome: str = ""
     # The only discipline that shipped ON (2026-08-07 review): without
     # these two the bench could not tell a mechanically-settled trial
     # from one where nothing fired.
@@ -743,6 +776,7 @@ class TrialResult:
             "error": self.error,
             "note": self.trial.note,
             "escalated_overturn": self.escalated_overturn,
+            "escalation_outcome": self.escalation_outcome,
             "confirm_withheld": self.confirm_withheld,
             "escalation_downgraded": self.escalation_downgraded,
             "truncation_guarded": self.truncation_guarded,
@@ -1496,6 +1530,15 @@ def _rate(num: int, denom: int) -> Optional[float]:
     return round(num / denom, 3) if denom else None
 
 
+
+def _count_outcomes(results) -> Dict[str, int]:
+    """Histogram of `TrialResult.escalation_outcome` (empty = no escalation)."""
+    out: Dict[str, int] = {}
+    for r in results:
+        k = getattr(r, "escalation_outcome", "") or "none"
+        out[k] = out.get(k, 0) + 1
+    return out
+
 def score_trials(results: List[TrialResult],
                  arm: str = ARM_RAW) -> Dict[str, Any]:
     """Aggregate trial results into per-fault and overall metrics.
@@ -1606,6 +1649,13 @@ def score_trials(results: List[TrialResult],
             "high_stakes_trials": len(hs),
             "refute_overturned": sum(1 for r in results
                                      if r.escalated_overturn),
+            # Escalations the STRONG model never answered (timeout, error,
+            # empty verdict): the cheap verdict stood, so these trials
+            # measured the raw judge, not the pipeline. A non-zero count
+            # is a contention/outage signature, not a verifier result.
+            "escalation_unavailable": sum(
+                1 for r in results if r.escalation_outcome == "unavailable"),
+            "escalation_outcomes": _count_outcomes(results),
             # Escalation discipline ship-gate metrics (2026-08-06): the
             # 2026-08-05 ad-hoc overturn attribution, formalized. A
             # RESCUE is an overturn on a trial that EXPECTED a
@@ -2213,6 +2263,8 @@ async def _run_trials_pinned(verifier: Verifier, trials: List[BenchTrial],
                     elapsed_s=time.monotonic() - t0,
                     escalated_overturn=bool(
                         getattr(vr, "escalated_overturn", False)),
+                    escalation_outcome=str(
+                        getattr(vr, "escalation", "") or ""),
                     escalation_replaced=bool(
                         getattr(vr, "escalation_replaced", False)),
                     objection_dismissed=bool(
@@ -2534,7 +2586,20 @@ async def run_bench(cases: List[BenchCase],
     # built above was for the arm, whose counters were all zero then.
     _post = escalation_arm(verifier, trials).get("route_health")
     if _post is not None:
+        # The strong model's silences are part of route health: a trial
+        # whose escalation came back `unavailable` measured the raw judge.
+        _unavail = 0
+        for _arm in (report.get("arms") or {}).values():
+            _unavail += int(((_arm.get("metrics") or {}).get("escalation_events") or {})
+                            .get("escalation_unavailable") or 0)
+        _post["escalation_unavailable"] = _unavail
+        _post["clean"] = bool(_post.get("clean")) and _unavail == 0
         report["provenance"]["escalation"]["route_health"] = _post
+        if _unavail:
+            logger.warning(
+                "verify_bench: %d escalation(s) came back UNAVAILABLE — the "
+                "strong model did not answer; those trials measured the raw "
+                "cheap judge, not the pipeline", _unavail)
         if not _post.get("clean"):
             logger.warning(
                 "verify_bench: %d cheap-leg call(s) fell through to the MAIN "

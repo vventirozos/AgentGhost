@@ -128,6 +128,8 @@ class TestDialects:
     @pytest.mark.parametrize("form,anchor,needles", [
         ("vortex", "tunnelFlow += (dtF / 60) * (0.008", ["gaitFlow", "gaitThicken"]),
         ("cube", "const alignMul = 1.0 - TUNE.alignGain * gaitAlign;", ["alignMul", "gaitFlash", "gaitFlow"]),
+        ("cube2", "const wobBase = 0.07 * CALM * (1.0 - TUNE.alignGain * gaitAlign);", ["gaitFlash"]),
+        ("cube2-flow", "cube2Flow += (dtF / 60) * (0.020", ["gaitFlow"]),
         ("descent", "const lr = 1.6 * (0.55", ["gaitFlow"]),
     ])
     def test_each_branch_speaks_its_dialect(self, graph_nc, form, anchor, needles):
@@ -146,7 +148,7 @@ class TestDialects:
         assert "let f = axis === 'none' ? 1.0 : radial;" in body
 
     def test_thicken_widens_the_link_radius(self, graph_nc):
-        assert "* (1.0 + TUNE.thickenLinks * gaitThicken);" in graph_nc
+        assert "* (1.0 + TUNE.thickenLinks * gaitThicken)" in graph_nc   # the link budget multiplies after it (2026-09-21)
 
     def test_shader_has_three_sweep_modes_and_the_uniform_follows_the_dialect(self, graph_js):
         assert "uniform float uSweepMode;" in graph_js

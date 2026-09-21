@@ -1170,6 +1170,155 @@ _LAST_ESCALATION_OUTCOME: "_contextvars.ContextVar[str]" = _contextvars.ContextV
     "ghost_verifier_last_escalation_outcome", default="")
 
 
+def conceded_figures_disagree(claim: str, cheap_issues, conceded,
+                              evidence: str = "") -> Optional[str]:
+    """§4JE: does the strong model's CONCESSION corroborate the cheap REFUTE?
+
+    A strong UNCERTAIN that came out of the §4IJ concession downgrade names
+    the discrepancy it confirmed over. When that concession and the cheap
+    judge's issue name the SAME figures — one the CLAIM states, one the
+    evidence states — the two judges agree the discrepancy exists and differ
+    only on severity. Severity is not the strong model's to wave through
+    with "minor rounding": the binder's arithmetic decides. Returns the
+    pair as text ("32 °c vs 31 °c") when the claim's figure does NOT agree
+    with the evidence figure at the claim's own precision (rounding, unit
+    conversion and hedges count as agreement — "about 396,000" for 396,960
+    stays safe), else None.
+
+    Pairing: among the figures both judges named, a CLAIM-side figure is one
+    the claim text states; the pair that decides is the same-family
+    claim/other pair the concession mentions CLOSEST together ("32°C vs
+    31°C"). Presence elsewhere in the evidence is deliberately NOT a
+    disqualifier — the shapes that escape the objection layer's mechanical
+    uphold are exactly those where the swapped figure also occurs somewhere
+    in a long evidence (long-weather-1: 32 appears in 2.9 kB of readings).
+    Clock times, version strings and figure-less prose are not quantities,
+    so this never widens beyond what the binder can prove.
+
+    Measured on the 2026-09-20 bench: 27 replaced_uncertain on refute-
+    expected faults, every fact_swap one a last-digit swap the strong model
+    called "valid rounding" (3.842 → 3.9, 12.41 → 12.5, 31 → 32).
+    """
+    try:
+        import dataclasses as _dc
+        from .claim_binding import (extract_quantities_with_pos,
+                                    quantities_agree, _hedged)
+        conc_text = " ".join(str(c) for c in (conceded or []) if str(c or "").strip())
+        issue_text = " ".join(str(i) for i in (cheap_issues or []) if str(i or "").strip())
+        if not conc_text or not issue_text:
+            return None
+
+        def _split(pairs):
+            # "from 3.842 ms to 3.9 ms" parses as ONE range quantity; the
+            # concession names two figures, so read both endpoints.
+            out = []
+            for q, pos in pairs:
+                if getattr(q, "hi", None) is not None:
+                    out.append((_dc.replace(q, hi=None), pos))
+                    out.append((_dc.replace(q, value=q.hi, hi=None), pos))
+                else:
+                    out.append((q, pos))
+            return out
+        conc = _split(extract_quantities_with_pos(conc_text))
+        issue_vals = {(q.value, q.family) for q, _ in _split(extract_quantities_with_pos(issue_text))}
+        shared = [(q, pos) for q, pos in conc if (q.value, q.family) in issue_vals]
+        if len(shared) < 2:
+            return None
+        claim_vals = {(q.value, q.family)
+                      for q, _ in _split(extract_quantities_with_pos(str(claim or "")))}
+        hedged = _hedged(str(claim or ""))
+        best_d, best_c, best_e = None, None, None
+        for c, cpos in shared:
+            if (c.value, c.family) not in claim_vals:
+                continue
+            for e, epos in shared:
+                if (e.value, e.family) in claim_vals or e.family != c.family:
+                    continue
+                d = abs(int(cpos) - int(epos))
+                if best_d is None or d < best_d:
+                    best_d, best_c, best_e = d, c, e
+        if best_c is None or best_e is None:
+            return None
+        c, e = best_c, best_e
+        if quantities_agree(c, e, hedged=hedged):
+            return None
+        return f"{c.value:g} {c.unit} vs {e.value:g} {e.unit}".strip()
+    except Exception:  # noqa: BLE001 — a corroboration check must never eat a verdict
+        return None
+
+
+_OPAQUE_TOKEN_FAMILIES = (
+    # (family, regex) — tokens with NO rounding: equal or not.
+    ("version", re.compile(r"(?<![\w.])v?\d+(?:\.\d+){2,3}(?!\w)(?!\.\d)")),
+    ("clock", re.compile(r"(?<![\w:])\d{1,2}:\d{2}(?::\d{2})?(?![\w:])")),
+    ("hexid", re.compile(r"(?<![\w])(?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{8,}(?![\w])")),
+)
+
+
+def _opaque_tokens(text: str):
+    """[(family, token, position)] for every version / clock / hex id in `text`."""
+    out = []
+    for fam, rx in _OPAQUE_TOKEN_FAMILIES:
+        for m in rx.finditer(str(text or "")):
+            tok = m.group(0)
+            if fam == "version":
+                tok = tok.lstrip("v")
+            out.append((fam, tok, m.start()))
+    return out
+
+
+def _clock_equal(claim_tok: str, other_tok: str) -> bool:
+    """A clock time agrees at the CLAIM's precision: "14:02" states minutes,
+    so 14:02:11 agrees with it and 14:03 does not; "14:02:11" states seconds."""
+    def parts(t):
+        p = [int(x) for x in t.split(":")]
+        return p + [0] * (3 - len(p))
+    c, o = parts(claim_tok), parts(other_tok)
+    depth = claim_tok.count(":") + 1
+    return c[:depth] == o[:depth]
+
+
+def conceded_tokens_disagree(claim: str, cheap_issues, conceded) -> Optional[str]:
+    """§4JH: the opaque-token sibling of `conceded_figures_disagree`.
+
+    Versions, clock times and hex identifiers have no rounding: when the
+    strong model's concession and the cheap judge's issue both name the
+    same two tokens of one family — one stated by the claim, one not — and
+    they differ (exactly; a clock time at the claim's precision), the two
+    judges agree the discrepancy exists and only the strong model's "minor
+    typo" reading stands between them. Returns "a vs b" or None. Pairing is
+    the concession's closest same-family claim/other pair, as in §4JE.
+    """
+    try:
+        conc_text = " ".join(str(c) for c in (conceded or []) if str(c or "").strip())
+        issue_text = " ".join(str(i) for i in (cheap_issues or []) if str(i or "").strip())
+        if not conc_text or not issue_text:
+            return None
+        issue_toks = {(f, t) for f, t, _ in _opaque_tokens(issue_text)}
+        shared = [(f, t, pos) for f, t, pos in _opaque_tokens(conc_text) if (f, t) in issue_toks]
+        if len(shared) < 2:
+            return None
+        claim_toks = {(f, t) for f, t, _ in _opaque_tokens(str(claim or ""))}
+        best_d, best_fam, best_c, best_o = None, "", "", ""
+        for fc, tc, pc in shared:
+            if (fc, tc) not in claim_toks:
+                continue
+            for fo, to, po in shared:
+                if fo != fc or (fo, to) in claim_toks or to == tc:
+                    continue
+                d = abs(pc - po)
+                if best_d is None or d < best_d:
+                    best_d, best_fam, best_c, best_o = d, fc, tc, to
+        if best_d is None:
+            return None
+        fam, tc, to = best_fam, best_c, best_o
+        if fam == "clock" and _clock_equal(tc, to):
+            return None
+        return f"{tc} vs {to}"
+    except Exception:  # noqa: BLE001 — a corroboration check must never eat a verdict
+        return None
+
+
 def _stamp_escalation(result, outcome: str):
     """Write the escalation outcome onto the verdict that is being returned."""
     if result is not None and outcome:
@@ -1632,7 +1781,7 @@ For EACH suspect, decide against the EVIDENCE whether it is a REAL problem or a 
 - The agent's OWN stated confidence, probability or ranking ("Confidence ≈ 78%", "strongly supported", "rumour") is its ASSESSMENT, not a fact from a tool: a "support" suspect built on such a number is a FALSE ALARM unless the label contradicts the evidence ("confirmed" for something no output supports).
 - "alignment" suspects are REAL only if the reply as a whole answers a different question than the USER REQUEST. If the USER REQUEST is empty or whitespace, alignment suspects are automatically FALSE ALARMS. A reply that answers the request and adds extra detail is NOT misaligned.
 - "constraint" suspects are REAL only if the USER REQUEST explicitly states that constraint in its own wording — and NEVER when the CLAIM plainly reports that the task could not be done (a tool failed, a file is missing or unreadable, access was denied) without pretending otherwise: the format binds an answer, not a failure report, and refuting the report teaches the agent that an invented value in the right shape scores better than the truth. (Live failure this rule pins: "reply with just the number" for a file that did not exist; the honest "I can't access that file" was refuted and the repair answered "0".)
-- "artifact" suspects are REAL only if the quoted noise is actually present in the CLAIM text.
+- "artifact" suspects are REAL only if the quoted noise is actually present in the CLAIM text. Additionally, scan the raw CLAIM for unflagged formatting artifacts (diff markers like `<<<<<<<`/`=======`/`>>>>>>>`, stray markdown, copy-paste glitches). If found, mark as a REAL problem.
 - Suspects that only cite project/task bookkeeping state ("the project is already complete", "all tasks are done", "nothing left to do") are FALSE ALARMS unless the USER REQUEST explicitly asked about completion state — a ledger's state never contradicts an operational reply (restart/check/fix/run) on its own.
 
 The SUSPECTS list is a starting point, not a boundary: if you notice a REAL problem the suspects missed — a fact in the CLAIM that appears in no tool output or contradicts one, a quantity the evidence states two ways while the CLAIM states one, two CLAIM statements that cannot both be true, machine noise in the reply, a violated explicit constraint — count it as a real problem and name it in "issues".
@@ -3959,6 +4108,30 @@ class Verifier:
                 final_confidence=strong.confidence, trace=trace)
             return strong
         if strong.verdict == VerifyVerdict.UNCERTAIN:
+            # §4JE: a strong UNCERTAIN born of a CONCESSION that names the
+            # very figures the cheap judge refuted on is corroboration, not
+            # a replacement — the two judges agree the discrepancy exists.
+            # The binder's arithmetic settles severity: uphold the refute
+            # when the claim's figure does not agree with the evidence's at
+            # the claim's precision (rounding/hedges/units count as agreement).
+            _pair = (conceded_figures_disagree(
+                        claim, result.issues, getattr(strong, "conceded", None),
+                        evidence=evidence)
+                     or conceded_tokens_disagree(          # §4JH: versions / times / ids
+                        claim, result.issues, getattr(strong, "conceded", None)))
+            if _pair:
+                logger.info(
+                    "Verifier escalation: main model UNCERTAIN conceded the "
+                    "same discrepancy the cheap judge refuted on (%s) — "
+                    "refute UPHELD, not replaced.", _pair)
+                record_escalation(strong_call=getattr(self, "_last_main_call", None),
+                    kind="refute", route=route, outcome="upheld",
+                    cheap_verdict=result.verdict.value,
+                    cheap_confidence=result.confidence,
+                    strong_verdict=strong.verdict.value,
+                    final_confidence=result.confidence,
+                    rebuttal=f"conceded_corroborates:{_pair}", trace=trace)
+                return result
             # ⚠ Not an overturn. A strong UNCERTAIN replaces the refute
             # (no punitive path fires) but nobody CONFIRMED the claim —
             # booking it `outcome="overturned"` with

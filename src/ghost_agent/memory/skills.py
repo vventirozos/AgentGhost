@@ -2218,6 +2218,46 @@ class SkillMemory:
         except Exception:
             return items
 
+    def unquarantine_lesson(self, trigger: str, *, reason_contains: str = "") -> int:
+        """§4JF: lift a quarantine — the mirror of `quarantine_lesson`, scoped
+        by WHO imposed it. Only lessons matching ``trigger`` whose
+        `quarantine_reason` contains ``reason_contains`` are restored (an
+        empty needle lifts any). The reason and timestamp are kept on the
+        row as `unquarantined_from` / `unquarantined_at` so a review can
+        still see the episode. Returns lessons updated."""
+        key = (trigger or "").strip().lower()
+        if not key:
+            return 0
+        needle = (reason_contains or "").strip().lower()
+        updated = 0
+        try:
+            with self._get_lock():
+                playbook = self._load_playbook()
+                for idx, raw in enumerate(playbook):
+                    t = (raw.get("trigger") or raw.get("task") or "").strip().lower()
+                    if t != key or not raw.get("quarantined"):
+                        continue
+                    if needle and needle not in str(raw.get("quarantine_reason") or "").lower():
+                        continue
+                    raw["quarantined"] = False
+                    raw["unquarantined_from"] = str(raw.get("quarantine_reason") or "")[:300]
+                    raw["unquarantined_at"] = _now_iso()
+                    raw.pop("quarantine_reason", None)
+                    raw.pop("quarantined_at", None)
+                    playbook[idx] = raw
+                    updated += 1
+                if updated:
+                    self._save_playbook_unlocked(playbook)
+        except Exception as e:
+            logger.debug(f"unquarantine_lesson failed: {e}")
+        if updated:
+            pretty_log(
+                "Lesson Restored",
+                f"{(trigger or '')[:50]} — quarantine lifted ({(reason_contains or 'any reason')[:60]})",
+                icon=Icons.MEM_SAVE,
+            )
+        return updated
+
     def quarantine_lesson(self, trigger: str, reason: str = "") -> int:
         """Mark every lesson matching ``trigger`` (case-insensitive) as
         quarantined — excluded from prompt injection, kept on disk with
@@ -2694,6 +2734,14 @@ class SkillMemory:
 
         filtered.sort(key=lambda kv: kv[0], reverse=True)
         return [l for _, l in filtered[: max(0, int(limit))]]
+
+    def count_lessons(self, *, scope: str = "all", source: str = "") -> int:
+        """How many lessons `list_lessons` would return with no limit — the
+        TOTAL behind a page. `tool_list_lessons` printed a page's length as
+        the count ("## 100 lessons:" over a 198-lesson store, R2-6,
+        2026-09-20); a listing tool that cannot say "of N" turns every
+        "how many" question into a wrong number."""
+        return len(self.list_lessons(scope=scope, source=source, limit=1 << 30))
 
     def find_by_trigger(self, trigger: str) -> dict:
         """Return the first lesson with an exact-match trigger (case

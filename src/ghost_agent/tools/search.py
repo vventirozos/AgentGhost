@@ -792,6 +792,125 @@ def _patch_ddgs_snippet_join() -> bool:
     return bool(_ddgs_patch_state["applied"])
 
 
+# §4JJ (2026-09-21): the wave's region was a fixed "wt-wt". Of the raced
+# engines, duckduckgo and brave read it (yandex and yahoo ignore it), so a
+# Greek-script query got worldwide ranking from the two engines that could
+# have localised it. Probed over Tor on 12 recorded Greek queries (region
+# the only variable): waves won 9/12 → 11/12, strict-on-topic results
+# 87 → 98, .gr sources 80 → 95 — modest, and yandex (region-blind) won
+# nearly every wave either way, so this is a cheap preference, not the
+# cure for the e69cab30 class (those facts surfaced from NO engine).
+# The basic block only: every Greek word carries at least one unaccented
+# letter, so the polytonic block (U+1F00–1FFF) added nothing a mutant could
+# be caught on (battery §4JJ: the mutant that dropped it was equivalent).
+_GREEK_SCRIPT_RE = re.compile(r"[\u0370-\u03FF]")
+_DEFAULT_REGION = "wt-wt"
+
+
+def region_for_query(query: str) -> str:
+    """The ddgs ``region`` for a query: ``gr-el`` when it carries Greek
+    script, the worldwide default otherwise. A preference for the engines
+    that read it, never a filter."""
+    return "gr-el" if _GREEK_SCRIPT_RE.search(query or "") else _DEFAULT_REGION
+
+
+# ── Encyclopedic supplement (2026-09-21, §4JO) ─────────────────────
+# Surveyed over Tor (17 recorded Greek queries × 2 circuits): the race's
+# yandex answers 30/34 but treats a figure as a model number; bing 25/34
+# with the SAME pages at a 17.9 s median (a race member that slow re-creates
+# the §4HR failed-wave cost); google and mojeek 0/34. What no web engine
+# gives a Greek proper-noun ask is the encyclopedic answer itself:
+# el.wikipedia's full-text search over Tor answered "Δημήτρης Κουφοντίνας",
+# "Ελεγκτικό Συνέδριο", "Οδός Μιχαήλ Βόδα" and the Tempi paraphrase in ~1 s
+# with the article intro, and nothing on the long figure-laden queries
+# (correctly). So: for a SHORT Greek-script query (≤ WIKI_SUPPLEMENT_MAX_
+# TOKENS content words) one lookup runs in PARALLEL with the first wave on
+# its own circuit, never delays it, and an article whose title/intro carries
+# the query's SUBJECT (the leading content word — the §4IL "any distinctive
+# token" rule reads every Greek word as distinctive, so "Πλωτό νοσοκομείο"
+# would pass for "Τζάνειο Νοσοκομείο") is placed FIRST in the batch; when
+# the web wave fails, it is the batch.
+WIKI_SUPPLEMENT_MAX_TOKENS = 6
+WIKI_SUPPLEMENT_TIMEOUT = 8
+WIKI_EXTRACT_CHARS = 700
+_WIKI_LANG = {"gr-el": "el"}
+
+
+def wiki_supplement_wanted(query: str) -> bool:
+    """A short Greek-script query — the shape the encyclopedia answers."""
+    if region_for_query(query) not in _WIKI_LANG:
+        return False
+    return 0 < len(_rel_tokens(query)) <= WIKI_SUPPLEMENT_MAX_TOKENS
+
+
+def wiki_article_on_topic(query: str, article: Dict) -> bool:
+    """The article's title or intro carries the query's SUBJECT — its
+    leading content word (folded) — not merely any word of it."""
+    dist = distinctive_tokens(query)
+    if not dist:
+        return False
+    hay = re.sub(r"\W+", "", _rel_fold(f"{article.get('title') or ''} {article.get('body') or ''}"), flags=re.UNICODE)
+    return dist[0] in hay
+
+
+def _wiki_lookup(query: str, proxy: Optional[str]) -> List[Dict]:
+    """Synchronous (runs on the race pool): full-text search, then the
+    intro extract of the top hits, on the language's Wikipedia."""
+    import curl_cffi.requests as creq
+    from urllib.parse import quote as _quote
+    lang = _WIKI_LANG[region_for_query(query)]
+    base = f"https://{lang}.wikipedia.org/w/api.php"
+    proxies = {"https": proxy, "http": proxy} if proxy else None
+    r = creq.get(base, params={"action": "query", "list": "search", "srsearch": query, "format": "json",
+                               "srlimit": 2, "utf8": 1}, proxies=proxies, timeout=WIKI_SUPPLEMENT_TIMEOUT,
+                 impersonate="chrome")
+    hits = ((r.json() or {}).get("query") or {}).get("search") or []
+    out: List[Dict] = []
+    for h in hits[:2]:
+        title = str(h.get("title") or "").strip()
+        if not title:
+            continue
+        r2 = creq.get(base, params={"action": "query", "prop": "extracts", "exintro": 1, "explaintext": 1,
+                                    "redirects": 1, "format": "json", "titles": title}, proxies=proxies,
+                      timeout=WIKI_SUPPLEMENT_TIMEOUT, impersonate="chrome")
+        pages = ((r2.json() or {}).get("query") or {}).get("pages") or {}
+        extract = str((next(iter(pages.values()), {}) or {}).get("extract") or "").strip()
+        if not extract:
+            continue
+        article = {"title": f"{title} — Βικιπαίδεια", "body": extract[:WIKI_EXTRACT_CHARS],
+                   "href": f"https://{lang}.wikipedia.org/wiki/{_quote(title.replace(' ', '_'))}"}
+        if wiki_article_on_topic(query, article):
+            out.append(article)
+    return out
+
+
+#: How long a search that the web has already answered waits for the
+#: encyclopedia (three Tor round trips run ~4-5 s; the wave itself ~2-3 s).
+#: When every web ticket failed the wait is the lookup's own full budget.
+WIKI_SUPPLEMENT_WAIT_AFTER_WIN = 6.0
+
+
+async def _wiki_supplement(task, budget: float) -> List[Dict]:
+    """The lookup's articles within ``budget`` seconds, or [] — a failure
+    or a late answer never sinks or delays the search (the thread finishes
+    on its own; nothing waits for it)."""
+    if task is None:
+        return []
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=budget)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("wiki supplement skipped: %s", e)
+        return []
+
+
+def merge_wiki_first(wiki: List[Dict], web: List[Dict]) -> List[Dict]:
+    """Encyclopedia articles first, then the web batch minus duplicates."""
+    if not wiki:
+        return list(web or [])
+    seen = {w.get("href") for w in wiki}
+    return list(wiki) + [r for r in (web or []) if (r.get("href") or r.get("url")) not in seen]
+
+
 async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
                             max_results: int = 20) -> List[Dict]:
     """Race ALL engines in parallel, each on its OWN Tor circuit; the first
@@ -807,6 +926,7 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
     """
     from ddgs import DDGS
     _patch_ddgs_snippet_join()
+    region = region_for_query(query)
 
     def _run_engine(engine: str, proxy: Optional[str]) -> List[Dict]:
         _eng_timeout = _engine_timeout(engine)
@@ -816,7 +936,7 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
         t_start = time.monotonic()
         try:
             with DDGS(**kwargs) as ddgs:
-                return list(ddgs.text(query, max_results=max_results, region="wt-wt",
+                return list(ddgs.text(query, max_results=max_results, region=region,
                                       safesearch="moderate", backend=engine))
         except StopIteration as e:
             # StopIteration cannot legally cross an asyncio Future boundary
@@ -1068,14 +1188,33 @@ async def tool_search_ddgs(query: str, tor_proxy: str):
     # them (_race_search_wave / _proxy_for_attempt) — search reachability
     # over Tor is exit-node-dependent, so fresh independent exits are what
     # actually beat a block, and it's far cheaper than NEWNYM.
+    # Encyclopedic supplement (§4JO): launched alongside the first wave on
+    # its own circuit; awaited only once a wave has answered (or both
+    # failed), so it never delays the web batch.
+    _wiki_task = None
+    if wiki_supplement_wanted(query):
+        _wiki_task = asyncio.get_running_loop().run_in_executor(
+            _RACE_POOL, _wiki_lookup, query, _proxy_for_attempt(tor_proxy, query, 0, salt="wiki"))
     for wave in range(2):
         valid_results = await _race_search_wave(query, tor_proxy, wave)
         if valid_results:
-            clean_output = format_search_results(valid_results[:8])
+            _wiki = await _wiki_supplement(_wiki_task, WIKI_SUPPLEMENT_WAIT_AFTER_WIN); _wiki_task = None
+            if _wiki:
+                pretty_log("Wiki Supplement", f"el.wikipedia: {_wiki[0]['title'][:60]} — placed first",
+                           icon=Icons.TOOL_SEARCH)
+            clean_output = format_search_results(merge_wiki_first(_wiki, valid_results)[:8])
             _cache_put(_cache_key, clean_output)
             return clean_output
         if wave == 0:
             await asyncio.sleep(1)
+    _wiki = await _wiki_supplement(_wiki_task, WIKI_SUPPLEMENT_TIMEOUT * 3)
+    if _wiki:
+        # Every web ticket failed; the encyclopedia alone is still an answer.
+        pretty_log("Wiki Supplement", f"el.wikipedia answered where every web engine failed: {_wiki[0]['title'][:60]}",
+                   icon=Icons.TOOL_SEARCH)
+        clean_output = format_search_results(_wiki)
+        _cache_put(_cache_key, clean_output)
+        return clean_output
 
     # --- QUERY REFORMULATION ---
     # Both waves with the original query failed (≈12 engine-circuit

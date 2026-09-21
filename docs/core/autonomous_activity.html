@@ -293,8 +293,28 @@
     <tr><th>Value</th><th>Means</th><th>Suppresses the DEAD alarm?</th></tr>
     <tr><td><code>entered</code></td><td>the phase started work; the outcome is unknown</td><td>No</td></tr>
     <tr><td><code>declined</code></td><td>it ran and producing nothing was correct (skip-if-unchanged)</td><td><strong>Yes</strong></td></tr>
-    <tr><td><code>failed</code></td><td>it raised</td><td>No</td></tr>
+    <tr><td><code>failed</code></td><td>it raised, <em>or</em> the trainer reported an exception (<code>report.exception</code>), <em>or</em> it produced a model the sanity gate rejected</td><td>No</td></tr>
   </table></div>
+
+  <p class="warn">&#9888; <strong>Every non-success exit must stamp (2026-09-20,
+  verification round R1-1).</strong> The router phase has <em>two</em> places it
+  can decline: the exact corpus-fingerprint skip in the phase itself, and the
+  trainer's own &ldquo;the labelled corpus is 89% the same as the last look
+  &mdash; the deployed model stays&rdquo; bail inside
+  <code>RouterTrainer.run()</code>. The 2026-08-30 fix stamped
+  <code>declined</code> only at the first; on a corpus that grows daily the exact
+  fingerprint always changes, so the first never fired and the second &mdash;
+  the branch that actually runs, hourly &mdash; left a bare
+  <code>entered</code>. Result: <code>&#10007; DEAD router_train</code> printed
+  every day by the very view built to stop printing it. Now the in-trainer bail
+  stamps <code>declined</code> when <code>report.exception</code> is false and
+  <code>failed</code> when it is true (the trainer sets the flag at each of its
+  <code>except</code> sites; an AST pin fails if a new handler forgets it), and
+  a rejected model stamps <code>failed</code>. Executed-path pins in
+  <code>tests/test_idle_attempt_heartbeat.py</code> drive the real phase with a
+  bailing, a raising and an insane-model trainer and read the stamp back
+  &mdash; the earlier executed test accepted <code>entered</code> as a valid
+  answer, which is why it was green in both worlds.</p>
 
   <p class="warn">&#9888; The first version stored a bare timestamp stamped at
   entry. A loop that <em>crashes on every cycle</em> was then byte-identical to

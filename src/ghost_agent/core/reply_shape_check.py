@@ -110,15 +110,16 @@ def refute_no_answer_fallback(reply: str) -> List[str]:
 
 
 def refute_narration_only(reply: str, *, n_real_tools: int,
-                          tool_names=()) -> List[str]:
+                          tool_names=(), request: str = "") -> List[str]:
     """One issue when ``reply`` is nothing but working narration after the
-    turn ran tools (§4GH). Empty list otherwise — never a pass."""
+    turn ran tools (§4GH). Empty list otherwise — never a pass. ``request``
+    lets figures echoed from the user's message count as echoes (§4JI)."""
     from .reply_smoothing import narration_only, strip_system_notes
     if int(n_real_tools or 0) < 1:
         return []
     if any(str(n).strip().lower() == "image_generation" for n in (tool_names or ())):
         return []
-    if not narration_only(strip_system_notes(reply or "")):
+    if not narration_only(strip_system_notes(reply or ""), request=request):
         return []
     return ["the reply is working narration only ('Let me…' / 'I'll…') — it "
             "announces work and reports no finding, so there is no claim to "

@@ -1082,11 +1082,14 @@ _NARRATION_BEAT_SENT_RE = re.compile(
 #: "Downloads" were work verbs by prefix); the Greek verbs carry their
 #: first-person endings (ψάξω / ψάξουμε), never a bare stem.
 _GREEK_1P = r"(?:ω|ουμε)"
+# §4JI (req e69cab30): "searches" / "κάνω πιο στοχευμένες αναζητήσεις" — the
+# work NOUN in the plural, or with modifiers between "κάνω" and the noun,
+# named no work here; the announcement shipped after 36 searches.
 _NARRATION_WORK_RE = re.compile(
-    r"\b(?:search|dig|read|fetch|re-?fetch|check|double-check|look|look up|take a look|"
+    r"\b(?:search(?:es)?|dig|read|fetch|re-?fetch|check|double-check|look|look up|take a look|"
     r"run|re-?run|try|start|begin|kick off|proceed|continue|investigate|extract|"
     r"navigate|open|load|gather|collect|pull|retrieve|verify|confirm|examine|explore|"
-    r"scan|query|grab|review|analy[sz]e|summari[sz]e|nail down|figure out|work out|"
+    r"scan|query|grab|review|analy[sz]e|summari[sz]e|nail down|firm up|pin down|figure out|work out|"
     r"sort out|go through|go ahead|write|rewrite|draft|compose|build|fix|apply|"
     r"implement|create|generate|render|update|edit|refactor|test|install|set up|"
     r"deploy|restart|launch|close|finish|complete|wrap up|mark|save|store|delete|"
@@ -1099,13 +1102,21 @@ _NARRATION_WORK_RE = re.compile(
     rf"τρέξ{_GREEK_1P}|δοκιμάσ{_GREEK_1P}|εξετάσ{_GREEK_1P}|βρω|βρούμε|δω|δούμε|κοιτάξ{_GREEK_1P}|ρίξ{_GREEK_1P} μια ματιά|"
     rf"συλλέξ{_GREEK_1P}|επαληθεύσ{_GREEK_1P}|εντοπίσ{_GREEK_1P}|αναλύσ{_GREEK_1P}|συγκρίν{_GREEK_1P}|φέρω|φέρουμε|"
     rf"κατεβάσ{_GREEK_1P}|γράψ{_GREEK_1P}|φτιάξ{_GREEK_1P}|ξεκινήσ{_GREEK_1P}|συνεχίσ{_GREEK_1P}|προχωρήσ{_GREEK_1P}|"
-    rf"ψάχν{_GREEK_1P}|κάν{_GREEK_1P} (?:μια |μία )?(?:έρευνα|έλεγχο|αναζήτηση|επαλήθευση))\b",
+    # the work NOUNS in singular and plural — the accent moves (αναζήτηση /
+    # αναζητήσεις, έλεγχο / ελέγχους), so both vowels are admitted
+    rf"ψάχν{_GREEK_1P}|κάν{_GREEK_1P}(?:\s+\S+){{0,3}}?\s+(?:[εέ]ρευν(?:α|ες|ών)|[εέ]λ[εέ]γχ(?:ο|ος|ους|οι|ων)"
+    r"|αναζ[ηή]τ[ηή]σ(?:η|ης|εις|εων)|επαλ[ηή]θε[υύ]σ(?:η|ης|εις|εων)))\b",
     re.IGNORECASE)
 #: A sentence that asks the user something, addresses them, or asks for
 #: something ("I'm going to need the password…") is an answer. The Greek
 #: question mark is ";" — read as one only in a sentence written in Greek.
+# §4JI: "the three items you mention" / "the file you sent" points BACK at
+# the request — an echo, not an address; "you" followed by a reporting
+# verb is exempt (the English twin of req e69cab30's reply read as addressed).
 _NARRATION_ADDRESSED_RE = re.compile(
-    r"\?|\byou\b|\byour\b|\bneed (?:the|a|an|more|some)\b"
+    r"\?|\byou\b(?!\s+(?:mention(?:ed)?|asked|said|described|noted|gave|provided|requested|wrote|"
+    r"listed|cited|named|specified|quoted|pointed|shared|sent|uploaded|pasted|linked|attached)\b)"
+    r"|\byour\b|\bneed (?:the|a|an|more|some)\b"
     r"|\b(?:σου|σας|σε|εσύ|εσείς|θέλεις|θες|θέλετε|θέτε|μπορείς|μπορείτε)\b", re.IGNORECASE)
 _GREEK_QUESTION_RE = re.compile(r"[α-ωά-ώ][^;\n]*;(?:\s|$)")
 #: A beat that introduces content with a colon ("Let me summarise: the agency
@@ -1152,14 +1163,55 @@ _SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 _NARRATION_GLUE_MAX_CHARS = 140
 
 
-def narration_only(text: str) -> bool:
+_ECHO_FIGURE_RE = re.compile(r"\d[\d.,:/-]*\d|\d{2,}")
+
+
+def _mask_request_echoes(block: str, request: str) -> str:
+    """§4JI: a figure the REQUEST already contains is an echo, not content.
+    `_NARRATION_CONTENT_RE` counts any 2+-digit figure as content; req
+    e69cab30 (2026-09-21) shipped "Ας κάνω πιο στοχευμένες αναζητήσεις για
+    … 23.125.000 δρχ … 23.100.000 δρχ." after 36 searches — an announcement
+    that restated the user's own three figures, which read as an answer to
+    every guard. The English twin ("Let me do more targeted searches for …
+    23,125,000 drachmas …") failed the same way: not a language gap, an echo
+    gap. Figures present verbatim in the request are blanked before the
+    content check; a figure the reply CONTRIBUTES still counts."""
+    if not request:
+        return block
+    req_figs = {m.group(0) for m in _ECHO_FIGURE_RE.finditer(request)}
+    if not req_figs:
+        return block
+    return _ECHO_FIGURE_RE.sub(lambda m: "" if m.group(0) in req_figs else m.group(0), block)
+
+
+_YEAR_TOKEN_RE = re.compile(r"(?<!\d)(?:19|20)\d\d(?!\d)")
+
+
+def _mask_beat_years(block: str) -> str:
+    """§4JJ: a year inside a WORK BEAT names a target ("Let me do one final
+    batch to firm up the 1995 video" — req 882f477c, 46 searches, 268 chars
+    of narration shipped), not a finding. Years are blanked only in
+    sentences that are beats once the year is gone; a year in any other
+    sentence ("It was 2023.") stays content. Corpus 2,933: +1 = 882f477c."""
+    sents = _SENT_SPLIT_RE.split(block)
+    out = []
+    for sent in sents:
+        bare = _YEAR_TOKEN_RE.sub("", sent)
+        out.append(bare if bare != sent and _is_work_beat(bare) else sent)
+    return " ".join(out)
+
+
+def narration_only(text: str, *, request: str = "") -> bool:
     """True when EVERY paragraph of ``text`` is a working-narration beat and
-    none carries content — the reply announces work and reports nothing."""
+    none carries content — the reply announces work and reports nothing.
+    ``request`` (the user's message) lets figures it already contains be
+    read as echoes rather than content (§4JI)."""
     blocks = [b.strip() for b in _split_blocks(text or "") if b.strip()]
     if not blocks:
         return False
     for b in blocks:
-        if len(b) > _MAX_NARRATION_CHARS or _NARRATION_CONTENT_RE.search(b):
+        if len(b) > _MAX_NARRATION_CHARS or _NARRATION_CONTENT_RE.search(
+                _mask_beat_years(_mask_request_echoes(b, request))):
             return False
         sents = [s for s in _SENT_SPLIT_RE.split(b) if s.strip()]
         beats = [_is_work_beat(s) for s in sents]
@@ -1179,16 +1231,18 @@ def narration_only(text: str) -> bool:
     return True
 
 
-def forced_final_has_no_answer(this_turn_text: str, accumulated: str) -> bool:
+def forced_final_has_no_answer(this_turn_text: str, accumulated: str,
+                               request: str = "") -> bool:
     """The forced-final decision: would the reply that ships now — the
     accumulated narration plus this turn's own text, system notes aside —
-    contain no answer at all (empty, or narration only)?"""
+    contain no answer at all (empty, or narration only)? ``request`` lets
+    echoed figures be read as echoes (§4JI)."""
     parts = [p for p in ((accumulated or "").strip(), (this_turn_text or "").strip()) if p]
     body = strip_system_notes("\n\n".join(parts)).strip()
-    return not body or narration_only(body)
+    return not body or narration_only(body, request=request)
 
 
-def is_narration_only_trim(smoothed: str, original: str) -> bool:
+def is_narration_only_trim(smoothed: str, original: str, request: str = "") -> bool:
     """True when smoothing reduced a reply to working narration — the
     inverted-trim failure (2026-07-25 live): the smoother kept "Let me
     search more specifically…" and dropped the findings. Lives here (not in
@@ -1211,7 +1265,7 @@ def is_narration_only_trim(smoothed: str, original: str) -> bool:
     if len(s) < 90 and bool(re.match(
             r"(Let me|Now |Next,? |I'll |I will |First,? |Then )", s)):
         return True
-    return narration_only(s)
+    return narration_only(s, request=request)
 
 
 def treat_reply(text: str, *, n_real_tools: int) -> str:

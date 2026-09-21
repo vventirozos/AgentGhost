@@ -20,8 +20,7 @@ import re
 
 import pytest
 
-from ghost_agent.core.prompts import (SPECIALIST_SYSTEM_PROMPT, SYSTEM_PROMPT,
-                                      SYSTEM_PROMPT_COMPILED)
+from ghost_agent.core.prompts import SPECIALIST_SYSTEM_PROMPT, SYSTEM_PROMPT
 
 _ROOT = os.path.join(os.path.dirname(__file__), "..")
 
@@ -67,10 +66,12 @@ def test_specialist_prompt_keeps_its_own_affirmative_line():
     assert "PLOTTING & IMAGES" in SPECIALIST_SYSTEM_PROMPT
 
 
-def test_compiled_variant_is_not_where_the_rule_was_hiding():
-    """Recorded fact, so the journal's account stays checkable: the compiled
-    (probe-only) prompt never carried the image tag; the specialist one did."""
-    assert "![Image](/api/download/" not in SYSTEM_PROMPT_COMPILED
+def test_compiled_variant_is_gone_so_the_rule_lives_in_the_main_prompt():
+    """The compiled (probe-only) prompt never carried the image tag and was
+    retired 2026-09-21 (§4JG); the main prompt must carry the rule itself."""
+    from ghost_agent.core import prompts as prompts_mod
+    assert not hasattr(prompts_mod, "SYSTEM_PROMPT_COMPILED")
+    assert "![Image](/api/download/" in SYSTEM_PROMPT
 
 
 def test_web_client_renders_api_download_images_inline():

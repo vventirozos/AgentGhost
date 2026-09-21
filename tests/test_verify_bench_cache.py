@@ -472,3 +472,43 @@ def test_the_startup_line_shows_the_resolved_path_and_entry_count():
     assert "CACHE IS EMPTY" in src, (
         "an empty cache in a replay mode must say so LOUDLY — it measures "
         "nothing, and silence is what made this cost an hour")
+
+
+# ── §4JE (2026-09-20): an EMPTY reply is the instrument failing, never a verdict ──
+
+def _resp(content):
+    return {"choices": [{"message": {"content": content}, "finish_reason": "length" if not content else "stop"}]}
+
+
+def test_an_empty_reply_is_not_cached(tmp_path):
+    """A thinking judge that spends its budget before the JSON returns
+    `content=""` with finish_reason=length (§4HO). Cached, it replayed as a
+    cheap-leg fall-through on every later `read` pass — the 2026-09-20 A+B
+    re-pass hit 1286 cached calls and still reported one empty reply."""
+    w = ResponseCache(tmp_path, "write")
+    body = {"messages": [{"role": "user", "content": "judge this"}]}
+    w.put(ResponseCache.key("http://j", body), "http://j", body, _resp(""))
+    assert w.entry_count() == 0
+    assert w.skipped_empty == 1
+    r = ResponseCache(tmp_path, "read")
+    assert r.get(ResponseCache.key("http://j", body), "http://j", body) is None  # re-asked, not replayed
+
+
+def test_a_real_reply_is_still_cached(tmp_path):
+    w = ResponseCache(tmp_path, "write")
+    body = {"messages": [{"role": "user", "content": "judge this"}]}
+    w.put(ResponseCache.key("http://j", body), "http://j", body, _resp('{"verdict":"CONFIRMED"}'))
+    assert w.entry_count() == 1
+
+
+@pytest.mark.parametrize("resp", [{"choices": []}, {"choices": [{"message": {}}]},
+                                  {"choices": [{"message": {"content": "   "}}]}])
+def test_every_empty_chat_shape_is_recognised(resp):
+    assert ResponseCache.is_empty_reply(resp) is True
+
+
+@pytest.mark.parametrize("resp", [{}, {"ok": 1}, {"choices": "not-a-list"}, "text"])
+def test_a_non_chat_or_malformed_response_is_not_called_empty(resp):
+    """Fail open on shape: only a chat reply with blank content is the
+    instrument failing; anything the check cannot read is the caller's."""
+    assert ResponseCache.is_empty_reply(resp) is False

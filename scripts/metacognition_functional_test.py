@@ -236,13 +236,22 @@ async def run_phase_25() -> None:
                                     duration_s=120.0, budget_s=10.0,
                                     severity="warning"))
 
-    check("replan: all three triggers reached the plan", len(plan.calls) == 3,
+    # §4HN (2026-09-16): a RESOURCE event is log-only — the bridge records
+    # `noop:resource_log_only` in its audit and never revises the plan
+    # (pinned in tests/test_triggers.py). This harness asserted all three
+    # kinds reached the plan until 2026-09-20 (R2-1), one revision behind.
+    check("replan: loop + anomaly reached the plan, resource did not",
+          len(plan.calls) == 2,
           f"calls={len(plan.calls)}")
     reasons = [c[1] for c in plan.calls]
     check("replan: reasons carry trigger kind",
-          all(any(k in r for k in ("loop", "resource", "anomaly"))
-              for r in reasons),
+          all(any(k in r for k in ("loop", "anomaly")) for r in reasons)
+          and not any("resource" in r for r in reasons),
           str(reasons))
+    check("replan: the resource event is audited as log-only",
+          any(r.get("action") == "noop:resource_log_only"
+              for r in bridge.revisions),
+          str([r.get("action") for r in bridge.revisions]))
 
 
 # ──────────────────────────────────────────────────────────────────────

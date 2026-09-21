@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from itertools import zip_longest
 
-from .prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_COMPILED, SPECIALIST_SYSTEM_PROMPT, SPECIALIST_TOOL_XML_LEGACY, SPECIALIST_TOOL_XML_NATIVE, SMART_MEMORY_PROMPT, PLANNING_SYSTEM_PROMPT, SYSTEM_3_GENERATION_PROMPT, SYSTEM_3_EVALUATOR_PROMPT, THINK_BUDGET_TIGHT, THINK_BUDGET_EXTENDED
+from .prompts import SYSTEM_PROMPT, SPECIALIST_SYSTEM_PROMPT, SPECIALIST_TOOL_XML_LEGACY, SPECIALIST_TOOL_XML_NATIVE, SMART_MEMORY_PROMPT, PLANNING_SYSTEM_PROMPT, SYSTEM_3_GENERATION_PROMPT, SYSTEM_3_EVALUATOR_PROMPT, THINK_BUDGET_TIGHT, THINK_BUDGET_EXTENDED
 from .planning import TaskTree, TaskStatus
 # Shared "what did this call operate on" helper — same definition the
 # offline post-mortem signature uses, so the in-run no-progress
@@ -1002,23 +1002,26 @@ def _count_real_tools_safe(tools_run) -> int:
         return len([t for t in (tools_run or []) if isinstance(t, dict) and not t.get("_synthetic")])
 
 
-def _announced_work_without_acting(this_turn_text: str) -> bool:
+def _announced_work_without_acting(this_turn_text: str, request: str = "") -> bool:
     """The zero-tool no-answer: this turn's own text is nothing but working
-    narration (`reply_smoothing.narration_only`, the §4GH predicate)."""
+    narration (`reply_smoothing.narration_only`, the §4GH predicate); the
+    user's ``request`` lets echoed figures read as echoes (§4JI)."""
     from .reply_smoothing import narration_only, strip_system_notes
     body = strip_system_notes(str(this_turn_text or "")).strip()
-    return bool(body) and narration_only(body)
+    return bool(body) and narration_only(body, request=request)
 
 
-def _forced_final_has_no_answer(this_turn_text: str, accumulated: str) -> bool:
+def _forced_final_has_no_answer(this_turn_text: str, accumulated: str,
+                                request: str = "") -> bool:
     """`reply_smoothing.forced_final_has_no_answer` over the model's text
-    with the loop's own dropped-mutation note removed first."""
+    with the loop's own dropped-mutation note removed first; ``request``
+    lets figures echoed from the user's message read as echoes (§4JI)."""
     from .reply_smoothing import forced_final_has_no_answer
     text = str(this_turn_text or "")
     i = text.find(_DROPPED_NOTE_HEAD)
     if i >= 0:
         text = text[:i]
-    return forced_final_has_no_answer(text, accumulated)
+    return forced_final_has_no_answer(text, accumulated, request=request)
 
 
 FORCED_FINAL_LOOP_MARKER = "[ATTEMPT_ABORTED_THINKING_LOOP]"
@@ -9448,8 +9451,29 @@ class GhostAgent:
                                     "weights) — NOT hot-swapping; router stays "
                                     "escalate-all."
                                 )
+                                # A model the sanity gate rejected is a
+                                # broken run, not a quiet one: `failed`
+                                # keeps the DEAD alarm armed.
+                                self._record_idle_attempt("router_train", "failed")
                             else:
                                 logger.debug("Router idle retrain skipped: %s", report.bail_reason or "unknown")
+                                # ⚠ THE OTHER decline site (R1-1, 2026-09-20).
+                                # The `declined` stamp above covers the
+                                # exact-fingerprint skip, which never fires
+                                # on a corpus that grows daily; the trainer
+                                # then declines INSIDE `run()` ("labelled
+                                # corpus is 89% the same … the deployed
+                                # model stays") and this branch is the one
+                                # that actually executes, hourly. Leaving it
+                                # at `entered` re-created the false
+                                # `✗ DEAD router_train` the heartbeat was
+                                # built to remove. An in-trainer EXCEPTION
+                                # is `failed` (the alarm stays armed); a
+                                # decision is `declined`.
+                                self._record_idle_attempt(
+                                    "router_train",
+                                    "failed" if getattr(report, "exception", False)
+                                    else "declined")
                         except Exception as e:
                             logger.warning(f"Router retrain phase failed: {e}")
                             # An exception IS an outcome. Without this the
@@ -12452,8 +12476,9 @@ class GhostAgent:
         lite_system = (
             "You are Ghost, a concise conversational AI. The user has sent a "
             "short greeting or trivial message. Reply warmly, in one or two "
-            "sentences. Do NOT call any tools. Do NOT mention internal state. "
-            "Do NOT preface with filler.\n\n"
+            "sentences, in the language the user wrote in. Do NOT call any "
+            "tools. Do NOT mention internal state. Do NOT preface with "
+            "filler.\n\n"
             + profile_block
         )
 
@@ -12911,24 +12936,14 @@ class GhostAgent:
             return []
 
     def _select_system_prompt(self, body) -> str:
-        """The base system prompt for this request (§4FF).
+        """The base system prompt for this request: `SYSTEM_PROMPT`, always.
 
-        `SYSTEM_PROMPT` for every real turn — the warmup, the prefix-cache
-        pins and the GEPA loader all read that constant. The COMPILED
-        variant is served only to a DIAGNOSTIC PROBE that asked for it
-        (`X-Ghost-Prompt-Variant: compiled`, honoured by the route inside
-        its probe branch; the probe prefix is re-checked here so no other
-        path can flip a user's prompt). This is how the instruction-
-        following bench pairs the two prompts on identical items without
-        touching live traffic; a live arm would sit at this same seam."""
-        try:
-            want = str((body or {}).get("_prompt_variant") or "").strip().lower()
-            if want == "compiled":
-                from ..utils.logging import is_probe_request_id, request_id_context
-                if is_probe_request_id(request_id_context.get()):
-                    return SYSTEM_PROMPT_COMPILED
-        except Exception:  # noqa: BLE001 — the control prompt is the safe default
-            pass
+        Until 2026-09-21 (§4JG) a diagnostic probe could ask for the COMPILED
+        variant here (§4FF); the full banded instruction-following bench
+        measured no difference between the two (87/95 vs 87/95, p = 1.0), so
+        the variant and its seam are retired. The method stays as the ONE
+        site a future prompt A/B would reattach to — `body` is accepted and
+        ignored so the call site does not change."""
         return SYSTEM_PROMPT
 
     def _evidence_gate_block(self, tools_run, req_id: str) -> str:
@@ -18211,6 +18226,7 @@ class GhostAgent:
                                 # 3 blocked turns x ~80 s of full-file
                                 # generation each).
                                 force_final_response = True
+                                self.context._breaker_forced_final = True  # §4JI: a tool call on this forced final IS the no-answer
                                 _diag += (
                                     " FINAL: you have now been blocked "
                                     f"{preflight_blocks_this_request} times on known-"
@@ -19240,10 +19256,13 @@ class GhostAgent:
                     # call fails with a known error pattern, append a
                     # concrete remediation hint so the LLM has an
                     # actionable next step instead of blindly retrying.
-                    _hint_exit = re.search(r"EXIT CODE:\s*(\d+)", str_res)
+                    # R4-1: execute-SHAPED only. Unanchored, this appended a
+                    # "[FALLBACK HINT for manage_projects]" to a status
+                    # payload that merely QUOTED a failed build's banner.
+                    from ..tools.tool_failure import exec_exit_code as _exec_exit_code
+                    _hint_code = _exec_exit_code(str_res)
                     if ((_failure_shaped
-                         or (_hint_exit is not None
-                             and int(_hint_exit.group(1)) != 0))
+                         or (_hint_code is not None and _hint_code != 0))
                             and not _outcome.is_rejection):
                         try:
                             from ..tools.tool_failure import get_fallback_hint
@@ -19926,6 +19945,53 @@ class GhostAgent:
                 # (Metacog per-tool outcomes are now recorded inside
                 # the enumerate(results) loop above, keyed per result.)
 
+                # §4JJ search-yield steer (behind the `search_yield_steer`
+                # arm). Req e69cab30: 36 searches, none opened, nothing
+                # shipped after 677 s; the no-progress breaker needs an
+                # IDENTICAL query. Counted over the batch in call order;
+                # once per request; tools KEPT — the measurement says the
+                # same run precedes both the empty finals and answers
+                # synthesised from snippets, so a stop is not supported.
+                try:
+                    from . import strikes as _sy_strk
+                    _sy_run = 0
+                    for _sy_meta in tool_call_metadata:
+                        _sy_run = strikes.note_search_yield(_sy_meta[0])
+                    if (_sy_run >= _sy_strk.SEARCH_YIELD_STEER
+                            and not strikes.search_yield_steered
+                            and not force_stop and not force_final_response):
+                        strikes.search_yield_steered = True
+                        from . import experiments as _sy_exp
+                        _sy_req = str(getattr(ts, "req_id", "")
+                                      or request_id_context.get() or "")
+                        _sy_arm = _sy_exp.arm_for(self.context, "search_yield_steer", _sy_req)
+                        if _sy_arm:
+                            _sy_treat = (_sy_arm == _sy_exp.TREATMENT)
+                            _sy_exp.mark_trigger(self.context, _sy_req,
+                                                 "search_yield_steer_fired", _sy_treat)
+                            pretty_log(
+                                "Search Yield",
+                                f"{_sy_run} web searches in a row and no result opened — "
+                                + ("steering: open one or answer (tools kept)" if _sy_treat
+                                   else "control arm: no steer"),
+                                level="WARNING", icon=Icons.WARN)
+                            if _sy_treat:
+                                messages.append({"role": "user", "content": (
+                                    f"SYSTEM ALERT: you have run {_sy_run} web searches in a row "
+                                    "and have not opened a single result. Search results are "
+                                    "snippets; another query of the same kind will not produce "
+                                    "new evidence. Do ONE of these NOW:\n"
+                                    "1. OPEN the one result most likely to hold the answer — "
+                                    "browser(operation='extract_text', url=<its URL>, "
+                                    "max_chars=8000) — and read it.\n"
+                                    "2. ANSWER from the snippets you already have: state what "
+                                    "they support, and name plainly each part of the question "
+                                    "you could NOT confirm and what you searched for it.\n"
+                                    "Do NOT run another web_search before doing one of these."
+                                )})
+                except Exception as _sy_exc:  # noqa: BLE001 — a steer must never sink the batch
+                    logger.debug("search-yield steer skipped: %s", _sy_exc)
+
                 # No-progress loop breaker. When the same SUCCEEDING
                 # action on the same target returned the same result
                 # >=3x this request, the agent is in an ungrounded
@@ -20002,6 +20068,7 @@ class GhostAgent:
                         )})
                     elif _acnt >= _hard_n and _nav_case:
                         force_final_response = True
+                        self.context._breaker_forced_final = True  # §4JI: a tool call on this forced final IS the no-answer
                         pretty_log(
                             "Loop Breaker",
                             f"No-progress: 'browser' on '{_atarget}' repeated {_acnt}x "
@@ -20019,6 +20086,7 @@ class GhostAgent:
                         # clear "this is what fails and why" is a valid
                         # deliverable; twenty more variations are not.
                         force_final_response = True
+                        self.context._breaker_forced_final = True  # §4JI: a tool call on this forced final IS the no-answer
                         pretty_log(
                             "Loop Breaker",
                             f"Same error {_acnt}x from {_exec_heads} — forcing a "
@@ -20171,6 +20239,7 @@ class GhostAgent:
                             )})
                         else:
                             force_final_response = True
+                            self.context._breaker_forced_final = True  # §4JI: a tool call on this forced final IS the no-answer
                             messages.append({"role": "user", "content": (
                                 f"SYSTEM ALERT: You have run '{_afname}'{_tgt_desc} {_acnt} times "
                                 "and gotten the SAME result with no change — re-observing "
@@ -20418,6 +20487,7 @@ class GhostAgent:
                         pretty_log("Failure Cap", "Forcing final response", icon=Icons.STOP, level="WARNING")
                         messages.append({"role": "user", "content": "SYSTEM ALERT: You have failed too many times. The task cannot be completed. Provide a final response explaining the situation."})
                         force_final_response = True
+                        self.context._breaker_forced_final = True  # §4JI: a tool call on this forced final IS the no-answer
                         # Tell the LATE episode write that this turn ended at
                         # the cap. It cannot re-derive that: the cap is
                         # `execution_failure_count >= 6 OR total_fail >= 8`,
@@ -21270,16 +21340,20 @@ class GhostAgent:
                     # framing, or the sandbox-job form. The as-data case
                     # ("ci-log.txt saved earlier says EXIT CODE: 3") stays
                     # excluded — unanchored, no framing.
-                    _exec_shaped = (
-                        _fb_name == "execute"
-                        or (re.search(r"(?m)^EXIT CODE:\s*\d+", _raw_out)
-                            is not None
-                            and ("STDOUT/STDERR:" in _raw_out
-                                 or "--- EXECUTION RESULT ---" in _raw_out))
-                        or re.search(r"\[sandbox job [^\]]*EXIT CODE:\s*\d+",
-                                     _raw_out) is not None)
-                    _m_exit = (re.search(r"EXIT CODE:\s*(\d+)", _raw_out)
-                               if _exec_shaped else None)
+                    # R4-1 (2026-09-20): the shape rule that lived only here
+                    # is now `tools.tool_failure.exec_exit_code`, shared by
+                    # every reader that used to search unanchored.
+                    from ..tools.tool_failure import exec_exit_code as _exec_exit_code
+                    # framing REQUIRED here: this decides what the USER is
+                    # told (§4EC TestExitBannerShape — a non-execute tool's
+                    # unframed banner is not a failed command).
+                    _exit_code = _exec_exit_code(_raw_out, require_framing=True)
+                    if _exit_code is None and _fb_name == "execute":
+                        # execute's own output is exec-shaped by NAME: keep
+                        # the wide search for a banner the helper's framing
+                        # check would not recognise.
+                        _m = re.search(r"EXIT CODE:\s*(\d+)", _raw_out)
+                        _exit_code = int(_m.group(1)) if _m else None
                     # A DECLARED failure is an OR, never an override: the
                     # exit-code banner still DECIDES for exec-shaped output
                     # (an explicit `EXIT CODE: 0` outranks an error-looking
@@ -21294,8 +21368,8 @@ class GhostAgent:
                         _fb_st is not None
                         and str(getattr(_fb_st, "value", _fb_st))
                         not in ("ok", "unresolved"))
-                    if _m_exit is not None:
-                        _looks_failed = (_m_exit.group(1) != "0"
+                    if _exit_code is not None:
+                        _looks_failed = (_exit_code != 0
                                          or _fb_declared_bad)
                     else:
                         _looks_failed = _fb_declared_bad or \
@@ -23692,6 +23766,7 @@ class GhostAgent:
                     if execution_failure_count >= 6:
                         pretty_log("Think-Loop Halt", "Forcing final response after repeated thinking loops", icon=Icons.STOP, level="WARNING")
                         force_final_response = True
+                        self.context._breaker_forced_final = True  # §4JI: a tool call on this forced final IS the no-answer
                     return "continue"
             except (httpx.ConnectError, httpx.ConnectTimeout):
                 final_ai_content = "CRITICAL: The upstream LLM server is unreachable. It may have crashed due to memory pressure or is currently restarting. Please wait a moment and try again."
@@ -23981,7 +24056,8 @@ class GhostAgent:
                 # directive; a second miss ships an honest fallback
                 # built from the last evidence instead of the beats.
                 if is_final_generation and (
-                        _forced_final_has_no_answer(clean_ui, final_ai_content)
+                        _forced_final_has_no_answer(clean_ui, final_ai_content,
+                                                    request=str(last_user_content or ""))
                         # §4IG: on a breaker-forced / reserved report turn a
                         # tool call IS the no-answer — the model went back
                         # to work instead of reporting, whatever prose came
@@ -24028,7 +24104,7 @@ class GhostAgent:
                 if (clean_ui and not is_final_generation and not force_final_response
                         and not force_stop and not _count_real_tools_safe(tools_run_this_turn)
                         and not _work_nudge_used and turn < effective_max_turns - 1
-                        and _announced_work_without_acting(clean_ui)):
+                        and _announced_work_without_acting(clean_ui, request=str(last_user_content or ""))):
                     _work_nudge_used = True
                     pretty_log(
                         "Turn Budget",
@@ -28560,7 +28636,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             if not issues:
                 issues = refute_narration_only(
                     claim, n_real_tools=count_real_tools(tools_run or []),
-                    tool_names=_names)
+                    tool_names=_names, request=request_text or "")
                 reasoning = self._NARRATION_ONLY_REASONING
             if not issues:
                 return None       # ⚠ NOT a pass — nothing to say

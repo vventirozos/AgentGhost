@@ -19,7 +19,8 @@ Assumes:
 
 Usage:
     PYTHONPATH=src python scripts/selfhood_functional_test.py \
-        [--skip stress,narrative]    # run a subset
+        [--skip f,d]                 # run a subset (section keys a-h)
+        [--corrupt-live-state]       # opt in to section G on a live GHOST_HOME
         [--turns N]                  # how many stress turns (default 15)
 
 Exit code 0 on full pass, 1 on any FAIL.
@@ -47,6 +48,19 @@ from ghost_agent.selfhood.schema import Experience
 
 GHOST_HOME = Path(os.environ.get("GHOST_HOME", "/Users/vasilis/Data/AI/Data"))
 SELFHOOD_DIR = GHOST_HOME / "system" / "selfhood"
+
+
+def _api_headers() -> dict:
+    """`X-Ghost-Key` on every request. The agent has required the header
+    since the 2026-07-13 key rollout; this harness predates it and failed
+    every turn with 403 on 2026-09-20 (R2-3). Same source as
+    scripts/functional_live_test.py: the operator's key file, falling
+    back to GHOST_API_KEY."""
+    key_path = Path.home() / "Data" / "AI" / ".ghost_api_key"
+    key = os.environ.get("GHOST_API_KEY", "").strip()
+    if not key and key_path.exists():
+        key = key_path.read_text(encoding="utf-8").strip()
+    return {"X-Ghost-Key": key} if key else {}
 TRAJECTORIES_DIR = GHOST_HOME / "system" / "trajectories"
 AGENT_URL = "http://127.0.0.1:8000/api/chat"
 
@@ -117,6 +131,18 @@ async def chat(client: httpx.AsyncClient, prompt: str, *, timeout: float = 180.0
     r.raise_for_status()
     data = r.json()
     return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+
+async def _live_prefix_toggle(client: httpx.AsyncClient):
+    """The running agent's `_SELFHOOD_PREFIX_ENABLED`, from /api/health —
+    the process's truth, not the source tree's. None when unreadable."""
+    try:
+        r = await client.get(AGENT_URL.rsplit("/api/", 1)[0] + "/api/health", timeout=15)
+        cfg = (r.json() or {}).get("config") or {}
+        v = cfg.get("toggle._SELFHOOD_PREFIX_ENABLED")
+        return None if v is None else bool(v)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 # -----------------------------------------------------------------
@@ -253,53 +279,85 @@ async def section_b_tools(report: TestReport, client: httpx.AsyncClient):
 async def section_c_state(report: TestReport, client: httpx.AsyncClient):
     report.section("C. State thread — open questions surface in next turn")
 
-    # Inject an open question via Python (the agent itself doesn't
-    # have a tool for this yet; this exercises the SURFACE side of
-    # the state thread).
-    sm = SelfModel(root=SELFHOOD_DIR, enabled=True)
-    q = sm.state.note_open_question(
-        "Why do trapdoor functions feel asymmetric — what makes one direction hard?"
-    )
-    sm.state.set_mood("inquisitive", "the trapdoor question is bugging me")
-    sm.state.add_unfinished("write up the trapdoor essay")
+    # ⚠ THROUGH THE AGENT, never through the file (2026-09-20, R2-4).
+    # `SelfStateThread` loads state.json ONCE and every write flushes the
+    # whole in-memory copy, so an out-of-process injection is (a) invisible
+    # to the running agent — `introspect` answered "no open questions" over
+    # a file that held one — and (b) a last-writer-wins race that can erase
+    # the agent's own state. The `self_state` tool is the in-process route
+    # (the old comment "the agent doesn't have a tool for this yet" was
+    # stale). Every write below is a bounded turn; cleanup goes the same way.
+    nonce = f"trapdoor-{int(time.time()) % 100000}"
+    question = (f"Why do {nonce} functions feel asymmetric — what makes one "
+                f"direction hard?")
+    thread = f"write up the {nonce} essay"
 
-    report.info(f"injected open question id={q.id[:8]}")
-    report.info(f"set mood=inquisitive, added unfinished thread")
+    r = await chat(client, f"Use the self_state tool with action='note_question' "
+                           f"and text exactly: {question} Then reply with only DONE.")
+    report.info(f"note_question turn → {r[:120]!r}")
+    r2 = await chat(client, f"Use the self_state tool with action='add_unfinished' "
+                            f"and text exactly: {thread} Then reply with only DONE.")
+    report.info(f"add_unfinished turn → {r2[:120]!r}")
 
-    # Verify the prefix renders correctly
-    prefix = sm.build_wakeup_prefix()
-    if "trapdoor functions" not in prefix:
-        report.failed("C", "open question in prefix", f"prefix={prefix[:200]}")
-        return
-    if "inquisitive" not in prefix:
-        report.failed("C", "mood in prefix", "missing")
-        return
-    if "trapdoor essay" not in prefix:
-        report.failed("C", "unfinished thread in prefix", "missing")
-        return
-    report.passed("C", "state surfaces in wake-up prefix",
-                   "open Q + mood + unfinished all present")
-
-    # Now ask the agent. The wake-up prefix should be spliced into
-    # the system prompt; the agent should reference the open question.
-    resp = await chat(
-        client,
-        "Without me telling you, what topic have you been mulling over "
-        "in your recent sessions? One sentence.",
-    )
-    report.info(f"agent response: {resp[:300]!r}")
-    if "trapdoor" in resp.lower():
-        report.passed("C", "agent recalls injected open question",
-                       "mentioned 'trapdoor'")
-    else:
-        # Soft check — the model might paraphrase. Look for any
-        # signal.
-        if any(w in resp.lower() for w in ("function", "asymmetric", "essay")):
-            report.passed("C", "agent recalls thematic content",
-                          "paraphrased reference found")
+    try:
+        # The on-disk state is the agent's flush, so this READ is safe and
+        # proves the write reached the process-owned state.
+        sm = SelfModel(root=SELFHOOD_DIR, enabled=True)
+        on_disk_q = [q for q in sm.state.open_questions() if nonce in q.text]
+        on_disk_t = [t for t in sm.state.unfinished_threads() if nonce in t.descriptor]
+        if on_disk_q and on_disk_t:
+            report.passed("C", "self_state writes reach the agent's state",
+                          f"question {on_disk_q[0].id[:8]}, thread {on_disk_t[0].id[:8]}")
         else:
-            report.failed("C", "agent recalls injected open question",
-                          f"no reference to trapdoor/function/asymmetric in {resp[:200]!r}")
+            report.failed("C", "self_state writes reach the agent's state",
+                          f"question found={bool(on_disk_q)} thread found={bool(on_disk_t)}")
+            return
+        prefix = sm.build_wakeup_prefix()
+        if nonce in prefix:
+            report.passed("C", "state surfaces in wake-up prefix", "open Q present")
+        else:
+            report.failed("C", "open question in prefix", f"prefix={prefix[:200]}")
+
+        # HOW the state reaches the model depends on a live toggle: with the
+        # wake-up prefix ON it is spliced into the system prompt; with it
+        # OFF (§3/§4EU, the operator's decision since 2026-09-05, read from
+        # /api/health) the ONLY route is `introspect`, so the question must
+        # name that route.
+        prefix_on = await _live_prefix_toggle(client)
+        report.info(f"live wake-up prefix toggle: {prefix_on}")
+        if prefix_on is False:
+            resp = await chat(
+                client,
+                "Use the introspect tool (action='overview') to read your open "
+                "questions and reply with the newest open question, quoted "
+                "verbatim, one line.",
+            )
+        else:
+            resp = await chat(
+                client,
+                "Without me telling you, what topic have you been mulling over "
+                "in your recent sessions? One sentence.",
+            )
+        report.info(f"agent response: {resp[:300]!r}")
+        if nonce in resp:
+            report.passed("C", "agent recalls the noted open question",
+                          f"route={'introspect' if prefix_on is False else 'prefix'}")
+        else:
+            report.failed("C", "agent recalls the noted open question",
+                          f"no '{nonce}' in {resp[:200]!r}")
+    finally:
+        r3 = await chat(client, f"Use the self_state tool with action='resolve_question' "
+                                f"and text: {nonce}. Then use action='close_unfinished' "
+                                f"with text: {nonce}. Reply with only DONE.")
+        report.info(f"cleanup turn → {r3[:120]!r}")
+        sm = SelfModel(root=SELFHOOD_DIR, enabled=True)
+        left_q = [q for q in sm.state.open_questions() if nonce in q.text]
+        left_t = [t for t in sm.state.unfinished_threads() if nonce in t.descriptor]
+        if left_q or left_t:
+            report.failed("C", "cleanup through the agent",
+                          f"still open: questions={len(left_q)} threads={len(left_t)}")
+        else:
+            report.passed("C", "cleanup through the agent", "nothing left behind")
 
 
 # -----------------------------------------------------------------
@@ -323,7 +381,7 @@ async def section_d_narrative(report: TestReport):
             "max_tokens": 1024,
             "stream": False,
         }
-        async with httpx.AsyncClient() as c:
+        async with httpx.AsyncClient(headers=_api_headers()) as c:
             r = await c.post(
                 "http://127.0.0.1:8088/v1/chat/completions",
                 json=body, timeout=120.0,
@@ -579,7 +637,7 @@ async def run(args):
     report = TestReport()
 
     # Verify the agent is reachable.
-    async with httpx.AsyncClient() as ping:
+    async with httpx.AsyncClient(headers=_api_headers()) as ping:
         try:
             r = await ping.get("http://127.0.0.1:8000/api/version", timeout=5.0)
             if r.status_code != 200:
@@ -593,8 +651,18 @@ async def run(args):
 
     skip = set(s.strip() for s in (args.skip or "").lower().split(",") if s.strip())
     only = set(s.strip() for s in (args.only or "").lower().split(",") if s.strip())
+    # Section keys are the single letters a–h. An unknown key used to be
+    # ignored SILENTLY, so `--skip corruption` ran §G anyway — against the
+    # operator's live state.json (R2-5, 2026-09-20). Refuse instead.
+    _known = set("abcdefgh")
+    _bad = (skip | only) - _known
+    if _bad:
+        report.failed("preflight", "section keys",
+                      f"unknown --skip/--only key(s) {sorted(_bad)}; "
+                      f"valid keys are {sorted(_known)}")
+        return report
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(headers=_api_headers()) as client:
         if args.mode == "main":
             for key in ("a", "b", "c"):
                 if only and key not in only: continue
@@ -606,7 +674,17 @@ async def run(args):
             if (not only or "f" in only) and "f" not in skip:
                 await section_f_stress(report, client, n=args.turns)
             if (not only or "g" in only) and "g" not in skip:
-                section_g_corruption(report)
+                # §G overwrites state.json with garbage and restores it a
+                # moment later — a race against the live agent's own writer
+                # and a window in which a real turn's state is lost. Only
+                # with the operator's explicit say-so on a live GHOST_HOME.
+                if args.corrupt_live_state:
+                    section_g_corruption(report)
+                else:
+                    report.section("G. Recovery from corrupted state.json")
+                    report.info("skipped: corrupts the LIVE state.json under "
+                                "a running agent — pass --corrupt-live-state "
+                                "to run it")
             if (not only or "h" in only) and "h" not in skip:
                 await section_h_unity(report, client)
         elif args.mode == "recall_only":
@@ -664,7 +742,10 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=("main", "recall_only", "disabled_check"),
                    default="main")
-    p.add_argument("--skip", default="")
+    p.add_argument("--skip", default="",
+                   help="comma-separated section keys a-h to skip")
+    p.add_argument("--corrupt-live-state", action="store_true",
+                   help="allow section G to corrupt+restore the live state.json")
     p.add_argument("--only", default="")
     p.add_argument("--turns", type=int, default=15)
     args = p.parse_args()

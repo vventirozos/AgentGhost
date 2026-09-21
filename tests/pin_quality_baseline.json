@@ -28,7 +28,6 @@
     "test_4ec_parser_dialects.py": 1,
     "test_4ec_read_budget_enumeration.py": 1,
     "test_4fd_provenance.py": 2,
-    "test_4ff_prompt_variant.py": 2,
     "test_4fg_coding_loop.py": 2,
     "test_4fm_prefix_rewarm.py": 1,
     "test_4fn_judge_fixes.py": 9,
@@ -275,5 +274,5 @@
     "test_workspace_cleanup_deletion_guards.py": 1,
     "test_workspace_tidy.py": 3
   },
-  "total_textual": 1337
+  "total_textual": 1335
 }

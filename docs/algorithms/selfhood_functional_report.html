@@ -63,6 +63,25 @@
   <p>When asked "what topic have you been mulling over in your recent sessions?", the agent replied: <em>"I've been mulling over what HTTP stands for."</em> It preferred the concrete experience entry over the abstract open question.</p>
   <p>This is a real research finding, not an implementation defect: the selfhood module surfaces the past, but the model's preference among the surfaced material is a separate alignment question. Possible mitigations (not yet implemented): reorder the prefix to put open questions AFTER experiences with stronger framing; use more emphatic markdown in the open-question block; introduce a hard priority signal the model can be trained against.</p>
 
+  <h3>Section C, re-run 2026-09-20 (verification round R2-4): the injection was never visible</h3>
+  <p>The analysis above assumed the running agent saw the injected question. It could not have:
+  <code>SelfStateThread</code> loads <code>state.json</code> once and every write flushes its whole
+  in-memory copy, so a question written from a <em>second</em> process is invisible to the live
+  agent &mdash; re-run in 2026-09, <code>introspect action='overview'</code> answered &ldquo;no open
+  questions&rdquo; over a file that held one &mdash; and the write is a last-writer-wins race that
+  can erase the agent's own state. The harness now injects, reads and cleans up
+  <strong>through the agent</strong> with the <code>self_state</code> tool
+  (<code>note_question</code> / <code>add_unfinished</code> / <code>resolve_question</code> /
+  <code>close_unfinished</code>; the &ldquo;agent-side state mutation tool&rdquo; follow-up below has
+  existed for a while), reads the live prefix toggle from <code>/api/health</code>, and routes the
+  recall question through <code>introspect</code> when the wake-up prefix is OFF (§4EU). Result:
+  4/4 &mdash; the noted question reached the process-owned state, surfaced in the prefix, was
+  quoted verbatim back through <code>introspect</code>, and was cleaned up leaving nothing
+  behind. Two more harness defects fixed the same day: it sent no <code>X-Ghost-Key</code> (403 on
+  every turn since the 2026-07-13 rollout), and <code>--skip</code> ignored unknown keys, so
+  Section G corrupted the <em>live</em> <code>state.json</code> under a running agent; G now needs
+  <code>--corrupt-live-state</code>.</p>
+
   <h2>Phase 2 — cross-restart recall</h2>
   <p><strong>Result: 1 / 1 PASS.</strong></p>
   <p>After Phase 1 the agent's on-disk selfhood directory held 25 autobiographical entries, a narrative diary, and a state thread. The agent process was killed; a fresh process was started against the same on-disk state.</p>

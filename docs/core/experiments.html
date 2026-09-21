@@ -485,6 +485,12 @@ radius = σ̂ · sqrt( 2(nρ² + 1) / (n²ρ²) · log( sqrt(nρ² + 1) / α ) )
         <td>The <a href="../tools/file_system.html">file_system batch macro</a> (§4F item 1): multi-path <code>paths</code> read + the post-edit view on <code>replace</code>.</td>
       </tr>
       <tr>
+        <td><code>search_yield_steer</code></td>
+        <td><code>search_yield_steer_fired</code></td>
+        <td><code>search_yield_steer_fired</code></td>
+        <td>§4JJ (2026-09-21): after <code>strikes.SEARCH_YIELD_STEER</code> (10) consecutive <code>web_search</code> calls with no result opened (<code>browser</code> / <code>deep_research</code> reset the run), the treatment appends one open-or-answer steer with the tools KEPT; control gets nothing. The trigger is the run itself — computed before either arm acts — so the triggered-only block is the comparison. Target: depth/duration of search-heavy turns without losing the answers they synthesise from snippets (the corpus could not separate the two: every empty final had such a run, and so did 26 answers). See <a href="agent.html#4jj">agent §4JJ</a>.</td>
+      </tr>
+      <tr>
         <td><code>foresight_note</code></td>
         <td><code>foresight_note_fired</code></td>
         <td><code>foresight_note_fired</code></td>

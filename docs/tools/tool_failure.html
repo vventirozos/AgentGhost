@@ -49,7 +49,35 @@
     <code>strip_advisory_sections</code> now removes advisory blocks before classification — a dashed rule, a short label ending in <code>HINT</code>, a dashed rule — matched generically so <code>execute</code>'s <code>--- 💡 DIAGNOSTIC HINT ---</code> (different label, different rule length) is covered by the same implementation. It cuts to the block's closing rule rather than to end-of-text, so anything appended after a hint survives; text with no hint is returned unchanged; and a result that is <em>nothing but</em> advice classifies <code>UNKNOWN</code> rather than inventing a failure. <code>tests/test_tool_failure_hint_stripping.py</code> carries an <code>ast.parse</code> enumeration that walks every string constant in <code>src/</code> and fails if a producer ever invents a banner shape the stripper cannot see.
   </p>
 
-  <h2>Retry delay</h2>
+  <h2>The exit code of an execute-shaped result &mdash; <code>exec_exit_code()</code> (2026-09-20, R4-1)</h2>
+<p>Five readers &mdash; <code>distill/outcome_heuristics._looks_like_tool_error</code>,
+<code>core/project_advancer._looks_like_failure</code> and
+<code>classify_verify_result</code>, <code>tools/registry._acquired_skill_result_class</code>,
+<code>tools/composed_skills._step_result_ok</code> &mdash; plus the turn loop's fallback-hint
+scan and <code>acquired_skills</code>' TDD gate each ran an <em>unanchored</em>
+<code>EXIT CODE:\s*(\d+)</code> over the whole body, while the turn loop's
+&ldquo;Process finished successfully.&rdquo; rule already demanded a line-anchored
+banner. Measured on the September 2026 corpus (2,331 calls replayed through every
+reader): a <code>manage_projects</code> status payload that <em>quotes</em> a past
+build &mdash; one JSON line holding <code>&hellip; --- EXECUTION RESULT --- EXIT CODE: 1
+STDOUT/STDERR: &hellip;</code> &mdash; was booked as a failed
+<code>manage_projects</code> call by the corpus readers (3 of 2,005 clean rows), a
+false failure fed to failure-distillation and the foresight index.</p>
+<p><code>exec_exit_code(text)</code> is now the one implementation: it returns the
+integer code for the sandbox-job form <code>[sandbox job &hellip; EXIT CODE: N]</code> or
+an <code>EXIT CODE: N</code> banner at the <em>start of a line</em>, and
+<code>None</code> for anything else (a quoted banner mid-line, a sentence that
+mentions one). 711/711 genuine execute results in the same corpus are line-anchored,
+so no real exit code is lost; an execution-framing requirement was tried and dropped
+(a pasted log carries framing too, and eight existing pins say
+<code>"boom\nEXIT CODE: 127"</code> is a failure). After the change the replay reads
+326/326 recorded failures caught, 0/2,005 false failures.
+<code>tests/test_exec_exit_code_anchored_r41.py</code> pins each reader on one input
+(R5) and walks the package for any unanchored search outside the helper; the only
+sites allowed to search wide are guarded by an <code>== "execute"</code> name check,
+i.e. their input is execute's own output.</p>
+
+<h2>Retry delay</h2>
   <pre><code>delay = min(base · 2^attempt, 30s)
 delay += 0.25 · delay · random()   # jitter</code></pre>
 

@@ -126,6 +126,16 @@ def _ctx(tmp_path, sm=None):
     return SimpleNamespace(skill_memory=sm, activity_log=log), log
 
 
+async def _confirmed_regression(dreamer, ctx):
+    """§4JF: one failed replay of a past SUCCESS is a CANDIDATE (no
+    quarantine, info-level); the reproducing failure confirms. Returns the
+    confirming batch's summary after asserting the candidate step."""
+    first = await cf.run_counterfactual_batch(dreamer, ctx)
+    assert first["regressions"] == 0 and first.get("candidates") == 1
+    assert not first["quarantined"]
+    return await cf.run_counterfactual_batch(dreamer, ctx)
+
+
 class TestBatch:
     async def test_regression_quarantines_and_notifies(self, home, tmp_path):
         _persist("SUCCESS")
@@ -137,7 +147,7 @@ class TestBatch:
         ctx, log = _ctx(tmp_path, sm)
         dreamer = _FakeDreamer("FAILURE")
 
-        summary = await cf.run_counterfactual_batch(dreamer, ctx)
+        summary = await _confirmed_regression(dreamer, ctx)
         assert summary["replayed"] == 1
         assert summary["regressions"] == 1
         assert summary["quarantined"] == ["use sets for dedup"]
@@ -150,10 +160,11 @@ class TestBatch:
         raw = sm._load_playbook()
         assert raw and raw[0].get("quarantined") is True
         assert "counterfactual regression" in raw[0]["quarantine_reason"]
-        # Operator notification is notify-severity.
+        # Recorded for the digest / introspect, NEVER pushed (2026-09-21:
+        # the operator does not want a night-time page for a regression).
         recs, _ = log.read_since(0)
-        assert any(r.severity == SEVERITY_NOTIFY
-                   and "regression" in r.summary for r in recs)
+        assert any("regression" in r.summary and "use sets for dedup" in r.summary for r in recs)
+        assert not any(r.severity == SEVERITY_NOTIFY for r in recs)
 
     async def test_generalized_is_info_and_no_quarantine(self, home, tmp_path):
         _persist("FAILURE")
@@ -259,7 +270,7 @@ class TestTriggerSnapshot:
         dreamer = _FakeDreamer("FAILURE (Exhausted 3 attempts)")
         # …but the dreamer stamped what the SIM actually hydrated.
         dreamer.last_selfplay_hydrated_triggers = ["sim hydrated lesson"]
-        summary = await cf.run_counterfactual_batch(dreamer, ctx)
+        summary = await _confirmed_regression(dreamer, ctx)
         assert summary["regressions"] == 1
         assert summary["quarantined"] == ["sim hydrated lesson"]
         assert sm.get_playbook_items("user turn lesson")  # untouched
@@ -271,7 +282,7 @@ class TestTriggerSnapshot:
         ctx, _ = _ctx(tmp_path, sm)
         dreamer = _FakeDreamer("FAILURE (Exhausted 3 attempts)")
         dreamer.last_selfplay_hydrated_triggers = []  # sim hydrated nothing
-        summary = await cf.run_counterfactual_batch(dreamer, ctx)
+        summary = await _confirmed_regression(dreamer, ctx)
         assert summary["regressions"] == 1
         assert summary["quarantined"] == []
         assert sm.get_playbook_items("user turn lesson")
@@ -284,7 +295,7 @@ class TestTriggerSnapshot:
         ctx, _ = _ctx(tmp_path, sm)
         dreamer = _FakeDreamer("FAILURE (Exhausted 3 attempts)")
         dreamer.last_selfplay_hydrated_triggers = None  # back-compat
-        summary = await cf.run_counterfactual_batch(dreamer, ctx)
+        summary = await _confirmed_regression(dreamer, ctx)
         assert summary["quarantined"] == ["user turn lesson"]
 
 
@@ -391,3 +402,141 @@ class TestReplayGate:
         # though the learning state is unchanged.
         s2 = await cf.run_counterfactual_batch(_FakeDreamer("SUCCESS"), ctx)
         assert s2["replayed"] == 1 and "skipped" not in s2
+
+
+# ── §4JF (2026-09-21): a regression must REPRODUCE; quarantine has a way back ──
+#
+# Measured: 7 regressions in 416 replays (~2% — the variance band of a 98%-pass
+# pool), 32 lessons quarantined by them, none of the 7 challenges ever replayed
+# again, no path back. World where these fail: the tree of 2026-09-20.
+
+from ghost_agent.core.autonomous_activity import SEVERITY_INFO
+
+
+class _SeqDreamer:
+    """Replays answer with a scripted SEQUENCE of statuses."""
+
+    def __init__(self, statuses):
+        self._seq = list(statuses)
+        self.injected = []
+        self.last_self_play_status = ""
+
+    async def synthetic_self_play(self, **kw):
+        self.injected.append(kw.get("injected_challenge"))
+        self.last_self_play_status = self._seq.pop(0) if self._seq else "SUCCESS"
+
+
+def _rows(home):
+    return cf._read_jsonl(home / "system" / "counterfactual" / "results.jsonl")
+
+
+class TestReproduceBeforeQuarantine:
+    async def test_first_failure_is_a_candidate_not_a_regression(self, home, tmp_path):
+        _persist("SUCCESS")
+        sm = _mem_with_lessons(tmp_path, "use sets for dedup")
+        sm.last_playbook_triggers = ["use sets for dedup"]
+        ctx, log = _ctx(tmp_path, sm)
+        summary = await cf.run_counterfactual_batch(_SeqDreamer(["FAILURE"]), ctx)
+        assert summary["regressions"] == 0 and summary.get("candidates") == 1
+        assert not summary["quarantined"]
+        assert sm._load_playbook()[0].get("quarantined") is not True
+        recs, _ = log.read_since(0)
+        cand = [r for r in recs if "regression-candidate" in r.summary]
+        assert cand and cand[0].severity == SEVERITY_INFO
+        assert "replayed again before any lesson is quarantined" in cand[0].summary
+        assert _rows(home)[-1]["verdict"] == cf.VERDICT_CANDIDATE
+
+    async def test_a_candidate_goes_first_in_the_next_batch_even_past_the_gate(self, home, tmp_path):
+        """The learning-state gate would park the candidate until the next
+        lesson landed; a candidate is owed its reproducing replay now."""
+        a = _persist("SUCCESS", challenge="first")
+        b = _persist("SUCCESS", challenge="second")
+        ctx, _ = _ctx(tmp_path, _mem_with_lessons(tmp_path, "x"))
+        await cf.run_counterfactual_batch(_SeqDreamer(["FAILURE"]), ctx, limit=1)   # `first` → candidate
+        allowed, why = cf.should_replay()
+        assert allowed and "candidate" in why
+        cands = cf.load_replay_candidates(limit=5)
+        assert cands[0]["challenge"] == "first" and cands[1]["challenge"] == "second"
+
+    async def test_a_pass_clears_the_candidate_without_quarantine(self, home, tmp_path):
+        _persist("SUCCESS")
+        sm = _mem_with_lessons(tmp_path, "use sets for dedup")
+        sm.last_playbook_triggers = ["use sets for dedup"]
+        ctx, log = _ctx(tmp_path, sm)
+        d = _SeqDreamer(["FAILURE", "SUCCESS"])
+        await cf.run_counterfactual_batch(d, ctx)
+        s2 = await cf.run_counterfactual_batch(d, ctx)
+        assert s2["stable"] == 1 and s2["regressions"] == 0
+        assert sm._load_playbook()[0].get("quarantined") is not True
+        recs, _ = log.read_since(0)
+        assert not any(r.severity == SEVERITY_NOTIFY for r in recs)
+        # concluded: a third batch has nothing to replay
+        assert (await cf.run_counterfactual_batch(d, ctx))["replayed"] == 0
+
+    async def test_the_reproducing_failure_quarantines_and_notifies_once(self, home, tmp_path):
+        _persist("SUCCESS")
+        sm = _mem_with_lessons(tmp_path, "use sets for dedup")
+        sm.last_playbook_triggers = ["use sets for dedup"]
+        ctx, log = _ctx(tmp_path, sm)
+        d = _SeqDreamer(["FAILURE", "FAILURE"])
+        await cf.run_counterfactual_batch(d, ctx)
+        s2 = await cf.run_counterfactual_batch(d, ctx)
+        assert s2["regressions"] == 1 and s2["quarantined"] == ["use sets for dedup"]
+        assert sm._load_playbook()[0].get("quarantined") is True
+        recs, _ = log.read_since(0)
+        confirmed = [r for r in recs if "reproduced on a second replay" in r.summary]
+        assert len(confirmed) == 1 and confirmed[0].severity == SEVERITY_INFO
+        assert not any(r.severity == SEVERITY_NOTIFY for r in recs)   # no push, ever
+
+
+class TestQuarantineHasAWayBack:
+    async def test_a_later_pass_lifts_the_quarantine_this_loop_imposed(self, home, tmp_path, monkeypatch):
+        # In production the quarantine WRITE changes the playbook fingerprint
+        # and opens the learning-state gate for the recheck; this store lives
+        # outside the fingerprinted dir, so the gate (out of scope) is off.
+        monkeypatch.setenv("GHOST_COUNTERFACTUAL_GATE", "0")
+        _persist("SUCCESS")
+        sm = _mem_with_lessons(tmp_path, "use sets for dedup", "unrelated lesson")
+        sm.last_playbook_triggers = ["use sets for dedup"]
+        ctx, log = _ctx(tmp_path, sm)
+        d = _SeqDreamer(["FAILURE", "FAILURE", "SUCCESS"])
+        await cf.run_counterfactual_batch(d, ctx)
+        await cf.run_counterfactual_batch(d, ctx)          # confirmed → quarantined
+        by = lambda: {r["trigger"]: r for r in sm._load_playbook()}
+        assert by()["use sets for dedup"].get("quarantined") is True
+        assert by()["unrelated lesson"].get("quarantined") is not True
+        s3 = await cf.run_counterfactual_batch(d, ctx)     # the recheck passes
+        assert s3["replayed"] == 1 and s3.get("restored") == ["use sets for dedup"]
+        row = by()["use sets for dedup"]
+        assert row.get("quarantined") is False and "counterfactual regression" in row["unquarantined_from"]
+        assert _rows(home)[-1].get("restored") == ["use sets for dedup"]
+        recs, _ = log.read_since(0)
+        assert any("quarantine lifted on: use sets for dedup" in r.summary for r in recs)
+
+    async def test_rechecks_are_bounded(self, home, tmp_path, monkeypatch):
+        monkeypatch.setenv("GHOST_COUNTERFACTUAL_GATE", "0")
+        _persist("SUCCESS")
+        sm = _mem_with_lessons(tmp_path, "l")
+        sm.last_playbook_triggers = ["l"]
+        ctx, _ = _ctx(tmp_path, sm)
+        d = _SeqDreamer(["FAILURE"] * 10)
+        for _ in range(2 + cf.MAX_REGRESSION_RECHECKS + 3):
+            await cf.run_counterfactual_batch(d, ctx)
+        verdicts = [r["verdict"] for r in _rows(home)]
+        # candidate, confirmed regression, then at most MAX_REGRESSION_RECHECKS rechecks (still failing)
+        assert verdicts[:2] == [cf.VERDICT_CANDIDATE, "regression"]
+        assert len(verdicts) == 2 + cf.MAX_REGRESSION_RECHECKS
+        # nothing from this loop is pushed; failed rechecks say "quarantine stands"
+        recs, _ = ctx.activity_log.read_since(0)
+        assert not any(r.severity == SEVERITY_NOTIFY for r in recs)
+        assert sum(1 for r in recs if "recheck still failing; the quarantine stands" in r.summary) == cf.MAX_REGRESSION_RECHECKS
+
+    def test_unquarantine_is_scoped_to_the_reason_that_imposed_it(self, tmp_path):
+        sm = _mem_with_lessons(tmp_path, "a", "b")
+        sm.quarantine_lesson("a", reason="counterfactual regression on challenge X: …")
+        sm.quarantine_lesson("b", reason="mirror audit: contradicts the profile")
+        assert sm.unquarantine_lesson("b", reason_contains="challenge X") == 0   # not this loop's
+        assert sm.unquarantine_lesson("a", reason_contains="challenge X") == 1
+        rows = {r["trigger"]: r for r in sm._load_playbook()}
+        assert rows["a"]["quarantined"] is False and rows["b"]["quarantined"] is True
+        assert sm.unquarantine_lesson("a", reason_contains="challenge X") == 0   # idempotent

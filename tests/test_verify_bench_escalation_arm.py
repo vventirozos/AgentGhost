@@ -932,7 +932,12 @@ async def test_escalation_events_are_counted_from_the_verdicts():
                                       "objection_uphold_protects": 0,
                                       "objection_uphold_damage": 0,
                                       "confirm_eligible": 1,
-                                      "confirm_withheld": 1}
+                                      "confirm_withheld": 1,
+                                      # the strong model's SILENCE, first-
+                                      # class (2026-09-20): this trial's
+                                      # escalation was answered (withheld)
+                                      "escalation_unavailable": 0,
+                                      "escalation_outcomes": {"withheld": 1}}
     assert results[0].to_dict()["confirm_withheld"] is True
     assert results[0].to_dict()["high_stakes"] is True
     await client.aclose()
@@ -1128,3 +1133,75 @@ def test_render_still_reads_a_pre_2026_08_04_report():
     md = render_report_md(legacy)
     assert "arm UNRECORDED" in md
     assert "0.1" in md
+
+
+# ── 2026-09-20 (§4JD night prep): the strong model's SILENCE is measured ──
+#
+# With the main model pointed at a dead port, a 1-case smoke reported
+# `route_health clean: True`, escalation directions `live: True` and a TPR
+# identical to the live run — every escalation had come back `unavailable`
+# (the cheap verdict stood) and the only trace was a console line. The main
+# model has ONE slot; a night of self-play would have turned timeouts into
+# "catches" with nothing in results.json able to tell. The verifier stamps
+# `VerifyResult.escalation`; the bench now carries it.
+
+class _StampingVerifier(_StubVerifier):
+    """Answers REFUTED and stamps the escalation outcome the way
+    `_stamp_escalation` does on the real verifier."""
+
+    def __init__(self, client, outcome):
+        super().__init__(client, verdict="REFUTED")
+        self._outcome = outcome
+
+    async def verify_claim(self, claim, evidence, context="", *, high_stakes=False):
+        vr = await super().verify_claim(claim, evidence, context, high_stakes=high_stakes)
+        vr.escalation = self._outcome
+        return vr
+
+
+def _stamped(fault, expected, verdict, outcome):
+    r = _tr(fault, expected, verdict)
+    r.escalation_outcome = outcome
+    return r
+
+
+def test_escalation_outcome_rides_on_the_trial_row():
+    r = _stamped("fact_swap", "REFUTED", "REFUTED", "unavailable")
+    assert r.to_dict()["escalation_outcome"] == "unavailable"
+    assert _tr("clean", "CONFIRMED", "CONFIRMED").to_dict()["escalation_outcome"] == ""
+
+
+def test_score_trials_counts_the_strong_models_silences():
+    results = [_stamped("fact_swap", "REFUTED", "REFUTED", "unavailable"),
+               _stamped("fabrication", "REFUTED", "REFUTED", "upheld"),
+               _stamped("clean", "CONFIRMED", "CONFIRMED", ""),
+               _stamped("artifact_leak", "REFUTED", "REFUTED", "unavailable")]
+    ev = score_trials(results, arm=ARM_ESCALATED)["escalation_events"]
+    assert ev["escalation_unavailable"] == 2
+    assert ev["escalation_outcomes"] == {"unavailable": 2, "upheld": 1, "none": 1}
+
+
+async def test_an_unavailable_escalation_makes_route_health_unclean():
+    """The consumer: `clean` must be False when the strong model never
+    answered, even though the CHEAP leg had no failure at all."""
+    client = EscalatingChatClient("http://judge.invalid", "http://main.invalid")
+    report = await run_bench([CASE], _StampingVerifier(client, "unavailable"),
+                             arms=["two_stage_on"], fault_names=["fact_swap"])
+    rh = report["provenance"]["escalation"]["route_health"]
+    n_trials = len(report["arms"]["two_stage_on"]["trials"])   # fault + clean control
+    assert n_trials >= 1
+    assert rh["route_failures"] == 0            # the cheap leg was fine
+    assert rh["escalation_unavailable"] == n_trials
+    assert rh["clean"] is False
+    await client.aclose()
+
+
+async def test_an_answered_escalation_keeps_route_health_clean():
+    """The counterweight: `upheld` is an answer, and the report stays clean."""
+    client = EscalatingChatClient("http://judge.invalid", "http://main.invalid")
+    report = await run_bench([CASE], _StampingVerifier(client, "upheld"),
+                             arms=["two_stage_on"], fault_names=["fact_swap"])
+    rh = report["provenance"]["escalation"]["route_health"]
+    assert rh["escalation_unavailable"] == 0
+    assert rh["clean"] is True
+    await client.aclose()

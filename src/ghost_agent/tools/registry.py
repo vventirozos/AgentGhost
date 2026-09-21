@@ -36,7 +36,6 @@ from .uncertainty_tool import tool_flag_uncertainty
 import json
 import logging
 import os
-import re
 from ..utils.logging import pretty_log, Icons
 
 
@@ -70,12 +69,12 @@ def _acquired_skill_result_class(result) -> str:
     from ..sandbox.jobs import is_promoted_result
     if is_promoted_result(s):
         return "infra"
-    m = re.search(r"EXIT CODE:\s*(\d+)", s)
-    if m:
-        code = m.group(1)
-        if code == "0":
+    from .tool_failure import exec_exit_code as _exec_exit_code
+    _code = _exec_exit_code(s)  # R4-1: execute-shaped only, line-anchored
+    if _code is not None:
+        if _code == 0:
             return "ok"
-        if code in ("124", "137"):  # timeout / SIGKILL: host pressure
+        if _code in (124, 137):  # timeout / SIGKILL: host pressure
             return "infra"
         return "fail"
     # No exit-code banner (non-execute-shaped result): success unless it

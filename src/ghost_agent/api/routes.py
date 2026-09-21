@@ -1063,13 +1063,8 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
         if not is_probe_request_id(request_id):
             request_id = PROBE_REQUEST_PREFIX + (
                 str(request_id or "").strip() or uuid.uuid4().hex[:8])
-        # §4FF: a PROBE may choose the system-prompt variant under test
-        # (`control` | `compiled`). Read ONLY inside the probe branch, so a
-        # user turn can never be switched by a header; the agent re-checks
-        # the probe prefix before honouring it (defence in depth).
-        _variant = (request.headers.get("X-Ghost-Prompt-Variant") or "").strip().lower()
-        if _variant in ("control", "compiled"):
-            body["_prompt_variant"] = _variant
+        # (§4FF's `X-Ghost-Prompt-Variant` probe header was retired here on
+        # 2026-09-21, §4JG — no prompt variant exists to select.)
 
     # ---- durable sessions (2026-07-11) --------------------------------
     # With `session_id`, the SERVER is the source of truth for history: the

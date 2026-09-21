@@ -343,11 +343,21 @@ def _router_stamp_calls():
                 and node.args
                 and isinstance(node.args[0], ast.Constant)
                 and node.args[0].value == "router_train"):
-            literal = (node.args[1].value
-                       if len(node.args) > 1
-                       and isinstance(node.args[1], ast.Constant)
-                       else None)
-            calls.append((node.lineno, literal))
+            # The outcome may be a literal or a conditional over literals
+            # (`"failed" if report.exception else "declined"` — the
+            # in-trainer bail site, R1-1). Record every literal branch;
+            # anything else is None and fails the known-set check below.
+            literals = []
+            if len(node.args) > 1:
+                arg = node.args[1]
+                if isinstance(arg, ast.Constant):
+                    literals = [arg.value]
+                elif (isinstance(arg, ast.IfExp)
+                      and isinstance(arg.body, ast.Constant)
+                      and isinstance(arg.orelse, ast.Constant)):
+                    literals = [arg.body.value, arg.orelse.value]
+            for literal in (literals or [None]):
+                calls.append((node.lineno, literal))
     lines = src.splitlines()
     # The ROUTER gate, not the PRM one: the last occurrence, which follows
     # the first stamp.
@@ -370,16 +380,20 @@ def test_entered_is_stamped_before_the_gate_and_decline_after_it():
     failed = [n for n, lit in calls if lit == "failed"]
 
     assert len(entered) == 1, f"expected exactly one entered stamp, got {entered}"
-    assert len(declined) == 1, (
-        f"expected exactly one declined stamp, got {declined} — a second one "
-        "before the gate restores the false green")
-    assert len(failed) == 1, f"expected exactly one failed stamp, got {failed}"
+    # "Exactly one declined" was the pin until 2026-09-20 — and exactly one
+    # was the DEFECT (R1-1): the gate skip stamped it, the in-trainer bail
+    # (the path that actually runs hourly) stamped nothing. There are two
+    # decline sites now, and two failure sites (exception, rejected model).
+    # The counts are pinned by the EXECUTED tests below; this one pins the
+    # ordering that makes any stamp mean something.
+    assert declined, "no declined stamp at all"
+    assert failed, "no failed stamp at all"
 
     assert entered[0] < gate, "the entered stamp must precede the skip gate"
-    assert declined[0] > gate, (
-        "the declined stamp must be ON the skip path — before the gate it "
-        "marks a crash as a healthy decline")
-    assert failed[0] > gate
+    assert all(n > gate for n in declined), (
+        f"a declined stamp precedes the skip gate {declined} — before the "
+        "gate it marks a crash as a healthy decline")
+    assert all(n > gate for n in failed), failed
 
 
 def test_no_call_site_passes_an_unexpected_outcome():
@@ -785,3 +799,149 @@ def test_the_reader_does_not_share_one_entry_across_phases(tmp_path):
     assert got["mid_entered"]["result"] == ATTEMPT_ENTERED
     assert got["old_failed"]["ts"] < got["mid_entered"]["ts"] < \
         got["fresh_declined"]["ts"], got
+
+
+# ══ R1-1 (2026-09-20): the in-trainer bail is a DECLINE, the exception a FAIL ═
+#
+# The executed-path test above accepts ENTERED as a valid outcome, so it was
+# green in both worlds — with the stamp and without it. These three drive the
+# same real phase and pin the value. Each fails on the pre-fix tree:
+# `_biological_tick` left the heartbeat at `entered` for every in-trainer
+# outcome, which is what printed `✗ DEAD router_train` daily (R1-1).
+
+
+def _router_phase_ctx(tmp_path):
+    import datetime
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from ghost_agent.core.autonomous_activity import ActivityLog
+    from ghost_agent.distill.collector import TrajectoryCollector
+    from ghost_agent.router import ComplexityDispatcher
+
+    led = tmp_path / "system" / "autonomous_activity.jsonl"
+    led.parent.mkdir(parents=True, exist_ok=True)
+    ctx = MagicMock()
+    ctx.activity_log = ActivityLog(led)
+    ctx.trajectory_collector = TrajectoryCollector(
+        root=tmp_path / "system" / "trajectories")
+    ctx.complexity_dispatcher = ComplexityDispatcher(
+        classifier=None, confidence_threshold=0.3, disabled=True)
+    ctx.memory_system = MagicMock()
+    ctx.memory_system.collection.get = MagicMock(return_value={"ids": []})
+    ctx.llm_client = SimpleNamespace(foreground_tasks=0)
+    for k in ("journal", "frontier_tracker", "reflector", "prm_scorer",
+              "postmortem_engine", "calibration_tracker"):
+        setattr(ctx, k, None)
+    ctx.last_activity_time = (datetime.datetime.now()
+                              - datetime.timedelta(seconds=1200))
+    ctx.args = MagicMock()
+    ctx.args.model = "test-model"
+    for k in ("prm_train_cooldown", "router_train_cooldown",
+              "self_narrative_cooldown", "calib_refit_cooldown"):
+        setattr(ctx.args, k, None)
+    return ctx, led
+
+
+async def _run_router_phase(tmp_path, monkeypatch, trainer_cls):
+    from ghost_agent.core.agent import GhostAgent
+    import ghost_agent.router as _router_pkg
+    monkeypatch.setenv("GHOST_HOME", str(tmp_path))
+    monkeypatch.setattr(_router_pkg, "RouterTrainer", trainer_cls)
+    ctx, led = _router_phase_ctx(tmp_path)
+    agent = GhostAgent.__new__(GhostAgent)
+    agent.context = ctx
+    await agent._biological_tick()
+    return read_attempts(led)
+
+
+class _BailingTrainer:
+    """RouterTrainer.run bails by DECISION (unchanged corpus / too few
+    samples) — the branch that runs hourly in production."""
+    def __init__(self, *a, **k):
+        self.classifier = None
+
+    def run(self, *a, **k):
+        from ghost_agent.router.trainer import RouterTrainerReport
+        r = RouterTrainerReport()
+        r.fit_succeeded = False
+        r.bail_reason = "the labelled corpus is 89% the same as the last look"
+        return r
+
+
+class _ExceptionTrainer(_BailingTrainer):
+    """RouterTrainer.run caught an exception inside and reported it."""
+    def run(self, *a, **k):
+        from ghost_agent.router.trainer import RouterTrainerReport
+        r = RouterTrainerReport()
+        r.fit_succeeded = False
+        r.bail_reason = "fit failed: boom"
+        r.exception = True
+        return r
+
+
+class _InsaneModelTrainer(_BailingTrainer):
+    """The fit succeeded but the sanity gate rejects the model."""
+    def __init__(self, *a, **k):
+        class _Clf:
+            def looks_sane(self):
+                return False
+        self.classifier = _Clf()
+
+    def run(self, *a, **k):
+        from ghost_agent.router.trainer import RouterTrainerReport
+        r = RouterTrainerReport()
+        r.fit_succeeded = True
+        return r
+
+
+async def test_an_in_trainer_decline_stamps_declined(tmp_path, monkeypatch):
+    got = await _run_router_phase(tmp_path, monkeypatch, _BailingTrainer)
+    assert got.get("router_train", {}).get("result") == ATTEMPT_DECLINED, got
+
+
+async def test_an_in_trainer_exception_stamps_failed(tmp_path, monkeypatch):
+    got = await _run_router_phase(tmp_path, monkeypatch, _ExceptionTrainer)
+    assert got.get("router_train", {}).get("result") == ATTEMPT_FAILED, got
+
+
+async def test_a_rejected_model_stamps_failed(tmp_path, monkeypatch):
+    got = await _run_router_phase(tmp_path, monkeypatch, _InsaneModelTrainer)
+    assert got.get("router_train", {}).get("result") == ATTEMPT_FAILED, got
+
+
+async def test_the_liveness_view_does_not_alarm_on_a_declining_trainer(
+        tmp_path, monkeypatch):
+    """The consumer, not just the stamp: after a decision-bail the learning
+    health view must NOT print the router loop as DEAD."""
+    from ghost_agent.core.learning_health import activity_liveness
+    await _run_router_phase(tmp_path, monkeypatch, _BailingTrainer)
+    led = tmp_path / "system" / "autonomous_activity.jsonl"
+    assert "router_train" not in activity_liveness(led)["alarms"]
+
+
+async def test_the_liveness_view_still_alarms_on_a_raising_trainer(
+        tmp_path, monkeypatch):
+    """And the alarm is not simply switched off: an exception keeps it."""
+    from ghost_agent.core.learning_health import activity_liveness
+    await _run_router_phase(tmp_path, monkeypatch, _ExceptionTrainer)
+    led = tmp_path / "system" / "autonomous_activity.jsonl"
+    assert "router_train" in activity_liveness(led)["alarms"]
+
+
+def test_the_trainer_marks_its_own_exceptions():
+    """`report.exception` is what the phase reads; every raise site in
+    `RouterTrainer.run` / bootstrap must set it, or an exception would be
+    stamped as a healthy decline."""
+    import ast
+    import inspect
+    from ghost_agent.router import trainer as _t
+    tree = ast.parse(inspect.getsource(_t))
+    handlers = [n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler)]
+    bail_handlers = [h for h in handlers
+                     if "bail_reason" in ast.unparse(h)]
+    assert bail_handlers, "no except-handler sets bail_reason — scanner broken"
+    unmarked = [h.lineno for h in bail_handlers
+                if "exception = True" not in ast.unparse(h)]
+    assert not unmarked, (
+        f"except-handlers that set bail_reason without report.exception: "
+        f"{unmarked}")

@@ -910,14 +910,15 @@ async def tool_create_skill(sandbox_dir: Path = None, memory_dir: Path = None, m
     # skill that wraps subprocess runs and prints their banners) passed the
     # old `"EXIT CODE: 0" in result` check despite exiting 1. Mirrors the
     # regex classification in registry._acquired_skill_result_class.
-    import re as _re
     from ..sandbox.jobs import is_promoted_result as _is_promoted
-    _exit_m = _re.search(r"EXIT CODE:\s*(\d+)", str(execution_result))
+    from .tool_failure import exec_exit_code as _exec_exit_code
+    # R4-1: the same anchored reading registry._acquired_skill_result_class
+    # now uses — a `.group(1)`-shaped shim so the two call sites below stay.
+    _exit_code = _exec_exit_code(str(execution_result))
     # A test run that outran its budget was DETACHED, not killed, and reports
     # exit 0 while STILL RUNNING (sandbox/jobs.py). Installing a skill on it
     # would gate the TDD contract on a test that never finished.
-    _tdd_passed = bool(_exit_m and _exit_m.group(1) == "0") \
-        and not _is_promoted(execution_result)
+    _tdd_passed = (_exit_code == 0) and not _is_promoted(execution_result)
     if not _tdd_passed or "(Process executed successfully, but no output was printed to stdout" in execution_result:
         # …but NEVER delete the file while a promoted job is still executing
         # it (sandbox/jobs.py). The gate correctly refuses to pass on an

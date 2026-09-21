@@ -191,6 +191,20 @@ DEFAULT_SPECS: Tuple[ExperimentSpec, ...] = (
         ),
     ),
     ExperimentSpec(
+        name="search_yield_steer",
+        arms=(CONTROL, TREATMENT),
+        traffic=1.0,
+        enabled=True,
+        description=(
+            "§4JJ: after SEARCH_YIELD_STEER consecutive web searches with no "
+            "result opened, the treatment appends one open-or-answer steer "
+            "(tools kept); control gets nothing. Trigger stamped on both arms "
+            "as search_yield_steer_fired. Target: depth/duration of "
+            "search-heavy turns without losing the answers they synthesise "
+            "from snippets (req e69cab30, 2026-09-21)."
+        ),
+    ),
+    ExperimentSpec(
         name="risk_steer",
         arms=(CONTROL, TREATMENT),
         traffic=1.0,

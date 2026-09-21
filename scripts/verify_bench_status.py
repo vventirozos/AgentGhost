@@ -69,6 +69,7 @@ from ghost_agent.eval.verify_bench import (  # noqa: E402
     ARM_RAW,
     bench_provenance,
     load_cases_jsonl,
+    _claim_binding_flags_off,
 )
 
 DEFAULT_BASELINE = "system/eval/verifier_incumbent_baseline.json"
@@ -103,6 +104,18 @@ _COMPONENTS = {
     "escalation.arm": ("measured pipeline changed (raw vs escalated)", _FULL),
     "escalation.leg": ("production rung changed (worker vs critic)", _FULL),
 }
+
+
+def current_fingerprint(cases, *, judge=None, escalation=None) -> dict:
+    """The CURRENT tree's flat fingerprint, built the way a BENCH RUN would
+    see it. `run_trials` pins the claim-binding live flags to "0" (§4IN) and
+    stamps the pinned values into provenance; an oracle that snapshots the
+    raw shell env reads "<unset>" against a baseline's "0" and cries drift
+    on three flags for every baseline recorded after §4IN — the first
+    re-recorded one (2026-09-20) did."""
+    with _claim_binding_flags_off():
+        return flat_fingerprint(bench_provenance(cases, judge=judge,
+                                                 escalation=escalation))
 
 
 def _wilson_half_width(p: float, n: int, z: float = 1.96) -> float:
@@ -279,8 +292,7 @@ def main() -> int:
     if args.base_url:
         esc = {"arm": ARM_ESCALATED if args.main_base_url else ARM_RAW,
                "cheap_route": args.leg}
-    new = flat_fingerprint(bench_provenance(cases, judge=judge,
-                                            escalation=esc))
+    new = current_fingerprint(cases, judge=judge, escalation=esc)
 
     drift, unknown = compare(old, new)
     needs_full = any(d["restore"] == _FULL for d in drift)

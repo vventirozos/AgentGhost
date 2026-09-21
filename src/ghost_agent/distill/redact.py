@@ -189,6 +189,33 @@ def _redact_qs_if_secret(m: "re.Match[str]") -> str:
     return m.group(0)
 
 
+# Prose credentials: "the wifi password is Zebra-Qu1lt-8817", "my passphrase
+# was …", "the API token: …" — the way an operator TYPES a secret into chat,
+# with a word ("is", "was") where every rule above expects `=`/`:`. Measured
+# 2026-09-20 (R2-7): a probe turn carrying three secrets left the two
+# key-SHAPED ones redacted and the spoken one in ghost-agent.log and a
+# trajectory. The name is present; only the separator was foreign to the
+# table. To keep "the password is wrong" / "the token is expired" readable
+# the VALUE must look like a secret: 8+ chars, at least one digit and one
+# letter, and not a bare dictionary word.
+_PROSE_SECRET_RE = re.compile(
+    r"(?i)\b((?:pass(?:word|phrase|code)|secret|token|api[ _-]?key|"
+    r"access[ _-]?key|pin[ _-]?code|credentials?)\b[ \t]+"
+    r"(?:is|was|are|were|=|:)?[ \t]*[\"'`]?)([^\s\"'`,;]+)")
+
+
+def _redact_prose_secret(m: "re.Match[str]") -> str:
+    """Redact the value after a spoken credential name iff it has secret
+    shape; leave ordinary prose ("the password is wrong") untouched."""
+    value = m.group(2).rstrip(".!?)")
+    trail = m.group(2)[len(value):]
+    has_digit = any(ch.isdigit() for ch in value)
+    has_alpha = any(ch.isalpha() for ch in value)
+    if len(value) >= 8 and has_digit and has_alpha:
+        return f"{m.group(1)}<REDACTED>{trail}"
+    return m.group(0)
+
+
 _BUILTIN_RULES: List[_BuiltinRule] = [
     # PEM private-key blocks (multi-line) — most specific, run first so the
     # whole block collapses before any sub-pattern nibbles at it.
@@ -308,6 +335,11 @@ _BUILTIN_RULES: List[_BuiltinRule] = [
     # The redactor was running; this shape simply wasn't in its table.
     # Anchored to [?&] so it can only fire inside a query string.
     ("url_query_secret", _QS_PARAM_RE, _redact_qs_if_secret),
+
+    # Spoken form — see `_PROSE_SECRET_RE` above. Runs AFTER the
+    # assignment rules so an already-`<REDACTED>` value is not re-matched
+    # (the placeholder has no digit and never qualifies anyway).
+    ("prose_secret", _PROSE_SECRET_RE, _redact_prose_secret),
 
     # .onion hostnames
     ("tor_onion", re.compile(r"\b[a-z2-7]{16,56}\.onion\b"), "<REDACTED_ONION>"),

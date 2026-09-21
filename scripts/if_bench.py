@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""§4FF — instruction-following bench: SYSTEM_PROMPT vs SYSTEM_PROMPT_COMPILED.
+"""§4FF — instruction-following bench over the live agent (single arm since §4JG).
 
 Drives a fixed bank of format-constrained requests through the LIVE agent as
 DIAGNOSTIC PROBES (`X-Ghost-Origin: probe` — probes never teach, never enrol
 in arms, and are recorded as `task_kind=probe`), once per prompt variant per
 repeat, paired per item. The variant is chosen by the probe-only header
-`X-Ghost-Prompt-Variant: control|compiled` (ignored on any other origin).
+(§4JG, 2026-09-21: the COMPILED prompt variant is retired — it measured no
+difference on the full banded bank, 87/95 vs 87/95, p = 1.0 — so the bench
+runs ONE arm, `control`, and reports pass rates per band. `--variants` stays
+for a future A/B that reattaches at `GhostAgent._select_system_prompt`; any
+name other than `control` is refused until one exists.)
 
 Each item carries a deterministic checker over the final reply text (exact,
 regex, word-count, starts-with, JSON, yes/no, language script), so the score
@@ -27,7 +31,7 @@ pins the format AND the fact. The summary reports per-band pass rates and
 per-band McNemar.
 
 usage: if_bench.py [--repeats 2] [--limit N] [--bands easy,tool,deep]
-                   [--variants control,compiled] [--out DIR]
+                   [--variants control] [--out DIR]
 """
 from __future__ import annotations
 
@@ -547,7 +551,7 @@ def _chat(text: str, variant: str, rid: str, timeout=400.0) -> dict:
     req = urllib.request.Request(
         f"{AGENT}/api/chat", data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json", "X-Ghost-Key": KEY,
-                 "X-Ghost-Origin": "probe", "X-Ghost-Prompt-Variant": variant,
+                 "X-Ghost-Origin": "probe",
                  "X-Request-ID": rid})
     t0 = time.time()
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -594,12 +598,18 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--offset", type=int, default=0, help="skip the first N items (chunked runs)")
     ap.add_argument("--items", default="", help="comma-separated item ids to run (overrides offset/limit)")
-    ap.add_argument("--variants", default="control,compiled")
+    ap.add_argument("--variants", default="control")
     ap.add_argument("--no-tools", action="store_true", help="skip tool-using items")
     ap.add_argument("--bands", default="", help="comma-separated bands to run (easy,tool,deep)")
     ap.add_argument("--out", default=str(GHOST_HOME / "system" / "eval" / "if_bench"))
     args = ap.parse_args()
     variants = [v.strip() for v in args.variants.split(",") if v.strip()]
+    _known = {"control"}          # §4JG: the only prompt that exists
+    _bad = [v for v in variants if v not in _known]
+    if _bad:
+        sys.exit(f"unknown prompt variant(s) {_bad}: no such prompt exists (the compiled "
+                 f"variant was retired 2026-09-21, §4JG); a future A/B reattaches at "
+                 f"GhostAgent._select_system_prompt")
     items = select_items(bands=args.bands, no_tools=args.no_tools,
                          item_ids=args.items, offset=args.offset, limit=args.limit)
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)

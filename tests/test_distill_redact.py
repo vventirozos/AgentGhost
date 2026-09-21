@@ -325,3 +325,53 @@ def test_redact_trajectory_jsonl_has_no_secret_in_extra():
     line = redact_trajectory(t).to_jsonl()
     assert "AKIAIOSFODNN7EXAMPLE" not in line
     assert "xoxb-1234567890-deadbeefcafe" not in line
+
+
+# ── R2-7 (2026-09-20): the SPOKEN credential ────────────────────────────────
+# A live probe carried three secrets through one turn: the two key-SHAPED
+# ones came out `<REDACTED_*>`; "the office wifi password is Zebra-Qu1lt-8817"
+# landed verbatim in ghost-agent.log and a trajectory. Every rule wanted
+# `=`/`:`; an operator types "is". Fails on the pre-rule tree: the literal
+# survives `redact_text`.
+
+@pytest.mark.parametrize("text, secret", [
+    ("the office wifi password is Zebra-Qu1lt-8817.", "Zebra-Qu1lt-8817"),
+    ("my passphrase was correct-horse-7-battery", "correct-horse-7-battery"),
+    ("API token: ghq9x8K2mLp0", "ghq9x8K2mLp0"),
+    ("the access key is 'AB12cd34ef56'", "AB12cd34ef56"),
+    ("Passcode = Q9z8Y7x6W5", "Q9z8Y7x6W5"),
+])
+def test_prose_secret_redacted(text, secret):
+    out = redact_text(text)
+    assert secret not in out, out
+    assert "<REDACTED>" in out
+
+
+@pytest.mark.parametrize("text", [
+    "the password is wrong",
+    "the token is expired, retry",
+    "password reset link sent",
+    "credentials are stored in the keychain",
+    "the api key is missing from the request",
+    "token was refreshed at 10:42",     # value without a letter+digit mix ≥8
+    "the token is v2 now",              # letter+digit but far below the floor
+    "password is 12345678 characters long",   # digits only, no letter
+])
+def test_prose_rule_leaves_ordinary_prose_alone(text):
+    """The counterweight: a value that is a plain word (or too short, or
+    digit-only) is prose, not a secret — redacting it would eat the log
+    lines the operator reads to debug auth."""
+    assert redact_text(text) == text
+
+
+def test_prose_rule_keeps_trailing_punctuation():
+    assert redact_text("password is Zebra-Qu1lt-8817.") == "password is <REDACTED>."
+
+
+def test_prose_rule_is_registered_after_the_assignment_rules():
+    """Order matters: an assignment already `<REDACTED>` must not be
+    re-matched, and the prose rule must run at all."""
+    from ghost_agent.distill.redact import _BUILTIN_RULES
+    names = [r[0] for r in _BUILTIN_RULES]
+    assert "prose_secret" in names
+    assert names.index("prose_secret") > names.index("form_secret_assignment")

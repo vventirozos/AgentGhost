@@ -65,12 +65,28 @@ const IS_MOBILE = _mqMobile.matches;
 // much slower morph. Mirrors the CSS prefers-reduced-motion block.
 const PREFERS_REDUCED_MOTION = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 const NODE_COUNT = IS_MOBILE ? 120 : 250;
-const MAX_LINES = IS_MOBILE ? 2500 : 10000;
+// 2026-09-21: the vortex's user-turn web measured 11,942 qualifying links
+// on desktop (2,944 mobile) against caps of 10,000 / 2,500 — capped in
+// 64% of turn frames (91% under the read gait's thicken). Headroom here
+// covers the plain turn; the link BUDGET below (`_linkBudget`) handles
+// whatever still overflows, uniformly.
+const MAX_LINES = IS_MOBILE ? 3000 : 12000;
 const BLOOM_SCALE = IS_MOBILE ? 0.6 : 1.0;
 // Tightened 2.5 → 1.7 with the medusa anatomy: the body is locally
 // dense (membrane, strands), so a wide link radius smeared the form
 // back into an undifferentiated web. Shorter links trace the anatomy.
 const PROXIMITY_SQ = 1.7;
+// Link budget (2026-09-21). When the proximity pass finds more pairs
+// than MAX_LINES, the emitter used to keep the FIRST pairs by node index
+// and silently drop the rest — so during a vortex surge the highest-
+// indexed region (the last-built stream nodes) lost its web entirely and
+// the count flickered across the cap frame to frame. Now an overflow
+// frame tightens the link radius a little for the next frame and an
+// under-budget frame relaxes it back: the web thins UNIFORMLY to fit,
+// nothing is dropped by position. `_linkBudget` scales proximitySq;
+// 1.0 whenever the budget is not binding.
+let _linkBudget = 1.0;
+const LINK_BUDGET_MIN = 0.45;
 
 let scene, camera, renderer, composer, bloomPass;
 let instancedMesh, linesMesh;
@@ -132,12 +148,48 @@ let huePhase = 0.0;      // bounded thermal oscillation (see hueDrift)
 let vortexTravel = 0.0;
 let tunnelFlow = 0.0;
 let vortexSpin = 0.0;
+// This frame's advance of vortexSpin. The stream's DIFFERENTIAL swirl
+// (matter near the hole turns slower than the rim) was written as
+// `vortexSpin × (0.9 − 0.4·dOut)` — the ever-growing spin angle times a
+// factor that changes as the node flows outward, so every frame the
+// node's angle jumped by `0.4 × vortexSpin × ΔdOut`: nothing on a fresh
+// page, 13× the idle motion after 20 minutes, and node teleports on a
+// user turn after an hour (measured 2026-09-21 — the §4JA class again,
+// spin×depth instead of time×rate). Each stream node now INTEGRATES its
+// own swirl at its current depth factor (`bp.swirl += step × factor`).
+let _vortexSpinStep = 0.0;
 // cube: the charge runners' integrated travel. Their progress used to
 // be `time * speed * (1 + 1.5 * drive + …)` — a phase that JUMPS by
 // `time × Δdrive` whenever the drive envelope moves, and `time` only
 // grows, so an hour into a session every log line sent the runners
 // zipping across the grid (2026-09-20). Integrated per frame instead.
 let cubeRunnerFlow = 0.0;
+
+// ── cube2 (2026-09-20, EXPERIMENT) — the infinite cube ─────────────
+// Wireframe cube shells nested at exponentially spaced scales: each is
+// BORN tiny and hot at the kernel, grows outward (self-similar
+// renormalisation — the vortex's trick, rectilinear) and dissolves as it
+// passes the viewer. THE CAMERA NEVER MOVES; a user turn accelerates the
+// birth rate (cube2Travel) exactly as the vortex's swallow surges.
+//   cube2Flow   = accumulated depth (a shell's phase d = fract(d0 + flow))
+//   cube2Travel = eased user-turn engagement 0..1
+let cube2Flow = 0.0;
+let cube2Travel = 0.0;
+// cube2 v2 (2026-09-21, operator: "fix them all" — the seven upgrades):
+// the kernel is a tumbling lattice whose spin is INTEGRATED (kernel
+// angle = c2KernelSpin, stepped per frame at the current rate); a shell
+// inherits the kernel's angle at birth (`sh.tw`, folded to ±45° — a cube's
+// own symmetry — so it is bounded) and unwinds toward the stack's alignment as it grows — the
+// kernel's rotation propagates outward as a torsion wave carried by the
+// shells and made visible by the ties between them. The per-shell twist
+// is a first-order decay of a BOUNDED angle, never an accumulator times
+// a per-shell factor (the §4JA/§4JK class).
+let c2KernelSpin = 0.0;
+const _c2KernelM = [1, 0, 0, 0, 1, 0, 0, 0, 1];   // the kernel lattice's rotation this frame
+const _c2Order = [];                              // shell indices sorted by depth phase, per frame
+const _c2LineStats = { shells: 0, rulings: 0, ties: 0, kernel: 0 };
+let c2Roll = 0.0;                                 // the stack's slow roll about the view axis (integrated)
+let _c2Wob = 0.0;                                 // the wobble amplitude in force this frame (debug)
 // v4 (operator): expansion flow. Contraction (matter streaming edges→
 // center) reads as moving BACKWARD; a black-hole fall needs the hole
 // AHEAD and the walls expanding outward past the viewer. The singularity
@@ -209,6 +261,10 @@ const CALM = PREFERS_REDUCED_MOTION ? 0.35 : 1.0;
 //               activation waves heat the sites they cross; a hot
 //               attention kernel drifts the volume, bending the grid
 //               toward itself; charge runners ride the axes. DEFAULT.
+//   cube2     — EXPERIMENT (2026-09-20): the infinite cube. Nested
+//               wireframe shells born hot at the kernel bloom outward
+//               past the viewer forever; slightly twisted with depth,
+//               breathing on the pulse clock, edges gently bent.
 //   vortex    — a black hole ahead of the viewer; self-similar
 //               expansion flow, accretion ring, dark shadow.
 //   descent   — the loss landscape: an undulating terrain sheet, cold
@@ -223,7 +279,7 @@ const CALM = PREFERS_REDUCED_MOTION ? 0.35 : 1.0;
 // name `cube` and became the default.
 // The header's form button opens a picker built from this roster; the
 // choice persists (server-side + localStorage).
-const FORMS = ['cube', 'vortex', 'descent', 'empty'];
+const FORMS = ['cube', 'cube2', 'vortex', 'descent', 'empty'];
 // Default form: CUBE (operator pick, 2026-09-20; vortex was the default
 // from 2026-07-28). The form the operator last picked overrides it —
 // resolved by `resolveInitialForm` below; a stored name that left the
@@ -384,6 +440,7 @@ export const DIALECT_VALUES = Object.freeze({
 });
 export const DIALECTS = Object.freeze({
     cube:         { radialAxis: 'none', search: 'plane', read: 'settle',   tool: 'flash',  write: 'flow', verify: 'align' },
+    cube2:        { radialAxis: 'none', search: 'ring',  read: 'settle',   tool: 'flash',  write: 'flow', verify: 'align' },
     vortex:       { radialAxis: 'none', search: 'ring',  read: 'thicken',  tool: 'kick',   write: 'flow', verify: 'still' },
     descent:      { radialAxis: 'y',    search: 'plane', read: 'settle',   tool: 'kick',   write: 'flow', verify: 'still' },
     empty:        { radialAxis: 'none', search: 'sweep', read: 'settle',   tool: 'kick',   write: 'wave', verify: 'still' },
@@ -498,6 +555,7 @@ uniform float uSweep;
 uniform float uSweepAngle;
 uniform float uSweepMode;
 uniform float uSweepHeat;
+uniform float uSweepReach;
 uniform float uCenterDim;
 uniform float uCenterXY;
 uniform float uFormDim;
@@ -562,7 +620,7 @@ void main() {
     float dAz = abs(mod(az - uSweepAngle + 3.14159, 6.28318) - 3.14159);
     float scan = fract(uSweepAngle / 6.28318);
     float dPlane = abs(instancePos.y - (scan * 4.0 - 2.0));
-    float dRing = abs(length(instancePos) - scan * 2.4);
+    float dRing = abs(length(instancePos) - scan * uSweepReach);
     float sweepD = uSweepMode < 0.5 ? dAz : (uSweepMode < 1.5 ? dPlane : dRing);
     float sweepW = uSweepMode < 0.5 ? 0.9 : 0.45;
     float sweepHeat = uSweep * uSweepHeat * smoothstep(sweepW, 0.0, sweepD);
@@ -637,8 +695,10 @@ void main() {
 const lineVertexShader = `
 attribute float aLightPass;
 attribute float aLineHue;
+attribute float aLineFade;
 varying float vLightPass;
 varying float vLineHue;
+varying float vLineFade;
 varying float vLineDepth;
 varying float vLineNear;
 varying vec3 vLinePos;
@@ -646,6 +706,7 @@ varying vec3 vLinePos;
 void main() {
     vLightPass = aLightPass;
     vLineHue = aLineHue;
+    vLineFade = aLineFade;
     vLinePos = position;
     vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
     vLineDepth = clamp((-mvPosition.z - 2.5) / 7.0, 0.0, 1.0);
@@ -670,10 +731,16 @@ uniform vec3 uBaseColor;
 uniform vec3 uErrorColor;
 uniform vec3 uAccentColor;
 uniform float uAccentStrength;
+uniform float uSweep;
+uniform float uSweepAngle;
+uniform float uSweepHeat;
+uniform float uSweepReach;
+uniform float uLineSweep;
 ${paletteGLSL}
 ${hueWaveGLSL}
 varying float vLightPass;
 varying float vLineHue;
+varying float vLineFade;
 varying float vLineDepth;
 varying float vLineNear;
 varying vec3 vLinePos;
@@ -697,7 +764,19 @@ void main() {
     // hues (vLineHue interpolates the endpoint seeds), riding the same
     // traveling hue wave as the nodes so links and their endpoints stay
     // in the same temperature current.
-    vec3 jewel = palette(vLineHue + uHueDrift + hueWave(vLinePos));
+    // Search scan on the LINES (cube2 v2, uLineSweep = 1): the ring
+    // expanding from the kernel lights whole shells as it crosses them
+    // — the search gait reads as a scan sweeping the infinite stack.
+    float scan = fract(uSweepAngle / 6.28318);
+    float ringR = scan * uSweepReach;
+    float dRing = abs(length(vLinePos) - ringR);
+    // Ring width grows with its radius (a fixed 0.45 is the whole kernel
+    // at r 0.5 and a hairline on a shell of half-size 6); warmth at 0.7 of
+    // the node sweep's — a passing highlight on the shell it crosses, not
+    // a fill (the near shell alone covers most of the screen).
+    float ringW = 0.25 + 0.06 * ringR;
+    float lineSweep = uLineSweep * uSweep * uSweepHeat * 0.7 * (1.0 - smoothstep(0.0, ringW, dRing));
+    vec3 jewel = palette(vLineHue + uHueDrift + hueWave(vLinePos) + lineSweep);
     float colorMix = sin(vLightPass * 10.0 + uTime * uOrganic * 0.4 + uWorkingState) * 0.5 + 0.5;
     vec3 mixCol = mix(uBaseColor + jewel * 0.18, jewel, colorMix);
 
@@ -706,7 +785,11 @@ void main() {
 
     float alpha = mix(0.30 + uWorkingState * 0.18, 1.0, pulse);
     alpha = max(alpha, burst * uPulseT);
+    alpha = min(1.0, alpha + 1.5 * lineSweep);
     alpha *= vLineNear;
+    // Explicit-edge forms (cube2) taper their shells in at birth and out
+    // as they pass the viewer; proximity links carry 1.0.
+    alpha *= vLineFade;
     // Inside the cloud MANY lines stack additively right in front of
     // the camera — dim each one so the sum stays comfortable.
     float diveDim = 1.0 - 0.30 * uDive;
@@ -772,10 +855,17 @@ void main() {
 // The thermal poles become BODY PLAN in every form: cold blue outer
 // structure, violet transitions, hot arterial strands and core.
 
+// Nodes a form draws with EXPLICIT edges instead of the proximity web
+// (cube2's shells): the O(n²) pass skips them, the edge emitter marks
+// them connected. Reset on every build.
+const _noProx = new Uint8Array(NODE_COUNT);
+
 function _buildAnatomy() {
     basePositions.length = 0;
+    _noProx.fill(0);
     const f = FORMS[formIndex];
     if (f === 'cube') _buildCube();
+    else if (f === 'cube2') _buildCube2();
     else if (f === 'descent') _buildDescent();
     else if (f === 'empty') _buildEmpty();
     else _buildVortex();
@@ -825,6 +915,7 @@ function _buildVortex() {
                 : Math.random() * Math.PI * 2;
             basePositions.push({
                 kind: armLocked ? 0 : 1, d0: d, theta0,
+                swirl: 0.0,          // integrated differential swirl (2026-09-21)
                 // Wide speed spread: streams genuinely SHEAR past each
                 // other instead of riding one conveyor (monotony fix).
                 flowScale: 0.6 + Math.random() * 1.0,
@@ -954,6 +1045,123 @@ function _buildCube() {
             sz: 0.85,
         });
         nodeSeeds[n] = 0.58 + Math.random() * 0.04;
+        n++;
+    }
+}
+
+// Form G — CUBE2 (2026-09-20, experiment): the infinite cube.
+// C2_SHELLS wireframe cube shells share one exponential depth axis:
+// a shell at phase d ∈ [0,1) has half-size L = C2_L0·e^(C2_K·d) —
+// born at C2_L0 inside the kernel, grown past the camera by d→1 —
+// and its phase advances with cube2Flow, wrapping invisibly (node size
+// and edge alpha taper to zero over the last fifth, so the wrap is
+// never a pop even on a 21:9 screen where a cube's back face can never
+// leave the frame). Each shell carries 8 corner + 12 mid-edge NODES;
+// its 12 edges are drawn as 6-segment polylines by _emitCube2Edges,
+// bent by a self-similar wobble field (in unit-cube coordinates, so a
+// shell keeps its shape as it grows) and pulled toward the kernel
+// while small — cubes are born where the kernel is and straighten as
+// they grow. Shells twist a little with depth (a slow spiral) and
+// breathe on the pulse clock, the breath propagating outward.
+// v2 (2026-09-21): ten shells (was eleven — the lattice kernel takes the
+// nodes), a 3×3×3 lattice kernel (2×2×2 on mobile), ties between
+// consecutive shells, per-edge packet phases, a heat wave on the birth
+// clock, the search scan on the lines, and the verdict grammar.
+// v3 (2026-09-21, operator: "kinda boring"): the shells are LINE-ONLY
+// (a wireframe needs no nodes), so the stack is 24 deep (12 mobile) — a
+// long corridor of frames converging on the kernel instead of ten hoops;
+// corner nodes ride every other shell; every face carries a "+" ruling
+// (paneled data-cubes, not hollow frames); the freed nodes are a STREAM
+// of matter riding the expansion at spread speeds and spiralling with
+// the twist — the vortex's swallow, inside the cube; the whole stack
+// rolls slowly; and the kernel is no longer centre-dimmed.
+const C2_SHELLS = IS_MOBILE ? 12 : 24;
+const C2_NODE_EVERY = 2;                          // corner nodes on every Nth shell
+const C2_RULINGS = !IS_MOBILE;                    // the face "+" rulings
+const C2_KERNEL_N = IS_MOBILE ? 2 : 3;            // lattice nodes per axis
+const C2_KERNEL = C2_KERNEL_N * C2_KERNEL_N * C2_KERNEL_N;
+const C2_KERNEL_R = 0.16;                         // lattice half-size at rest
+const C2_TIE_GAIN = 0.65;                         // tie edges vs shell edges
+const C2_KERNEL_LINE_GAIN = 2.0;
+const C2_RULING_GAIN = 0.55;                      // rulings vs edges
+const C2_STREAM_SPIRAL = 0.9;                     // rad of spiral over a particle's life
+const C2_TW_DECAY = 0.997;                        // a shell's inherited twist unwinds (per 60fps frame)
+const C2_TW_DECAY_PASS = 0.975;                   // …much faster while a pass crystallises
+const C2_L0 = 0.08;                       // newborn half-size
+const C2_K = Math.log(100);               // L(1) = 8.0 — well past the camera
+const C2_TILT_X = 0.24, C2_TILT_Y = 0.42; // base view tilt (3D silhouette)
+const C2_TWIST = 0.70;                    // total z-twist across the depth
+const C2_LINE_GAIN = 1.8;                 // shell edges are single long lines — lift them
+const C2_SEGS = IS_MOBILE ? 4 : 6;        // polyline segments per edge
+// Edge table: [axis, sign of the 1st other coord, sign of the 2nd].
+const C2_EDGES = [];
+for (let a = 0; a < 3; a++)
+    for (const sb of [-1, 1]) for (const sc of [-1, 1]) C2_EDGES.push([a, sb, sc]);
+const _c2Shells = [];                     // per-shell frame state (per frame)
+let _c2KernelBase = 0;                    // index of the first kernel node
+let _c2StreamCount = 0;                   // stream grains built (the nodes the shells and kernel leave)
+function _buildCube2() {
+    _c2Shells.length = 0;
+    let n = 0;
+    for (let k = 0; k < C2_SHELLS; k++) {
+        _c2Shells.push({
+            // Near-even phases with a little jitter — a metronomic
+            // recession read as machined, not grown.
+            d0: (k + 0.5 + (Math.random() - 0.5) * 0.35) / C2_SHELLS,
+            ph: Math.random() * Math.PI * 2,  // wobble personality (re-rolled at wrap)
+            prevD: 0, d: 0, L: 1, fade: 0, seed: 0.3, wob: 0,
+            tw: 0,                            // inherited kernel twist, unwinding (v2)
+            cx: 0, cy: 0, cz: 0,
+            m: [1, 0, 0, 0, 1, 0, 0, 0, 1],
+        });
+        // 8 corner nodes on every C2_NODE_EVERY-th shell (v3: the edges
+        // are explicit lines and need no nodes; the corners are sparks).
+        if (k % C2_NODE_EVERY === 0) {
+            for (let c = 0; c < 8; c++, n++) {
+                basePositions.push({ kind: 0, k, ux: (c & 1) ? 1 : -1, uy: (c & 2) ? 1 : -1, uz: (c & 4) ? 1 : -1, sz: 1.0 });
+                nodeSeeds[n] = 0.3; _noProx[n] = 1;
+            }
+        }
+    }
+    // The kernel: a hot LATTICE at the origin every shell is born from —
+    // C2_KERNEL_N³ sites in unit coordinates, tumbling on c2KernelSpin;
+    // its edges are drawn explicitly (see _emitCube2Edges), so these
+    // nodes skip the proximity pass like the shells.
+    _c2KernelBase = n;
+    for (let iz = 0; iz < C2_KERNEL_N; iz++)
+        for (let iy = 0; iy < C2_KERNEL_N; iy++)
+            for (let ix = 0; ix < C2_KERNEL_N; ix++, n++) {
+                const u = (v) => C2_KERNEL_N > 1 ? (v / (C2_KERNEL_N - 1)) * 2 - 1 : 0;
+                basePositions.push({
+                    kind: 2, lx: u(ix), ly: u(iy), lz: u(iz),
+                    jit: Math.random() * Math.PI * 2,
+                    sz: 0.85,
+                });
+                nodeSeeds[n] = 0.58 + Math.random() * 0.04;
+                _noProx[n] = 1;
+            }
+    // The stream (v3): matter born at the kernel, riding the same
+    // exponential expansion as the shells — each grain at its OWN speed
+    // (a wide spread, so streams shear past each other) on a spiral
+    // about the stack's axis, hot at birth and cooling as it recedes;
+    // the vortex's swallow, inside the cube. Fills every node the shells
+    // and the kernel leave.
+    _c2StreamCount = 0;
+    while (n < NODE_COUNT) {
+        const r = 0.12 + 0.68 * Math.sqrt(Math.random());
+        const phi = Math.random() * Math.PI * 2;
+        basePositions.push({
+            kind: 3,
+            ur: r, uphi: phi,
+            uz: (Math.random() * 2 - 1) * 0.9,
+            d0: Math.random(),
+            flowScale: 0.7 + Math.random() * 1.1,
+            jit: Math.random() * Math.PI * 2,
+            sz: 0.9,
+        });
+        nodeSeeds[n] = 0.10 + Math.random() * 0.10;
+        _noProx[n] = 1;
+        _c2StreamCount++;
         n++;
     }
 }
@@ -1179,6 +1387,7 @@ export function init() {
             uSweepAngle: { value: 0.0 },
             uSweepMode: { value: 0.0 },
             uSweepHeat: { value: TUNE.sweepHeat },
+            uSweepReach: { value: 2.4 },
             uBaseColor: { value: COLORS.nodeBase },
             uErrorColor: { value: COLORS.nodeError },
             uAccentColor: { value: accentColor },
@@ -1198,10 +1407,12 @@ export function init() {
     const linePositions = new Float32Array(MAX_LINES * 2 * 3);
     const lineUvs = new Float32Array(MAX_LINES * 2);
     const lineHues = new Float32Array(MAX_LINES * 2);
+    const lineFades = new Float32Array(MAX_LINES * 2).fill(1.0);
 
     lineGeometry.setAttribute('position', new THREE.BufferAttribute(linePositions, 3));
     lineGeometry.setAttribute('aLightPass', new THREE.BufferAttribute(lineUvs, 1));
     lineGeometry.setAttribute('aLineHue', new THREE.BufferAttribute(lineHues, 1));
+    lineGeometry.setAttribute('aLineFade', new THREE.BufferAttribute(lineFades, 1));
 
     lineMaterial = new THREE.ShaderMaterial({
         vertexShader: lineVertexShader,
@@ -1217,6 +1428,11 @@ export function init() {
             uErrorState: { value: 0.0 },
             uPulseT: { value: 0.0 },
             uDive: { value: 0.0 },
+            uSweep: { value: 0.0 },
+            uSweepAngle: { value: 0.0 },
+            uSweepHeat: { value: TUNE.sweepHeat },
+            uSweepReach: { value: 2.4 },
+            uLineSweep: { value: 0.0 },
             uBaseColor: { value: COLORS.lineBase },
             uErrorColor: { value: COLORS.lineError },
             uAccentColor: { value: accentColor },
@@ -1419,7 +1635,12 @@ export function getDebugState() {
         phase, gait: { ...gait }, toolPulse, recallSpark, verdict, verdictEnv,
         backgroundBusy, moodHue, gazeY, errorKind, errorKindEnv,
         dialect: dialectFor(FORMS[formIndex]), gaitFlow, gaitThicken, gaitFlash, gaitAlign,
-        dtF, clock: time, cubeRunnerFlow, twitchAmp,
+        dtF, clock: time, cubeRunnerFlow, cube2Flow, cube2Travel, twitchAmp,
+        vortexSpin, linkBudget: _linkBudget, maxLines: MAX_LINES,
+        cube2: { lines: { ..._c2LineStats }, kernelSpin: c2KernelSpin, wob: _c2Wob,
+                 tw: _c2Shells.map((sh) => sh.tw), d: _c2Shells.map((sh) => sh.d),
+                 seeds: _c2Shells.map((sh) => sh.seed), kernelBase: _c2KernelBase,
+                 shells: C2_SHELLS, kernelN: C2_KERNEL_N, stream: _c2StreamCount, roll: c2Roll },
     };
 }
 
@@ -1446,6 +1667,202 @@ export function setWorkingState(isWorking) {
         }
         targetWorkingState = 0.0;
     }
+}
+
+// ── cube2 helpers ──────────────────────────────────────────────────
+
+// Fill a shell's per-frame frame for phase d: half-size (with the
+// outward-travelling breath), rotation (base tilt + depth twist), the
+// birth-pull toward the kernel, wobble amplitude and the taper.
+function _c2Frame(sh, d, kx, ky, kz, wobBase, pAmp) {
+    sh.d = d;
+    const breath = 1.0 + 0.10 * pAmp * _pulseShape(_fract(pulsePhase - d * 0.35));
+    sh.L = C2_L0 * Math.exp(C2_K * d) * breath;
+    // Born where the kernel is; centred by the time it is grown.
+    const pull = Math.exp(-sh.L / 0.6);
+    sh.cx = kx * pull; sh.cy = ky * pull; sh.cz = kz * pull;
+    sh.wob = wobBase;
+    // Taper: in over the first 6% (already tiny), out over the last fifth.
+    const tin = Math.min(1, d / 0.06);
+    const tout = 1.0 - Math.max(0, Math.min(1, (d - 0.78) / 0.22));
+    sh.fade = tin * tin * (3 - 2 * tin) * tout * tout * (3 - 2 * tout);
+    // Rotation m = Ry(tiltY + slow wander) · Rx(tiltX) · Rz(twist(d)).
+    const az = C2_TWIST * (d - 0.5) + sh.tw + 0.04 * Math.sin(time * 0.05);
+    const ax = C2_TILT_X + 0.03 * Math.sin(time * 0.041 + 0.7);
+    const ay = C2_TILT_Y + 0.05 * Math.sin(time * 0.033 + 1.9);
+    const cz = Math.cos(az), sz = Math.sin(az), cx = Math.cos(ax), sx = Math.sin(ax),
+        cy = Math.cos(ay), sy = Math.sin(ay);
+    const m = sh.m;
+    // Rx·Rz
+    const r00 = cz, r01 = -sz, r02 = 0;
+    const r10 = cx * sz, r11 = cx * cz, r12 = -sx;
+    const r20 = sx * sz, r21 = sx * cz, r22 = cx;
+    // Ry·(Rx·Rz)
+    m[0] = cy * r00 + sy * r20; m[1] = cy * r01 + sy * r21; m[2] = cy * r02 + sy * r22;
+    m[3] = r10; m[4] = r11; m[5] = r12;
+    m[6] = -sy * r00 + cy * r20; m[7] = -sy * r01 + cy * r21; m[8] = -sy * r02 + cy * r22;
+}
+
+// An angle folded into (−π, π].
+function _wrapPi(a) {
+    const t = Math.PI * 2;
+    return ((a + Math.PI) % t + t) % t - Math.PI;
+}
+// The kernel's angle as a CUBE sees it: a cube is 4-fold symmetric about
+// its axis, so a rotation of θ looks like θ mod 90°. A newborn shell
+// inherits the kernel's angle folded into (−45°, 45°] — the shortest
+// unwind to the stack's alignment, bounded, never an accumulator carried
+// into a per-shell factor (the §4JA/§4JK class).
+function _wrapQuarter(a) {
+    return _wrapPi(4.0 * a) / 4.0;
+}
+
+// The kernel lattice's rotation for this frame: a tumble about a tilted
+// axis — Ry(spin) · Rx(0.55) · Rz(0.37·spin) — written into _c2KernelM.
+function _c2KernelFrame(spin) {
+    const ay = spin, ax = 0.55, az = 0.37 * spin;
+    const cz = Math.cos(az), sz = Math.sin(az), cx = Math.cos(ax), sx = Math.sin(ax),
+        cy = Math.cos(ay), sy = Math.sin(ay);
+    const r00 = cz, r01 = -sz, r02 = 0;
+    const r10 = cx * sz, r11 = cx * cz, r12 = -sx;
+    const r20 = sx * sz, r21 = sx * cz, r22 = cx;
+    const m = _c2KernelM;
+    m[0] = cy * r00 + sy * r20; m[1] = cy * r01 + sy * r21; m[2] = cy * r02 + sy * r22;
+    m[3] = r10; m[4] = r11; m[5] = r12;
+    m[6] = -sy * r00 + cy * r20; m[7] = -sy * r01 + cy * r21; m[8] = -sy * r02 + cy * r22;
+}
+
+// A unit-cube point (ux,uy,uz ∈ [-1,1]) of shell `sh` → model space,
+// through the self-similar wobble (evaluated in unit coordinates so a
+// shell keeps its shape as it grows), the shell's rotation and centre.
+function _c2Pt(out, sh, ux, uy, uz) {
+    const w = sh.wob, t = time, ph = sh.ph;
+    const px = ux + w * Math.sin(1.9 * uy + 1.1 * uz + t * 0.27 + ph);
+    const py = uy + w * Math.sin(1.7 * uz + 1.3 * ux + t * 0.23 + ph * 2.0);
+    const pz = uz + w * Math.sin(2.3 * ux + 0.9 * uy + t * 0.19 + ph * 3.0);
+    const L = sh.L, m = sh.m;
+    out.x = L * (m[0] * px + m[1] * py + m[2] * pz) + sh.cx;
+    out.y = L * (m[3] * px + m[4] * py + m[5] * pz) + sh.cy;
+    out.z = L * (m[6] * px + m[7] * py + m[8] * pz) + sh.cz;
+    return out;
+}
+
+// Draw every shell's 12 edges as C2_SEGS-segment polylines through the
+// same _c2Pt the nodes use; marks the explicit-edge nodes connected.
+// Edge alpha carries the shell's taper (× the reorganisation blend, so
+// a switch INTO cube2 materialises the wireframe as the nodes arrive).
+const _c2A = new THREE.Vector3(), _c2B = new THREE.Vector3();
+// One line segment into the buffers; returns the next index.
+function _c2Line(pos, uv, hue, fade, lineIdx, a, b, u0, u1, h0, h1, f) {
+    const o = lineIdx * 6;
+    pos[o] = a.x; pos[o + 1] = a.y; pos[o + 2] = a.z;
+    pos[o + 3] = b.x; pos[o + 4] = b.y; pos[o + 5] = b.z;
+    uv[lineIdx * 2] = u0; uv[lineIdx * 2 + 1] = u1;
+    hue[lineIdx * 2] = h0; hue[lineIdx * 2 + 1] = h1;
+    fade[lineIdx * 2] = f; fade[lineIdx * 2 + 1] = f;
+    return lineIdx + 1;
+}
+// Draw every shell's 12 edges as C2_SEGS-segment polylines through the
+// same _c2Pt the nodes use, the ties between consecutive shells and the
+// kernel lattice's edges; marks the explicit-edge nodes connected. Edge
+// alpha carries the shell's taper (× the reorganisation blend, so a
+// switch INTO cube2 materialises the wireframe as the nodes arrive).
+function _emitCube2Edges(pos, uv, hue, fade, connected, lineIdx) {
+    const blend = formBlend < 1.0 ? formBlend * formBlend * (3.0 - 2.0 * formBlend) : 1.0;
+    _c2LineStats.shells = 0; _c2LineStats.rulings = 0; _c2LineStats.ties = 0; _c2LineStats.kernel = 0;
+    // Shell edges. Every edge carries its OWN packet phase (v2): the line
+    // shader's travelling charge is `fract(vLightPass·1.5 − uTime·2)`, so
+    // a per-edge offset spreads the packets over the stack instead of
+    // marching every edge in lock-step (invisible as motion).
+    for (let k = 0; k < _c2Shells.length; k++) {
+        const sh = _c2Shells[k];
+        const f = sh.fade * blend * C2_LINE_GAIN;
+        if (f < 0.002) continue;
+        for (let e = 0; e < C2_EDGES.length; e++) {
+            const [a, sb, sc] = C2_EDGES[e];
+            const ph0 = _fract(0.37 * e + 0.11 * k);
+            const u = [0, 0, 0]; u[(a + 1) % 3] = sb; u[(a + 2) % 3] = sc;
+            u[a] = -1; _c2Pt(_c2A, sh, u[0], u[1], u[2]);
+            for (let sgi = 1; sgi <= C2_SEGS; sgi++) {
+                if (lineIdx >= MAX_LINES) return lineIdx;
+                u[a] = -1 + 2 * sgi / C2_SEGS;
+                _c2Pt(_c2B, sh, u[0], u[1], u[2]);
+                lineIdx = _c2Line(pos, uv, hue, fade, lineIdx, _c2A, _c2B,
+                    ph0 + (sgi - 1) / C2_SEGS, ph0 + sgi / C2_SEGS, sh.seed, sh.seed, f);
+                _c2LineStats.shells++;
+                _c2A.copy(_c2B);
+            }
+        }
+    }
+    // Face rulings (v3): a "+" on every face — the mid-lines of the
+    // face, bent by the same wobble field — so a shell reads as a
+    // paneled data-cube, not a hollow frame. Dimmer than the edges.
+    if (C2_RULINGS) {
+        for (let k = 0; k < _c2Shells.length; k++) {
+            const sh = _c2Shells[k];
+            const f = sh.fade * blend * C2_LINE_GAIN * C2_RULING_GAIN;
+            if (f < 0.002) continue;
+            for (let face = 0; face < 3; face++) for (const sgn of [-1, 1]) for (let axis = 0; axis < 2; axis++) {
+                // the ruling runs along axis `run` across the face normal to `face`
+                const run = (face + 1 + axis) % 3, mid = (face + 2 - axis) % 3;
+                const u = [0, 0, 0]; u[face] = sgn; u[mid] = 0;
+                const ph0 = _fract(0.29 * (face * 4 + (sgn + 1) + axis) + 0.13 * k);
+                u[run] = -1; _c2Pt(_c2A, sh, u[0], u[1], u[2]);
+                for (let sgi = 1; sgi <= C2_SEGS; sgi++) {
+                    if (lineIdx >= MAX_LINES) return lineIdx;
+                    u[run] = -1 + 2 * sgi / C2_SEGS;
+                    _c2Pt(_c2B, sh, u[0], u[1], u[2]);
+                    lineIdx = _c2Line(pos, uv, hue, fade, lineIdx, _c2A, _c2B,
+                        ph0 + (sgi - 1) / C2_SEGS, ph0 + sgi / C2_SEGS, sh.seed, sh.seed, f);
+                    _c2LineStats.rulings++;
+                    _c2A.copy(_c2B);
+                }
+            }
+        }
+    }
+    // Ties (v2): the 8 corners of each shell joined to the corners of the
+    // next shell out — nested frames become ONE tunnel receding to the
+    // kernel, and the shells' differing twists make the ties a visible
+    // helix. Consecutive in DEPTH order; the wrap pair (oldest → newborn)
+    // is skipped — that would be a line across the whole scene from the
+    // faded rim to the kernel.
+    _c2Order.length = 0;
+    for (let k = 0; k < _c2Shells.length; k++) _c2Order.push(k);
+    _c2Order.sort((i, j) => _c2Shells[i].d - _c2Shells[j].d);
+    for (let q = 0; q + 1 < _c2Order.length; q++) {
+        const A = _c2Shells[_c2Order[q]], B = _c2Shells[_c2Order[q + 1]];
+        const f = Math.min(A.fade, B.fade) * blend * C2_LINE_GAIN * C2_TIE_GAIN;
+        if (f < 0.002) continue;
+        for (let c = 0; c < 8; c++) {
+            if (lineIdx >= MAX_LINES) return lineIdx;
+            const ux = (c & 1) ? 1 : -1, uy = (c & 2) ? 1 : -1, uz = (c & 4) ? 1 : -1;
+            _c2Pt(_c2A, A, ux, uy, uz); _c2Pt(_c2B, B, ux, uy, uz);
+            const ph0 = _fract(0.23 * c + 0.31 * q);
+            lineIdx = _c2Line(pos, uv, hue, fade, lineIdx, _c2A, _c2B, ph0, ph0 + 1.0, A.seed, B.seed, f);
+            _c2LineStats.ties++;
+        }
+    }
+    // The kernel lattice's edges (v2): adjacent sites along each axis,
+    // read from the node positions already placed this frame.
+    const N = C2_KERNEL_N, kb = _c2KernelBase;
+    const site = (ix, iy, iz) => kb + ix + N * (iy + N * iz);
+    const fk = blend * C2_KERNEL_LINE_GAIN;
+    for (let iz = 0; iz < N; iz++) for (let iy = 0; iy < N; iy++) for (let ix = 0; ix < N; ix++) {
+        const i0 = site(ix, iy, iz);
+        const p0 = currentPositions[i0], h0 = nodeSeeds[i0];
+        const nb = [];
+        if (ix + 1 < N) nb.push(site(ix + 1, iy, iz));
+        if (iy + 1 < N) nb.push(site(ix, iy + 1, iz));
+        if (iz + 1 < N) nb.push(site(ix, iy, iz + 1));
+        for (const j of nb) {
+            if (lineIdx >= MAX_LINES) return lineIdx;
+            const ph0 = _fract(0.41 * (ix + iy + iz) + 0.17 * j);
+            lineIdx = _c2Line(pos, uv, hue, fade, lineIdx, p0, currentPositions[j], ph0, ph0 + 1.0, h0, nodeSeeds[j], fk);
+            _c2LineStats.kernel++;
+        }
+    }
+    for (let i = 0; i < NODE_COUNT; i++) if (_noProx[i]) connected[i] = true;
+    return lineIdx;
 }
 
 // --- Main animation loop -------------------------------------------
@@ -1563,6 +1980,16 @@ function animate(ts) {
     // keys on the NAME (index comparisons broke silently whenever the
     // FORMS array grew; 2026-07-29, when the four AI forms joined).
     const FORM = FORMS[formIndex];
+    // The camera-STATIC forms (vortex, cube2 — their user-turn story is
+    // their own engagement law; empty has nothing to dive into) opt out
+    // of everything the dive does for a camera that moves INTO the cloud:
+    // the interior line dim, the bloom damp (×0.5 — it made the vortex's
+    // busy state DIMMER than idle, 0.50 vs 0.57, cancelling the surge the
+    // comments promise), the motes, the interior clock speed-up and the
+    // proximity thickening. The scene swell was already neutralised for
+    // them; these five couplings were not (measured 2026-09-21: vortex
+    // mean brightness FELL on a user turn, 6.6 → 6.3).
+    const camDive = (FORM === 'vortex' || FORM === 'cube2' || FORM === 'empty') ? 0.0 : dive;
 
     // Vortex engagement + flow (see the vortexTravel declaration).
     // Engagement eases up while a user turn runs and eases back down on
@@ -1596,10 +2023,36 @@ function animate(ts) {
         // alongside the flow surge — falling faster AND spinning
         // faster, but nowhere near the early "way too fast" rates
         // (that culprit was wind-coupling, long since fixed).
-        vortexSpin += (dtF / 60) * (0.125
+        _vortexSpinStep = (dtF / 60) * (0.125
             + 0.025 * Math.max(workingState, activity, travelNorm)) * CALM;
+        vortexSpin += _vortexSpinStep;
     } else {
         vortexTravel = 0.0;
+        _vortexSpinStep = 0.0;
+    }
+    // cube2: the same engagement law as the vortex — the birth rate is
+    // the swallow. Idle ≈ a new shell every ~4.5s; a user turn ≈ every
+    // 0.7s, gulping in rhythm with the pulse; completion is a pure
+    // intensity morph (no reset, no camera travel).
+    if (FORM === 'cube2') {
+        if (userTurnState > 0.5) {
+            cube2Travel += (IMMERSION_CAP - cube2Travel) * ease(0.010);
+        } else if (cube2Travel > 0.001) {
+            cube2Travel *= decay(0.985);
+        } else {
+            cube2Travel = 0.0;
+        }
+        const c2n = Math.min(cube2Travel / Math.max(IMMERSION_CAP, 0.001), 1.0);
+        const c2Turb = 1.0 + CALM * (0.30 * Math.sin(time * 0.21) * Math.sin(time * 0.077 + 1.1)
+            + 0.45 * c2n * _pulseShape(_fract(pulsePhase)));
+        cube2Flow += (dtF / 60) * (0.020 + 0.020 * Math.max(workingState, activity)
+            + 0.10 * c2n) * c2Turb * CALM * (1.0 + TUNE.flowWrite * gaitFlow);
+        // v2: a tool call sends a burst of packets down every edge (the
+        // line shader's `burst` term rides uPulseT), and a user turn keeps
+        // the charge visibly moving.
+        pulseT = Math.min(1.0, pulseT + 0.6 * toolPulse + 0.15 * c2n);
+    } else {
+        cube2Travel = 0.0;
     }
 
     // Accumulate time for lines at steady pace — except inside the
@@ -1608,7 +2061,7 @@ function animate(ts) {
     // tStep is THIS frame's advance of the shared clock; the per-form
     // integrated phases below (runner flow, cube churn/spin) step by it
     // so they stay locked to `time` at constant rate.
-    const tStep = 0.005 * (1.0 + dive * 0.6) * motionMul * dtF;
+    const tStep = 0.005 * (1.0 + camDive * 0.6) * motionMul * dtF;
     time += tStep;
 
     // Idle breathing: ±1% scene-scale sine at ~0.1Hz. Below the
@@ -1635,7 +2088,7 @@ function animate(ts) {
     // background breath is a second, slower rhythm under everything.
     const exhale = verdict === 'stop' ? TUNE.exhale * Math.sin(Math.PI * (1.0 - verdictEnv)) * verdictEnv : 0;
     const bgBreath = TUNE.bgBreath * backgroundBusy * Math.sin(time * 0.31 + 0.9);
-    const sceneScale = (FORM === 'vortex' ? 0.9 * breathe
+    const sceneScale = ((FORM === 'vortex' || FORM === 'cube2') ? 0.9 * breathe
         : FORM === 'cube' ? 0.9 * breathe * (1.0 + dive * 0.18)
         : baseScale) * (1.0 + exhale + bgBreath);
     scene.scale.set(sceneScale, sceneScale, sceneScale);
@@ -1653,7 +2106,7 @@ function animate(ts) {
             scene.rotation.z = vortexSpin * 0.22;
             scene.position.x = 0.05 * Math.sin(time * 0.031);
             scene.position.y = _bob * 0.5;
-        } else if (FORM === 'cube') {
+        } else if (FORM === 'cube' || FORM === 'cube2') {
             // Cube: near-still heading — its OWN slow tumble is the
             // motion. The full heading wander compounded with the
             // focus-translation release into an "erratic zoom-out" (the
@@ -1662,7 +2115,8 @@ function animate(ts) {
             // of the tumble rate — nothing the eye will miss.
             scene.rotation.y = 0.09 * Math.sin(time * 0.029);
             scene.rotation.x = 0.05 * Math.sin(time * 0.021 + 0.7);
-            scene.rotation.z = 0.02 * Math.sin(time * 0.017 + 2.0);
+            scene.rotation.z = 0.02 * Math.sin(time * 0.017 + 2.0)
+                + (FORM === 'cube2' ? c2Roll : 0.0);        // v3: the corridor's slow roll
             scene.position.x = 0.04 * Math.sin(time * 0.023);
             scene.position.y = _bob * 0.4;
         } else {
@@ -1691,6 +2145,11 @@ function animate(ts) {
         camera.position.z = CAMERA_REST_Z;
         camera.lookAt(camera.position.x * 0.35, camera.position.y * 0.35,
             VORTEX_APEX_Z);
+    } else if (FORM === 'cube2') {
+        // cube2: the camera never moves either — the shells' outward
+        // bloom is the fall; it studies the kernel at the origin.
+        camera.position.z = CAMERA_REST_Z;
+        camera.lookAt(camera.position.x * 0.35, camera.position.y * 0.35, 0.0);
     } else {
         // Cube: PARTIAL dive only — close enough to watch the attention
         // kernel work the grid, never inside the cloud ("zoom is too
@@ -1804,8 +2263,8 @@ function animate(ts) {
                 // too (0.9→0.5 center→rim, was 1.5): the center is
                 // where the eye rests, so it must not spin fastest by
                 // much. Busy total ≈ 13°/s near the hole vs ~6°/s idle.
-                const theta = bp.theta0 + (1.0 - dOut) * 0.35
-                    + vortexSpin * (0.9 - 0.4 * dOut);
+                bp.swirl += _vortexSpinStep * (0.9 - 0.4 * dOut);   // integrated, see _vortexSpinStep
+                const theta = bp.theta0 + (1.0 - dOut) * 0.35 + bp.swirl;
                 // Organic cross-section morph — the procedural content.
                 const shape = 1.0
                     + a2 * Math.sin(2.0 * theta + dOut * 5.0)
@@ -1826,6 +2285,89 @@ function animate(ts) {
                         + turb * 0.12 * CALM
                         + 0.05 * CALM * Math.sin(time * 0.6 + bp.jit));
                 nodeSeeds[i] = Math.max(0.02, 0.60 - dOut * 0.56) + bp.seedJit;
+            }
+        }
+        instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
+    } else if (FORM === 'cube2') {
+        // ── CUBE2 (v2): the kernel lattice tumbles on its integrated spin;
+        //    each shell's frame (phase → size, twist = stack twist + the
+        //    inherited kernel angle unwinding, breath, wobble, birth-pull,
+        //    taper), then the corner/mid nodes through the same _c2Pt the
+        //    edge emitter uses, the lattice sites, and the dust.
+        const c2n = Math.min(cube2Travel / Math.max(IMMERSION_CAP, 0.001), 1.0);
+        const kx = 0.22 * Math.sin(time * 0.090), ky = 0.18 * Math.sin(time * 0.070 + 1.3),
+            kz = 0.12 * Math.cos(time * 0.050 + 0.4);
+        // Verdict grammar (v2): a pass CRYSTALLISES — the wobble collapses
+        // and the inherited twists unwind fast (edges a touch brighter via
+        // the global formDim pass lift); a refute SHUDDERS — a fast jitter
+        // on the wobble that dies with the verdict envelope; a stop exhales
+        // through the scene-scale exhale every form shares.
+        const passEnv = verdict === 'pass' ? verdictEnv : 0.0;
+        const shudder = verdict === 'refute' ? 0.09 * verdictEnv * CALM * Math.sin(time * 45.0) : 0.0;
+        const wobBase = 0.07 * CALM * (1.0 - TUNE.alignGain * gaitAlign);
+        const wob = wobBase * (1.0 - 0.85 * passEnv) + shudder;
+        _c2Wob = wob;
+        // Kernel spin: integrated at the current rate (idle a slow turn,
+        // a user turn faster, a tool call a kick) — see c2KernelSpin.
+        c2KernelSpin += (dtF / 60) * (0.10 + 0.50 * c2n + 0.8 * gaitFlash) * CALM * motionMul;
+        _c2KernelFrame(c2KernelSpin);
+        // The stack's slow roll (v3): the whole corridor screws inward —
+        // a full turn in ~5 minutes at idle, three times that on a turn.
+        c2Roll += (dtF / 60) * (0.02 + 0.04 * c2n) * CALM * motionMul;
+        const twDecay = decay(passEnv > 0.05 ? C2_TW_DECAY_PASS : C2_TW_DECAY);
+        for (let k = 0; k < _c2Shells.length; k++) {
+            const sh = _c2Shells[k];
+            const d = _fract(sh.d0 + cube2Flow);
+            if (d < sh.prevD - 0.5) {                     // wrapped: born again
+                sh.ph = Math.random() * Math.PI * 2;      // new wobble personality
+                sh.tw = _wrapQuarter(c2KernelSpin);       // inherits the kernel's angle (bounded, ≤ 45°)
+            }
+            sh.prevD = d;
+            sh.tw *= twDecay;
+            _c2Frame(sh, d, kx, ky, kz, wob, pulseAmp);
+            // Heat wave (v2): hottest at birth, cooling as it grows, with a
+            // pulse of warmth racing outward on the breath clock — stronger
+            // while a user turn runs, so busy reads as red pulses leaving
+            // the kernel.
+            sh.seed = Math.min(0.62, Math.max(0.02, 0.60 - d * 0.52)
+                + 0.10 * (0.35 + c2n) * _pulseShape(_fract(pulsePhase - d * 0.35))
+                + 0.08 * c2n * (1.0 - d));
+        }
+        const g = 1.0 + 0.30 * c2n + 0.25 * gaitFlash * TUNE.flashGain
+            + 0.12 * _pulseShape(_fract(pulsePhase + 0.05));
+        const tremor = 0.010 + 0.020 * c2n;
+        const _dust = { d0: 0, ph: 0, prevD: 0, d: 0, L: 1, fade: 0, seed: 0, wob: 0, tw: 0, cx: 0, cy: 0, cz: 0, m: [1, 0, 0, 0, 1, 0, 0, 0, 1] };
+        const km = _c2KernelM, kr = C2_KERNEL_R * g;
+        for (let i = 0; i < NODE_COUNT; i++) {
+            const bp = basePositions[i];
+            const P = currentPositions[i];
+            if (bp.kind === 0) {
+                const sh = _c2Shells[bp.k];
+                _c2Pt(P, sh, bp.ux, bp.uy, bp.uz);
+                const corner = bp.ux !== 0 && bp.uy !== 0 && bp.uz !== 0;
+                // Corner sparks (v2): a tool call flashes the corners.
+                bp.sz = (corner ? 1.0 + 0.6 * gaitFlash : 0.8) * sh.fade;
+                nodeSeeds[i] = sh.seed;
+            } else if (bp.kind === 2) {
+                const lx = bp.lx * kr, ly = bp.ly * kr, lz = bp.lz * kr;
+                P.set(
+                    kx + km[0] * lx + km[1] * ly + km[2] * lz + tremor * CALM * Math.sin(time * 1.1 + bp.jit),
+                    ky + km[3] * lx + km[4] * ly + km[5] * lz + tremor * CALM * Math.cos(time * 0.9 + bp.jit * 2.0),
+                    kz + km[6] * lx + km[7] * ly + km[8] * lz + tremor * CALM * Math.sin(time * 0.7 + bp.jit * 3.0));
+                bp.sz = 1.15 * (1.0 + 0.5 * c2n + 0.4 * gaitFlash);
+                nodeSeeds[i] = Math.min(0.62, 0.58 + 0.03 * c2n + 0.02 * Math.sin(time * 0.8 + bp.jit));
+            } else {
+                // Stream grain (v3): its own phase and speed on the shared
+                // expansion; spirals about the axis as it recedes; hot at
+                // birth, cooling outward; tapered like a shell.
+                const d = _fract(bp.d0 + cube2Flow * bp.flowScale);
+                _c2Frame(_dust, d, kx, ky, kz, 0.0, pulseAmp);
+                const phi = bp.uphi + C2_STREAM_SPIRAL * d;
+                _c2Pt(P, _dust, bp.ur * Math.cos(phi), bp.ur * Math.sin(phi), bp.uz);
+                P.x += 0.02 * CALM * Math.sin(time * 0.6 + bp.jit);
+                P.y += 0.02 * CALM * Math.cos(time * 0.5 + bp.jit * 2.0);
+                bp.sz = 0.9 * _dust.fade * (1.0 + 0.3 * c2n);
+                nodeSeeds[i] = Math.min(0.62, Math.max(0.02, 0.60 - d * 0.55) + 0.06 * c2n * (1.0 - d));
             }
         }
         instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
@@ -2085,6 +2627,14 @@ function animate(ts) {
     // vanish at once (the graph "disintegrated") on any log line
     // containing ERROR — spectacular, but the opposite of "alive".
     const connected = new Array(NODE_COUNT).fill(false);
+    const lineFadeAttr = lineGeometry.attributes.aLineFade.array;
+
+    // cube2 draws its shells as explicit polylines (a wireframe cube's
+    // edges span far more than any proximity radius at the outer
+    // scales); those nodes are skipped by the O(n²) pass below.
+    if (FORM === 'cube2') {
+        lineIdx = _emitCube2Edges(linePosAttr, lineUvAttr, lineHueAttr, lineFadeAttr, connected, lineIdx);
+    }
 
     // The web THICKENS while immersed: easing the proximity threshold
     // up with the dive forms more links exactly when the viewer is in
@@ -2099,23 +2649,29 @@ function animate(ts) {
     const LINK_MULT = {
         vortex: 1.5,
         cube: 0.45,
+        cube2: 0.35,      // only the kernel tangle links by proximity
         // Descent radius must cover a grid step across the WORST-CASE
         // analytic slope of _lossH (all terms aligned), or the sheet
         // tears momentarily on steep ridges — computed invariant pinned
         // in tests/test_interface_face_forms_ai.py.
         descent: IS_MOBILE ? 0.38 : 0.20,
     };
-    const proximitySq = PROXIMITY_SQ * (1.0 + dive * 0.15)
+    const proximitySq = PROXIMITY_SQ * (1.0 + camDive * 0.15)
         * (LINK_MULT[FORM] === undefined ? 1.0 : LINK_MULT[FORM])
-        * (1.0 + TUNE.thickenLinks * gaitThicken);   // read, 'thicken' dialect
+        * (1.0 + TUNE.thickenLinks * gaitThicken)    // read, 'thicken' dialect
+        * _linkBudget;                                // see LINK_BUDGET_MIN
+    let _pairsFound = 0;                              // every qualifying pair, drawn or not
 
     for (let i = 0; i < NODE_COUNT; i++) {
+        if (_noProx[i]) continue;
         for (let j = i + 1; j < NODE_COUNT; j++) {
+            if (_noProx[j]) continue;
             const distSq = currentPositions[i].distanceToSquared(currentPositions[j]);
             if (distSq < proximitySq) {
                 {
                     connected[i] = true;
                     connected[j] = true;
+                    _pairsFound++;
 
                     if (lineIdx < MAX_LINES) {
                         linePosAttr[lineIdx * 6] = currentPositions[i].x;
@@ -2128,6 +2684,8 @@ function animate(ts) {
 
                         lineUvAttr[lineIdx * 2] = 0;
                         lineUvAttr[lineIdx * 2 + 1] = 1;
+                        lineFadeAttr[lineIdx * 2] = 1.0;
+                        lineFadeAttr[lineIdx * 2 + 1] = 1.0;
 
                         // Endpoint hues — the fragment shader gradients
                         // between them along the segment.
@@ -2138,6 +2696,15 @@ function animate(ts) {
                 }
             }
         }
+    }
+    // Link budget feedback (see _linkBudget): tighten a little after an
+    // overflow frame, relax once comfortably under. Per-frame steps (not
+    // dt-scaled on purpose: this is a controller on the emitter's own
+    // output, and one frame IS its sampling period).
+    if (_pairsFound > MAX_LINES - 1) {
+        _linkBudget = Math.max(LINK_BUDGET_MIN, _linkBudget * 0.97);
+    } else if (_linkBudget < 1.0 && _pairsFound < MAX_LINES * 0.92) {
+        _linkBudget = Math.min(1.0, _linkBudget / 0.99);
     }
     // Recall comet: a hot streak from the periphery into the recalled
     // node, shortening as it arrives; the node itself flares below.
@@ -2151,12 +2718,14 @@ function animate(ts) {
         linePosAttr[lineIdx * 6 + 2] = N.z + recallDir[2] * reach;
         linePosAttr[lineIdx * 6 + 3] = N.x; linePosAttr[lineIdx * 6 + 4] = N.y; linePosAttr[lineIdx * 6 + 5] = N.z;
         lineUvAttr[lineIdx * 2] = 0; lineUvAttr[lineIdx * 2 + 1] = 1;
+        lineFadeAttr[lineIdx * 2] = 1.0; lineFadeAttr[lineIdx * 2 + 1] = 1.0;
         lineHueAttr[lineIdx * 2] = 0.60; lineHueAttr[lineIdx * 2 + 1] = 0.58;
         lineIdx++;
     }
     lineGeometry.attributes.position.needsUpdate = true;
     lineGeometry.attributes.aLightPass.needsUpdate = true;
     lineGeometry.attributes.aLineHue.needsUpdate = true;
+    lineGeometry.attributes.aLineFade.needsUpdate = true;
     lineGeometry.setDrawRange(0, lineIdx * 2);
 
     // 3. Update nodes meshes (hide unconnected nodes)
@@ -2201,7 +2770,8 @@ function animate(ts) {
     // distance (its hot zone sits on the view axis at depth) and damps
     // the hue wave/drift so its center stays anchored DARK RED instead
     // of swinging through the plum stop ("bright purple" report).
-    const centerDim = FORM === 'vortex' ? 0.85 : 0.30;
+    // cube2 v3: the kernel IS the hot focal point — no centre dim there.
+    const centerDim = FORM === 'vortex' ? 0.85 : (FORM === 'cube2' ? 0.0 : 0.30);
     const centerXY = FORM === 'vortex' ? 1.0 : 0.0;
     const waveAmp = FORM === 'vortex' ? 0.3 : 1.0;
     // Mood rides the drift as a slow baseline (cold-pole shift only;
@@ -2236,6 +2806,9 @@ function animate(ts) {
     nUniforms.uSweepAngle.value = sweepAngle;
     nUniforms.uSweepMode.value = DIAL.search === 'plane' ? 1.0 : (DIAL.search === 'ring' ? 2.0 : 0.0);
     nUniforms.uSweepHeat.value = TUNE.sweepHeat;
+    // The ring scan reaches the whole stack in cube2 (shells grow to ~8).
+    const sweepReach = FORM === 'cube2' ? 7.0 : 2.4;
+    nUniforms.uSweepReach.value = sweepReach;
     nUniforms.uAccentStrength.value = accentStrength;
     nUniforms.uHueDrift.value = hueDriftOut;
 
@@ -2250,15 +2823,20 @@ function animate(ts) {
     lUniforms.uPulseT.value = pulseT;
     lUniforms.uAccentStrength.value = accentStrength;
     lUniforms.uHueDrift.value = hueDriftOut;
-    lUniforms.uDive.value = dive;
+    lUniforms.uDive.value = camDive;
+    lUniforms.uSweep.value = gait.search;
+    lUniforms.uSweepAngle.value = sweepAngle;
+    lUniforms.uSweepHeat.value = TUNE.sweepHeat;
+    lUniforms.uSweepReach.value = sweepReach;
+    lUniforms.uLineSweep.value = FORM === 'cube2' ? 1.0 : 0.0;
 
     // Interior motes: only rendered while actually diving — and never
     // for the empty form (a dive there would summon motes out of a
     // deliberately blank screen).
-    motesMesh.visible = dive > 0.01 && FORM !== 'empty';
+    motesMesh.visible = camDive > 0.01;
     if (motesMesh.visible) {
         motesMaterial.uniforms.uTime.value = time;
-        motesMaterial.uniforms.uDive.value = dive;
+        motesMaterial.uniforms.uDive.value = camDive;
         motesMaterial.uniforms.uHueDrift.value = hueDriftOut;
         motesMaterial.uniforms.uWaveAmp.value = waveAmp;
     }
@@ -2279,7 +2857,7 @@ function animate(ts) {
         + errorState * 0.5 + 0.20 * toolPulse + 0.25 * recallSpark
         + (verdict === 'pass' ? 0.2 * verdictEnv : 0)
         + 0.08 * backgroundBusy * (0.5 + 0.5 * Math.sin(time * 0.31 + 0.9)))
-        * BLOOM_SCALE * (1.0 - 0.5 * dive) * 0.65;
+        * BLOOM_SCALE * (1.0 - 0.5 * camDive) * 0.65;
 
     composer.render();
 }
