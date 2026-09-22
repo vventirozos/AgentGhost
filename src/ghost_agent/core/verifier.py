@@ -3548,10 +3548,19 @@ class Verifier:
                           else (f"incumbent {inc_v} CAPPED — unsupported or echoed fact(s) {list(capped)[:3]}" if capped
                                 else f"shadow: incumbent {inc_v} vs claim-binding {cb_v}")))
             secs = row.get("binder_s", row.get("wait_s", 0.0))
+            # Level = "did this CHANGE anything?", not "did the two differ?".
+            # A shadow disagreement that decided nothing is the measurement
+            # this rollout exists to take, and it is already recorded by
+            # `record_claim_binding_shadow(row)` above — colouring it like a
+            # fault made an ordinary 0.0s telemetry line look like a problem
+            # in the operator's stream (asked about live, 2026-09-22). The
+            # three that DO change the shipped verdict stay loud: the binder
+            # overriding the incumbent, a binder error, and a capped
+            # confidence.
             pretty_log("Claim Binding",
                        f"{what} ({', '.join(f'{k} {v}' for k, v in counts.items() if v)}) {secs}s",
                        icon=Icons.VERIFIER_LAB,
-                       level="WARNING" if (decided == "claim_binding" or row["agree"] is False or error or capped) else "INFO")
+                       level="WARNING" if (decided == "claim_binding" or error or capped) else "INFO")
         except Exception:  # noqa: BLE001
             pass
 

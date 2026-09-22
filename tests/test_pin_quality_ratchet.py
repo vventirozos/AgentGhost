@@ -615,7 +615,7 @@ _GRANDFATHERED_BASELINE = \
 #: grandfather digest live here. An honest re-write updates this constant in
 #: the same change; `--write` prints the new digest for exactly that.
 _COMMITTED_BASELINE_DIGEST = \
-    "f689826cbc406378cd079f70a08f04bde9422704b22a4a39373b354e7820f7f7"
+    "01fb89a86eb94ba2c0d6b1e60a2631d60d7ee1235d27513cb1c594f2bb30b5d2"
 
 
 def baseline_digest(baseline: dict) -> str:

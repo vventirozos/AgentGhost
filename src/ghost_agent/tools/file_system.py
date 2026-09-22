@@ -4903,9 +4903,38 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
             return ToolOutcome.rejected("SYSTEM INSTRUCTION: The 'url' parameter is MANDATORY for download operations.", reason_code="missing_url")
             
         # Auto-heal missing or invalid target_path
-        if not target_path or str(target_path).strip() == "" or str(target_path).startswith("http") or target_path == url:
+        # `startswith("http")` also discarded legitimate filenames — httpd.conf,
+        # http_log.txt, https_cert.pem — so test for an actual URL instead.
+        _tp = str(target_path or "").strip()
+        if not _tp or "://" in _tp or _tp == str(url):
             parsed = urllib.parse.urlparse(str(url))
             path_name = Path(parsed.path).name
+            # PERCENT-DECODE the name (§4JZ). Saved raw, a Wikimedia URL lands
+            # as `960px-Zoi_..._%28cropped%29.jpg` while every human-readable
+            # reference to it — the model's, the page's — says `(cropped)`, so
+            # a later `reference_images` / read by that name misses. Seen live.
+            # ⚠ Re-take `.name` AFTER decoding: `%2F` decodes to a separator,
+            # and a filename that smuggles one would escape this directory.
+            if path_name:
+                decoded = Path(urllib.parse.unquote(path_name)).name
+                # ⚠ Drop CONTROL characters, not just surrounding whitespace.
+                # `%00` put a real NUL in the name; `_get_safe_path` then raised
+                # ValueError("embedded null byte") and the handler returned that
+                # BARE STRING, which the outcome classifier reads as neither a
+                # failure nor a rejection — a download that wrote nothing was
+                # booked as a success. And `%0A` let the URL inject whole fake
+                # lines ("SUCCESS: …") into the tool output the model reads.
+                decoded = "".join(c for c in decoded if c.isprintable())
+                decoded = decoded.replace("\\", "_").strip()
+                # Leading dots are legitimate (`.env`, `.gitignore`); only a
+                # name that is ENTIRELY dots is a traversal shape.
+                if decoded.strip(".") == "":
+                    decoded = ""
+                if len(decoded) > 180:
+                    stem, _, ext = decoded.rpartition(".")
+                    decoded = (stem[:170] + "." + ext[:9]) if stem else decoded[:180]
+                if decoded:
+                    path_name = decoded
             target_path = path_name if path_name else "download.bin"
 
         return await tool_download_file(url=str(url), sandbox_dir=sandbox_dir, tor_proxy=kwargs.get("tor_proxy"), filename=target_path)

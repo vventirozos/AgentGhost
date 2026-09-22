@@ -479,6 +479,66 @@ async def _with_context(profile_dir, proxy, timeout_ms, op_fn):
                 pass
 
 
+async def _probe_main_image(page):
+    """The page's own main image, as a URL that can be downloaded.
+
+    §4JY: asked to fetch a photo of a person, the agent could not get one —
+    it GUESSED Wikimedia thumbnail paths (`800px-…`, `640px-…` → HTTP 400,
+    because only some widths are pre-rendered), fell back to screenshotting
+    the file PAGE, and ended up passing a 1280x2290 picture of a web page as
+    a "photo". Every page already publishes the answer in `og:image`; that
+    exact URL fetched 200 over Tor. So stop making the model guess and hand
+    it the URL the SITE declares.
+
+    ⚠ The obvious fallback — "the biggest <img>" — is a trap: HTML width/
+    height attributes are INTRINSIC, so on the same page it selected a
+    7651x5103 photo of a different politician entirely. Only RENDERED
+    geometry says what the page is actually showing, so the fallback reads
+    `getBoundingClientRect` and prefers what sits near the top of the
+    document. `source` travels with the URL so the caller knows which of the
+    two it got. Returns {} on any failure — never raises into the op."""
+    js = """() => {
+      // http(s) ONLY, and bounded. The og:image branch used to return
+      // whatever the page declared: `data:` URIs (megabytes of base64 that
+      // flood the caller's context), `javascript:` and `file:///etc/passwd`
+      // all passed straight through to a line that says "download this".
+      const abs = (u) => {
+        try {
+          const h = new URL(u, location.href);
+          if (h.protocol !== 'http:' && h.protocol !== 'https:') return null;
+          return h.href.length > 2048 ? null : h.href;
+        } catch(e) { return null; }
+      };
+      const meta = (sel) => { const el = document.querySelector(sel); return el && el.content ? abs(el.content) : null; };
+      const og = meta('meta[property="og:image"]') || meta('meta[name="og:image"]');
+      const tw = meta('meta[name="twitter:image"]') || meta('meta[property="twitter:image"]');
+      const declared = og || tw;
+      const declaredSource = og ? 'og:image' : 'twitter:image';
+      if (declared) return { url: declared, source: declaredSource };
+      let best = null;
+      for (const img of document.querySelectorAll('img')) {
+        const src = img.currentSrc || img.src || '';
+        if (!src || src.startsWith('data:') || /\.svg(\?|$)/i.test(src)) continue;
+        let r; try { r = img.getBoundingClientRect(); } catch(e) { continue; }
+        if (r.width < 128 || r.height < 128) continue;          // icons, spacers, tracking pixels
+        const area = r.width * r.height;
+        const score = area / (1 + Math.max(0, r.top + window.scrollY) / 1000);  // prefer near the top
+        if (!best || score > best.score) best = { score, area, url: abs(src), w: Math.round(r.width), h: Math.round(r.height) };
+      }
+      return best ? { url: best.url, source: 'largest-rendered', w: best.w, h: best.h } : {};
+    }"""
+    try:
+        # ⚠ BOUNDED. `page.evaluate` honours no default timeout, so a page with
+        # a busy main thread (or a getter that spins) made this non-essential
+        # probe hang the whole op until the subprocess was killed — losing the
+        # page text that had already been collected. It is a nicety; it must
+        # never cost the caller the result.
+        out = await asyncio.wait_for(page.evaluate(js), timeout=3.0)
+        return out if isinstance(out, dict) and out.get("url") else {}
+    except Exception:
+        return {}
+
+
 async def _probe_pre_interaction(page):
     """Detect a visible start / play / loading control on the page.
 
@@ -489,7 +549,14 @@ async def _probe_pre_interaction(page):
     "fully functional" from a capture that still had the start modal up).
     Returns ``{pre_interaction: bool, controls: [text,…]}`` (or {} on any
     failure — never raises into the op)."""
-    js = """() => {
+    # ⚠ RAW string. Non-raw, Python ate the JS regex's word boundaries: `\b`
+    # became U+0008 BACKSPACE, so `\bloading\b` could never match a loading
+    # screen — the exact false-positive this probe exists to catch. It went
+    # unnoticed because the test extracted the SOURCE TEXT (where `\b`
+    # survives) while production evaluated the escape, so the harness and the
+    # runtime were running different regexes (§4JY; the trap in
+    # tests/helpers.py::eval_js, now also enforced by an AST-scoped extractor).
+    js = r"""() => {
       const KW = /click to (play|start)|press (to )?start|start game|tap to (play|start)|enter game|^play$|^start$|^begin$|\bloading\b/i;
       const vis = (el) => { try { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width>4 && r.height>4 && s.visibility!=='hidden' && s.display!=='none' && parseFloat(s.opacity||'1')>0.1; } catch(e){ return false; } };
       const out = [];
@@ -550,6 +617,9 @@ async def op_navigate(op):
         probe = await _probe_pre_interaction(page)
         if probe.get("pre_interaction"):
             result["pre_interaction"] = probe
+        main_img = await _probe_main_image(page)
+        if main_img:
+            result["main_image"] = main_img
         return result
 
     return await _with_context(op["profile_dir"], op.get("proxy"), op["timeout_ms"], run)
@@ -599,6 +669,9 @@ async def op_extract_text(op):
             # much was dropped from any downstream "got the whole page?" check.
             "length": full_len,
             "used_last_url": used_fallback,
+            # The page's own main image, so a caller after a PHOTO does not
+            # have to guess thumbnail URLs (§4JY).
+            **({"main_image": _mi} if (_mi := await _probe_main_image(page)) else {}),
         }
 
     return await _with_context(op["profile_dir"], op.get("proxy"), op["timeout_ms"], run)

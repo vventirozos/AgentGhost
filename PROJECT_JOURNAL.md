@@ -46023,3 +46023,151 @@ process-free window, so an external write would race the live agent. The designe
 the reversible one: excluded from injection, kept on disk with reason + timestamp. Verified after:
 236 entries (nothing deleted), 208 active, 28 quarantined, the target carrying `quarantined: true`
 and the reason. See [[skill-prune-off-by-default]] for why deletion is the wrong reflex here.
+
+## §4JW — Two things the operator saw in the stream (2026-09-22, 18:45–19:20)
+
+**1. A Pillow warning printed into the rendered output.** Live CLI session: an image reply was
+followed by `bin/ghost:717: DeprecationWarning: Image.Image.getdata is deprecated…`. The CLI writes
+escape sequences and rendered frames to the terminal, so a library warning is not a note — it is
+corruption in the middle of what the operator sees. Fixed at the source: `pal_img.tobytes()`
+replaces `getdata()` (mode "P" → one byte per pixel, row-major, no padding — byte-identical, no
+400k-element list, and no deprecation; getdata is removed in Pillow 14). Also, a TUI must not let
+ANY library warning into the frame, so the client now sets `warnings.simplefilter("ignore")` at
+import with `GHOST_CLI_WARN=1` as the escape hatch. Verified on a real 768×512 node image: valid
+DCS…ST sequence, zero warnings, empty stderr. `bin/ghost` is a symlink into the repo, so no
+restart was needed.
+
+*Not a defect:* the ~24 "blank lines" after the image are the image. tmux reports 8×18 px cells
+here, so a 640-px-wide render occupies 24 grid rows and the tail advances the cursor past them;
+copying the pane yields blanks because tmux owns those cells. (The comment at `_tmux_cell_px`
+states the pair backwards — the code reads `client_cell_width` then `client_cell_height`
+correctly.)
+
+**2. A yellow Claim Binding line that meant nothing was wrong.**
+`shadow: incumbent CONFIRMED vs claim-binding UNCERTAIN … 0.0s` logged at WARNING because the
+level tested `row["agree"] is False` — i.e. "did the two differ?" — when the shadow verdict had
+decided nothing and the incumbent's CONFIRMED shipped. Level now tests **impact**: WARNING for an
+override (`decided == "claim_binding"`), a binder error, or a capped confidence; INFO for a
+disagreement that changed nothing. The measurement is untouched — `record_claim_binding_shadow(row)`
+still writes `agree: False`, and a pin fails if the colour change ever costs the row. Matches the
+operator's standing "surface only actionable" preference.
+
+**3. Answered, no change:** the `memory used 2/22` line prints after the request-finished footer
+because `_judge_hydration_safe` (agent.py:31071) is fire-and-forget by design — it needs the final
+reply to judge which surfaced memories were used, runs on the worker node, and staggers behind any
+in-flight verifier verdict so the two never contend for Nova. Running it inline would add a worker
+round-trip to every turn's latency for bookkeeping.
+
+**Verification.** Pins: `tests/test_claim_binding_log_level.py` (6, incl. one that fails if the
+ledger row is dropped while the log goes quiet) and 4 added to `tests/test_ghost_cli.py`.
+Batteries: CLI **3/3**, claim-binding **6/6**, controls correct in both. ⚠ The ratchet rejected my
+first draft of the CLI pins — I had written `assert ".getdata()" not in src` style source-text
+assertions, the exact shape R4 forbids, for the SECOND time in one day (§4JU was the first).
+Rewritten behavioural: one deleted as redundant with the render-a-real-image-and-catch-warnings
+test, the other now runs the client in a subprocess with and without `GHOST_CLI_WARN` and checks
+whether a warning reaches stderr. Re-running the battery proved the swap cost no coverage (same
+3/3). Suite ONCE after the last change: **24,029 / 0 / 67**. Operator restarted the agent at
+19:15 (pid 88029, one boot, healthy) — which also put the §4JU/§4JV image-tool changes in the live
+process for the first time.
+
+**Standing instruction recorded:** [[operator-restarts-the-agent]] — never restart the live agent;
+deploy, say it needs a restart, and let the operator choose the moment. Not extended to
+`ghost-image-node` without asking.
+
+## §4JX — "Generate the Greek PM in space": the likeness needs pixels (2026-09-22, 19:44–20:10)
+
+**Trigger.** Operator: how do I generate an image of someone the model doesn't know — the Greek
+PM — with no photo on hand? Answered, then tested end to end on the live agent.
+
+**Run 1 (no hints, natural phrasing).** The agent searched, navigated Wikipedia, screenshotted the
+Commons file page, hit `browser extract_text` runner failures and two BLOCKED fetches, downloaded
+via `file_system download` → **HTTP 429** (Wikimedia rate-limiting the Tor exit), tried sandbox
+`curl` → a 166-byte redirect stub, then `curl` again → exit 23. It finally screenshotted the
+Commons page as `mitsotakis_blinken.jpg` (1280×2290 — a PICTURE OF A WEB PAGE), described it with
+`vision_analysis`, and called `image_generation` with a text prompt: node logged **`refs=0`**,
+768×512 @30 cfg=1, 203 s → a generic dark-haired man in a US-flag astronaut suit. 523 s, 21 turns.
+
+**Two distinct defects, and the first was MINE from §4JV.** (1) `reference_images` was described as
+"EDIT MODE. The sandbox filename of the image to edit" — so "put this person in space" did not
+read as an edit and the model never reached for it. Fixed in both texts the model reads: a
+specific real person/product/place must come from a photo; a name or a description (including a
+`vision_analysis` caption you just read) yields a generic stranger; looking at a photo is not
+passing it. (2) ACQUISITION — the agent could not obtain a usable portrait at all; even with (1)
+fixed it would have passed a screenshot of a web page as the reference.
+
+**Run 2 (operator restarted the agent; portrait placed in the sandbox by hand).** Same request →
+**`refs=1`**, `steps=20 cfg=4` (the node's own edit path), decided in **13 s** vs 207 s of flailing,
+632 s render → **recognisably Mitsotakis**: grey-flecked hair, face shape, the smile. Not a
+portrait-grade match — one 500×658 reference into a 768×512 budget — but not a stranger. Files:
+`pm_SOURCE_portrait.jpg` → `pm_in_space_WITH_reference.png`, with
+`pm_in_space_NO_reference.png` as the control.
+
+**Fetching the portrait by hand (over Tor, honouring the egress rule) took three attempts:**
+`thumb.wikimedia.org` → 400; `upload.wikimedia.org` 800px → 400, 640px → 400, **500px → 200** (91 KB).
+The URL-shape maze is what the agent cannot navigate, not the network.
+
+**Verification.** 4 pins (`TestIdentityNeedsAPhoto`) + the existing 95. Battery **42/42**. ⚠ Two
+mutants SURVIVED the first draft: my pins asserted `"specific real person" in desc`, which is still
+true after replacing the steer with "A specific real person is fine to name" — a pin that cannot
+distinguish the rule from its opposite ([[verify-cannot-distinguish]]). Rewritten to assert the
+CLAIM: "must pass a photo", "never from a name", "generic stranger". Docs: tool page gains the
+finding and the acquisition caveat.
+
+**Open:** teach `browser` to return a page's main image URL (the actual gap behind run 1); test
+whether 2 references fit (more angles → sharper identity).
+
+## §4JY — MAIN_IMAGE, and a probe regex that never matched (2026-09-22, 20:10–)
+
+**Trigger.** Operator: "fix both open items" — (1) the browser cannot hand back a page's image, so
+the agent could not obtain a photo (§4JX); (2) does a second reference image fit.
+
+**1. The acquisition bug was GUESSING, not the network.** Diagnosed by hand over Tor: Wikimedia
+pre-renders only some thumbnail widths, so the agent's hand-built `800px-…` and `640px-…` both
+return **HTTP 400** while `500px-…` returns 200 — and `og:image` on the same page, the URL the site
+itself declares, **fetched 200 from both `thumb.` and `upload.` hosts**. Nothing was blocked; the
+model was inventing URLs because nothing handed it one. Shipped: `_probe_main_image` in the runner
+(og:image/twitter:image first, else the largest image by RENDERED geometry near the top of the
+document, ≥128 px, skipping `data:`/SVG, resolved absolute), surfaced by `navigate` and
+`extract_text` as `MAIN_IMAGE` + `MAIN_IMAGE_SOURCE`, and advertised in the schema with the
+explicit rule: never hand-build an image URL.
+
+⚠ **The obvious fallback is a trap.** "Biggest `<img>`" reads the HTML width/height attributes,
+which are INTRINSIC — on the very page under test that selects a 7651×5103 photo of a DIFFERENT
+politician. Only `getBoundingClientRect` says what the page is showing. Pinned by execution.
+
+**2. A live bug this exposed in code I did not write.** Replacing the test's file-wide JS-extraction
+regex with an AST-scoped one made `test_a_real_loading_screen_matches_but_download_words_do_not`
+fail — correctly. `_probe_pre_interaction`'s JS was a NON-RAW Python string, so the regex's `\b`
+word boundaries evaluated to **U+0008 BACKSPACE**: `\bloading\b` could never match, i.e. the
+loading-screen false-positive the probe exists to catch has been undetectable in production. It
+survived because the harness extracted the SOURCE TEXT (where `\b` is intact) while production ran
+the evaluated string — the harness and the runtime were testing different regexes
+([[embedded-script-string-trap]], [[harness-shim-diverges-from-the-dom]]). Fixed with `r"""`, plus
+an R1 enumeration that walks every JS-looking string constant in the runner and fails on any
+control character — the class, not the site. The extractor is now AST-scoped so a future probe
+added above another cannot silently span two functions.
+
+**Verification.** `tests/test_browser_main_image.py` (26) — 9 of them EXECUTE the arrow fn under
+node against fake DOMs via `tests/helpers.py::eval_js`, including the intrinsic-size trap, the
+top-of-document preference, data:/SVG/<128px rejection and relative→absolute. Battery **12/12**.
+⚠ Three mutants survived the first draft, all the same defect in my pins: `og:image` preference
+asserted by WORD ORDER (`js.index('og:image') < js.index('querySelectorAll')`, still true with the
+early return disabled), no pin at all on the runner WIRING (the formatter tests feed a hand-made
+payload), and a schema pin that checked for "MAIN_IMAGE" while the mutant removed only the trigger
+sentence. Rewritten: assert the branch, AST-check the call sites, assert the cue. Browser+sandbox
+slice: 963 passed.
+
+⚠ **Needs a restart to go live** — `_runner_script()` caches `browser_runner.py` per process, and
+the formatter lives in module code.
+
+**3. A second reference does NOT fit — measured, three legs.**
+`ref1_768x512 rc=0 620 s peak 6806 MB` · `ref2_768x512 rc=1 956 s peak 6803 MB` ·
+`ref2_608x608 rc=1 52 s peak 6812 MB`. Both two-reference runs died the same way — the DiT could
+not stage a block ("cannot make enough memory available on CUDA0": need 1604 MB / available 1467
+at 768×512 segment 5/34; need 698 / available 618 at 608×608 segment 8/34) — and **shrinking the
+render does not buy it back**, because the reference latents ride the sequence regardless. The
+768×512 failure is the nasty one: it spent **921 s of sampling first**, i.e. a quarter-hour of the
+node's only GPU to produce an error. `MAX_REFERENCES = 1` therefore stands as a MEASUREMENT, and
+both copies of the constant now carry the numbers so it does not drift upward on optimism; a pin
+asserts the two agree and that a second reference is refused before the node is called.
+So: better identity on this box would need a smaller model or more RAM, not more references.

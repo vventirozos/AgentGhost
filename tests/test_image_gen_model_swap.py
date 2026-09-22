@@ -199,6 +199,12 @@ class _FakeProc:
 
     def kill(self):
         self.killed = True
+        self.returncode = -9
+
+    def poll(self):
+        """Real Popen exposes this; the reaping path calls it on EVERY exit.
+        A double that lacks it turns a genuine bug into an AttributeError."""
+        return self.returncode
 
     def wait(self, timeout=None):
         self.waited = timeout
@@ -233,6 +239,40 @@ class TestRunner:
         with pytest.raises(RuntimeError) as ei:
             mod.run_sd_cli(["sd-cli"], timeout=5)
         assert "out of memory" in str(ei.value) and "exit 1" in str(ei.value)
+
+    def test_sd_cli_is_reaped_when_communicate_itself_fails(self, monkeypatch, fake_popen):
+        """Only TimeoutExpired used to kill it. Any OTHER exception here —
+        a MemoryError accumulating stdout on an 8 GB box, a decode error —
+        left sd-cli running with ~6.8 GB of the GPU while the endpoint's
+        `finally` released the lock, so the next request ran concurrently:
+        the NvMap `error 12` regime this module exists to avoid."""
+        mod = _load_server(monkeypatch)
+
+        def boom(self, timeout=None):
+            raise MemoryError("stdout")
+
+        monkeypatch.setattr(fake_popen, "communicate", boom, raising=False)
+        with pytest.raises(MemoryError):
+            mod.run_sd_cli(["sd-cli"], timeout=5)
+        main = fake_popen.instances[0]
+        assert main.killed, "sd-cli was left running while the GPU lock was released"
+
+    def test_a_root_sidecar_that_will_not_die_does_not_fail_the_generation(self, monkeypatch, fake_popen):
+        """The sidecar is `sudo`, a ROOT child of an unprivileged parent:
+        .kill() raises PermissionError. Raised from the `finally`, it replaced
+        the return of a COMPLETED 15-minute edit with a 500."""
+        mod = _load_server(monkeypatch)
+
+        def stubborn(self, timeout=None):
+            raise subprocess.TimeoutExpired("sidecar", timeout or 5)
+
+        def eperm(self):
+            raise PermissionError(1, "Operation not permitted")
+
+        sidecar_cls = fake_popen
+        monkeypatch.setattr(sidecar_cls, "wait", stubborn, raising=False)
+        monkeypatch.setattr(sidecar_cls, "kill", eperm, raising=False)
+        mod.run_sd_cli(["sd-cli"], timeout=5)      # must simply return
 
     def test_timeout_kills_and_raises(self, monkeypatch, fake_popen):
         mod = _load_server(monkeypatch)
@@ -896,8 +936,14 @@ def test_queue_wait_fits_inside_the_clients_timeout(monkeypatch):
     # WORST_GENERATION_S is the measured end-to-end worst case (a CFG edit),
     # not a formula — the 28 s/step measurement already contains CFG's two
     # forwards, and deriving it as 2 x steps x 30 double-counts that.
+    # The invariant, at the settings the node PERMITS (not at its defaults):
+    # wait out the worst generation and still answer before the client gives up.
     assert mod.BUSY_WAIT_TIMEOUT + mod.WORST_GENERATION_S < mod.CLIENT_TIMEOUT_S
-    assert mod.BUSY_WAIT_TIMEOUT > mod.WORST_GENERATION_S / 2   # long enough to be worth queueing
+    # …and WORST_GENERATION_S must be derived from the permitted ceiling, not
+    # from the default: hand-picking 700 (the 20-step number) let 400 + 935
+    # pass two pins separately while the real case blew the client's window.
+    assert mod.WORST_GENERATION_S >= mod.MAX_EDIT_STEPS * mod.EDIT_S_PER_STEP
+    assert mod.BUSY_WAIT_TIMEOUT >= 60          # still worth queueing behind
     assert mod.GEN_TIMEOUT_S > mod.WORST_GENERATION_S           # the hard stop cannot cut a healthy run
     # CLIENT_TIMEOUT_S must be what the agent ACTUALLY configures for the
     # image pool, not a number that drifted: build a client the way llm.py
@@ -1068,3 +1114,318 @@ def test_an_unreadable_reference_is_a_result_not_an_exception(tmp_path):
         out = asyncio.run(tool_generate_image(prompt="x", llm_client=llm,
                                               sandbox_dir=tmp_path, reference_images=[name]))
         assert out.startswith("ERROR") and "not found in the sandbox" in out, (name, out)
+
+
+class TestIdentityNeedsAPhoto:
+    """Live failure 2026-09-22 (§4JX): asked to put the Greek PM in space, the
+    agent searched, downloaded a real photo of him into the sandbox, ran
+    `vision_analysis describe_picture` on it — and then called image_generation
+    with a TEXT prompt and no reference (`refs=0` at the node). The result was a
+    generic dark-haired man in an astronaut suit.
+
+    The cause was the advice, not the model: `reference_images` was described
+    only as "EDIT MODE … change an EXISTING image", so "put this person in
+    space" did not read as an edit. Both texts the model reads must say that a
+    specific real person's likeness comes from PIXELS, and that looking at a
+    photo is not the same as passing it."""
+
+    def _tool(self):
+        import sys
+        sys.path.insert(0, str(REPO / "src"))
+        from unittest.mock import MagicMock
+        from ghost_agent.tools.registry import get_active_tool_definitions
+        ctx = MagicMock()
+        ctx.llm_client.image_gen_clients = ["http://gpu"]
+        return next(t for t in get_active_tool_definitions(ctx)
+                    if t.get("function", {}).get("name") == "image_generation")["function"]
+
+    def test_the_schema_says_a_real_person_needs_a_photo(self):
+        # ⚠ Assert the CLAIM, not a topic word. A first draft checked for
+        # "specific real person", which survives replacing the steer with
+        # "A specific real person is fine to name" — the mutation battery
+        # caught that the pin could not tell the steer from its opposite.
+        desc = self._tool()["description"].lower()
+        assert "must pass a photo" in desc                  # the imperative
+        assert "never from a name" in desc                  # why naming fails
+        assert "generic stranger" in desc                   # what you get instead
+        assert "vision_analysis" in desc                    # the wrong turn it took live
+
+    def test_the_reference_parameter_is_not_edit_only(self):
+        # It was labelled "EDIT MODE." — the label itself is what made the
+        # model skip it for a new scene.
+        d = self._tool()["parameters"]["properties"]["reference_images"]["description"]
+        assert not d.startswith("EDIT MODE")
+        assert "identity" in d.lower() and "editing" in d.lower()
+
+    def test_the_system_prompt_says_it_too(self):
+        import sys
+        sys.path.insert(0, str(REPO / "src"))
+        from ghost_agent.core.prompts import SYSTEM_PROMPT
+        block = SYSTEM_PROMPT[SYSTEM_PROMPT.index("- IMAGE GENERATION:"):][:1200]
+        assert "reference_images" in block
+        assert "HAS TO COME FROM A PHOTO" in block          # the imperative, not the topic
+        assert "generic stranger" in block                  # the consequence of not doing it
+        assert "vision_analysis" in block                   # the exact wrong turn it took live
+
+    def test_the_tool_still_accepts_a_downloaded_photo_by_name(self, tmp_path):
+        # End of the chain the agent was supposed to complete: a file that
+        # arrived via file_system download, passed straight through.
+        from unittest.mock import MagicMock
+        import sys
+        sys.path.insert(0, str(REPO / "src"))
+        from ghost_agent.tools.image_gen import tool_generate_image
+        (tmp_path / "mitsotakis_blinken.jpg").write_bytes(b"\xff\xd8\xff" + b"0" * 64)
+        cap = {}
+        llm = MagicMock()
+        llm.image_gen_clients = [{"x": 1}]
+
+        async def gen(payload):
+            cap.update(payload)
+            return {"data": [{"b64_json": base64.b64encode(_png_bytes(768, 512)).decode()}], "seed": 3}
+
+        llm.generate_image = gen
+        out = asyncio.run(tool_generate_image(
+            prompt="floating in space above Earth in an astronaut suit",
+            llm_client=llm, sandbox_dir=tmp_path,
+            reference_images=["mitsotakis_blinken.jpg"]))
+        assert "SUCCESS" in out and len(cap["reference_images"]) == 1
+
+
+def test_the_reference_cap_is_one_and_says_why(monkeypatch):
+    """§4JW measured the second reference instead of assuming it: at 768x512
+    two references OOM the DiT ("need 1604 MB / available 1467 MB", segment
+    5/34) — and only AFTER 921 s of sampling. The cap is what stops a caller
+    spending a quarter-hour of the node's only GPU on a guaranteed failure, so
+    it must not drift upward on optimism."""
+    import sys
+    sys.path.insert(0, str(REPO / "src"))
+    from ghost_agent.tools import image_gen as tool
+    mod = _load_server(monkeypatch)
+    assert mod.MAX_REFERENCES == tool.MAX_REFERENCES == 1
+    # A second reference is refused BEFORE the node is called at all.
+    from unittest.mock import MagicMock
+    import tempfile
+    from pathlib import Path as _P
+    d = _P(tempfile.mkdtemp())
+    for n in ("a.png", "b.png"):
+        (d / n).write_bytes(_PNG_1x1)
+    llm = MagicMock()
+    llm.image_gen_clients = [{"x": 1}]
+    llm.generate_image = MagicMock()
+    out = asyncio.run(tool.tool_generate_image(prompt="x", llm_client=llm, sandbox_dir=d,
+                                               reference_images=["a.png", "b.png"]))
+    assert out.startswith("ERROR") and not llm.generate_image.called
+
+
+class TestEncodedFilenames:
+    """Live §4JZ: `file_system download` derived the filename straight from the
+    URL path, so a Wikimedia photo landed as
+    `960px-Zoi_..._%28cropped%29.jpg` while the model — reading the page, the
+    caption, its own earlier message — asked for `...(cropped).jpg`. The edit
+    failed with "not found in the sandbox" and the agent had to guess the
+    encoding. Both halves are fixed: downloads decode the name, and reference
+    resolution accepts either spelling for files already on disk."""
+
+    def _resolve(self, sandbox, name):
+        import sys
+        sys.path.insert(0, str(REPO / "src"))
+        from ghost_agent.tools.image_gen import _resolve_reference
+        return _resolve_reference(name, sandbox)
+
+    def test_a_decoded_request_finds_an_encoded_file(self, tmp_path):
+        (tmp_path / "960px-Zoi_a_Sept_2015_%28cropped%29.jpg").write_bytes(_PNG_1x1)
+        got = self._resolve(tmp_path, "960px-Zoi_a_Sept_2015_(cropped).jpg")
+        assert got.name.endswith("%28cropped%29.jpg")
+
+    def test_an_encoded_request_finds_a_decoded_file(self, tmp_path):
+        (tmp_path / "960px-Zoi_a_Sept_2015_(cropped).jpg").write_bytes(_PNG_1x1)
+        got = self._resolve(tmp_path, "960px-Zoi_a_Sept_2015_%28cropped%29.jpg")
+        assert got.name.endswith("(cropped).jpg")
+
+    def test_an_exact_name_still_wins(self, tmp_path):
+        (tmp_path / "plain.png").write_bytes(_PNG_1x1)
+        assert self._resolve(tmp_path, "plain.png").name == "plain.png"
+
+    def test_a_missing_file_is_still_missing(self, tmp_path):
+        with pytest.raises(ValueError, match="not found"):
+            self._resolve(tmp_path, "nope_%28x%29.png")
+
+    def test_decoding_cannot_walk_out_of_the_sandbox(self, tmp_path):
+        # %2F decodes to a separator; the containment check runs per candidate.
+        outside = tmp_path.parent / "secret.png"
+        outside.write_bytes(_PNG_1x1)
+        for name in ("..%2Fsecret.png", "%2E%2E%2Fsecret.png"):
+            with pytest.raises(ValueError):
+                self._resolve(tmp_path, name)
+
+
+class TestDownloadNamesAreReadable:
+    """Behavioural: drive the REAL `file_system(operation="download")` auto-heal
+    branch and capture the filename it hands the downloader. A first version of
+    this grepped file_system.py for "unquote" — a source-text pin the ratchet
+    hard-rejects, and rightly: it passes just as well if the call is in a
+    comment."""
+
+    def _derive(self, url, tmp_path):
+        import sys
+        sys.path.insert(0, str(REPO / "src"))
+        from unittest.mock import patch
+        import ghost_agent.tools.file_system as fs
+        seen = {}
+
+        async def fake_download(url, sandbox_dir, tor_proxy, filename=None):
+            seen["filename"] = filename
+            return f"SUCCESS: Downloaded '{url}' to '{filename}'."
+
+        with patch.object(fs, "tool_download_file", fake_download):
+            asyncio.run(fs.tool_file_system(operation="download", sandbox_dir=tmp_path,
+                                            url=url))
+        return seen.get("filename")
+
+    @pytest.mark.parametrize("url,expected", [
+        ("https://u/a/960px-Zoi_%28cropped%29.jpg", "960px-Zoi_(cropped).jpg"),
+        ("https://u/y/photo.jpg", "photo.jpg"),
+        ("https://u/", "download.bin"),
+    ])
+    def test_names_come_back_readable(self, url, expected, tmp_path):
+        assert self._derive(url, tmp_path) == expected
+
+    @pytest.mark.parametrize("url", ["https://evil/%2F%2E%2E%2Fetc%2Fpasswd",
+                                     "https://evil/..%2F..%2Fsecret.png"])
+    def test_a_decoded_separator_cannot_escape(self, url, tmp_path):
+        got = self._derive(url, tmp_path)
+        assert "/" not in got and ".." not in got, got
+
+
+class TestAnyFormatReferenceKeepsItsShape:
+    """§4KA, found by review after the live run: the size probe was PNG-only,
+    so a JPEG reference returned None, the node fell back to its 768x512
+    default and `fit_reference` LANCZOS-squashed the photo into it. The live
+    run downloaded a 960x1264 PORTRAIT and rendered 768x512 landscape — a 0.76
+    aspect crushed to 1.50. JPEG is the COMMON case: the tool tells the model
+    to download photos."""
+
+    def _img(self, w, h, fmt):
+        from io import BytesIO
+        from PIL import Image
+        b = BytesIO()
+        Image.new("RGB", (w, h), (90, 120, 60)).save(b, format=fmt)
+        return b.getvalue()
+
+    @pytest.mark.parametrize("fmt", ["JPEG", "PNG", "WEBP"])
+    def test_every_supported_format_reports_its_size(self, monkeypatch, fmt):
+        mod = _load_server(monkeypatch)
+        assert mod.image_size(self._img(1200, 900, fmt)) == (1200, 900)
+
+    @pytest.mark.parametrize("fmt", ["JPEG", "PNG", "WEBP"])
+    def test_a_portrait_reference_is_not_rendered_landscape(self, monkeypatch, fmt):
+        mod = _load_server(monkeypatch)
+        ref = self._img(960, 1264, fmt)                      # the live shape
+        w, h = mod._resolve_size(mod.ImageRequest(prompt="x"), mod.image_size(ref))
+        assert h > w, f"{fmt} portrait came back {w}x{h}"
+        err = abs((w / h) - (960 / 1264)) / (960 / 1264)
+        assert err <= mod.ASPECT_BAND, f"{fmt} aspect off by {err:.1%}"
+
+    def test_the_endpoint_uses_the_format_agnostic_probe(self, monkeypatch, tmp_path):
+        # The whole point: a JPEG reference through the real request path.
+        mod = _load_server(monkeypatch)
+        mod._ready, mod._load_error = True, None
+        mp = tmp_path / "mmproj.gguf"; mp.write_bytes(b"x"); mod.MMPROJ_PATH = str(mp)
+        mod.OUT_DIR = tmp_path
+        seen = {}
+        monkeypatch.setattr(mod, "_generate_png",
+                            lambda p, w, h, s, **k: seen.update(w=w, h=h) or b"PNG")
+        TestClient(mod.app).post(
+            "/generate",
+            json={"prompt": "put him in space",
+                  "reference_images": [base64.b64encode(self._img(960, 1264, "JPEG")).decode()]},
+            headers={"X-Ghost-Key": "sekrit"})
+        assert seen["h"] > seen["w"], f"JPEG portrait rendered {seen['w']}x{seen['h']}"
+
+    def test_an_unreadable_reference_still_falls_back_cleanly(self, monkeypatch):
+        mod = _load_server(monkeypatch)
+        assert mod.image_size(b"\xff\xd8\xffnot-an-image") is None
+        # …and the caller then uses the default rather than raising
+        assert mod._resolve_size(mod.ImageRequest(prompt="x"), None) == (768, 512)
+
+
+class TestNodeInputHardening:
+    """Adversarial-review findings, each verified against the running code
+    before the fix: a negative seed was reported back although sd-cli treats it
+    as 'randomise'; a 400-digit width raised OverflowError out of an unwrapped
+    call; the aspect metric saturated so a 100000x1 request came back PORTRAIT;
+    NaN guidance reached the CLI."""
+
+    def test_a_negative_seed_becomes_a_concrete_one(self, monkeypatch):
+        mod = _load_server(monkeypatch)
+        got = {mod.resolve_seed(-1) for _ in range(20)}
+        assert -1 not in got and all(0 <= g <= 2**31 - 1 for g in got)
+        assert len(got) > 15, "a negative seed must randomise, not pin a constant"
+
+    def test_an_out_of_range_seed_is_folded_not_crashed(self, monkeypatch):
+        mod = _load_server(monkeypatch)
+        assert 0 <= mod.resolve_seed(2**64) <= 2**31 - 1
+        assert mod.resolve_seed(7) == 7          # ordinary seeds untouched
+
+    @pytest.mark.parametrize("w,h", [(10**400, 1), (1, 10**400), (10**400, 10**400)])
+    def test_an_absurd_dimension_clamps_instead_of_raising(self, monkeypatch, w, h):
+        mod = _load_server(monkeypatch)
+        got = mod._resolve_size(mod.ImageRequest(prompt="x", width=w, height=h))
+        assert got in mod.LEGAL_SIZES
+
+    def test_an_extreme_landscape_request_stays_landscape(self, monkeypatch):
+        # The saturating metric returned 288x352 — portrait — for 100000x1.
+        mod = _load_server(monkeypatch)
+        w, h = mod._resolve_size(mod.ImageRequest(prompt="x", width=100000, height=1))
+        assert w > h, f"got {w}x{h}"
+        w2, h2 = mod._resolve_size(mod.ImageRequest(prompt="x", width=1, height=100000))
+        assert h2 > w2, f"got {w2}x{h2}"          # the direction that always worked
+
+    def test_the_good_cases_survive_the_new_metric(self, monkeypatch):
+        mod = _load_server(monkeypatch)
+        assert mod._resolve_size(mod.ImageRequest(prompt="x", width=1920, height=1080)) == (736, 416)
+        assert mod._resolve_size(mod.ImageRequest(prompt="x", width=1024, height=1024)) == (608, 608)
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -5.0, 1e9])
+    def test_guidance_is_bounded(self, monkeypatch, bad):
+        mod = _load_server(monkeypatch)
+        g = mod.resolve_guidance(bad, False)
+        assert mod.MIN_GUIDANCE <= g <= mod.MAX_GUIDANCE and g == g
+
+    def test_an_oversized_body_is_refused_without_a_key(self, monkeypatch):
+        """Auth cannot defend this: the body is parsed before the handler runs,
+        so the cap has to sit in front of parsing."""
+        import json as _json
+        mod = _load_server(monkeypatch)
+        c = TestClient(mod.app)
+        r = c.post("/generate", content=_json.dumps({"prompt": "A" * (mod.MAX_BODY_BYTES + 1024)}),
+                   headers={"Content-Type": "application/json"})
+        assert r.status_code == 413
+        # …and an ordinary unauthenticated request is still a 401, not a 413
+        assert c.post("/generate", json={"prompt": "a cat"}).status_code == 401
+
+    def test_the_rgba_wrap_is_not_defeated_by_the_words_appearing(self, monkeypatch):
+        mod = _load_server(monkeypatch)
+        p = "a transparent rgba colour swatch"
+        assert mod.wrap_transparent(p).startswith(mod.RGBA_PROMPT_PREFIX)
+        assert mod.wrap_transparent(mod.wrap_transparent(p)) == mod.wrap_transparent(p)
+
+
+def test_an_oversized_sandbox_reference_is_refused_before_it_is_read(tmp_path):
+    """The reference read sits OUTSIDE the tool's try/except, so a MemoryError
+    on a huge file escaped the tool entirely — and the node rejects anything
+    over its cap anyway, after the bytes have crossed the LAN. Refuse first."""
+    from unittest.mock import MagicMock
+    import sys
+    sys.path.insert(0, str(REPO / "src"))
+    from ghost_agent.tools import image_gen as tool
+    big = tmp_path / "huge.png"
+    big.write_bytes(_PNG_1x1 + b"\0" * (tool.MAX_REFERENCE_BYTES + 1 - len(_PNG_1x1)))
+    llm = MagicMock()
+    llm.image_gen_clients = [{"x": 1}]
+    llm.generate_image = MagicMock()
+    out = asyncio.run(tool.tool_generate_image(prompt="x", llm_client=llm,
+                                               sandbox_dir=tmp_path,
+                                               reference_images=["huge.png"]))
+    assert out.startswith("ERROR") and "MB" in out, out
+    assert not llm.generate_image.called, "the node was called with an oversized reference"

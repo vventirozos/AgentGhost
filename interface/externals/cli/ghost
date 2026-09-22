@@ -66,6 +66,17 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
 
+import warnings
+
+# This process writes escape sequences and rendered frames to the terminal, so
+# a library DeprecationWarning is not a note — it is corruption printed into
+# the middle of the output (live 2026-09-22: Pillow's getdata warning landed
+# between an image reply and its sixel). Warnings are for the developer, not
+# for the person using the CLI; route them out of the frame. GHOST_CLI_WARN=1
+# restores them for debugging.
+if not os.environ.get("GHOST_CLI_WARN"):
+    warnings.simplefilter("ignore")
+
 import requests
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
@@ -714,7 +725,13 @@ def _render_sixel(data: bytes, name: str) -> bool:
     pal_img = img.quantize(colors=256)
     W, H = pal_img.size
     palette = pal_img.getpalette() or []
-    pix = list(pal_img.getdata())                  # flat, row-major
+    # `tobytes()`, NOT `getdata()`: for mode "P" the raw encoder yields one
+    # byte per pixel, row-major with no padding — byte-identical to the old
+    # list, without building a 400k-element Python list, and without the
+    # DeprecationWarning that Pillow 12 prints STRAIGHT INTO THE RENDERED
+    # OUTPUT (getdata is removed in Pillow 14). A warning here lands between
+    # the reply and the image and corrupts what the operator sees.
+    pix = pal_img.tobytes()                        # flat, row-major
     parts = [f"\x1bPq\"1;1;{W};{H}"]
     ncolors = max(pix) + 1 if pix else 1
     for i in range(ncolors):

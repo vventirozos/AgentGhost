@@ -1600,3 +1600,58 @@ class TestChrome:
         assert kw["complete_style"] == CompleteStyle.READLINE_LIKE
         assert kw["complete_while_typing"] is False
         assert kw["completer"] is cli.COMPLETER      # Tab still completes
+
+
+class TestRenderedOutputIsNotPollutedByWarnings:
+    """The CLI writes escape sequences and rendered frames to the terminal, so
+    a library warning is not a note — it is corruption printed into the middle
+    of what the operator sees. Live 2026-09-22: Pillow 12's
+    `Image.Image.getdata is deprecated` landed between an image reply and its
+    sixel, in the operator's session."""
+
+    def test_sixel_emits_no_warning_and_no_stderr(self, monkeypatch, capsys):
+        import io
+        import warnings as _w
+        Image = cli._pil()
+        if Image is None:
+            pytest.skip("Pillow not installed")
+        monkeypatch.delenv("TMUX", raising=False)
+        buf = io.BytesIO()
+        Image.new("RGB", (16, 12), (9, 40, 200)).save(buf, "PNG")
+        with _w.catch_warnings(record=True) as caught:
+            _w.simplefilter("always")             # defeat the module-level filter
+            assert cli._render_sixel(buf.getvalue(), "x.png")
+        assert [str(c.message) for c in caught] == [], "a warning reached the frame"
+        assert capsys.readouterr().err == ""
+
+    def test_tobytes_matches_what_getdata_returned(self):
+        Image = cli._pil()
+        if Image is None:
+            pytest.skip("Pillow not installed")
+        pal = Image.new("RGB", (7, 5), (30, 60, 90)).quantize(colors=256)
+        import warnings as _w
+        with _w.catch_warnings():
+            _w.simplefilter("ignore")
+            assert list(pal.tobytes()) == list(pal.getdata())
+
+    @pytest.mark.parametrize("env_val,expect_warning", [(None, False), ("1", True)])
+    def test_warnings_are_silenced_but_recoverable(self, env_val, expect_warning):
+        """Behavioural: import the CLI the way a shell does and see whether a
+        warning raised afterwards actually reaches stderr. GHOST_CLI_WARN=1
+        brings them back for whoever is debugging it."""
+        import subprocess
+        import sys as _sys
+        env = dict(os.environ)
+        env.pop("GHOST_CLI_WARN", None)
+        if env_val is not None:
+            env["GHOST_CLI_WARN"] = env_val
+        code = (
+            "import importlib.machinery, importlib.util, warnings, sys\n"
+            f"l = importlib.machinery.SourceFileLoader('g', {str(REPO_CLI)!r})\n"
+            "m = importlib.util.module_from_spec(importlib.util.spec_from_loader('g', l))\n"
+            "l.exec_module(m)\n"
+            "warnings.warn('probe', DeprecationWarning)\n"
+        )
+        r = subprocess.run([_sys.executable, "-c", code], capture_output=True,
+                           text=True, env=env, timeout=120)
+        assert ("probe" in r.stderr) is expect_warning, r.stderr[:300]

@@ -89,6 +89,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
@@ -126,6 +127,8 @@ DEFAULT_GUIDANCE = 1.0        # CFG-free is the model's default for T2I
 # new text and left the rest of the scene alone. There is no unconditional
 # branch to push away from at 1.0, so the edit has nothing to steer it.
 EDIT_GUIDANCE = 4.0
+MIN_GUIDANCE = 1.0            # below 1 is not "less guidance", it is unsupported
+MAX_GUIDANCE = 20.0
 MAX_VRAM_GIB = "4.5"          # sd-cli managed budget; at 768×512 the DiT stays monolithic
 GEN_TIMEOUT_S = 1500.0        # an edit (CFG × refs) runs ~11 min at 20 steps; 25 min is the hard stop
 # How long a queued request waits for the single GPU before 503. Sized against
@@ -135,17 +138,30 @@ GEN_TIMEOUT_S = 1500.0        # an edit (CFG × refs) runs ~11 min at 20 steps; 
 # window (400 + 660 + overhead < 1200). The old 180 s was ~4.5x a 40 s SD1.5
 # generation; kept literally, it now fails a request that only needed to wait
 # out one edit — the agent can and does issue two image calls in one turn.
-BUSY_WAIT_TIMEOUT = 400.0
-# MEASURED worst case, end to end, on this box: a 768x512 edit at 20 steps with
-# one reference (CFG on) = 654 s and 628 s across two runs, including model
-# streaming, the reference encode and the VAE decode. The 28 s/step already
-# includes CFG's two forwards — do not multiply by two again.
-WORST_GENERATION_S = 700.0
-CLIENT_TIMEOUT_S = 1200.0     # what core/llm.py gives the image pool; the bound above assumes it
+CLIENT_TIMEOUT_S = 1200.0     # what core/llm.py gives the image pool
+# MEASURED: a 768x512 edit is ~28 s/step (CFG's two forwards are already in
+# that number) plus ~95 s of fixed overhead — 20 steps came to 654 s and 628 s
+# across two runs, end to end. The worst case the node PERMITS is therefore an
+# edit at MAX_EDIT_STEPS, not at the default.
+EDIT_S_PER_STEP = 28.0
+GENERATION_OVERHEAD_S = 95.0
+WORST_GENERATION_S = MAX_EDIT_STEPS * EDIT_S_PER_STEP + GENERATION_OVERHEAD_S   # 935 s
+# ⚠ DERIVED, not chosen. A queued request must be able to wait out the worst
+# generation the node allows and STILL answer before the client gives up. The
+# previous hand-picked 400 s satisfied two pins that each passed alone —
+# `400 + 700 < 1200` and `30*28+95 < 1200` — while the case that actually
+# happens, a second image call queued behind a 30-step edit, is 400 + 935 =
+# 1335 s and blows the client's ceiling. Deriving it makes that impossible.
+BUSY_WAIT_TIMEOUT = max(60.0, CLIENT_TIMEOUT_S - WORST_GENERATION_S - 30.0)      # 235 s
 PREFLIGHT_SIZE = 256          # 1-step self-test at startup (~20 s incl. model streaming)
-# Editing: each reference adds its latent tokens to the DiT sequence. Measured
-# §4JV at 768×512: one ref → 14.2 s/step (2.4× plain) and 6.7 GB peak; two would
-# put 4608 tokens through a box where 4096 (1024²) already peaked at 6.7 GB.
+# Editing: each reference adds its latent tokens to the DiT sequence.
+# ⚠ ONE. Not a guess — §4JW measured the second: at 768×512 two references
+# OOM the DiT ("cannot make enough memory available on CUDA0: need 1604 MB /
+# available 1467 MB", segment 5/34) and, worse, they do it **after 921 s of
+# sampling** — a quarter-hour of the node's only GPU spent to produce a
+# failure. One reference at the same size peaks at 6.8 GB of 7.6 GB, so the
+# headroom for a second simply is not there. Raising this needs a smaller
+# render size, not optimism.
 MAX_REFERENCES = 1
 MAX_REFERENCE_BYTES = 12 * 1024 * 1024
 # The model's own RGBA recipe (model card): the prompt is wrapped, nothing else.
@@ -290,12 +306,20 @@ def resolve_seed(requested) -> int:
     so leaving this out was a silent regression. The resolved value goes back
     in the response, which is also what lets a caller re-roll the SAME seed
     with a tweaked prompt — the lossless alternative to an edit."""
+    _MAX = 2**31 - 1
     try:
         if requested is not None:
-            return int(requested)
+            n = int(requested)
+            # ⚠ NEGATIVE MEANS RANDOM to sd-cli ("use random seed for < 0"), so
+            # passing it through and then REPORTING it produced a seed that
+            # cannot reproduce its own image — and -1 is the usual way callers
+            # spell "surprise me". Draw a concrete one instead, so the number
+            # in the response is always the number that was rendered.
+            # Out-of-range positives would abort sd-cli's `stoll`; fold them in.
+            return secrets.randbelow(_MAX) if n < 0 else (n if n <= _MAX else n % _MAX)
     except (TypeError, ValueError):
         pass
-    return secrets.randbelow(2**31 - 1)
+    return secrets.randbelow(_MAX)
 
 
 def resolve_steps(requested, editing: bool) -> int:
@@ -314,8 +338,14 @@ def resolve_guidance(requested, editing: bool) -> float:
     edit (which does not follow its instruction without it)."""
     try:
         if requested is not None:
-            return float(requested)
-    except (TypeError, ValueError):
+            g = float(requested)
+            # json.loads accepts bare NaN/Infinity and pydantic passes them
+            # through, so `--cfg-scale nan` reached sd-cli and produced a
+            # full-length run of garbage — with the negative prompt silently
+            # dropped, since `nan > 1.0` is False. Bound it like steps.
+            if g == g and abs(g) != float("inf"):
+                return max(MIN_GUIDANCE, min(MAX_GUIDANCE, g))
+    except (TypeError, ValueError, OverflowError):
         pass
     return EDIT_GUIDANCE if editing else DEFAULT_GUIDANCE
 
@@ -324,7 +354,10 @@ def wrap_transparent(prompt: str) -> str:
     """Apply the model card's RGBA template once (idempotent on a prompt
     that already carries it)."""
     p = (prompt or "").strip()
-    if "rgba" in p.lower() and "transparent" in p.lower():
+    # Check for THIS template, not merely for the words: "a transparent rgba
+    # colour swatch" is an ordinary prompt and used to suppress the wrap
+    # entirely, making `transparent=true` a silent no-op.
+    if p.startswith(RGBA_PROMPT_PREFIX) and p.endswith(RGBA_PROMPT_SUFFIX):
         return p
     if p and p[-1] not in ".!?":
         p += "."
@@ -386,19 +419,48 @@ def fit_reference(data: bytes, width: int, height: int) -> bytes:
             buf = BytesIO()
             im.save(buf, format="PNG")
             return buf.getvalue()
+    except (MemoryError, RecursionError) as e:
+        # The pass-through exists for bytes sd-cli should judge. It must NOT
+        # cover the case this function exists to prevent: an image too big to
+        # decode here is exactly the one that OOMs the DiT ~15 minutes later.
+        raise ValueError(f"reference image is too large to process ({type(e).__name__})")
     except Exception as e:      # unreadable/unsupported: let sd-cli be the judge
+        if "DecompressionBomb" in type(e).__name__:
+            raise ValueError("reference image is a decompression bomb — refusing it")
         _log(f"WARN: could not resize reference ({type(e).__name__}: {e}) — passing it through")
         return data
 
 
 def png_size(data: bytes) -> "tuple[int, int] | None":
-    """(w, h) from a PNG IHDR, else None (an edit with no requested size
-    inherits its reference's shape)."""
+    """(w, h) from a PNG IHDR, else None. Dependency-free fast path."""
     if len(data) >= 24 and data.startswith(b"\x89PNG\r\n\x1a\n") and data[12:16] == b"IHDR":
         w, h = int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
         if w and h:
             return w, h
     return None
+
+
+def image_size(data: bytes) -> "tuple[int, int] | None":
+    """(w, h) of ANY supported reference — this is what gives an edit its shape.
+
+    ⚠ MUST NOT be PNG-only. It was, and the effect was invisible and bad: a
+    JPEG reference returned None, the node fell back to its 768x512 default,
+    and `fit_reference` then LANCZOS-squashed the photo into that box. Live
+    2026-09-22 the agent downloaded a 960x1264 PORTRAIT and the edit rendered
+    768x512 landscape — a 0.76 aspect crushed to 1.50, i.e. every JPEG edit
+    was drawn from a horizontally stretched face. JPEG is the common case
+    precisely because the tool tells the model to download photos.
+    """
+    px = png_size(data)
+    if px:
+        return px
+    try:
+        from PIL import Image
+        with Image.open(BytesIO(data)) as im:
+            w, h = im.size
+            return (w, h) if w and h else None
+    except Exception:      # unreadable → caller falls back to the default size
+        return None
 
 
 # --- sizing ---------------------------------------------------------------------
@@ -428,12 +490,17 @@ def _resolve_size(req: "ImageRequest", fallback: "tuple[int, int] | None" = None
         w, h = fallback
     if not w or not h:
         w, h = DEFAULT_WIDTH, DEFAULT_HEIGHT
-    w, h = max(1, int(w)), max(1, int(h))
+    # Bound BEFORE any arithmetic: a 400-digit width made `w / h` raise
+    # OverflowError out of an unwrapped call site — a 500 where a request this
+    # silly deserves a clamp. 1e6 is far past anything renderable.
+    w, h = max(1, min(int(w), 1_000_000)), max(1, min(int(h), 1_000_000))
     # Pick the closest LEGAL size instead of scaling and then clamping each
     # side on its own. ⚠ Independent clamping is what squashed extreme aspect
     # ratios: a 1200x3000 reference scaled to 396x991 and then clamped to
-    # 384x768 — a 25% aspect error — while the legal 320x768 (4%) sat right
-    # there. An edit inherits its reference's shape, so that squash would be
+    # 384x768 — a 25% aspect error — while the legal 256x640 (exact) sat right
+    # there. (256x640 is what the banded search below returns for that shape;
+    # 320x768 is 4.2% off and loses the band, at the cost of 60% of the pixel
+    # budget — the price of preferring aspect over area on extreme ratios.) An edit inherits its reference's shape, so that squash would be
     # visible in the result. Aspect first, then the closest area to what was
     # asked (capped at the budget, so an oversized request lands on the
     # largest legal size rather than a small one).
@@ -444,8 +511,17 @@ def _resolve_size(req: "ImageRequest", fallback: "tuple[int, int] | None" = None
     # resolution for a rounding artefact — 1920x1080 landed on 512x288
     # (147k px) because it is exactly 16:9, while 736x416 (0.5% off, 306k px)
     # was legal. Inside a band, the closest area to what was asked wins.
+    # ⚠ Compare aspects in LOG space. The plain relative error
+    # `|c_ar - target_ar| / target_ar` saturates at ~1.0 once the request is
+    # wider than the widest legal ratio (3:1), so every candidate fell into
+    # one band and the area tiebreak decided: a 100000x1 request came back
+    # 288x352 — PORTRAIT. A log ratio is symmetric (a 1x100000 request was
+    # always handled correctly) and never saturates.
+    import math
+    log_target = math.log(target_ar)
+    band = math.log(1.0 + ASPECT_BAND)
     return min(LEGAL_SIZES,
-               key=lambda c: (int((abs(c[0] / c[1] - target_ar) / target_ar) / ASPECT_BAND),
+               key=lambda c: (int(abs(math.log(c[0] / c[1]) - log_target) / band),
                               abs(c[0] * c[1] - target_area)))
 
 
@@ -529,8 +605,9 @@ def run_sd_cli(args: "list[str]", timeout: float = GEN_TIMEOUT_S) -> None:
     if not _drop_caches_now():
         _log("WARN: drop_caches unavailable (no passwordless sudo?) — running without it")
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True)
+                            text=True, errors="replace")
     sidecar = _spawn_sidecar(proc.pid)
+    out = ""
     try:
         out, _ = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -538,11 +615,33 @@ def run_sd_cli(args: "list[str]", timeout: float = GEN_TIMEOUT_S) -> None:
         out, _ = proc.communicate()
         raise RuntimeError(f"sd-cli timed out after {timeout:.0f}s")
     finally:
+        # ⚠ REAP sd-cli on EVERY path, not just the timeout. Only
+        # TimeoutExpired used to kill it, so any other exception here (a
+        # MemoryError accumulating stdout, a decode error) left sd-cli running
+        # with ~6.8 GB of the GPU while the endpoint's handler released
+        # `_gpu_lock` — the next request then ran concurrently, which is the
+        # NvMap `error 12` regime this whole module is built to avoid.
+        if proc.poll() is None:
+            try:
+                proc.kill()
+                proc.wait(timeout=10)
+            except Exception:       # noqa: BLE001 — best effort; never mask the original error
+                pass
+        # ⚠ The sidecar is `sudo`, i.e. a ROOT child of an unprivileged
+        # parent: `.kill()` raises PermissionError, and raising it from this
+        # `finally` replaced the return of a COMPLETED 15-minute generation
+        # with a 500. It exits on its own when sd-cli's pid disappears, so
+        # reaping it is best-effort by definition.
         if sidecar is not None:
             try:
                 sidecar.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                sidecar.kill()
+                try:
+                    sidecar.kill()
+                except Exception:   # noqa: BLE001 — EPERM on a root child
+                    pass
+            except Exception:       # noqa: BLE001
+                pass
     if proc.returncode != 0:
         tail = "\n".join((out or "").strip().splitlines()[-6:])
         raise RuntimeError(f"sd-cli exit {proc.returncode}: {tail}")
@@ -560,8 +659,11 @@ def _generate_png(prompt: str, width: int, height: int, steps: int, *,
     try:
         for i, data in enumerate(references or []):
             rp = OUT_DIR / f"ref_{tag}_{i}.png"
-            rp.write_bytes(fit_reference(data, width, height))
+            # Register BEFORE writing: a write that dies partway (ENOSPC) still
+            # created the file, and the cleanup below only knows what is in
+            # this list.
             ref_paths.append(rp)
+            rp.write_bytes(fit_reference(data, width, height))
         run_sd_cli(build_sd_cli_args(prompt, width, height, steps, out_path,
                                      seed=seed, guidance=guidance,
                                      negative_prompt=negative_prompt,
@@ -625,6 +727,50 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Jetson ImgGen Node (Qwen-Image-2.1)", lifespan=lifespan)
 
 
+#: A request body cannot exceed this. One reference at MAX_REFERENCE_BYTES is
+#: 12 MB raw, ~16 MB base64, plus the prompt — 24 MB is generous.
+MAX_BODY_BYTES = 24 * 1024 * 1024
+
+
+@app.middleware("http")
+async def _cap_request_body(request: Request, call_next):
+    """Refuse an oversized body BEFORE anything parses it.
+
+    ⚠ `_require_key` cannot defend this. `req: ImageRequest` is a body
+    parameter, so Starlette has already buffered the whole body, json.loads
+    has built a str from it and pydantic has copied it into the model —
+    several multiples of the payload resident — before the handler's first
+    line runs. On an 8 GB node that is an unauthenticated OOM: a LAN caller
+    with no key POSTs a 2 GB body and the OOM killer takes the unit. The
+    handler-level `MAX_REFERENCE_BYTES` check is also too late for the same
+    reason: it runs after `base64.b64decode` has allocated the decoded bytes.
+    The cap has to sit in front of parsing, which is what this is — modelled
+    on the agent's own `api/body_limit.py`, which exists for this exact
+    lesson. Content-Length is refused outright; a chunked body is counted as
+    it arrives.
+    """
+    if request.method in ("POST", "PUT", "PATCH"):
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > MAX_BODY_BYTES:
+            return JSONResponse({"detail": "request body too large"}, status_code=413)
+        if not declared:
+            received = 0
+            chunks = []
+            async for chunk in request.stream():
+                received += len(chunk)
+                if received > MAX_BODY_BYTES:
+                    return JSONResponse({"detail": "request body too large"},
+                                        status_code=413)
+                chunks.append(chunk)
+            body = b"".join(chunks)
+
+            async def _replay():            # hand the buffered body to the app
+                return {"type": "http.request", "body": body, "more_body": False}
+
+            request._receive = _replay      # noqa: SLF001 — the documented Starlette pattern
+    return await call_next(request)
+
+
 class ImageRequest(BaseModel):
     prompt: str
     negative_prompt: str = NEGATIVE_PROMPT_DEFAULT
@@ -674,7 +820,7 @@ async def generate_image(req: ImageRequest, request: Request):
         raise HTTPException(status_code=400, detail=str(e))
     if references and not Path(MMPROJ_PATH).exists():
         raise HTTPException(status_code=501, detail="editing unavailable: no vision projector on this node")
-    fallback = png_size(references[0]) if references else None
+    fallback = image_size(references[0]) if references else None
     width, height = _resolve_size(req, fallback)
     editing = bool(references)
     steps = resolve_steps(req.steps, editing)

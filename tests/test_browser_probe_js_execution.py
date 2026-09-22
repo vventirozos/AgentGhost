@@ -18,12 +18,32 @@ _RUNNER = (Path(__file__).resolve().parents[1] / "src" / "ghost_agent"
            / "tools" / "browser_runner.py").read_text(encoding="utf-8")
 
 
+def _arrow_from(func_name: str) -> str:
+    """The `() => {...}` arrow fn literal assigned inside ``func_name``.
+
+    ⚠ Scoped to ONE function on purpose. This used to be a file-wide regex
+    anchored on the literal js-assignment opener plus `return { pre_interaction`,
+    which silently spanned two functions the moment another JS probe was added
+    ABOVE this one — node then received the tail of one function plus the head
+    of the next and failed to parse. Locating the assignment inside the target
+    function's own AST cannot drift that way.
+    """
+    import ast
+    fn = next((n for n in ast.walk(ast.parse(_RUNNER))
+               if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef))
+               and n.name == func_name), None)
+    assert fn is not None, f"{func_name} not found in browser_runner.py"
+    for node in ast.walk(fn):
+        if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
+                and node.value.value.lstrip().startswith("()")):
+            return node.value.value
+    raise AssertionError(f"no arrow-fn JS literal assigned in {func_name}")
+
+
 def _probe_arrow() -> str:
     """The `() => {...}` arrow fn literal from _probe_pre_interaction."""
-    m = re.search(r'js = """(\(\) => \{.*?return \{ pre_interaction.*?\};?\s*)"""',
-                  _RUNNER, re.S)
-    assert m, "could not locate the probe arrow fn in browser_runner.py"
-    return m.group(1)
+    return _arrow_from("_probe_pre_interaction")
 
 
 def _run(elements):
@@ -95,3 +115,34 @@ def test_a_real_loading_screen_matches_but_download_words_do_not():
     for word in ("Downloading files", "Reloading page", "Uploading photo"):
         assert _run([{"text": word}])["pre_interaction"] is False, (
             f"{word!r} wrongly tripped the loading-screen detector")
+
+
+# ---------------------------------------------------------------- the class
+def test_no_embedded_js_literal_loses_its_escapes():
+    """R1 enumeration, not a one-site fix (§4JY).
+
+    `_probe_pre_interaction`'s JS was a NON-raw Python string, so the regex's
+    `\\b` word boundaries evaluated to U+0008 BACKSPACE and `\\bloading\\b`
+    could never match — the loading-screen false-positive the probe exists to
+    prevent. It survived because the test read the SOURCE TEXT (where the
+    backslash is still there) while production ran the evaluated string.
+
+    Any JS literal that Python has silently rewritten shows up as a control
+    character in the evaluated value. Walk every string constant in the runner
+    that looks like page JS and refuse them all.
+    """
+    import ast
+    bad = []
+    for node in ast.walk(ast.parse(_RUNNER)):
+        if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+            continue
+        v = node.value
+        if "=>" not in v and "document." not in v:      # not page JS
+            continue
+        ctrl = {c for c in v if ord(c) < 32 and c not in "\n\r\t"}
+        if ctrl:
+            bad.append((getattr(node, "lineno", "?"), sorted(hex(ord(c)) for c in ctrl)))
+    assert not bad, (
+        "embedded JS with Python-eaten escapes (use an r-string): "
+        f"{bad} — e.g. a regex \\\\b became a backspace, so it matches nothing"
+    )

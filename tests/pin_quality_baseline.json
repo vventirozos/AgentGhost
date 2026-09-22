@@ -2,15 +2,15 @@
   "_comment": "\u00a74GJ pin-quality ratchet. Source-TEXT pins (R4 hard-reject) per test file; regenerate DOWNWARD only, with `python tests/test_pin_quality_ratchet.py --write`. The slack ceiling is ALLOWED_SLACK in the module, not a key here.",
   "_migration": {
     "bootstrap": false,
-    "files_added": 1,
+    "files_added": 0,
     "files_lost": 0,
-    "files_that_grew": 7,
-    "files_that_shrank": 8,
-    "new_files": 261,
-    "new_total": 1348,
-    "previous_files": 260,
-    "previous_total": 1357,
-    "reason": "\u00a74GS 2026-09-14: decomposition step 4b split handle_chat's turn loop \u2014 the internal consumer moved into _run_internal_turn, so every source-inspecting pin that reads the turn loop now reads TWO functions (one getsource call became two, and the unit of this ratchet is the textual USE). 20 files, +20 uses, plus 1 for the new step's symtable free-name check. The suite did not gain a weak pin; the code it inspects moved."
+    "files_that_grew": 0,
+    "files_that_shrank": 0,
+    "new_files": 259,
+    "new_total": 1334,
+    "previous_files": 259,
+    "previous_total": 1334,
+    "reason": "\u00a74JY 2026-09-22: source-text pins converted to behavioural/executed ones \u2014 the browser probe JS extractor became AST-scoped (a file-wide regex spanned two functions once a second probe was added), and the CLI/image-gen pins that grepped source were rewritten to drive the code. Net: fewer textual pins, none lost in coverage (batteries 12/12 and 42/42 after the rewrite). \u26a0 RECORD PROVENANCE: the previous_*/grew/shrank fields above read as a no-op (1334\u21921334) because --write was run BEFORE --migrate, so the stamp describes the already-written tree. The TRUE transition this migration documents is 1348 textual pins across 261 files \u2192 1334 across 259 (the prior record's own new_total/new_files). The per-file breakdown of that step was not recoverable and has deliberately NOT been invented."
   },
   "per_file": {
     "test_4cs_loop_yield.py": 3,
@@ -62,7 +62,6 @@
     "test_bio_time_scale.py": 2,
     "test_boot_ready_ordering.py": 2,
     "test_browser_interact_evaluate.py": 1,
-    "test_browser_probe_js_execution.py": 1,
     "test_browser_service_proxy_bypass.py": 1,
     "test_browser_tool.py": 6,
     "test_browser_wallclock_ceiling.py": 2,
@@ -274,5 +273,5 @@
     "test_workspace_cleanup_deletion_guards.py": 1,
     "test_workspace_tidy.py": 3
   },
-  "total_textual": 1335
+  "total_textual": 1334
 }

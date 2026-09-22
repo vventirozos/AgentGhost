@@ -26,8 +26,11 @@ _DEFAULT_BUCKET: Tuple[int, int] = (768, 512)
 # the DiT on their latents, so each reference costs roughly one more image
 # of tokens, and an edit also runs CFG (two forwards per step, without which
 # the instruction is ignored entirely) — measured ~11 min at 768x512/20 steps.
-# The cap mirrors the node's MAX_REFERENCES (memory on the 8 GB Jetson).
+# The cap mirrors the node's MAX_REFERENCES. Measured §4JW: a second
+# reference at 768×512 OOMs the DiT after 921 s of sampling — the cap is what
+# stops the model spending a quarter-hour of GPU on a guaranteed failure.
 MAX_REFERENCES = 1
+MAX_REFERENCE_BYTES = 12 * 1024 * 1024   # mirrors the node's own cap
 _REF_KEYS = ("reference_images", "reference_image", "references", "input_image",
              "image_path", "source_image", "base_image")
 
@@ -52,23 +55,44 @@ def _resolve_reference(name, sandbox_dir) -> Path:
     for prefix in ("/api/download/", "api/download/"):
         if raw.startswith(prefix):
             raw = raw[len(prefix):]
-    from .file_system import project_download_prefix
-    dl = project_download_prefix(sandbox_dir)
-    if dl and raw.startswith(dl):
-        raw = raw[len(dl):]
+    # ⚠ ORDER MATTERS. The project prefix was stripped FIRST, so the absolute
+    # container spelling `execute` prints — /workspace/projects/<id>/gen_x.png —
+    # never matched it and resolved to <root>/projects/<id>/projects/<id>/…,
+    # i.e. "not found in the sandbox" for the one path every other tool heals.
+    # Strip the container root first, then the project prefix.
     for prefix in ("/sandbox/", "sandbox/", "/workspace/", "workspace/"):
         if raw.startswith(prefix):
             raw = raw[len(prefix):]
     raw = raw.lstrip("/")
+    from .file_system import project_download_prefix
+    dl = project_download_prefix(sandbox_dir)
+    if dl and raw.startswith(dl):
+        raw = raw[len(dl):]
+    raw = raw.lstrip("/")
     root = Path(sandbox_dir).resolve()
-    target = (root / raw).resolve()
-    try:
-        target.relative_to(root)
-    except ValueError:
-        raise ValueError(f"reference image {name!r} is outside the sandbox")
-    if not target.is_file():
-        raise ValueError(f"reference image {name!r} not found in the sandbox")
-    return target
+
+    # A downloaded file may sit under its PERCENT-ENCODED name while every
+    # readable reference to it uses the decoded one (or the reverse) — live
+    # §4JZ: `..._%28cropped%29.jpg` on disk, `...(cropped).jpg` in the model's
+    # hand, and the edit failed on "not found". Try both spellings before
+    # giving up; each candidate is containment-checked on its own, so a
+    # decoded `%2F` cannot walk out of the sandbox.
+    import urllib.parse as _up
+    candidates, seen = [], set()
+    for cand in (raw, _up.unquote(raw), _up.quote(raw, safe="/._-")):
+        if cand and cand not in seen:
+            seen.add(cand)
+            candidates.append(cand)
+
+    for cand in candidates:
+        target = (root / cand).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError:
+            raise ValueError(f"reference image {name!r} is outside the sandbox")
+        if target.is_file():
+            return target
+    raise ValueError(f"reference image {name!r} not found in the sandbox")
 
 
 def _snap_to_bucket(width: int, height: int) -> Tuple[Tuple[int, int], bool]:
@@ -167,14 +191,27 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
                     f"(got {len(refs_in)}). Pick the one that matters most.")
         for name in refs_in:
             try:
-                data = await asyncio.to_thread(_resolve_reference(name, sandbox_dir).read_bytes)
+                _ref_path = _resolve_reference(name, sandbox_dir)
+                # Bound the read: this block sits OUTSIDE the tool's
+                # try/except, so a MemoryError on a huge file (execute output
+                # is not size-capped) escaped the tool entirely — and the node
+                # rejects anything over 12 MB anyway, after it crossed the LAN.
+                _sz = await asyncio.to_thread(lambda p=_ref_path: p.stat().st_size)
+                if _sz > MAX_REFERENCE_BYTES:
+                    return (f"ERROR: reference image {name!r} is {_sz // (1024*1024)} MB; "
+                            f"the node accepts at most {MAX_REFERENCE_BYTES // (1024*1024)} MB. "
+                            f"Use a smaller image.")
+                data = await asyncio.to_thread(_ref_path.read_bytes)
             except ValueError as e:
                 return f"ERROR: {e}. Use the exact filename a previous image_generation result gave you (e.g. gen_1a2b3c4d.png)."
-            except OSError as e:
+            except (OSError, TypeError, MemoryError) as e:
                 # A name that resolves but cannot be READ (permissions, a dead
                 # symlink, a directory). This block sits OUTSIDE the tool's
                 # try/except, so without this the OSError escaped the tool
                 # entirely instead of becoming a result the model can act on.
+                # TypeError covers sandbox_dir=None (project_scoped_sandbox can
+                # return it); MemoryError covers a file that fits the cap but
+                # not this process.
                 return f"ERROR: cannot read reference image {name!r}: {e.__class__.__name__}."
             ref_bytes.append(data)
             ref_b64.append(base64.b64encode(data).decode("ascii"))
@@ -266,7 +303,7 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
                f"size if they asked for a specific one)" if snapped else "")
             + ("; edited from the reference image" if len(ref_b64) == 1 else
                f"; edited from {len(ref_b64)} reference images" if ref_b64 else "")
-            + ("; transparent background (PNG alpha)" if transparent else "")
+            + ("; NOTE: transparency was requested but this backend does not decode an alpha matte — the background will be opaque" if transparent else "")
             + ".\n\n"
             # The node picks a random seed when none was given and reports it.
             # ⚠ MEASURED, not assumed: re-running the same seed with a tweaked
