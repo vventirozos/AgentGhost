@@ -311,3 +311,57 @@ async def test_a_partial_scrub_with_no_retry_answer_still_carries_the_note_once(
     client, _, retries = await _drive([partial], retry_reply="Let me look into that further.")
     assert client.count(UNPARSED_TOOL_CALL_NOTE) == 1
 
+
+
+# ── §4JP (2026-09-21): the §4IG rule on the stream path ──────────────────
+
+_DEADLINE_LIVE_TURN = ("I've found the founding years for three of the four newspapers. I still need "
+                       "to search for Eleftherotypia's founding year to complete the summary."
+                       "\n\n<tool_call>\n<function=web_search>\n<parameter=query>Eleftherotypia founding"
+                       "</parameter>\n</function>\n</tool_call>")
+_DEADLINE_REPORT = ("Report: Naftemporiki 1924, Kathimerini 1919, To Vima 1922 (found); Eleftherotypia "
+                    "not searched — the client deadline stopped the work.")
+
+
+@pytest.mark.asyncio
+async def test_on_a_breaker_forced_final_a_tool_call_is_the_no_answer_on_the_stream_too():
+    """The first live client-deadline report (probe a3b3b65c): the report
+    turn streamed an assessment + "I still need to search…" + a search call;
+    neither trigger saw it (the sentence is not a beat) and the client got
+    the narration with a dropped-call note. FAILS IF: the stream path ignores
+    `_breaker_forced_final` — the §4IG rule the internal path has had."""
+    a_flag = {"set": True}
+    orig = make_stream_agent
+
+    def _agent_with_flag():
+        a = orig()
+        a.context._breaker_forced_final = True
+        return a
+    globals()["make_stream_agent"] = _agent_with_flag
+    try:
+        client, durable, retries = await _drive([_DEADLINE_LIVE_TURN], retry_reply=_DEADLINE_REPORT)
+    finally:
+        globals()["make_stream_agent"] = orig
+    assert len(retries) == 1
+    assert _DEADLINE_REPORT in client and _DEADLINE_REPORT in durable
+    assert "I still need to search" not in client.split(_DEADLINE_REPORT)[-1]
+
+
+@pytest.mark.asyncio
+async def test_without_the_breaker_flag_an_answer_plus_a_call_still_ships_unretried():
+    """The §4HF contract stands where no breaker closed the loop: a final that
+    ANSWERS and then tries one more call has answered."""
+    orig = make_stream_agent
+
+    def _agent_unarmed():
+        a = orig()
+        a.context._breaker_forced_final = False
+        return a
+    globals()["make_stream_agent"] = _agent_unarmed
+    try:
+        client, _, retries = await _drive([_ANSWER + "\n\n<tool_call>\n<function=web_search>\n"
+                                           "<parameter=query>x</parameter>\n</function>\n</tool_call>"],
+                                          retry_reply="SHOULD NOT APPEAR")
+    finally:
+        globals()["make_stream_agent"] = orig
+    assert retries == [] and "SHOULD NOT APPEAR" not in client

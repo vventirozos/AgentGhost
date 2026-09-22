@@ -5,7 +5,7 @@ Headless measurement had said why cube2 read flat: idle and busy were
 pixel-identical (lit 4.2% both), nested wireframes with nothing happening
 ON them. Each mechanism below is driven through the real ``animate()``
 under node (the §4JA harness) and read back from positions, line buffers,
-uniforms and ``getDebugState().cube2``:
+uniforms and ``getDebugState().tesseract``:
 
   1 ties        8 corner-to-corner lines between consecutive shells (by
                 depth), skipping the wrap pair — one tunnel, not frames
@@ -58,47 +58,47 @@ pytestmark = pytest.mark.skipif(shutil.which("node") is None, reason="node not o
 _SCENARIOS = {
     "mech": r"""
 import { face, tick, run, snapshot, lines, scene, maxOf, p95Of, emit } from './harness.mjs';
-face.setForm('cube2'); tick(300);
+face.setForm('tesseract'); tick(300);
 const d0 = face.getDebugState(); const sceneZ0 = scene.rotation.z;
-const rest = { lines: { ...d0.cube2.lines }, wob: d0.cube2.wob, spin: d0.cube2.kernelSpin,
+const rest = { lines: { ...d0.tesseract.lines }, wob: d0.tesseract.wob, spin: d0.tesseract.kernelSpin,
                uLineSweep: lines.material.uniforms.uLineSweep.value, reach: lines.material.uniforms.uSweepReach.value,
-               seedsMax: Math.max(...d0.cube2.seeds), twMax: Math.max(...d0.cube2.tw.map(Math.abs)) };
+               seedsMax: Math.max(...d0.tesseract.seeds), twMax: Math.max(...d0.tesseract.tw.map(Math.abs)) };
 const idle = run(1200);
-const spin1 = face.getDebugState().cube2.kernelSpin;
+const spin1 = face.getDebugState().tesseract.kernelSpin;
 const turn = run(900, { 0: () => { face.setUserTurn(true); face.setWorkingState(true); } });
 const dT = face.getDebugState();
-const twAbs = dT.cube2.tw.map(Math.abs);
+const twAbs = dT.tesseract.tw.map(Math.abs);
 const uv = lines.geometry.attributes.aLightPass.array; const bases = new Set();
 for (let e = 0; e < 12; e++) bases.add(Math.round(uv[(e * 6) * 2] * 1000) / 1000);
 face.noteToolCall(); tick(3);
 const dTool = face.getDebugState();
 const cornerSizesTool = snapshot().slice(0, 8).map(p => p.s);
 tick(400);
-face.noteVerdict('pass'); tick(5); const wobPass = face.getDebugState().cube2.wob;
-const pA = face.getDebugState().cube2; tick(60); const pB = face.getDebugState().cube2;
+face.noteVerdict('pass'); tick(5); const wobPass = face.getDebugState().tesseract.wob;
+const pA = face.getDebugState().tesseract; tick(60); const pB = face.getDebugState().tesseract;
 // the unwind ratio over the SAME shells (a shell born inside the window carries a fresh twist)
 let num = 0, den = 0; for (let k = 0; k < pA.tw.length; k++) { if (pB.d[k] > pA.d[k] && Math.abs(pA.tw[k]) > 0.02) { num += Math.abs(pB.tw[k]); den += Math.abs(pA.tw[k]); } }
 const twA = den, twB = num;
-tick(400); face.noteVerdict('refute'); let shudder = 0; for (let i = 0; i < 12; i++) { tick(1); shudder = Math.max(shudder, Math.abs(face.getDebugState().cube2.wob - rest.wob)); }
+tick(400); face.noteVerdict('refute'); let shudder = 0; for (let i = 0; i < 12; i++) { tick(1); shudder = Math.max(shudder, Math.abs(face.getDebugState().tesseract.wob - rest.wob)); }
 tick(400);
 face.setPhase('search'); tick(120); const sweepOn = lines.material.uniforms.uSweep.value; face.setPhase(null);
 face.setUserTurn(false); face.setWorkingState(false); face.noteVerdict('stop'); tick(600);
 const snap = snapshot(); let nan = 0; for (const p of snap) if (p && !Number.isFinite(p.x + p.y + p.z + p.s)) nan++;
 emit({ rest, idleP95: p95Of(idle), turnP95: p95Of(turn), turnMax: maxOf(turn),
-       spinIdleRate: (spin1 - d0.cube2.kernelSpin) / 20, spinTurnRate: (dT.cube2.kernelSpin - spin1) / 15,
+       spinIdleRate: (spin1 - d0.tesseract.kernelSpin) / 20, spinTurnRate: (dT.tesseract.kernelSpin - spin1) / 15,
        twMaxTurn: Math.max(...twAbs), twNonZero: twAbs.filter(t => t > 0.05).length,
-       seedsTurnMax: Math.max(...dT.cube2.seeds), edgePhaseBases: bases.size,
+       seedsTurnMax: Math.max(...dT.tesseract.seeds), edgePhaseBases: bases.size,
        flashTool: dTool.gaitFlash, cornerSizesTool, wobPass, twPassDecay: twB / Math.max(1e-9, twA), shudder,
        sweepOn, nan, wraps: turn.reduce((m, s) => m + s.wraps, 0), lines: lines.geometry.drawRange.count / 2,
-       kernelBase: d0.cube2.kernelBase, shells: d0.cube2.shells, kernelN: d0.cube2.kernelN,
-       stream: d0.cube2.stream, rollIdleRate: (face.getDebugState().cube2.roll - d0.cube2.roll) / ((1200 + 900 + 3 + 400 + 5 + 60 + 400 + 12 + 400 + 120 + 600) / 60),
+       kernelBase: d0.tesseract.kernelBase, shells: d0.tesseract.shells, kernelN: d0.tesseract.kernelN,
+       stream: d0.tesseract.stream, rollIdleRate: (face.getDebugState().tesseract.roll - d0.tesseract.roll) / ((1200 + 900 + 3 + 400 + 5 + 60 + 400 + 12 + 400 + 120 + 600) / 60),
        centerDim: lines.material.uniforms.uCenterDim.value,
-       sceneRoll: scene.rotation.z - sceneZ0, rollAcc: face.getDebugState().cube2.roll - d0.cube2.roll });
+       sceneRoll: scene.rotation.z - sceneZ0, rollAcc: face.getDebugState().tesseract.roll - d0.tesseract.roll });
 """,
     "stream": r"""
 import { face, tick, snapshot, emit } from './harness.mjs';
-face.setForm('cube2'); tick(300);
-const d = face.getDebugState().cube2; const kb = d.kernelBase, kn = d.kernelN * d.kernelN * d.kernelN;
+face.setForm('tesseract'); tick(300);
+const d = face.getDebugState().tesseract; const kb = d.kernelBase, kn = d.kernelN * d.kernelN * d.kernelN;
 const s0 = kb + kn, N = snapshot().length;                       // stream nodes follow the kernel
 const a = snapshot(); tick(30); const b = snapshot();
 let out = 0, inn = 0, seen = 0; const speeds = [];
@@ -112,14 +112,14 @@ emit({ streamNodes: N - s0, seen, out, inn, spreadRatio: speeds[Math.floor(speed
 """,
     "uptime": r"""
 import { face, tick, run, p95Of, maxOf, emit } from './harness.mjs';
-face.setForm('cube2'); tick(300);
+face.setForm('tesseract'); tick(300);
 const early = run(900);
 const hooks = {}; for (let f = 0; f < 28800; f += 120) hooks[f] = () => face.noteActivity(0.12, '#3a1750');
 run(28800, hooks);                                             // 8 minutes
 const late = run(900);
 const turn = run(300, { 0: () => { face.setUserTurn(true); face.setWorkingState(true); } });
-const tw = face.getDebugState().cube2.tw.map(Math.abs);
-emit({ earlyP95: p95Of(early), lateP95: p95Of(late), turnP95: p95Of(turn), turnMax: maxOf(turn), twMax: Math.max(...tw), spin: face.getDebugState().cube2.kernelSpin });
+const tw = face.getDebugState().tesseract.tw.map(Math.abs);
+emit({ earlyP95: p95Of(early), lateP95: p95Of(late), turnP95: p95Of(turn), turnMax: maxOf(turn), twMax: Math.max(...tw), spin: face.getDebugState().tesseract.kernelSpin });
 """,
     "other": r"""
 import { face, tick, lines, emit } from './harness.mjs';
@@ -236,5 +236,5 @@ def test_the_twist_does_not_grow_with_uptime(lab):
 def test_the_backup_drew_shell_edges_only(lab):
     """Negative control, executed: the pre-v2 face draws 11 shells × 72
     segments plus a proximity tangle — no ties, no rulings, no lattice."""
-    r = _run(lab["old"], "other", FACE_FORM="cube2")
+    r = _run(lab["old"], "other", FACE_FORM="tesseract")
     assert 11 * 72 <= r["lines"] < 11 * 72 + 200, r

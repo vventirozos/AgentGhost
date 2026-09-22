@@ -258,9 +258,9 @@ tick(F(6));
 const b = face.getDebugState();
 emit({ hz, immA: a.immersion, camA, immB: b.immersion, camB: camera.position.z, actB: b.activity, rotB: scene.rotation.y, clockB: b.clock, flowB: b.cube2Flow || 0 });
 """,
-    "cube2": r"""
+    "tesseract": r"""
 import { face, tick, run, snapshot, camera, lines, emit } from './harness.mjs';
-face.setForm('cube2'); tick(240);
+face.setForm('tesseract'); tick(240);
 const N = snapshot().filter(p => p && p.x < 9000).length;
 const idle = run(1800);
 const f0 = face.getDebugState().cube2Flow;
@@ -290,7 +290,7 @@ const form = face.getForm();
 tick(240);
 run(480, { 0: () => { face.setUserTurn(true); face.setWorkingState(true); } });
 const snap = snapshot();
-const idxs = form === 'descent' ? [225] : form === 'cube2' ? range(96, 123) : range(236, 250);   // kernel (v3: after 12 shells' corners) / bead / embers
+const idxs = form === 'descent' ? [225] : form === 'tesseract' ? range(96, 123) : range(236, 250);   // kernel (v3: after 12 shells' corners) / bead / embers
 const c = centroid(snap, idxs);
 const pr = project(toWorld(c));
 emit({ form, sx: pr.sx, sy: pr.sy, depth: pr.depth, camZ: camera.position.z, immersion: face.getDebugState().immersion,
@@ -381,7 +381,7 @@ def test_descent_tail_glides(lab):
 # D1 — frame-rate invariance (executed at 30 / 60 / 120 Hz)
 # ═══════════════════════════════════════════════════════════════════════════
 
-@pytest.mark.parametrize("form", ["cube", "cube2", "descent"])
+@pytest.mark.parametrize("form", ["cube", "tesseract", "descent"])
 def test_same_wall_clock_state_at_30_60_and_120hz(lab, form):
     rs = {hz: _run(lab["new"], "framerate", form, FACE_HZ=hz) for hz in (30, 60, 120)}
     # immersion/camera/activity are ease-driven; the scene heading is
@@ -435,7 +435,7 @@ def test_cube2_infinite_cube_contract(lab):
     the birth rate is the swallow (idle ≈ a shell per 4s, a user turn
     ≈ one per 0.7s, easing back after), the shells are drawn as explicit
     polylines (12 edges × 6 segments × shells) and the camera never moves."""
-    r = _run(lab["new"], "cube2", "cube2")
+    r = _run(lab["new"], "tesseract", "tesseract")
     assert r["visibleWraps"] == 0, r
     assert r["idleSpikes"] == 0, r
     assert 0.018 < r["idleRate"] < 0.035, r
@@ -447,7 +447,7 @@ def test_cube2_infinite_cube_contract(lab):
 
 
 def test_cube2_kernel_sits_on_the_view_axis(lab):
-    r = _run(lab["new"], "focus", "cube2")
+    r = _run(lab["new"], "focus", "tesseract")
     assert abs(r["sx"]) < 0.15 and abs(r["sy"]) < 0.15, r
     assert abs(r["camZ"] - 5.0) < 1e-9, r
     assert r["lines"] >= 20 * 144 + 54, r

@@ -112,7 +112,7 @@ class TestFacePureHelpers:
                      "fireIdleTwitch", "ghost_face_auto", "ghost_face_tune"):
             assert gone not in graph_nc, f"{gone} is back"
         m = re.search(r"const FORMS = \[(.*?)\];", graph_nc, re.DOTALL)
-        assert re.findall(r"'(\w+)'", m.group(1)) == ["cube", "cube2", "vortex", "descent", "empty"]
+        assert re.findall(r"'(\w+)'", m.group(1)) == ["cube", "tesseract", "vortex", "descent", "empty"]
 
 
 class TestFaceRenderWiring:
@@ -173,7 +173,7 @@ class TestFaceRenderWiring:
         i = graph_nc.rindex("    if (FORM === 'vortex') {", 0, j)
         chain = graph_nc[i:j]
         branches = re.findall(r"\} else if \(FORM === '(\w+)'\)", chain)
-        assert branches == ["cube2", "cube", "descent"], branches   # 2026-09-20 roster (+ the cube2 experiment)
+        assert branches == ["tesseract", "cube", "descent"], branches   # 2026-09-20 roster (+ the cube2 experiment)
         assert "} else if (FORM === 'empty')" not in chain, "empty is the trailing else now"
 
 
@@ -271,7 +271,7 @@ let _turnVerdict = null, _lastRecallAt = 0;
         assert 'id="face-tooltip"' not in html
         i = app_nc.index("const FACE_FORM_HINTS = {")
         hints = app_nc[i:app_nc.index("};", i)]
-        assert re.findall(r"(\w+): ", hints) == ["cube", "cube2", "vortex", "descent", "empty"]
+        assert re.findall(r"(\w+): ", hints) == ["cube", "tesseract", "vortex", "descent", "empty"]
         ws = strip_js_comments((_STATIC / "workspace.js").read_text(encoding="utf-8"))
         pal = strip_js_comments((_STATIC / "palette.js").read_text(encoding="utf-8"))
         assert "facelab" not in ws and "faceLab" not in ws and "faceLab" not in pal and "Face lab" not in pal
@@ -338,6 +338,6 @@ def test_touched_modules_bumped():
     index = (_STATIC / "index.html").read_text()
     app = (_STATIC / "app.js").read_text()
     ws = (_STATIC / "workspace.js").read_text()
-    assert "app.js?v=13.2" in index and "style.css?v=6.4" in index
-    assert "matrix_graph.js?v=13.2" in app and "workspace.js?v=8.6" in app
+    assert "app.js?v=13.3" in index and "style.css?v=6.4" in index
+    assert "matrix_graph.js?v=13.3" in app and "workspace.js?v=8.6" in app
     assert "status.js?v=7.4" in ws and "palette.js?v=7.2" in ws

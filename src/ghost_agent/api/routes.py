@@ -23,7 +23,8 @@ from starlette.background import BackgroundTask
 from ..utils.helpers import get_utc_timestamp
 from ..utils.helpers import env_positive
 import logging
-from ..utils.logging import Icons, pretty_log, ORIGIN_PROBE, PROBE_REQUEST_PREFIX, is_probe_request_id
+from ..utils.logging import (Icons, pretty_log, ORIGIN_PROBE, PROBE_REQUEST_PREFIX, is_probe_request_id,
+                             client_deadline_context)
 
 logger = logging.getLogger("GhostAgent")
 
@@ -1065,6 +1066,16 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                 str(request_id or "").strip() or uuid.uuid4().hex[:8])
         # (§4FF's `X-Ghost-Prompt-Variant` probe header was retired here on
         # 2026-09-21, §4JG — no prompt variant exists to select.)
+
+    # §4JP: the client's own timeout, when it says so (the web interface
+    # sends GHOST_CHAT_TIMEOUT). The turn loop reserves the last minutes of
+    # it for a state report instead of being cut mid-tool. Absent or
+    # malformed → 0.0 = no deadline (Slack, CLI, probes without the header).
+    try:
+        _cdl = float(request.headers.get("X-Ghost-Client-Timeout") or 0.0)
+    except (TypeError, ValueError):
+        _cdl = 0.0
+    client_deadline_context.set(_cdl if _cdl > 0 else 0.0)
 
     # ---- durable sessions (2026-07-11) --------------------------------
     # With `session_id`, the SERVER is the source of truth for history: the

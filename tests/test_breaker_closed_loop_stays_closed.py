@@ -102,8 +102,10 @@ def test_edit_churn_report_tier_raises_the_flag():
 def test_reserved_report_turn_raises_the_flag():
     tree = _tree(GhostAgent.handle_chat)
     bodies = _enclosing_bodies_with(tree, lambda s: _is_assign_to(s, "_report_turn_forced", True))
-    assert len(bodies) == 1
-    assert _assigns_flag(bodies[0], True)
+    # two report sites since 2026-09-21: the reserved last turn and the
+    # client-deadline report (§4JP) — each must arm the flag
+    assert len(bodies) == 2
+    assert all(_assigns_flag(b, True) for b in bodies)
 
 
 # ── the gate consults it, before the repair branch ────────────────────

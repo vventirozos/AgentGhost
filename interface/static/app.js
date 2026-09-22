@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=13.2';
+import * as matrixGraphFace from './matrix_graph.js?v=13.3';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -3233,7 +3233,7 @@ if (fullscreenBtn) {
 // predates getForms/setForm (stale cache).
 const FACE_FORM_HINTS = {
     cube: 'weight tensor',
-    cube2: 'infinite cube',
+    tesseract: 'infinite corridor',
     vortex: 'black hole',
     descent: 'loss landscape',
     empty: 'no face',

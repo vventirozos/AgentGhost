@@ -15,7 +15,7 @@ try:
     from curl_cffi import requests as curl_requests
 except ImportError:
     curl_requests = None
-from ..utils.logging import Icons, pretty_log
+from ..utils.logging import Icons, pretty_log, request_id_context
 from ..utils.helpers import request_new_tor_identity
 
 def _read_head(path: Path, max_bytes: int = 8192) -> bytes:
@@ -3684,6 +3684,35 @@ async def _write_replace_guarded(path: Path, prev_content: str, new_content: str
     return _text
 
 
+# §4JP (2026-09-21, req fd89fd6d): the model rewrote a 15–30 KB HTML file
+# from scratch SEVEN times in one request (126 KB generated, 90–256 s of
+# generation each — half of a 30-minute budget) while `replace` was used
+# twice. From the third full rewrite of a large existing file the success
+# line says so and names the cheaper operation. Per request, per path.
+REWRITE_HINT_AT = 3
+REWRITE_HINT_MIN_BYTES = 8000
+_REWRITES: "dict[tuple, int]" = {}
+_REWRITES_MAX = 512
+
+
+def note_full_rewrite(req_id: str, rel_path: str, prev_bytes: int) -> str:
+    """Count this full write of an EXISTING file of prev_bytes and return the
+    hint once the count reaches REWRITE_HINT_AT (and every time after)."""
+    if prev_bytes < REWRITE_HINT_MIN_BYTES:
+        return ""
+    key = (str(req_id or ""), str(rel_path))
+    if len(_REWRITES) >= _REWRITES_MAX and key not in _REWRITES:
+        for k in list(_REWRITES)[: _REWRITES_MAX // 4]:
+            _REWRITES.pop(k, None)
+    n = _REWRITES.get(key, 0) + 1
+    _REWRITES[key] = n
+    if n < REWRITE_HINT_AT:
+        return ""
+    return (f" NOTE: this is full rewrite #{n} of an existing {prev_bytes:,}-byte file in this request — "
+            "each rewrite regenerates the whole file (minutes of generation). For further changes use "
+            "operation='replace' with a SEARCH/REPLACE block of just the lines that change.")
+
+
 async def tool_write_file(filename: str, content: Any, sandbox_dir: Path):
     # Include the size so the log says HOW MUCH was written, not just the path
     # (a path-only line can't tell an empty write from a 40 KB one).
@@ -3758,6 +3787,10 @@ async def tool_write_file(filename: str, content: Any, sandbox_dir: Path):
                 except OSError:
                     pass
                 raise
+        try:
+            _prev_bytes = path.stat().st_size if path.exists() else -1
+        except OSError:
+            _prev_bytes = -1
         await asyncio.to_thread(_atomic_write)
         # Report the resolved sandbox-relative path so scripts running
         # in the container (cwd=/workspace) know exactly where to find
@@ -3771,10 +3804,11 @@ async def tool_write_file(filename: str, content: Any, sandbox_dir: Path):
             rel_str = str(filename)
         summary = _fixture_summary(content, ext)
         syntax_note = await _syntax_feedback(path, filename)
+        rewrite_note = note_full_rewrite(request_id_context.get() or "", rel_str, _prev_bytes) if _prev_bytes >= 0 else ""
         _text = (
             f"SUCCESS: Wrote {len(content)} chars to '{filename}'. "
             f"Script-side path (from sandbox cwd): '{rel_str}'."
-            f"{summary}{syntax_note}"
+            f"{summary}{syntax_note}{rewrite_note}"
         )
         if syntax_note:
             return ToolOutcome.partial(_text, world_changed=True,

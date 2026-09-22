@@ -336,6 +336,8 @@ Any claim that content renders is UNSUPPORTED by this screenshot…</code></pre>
     includes <code>/_ray/pow</code>. Corpus (September, 321 browser results): the new patterns hit exactly the five Hetzner results.
     Pinned in <code>tests/test_browser_blocked_page.py</code>.
   </p>
+  <h2 id="4jp">WebGL2 is available — and a page-side denial is flagged <span class="tag">2026-09-21 &sect;4JP</span></h2>
+  <p>Req <code>fd89fd6d</code>: the page printed "WebGL2 required", the model concluded the headless browser lacked WebGL2 and threw away a GPU renderer. Measured through this runner (proxy, loopback http, persistent profile): <code>canvas.getContext("webgl2")</code> is live — ANGLE on SwiftShader/Vulkan, software-rendered. The tool description now states it; <code>webgl_denial_note</code> appends a capability note to a navigate whose page text claims WebGL is missing/unsupported, pointing at the exceptions block above it. Pins: <code>tests/test_fd89fd6d_rewrite_hint_and_webgl_note_2026_09_21.py</code>.</p>
 </main>
 </body>
 </html>

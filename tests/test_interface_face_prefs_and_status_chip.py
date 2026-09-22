@@ -176,7 +176,11 @@ class TestPrefsRoutes:
 def _forms_js() -> str:
     m = re.search(r"const FORMS = \[(.*?)\];", _raw("matrix_graph.js"), re.DOTALL)
     assert m, "FORMS roster not found"
-    return f"const FORMS = [{m.group(1)}];\n"
+    # 2026-09-22: the resolver also reads FORM_ALIASES (a retired name that
+    # was RENAMED, not removed — `cube2` → `tesseract`).
+    a = re.search(r"const FORM_ALIASES = \{(.*?)\};", _raw("matrix_graph.js"), re.DOTALL)
+    aliases = f"const FORM_ALIASES = {{{a.group(1)}}};\n" if a else "const FORM_ALIASES = {};\n"
+    return f"const FORMS = [{m.group(1)}];\n" + aliases
 
 
 def _forms() -> list:
@@ -198,6 +202,8 @@ class TestBootPrecedence:
         # default (which IS the renamed lattice), never on a blank face.
         for retired in ("lattice", "embedding", "stack", "horizon"):
             assert eval_js(resolver, f"resolveInitialForm('{retired}', '{retired}', 'cube')") == "cube", retired
+        # …but a RENAMED form's old name resolves to its new one (2026-09-22)
+        assert eval_js(resolver, "resolveInitialForm('cube2', null, 'cube')") == "tesseract"
 
     def test_local_storage_is_the_fallback(self, resolver):
         for server_value in ("null", "undefined", "''", "'bogus'", "42", "{}"):
@@ -453,3 +459,4 @@ class TestStatusChip:
         assert out["first"]["title"].startswith("DEGRADED")
         assert out["degraded"] is False and out["title"] == "Live log"
         assert out["calls"] == ["/api/health", "/api/interface/health"] * 2, "tab-visible must re-poll"
+

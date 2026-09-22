@@ -128,8 +128,8 @@ class TestDialects:
     @pytest.mark.parametrize("form,anchor,needles", [
         ("vortex", "tunnelFlow += (dtF / 60) * (0.008", ["gaitFlow", "gaitThicken"]),
         ("cube", "const alignMul = 1.0 - TUNE.alignGain * gaitAlign;", ["alignMul", "gaitFlash", "gaitFlow"]),
-        ("cube2", "const wobBase = 0.07 * CALM * (1.0 - TUNE.alignGain * gaitAlign);", ["gaitFlash"]),
-        ("cube2-flow", "cube2Flow += (dtF / 60) * (0.020", ["gaitFlow"]),
+        ("tesseract", "const wobBase = 0.07 * CALM * (1.0 - TUNE.alignGain * gaitAlign);", ["gaitFlash"]),
+        ("tesseract-flow", "cube2Flow += (dtF / 60) * (0.020", ["gaitFlow"]),
         ("descent", "const lr = 1.6 * (0.55", ["gaitFlow"]),
     ])
     def test_each_branch_speaks_its_dialect(self, graph_nc, form, anchor, needles):

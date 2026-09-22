@@ -36,6 +36,7 @@ import logging
 import shlex
 from pathlib import Path
 import os
+import re
 import time
 from typing import Dict, Optional
 from urllib.parse import urlparse as _urlparse
@@ -761,6 +762,29 @@ def _format_js_diagnostics(parsed: dict) -> str:
     return ("\n" + "\n".join(out)) if out else ""
 
 
+# §4JP (2026-09-21, req fd89fd6d): the page printed "WebGL2 required", the
+# model believed it ("the headless browser doesn't support WebGL2"), threw
+# away a two-minute GPU rewrite and went back to a 3 FPS CPU renderer.
+# Measured in the sandbox through this very runner (proxy, loopback http,
+# the persistent profile): `canvas.getContext("webgl2")` is LIVE — ANGLE on
+# SwiftShader/Vulkan, software-rendered, slow but real. A page that says
+# WebGL is missing has failed on its own side (a shader that did not
+# compile, an exception in init — see the exceptions block); say so.
+_WEBGL_DENIAL_RE = re.compile(
+    r"webgl\s*2?\s*(?:is\s+)?(?:required|not\s+(?:supported|available)|unavailable|unsupported|missing|"
+    r"could\s+not\s+be\s+initiali[sz]ed|failed)", re.IGNORECASE)
+WEBGL_CAPABILITY_NOTE = (
+    "\nNOTE (browser capability): this headless browser DOES have WebGL2 — ANGLE on "
+    "SwiftShader (software rendering: slow, but real). The page's own check failed on the "
+    "page's side (a shader that did not compile, an exception in its init — see the "
+    "exceptions/console above); do not abandon a WebGL approach on this message alone.")
+
+
+def webgl_denial_note(page_text: str) -> str:
+    """The capability note when the page text claims WebGL is missing."""
+    return WEBGL_CAPABILITY_NOTE if _WEBGL_DENIAL_RE.search(page_text or "") else ""
+
+
 async def tool_browser(
     operation: str = None,
     url: Optional[str] = None,
@@ -1402,7 +1426,8 @@ async def tool_browser(
             return ""
         trunc = " (truncated)" if p.get("truncated") else ""
         return (f"\nLENGTH: {p.get('length')}{trunc}"
-                f"\n--- PAGE TEXT (capped preview) ---\n{text}")
+                f"\n--- PAGE TEXT (capped preview) ---\n{text}"
+                f"{webgl_denial_note(str(text))}")
 
     if operation == "navigate":
         return _declared(

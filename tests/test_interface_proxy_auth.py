@@ -55,8 +55,10 @@ async def test_chat_proxy_adds_auth_header_streaming(mock_client_class):
     assert kwargs["headers"]["X-Ghost-Key"] == server.GHOST_API_KEY
     # 2026-09-11: the proxy also mints the agent's request id and sends it
     # up front (contract: tests/test_interface_fix_first_2026_09_11.py);
-    # nothing else may ride along.
-    assert set(kwargs["headers"]) == {"X-Ghost-Key", "X-Request-ID"}
+    # 2026-09-21 (§4JP): and its own timeout, so the agent can reserve the
+    # last minutes for a state report; nothing else may ride along.
+    assert set(kwargs["headers"]) == {"X-Ghost-Key", "X-Request-ID", "X-Ghost-Client-Timeout"}
+    assert kwargs["headers"]["X-Ghost-Client-Timeout"] == str(int(server.CHAT_TIMEOUT_S))
 
 @pytest.mark.asyncio
 async def test_chat_proxy_adds_auth_header_non_streaming():
@@ -80,7 +82,8 @@ async def test_chat_proxy_adds_auth_header_non_streaming():
     mock_client.post.assert_called_once()
     args, kwargs = mock_client.post.call_args
     assert "headers" in kwargs
-    assert kwargs["headers"] == {"X-Ghost-Key": server.GHOST_API_KEY}
+    assert kwargs["headers"] == {"X-Ghost-Key": server.GHOST_API_KEY,
+                                 "X-Ghost-Client-Timeout": str(int(server.CHAT_TIMEOUT_S))}   # §4JP
 
 @pytest.mark.asyncio
 async def test_upload_proxy_adds_auth_header():

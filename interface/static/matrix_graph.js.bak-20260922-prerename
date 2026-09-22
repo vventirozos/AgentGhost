@@ -279,13 +279,7 @@ const CALM = PREFERS_REDUCED_MOTION ? 0.35 : 1.0;
 // name `cube` and became the default.
 // The header's form button opens a picker built from this roster; the
 // choice persists (server-side + localStorage).
-// `tesseract` (2026-09-22) is the form built as `cube2` on 2026-09-20/21 —
-// the infinite corridor of nested frames, kernel lattice, stream and roll;
-// the operator kept it and asked for a name of its own. The engine's
-// internals keep their cube2/C2 names; the stored pick "cube2" resolves to
-// it (FORM_ALIASES).
-const FORMS = ['cube', 'tesseract', 'vortex', 'descent', 'empty'];
-const FORM_ALIASES = { cube2: 'tesseract' };
+const FORMS = ['cube', 'cube2', 'vortex', 'descent', 'empty'];
 // Default form: CUBE (operator pick, 2026-09-20; vortex was the default
 // from 2026-07-28). The form the operator last picked overrides it —
 // resolved by `resolveInitialForm` below; a stored name that left the
@@ -309,8 +303,7 @@ let formIndex = FORMS.indexOf('cube');
 // exported so the precedence is EXECUTED under node
 // (tests/test_interface_face_prefs_and_status_chip.py), not read.
 export function resolveInitialForm(serverForm, storedForm, fallback) {
-    for (const raw of [serverForm, storedForm]) {
-        const candidate = (typeof raw === 'string' && FORM_ALIASES[raw]) ? FORM_ALIASES[raw] : raw;
+    for (const candidate of [serverForm, storedForm]) {
         if (typeof candidate === 'string' && FORMS.indexOf(candidate) >= 0) return candidate;
     }
     return fallback;
@@ -447,7 +440,7 @@ export const DIALECT_VALUES = Object.freeze({
 });
 export const DIALECTS = Object.freeze({
     cube:         { radialAxis: 'none', search: 'plane', read: 'settle',   tool: 'flash',  write: 'flow', verify: 'align' },
-    tesseract:    { radialAxis: 'none', search: 'ring',  read: 'settle',   tool: 'flash',  write: 'flow', verify: 'align' },
+    cube2:        { radialAxis: 'none', search: 'ring',  read: 'settle',   tool: 'flash',  write: 'flow', verify: 'align' },
     vortex:       { radialAxis: 'none', search: 'ring',  read: 'thicken',  tool: 'kick',   write: 'flow', verify: 'still' },
     descent:      { radialAxis: 'y',    search: 'plane', read: 'settle',   tool: 'kick',   write: 'flow', verify: 'still' },
     empty:        { radialAxis: 'none', search: 'sweep', read: 'settle',   tool: 'kick',   write: 'wave', verify: 'still' },
@@ -872,7 +865,7 @@ function _buildAnatomy() {
     _noProx.fill(0);
     const f = FORMS[formIndex];
     if (f === 'cube') _buildCube();
-    else if (f === 'tesseract') _buildCube2();
+    else if (f === 'cube2') _buildCube2();
     else if (f === 'descent') _buildDescent();
     else if (f === 'empty') _buildEmpty();
     else _buildVortex();
@@ -1644,7 +1637,7 @@ export function getDebugState() {
         dialect: dialectFor(FORMS[formIndex]), gaitFlow, gaitThicken, gaitFlash, gaitAlign,
         dtF, clock: time, cubeRunnerFlow, cube2Flow, cube2Travel, twitchAmp,
         vortexSpin, linkBudget: _linkBudget, maxLines: MAX_LINES,
-        tesseract: { lines: { ..._c2LineStats }, kernelSpin: c2KernelSpin, wob: _c2Wob,
+        cube2: { lines: { ..._c2LineStats }, kernelSpin: c2KernelSpin, wob: _c2Wob,
                  tw: _c2Shells.map((sh) => sh.tw), d: _c2Shells.map((sh) => sh.d),
                  seeds: _c2Shells.map((sh) => sh.seed), kernelBase: _c2KernelBase,
                  shells: C2_SHELLS, kernelN: C2_KERNEL_N, stream: _c2StreamCount, roll: c2Roll },
@@ -1996,7 +1989,7 @@ function animate(ts) {
     // proximity thickening. The scene swell was already neutralised for
     // them; these five couplings were not (measured 2026-09-21: vortex
     // mean brightness FELL on a user turn, 6.6 → 6.3).
-    const camDive = (FORM === 'vortex' || FORM === 'tesseract' || FORM === 'empty') ? 0.0 : dive;
+    const camDive = (FORM === 'vortex' || FORM === 'cube2' || FORM === 'empty') ? 0.0 : dive;
 
     // Vortex engagement + flow (see the vortexTravel declaration).
     // Engagement eases up while a user turn runs and eases back down on
@@ -2041,7 +2034,7 @@ function animate(ts) {
     // the swallow. Idle ≈ a new shell every ~4.5s; a user turn ≈ every
     // 0.7s, gulping in rhythm with the pulse; completion is a pure
     // intensity morph (no reset, no camera travel).
-    if (FORM === 'tesseract') {
+    if (FORM === 'cube2') {
         if (userTurnState > 0.5) {
             cube2Travel += (IMMERSION_CAP - cube2Travel) * ease(0.010);
         } else if (cube2Travel > 0.001) {
@@ -2095,7 +2088,7 @@ function animate(ts) {
     // background breath is a second, slower rhythm under everything.
     const exhale = verdict === 'stop' ? TUNE.exhale * Math.sin(Math.PI * (1.0 - verdictEnv)) * verdictEnv : 0;
     const bgBreath = TUNE.bgBreath * backgroundBusy * Math.sin(time * 0.31 + 0.9);
-    const sceneScale = ((FORM === 'vortex' || FORM === 'tesseract') ? 0.9 * breathe
+    const sceneScale = ((FORM === 'vortex' || FORM === 'cube2') ? 0.9 * breathe
         : FORM === 'cube' ? 0.9 * breathe * (1.0 + dive * 0.18)
         : baseScale) * (1.0 + exhale + bgBreath);
     scene.scale.set(sceneScale, sceneScale, sceneScale);
@@ -2113,7 +2106,7 @@ function animate(ts) {
             scene.rotation.z = vortexSpin * 0.22;
             scene.position.x = 0.05 * Math.sin(time * 0.031);
             scene.position.y = _bob * 0.5;
-        } else if (FORM === 'cube' || FORM === 'tesseract') {
+        } else if (FORM === 'cube' || FORM === 'cube2') {
             // Cube: near-still heading — its OWN slow tumble is the
             // motion. The full heading wander compounded with the
             // focus-translation release into an "erratic zoom-out" (the
@@ -2123,7 +2116,7 @@ function animate(ts) {
             scene.rotation.y = 0.09 * Math.sin(time * 0.029);
             scene.rotation.x = 0.05 * Math.sin(time * 0.021 + 0.7);
             scene.rotation.z = 0.02 * Math.sin(time * 0.017 + 2.0)
-                + (FORM === 'tesseract' ? c2Roll : 0.0);        // v3: the corridor's slow roll
+                + (FORM === 'cube2' ? c2Roll : 0.0);        // v3: the corridor's slow roll
             scene.position.x = 0.04 * Math.sin(time * 0.023);
             scene.position.y = _bob * 0.4;
         } else {
@@ -2152,7 +2145,7 @@ function animate(ts) {
         camera.position.z = CAMERA_REST_Z;
         camera.lookAt(camera.position.x * 0.35, camera.position.y * 0.35,
             VORTEX_APEX_Z);
-    } else if (FORM === 'tesseract') {
+    } else if (FORM === 'cube2') {
         // cube2: the camera never moves either — the shells' outward
         // bloom is the fall; it studies the kernel at the origin.
         camera.position.z = CAMERA_REST_Z;
@@ -2295,7 +2288,7 @@ function animate(ts) {
             }
         }
         instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
-    } else if (FORM === 'tesseract') {
+    } else if (FORM === 'cube2') {
         // ── CUBE2 (v2): the kernel lattice tumbles on its integrated spin;
         //    each shell's frame (phase → size, twist = stack twist + the
         //    inherited kernel angle unwinding, breath, wobble, birth-pull,
@@ -2639,7 +2632,7 @@ function animate(ts) {
     // cube2 draws its shells as explicit polylines (a wireframe cube's
     // edges span far more than any proximity radius at the outer
     // scales); those nodes are skipped by the O(n²) pass below.
-    if (FORM === 'tesseract') {
+    if (FORM === 'cube2') {
         lineIdx = _emitCube2Edges(linePosAttr, lineUvAttr, lineHueAttr, lineFadeAttr, connected, lineIdx);
     }
 
@@ -2656,7 +2649,7 @@ function animate(ts) {
     const LINK_MULT = {
         vortex: 1.5,
         cube: 0.45,
-        tesseract: 0.35,  // nothing links by proximity here (explicit edges); kept for the table's completeness
+        cube2: 0.35,      // only the kernel tangle links by proximity
         // Descent radius must cover a grid step across the WORST-CASE
         // analytic slope of _lossH (all terms aligned), or the sheet
         // tears momentarily on steep ridges — computed invariant pinned
@@ -2778,7 +2771,7 @@ function animate(ts) {
     // the hue wave/drift so its center stays anchored DARK RED instead
     // of swinging through the plum stop ("bright purple" report).
     // cube2 v3: the kernel IS the hot focal point — no centre dim there.
-    const centerDim = FORM === 'vortex' ? 0.85 : (FORM === 'tesseract' ? 0.0 : 0.30);
+    const centerDim = FORM === 'vortex' ? 0.85 : (FORM === 'cube2' ? 0.0 : 0.30);
     const centerXY = FORM === 'vortex' ? 1.0 : 0.0;
     const waveAmp = FORM === 'vortex' ? 0.3 : 1.0;
     // Mood rides the drift as a slow baseline (cold-pole shift only;
@@ -2814,7 +2807,7 @@ function animate(ts) {
     nUniforms.uSweepMode.value = DIAL.search === 'plane' ? 1.0 : (DIAL.search === 'ring' ? 2.0 : 0.0);
     nUniforms.uSweepHeat.value = TUNE.sweepHeat;
     // The ring scan reaches the whole stack in cube2 (shells grow to ~8).
-    const sweepReach = FORM === 'tesseract' ? 7.0 : 2.4;
+    const sweepReach = FORM === 'cube2' ? 7.0 : 2.4;
     nUniforms.uSweepReach.value = sweepReach;
     nUniforms.uAccentStrength.value = accentStrength;
     nUniforms.uHueDrift.value = hueDriftOut;
@@ -2835,7 +2828,7 @@ function animate(ts) {
     lUniforms.uSweepAngle.value = sweepAngle;
     lUniforms.uSweepHeat.value = TUNE.sweepHeat;
     lUniforms.uSweepReach.value = sweepReach;
-    lUniforms.uLineSweep.value = FORM === 'tesseract' ? 1.0 : 0.0;
+    lUniforms.uLineSweep.value = FORM === 'cube2' ? 1.0 : 0.0;
 
     // Interior motes: only rendered while actually diving — and never
     // for the empty form (a dive there would summon motes out of a

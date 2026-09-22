@@ -1524,7 +1524,13 @@ async def chat_proxy(request: Request):
                 if t is None:
                     return
                 try:
-                    _up_headers = {"X-Ghost-Key": GHOST_API_KEY}
+                    # §4JP: the agent budgets its turn loop toward the client's
+                    # deadline — it reserves the last minutes for a state report
+                    # instead of being cut mid-tool at CHAT_TIMEOUT_S (req fd89fd6d:
+                    # 30 min of work, a 60 s sleep started with 61 s left, and the
+                    # stitched narration delivered as the reply).
+                    _up_headers = {"X-Ghost-Key": GHOST_API_KEY,
+                                   "X-Ghost-Client-Timeout": str(int(CHAT_TIMEOUT_S))}
                     if t.get("request_id"):
                         _up_headers["X-Request-ID"] = t["request_id"]
                     async with client.stream("POST", "http://localhost:8000/api/chat", json=payload, headers=_up_headers, timeout=_chat_timeout()) as response:
@@ -1657,7 +1663,8 @@ async def chat_proxy(request: Request):
             response = await client.post(
                 "http://localhost:8000/api/chat",
                 json=body,
-                headers={"X-Ghost-Key": GHOST_API_KEY},
+                headers={"X-Ghost-Key": GHOST_API_KEY,
+                         "X-Ghost-Client-Timeout": str(int(CHAT_TIMEOUT_S))},   # §4JP
                 timeout=_chat_timeout(),
             )
             # Propagate the upstream status — returning the body with an

@@ -1592,7 +1592,10 @@ class TestProducerParserParity:
     #  path heuristic is a guess about someone else's source, and a tripwire
     #  is what a guess deserves.
     EXPECTED_SITES = 13
-    EXPECTED_SLOT_COUNTS = [1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 4]
+    # 2026-09-21 (§4JP): the write site's message gained `{rewrite_note}` —
+    # a hint, not a path; the renderer's heuristic counts it as a slot. The
+    # ledger's captures were re-checked (the parity assertions below pass).
+    EXPECTED_SLOT_COUNTS = [1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 5]
 
     def _rendered_messages(self):
         """Every `SUCCESS:` message tools/file_system.py can emit, rendered.

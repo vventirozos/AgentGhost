@@ -25,6 +25,11 @@ request_id_context = contextvars.ContextVar("request_id", default="SYSTEM")
 # text itself still comes from the explicit `origin=` argument, so the
 # liveness `origin=` stamp readers see nothing new.
 request_origin_context = contextvars.ContextVar("request_origin", default="")
+#: §4JP: how many seconds the CLIENT will wait for this request before it
+#: closes the connection (the web interface's GHOST_CHAT_TIMEOUT, sent as
+#: `X-Ghost-Client-Timeout`); 0.0 = unknown / no deadline. The turn loop
+#: reserves the last minutes for a state report (`request_remaining_s`).
+client_deadline_context = contextvars.ContextVar("client_deadline_s", default=0.0)
 
 # §4FB (2026-09-06): a DIAGNOSTIC request — an operator/Claude probe sent
 # through the live user path to exercise it. It must run exactly like a user
@@ -340,6 +345,21 @@ def _req_started(req_id: str) -> Optional[float]:
     with _REQ_STATE_LOCK:
         s = _REQ_STATE.get(req_id)
         return s["started"] if s else None
+
+
+def request_remaining_s(req_id: str) -> Optional[float]:
+    """Seconds until the client's deadline for this request, or ``None``
+    when no deadline is known (no header, or the request isn't tracked)."""
+    try:
+        deadline = float(client_deadline_context.get() or 0.0)
+    except Exception:  # noqa: BLE001
+        deadline = 0.0
+    if deadline <= 0:
+        return None
+    elapsed = request_elapsed_s(req_id)
+    if elapsed is None:
+        return None
+    return deadline - elapsed
 
 
 def request_elapsed_s(req_id: str) -> Optional[float]:

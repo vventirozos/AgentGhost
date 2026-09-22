@@ -1225,7 +1225,10 @@ class TestTheRunnerIsARealFileNotAString:
         # matched its own explanation.
         assert "\nasync def op_navigate(op):" not in src, (
             "the runner source is inline in browser.py again")
-        assert len(src.splitlines()) < 1600, (
+        # 1600 → 1650 on 2026-09-21: §4JP added the WebGL capability note
+        # (~25 lines of tool code, not runner code — the runner is still a
+        # file of its own, pinned by the assertion above).
+        assert len(src.splitlines()) < 1650, (
             "browser.py grew back toward its pre-extraction size")
 
     def test_the_module_scope_is_now_UNAMBIGUOUS(self):

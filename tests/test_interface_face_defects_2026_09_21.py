@@ -139,7 +139,7 @@ def test_the_backup_is_capped_most_of_the_read_turn(lab):
 
 # ── F3: camera-static forms opt out of the dive couplings ─────────────
 
-@pytest.mark.parametrize("form", ["vortex", "cube2"])
+@pytest.mark.parametrize("form", ["vortex", "tesseract"])
 def test_a_static_camera_form_gets_no_dive_dim_and_a_brighter_busy_state(lab, form):
     r = _run(lab["new"], "camdive", FACE_FORM=form)
     assert r["immersion"] > 0.8, r                          # the turn engaged (the dive VALUE still rises)

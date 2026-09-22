@@ -360,6 +360,8 @@ SyntaxError: Unexpected identifier 't'</pre>
 
   <h2 id="4hc-find">`find path="*.md"` means pattern="*.md" <span class="tag">2026-09-15 &sect;4HC</span></h2>
   <p>All 7 corpus rejections for a missing <code>pattern</code> had the glob in <code>path</code>. A literal directory is never spelled with <code>*</code> or <code>?</code>, so the glob is read as the pattern and the directory as the root; a plain directory with no pattern is still rejected — guessing one would be an invention. Covered by <code>tests/test_file_system_find_glob_path.py</code>.</p>
+  <h2 id="4jp">The rewrite hint <span class="tag">2026-09-21 &sect;4JP</span></h2>
+  <p>Req <code>fd89fd6d</code> rewrote a 15–30 KB file from scratch seven times in one request (126 KB generated, ~15 of its 30 minutes) while <code>replace</code> was used twice. <code>note_full_rewrite</code> counts full writes of an existing file ≥ <code>REWRITE_HINT_MIN_BYTES</code> (8,000) per request and path; from <code>REWRITE_HINT_AT</code> (3) the success line says so and names <code>operation='replace'</code>. Small files, first writes and other requests never count. Pins: <code>tests/test_fd89fd6d_rewrite_hint_and_webgl_note_2026_09_21.py</code>.</p>
 </main>
 </body>
 </html>

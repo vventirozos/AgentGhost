@@ -4241,6 +4241,51 @@ def request_checkpoint_namespace(req_id) -> str:
     return f"req:{str(req_id or '').strip() or 'anon'}"
 
 
+#: §4JP: seconds before the CLIENT's deadline at which the loop stops
+#: issuing tool turns and forces the state report (a report turn on the
+#: main model runs ~10–60 s, its no-answer retry the same; 150 s leaves
+#: both room). Req fd89fd6d: the web interface's 1800 s timeout cut a
+#: 35-turn build mid-`sleep 60000` with 61 s left, and the reply that landed
+#: was the stitched working narration.
+DEADLINE_REPORT_FLOOR_S = 150.0
+
+
+def deadline_needs_report(remaining_s, floor_s: float, force_final_response, force_stop) -> bool:
+    """True when the client's deadline is known and within ``floor_s`` on a
+    request still running tools — the remaining time must go to a report."""
+    try:
+        if remaining_s is None or force_final_response or force_stop:
+            return False
+        return float(remaining_s) <= float(floor_s)
+    except (TypeError, ValueError):
+        return False
+
+
+def declared_wait_s(fname: str, t_args) -> float:
+    """How long a tool call DECLARES it will wait, in seconds — the browser's
+    `sleep` / `settle_ms` actions (the fd89fd6d sleep). Unknown → 0."""
+    try:
+        if fname != "browser" or not isinstance(t_args, dict):
+            return 0.0
+        total = float(t_args.get("settle_ms") or 0) / 1000.0
+        for a in (t_args.get("actions") or []):
+            if isinstance(a, dict) and str(a.get("action") or "").lower() == "sleep":
+                total += float(a.get("ms") or 0) / 1000.0
+        return max(0.0, total)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def wait_crosses_deadline(wait_s: float, remaining_s, floor_s: float) -> bool:
+    """A declared wait that would end inside the report floor (or past the
+    deadline) is refused before it runs."""
+    try:
+        return (remaining_s is not None and float(wait_s) > 0
+                and float(wait_s) > float(remaining_s) - float(floor_s))
+    except (TypeError, ValueError):
+        return False
+
+
 def last_turn_needs_report(turn: int, max_turns: int, force_final_response,
                            force_stop) -> bool:
     """True on the final budget turn of a request that is still running
@@ -18264,6 +18309,26 @@ class GhostAgent:
                     # `last_was_failure` are deliberately untouched. A
                     # deliberate steer that counted as a strike would
                     # spend the turn's error budget on its own advice.
+                    # §4JP: a declared wait that would run into the client's
+                    # report floor is not run — the same synthetic-rejection
+                    # shape as the pre-flight steer, not a strike.
+                    _dl_remaining = _glog.request_remaining_s(request_id_context.get() or "")
+                    _dl_wait = declared_wait_s(fname, t_args)
+                    if wait_crosses_deadline(_dl_wait, _dl_remaining, DEADLINE_REPORT_FLOOR_S):
+                        _dl_note = (
+                            f"SYSTEM PREFLIGHT — deadline: this call was NOT run. It declares a "
+                            f"{_dl_wait:.0f} s wait but the client closes its connection in about "
+                            f"{int(max(0.0, _dl_remaining))} s and the last {int(DEADLINE_REPORT_FLOOR_S)} s are "
+                            "reserved for your report. Do not wait: report what exists now (files, "
+                            "URLs, what remains) or take an action that returns immediately.")
+                        pretty_log("Client Deadline",
+                                   f"{fname}: refused a {_dl_wait:.0f}s wait with {_dl_remaining:.0f}s remaining",
+                                   level="WARNING", icon=Icons.STOP)
+                        _dl_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname,
+                                   "content": _TO.rejected(_dl_note, reason_code="deadline_wait")}
+                        messages.append(_dl_msg)
+                        tools_run_this_turn.append({**_dl_msg, "_synthetic": True})
+                        continue
                     _im_note = self._imagine_preflight_note(
                         fname, t_args, a_hash,
                         request_id_context.get() or "")
@@ -24867,6 +24932,14 @@ class GhostAgent:
                 char_budget = int(self.context.args.max_context * 3.5)
                 pretty_log("Request Initialized", special_marker="BEGIN",
                            origin=_turn_origin)
+                # §4JP: say on the turn's first lines whether a client deadline
+                # is known — the live evidence that the header made it here.
+                _cdl = float(_glog.client_deadline_context.get() or 0.0)
+                if _cdl > 0:
+                    pretty_log("Client Deadline",
+                               f"the client closes its connection after {_cdl:.0f}s — "
+                               f"the last {DEADLINE_REPORT_FLOOR_S:.0f}s are the report's",
+                               icon=Icons.WARN, level="INFO")
                 messages, model, stream_response = body.get("messages", []), body.get("model", "qwen-3.6-35b-a3"), body.get("stream", False)
 
                 # Pre-allocate the trajectory id for THIS turn. Several
@@ -26187,6 +26260,28 @@ class GhostAgent:
                             "turn budget",
                             f"this is your last turn ({turn + 1} of {effective_max_turns}) "
                             "and the task is not finished")})
+                    # §4JP — the CLIENT's deadline is a budget too. The web
+                    # interface closes its connection at GHOST_CHAT_TIMEOUT
+                    # (1800 s); the loop never knew, so req fd89fd6d spent
+                    # its last minute in a 60 s sleep and the interface
+                    # delivered the stitched narration. With the timeout
+                    # sent as a header, the last DEADLINE_REPORT_FLOOR_S
+                    # seconds are the report's — the same breaker shape as
+                    # the reserved turn (tools off, the §4IG flag armed).
+                    _remaining_s = _glog.request_remaining_s(str(req_id or ""))
+                    if deadline_needs_report(_remaining_s, DEADLINE_REPORT_FLOOR_S,
+                                             force_final_response, force_stop):
+                        force_final_response = True
+                        _report_turn_forced = True
+                        self.context._breaker_forced_final = True  # §4JP: a tool call on this final IS the no-answer
+                        pretty_log("Client Deadline",
+                                   f"{_remaining_s:.0f}s remain before the client closes its connection — "
+                                   "reserved for the report, tools off",
+                                   level="WARNING", icon=Icons.STOP)
+                        messages.append({"role": "user", "content": blocker_report_alert(
+                            "client deadline",
+                            f"the client will close its connection in about {int(max(0.0, _remaining_s))} seconds "
+                            "and the task is not finished — say where the work stands and where the files are")})
 
                     # --- RISK GOVERNOR (core/risk.py, experiment-gated) ------
                     # Depth is this agent's strongest measured failure
@@ -29939,11 +30034,19 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 _ff_raw_turn = (full_content or "")[len(stream_prefix or ""):]
                 _ff_turn = _MODULE_SCRUB_RE.sub("", _ff_raw_turn).strip()
                 _ff_tried_tool = _ff_called(_ff_raw_turn)
+                # §4JP (probe a3b3b65c, the first live client-deadline report):
+                # on a BREAKER-forced final a tool call IS the no-answer,
+                # whatever prose came with it — the §4IG rule the internal
+                # path has had since 2026-09-17 and this path did not ("I've
+                # found three of the four… I still need to search for…" +
+                # a search call streamed out as the report). `is True`: a
+                # MagicMock context must not read as armed.
+                _ff_breaker = getattr(self.context, "_breaker_forced_final", False) is True
                 _ff_fire = (
                     _stream_scrub_active
                     and (not _scrub_fallback_emitted or _scrub_fallback_deferred)  # §4HW
                     and not loop_detected and not stream_aborted
-                    and ((_ff_tried_tool and (not _ff_turn or _ff_narr(_ff_turn)))
+                    and ((_ff_tried_tool and (not _ff_turn or _ff_narr(_ff_turn) or _ff_breaker))
                          or _ff_no_answer(_ff_turn, stream_prefix or "")))
                 if _ff_fire:
                     pretty_log(

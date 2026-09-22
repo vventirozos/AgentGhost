@@ -45566,3 +45566,78 @@ proper-noun search costs ~2 s more; a Latin or long query costs nothing.
 Pins: `tests/test_search_wiki_supplement_2026_09_21.py` (12). Battery 10 + 2 controls, 10/10.
 Docs `tools/search.html#4jo`. Honest scope: this answers the Koufontinas / Tzaneio / Μιχαήλ Βόδα
 class (who/what is X); it does not find the 1990s drachma threshold — no engine indexed it.
+
+Suite ONCE: 23,866 / 0 / 67. Deployed 2026-09-21 23:25 (pid 80190 → 1494, one listener). Live: a Greek probe
+("τι είναι η Οδός Μιχαήλ Βόδα") logged `wiki supplement — el.wikipedia: Οδός Μιχαήλ Βόδα — Βικιπαίδεια —
+placed first` 0.0 s after yandex won the wave (the lookup had finished in parallel); an English probe on the
+same subject searched in Latin script and, by design, got no supplement (Greek-script queries only).
+
+
+## §4JP — The client's deadline is a budget (2026-09-21, 23:30–01:10)
+
+**Trigger.** Operator: "look at request fd89fd6d, what went wrong?" → "fix them all".
+
+**Diagnosis.** "Redo this" (a Sponza path tracer): 35 turns / 34 tools, cut at exactly 1800 s =
+the web interface's GHOST_CHAT_TIMEOUT; the loop never knew the client's deadline, started a 60 s
+browser sleep with 61 s left, and the interface delivered the stitched narration. The half hour:
+~15 min regenerating a 15–30 KB file SEVEN times (126 KB; `replace` twice); ~3 min on a WebGL2
+rewrite abandoned because its page said "WebGL2 required"; 135 s of sleeps; ~1 min on ports
+(8088 reserved; the imagine pre-flight deferred 8100/8101). Corpus: 3 user requests hit the 1800 s
+wall in Aug–Sep; the seven-rewrite loop is unique.
+
+**Measured before fixing:** WebGL2 IS available in the sandbox browser — probed through the real
+runner with the proxy, a loopback http server and the persistent profile: `WEBGL2=true`, ANGLE on
+SwiftShader/Vulkan. The model believed its own page's failure message. (The flags I was going to
+add were unnecessary; the fix is to state the capability and flag page-side denials.)
+
+**Shipped:** (1) `X-Ghost-Client-Timeout` from the interface (both upstream calls) →
+`client_deadline_context` in the chat route → `request_remaining_s`; in the loop
+`deadline_needs_report` (floor `DEADLINE_REPORT_FLOOR_S` 150 s) forces the report turn beside the
+reserved-turn breaker (tools off, §4IG flag), and `declared_wait_s` / `wait_crosses_deadline`
+refuse a browser wait that would end inside the floor (synthetic rejection, not a strike). No
+header → no deadline → untouched. (2) The browser tool states its WebGL2 capability;
+`webgl_denial_note` appends a note when the page text claims WebGL is missing. (3)
+`note_full_rewrite`: from the third full rewrite of an existing ≥8 KB file per request/path the
+success line names `operation='replace'`.
+
+Pins: `tests/test_client_deadline_report_2026_09_21.py` (11; the route pin was a text pin at
+first — the ratchet rejected it, rightly — now executed through `chat_proxy`),
+`tests/test_fd89fd6d_rewrite_hint_and_webgl_note_2026_09_21.py` (10). Enumeration pins updated:
+eleven armed force-final sites, two report sites. Battery 14 + 2 controls, 14/14. Docs
+`core/agent.html#4jp`. Side finding: `/workspace` (virtiofs) EAGAIN on create, twice today —
+classified transient by the tool; watch.
+
+Suite ONCE: 23,889 / 0 / 67 (after two tripwire updates: the write site's slot count 4 → 5 — the hint is
+not a path; browser.py size guard 1600 → 1650 for the capability note). Deployed 2026-09-22 01:20: agent
+pid 1494 → 47693, web server pid 430 → 47804 (both changed: the header is sent by the interface).
+
+### §4JP — verified in the real environment (2026-09-22, 01:25–01:50)
+
+Operator: "do you need to verify your changes from this session?" Everything else had been seen live;
+§4JP had not. Live checks: (1) a chat through the web server → the agent logs `client deadline — the
+client closes its connection after 1800s` (new BEGIN-frame line; the header travels). (2) A STREAMED
+probe with `X-Ghost-Client-Timeout: 200` and a sequential-search task: the breaker fired at +51 s
+("149s remain … reserved for the report, tools off"), the report turn ran thinking-off — and the
+client received "I've found three of the four… I still need to search for Eleftherotypia…" + a
+dropped-call note. DEFECT: the §4IG rule (a tool call on a breaker-forced final IS the no-answer)
+existed only on the INTERNAL path; the streamed retry (§4HF) required the text to be empty/narration
+too, and "I still need to search…" is not a beat. One-path fix shipped half — again. Fix: `_ff_breaker`
+(`_breaker_forced_final is True`) added to the stream retry trigger; pins +2 in
+`tests/test_stream_forced_final_retry.py` (armed → retry ships the report; unarmed → the §4HF
+answer-plus-call contract stands). Mini battery: the rule-dropped mutant killed; the `is True` vs
+truthiness mutant is equivalent in the harness (real contexts carry a bool) — kept as defence.
+Re-run with a 170 s deadline: breaker at +22 s, the retry's report reached the client (a table of
+found / not-yet-determined + what remains). The suite gate and the redeploy follow.
+
+Suite ONCE after the stream-path fix: 23893 passed, 65 skipped, 44 warnings. Agent already redeployed before the re-probe (pid 48083); no source newer than the process.
+
+## §4JQ — cube2 → tesseract (2026-09-22, 02:00–02:20)
+
+Operator: "cube2 v3 looks good, just rename it to something unique." Renamed the user-facing form
+to `tesseract` (hint "infinite corridor"); internals keep cube2/C2 names; `FORM_ALIASES`
+{cube2 → tesseract} so a stored pick survives the rename (executed pin in the prefs suite —
+retired names still fall through, a RENAMED one resolves). Six test modules and the six version
+pins updated (13.3). Live: roster, pick, picker menu and render checked headlessly, 0 JS errors.
+
+Suite ONCE after the rename: 23891 passed, 67 skipped, 42 warnings. Statics only — no restart.
+
