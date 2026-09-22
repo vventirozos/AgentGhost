@@ -1301,6 +1301,61 @@ PYTHONPATH=src python scripts/verify_bench.py --tier private --two-stage both</p
     it, or say it was not read). Corpus: 1 such turn in 654; "I read &lt;url&gt;" with no fetch: 0. Pinned in
     <code>tests/test_unread_source_refute.py</code>.
   </p>
+
+  <h2 id="4jr-reply-language">The reply in the other language <span class="tag">2026-09-22 &sect;4JR</span></h2>
+  <p>
+    <strong>The live failure.</strong> Req <code>84dc65c4</code> (Slack): "i want to come up with a new bjj submission that doesn't yet exist
+    &hellip; give me an action plan". Six tool turns reasoned in English, a 10.5&nbsp;KB plan file was written in English, and the final reply
+    came out in Greek &mdash; with <a href="prompts.html#4jn">rule 5 LANGUAGE</a> in the system message. Every input to the prompt was traced:
+    the Slack payload was a single message (no thread history), the recalled sessions / episodes / graph facts / lessons were English, reply
+    smoothing is deterministic text&rarr;text. The one Greek cue was the profile's Athens address, which the model had been naming the technique
+    after ("The Thrakomakedon", "Greek name, unique story") when it wrote the long final generation. The corpus shows the same drift ~6 times in
+    2,052 real turns, always a Greece-flavoured subject on a final-gen turn after tools. Two things kept it from being caught: the judge grades
+    content, not script, and on the non-streaming path its verdict rides the 65&nbsp;s critic await &mdash; which timed out here ("verdict
+    deferred"); and the in-loop auto-repair is gated on a clean turn (<code>execution_failure_count == 0</code>), which this one, with a path-less
+    write and one strike, was not.
+  </p>
+  <p>
+    <strong>What.</strong> <code>core/reply_language.py</code> is the one classifier: <code>request_script</code> (Latin / Greek / abstain),
+    <code>prose_lines</code> (the reply minus fenced code, list items and their indented continuations, table rows, headings and «quoted» lines
+    &mdash; the part whose language is the model's own choice) and <code>reply_language_mismatch</code> (a Latin request with prose Greek share
+    above 0.6, or a Greek request below 0.2 &rarr; <code>("English", "Greek")</code> / <code>("Greek", "English")</code>, else None). It is consumed
+    three ways: (1) <code>turn_state_check</code> carries it as the <code>reply_language</code> rule &mdash; a delivery-<em>shape</em> complaint in the
+    <code>_REFUTE_TASK_ARTIFACT_RE</code> vocabulary, so it reaches both delivery paths, the verdict record and the labels, is never a project task
+    or a retroactive correction, and selects the "re-send the SAME answer in the form asked for, no tools" directive; (2) <code>_run_internal_turn</code>
+    (the non-streaming path, where the draft has not been delivered) checks it <em>before</em> the verifier, LLM-free, under its own gate &mdash; only
+    that the one regeneration round is unspent (<code>repair_round</code>, shared with the verifier repair: never two regenerations per request) &mdash;
+    discards the draft whole and re-opens the loop for exactly one <em>text-only</em> turn (a forced final: tool calls dropped, so a breaker- or
+    planner-closed loop never gets its tools back) with the shape directive. <strong>Not gated on <code>force_stop</code></strong>: the first deploy was,
+    and the live re-probe (<code>probe4jr</code>, the Tzaneio ask) came back 100% Greek with the guard silent &mdash; on the planning arm the planner's
+    "Agent signaled completion" sets <code>force_stop</code> <em>before</em> the final generation, so that gate (which the verifier's auto-repair also
+    carries, and which therefore never fires on the planning arm &mdash; a standing gap, not touched here) silenced it. Every other site that sets
+    <code>force_stop</code> ships a code-authored reply and breaks before any model text reaches the branch, so the guard clears the stop for its one
+    turn: the regeneration <em>is</em> the final turn the stop announced; (3) <code>scripts/measure_reply_language.py</code> imports the
+    same functions and thresholds, so the measurement counts exactly what the guard acts on. The streamed path cannot un-send a draft; there the
+    rule lands as a late turn-state verdict. Kill switch <code>GHOST_REPLY_LANGUAGE_REPAIR=0</code>.
+  </p>
+  <p>
+    <strong>Measured before wiring</strong> (<code>scripts/turn_state_replay.py --rule reply_language</code>, 2,052 real user turns): the first cut
+    fired 11 times, 4 of them wrong, each for a different reason, and each reason became a rule rather than a patch &mdash; a bilingual answer to
+    "Can you speak Greek?" at 0.54 (the threshold is 0.6, and a request that <em>names</em> a language abstains); a news digest whose Greek summaries
+    were indented continuation lines under the numbered headlines (indented lines belong to the list); the runtime's own
+    <code>[ATTEMPT_ABORTED_STRIKE_CAP] I hit a hard limit&hellip;</code> note on a Greek ask (code-authored abort notes and the forced-final fallback
+    abstain); a restaurant list with Greek descriptions copied from Greek sources at 0.556. Greeklish ("ti douleia kanei o sytistis sto strato",
+    which the model rightly answers in Greek) abstains on two distinctive tokens; mixed-script and short requests abstain; and the regeneration
+    site hands the classifier the conversation's earlier user turns, so a standing "answer me in Greek from now on" two messages back is the
+    user's choice and not a drift (the turn-state tier, which has no conversation, keeps the per-message rule). After the abstentions: 6
+    fires, all genuine drifts (the xtc and coca-seed dark-web searches, "what have you learned today", the two 17N follow-ups, and 84dc65c4).
+    Re-measure with <code>scripts/measure_reply_language.py --since 2026-09-22</code> (baseline at the 0.6 line: 11 / 2,151 English requests, 0.51%).
+  </p>
+  <p>
+    Pins: <code>tests/test_reply_language_guard_2026_09_22.py</code> (24: the classifier and each abstention, the rule through
+    <code>refute_turn_state</code> and the shape predicate, and the regeneration replayed through a real <code>handle_chat</code> &mdash; a strike, a
+    Greek final, the English answer ships; an English final untouched; a Greek conversation untouched; a standing language instruction honoured; the round spent once; the kill switch; the planner's completion signal replayed through the real planner path &mdash; DONE plan, Greek final, English ships; and a tool call on the regeneration turn dropped, not dispatched).
+    Battery <code>scripts/mutate_4jr.py</code>: 24 mutants, 24 killed, no-op control survived, known-bad control killed. Migrated pins: the
+    repair-directive site count (one &rarr; two sites, both passing the current request), the &sect;4FY one-predicate pin (both sites), and two
+    &sect;4IY fixtures that answer an English ask in Greek to exercise the abbreviation list &mdash; a <code>reply_language</code> fire there is now by design.
+  </p>
 </main>
   <h2>Conflicting evidence and internal contradiction (§4IJ, 2026-09-17)</h2>
   <p><strong>The blind spot.</strong> The stage-2 "support" rule read: REAL only if the fact appears in NO tool output or directly contradicts one. A fact that IS in the output therefore passed even when the same output also said otherwise — the bench fault <code>omitted_contradiction</code> (§4IA: the evidence line carrying a claim number is copied with the number perturbed and appended as another row of the same output; the claim reports one value) was CONFIRMED 23/23 at mean confidence 0.96, and the stage-1 pass had often <em>named</em> the conflict ("Evidence shows two different temperatures: 34°C and 35°C") only for stage 2 to dismiss it as supported. The live twin (probe <code>ifs21382…</code>): a reply stating "~10 km nominal resolution" and "the nearest grid point is ~86 km away" — both numbers printed by its own script, whose longitudes were radians labelled as degrees — CONFIRMED at 0.90.</p>

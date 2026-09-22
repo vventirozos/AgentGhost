@@ -520,6 +520,8 @@
   forensics. Live same-seed re-generation was REJECTED as a goal: llama.cpp on Metal with
   prefix-cache reuse is not byte-stable run-to-run. Tests:
   <code>tests/test_llm_recording.py</code>.</p>
+  <h2 id="4js-stream-cancel">The stream reader and a cancellation that vanished <span class="tag">2026-09-22 &sect;4JS</span></h2>
+  <p>The per-chunk read is <code>utils.aio.wait_for(chunk_iter.__anext__(), timeout)</code>, not <code>asyncio.wait_for</code>. On Python 3.10 the stdlib form drops the calling task's cancellation whenever the chunk completed in the same loop iteration (bpo-42130): a cancelled turn kept streaming, the watchdog that owned it never died, and a SIGTERM shutdown hung 15&nbsp;minutes. The helper has the same contract (result, <code>TimeoutError</code> with the inner cancelled first) on <code>asyncio.wait</code>, whose cancel path has no shortcut. Details and pins on <a href="agent.html">the agent page</a> (§4JS).</p>
 </main>
 </body>
 </html>

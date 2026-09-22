@@ -24,23 +24,15 @@ import os
 import re
 from pathlib import Path
 
-GREEK = re.compile(r"[Ͱ-Ͽ]")
-LATIN = re.compile(r"[A-Za-z]")
-_SKIP_LINE = re.compile(r"^\s*(?:[-*•]|\d+[.)]|\||#{1,6}\s|\*\*[^*]*«|«)")
+# §4JR: the classifier is `core/reply_language.py` — the same functions and
+# thresholds the finalize-time guard and the turn-state rule use, so this
+# script measures exactly what the guard acts on (one authority).
+from ghost_agent.core.reply_language import (  # noqa: E402
+    EL_TO_EN_MAX_SHARE, EN_TO_EL_MIN_SHARE, GREEK, LATIN, prose_lines,
+    reply_language_mismatch, script_share,
+)
+
 INTERNAL_KINDS = ("reflection", "bench", "self", "dream", "probe_internal")
-
-
-def script_share(text: str) -> float:
-    """Greek letters over Greek+Latin letters; 0.0 when there are none."""
-    g = len(GREEK.findall(text or "")); l = len(LATIN.findall(text or ""))
-    return g / (g + l) if g + l else 0.0
-
-
-def prose_lines(reply: str) -> str:
-    """The reply minus list items, table rows, headings and «quoted» lines —
-    the parts whose language is the model's own choice."""
-    keep = [ln for ln in (reply or "").splitlines() if ln.strip() and not _SKIP_LINE.match(ln)]
-    return "\n".join(keep)
 
 
 def query_of(call) -> str:
@@ -71,6 +63,8 @@ def classify(row: dict) -> dict | None:
         "n_queries": len(queries),
         "greek_queries": sum(1 for q in queries if GREEK.search(q)),
         "mixed_queries": sum(1 for q in queries if GREEK.search(q) and LATIN.search(q)),
+        # what the §4JR guard would do with this turn (its abstentions applied)
+        "guard": (reply_language_mismatch(req, rep) or (None, None))[1],
     }
 
 
@@ -85,10 +79,14 @@ def summarize(facts: list[dict]) -> dict:
         "english_with_searches": len(eng_s),
         "query_switch": {"n": sum(1 for f in eng_s if f["greek_queries"]), "rate": rate(sum(1 for f in eng_s if f["greek_queries"]), len(eng_s))},
         "mixed_script_queries": {"n": sum(f["mixed_queries"] for f in eng_s), "of_queries": sum(f["n_queries"] for f in eng_s)},
-        "reply_mismatch_en": {"n": sum(1 for f in eng if f["rep_greek_prose"] > 0.5), "rate": rate(sum(1 for f in eng if f["rep_greek_prose"] > 0.5), len(eng)),
-                              "ids": [f["id"] for f in eng if f["rep_greek_prose"] > 0.5]},
+        "reply_mismatch_en": {"n": sum(1 for f in eng if f["rep_greek_prose"] > EN_TO_EL_MIN_SHARE),
+                              "rate": rate(sum(1 for f in eng if f["rep_greek_prose"] > EN_TO_EL_MIN_SHARE), len(eng)),
+                              "ids": [f["id"] for f in eng if f["rep_greek_prose"] > EN_TO_EL_MIN_SHARE]},
+        "guard_would_fire": {"en_to_el": sum(1 for f in facts if f["guard"] == "Greek"),
+                             "el_to_en": sum(1 for f in facts if f["guard"] == "English")},
         "greek_requests": len(gr),
-        "reply_mismatch_el": {"n": sum(1 for f in gr if f["rep_greek_prose"] < 0.2), "rate": rate(sum(1 for f in gr if f["rep_greek_prose"] < 0.2), len(gr))},
+        "reply_mismatch_el": {"n": sum(1 for f in gr if f["rep_greek_prose"] < EL_TO_EN_MAX_SHARE),
+                              "rate": rate(sum(1 for f in gr if f["rep_greek_prose"] < EL_TO_EN_MAX_SHARE), len(gr))},
     }
 
 

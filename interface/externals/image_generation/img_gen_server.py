@@ -1,51 +1,88 @@
 """
-Jetson image-generation node (SD1.5, currently DreamShaper 8) — hardened.
+Jetson image-generation node — Qwen-Image-2.1 (Q4_K) via stable-diffusion.cpp.
 
-Fixes for the two failure modes we actually observed:
+Backend swap 2026-09-22 (§4JT/§4JU): SD1.5 DreamShaper 8 under diffusers →
+Qwen-Image-2.1 (7B single-stream DiT + Qwen3-VL-8B text encoder + 16× VAE)
+quantized to Q4_K GGUF and run by `sd-cli` from stable-diffusion.cpp. Same
+HTTP contract as before (`/generate`, `/v1/images/generations`, `/health`,
+`/ready`, the fleet X-Ghost-Key), so the agent only needed its prompt advice
+and size ladder retuned — see tools/image_gen.py.
 
-  A) `ConnectError: All connection attempts failed` right after a restart.
-     CAUSE: the old layout loaded the model at *import* time and warmed up
-     inside lifespan startup, and uvicorn only binds port 8000 AFTER
-     startup finishes — so for ~30-90s after a restart the port simply
-     isn't listening and every request gets a connect failure.
-     FIX: the port binds immediately; the model loads in the BACKGROUND on
-     a dedicated GPU thread. While loading, requests get a clean HTTP 503
-     ("warming up") they can poll/retry — never a connect failure.
+Why a subprocess per request instead of a resident pipeline:
+  * The three models total 9.3 GB at Q4 on an 8 GB unified-memory box. They
+    fit only PHASED — encoder (5.0 GB) → freed → DiT (4.2 GB) + workspace →
+    VAE — and sd-cli's model manager does exactly that (`--params-backend
+    disk` streams each from the NVMe file, ~2 GB/s, ~5 s per image). Holding
+    anything resident between requests would leave no room for the next
+    phase. The process exits after every image, so the node's idle footprint
+    is ~50 MB instead of the 3.2 GB the diffusers pipeline pinned.
+  * diffusers could not run this model here anyway (no GGUF loader for the
+    2.1 transformer, transformers>=5.17, flex-attention prefill).
 
-  B) `NVML_SUCCESS == r INTERNAL ASSERT ... CUDACachingAllocator.cpp:1154`
-     CAUSE: an oversized request (the agent asks for 1024x1024; the old
-     768-px ceiling let that through) exhausts 8GB VRAM and the Tegra
-     allocator asserts instead of OOMing cleanly. Measured-safe envelope
-     on this box is ~512x768.
-     FIX: every request is clamped to a pixel BUDGET (not just a per-side
-     cap), preserving aspect ratio, so the agent's big SDXL buckets are
-     scaled down into the safe range.
+Measured on ghost (§4JT, seed 42, 40 steps, cfg 1.0): 768×512 4.3 min,
+768×768 6.7 min, 1024² 14.8 min. The operator chose 768×512 at 30 steps
+(~3.3 min) as the node's envelope.
+
+Editing (§4JV): a request may carry `reference_images` (base64 PNG/JPEG, at
+most MAX_REFERENCES) — sd-cli gets them as `-r` files plus the Qwen3-VL
+vision projector (`--llm_vision`), and the prompt describes the CHANGE.
+Three things the path does NOT survive without:
+  * TRUE CFG. At the T2I default (guidance 1.0) an edit reproduces its
+    reference and ignores the instruction — measured, repeatedly, on both a
+    text change and a scene change. `resolve_guidance` turns it on.
+  * A resolved SEED. sd-cli's own default is a fixed 42; `resolve_seed`
+    draws one and the response reports it (see its docstring).
+  * A fitted reference. sd-cli encodes a reference at ITS OWN resolution,
+    so `fit_reference` matches it to the render geometry first.
+Cost: ~11 min at 768x512/20 steps, about 3.3x a plain image — the
+reference's latents lengthen the DiT sequence AND CFG doubles the forwards
+per step. MAX_REFERENCES is a memory cap on an 8 GB box, not a taste.
+With no size requested, an edit inherits the reference's shape.
+
+Transparency (§4JV): `transparent=true` wraps the prompt in the model
+card's RGBA template — kept for the day sd.cpp decodes the alpha matte for
+this model; measured 2026-09-22 it does NOT (the 4th channel is noise
+around opaque: background a~248, subject a~218), so the agent does not
+advertise it.
+
+THE ALLOCATOR TRAP (cost 40 min of §4JT — do not "simplify" this away):
+Tegra's CUDA allocator (NvMap) fails with `error 12` while `free` shows GBs
+"available", because reclaimable page cache counts as available and NvMap
+does not reclaim it on demand. Streaming 9 GB of model files through the
+page cache is exactly what triggers it. `vm.min_free_kbytes` makes sd-cli's
+own memory check refuse; a memcg cap throttles the GPU allocations
+themselves (NvMap pages are charged to the process). What works is dropping
+the page cache before the run and every second DURING it — the sidecar
+below, which needs passwordless sudo for `/proc/sys/vm/drop_caches` and
+exits on its own when sd-cli does (`kill -0 <pid>` — never a pattern kill).
 
 Auth (2026-07-15): this server binds 0.0.0.0 on the LAN and a generation
-monopolises the GPU for ~30-60s, so /generate now requires the fleet key
+monopolises the GPU for minutes, so /generate requires the fleet key
 (X-Ghost-Key, same key the agent's own API uses). Key resolution mirrors
 the agent's main.py: GHOST_API_KEY env wins (explicit '' knowingly
-disables auth), else ~/Data/AI/.ghost_api_key, else REFUSE TO START —
-an unset key on a 0.0.0.0 bind is indistinguishable from a
-misconfiguration. /health and /ready stay open for monitoring/warmup
-polling; they leak nothing but readiness state.
+disables auth), else ~/Data/AI/.ghost_api_key, else REFUSE TO START.
+/health and /ready stay open for monitoring/warmup polling.
 
 Design notes:
-  * ALL GPU work (load, warmup, every generation) runs on ONE dedicated
-    worker thread (`max_workers=1`). That keeps CUDA off the event loop
-    (so the server stays responsive and the port stays accept-able) while
-    using a single, consistent CUDA context — and it naturally serialises
-    generations so two never race the 8GB card.
-  * Run under systemd/supervisor with restart=always; the background-load
-    design means the not-listening window after a crash is ~1-2s, not ~60s.
+  * The port binds immediately; readiness is established in the background
+    by a real 1-step preflight generation (binary + models + CUDA + memory
+    all proven, ~20 s). Requests get a clean 503 until then. A restart
+    right after a crash can still race Tegra's NvMap teardown, hence the
+    retry loop.
+  * ALL generation work runs on ONE worker thread (`max_workers=1`), which
+    serialises the GPU; a queued request 503s after BUSY_WAIT_TIMEOUT.
 """
 
 import asyncio
 import base64
-import gc
 import hmac
 import os
+import secrets
+import re as _re
+import shlex
+import subprocess
 import time
+import uuid
 from io import BytesIO
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -54,33 +91,68 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
-# NOTE: torch / diffusers are deliberately NOT imported at module top level.
-# Importing them takes ~10s on a Jetson and would run BEFORE uvicorn binds
-# port 8000 — re-creating the connect-failure window. They're imported inside
-# the background loader instead, so the port comes up in ~1-2s and serving
-# requests get a clean 503 while the libraries + model load.
-
 # ---------------------------------------------------------------------------
-# Tunables — defaults measured-safe for an 8GB Jetson + SD1.5 fp16.
+# Tunables — measured on an 8 GB Orin Nano (§4JT). Paths are relative to the
+# systemd WorkingDirectory (~/Data/AI/ImgGen) unless overridden by env.
 # ---------------------------------------------------------------------------
-MODEL_PATH = "models/dreamshaper_8.safetensors"
-VAE_PATH = "models/vae/ClearVAE_V2.3_fp16.pt"
+SD_CLI = os.environ.get("IMGGEN_SD_CLI", "qwen21/build/bin/sd-cli")
+DIT_PATH = os.environ.get("IMGGEN_DIT", "qwen21/models/qwen_image_2.1-Q4_K.gguf")
+TE_PATH = os.environ.get("IMGGEN_TE", "qwen21/models/Qwen3VL-8B-Instruct-Q4_K_M.gguf")
+VAE_PATH = os.environ.get("IMGGEN_VAE_PATH", "qwen21/models/qwen_image_2.1_vae_bf16.safetensors")
+MMPROJ_PATH = os.environ.get("IMGGEN_MMPROJ", "qwen21/models/mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf")
+OUT_DIR = Path(os.environ.get("IMGGEN_OUT_DIR", "tmp"))
 
-DEFAULT_WIDTH = 512
-DEFAULT_HEIGHT = 768
+DEFAULT_WIDTH = 768
+DEFAULT_HEIGHT = 512
 MIN_DIM = 256
 MAX_DIM = 768                  # hard per-side cap
-MAX_PIXELS = 512 * 768        # area budget: 768x768 (590k px) OOM-asserts; this works
+MAX_PIXELS = 768 * 512        # area budget the operator chose (§4JT): ~3.3 min @30 steps
+SIZE_STEP = 32                # sd.cpp: Qwen-Image 2.1 dimensions must be /32
+ASPECT_BAND = 0.02            # sizes within 2% of the asked aspect compete on area
 DEFAULT_STEPS = 30
-MIN_STEPS = 15                # below this a non-LCM SD1.5 model looks bad
+DEFAULT_EDIT_STEPS = 20       # an edit runs CFG (2 forwards/step), so fewer steps
+MIN_STEPS = 15
 MAX_STEPS = 50
-DEFAULT_GUIDANCE = 6.0
-BUSY_WAIT_TIMEOUT = 180.0     # seconds a queued request waits for the GPU before 503
-# A `systemctl restart` starts the new process while the old one's CUDA
-# teardown is still releasing Tegra NvMap memory, so the FIRST load attempt
-# can OOM-assert (observed live 2026-07-15: NvMap error 12 during warmup →
-# CUDACachingAllocator assert). The old design parked on that error until a
-# manual bounce; retrying heals it by attempt 2.
+# An edit costs ~28 s/step plus ~95 s of fixed overhead (measured: 20 steps =
+# 654 s end to end). At the shared MAX_STEPS of 50 that is ~23 min — past the
+# client's 1200 s ceiling, so the caller times out while the GPU stays busy for
+# another ten minutes. 30 steps (~935 s) is the most that still answers.
+MAX_EDIT_STEPS = 30
+DEFAULT_GUIDANCE = 1.0        # CFG-free is the model's default for T2I
+# ⚠ AN EDIT NEEDS TRUE CFG. Measured 2026-09-22 (§4JV): at guidance 1.0 the
+# reference is reproduced and the INSTRUCTION IS IGNORED — three live attempts
+# to change a sign's text returned haloed near-copies (the shape of upstream
+# diffusers issue #14824). At 4.0 the same prompt, seed and steps rendered the
+# new text and left the rest of the scene alone. There is no unconditional
+# branch to push away from at 1.0, so the edit has nothing to steer it.
+EDIT_GUIDANCE = 4.0
+MAX_VRAM_GIB = "4.5"          # sd-cli managed budget; at 768×512 the DiT stays monolithic
+GEN_TIMEOUT_S = 1500.0        # an edit (CFG × refs) runs ~11 min at 20 steps; 25 min is the hard stop
+# How long a queued request waits for the single GPU before 503. Sized against
+# the CLIENT's own ceiling, not by feel: the agent's image pool uses httpx
+# timeout=1200 s, and the longest generation here is an edit at ~660 s, so a
+# request that waits this long and then runs still answers inside the client's
+# window (400 + 660 + overhead < 1200). The old 180 s was ~4.5x a 40 s SD1.5
+# generation; kept literally, it now fails a request that only needed to wait
+# out one edit — the agent can and does issue two image calls in one turn.
+BUSY_WAIT_TIMEOUT = 400.0
+# MEASURED worst case, end to end, on this box: a 768x512 edit at 20 steps with
+# one reference (CFG on) = 654 s and 628 s across two runs, including model
+# streaming, the reference encode and the VAE decode. The 28 s/step already
+# includes CFG's two forwards — do not multiply by two again.
+WORST_GENERATION_S = 700.0
+CLIENT_TIMEOUT_S = 1200.0     # what core/llm.py gives the image pool; the bound above assumes it
+PREFLIGHT_SIZE = 256          # 1-step self-test at startup (~20 s incl. model streaming)
+# Editing: each reference adds its latent tokens to the DiT sequence. Measured
+# §4JV at 768×512: one ref → 14.2 s/step (2.4× plain) and 6.7 GB peak; two would
+# put 4608 tokens through a box where 4096 (1024²) already peaked at 6.7 GB.
+MAX_REFERENCES = 1
+MAX_REFERENCE_BYTES = 12 * 1024 * 1024
+# The model's own RGBA recipe (model card): the prompt is wrapped, nothing else.
+RGBA_PROMPT_PREFIX = "This is an RGBA image with transparency. "
+RGBA_PROMPT_SUFFIX = " The image has alpha channel and the background is transparent."
+# A `systemctl restart` can race the previous process's NvMap teardown, so
+# the first preflight can OOM; retrying heals it (observed 2026-07-15).
 LOAD_RETRIES = 5
 LOAD_RETRY_DELAY_S = 20.0
 
@@ -125,22 +197,15 @@ def _require_key(request: Request) -> None:
                             detail=f"invalid or missing {API_KEY_NAME}")
 
 
-# Weights here are REAL now (parsed by the A1111-style layer below), and
-# chunked encoding means nothing gets truncated at 77 tokens anymore.
-# Style terms (cartoon/anime/3d render) deliberately NOT banned here —
-# DreamShaper is a general-purpose model and the caller picks the style
-# in the positive prompt.
-NEGATIVE_PROMPT_DEFAULT = (
-    "(worst quality, low quality:1.3), (deformed, disfigured, bad anatomy:1.2), "
-    "(extra fingers, mutated hands, extra limbs:1.2), watermark, text, signature, "
-    "jpeg artifacts, blurry, cropped, out of frame, oversaturated"
-)
+# No default negative prompt: the model runs CFG-free (guidance 1.0), where
+# a negative prompt is ignored, and its LLM encoder needs no quality
+# incantations. A caller that sets guidance_scale > 1 may pass one.
+NEGATIVE_PROMPT_DEFAULT = ""
 
-# --- runtime state (populated by the background loader) --------------------
-pipe = None
+# --- runtime state (populated by the background preflight) ------------------
 _ready = False
 _load_error: "str | None" = None
-# One dedicated thread for ALL CUDA work → consistent context + serialised GPU.
+# One dedicated thread for ALL generation work → serialised GPU.
 _gpu = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu")
 # Guards the busy-vs-queue decision so we can 503 instead of piling up.
 _gpu_lock = asyncio.Lock()
@@ -151,128 +216,17 @@ def _log(msg: str) -> None:
 
 
 async def _run_on_gpu(fn):
-    """Run a blocking GPU callable on the dedicated GPU thread."""
+    """Run a blocking callable on the dedicated GPU thread."""
     return await asyncio.get_running_loop().run_in_executor(_gpu, fn)
 
 
-def _load_model_blocking():
-    """Heavy imports + load + warmup. Runs on the GPU thread, off the event
-    loop, AFTER the port is already bound."""
-    global pipe
-    import torch
-    from diffusers import (
-        StableDiffusionPipeline, AutoencoderKL, DPMSolverMultistepScheduler,
-    )
-    kwargs = {}
-    if os.environ.get("IMGGEN_VAE", "baked").lower() == "clear":
-        _log("Loading ClearVAE fp16 (IMGGEN_VAE=clear)...")
-        kwargs["vae"] = AutoencoderKL.from_single_file(
-            VAE_PATH, torch_dtype=torch.float16)
-    else:
-        # DreamShaper 8 bakes its own VAE into the checkpoint (as did
-        # CyberRealistic before it) — don't override a baked VAE with a
-        # style-tuned external one. Default: trust the baked one.
-        _log("Using the checkpoint's baked VAE (IMGGEN_VAE=baked).")
-
-    _log(f"Loading model: {MODEL_PATH} ...")
-    p = StableDiffusionPipeline.from_single_file(
-        MODEL_PATH,
-        torch_dtype=torch.float16,        # crucial for 8GB VRAM
-        safety_checker=None,
-        requires_safety_checker=False,
-        **kwargs,
-    )
-    # DPM++ 2M Karras, pinned explicitly (from_config kept whatever
-    # algorithm_type the base config had).
-    p.scheduler = DPMSolverMultistepScheduler.from_config(
-        p.scheduler.config, use_karras_sigmas=True,
-        algorithm_type="dpmsolver++",
-    )
-    p.to("cuda")
-    p.enable_attention_slicing()
-    p.vae.enable_slicing()
-    p.vae.enable_tiling()
-
-    _log("Warming up allocator (ignore NvMap noise)...")
-    _ = p(prompt="warmup", num_inference_steps=1,
-          guidance_scale=DEFAULT_GUIDANCE, width=512, height=512)
-    gc.collect()
-    torch.cuda.empty_cache()
-    pipe = p
-    _log("Warm-up complete — ready.")
-
-
-def _cleanup_after_failed_load():
-    """Drop whatever a failed attempt half-allocated before retrying.
-    Runs on the GPU thread; torch is importable there by the time a load
-    attempt has failed."""
-    try:
-        import torch
-        gc.collect()
-        torch.cuda.empty_cache()
-    except Exception:
-        pass
-
-
-async def _background_load():
-    global _ready, _load_error
-    for attempt in range(1, LOAD_RETRIES + 1):
-        try:
-            await _run_on_gpu(_load_model_blocking)
-            _ready = True
-            # MUST clear: /ready and /generate check _load_error before
-            # _ready, so a stale error from a failed attempt would 500
-            # forever after a successful retry.
-            _load_error = None
-            return
-        except Exception as e:           # stay up and report, don't crash silently
-            _load_error = f"{type(e).__name__}: {e}"
-            _log(f"MODEL LOAD FAILED (attempt {attempt}/{LOAD_RETRIES}): {_load_error}")
-            if attempt < LOAD_RETRIES:
-                await _run_on_gpu(_cleanup_after_failed_load)
-                await asyncio.sleep(LOAD_RETRY_DELAY_S)
-    _log("MODEL LOAD: all retries exhausted; serving errors until restart.")
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Kick off loading but DON'T await it → lifespan startup returns now,
-    # so uvicorn binds the port immediately (no connect-failure window).
-    app.state.loader = asyncio.create_task(_background_load())
-    _log("Port open; model loading in background. Requests get 503 until ready.")
-    yield
-
-
-app = FastAPI(title="Jetson ImgGen Node", lifespan=lifespan)
-
-
-class ImageRequest(BaseModel):
-    prompt: str
-    negative_prompt: str = NEGATIVE_PROMPT_DEFAULT
-    steps: int = DEFAULT_STEPS
-    guidance_scale: float = DEFAULT_GUIDANCE
-    width: "int | None" = None
-    height: "int | None" = None
-    size: "str | None" = None     # OpenAI-style "WxH", optional
-    seed: "int | None" = None     # reproducibility; None = random
-    clip_skip: int = 2            # DreamShaper 8 recommends 2 (penultimate CLIP layer)
-
-
-
-# --- Prompt quality layer (2026-07-12) -------------------------------------
-# Two silent quality killers in the stock diffusers text path:
-#   1) CLIP truncates at 77 tokens — the agent's detailed prompts lost most
-#      of their content, silently. Images "ignored the prompt".
-#   2) A1111 attention syntax "(thing:1.3)" is NOT parsed by diffusers — the
-#      parens and ":1.3" entered the embedding as literal text garbage (the
-#      old default negative prompt was full of it).
-# This layer parses A1111-style weights and encodes ARBITRARY-length prompts
-# by chunking into 77-token windows and concatenating embeddings (the
-# standard "lpw" approach; SD1.5 cross-attention accepts any multiple of 77).
-# torch is passed in as an argument — top-level imports stay light so the
-# port still binds in ~1-2s.
-import re as _re
-
+# --- prompt handling ---------------------------------------------------------
+# The previous (CLIP) backend parsed A1111 attention syntax — "(x:1.3)",
+# "((x))", "[x]" — into per-token weights. Qwen-Image's encoder is an LLM
+# that reads the prompt as prose: the parens and ":1.3" would enter it as
+# literal text. The agent no longer emits the syntax, but a user-typed
+# prompt still might, so the node flattens it to plain words. The parser is
+# kept verbatim (it is the A1111 grammar; only the consumer changed).
 _ATTN_RE = _re.compile(
     r"\\\(|\\\)|\\\[|\\\]|\\\\|\(|\[|:\s*([+-]?[\d.]+)\s*\)|\)|\]|[^\\()\[\]:]+|:"
 )
@@ -319,66 +273,150 @@ def parse_prompt_attention(text):
     return res
 
 
-def _encode_chunks(p, token_ids, weights, clip_skip, torch):
-    """Encode 75-token windows -> concat (1, 77*n, dim), applying per-token
-    weights the A1111 way (scale, then restore the original mean)."""
-    tok, te = p.tokenizer, p.text_encoder
-    bos, eos = tok.bos_token_id, tok.eos_token_id
-    windows = [token_ids[i:i + 75] for i in range(0, len(token_ids), 75)] or [[]]
-    wwindows = [weights[i:i + 75] for i in range(0, len(weights), 75)] or [[]]
-    embs = []
-    with torch.no_grad():
-        for ids, ws in zip(windows, wwindows):
-            pad = 75 - len(ids)
-            t = torch.tensor([[bos] + ids + [eos] * (pad + 1)], device=te.device)
-            out = te(t, output_hidden_states=True)
-            if clip_skip and clip_skip > 1:
-                emb = te.text_model.final_layer_norm(out.hidden_states[-clip_skip])
-            else:
-                emb = out.last_hidden_state
-            w = torch.tensor([1.0] + ws + [1.0] * (pad + 1),
-                             device=emb.device, dtype=emb.dtype)[None, :, None]
-            prev_mean = emb.float().mean()
-            emb = emb * w
-            emb = emb * (prev_mean / emb.float().mean()).to(emb.dtype)
-            embs.append(emb)
-    return torch.cat(embs, dim=1)
+def strip_attention_syntax(text: str) -> str:
+    """'(sharp focus:1.2), [background]' → 'sharp focus, background'.
+    Weights are dropped, the words stay in order; whitespace is tidied."""
+    flat = "".join(chunk for chunk, _w in parse_prompt_attention(text or ""))
+    return _re.sub(r"\s+", " ", flat).strip()
 
 
-def encode_weighted_prompt(p, prompt, negative, clip_skip, torch):
-    """Full-length weighted embeddings for both prompts, padded to the same
-    window count so the UNet sees matching sequence lengths."""
-    def to_ids(text):
-        ids, ws = [], []
-        for chunk, weight in parse_prompt_attention(text or ""):
-            t = p.tokenizer(chunk, add_special_tokens=False).input_ids
-            ids += t
-            ws += [weight] * len(t)
-        return ids, ws
+def resolve_seed(requested) -> int:
+    """Pick the seed to RENDER WITH, always a concrete number.
 
-    import math
-    pi, pw = to_ids(prompt)
-    ni, nw = to_ids(negative)
-    nchunks = max(math.ceil(max(len(pi), 1) / 75),
-                  math.ceil(max(len(ni), 1) / 75))
-    pe = _encode_chunks(p, pi, pw, clip_skip, torch)
-    ne = _encode_chunks(p, ni, nw, clip_skip, torch)
-    while pe.shape[1] < nchunks * 77:
-        pe = torch.cat([pe, _encode_chunks(p, [], [], clip_skip, torch)], dim=1)
-    while ne.shape[1] < nchunks * 77:
-        ne = torch.cat([ne, _encode_chunks(p, [], [], clip_skip, torch)], dim=1)
-    return pe, ne
+    ⚠ sd-cli's own default is a FIXED 42 ("RNG seed (default: 42...)"), so
+    omitting `--seed` does not mean "random" — it means every image the node
+    ever makes for a given prompt is byte-identical, and "give me another one"
+    returns the same picture. The diffusers node it replaced randomised here,
+    so leaving this out was a silent regression. The resolved value goes back
+    in the response, which is also what lets a caller re-roll the SAME seed
+    with a tweaked prompt — the lossless alternative to an edit."""
+    try:
+        if requested is not None:
+            return int(requested)
+    except (TypeError, ValueError):
+        pass
+    return secrets.randbelow(2**31 - 1)
 
 
-def _snap8(v: int) -> int:
-    v = max(MIN_DIM, min(MAX_DIM, int(v)))
-    return max(MIN_DIM, (v // 8) * 8)
+def resolve_steps(requested, editing: bool) -> int:
+    """Caller's value wins; otherwise the mode's default. Always clamped."""
+    base = DEFAULT_EDIT_STEPS if editing else DEFAULT_STEPS
+    try:
+        n = base if requested is None else int(requested)
+    except (TypeError, ValueError):
+        n = base
+    ceiling = MAX_EDIT_STEPS if editing else MAX_STEPS
+    return max(MIN_STEPS, min(ceiling, n))
 
 
-def _resolve_size(req: "ImageRequest") -> "tuple[int, int]":
-    """Pick (w, h) from fields or an OpenAI-style 'size' string, scale to
-    fit the VRAM-safe pixel budget while preserving aspect ratio, clamp
-    per-side, and snap to multiples of 8."""
+def resolve_guidance(requested, editing: bool) -> float:
+    """Caller's value wins; otherwise CFG-free for T2I and EDIT_GUIDANCE for an
+    edit (which does not follow its instruction without it)."""
+    try:
+        if requested is not None:
+            return float(requested)
+    except (TypeError, ValueError):
+        pass
+    return EDIT_GUIDANCE if editing else DEFAULT_GUIDANCE
+
+
+def wrap_transparent(prompt: str) -> str:
+    """Apply the model card's RGBA template once (idempotent on a prompt
+    that already carries it)."""
+    p = (prompt or "").strip()
+    if "rgba" in p.lower() and "transparent" in p.lower():
+        return p
+    if p and p[-1] not in ".!?":
+        p += "."
+    return f"{RGBA_PROMPT_PREFIX}{p}{RGBA_PROMPT_SUFFIX}"
+
+
+# --- reference images (editing) ----------------------------------------------------
+_IMAGE_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"RIFF")   # png / jpeg / webp
+
+
+def decode_reference_images(items) -> "list[bytes]":
+    """base64 (data-URI prefix tolerated) → bytes, validated: decodable,
+    non-empty, a real image by magic, within size, at most MAX_REFERENCES.
+    Raises ValueError with a caller-facing message (→ HTTP 400)."""
+    items = list(items or [])
+    if len(items) > MAX_REFERENCES:
+        raise ValueError(f"at most {MAX_REFERENCES} reference images (got {len(items)})")
+    out = []
+    for i, item in enumerate(items):
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"reference image {i} is empty")
+        b64 = item.split(",", 1)[-1] if item.startswith("data:") else item
+        try:
+            data = base64.b64decode(b64, validate=True)
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"reference image {i} is not valid base64: {e}")
+        if not data:
+            raise ValueError(f"reference image {i} decoded to zero bytes")
+        if len(data) > MAX_REFERENCE_BYTES:
+            raise ValueError(f"reference image {i} exceeds {MAX_REFERENCE_BYTES // (1024 * 1024)} MB")
+        if not data.startswith(_IMAGE_MAGIC):
+            raise ValueError(f"reference image {i} is not a PNG/JPEG/WEBP")
+        out.append(data)
+    return out
+
+
+def fit_reference(data: bytes, width: int, height: int) -> bytes:
+    """Resize a reference to the geometry the node will actually render.
+
+    ⚠ NOT cosmetic. sd-cli VAE-encodes the reference at ITS OWN resolution and
+    those latents join the DiT sequence, so a 4000x3000 phone photo would put
+    ~30x the tokens of the output through an 8 GB box that already peaks at
+    6.7 GB on a 768x512 edit. The output is capped at 768x512 either way, so a
+    larger reference buys nothing and can only OOM. Matching the output
+    geometry also keeps the edit aligned when the aspect ratios differ.
+
+    Returns PNG bytes, or the input unchanged when it already matches or when
+    Pillow cannot read it (sd-cli then fails loudly rather than silently
+    editing something else)."""
+    if png_size(data) == (width, height):
+        return data
+    try:
+        from PIL import Image
+        with Image.open(BytesIO(data)) as im:
+            im = im.convert("RGB")
+            if im.size == (width, height):
+                return data
+            im = im.resize((width, height), Image.LANCZOS)
+            buf = BytesIO()
+            im.save(buf, format="PNG")
+            return buf.getvalue()
+    except Exception as e:      # unreadable/unsupported: let sd-cli be the judge
+        _log(f"WARN: could not resize reference ({type(e).__name__}: {e}) — passing it through")
+        return data
+
+
+def png_size(data: bytes) -> "tuple[int, int] | None":
+    """(w, h) from a PNG IHDR, else None (an edit with no requested size
+    inherits its reference's shape)."""
+    if len(data) >= 24 and data.startswith(b"\x89PNG\r\n\x1a\n") and data[12:16] == b"IHDR":
+        w, h = int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+        if w and h:
+            return w, h
+    return None
+
+
+# --- sizing ---------------------------------------------------------------------
+def _legal_sizes() -> "list[tuple[int, int]]":
+    """Every (w, h) the node can actually render: on the /32 grid, inside the
+    per-side bounds, inside the pixel budget."""
+    vals = range(MIN_DIM, MAX_DIM + 1, SIZE_STEP)
+    return [(w, h) for w in vals for h in vals if w * h <= MAX_PIXELS]
+
+
+LEGAL_SIZES = _legal_sizes()
+
+
+def _resolve_size(req: "ImageRequest", fallback: "tuple[int, int] | None" = None) -> "tuple[int, int]":
+    """Pick (w, h) from fields or an OpenAI-style 'size' string (else
+    `fallback` — an edit's reference shape — else the default), scale to
+    fit the pixel budget while preserving aspect ratio, clamp per-side,
+    and snap to multiples of 32 (a sd.cpp requirement for this model)."""
     w, h = req.width, req.height
     if (not w or not h) and req.size and "x" in req.size.lower():
         try:
@@ -386,14 +424,221 @@ def _resolve_size(req: "ImageRequest") -> "tuple[int, int]":
             w, h = int(a.strip()), int(b.strip())
         except (ValueError, AttributeError):
             w = h = None
+    if (not w or not h) and fallback:
+        w, h = fallback
     if not w or not h:
         w, h = DEFAULT_WIDTH, DEFAULT_HEIGHT
     w, h = max(1, int(w)), max(1, int(h))
-    # Scale down to the pixel budget, keeping aspect ratio.
-    if w * h > MAX_PIXELS:
-        scale = (MAX_PIXELS / (w * h)) ** 0.5
-        w, h = int(w * scale), int(h * scale)
-    return _snap8(w), _snap8(h)
+    # Pick the closest LEGAL size instead of scaling and then clamping each
+    # side on its own. ⚠ Independent clamping is what squashed extreme aspect
+    # ratios: a 1200x3000 reference scaled to 396x991 and then clamped to
+    # 384x768 — a 25% aspect error — while the legal 320x768 (4%) sat right
+    # there. An edit inherits its reference's shape, so that squash would be
+    # visible in the result. Aspect first, then the closest area to what was
+    # asked (capped at the budget, so an oversized request lands on the
+    # largest legal size rather than a small one).
+    target_ar = w / h
+    target_area = min(w * h, MAX_PIXELS)
+    # Aspect error is BANDED, not compared exactly: the /32 grid often has no
+    # exact match at a usable size, and strict aspect-first threw away
+    # resolution for a rounding artefact — 1920x1080 landed on 512x288
+    # (147k px) because it is exactly 16:9, while 736x416 (0.5% off, 306k px)
+    # was legal. Inside a band, the closest area to what was asked wins.
+    return min(LEGAL_SIZES,
+               key=lambda c: (int((abs(c[0] / c[1] - target_ar) / target_ar) / ASPECT_BAND),
+                              abs(c[0] * c[1] - target_area)))
+
+
+# --- the sd-cli invocation ---------------------------------------------------------
+def build_sd_cli_args(prompt: str, width: int, height: int, steps: int,
+                      out_path: "str | os.PathLike", *, seed: "int | None" = None,
+                      guidance: float = DEFAULT_GUIDANCE,
+                      negative_prompt: str = "",
+                      ref_paths: "list[str | os.PathLike] | None" = None) -> "list[str]":
+    """The exact argv for one generation. Pure — pinned by tests.
+    A negative prompt is only passed when CFG is actually on (guidance > 1);
+    at 1.0 sd-cli would ignore it anyway and it costs a second encode.
+    Reference images (editing) add `-r <file>` each plus the vision
+    projector — only then, since the projector costs memory in the encoder
+    phase."""
+    args = [
+        SD_CLI,
+        "--diffusion-model", DIT_PATH,
+        "--llm", TE_PATH,
+        "--vae", VAE_PATH,
+        "--params-backend", "disk",
+        "--max-vram", MAX_VRAM_GIB,
+        "--diffusion-fa",
+        "--vae-tiling",
+        "--sampling-method", "euler",
+        "--steps", str(int(steps)),
+        "--cfg-scale", f"{float(guidance):g}",
+        "-W", str(int(width)),
+        "-H", str(int(height)),
+        "-p", strip_attention_syntax(prompt),
+        "-o", str(out_path),
+    ]
+    if seed is not None:
+        args += ["--seed", str(int(seed))]
+    if float(guidance) > 1.0 and negative_prompt:
+        args += ["--negative-prompt", strip_attention_syntax(negative_prompt)]
+    if ref_paths:
+        args += ["--llm_vision", MMPROJ_PATH]
+        for rp in ref_paths:
+            args += ["-r", str(rp)]
+    return args
+
+
+_SUDO_DROP = "sudo -n sh -c"
+_PRE_DROP = "sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory"
+
+
+def _drop_caches_now() -> bool:
+    """Empty the page cache and compact before a run. False (logged, not
+    fatal) when passwordless sudo is unavailable."""
+    try:
+        r = subprocess.run(shlex.split(_SUDO_DROP) + [_PRE_DROP],
+                           capture_output=True, timeout=30)
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def sidecar_command(pid: int) -> "list[str]":
+    """The drop-cache loop bound to ONE pid: it re-checks `kill -0 <pid>`
+    every second and exits by itself when sd-cli is gone. No pattern
+    matching, nothing for the node to kill afterwards."""
+    return shlex.split(_SUDO_DROP) + [
+        f"while kill -0 {int(pid)} 2>/dev/null; do "
+        f"echo 1 > /proc/sys/vm/drop_caches; sleep 1; done"
+    ]
+
+
+def _spawn_sidecar(pid: int):
+    try:
+        return subprocess.Popen(sidecar_command(pid),
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        return None
+
+
+def run_sd_cli(args: "list[str]", timeout: float = GEN_TIMEOUT_S) -> None:
+    """Blocking: run one sd-cli generation with the page-cache sidecar.
+    Raises RuntimeError with the tail of sd-cli's output on failure or
+    timeout. Runs on the GPU thread."""
+    if not _drop_caches_now():
+        _log("WARN: drop_caches unavailable (no passwordless sudo?) — running without it")
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True)
+    sidecar = _spawn_sidecar(proc.pid)
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, _ = proc.communicate()
+        raise RuntimeError(f"sd-cli timed out after {timeout:.0f}s")
+    finally:
+        if sidecar is not None:
+            try:
+                sidecar.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                sidecar.kill()
+    if proc.returncode != 0:
+        tail = "\n".join((out or "").strip().splitlines()[-6:])
+        raise RuntimeError(f"sd-cli exit {proc.returncode}: {tail}")
+
+
+def _generate_png(prompt: str, width: int, height: int, steps: int, *,
+                  seed=None, guidance=DEFAULT_GUIDANCE, negative_prompt="",
+                  references: "list[bytes] | None" = None) -> bytes:
+    """Blocking, on the GPU thread: one image → PNG bytes; the temp output
+    and the temp reference files are always removed."""
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    tag = uuid.uuid4().hex
+    out_path = OUT_DIR / f"gen_{tag}.png"
+    ref_paths = []
+    try:
+        for i, data in enumerate(references or []):
+            rp = OUT_DIR / f"ref_{tag}_{i}.png"
+            rp.write_bytes(fit_reference(data, width, height))
+            ref_paths.append(rp)
+        run_sd_cli(build_sd_cli_args(prompt, width, height, steps, out_path,
+                                     seed=seed, guidance=guidance,
+                                     negative_prompt=negative_prompt,
+                                     ref_paths=ref_paths))
+        try:
+            data = out_path.read_bytes()
+        except OSError as e:
+            raise RuntimeError(f"sd-cli produced no image: {e}")
+        if not data:
+            raise RuntimeError("sd-cli produced an empty image")
+        return data
+    finally:
+        for p in [out_path, *ref_paths]:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+
+# --- readiness ---------------------------------------------------------------------
+def _load_model_blocking():
+    """Preflight, on the GPU thread, AFTER the port is bound: prove the
+    binary, the three model files, CUDA and the memory phasing all work by
+    generating one tiny image. A node that says ready has generated."""
+    missing = [p for p in (SD_CLI, DIT_PATH, TE_PATH, VAE_PATH) if not Path(p).exists()]
+    if missing:
+        raise FileNotFoundError(f"missing: {', '.join(missing)}")
+    _log("Preflight: 1-step generation ...")
+    png = _generate_png("preflight", PREFLIGHT_SIZE, PREFLIGHT_SIZE, 1, seed=0)  # noqa: F841
+    _log(f"Preflight OK ({len(png)} bytes) — ready.")
+
+
+async def _background_load():
+    global _ready, _load_error
+    for attempt in range(1, LOAD_RETRIES + 1):
+        try:
+            await _run_on_gpu(_load_model_blocking)
+            _ready = True
+            # MUST clear: /ready and /generate check _load_error before
+            # _ready, so a stale error from a failed attempt would 500
+            # forever after a successful retry.
+            _load_error = None
+            return
+        except Exception as e:           # stay up and report, don't crash silently
+            _load_error = f"{type(e).__name__}: {e}"
+            _log(f"PREFLIGHT FAILED (attempt {attempt}/{LOAD_RETRIES}): {_load_error}")
+            if attempt < LOAD_RETRIES:
+                await asyncio.sleep(LOAD_RETRY_DELAY_S)
+    _log("PREFLIGHT: all retries exhausted; serving errors until restart.")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Kick off the preflight but DON'T await it → lifespan startup returns
+    # now, so uvicorn binds the port immediately (no connect-failure window).
+    app.state.loader = asyncio.create_task(_background_load())
+    _log("Port open; preflight running in background. Requests get 503 until ready.")
+    yield
+
+
+app = FastAPI(title="Jetson ImgGen Node (Qwen-Image-2.1)", lifespan=lifespan)
+
+
+class ImageRequest(BaseModel):
+    prompt: str
+    negative_prompt: str = NEGATIVE_PROMPT_DEFAULT
+    # None = "not specified" → the mode's default (T2I vs edit) is applied in
+    # `resolve_steps` / `resolve_guidance`. An explicit value always wins.
+    steps: "int | None" = None
+    guidance_scale: "float | None" = None
+    width: "int | None" = None
+    height: "int | None" = None
+    size: "str | None" = None     # OpenAI-style "WxH", optional
+    seed: "int | None" = None     # reproducibility; None = random
+    clip_skip: int = 0            # accepted for wire compatibility; no CLIP here, ignored
+    reference_images: "list[str] | None" = None   # editing: base64 PNG/JPEG, ≤ MAX_REFERENCES
+    transparent: bool = False     # RGBA output via the model's prompt template
 
 
 @app.get("/health")
@@ -404,7 +649,7 @@ async def health():
 @app.get("/ready")
 async def ready():
     if _load_error:
-        raise HTTPException(status_code=500, detail=f"model load failed: {_load_error}")
+        raise HTTPException(status_code=500, detail=f"preflight failed: {_load_error}")
     if not _ready:
         raise HTTPException(status_code=503, detail="warming up")
     return {"ready": True}
@@ -417,12 +662,25 @@ async def generate_image(req: ImageRequest, request: Request):
     # in every server state, never a probe of warmup/GPU state.
     _require_key(request)
     if _load_error:
-        raise HTTPException(status_code=500, detail=f"model load failed: {_load_error}")
+        raise HTTPException(status_code=500, detail=f"preflight failed: {_load_error}")
     if not _ready:
-        raise HTTPException(status_code=503, detail="model warming up, retry shortly")
+        raise HTTPException(status_code=503, detail="node warming up, retry shortly")
 
-    width, height = _resolve_size(req)
-    steps = max(MIN_STEPS, min(MAX_STEPS, int(req.steps)))
+    # Editing inputs are validated BEFORE the GPU lock: a bad reference is
+    # the caller's 400, not a minute of queueing followed by a 500.
+    try:
+        references = decode_reference_images(req.reference_images)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if references and not Path(MMPROJ_PATH).exists():
+        raise HTTPException(status_code=501, detail="editing unavailable: no vision projector on this node")
+    fallback = png_size(references[0]) if references else None
+    width, height = _resolve_size(req, fallback)
+    editing = bool(references)
+    steps = resolve_steps(req.steps, editing)
+    guidance = resolve_guidance(req.guidance_scale, editing)
+    seed = resolve_seed(req.seed)
+    prompt = wrap_transparent(req.prompt) if req.transparent else req.prompt
 
     # Queue for the GPU; 503 (not a hang) if the wait is too long.
     try:
@@ -432,49 +690,18 @@ async def generate_image(req: ImageRequest, request: Request):
 
     try:
         t0 = time.monotonic()
-        _log(f"GEN start: {width}x{height} steps={steps} prompt={req.prompt[:48]!r}")
-
-        def _run():
-            import torch
-            try:
-                pe, ne = encode_weighted_prompt(
-                    pipe, req.prompt, req.negative_prompt,
-                    max(1, min(4, int(req.clip_skip))), torch)
-                gen = None
-                if req.seed is not None:
-                    gen = torch.Generator(device="cuda").manual_seed(int(req.seed))
-                result = pipe(
-                    prompt_embeds=pe,
-                    negative_prompt_embeds=ne,
-                    num_inference_steps=steps,
-                    guidance_scale=req.guidance_scale,
-                    width=width,
-                    height=height,
-                    generator=gen,
-                )
-                image = result.images[0]
-                del result
-                return image
-            finally:
-                gc.collect()
-                torch.cuda.empty_cache()
-
-        image = await _run_on_gpu(_run)     # same dedicated GPU thread
-
-        buffered = BytesIO()
-        image.save(buffered, format="PNG")
-        img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+        _log(f"GEN start: {width}x{height} steps={steps} cfg={guidance:g} seed={seed} "
+             f"refs={len(references)} rgba={int(req.transparent)} prompt={prompt[:48]!r}")
+        png = await _run_on_gpu(lambda: _generate_png(
+            prompt, width, height, steps, seed=seed,
+            guidance=guidance, negative_prompt=req.negative_prompt,
+            references=references))
+        img_str = base64.b64encode(png).decode("utf-8")
         _log(f"GEN done in {time.monotonic() - t0:.1f}s")
-        return {"data": [{"b64_json": img_str}]}
-
+        # `seed` is reported so a caller can reproduce or re-roll this image.
+        return {"data": [{"b64_json": img_str}], "seed": seed,
+                "width": width, "height": height, "steps": steps}
     except Exception as e:
-        def _cleanup():
-            import torch
-            gc.collect(); torch.cuda.empty_cache()
-        try:
-            await _run_on_gpu(_cleanup)
-        except Exception:
-            pass
         _log(f"GEN failed: {e}")
         raise HTTPException(status_code=500, detail=f"Image generation failed: {e}")
     finally:
@@ -483,5 +710,5 @@ async def generate_image(req: ImageRequest, request: Request):
 
 if __name__ == "__main__":
     import uvicorn
-    # Single worker on purpose: one GPU, one pipeline, one CUDA thread.
+    # Single worker on purpose: one GPU, one generation at a time.
     uvicorn.run(app, host="0.0.0.0", port=8000)

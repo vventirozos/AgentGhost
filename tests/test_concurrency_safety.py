@@ -221,7 +221,10 @@ async def test_stream_chunk_timeout_short_circuits_stalled_upstream():
         await coro.__anext__() if hasattr(coro, '__anext__') else None
         raise asyncio.TimeoutError()
 
-    with patch("ghost_agent.core.llm.asyncio.wait_for", side_effect=asyncio.TimeoutError):
+    # §4JS: the per-chunk read goes through the cancellation-safe helper now
+    # (`utils.aio.wait_for`, bound in llm.py as `_wait_for_cancel_safe`), so
+    # the stall is simulated where the reader actually waits.
+    with patch("ghost_agent.core.llm._wait_for_cancel_safe", side_effect=asyncio.TimeoutError):
         async for chunk in client._do_stream_chat_completion({"model": "x"}):
             chunks.append(chunk)
             if len(chunks) > 5:  # safety brake

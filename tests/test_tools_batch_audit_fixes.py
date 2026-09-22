@@ -144,7 +144,7 @@ async def test_image_success_reports_snapped_dimensions(tmp_path):
         prompt="a cat", llm_client=llm, sandbox_dir=tmp_path,
         width=1024, height=1024)
     assert "SUCCESS" in out
-    assert "624x624" in out          # actual bucket
+    assert "608x608" in out          # actual bucket
     assert "snapped from" in out     # and that it was adjusted
 
 

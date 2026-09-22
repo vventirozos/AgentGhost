@@ -405,21 +405,21 @@ async def test_bug9_pdf_rejects_unsafe_filename(tmp_path, monkeypatch):
 
 def test_bug10_snap_returns_exact_bucket_when_matching():
     from ghost_agent.tools.image_gen import _snap_to_bucket
-    (w, h), adjusted = _snap_to_bucket(624, 624)
-    assert (w, h) == (624, 624)
+    (w, h), adjusted = _snap_to_bucket(608, 608)
+    assert (w, h) == (608, 608)
     assert adjusted is False
 
 
 def test_bug10_snap_square_to_node_square():
-    """Squares snap to the node's square bucket (624x624 — the node is an
-    SD1.5 Jetson with a 512x768 pixel budget; the old SDXL 1024 buckets
-    exceeded it and got scale-distorted server-side)."""
+    """Squares snap to the node's square bucket (608x608 — the node is a
+    Qwen-Image-2.1 Jetson with a 768x512 pixel budget and /32 sides; the
+    old SDXL 1024 buckets exceeded it and got scale-distorted server-side)."""
     from ghost_agent.tools.image_gen import _snap_to_bucket
     (w, h), adjusted = _snap_to_bucket(512, 512)
-    assert (w, h) == (624, 624)
+    assert (w, h) == (608, 608)
     assert adjusted is True
     (w, h), adjusted = _snap_to_bucket(1024, 1024)
-    assert (w, h) == (624, 624)
+    assert (w, h) == (608, 608)
     assert adjusted is True
 
 
@@ -467,8 +467,8 @@ async def test_bug10_payload_contains_snapped_size(tmp_path):
         height=512,
     )
     assert "SUCCESS" in out
-    assert captured["width"] in (624,)   # snapped to the node's square bucket
-    assert captured["height"] in (624,)
+    assert captured["width"] in (608,)   # snapped to the node's square bucket
+    assert captured["height"] in (608,)
     # Steps omitted -> node's tuned default (30) applies server-side; the
     # old LCM-era 4-8 clamp forced every image to the 15-step floor.
     assert "steps" not in captured

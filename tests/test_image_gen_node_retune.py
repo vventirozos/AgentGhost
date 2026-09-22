@@ -1,7 +1,8 @@
 """Agent-side retune for the upgraded image node (2026-07-12).
 
 The node (ghost, Jetson Orin) moved from DreamShaper LCM to SD1.5
-CyberRealistic long ago, but the agent side was still tuned for LCM:
+CyberRealistic long ago (and to Qwen-Image-2.1 on 2026-09-22 — see
+test_image_gen_model_swap.py), but the agent side was still tuned for LCM:
 steps were clamped to 4-8 ("Lightning models") — the server floor-raised
 that to 15, HALF its tuned default of 30, silently degrading every
 image. Sizes snapped to SDXL buckets (1024²+) that blow the node's
@@ -85,12 +86,13 @@ class TestSeedAndNegative:
 
 class TestNodeBuckets:
     def test_all_buckets_fit_the_node_budget(self):
-        # The node OOM-asserts past 512*768 pixels and clamps sides at 768;
-        # every bucket must fit natively so the server never rescales.
+        # The node's budget is 768*512 pixels with sides clamped at 768 and
+        # (Qwen-Image-2.1 / sd.cpp) a multiple of 32; every bucket must fit
+        # natively so the server never rescales.
         for w, h in _NODE_BUCKETS:
-            assert w * h <= 512 * 768, (w, h)
+            assert w * h <= 768 * 512, (w, h)
             assert w <= 768 and h <= 768, (w, h)
-            assert w % 8 == 0 and h % 8 == 0, (w, h)
+            assert w % 32 == 0 and h % 32 == 0, (w, h)
 
     def test_schema_matches_reality(self):
         # The model-facing schema advertises the same sizes/steps the tool

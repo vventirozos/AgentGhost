@@ -105,7 +105,11 @@ def _agent_tree():
 
 class TestTheProductionSiteUsesTheBuilder:
 
-    def test_refuted_branch_calls_the_builder_with_the_current_request(self):
+    def test_every_repair_site_calls_the_builder_with_the_current_request(self):
+        """Two sites since §4JR: the verifier's REFUTED repair and the
+        reply-language regeneration (req 84dc65c4). Both must pass the
+        loop's CURRENT request — a third site that hand-rolls or drops it
+        fails here by count."""
         calls = [n for n in ast.walk(_agent_tree())
                  if isinstance(n, ast.Assign)
                  and any(isinstance(t, ast.Name) and t.id == "_directive"
@@ -113,21 +117,23 @@ class TestTheProductionSiteUsesTheBuilder:
                  and isinstance(n.value, ast.Call)
                  and isinstance(n.value.func, ast.Name)
                  and n.value.func.id == "_render_refute_directive"]
-        assert len(calls) == 1, (
-            "expected exactly one `_directive = _render_refute_directive(...)` "
-            f"in the agent module, found {len(calls)}")
-        call = calls[0].value
-        kw = {k.arg: k.value for k in call.keywords}
-        assert "pending_request" in kw, "the site dropped pending_request"
-        v = kw["pending_request"]
-        assert isinstance(v, ast.Name) and v.id == "last_user_content", (
-            "pending_request must be the loop's last_user_content (the "
-            f"CURRENT request), got {ast.dump(v)[:80]}")
-        # §4GS: the repair branch moved with the internal consumer into
-        # `_run_internal_turn`; the pin is that it lives in the TURN LOOP,
-        # not in which of the loop's two halves it ended up.
-        assert _enclosing_function(calls[0]) in (
-            "handle_chat", "_run_internal_turn")
+        assert len(calls) == 2, (
+            "expected exactly two `_directive = _render_refute_directive(...)` "
+            f"sites in the agent module, found {len(calls)}")
+        for site in calls:
+            kw = {k.arg: k.value for k in site.value.keywords}
+            assert "pending_request" in kw, (
+                f"line {site.lineno}: the site dropped pending_request")
+            v = kw["pending_request"]
+            assert isinstance(v, ast.Name) and v.id == "last_user_content", (
+                f"line {site.lineno}: pending_request must be the loop's "
+                "last_user_content (the CURRENT request), got "
+                f"{ast.dump(v)[:80]}")
+            # §4GS: the repair branch moved with the internal consumer into
+            # `_run_internal_turn`; the pin is that it lives in the TURN
+            # LOOP, not in which of the loop's two halves it ended up.
+            assert _enclosing_function(site) in (
+                "handle_chat", "_run_internal_turn")
 
     def test_no_alert_text_is_assembled_outside_the_builder(self):
         """Enumeration: every literal carrying the alert's opening lives in

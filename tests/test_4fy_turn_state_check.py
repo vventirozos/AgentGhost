@@ -863,16 +863,18 @@ def test_the_repair_directive_for_a_shape_refute_asks_for_the_same_answer_reshap
     assert "Do NOT repeat the same claim" in d0 and "SHAPE" not in d0
 
 
-def test_the_repair_site_passes_shape_only_from_the_one_predicate():
-    """AST: the single repair-directive call site passes
-    `shape_only=self._delivery_shape_only(...)` — not a second rule."""
+def test_the_repair_sites_pass_shape_only_from_the_one_predicate():
+    """AST: every repair-directive call site (the verifier's and, since
+    §4JR, the reply-language regeneration's) passes
+    `shape_only=GhostAgent._delivery_shape_only(...)` — not a second rule."""
     import ghost_agent.core.agent as agent_mod
     tree = ast.parse(Path(agent_mod.__file__).read_text())
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
              and getattr(n.func, "id", "") == "_render_refute_directive"]
-    assert len(calls) == 1
-    kw = {k.arg: ast.unparse(k.value) for k in calls[0].keywords}
-    assert kw.get("shape_only", "").startswith("GhostAgent._delivery_shape_only(")
+    assert len(calls) == 2
+    for call in calls:
+        kw = {k.arg: ast.unparse(k.value) for k in call.keywords}
+        assert kw.get("shape_only", "").startswith("GhostAgent._delivery_shape_only("), (call.lineno, kw)
 
 
 def test_the_streamed_tool_free_turn_reaches_the_mechanical_checks():
@@ -946,7 +948,11 @@ def test_the_replay_script_counts_a_planted_violation_and_joins_human_labels(tmp
     ("Tell me in one sentence what happened.", "Η συνάντηση έγινε στις 9 π.μ. Τρίτη στο γραφείο του κ. Παπαδόπουλου, Λεωφ. Κηφισίας 12, Μαρούσι."),
 ])
 def test_4iy_correct_replies_are_not_refuted(req, reply):
-    assert T.refute_turn_state(request=req, reply=reply) == []
+    # §4JR: two of these fixtures answer an English ask in Greek to exercise
+    # the Greek abbreviation list — that IS a `reply_language` fire now, by
+    # design; the pin here is that the CAP rules stay quiet.
+    assert [r for r, _ in T.refute_turn_state(request=req, reply=reply)
+            if r != "reply_language"] == []
 
 
 def test_4iy_the_rules_still_fire_on_real_violations():
@@ -975,8 +981,10 @@ def test_4iy_empty_evidence_knows_local_reads_and_honest_phrasings():
 
 def test_4iy_greek_titles_and_local_reads_alone():
     # three Greek titles in one sentence: only the abbreviation list keeps it at one
-    assert T.refute_turn_state(request="Tell me in one sentence what happened.",
-                               reply="Ο Δρ. Παπαδόπουλος συνάντησε τον Καθ. Νικολάου στη Λεωφ. Κηφισίας 12 στις 9 π.μ. Τρίτη.") == []
+    assert [r for r, _ in T.refute_turn_state(
+        request="Tell me in one sentence what happened.",
+        reply="Ο Δρ. Παπαδόπουλος συνάντησε τον Καθ. Νικολάου στη Λεωφ. Κηφισίας 12 στις 9 π.μ. Τρίτη.")
+        if r != "reply_language"] == []      # §4JR: the language fire is expected here
     # an assertive 30+ word answer from a substantive local read, no acknowledgement phrase
     ok = ("The project depends on requests 2.31 and numpy 1.26, both pinned in requirements.txt with their hashes, "
           "and the constraints file adds urllib3 below 2.0 for the older client that the deploy script still imports.")

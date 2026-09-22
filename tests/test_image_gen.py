@@ -34,14 +34,15 @@ async def test_tool_generate_image_success(mock_sandbox, mock_llm_client):
     result = await tool_generate_image(prompt, mock_llm_client, mock_sandbox)
 
     # The tool snaps requested size to the node's native bucket ladder
-    # (SD1.5 Jetson envelope). With no width/height passed, the square
-    # bucket 624x624 is used. Steps are OMITTED by default so the node's
-    # tuned default (30) applies — the old LCM-era steps=6 forced the
-    # server's 15-step floor and silently halved quality.
+    # (Qwen-Image-2.1 Jetson envelope, 768x512 budget). With no
+    # width/height passed, the default landscape bucket 768x512 is used.
+    # Steps are OMITTED by default so the node's tuned default (30)
+    # applies — the old LCM-era steps=6 forced the server's 15-step floor
+    # and silently halved quality.
     mock_llm_client.generate_image.assert_awaited_once_with({
         "prompt": prompt,
-        "width": 624,
-        "height": 624,
+        "width": 768,
+        "height": 512,
     })
 
     # Verify result string format. The tool was redesigned to embed a
@@ -75,7 +76,7 @@ async def test_tool_generate_image_offline_client(mock_sandbox, mock_llm_client)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("input_steps, expected_steps", [
-    (2, 15),     # below the SD1.5 quality floor -> raised
+    (2, 15),     # below the node's quality floor -> raised
     (10, 15),    # LCM-era habit values also land on the floor
     (30, 30),    # within range
     ("35", 35),  # string castable to int
@@ -92,8 +93,8 @@ async def test_tool_generate_image_steps_clipping(mock_sandbox, mock_llm_client,
 
     mock_llm_client.generate_image.assert_awaited_once_with({
         "prompt": "prompt",
-        "width": 624,
-        "height": 624,
+        "width": 768,
+        "height": 512,
         "steps": expected_steps,
     })
 

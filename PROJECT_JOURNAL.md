@@ -45641,3 +45641,385 @@ pins updated (13.3). Live: roster, pick, picker menu and render checked headless
 
 Suite ONCE after the rename: 23891 passed, 67 skipped, 42 warnings. Statics only — no restart.
 
+
+## §4JR — The reply in the other language (2026-09-22, 09:45–)
+
+**Trigger.** Operator: "i gave the following request to the agent and the agent replied in greek
+without asking it, why?" → "fix it." Req `84dc65c4` (Slack, 09:29): "i want to come up with a new
+bjj submission that doesn't yet exist … give me an action plan".
+
+**Diagnosis.** Six tool turns, all reasoned in English; the 10.5 KB plan file written in English
+(one Greek word); the turn-7 final reply in Greek. Every prompt input traced: the Slack payload was a
+single top-level message (no thread history); the 4 stored sessions, the 10 episodes credited at
+09:29:08 (ids 28/47/186/249/280/52/148/87/234/81), the graph triplets and the 6 lessons were all
+English; the Greek-heavy vector entries are off-topic; reply smoothing is deterministic text→text;
+rule 5 LANGUAGE (§4JN) WAS in the system message (h=215efdfc). The one Greek cue: the profile's
+Athens / Thrakomakedones address, which the model had been riffing on ("The Thrakomakedon", Athens
+Choke / Aegean Lock / Piraeus Twist, "Greek name, unique story") when it wrote the 3.3 KB final
+generation (qwen-3.6-35b-a3, temp 0.60). Corpus: ~6 genuine flips in 2,052 real turns, all
+Greece-flavoured subjects on a final-gen turn after tools (xtc / coca-seed dark-web searches, "what
+have you learned today", two 17N follow-ups, this one). Why nothing caught it: the judge grades
+content, not script; on the non-streaming path its verdict rides the 65 s critic await, which timed
+out here ("verdict deferred"); and the in-loop auto-repair is gated on `execution_failure_count == 0`,
+which this turn (a path-less write, strike 1/6) failed. No reply-language check existed anywhere.
+
+**Shipped.** `core/reply_language.py` — the one classifier: `request_script` (Latin / Greek /
+abstain), `prose_lines` (minus fenced code, list items and their INDENTED continuations, table rows,
+headings, «quoted» lines), `reply_language_mismatch` (Latin request with prose Greek share > 0.6, or
+Greek request < 0.2). Three consumers: (1) `turn_state_check` rule `reply_language` — in the
+`_REFUTE_TASK_ARTIFACT_RE` shape vocabulary, so it reaches both delivery paths, the verdict record and
+the labels, is never a task or a retroactive correction, and selects the "same answer, other
+language, no tools" directive; (2) `_run_internal_turn`: an LLM-free check BEFORE the verifier under
+its own gate (loop open, `repair_round` unspent — shared with the verifier repair, never two
+regenerations per request; NOT gated on a clean turn), the draft discarded whole, one re-entry with the
+shape directive through the one `_delivery_shape_only` predicate; the site hands the classifier the
+conversation's earlier USER turns so a standing "answer in Greek from now on" abstains; (3)
+`scripts/measure_reply_language.py` imports the same functions and thresholds (+ `guard_would_fire`).
+Kill switch `GHOST_REPLY_LANGUAGE_REPAIR=0`. The streamed path cannot un-send a draft — there the rule
+lands as a late turn-state verdict.
+
+**Measured before wiring** (`scripts/turn_state_replay.py --rule reply_language`, 2,052 real turns):
+first cut 11 fires, 4 wrong, each a different cause, each now a rule — bilingual "Can you speak
+Greek?" at 0.54 (threshold 0.6 + a request naming a language abstains); a news digest's Greek
+summaries as indented continuation lines (indented = the list's); the runtime's own
+`[ATTEMPT_ABORTED_STRIKE_CAP] I hit a hard limit…` on a Greek ask (abort notes + forced-final fallback
+abstain); a restaurant list at 0.556. Greeklish abstains on 2 distinctive tokens; mixed / short
+requests abstain. After: 6 fires, all genuine. Baseline at the 0.6 line: 11 / 2,151 English requests
+(0.51%); EL→EN 0 after the abstentions (§4JN's 2 were both the canned fallback).
+
+Pins `tests/test_reply_language_guard_2026_09_22.py` (22: the classifier and each abstention; the
+rule through `refute_turn_state` + the shape predicate; the regeneration replayed through a real
+`handle_chat` — a strike, a Greek final, the English answer ships, the directive names the request and
+carries the standalone suffix; English final untouched; Greek conversation untouched; standing
+instruction honoured; round spent once; kill switch; an AST enumeration of the site's gate and order).
+Battery `scripts/mutate_4jr.py` on a copy tree: 24 mutants, 24 killed, no-op control survived,
+known-bad killed. Migrated: the repair-directive site pin (1 → 2 sites, both `last_user_content`), the
+§4FY one-predicate pin (both sites), two §4IY fixtures (English ask / Greek reply for the abbreviation
+list — a `reply_language` fire there is by design), and the pin-quality ratchet rejected my one
+source-text pin → rewritten as an AST walk. Docs: `core/verifier.html#4jr-reply-language`,
+`core/prompts.html#4jn` (pointer), `configuration.html` (the switch).
+
+**Live re-probe caught a second gate (11:00).** Deployed (pid 48490 → 53243; the TERM hung ~15 min in
+the shutdown handler's `await bio` — the biological watchdog had swallowed its cancel and ran a whole
+self-play cycle AFTER the shutdown line, SIGUSR2 task dump: serve / rewarm / keepalive /
+biological_watchdog:7906 / _reap_sandbox_jobs / lifespan main — a pre-existing shutdown bug, SIGKILLed,
+container reclaimed; NOT fixed here). Probe `probe4jr` ("Use web search: when was the Tzaneio general
+hospital in Piraeus founded…", non-streaming): 100% Greek final, guard SILENT. Cause: the planning arm —
+the planner's "Agent signaled completion" sets `force_stop = True` BEFORE the final generation, and the
+guard's gate carried `not force_stop` (copied from the verifier's auto-repair gate, which therefore has
+never fired on the planning arm either — a standing gap, left as is). Every other `force_stop = True`
+site ships a code-authored reply and breaks before model text reaches the branch. Fix: the gate is only
+"round unspent"; the re-entry sets `force_final_response = True` (a text-only forced final — tool calls
+dropped, §4ID) and clears `force_stop` for that one turn. New pins: the planner path replayed through
+the real planner (`task_label="planner"` side effect; `tree_update` is the ROOT NODE — the old
+`test_planner_termination` fixture's `{root_id, nodes}` shape never reached the completion signal),
+and a tool call on the regeneration turn dropped. Battery now 24 mutants, 24 killed.
+
+Redeployed 11:29 (pid 53243 → new, TERM clean in 15 s — no self-play in flight). Suite ONCE after the last
+code change: 23,915 / 0 / 67. Live: five Tzaneio probes on the control arm (planner withheld): four
+answered in English unaided (guard silent, no false fire); probe 5 drafted a 345-char Greek final on
+turn 10 → `verifier gate — reply_language … → regeneration round 1/1 (text-only turn)` → turn 11, 332
+chars of English in 7.3 s, shipped. The planner arm is covered by the executed pin (the live probe4jr
+world). Cost of a fire: one extra final generation; cost of the check: none.
+
+Honest scope: the guard fires on the last message's script; a Greek-history conversation with one
+English message gets English (rule 5's reading) unless an earlier message named a language. The
+canned English abort notes on a Greek ask are a separate, real gap (code-authored strings are
+English-only) — not addressed. Suite ONCE after the last code change: 23,913 passed / 67 skipped.
+
+## §4JS — The cancellation that vanished mid-stream; the planner's stop (2026-09-22, 11:45–)
+
+**Trigger.** Operator: "fix both" — the two findings §4JR left open.
+
+**1. Shutdown hang.** 10:36:36 `kill -TERM` → "system shutdown … 0 turn(s) in flight" → metacog summary
+→ silence for 15 min; `await bio` in the lifespan handler. The idle self-play sim turn 6d161f7a was
+streaming Turn 7 at that second; the cancel vanished — no aborted-turn record, the sim finished at
++161 s, sim 242da035 ran after it, "idle cycle: ran self-play" logged AFTER the shutdown line, SIGUSR2
+dump: watchdog alive at its sleep. Static hunt for swallowed cancels (AST: every handler catching
+CancelledError / BaseException / bare that does not re-raise) found none on the async path. The
+cause is the RUNTIME: `llm.py` reads every chunk via `asyncio.wait_for(chunk_iter.__anext__(), t)`,
+and 3.10's `wait_for` does `except CancelledError: if fut.done(): return fut.result()` — the
+caller's cancellation is dropped when the inner completed in the same iteration (bpo-42130, fixed
+3.12). A chunk completes every few ms → a cancel mid-stream is LIKELY lost. Reproduced
+deterministically (inner `set_result` + outer `cancel()` in one iteration → "continued").
+
+Shipped: `utils/aio.wait_for` (same contract on `asyncio.wait`; cancel always propagates; inner
+cancelled on timeout and awaited briefly) at the chunk reader; enumeration: no stdlib `wait_for`
+wraps `__anext__`/`anext`/`.get()`/`.readline()`/`.receive()` anywhere in src (the other 47 uses wrap
+single long awaits — one-iteration windows). Rail: `main._stop_biological_watchdog` — cancel, wait
+`_BIO_SHUTDOWN_GRACE_S`=15 s, then WARN "did not stop within … parked at <frame>" (`_task_where`, now
+also the SIGUSR2 dump's renderer) and continue the shutdown.
+
+**2. Planner's stop.** `if tree DONE and turn > 0: force_stop = True` ran BEFORE the final
+generation, so the final turn's text never reached finalisation's `not force_stop` gates: the
+verifier auto-repair never fired on the `use_planning` treatment arm (and §4JR's first cut was
+silenced the same way). The required_tool=none branch already sets `force_final_response = True`
+for that turn, so the stop added nothing but the silencing. Now `_plan_signals_done` →
+`force_final_response = True` (a forced final; §4JI non-breaker, exempt count 6); the loop ends at
+the no-tool-call finalisation's "break". A steer that asks for one more turn now gets one.
+
+Pins `tests/test_4js_cancel_safe_wait_for.py` (14): the 3.10 race (skip ≥3.12) and the helper's
+propagation; contract (result / TimeoutError with inner cancelled / None / inner exception); a cancel
+landing WITH a chunk through the real `_do_stream_chat_completion` raises in the consumer (control:
+an uncancelled stream completes); the class enumeration; the reader uses the helper; a watchdog that
+swallows ONE cancel no longer pins the shutdown and the line names `stubborn:<line>`; a cooperative
+one stops; the lifespan has no bare `await bio`; the verifier repair fires on the planning arm through
+the real planner (DONE plan, REFUTED final → repair → corrected ships, repair turn text-only); the
+DONE site is a forced final by AST. Battery `scripts/mutate_4js.py`: 9 mutants, 9 killed, no-op
+survived, known-bad killed; one equivalent mutant (`wait_for(aw, None)` ≡ `await aw`) deleted.
+Docs `core/agent.html` (§4JS), `core/llm.html#4js-stream-cancel`.
+
+Suite ONCE after the last code change: 23,927 / 0 / 67 (one test-only migration after it:
+`test_concurrency_safety` patched `asyncio.wait_for` to simulate a stall — now patches the helper the
+reader calls). Deployed 12:23 (pid 93259 → 17393 …). Live, three shutdowns: (a) idle: TERM → gone
+in 15 s; (b) TERM during a streaming USER turn (probe4jt, 2000-word essay): uvicorn drained the
+request first (its standard graceful behaviour — no `timeout_graceful_shutdown` configured; a
+foreground request is finished, not cut), lifespan shutdown after, exit at +90 s with the reply
+delivered; (c) THE LIVE SHAPE: `POST /api/bench/drain {"count":1}`, TERM at 12:28:10 while the
+watchdog's own bench turn was streaming → `turn aborted — bench-8e…: cancelled: client disconnected
+or process shutdown — recording the partial turn` → process gone in 10 s, respawned, watchdog alive,
+drain 0. The same shape hung 15 min at 10:36. Note for (b): a TERM mid-user-turn waits for the turn;
+that is uvicorn's choice, not the watchdog's, and was left as is.
+
+## §4JT — Qwen-Image-2.1 on the Jetson: the A/B against DreamShaper 8 (2026-09-22, 10:55–13:00)
+
+**Trigger.** Operator: compare the ghost image node (SD1.5 DreamShaper 8 fp16, 512×768, 30 steps,
+`ghost-image-node` :8000) against a quantized Qwen-Image-2.1 (released 2026-09-14) on the same
+8 GB Orin Nano. Constraint set during the round: speed is secondary; **eva is not to be touched**
+(the remote-text-encoder design — ship the `[N,4096]` pre-norm hidden state from a Qwen3-VL-8B on
+eva — was rejected); everything runs on ghost.
+
+**What the model is.** 33 GB bf16 = Qwen3-VL-8B text encoder (17.5 GB; the DiT is trained on its
+last decoder layer PRE-final-RMSNorm, template prefix dropped) + 7B single-stream DiT (14.2 GB, 32
+layers, hidden 4096, mlp×3, `causal_condition` prefix KV cache) + 0.7B 16×/64-ch VAE. `true_cfg_scale`
+defaults to 1.0 (CFG-free). License: Qwen RESEARCH (non-commercial; v1 was Apache-2.0). The 35B
+cannot stand in for the encoder (hidden 2048, different space) — a training project, not a switch.
+
+**Path chosen: stable-diffusion.cpp** (master 6dcb5bb, 2.1 support landed 2026-09-21). diffusers
+main has `QwenImage21Pipeline` but no GGUF loader mapping for the 2.1 transformer, needs
+`transformers>=5.17` (ghost: 4.57.6) and flex-attention prefill (triton on aarch64). Built with
+`-DSD_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=87` (~35 min at -j3→-j6). Files (9.3 GB, kept at
+`ghost:~/Data/AI/ImgGen/qwen21/models/`): `leejet/…/qwen_image_2.1-Q4_K.gguf` 4.2 GB,
+`Qwen/Qwen3-VL-8B-Instruct-GGUF/…Q4_K_M.gguf` 5.0 GB, Comfy-Org `qwen_image_2.1_vae_bf16.safetensors`
+0.68 GB. Flags that worked: `--params-backend disk --max-vram 4.5 --diffusion-fa --vae-tiling
+--sampling-method euler --steps 40 --cfg-scale 1.0`.
+
+**Measured (seed 42, 40 steps, same prompts to both; SD1.5 at its 393k-px budget, 30 steps):**
+
+| size | tokens | s/step | VAE | total | peak RAM |
+|---|---|---|---|---|---|
+| SD1.5 768×512 | — | 1.3 | — | **39 s** | node RSS 3.2 GB |
+| Qwen 768×512 | 1536 | 6.0 | 13 s | **4.3 min** | 5.5 GB |
+| Qwen 640×960 | 2400 | 9.9 | 24 s | **7.1 min** | 5.7 GB |
+| Qwen 768×768 | 2304 | 9.3 | 24 s | **6.7 min** | 5.7 GB (1 segment) |
+| Qwen 1024×1024 | 4096 | 20.8 | 52 s | **14.8 min** | 6.7 GB (34 segments) |
+
+Text encode 4.4 s; loads ~2–6 s each from NVMe (2.2 GB/s). The DiT-shaped cuBLAS bf16 microbench
+gave 8.8 TFLOPS on this GPU; ggml's Q4_K path reaches ~3.7 effective — my per-step estimate was
+2.5× optimistic. **Operator's chosen operating point: 768×768 (~7 min @40, ~5.5 @30).**
+
+**Quality (images in `~/Data/AI/ImgGen-ab-2026-09-22/`, SD1.5 vs Qwen per prompt):** adherence
+prompt (bicycle/blue door/black cat/3 basil pots/Athens) — SD1.5 dropped the bicycle, doubled the
+cat, one pot; Qwen 768×512 had every element, 1024² showed two pots. Text — SD1.5 "GHOTAST
+BRAKESY"; Qwen "GHOST BAKERY" carved serif (one stray white square: a Q4/VAE glitch). Portrait —
+both good; Qwen closer to the brief, no invented shawl. Illustration — SD1.5 one treehouse, dragon on
+the roof; Qwen a village with rope bridges and the dragon asleep on a balcony. Verdict: prompt
+adherence and typography are a different league; SD1.5 keeps only speed.
+
+**The trap that ate 40 min: Tegra's allocator vs the page cache.** Every 1024² run died with
+`NvMapMemAllocInternalTagged error 12` while `MemAvailable` said 2.5 GB — reclaimable page cache
+from streaming 9 GB of model files counts as available, but NvMap (cuMemCreate) does not reclaim it
+on demand; lfb was 512 kB–4 MB. The SAME failure hit the SD1.5 node twice today (baseline gen 500
+while wget filled the cache; Sep-20 journal lines) — the node's "512×768 is safe" rule assumes an
+empty page cache. Things that did NOT work: `vm.min_free_kbytes=1G` (sd.cpp's UMA check subtracts
+the watermark → "need 522 MB, available 423" and refuses); `systemd-run --scope -p MemoryHigh`
+(`--uid` drops supplementary groups → no /dev/nvhost → silent CPU fallback + 4 GB swap); a manual
+cgroup with `memory.high=600M` (NvMap pages are CHARGED to the process memcg — anon=0 file=0 yet
+current=1.1 GB — so the cap throttled the GPU memory itself, sd-cli in D state). What worked: a
+1-s `echo 1 > /proc/sys/vm/drop_caches` loop beside the run (+ `--max-vram 4.5` so the DiT
+segments at 1024²). A production node needs a real answer: `posix_fadvise(DONTNEED)` after each
+load, or keep the loop as a sidecar. Also `pkill -f build.sh` killed my own ssh shell (the probe
+carries its own pattern — again).
+
+**Open (not started):** (1) a Qwen node on ghost — FastAPI shelling out to `sd-cli` per request
+(~5 s load), 768×768 default, 30–40 steps, drop-cache sidecar, port 8000 replacing DreamShaper or a
+second port; (2) the AGENT still encodes SD1.5: `tools/image_gen.py` bucket ladder, `(x:1.2)`
+weight advice in prompts.py/registry (garbage to an LLM encoder), negative-prompt defaults (ignored
+at cfg 1.0), the 8 s 503 wait vs a 7-min generation (needs async/poll or a long timeout);
+(3) Q5_K_M (5.2 GB) vs Q4_K quality — the bakery white square says try it at 768×768 where 1.2 GB
+of headroom exists; (4) the license question is the operator's; (5) the node's own page-cache
+fragility deserves the same fadvise/drop treatment regardless of the model swap.
+
+## §4JU — Qwen-Image-2.1 adopted: the node and the agent (2026-09-22, 13:00–13:40)
+
+**Trigger.** Operator, after §4JT: "let's go with Qwen 768×512, fully adopt it in ghost and in the
+agent." Then: "have you also changed and optimized the agent's tool for image generation to match
+the new model capabilities?" — answered below (prompt contract yes; editing/RGBA not yet).
+
+**Node** (`interface/externals/image_generation/img_gen_server.py` → ghost `~/Data/AI/ImgGen/
+server.py`, unit `ghost-image-node` retitled, PyTorch env dropped; old server kept as
+`server.sd15-dreamshaper.bak.py`). Same HTTP contract (auth, `/generate`, `/v1/images/generations`,
+`/health`, `/ready`, `{"data":[{"b64_json"}]}`), new engine: one `sd-cli` subprocess per request
+(`--params-backend disk --max-vram 4.5 --diffusion-fa --vae-tiling`, euler), nothing resident
+between requests (idle ~50 MB vs the 3.2 GB pipeline). Defaults 768×512 / 30 steps / cfg 1.0 /
+empty negative (only passed when cfg>1); sizes scaled into the 768×512 budget and snapped to /32;
+`clip_skip` accepted and ignored; A1111 weights flattened to words (`strip_attention_syntax`,
+the old parser reused as the grammar). Readiness = a REAL 1-step 256² preflight (13 s live).
+The §4JT allocator trap is built in: drop+compact before a run, a `sudo -n` sidecar loop bound
+to sd-cli's pid via `kill -0` during it (exits by itself; no pattern kill), warning (not failure)
+without passwordless sudo. Live: preflight OK, bicycle prompt 768×512 @30 = **199 s**, every
+element present — 30 steps stays the default.
+
+**Agent.** `tools/image_gen.py`: ladder `512x768, 576x672, 608x608, 672x576, 768x512` (all /32,
+≤ budget), default 768×512 (was 624² square), comments retargeted. `tools/registry.py` +
+`core/prompts.py`: prose prompts in any language (Greek works), text-in-double-quotes renders,
+NO `(x:1.2)`/`[x]` (LLM encoder reads it literally), ~3–4 min per image → call once and wait,
+steps ~6 s each. Transport was already 1200 s and no tool-level timeout wraps the gather;
+interface chat proxy 1800 s with a 15 s SSE ping — nothing cuts a 200 s tool call.
+
+**Pins** `tests/test_image_gen_model_swap.py` (rewritten, 34): defaults; every resolved size is
+/32, ≤768, ≤budget over 11 shapes; the agent ladder is identity on the node and the default
+buckets agree (R5 one story); weight flattening incl. escaped parens; argv (models, flags,
+`--cfg-scale 1`, negative only with cfg>1, seed only when given); runner (sidecar bound to the
+pid and reaped, non-zero exit → RuntimeError with log tail, timeout → kill, temp PNG always
+removed, empty/missing output → error); preflight is a real 1-step generation and a failed one
+is not ready; endpoint (b64 round-trip, server-side clamp, 500 releases the lock). The advice pin
+is behavioural (built schema + SYSTEM_PROMPT) after the source-text ratchet rejected its first
+draft (+7 text pins → R4). Migrated: `test_audit_bug_fixes` (624→608), `test_tools_batch_audit_
+fixes`, `test_image_gen` (default 768×512), `test_image_gen_integration` (prose/forbidden weights/
+quotes), `test_image_gen_node_retune` (/32). Auth file unchanged, 15/15.
+
+**Mutation battery** (scratch `mutate_4ju.py`, whole-file string mutants, py_compile first,
+purge `__pycache__`, restore per mutant): **17/17 killed**; no-op control survived, known-bad
+control died at py_compile. Note: "lock never released" died via the 120 s per-test timeout, not
+the 0.5 s wait — Starlette's TestClient without a context manager runs each request on a fresh
+loop, so a cross-loop `asyncio.Lock` waiter hangs instead of timing out (harness artifact).
+
+**Docs** `docs/interfaces/image_gen_server.html` (rewritten: model, phasing, tunables, the
+allocator trap, prompt handling, deployment, licence), `docs/tools/image_gen.html` (ladder, what the
+model is told), guide `docs/tools.html` row. `test_docs_site` 23/23.
+
+Suite ONCE after the last code change: 23,960 / 1 / 67 — the one failure was the ratchet on my
+own text pin; migrated to behavioural (test-only), ratchet green. Deployed 13:31 (TERM 17995 →
+39814 listening at +45 s, one boot). **Live probe through the agent:** "rustic wooden sign that
+reads "GHOST BAKERY"…" → EXACT mode, node `768x512 steps=30 cfg=1`, GEN 200.0 s, turn 243 s,
+legible sign, embed + caption as specified. Images in `~/Data/AI/ImgGen-ab-2026-09-22/`.
+
+**Not exposed yet (the model's capabilities the tool does not use):** (1) image EDITING with
+reference images (≤10 refs, masks) — needs the Qwen3-VL mmproj on ghost (0.75 GB, not fetched),
+`-r` support in the node, a `reference_images` tool parameter, and an encoder-phase memory check;
+(2) RGBA output — sd.cpp already writes RGBA PNGs for this model, so the prompt template may be
+all it takes; one test owed. Offered to the operator; awaiting the call.
+
+## §4JV — Image editing + transparency: what the backend actually delivers (2026-09-22, 13:40–)
+
+**Trigger.** Operator: "proceed with both capabilities", then (unattended) "make as many tests,
+edits or restarts as you need to ensure the new img gen functionality is perfect."
+
+**1. Editing needs true CFG — the single finding that made it work.** Built the path (base64
+`reference_images` → temp files → `-r` + `--llm_vision` with the 0.75 GB Qwen3-VL projector,
+downloaded to ghost). First live run through the agent: the mechanism was perfect (refs=1, size
+inherited, scene conditioned) and the INSTRUCTION WAS IGNORED three times — haloed near-copies,
+the shape of diffusers issue #14824. A structural edit ("make it night") at the same settings was
+also a no-op. Cause: the node ran the T2I default `guidance_scale` 1.0, and sd.cpp's own editing
+example uses `--cfg-scale 6.0`. **At CFG 1.0 there is no unconditional branch to steer away from,
+so the instruction has nothing to act through.** At 4.0, same prompt/seed/steps: "GHOST CAFE"
+rendered, rest of the scene intact. Shipped `resolve_guidance`/`resolve_steps` — references
+present and no explicit value → EDIT_GUIDANCE 4.0 + 20 steps; an explicit value always wins.
+Measured 654 s / 628 s / 632 s (~11 min); `MAX_EDIT_STEPS` 30 because 50 steps (~23 min) would
+outlive the client's 1200 s ceiling while the GPU stayed busy.
+
+**2. The seed regression (found by reading sd.cpp's own help text).** `sd-cli`'s default seed is a
+FIXED 42 — omitting `--seed` does not mean "random", it means every image for a given prompt is
+byte-identical and "give me another one" returns the same picture. The diffusers node it replaced
+randomised. `resolve_seed` now draws one and the response reports `seed`/`width`/`height`/`steps`;
+two identical live requests now differ (seeds 262017181 vs 2126144063, mean abs diff 62/255).
+
+**3. Quality: the "edits look worse" report was real, and partly MINE.** Operator noticed the
+edited images were worse than the original. Measured against the reference (HF energy / edge
+energy / clipped pixels): seed-42 edits lost ~16% fine detail, doubled edge energy (halos) and
+blew 0.3%→4.6% of pixels with levels stretched (lum 75→94). VAE tiling was exonerated — identical
+to three decimals with it off (0.3897 vs 0.3895; at 768×512 it is ONE tile, but it caps the VAE
+buffer at 2450 MB vs 3675 MB, so it stays). Then the first live edit on a RANDOM seed came back at
+HF 0.4456 vs the reference's 0.4650, edge energy BELOW the reference, clipping 2.27%, luminance
+preserved. **Every degraded sample I had used seed 42** — sd-cli's default, i.e. the regression in
+(2) was also contaminating the quality measurements. **Seed spread, same edit, detail kept vs the
+source: seed 42 = 84% (edge 1472 vs 1121, clipped 4.61%, lum 94 vs 75); seed 7 = 98%; seed
+20260922 = 99%; seed 344238531 = 96%** — the other three sit at or below the source's edge energy
+with clipping 1.3-2.3% and luminance preserved. Seed 42 is an outlier AND was every sample I had,
+because sd-cli's default put every edit on that one draw. The "edits look worse" report was the
+seed regression, not the VAE round trip; the docs paragraph asserting the latter was written
+before the evidence and has been retracted. (Seed 42 reproduces bit-exactly across runs, so the
+comparison is deterministic, not noise.)
+
+**4. Geometry defect in my own code.** `_snap32` clamped each side independently, so a 1200×3000
+reference rendered 384×768 — a 25% aspect squash — while the legal 320×640 sat unused; an edit
+inherits its reference's shape, so the squash would land in the result. Replaced with a search over
+`LEGAL_SIZES` (246 sizes on the /32 grid inside the budget), aspect banded at 2% so near-exact
+options compete on area: worst realistic error 25%→1.6%, and 1920×1080 now renders 736×416
+(306k px) instead of 512×288 (147k px). Ratios past 3:1 are clamped (beyond the model's trained
+range and impossible inside [256,768]).
+
+**5. `fit_reference`.** sd-cli VAE-encodes a reference at ITS OWN resolution, so an unresized
+4000×3000 upload would push ~30× the output's tokens through a box that peaks at 6.8 GB on a
+768×512 edit. References are now resized to the render geometry (Pillow, already on ghost);
+unreadable bytes pass through so sd-cli fails loudly instead of the node editing something else.
+
+**6. Transparency: BUILT, NOT ADVERTISED.** `transparent=true` applies the model card's RGBA
+template. The model supports it; **stable-diffusion.cpp does not decode the alpha matte for this
+model** — measured: background α≈248, subject α≈218, i.e. noise around opaque, a die-cut sticker
+drawn on white. Kept behind the flag, absent from the tool schema, documented.
+
+**7. Retry cap.** The verifier correctly OCR'd the failed edit and drove THREE ~8-min attempts on
+one request. An edit's tool result now caps re-attempts at one and tells the model to report what
+changed and what didn't. Also corrected a claim I had shipped in the same text: re-rolling a seed
+with a tweaked prompt does NOT preserve the scene (measured: 200 s, full quality, mean abs diff
+30/255 — a different composition). The wording now offers it as "another take", with editing as
+the only route to "fix this picture".
+
+**Verification.** Pins `tests/test_image_gen_model_swap.py` (89: CFG resolution end-to-end, seed
+randomisation/reporting, reference decode/fit, size geometry incl. the squash regression by exact
+shape, edit-step ceiling vs the client timeout, queue wait vs the client timeout built from the
+REAL `LLMClient`, retry cap, transparency wrap). Battery `mutate_4ju.py`: **36/36 killed**, no-op
+survived, known-bad killed; its own tally was off by one (subtracted both controls from the kill
+count) — fixed. Two pins the source-text ratchet rejected were rewritten behavioural.
+Battery re-run after every later edit: **38/38**. Suite ONCE after the last code change:
+**24,018 / 0 / 67** (earlier interim runs: 23,989 clean, and 24,011 with the ratchet rejecting my
+own text pins, rewritten behavioural). Docs: node page (CFG, fitting, the seed-spread table,
+tiling verdict, transparency verdict) + tool page + guide row; `test_gen.py` rewritten (it had
+answered 401 since auth landed in July and still asked for LCM-era `steps: 6`).
+
+**Also fixed while unattended, each found by testing rather than assumed:** the per-side clamp
+squash (item 4); `MAX_EDIT_STEPS` 30, because the shared 50 would run ~23 min and outlive the
+client's 1200 s while holding the GPU; `BUSY_WAIT_TIMEOUT` 180→400 s, sized against
+`WORST_GENERATION_S` 700 and the client ceiling (the old value was ~4.5x a 40 s SD1.5 generation
+and would fail the second of two image calls in one turn); the edit path's closing instruction,
+which told the model to describe "what you generated and the mood you went for" after an edit
+instead of what changed; and the `seed` schema line, which still promised that re-rolling a seed
+"refines an image the user liked" — contradicting the corrected tool result.
+
+**§4JV LIVE VERIFICATION (16:10–16:22).** Node redeployed (checksum-matched) and agent restarted
+(pid 60082 → 22577, one boot, 60 s). End-to-end through the agent's API: *"Edit gen_2daeaf05.png
+so the sign reads GHOST CAFE, keep everything else the same"* → node log
+`768x512 steps=20 cfg=4 seed=938536974 refs=1` (every default resolved as designed) → GEN 630 s,
+turn 736 s → the reply embedded the image and said what changed, not what it generated. Quality vs
+the source: **95% detail kept, edge energy 1036 vs 1121 (no halo), clipping 2.53%, luminance 73.9
+vs 74.7**. Images in `~/Data/AI/ImgGen-ab-2026-09-22/` (`agent_edit_SOURCE_ghost_bakery.png` →
+`agent_edit_ghost_cafe.png`). Also verified live: two identical plain requests now return
+different seeds and different images (the fixed-42 regression), and a 4-seed spread on the same
+edit (table above).
+
+Final battery **39/39** — including one survivor found and fixed: the pin for the unreadable-
+reference path used a directory and a dead symlink, both of which fail `is_file()` and take the
+ValueError branch, so it passed without the `except OSError` handler existing at all. Rewritten
+with a chmod-000 file (skips as root). Suite ONCE after the last change: **24,019 / 0 / 67**.
+
+**The falsely-attributed lesson — QUARANTINED on the operator's call (18:24).** A
+`skills_playbook` entry learned at 14:43 ("image_generation returned the same error 4x") recorded
+MY node bounce killing an in-flight edit as an agent mistake. Flagged rather than removed
+unilaterally; on approval, quarantined via `POST /api/lessons/quarantine` — NOT by editing the
+file, because the playbook has a single-writer contract (`_crossproc_lock`) and launchd leaves no
+process-free window, so an external write would race the live agent. The designed path is also
+the reversible one: excluded from injection, kept on disk with reason + timestamp. Verified after:
+236 entries (nothing deleted), 208 active, 28 quarantined, the target carrying `quarantined: true`
+and the reason. See [[skill-prune-off-by-default]] for why deletion is the wrong reflex here.

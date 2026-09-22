@@ -1274,27 +1274,27 @@ def get_active_tool_definitions(context, query: str = None, *,
             "type": "function",
             "function": {
                 "name": "image_generation",
-                "description": "Generate an image on the external GPU node (SD1.5 DreamShaper — versatile: photorealistic, fantasy, surreal, cartoon/illustration; pick the style in the prompt). Follow 3 modes: 1) EXACT: use prompt exactly as-is, 2) ENHANCED: append style/quality enhancements matching the intended look, 3) IMAGINATION: create a high-entropy prompt. Preserve the user's exact subject description in modes 1 and 2. LONG prompts are fully used (no truncation), and A1111 attention weights work — (sharp focus:1.2) emphasises, [background] de-emphasises. CRITICAL: If the user says the generated image is WRONG or needs fixing, DO NOT blind-guess what to change. You MUST use the `vision_analysis` tool first on the previously generated image to explicitly 'see' what went wrong.",
+                "description": "Generate an image on the external GPU node (Qwen-Image-2.1 — a prompt-faithful model: it renders every object, count and spatial relation you describe, in any style: photorealistic, fantasy, surreal, cartoon/illustration; pick the style in the prompt). It can render LEGIBLE TEXT: put the exact words in double quotes (a sign that reads \"OPEN\"). Write the prompt as natural-language prose in any language (Greek works); do NOT use attention-weight syntax like (x:1.2) or [x] — its text encoder is an LLM and reads that as literal characters. Follow 3 modes: 1) EXACT: use prompt exactly as-is, 2) ENHANCED: append style/quality enhancements matching the intended look, 3) IMAGINATION: create a high-entropy prompt. Preserve the user's exact subject description in modes 1 and 2. LONG prompts are fully used. A generation takes about 3-4 MINUTES — call it ONCE and wait; never re-call because it seems slow. EDITING: to change an EXISTING image (fix a detail, change the text on a sign, restyle, add/remove an object, change the background) pass its sandbox filename in `reference_images` and describe THE CHANGE in the prompt ('Change the sign so it reads \"OPEN\"; keep everything else the same') — the model preserves the rest, including people's identity; an edit keeps the reference's size and takes about 11 MINUTES (it runs guidance, which doubles the work per step) — so make the instruction count on the first try. CRITICAL: If the user says the generated image is WRONG or needs fixing, DO NOT blind-guess what to change. You MUST use the `vision_analysis` tool first on the previously generated image to explicitly 'see' what went wrong — then EDIT it with `reference_images` rather than regenerating from scratch.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "prompt": {
                             "type": "string",
-                            "description": "The final image generation prompt. 1) EXACT: Provide the user's requested subject EXACTLY as they described it, without filtering or altering it. 2) ENHANCED: Append comma-separated style tags matching the intended look (photographic, painterly, cartoon, …); attention weights like (cinematic lighting:1.2) are supported. 3) IMAGINATION: Generate a high-entropy prompt. Detail is rewarded — the full prompt is used however long it is."
+                            "description": "The final image generation prompt, written as natural-language prose (sentences, not tag salad; no (x:1.2) weights). 1) EXACT: Provide the user's requested subject EXACTLY as they described it, without filtering or altering it. 2) ENHANCED: Append descriptive style sentences matching the intended look (photographic terms, painterly terms, cartoon terms, …). 3) IMAGINATION: Generate a high-entropy prompt. Detail is rewarded — the full prompt is used however long it is. Text to appear IN the image goes in double quotes."
                         },
                         "steps": {
                             "type": "integer",
                             "minimum": 15,
                             "maximum": 50,
-                            "description": "Inference steps. OMIT to get the node's tuned default (30). Only set it to trade quality for speed (15 = fast draft, 40+ = maximum detail)."
+                            "description": "Inference steps. OMIT to get the node's tuned default — 30 for a new image (~3.3 min), 20 for an edit (~11 min, since an edit runs guidance and each step costs twice). Only set it to trade time for detail (15 = fast draft, 50 = maximum); on an edit every extra step costs ~28 s."
                         },
                         "width": {
                             "type": "integer",
                             "description": (
                                 "Requested width in pixels (optional). Snapped to "
                                 "the node's supported sizes: 512x768 (portrait), "
-                                "544x720, 624x624 (square), 720x544, 768x512 "
-                                "(landscape) — choose by aspect ratio."
+                                "576x672, 608x608 (square), 672x576, 768x512 "
+                                "(landscape, the default) — choose by aspect ratio."
                             ),
                         },
                         "height": {
@@ -1306,7 +1306,13 @@ def get_active_tool_definitions(context, query: str = None, *,
                         },
                         "seed": {
                             "type": "integer",
-                            "description": "Optional. Reuse the SAME seed with a tweaked prompt to refine an image the user liked; omit for a fresh random image."
+                            "description": "Optional. Omit for a fresh random image — the result tells you the seed it used. Pass that seed back with the SAME prompt to reproduce an image exactly; with a TWEAKED prompt it gives another take on the idea, NOT the same picture with an edit (measured: the composition changes). To alter an existing picture, use `reference_images`."
+                        },
+                        "reference_images": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": 1,
+                            "description": "EDIT MODE. The sandbox filename of the image to edit, exactly as a previous image_generation result named it (e.g. [\"gen_1a2b3c4d.png\"]); a file the user uploaded to the sandbox works too. One reference per edit on this node. The prompt then describes the CHANGE, not the whole scene. Omit for a fresh image."
                         },
                     },
                     "required": ["prompt"]

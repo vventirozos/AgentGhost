@@ -7,15 +7,68 @@ from ..utils.logging import Icons, pretty_log
 
 # Diffusion models are happiest at their training buckets — an arbitrary
 # size produces stretched or mode-collapsed output. The live node
-# (ghost, Jetson Orin) runs SD1.5 DreamShaper 8 with a VRAM-safe pixel
-# budget of 512x768 (393k px) and a 768 per-side cap; the old SDXL
-# buckets (1024², 640x1536, …) all exceeded it, so the node scaled them
-# down and the per-side clamp DISTORTED the extreme aspect ratios the
-# bucket snap had deliberately chosen. This ladder fits the node's
-# envelope natively (all /8, all ≤ budget, portrait→landscape coverage).
+# (ghost, Jetson Orin) runs Qwen-Image-2.1 (Q4, stable-diffusion.cpp)
+# inside a 768x512 pixel budget (393k px, ~3.3 min at 30 steps — the
+# operator's chosen envelope, §4JT) with a 768 per-side cap, and this
+# model needs every side to be a multiple of 32. Anything bigger is
+# scaled down node-side and the per-side clamp would DISTORT the aspect
+# ratio the bucket snap had deliberately chosen, so the ladder fits the
+# envelope natively (all /32, all ≤ budget, portrait→landscape coverage).
+# ⚠ Keep in step with `_resolve_size` in interface/externals/
+# image_generation/img_gen_server.py — one story on both surfaces.
 _NODE_BUCKETS: list[Tuple[int, int]] = [
-    (512, 768), (544, 720), (624, 624), (720, 544), (768, 512),
+    (512, 768), (576, 672), (608, 608), (672, 576), (768, 512),
 ]
+# No size supplied → the node's default envelope (landscape). The model
+# picks portrait/square via width/height when the subject calls for it.
+_DEFAULT_BUCKET: Tuple[int, int] = (768, 512)
+# Editing (§4JV): the node accepts base64 reference images and conditions
+# the DiT on their latents, so each reference costs roughly one more image
+# of tokens, and an edit also runs CFG (two forwards per step, without which
+# the instruction is ignored entirely) — measured ~11 min at 768x512/20 steps.
+# The cap mirrors the node's MAX_REFERENCES (memory on the 8 GB Jetson).
+MAX_REFERENCES = 1
+_REF_KEYS = ("reference_images", "reference_image", "references", "input_image",
+             "image_path", "source_image", "base_image")
+
+
+def _png_size(data: bytes):
+    """(w, h) from a PNG IHDR, else None — the node picks an edit's size
+    from its reference when none was requested, so the SUCCESS note reads
+    the real size back from the bytes."""
+    if len(data) >= 24 and data.startswith(b"\x89PNG\r\n\x1a\n") and data[12:16] == b"IHDR":
+        return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+    return None
+
+
+def _resolve_reference(name, sandbox_dir) -> Path:
+    """A sandbox filename the model may spell as `gen_x.png`, `/gen_x.png`,
+    `/sandbox/gen_x.png` or the `/api/download/...` link it was shown.
+    Resolved INSIDE the sandbox only — a traversal or an absolute path
+    outside it is refused, not silently read."""
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("empty reference image name")
+    raw = name.strip()
+    for prefix in ("/api/download/", "api/download/"):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix):]
+    from .file_system import project_download_prefix
+    dl = project_download_prefix(sandbox_dir)
+    if dl and raw.startswith(dl):
+        raw = raw[len(dl):]
+    for prefix in ("/sandbox/", "sandbox/", "/workspace/", "workspace/"):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix):]
+    raw = raw.lstrip("/")
+    root = Path(sandbox_dir).resolve()
+    target = (root / raw).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        raise ValueError(f"reference image {name!r} is outside the sandbox")
+    if not target.is_file():
+        raise ValueError(f"reference image {name!r} not found in the sandbox")
+    return target
 
 
 def _snap_to_bucket(width: int, height: int) -> Tuple[Tuple[int, int], bool]:
@@ -39,14 +92,14 @@ def _snap_to_bucket(width: int, height: int) -> Tuple[Tuple[int, int], bool]:
     return best, True
 
 
-async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=None, steps: int = 0, width: int = 0, height: int = 0, seed=None, negative_prompt: str = "", **kwargs):
+async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=None, steps: int = 0, width: int = 0, height: int = 0, seed=None, negative_prompt: str = "", reference_images=None, transparent=False, **kwargs):
     # --- PARAMETER HALLUCINATION HEALING ---
     prompt = prompt or kwargs.get("image") or kwargs.get("description") or kwargs.get("subject") or kwargs.get("text")
     if not prompt:
         # Extreme fallback: If they hallucinated `<parameter name="imagination_prompt">`, grab the longest string passed
         longest_str = ""
         _skip = {"steps", "mode", "size", "dimensions", "width", "height",
-                 "seed", "negative_prompt"}
+                 "seed", "negative_prompt", "transparent", *_REF_KEYS}
         for k, v in kwargs.items():
             if k not in _skip and isinstance(v, str) and len(v) > len(longest_str):
                 longest_str = v
@@ -57,11 +110,10 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
     if not prompt:
         return "SYSTEM ERROR: The 'prompt' parameter is MANDATORY for image generation. You must provide a description of the image."
 
-    # Steps: 0/absent = defer to the NODE's tuned default (30 for a
-    # non-LCM SD1.5 model). The old 4-8 clamp was for the long-gone
-    # DreamShaper *LCM* node — against a standard checkpoint it forced
-    # every image down to the server's 15-step floor, half the tuned
-    # quality. (The current DreamShaper 8 is the standard, non-LCM one.)
+    # Steps: 0/absent = defer to the NODE's tuned default (30 — measured
+    # indistinguishable from 40 on Qwen-Image-2.1 at 768x512, §4JU). The
+    # explicit range mirrors the node's clamp: below 15 a flow model
+    # looks like a draft, above 50 only the wall clock grows.
     try:
         steps = int(steps)
     except (TypeError, ValueError):
@@ -71,8 +123,8 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
 
     # Accept hallucinated parameter shapes the model commonly emits:
     # `size="512x512"`, `dimensions=[w, h]`, or separate `width`/
-    # `height`. Snap to the nearest SDXL bucket so output isn't a
-    # stretched mess. If nothing usable was supplied, default to 1024².
+    # `height`. Snap to the nearest node bucket so output isn't a
+    # stretched mess. If nothing usable was supplied, use the default.
     def _as_int(v):
         try:
             return int(v)
@@ -93,20 +145,71 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
                 pass
         elif isinstance(size_str, (list, tuple)) and len(size_str) == 2:
             raw_w, raw_h = _as_int(size_str[0]), _as_int(size_str[1])
-    if not (raw_w and raw_h):
-        raw_w, raw_h = 624, 624
-    (final_w, final_h), snapped = _snap_to_bucket(raw_w, raw_h)
+    # References (editing). Accept the parameter shapes the model emits —
+    # a list, a single string, or one of the synonyms — and read the files
+    # from the sandbox NOW so a bad name is a clear error, not a 400 from
+    # the node after minutes of queueing.
+    refs_in = reference_images
+    if refs_in is None:
+        for k in _REF_KEYS[1:]:
+            if kwargs.get(k):
+                refs_in = kwargs[k]
+                break
+    if isinstance(refs_in, str):
+        refs_in = [refs_in]
+    ref_b64: list = []
+    ref_bytes: list = []
+    if refs_in:
+        if not isinstance(refs_in, (list, tuple)):
+            return "ERROR: reference_images must be a list of sandbox image filenames."
+        if len(refs_in) > MAX_REFERENCES:
+            return (f"ERROR: at most {MAX_REFERENCES} reference image per edit on this node "
+                    f"(got {len(refs_in)}). Pick the one that matters most.")
+        for name in refs_in:
+            try:
+                data = await asyncio.to_thread(_resolve_reference(name, sandbox_dir).read_bytes)
+            except ValueError as e:
+                return f"ERROR: {e}. Use the exact filename a previous image_generation result gave you (e.g. gen_1a2b3c4d.png)."
+            except OSError as e:
+                # A name that resolves but cannot be READ (permissions, a dead
+                # symlink, a directory). This block sits OUTSIDE the tool's
+                # try/except, so without this the OSError escaped the tool
+                # entirely instead of becoming a result the model can act on.
+                return f"ERROR: cannot read reference image {name!r}: {e.__class__.__name__}."
+            ref_bytes.append(data)
+            ref_b64.append(base64.b64encode(data).decode("ascii"))
+    transparent = str(transparent).strip().lower() in ("1", "true", "yes") if not isinstance(transparent, bool) else transparent
+
+    # An edit with no requested size keeps its reference's shape (the node
+    # derives it); a plain generation snaps to the ladder as before.
+    size_requested = bool(raw_w and raw_h)
+    if not size_requested and ref_bytes:
+        final_w = final_h = None
+        snapped = False
+    else:
+        if not size_requested:
+            raw_w, raw_h = _DEFAULT_BUCKET
+        (final_w, final_h), snapped = _snap_to_bucket(raw_w, raw_h)
 
     try:
         pretty_log("Image Gen",
-                   f"Prompt: {prompt[:30]}... | size={final_w}x{final_h}"
-                   + (f" (snapped from {raw_w}x{raw_h})" if snapped else ""),
+                   f"Prompt: {prompt[:30]}... | size="
+                   + (f"{final_w}x{final_h}" if final_w else "from reference")
+                   + (f" (snapped from {raw_w}x{raw_h})" if snapped else "")
+                   + (f" | refs={len(ref_b64)}" if ref_b64 else "")
+                   + (" | transparent" if transparent else ""),
                    icon=Icons.IMAGE_GEN)
 
         if not getattr(llm_client, 'image_gen_clients', None):
             return "ERROR: Image generation node is offline or not configured."
 
-        payload = {"prompt": prompt, "width": final_w, "height": final_h}
+        payload = {"prompt": prompt}
+        if final_w and final_h:
+            payload["width"], payload["height"] = final_w, final_h
+        if ref_b64:
+            payload["reference_images"] = ref_b64
+        if transparent:
+            payload["transparent"] = True
         if steps > 0:
             payload["steps"] = steps        # omitted → node's tuned default
         try:
@@ -118,6 +221,7 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
             payload["negative_prompt"] = negative_prompt
         resp_data = await llm_client.generate_image(payload)
 
+        used_seed = resp_data.get("seed")
         b64_str = (resp_data.get("data") or [{}])[0].get("b64_json") or ""
         # A backend content-filter refusal can return HTTP 200 with an empty
         # b64 → a 0-byte PNG that we'd otherwise report as SUCCESS with a dead
@@ -137,7 +241,7 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
         file_path = sandbox_dir / filename
         # mkdir first: a fresh project scope may not have created the dir yet,
         # and without this a FileNotFoundError would discard an image the GPU
-        # node already spent ~30s producing.
+        # node already spent ~3 minutes producing.
         await asyncio.to_thread(
             lambda: Path(sandbox_dir).mkdir(parents=True, exist_ok=True))
         await asyncio.to_thread(file_path.write_bytes, image_bytes)
@@ -150,25 +254,62 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
         # Tell the model the ACTUAL output dimensions (and that a requested
         # size was snapped to the node's bucket ladder) — otherwise it reports
         # the size the user asked for, or re-calls the tool trying to "fix" a
-        # size that was deliberately adjusted for the diffusion model.
+        # size that was deliberately adjusted for the diffusion model. For an
+        # edit that inherited its reference's size, read it from the PNG.
+        if not final_w:
+            _actual = _png_size(image_bytes)
+            final_w, final_h = _actual if _actual else ("?", "?")
         _size_note = (
             f"Rendered at {final_w}x{final_h}"
             + (f" (snapped from the requested {raw_w}x{raw_h} to the image "
                f"node's nearest supported bucket — tell the user the actual "
                f"size if they asked for a specific one)" if snapped else "")
+            + ("; edited from the reference image" if len(ref_b64) == 1 else
+               f"; edited from {len(ref_b64)} reference images" if ref_b64 else "")
+            + ("; transparent background (PNG alpha)" if transparent else "")
             + ".\n\n"
+            # The node picks a random seed when none was given and reports it.
+            # ⚠ MEASURED, not assumed: re-running the same seed with a tweaked
+            # prompt does NOT reproduce this scene with the change — the prompt
+            # shifts the whole trajectory (mean abs pixel diff 30/255 on the
+            # bakery→cafe test). It is a fresh take at full quality in ~3 min,
+            # which is the right tool for "another one like this", while only an
+            # edit keeps the actual picture. Saying otherwise sent the model
+            # down the wrong path, so the wording states both plainly.
+            + (f"Seed: {used_seed}. Reuse seed={used_seed} with a tweaked prompt for "
+               f"ANOTHER TAKE on the same idea (~3 min, full quality) — but expect a "
+               f"different composition; the seed does not preserve this scene. To keep "
+               f"THIS picture and change one thing in it, pass its filename in "
+               f"reference_images instead (an edit: ~11 min, slightly softer).\n\n"
+               if used_seed is not None and not ref_b64 else "")
         )
+        # An EDIT that did not apply must not start a retry loop: every attempt
+        # costs MINUTES of the node's only GPU. Live 2026-09-22: a text edit was
+        # silently ignored by the backend and the verifier's self-correction
+        # drove THREE ~8-minute attempts on one request (§4JV). The tool result
+        # is the only place that budget is visible to the model, so it caps it
+        # here — one re-attempt, then report honestly.
+        _edit_note = (
+            "THIS WAS AN EDIT. If the change did not actually apply, you may "
+            "re-attempt AT MOST ONCE with a differently-worded instruction; if "
+            "it still did not apply, STOP and tell the user plainly which part "
+            "changed and which did not. Do NOT keep retrying — each attempt "
+            "occupies the image node for several minutes.\n\n"
+        ) if ref_b64 else ""
         return (
             "SUCCESS: Image generated and saved to sandbox. "
-            f"{_size_note}"
+            f"{_size_note}{_edit_note}"
             "DO NOT CALL THIS TOOL AGAIN with the same prompt.\n\n"
             "Respond DIRECTLY to the user. First, display the image using EXACTLY "
             "this markdown line (keep the short alt text — do NOT paste the full "
             "prompt into it):\n\n"
             f"![generated image](/api/download/{download_rel})\n\n"
             "Then, on the next line, write ONE or TWO short sentences in your own "
-            "words telling the user what you generated and the mood/style you went "
-            "for. Do NOT paste the raw prompt verbatim."
+            + ("words telling the user WHAT YOU CHANGED (and anything you could not "
+               "change). Do NOT describe the whole picture again."
+               if ref_b64 else
+               "words telling the user what you generated and the mood/style you went "
+               "for. Do NOT paste the raw prompt verbatim.")
         )
     except Exception as e:
         return f"ERROR generating image: {str(e)}"

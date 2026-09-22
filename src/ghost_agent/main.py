@@ -1335,6 +1335,56 @@ def calib_startup_fields(cp) -> dict:
 _BOOT_MONO = None
 
 
+#: §4JS: how long the lifespan shutdown waits for the cancelled biological
+#: watchdog before abandoning it. The healthy case takes milliseconds.
+_BIO_SHUTDOWN_GRACE_S = 15.0
+
+
+def _task_where(task, limit: int = 3) -> str:
+    """"coro:lineno (file) <- caller:lineno (file)" for the frames a task is
+    parked in, innermost first — one renderer for the SIGUSR2 task dump and
+    the shutdown straggler line — or "(no frame)"."""
+    try:
+        frames = task.get_stack(limit=limit)
+        return " <- ".join(
+            f"{f.f_code.co_name}:{f.f_lineno}"
+            f" ({f.f_code.co_filename.rsplit('/', 1)[-1]})"
+            for f in reversed(frames)
+        ) or "(no frame)"
+    except Exception:  # noqa: BLE001 — diagnostics never fail a shutdown
+        return "(no frame)"
+
+
+async def _stop_biological_watchdog(bio, grace_s: Optional[float] = None) -> bool:
+    """Cancel the watchdog task and wait a BOUNDED time for it to stop.
+
+    True when it stopped (cancelled or finished); False when it is still
+    running after ``grace_s`` — then the line names where it is parked
+    and the shutdown goes on without it. Never raises into the shutdown
+    (a caller cancellation still propagates).
+    """
+    if bio is None:
+        return True
+    grace = _BIO_SHUTDOWN_GRACE_S if grace_s is None else float(grace_s)
+    bio.cancel()
+    try:
+        _done, pending = await asyncio.wait({bio}, timeout=grace)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"Biological daemon shutdown error: {e}")
+        return False
+    if pending:
+        logger.warning(
+            "Biological watchdog did not stop within %.0fs of cancel — "
+            "parked at %s; abandoning it (its cancellation was swallowed; "
+            "see utils/aio.py)", grace, _task_where(bio))
+        return False
+    if not bio.cancelled() and bio.exception() is not None:
+        logger.error("Biological daemon shutdown error: %s", bio.exception())
+    return True
+
+
 def shutdown_line(agent) -> str:
     """What the operator sees when the process drains: how long it ran and
     what it was doing. The bare "draining background work…" left three
@@ -3243,14 +3293,8 @@ async def lifespan(app):
                 pretty_log("Task Dump", f"{len(tasks)} live asyncio task(s)",
                            icon=Icons.BRAIN_PLAN, level="WARNING")
                 for t in tasks:
-                    frames = t.get_stack(limit=3)
-                    where = " <- ".join(
-                        f"{f.f_code.co_name}:{f.f_lineno}"
-                        f" ({f.f_code.co_filename.rsplit('/', 1)[-1]})"
-                        for f in reversed(frames)
-                    ) or "(no frame)"
                     pretty_log("Task Dump",
-                               f"{t.get_name()}: {where}",
+                               f"{t.get_name()}: {_task_where(t)}",
                                icon=Icons.BRAIN_PLAN, level="WARNING")
             except Exception as _tde:
                 logger.warning("task dump failed: %s", _tde)
@@ -3381,15 +3425,14 @@ async def lifespan(app):
                 logger.debug("tor guard uninstall error: %s", _tgx)
             context._tor_guard_uninstall = None
         # Cancel via the canonical reference on context.
-        bio = context.biological_task
-        if bio is not None:
-            bio.cancel()
-            try:
-                await bio
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.error(f"Biological daemon shutdown error: {e}")
+        # §4JS: BOUNDED. `await bio` sat 15 minutes on 2026-09-22 — the
+        # watchdog's cancellation had been swallowed mid-stream (the 3.10
+        # `wait_for` race, `utils/aio.py`) and the task was alive at its
+        # 60 s sleep; nothing below ran, launchd never got its exit, and
+        # the operator was left with a process that served nothing. The
+        # cause is fixed at the reader; this is the rail: wait a bounded
+        # time, then name where the straggler is parked and go on.
+        await _stop_biological_watchdog(context.biological_task)
         # Drain in-flight post-turn reflection tasks. These are
         # fire-and-forget tasks scheduled by user-correction
         # promotion; without an explicit drain they get destroyed

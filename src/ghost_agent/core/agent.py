@@ -15690,7 +15690,7 @@ class GhostAgent:
         # strict JSON…", "empty_evidence: every retrieval…") is about THIS
         # reply's shape or grounding, never project work.
         r"|^(?:strict_json|exact|number_only|word_cap|line_cap|sentence_cap"
-        r"|empty_evidence):\s"
+        r"|empty_evidence|reply_language):\s"
         # §4IN: the claim-binding verifier's artifact finding ("artifact:
         # machine noise in the reply: '<<<<'") is packaging, not work
         r"|^artifact:\s"
@@ -24430,6 +24430,91 @@ class GhostAgent:
                         final_ai_content += "\n\n"
                     final_ai_content += ui_content
 
+                # --- REPLY LANGUAGE (§4JR, in-loop regeneration) ---
+                # Req 84dc65c4: an English request answered in Greek on the
+                # final turn, with rule 5 LANGUAGE in the prompt. The judge
+                # grades content, not script, and on this path its verdict
+                # rides the critic await (65 s) — it timed out here — while
+                # the auto-repair block below is gated on a clean turn
+                # (this one carried a strike). So the language check is its
+                # own gate: LLM-free, before the verifier, needing only that
+                # the ONE regeneration round is unspent (`repair_round` is
+                # shared with the verifier repair — never two regenerations
+                # per request). NOT gated on `force_stop`: the planner's
+                # "Agent signaled completion" sets it BEFORE the final
+                # generation (live probe probe4jr: a 100% Greek final on the
+                # planning arm, guard silent), and every other site that
+                # sets it ships a code-authored reply and breaks before any
+                # model text reaches this branch. The draft has not been
+                # delivered on this path, so it is discarded whole and the
+                # loop re-opens for exactly one TEXT-ONLY turn (a forced
+                # final: tool calls dropped) with the shape directive — the
+                # SAME answer in the user's language. The streamed path
+                # cannot un-send a draft; there the same rule lands as a
+                # late turn-state verdict (`turn_state_check.reply_language`).
+                if (repair_round < self._MAX_VERIFIER_REPAIRS
+                        and os.getenv("GHOST_REPLY_LANGUAGE_REPAIR", "1")
+                        .strip().lower() not in ("0", "false", "no", "off")):
+                    try:
+                        from .reply_language import reply_language_mismatch
+                        # Earlier USER turns only: a standing "answer in
+                        # Greek from now on" is the user's choice for the
+                        # conversation and the check abstains on it.
+                        _lang_mismatch = reply_language_mismatch(
+                            last_user_content, final_ai_content,
+                            prior_user_messages=[
+                                str(m.get("content") or "")
+                                for m in (messages or [])[:-1]
+                                if isinstance(m, dict) and m.get("role") == "user"
+                                and isinstance(m.get("content"), str)])
+                    except Exception as _lang_exc:  # noqa: BLE001 — never cost the turn
+                        logger.debug("reply language check skipped: %s: %s",
+                                     type(_lang_exc).__name__, _lang_exc)
+                        _lang_mismatch = None
+                    if _lang_mismatch:
+                        _crit = (f"reply_language: the user wrote in {_lang_mismatch[0]} "
+                                 f"but the reply's prose is in {_lang_mismatch[1]} — "
+                                 f"answer in {_lang_mismatch[0]}")
+                        # The same verdict shape the turn-state tier mints
+                        # for this rule, through the ONE shape predicate —
+                        # so the vocabulary entry that makes `reply_language`
+                        # a delivery-shape complaint is what selects the
+                        # "same answer, other language, no tools" directive.
+                        from .verifier import VerifyResult as _LangVR
+                        from .verifier import VerifyVerdict as _LangVV
+                        _lang_vr = _LangVR(
+                            verdict=_LangVV.REFUTED, confidence=0.9,
+                            reasoning="turn-state check (reply_language)",
+                            issues=[_crit])
+                        _directive = _render_refute_directive(
+                            _crit,
+                            shape_only=GhostAgent._delivery_shape_only(_lang_vr),
+                            pending_request=last_user_content,
+                        )
+                        _directive += _REPAIR_STANDALONE_SUFFIX
+                        messages.append(msg)
+                        messages.append({"role": "user", "content": _directive})
+                        repair_round += 1
+                        # Text-only re-entry: the regeneration needs no tool
+                        # (unlike the verifier's content repair), and a
+                        # breaker- or planner-closed loop must not get its
+                        # tools back (§4ID). `force_stop` is cleared for this
+                        # one turn — the regeneration IS the final turn the
+                        # stop was announcing.
+                        force_final_response = True
+                        force_stop = False
+                        _repair_reentry_active = True
+                        final_ai_content = ""
+                        _verdict_is_fresh = False
+                        _verifier_verdict_cache = None
+                        pretty_log(
+                            "Verifier Gate",
+                            f"{_crit} → regeneration round {repair_round}/"
+                            f"{self._MAX_VERIFIER_REPAIRS} (text-only turn)",
+                            icon=Icons.VERIFIER_LAB, level="WARNING",
+                        )
+                        return "continue"
+
                 # --- VERIFIER-GATE AUTO-REPAIR (in-loop re-entry) ---
                 # We're at the normal-success finalisation (model
                 # produced a final answer with no further tool calls).
@@ -27036,9 +27121,27 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             pretty_log("INTERNAL MONOLOGUE", icon=Icons.BRAIN_THINK, special_marker="SECTION_END")
                             pretty_log("Reasoning Loop", f"Plan Updated. Focus: {next_action_id}", icon=Icons.OK)
 
-                            if task_tree.root_id and task_tree.nodes[task_tree.root_id].status == TaskStatus.DONE and turn > 0:
-                                pretty_log("Finalizing", "Agent signaled completion", icon=Icons.OK)
-                                force_stop = True
+                            # §4JS: a DONE plan makes THIS turn the final
+                            # generation — tools off (`force_final_response`,
+                            # which the required_tool=none branch below sets
+                            # too) — not a loop STOP. `force_stop = True` here
+                            # closed the loop before the final turn's text
+                            # ever reached finalisation's gates: the verifier's
+                            # in-loop auto-repair (`not force_stop`) never
+                            # fired on the planning arm, and neither did the
+                            # first cut of the §4JR language guard (live probe
+                            # probe4jr). The loop still ends where every final
+                            # answer ends — the no-tool-call finalisation
+                            # returns "break" — and a steer that asks for one
+                            # more turn now gets one instead of exiting on a
+                            # half-built reply.
+                            _plan_signals_done = bool(
+                                task_tree.root_id
+                                and task_tree.nodes[task_tree.root_id].status == TaskStatus.DONE
+                                and turn > 0)
+                            if _plan_signals_done:
+                                pretty_log("Finalizing", "Agent signaled completion — final generation, tools off", icon=Icons.OK)
+                                force_final_response = True
                         except Exception as e:
                             logger.error(f"Planning step failed: {e}")
                             if not any("### ACTIVE STRATEGY" in m.get("content", "") for m in messages):

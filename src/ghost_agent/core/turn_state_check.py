@@ -18,7 +18,13 @@ producing NEGATIVE verdicts only:
     by the reply's SHAPE (JSON-ness, an exact phrase, a word / line /
     sentence cap, a number-only answer);
   * every web retrieval this turn came back empty or errored and the reply
-    asserts an answer anyway, without saying so.
+    asserts an answer anyway, without saying so;
+  * the reply's prose is in the other script from the request (§4JR: an
+    English request answered in Greek, req 84dc65c4) — the one constraint
+    every request carries without stating it. The classifier and its
+    abstentions (mixed scripts, Greeklish, short texts, quoted lines) live
+    in `core/reply_language.py`, shared with the finalize-time
+    regeneration and the measurement script.
 
 Two rules were built, measured on the corpus and deleted — a mandated
 opening phrase and a count-versus-own-list check; the notes beside where
@@ -72,6 +78,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .evidence_gate import assess_turn_evidence
+from .reply_language import reply_language_mismatch
 
 __all__ = ["refute_turn_state", "mechanical_constraints", "Constraint"]
 
@@ -689,6 +696,19 @@ def _check_empty_evidence(body: str, rows: List[Dict[str, Any]]) -> Optional[str
             f"({reasons}) and the reply asserts an answer without saying so")
 
 
+def _check_reply_language(request: str, body: str) -> Optional[str]:
+    """§4JR: the reply's prose in the other script from the request. The
+    honest-inability stand-down does NOT apply — a refusal in the wrong
+    language is still in the wrong language, and the shape directive tells
+    the model to keep refusing, in the user's language."""
+    found = reply_language_mismatch(request, body)
+    if not found:
+        return None
+    expected, got = found
+    return (f"the user wrote in {expected} but the reply's prose is in {got} "
+            f"— answer in {expected}")
+
+
 def refute_turn_state(*, request: str, reply: str,
                       tools_run: Optional[Iterable[Dict[str, Any]]] = None
                       ) -> List[Tuple[str, str]]:
@@ -726,6 +746,9 @@ def refute_turn_state(*, request: str, reply: str,
         msg = _check_empty_evidence(body, _tool_rows(tools_run))
         if msg:
             issues.append(("empty_evidence", msg))
+        msg = _check_reply_language(request, body)
+        if msg:
+            issues.append(("reply_language", msg))
         return issues
     except Exception:  # noqa: BLE001 — a checker must never break a turn
         return []

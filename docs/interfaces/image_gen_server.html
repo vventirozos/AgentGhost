@@ -27,56 +27,103 @@
   <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
 
   <h1>interface / externals / image_generation / img_gen_server.py</h1>
-  <p class="subtitle">SD1.5 image-generation node on the Jetson Orin Nano (8GB, CUDA). Current checkpoint: <strong>DreamShaper&nbsp;8</strong>.</p>
+  <p class="subtitle">Qwen-Image-2.1 image-generation node on the Jetson Orin Nano (8GB unified memory, CUDA), run through <strong>stable-diffusion.cpp</strong>. Replaced the SD1.5 DreamShaper&nbsp;8 diffusers node on 2026-09-22 (§4JT/§4JU).</p>
 
   <h2>Endpoints</h2>
   <div class="scroll"><table>
     <thead><tr><th>Method · Path</th><th>Behaviour</th></tr></thead>
     <tbody>
-      <tr><td>POST /generate · POST /v1/images/generations</td><td>Body: <code>{"prompt", "negative_prompt", "steps", "width", "height", "size", "seed", "clip_skip"}</code>. Requires <code>X-Ghost-Key</code>. Size clamped to a VRAM-safe pixel budget. Returns <code>{"data": [{"b64_json": ...}]}</code>.</td></tr>
-      <tr><td>GET /health · GET /ready</td><td>Unauthenticated. <code>/health</code> reports <code>{ok, ready, load_error}</code>; <code>/ready</code> is 200 when the model is loaded, 503 while warming, 500 on load failure.</td></tr>
+      <tr><td>POST /generate · POST /v1/images/generations</td><td>Body: <code>{"prompt", "negative_prompt", "steps", "guidance_scale", "width", "height", "size", "seed", "clip_skip", "reference_images", "transparent"}</code>. Requires <code>X-Ghost-Key</code>. Size scaled into the pixel budget and snapped to multiples of 32. Returns <code>{"data": [{"b64_json": ...}]}</code>. <code>clip_skip</code> is accepted for wire compatibility and ignored (no CLIP in this model).</td></tr>
+      <tr><td>GET /health · GET /ready</td><td>Unauthenticated. <code>/health</code> reports <code>{ok, ready, load_error}</code>; <code>/ready</code> is 200 once the preflight generation succeeded, 503 while it runs, 500 if it failed.</td></tr>
     </tbody>
   </table></div>
 
-  <h2>Model &amp; scheduler</h2>
+  <h2>Model &amp; runtime</h2>
   <ul>
-    <li><code>StableDiffusionPipeline.from_single_file</code> on <code>models/dreamshaper_8.safetensors</code>, <code>torch.float16</code>. DreamShaper&nbsp;8 replaced CyberRealistic&nbsp;v9 (2026-07-26): same SD1.5 size/VRAM/speed, but versatile — photoreal, fantasy, surreal, cartoon/illustration — with style chosen by the prompt.</li>
-    <li><code>DPMSolverMultistepScheduler</code> pinned to DPM++ 2M Karras (<code>use_karras_sigmas=True</code>, <code>algorithm_type="dpmsolver++"</code>).</li>
-    <li><code>clip_skip</code> defaults to <strong>2</strong> (DreamShaper's recommendation); callers can override per request.</li>
-    <li>VAE: the checkpoint's <em>baked</em> VAE by default; <code>IMGGEN_VAE=clear</code> switches to ClearVAE fp16 (only if colors wash out).</li>
-    <li>Default negative prompt bans quality defects only — it deliberately does <em>not</em> ban cartoon/anime/3d-render, since those are now legitimate styles.</li>
+    <li><strong>Qwen-Image-2.1</strong>: a 7B single-stream DiT + a Qwen3-VL-8B text encoder + a 16×/64-channel VAE, all quantized — DiT <code>qwen_image_2.1-Q4_K.gguf</code> (4.2 GB), encoder <code>Qwen3VL-8B-Instruct-Q4_K_M.gguf</code> (5.0 GB), VAE bf16 (0.7 GB). 9.3 GB of weights on an 8 GB box: they fit only <em>phased</em> (encoder → freed → DiT → VAE).</li>
+    <li>Each request runs <code>sd-cli</code> (stable-diffusion.cpp, CUDA sm_87) as a subprocess with <code>--params-backend disk --max-vram 4.5 --diffusion-fa --vae-tiling</code>; its model manager streams each model from the NVMe file (~2 GB/s, ~5 s per image) and frees it after use. Nothing stays resident between requests, so the node idles at ~50 MB instead of the 3.2 GB the diffusers pipeline pinned.</li>
+    <li>CFG is <strong>off</strong> by default (<code>guidance_scale</code> 1.0, the model's own default); a negative prompt is only passed when a caller sets guidance &gt; 1, which doubles the runtime. The default negative prompt is empty.</li>
+    <li>Euler sampler; sd.cpp picks the resolution-dependent flow schedule.</li>
   </ul>
 
-  <h2>Tunables</h2>
+  <h2>Tunables (measured, §4JT)</h2>
   <ul>
-    <li>Sizes: default 512×768, per-side cap 768, area budget 512×768 px (768² OOM-asserts on the 8GB Jetson).</li>
-    <li>Steps: default 30, floor 15 (below that a non-LCM SD1.5 model looks bad), cap 50. Guidance 6.0.</li>
-    <li>Queued requests wait up to 180s for the GPU, then 503.</li>
+    <li>Sizes: default 768×512, per-side cap 768, area budget 768×512 px, sides snapped to /32. At this size one image takes <strong>~3.3 min at 30 steps</strong> (768×768 would be ~6.7 min, 1024² ~15 min — the operator chose 768×512).</li>
+    <li>Steps: default 30 (indistinguishable from 40 on this model at this size), floor 15, cap 50; ~6 s per step.</li>
+    <li>Queued requests wait up to 180 s for the GPU, then 503. A generation is killed after 900 s.</li>
   </ul>
 
   <h2>Boot &amp; resilience</h2>
-  <p>The port binds in ~1–2s; <code>torch</code>/<code>diffusers</code> imports and the model load run in a <em>background</em> thread (requests get a clean 503 while warming). A post-restart CUDA-teardown OOM (Tegra NvMap still releasing) retries up to 5× with 20s backoff instead of parking until a manual bounce. One dedicated GPU thread serialises all CUDA work.</p>
+  <p>The port binds in ~1–2 s; readiness is established by a <em>real</em> 1-step 256² preflight generation in a background thread (~15 s), so a node that says ready has proven the binary, the three model files, CUDA and the memory phasing. Requests get a clean 503 until then. A post-restart NvMap-teardown OOM retries up to 5× with 20 s backoff. One dedicated worker thread serialises all generation work.</p>
 
-  <h2>Prompt quality layer</h2>
-  <p>A1111-style attention weights (<code>(x:1.4)</code>, <code>[x]</code>) are parsed for real, and arbitrary-length prompts are encoded via 77-token chunking (the "lpw" approach) — nothing is silently truncated. <code>clip_skip</code> selects the penultimate CLIP layer A1111-style.</p>
+  <div class="note">
+    <strong>The Tegra allocator trap.</strong> CUDA allocations on the Jetson fail with
+    <code>NvMapMemAllocInternalTagged error 12</code> while <code>free</code> still shows gigabytes
+    "available", because reclaimable page cache counts as available and NvMap does not reclaim it on
+    demand — and streaming 9 GB of model files is exactly what fills the page cache. Raising
+    <code>vm.min_free_kbytes</code> makes sd-cli's own memory check refuse; a cgroup
+    <code>memory.high</code> throttles the GPU allocations themselves (NvMap pages are charged to the
+    process). What works: the node drops the page cache before each run and a <em>sidecar</em>
+    (<code>sudo -n sh -c 'while kill -0 &lt;pid&gt;; do echo 1 &gt; /proc/sys/vm/drop_caches; sleep 1; done'</code>)
+    keeps dropping it every second while sd-cli runs, exiting by itself when the pid is gone. It
+    needs passwordless sudo on the node; without it the node logs a warning and runs unprotected.
+  </div>
+
+  <h2>Editing with a reference image (§4JV)</h2>
+  <p><code>reference_images</code> carries base64 PNG/JPEG/WEBP (a <code>data:</code> URI prefix is tolerated). The node validates them <em>before</em> taking the GPU lock — bad base64, a non-image, an oversized file (&gt;12 MB) or too many references are a <strong>400</strong>; a node without the vision projector answers <strong>501</strong>. Each reference is written to a temp file and passed to <code>sd-cli</code> as <code>-r</code>, together with the Qwen3-VL projector (<code>--llm_vision</code>, <code>mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf</code>, loaded only for edits since it costs encoder-phase memory). The prompt describes the change; the model preserves the rest, including people's identity. With no size requested an edit inherits its reference's shape (PNG IHDR), scaled into the budget and snapped to /32.</p>
+  <p><strong>An edit needs true CFG, and the node turns it on by itself.</strong> Measured 2026-09-22: at the T2I default (<code>guidance_scale</code> 1.0, CFG-free) an edit <em>reproduces its reference and ignores the instruction</em> — three live attempts to change a sign's text, and a separate attempt to change a scene to night, all returned near-copies. At 4.0 the same prompt, seed and steps rendered the new text and left the rest of the scene alone: there is no unconditional branch to steer away from at 1.0, so the instruction has nothing to act through. <code>resolve_guidance</code> therefore returns <code>EDIT_GUIDANCE</code> (4.0) whenever references are present and the caller did not ask for a specific value; an explicit <code>guidance_scale</code> always wins. CFG doubles the work per step, so an edit also defaults to fewer steps (<code>DEFAULT_EDIT_STEPS</code> = 20) — <strong>about 11 minutes</strong> at 768×512.</p>
+
+  <p><strong>Every reference is resized to the geometry the node will render</strong> (<code>fit_reference</code>). sd-cli VAE-encodes a reference at its own resolution and those latents join the DiT sequence, so an unresized 4000×3000 upload would push roughly 30× the output's tokens through a box that already peaks at 6.7 GB on a 768×512 edit. The output is capped either way, so a larger reference buys nothing and can only OOM. A reference that already matches passes through untouched; one Pillow cannot read is passed through unchanged so sd-cli fails loudly rather than the node silently editing something else.</p>
+
+  <p><strong>Edit quality is seed-dependent, and the old fixed default was a bad draw.</strong> The first edits looked visibly worse than their source — softer, haloed, contrast crushed — and the obvious explanation (the 16× VAE encode→decode round trip an edit performs and a plain generation does not) turned out to be wrong. The same edit across four seeds, measured against the source's high-frequency energy:</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Seed</th><th>Detail kept</th><th>Edge energy (source: 1121)</th><th>Clipped px (source: 0.29%)</th><th>Mean luminance (source: 74.7)</th></tr></thead>
+    <tbody>
+      <tr><td>42 — <em>sd-cli's default</em></td><td><strong>84%</strong></td><td>1472 (halos)</td><td>4.61%</td><td>93.6 (washed out)</td></tr>
+      <tr><td>7</td><td>98%</td><td>1121</td><td>1.66%</td><td>72.0</td></tr>
+      <tr><td>20260922</td><td>99%</td><td>1146</td><td>1.31%</td><td>73.1</td></tr>
+      <tr><td>344238531</td><td>96%</td><td>1068</td><td>2.27%</td><td>72.7</td></tr>
+    </tbody>
+  </table></div>
+  <p>Seed 42 is the outlier, and it was <em>every</em> sample: sd-cli defaults <code>--seed</code> to 42, so before the node started resolving its own seed, every edit landed on that one draw. With a resolved seed a typical edit keeps 96–99% of the source's detail with edge energy at or below it. VAE tiling was ruled out along the way — with it off the numbers reproduce to three decimals (0.3897 vs 0.3895). Still true regardless of seed: do not chain edits, since each one is another round trip.</p>
+  <p>Re-rolling the same seed with a tweaked prompt is <em>not</em> a substitute for an edit: measured on the same bakery→cafe change it renders at full quality in 200 s but produces a different composition (mean absolute pixel difference 30/255), because the prompt change moves the whole sampling trajectory. It is the right call for "another take on this idea"; only an edit keeps the actual picture.</p>
+
+  <p><strong>The cap is one reference.</strong> A reference's latents join the DiT sequence, so an edit costs about (1 + refs) × a plain generation: measured at 768×512, one reference runs at 14.2 s/step (2.4× plain) with a 6.7 GB peak — <strong>~8 min at 30 steps</strong>. Two references would push 4608 tokens through a box where 4096 (the 1024² run) already peaked at 6.7 GB. <code>MAX_REFERENCES</code> is a memory cap, mirrored by the agent tool.</p>
+
+  <h2>Transparency — not available (measured 2026-09-22)</h2>
+  <p><code>transparent: true</code> wraps the prompt in the model card's RGBA recipe ("This is an RGBA image with transparency. … The image has alpha channel and the background is transparent."). The model supports it, <em>this backend does not yet</em>: stable-diffusion.cpp has no alpha-matte decode for Qwen-Image-2.1, and the 4-channel PNG it writes carries noise around opaque (background α≈248, subject α≈218; a die-cut sticker drawn on white). The field is kept for the day sd.cpp adds it; the agent does <strong>not</strong> advertise it.</p>
+
+  <h2>Prompt handling</h2>
+  <p>The text encoder is an LLM that reads the prompt as prose, so A1111 attention syntax
+  (<code>(x:1.4)</code>, <code>[x]</code>) would enter it as literal characters. The node flattens that
+  syntax to plain words (<code>strip_attention_syntax</code>) in case a user types it; the agent no
+  longer advertises it. Text meant to appear in the image goes in double quotes and renders legibly.
+  Any language works, including Greek. Prompts are used in full — no 77-token truncation.</p>
 
   <div class="note">
     <strong>Auth (2026-07-15).</strong> The node binds <code>0.0.0.0</code> on the LAN and a generation
-    monopolises the GPU for ~30–60s, so <code>/generate</code> requires the fleet
+    monopolises the GPU for minutes, so <code>/generate</code> requires the fleet
     <code>X-Ghost-Key</code> (resolved from <code>GHOST_API_KEY</code> env, else
     <code>~/Data/AI/.ghost_api_key</code>, else the server refuses to start — an explicit
     <code>GHOST_API_KEY=''</code> knowingly disables it on a trusted network). Auth is checked
     <em>before</em> the readiness gates, so an unauthenticated caller can never probe warmup/GPU
     state. Monitoring endpoints (<code>/health</code>, <code>/ready</code>) stay open. The agent stamps the
     key only on its <code>image_gen</code> httpx pool (llama.cpp pools don't check keys). Covered by
-    <code>tests/test_imggen_node_auth.py</code>.
+    <code>tests/test_imggen_node_auth.py</code>; the swap itself by
+    <code>tests/test_image_gen_model_swap.py</code>.
   </div>
+
+  <h2>Deployment</h2>
+  <ul>
+    <li>Deployed to ghost as <code>~/Data/AI/ImgGen/server.py</code>; systemd unit <code>ghost-image-node</code> (User=vasilis, WorkingDirectory <code>~/Data/AI/ImgGen</code>, port 8000). Binary and models live under <code>~/Data/AI/ImgGen/qwen21/</code>; paths are overridable via <code>IMGGEN_SD_CLI</code>, <code>IMGGEN_DIT</code>, <code>IMGGEN_TE</code>, <code>IMGGEN_VAE_PATH</code>, <code>IMGGEN_OUT_DIR</code>.</li>
+    <li>The previous SD1.5 server is kept on the node as <code>server.sd15-dreamshaper.bak.py</code>.</li>
+    <li>License: Qwen-Image-2.1 ships under the Qwen Research License (non-commercial).</li>
+  </ul>
 
   <h2>Dependencies</h2>
   <ul>
-    <li><code>diffusers</code> (StableDiffusionPipeline, AutoencoderKL, DPMSolverMultistepScheduler)</li>
-    <li><code>torch</code> (float16, CUDA)</li>
-    <li><code>PIL</code>, <code>fastapi</code>/<code>uvicorn</code></li>
+    <li><code>stable-diffusion.cpp</code> (<code>sd-cli</code>, built with <code>-DSD_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=87</code>)</li>
+    <li><code>fastapi</code>/<code>uvicorn</code>; passwordless <code>sudo</code> for the page-cache sidecar</li>
   </ul>
 
   <footer><a href="../index.html">← Back to index</a></footer>

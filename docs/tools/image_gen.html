@@ -25,25 +25,31 @@
   <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
 
   <h1>tools / image_gen.py</h1>
-  <p class="subtitle">Stable Diffusion XL image generation routed to an external GPU node.</p>
+  <p class="subtitle">Image generation routed to the external GPU node (ghost: Qwen-Image-2.1 via stable-diffusion.cpp since 2026-09-22).</p>
 
   <h2>Tool: <code>image_generation</code></h2>
   <p>Auto-registered when <code>context.llm_client.image_gen_clients</code> exists.</p>
   <ul>
     <li>Heals missing prompt by checking related kwargs (<code>image</code>, <code>description</code>, <code>subject</code>, <code>text</code>).</li>
-    <li>Clamps <code>steps</code> to <code>[4, 8]</code> (Lightning models hate longer schedules).</li>
-    <li>Calls <code>llm_client.generate_image({"prompt", "steps"})</code>.</li>
+    <li>Omits <code>steps</code> unless the model set it (the node's tuned default, 30, wins); an explicit value is clamped to <code>[15, 50]</code>.</li>
+    <li>Snaps the requested size to the node's bucket ladder — <code>512x768, 576x672, 608x608, 672x576, 768x512</code> (all inside the node's 768×512 pixel budget, all multiples of 32 as sd.cpp requires for this model); no size → <code>768x512</code>. The ladder and the node's <code>_resolve_size</code> are pinned to agree (<code>tests/test_image_gen_model_swap.py</code>).</li>
+    <li>Passes <code>seed</code> and <code>negative_prompt</code> through when given (the negative only matters if the node runs with CFG on, which it does not by default).</li>
+    <li><strong>Editing</strong> (<code>reference_images</code>, one filename on this node): resolves the sandbox file the model names in any of the spellings it uses (<code>gen_x.png</code>, <code>/gen_x.png</code>, <code>/sandbox/gen_x.png</code>, the <code>/api/download/…</code> link it was shown), refuses anything outside the sandbox or missing <em>before</em> calling the node, sends it base64, omits the size so the edit keeps the reference's shape, and reads the actual size back from the returned PNG for the SUCCESS note. Synonyms the model hallucinates (<code>reference_image</code>, <code>input_image</code>, <code>source_image</code>, …) are healed. An edit takes ~11 minutes (the node runs guidance for edits, without which the instruction is ignored) and costs some fine detail to the VAE round trip, so the tool result tells the model to re-attempt at most once and never to chain edits.</li>
+    <li>Calls <code>llm_client.generate_image({"prompt", "width", "height", …})</code>; the transport allows 20 minutes — one image takes ~3.3 minutes on the node, and no tool-level timeout wraps the call.</li>
     <li>Decodes base64 PNG, writes to sandbox as <code>gen_UUID.png</code>.</li>
     <li>Returns a markdown embed with a <strong>short</strong> alt text (<code>![generated image](/api/download/gen_UUID.png)</code>) — the giant raw prompt is deliberately kept out of the alt text.</li>
     <li>Instructs the model to follow the embed with one or two short sentences describing what it generated, in its own words, so the user always gets a human-readable caption instead of a bare link.</li>
   </ul>
 
-  <p>Backend topology and SDXL model config: <a href="../interfaces/image_gen_server.html">image-gen server</a>.</p>
+  <h2>What the model is told (2026-09-22 swap)</h2>
+  <p>The tool description and the system prompt teach the new backend's contract: write the prompt as natural-language prose in any language (Greek works); put text that should appear in the image in double quotes (it renders legibly); do <em>not</em> use A1111 attention-weight syntax — the model's text encoder is an LLM and would read <code>(x:1.2)</code> as literal characters (the old SD1.5 node parsed it; the new node flattens it defensively); and one image takes 3–4 minutes, so call the tool once and wait. The self-correction loop now ends in an <em>edit</em>: look at the wrong image with <code>vision_analysis</code>, then call <code>image_generation</code> with <code>reference_images</code> and a prompt that describes only the change. Transparency is deliberately not offered — the backend cannot deliver it yet (see the server page). The old advice — attention weights, 624×624 squares, "SD1.5 DreamShaper" — is gone from <code>tools/registry.py</code> and <code>core/prompts.py</code>; a pin fails if it comes back.</p>
+
+  <p>Backend, memory phasing and the Tegra allocator trap: <a href="../interfaces/image_gen_server.html">image-gen server</a>.</p>
 
   <h2>2026-07-14 audit fixes</h2>
   <ul>
-    <li><strong>The SUCCESS message now states the actual output size.</strong> The requested dimensions are snapped to the image node's bucket ladder (SD1.5 VRAM envelope), but that adjustment was only logged for the operator — the model told the user it generated the requested size, or re-called the tool trying to "fix" a size that was deliberately snapped. The message now says <q>Rendered at WxH (snapped from …)</q>.</li>
-    <li><strong>The sandbox dir is created before the write.</strong> A fresh project scope may not have created the dir yet; without the <code>mkdir</code> a <code>FileNotFoundError</code> discarded an image the GPU node had already spent ~30s producing. Covered by <code>tests/test_tools_batch_audit_fixes.py</code>.</li>
+    <li><strong>The SUCCESS message now states the actual output size.</strong> The requested dimensions are snapped to the image node's bucket ladder (the node's VRAM envelope), but that adjustment was only logged for the operator — the model told the user it generated the requested size, or re-called the tool trying to "fix" a size that was deliberately snapped. The message now says <q>Rendered at WxH (snapped from …)</q>.</li>
+    <li><strong>The sandbox dir is created before the write.</strong> A fresh project scope may not have created the dir yet; without the <code>mkdir</code> a <code>FileNotFoundError</code> discarded an image the GPU node had already spent minutes producing. Covered by <code>tests/test_tools_batch_audit_fixes.py</code>.</li>
   </ul>
 
   <footer><a href="../index.html">← Back to index</a></footer>

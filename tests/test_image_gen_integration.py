@@ -126,9 +126,12 @@ def test_prompts_and_registry_image_gen_instructions():
     
     param_desc = img_gen_def["function"]["parameters"]["properties"]["prompt"]["description"]
     assert "EXACTLY as they described it" in param_desc
-    # The node is SD1.5 with real weight support now — the description
-    # teaches attention-weight syntax instead of "SDXL quality boosters".
-    assert "attention weights" in param_desc
+    # The node is Qwen-Image-2.1 (LLM text encoder) — the description
+    # teaches prose and FORBIDS attention-weight syntax, which that encoder
+    # would read as literal characters (2026-09-22 swap).
+    assert "prose" in param_desc
+    assert "(x:1.2)" in param_desc
+    assert "double quotes" in param_desc     # typography is a real capability now
     assert "high-entropy prompt" in param_desc
     
     vision_def = next((t for t in tools if t.get("function", {}).get("name") == "vision_analysis"), None)

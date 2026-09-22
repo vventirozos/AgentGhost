@@ -11,6 +11,7 @@ import httpx
 from ..utils.logging import (Icons, pretty_log, request_id_context,
                              verify_purpose_context)
 from ..utils.helpers import get_utc_timestamp, env_positive
+from ..utils.aio import wait_for as _wait_for_cancel_safe
 
 logger = logging.getLogger("GhostAgent")
 
@@ -3490,7 +3491,14 @@ class LLMClient:
                         while True:
                             _timeout = _STREAM_FIRST_BYTE_TIMEOUT if awaiting_first_byte else _STREAM_IDLE_TIMEOUT
                             try:
-                                chunk = await asyncio.wait_for(chunk_iter.__anext__(), timeout=_timeout)
+                                # §4JS: NOT `asyncio.wait_for` — on 3.10 it
+                                # drops the caller's cancellation when the
+                                # chunk lands in the same loop iteration
+                                # (bpo-42130), and a chunk lands every few ms:
+                                # a cancelled turn kept streaming, the
+                                # watchdog that owned it never died, and a
+                                # SIGTERM shutdown hung 15 min (2026-09-22).
+                                chunk = await _wait_for_cancel_safe(chunk_iter.__anext__(), timeout=_timeout)
                             except StopAsyncIteration:
                                 break
                             except asyncio.TimeoutError:
