@@ -4923,7 +4923,10 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
                 # BARE STRING, which the outcome classifier reads as neither a
                 # failure nor a rejection — a download that wrote nothing was
                 # booked as a success. And `%0A` let the URL inject whole fake
-                # lines ("SUCCESS: …") into the tool output the model reads.
+                # result lines into the tool output the model reads.
+                # (Deliberately NOT quoting the literal prefix here: the
+                # producer/parser parity check scans this file for message
+                # shapes, and a comment carrying one registers as a producer.)
                 decoded = "".join(c for c in decoded if c.isprintable())
                 decoded = decoded.replace("\\", "_").strip()
                 # Leading dots are legitimate (`.env`, `.gitignore`); only a

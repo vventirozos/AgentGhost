@@ -494,16 +494,16 @@ def _dead_onion_notice(url: str):
     )
 
 
-def _main_image_line(parsed) -> str:
-    """Surface the page's own main image as a ready-to-download URL.
+_IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
 
-    §4JY: the model could not obtain a photo of a person. It guessed
-    Wikimedia thumbnail widths (`800px-…`/`640px-…` → HTTP 400; only some
-    widths are pre-rendered), then screenshotted the file PAGE and passed a
-    picture of a web page as the "photo". The site already declares its main
-    image in `og:image`, and that URL fetched 200. Printing it here — with
-    the source, since `largest-rendered` is a guess and `og:image` is not —
-    turns "find me a photo" from a URL-shape puzzle into one download.
+
+def _main_image_line(parsed) -> str:
+    """The page's own main image, as a ready-to-download URL (§4JY).
+
+    The model could not obtain a photo: it guessed thumbnail widths that
+    404/400, then screenshotted the file PAGE. Sites declare the answer in
+    `og:image`. `source` travels with it because `largest-rendered` is a
+    guess and a declaration is not.
     """
     mi = (parsed or {}).get("main_image") or {}
     url = mi.get("url")
@@ -511,21 +511,14 @@ def _main_image_line(parsed) -> str:
         return ""
     src = mi.get("source", "?")
     dims = f", {mi['w']}x{mi['h']} as rendered" if mi.get("w") else ""
-    # ⚠ NAME THE DESTINATION. Suggesting `download(url=…)` with no `path` let
-    # the PAGE choose the filename: `file_system`'s auto-heal derives it from
-    # the URL, so `<meta property="og:image" content="https://evil/x/main.py">`
-    # wrote attacker bytes over the agent's own main.py — which a later
-    # `execute` runs. The extension is the only part of a hostile URL worth
-    # keeping, and even that is whitelisted.
-    ext = ""
+    # ⚠ NAME THE DESTINATION. With no `path` the download's auto-heal takes the
+    # filename from the URL, so a page declaring og:image=…/main.py overwrote
+    # the agent's own main.py. Only a whitelisted extension survives.
     try:
-        from urllib.parse import urlparse as _up
-        cand = Path(_up(url).path).suffix.lower()
-        if cand in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"):
-            ext = cand
+        _ext = Path(_urlparse(url).path).suffix.lower()
     except Exception:  # noqa: BLE001
-        pass
-    suggested = f"main_image{ext or '.jpg'}"
+        _ext = ""
+    suggested = "main_image" + (_ext if _ext in _IMG_EXTS else ".jpg")
     return (f"\nMAIN_IMAGE: {url}\n"
             f"MAIN_IMAGE_SOURCE: {src}{dims} — to get the picture itself call "
             f"file_system(operation=\"download\", url=<that URL>, "
