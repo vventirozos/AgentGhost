@@ -133,19 +133,27 @@ async def test_available_hint_works_under_dot_dir_root(tmp_path):
 
 # ============================================================ image_gen
 
-async def test_image_success_reports_snapped_dimensions(tmp_path):
+async def test_image_success_reports_the_size_the_node_rendered(tmp_path):
+    """§4KA: the tool no longer snaps sizes — the node searches 246 legal sizes
+    and the result must state what it actually rendered, not what was asked.
+    Reporting the request as fact is how a user was told 768x512 when the node
+    had chosen otherwise."""
     from ghost_agent.tools import image_gen
     import base64
-    png = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"0" * 32).decode()
+    png = base64.b64encode(
+        b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\x0dIHDR"
+        + (736).to_bytes(4, "big") + (416).to_bytes(4, "big")
+        + b"\x08\x06\x00\x00\x00" + b"\x00" * 8).decode()
     llm = MagicMock()
     llm.image_gen_clients = [{"x": 1}]
-    llm.generate_image = AsyncMock(return_value={"data": [{"b64_json": png}]})
+    llm.generate_image = AsyncMock(return_value={"data": [{"b64_json": png}],
+                                                 "width": 736, "height": 416})
     out = await image_gen.tool_generate_image(
-        prompt="a cat", llm_client=llm, sandbox_dir=tmp_path,
-        width=1024, height=1024)
+        prompt="a cat", llm_client=llm, sandbox_dir=tmp_path, width=1920, height=1080)
     assert "SUCCESS" in out
-    assert "608x608" in out          # actual bucket
-    assert "snapped from" in out     # and that it was adjusted
+    assert "Rendered at 736x416" in out          # what the node did
+    assert "1920x1080" in out                    # and what was asked, so the model can say so
+
 
 
 async def test_image_writes_when_sandbox_dir_absent(tmp_path):

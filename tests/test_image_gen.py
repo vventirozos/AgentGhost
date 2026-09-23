@@ -33,17 +33,12 @@ async def test_tool_generate_image_success(mock_sandbox, mock_llm_client):
     # Run the tool
     result = await tool_generate_image(prompt, mock_llm_client, mock_sandbox)
 
-    # The tool snaps requested size to the node's native bucket ladder
-    # (Qwen-Image-2.1 Jetson envelope, 768x512 budget). With no
-    # width/height passed, the default landscape bucket 768x512 is used.
-    # Steps are OMITTED by default so the node's tuned default (30)
-    # applies — the old LCM-era steps=6 forced the server's 15-step floor
-    # and silently halved quality.
-    mock_llm_client.generate_image.assert_awaited_once_with({
-        "prompt": prompt,
-        "width": 768,
-        "height": 512,
-    })
+    # §4KA: the tool no longer snaps sizes. With no width/height passed it
+    # sends NONE and the node applies its own default — one source of truth
+    # for geometry, and the node picks from 246 legal sizes rather than the
+    # five this tool used to impose. Steps are OMITTED by default too, so the
+    # node's tuned default (30) applies.
+    mock_llm_client.generate_image.assert_awaited_once_with({"prompt": prompt})
 
     # Verify result string format. The tool was redesigned to embed a
     # SHORT alt text ("generated image") and instruct the model to
@@ -93,8 +88,6 @@ async def test_tool_generate_image_steps_clipping(mock_sandbox, mock_llm_client,
 
     mock_llm_client.generate_image.assert_awaited_once_with({
         "prompt": "prompt",
-        "width": 768,
-        "height": 512,
         "steps": expected_steps,
     })
 

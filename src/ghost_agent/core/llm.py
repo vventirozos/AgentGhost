@@ -1395,6 +1395,11 @@ class LLMClient:
             return None
         return image_gen_clients[0]
 
+    #: Backoff between image-node attempts when it answers 503. Escalating,
+    #: and long enough in total (45 s) to cover a node whose preflight is
+    #: re-running — see the comment at the retry site.
+    _IMAGE_WARMUP_BACKOFF = (10.0, 35.0)
+
     async def generate_image(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """
         Generates an image by posting to an image generation node.
@@ -1457,14 +1462,26 @@ class LLMClient:
                 if node.get("url") and _is_node_fault(e):
                     self.circuit_breaker.record_failure(node["url"])
                 if attempt < 2:
-                    # A 503 is the node WARMING UP (it binds its port ~1-2s
-                    # after a restart but loads the model for ~5-10s more) or
-                    # GPU-busy — a fixed 1-2s backoff expired before either
-                    # cleared. Wait long enough for the warmup to finish.
+                    # A 503 is the node WARMING UP or GPU-busy, and the wait
+                    # has to match what the node actually does.
+                    # ⚠ The old 8 s x 3 was sized for a "~5-10 s model load"
+                    # that no longer exists: readiness is now a REAL 1-step
+                    # preflight generation (~13-20 s measured), and a failed
+                    # one retries five times with a 20 s delay. Three 8 s
+                    # sleeps cannot outlast even the happy path, so a request
+                    # arriving during a restart burned all three attempts and
+                    # surfaced "generation failed" for a node that was simply
+                    # starting. GPU-busy is the other 503 and is worth waiting
+                    # on too — a generation runs minutes, so a short backoff
+                    # helps nobody.
                     _is_503 = getattr(getattr(e, "response", None),
                                       "status_code", None) == 503
-                    pretty_log("Image Node Retry", f"Attempt {attempt+1} failed: {type(e).__name__}: {e}", level="WARNING", icon=Icons.WARN)
-                    await asyncio.sleep(8.0 if _is_503 else 2 ** attempt)
+                    _wait = self._IMAGE_WARMUP_BACKOFF[attempt] if _is_503 else 2 ** attempt
+                    pretty_log("Image Node Retry",
+                               f"Attempt {attempt+1} failed: {type(e).__name__}: {e}"
+                               + (f" — 503, waiting {_wait:.0f}s for warmup/GPU" if _is_503 else ""),
+                               level="WARNING", icon=Icons.WARN)
+                    await asyncio.sleep(_wait)
                     # Try to get next node if possible
                     node = self.get_image_gen_node()
                 else:

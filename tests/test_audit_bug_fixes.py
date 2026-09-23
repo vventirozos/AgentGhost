@@ -403,76 +403,12 @@ async def test_bug9_pdf_rejects_unsafe_filename(tmp_path, monkeypatch):
 # Bug #10 — image-gen snaps requested size to nearest SDXL bucket
 # ======================================================================
 
-def test_bug10_snap_returns_exact_bucket_when_matching():
-    from ghost_agent.tools.image_gen import _snap_to_bucket
-    (w, h), adjusted = _snap_to_bucket(608, 608)
-    assert (w, h) == (608, 608)
-    assert adjusted is False
-
-
-def test_bug10_snap_square_to_node_square():
-    """Squares snap to the node's square bucket (608x608 — the node is a
-    Qwen-Image-2.1 Jetson with a 768x512 pixel budget and /32 sides; the
-    old SDXL 1024 buckets exceeded it and got scale-distorted server-side)."""
-    from ghost_agent.tools.image_gen import _snap_to_bucket
-    (w, h), adjusted = _snap_to_bucket(512, 512)
-    assert (w, h) == (608, 608)
-    assert adjusted is True
-    (w, h), adjusted = _snap_to_bucket(1024, 1024)
-    assert (w, h) == (608, 608)
-    assert adjusted is True
-
-
-def test_bug10_snap_landscape_to_landscape_bucket():
-    """A landscape request must NOT pick a portrait bucket — aspect
-    ratio is the primary discriminator."""
-    from ghost_agent.tools.image_gen import _snap_to_bucket
-    # 16:9-ish landscape.
-    (w, h), adjusted = _snap_to_bucket(1600, 900)
-    assert w > h, f"expected landscape, got {w}x{h}"
-    assert adjusted is True
-
-
-def test_bug10_snap_portrait_to_portrait_bucket():
-    from ghost_agent.tools.image_gen import _snap_to_bucket
-    (w, h), adjusted = _snap_to_bucket(900, 1600)
-    assert h > w, f"expected portrait, got {w}x{h}"
-    assert adjusted is True
-
-
-@pytest.mark.asyncio
-async def test_bug10_payload_contains_snapped_size(tmp_path):
-    """The payload sent to the image client must include the snapped
-    width/height (not the raw user request)."""
-    from ghost_agent.tools.image_gen import tool_generate_image
-
-    captured = {}
-
-    async def fake_gen(payload):
-        captured.update(payload)
-        # Minimal valid response: a single 1x1 PNG.
-        import base64
-        png = base64.b64encode(b"\x89PNG\r\n\x1a\n").decode()
-        return {"data": [{"b64_json": png}]}
-
-    llm = MagicMock()
-    llm.image_gen_clients = [object()]  # truthy
-    llm.generate_image = fake_gen
-
-    out = await tool_generate_image(
-        prompt="a cat",
-        llm_client=llm,
-        sandbox_dir=tmp_path,
-        width=512,
-        height=512,
-    )
-    assert "SUCCESS" in out
-    assert captured["width"] in (608,)   # snapped to the node's square bucket
-    assert captured["height"] in (608,)
-    # Steps omitted -> node's tuned default (30) applies server-side; the
-    # old LCM-era 4-8 clamp forced every image to the 15-step floor.
-    assert "steps" not in captured
-
+# RETIRED §4KA (2026-09-22): these pinned a client-side bucket snap that has
+# been REMOVED. The node searches 246 legal sizes with a banded aspect metric,
+# so snapping in the tool degraded the result (1920x1080 -> 768x512, 15.6%
+# aspect error vs the node's 736x416 at 0.5%) and then reported the client's
+# pick as the node's choice. The surviving property — the tool reports the size
+# actually RENDERED — lives in tests/test_image_gen_model_swap.py.
 
 # ======================================================================
 # Bug #11 — `update_profile` replaces singleton keys instead of merging

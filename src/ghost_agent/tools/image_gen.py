@@ -2,26 +2,18 @@ import asyncio
 import uuid
 import base64
 from pathlib import Path
-from typing import Tuple
 from ..utils.logging import Icons, pretty_log
 
-# Diffusion models are happiest at their training buckets — an arbitrary
-# size produces stretched or mode-collapsed output. The live node
-# (ghost, Jetson Orin) runs Qwen-Image-2.1 (Q4, stable-diffusion.cpp)
-# inside a 768x512 pixel budget (393k px, ~3.3 min at 30 steps — the
-# operator's chosen envelope, §4JT) with a 768 per-side cap, and this
-# model needs every side to be a multiple of 32. Anything bigger is
-# scaled down node-side and the per-side clamp would DISTORT the aspect
-# ratio the bucket snap had deliberately chosen, so the ladder fits the
-# envelope natively (all /32, all ≤ budget, portrait→landscape coverage).
-# ⚠ Keep in step with `_resolve_size` in interface/externals/
-# image_generation/img_gen_server.py — one story on both surfaces.
-_NODE_BUCKETS: list[Tuple[int, int]] = [
-    (512, 768), (576, 672), (608, 608), (672, 576), (768, 512),
-]
-# No size supplied → the node's default envelope (landscape). The model
-# picks portrait/square via width/height when the subject calls for it.
-_DEFAULT_BUCKET: Tuple[int, int] = (768, 512)
+# SIZE IS THE NODE'S DECISION (§4KA). This tool used to snap every request to
+# five fixed shapes, a habit from the SD1.5 node whose server could only scale
+# and per-side clamp. The node now picks from 246 legal sizes by aspect (2%
+# band, then closest area), so snapping here only DEGRADED the result and then
+# reported a falsehood: 1920x1080 became 768x512 (15.6% aspect error) when the
+# node would have chosen 736x416 (0.5%), and 1200x3000 became 512x768 (66.7%)
+# against an exact 256x640 — while the SUCCESS note called the client's pick
+# "the image node's nearest supported bucket". Width/height are now passed
+# through untouched, omitted entirely when the caller gave none, and the size
+# REPORTED back is the one the node says it rendered.
 # Editing (§4JV): the node accepts base64 reference images and conditions
 # the DiT on their latents, so each reference costs roughly one more image
 # of tokens, and an edit also runs CFG (two forwards per step, without which
@@ -40,7 +32,9 @@ def _png_size(data: bytes):
     from its reference when none was requested, so the SUCCESS note reads
     the real size back from the bytes."""
     if len(data) >= 24 and data.startswith(b"\x89PNG\r\n\x1a\n") and data[12:16] == b"IHDR":
-        return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+        w, h = int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+        if w and h:          # a malformed IHDR printed "Rendered at 0x0" as fact
+            return w, h
     return None
 
 
@@ -95,27 +89,6 @@ def _resolve_reference(name, sandbox_dir) -> Path:
     raise ValueError(f"reference image {name!r} not found in the sandbox")
 
 
-def _snap_to_bucket(width: int, height: int) -> Tuple[Tuple[int, int], bool]:
-    """Return ((w, h), adjusted) where adjusted=True iff the requested
-    size was not already a valid bucket. Picks the bucket minimising
-    aspect-ratio distance first, then pixel-area distance.
-    """
-    requested = (int(width), int(height))
-    if requested in _NODE_BUCKETS:
-        return requested, False
-    rw, rh = max(1, requested[0]), max(1, requested[1])
-    target_ar = rw / rh
-    target_area = rw * rh
-    best = min(
-        _NODE_BUCKETS,
-        key=lambda b: (
-            abs((b[0] / b[1]) - target_ar),
-            abs((b[0] * b[1]) - target_area),
-        ),
-    )
-    return best, True
-
-
 async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=None, steps: int = 0, width: int = 0, height: int = 0, seed=None, negative_prompt: str = "", reference_images=None, transparent=False, **kwargs):
     # --- PARAMETER HALLUCINATION HEALING ---
     prompt = prompt or kwargs.get("image") or kwargs.get("description") or kwargs.get("subject") or kwargs.get("text")
@@ -147,8 +120,11 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
 
     # Accept hallucinated parameter shapes the model commonly emits:
     # `size="512x512"`, `dimensions=[w, h]`, or separate `width`/
-    # `height`. Snap to the nearest node bucket so output isn't a
-    # stretched mess. If nothing usable was supplied, use the default.
+    # `height`. Whatever is parsed is passed THROUGH untouched — the node
+    # owns geometry and searches 246 legal sizes within an aspect band, so
+    # snapping here only threw away precision (1920x1080 became 768x512,
+    # 15.6% off, where the node answers 736x416 at 0.5%). If nothing usable
+    # was supplied, send no size at all and let the node use its default.
     def _as_int(v):
         try:
             return int(v)
@@ -156,8 +132,8 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
             return 0
 
     # Coerce the direct width/height first: a hallucinated "1024px" / "large"
-    # is truthy but not int-able, and _snap_to_bucket's int() ran OUTSIDE
-    # the try below → an uncaught ValueError escaped the tool.
+    # is truthy but not int-able; coercing here keeps a ValueError from
+    # escaping the tool.
     raw_w, raw_h = _as_int(width), _as_int(height)
     if not (raw_w and raw_h):
         size_str = kwargs.get("size") or kwargs.get("dimensions")
@@ -217,22 +193,15 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
             ref_b64.append(base64.b64encode(data).decode("ascii"))
     transparent = str(transparent).strip().lower() in ("1", "true", "yes") if not isinstance(transparent, bool) else transparent
 
-    # An edit with no requested size keeps its reference's shape (the node
-    # derives it); a plain generation snaps to the ladder as before.
+    # No size given → send none and let the node apply its default (or, for an
+    # edit, the reference's shape). One source of truth for geometry.
     size_requested = bool(raw_w and raw_h)
-    if not size_requested and ref_bytes:
-        final_w = final_h = None
-        snapped = False
-    else:
-        if not size_requested:
-            raw_w, raw_h = _DEFAULT_BUCKET
-        (final_w, final_h), snapped = _snap_to_bucket(raw_w, raw_h)
+    final_w, final_h = (raw_w, raw_h) if size_requested else (None, None)
 
     try:
         pretty_log("Image Gen",
                    f"Prompt: {prompt[:30]}... | size="
-                   + (f"{final_w}x{final_h}" if final_w else "from reference")
-                   + (f" (snapped from {raw_w}x{raw_h})" if snapped else "")
+                   + (f"{final_w}x{final_h}" if final_w else "node default")
                    + (f" | refs={len(ref_b64)}" if ref_b64 else "")
                    + (" | transparent" if transparent else ""),
                    icon=Icons.IMAGE_GEN)
@@ -288,19 +257,22 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
         from .file_system import project_download_prefix
         download_rel = f"{project_download_prefix(sandbox_dir)}{filename}"
 
-        # Tell the model the ACTUAL output dimensions (and that a requested
-        # size was snapped to the node's bucket ladder) — otherwise it reports
+        # Tell the model the ACTUAL output dimensions — otherwise it reports
         # the size the user asked for, or re-calls the tool trying to "fix" a
-        # size that was deliberately adjusted for the diffusion model. For an
-        # edit that inherited its reference's size, read it from the PNG.
-        if not final_w:
-            _actual = _png_size(image_bytes)
-            final_w, final_h = _actual if _actual else ("?", "?")
+        # size the node chose deliberately.
+        # ⚠ REPORT what was RENDERED, not what was asked. The response carries
+        # the node's authoritative width/height; fall back to reading the PNG,
+        # and only then to the request. Echoing the request made the tool state
+        # a size the node had overridden — as fact, to the user.
+        _rw, _rh = resp_data.get("width"), resp_data.get("height")
+        if not (_rw and _rh):
+            _rw, _rh = _png_size(image_bytes) or (final_w, final_h)
+        _asked = (f" (you asked for {raw_w}x{raw_h}; the node renders the nearest size it "
+                  f"supports — tell the user the actual size if they asked for a specific one)"
+                  if size_requested and (_rw, _rh) != (raw_w, raw_h) else "")
         _size_note = (
-            f"Rendered at {final_w}x{final_h}"
-            + (f" (snapped from the requested {raw_w}x{raw_h} to the image "
-               f"node's nearest supported bucket — tell the user the actual "
-               f"size if they asked for a specific one)" if snapped else "")
+            (f"Rendered at {_rw}x{_rh}" if _rw and _rh else "Rendered")
+            + _asked
             + ("; edited from the reference image" if len(ref_b64) == 1 else
                f"; edited from {len(ref_b64)} reference images" if ref_b64 else "")
             + ("; NOTE: transparency was requested but this backend does not decode an alpha matte — the background will be opaque" if transparent else "")

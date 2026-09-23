@@ -91,7 +91,7 @@
     <li><code>_chromium_binary_present()</code> — <code>find /root/.cache/ms-playwright -type f \( -name headless_shell -o -name chrome \) -print -quit</code>. Defends against the silent-failure mode where a prior install exited 0 but the binary isn't actually on disk (network flake, mid-extract disk-full, etc.).</li>
   </ol>
   <p>If the marker is present but the binary is missing, the gate logs <code>⚠ Provision marker present but Chromium binary missing. Reinstalling...</code> and re-runs the full install. Post-install, <code>_chromium_binary_present()</code> is checked AGAIN before the marker is touched — <strong>fail-loud:</strong> the v4 marker is never set unless the binary actually verifies on disk, so a failed install cannot silently poison future boots.</p>
-  <p>Bump the marker (in both <code>sandbox/Dockerfile</code> AND <code>sandbox/docker.py</code>) any time the install surface genuinely changes — e.g. <code>.v4</code> (2026-07-12) added <code>iproute2</code>/<code>flask</code>/<code>python-chess</code>. The meta-tests <code>test_v4_marker_gate_name_pinned</code> and <code>test_provisioning_bakes_ss_flask_chess_and_stays_in_sync</code> assert the two files agree on both the marker and the package set.</p>
+  <p>Bump the marker (in both <code>sandbox/Dockerfile</code> AND <code>sandbox/docker.py</code>) any time the install surface genuinely changes — e.g. <code>.v4</code> (2026-07-12) added <code>iproute2</code>/<code>flask</code>/<code>python-chess</code>. The marker is now <code>/root/.supercharged.v9</code> (previous <code>.v8</code>). The meta-tests <code>test_v5_marker_gate_name_pinned</code> (its name froze at v5; it asserts the CURRENT marker) and <code>test_provisioning_bakes_ss_flask_chess_and_stays_in_sync</code> assert the two files agree on both the marker and the package set.</p>
   <p><strong>Bumps upgrade IN PLACE from the previous marker (2026-09-09, §4FR; v6 added <code>file</code>, v7 added <code>xxd</code> after the live check found the model's chain pipes through it too; v8 added <code>lsof</code> and <code>dnsutils</code>, the only other commands the trajectories show the model reaching for; v9 added <code>iptables</code> for the Tor-only egress rules).</strong> v6 adds <code>file</code>: the
   model verifies a download the standard way, <code>file x.pdf</code>, and the missing binary turned
   a successful 16 MB fetch into exit 127, a failure banner and a strike (request d50a34bd). Every
@@ -104,7 +104,7 @@
   backoff as the full install &mdash; armed pessimistically before the apt call, cleared on success &mdash; so a
   broken mirror is not hit with a 600 s install on every command while the provision lock is held (review,
   2026-09-09). Pins:
-  <code>tests/test_sandbox_v6_file_upgrade.py</code>.</p>
+  <code>tests/test_sandbox_marker_upgrade.py</code>.</p>
   <p>Covered by <code>tests/test_sandbox_chromium_gate.py</code> (13 cases including binary-present/absent probes, legacy-marker handling, post-install verification refusing to mark a broken image, Dockerfile-level assertions about <code>--with-deps</code>, and the docker.py↔Dockerfile package-sync check).</p>
 
   <h2>Resource caps</h2>

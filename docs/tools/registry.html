@@ -71,7 +71,7 @@
       <tr><td><code>manage_skills</code></td><td>acquired_skills</td><td>List / delete the agent's acquired SKILLS (custom Python tools created via <code>create_skill</code>). This is the routing target for "show me your skills", "list your skills", "what skills do you have". Distinct from <code>list_lessons</code>: a SKILL is a tool, a LESSON is a mistake-and-fix.</td></tr>
       <tr><td><code>manage_composed_skills</code></td><td><a href="composed_skills.html">composed_skills</a></td><td>Define / list / delete named macros that bundle several tool calls into one (e.g. a <code>morning_briefing</code> = weather + headlines + diagnostics + lessons). <code>mode ∈ {parallel, sequential}</code>. A defined macro becomes its own top-level tool.</td></tr>
       <tr><td><code>vision_analysis</code></td><td><a href="vision.html">vision</a></td><td>Image / PDF analysis (auto-registered when vision-capable LLM available).</td></tr>
-      <tr><td><code>image_generation</code></td><td><a href="image_gen.html">image_gen</a></td><td>SDXL gen (auto-registered when <code>image_gen_clients</code> configured).</td></tr>
+      <tr><td><code>image_generation</code></td><td><a href="image_gen.html">image_gen</a></td><td>Qwen-Image-2.1 generation and editing (auto-registered when <code>image_gen_clients</code> configured).</td></tr>
       <tr><td><code>report_pdf</code></td><td><a href="report_pdf.html">report_pdf</a></td><td>Native multi-page PDF report from markdown sections (PyMuPDF + markdown; no remote service required).</td></tr>
       <tr><td><code>introspect</code></td><td><a href="introspect.html">introspect</a></td><td>Read-only selfhood snapshot — running diary, recent experiences, stats, IDF-weighted past-recall. The deterministic answer to "tell me about yourself".</td></tr>
       <tr><td><code>workspace</code></td><td><a href="workspace.html">workspace</a></td><td>Read-only activity ledger (what already happened; not a place to do work) — tracked-file diffs, scheduled-task outcomes, research artifacts, command outcomes, running workspace narrative.</td></tr>
@@ -85,7 +85,7 @@
   <ol>
     <li>Start with the static <code>TOOL_DEFINITIONS</code> array.</li>
     <li>Append <code>vision_analysis</code> when the LLM client supports vision (line 234).</li>
-    <li>Append <code>image_generation</code> when <code>context.llm_client.image_gen_clients</code> exists (line 262).</li>
+    <li>Append <code>image_generation</code> when <code>context.llm_client.image_gen_clients</code> exists (line 1272).</li>
     <li>If a <code>query</code> is provided, RAG-retrieve relevant acquired skills via <code>memory_system.collection.query(query_texts=[query], where={"type": "acquired_skill"})</code> and inject only the matches. A failure of that vector query now degrades to <q>advertise all active skills</q> (2026-07-03) instead of aborting the whole block — a transient store hiccup used to hide every acquired skill from the schema while leaving them dispatchable (invisible-but-callable).</li>
     <li>Otherwise inject every <code>active</code>-status acquired skill that doesn't shadow a built-in.</li>
     <li><code>register_composed_skills(active_tools, context)</code> appends macro tools (line 345-348).</li>

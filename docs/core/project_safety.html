@@ -33,7 +33,7 @@
   <div class="scroll"><table>
     <thead><tr><th>Function</th><th>Purpose</th></tr></thead>
     <tbody>
-      <tr><td><code>check_budget(proj_metadata) -&gt; BudgetDecision</code></td><td>Multi-dimensional budget check — steps · runtime_seconds · tool_calls (line 39).</td></tr>
+      <tr><td><code>check_budget(proj_metadata) -&gt; BudgetDecision</code></td><td>Multi-dimensional budget check — the three axes are labelled <code>steps</code>, <code>runtime</code> and <code>tool_calls</code> (line 40).</td></tr>
       <tr><td><code>enforce_human_gate(task) -&gt; Optional[str]</code></td><td>Returns the reason from the first <code>HUMAN_GATE:</code>-prefixed postcondition, or None (line 114). Non-None → the task must go NEEDS_USER, not DONE (see below).</td></tr>
       <tr><td><code>detect_contradiction(new_summary, prior_summary) -&gt; Optional[str]</code></td><td>Textual conflict detection (true↔false, yes↔no, …) (line 142).</td></tr>
       <tr><td><code>route_contradiction(contradiction_log, new_fact, prior_facts, reason)</code></td><td>Append a revision event to the contradiction log (line 162).</td></tr>
@@ -42,7 +42,7 @@
   </table></div>
 
   <h2>Budget knobs</h2>
-  <p>Stored in <code>project_metadata</code>:</p>
+  <p>Stored in the project's metadata dict (<code>proj_metadata</code> as <code>check_budget</code> receives it; persisted as the projects store's <code>metadata_json</code> column):</p>
   <ul>
     <li><code>steps_cap</code> / <code>steps_used</code></li>
     <li><code>runtime_cap_seconds</code> / <code>runtime_used_seconds</code></li>

@@ -179,7 +179,7 @@
       <tr><td><code>--worker-nodes</code></td><td>Cheap classifier sub-tasks (routing, query expansion, arg validation); also the verifier fallback when <code>--critic-nodes</code> is not set</td><td><code>route(task=...)</code> dispatch</td></tr>
       <tr><td><code>--visual-nodes</code></td><td>Multimodal vision (PDF + image)</td><td><code>chat_completion(use_vision=True)</code></td></tr>
       <tr><td><code>--coding-nodes</code></td><td>Code generation specialists</td><td><code>chat_completion(use_coding=True)</code></td></tr>
-      <tr><td><code>--image-gen-nodes</code></td><td>SDXL image generation</td><td><code>generate_image()</code></td></tr>
+      <tr><td><code>--image-gen-nodes</code></td><td>Qwen-Image-2.1 image generation</td><td><code>generate_image()</code></td></tr>
       <tr><td><code>--critic-nodes</code></td><td>Self-evaluation verifier on a dedicated (often slower, off-host) judge model — e.g. a spare Mac Mini running a 9B. Kept off the worker pool so a slow verdict never blocks fast routing chores, and off the foreground slot so it never competes with the main model for the KV-cache.</td><td><code>chat_completion(use_critic=True)</code></td></tr>
     </tbody>
   </table></div>

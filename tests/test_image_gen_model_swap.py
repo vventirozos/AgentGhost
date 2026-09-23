@@ -89,16 +89,19 @@ class TestResolveSize:
         mod = _load_server(monkeypatch)
         assert mod._resolve_size(mod.ImageRequest(prompt="x", size="512x768")) == (512, 768)
 
-    def test_agent_ladder_is_identity_on_the_node(self, monkeypatch):
-        # R5: the agent's buckets must pass through the node untouched —
-        # otherwise the tool reports one size and the node renders another.
+    def test_the_tool_passes_geometry_through_untouched(self, monkeypatch):
+        """R5 — one input, one story. The tool no longer keeps a ladder of its
+        own (§4KA): whatever the caller asks for reaches the node, and the node
+        is the single owner of what is legal. Snapping in both places meant the
+        worse answer won and was then reported as the node's."""
         import sys
         sys.path.insert(0, str(REPO / "src"))
-        from ghost_agent.tools.image_gen import _NODE_BUCKETS, _DEFAULT_BUCKET
+        from ghost_agent.tools import image_gen
+        for gone in ("_NODE_BUCKETS", "_DEFAULT_BUCKET", "_snap_to_bucket"):
+            assert not hasattr(image_gen, gone), f"{gone} is back"
         mod = _load_server(monkeypatch)
-        for w, h in _NODE_BUCKETS:
-            assert mod._resolve_size(mod.ImageRequest(prompt="x", width=w, height=h)) == (w, h), (w, h)
-        assert _DEFAULT_BUCKET == (mod.DEFAULT_WIDTH, mod.DEFAULT_HEIGHT)
+        for w, h in (mod.LEGAL_SIZES[0], mod.LEGAL_SIZES[-1], (768, 512), (608, 608)):
+            assert mod._resolve_size(mod.ImageRequest(prompt="x", width=w, height=h)) == (w, h)
 
 
 # ---------------------------------------------------------------- prompt
@@ -141,9 +144,12 @@ class TestAttentionSyntax:
         assert "Qwen-Image-2.1" in desc and "double quotes" in desc and "MINUTES" in desc
         assert "(x:1.2)" in desc                       # forbidden, by name
         assert "prose" in props["prompt"]["description"]
-        for size in ("512x768", "576x672", "608x608", "672x576", "768x512"):
-            assert size in props["width"]["description"], size
-        assert "624x624" not in props["width"]["description"]   # the SD1.5 ladder is gone
+        wd = props["width"]["description"]
+        # §4KA: the schema no longer promises a fixed ladder — it says the node
+        # chooses and the result reports what was used.
+        assert "nearest size it supports" in wd
+        assert "Snapped" not in wd
+        assert "624x624" not in wd                      # the SD1.5 ladder is long gone
         assert "Attention weights are supported" not in SYSTEM_PROMPT
         assert "Qwen-Image-2.1" in SYSTEM_PROMPT and "double quotes" in SYSTEM_PROMPT
 
@@ -620,12 +626,14 @@ class TestToolEditing:
                                        reference_images=["a.png", "b.png"]))
         assert out.startswith("ERROR") and "at most 1" in out and not cap
 
-    def test_explicit_size_still_snaps_for_an_edit(self, tmp_path):
+    def test_an_explicit_size_on_an_edit_reaches_the_node_verbatim(self, tmp_path):
+        """It used to be snapped client-side to one of five shapes; now the
+        node decides, so an edit can use any size the node supports."""
         (tmp_path / "a.png").write_bytes(_PNG_1x1)
         llm, cap = self._client()
         asyncio.run(self._tool()(prompt="x", llm_client=llm, sandbox_dir=tmp_path,
                                  reference_images=["a.png"], width=1000, height=1000))
-        assert (cap["width"], cap["height"]) == (608, 608)
+        assert (cap["width"], cap["height"]) == (1000, 1000)
 
     def test_schema_teaches_editing_but_not_transparency(self):
         import sys
@@ -1429,3 +1437,106 @@ def test_an_oversized_sandbox_reference_is_refused_before_it_is_read(tmp_path):
                                                reference_images=["huge.png"]))
     assert out.startswith("ERROR") and "MB" in out, out
     assert not llm.generate_image.called, "the node was called with an oversized reference"
+
+
+class TestNodeHousekeeping:
+    def test_an_overlong_prompt_is_a_400_not_an_E2BIG(self, monkeypatch):
+        """A prompt is an argv entry (Linux caps one at 128 KiB → Popen fails
+        with E2BIG, a 500) and a parser input (the A1111 attention parser is
+        quadratic in bracket depth, burning CPU on the GPU thread while the
+        lock is held)."""
+        mod = _load_server(monkeypatch)
+        mod._ready, mod._load_error = True, None
+        called = []
+        monkeypatch.setattr(mod, "_generate_png", lambda *a, **k: called.append(1) or b"x")
+        r = TestClient(mod.app).post("/generate", json={"prompt": "A" * (mod.MAX_PROMPT_CHARS + 1)},
+                                     headers={"X-Ghost-Key": "sekrit"})
+        assert r.status_code == 400 and not called
+
+    def test_a_normal_long_prompt_still_works(self, monkeypatch):
+        mod = _load_server(monkeypatch)
+        mod._ready, mod._load_error = True, None
+        monkeypatch.setattr(mod, "_generate_png", lambda *a, **k: b"x")
+        r = TestClient(mod.app).post("/generate", json={"prompt": "a cat. " * 200},
+                                     headers={"X-Ghost-Key": "sekrit"})
+        assert r.status_code == 200
+
+    def test_startup_sweeps_files_a_crash_left_behind(self, monkeypatch, tmp_path):
+        """`_generate_png`'s finally only runs on a clean exit; a SIGKILL or an
+        OOM kill mid-render leaked its temp files for ever."""
+        mod = _load_server(monkeypatch)
+        mod.OUT_DIR = tmp_path
+        (tmp_path / "gen_abandoned.png").write_bytes(b"x")
+        (tmp_path / "ref_abandoned_0.png").write_bytes(b"x")
+        keep = tmp_path / "something_else.txt"
+        keep.write_bytes(b"x")
+        assert mod._sweep_out_dir() == 2
+        assert keep.exists(), "the sweep must only take its own leftovers"
+        assert not list(tmp_path.glob("gen_*.png")) and not list(tmp_path.glob("ref_*.png"))
+
+    def test_the_sweep_runs_before_the_preflight(self):
+        import ast
+        src = SERVER_PATH.read_text()
+        fn = next(n for n in ast.walk(ast.parse(src))
+                  if isinstance(n, ast.AsyncFunctionDef) and n.name == "lifespan")
+        calls = [n.func.id for n in ast.walk(fn)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+        assert "_sweep_out_dir" in calls
+
+
+class TestTheReportedSizeIsTheRenderedSize:
+    """Review finding: "Rendered at WxH" echoed the REQUEST on every path but
+    one, although the response carries the node's authoritative width/height
+    and the PNG is in hand. Any disagreement — the node choosing a different
+    legal size, an edit deriving it from the reference — was told to the user
+    as fact."""
+
+    def _run(self, tmp_path, node_reply, **kw):
+        from unittest.mock import MagicMock
+        import sys
+        sys.path.insert(0, str(REPO / "src"))
+        from ghost_agent.tools.image_gen import tool_generate_image
+        llm = MagicMock()
+        llm.image_gen_clients = [{"x": 1}]
+
+        async def gen(payload):
+            return node_reply
+
+        llm.generate_image = gen
+        return asyncio.run(tool_generate_image(prompt="a cat", llm_client=llm,
+                                               sandbox_dir=tmp_path, **kw))
+
+    def test_the_nodes_size_wins_over_the_request(self, tmp_path):
+        # asked 1920x1080; the node rendered 736x416 and says so
+        out = self._run(tmp_path,
+                        {"data": [{"b64_json": base64.b64encode(_png_bytes(736, 416)).decode()}],
+                         "width": 736, "height": 416, "seed": 1},
+                        width=1920, height=1080)
+        assert "Rendered at 736x416" in out
+        assert "1920x1080" in out and "nearest size it supports" in out   # and says what was asked
+
+    def test_it_falls_back_to_reading_the_png(self, tmp_path):
+        # an older node that reports no dimensions
+        out = self._run(tmp_path,
+                        {"data": [{"b64_json": base64.b64encode(_png_bytes(608, 608)).decode()}],
+                         "seed": 1},
+                        width=1024, height=1024)
+        assert "Rendered at 608x608" in out
+
+    def test_no_size_disagreement_means_no_noise(self, tmp_path):
+        out = self._run(tmp_path,
+                        {"data": [{"b64_json": base64.b64encode(_png_bytes(768, 512)).decode()}],
+                         "width": 768, "height": 512, "seed": 1},
+                        width=768, height=512)
+        assert "Rendered at 768x512" in out and "you asked for" not in out
+
+    def test_a_malformed_png_is_not_reported_as_0x0(self, tmp_path):
+        import sys
+        sys.path.insert(0, str(REPO / "src"))
+        from ghost_agent.tools.image_gen import _png_size
+        broken = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\x0dIHDR" + (0).to_bytes(4, "big") \
+            + (0).to_bytes(4, "big") + b"\x08\x06\x00\x00\x00" + b"\x00" * 8
+        assert _png_size(broken) is None
+        out = self._run(tmp_path, {"data": [{"b64_json": base64.b64encode(broken).decode()}],
+                                   "seed": 1})
+        assert "0x0" not in out

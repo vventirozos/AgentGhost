@@ -164,6 +164,12 @@ PREFLIGHT_SIZE = 256          # 1-step self-test at startup (~20 s incl. model s
 # render size, not optimism.
 MAX_REFERENCES = 1
 MAX_REFERENCE_BYTES = 12 * 1024 * 1024
+# A prompt is an argv entry and a parser input, so it needs a ceiling on both
+# counts: Linux caps a single argument at 128 KiB (MAX_ARG_STRLEN) — past that
+# Popen fails with E2BIG, a 500 where a 400 belongs — and the A1111 attention
+# parser is quadratic in bracket depth, so a pathological prompt burns CPU on
+# the GPU thread while `_gpu_lock` is held. No real prompt is near this.
+MAX_PROMPT_CHARS = 8000
 # The model's own RGBA recipe (model card): the prompt is wrapped, nothing else.
 RGBA_PROMPT_PREFIX = "This is an RGBA image with transparency. "
 RGBA_PROMPT_SUFFIX = " The image has alpha channel and the background is transparent."
@@ -696,6 +702,29 @@ def _load_model_blocking():
     _log(f"Preflight OK ({len(png)} bytes) — ready.")
 
 
+def _sweep_out_dir() -> int:
+    """Delete leftovers from a generation that never finished.
+
+    `_generate_png`'s `finally` only runs on a clean exit; a SIGKILL, an OOM
+    kill or a systemd stop mid-render leaves `gen_*.png` / `ref_*.png` behind
+    for ever, so the "always removed" contract held only for tidy deaths. The
+    node owns OUT_DIR exclusively and nothing is in flight at startup, so
+    anything here is dead by definition."""
+    removed = 0
+    try:
+        for stale in list(OUT_DIR.glob("gen_*.png")) + list(OUT_DIR.glob("ref_*.png")):
+            try:
+                stale.unlink()
+                removed += 1
+            except OSError:
+                pass
+    except OSError:
+        pass
+    if removed:
+        _log(f"Swept {removed} stale file(s) from {OUT_DIR}")
+    return removed
+
+
 async def _background_load():
     global _ready, _load_error
     for attempt in range(1, LOAD_RETRIES + 1):
@@ -719,6 +748,7 @@ async def _background_load():
 async def lifespan(app: FastAPI):
     # Kick off the preflight but DON'T await it → lifespan startup returns
     # now, so uvicorn binds the port immediately (no connect-failure window).
+    _sweep_out_dir()
     app.state.loader = asyncio.create_task(_background_load())
     _log("Port open; preflight running in background. Requests get 503 until ready.")
     yield
@@ -821,6 +851,9 @@ async def generate_image(req: ImageRequest, request: Request):
     if references and not Path(MMPROJ_PATH).exists():
         raise HTTPException(status_code=501, detail="editing unavailable: no vision projector on this node")
     fallback = image_size(references[0]) if references else None
+    if len(req.prompt or "") > MAX_PROMPT_CHARS:
+        raise HTTPException(status_code=400,
+                            detail=f"prompt exceeds {MAX_PROMPT_CHARS} characters")
     width, height = _resolve_size(req, fallback)
     editing = bool(references)
     steps = resolve_steps(req.steps, editing)

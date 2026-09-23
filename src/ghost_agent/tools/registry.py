@@ -1291,17 +1291,20 @@ def get_active_tool_definitions(context, query: str = None, *,
                         "width": {
                             "type": "integer",
                             "description": (
-                                "Requested width in pixels (optional). Snapped to "
-                                "the node's supported sizes: 512x768 (portrait), "
-                                "576x672, 608x608 (square), 672x576, 768x512 "
-                                "(landscape, the default) — choose by aspect ratio."
+                                "Requested width in pixels (optional). OMIT unless the "
+                                "user asked for a particular shape — the node then uses "
+                                "768x512, or the reference's shape for an edit. Any value "
+                                "is accepted: the node renders the nearest size it supports "
+                                "(multiples of 32 within a 768x512 pixel budget, e.g. "
+                                "512x768 portrait, 608x608 square, 768x512 landscape) and "
+                                "the result tells you which size it actually used."
                             ),
                         },
                         "height": {
                             "type": "integer",
                             "description": (
-                                "Requested height in pixels (optional). Snapped "
-                                "together with `width` to the node's size set."
+                                "Requested height in pixels (optional). Sent together "
+                                "with `width`; the node picks the nearest size it supports."
                             ),
                         },
                         "seed": {

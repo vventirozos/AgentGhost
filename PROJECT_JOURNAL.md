@@ -46171,3 +46171,180 @@ node's only GPU to produce an error. `MAX_REFERENCES = 1` therefore stands as a 
 both copies of the constant now carry the numbers so it does not drift upward on optimism; a pin
 asserts the two agree and that a second reference is refused before the node is called.
 So: better identity on this box would need a smaller model or more RAM, not more references.
+
+## §4KA — Three fresh-eye reviews of one day's work (2026-09-22, 22:15–23:30)
+
+**Trigger.** Operator: "run the full test and fresh eye review your changes, make sure everything
+is all good." Self-review was the wrong instrument (§R / [[fix-inherits-the-blind-spot]]), so three
+independent reviewers were run in parallel against the day's production code, each told NOT to
+trust its comments — several of which assert measurements. **38 findings. The serious ones were
+all in code written TODAY, and my tests were green throughout.**
+
+**Security, all reachable, all mine.**
+1. *A hostile page could overwrite the agent's own files.* The `MAIN_IMAGE` line I added told the
+   model to call `file_system(download, url=…)` with **no `path`**, and the download auto-heal
+   derives the filename from the URL — so `<meta property="og:image" content="https://evil/x/
+   main.py">` wrote attacker bytes over `main.py`, which a later `execute` runs. The line now names
+   a destination (`main_image.<whitelisted ext>`) and says why an explicit path is mandatory.
+2. *Unauthenticated OOM of the node.* `_require_key` cannot defend a body parameter: Starlette has
+   buffered, json-parsed and pydantic-copied the whole body before the handler's first line. A
+   keyless 2 GB POST would take the unit down on an 8 GB box. A 24 MB cap now sits in FRONT of
+   parsing (modelled on the agent's own `api/body_limit.py`, which exists for this exact lesson).
+   Verified live: 25 MB keyless POST → **413**, node memory untouched; a normal keyless request is
+   still 401.
+3. *`%00` in a URL booked a failed download as a success.* `unquote` put a real NUL in the name,
+   `_get_safe_path` raised `ValueError("embedded null byte")`, the handler returned that BARE
+   STRING, and the outcome classifier reads it as neither failure nor rejection — the §4DX shape.
+   `%0A` separately let a URL inject fake result lines into the tool output the model reads.
+   Control characters are now stripped; `.env` survives as `.env` (the old `.strip(".")` mangled
+   dotfiles); `..`-shaped names fall back to a spelling `_get_safe_path` refuses.
+4. *The declared-image branch accepted `data:`, `javascript:` and `file://`* and unbounded lengths —
+   printed verbatim under a "download this" instruction. Now http(s) only, ≤2048 chars.
+
+**Correctness.**
+5. *Every JPEG edit rendered from a stretched face,* including the PM images shown to the operator:
+   `png_size()` returns None for JPEG, so the node fell back to 768×512 landscape and
+   `fit_reference` LANCZOS-squashed the photo into it. The live run's 960×1264 **portrait** was
+   crushed to 1.50 aspect — 97% distortion. `image_size()` is now format-agnostic (PNG fast path,
+   Pillow fallback); that portrait renders 544×704, 1.7% error. This is the §4JV aspect-squash
+   class re-entering through a format check.
+6. *A bound my own pins missed.* `400 + 700 < 1200` and `30×28+95 < 1200` each passed ALONE, while
+   the case that happens — a second request queued behind a 30-step edit — is `400 + 935 = 1335`
+   and blows the client's window. `BUSY_WAIT_TIMEOUT` is now DERIVED from `MAX_EDIT_STEPS`, so the
+   two cannot drift apart again.
+7. *A completed 15-minute edit could be reported as a 500*: the sidecar is `sudo` (a ROOT child),
+   `.kill()` raises `PermissionError`, and raising it from the `finally` replaced the return value.
+   Reaping is now best-effort by definition.
+8. *sd-cli was reaped only on the timeout path,* so any other exception left it holding ~6.8 GB
+   while the endpoint released `_gpu_lock` — two generations could overlap, which is the NvMap
+   `error 12` regime the module exists to prevent.
+9. Negative seed passed through (sd-cli reads <0 as "randomise", so the REPORTED seed could not
+   reproduce its own image); 400-digit width → `OverflowError` → 500; the aspect metric saturated
+   so `100000×1` returned **portrait** (now compared in log space, symmetric); NaN/inf/negative
+   guidance reached the CLI; the RGBA idempotency check was a substring test that made
+   `transparent=true` a silent no-op on any prompt containing those words; the project-prefix strip
+   ran before the container-root strip, so `/workspace/projects/<id>/gen_x.png` — the spelling
+   `execute` prints — never resolved; the reference read was unbounded and outside the tool's
+   try/except.
+
+**What the FULL SUITE then caught, twice, both mine.** A comment of mine contained the literal
+`SUCCESS: …`, and the producer/parser parity check scans that file for message shapes — my comment
+registered as a producer and would have blinded the ground-truth check. And `browser.py` grew to
+1656 lines against a 1650 ceiling that exists because the runner was extracted out of it after four
+defects; condensed to 1649 rather than raising the limit.
+
+**Verification.** Batteries **56/56** (image path) and **16/16** (browser), controls correct in
+both. ⚠ One intermediate battery run reported 56/56 **with the no-op control KILLED** — discarded,
+because a battery whose control fails is measuring a broken suite, not the code; the cause was a
+test of mine that patched `Path.stat` and broke collection. Rewritten with a real oversized file.
+Suite ONCE after the last change: **24,108 / 0 / 67**. Node redeployed (checksum-matched, preflight
+20 s) and the three security fixes confirmed against the LIVE node.
+
+**The lesson worth keeping:** every one of these shipped with green tests and a mutation battery at
+100%. What found them was adversarial reading by someone who had not written the code — and the
+first draft of the pins for the fixes was itself weak three separate times (assertions that held
+against the rule's exact opposite). See [[review-needs-a-reader-who-did-not-write-it]].
+
+**Second pass, unattended overnight (23:00–00:00), closing the rest of the 38.**
+
+*The client-side size ladder is GONE.* `tools/image_gen.py` snapped every request to five fixed
+shapes — an SD1.5 habit from when the node could only scale-and-clamp — BEFORE the node's 246-size
+banded search saw it. Measured: 1920x1080 → 768x512 (15.6% aspect error) where the node picks
+736x416 (0.5%); 1200x3000 → 512x768 (66.7%) against an exact 256x640. The SUCCESS note then called
+the client's pick "the image node's nearest supported bucket" — a falsehood relayed to the user.
+Width/height now pass through untouched, are omitted entirely when unset, and the size REPORTED is
+read from the node's response (then the PNG, then the request). `_snap_to_bucket`, `_NODE_BUCKETS`
+and `_DEFAULT_BUCKET` deleted; four test files migrated; the schema now says the node chooses.
+`_png_size` also stopped reporting a malformed IHDR as "Rendered at 0x0".
+
+*Node housekeeping:* prompt bounded at 8000 chars (Linux caps one argv entry at 128 KiB → E2BIG
+was a 500, and the A1111 parser is quadratic in bracket depth while the GPU lock is held); a
+startup sweep of `gen_*.png`/`ref_*.png`, because `_generate_png`'s `finally` only runs on a clean
+exit and every SIGKILL mid-render leaked its temp files for ever.
+
+*The retry could not outlast the node it retries.* `core/llm.py`'s 503 backoff was 8 s x 3, sized
+for a "~5-10 s model load" that no longer exists — readiness is a REAL preflight generation
+(13-20 s measured) with a 5x20 s retry ladder behind it, so a request arriving during a restart
+burned all three attempts and reported "generation failed" for a node that was merely starting.
+Now 10 s + 35 s, pinned against the node's own numbers.
+
+*Docs:* five pages still described an SDXL backend this project has NEVER run (capabilities,
+registry, llm, cli_reference), plus a stale source-line reference, the preflight duration, the
+180 s/900 s timeouts, the 2.4x edit cost, the two steps ceilings, the `twitter:image` mislabel, the
+test count, `IMGGEN_MMPROJ`, the response fields, and a 9.3-vs-9.9 GB unit error.
+
+*Two stale descriptions of the retired ladder, found by re-reading after the fix.* The comment
+above the size parsing in `tools/image_gen.py` still said "Snap to the nearest node bucket so
+output isn't a stretched mess", and `docs/tools/image_gen.html` documented the five-entry ladder
+as CURRENT behaviour in two places — including a SUCCESS-message format, `Rendered at WxH
+(snapped from …)`, that the code no longer emits. Deleting code does not delete its prose; both
+now describe the pass-through and carry the measured numbers.
+
+**Verification.** Battery **60/60**, controls correct — two survivors first caught me fixing the
+size REPORTING without pinning it. Suite: 24,112 passed with three failures, all mine and all
+guards doing their job — a lint gate catching `possibly-used-before-assignment` from a scripted
+edit that left `if True:` behind, and two pins still asserting the retired snap. Fixed, then
+**green**. Node redeployed (checksum ccfe7de8b638, sweep + preflight 14 s) and agent restarted
+(92532 → 11265, one boot). Live on the real node: 25 MB keyless body → 413; 9000-char prompt →
+400; keyless normal request → 401; and a `seed=-1`, `100000x1` request rendered **768x256 with
+seed 145277786** — the two fixes that used to produce a portrait image and a seed that could not
+reproduce itself. Then a real 16:9 request rendered **736x416** (0.48% aspect error against the
+ladder's 15.62%), and an end-to-end run of `tool_generate_image` itself, against the live GPU,
+took a 21:9 `2560x1080` — a shape the ladder had NO entry for — to **768x320**: 1.25% error
+against 36.72%, with the SUCCESS note's reported size matching the PNG header exactly and no
+longer claiming the size that was asked for. Final suite **24,115 passed / 67 skipped / 0 failed**
+(8:51, `-n 8 --dist loadfile`).
+
+**Docs drift sweep (2026-09-23), prompted by the five SDXL-era pages.** Mechanical, because a
+page reads plausibly whether or not the thing it names exists. Two passes over all 142 doc pages:
+every `<code>` span that looks like a repo path checked against the tree, and every identifier-like
+span checked against a blob of all 1,699 source files.
+
+**9 real defects, all of the same shape — a name that no longer resolves:**
+
+| Page | Claimed | Actually |
+|---|---|---|
+| `sandbox/docker.html` | pin `tests/test_sandbox_v6_file_upgrade.py` | `tests/test_sandbox_marker_upgrade.py` |
+| `sandbox/docker.html` | meta-test `test_v4_marker_gate_name_pinned` | `test_v5_marker_gate_name_pinned`; marker is now `.v9` |
+| `core/verifier.html` | `verify_claim` delegates to `_verify_claim_impl` | `_verify_claim_incumbent` / `_verify_claim_binding` |
+| `tools/search.html` | closes with `_close_curl` | `aclose_curl_response` (`utils/helpers.py`) |
+| `core/project_advancer.html` | budget axis `runtime_seconds` | the label is `runtime` |
+| `core/project_safety.html` | same axis, plus `check_budget` at line 39 | `runtime`, line 40 |
+| `core/project_safety.html` | "stored in `project_metadata`" | `proj_metadata` / column `metadata_json` |
+| `memory/vector.html` | `test_reset_all_holds_the_vector_lock` | `..._across_the_WHOLE_wipe`, in `test_forget_disk_sweep_scope.py` |
+| 4 pages | `bin/start-ghost-agent.sh` (reads as repo-relative) | `~/Data/AI/bin/` — there is no `bin/` in the repo |
+
+**The one that mattered most was a tombstone that never got its stone.** `docs/core/workspace_model.html`
+still opened `core / workspace_model.py — WorkspaceModel` with per-line references, for a module
+deleted in the 2026-05-30 gap sweep as a shadow of the live `workspace/` package. Its two siblings,
+`qwen_bridge.html` and `agent_qwen.html`, both carry `— REMOVED` in title and `<h1>`; this one did
+not, so only a reader arriving via `reference.html` (which does flag it) learned it was dead. It now
+matches its siblings, and says explicitly that `WorkspaceModel` survives in `workspace/model.py`
+while `FileState`, `WorkspaceDiff` and `advance_turn` exist nowhere. *The sibling one revision
+behind* — the page that missed the convention its neighbours follow.
+
+**The harness lied once, and the failure is the lesson.** The first symbol pass reported four missing
+CLI symbols (`RATE_TIMEOUT`, `_reply_block`, `_turn_interrupted`, `__rich_console__`). They all
+exist — in `interface/externals/cli/ghost`, an **extensionless** file the blob skipped because it
+only read known suffixes. A reader that cannot open a file reports its contents as absent, which is
+the read-side twin of a harness that cannot run reporting success. Re-run over all text files,
+five false positives disappeared.
+
+**What the sweep did NOT find is the better news.** 43 of 43 `tests/…::test_name` references
+resolve. The remaining 32 unresolved identifiers are all legitimate: PyQt and PostgreSQL names,
+`faster_whisper`/`af_heart`, prose examples, and — the common case — symbols inside DATED sections
+that already announce their own removal. `web_server.html` names `conversationLayout` and
+`facelab.js` under headings that say they were removed 2026-09-12, and its roster
+(`cube, tesseract, vortex, descent, empty`) matches the live `FORMS` array exactly, rename and all.
+Every four-to-six-digit "N passed" in the docs is a point-in-time round record, not a live claim.
+So the convention is holding; what escapes it is the RENAME — a thing that still exists under a
+different name, which no reader can distinguish from a thing that works.
+
+⚠ *Two process errors worth keeping.* The first full suite tonight was started and THEN a source
+comment was edited — a run overlapping an edit describes neither state, and "it is only a comment"
+is exactly the reasoning that ships a contaminated run; it was discarded and re-run. The second
+was run SERIALLY (24 min and still going) and without `env -u FORCE_COLOR`, because
+`source .venv/bin/activate` silently failed — there is no `.venv` in the repo, the venv is
+`/Users/vasilis/Data/AI/.agent.venv`, and `-n 8 --dist loadfile` is the documented default. An
+activation that fails quietly leaves you running SOMETHING, which is why the earlier run died on
+`GHOST_API_KEY is set but EMPTY` instead.

@@ -100,7 +100,7 @@
     <li>All state-mutating endpoints depend on <code>verify_interface_key()</code> which compares <code>X-Ghost-Key</code>.</li>
     <li>The page itself is gated by a query parameter check (browsers send keys in URL on first load only).</li>
     <li>CORS: <code>allow_origins=*</code>, <code>allow_credentials=False</code>.</li>
-    <li><strong>Key provenance (2026-07-13 rotation)</strong>: the prod key comes from the canonical mode-600 secret file <code>~/Data/AI/.ghost_api_key</code>, exported by <code>bin/start-ghost-client.sh</code> — this deliberately OVERRIDES the stale <code>GHOST_API_KEY=ghost-secret-123</code> still present in <code>/Library/LaunchDaemons/com.local.ghost-client.plist</code> (plist edit needs sudo; the old public key no longer works anywhere). The same value is the AGENT's key (agent auth enabled the same day), which is why the baked upstream <code>X-Ghost-Key</code> keeps working. Bookmarks using <code>?key=ghost-secret-123</code> must be re-saved with the new key.</li>
+    <li><strong>Key provenance (2026-07-13 rotation)</strong>: the prod key comes from the canonical mode-600 secret file <code>~/Data/AI/.ghost_api_key</code>, exported by <code>~/Data/AI/bin/start-ghost-client.sh</code> — this deliberately OVERRIDES the stale <code>GHOST_API_KEY=ghost-secret-123</code> still present in <code>/Library/LaunchDaemons/com.local.ghost-client.plist</code> (plist edit needs sudo; the old public key no longer works anywhere). The same value is the AGENT's key (agent auth enabled the same day), which is why the baked upstream <code>X-Ghost-Key</code> keeps working. Bookmarks using <code>?key=ghost-secret-123</code> must be re-saved with the new key.</li>
   </ul>
 
   <h2>Concurrency</h2>

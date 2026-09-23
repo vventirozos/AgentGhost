@@ -34,7 +34,7 @@
     <thead><tr><th>Method · Path</th><th>Behaviour</th></tr></thead>
     <tbody>
       <tr><td>POST /generate · POST /v1/images/generations</td><td>Body: <code>{"prompt", "negative_prompt", "steps", "guidance_scale", "width", "height", "size", "seed", "clip_skip", "reference_images", "transparent"}</code>. Requires <code>X-Ghost-Key</code>. Size scaled into the pixel budget and snapped to multiples of 32. Returns <code>{"data": [{"b64_json": ...}]}</code>. <code>clip_skip</code> is accepted for wire compatibility and ignored (no CLIP in this model).</td></tr>
-      <tr><td>GET /health · GET /ready</td><td>Unauthenticated. <code>/health</code> reports <code>{ok, ready, load_error}</code>; <code>/ready</code> is 200 once the preflight generation succeeded, 503 while it runs, 500 if it failed.</td></tr>
+      <tr><td>GET /health · GET /ready</td><td>Unauthenticated. <code>/health</code> reports <code>{ok, ready, load_error}</code> — note <code>load_error</code> carries the tail of sd-cli's output, so on a node whose preflight failed it can disclose model and binary paths to anyone on the LAN; <code>/ready</code> is 200 once the preflight generation succeeded, 503 while it runs, 500 if it failed.</td></tr>
     </tbody>
   </table></div>
 
@@ -54,7 +54,7 @@
   </ul>
 
   <h2>Boot &amp; resilience</h2>
-  <p>The port binds in ~1–2 s; readiness is established by a <em>real</em> 1-step 256² preflight generation in a background thread (~15 s), so a node that says ready has proven the binary, the three model files, CUDA and the memory phasing. Requests get a clean 503 until then. A post-restart NvMap-teardown OOM retries up to 5× with 20 s backoff. One dedicated worker thread serialises all generation work.</p>
+  <p>The port binds in ~1–2 s; readiness is established by a <em>real</em> 1-step 256² preflight generation in a background thread (~20 s including model streaming; measured 13 s and 20 s on restarts), so a node that says ready has proven the binary, the three model files, CUDA and the memory phasing. Requests get a clean 503 until then. A post-restart NvMap-teardown OOM retries up to 5× with 20 s backoff. One dedicated worker thread serialises all generation work.</p>
 
   <div class="note">
     <strong>The Tegra allocator trap.</strong> CUDA allocations on the Jetson fail with

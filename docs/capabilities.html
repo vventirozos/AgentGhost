@@ -47,7 +47,7 @@
     <a class="card" href="#research"><h3>Research &amp; synthesis</h3><p>Multi-source web search, PDF &amp; page ingestion, cross-referenced summaries.</p></a>
     <a class="card" href="#code"><h3>Code &amp; data analysis</h3><p>Run Python / shell inside a Docker sandbox on files you upload.</p></a>
     <a class="card" href="#projects"><h3>Multi-step projects</h3><p>Scaffold, implement, test, and iterate on deliverables over many turns.</p></a>
-    <a class="card" href="#image"><h3>Image generation</h3><p>SDXL-backed visuals through a dedicated GPU swarm pool.</p></a>
+    <a class="card" href="#image"><h3>Image generation</h3><p>Qwen-Image-2.1 on a dedicated GPU node — prompt-faithful, renders legible text, and edits an existing photo.</p></a>
     <a class="card" href="#pdf"><h3>PDF reports</h3><p>Compile research into a styled, multi-page PDF deliverable rendered locally.</p></a>
     <a class="card" href="#vision"><h3>Vision &amp; OCR</h3><p>Describe screenshots, extract tables from PDFs, caption photos.</p></a>
     <a class="card" href="#memory"><h3>Long-term memory</h3><p>Remembers preferences, facts, and hard-won procedures across sessions.</p></a>
@@ -79,11 +79,11 @@
   <p><strong>Tools:</strong> <a href="tools/projects.html"><code>projects</code></a>, <a href="tools/execute.html"><code>execute</code></a>, <a href="tools/file_system.html"><code>file_system</code></a>. <strong>See also:</strong> <a href="memory/projects.html">Project store</a>.</p>
 
   <h2 id="image">Image generation</h2>
-  <p>Image requests are routed to a dedicated SDXL swarm pool (<code>--image-gen-nodes</code>). The image is saved into the sandbox and returned as a path; the agent can then re-read it through the vision pool for critique-and-iterate loops.</p>
+  <p>Image requests are routed to a dedicated image node (<code>--image-gen-nodes</code>) running Qwen-Image-2.1 through stable-diffusion.cpp. The image is saved into the sandbox and returned as a path; the agent can then re-read it through the vision pool for critique-and-iterate loops.</p>
   <pre><code>&gt; Draft a landing-page hero banner: retro-futurist, teal-and-gold,
   1600×600, no text overlay. Iterate if the composition feels
   bottom-heavy.</code></pre>
-  <p><strong>Under the hood:</strong> <a href="tools/image_gen.html"><code>image_gen</code></a> → SDXL server → <code>file_system.read</code> → <a href="tools/vision.html"><code>vision</code></a> critique → optional second generation pass.</p>
+  <p><strong>Under the hood:</strong> <a href="tools/image_gen.html"><code>image_gen</code></a> → image node → <code>file_system.read</code> → <a href="tools/vision.html"><code>vision</code></a> critique → optional second generation pass.</p>
   <p><strong>Tools:</strong> <a href="tools/image_gen.html"><code>image_gen</code></a>, <a href="tools/vision.html"><code>vision</code></a>, <a href="tools/swarm.html"><code>swarm</code></a>.</p>
 
   <h2 id="pdf">PDF reports</h2>

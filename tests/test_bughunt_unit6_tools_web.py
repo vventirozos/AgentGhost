@@ -133,7 +133,7 @@ class TestVision:
 # 5. image_gen
 # ──────────────────────────────────────────────────────────────────────
 
-from ghost_agent.tools.image_gen import tool_generate_image, _snap_to_bucket
+from ghost_agent.tools.image_gen import tool_generate_image
 
 
 class TestImageGen:

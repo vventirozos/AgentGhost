@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../s
 import asyncio
 from unittest.mock import MagicMock
 
-from ghost_agent.tools.image_gen import tool_generate_image, _NODE_BUCKETS
+from ghost_agent.tools.image_gen import tool_generate_image
 
 
 def _capture_client():
@@ -85,14 +85,16 @@ class TestSeedAndNegative:
 
 
 class TestNodeBuckets:
-    def test_all_buckets_fit_the_node_budget(self):
-        # The node's budget is 768*512 pixels with sides clamped at 768 and
-        # (Qwen-Image-2.1 / sd.cpp) a multiple of 32; every bucket must fit
-        # natively so the server never rescales.
-        for w, h in _NODE_BUCKETS:
-            assert w * h <= 768 * 512, (w, h)
-            assert w <= 768 and h <= 768, (w, h)
-            assert w % 32 == 0 and h % 32 == 0, (w, h)
+    def test_the_tool_no_longer_imposes_its_own_size_ladder(self):
+        """§4KA: this tool used to snap every request to five fixed shapes —
+        an SD1.5 habit. The node now searches 246 legal sizes by aspect, so
+        snapping here only degraded the result (1920x1080 -> 768x512, 15.6%
+        aspect error, against the node's 736x416 at 0.5%) and then reported
+        the client's pick as the node's. Geometry has ONE owner now."""
+        from ghost_agent.tools import image_gen
+        assert not hasattr(image_gen, "_snap_to_bucket")
+        assert not hasattr(image_gen, "_NODE_BUCKETS")
+        assert not hasattr(image_gen, "_DEFAULT_BUCKET")
 
     def test_schema_matches_reality(self):
         # The model-facing schema advertises the same sizes/steps the tool

@@ -140,7 +140,7 @@
   Covered by <code>tests/test_project_readside_plumbing.py</code>.</p>
 
   <h2>Budget enforcement</h2>
-  <p><code>_get_budget()</code> reads <code>steps_cap / steps_used</code> from project metadata; <code>_increment_budget()</code> bumps after each tick. Checked via <a href="project_safety.html">check_budget()</a> across <code>steps</code>, <code>runtime_seconds</code>, and <code>tool_calls</code>.</p>
+  <p><code>_get_budget()</code> reads <code>steps_cap / steps_used</code> from project metadata; <code>_increment_budget()</code> bumps after each tick. Checked via <a href="project_safety.html">check_budget()</a> across <code>steps</code>, <code>runtime</code>, and <code>tool_calls</code>.</p>
 
   <h2>AdvanceResult</h2>
   <pre><code>AdvanceResult(ok: bool, task_id: str, classification: str, summary: str, artifact_id: Optional[str])</code></pre>
