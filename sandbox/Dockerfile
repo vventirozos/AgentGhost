@@ -43,7 +43,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     DISABLE_VERSION_CHECK=1
 
 # --- System packages ---
-# sudo          : tool execution needs passwordless sudo for apt/root ops
+# sudo          : model scripts say `sudo apt-get`; exec runs as root, so
+#                 no sudoers grant is needed (or provisioned, §4KF)
 # nodejs/npm    : for JS sandbox targets
 # g++           : compiled-code targets (pandas wheels fallback, C extensions)
 # curl/wget/git : fetch fixtures inside tasks
@@ -54,15 +55,24 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # ripgrep       : fast code search
 # sqlite3       : lightweight data-analysis tasks
 # iproute2      : `ss` — socket/port inspection (what's listening)
+# §4KG (2026-09-24): netcat-openbsd (the egress leak probe needs `nc`), socat,
+#                 jq, unzip/zip, tree, nano, bc, gawk, rsync, pkg-config, telnet,
+#                 whois, p7zip-full, poppler-utils (pdftotext), ffmpeg, imagemagick.
+#                 Kept in step with SANDBOX_TOOL_PACKAGES in sandbox/docker.py.
+#                 No ping/traceroute: NET_RAW is dropped (§4KF).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         sudo coreutils nodejs npm g++ curl wget git procps \
-        postgresql-client libpq-dev tor ripgrep sqlite3 iproute2 stockfish file xxd lsof dnsutils iptables \
+        postgresql-client libpq-dev tor ripgrep sqlite3 iproute2 file xxd lsof dnsutils iptables \
+        netcat-openbsd socat jq unzip zip tree nano bc gawk rsync pkg-config telnet whois p7zip-full poppler-utils ffmpeg imagemagick stockfish \
  && rm -rf /var/lib/apt/lists/*
 
 # Passwordless sudo — the sandbox runs as root by default, but the
 # self-play harness sometimes invokes sudo explicitly inside solutions.
-RUN echo "ALL ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+# (§4KF 2026-09-24) No `ALL ALL=(ALL) NOPASSWD: ALL` sudoers line: on macOS the
+# sandbox exec user is root (the grant added nothing); on Linux it is the host
+# uid:gid (the grant would hand it root). Root through Debian's stock sudoers
+# still works. A cached image that carries the line is stripped at adoption.
 
 # --- Python deep-learning / data stack ---
 # Mirrors the runtime install_cmd in sandbox/docker.py. Kept here so
@@ -99,7 +109,9 @@ RUN python3 -m playwright install --with-deps chromium
 # tag (and the corresponding string in docker.py) whenever this
 # Dockerfile's install surface changes in a way that prior images
 # can't be trusted to match.
-RUN touch /root/.supercharged.v9
+# stockfish installs to /usr/games, off the exec PATH — expose it (§4KG).
+RUN ln -sf /usr/games/stockfish /usr/local/bin/stockfish
+RUN touch /root/.supercharged.v10
 
 WORKDIR /workspace
 CMD ["sleep", "infinity"]

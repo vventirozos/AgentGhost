@@ -40,7 +40,9 @@ async def test_every_name_for_this_capability_reaches_the_ingest_handler(
         action, monkeypatch):
     seen = []
 
-    async def _fake_gain(target, sandbox_dir, memory_system):
+    async def _fake_gain(target, sandbox_dir, memory_system, **route_kwargs):
+        # §4KE: the dispatcher now also threads `tor_proxy`/`language`
+        # (the YouTube route is Tor-only); the alias test is about the NAME.
         seen.append(target)
         return "ok"
 
@@ -114,12 +116,17 @@ def test_transcribe_is_advertised_in_the_action_enum():
     assert "same action" in action.get("description", "").lower()
 
 
-def test_the_filename_param_refuses_a_video_URL():
-    """The observed plan tried to hand a YouTube URL straight to ingest.
-    The file must be downloaded first — that step IS real work."""
+def test_the_filename_param_accepts_a_youtube_URL_as_is():
+    """Inverted on 2026-09-24 (§4KE). The observed plan handed a YouTube URL
+    straight to ingest — and that is now RIGHT: the tool fetches it over Tor
+    itself (captions first, audio otherwise). What the description must
+    forbid instead is the model downloading YouTube by hand, the step that
+    used to burn a turn on yt-dlp inside the sandbox."""
     fn = _kb_schema()["parameters"]["properties"]["filename"]["description"]
-    assert "NOT a YouTube" in fn or "not a youtube" in fn.lower()
-    assert "download the file first" in fn.lower()
+    low = fn.lower()
+    assert "youtube" in low and "as-is" in low
+    assert "never download youtube" in low
+    assert "not a youtube" not in low, "the old refusal must be gone — it now contradicts the route"
 
 
 # --------------------------------------------------------- the plan itself
@@ -133,5 +140,5 @@ def test_the_planner_is_told_the_step_does_not_exist():
     rules = PLANNING_SYSTEM_PROMPT
     assert "TRANSCRIPTION AND INGESTION ARE ONE STEP" in rules
     assert "transcribe.py" in rules
-    assert "Downloading the media first IS legitimate work" in rules, (
+    assert "Downloading a media FILE from an ordinary URL first is legitimate work" in rules, (
         "the rule must not over-correct into forbidding the download too")

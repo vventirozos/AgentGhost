@@ -8703,6 +8703,19 @@ class GhostAgent:
         except Exception as _epe:  # noqa: BLE001 — never break the tick
             logger.debug("epoch swap check failed: %s", _epe)
 
+        # ── §4KH: the YouTube route canary ──
+        # Above the memory guard (it needs no memory) and with its own
+        # foreground gate inside: one cheap check per ~60 s that decides
+        # whether a probe is due (default once a day, first one 10 min after
+        # boot) and, if so, runs it in a worker thread. Announces only a
+        # TRANSITION (walled / helper down / recovered) through the
+        # activity ledger → Slack DM / webhook.
+        try:
+            from ..memory import youtube_canary as _ytc
+            _ytc.maybe_run(self)
+        except Exception as _yce:  # noqa: BLE001 — never break the tick
+            logger.debug("youtube canary tick skipped: %s", _yce)
+
         if not getattr(ctx, 'memory_system', None):
             return
 

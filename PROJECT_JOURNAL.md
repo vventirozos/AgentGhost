@@ -47476,3 +47476,479 @@ that middleware; it is pure ASGI now (`_BodyCapMiddleware`, same two 413 pins, a
 16.6s`), sd-cli gone, `/ready` true at once. Battery 8/8 (the three ~33 s kills are pins timing
 out an uncancelled render — the defect demonstrating itself). Pins drive a real subprocess.
 Deployed to ghost (backups `server.pre-cancel.bak.py`, `server.pre-asgi.bak.py`; md5 matches).
+
+## §4KE — Video reading review (transcript + summarisation) and YouTube over Tor (2026-09-24) — R0 scope, written first
+
+**Request (operator, 2026-09-24):** "code review the video reading functionality (transcript, summarization)
+the same way [§R]. Also let's see if we can come up with a way to make it work for youtube over tor."
+
+**What "video reading" is in this tree (surveyed before any opinion):**
+- `tools/yt_download.py` + `tools/yt_tor_download.sh` — the `youtube_transcribe` macro (sequential:
+  `execute` runs a base64-smuggled bash script that installs yt-dlp/deno in the sandbox and downloads
+  `yt_audio.<ext>` over Tor with SOCKS-auth circuit rotation on a 429/"unavailable" regex; then
+  `knowledge_base(action='transcribe', filename='yt_audio.m4a')`).
+- `memory/audio_ingest.py` — ffmpeg windows (720 s, 15 s overlap, 6 h cap) → nova Gemma-4 E4B audio node
+  (`input_audio`, temperature 0, 8192 max tokens, 900 s per window) → timestamp-crumbed chunks → `ingest_document`.
+- `tools/memory.py::tool_gain_knowledge` audio branch (+ the `document_summary` row), `tool_query_document`,
+  `tool_document_outline`, the dispatcher's `transcribe` alias; `registry.py:661` description; `prompts.py` rules 8/10.
+- Consumers that decide whether the macro "worked": `composed_skills._execute_sequential` / `_step_result_ok`,
+  `execute` job promotion (`GHOST_SANDBOX_JOB_PROMOTE_AFTER_S` = **90 s**, not the 600 s the script's comments assume),
+  `sandbox/jobs.is_promoted_result`.
+- Tests: `test_yt_tor_download.py` (27), `test_audio_ingest.py` (19), `test_transcribe_discoverability.py`,
+  `test_kb_ingest_*`, `test_composed_skill_run_action.py`. Docs: `docs/tools/memory_tools.html`, `docs/tools/composed_skills.html`.
+
+**Ground truth measured before the review (all over live Tor `:9050`, host, 2026-09-24 morning):**
+- Live store: `youtube_transcribe` **usage 3, success 0** (all 2026-08-12). It has never completed.
+- Plain yt-dlp 2026.08.19 + deno over Tor: **0/9** — default client ×3 fresh circuits, mweb, tv, android_vr,
+  web_embedded, ios, tv_embedded: "Sign in to confirm you're not a bot" or 403 on every circuit. The wall is
+  UNIFORM, not per-exit: the script's premise (rotate past 429s) is stale — every run now burns 8 circuits + backoff
+  to reach the same answer.
+- Invidious: instance API lists 6 candidates; all returned 0 B / timeout (the public network is dead to YouTube).
+  Piped: `SignInConfirmNotBotException` (same wall on their side). youtubetranscript.com: "YouTube is currently
+  blocking" (same). Legacy/json3 timedtext: 429. The watch PAGE itself loads fine (1.2 MB, 200) — only the player API is walled.
+- **yt-dlp + `bgutil-ytdlp-pot-provider` (PO token = BotGuard proof-of-origin, solved locally in node, the
+  challenge fetch forwarded through the SAME Tor circuit — verified in the plugin source `request_proxy` and the
+  server log "Using proxy: socks5h://…"): 3/3 fresh circuits, 3–10 s, title + duration + auto-captions (vtt) +
+  manual subtitles (json3).** Forcing a `player_client` breaks it; the default client mix is the one that works.
+  Keyless, accountless, no cookies, Tor-only — inside the no-identity-egress rule. Byte-transfer (captions + audio,
+  short and ~18-min video) measurement in flight at R0 time.
+- nova audio node: `/health` ok, model gemma-4-E4B loaded.
+
+**Threat model / questions the review must answer (fix CLASSES, not instances):**
+1. **Can the macro ever complete?** Step 1 legitimately exceeds 90 s (8 attempts, deno install, a real download over
+   Tor) → promoted → `_step_result_ok` = False → macro aborts, step 2 never runs; the download finishes in the
+   background and nothing transcribes it. Class: a composed step whose duration exceeds the promotion budget.
+2. **Constant filename vs a filename-keyed KB.** `yt_audio.m4a` every time; `tool_gain_knowledge` returns
+   `Skipped: … already in KB` for a known name — the SECOND video ever can never be ingested, and "Skipped" may
+   read as success to `_step_result_ok`. Class: dedup key = user-visible name, not content.
+3. **Extension fallback vs hardcoded step-2 filename** (`ba[ext=m4a]/ba` may yield .webm/.opus; step 2 says `.m4a`).
+   Does the transcribe step really "resolve by stem" as the script comment claims?
+4. **Route liveness.** The retry regex treats "not a bot" as retryable → 8 × (attempt + backoff) for a uniform wall.
+   Class: a retry loop whose premise is no longer true, with no wall-class detection and no early honest stop.
+5. **Summarisation is metadata.** The stored `document_summary` for audio is counts (duration, windows, chunks),
+   not content; `query` returns k=8 passages of ≤1200 chars; there is no whole-transcript read and no outline for
+   audio (timestamps could BE the outline). What does "transcribe this video and summarise it" actually produce?
+6. **Transcription correctness/resource:** the `(no speech)` sentinel across languages; `finish_reason=length`;
+   900 s × windows inside one tool call (a 6 h cap = 30 windows); 12-min 16 kHz WAV = ~23 MB → ~31 MB base64 per
+   POST; no retry per window; nova shared with the critic; overlap duplication; music/hallucination.
+7. **Security of the smuggled step:** URL → quoted heredoc: is a NEWLINE in `$url` (raw resolver replacement) a
+   heredoc break = command injection? `pip install yt-dlp` and `curl deno.land | sudo sh` at run time (unpinned
+   remote code as root, albeit over in-container Tor). Class: run-time supply chain in a model-driven step.
+8. **Description/prompt/docs drift:** registry says "transcribes it LOCALLY" (nova, over tailnet); prompt rule 8
+   says downloading is legitimate work while rule 10 says call the macro; docs for both pages.
+
+**Design target for YouTube over Tor (built only after the review; measured route first):**
+a **first-class `youtube` route inside the agent process** (not a shell smuggle in a macro): resolve → captions
+tier (`--write-auto-subs`, exact words, full transcript returnable, no nova) → else audio tier (`ba[ext=m4a]/ba` →
+existing `audio_ingest`); yt-dlp + PO-token provider (bgutil server as a supervised local service, its BotGuard
+fetch riding the same per-attempt Tor circuit), per-video filenames, duration-owned execution (a job the caller can
+await/poll, never a 90 s guillotine), and a content-bearing summary row. Rejected on the standing rule:
+cookies/accounts, keyed transcript APIs, any non-Tor egress. Ship criteria: full §R battery (mutation on an isolated
+copy, no-op + known-bad controls), suite once at the end, deploy, live verify on a real URL over Tor.
+
+**Reviewers:** three fresh-eye lenses (pipeline liveness/failure path; transcription correctness/resource;
+product-summarisation + prompt/docs + security). They report classes with sibling enumerations; no fixes. R7 stopping
+rule: nothing above MINOR inside the fixes for one full round.
+
+### §4KE — R1: three fresh-eye lenses, consolidated (2026-09-24)
+
+Reviewers did not write the code and did not fix anything. Findings are grouped by CLASS; the instance
+list is what the fixes below enumerate.
+
+**Class 1 — a pipeline step that outlives its caller's budget (CRITICAL).** `execute` promotes at 90 s; the
+download step cannot finish inside that (pip install + deno install + 8 circuits × attempt + 57 s of backoff);
+`_step_result_ok` books the promotion banner as a FAILED step; the macro aborts; the audio finishes in the
+background and nothing ever transcribes it; the generic job wake carries no notion of the pending step 2.
+Live evidence: usage 3 / success 0. Sibling: any sequential macro whose first step is `execute`.
+→ FIX: no shell step at all. YouTube becomes an in-process route (`memory/youtube_ingest.py`) owned by
+`knowledge_base(action='transcribe', filename=<url>)`; the macro `youtube_transcribe` shrinks to ONE step that
+calls it (kept only so the name in prompt rule 10 keeps working); the store entry is reconciled from the
+code-owned definition at registry load (the sync script's "stop the agent first" dance goes away).
+
+**Class 2 — a constant artefact name used as a durable identity (CRITICAL).** `yt_audio.m4a` every run +
+name-keyed KB dedup → the second video ever returns `Skipped: already in KB`, which `_step_result_ok` books as
+SUCCESS, and every later query answers from video one. Stem resolution is the generic fuzzy walk (per-EXTENSION
+dedup, and Priority-3 substring matches yt-dlp's in-flight `yt_audio.m4a.part`, which then ingests partial AAC
+as TEXT). Siblings: `.yt_url`, `yt_attempt.log`, two concurrent runs sharing one cwd; `test_definition_shape`
+PINNED the constant. → FIX: per-video filenames `yt-<video_id>.<ext>` / `yt-<video_id>.captions.<lang>`; the
+resolver skips in-flight suffixes (`.part`, `.ytdl`, `.tmp`, `.crdownload`, `.download`).
+
+**Class 3 — retry premise gone stale, no wall-class stop (MAJOR).** `BLOCK_RE` treats "not a bot" as
+retryable; measured today it is uniform without a PO token (0/9) and per-circuit WITH one (5/12, failures in
+2–9 s). → FIX: yt-dlp + `bgutil-ytdlp-pot-provider` (local BotGuard solve; the challenge fetch is forwarded
+through the SAME per-attempt Tor circuit — verified in plugin source and server log); attempts on fresh
+SOCKS-auth circuits; terminal errors (private/removed/unsupported/bad URL) stop at once; a missing PO server is
+reported as the cause, not as "every exit blocked".
+
+**Class 4 — template interpolation without a per-sink escaper (CRITICAL, security).** `_resolve_args`
+splices `$url` raw into the heredoc body; the quoted heredoc blocks expansion but not the TERMINATOR: a value
+carrying a line break followed by the delimiter line ends the heredoc and the rest runs as shell in the
+sandbox. Tool args are `json.loads(strict=False)`, so `\n` decodes to a real newline; nothing on the path
+rejects control characters; the three injection pins are all single-line. → FIX: the smuggled command is
+deleted (Class 1), AND `_resolve_args` refuses C0 control characters (except tab) in any value interpolated
+into an `execute` step's `command`, recorded as a failed step. Pin with a multi-line value.
+
+**Class 5 — model-driven run-time supply chain as root (MAJOR, security).** `pip install yt-dlp` unpinned +
+`curl deno.land/install.sh | sudo sh` inside a NOPASSWD-sudo container whose cap-drop is OFF by default and
+whose network mode is host on Linux; output swallowed. → FIX: gone with the shell step; yt-dlp and the plugin
+are pinned venv dependencies on the host; deno/node are Homebrew binaries resolved by absolute path. (The
+sandbox hardening defaults are out of scope here and noted for the operator.)
+
+**Class 6 — a detector keyed to one measured shape (CRITICAL).** Only `empty + finish_reason=length` raises;
+`text + length` is stored as a complete window under a crumb claiming all 12 minutes. Thinking is never
+disabled, and it eats the budget: measured on nova, a ~5-min window = 2425 completion tokens WITH thinking
+(1346 of them reasoning) vs 1079 WITHOUT, 90 s vs 54 s, identical transcript. → FIX: `chat_template_kwargs:
+{enable_thinking: false}` (verified accepted by the node) + every non-`stop` finish is recorded as a truncated
+window with its timestamp in the report.
+
+**Class 7 — coverage from the max endpoint, errors collected but never shown (CRITICAL).** A failed middle
+window leaves no gap in `st.seconds`, the summary row, or the store; `st.errors` reaches the user only when
+EVERYTHING failed. No retry, no consecutive-failure abort: a starved node (accepts TCP, never answers) costs
+windows × 900 s inside one interactive tool call. → FIX: coverage = union of transcribed windows + explicit
+`gaps` (timestamp ranges + cause) in the result AND the summary row; one retry per window on transient faults;
+abort after 3 consecutive failures; httpx timeout split (connect 10 s / read 900 s); progress per WINDOW, not
+per 256-chunk flush; ingests serialised (nova is shared with the critic).
+
+**Class 8 — lexical guard speaking one language and one surface form (MAJOR).** `(no speech)` prefix match on
+an English literal: `No speech.`, quoted/bold forms, `Transcript: (no speech)`, Greek forms all become stored
+"passages"; a leading sentinel followed by real speech DISCARDS the speech. → FIX: shape-based sentinel
+(normalise quotes/markdown/labels; a ≤40-char bracketed reply is a sentinel; a known multilingual set), and a
+sentinel followed by ≥80 chars keeps the remainder.
+
+**Class 9 — structure computed for the breadcrumb and thrown away (MAJOR, product).** No ordinal in the
+store, no outline record for audio, the `document_summary` row is counts only, no whole-transcript route: after
+a successful transcribe the model can hold at most k=8 × 1200 chars of a talk and presents that as "the
+summary"; `outline` for audio rebuilds from crumbs (timestamps as headings). → FIX: an ordered transcript
+sidecar (`set_document_text`/`get_document_text`, dropped with the document), new
+`knowledge_base(action='transcript', filename, offset, max_chars)`, an outline record per window with first
+words, a CONTENT-bearing summary row (title/url/language + first 600 chars), and the transcribe result itself
+returns a transcript preview so a summary needs no second call.
+
+**Class 10 — implicit defaults on multi-stream/odd containers (MAJOR).** No `-map` (ffmpeg picks the most
+channels: system audio over the mic), `float("N/A")` duration is fatal, video-only files fail once per window,
+`.m4b/.3gp/.amr/.aif/.oga/.mka` fall into the plain-text branch, four env knobs unvalidated while their sibling
+uses `env_positive`, ffmpeg cut borrows the 900 s network timeout. → FIX: `-map 0:a:0`; probe format AND
+streams and require an audio stream; extension list extended; `env_positive` everywhere; cut timeout 180 s.
+
+**Class 11 — description/prompt/docs drift (MAJOR).** "transcribes it LOCALLY" (it is nova over tailnet —
+private, no internet egress, not local); the filename param says "NOT a YouTube/video URL (download the file
+first)" while rule 10 says call the macro; not-found advice sends a YouTube URL to `file_system download`
+(a GET that writes the watch page as `.m4a`); a YouTube URL passed as filename ingested the watch-page HTML as a
+document and reported SUCCESS. → FIX: description, params, prompt rule 8, both docs pages, and the URL branch.
+
+**Reviewer 3 note:** its A/B prose was withheld by a safety classifier on resend (it had quoted the injection
+mechanism); the anchors it listed were read directly and are folded into classes 9 and 11 above.
+
+### §4KE — outcome (2026-09-24, 05:40–08:00) — SHIPPED, deployed, live-verified
+
+**What shipped (files):** NEW `memory/youtube_ingest.py` (the in-process YouTube route); REWRITTEN
+`memory/audio_ingest.py`; `tools/memory.py` (YouTube branch before the filename rules, `_INFLIGHT_SUFFIXES`,
+`_persist_audio_structure` / `_audio_success_message`, `tool_document_transcript` + `transcript` action, tor_proxy/
+language threaded); `memory/vector.py` (`set/get/drop_document_text` sidecar, dropped with the document);
+`tools/composed_skills.py` (`ComposedArgError` for control chars into `execute.command`, both runners catch it;
+`_reconcile_code_owned()` at load); `tools/yt_download.py` (one-step macro + `CODE_OWNED_MACROS`;
+`yt_tor_download.sh` DELETED); `tools/registry.py` (description, `transcript`, `language`/`offset`/`max_chars`,
+`tor_proxy` in the dispatch); `core/prompts.py` rule 8; `interface/externals/pot_provider/` (LaunchDaemon plist +
+README); docs: new `docs/memory/youtube_ingest.html`, `vector.html`, `tools/memory_tools.html`,
+`tools/composed_skills.html`, `tools.html`, `reference.html`; `scripts/sync_youtube_transcribe_macro.py` docstring.
+Host: `yt-dlp` + `bgutil-ytdlp-pot-provider` installed in `.agent.venv`; PO-token helper built to
+`~/Data/AI/PotProvider` (upstream commit in `UPSTREAM_COMMIT`) and installed as `com.local.ghost-pot` (system
+LaunchDaemon, user vasilis, loopback 4416, logs `~/Data/AI/Logs/ghost-pot.{log,err}`).
+
+**Round 2 (a reader of my own fixes) found 4 MAJOR + 8 MINOR in the new code.** Three MAJORs were real and are
+fixed: (a) the consecutive-failure abort RAISED out of the generator, discarding every good window, and past 256
+flushed chunks left a library entry that made the video a permanent "Skipped" → the loop now STOPS, keeps what it
+has, reports the rest as one gap, the reply head is `SUCCESS (partial)` and names the redo (`forget`, then
+transcribe); (b) `language=` returned a machine translation filed as that language's captions → a requested
+language is honoured only by a manual track or `<lang>-orig`, else the original is used and the reply says so;
+(c) no deadline anywhere → wall budget `GHOST_AUDIO_TOTAL_BUDGET_S` (2 h) inside the window loop, ingest-lock wait
+bounded (`GHOST_AUDIO_LOCK_WAIT_S` 600 s → an honest error). MINORs fixed: country-block and "no video formats" are
+circuit faults (retry); ffmpeg failures no longer count toward the NODE abort; schemeless and >240-char YouTube
+URLs take the route; leftover `yt-<id>.m4a` from an earlier attempt is reused; the PO hint judges the failing
+STAGE; `transcript` accepts the YouTube URL and refuses an ambiguous prefix.
+**The fourth MAJOR was wrong**: "the audio tier cannot work — no `yt-dlp-ejs`, empty deno npm cache, no
+`--remote-components`". Measured: the forced audio tier downloaded 301 KB over Tor and transcribed on nova in
+11 s; under a launchd-like environment (`env -i`, no HOME, minimal PATH) yt-dlp resolved format 140 with a
+googlevideo URL — the deno JS-challenge provider is what this yt-dlp uses. A reasoned claim about a third party's
+internals is a hypothesis until run.
+
+**Batteries.** Isolated-copy mutation battery, 38 single-fix reverts + no-op and known-bad controls: **36/39 as
+expected** — the three "problems" are two round-1 anchors that round 2 rewrote (M3 → superseded by M29, M14 → by
+M32, both killed) and one EQUIVALENT mutant (M31: incrementing the counter on an ffmpeg failure never reaches the
+abort check, so the behaviour is identical — not a hollow pin). Every other mutant was killed by the pin written
+for it. Pins: `tests/test_4ke_video_pipeline_review.py` (99 tests, behavioural; the one structural pin is AST).
+`test_transcribe_discoverability.py` pin INVERTED on purpose (the filename param now accepts a YouTube URL as-is
+and forbids downloading YouTube by hand). Ratchets that caught my new code: symlink-class (a `glob` read in a
+tempdir → `walk_nofollow` + `read_text_nofollow`), lint gate (two unused variables), flag-documentation gate
+(`GHOST_AUDIO_THINKING`, `GHOST_YT_POT_LOG`), kb-error-parameter gate (the worked call named `offset`).
+
+**Full suite ONCE at the end: 24,530 passed / 0 failed / 65 skipped, 8:53** (`-n 8 --dist loadfile`, with
+`GHOST_API_KEY` exported — a first run without it produced 129 interface errors that were the environment, not the
+code; the canonical command in the run-and-test memory has the export).
+
+**Deploy + live.** `launchctl kickstart -k`, listener pid 96887 → 16738 in 45 s, one main process. Boot log:
+`composed skill 'youtube_transcribe' reconciled to its code-owned definition`; the store now holds the one-step
+macro with its usage counters. Live request through `/api/chat` ("Transcribe this YouTube video and give me a
+3-sentence summary"): the model called `youtube_transcribe`, the route resolved the 5:56 TEDx talk over Tor on
+the first circuit, indexed 5 caption passages as `yt-8S0FDjFBj8o.captions.en` at +70 s, and the reply was an
+accurate three-sentence summary at **114 s** total. Earlier direct runs: captions tier 7–11 s per video; forced
+audio tier 11 s for a 19 s clip (download + nova).
+
+**Standing measurements for whoever touches this next.** PO-token per-circuit success 5/12; nova window with
+thinking off ≈ 2× faster and half the completion tokens for identical text; the sandbox container is NOT on the
+route any more (no run-time `pip`/`curl | sudo sh`); the sandbox hardening defaults reviewer 3 flagged (NOPASSWD
+sudo, cap-drop off, host network on Linux) are unchanged and are the operator's call.
+
+**Left open (MINOR, recorded not fixed):** `_lang_matches`-style script/region edge cases beyond `zh-Hans`; the
+macro's "missing url" error names `filename`; `_reconcile_code_owned` makes any second process that opens the
+store a boot-time writer (last-writer-wins on counters); the resolver guard covers control characters only
+(quotes/`;` in a value spliced into `execute.command` still pass — no code-owned macro has a shell step now).
+
+## §4KF — Sandbox privilege defaults (2026-09-24) — R0 scope, written first
+
+**Request:** "proceed, standard verification protocol" on the item §4KE left with the operator: the sandbox
+hardening defaults reviewer 3 flagged (passwordless sudo, capability drop off by default, host network on Linux).
+
+**Measured on the LIVE container before any opinion** (`ghost-agent-sandbox-ecf4109f`, image
+`ghost-agent-base:latest`): `User=` empty → every exec, including the model's `execute`, runs as **uid 0 (root)**;
+`CapDrop=[] CapAdd=[]` → Docker's default 14 capabilities (CapEff `a80425fb`: CHOWN, DAC_OVERRIDE, FOWNER,
+FSETID, KILL, SETGID, SETUID, SETPCAP, NET_BIND_SERVICE, NET_RAW, SYS_CHROOT, MKNOD, AUDIT_WRITE, SETFCAP);
+`SecOpt=[]`; `Net=bridge` (this is macOS/OrbStack: host mode is the LINUX default, which no deployment uses);
+`Priv=false`; pids 1024; mem 4 GiB; `sudo -n true` works and `/etc/sudoers` carries `ALL ALL=(ALL) NOPASSWD: ALL`
+twice (Dockerfile + runtime provisioning both append it).
+
+**What that means for the three flagged items:**
+1. **Passwordless sudo is not an escalation — the exec user is already root.** The sudoers line grants nothing
+   root does not have; it is dead weight today and a loaded footgun the day a non-root exec user is introduced.
+   Class: provisioning that grants more than the exec model uses. → remove the line from both places; keep the
+   `sudo` PACKAGE (model-written scripts say `sudo apt-get`, and root through sudo works with Debian's stock
+   sudoers). `tests/test_docker_sudo.py` pins the line and must be inverted.
+2. **Capability drop is off because of a stale reason.** The code comment says `no-new-privileges`/`cap_drop`
+   would break "passwordless sudo (setuid) for in-container apt installs" — but exec is root, so apt never needs
+   setuid GAIN; what apt/dpkg/pip/Tor need is the ability to DROP (SETUID/SETGID to `_apt`, `debian-tor`) plus
+   CHOWN/DAC_OVERRIDE/FOWNER/FSETID for package files, and KILL for the service supervisor. The iptables rules
+   are applied through a PRIVILEGED `docker exec`, which grants its own caps regardless of the container's set.
+   → default becomes `cap_drop=ALL` + `cap_add=[CHOWN, DAC_OVERRIDE, FOWNER, FSETID, SETGID, SETUID, KILL]` +
+   `security_opt=[no-new-privileges]`; `GHOST_SANDBOX_DROP_CAPS=0` opts OUT (the old opt-in flag becomes the
+   opt-out). Dropped for real: NET_RAW (raw sockets/spoofed packets), MKNOD, SYS_CHROOT, SETPCAP, SETFCAP,
+   AUDIT_WRITE, NET_BIND_SERVICE (services bind ≥1024 by design). **Measured on a throwaway container from the
+   live image BEFORE touching the live one**: setuid drop, chown, apt's privilege drop, tor start as
+   `debian-tor`, Chromium headless launch, a supervised node service bind, and the privileged iptables exec.
+3. **Host network as the Linux default is a leftover from before the in-container Tor.** §4FU (2026-09-09)
+   moved egress enforcement INSIDE the container (Tor + iptables in the container's own netns), which only works
+   in bridge mode; under host networking the in-container Tor cannot bind and the enforcement "does not apply and
+   says so". The comment justifying host mode ("the browser must reach the host's Tor at 127.0.0.1:9050") is
+   the pre-§4FU topology. → Linux default becomes `bridge` (with `host.docker.internal:host-gateway`, already
+   coded for that branch); `GHOST_SANDBOX_NETWORK=host` remains an explicit choice. Unmeasurable on this Mac
+   beyond unit pins; recorded as such.
+
+**Out of scope, recorded:** running the model's commands as a NON-root user (bind-mount ownership, pip user
+site, playwright paths, services — a redesign, not a default flip). The privileged iptables exec stays: it is the
+operator's code, not the model's.
+
+**Ship criteria:** throwaway-container measurement first; then the flag change; pins behavioural (run-kwargs
+assembled by `ensure_running` under a mocked docker client — the shape `test_isolation_replay` already uses);
+mutation battery on an isolated copy; fresh-eye reviewer on the diff; suite once; recreate the live sandbox
+(the flags apply only at creation — that discards in-sandbox state, which is the sandbox's contract) and verify
+`docker inspect` + a real `execute`, browser, and Tor-egress check through the live agent.
+
+### §4KF — outcome (2026-09-24, 08:00–08:35) — SHIPPED, live sandbox recreated hardened
+
+**Measured first, on a throwaway container from the live image with the proposed flags:** apt's privilege
+drop to `_apt`, `su` to `debian-tor`, chown, pip, tor start as debian-tor, Chromium headless (`--no-sandbox`), a
+node service bind on 8100, killing a child, and the PRIVILEGED-exec iptables rules all worked; raw sockets,
+mknod, chroot and plain-root iptables were refused. Only then did the defaults move.
+
+**What shipped.** `sandbox/docker.py`: `cap_drop=ALL` + `cap_add=SANDBOX_KEPT_CAPS` (CHOWN, DAC_OVERRIDE,
+FOWNER, FSETID, SETGID, SETUID, KILL) + `no-new-privileges` by DEFAULT (`GHOST_SANDBOX_DROP_CAPS=0` opts out;
+the old opt-in "1" reads as the default it now is); `bridge` on every platform (`host` stays an explicit
+choice); the runtime `NOPASSWD: ALL` sudoers append removed; `binds_host_netns()` reads the ADOPTED container's
+mode first. `sandbox/Dockerfile`: grant removed. `sandbox/services.py` comments; docs `sandbox/docker.html`
+(new "Privilege defaults" section), `sandbox/services.html`, `audit_fixes.html` superseded notes.
+
+**The fresh-eye review of the change found the thing that would have shipped nothing.** MAJOR-1: the recreate
+boots `ghost-agent-base:latest`, which is a runtime `container.commit()` — not a build of the Dockerfile — and
+provisioning is skipped on the `/root/.supercharged.v9` marker, so the recipe change never reached a recreated
+container: measured, the image still carried the grant twice, and my pin checked the RECIPE. Fix:
+`_settle_privileges_once()` runs once per container generation from the same entry point as egress
+enforcement: strips the grant in place as root, and compares the adopted container's `HostConfig` with the
+intended set, logging ONE WARNING with the remedy (`docker rm -f <container>`; the agent never recreates on its
+own). MAJOR-2 (latent, Linux): the exec user is root only on macOS — on Linux `execute` runs as the host uid:gid;
+comments, Dockerfile and this journal narrowed accordingly. MAJOR-3 (latent, Linux): `binds_host_netns()`
+mirrored the new default, not the adopted container — a Linux agent upgraded in place would have bound
+services on 0.0.0.0 in its old host-mode container; fixed to read the container. MEDIUM-4 = the drift report
+above. MINORs fixed: `extra_hosts` rationale, stale "Linux default" comments/docs, the AST pin now requires the
+privileged exec to be the one applying the rules. Recorded, not fixed: the browser dials the HOST's configured
+proxy address inside a Linux bridge container; the UDP leak probe uses `nc`, which the image lacks (exit 127
+prints "blocked"); a non-root exec user on macOS.
+
+**My own second-round defect:** the drift check read a MagicMock's `attrs` as real drift and broke the two
+"ensure_running is silent" pins — the `_recreate_if_cut_off` lesson (a stub is not evidence) applied again;
+it now requires a real `HostConfig` dict.
+
+**Batteries.** §4KF mutation battery on an isolated copy: **15/15** (13 single-fix reverts + no-op and known-bad
+controls; every revert killed by its pin, including strip-disabled, drift-silenced, netns-ignores-container,
+check-not-once, NET_ADMIN kept, sudoers back in provisioning and in the recipe, Linux host default back).
+Pins: `tests/test_4kf_sandbox_privilege_defaults.py` (17), `tests/test_docker_sudo.py` inverted. **Full suite
+once at the end: 24,547 passed / 0 failed / 67 skipped, 8:28.**
+
+**Deploy + live.** Agent kickstarted (pid 16738 → 47246). At boot, on the OLD container: `sandbox privileges —
+removed the NOPASSWD sudoers grant left by the cached image` and the WARNING `container … predates the current
+privilege defaults: cap_drop none (intended ['ALL']) …` — both mechanisms fired on the real thing. Then the old
+container was removed and a diagnostic turn through `/api/chat` recreated it: the model's `execute` returned
+`uid=0(root)`, `NOPASSWD_LINES=0`, `CapEff 00000000000000fb` (exactly the seven kept bits), `NoNewPrivs 1`,
+and `{"IsTor":true}` from check.torproject.org; `docker inspect`: `CapDrop=[ALL] CapAdd=[CHOWN DAC_OVERRIDE
+FOWNER FSETID SETGID SETUID KILL] SecOpt=[no-new-privileges] Net=bridge`; Tor-only egress ENFORCED at +59 s of
+the turn; plain-root iptables refused inside. Turn time 87 s.
+
+## §4KG — The sandbox's everyday CLI set (2026-09-24) — R0 + build
+
+**Request:** "add nc (and any other tools that might be missing) to the container."
+
+**Measured first.** Live log, all time, model commands that hit "command not found" inside the sandbox:
+xxd ×7, file ×3 (both added in v6/v7 already), then yt-dlp, ffmpeg, nslookup, lsof, host ×1 each (the rest were
+task names). Binaries the sandbox CODE invokes in-container: host, file, timeout, iptables, python3, tor, pip,
+setsid, curl, pgrep, ip, ps, xxd, ss, nohup, git, wget, rg, node, pkill, lsof, unzip, tar, stockfish, nslookup,
+npm, sqlite3, readlink, nc, dig. Probe of the LIVE container: missing were nc/netcat, socat, ffmpeg/ffprobe, jq,
+unzip, zip, **stockfish** (in the Dockerfile, absent from the live image — the running image is a runtime
+commit, not a build, the §4KF lesson again), pkg-config, rsync, nano, vim, tree, bc, gawk, whois, traceroute,
+ping, telnet, pdftotext, convert, pandoc, tesseract, 7z. `unzip` (code) and `nc` (the UDP leak probe in
+tor_egress — exit 127 printed "blocked", the harness-that-cannot-run class) were real defects; ffmpeg was real
+demand; the rest is the everyday set. Excluded on purpose: ping/traceroute (NET_RAW, dropped in §4KF),
+pandoc/tesseract (size; OCR is the vision tool's job), vim (nano suffices), yt-dlp (the host route, §4KE).
+
+**Shape.** Provisioning marker **v10** (`.supercharged.v9` → `.v10` in place): delta = `apt-get update &&
+apt-get install -y --no-install-recommends netcat-openbsd socat jq unzip zip tree nano bc gawk rsync pkg-config
+telnet whois p7zip-full poppler-utils ffmpeg imagemagick stockfish` under `timeout 1800` (apt rides the
+container's own Tor), verified by a `command -v` chain over the 18 binaries before the marker is written; the
+same packages on the full-provision line and in `sandbox/Dockerfile`; three copies pinned to one pair of tuples
+(`SANDBOX_TOOL_PACKAGES` / `SANDBOX_TOOL_BINARIES`). The upgrade log line derived from the tuple (it used to
+say "(adds iptables)" for ever). ffmpeg + imagemagick were pre-installed by hand into the live container
+(32 s) so the live delta is the small set; the delta mechanism itself is exercised live at deploy.
+
+### §4KG — outcome (2026-09-24, 08:40–09:25) — SHIPPED, live v10 in 7 s
+
+**Correction to the R0 above:** `stockfish` was never absent — it has been installed since v5; Debian puts it in
+`/usr/games`, which the python image's exec PATH lacks, so `command -v stockfish` read "missing" for a package
+that was there. `command -v` is a PATH proxy, not "installed" (check `dpkg -L`). Without the fix the v10 verify
+chain would have failed on every boot and the sandbox would have fallen back to a full re-provision for ever.
+v10 links it into `/usr/local/bin` in all three copies (delta, full-provision line, Dockerfile).
+
+**Fresh-eye review of the change (measured in a throwaway container from the same base):** all 18 package names
+resolve on bookworm arm64; binaries as expected (`convert` not `magick`, `7z`, `telnet` via the transitional
+package); no maintainer script needs a dropped capability; delta closure 60.6 MiB (ffmpeg pulls the SDL/pulse/
+wayland/vpx/x265 tree, no ghostscript), so `timeout 1800` holds down to ~35 KB/s; the client deadline derivation
+(`_provision_deadline_s`) stays above the in-container cap. Two MAJORs, both fixed: (1) a failed delta discarded
+its exit code and output — mirror-down over Tor, a verify miss and a timeout were indistinguishable → the WARNING
+now carries `delta exit N` and the last three output lines; (2) **the UDP leak probe's `nc` exit code carries no
+information** — OpenBSD `nc -u` exits 0 under REJECT, under DROP and with no rules (it swallows the EPERM on the
+connected-UDP write), so the probe printed "blocked" yesterday because nc was MISSING (exit 127) and would have
+printed LEAK for ever once installed. The block IS observable: `sendto` raises EPERM inside the netns → the probe
+is a Python `sendto` now; live on the recreated container it reads `blocked (EPERM)`. MINOR fixed: the
+full-provision fallback now runs unattended and without recommends like the delta and the recipe (it used to pull
+114 MiB against 60). Recorded: `LEAK_PROBES` has no consumer in the tree (operator-facing).
+
+**Pins and batteries.** `tests/test_4kg_sandbox_tools.py` (8; PARSED — the ladder's string constants are read
+off the AST after the pin-quality ratchet rejected the first, text-based version: +10 source-text pins, hard
+refusal, converted), `test_sandbox_marker_upgrade.py` (ladder parsed from source; package list now ends at the
+first `&&`, the delta key includes its flags so the full line cannot be mistaken for it), `test_docker_init.py`
+prefix pin moved deliberately. Mutation battery on an isolated copy: **13/13** after two rounds — the first run's
+survivor (G11: delta failure detail dropped) got its pin (drives the real provisioning path with an exec stub,
+asserts the WARNING names exit code and cause); the first run's failing no-op control was a stale test copy
+(rerun clean). Full suite once after the code was final: **24,554 passed / 0 code failures** (two TEST-side
+expectations — the ratchet's source-text count and the old apt prefix — were updated afterwards and re-run
+green individually; no source changed after the suite).
+
+**Deploy + live.** Agent kickstarted (47246 → 78061). At the first `ensure_running` after boot: `sandbox
+provision — Upgrading v9 → v10 in place (adds: nc socat jq …)` at +0.11 s, `sandbox cache — Committing fast-boot
+image cache…` at +6.94 s — **the live delta took 7 s** (apt lists fresh, the small set ≈ 3 MB; ffmpeg and
+imagemagick had been pre-installed by hand, 32 s). A diagnostic turn through `/api/chat` (54 s): all 18
+binaries `ok`, `/root/.supercharged.v10`, `NOPASSWD_LINES=0`; `command -v stockfish` → `/usr/local/bin/stockfish`;
+image `ghost-agent-base:latest` recommitted (4.35 GB). Persistence: run flags come from code at every creation;
+the tool set is in the committed image, the v10 delta (for a v9 image), the full-provision line (no image) and the
+Dockerfile (a rebuild) — the three lists are pinned to one pair of tuples.
+
+## §4KH — YouTube route canary (2026-09-24) — R0 scope, written first
+
+**Request:** make the agent notice on its own when YouTube rotates its challenge (the PO-token helper and
+yt-dlp then need updating together), instead of the operator learning it at the next failed request. The
+operator chose MONITORING (option 2) over unattended self-update; the update stays a one-command operator step.
+
+**What exists:** the route already classifies "every circuit of a stage hit the bot wall even with a PO token"
+and says "update yt-dlp and the helper" — but only when someone uses the route. The agent has a notification
+spine: `core/autonomous_activity.ActivityLog.record(phase, summary, severity="notify")` → immediate push through
+`utils/notify.OutboundNotifier` (webhook/ntfy over Tor) AND the `/api/notifications/pending` feed the Slack bot
+polls every 30 s and DMs to the owner. The biological tick (`agent._biological_tick`, ~60 s) is where cheap
+periodic self-checks live (staleness audit, epoch swap).
+
+**Design.** `memory/youtube_canary.py`: once per `GHOST_YT_CANARY_HOURS` (default 24; `0` disables), first
+run `GHOST_YT_CANARY_BOOT_DELAY_S` (default 600) after boot, driven from the biological tick in a worker thread
+(never on the loop; skipped while a foreground turn is in flight; never overlapping itself). One probe: helper
+`/ping`, Tor liveness, then `fetch_info` of a fixed public video (`jNQXAC9IVRw`, "Me at the zoo") on up to 4
+fresh circuits — resolve only, no captions, no store writes. States: `ok` (with attempts used), `walled`
+(every attempt bot-walled with the helper up → rotation suspected), `helper_down`, `tor_down`, `error`
+(a terminal/other fault). Persisted at `$GHOST_HOME/system/youtube_canary.json` (state, since, last run,
+attempts, reason, 30-entry history). **Fire once per transition**: entering a failure state records a
+`notify`-severity activity ("YouTube route: WALLED — every circuit refused even with a PO token; YouTube has
+likely rotated its challenge. Remedy: bin/update-youtube-stack.sh"); returning to `ok` records one recovery
+notice; steady states record nothing (the fire-once lesson). `/api/health` gains `youtube_route`
+(state/since/last_run). `bin/update-youtube-stack.sh` = the named remedy: upgrade yt-dlp + plugin in the venv,
+pull/rebuild the helper, rsync, kickstart the daemon, verify `/ping` and one live resolve. Manual by design.
+
+**Ship criteria:** pins behavioural (classification from injected probe results; the transition ledger fires
+once; cadence honoured; disabled by env; the tick schedules off-loop and never overlaps); mutation battery;
+suite once; deploy; live: the boot-delayed first run appears in the log and the health field, and a forced
+`walled` state (helper stopped for one run) produces exactly one Slack-feed record.
+
+### §4KH — outcome (2026-09-24, 09:25–10:05) — SHIPPED, live transitions proven end to end
+
+**What shipped.** NEW `memory/youtube_canary.py` (probe / transition ledger / cadence / health view); hook at
+the top of `GhostAgent._biological_tick` (above the memory guard, own foreground gate, worker thread, overlap
+guard); `/api/health` → `youtube_route`; `POST /api/youtube-canary/run` (the operator's button); phase
+`youtube_canary` registered `EXPECT_ON_OUTPUT` with a label; `bin/update-youtube-stack.sh` (the manual remedy);
+docs in `memory/youtube_ingest.html`. Flags: `GHOST_YT_CANARY_HOURS` (24, `0` off), `GHOST_YT_CANARY_BOOT_DELAY_S`
+(600), `GHOST_YT_CANARY_ATTEMPTS` (4), `GHOST_YT_CANARY_RECHECK_S` (900).
+
+**Fresh-eye review — two MAJORs, both real, both fixed before deploy.** (1) `error` was "any all-fail that is
+not pure bot walls", paged from ONE run: with ~4/10 circuits passing, four failing by chance is ≈13% per run
+whatever the mix, so a 3-walls-plus-one-403 night would have DM'd "yt-dlp broken" and "RECOVERED" a day later,
+roughly fortnightly. Now an EXHAUSTED rotation yields `walled` (all walls) or `unstable` (mixed) and BOTH are
+held; only a rotation that stopped EARLY (a terminal fault) is `error` at once. (2) A held verdict waited the
+full 24 h interval to be confirmed (24–48 h latency) and a held FIRST run read `not_yet_run` on the health
+endpoint: a re-check clock (`RECHECK_S`, 15 min) and a health view keyed on `last_run` that shows `last_state`,
+`last_reason` and `pending`. MEDIUMs fixed: the health view no longer hides a held wall; the remedy script now
+preflights passwordless sudo BEFORE touching anything, shows npm failures, builds the helper at the tag matching
+the pip plugin's version, states its clear-net egress, and points at the run endpoint. MINORs fixed: `announced`
+moves only when the ledger ACCEPTED the record (a lost DM is retried next run); a probe that raises is an
+`error` verdict with `last_run` advanced (else a broken resolver re-probed every 60 s for ever); the boot clock
+lives on `app.state`, so the module's first-import time is the boot proxy (comment corrected); a future
+`last_run` is not waited out; `CANARY_ATTEMPTS ≥ 1`; the route docstring says `force` skips the foreground gate
+and returns the PRE-run view; the overlap pin now uses a blocking probe (it was race-dependent); the phase-label
+pin read a name that did not exist. Recorded, not fixed: two agent processes on one GHOST_HOME could each probe
+and each announce a transition (deploy overlap; low frequency); a harness that drives `_biological_tick` with a
+real `memory_dir` performs a live probe.
+
+**My own defect in round 2:** a `gate.clear()` in the overlap pin made the forced second probe block on the
+gate; it passed alone by timing and failed under `-n 8` (and in the battery's no-op control). Fixed; run 3×.
+
+**Batteries.** Mutation battery on an isolated copy: **22/22** (20 single-fix reverts incl. announce-every-run,
+no recovery notice, wall announced unconfirmed, mixed all-fail paged at once, re-check clock off, announced on an
+unaccepted record, health keyed on state, overlap allowed, foreground ignored, boot delay ignored, tick hook
+removed, phase PERIODIC, remedy missing from the alert, probe exception not a verdict, boot fallback dropped,
+future last_run waited out; plus controls). One battery pass included `test_docs_site` inside a copy that has no
+`docs/` — a harness artefact, removed. Pins: `tests/test_4kh_youtube_canary.py` (19, behavioural; the tick
+placement pin is AST). **Full suite once after the code was final: 24,573 passed / 0 code failures** (the one
+failure was the race in my own new pin, fixed afterwards and run 3× green; no source changed after the suite).
+
+**Deploy + live (the whole transition ledger, through the real API and the real notification feed).** Agent
+kickstarted (78061 → 10391). A probe consumer `kh-probe` was baselined on `/api/notifications/pending` and acked.
+Then: `POST /api/youtube-canary/run` → `ok` on attempt 4/4 at +15 s, no record; `launchctl bootout` the helper →
+run → `helper_down` at +3 s and **exactly one** `notify` record ("YouTube route DOWN: the PO-token helper does not
+answer — check …"); helper bootstrapped again → run → `ok` (attempt 1/4) and **one** record ("YouTube route
+RECOVERED … after being helper_down"); a fourth run in steady `ok` → **0** new records. State file:
+`state ok, announced ok, history [(ok,4),(helper_down,0),(ok,1),(ok,3)]`; log lines at WARNING / INFO as
+designed. The Slack bot's own consumer drained the same two records (a DM each) — the DOWN/RECOVERED pair is the
+first the operator will ever receive from this mechanism, and it was exercised on purpose.
+
+**What remains manual, by the operator's choice:** the update itself (`bin/update-youtube-stack.sh`, then the
+run endpoint to get the RECOVERED notice).

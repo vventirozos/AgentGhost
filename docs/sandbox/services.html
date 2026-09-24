@@ -172,7 +172,7 @@
     next re-provision — and the service binds <code>0.0.0.0</code> inside the
     container so the bridge-publish can forward. <code>0.0.0.0</code> there is
     safe: only the explicitly-published host-loopback mapping escapes. In
-    <code>host</code> network mode (Linux default) the container SHARES the
+    <code>host</code> network mode (an explicit choice since §4KF; it was the Linux default) the container SHARES the
     host's network stack, so a service binding <code>0.0.0.0</code> would be
     reachable LAN-wide and unauthenticated — hosting untrusted, LLM-generated
     code. To prevent that the manager binds <strong>loopback</strong>

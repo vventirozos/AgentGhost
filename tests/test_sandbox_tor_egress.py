@@ -309,12 +309,14 @@ def test_without_a_tor_proxy_policy_nothing_is_enforced(tmp_path):
     assert not any("iptables" in c for c in _cmds(seen))
 
 
-def test_the_image_carries_iptables_at_v9():
-    """The rules need the binary; v9 adds it in place from v8."""
-    import inspect
+def test_the_image_carries_iptables():
+    """The rules need the binary; v9 added it in place from v8, and every
+    later marker's full-provision line and recipe must keep it."""
+    import inspect, re
     src = inspect.getsource(DockerSandbox._ensure_running_impl)
-    assert 'marker_path = "/root/.supercharged.v9"' in src
-    assert "apt-get install -y iptables'" in src
+    assert 'marker_path = "/root/.supercharged.v10"' in src
+    apt_line = re.search(r'apt_cmd = "(.+?)"\n', src).group(1)
+    assert " iptables " in apt_line or " iptables'" in apt_line
     assert "iptables" in (Path(__file__).resolve().parents[1] / "sandbox" / "Dockerfile").read_text()
 
 

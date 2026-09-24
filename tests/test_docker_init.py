@@ -60,7 +60,7 @@ def test_docker_init_installs_packages(tmp_path):
                 apt_call_found = True
                 # `timeout NNN` bounds the install (it blocks a worker
                 # thread while holding the provision lock).
-                assert cmd_arg.startswith("timeout 900 sh -c 'apt-get update && apt-get install -y")
+                assert cmd_arg.startswith("timeout 1800 sh -c 'export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y")   # §4KG: unattended, 1800 s cap (the list grew by 18 packages)
         
         assert apt_call_found, "The apt-get update && install command was not found in exec_run calls"
 

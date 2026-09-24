@@ -1,5 +1,6 @@
 import logging
 import os
+import shlex
 import re
 import threading
 import time
@@ -47,6 +48,23 @@ def _pid_is_live(pid: str) -> bool:
 
 CONTAINER_NAME = "ghost-agent-sandbox"
 CONTAINER_WORKDIR = "/workspace"
+
+#: The capabilities the sandbox KEEPS when `cap_drop=ALL` (the §4KF default).
+#: Everything the image's jobs need as ROOT: package files (CHOWN,
+#: DAC_OVERRIDE, FOWNER, FSETID), privilege DROPS to `_apt`/`debian-tor`
+#: (SETUID, SETGID), signalling supervised children (KILL). Deliberately
+#: absent: NET_RAW, NET_BIND_SERVICE, MKNOD, SYS_CHROOT, SETPCAP, SETFCAP,
+#: AUDIT_WRITE, and of course NET_ADMIN (the egress rules go in through a
+#: privileged exec so the model cannot undo them).
+SANDBOX_KEPT_CAPS = ("CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "SETGID", "SETUID", "KILL")
+
+#: The everyday CLI set added in provisioning marker v10 (§4KG): apt package
+#: names, and the binaries that PROVE they landed (the marker is written only
+#: after every one answers `command -v`). Three copies must agree — the v10
+#: delta command, the full-provision apt line, and sandbox/Dockerfile — and
+#: tests/test_4kg_sandbox_tools.py holds them to these two tuples.
+SANDBOX_TOOL_PACKAGES = tuple("netcat-openbsd socat jq unzip zip tree nano bc gawk rsync pkg-config telnet whois p7zip-full poppler-utils ffmpeg imagemagick stockfish".split())
+SANDBOX_TOOL_BINARIES = tuple("nc socat jq unzip zip tree nano bc gawk rsync pkg-config telnet whois 7z pdftotext ffmpeg convert stockfish".split())
 
 # Client-side deadline (seconds) for a container exec when the caller gives no
 # explicit one. docker-py's exec socket read blocks in poll() with NO timeout
@@ -295,19 +313,28 @@ class DockerSandbox:
 
     def binds_host_netns(self) -> bool:
         """True when the sandbox shares the HOST network namespace (docker
-        ``--network host``): the effective default on Linux. In that mode a
+        ``--network host``): an explicit choice only, since §4KF. In that mode a
         service the agent hosts binds a real host port, so exporting
         ``HOST=0.0.0.0`` exposes it LAN-wide unauthenticated — sandbox.services
         consults this to bind loopback instead. Mirrors the create-time logic
-        (GHOST_SANDBOX_NETWORK override → Linux=host / else bridge)."""
-        import sys as _sys
+        (per-manager override → GHOST_SANDBOX_NETWORK → bridge)."""
+        # The CONTAINER is the truth when there is one: a Linux agent that
+        # adopted a pre-§4KF `host`-mode container must still bind loopback,
+        # whatever today's default says (§4KF review, MAJOR-3).
+        if getattr(self, "container", None) is not None:
+            try:
+                mode = self._container_network_mode()
+            except Exception:  # noqa: BLE001
+                mode = ""
+            if mode in ("host", "bridge", "none"):
+                return mode == "host"
         _override = getattr(self, "network_override", None)
         if _override:
             return _override == "host"
         _net = os.environ.get("GHOST_SANDBOX_NETWORK", "").strip().lower()
         if _net in ("host", "bridge", "none"):
             return _net == "host"
-        return _sys.platform.startswith("linux")
+        return False  # §4KF: bridge is the default on every platform
 
     def published_service_ports(self):
         """The ports docker ACTUALLY published to the host loopback for the
@@ -578,6 +605,7 @@ class DockerSandbox:
             # `unpause` keeps both (the freezer holds the namespace and the
             # processes), so covering it costs one idempotent re-apply.
             self._tor_attempted = False
+            self._privilege_checked = False
             self._enforce_egress_once()
             self.mark_ready()
             return True
@@ -696,7 +724,6 @@ class DockerSandbox:
                     logger.debug(f"Sandbox workspace mkdir skipped: {mkdir_err}")
 
                 import sys
-                is_linux = sys.platform.startswith("linux")
                 is_mac = sys.platform == "darwin"
                 
                 # 1g is far too tight for ML workloads (pandas/sklearn/torch
@@ -755,21 +782,41 @@ class DockerSandbox:
                 except Exception as _lbl:  # noqa: BLE001
                     logger.debug("owner label skipped: %s", _lbl)
 
-                # Optional capability hardening — OFF by default because the
-                # sandbox provisions passwordless sudo (setuid) for in-container
-                # apt installs, which `no-new-privileges` / `cap_drop=ALL` would
-                # break. Operators who don't need in-sandbox package installs can
-                # opt in with GHOST_SANDBOX_DROP_CAPS=1.
-                if _os.environ.get("GHOST_SANDBOX_DROP_CAPS", "").lower() in ("1", "true", "yes"):
+                # Capability hardening — ON by default (§4KF, 2026-09-24).
+                # It used to be opt-in because of a stale reason: "passwordless
+                # sudo (setuid) for apt installs would break". The exec user
+                # is ROOT on macOS (on Linux `execute` runs as the host
+                # uid:gid, where setuid sudo was already refused for an
+                # unknown uid), so nothing the SANDBOX CODE does needs to GAIN
+                # privilege; what apt/dpkg/pip/Tor/the service supervisor need
+                # is to DROP it (SETUID/SETGID to `_apt` and `debian-tor`),
+                # own package files (CHOWN/DAC_OVERRIDE/FOWNER/FSETID) and
+                # signal children (KILL). Measured on a throwaway container
+                # from the live image before this flipped: apt's privilege
+                # drop, tor as debian-tor, chown, pip, Chromium headless, a
+                # node service bind, killing a child — all fine; raw sockets,
+                # mknod, chroot and plain-root iptables refused. The iptables
+                # egress rules are applied through a PRIVILEGED exec, which
+                # carries its own capabilities regardless of this set.
+                # GHOST_SANDBOX_DROP_CAPS=0 opts OUT (the pre-§4KF opt-in
+                # spelling "1" is accepted as the default it now is).
+                if _os.environ.get("GHOST_SANDBOX_DROP_CAPS", "1").strip().lower() not in ("0", "false", "no", "off"):
                     run_kwargs["cap_drop"] = ["ALL"]
+                    run_kwargs["cap_add"] = list(SANDBOX_KEPT_CAPS)
                     run_kwargs["security_opt"] = ["no-new-privileges"]
 
-                # Network mode. On Linux the default is `host` because the
-                # in-sandbox browser must reach the host's Tor proxy at
-                # 127.0.0.1:9050 (bridge would break Tor-routed browsing). This
-                # also means sandboxed code shares the host's loopback — set
-                # GHOST_SANDBOX_NETWORK=bridge (or none) to ISOLATE when you
-                # don't rely on host-loopback services from the sandbox.
+                # Network mode. `bridge` everywhere by default (§4KF): the
+                # in-container Tor + iptables egress enforcement (§4FU) only
+                # works in the container's OWN netns; under `host` the
+                # in-container Tor cannot bind and the enforcement does not
+                # apply. The old Linux default of `host` predates §4FU (it
+                # existed so the browser could reach the HOST's Tor at
+                # 127.0.0.1:9050, which the in-container Tor made moot).
+                # GHOST_SANDBOX_NETWORK=host remains an explicit choice, and
+                # `none` isolates a replay. Non-mac bridge gets
+                # host.docker.internal — reachable only when no Tor egress is
+                # enforced (the rules redirect every non-loopback TCP to the
+                # TransPort, and Tor cannot dial the host gateway).
                 _net = (getattr(self, "network_override", None)
                         or _os.environ.get("GHOST_SANDBOX_NETWORK", "")
                         ).strip().lower()
@@ -777,8 +824,6 @@ class DockerSandbox:
                     run_kwargs["network_mode"] = _net
                     if _net == "bridge" and not is_mac:
                         run_kwargs["extra_hosts"] = {"host.docker.internal": "host-gateway"}
-                elif is_linux:
-                    run_kwargs["network_mode"] = "host"
                 else:
                     run_kwargs["network_mode"] = "bridge"
                     if not is_mac:
@@ -925,6 +970,7 @@ class DockerSandbox:
                 # the previous generation no longer apply.
                 self._env_verified = False
                 self._tor_attempted = False
+                self._privilege_checked = False
                 # ⚠ AND NEITHER DOES THE CUT-OFF (§4GK round 6). `_cut_off`
                 # was raised by `_block_egress_hard` and lowered ONLY by
                 # `_recreate_if_cut_off` — which returns early when the
@@ -1011,17 +1057,34 @@ class DockerSandbox:
         #                "command not found" counted: after file and xxd,
         #                these were the only tools the model reached for
         #                that the image lacked (lsof ×2, host/nslookup ×2).
-        #   v9 (now):    .supercharged.v9 — adds `iptables`, for the
+        #   v9:          .supercharged.v9 — adds `iptables`, for the
         #                Tor-only egress rules (§4FU, sandbox/tor_egress.py).
-        #                v8 images upgrade in place; older ones take the
-        #                full provision.
-        marker_path = "/root/.supercharged.v9"
+        #   v10 (now):   .supercharged.v10 — the everyday CLI set the image
+        #                lacked (§4KG, 2026-09-24): `nc`/`socat` (network
+        #                plumbing a shell task reaches for; the UDP leak
+        #                probe that used to call `nc` now observes EPERM from
+        #                Python instead — nc's exit code says nothing),
+        #                `unzip` (referenced by the sandbox code), `ffmpeg`
+        #                (asked for and missing), and jq, zip, tree, nano,
+        #                bc, gawk, rsync, pkg-config, telnet, whois, 7z,
+        #                pdftotext, imagemagick. `stockfish` was installed
+        #                since v5 but lives in /usr/games, OFF the exec PATH
+        #                — v10 links it into /usr/local/bin. No
+        #                ping/traceroute: they need NET_RAW, which §4KF
+        #                dropped. v9 images upgrade in place; older ones
+        #                take the full provision.
+        marker_path = "/root/.supercharged.v10"
         # The marker this version supersedes, and the delta that lifts an
         # image from it to this one. Keep the three in step with the history
-        # above when bumping again.
-        prev_marker_path = "/root/.supercharged.v8"
-        upgrade_delta_cmd = "timeout 600 sh -c 'apt-get update && apt-get install -y iptables'"
-        upgrade_delta_verify = "sh -c 'command -v iptables'"
+        # above when bumping again — and with SANDBOX_TOOL_PACKAGES /
+        # SANDBOX_TOOL_BINARIES (pinned equal by tests/test_4kg_sandbox_tools).
+        # Debian installs stockfish under /usr/games, which the exec PATH
+        # (the python image's) does not include: it was "missing" on the
+        # live container while the package was there. The symlink puts it on
+        # PATH for the model and for the verify chain alike (measured 2026-09-24).
+        prev_marker_path = "/root/.supercharged.v9"
+        upgrade_delta_cmd = "timeout 1800 sh -c 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends netcat-openbsd socat jq unzip zip tree nano bc gawk rsync pkg-config telnet whois p7zip-full poppler-utils ffmpeg imagemagick stockfish && ln -sf /usr/games/stockfish /usr/local/bin/stockfish'"
+        upgrade_delta_verify = "sh -c 'command -v nc && command -v socat && command -v jq && command -v unzip && command -v zip && command -v tree && command -v nano && command -v bc && command -v gawk && command -v rsync && command -v pkg-config && command -v telnet && command -v whois && command -v 7z && command -v pdftotext && command -v ffmpeg && command -v convert && command -v stockfish'"
 
         # The marker/chromium probes are two docker execs; running them
         # before EVERY command added latency for nothing. Verify once per
@@ -1055,10 +1118,12 @@ class DockerSandbox:
                 pretty_log(
                     "Sandbox Provision",
                     f"Upgrading {prev_marker_path.rsplit('.', 1)[-1]} → "
-                    f"{marker_path.rsplit('.', 1)[-1]} in place (adds iptables)…",
+                    f"{marker_path.rsplit('.', 1)[-1]} in place (adds: "
+                    f"{' '.join(SANDBOX_TOOL_BINARIES)})…",
                     icon=Icons.SANDBOX_BOX,
                 )
                 _verified = False
+                _code, _out = None, b""
                 try:
                     _code, _out = self._provision_exec(
                         upgrade_delta_cmd, environment=env_vars)
@@ -1081,9 +1146,20 @@ class DockerSandbox:
                     marker_ok = True
                     did_work = True
                 else:
+                    # Say WHY (§4KG review): a mirror down over Tor, a verify
+                    # chain that missed a binary and a timeout used to be
+                    # indistinguishable — the delta's exit code and output
+                    # were discarded and only an exception reached DEBUG.
+                    _tail = ""
+                    try:
+                        _tail = (_out or b"").decode("utf-8", "replace").strip().splitlines()[-3:]
+                        _tail = " | ".join(_tail)[:400]
+                    except Exception:  # noqa: BLE001
+                        _tail = ""
                     pretty_log(
                         "Sandbox Provision",
-                        "In-place upgrade did not verify — falling back to a full provision.",
+                        f"In-place upgrade did not verify (delta exit {_code if _code is not None else 'n/a'}"
+                        f"{'; ' + _tail if _tail else ''}) — falling back to a full provision.",
                         level="WARNING", icon=Icons.WARN,
                     )
 
@@ -1119,13 +1195,19 @@ class DockerSandbox:
             # unbounded mirror/CDN stall would wedge every concurrent tool
             # call in the agent. The caps are generous — they exist to
             # bound a stall, not to race a slow link.
-            apt_cmd = "timeout 900 sh -c 'apt-get update && apt-get install -y sudo coreutils nodejs npm g++ curl wget git procps postgresql-client libpq-dev tor ripgrep sqlite3 iproute2 stockfish file xxd lsof dnsutils iptables'"
+            apt_cmd = "timeout 1800 sh -c 'export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y sudo coreutils nodejs npm g++ curl wget git procps postgresql-client libpq-dev tor ripgrep sqlite3 iproute2 file xxd lsof dnsutils iptables netcat-openbsd socat jq unzip zip tree nano bc gawk rsync pkg-config telnet whois p7zip-full poppler-utils ffmpeg imagemagick stockfish --no-install-recommends && ln -sf /usr/games/stockfish /usr/local/bin/stockfish'"
             code, out = self._provision_exec(apt_cmd, environment=env_vars)
             if code != 0:
                 err_msg = out.decode("utf-8", errors="replace") if out else "Unknown error"
                 raise Exception(f"System package installation failed: {err_msg}")
 
-            self._exec_run("sh -c 'echo \"ALL ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'")
+            # No `ALL ALL=(ALL) NOPASSWD: ALL` sudoers line any more (§4KF): on
+            # macOS the exec user is root, so the line granted nothing root
+            # lacks; on Linux the exec user is the host uid:gid and the grant
+            # would hand it root outright. The `sudo` PACKAGE stays (model
+            # scripts say `sudo apt-get`; root through Debian's stock sudoers
+            # works without a password). A cached image that still carries
+            # the grant is stripped in `_settle_privileges_once`.
 
             if self.tor_proxy:
                 code, out = self._provision_exec("timeout 600 pip install --no-cache-dir pysocks requests")
@@ -1433,6 +1515,7 @@ class DockerSandbox:
             # all. Every other generation boundary (resume, create) already
             # resets it; this one did not (§4GK round 4).
             self._tor_attempted = False
+            self._privilege_checked = False
             self.container = None
             # Belt: `_ready_is_fresh` also requires a container, but making the
             # stamp stale here means the ordering holds even if that changes.
@@ -1455,10 +1538,86 @@ class DockerSandbox:
         path that starts a container to do the same. Cheap and idempotent
         when the generation has already been enforced.
         """
+        self._settle_privileges_once()
         if not self.tor_proxy or self._tor_attempted:
             return
         self._tor_attempted = True
         self._enforce_tor_egress()
+
+    #: Intended create-time privilege set (§4KF), used to REPORT drift on a
+    #: container this process adopted rather than created.
+    _privilege_checked = False
+    _privilege_drift = ""
+
+    def _intended_privileges(self) -> dict:
+        drop_on = os.environ.get("GHOST_SANDBOX_DROP_CAPS", "1").strip().lower() not in ("0", "false", "no", "off")
+        return {
+            "cap_drop": ["ALL"] if drop_on else [],
+            "security_opt": ["no-new-privileges"] if drop_on else [],
+            "network_mode": (getattr(self, "network_override", None)
+                             or os.environ.get("GHOST_SANDBOX_NETWORK", "").strip().lower()
+                             or "bridge"),
+        }
+
+    def _settle_privileges_once(self) -> None:
+        """Once per container generation (§4KF): (1) strip the
+        ``ALL ALL=(ALL) NOPASSWD: ALL`` sudoers grant IN PLACE — the cached
+        ``ghost-agent-base:latest`` is a runtime commit that still carries it
+        twice, and provisioning is skipped when the marker is present, so the
+        recipe change alone never reaches a recreated container; (2) compare
+        the adopted container's HostConfig with the intended privilege set
+        and say so ONCE at WARNING when they differ — flags apply at create,
+        so a container that outlived a deploy keeps its old ones silently
+        otherwise. Never raises; never recreates (that discards state and is
+        the operator's call: remove the container and the next turn rebuilds
+        it with the current defaults)."""
+        if self._privilege_checked or not getattr(self, "container", None):
+            return
+        self._privilege_checked = True
+        try:
+            code, out = self._exec_run(
+                "sh -c " + shlex.quote(
+                    "grep -qF 'NOPASSWD: ALL' /etc/sudoers 2>/dev/null && "
+                    "sed -i '/NOPASSWD: ALL/d' /etc/sudoers && echo stripped || echo clean"),
+                user="root")
+            if code == 0 and b"stripped" in (out or b""):
+                pretty_log("Sandbox Privileges", "removed the NOPASSWD sudoers grant left by the cached image",
+                           icon=Icons.SANDBOX_BOX)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("sudoers strip skipped: %s", exc)
+        try:
+            self.container.reload()
+            attrs = self.container.attrs
+            hc = attrs.get("HostConfig") if isinstance(attrs, dict) else None
+            if not isinstance(hc, dict):
+                # A stub or a half-inspected object is NOT evidence of drift
+                # (the same rule `_recreate_if_cut_off` learned: reading a
+                # fake's absence as a state sent every test double down the
+                # remedy path).
+                return
+            actual = {
+                "cap_drop": [str(c).upper() for c in (hc.get("CapDrop") or [])],
+                "security_opt": [str(o) for o in (hc.get("SecurityOpt") or [])],
+                "network_mode": str(hc.get("NetworkMode") or ""),
+            }
+            want = self._intended_privileges()
+            drift = []
+            if set(actual["cap_drop"]) != set(want["cap_drop"]):
+                drift.append(f"cap_drop {actual['cap_drop'] or 'none'} (intended {want['cap_drop'] or 'none'})")
+            if set(actual["security_opt"]) != set(want["security_opt"]):
+                drift.append(f"security_opt {actual['security_opt'] or 'none'} (intended {want['security_opt'] or 'none'})")
+            if actual["network_mode"] and actual["network_mode"] != want["network_mode"]:
+                drift.append(f"network {actual['network_mode']} (intended {want['network_mode']})")
+            self._privilege_drift = "; ".join(drift)
+            if drift:
+                pretty_log(
+                    "Sandbox Privileges",
+                    f"container {self.container_name} predates the current privilege defaults: "
+                    f"{self._privilege_drift}. Flags apply at creation — remove the container "
+                    f"(docker rm -f {self.container_name}) and the next turn recreates it hardened.",
+                    level="WARNING", icon=Icons.WARN)
+        except Exception as exc:  # noqa: BLE001 — attrs may be stubbed
+            logger.debug("privilege drift check skipped: %s", exc)
 
     def _enforce_tor_egress(self) -> None:
         """Make every connection the sandbox opens leave through Tor.

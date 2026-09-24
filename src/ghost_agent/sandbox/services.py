@@ -26,7 +26,7 @@ Reachability: in-sandbox consumers (the ``browser`` tool's embedded runner,
 ``execute``) reach a service at ``http://127.0.0.1:<port>`` — the browser's
 SSRF guard admits loopback ports that appear in this registry (see
 ``active_service_ports``). Operator access from the HOST depends on the
-sandbox network mode: ``host`` mode (Linux default) exposes the port
+sandbox network mode: ``host`` mode (an explicit choice since §4KF) exposes the port
 directly; ``bridge`` mode (macOS default) publishes the
 ``GHOST_SANDBOX_SERVICE_PORTS`` range (default 8100-8104) to
 ``127.0.0.1`` when the container is (re)created.
@@ -499,7 +499,7 @@ class ServiceSupervisor:
             return None
 
     def _binds_host_netns(self) -> bool:
-        """True in host network mode (Linux default): every service port is
+        """True in host network mode (explicit `GHOST_SANDBOX_NETWORK=host`, or an adopted pre-§4KF container): every service port is
         then on the host loopback already, so "not published" does not mean
         "not reachable from the host". Stub/older managers → bridge."""
         try:
@@ -1081,7 +1081,7 @@ class ServiceSupervisor:
             #   because 0.0.0.0 inside a NAT-isolated container is NOT a LAN
             #   address; only the explicitly-published loopback mapping escapes.
             #
-            # * HOST-netns mode (`--network host`, the Linux DEFAULT): the
+            # * HOST-netns mode (`--network host`, explicit since §4KF): the
             #   container SHARES the host's network stack. 0.0.0.0 there binds
             #   EVERY host interface, so the service — hosting UNTRUSTED,
             #   LLM-generated code with no auth of its own — becomes reachable

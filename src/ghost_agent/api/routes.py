@@ -623,6 +623,32 @@ def _bench_last_item_iso(agent):
     return out if isinstance(out, str) else None
 
 
+def _youtube_route_health(context) -> dict:
+    try:
+        from ..memory.youtube_canary import health_view
+        return health_view(context)
+    except Exception:  # noqa: BLE001 — health must never raise
+        return {"state": "unknown"}
+
+
+@router.post("/api/youtube-canary/run", dependencies=[Security(verify_api_key)])
+async def youtube_canary_run(request: Request):
+    """Operator trigger (§4KH): start one canary probe now, off-loop, ignoring
+    the cadence, the boot delay AND the foreground gate (an explicit request).
+    Used after `bin/update-youtube-stack.sh` to get the RECOVERED notice
+    without waiting a day. Returns whether a probe STARTED plus the view as it
+    was BEFORE this probe; poll `/api/health` → `youtube_route` for the
+    result (a probe takes 5–60 s)."""
+    agent = get_agent(request)
+    try:
+        from ..memory.youtube_canary import health_view, maybe_run
+        started = bool(maybe_run(agent, force=True))
+        return JSONResponse({"started": started, "youtube_route_before": health_view(agent.context),
+                             "poll": "/api/health → youtube_route"})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"started": False, "error": f"{type(e).__name__}: {e}"}, status_code=500)
+
+
 @router.get("/api/health", dependencies=[Security(verify_api_key)])
 async def api_health(request: Request):
     """Runtime introspection for the operator + NetMon + the RSS supervisor
@@ -745,6 +771,10 @@ async def api_health(request: Request):
         # solve" (advanced, then froze while an item is still in flight).
         "bench_item_started_at": _bench_started_iso(agent),
         "scheduler_jobs": sched_jobs,
+        # §4KH: the YouTube route canary's last verdict (ok / walled /
+        # helper_down / tor_down / error / not_yet_run) — read from its
+        # state file, so a dead tick shows as a stale `last_run`.
+        "youtube_route": _youtube_route_health(context),
         "nodes": nodes,
         "node_health": node_health,
         "config": getattr(app.state, "resolved_config", {}),

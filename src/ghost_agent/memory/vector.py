@@ -879,6 +879,56 @@ class VectorMemory:
         rec = self._read_outlines().get(str(filename))
         return rec if isinstance(rec, dict) else {}
 
+    # ── ordered-text sidecar (§4KE) ────────────────────────────────────
+    #
+    # Chunks are a retrieval structure, not a reading order: their metadata
+    # carries no ordinal, so a transcript could not be reconstructed from the
+    # store (and `collection.get` returns a window's 4–8 chunks in arbitrary
+    # order). The ORDERED text of a document that has one — a transcript, its
+    # passages with timestamps — lives here, one JSON file per document under
+    # the outline sidecar's directory, and is dropped with the document.
+
+    def _document_text_path(self, filename: str) -> Path:
+        import hashlib as _hl
+        d = self.outlines_file.parent / "document_text"
+        return d / (_hl.sha1(str(filename).encode("utf-8")).hexdigest() + ".json")
+
+    def set_document_text(self, filename: str, record: dict) -> None:
+        """Store a document's ordered text record (``{"passages": [[start,
+        end, text], …], …}``). Atomic; never raises into an ingest."""
+        if not filename or not isinstance(record, dict):
+            return
+        with self._get_lock():
+            try:
+                path = self._document_text_path(filename)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_suffix(path.suffix + ".tmp")
+                tmp.write_text(json.dumps(dict(record, filename=str(filename))))
+                os.replace(tmp, path)
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"Document text write failed for {filename}: {e}")
+
+    def get_document_text(self, filename: str) -> dict:
+        """The ordered text record, or ``{}`` when the document has none."""
+        try:
+            path = self._document_text_path(filename)
+            if not path.exists():
+                return {}
+            data = json.loads(path.read_text() or "{}")
+            return data if isinstance(data, dict) else {}
+        except Exception:  # noqa: BLE001
+            logger.warning(f"Document text sidecar for {filename} was unreadable; ignoring it")
+            return {}
+
+    def drop_document_text(self, filename: str) -> None:
+        with self._get_lock():
+            try:
+                path = self._document_text_path(filename)
+                if path.exists():
+                    path.unlink()
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"Document text drop failed for {filename}: {e}")
+
     def drop_document_outline(self, filename: str) -> None:
         with self._get_lock():
             try:
@@ -1875,6 +1925,7 @@ class VectorMemory:
             # …a forgotten document that keeps its structure is a claim
             # about a document that no longer exists.
             self.drop_document_outline(filename)
+            self.drop_document_text(filename)
         return True, "Deleted"
 
     # ── Cross-store reconciliation (§4GJ) ─────────────────────────────

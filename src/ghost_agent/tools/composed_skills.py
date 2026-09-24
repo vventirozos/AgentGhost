@@ -57,6 +57,20 @@ MAX_STEP_RESULT_CHARS = 4000
 # matches a param whose ENTIRE value is one reference (substitute as-is);
 # _VAR_RE finds references embedded in surrounding text (interpolate).
 _WHOLE_VAR_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
+
+#: C0 controls other than TAB, plus DEL and the Unicode line/paragraph
+#: separators — anything that can end a line inside a shell template.
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f\u2028\u2029]")
+#: (tool, param) pairs whose interpolated value is executed by a shell.
+_SHELL_SINKS = frozenset({("execute", "command")})
+
+
+def _is_shell_sink(tool_name: str, param: str) -> bool:
+    return (str(tool_name), str(param)) in _SHELL_SINKS
+
+
+class ComposedArgError(ValueError):
+    """A step's argument could not be resolved SAFELY (see `_resolve_args`)."""
 _VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 
 # Cap a value BOUND via save_as. Larger than the display cap (a downstream
@@ -836,6 +850,49 @@ class ComposedSkillRegistry:
                 )
             except Exception as exc:
                 logger.warning("Skipping malformed composed skill %r: %s", name, exc)
+        self._reconcile_code_owned()
+
+    def _reconcile_code_owned(self) -> None:
+        """Hand-written macros are CODE (`tools/yt_download.CODE_OWNED_MACROS`):
+        a stored copy whose steps or description differ from the builder is
+        overwritten IN PLACE (usage counters kept) and saved. Never creates
+        one — whether a macro exists is the operator's decision; what a
+        code-owned one DOES is the code's. Before §4KE a definition change
+        needed the agent stopped and a sync script run, or the live
+        registry's next save clobbered the update with its stale copy."""
+        try:
+            from .yt_download import CODE_OWNED_MACROS
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("code-owned macro table unavailable: %s", exc)
+            return
+        changed = False
+        for name, build in CODE_OWNED_MACROS.items():
+            cur = self.skills.get(name)
+            if cur is None:
+                continue
+            try:
+                d = build()
+                steps = [
+                    SkillStep(tool_name=s["tool"], description=s.get("description", ""),
+                              param_template=dict(s.get("params") or {}))
+                    for s in d["steps"]
+                ]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("code-owned macro %r could not be built: %s", name, exc)
+                continue
+            shape = lambda seq: [(st.tool_name, dict(st.param_template)) for st in seq]  # noqa: E731
+            if (shape(cur.steps) == shape(steps) and not cur.branches
+                    and cur.trigger_description == d["description"]
+                    and cur.execution_mode == d.get("mode", "sequential")):
+                continue
+            cur.steps = steps
+            cur.branches = {}
+            cur.trigger_description = d["description"]
+            cur.execution_mode = d.get("mode", "sequential")
+            changed = True
+            logger.info("composed skill %r reconciled to its code-owned definition", name)
+        if changed:
+            self.save()
 
     def save(self):
         """Persist composed skills to disk. Atomic (temp + os.replace) under a
@@ -1107,10 +1164,25 @@ class ComposedSkillRegistry:
                 # bind a non-str via save_as in a future caller).
                 resolved_args[k] = params.get(m.group(1), "")
             else:
+                shell_sink = _is_shell_sink(step.tool_name, k)
+
                 def _sub(mo):
                     # Two alternations (${var} | $var) — exactly one group hits.
                     name = mo.group(1) or mo.group(2)
-                    return str(params.get(name, ""))
+                    val = str(params.get(name, ""))
+                    if shell_sink and _CONTROL_CHAR_RE.search(val):
+                        # §4KE: a value spliced into a shell COMMAND template
+                        # is data only while it stays on its line. A line
+                        # break lets it end a quoted heredoc (or start a new
+                        # command) and the rest runs as shell. Quoting rules
+                        # in the template cannot defend against that, so
+                        # the resolver refuses the value outright.
+                        raise ComposedArgError(
+                            f"param {k!r} splices ${name} into a shell command, and its "
+                            f"value contains a line break or control character "
+                            f"(refused — a shell template only keeps a value as data "
+                            f"while it is one line).")
+                    return val
                 resolved_args[k] = _VAR_RE.sub(_sub, v)
         return resolved_args
 
@@ -1183,7 +1255,15 @@ class ComposedSkillRegistry:
                 break
             _executions += 1
             step = active_steps[step_idx]
-            resolved_args = self._resolve_args(step, scope)
+            try:
+                resolved_args = self._resolve_args(step, scope)
+            except ComposedArgError as _ae:
+                results.append({
+                    "step": step.description, "tool": step.tool_name,
+                    "error": f"Error: {_ae}", "success": False,
+                })
+                success = False
+                break
 
             try:
                 result = await executor(step.tool_name, resolved_args)
@@ -1309,7 +1389,11 @@ class ComposedSkillRegistry:
                                  params: Dict[str, Any]) -> Dict[str, Any]:
         """Run ONE parallel-mode step and classify its result (tools return
         error strings, not raises)."""
-        resolved_args = self._resolve_args(step, params)
+        try:
+            resolved_args = self._resolve_args(step, params)
+        except ComposedArgError as _ae:
+            return {"step": step.description, "tool": step.tool_name,
+                    "error": f"Error: {_ae}", "success": False}
         try:
             result = await executor(step.tool_name, resolved_args)
             result_str = str(result)

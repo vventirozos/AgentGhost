@@ -51,12 +51,19 @@ _SRC = inspect.getsource(DockerSandbox._ensure_running_impl)
 _CUR_MARKER = re.search(r'(?<!prev_)marker_path = "([^"]+)"', _SRC).group(1)
 _PREV_MARKER = re.search(r'prev_marker_path = "([^"]+)"', _SRC).group(1)
 _DELTA = re.search(r"upgrade_delta_cmd = \"(.+?)\"\n", _SRC).group(1)
-_DELTA_PKGS = _DELTA.split("apt-get install -y ", 1)[1].rstrip("'")
+# Packages only: apt FLAGS (`--no-install-recommends`) are not packages and
+# must not be looked for in the full-provision line or the Dockerfile.
+# …and the package list ends at the first `&&` (a post-install step such as
+# the stockfish PATH symlink is not a package either).
+_DELTA_PKGS = " ".join(w for w in _DELTA.split("apt-get install -y ", 1)[1].split(" && ", 1)[0].rstrip("'").split()
+                       if not w.startswith("--"))
 _VERIFY = re.search(r"upgrade_delta_verify = \"(.+?)\"\n", _SRC).group(1)
 _VERIFY_TOOL = re.search(r"command -v (\w+)", _VERIFY).group(1)
 CUR = f"test -f {_CUR_MARKER}"
 PREV = f"test -f {_PREV_MARKER}"
-DELTA_KEY = f"apt-get install -y {_DELTA_PKGS}'"
+# The delta's own install argument (flags included) — distinct from the
+# full-provision line, which now carries the same package names.
+DELTA_KEY = "apt-get install -y " + _DELTA.split("apt-get install -y ", 1)[1]
 VERIFY_KEY = f"command -v {_VERIFY_TOOL}"
 TOUCH_CUR = f"touch {_CUR_MARKER}"
 RM_PREV = f"rm -f {_PREV_MARKER}"
@@ -117,7 +124,7 @@ def test_the_previous_image_is_upgraded_in_place_with_only_the_delta(tmp_path):
 
     delta = [c for c in seen if DELTA_KEY in c]
     assert len(delta) == 1, seen
-    assert "timeout 600" in delta[0], "the delta must carry its own in-container cap"
+    assert re.search(r"timeout \d+ ", delta[0]), "the delta must carry its own in-container cap"
     assert _installs(seen) == [], f"a full provision ran: {_installs(seen)}"
     assert any(VERIFY_KEY in c for c in seen), "the binary was never probed"
     assert TOUCH_CUR in seen
@@ -206,7 +213,7 @@ def test_runtime_and_dockerfile_agree_on_the_ladder_and_the_packages():
     # anchored to the apt LINES: "file" also occurs in the word "Dockerfile"
     # and in the changelog comment inside the provisioner (review, 2026-09-09)
     df_apt = "\n".join(l for l in dockerfile.split("\n") if "apt-get install" in l or l.strip().startswith(("sudo", "postgresql-client")))
-    rt_apt = runtime.split("apt-get install -y sudo", 1)[1][:400]
+    rt_apt = runtime.split("apt-get install -y sudo", 1)[1][:1200]   # the list is ~300 chars at v10; do not silently truncate
     for pkg in ("file", "xxd", "lsof", "dnsutils", "iptables"):
         assert f" {pkg} " in df_apt or f" {pkg} \\" in df_apt, f"{pkg} missing from the Dockerfile apt list"
         assert f" {pkg} " in rt_apt or f" {pkg}'" in rt_apt, f"{pkg} missing from the runtime apt list"
@@ -232,9 +239,15 @@ def test_this_versions_delta_is_what_the_evidence_asked_for():
     one line that states the expectation from outside: v9 exists to add
     iptables for the Tor-only egress rules. Update it with the next bump,
     deliberately."""
-    assert _CUR_MARKER.endswith(".v9")
-    assert set(_DELTA_PKGS.split()) == {"iptables"}, _DELTA_PKGS      # §4FU: the Tor-only egress rules
-    assert _VERIFY_TOOL == "iptables", _VERIFY
+    assert _CUR_MARKER.endswith(".v10")   # §4KG: the everyday CLI set (nc for the leak probe, unzip, stockfish, ffmpeg, …)
+    # §4KG (marker v10): the everyday CLI set. The delta's package list and
+    # the verify chain are held to the module tuples, so the three copies
+    # (delta, full provision, Dockerfile) cannot drift apart.
+    from ghost_agent.sandbox.docker import SANDBOX_TOOL_BINARIES, SANDBOX_TOOL_PACKAGES
+    assert set(_DELTA_PKGS.split()) == set(SANDBOX_TOOL_PACKAGES), _DELTA_PKGS
+    for b in SANDBOX_TOOL_BINARIES:
+        assert f"command -v {b}" in _VERIFY, f"verify does not prove {b} landed"
+    assert _VERIFY_TOOL == SANDBOX_TOOL_BINARIES[0], _VERIFY
 
 
 # --- the delta obeys the provisioning backoff (review, 2026-09-09) ---------

@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Sync the stored `youtube_transcribe` macro to the code-owned definition
-(resilient Tor download → transcribe). Idempotent; safe to re-run.
+"""Sync the stored `youtube_transcribe` macro to the code-owned definition.
+Idempotent; safe to re-run.
 
-The download step's command comes from `tools/yt_download.build_download_command`
-(base64-smuggled `yt_tor_download.sh`: exit-node rotation + 429 retry).
+§4KE (2026-09-24): the macro is now ONE step — `knowledge_base(action='transcribe',
+filename='$url')` — and the registry reconciles the stored copy from
+`tools/yt_download.CODE_OWNED_MACROS` at every load, so this script is no longer
+part of a deploy. It remains useful for a store the agent is NOT holding open
+(a migration, a copied GHOST_HOME).
 
-IMPORTANT — run this while the agent is STOPPED, then start it:
+If the agent IS running, stop it first, then start it:
     the live agent caches the composed-skill registry in memory and rewrites the
     whole file on any macro save (usage counters, dream-cycle proposals). If it
     is running when this script writes, its next save clobbers the update with

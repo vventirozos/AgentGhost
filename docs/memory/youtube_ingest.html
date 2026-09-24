@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>memory.youtube_ingest — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Memory</h3>
+    <a href="vector.html">vector</a>
+    <a href="graph.html">graph</a>
+    <a href="profile.html">profile</a>
+    <a href="temporal.html">temporal</a>
+    <a href="skills.html">skills</a>
+    <a href="journal.html">journal</a>
+    <a href="scratchpad.html">scratchpad</a>
+    <a href="episodes.html">episodes</a>
+    <a href="frontier.html">frontier</a>
+    <a href="projects.html">projects</a>
+    <a href="adaptive_threshold.html">adaptive_threshold</a>
+    <a href="contradiction_log.html">contradiction_log</a>
+    <a class="current" href="youtube_ingest.html">youtube_ingest</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
+  <h1>memory / youtube_ingest.py — a YouTube link, over Tor, into the knowledge base</h1>
+  <p class="subtitle">The route <code>knowledge_base(action='transcribe', filename='&lt;youtube url&gt;')</code> takes (§4KE, 2026-09-24). Everything egresses through Tor; no cookies, accounts or keyed APIs are involved.</p>
+
+  <h2>Why it exists</h2>
+  <p>Until September 2026 YouTube was handled by a composed skill whose first step ran a shell script inside the sandbox: <code>pip install yt-dlp</code>, install deno, download the audio with exit-node rotation, then a second step transcribed <code>yt_audio.m4a</code>. It never completed. The sandbox promotes any command still running at 90&nbsp;s to a background job, the sequential runner books that as a failed step, and the transcribe step never ran — the live registry showed <strong>3 uses, 0 successes</strong>. It also wrote every video to one constant filename, so the knowledge base's name-keyed dedup would have answered every later video from the first; it ran unpinned installs as root at run time; and its quoted-heredoc defence for the URL could be ended by a line break in the URL. The review that found all this is in <code>PROJECT_JOURNAL.md §4KE</code>.</p>
+
+  <h2>What was measured before designing it</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Route over Tor (2026-09-24)</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td>yt-dlp, default and 8 other player clients, no PO token</td><td>0 / 9 circuits — "Sign in to confirm you're not a bot"</td></tr>
+      <tr><td>Invidious instances, Piped, timedtext endpoints, third-party transcript sites</td><td>dead, or the same wall on their side</td></tr>
+      <tr><td>yt-dlp + a locally minted PO token (BotGuard solved by the helper)</td><td>5 / 12 circuits; failures in 2–9 s; captions and audio both flow</td></tr>
+    </tbody>
+  </table></div>
+  <p>The wall is per-circuit once a proof-of-origin token is present, so the winning shape is the one <code>tools/search.py</code> already uses: a handful of attempts, each on a fresh circuit (a distinct SOCKS username makes Tor build a new one), fail fast, stop early on a fault no exit can pass.</p>
+
+  <h2>How a link flows</h2>
+  <ol class="flow">
+    <li><strong>Recognise.</strong> <code>youtube_video_id()</code> accepts watch, youtu.be, shorts, live, embed and music URLs and rejects channels, playlists and look-alike hosts (those fall to the ordinary web fetch).</li>
+    <li><strong>Dedup by video.</strong> A document named <code>yt-&lt;id&gt;.…</code> already in the library means <em>Skipped</em>, whichever tier ingested it, before any network.</li>
+    <li><strong>Resolve.</strong> yt-dlp runs as a module of the agent's own interpreter (<code>python -m yt_dlp</code>, so the venv's pinned yt-dlp and the PO-token plugin are what run), with <code>--proxy socks5h://&lt;tag&gt;:isolate@127.0.0.1:9050</code> (remote DNS — <code>socks5://</code> would resolve the host locally) and <code>--extractor-args youtubepot-bgutilhttp:base_url=…</code>. Up to eight circuits; a bot wall, a 429/403, a "format not available" (SABR-only session) or a transport error earns another circuit; a private/removed video or an unknown error stops at once with yt-dlp's own last ERROR line as the reason.</li>
+    <li><strong>Captions tier.</strong> <code>choose_caption_track()</code> prefers a manual track, then the ORIGINAL-language automatic track (<code>&lt;lang&gt;-orig</code>) — the other automatic keys are machine translations and would hand back English for a Greek talk. One language per request (a second one on the same circuit drew a 429). Fetched on the circuit that just resolved the video, parsed from json3 (word segments joined per event) or VTT (tags stripped, rolling duplicates collapsed), grouped into ~90-second passages, indexed under <code>yt-&lt;id&gt;.captions.&lt;lang&gt;</code>.</li>
+    <li><strong>Audio tier.</strong> No usable captions: download the audio track into the sandbox as <code>yt-&lt;id&gt;.m4a</code> on its own circuit and hand it to <a href="vector.html">memory/audio_ingest.py</a> (the private audio node). Recordings past <code>GHOST_AUDIO_MAX_S</code> are refused with the reason.</li>
+    <li><strong>Persist structure.</strong> An outline record (one entry per passage), the ordered transcript beside the store (<code>set_document_text</code>, read back by <code>action='transcript'</code>, dropped with the document) and a summary row that carries the title, URL, language, gaps and the opening words — not just counts.</li>
+    <li><strong>Reply.</strong> <code>SUCCESS: …</code> with the first 3,000 characters of the transcript and the offset to continue from, so "summarise it" needs no second call.</li>
+  </ol>
+
+  <h2>The PO-token helper</h2>
+  <p><code>com.local.ghost-pot</code> is a system LaunchDaemon running the <a href="https://github.com/Brainicism/bgutil-ytdlp-pot-provider">bgutil-ytdlp-pot-provider</a> server from <code>~/Data/AI/PotProvider</code> on <code>127.0.0.1:4416</code> (plist and notes under <code>interface/externals/pot_provider/</code>). yt-dlp forwards its per-attempt proxy to the helper, so the BotGuard challenge fetch rides the same Tor circuit as the video request — verified in the plugin source and the helper's log. If the daemon is down the route tries to spawn the server itself; if that fails too, the error names the helper as the cause instead of "every exit blocked". Overrides: <code>GHOST_YT_POT_URL</code>, <code>GHOST_YT_POT_DIR</code>, <code>GHOST_YT_ATTEMPTS</code>, <code>GHOST_YT_INFO_TIMEOUT_S</code>, <code>GHOST_YT_AUDIO_TIMEOUT_S</code>, <code>GHOST_YT_PASSAGE_S</code>, <code>GHOST_YT_POT_LOG</code> (log of an on-demand spawn).</p>
+
+  <h2>The canary (§4KH, 2026-09-24)</h2>
+  <p>YouTube rotates its BotGuard challenge from time to time; when it does, the helper's tokens stop being honoured and every circuit is refused until yt-dlp and the helper are updated <em>together</em>. Rather than learn that at the next pasted link, the agent probes the route itself: <code>memory/youtube_canary.py</code>, driven from the biological tick, once per <code>GHOST_YT_CANARY_HOURS</code> (default 24; <code>0</code> disables), first <code>GHOST_YT_CANARY_BOOT_DELAY_S</code> (600) after boot, in a worker thread, never while a turn is in flight. One probe = helper <code>/ping</code>, Tor liveness, then a resolve-only fetch of a fixed public video on up to <code>GHOST_YT_CANARY_ATTEMPTS</code> (4) fresh circuits &mdash; no captions, no audio, no store writes.</p>
+  <p>States: <code>ok</code>; <code>walled</code> (every circuit refused &mdash; rotation suspected) and <code>unstable</code> (every circuit failed with mixed faults: 403s, timeouts, a SABR-only session) are the two verdicts an <em>exhausted</em> rotation produces, and since four circuits failing by chance is about 13% per run whatever the cause, both are <strong>held</strong> and re-checked after <code>GHOST_YT_CANARY_RECHECK_S</code> (15 min), announced only when a second consecutive run confirms them; <code>error</code> (the rotation stopped early on a terminal fault), <code>helper_down</code> and <code>tor_down</code> are announced at once. <strong>It speaks only on a transition</strong>: entering a failure state writes one <code>notify</code>-severity activity record (Slack DM to the owner, webhook/ntfy), returning to <code>ok</code> writes one recovery notice, a steady state writes nothing, and a message the ledger did not accept is retried on the next run rather than forgotten. The current verdict is always on <code>/api/health</code> as <code>youtube_route</code> (settled <code>state</code>, the last run's own <code>last_state</code>/<code>last_reason</code>, a <code>pending</code> held verdict, ISO timestamps) and in <code>$GHOST_HOME/system/youtube_canary.json</code>; <code>POST /api/youtube-canary/run</code> starts a probe now (the operator's button after an update). The remedy it names, <code>bin/update-youtube-stack.sh</code>, is deliberately a manual, one-command step: it checks for passwordless sudo first, upgrades yt-dlp and the plugin in the agent's venv, builds the helper at the release matching the plugin, restarts the daemon, and proves the result with a live resolve &mdash; fetching from PyPI, GitHub and npm over the clear from the host, which is operator egress, not the agent's.</p>
+
+  <h2>The macro that remains</h2>
+  <p><code>youtube_transcribe(url=…)</code> still appears in the tool list, as a one-step alias of the knowledge-base call. Its definition is code (<code>tools/yt_download.CODE_OWNED_MACROS</code>); the composed-skill registry overwrites a stored copy whose steps differ at load, keeping its usage counters, so a change ships with the code — no more stopping the agent for a sync script. See <a href="../tools/composed_skills.html">composed_skills</a>.</p>
+
+  <h2>Tests</h2>
+  <p><code>tests/test_4ke_video_pipeline_review.py</code> — URL shapes, circuit isolation and remote DNS, the fault classes, caption preference, json3/VTT parsing, the rotate-then-index path with a scripted yt-dlp, terminal stop, helper-down reporting, the audio fallback with per-video names, dedup by id, Tor-only, plus the transcriber and knowledge-base pins. Mutation battery in <code>PROJECT_JOURNAL.md §4KE</code>.</p>
+</main>
+</body>
+</html>

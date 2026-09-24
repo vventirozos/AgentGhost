@@ -80,6 +80,7 @@ _PHASE_LABELS = {
     "negative_controls": "Negative Controls",
     # §4DC Phase 0+1: the autonomous GEPA supply watch + live judge.
     "gepa_autonomy": "GEPA autonomy",
+    "youtube_canary": "YouTube route canary",
 }
 
 # ── LIVENESS REGISTRY ───────────────────────────────────────────────────────
@@ -177,6 +178,10 @@ PHASE_EXPECTATION = {
     # loop's own liveness is the pretty_log lines and the state file's
     # last_run_epoch.
     "gepa_autonomy": EXPECT_ON_OUTPUT,
+    # §4KH: writes only on a TRANSITION (walled / helper down / recovered);
+    # a steady healthy route is silent for months by design. Liveness of the
+    # probe itself is `youtube_route.last_run` on /api/health.
+    "youtube_canary": EXPECT_ON_OUTPUT,
     # §4CM D3: the counterfactual replay batch. GATED, not periodic —
     # `GHOST_DREAM_REPLAY` defaults OFF and the whole engine is inert
     # until an operator turns it on, so a zero must report the gate

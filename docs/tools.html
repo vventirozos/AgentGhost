@@ -71,7 +71,8 @@
   <p>For pages that need clicking, typing and logging in rather than just reading. The browser runs inside the sandbox, so it can reach the internet through Tor and any service the sandbox itself is hosting — but not the rest of your network.</p>
 
   <h3>Read documents, PDFs and recordings</h3>
-  <p>Hand it a file and it goes into memory as searchable passages. Audio and video are transcribed locally first, and each passage keeps its timestamp — so you can ask "what did they say about pricing?" and get an answer that points at the moment in the recording.</p>
+  <p>Hand it a file and it goes into memory as searchable passages. Audio and video are transcribed first on its own audio node (nothing leaves the network), and each passage keeps its timestamp — so you can ask "what did they say about pricing?" and get an answer that points at the moment in the recording. Ask for the transcript and it reads it back in order; a window it could not transcribe is listed as a gap rather than glossed over.</p>
+  <p>A YouTube link works the same way: paste it and Ghost fetches it over Tor — captions when the video has them, the audio otherwise — and comes back with the opening of the transcript. YouTube refuses most Tor exits, so it rotates circuits with a locally minted proof-of-origin token; roughly four in ten circuits pass and the rest fail within seconds, which is why a link usually resolves in under half a minute and occasionally not at all.</p>
   <p>You don't need to ask it to write transcription code. It has this built in, and asking for a script instead gets a worse result.</p>
 
   <h3>Look at images</h3>

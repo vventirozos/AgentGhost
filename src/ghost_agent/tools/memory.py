@@ -1,4 +1,5 @@
 import asyncio
+import tempfile
 import hashlib
 import logging
 import os
@@ -40,9 +41,17 @@ _GRAPH_EXTRACT_TIMEOUT_S = 20.0
 # noise. VIDEO is included deliberately: ffmpeg takes the audio track, and a
 # recorded conference talk is far more often an .mp4 than a .wav.
 _AUDIO_INGEST_EXTS = (
-    ".wav", ".mp3", ".m4a", ".flac", ".ogg", ".opus", ".aac", ".wma", ".aiff",
-    ".mp4", ".mov", ".mkv", ".webm", ".avi",
+    ".wav", ".mp3", ".m4a", ".m4b", ".flac", ".ogg", ".oga", ".opus", ".aac", ".wma",
+    ".aiff", ".aif", ".amr", ".3gp", ".weba", ".mpga",
+    ".mp4", ".mov", ".mkv", ".mka", ".webm", ".avi",
 )
+
+# Suffixes a downloader gives a file it is STILL WRITING. The fuzzy resolver
+# below matches by stem/substring, and `yt_audio.m4a.part` matched
+# `yt_audio.m4a` — partial AAC then went down the plain-text branch as
+# replacement-character noise (§4KE). In-flight artefacts are never a
+# document.
+_INFLIGHT_SUFFIXES = (".part", ".ytdl", ".tmp", ".crdownload", ".download", ".partial")
 
 
 def _is_within_root(path: Path, root: Path) -> bool:
@@ -327,7 +336,90 @@ async def tool_remember(text: str = None, memory_system=None, graph_memory=None,
     except Exception as e:
         return f"Error storing memory: {e}"
 
-async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, memory_system=None):
+def _persist_audio_structure(memory_system, filename: str, stats, passages, gaps, now: str) -> None:
+    """Outline record (one entry per window), the ordered transcript sidecar
+    and a summary row that carries the opening words — for a recording
+    transcribed from a sandbox file (the YouTube route has its own twin in
+    `memory.youtube_ingest`)."""
+    from ..memory.audio_ingest import format_timestamp as _fmt
+    entries = [[1, f"{_fmt(s)}–{_fmt(e)}  {t[:80]}"] for s, e, t in passages]
+    try:
+        memory_system.set_document_outline(filename, {
+            "filename": filename, "source": "audio", "entries": entries,
+            "duration_s": float(getattr(stats, "total_seconds", 0.0) or 0.0),
+            "transcribed_s": float(getattr(stats, "seconds", 0.0) or 0.0),
+            "chunks": int(getattr(stats, "chunks", 0) or 0), "gaps": gaps, "at": now,
+        })
+    except Exception as _oe:  # noqa: BLE001
+        logger.debug("outline not stored for %s: %s", filename, _oe)
+    try:
+        memory_system.set_document_text(filename, {
+            "filename": filename, "route": "audio", "gaps": gaps,
+            "duration_s": float(getattr(stats, "total_seconds", 0.0) or 0.0),
+            "passages": [[s, e, t] for s, e, t in passages], "at": now,
+        })
+    except Exception as _te:  # noqa: BLE001
+        logger.debug("transcript sidecar not stored for %s: %s", filename, _te)
+    try:
+        opening = " ".join(t for _s, _e, t in passages)[:600]
+        summary = (
+            f"[Document Summary: {filename}] Audio transcript: "
+            f"{_fmt(getattr(stats, 'seconds', 0.0))} of "
+            f"{_fmt(getattr(stats, 'total_seconds', 0.0))} transcribed in "
+            f"{int(getattr(stats, 'windows', 0))} windows, {int(getattr(stats, 'chunks', 0))} "
+            f"indexed chunks" + (f", gaps: {'; '.join(gaps)}" if gaps else "") +
+            f". Opening words: {opening}… Read it in order with knowledge_base("
+            f"action='transcript', filename='{filename}'); ask about it with action='query'."
+        )
+        memory_system.add(summary, {"type": "document_summary", "source": filename, "timestamp": now})
+    except Exception as _se:  # noqa: BLE001
+        logger.debug("summary row not stored for %s: %s", filename, _se)
+
+
+_AUDIO_PREVIEW_CHARS = 3000
+
+
+def _audio_success_message(filename: str, stats, passages, gaps) -> str:
+    from ..memory.audio_ingest import format_timestamp as _fmt
+
+    def _plural(n, word):
+        return f"{n} {word}" if n == 1 else f"{n} {word}s"
+
+    note = ""
+    if getattr(stats, "truncated", False):
+        note += " (TRUNCATED at the duration cap)"
+    if getattr(stats, "skipped_windows", 0):
+        note += f" ({_plural(stats.skipped_windows, 'window')} failed and were skipped)"
+    if getattr(stats, "truncated_windows", 0):
+        note += f" ({_plural(stats.truncated_windows, 'window')} cut short at the token budget)"
+    gap_note = f" NOT transcribed: {'; '.join(gaps)}." if gaps else ""
+    stopped = str(getattr(stats, "aborted", "") or "")
+    if stopped:
+        gap_note += (f" STOPPED EARLY: {stopped}. What was transcribed is kept; to redo the whole "
+                     f"recording later: knowledge_base(action='forget', target='{filename}') then "
+                     f"transcribe again.")
+    head = "SUCCESS (partial)" if stopped else "SUCCESS"
+    transcript = "\n".join(f"[{_fmt(s)}–{_fmt(e)}] {t}" for s, e, t in passages)
+    preview = transcript[:_AUDIO_PREVIEW_CHARS]
+    more = ""
+    if len(transcript) > _AUDIO_PREVIEW_CHARS:
+        more = (f"\n… [{len(transcript) - _AUDIO_PREVIEW_CHARS} more characters — read on with "
+                f"knowledge_base(action='transcript', filename='{filename}', offset={_AUDIO_PREVIEW_CHARS})]")
+    return (
+        f"{head}: Transcribed and ingested '{filename}' — "
+        f"{_fmt(getattr(stats, 'seconds', 0.0))} of {_fmt(getattr(stats, 'total_seconds', 0.0))} "
+        f"transcribed, {_plural(getattr(stats, 'windows', 0), 'window')}, "
+        f"{_plural(getattr(stats, 'chunks', 0), 'chunk')}{note}.{gap_note}\n"
+        f"TRANSCRIPT ({min(len(transcript), _AUDIO_PREVIEW_CHARS)} of {len(transcript)} chars):\n"
+        f"{preview}{more}\n"
+        f"Passages carry timestamps, so answers can cite the moment. Ask questions with "
+        f"knowledge_base(action='query', filename='{filename}', question='...'); the whole "
+        f"text in order is action='transcript'."
+    )
+
+
+async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, memory_system=None,
+                              tor_proxy: str = None, language: str = None):
     if not filename:
         return "SYSTEM ERROR: The 'filename' parameter is MANDATORY. You must specify it."
     import time
@@ -376,6 +468,26 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
     if filename.startswith("#") or filename.lower().startswith("title:") or (" " in filename and "." not in filename):
         return f"Error: You passed the document CONTENT or TITLE ('{filename[:30]}...'). You MUST pass the FILENAME (e.g. 'romeo_source.txt')."
 
+    # ── YOUTUBE: fetched over Tor, captions or audio, in-process (§4KE) ──
+    # Before this branch a YouTube URL fell through to the generic web fetch,
+    # which ingested the watch page's HTML shell as a "document" and reported
+    # SUCCESS. Checked BEFORE the length and scheme rules: a schemeless
+    # `youtu.be/<id>` and a 300-char watch URL with tracking params are both
+    # links, not filenames.
+    from ..memory.youtube_ingest import ingest_youtube, is_youtube_url
+    if is_youtube_url(filename):
+        def _yt_progress(msg: str) -> None:
+            pretty_log("YouTube", msg, icon=Icons.MEM_INGEST)
+        try:
+            _dest = Path(sandbox_dir) if sandbox_dir else Path(tempfile.gettempdir())
+            res = await asyncio.to_thread(
+                ingest_youtube, filename, sandbox_dir=_dest, memory_system=memory_system,
+                tor_proxy=tor_proxy, language=language, progress=_yt_progress,
+            )
+        except Exception as e:  # noqa: BLE001
+            return f"Ingest Error: the YouTube route failed: {e}"
+        return res.message
+
     # OS limit usually 255, we use 240 to be safe. (The old `> 2000` branch
     # below this was dead — `> 240` always returns first — and had a typo.)
     if len(filename) > 240:
@@ -389,7 +501,7 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
         return f"Skipped: '{filename}' is already in KB."
 
     is_web = filename.lower().startswith("http://") or filename.lower().startswith("https://")
-    
+
     if is_web and filename.lower().split("?")[0].endswith(".pdf"):
         return ("Error: You cannot directly ingest a PDF URL. If you already downloaded it to the sandbox, "
                 "pass the LOCAL FILENAME (e.g. 'document.pdf') instead of the URL. If you haven't downloaded "
@@ -450,7 +562,7 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
                     for root_dir, dirs, fnames in os.walk(sandbox_dir):
                         dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['node_modules', 'venv', '__pycache__', 'env']]
                         for f in fnames:
-                            if not f.startswith('.'):
+                            if not f.startswith('.') and not f.lower().endswith(_INFLIGHT_SUFFIXES):
                                 all_files.append(Path(root_dir) / f)
                     
                     # Priority 1: Exact name match (case-insensitive)
@@ -531,7 +643,9 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
                         f"file_system(operation='download', url='<the url>', path={filename!r}), "
                         f"then call again with filename={filename!r}. If the download tool "
                         "reports the site refuses it, ask the user to provide the file — do "
-                        "not fetch it any other way. If it should already exist, list_files "
+                        "not fetch it any other way. A YouTube link needs no download step: "
+                        "pass the URL itself as filename and this action fetches and "
+                        "transcribes it. If it should already exist, list_files "
                         "shows the exact name."
                     )
             except:
@@ -687,39 +801,16 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
                     f"{'Windows failed: ' + '; '.join(stats.errors[:3]) if stats.errors else 'The recording may be silent or music-only.'}"
                 )
 
-            try:
-                summary = (
-                    f"[Document Summary: {filename}] Audio transcript: "
-                    f"{format_timestamp(stats.seconds)} across "
-                    f"{_plural(stats.windows, 'window')}, "
-                    f"{_plural(stats.chunks, 'indexed chunk')}, {stats.chars} "
-                    f"characters. Chunks are stamped with timestamp ranges. "
-                    f"Query it with knowledge_base(action='query', "
-                    f"filename='{filename}', question='...')."
-                )
-                await asyncio.to_thread(
-                    memory_system.add, summary,
-                    {"type": "document_summary", "source": filename,
-                     "timestamp": get_utc_timestamp()},
-                )
-            except Exception:
-                pass
-
-            note = ""
-            if stats.truncated:
-                note += " (TRUNCATED at the duration cap)"
-            if stats.skipped_windows:
-                note += f" ({stats.skipped_windows} windows failed and were skipped)"
-            return (
-                f"SUCCESS: Transcribed and ingested '{filename}' — "
-                f"{format_timestamp(stats.seconds)} of audio, "
-                f"{_plural(stats.windows, 'window')}, "
-                f"{_plural(stats.chunks, 'chunk')}{note}. "
-                f"Passages carry timestamps, so "
-                f"answers can cite the moment. Ask questions with "
-                f"knowledge_base(action='query', filename='{filename}', "
-                f"question='...')."
-            )
+            # Structure, ordered text and a CONTENT-bearing summary (§4KE):
+            # the old summary row was counts only, no outline record was
+            # written for audio, and the transcript could not be read in
+            # order. Each store is best-effort and independent.
+            _passages = list(getattr(stats, "transcript", []) or [])
+            _gaps = list(getattr(stats, "gaps", []) or [])
+            await asyncio.to_thread(
+                _persist_audio_structure, memory_system, filename, stats, _passages, _gaps,
+                get_utc_timestamp())
+            return _audio_success_message(filename, stats, _passages, _gaps)
 
         try:
             def _extract_text():
@@ -935,6 +1026,97 @@ async def tool_query_document(filename: str = None, question: str = None,
         d = float(h.get("dist", h.get("score", 0.0)))
         parts.append(f"--- [{i}] ({_match_word(d)} match, distance {d:.2f}) "
                      f"---\n{h['text']}")
+    return "\n".join(parts)
+
+
+#: One page of an ordered transcript (`action='transcript'`).
+TRANSCRIPT_PAGE_CHARS = 12000
+
+
+async def tool_document_transcript(filename: str = None, offset=0, max_chars=TRANSCRIPT_PAGE_CHARS,
+                                   memory_system=None):
+    """The ORDERED, timestamped text of a transcribed recording or video,
+    one page at a time (§4KE).
+
+    Chunks are a retrieval structure — no ordinal, arbitrary order out of
+    the store — so "give me the transcript" and "summarise the whole talk"
+    had no route: the model could hold k=8 passages and call that the
+    summary. The ingest now keeps the ordered passages beside the store
+    (`set_document_text`), and this pages through them.
+    """
+    if not filename:
+        return ("SYSTEM ERROR: 'filename' is MANDATORY for action='transcript'. Worked call: "
+                "knowledge_base(action='transcript', filename='<a transcribed document>')")
+    if not memory_system:
+        return "Error: Memory system is disabled."
+    try:
+        offset = max(0, int(offset or 0))
+    except (TypeError, ValueError):
+        offset = 0
+    try:
+        max_chars = max(500, min(int(max_chars or TRANSCRIPT_PAGE_CHARS), 60000))
+    except (TypeError, ValueError):
+        max_chars = TRANSCRIPT_PAGE_CHARS
+
+    library = await asyncio.to_thread(memory_system.get_library)
+    library = library or []
+    if filename not in library:
+        from ..memory.youtube_ingest import existing_document_for, youtube_video_id
+        vid = youtube_video_id(filename)
+        match = existing_document_for(vid, library) if vid else None
+        if not match:
+            stem = str(filename).lower().rsplit(".", 1)[0]
+            match = next((f for f in library if f.lower() == str(filename).lower()
+                          or f.lower().rsplit(".", 1)[0] == stem), None)
+        if not match and stem:
+            # A bare prefix is accepted only when it names ONE document.
+            starts = [f for f in library if f.lower().startswith(stem)]
+            if len(starts) == 1:
+                match = starts[0]
+            elif len(starts) > 1:
+                return (f"Error: '{filename}' matches several documents: {starts}. "
+                        f"Pass one exact name.")
+        if not match:
+            return (f"Error: '{filename}' is not in the knowledge base. "
+                    f"Available documents: {library or '(none)'}.")
+        filename = match
+
+    rec = await asyncio.to_thread(memory_system.get_document_text, filename)
+    passages = (rec or {}).get("passages") or []
+    if not passages:
+        return (f"Error: '{filename}' has no ordered transcript stored (documents transcribed "
+                f"before 2026-09-24, PDFs and text files keep only searchable passages). Use "
+                f"action='query' with a question, or action='outline' for its structure.")
+    from ..memory.audio_ingest import format_timestamp as _fmt
+    lines = []
+    for p in passages:
+        try:
+            s, e, t = float(p[0]), float(p[1]), str(p[2])
+        except (TypeError, ValueError, IndexError):
+            continue
+        lines.append(f"[{_fmt(s)}–{_fmt(e)}] {t}")
+    text = "\n".join(lines)
+    total = len(text)
+    if offset >= total:
+        return (f"TRANSCRIPT of '{filename}': {total} chars in total; offset {offset} is past the end.")
+    page = text[offset:offset + max_chars]
+    head = [f"TRANSCRIPT of '{filename}'"]
+    title = (rec or {}).get("title")
+    if title:
+        head.append(f"— \"{title}\"")
+    if (rec or {}).get("url"):
+        head.append(f"({rec['url']})")
+    gaps = (rec or {}).get("gaps") or []
+    parts = [" ".join(head) + f" — chars {offset}–{offset + len(page)} of {total}."]
+    if gaps:
+        parts.append(f"Not transcribed: {'; '.join(str(g) for g in gaps)}.")
+    parts.append("")
+    parts.append(page)
+    if offset + len(page) < total:
+        parts.append(f"\n… [{total - offset - len(page)} more characters: knowledge_base("
+                     f"action='transcript', filename='{filename}', offset={offset + len(page)})]")
+    else:
+        parts.append("\n[end of transcript]")
     return "\n".join(parts)
 
 
@@ -2228,7 +2410,7 @@ _KB_TARGET_ALIASES = (
 #: generated from it. (`update_profile` is dispatched but deliberately not
 #: advertised; see the branch at the end of `tool_knowledge_base`.)
 _KB_ACTIONS = (
-    "transcribe", "ingest_document", "query", "outline", "insert_fact",
+    "transcribe", "ingest_document", "query", "outline", "transcript", "insert_fact",
     "expand", "forget", "list_docs", "reset_all",
 )
 
@@ -2401,13 +2583,16 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
         _is_media_verb = action_as_called != "ingest_document"
         filename, err = _kb_target_or_error(
             kwargs, action_as_called, "filename",
-            ("pass the name of an EXISTING audio or video file in your sandbox"
+            ("pass the name of an EXISTING audio or video file in your sandbox, "
+             "or a YouTube link"
              if _is_media_verb else
              "pass the name of an EXISTING file in your sandbox, or a web URL"),
             "<your-recording.mp4>" if _is_media_verb else "<your-file.pdf>")
         if err:
             return err
-        return await tool_gain_knowledge(filename, sandbox_dir, memory_system)
+        return await tool_gain_knowledge(
+            filename, sandbox_dir, memory_system,
+            tor_proxy=kwargs.get("tor_proxy"), language=kwargs.get("language"))
 
     elif action == "forget":
         subject, err = _kb_target_or_error(
@@ -2423,6 +2608,14 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
             filename=kwargs.get("filename") or kwargs.get("source") or target,
             question=(kwargs.get("question") or kwargs.get("query")
                       or kwargs.get("q")),
+            memory_system=memory_system,
+        )
+
+    elif action == "transcript":
+        return await tool_document_transcript(
+            filename=kwargs.get("filename") or kwargs.get("source") or target,
+            offset=kwargs.get("offset", 0),
+            max_chars=kwargs.get("max_chars", TRANSCRIPT_PAGE_CHARS),
             memory_system=memory_system,
         )
 

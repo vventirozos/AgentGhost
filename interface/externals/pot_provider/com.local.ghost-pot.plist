@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Ghost Agent PO-token helper (bgutil-ytdlp-pot-provider server) —
+         system LaunchDaemon, §4KE 2026-09-24.
+
+         What it is: a local node service that solves YouTube's BotGuard
+         challenge and mints proof-of-origin tokens for yt-dlp. Without it
+         YouTube refuses every Tor exit ("Sign in to confirm you're not a
+         bot" — measured 0/9 circuits); with it ~4 in 10 circuits pass.
+         yt-dlp forwards its per-attempt Tor proxy to this server, so the
+         challenge fetch rides the SAME circuit; the server binds loopback
+         only and holds no account, cookie or key.
+
+         Install/replace:
+           sudo cp <this> /Library/LaunchDaemons/com.local.ghost-pot.plist
+           sudo chown root:wheel /Library/LaunchDaemons/com.local.ghost-pot.plist
+           sudo chmod 644       /Library/LaunchDaemons/com.local.ghost-pot.plist
+           sudo launchctl bootstrap system /Library/LaunchDaemons/com.local.ghost-pot.plist
+         Health:  curl -s http://127.0.0.1:4416/ping
+         Stop:    sudo launchctl bootout system/com.local.ghost-pot
+         Code:    ~/Data/AI/PotProvider (built from github.com/Brainicism/
+                  bgutil-ytdlp-pot-provider, commit in UPSTREAM_COMMIT). -->
+    <key>Label</key>
+    <string>com.local.ghost-pot</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/node</string>
+        <string>/Users/vasilis/Data/AI/PotProvider/build/main.js</string>
+        <string>--port</string>
+        <string>4416</string>
+        <string>--host</string>
+        <string>127.0.0.1</string>
+    </array>
+
+    <key>UserName</key>
+    <string>vasilis</string>
+    <key>GroupName</key>
+    <string>staff</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/vasilis/Data/AI/PotProvider</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/vasilis</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>15</integer>
+
+    <!-- Log files must be WRITABLE BY vasilis or launchd exits 78 before
+         the program runs (see memory: launchd UserName log ownership). -->
+    <key>StandardOutPath</key>
+    <string>/Users/vasilis/Data/AI/Logs/ghost-pot.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/vasilis/Data/AI/Logs/ghost-pot.err</string>
+</dict>
+</plist>

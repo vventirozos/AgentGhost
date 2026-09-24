@@ -59,4 +59,9 @@ def test_docker_ensure_running_installs_sudo():
             configured_sudoers = True
             
     assert installed_sudo, "sudo package was not installed during sandbox initialization"
-    assert configured_sudoers, "passwordless sudo was not configured during sandbox initialization"
+    # §4KF (2026-09-24), INVERTED: the exec user is root, so a NOPASSWD grant
+    # added nothing — and would hand root back to any future non-root exec
+    # user. Provisioning must NOT write it.
+    assert not configured_sudoers, (
+        "provisioning wrote `ALL ALL=(ALL) NOPASSWD: ALL` to /etc/sudoers again — "
+        "the sandbox exec user is root; the grant is dead weight and a footgun (§4KF)")
