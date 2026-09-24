@@ -877,7 +877,10 @@ def format_for_slack(text: str) -> str:
 async def _process_message(messages: list, say, thread_ts: str | None = None,
                            event_files: list | None = None,
                            requester: str | None = None):
-    request_id = str(uuid.uuid4())[:8]
+    # §4KD: the `slack-` prefix is how the agent knows this turn must never
+    # teach (no playbook lesson from a channel member's prompt). The same id
+    # is what feedback reactions correlate on, so it is minted HERE, once.
+    request_id = "slack-" + str(uuid.uuid4())[:8]
     log_task = asyncio.create_task(tail_logs(request_id, say, thread_ts))
 
     try:

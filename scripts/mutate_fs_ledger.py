@@ -371,6 +371,7 @@ for _rx, _label in (
         (r"\^SUCCESS: Anchor", "shape: Anchor"),
         (r"\^SUCCESS: Deleted", "shape: Deleted"),
         (r"\^SUCCESS: Renamed/Moved", "shape: Renamed/Moved"),
+        (r"\^SUCCESS: edited", "shape: edited (§4KC)"),
 ):
     MUTANTS.append((_label, _rx.replace("\\", ""), _rx.replace("^SUCCESS", "^NOPE").replace("\\", "")))
 

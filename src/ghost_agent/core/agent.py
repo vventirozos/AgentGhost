@@ -1352,6 +1352,21 @@ def turn_origin(context) -> str:
                             "is_read_only", False) is True else "user"
 
 
+def turn_may_teach(context) -> bool:
+    """§4KD: may THIS turn write to the playbook? False for a diagnostic
+    probe (§4FB/§4FS) and for a Slack turn (`slack-` request-id prefix —
+    real traffic, so `turn_origin` still says "user", but a channel member's
+    prompt must not become the owner's lesson). The writer itself has the
+    same rule as a backstop (`memory.skills.playbook_writes_blocked`)."""
+    try:
+        if turn_origin(context) == "probe":
+            return False
+        from ..utils.logging import is_slack_request_id, request_id_context
+        return not is_slack_request_id(request_id_context.get())
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def rubric_shadow_eligible(context, traj) -> bool:
     """Is this turn one the verifier DECLINED, on real traffic?
 
@@ -2514,6 +2529,7 @@ _HYDRATION_JUDGE_STAGGER_S = 90.0
 _FILE_MUTATION_MARKERS = (
     "wrote", "written", "replaced", "replace applied",
     "auto-promoted", "search/replace", "overwrote", "overwritten",
+    "edited",                                  # §4KC operation='edit'
 )
 
 
@@ -2535,6 +2551,81 @@ def _verifier_note_block(issues_str: str) -> str:
     return f"\n\n---\n**Verifier note:** {flat}"
 
 
+#: Confirmation shapes of a TARGETED edit — a region of an existing file
+#: changed in place. Operator decision (2026-09-23, after §4KC's probes): the
+#: unverified-mutation gate is narrowed to WHOLE-FILE writes, the shape it
+#: was written for (req_C0: a 33-minute build finishing on an untested
+#: `write`). A one-line edit of a library module has nothing to "run", and
+#: the repair round it forced ended every such turn `failed · 0.17`. An
+#: UNRECOGNISED SUCCESS that carries a mutation marker is still guarded — a
+#: reworded message must not silently disarm the gate (§4GL pin).
+_TARGETED_EDIT_RES = (
+    re.compile(r"^SUCCESS: (?:Exact|Flexible) match found and replaced in '"),
+    re.compile(r"^SUCCESS: Fuzzy match \("),
+    re.compile(r"^SUCCESS: Anchor match — replaced the block spanning"),
+    re.compile(r"^SUCCESS: Applied \d+ SEARCH/REPLACE blocks to '"),
+    re.compile(r"^SUCCESS: Streaming replace applied to '"),
+    re.compile(r"^SUCCESS: edited — replaced \d+ occurrence"),
+)
+
+
+#: A whole-file write SMALLER than this does not trip the gate. req_C0 was a
+#: 33-minute build of thousands of chars; a 69-char three-line helper is not
+#: that shape, and "run it" for one is a footer on a correct reply (operator
+#: decision, 2026-09-23). The size is the tool's own `Wrote N chars` figure;
+#: the replace→write auto-promote (a complete module, size unstated) and an
+#: unrecognised SUCCESS keep the guard, conservatively.
+UNVERIFIED_WRITE_MIN_CHARS = 2048
+_FS_WROTE_SIZE_RE = re.compile(r"^SUCCESS: Wrote (\d+) chars to '")
+
+
+def _below_write_threshold(head_lines) -> bool:
+    """True when EVERY confirmation in the leading run is a `Wrote N chars`
+    line with N below the threshold — nothing there is the req_C0 shape.
+    Any other shape in the run (auto-promote, unrecognised) keeps the
+    guard."""
+    seen = False
+    for ln in head_lines:
+        m = _FS_WROTE_SIZE_RE.match(ln)
+        if not m:
+            return False
+        seen = True
+        if int(m.group(1)) >= UNVERIFIED_WRITE_MIN_CHARS:
+            return False
+    return seen
+
+
+#: The reason the unverified-mutation gate books a turn `failed` with when
+#: NO verdict exists yet. It is a PRIOR, not a refutation — so it carries the
+#: structural-failure prefix, which is the one class `resolve_turn_outcome`
+#: lets a strong LATE verdict lift. Measured 2026-09-23 (reqs 07c0c588,
+#: 3b827526): the gate booked `failed · 0.17`, the verifier then landed
+#: CONFIRMED 100% with FILE-ARTIFACT present, and the corpus row stayed
+#: `failed` forever because it had been stamped "verifier refuted".
+UNVERIFIED_MUTATION_REASON = (
+    "structural failure:unverified mutation — finalised on an untested file "
+    "write/replace; the change was never run or screenshotted")
+
+
+def _backfilled_failure_reason(verifier: Optional[str], verifier_reason: str,
+                               traj) -> str:
+    """The `failure_reason` a consolidated FAILED row is stamped with.
+
+    A verifier-backfilled FAILED that is really the unverified-mutation
+    PRIOR keeps its structural-class reason so a later CONFIRMED can lift
+    it; a genuine refutation is "verifier refuted" and never lifts; a
+    FAILED with no verifier signal names its structural cause.
+    """
+    from ..distill.outcome_heuristics import (
+        is_structural_reason, structural_cause_for_trajectory,
+        structural_reason)
+    if verifier == "failed":
+        if verifier_reason and is_structural_reason(verifier_reason):
+            return verifier_reason
+        return "verifier refuted"
+    return structural_reason(structural_cause_for_trajectory(traj))
+
+
 def _is_unverified_mutation(tool: Optional[dict]) -> bool:
     """True when ``tool`` is a SUCCESSFUL file write/replace — i.e. the
     turn's final substantive action mutated a file but the turn ended
@@ -2552,11 +2643,30 @@ def _is_unverified_mutation(tool: Optional[dict]) -> bool:
     name = str(tool.get("name", "")).lower().replace("-", "_").replace(" ", "_")
     if name not in ("file_system", "filesystem", "file"):
         return False
-    content = str(tool.get("content", "")).lower()
-    if "success" not in content:
+    # The confirmation LINE, and only a SUCCESS one: a REJECTED edit whose
+    # nearest-region echo happened to contain "successfully edited" booked
+    # the turn as an unverified mutation over a file nothing touched
+    # (fresh-eye §4KC round 2).
+    _raw = str(tool.get("content", "")).lstrip()
+    if _raw.startswith("[FAILURE BANNER]"):
+        _raw = _raw.split("\n", 1)[1] if "\n" in _raw else ""
+    if not _raw.lstrip().upper().startswith("SUCCESS"):
         return False
+    _head = _raw.split("\n", 1)[0].strip()
+    if any(rx.match(_head) for rx in _TARGETED_EDIT_RES):
+        return False                    # a targeted edit is not the gate's shape
+    content = _head.lower()
     if not any(marker in content for marker in _FILE_MUTATION_MARKERS):
         return False
+    # the leading run of SUCCESS lines, like `_written_paths_from_confirmation`
+    _run = []
+    for ln in _raw.split("\n"):
+        ln = ln.strip()
+        if not ln.startswith("SUCCESS"):
+            break
+        _run.append(ln)
+    if _below_write_threshold(_run):
+        return False                    # small whole-file writes are not req_C0
     # ⚠ ONLY A RUNNABLE ARTIFACT CAN BE RUN (§4GL, req cf45e352). This gate
     # used to fire on the TOOL NAME alone, so every successful file write
     # demanded that the file be "run or rendered" before the turn could
@@ -2578,7 +2688,7 @@ def _is_unverified_mutation(tool: Optional[dict]) -> bool:
     # have to be executed or rendered. Unknown or extensionless names still
     # fire, so a `Makefile` or a `Dockerfile` keeps the guard; only the
     # explicitly inert kinds are exempt.
-    _paths = _written_paths_from_confirmation(str(tool.get("content", "")))
+    _paths = _written_paths_from_confirmation(_raw)
     if _paths and all(_is_inert_artifact(q) for q in _paths):
         return False
     return True
@@ -2610,8 +2720,17 @@ def _written_paths_from_confirmation(content: str) -> list:
     message goes blind in one place, not two, and the existing
     producer/parser parity tripwire covers both."""
     out = []
-    for line in str(content or "").splitlines():
+    # The LEADING RUN of `SUCCESS:` lines only. Everything after the first
+    # line that is not one is the tool echoing file content (a POST-EDIT
+    # VIEW, a nearest-region snippet — each opens with a blank line or a
+    # `---` header), whose text is data, not a confirmation (§4KC r2: an
+    # echoed "SUCCESS: Wrote …" inside an edited file reached this parser).
+    # A run, not just the head, because a mixed confirmation lists one
+    # runnable artifact after an inert one and the gate must keep it.
+    for line in str(content or "").split("\n"):
         line = line.strip()
+        if not line.startswith("SUCCESS"):
+            break
         m = _FS_WROTE_PAIR_RE.match(line)
         if m:
             out.extend([m.group(1), m.group(2)])
@@ -2689,6 +2808,10 @@ _FS_WROTE_PAIR_RE = re.compile(
     r"Script-side path \(from sandbox cwd\): '(.+?)'\.")
 _FS_PRODUCE_RES = (
     re.compile(r"^SUCCESS: Wrote \d+ chars to '(.+?)'\."),
+    # §4KC operation='edit' — path LAST and end-anchored, so a filename
+    # containing `' — replaced` cannot plant a phantom path.
+    re.compile(r"^SUCCESS: edited — replaced \d+ occurrence\S* of old_string "
+               r"\(line[^)]*\) in '(.+?)'\.$"),
     re.compile(r"^SUCCESS: auto-promoted operation='replace' to 'write' "
                r"for '(.+?)' because"),
     re.compile(r"^SUCCESS: Streaming replace applied to '(.+?)' "
@@ -2797,7 +2920,7 @@ def _keys_removable_after_write(tools_run: Optional[list]) -> set:
             content = content.split("\n", 1)[1] if "\n" in content else ""
         if not content.startswith("SUCCESS"):
             continue
-        head = content.split("\n", 1)[0][:4000]
+        head = content.split("\n", 1)[0][:4000].strip()
         produced = []
         m = _FS_WROTE_PAIR_RE.match(head)
         if m:
@@ -2856,7 +2979,7 @@ def _fs_wrote_pair_alts(tools_run: Optional[list]) -> dict:
             content = content.split("\n", 1)[1] if "\n" in content else ""
         if not content.startswith("SUCCESS"):
             continue
-        m = _FS_WROTE_PAIR_RE.match(content.split("\n", 1)[0][:4000])
+        m = _FS_WROTE_PAIR_RE.match(content.split("\n", 1)[0][:4000].strip())
         if m and _fs_norm(m.group(1)) != _fs_norm(m.group(2)):
             out.setdefault(m.group(1), []).append(m.group(2))
     return out
@@ -2971,7 +3094,7 @@ def _fs_path_ledger(tools_run: Optional[list]) -> tuple:
             content = content.split("\n", 1)[1] if "\n" in content else ""
         if not content.startswith("SUCCESS"):
             continue
-        head = content.split("\n", 1)[0][:4000]
+        head = content.split("\n", 1)[0][:4000].strip()
         # ⚠ FOUR OVERLAPPING GUARDS keep an echoed confirmation inert: the
         # SUCCESS fast-path above, this confirmation-line split, `re.match`
         # anchoring at offset 0, and the `^` every pattern carries. The split
@@ -6603,10 +6726,19 @@ _MUTATING_TOOLS_FOR_DROP_NOTE = frozenset({
 })
 
 
-def _dropped_mutation_note(dropped_names, paths=()) -> str:
+def _dropped_mutation_note(dropped_names, paths=(), landed=(), creating=(),
+                           deleting=()) -> str:
     """Return the not-applied honesty note when ``dropped_names`` contains a
     mutating tool, else "". Appended to the final reply so a fix the turn
     closure swallowed is never presented as done.
+
+    ⚠ IT MUST NOT DISCLAIM WHAT DID LAND (§4KC, req 76b3602e). The turn's
+    ONE edit succeeded at +40 s; a redundant second `file_system` call was
+    dropped at the finish line; the note then told the user "nothing
+    described above as written … was actually written" over a file that
+    was, verifiably, changed. ``landed`` (from `_files_mutated_this_turn`,
+    i.e. the tool results' own SUCCESS lines, not prose) names what did
+    land, and the note then disclaims only the dropped action.
 
     ⚠ IT MUST CONTRADICT THE PAST TENSE, NOT ONLY THE FUTURE (§4GN). The
     note used to say "any change described above as about to happen has NOT
@@ -6621,10 +6753,53 @@ def _dropped_mutation_note(dropped_names, paths=()) -> str:
                    if str(n) in _MUTATING_TOOLS_FOR_DROP_NOTE})
     if not muts:
         return ""
-    named = [str(x) for x in (paths or []) if str(x).strip()][:3]
-    where = (" — including `" + "`, `".join(named) + "`, which "
-             + ("does" if len(named) == 1 else "do") + " NOT exist"
-             ) if named else ""
+    done_all = [str(x) for x in (landed or []) if str(x).strip()]
+    done_keys = {_fs_norm(x) for x in done_all}
+    # A dropped path that ALSO landed this turn is not "missing": the
+    # dropped call was a second action on a file an earlier call changed.
+    _del_keys = {_fs_norm(str(x)) for x in (deleting or [])}
+    named, _seen = [], set()
+    for x in (paths or []):
+        x = str(x)
+        k = _fs_norm(x)
+        # a dropped DELETE of a file that landed this turn is still a real
+        # pending action on a real file — name it (r5)
+        if not x.strip() or (k in done_keys and k not in _del_keys) or k in _seen:
+            continue
+        _seen.add(k)
+        named.append(x)
+    named = named[:3]
+    creating_keys = {_fs_norm(str(x)) for x in (creating or [])}
+    deleting_keys = {_fs_norm(str(x)) for x in (deleting or [])}
+    missing = [x for x in named if _fs_norm(x) in creating_keys
+               and _fs_norm(x) not in done_keys]
+    # a file that landed and had a dropped delete: it exists, the delete is
+    # the pending action — say "not deleted", never "does NOT exist" (r6)
+    undeleted = [x for x in named if _fs_norm(x) in deleting_keys
+                 and (_fs_norm(x) not in creating_keys or _fs_norm(x) in done_keys)]
+    changed = [x for x in named if _fs_norm(x) not in creating_keys
+               and _fs_norm(x) not in deleting_keys]
+    where = ""
+    if missing:
+        where += (" — `" + "`, `".join(missing) + "` "
+                  + ("does" if len(missing) == 1 else "do") + " NOT exist")
+    if undeleted:
+        where += ((";" if where else " —") + " `" + "`, `".join(undeleted)
+                  + "` " + ("was" if len(undeleted) == 1 else "were")
+                  + " not deleted")
+    if changed:
+        where += ((";" if where else " —") + " `" + "`, `".join(changed)
+                  + "` " + ("was" if len(changed) == 1 else "were")
+                  + " not changed")
+    done = done_all[:3]
+    if done:
+        return (
+            f"\n\n{_DROPPED_NOTE_HEAD} "
+            f"{', '.join(muts)} action(s) could run. The change(s) confirmed "
+            f"above by a tool result — `" + "`, `".join(done) + "` — DID "
+            f"land on disk; only that final pending action was not "
+            f"applied{where}. Ask me to continue to apply it."
+        )
     return (
         f"\n\n{_DROPPED_NOTE_HEAD} "
         f"{', '.join(muts)} action(s) could run — nothing described above as "
@@ -6660,13 +6835,107 @@ def _with_abort_note(final_ai_content: str, note: str) -> str:
     return final_ai_content.rstrip() + "\n\n" + note
 
 
-def _dropped_write_paths(tool_calls) -> list:
-    """Paths the DROPPED `file_system` calls were about to write.
+#: `file_system` operations that CHANGE the workspace — the only ones a
+#: dropped-call note may disclaim. A dropped verify-`read` used to produce
+#: the full "nothing was written" disclaimer (fresh-eye §4KC round 2).
+_DROP_NOTE_MUTATING_FS_OPS = frozenset({
+    "write", "edit", "replace", "delete", "download", "copy", "rename",
+    "move",
+})
+#: The subset that CREATES a file — for these "does NOT exist" is the right
+#: disclaimer; a dropped `edit`/`replace`/`delete` targets a file that
+#: exists and was merely not changed. For copy/rename/move the CREATED path
+#: is the DESTINATION (`path` is the source, which exists — §4KC r3).
+_DROP_NOTE_CREATING_FS_OPS = frozenset({"write", "download", "copy",
+                                        "rename", "move"})
+_DROP_NOTE_DEST_OPS = frozenset({"copy", "rename", "move"})
 
-    Read from the call's own arguments, so the note names the exact file
-    rather than pattern-matching the prose that claims it. Never raises: a
-    malformed argument blob costs the note its detail, not the note.
-    """
+
+#: §4KD: tools whose one call costs MINUTES of a shared resource (the image
+#: node's only GPU). A one-token or unintelligible follow-up after a turn
+#: that ran one must be clarified, never re-run: on 2026-09-23 a Slack
+#: member's `emp1` after an image turn produced a second image, because the
+#: tool result ended with a ready next action and the generic "if you lack
+#: information, ASK" prompt line lost.
+COSTLY_TOOLS = frozenset({"image_generation"})
+_COSTLY_TURN_TTL_S = 3600.0
+_COSTLY_TURNS_MAX = 256
+#: the image tool's own link shape, root OR project-scoped
+#: (`/api/download/projects/<id>/gen_….png`) — the first version missed the
+#: project form, i.e. every project conversation (§4KD review)
+_COSTLY_RESULT_RE = re.compile(r"/api/download/(?:projects/[^/\s)]+/)?gen_[0-9a-f]{8}\.png")
+_ALPHA_RUN_RE = re.compile(r"[^\W\d_]{3,}", re.UNICODE)
+
+
+def _is_low_information_message(text) -> bool:
+    """One token, or nothing that reads as a word in any script: `emp1`,
+    `?`, `...`, `ok`, `k`. Not a judgement on the user — a statement that
+    the message cannot carry an instruction worth minutes of GPU."""
+    t = str(text or "").strip()
+    if not t:
+        return True
+    tokens = [x for x in re.split(r"\s+", t) if x]
+    if len(tokens) <= 1:
+        return True
+    return not _ALPHA_RUN_RE.search(t)
+
+
+def _last_assistant_text(messages) -> str:
+    """The assistant message before the CURRENT user turn (the last user
+    entry), as text; "" when there is none."""
+    hist = [m for m in (messages or []) if isinstance(m, dict)]
+    # drop the current user message and anything the loop appended after it
+    idx = max((i for i, m in enumerate(hist) if m.get("role") == "user"), default=-1)
+    prior = hist[:idx] if idx >= 0 else hist
+    for m in reversed(prior):
+        if m.get("role") == "assistant":
+            c = m.get("content")
+            if isinstance(c, list):
+                c = " ".join(i.get("text", "") for i in c if isinstance(i, dict))
+            return str(c or "")
+    return ""
+
+
+def _previous_turn_asked_a_question(messages) -> bool:
+    tail = _last_assistant_text(messages).rstrip()
+    return tail.endswith("?") or tail.rsplit("\n", 1)[-1].strip().endswith("?")
+
+
+def _previous_turn_was_costly(messages, costly_record: bool) -> bool:
+    """Read from the conversation ITSELF (the image tool's own link in the
+    last assistant message) OR the in-process per-conversation record —
+    the client may resend text only, and the record dies with a restart."""
+    if costly_record:
+        return True
+    return bool(_COSTLY_RESULT_RE.search(_last_assistant_text(messages)))
+
+
+def _clarify_first_block(fname, user_text, messages, costly_record: bool):
+    """The SYSTEM BLOCK for a costly tool call that a one-token follow-up
+    cannot justify, else None."""
+    if str(fname or "") not in COSTLY_TOOLS:
+        return None
+    if not _is_low_information_message(user_text):
+        return None
+    if _previous_turn_asked_a_question(messages):
+        return None                      # "ok" / "yes" answers OUR question
+    if not _previous_turn_was_costly(messages, costly_record):
+        return None
+    return (
+        f"SYSTEM BLOCK — clarify first: the user's message ({str(user_text or '')[:40]!r}) "
+        f"is a single token or not intelligible, and the previous turn already ran "
+        f"'{fname}', which occupies the image node for minutes. Do NOT run "
+        f"'{fname}' on a guess. Reply to the user in ONE short sentence asking "
+        f"what they would like (a change to the last image, another one, or "
+        f"something else). Nothing was generated."
+    )
+
+
+def _dropped_fs_calls(tool_calls) -> list:
+    """[(op, path)] for every dropped `file_system` call whose op MUTATES;
+    `path` is the file the call would have CREATED or CHANGED (the
+    destination for copy/rename/move). Never raises: a malformed argument
+    blob costs the note its detail."""
     out = []
     for tc in (tool_calls or []):
         try:
@@ -6678,9 +6947,127 @@ def _dropped_write_paths(tool_calls) -> list:
                 args = json.loads(args or "{}")
             if not isinstance(args, dict):
                 continue
-            path = args.get("path") or args.get("file_path")
-            if isinstance(path, str) and path.strip():
-                out.append(path.strip())
+            op = str(args.get("operation") or "").strip().lower()
+            if op not in _DROP_NOTE_MUTATING_FS_OPS:
+                continue
+            if op in _DROP_NOTE_DEST_OPS:
+                path = (args.get("destination") or args.get("new_name")
+                        or args.get("target") or args.get("new_path"))
+            else:
+                # the dispatcher's own alias chain (path/filename/file)
+                path = (args.get("path") or args.get("filename")
+                        or args.get("file") or args.get("file_path"))
+            out.append((op, path.strip() if isinstance(path, str) else ""))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def _dropped_entries(tool_calls, tools_seen: int) -> list:
+    """What site 2 needs to reconcile a drop LATER: `(name, op, path,
+    tools_seen)` per dropped mutating call, where `tools_seen` is how many
+    tool results the turn had at the moment of the drop."""
+    out = []
+    for tc in (tool_calls or []):
+        try:
+            fn = (tc or {}).get("function") or {}
+            name = str(fn.get("name") or "?")
+            if name != "file_system":
+                out.append((name, "", "", tools_seen))
+                continue
+            for op, p in _dropped_fs_calls([tc]):
+                out.append((name, op, p, tools_seen))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def _confirmed_paths_any_op(content: str, kind: str = "any") -> set:
+    """Keys of every path a `file_system` SUCCESS line names as PRODUCED /
+    COPIED-MOVED TO (``kind="produced"``) or DELETED / MOVED AWAY
+    (``kind="deleted"``) — the reconcile signal for a dropped call. r5:
+    kind-aware, because a dropped WRITE was being retired by a later
+    `Deleted` of the same name (the file is GONE — the note must stand)."""
+    raw = str(content or "").lstrip()
+    if raw.startswith("[FAILURE BANNER]"):
+        raw = raw.split("\n", 1)[1] if "\n" in raw else ""
+    head = raw.split("\n", 1)[0][:4000].strip()
+    produced, deleted = set(), set()
+    produced |= {_fs_norm(p) for p in _written_paths_from_confirmation(raw)}
+    m = _FS_DEST_RE.match(head)
+    if m:
+        produced.add(_fs_norm(m.group(1)))
+    m = _FS_MOVED_RE.match(head)
+    if m:
+        produced.add(_fs_norm(m.group(2)))
+        deleted.add(_fs_norm(m.group(1)))
+    m = _FS_RETIRE_RE.match(head)
+    if m:
+        deleted.add(_fs_norm(m.group(1)))
+    if kind == "produced":
+        keys = produced
+    elif kind == "deleted":
+        keys = deleted
+    else:
+        keys = produced | deleted
+    return {k for k in keys if k}
+
+
+def _still_pending_drops(entries, tools_run) -> list:
+    """The dropped entries NOT followed by a later `file_system` SUCCESS.
+
+    A write dropped on a forced-final miss is routinely RE-DONE by the
+    verifier repair re-entry; the list was never cleared, so the shipped
+    reply still said "that final pending action was not applied" over a
+    file the re-entry had just written (§4KC r3). A non-file_system tool
+    (execute, manage_services…) has no such signal and stays pending."""
+    runs = list(tools_run or [])
+    out = []
+    for e in entries or []:
+        try:
+            name, _op, path, seen = e
+        except (TypeError, ValueError):
+            out.append(e)
+            continue
+        if name == "file_system":
+            # The SAME file, by the ledger's own key — a later SUCCESS on an
+            # unrelated file must not retire this one. Any op's confirmation
+            # counts (produced, copied/moved to, deleted); an entry with no
+            # path can only be retired by nothing.
+            key = _fs_norm(path) if path else ""
+            later = [t for t in runs[int(seen or 0):]
+                     if isinstance(t, dict) and str(t.get("name", "")) == "file_system"]
+            _kind = "deleted" if _op == "delete" else "produced"
+            if key and any(key in _confirmed_paths_any_op(t.get("content", ""), _kind)
+                           for t in later):
+                continue
+        out.append(e)
+    return out
+
+
+def _dropped_write_paths(tool_calls) -> list:
+    """Paths the DROPPED mutating `file_system` calls were about to touch.
+
+    Read from the call's own arguments, so the note names the exact file
+    rather than pattern-matching the prose that claims it.
+    """
+    return [p for _op, p in _dropped_fs_calls(tool_calls) if p]
+
+
+def _dropped_mutating_names(tool_calls) -> list:
+    """Tool names of the dropped calls that would have CHANGED something:
+    every non-file_system tool by name (the note's own allow-list decides),
+    and `file_system` only when its operation mutates."""
+    out = []
+    for tc in (tool_calls or []):
+        try:
+            fn = (tc or {}).get("function") or {}
+            name = str(fn.get("name") or "?")
+            if name != "file_system":
+                out.append(name)
+                continue
+            if _dropped_fs_calls([tc]):
+                out.append(name)
         except Exception:  # noqa: BLE001
             continue
     return out
@@ -7045,6 +7432,10 @@ class GhostAgent:
     def __init__(self, context: GhostContext):
         self.context = context
         self.disabled_tools = set()
+        #: §4KD: conversation fingerprint -> monotonic-ish wall time of the
+        #: last turn that ran a COSTLY tool (bounded; consulted by the
+        #: clarify-first guard when the client resends text only).
+        self._costly_turns: "dict[str, float]" = {}
         # Corrections queued by a previous turn's async verdict (GHOST_CRITIC_ASYNC),
         # surfaced at the top of the next turn. See _record_late_verdict /
         # _consume_pending_corrections.
@@ -15541,8 +15932,9 @@ class GhostAgent:
             if sm is None or not triggers:
                 return
             # §4FB: diagnostics never teach — no outcome credit (and no
-            # late-verdict stash, which is written below) for a probe turn.
-            if turn_origin(self.context) == "probe":
+            # late-verdict stash, which is written below) for a probe turn;
+            # §4KD: nor for a Slack turn.
+            if not turn_may_teach(self.context):
                 return
             rec = getattr(sm, "record_surfaced_outcomes", None)
             if not callable(rec):
@@ -16085,6 +16477,26 @@ class GhostAgent:
         except Exception:
             return False
         return False
+
+    def _note_costly_turn(self, conv_fp, tools_run) -> bool:
+        """§4KD: record that ``conv_fp`` just ran a COSTLY tool (a real call,
+        not a synthetic refusal row), for the next turn's clarify-first
+        guard. Bounded; never raises. Returns whether a record was written."""
+        try:
+            if not conv_fp:
+                return False
+            ran = any(str(t.get("name", "")) in COSTLY_TOOLS
+                      for t in (tools_run or []) if isinstance(t, dict)
+                      and not t.get("_synthetic"))
+            if not ran:
+                return False
+            if len(self._costly_turns) >= _COSTLY_TURNS_MAX:
+                for _k in list(self._costly_turns)[: _COSTLY_TURNS_MAX // 4]:
+                    self._costly_turns.pop(_k, None)
+            self._costly_turns[str(conv_fp)] = time.time()
+            return True
+        except Exception:  # noqa: BLE001
+            return False
 
     def _record_late_verdict(self, v_result, trajectory_id, conv_fp="",
                              last_tool=None, force_correction=False,
@@ -17792,6 +18204,46 @@ class GhostAgent:
                     last_was_failure = True
                     continue
 
+                # §4KD: a Slack turn never teaches — the model's explicit
+                # `learn_skill` is refused here, deterministically, next to
+                # the writers' own backstop.
+                if _cname == "learn_skill" and not turn_may_teach(self.context):
+                    pretty_log("Local Guard",
+                               "learn_skill refused — this turn must not teach (probe/slack)",
+                               icon=Icons.STOP, level="WARNING")
+                    err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname,
+                               "content": _TO.rejected(
+                                   "SYSTEM BLOCK: lessons are not recorded from this "
+                                   "channel. Continue without saving a lesson.",
+                                   reason_code="lesson_channel_blocked")}
+                    messages.append(err_msg)
+                    tools_run_this_turn.append({**err_msg, "_synthetic": True})
+                    continue
+
+                # §4KD: clarify-first. A one-token or unintelligible follow-up
+                # after a costly tool turn must ASK, not re-run the tool.
+                try:
+                    _cf_conv = self._conversation_fingerprint(messages)
+                except Exception:  # noqa: BLE001
+                    _cf_conv = ""
+                _cf_block = _clarify_first_block(
+                    _cname, last_user_content, messages,
+                    bool(_cf_conv and self._costly_turns.get(_cf_conv, 0.0) > time.time() - _COSTLY_TURN_TTL_S))
+                if _cf_block:
+                    pretty_log("Clarify First",
+                               f"{_cname} blocked — one-token/unintelligible follow-up "
+                               f"({str(last_user_content or '')[:24]!r}) after a costly turn",
+                               icon=Icons.STOP, level="WARNING")
+                    err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname,
+                               "content": _TO.rejected(_cf_block, reason_code="clarify_first")}
+                    messages.append(err_msg)
+                    tools_run_this_turn.append({**err_msg, "_synthetic": True})
+                    # No strike: the turn that ASKS instead of spending minutes
+                    # of GPU on a guess is the correct turn, and a strike booked
+                    # it `failed` for the outcome-gated learning loops (live
+                    # probe, 2026-09-24). The REJECTED row alone steers.
+                    continue
+
                 if fname == "system_parse_error":
                     consecutive_parse_errors += 1
                     pretty_log(
@@ -17899,7 +18351,7 @@ class GhostAgent:
                     # the new file. Keep the two op lists identical; the
                     # test asserts it.
                     is_sandbox_mutation = _cname in ["execute", "image_generation"] or \
-                                          (_cname == "file_system" and t_args.get("operation") in ["write", "replace", "download", "delete", "move", "rename", "unzip", "git_clone", "copy"])
+                                          (_cname == "file_system" and t_args.get("operation") in ["write", "edit", "replace", "download", "delete", "move", "rename", "unzip", "git_clone", "copy"])
 
                     if is_sandbox_mutation:
                         # Invalidate both the legacy global and the
@@ -17967,7 +18419,7 @@ class GhostAgent:
                 # ...and on the HEALED TOOL NAME (`_cname`, resolved once at
                 # the top of this block), for the same reason.
                 is_mutating = _cname in ["execute", "image_generation", "manage_tasks", "update_profile", "learn_skill", "vision_analysis"] or \
-                              (_cname == "file_system" and t_args.get("operation") in ["write", "replace", "download", "delete", "move", "rename", "unzip", "git_clone", "copy"]) or \
+                              (_cname == "file_system" and t_args.get("operation") in ["write", "edit", "replace", "download", "delete", "move", "rename", "unzip", "git_clone", "copy"]) or \
                               (_cname == "knowledge_base" and str(t_args.get("action") or "").strip().lower() in ["ingest_document", "forget", "reset_all", "insert_fact", "transcribe", "transcribe_document", "transcription", "ingest", "ingest_file", "update_profile"]) or \
                               (_cname == "manage_composed_skills" and str(t_args.get("action") or "").strip().lower() in ["define", "approve", "delete"])
 
@@ -18081,7 +18533,7 @@ class GhostAgent:
                     # dispatch — the 2026-07-05 chess session
                     # shipped random.choice(legal_moves) past both
                     # the system prompt and the post-write steer.
-                    if op in ("write", "replace"):
+                    if op in ("write", "edit", "replace"):
                         from ..utils.constraints import (
                             participant_write_violation,
                         )
@@ -18256,9 +18708,11 @@ class GhostAgent:
                                 + (f" on target '{_pf_target}'" if _pf_target else "")
                                 + f" already failed recently with: \"{_pf_err}\". "
                                 f"Re-running it UNCHANGED will fail the same way. "
-                                f"Legal ways forward: use a DIFFERENT operation of "
-                                f"the same tool (e.g. operation='write' with the "
-                                f"full file instead of 'replace'), a different "
+                                f"Legal ways forward: use a DIFFERENT operation or "
+                                f"argument of the same tool (e.g. operation='edit' "
+                                f"with a smaller, unique old_string copied from a "
+                                f"FRESH read — or operation='write' with the full "
+                                f"file only if the file is small), a different "
                                 f"tool, fix the underlying cause first, or ask "
                                 f"the user."
                             )
@@ -21323,8 +21777,8 @@ class GhostAgent:
                 # origin=probe by this path — the model's optimisation of
                 # "Run exactly this and report the exit code" is not a
                 # lesson about anything a user will ask.
-                if turn_origin(self.context) == "probe":
-                    logger.debug("Perfect-It skipped: probe-origin turn")
+                if not turn_may_teach(self.context):
+                    logger.debug("Perfect-It skipped: a turn that must not teach (probe/slack)")
                 else:
                     _pp_task = asyncio.create_task(_deferred_perfect_it())
                     _bg.add(_pp_task)
@@ -21649,12 +22103,7 @@ class GhostAgent:
                         # so confidence drops below threshold and the turn
                         # is recorded as unverified rather than success.
                         if _is_unverified_mutation(last_tool):
-                            verifier_backfill = (
-                                "failed",
-                                "unverified mutation — finalised on an "
-                                "untested file write/replace; the change "
-                                "was never run or screenshotted",
-                            )
+                            verifier_backfill = ("failed", UNVERIFIED_MUTATION_REASON)
                             note = (
                                 "\n\n---\n**⚠ Unverified:** the final action "
                                 "was a file write that was never executed or "
@@ -21751,7 +22200,16 @@ class GhostAgent:
                 # producer has the same gate; both must agree.
                 if getattr(self.context, 'journal', None) and self.context.args.smart_memory > 0.0 and not forget_was_called:
 
-                    await self._journal_append_safe('post_mortem', {'user': last_user_content, 'tools': list(tools_run_this_turn), 'ai': final_ai_content, 'model': model})
+                    # §4KD: remember that THIS conversation just paid for a
+                    # costly tool, for the next turn's clarify-first guard.
+                    self._note_costly_turn(_stable_conv_fp, tools_run_this_turn)
+                    if turn_may_teach(self.context):
+                        await self._journal_append_safe('post_mortem', {'user': last_user_content, 'tools': list(tools_run_this_turn), 'ai': final_ai_content, 'model': model})
+                    else:
+                        # §4KD: the queue consumer runs under the "SYSTEM"
+                        # request id, so a Slack post-mortem cannot know it
+                        # must not teach — it is simply never queued.
+                        logger.debug("post_mortem not queued: a turn that must not teach (probe/slack)")
                     await self._record_episode_safe(
                         last_user_content, list(tools_run_this_turn),
                         final_ai_content,
@@ -22262,8 +22720,8 @@ class GhostAgent:
                     # A write's result is a "SUCCESS: <verb>…" line; a read
                     # returns raw file content, an error an "Error:"/"SYSTEM"
                     # prefix — neither matches.
-                    _WRITE_VERBS = ("wrote", "applied", "replace", "renamed",
-                                    "moved", "deleted", "downloaded",
+                    _WRITE_VERBS = ("wrote", "applied", "replace", "edited",
+                                    "renamed", "moved", "deleted", "downloaded",
                                     "unzipped", "cloned", "created",
                                     "auto-promoted", "inserted", "appended",
                                     "copied")  # § R1 A-F6: copy IS a write
@@ -22358,6 +22816,7 @@ class GhostAgent:
                 # Consolidate the corpus outcome with the same signals
                 # calibration + selfhood use (was heuristics-only here).
                 verifier=(verifier_backfill[0] if verifier_backfill else None),
+                verifier_reason=(str(verifier_backfill[1]) if verifier_backfill else ""),
                 # `execution_failure_count` is a decayed-strike ledger, not
                 # a terminal state — a turn that recovered mid-way can end
                 # with a residual strike. Only call the execution FAILED
@@ -24046,7 +24505,8 @@ class GhostAgent:
                     "Dropping %d tool_call(s) — final-generation turn (names=%s)",
                     len(tool_calls), dropped,
                 )
-                _forced_final_dropped.extend(dropped)
+                _forced_final_dropped.extend(
+                    _dropped_entries(tool_calls, len(tools_run_this_turn or [])))
                 # HONESTY NOTE ON DROPPED MUTATIONS (2026-07-14). When
                 # the dropped call would have CHANGED something
                 # (file_system replace at the finish line — observed
@@ -24057,7 +24517,13 @@ class GhostAgent:
                 # Terminal-tool re-calls (self_play etc.) stay silent —
                 # dropping those is the point of this guard.
                 _drop_note = _dropped_mutation_note(
-                    dropped, _dropped_write_paths(tool_calls))
+                    _dropped_mutating_names(tool_calls),
+                    _dropped_write_paths(tool_calls),
+                    landed=_files_mutated_this_turn(tools_run_this_turn),
+                    creating=[p for op, p in _dropped_fs_calls(tool_calls)
+                              if p and op in _DROP_NOTE_CREATING_FS_OPS],
+                    deleting=[p for op, p in _dropped_fs_calls(tool_calls)
+                              if p and op == "delete"])
                 if _drop_note:
                     ui_content = (ui_content or "").rstrip() + _drop_note
                 tool_calls = []
@@ -24158,7 +24624,16 @@ class GhostAgent:
                     final_ai_content = ""
                 # A write dropped on an EARLIER forced-final miss is
                 # still pending: the note rides the reply that ships.
-                _ffd_note = _dropped_mutation_note(_forced_final_dropped)
+                _pending = _still_pending_drops(_forced_final_dropped,
+                                                tools_run_this_turn)
+                _ffd_note = _dropped_mutation_note(
+                    [e[0] for e in _pending],
+                    [e[2] for e in _pending if e[2]],
+                    landed=_files_mutated_this_turn(tools_run_this_turn),
+                    creating=[e[2] for e in _pending
+                              if e[2] and e[1] in _DROP_NOTE_CREATING_FS_OPS],
+                    deleting=[e[2] for e in _pending if e[2] and e[1] == "delete"]
+                ) if _pending else ""
                 if _ffd_note and _DROPPED_NOTE_HEAD not in (ui_content or ""):
                     ui_content = (ui_content or "").rstrip() + _ffd_note
                     clean_ui = ui_content.strip("` \n\r")
@@ -31345,9 +31820,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         p_msg = perfection_data["choices"][0]["message"].get("content", "")
         p_msg = re.sub(r'<tool_call>.*?</tool_call>', '', p_msg, flags=re.DOTALL | re.IGNORECASE).strip()
 
-        if turn_origin(self.context) == "probe":
+        if not turn_may_teach(self.context):
             # The inline (--perfect-it) path reaches here without the
-            # scheduling gate above; same rule, same reason (§4FS).
+            # scheduling gate above; same rule, same reason (§4FS; §4KD
+            # adds Slack).
             return p_msg
         if p_msg and getattr(self.context, 'skill_memory', None):
             await asyncio.to_thread(
@@ -31605,6 +32081,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         trajectory_id: str = "",
         user_request: str = "",
         verifier: Optional[str] = None,
+        verifier_reason: str = "",
         execution_failed: bool = False,
         pressure_lockdown: Optional[bool] = None,
     ) -> Optional["Trajectory"]:
@@ -31950,7 +32427,6 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         try:
             from ..distill.outcome_heuristics import (
                 resolve_turn_outcome, STRUCTURAL_FAILURE_REASON,
-                structural_cause_for_trajectory, structural_reason,
                 unacknowledged_total_failure_for_trajectory,
             )
             # Shape rule (2026-08-04): every tool call failed and the reply
@@ -31980,11 +32456,11 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # labels train the complexity router. `structural_reason`
                     # keeps the load-bearing string as a PREFIX so the late
                     # verifier-PASS upgrade still matches.
-                    traj.failure_reason = (
-                        "verifier refuted" if verifier == "failed"
-                        else structural_reason(
-                            structural_cause_for_trajectory(traj))
-                    )
+                    # §4KC r5: the unverified-mutation gate is a PRIOR and
+                    # keeps its structural-class reason; only a real
+                    # refutation is stamped "verifier refuted".
+                    traj.failure_reason = _backfilled_failure_reason(
+                        verifier, verifier_reason, traj)
                 traj.outcome = _resolved
         except Exception as e:
             logger.debug("outcome consolidation skipped: %s: %s", type(e).__name__, e)

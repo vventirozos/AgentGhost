@@ -1,7 +1,8 @@
 import asyncio
 import errno as _errno
-import hashlib
+import io
 import os
+import stat as stat_mod
 import re
 import urllib.parse
 import json
@@ -16,6 +17,7 @@ try:
 except ImportError:
     curl_requests = None
 from ..utils.logging import Icons, pretty_log, request_id_context
+from ..utils.edit_ledger import record_edit
 from ..utils.helpers import request_new_tor_identity
 
 def _read_head(path: Path, max_bytes: int = 8192) -> bytes:
@@ -1924,6 +1926,14 @@ async def tool_read_file(filename: str, sandbox_dir: Path, max_context: int = 81
                 f"Use that /workspace/... path to reference it in other "
                 f"file/shell operations.\n")
 
+        # ⚠ TYPE CHECK BEFORE ANY BRANCH. `read` is the repair every gate
+        # refusal names, so a wedge here is reachable from the guard's own
+        # prescribed recovery. The ranged read, the >96 KB sampler and the
+        # whole-file read all open the path below.
+        _nr = _nonregular_refusal(path, filename)
+        if _nr:
+            return _nr
+
         # LINE-RANGE READ (#11): a bounded slice, EXEMPT from the whole-file
         # size cap — this is the cheap recovery path after a failed replace or
         # a too-large-file error. The range is streamed (we stop reading at
@@ -1933,6 +1943,12 @@ async def tool_read_file(filename: str, sandbox_dir: Path, max_context: int = 81
         if start_line is not None or end_line is not None:
             _rng = await asyncio.to_thread(
                 _read_line_range, path, filename, start_line, end_line)
+            # §4KB: a ranged read grounds an edit. Success is detected by
+            # this module's OWN error protocol — every failure return in
+            # file_system.py begins with "Error:", the same convention
+            # `tools.tool_failure.result_is_failure` reads project-wide, and
+            # `test_edit_read_receipts.py` enumerates _read_line_range's
+            # failure modes against it. Not an invented proxy.
             if _fb_note and not _rng.startswith("Error"):
                 _rng = _fb_note + _rng
             return _rng
@@ -2073,6 +2089,27 @@ async def tool_read_file(filename: str, sandbox_dir: Path, max_context: int = 81
 # keyed by the resolved path, single-slot per path, and expires; the model
 # redeems it by name, so nothing is written the model did not ask to write.
 _HELD_CONTENT_TOKEN = "<<HELD>>"
+def _nonregular_refusal(path: Path, filename: str) -> Optional[str]:
+    """Refusal when ``path`` exists and is not a regular file, else None.
+
+    ONE helper, because this wedge was closed three times and reopened three
+    times: `open()` on a FIFO blocks forever waiting for a writer, so every
+    site that opens a model-named path needs the check BEFORE the open, and
+    every site that forgot it reopened the hole — the binary sniff, `read`'s
+    own sniff, the auto-promote's `write_text`, and the symbol indexer.
+    `TimeoutError` is an `OSError`, so nothing can rescue it afterwards.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None                     # missing: the caller's own problem
+    if stat_mod.S_ISREG(st.st_mode):
+        return None
+    return (f"Error: '{filename}' is not a regular file (it is a FIFO, "
+            f"device, socket or directory), so it cannot be read or written "
+            f"as text. '{filename}' is unchanged.")
+
+
 _HELD_CONTENT_TTL_S = 600.0
 _HELD_CONTENT_MAX = 8
 _HELD_REPLACE_CONTENT: Dict[str, Tuple[float, str]] = {}
@@ -2137,10 +2174,816 @@ def _redeem_held_content(sandbox_dir: Path, filename: str) -> Optional[str]:
 
 
 async def tool_replace_text(filename: str, old_text: str, new_text: str,
-                            sandbox_dir: Path, *, post_edit: bool = False):
-    """Targeted edit. ``post_edit`` is the `fs_batch` treatment flag — see
+                            sandbox_dir: Path, *, post_edit: bool = False,
+                            project_store=None):
+    """Targeted edit — thin wrapper whose only job is to record ONE ladder row.
+
+    §4KB. The edit itself lives in `_replace_text_impl`, which has ~20 return
+    paths; recording at each of them would be the instance-fix this project's
+    R1 forbids, and the next path added would silently go unrecorded. So the
+    impl writes what it did into a mutable ``telem`` dict and this wrapper —
+    the single place every path must pass through — writes the row.
+
+    The ledger never changes the outcome: a failed write is swallowed, and the
+    result object is returned untouched whether or not the row landed.
+    """
+    telem: Dict[str, Any] = {"strategies": [], "blocks_total": 0,
+                             "blocks_applied": 0, "file_len": 0}
+    try:
+        result = await _replace_text_impl(
+            filename, old_text, new_text, sandbox_dir,
+            post_edit=post_edit, telem=telem, project_store=project_store)
+    except BaseException as exc:                            # noqa: BLE001
+        # An exception is an outcome too, and the one most worth counting.
+        # Recorded, then re-raised unchanged — this wrapper must not swallow
+        # a failure the caller is written to see.
+        record_edit(path=str(filename), op="replace", applied=False,
+                    reason=f"exception:{type(exc).__name__}",
+                    search_len=len(str(old_text or "")),
+                    file_len=int(telem.get("file_len") or 0),
+                    req_id=str(request_id_context.get() or ""))
+        raise
+    # A matched rung is NOT an applied edit: `_write_replace_guarded` rolls
+    # back on a marker leak or a syntax regression and returns REJECTED. The
+    # ladder row must say "matched fuzzy, did NOT land", or the rollback
+    # guards would read as tolerance successes.
+    # A matched rung is NOT an applied edit. Two ways it is not:
+    #   * the guard rolled the write back and returned REJECTED;
+    #   * the write RAISED and unwound to the generic `except` that returns a
+    #     plain "Error: ..." string — measured live on a 0444 file, which
+    #     recorded `applied: True, strategies: ['exact']` over a file that was
+    #     byte-identical on disk.
+    # "Error:" is this module's own failure protocol (the same one
+    # `tools.tool_failure.result_is_failure` reads project-wide), not an
+    # invented text proxy.
+    applied = _edit_applied(result, telem)
+    # A TOLERANT apply is the event this whole ledger exists to price, so it
+    # is also the one the operator should be able to SEE happening rather
+    # than reconstruct from a JSONL afterwards. Exact applies stay quiet —
+    # they are the common case and logging them would be noise.
+    _applied_rungs = [str(x) for x in (telem.get("strategies") or [])]
+    _tolerant = [x for x in _applied_rungs if not x.startswith("exact")]
+    if applied and _tolerant:
+        pretty_log(
+            "Tolerant Match",
+            f"{filename}: applied on {', '.join(_tolerant)} — did NOT "
+            f"byte-match; verify the edited region is the intended one",
+            icon=Icons.WARN, level="WARNING")
+    record_edit(
+        path=str(filename), op=str(telem.get("op") or "replace"),
+        applied=applied,
+        strategies=list(telem.get("strategies") or []),
+        # The ledger's contract is that `reason` explains a NON-applied row.
+        # A mixed batch (one block landed, one ambiguous) wrote applied=True
+        # WITH reason="ambiguous_block", corrupting any reason-keyed analysis
+        # of applied edits.
+        # L1: the OUTCOME's reason_code wins. `telem["reason"]` is set
+        # per-block inside the loop, so a batch whose guard then ROLLED BACK
+        # logged "ambiguous_block" while the real verdict was
+        # `syntax_regression_rolled_back`, mis-attributing rollbacks to
+        # ambiguity in the report's histogram.
+        reason=("" if applied else
+                str(_outcome_reason(result) or telem.get("reason") or "")),
+        search_len=len(str(old_text or "")),
+        file_len=int(telem.get("file_len") or 0),
+        blocks_total=int(telem.get("blocks_total") or 0),
+        blocks_applied=int(telem.get("blocks_applied") or 0),
+        req_id=str(request_id_context.get() or ""),
+    )
+    return result
+
+
+def _outcome_reason(result: Any) -> str:
+    """The `reason_code` a ToolOutcome carries, else "" — never the message.
+
+    Deliberately NOT parsed out of the result TEXT. This project has a
+    standing lesson about lexical proxies for semantic properties; a ledger
+    that greps its own success strings would break the moment a message is
+    reworded, and would do it silently.
+    """
+    try:
+        rc = getattr(result, "reason_code", "")
+        return str(rc or "")
+    except Exception:                                       # noqa: BLE001
+        return ""
+
+
+def _edit_applied(result: Any, telem: Dict[str, Any]) -> bool:
+    """The ONE rule that decides whether a ledger row says `applied`.
+
+    Shared by `tool_replace_text` and `tool_edit_text` so the two operations
+    are measured by the same yardstick — a second copy of this rule would be
+    the first place the `edit` vs `replace` comparison drifts.
+
+    A matched rung is NOT an applied edit. Two ways it is not:
+      * the guard rolled the write back and returned REJECTED;
+      * the write RAISED and unwound to a handler that returns a plain
+        "Error: ..." string — measured live on a 0444 file, which recorded
+        `applied: True, strategies: ['exact']` over a byte-identical file.
+    "Error:" is this module's own failure protocol (the same one
+    `tools.tool_failure.result_is_failure` reads project-wide), not an
+    invented text proxy.
+    """
+    _failed = str(result).lstrip().startswith("Error:")
+    return (bool(telem.get("strategies")) or bool(telem.get("blocks_applied"))) \
+        and not bool(getattr(result, "is_rejection", False)) \
+        and not _failed
+
+
+# ══════════════════════════════════════════════════════════════════════
+# operation='edit' — §4KC (2026-09-23)
+#
+# What 102 real `replace` calls in the §4KB ledger showed: 46% rejected,
+# and the rejections were INTERFACE failures, not matching failures —
+# `missing_replace_with` 13/47, whole files pushed through the envelope
+# (27% of applies were `write_promote`), not-found 11/47. The envelope's
+# original justification (survive native tool-call argument corruption)
+# died on 2026-07-31 when the transport was fixed; the ladder's tolerance
+# rungs applied 4/61 times and are the ONLY edits no result-guard can
+# see land in the wrong place.
+#
+# So `edit` is the claude-code shape and nothing else: `old_string` +
+# `new_string`, both REQUIRED, exact and unique or REJECTED with the
+# evidence a model needs to fix the call (where the nearest text is, what
+# differs). No aliases, no envelope, no ladder, no auto-promote. `replace`
+# stays for one measurement cycle; the ledger records `op` per row, so
+# the two are comparable on the same yardstick (`_edit_applied`).
+# ══════════════════════════════════════════════════════════════════════
+
+#: A file this long, with `old_string` covering this share of it BY BOTH
+#: measures (chars AND lines), is a rewrite wearing an edit's clothes:
+#: refused, naming `write`. Short files are exempt — replacing all three
+#: lines of a three-line file is an edit. Both axes, because a minified
+#: bundle or a data URI puts most of a 30-line file's CHARS on one line and
+#: a one-line edit of it is not a rewrite (fresh-eye review, §4KC round 2).
+EDIT_WHOLE_FILE_MIN_LINES = 30
+EDIT_WHOLE_FILE_SHARE = 0.8
+
+#: How many occurrence lines an ambiguity rejection names.
+_EDIT_AMBIGUITY_LINE_CAP = 8
+
+#: The unambiguous envelope signature. NOT a bare `====` or `>>>>` line:
+#: `====` is a Markdown setext underline and an edit must be free to write
+#: one — that over-match was caught by this operation's own battery.
+_ENVELOPE_MARKER_RE = re.compile(r"^<{4,}[ \t]*SEARCH[ \t]*$", re.MULTILINE)
+
+#: The miss diagnosis scans the file several times; on a 50 MB file that is
+#: seconds of blocked loop. It runs in a thread AND only over this much of
+#: the head — a diagnosis is a hint, and the nearest-snippet fallback still
+#: covers the rest.
+_EDIT_DIAG_MAX_CHARS = 4 * 1024 * 1024
+
+_EDIT_MAX_BYTES = 50 * 1024 * 1024
+
+
+class _FileChangedUnderneath(Exception):
+    """The target's identity or contents moved between the read and the
+    write — raised BEFORE anything is truncated."""
+
+
+def _first_line_at(file_content: str, text: str) -> int:
+    """1-based line where the first non-blank line of ``text`` first occurs
+    in the file, else 0. The cheapest anchor a miss diagnosis can offer."""
+    first = next((ln for ln in text.splitlines() if ln.strip()), "")
+    if not first:
+        return 0
+    at = _occurrence_lines(file_content, first, cap=1)
+    return at[0] if at else 0
+
+
+def _snippet_at(file_content: str, line_no: int, context_lines: int = 3) -> str:
+    """``context_lines`` around a 1-based line, rendered like
+    `_nearest_snippet` (the `>>>` marks the anchor)."""
+    lines = file_content.splitlines()
+    if not lines:
+        return "(file is empty)"
+    i = max(0, min(len(lines) - 1, line_no - 1))
+    start, end = max(0, i - context_lines), min(len(lines), i + context_lines + 1)
+    return "\n".join(f"{'>>>' if k == i else '   '} {k + 1:4d}: {lines[k]}"
+                     for k in range(start, end))
+
+
+def _ws_line(s: str) -> str:
+    return re.sub(r"[ \t]+", " ", s.strip())
+
+
+def _edit_miss_diagnosis(file_content: str, old: str) -> Tuple[str, int]:
+    """WHY an exact match missed, when a cheap check can tell.
+
+    Returns ``(why, line)``: a sentence naming the concrete difference, and
+    the 1-based line the evidence sits at (0 = unknown). Diagnostic only —
+    none of these variants is ever APPLIED; that would be the tolerance
+    ladder under another name. The point is that the model's retry is a
+    copy, not a guess.
+
+    Each verdict is checked against the file before it is uttered (fresh-eye
+    review, §4KC round 2: the first version said "different indentation"
+    for a diverging tail, for a missing EOF newline and for a BOM). The
+    whitespace verdict compares normalised LINE LISTS as a contiguous
+    slice, so a line that merely CONTAINS old_string's line is not a hit.
+    """
+    if not old.strip():
+        return "old_string is blank.", 0
+    head = file_content[:_EDIT_DIAG_MAX_CHARS]
+    line = _first_line_at(head, old)
+    if "\r" in old and "\r" not in head:
+        if old.replace("\r\n", "\n").replace("\r", "\n") in head:
+            return ("old_string carries CR characters the file does not "
+                    "have; the text is otherwise present.", line)
+    # A trailing newline the file's LAST line does not have. A read cannot
+    # show this either; say it rather than blame indentation.
+    if old.endswith("\n") and not head.endswith("\n") and head.endswith(old[:-1]):
+        return ("old_string ends with a newline but the file's last line has "
+                "no trailing newline; drop the final newline from old_string.",
+                head.count("\n") + 1)
+    # Mixed endings: some lines CRLF, some LF — the all-CRLF inverse does
+    # not apply, and blaming indentation would be false.
+    if "\r" in head and "\r" not in old and old in head.replace("\r\n", "\n"):
+        return ("The file mixes CRLF and LF line endings and the lines you "
+                "named carry a CR the read could not show; edit those lines "
+                "one at a time, or use `execute` to normalise the endings "
+                "first.", line)
+    old_lines = [_ws_line(x) for x in old.splitlines()]
+    _popped = 0
+    while old_lines and not old_lines[-1]:
+        old_lines.pop()                       # a trailing blank line is not a line to match
+        _popped += 1
+    file_lines = [_ws_line(x) for x in head.splitlines()]
+    raw_file_lines = head.splitlines()
+    raw_old_lines = old.splitlines()[:len(old_lines)]
+    n = len(old_lines)
+    # The slice compare runs BEFORE the ends-at sentence: a block present
+    # earlier in the file must not be reported as running past EOF (r5).
+    if old_lines and n <= len(file_lines):
+        for i in range(len(file_lines) - n + 1):
+            if file_lines[i:i + n] == old_lines:
+                if _popped and raw_file_lines[i:i + n] == raw_old_lines:
+                    _tail_old = old.splitlines()[n:n + _popped]
+                    _tail_file = raw_file_lines[i + n:i + n + _popped]
+                    _blank_after = sum(1 for x in _tail_file if not x.strip())
+                    if _blank_after < _popped:
+                        return (f"old_string ends with {_popped} blank line(s) "
+                                f"but the file has only {_blank_after} after "
+                                f"line {i + n}; drop the extra one(s).", i + 1)
+                    if _tail_old != _tail_file[:len(_tail_old)]:
+                        return (f"old_string's trailing blank line(s) carry "
+                                f"whitespace the file's blank lines after line "
+                                f"{i + n} do not; make them empty.", i + 1)
+                    return (f"old_string ends with {_popped} blank line(s) the "
+                            f"file does not have after line {i + n}; drop "
+                            f"them.", i + 1)
+                return ("The text IS in the file but with different "
+                        "indentation or spacing (tabs vs spaces, trailing "
+                        "spaces, or a wrapped line). Copy it byte-for-byte "
+                        "from a read; do not retype it.", i + 1)
+    if old_lines and line and line + n - 1 > len(file_lines):
+        return (f"old_string has {n} lines but the file ends at line "
+                f"{len(file_lines)} — it is longer than what remains.", line)
+    m = re.search(re.escape(old), head, re.IGNORECASE)
+    if m:
+        return ("The text matches only if letter case is ignored.",
+                head.count("\n", 0, m.start()) + 1)
+    if line:
+        _first = next(ln for ln in old.splitlines() if ln.strip())
+        at = list(dict.fromkeys(_occurrence_lines(head, _first, cap=3)))
+        _where = ", ".join(str(k) for k in at)
+        # (the contiguous-slice compare above already failed, so for a
+        # one-line old_string no line EQUALS the text — it can only be part
+        # of a longer one)
+        if n == 1:
+            return (f"old_string's text occurs at line(s) {_where} only as "
+                    f"PART of a longer line — the line continues beyond what "
+                    f"you named (a trailing comment or argument, perhaps). "
+                    f"Include the whole line.", line)
+        return (f"The first line of old_string occurs at line(s) {_where} "
+                f"but the block diverges after it — a later line was "
+                f"misremembered.", line)
+    if head.startswith("﻿") and old.lstrip("﻿") != old:
+        return ("old_string starts with a BOM character; the file's BOM "
+                "sits before line 1, include it only if you mean it.", 1)
+    if head.startswith("﻿"):
+        return ("(The file starts with a UTF-8 BOM; if your old_string "
+                "begins at the very top of the file, the BOM precedes it.)", 1)
+    return "", 0
+
+
+def _edit_envelope_refusal(filename: str, which: str, text: str):
+    """An envelope in an `edit` argument is always a habit from `replace`."""
+    if not _ENVELOPE_MARKER_RE.search(text):
+        return None
+    return ToolOutcome.rejected(
+        f"REJECTED: '{which}' for '{filename}' contains SEARCH/REPLACE "
+        f"envelope marker lines. operation='edit' takes PLAIN TEXT: "
+        f"old_string is the exact current text, new_string is its "
+        f"replacement — no markers. '{filename}' is unchanged.",
+        reason_code="envelope_on_edit")
+
+
+def _edit_roots(sandbox_dir: Path) -> list:
+    sd = Path(sandbox_dir)
+    roots = [sd.resolve()]
+    if sd.parent.name == "projects":
+        roots.append(sd.parent.parent.resolve())
+    return roots
+
+
+class _InodeDenied(Exception):
+    """The opened inode is one the write guards refuse; carries the outcome."""
+    def __init__(self, outcome):
+        super().__init__(str(outcome))
+        self.outcome = outcome
+
+
+def _canonical_fd_path(fd: int) -> Optional[str]:
+    """The kernel's own spelling of the path behind an open fd — on-disk
+    case and Unicode form, not the caller's. macOS: F_GETPATH; Linux:
+    /proc/self/fd. None when neither answers."""
+    try:
+        import fcntl as _fcntl
+        if hasattr(_fcntl, "F_GETPATH"):
+            raw = _fcntl.fcntl(fd, _fcntl.F_GETPATH, b"\0" * 1024)
+            return raw.split(b"\0", 1)[0].decode("utf-8", "surrogateescape")
+    except (OSError, ImportError, ValueError):
+        pass
+    try:
+        return os.readlink(f"/proc/self/fd/{fd}")
+    except OSError:
+        return None
+
+
+def _inode_write_refusal(fd: int, filename: str, sandbox_dir, project_store):
+    """The write guards the dispatcher ran on the REQUESTED spelling, run
+    again on the OPENED inode — the only thing an in-place write actually
+    mutates (§4KC round 3).
+
+    Three confirmed bypasses shared one root: a hardlink named `cfg.ini`
+    into `.git/config`; a hardlink at the sandbox root into a RELEASED
+    project's file; and `project\u017f/<id>/` — LATIN SMALL LETTER LONG S,
+    which APFS folds to `projects` and `str.lower()` does not. A name-based
+    guard cannot see any of them. So: a shared inode (`st_nlink > 1`) is
+    refused outright for in-place writers (`write` is tmp+rename and breaks
+    the link, so it needs no such rule), and the `.git` / released decisions
+    are re-derived from the kernel's canonical path of the fd.
+    Returns a ToolOutcome to hand back, or None.
+    """
+    st = os.fstat(fd)
+    if getattr(st, "st_nlink", 1) > 1:
+        return ToolOutcome.rejected(
+            f"REJECTED: '{filename}' has {st.st_nlink} hard links — an "
+            f"in-place edit would change every name that shares the inode, "
+            f"including ones outside what this call was checked against. "
+            f"Nothing was changed. Use operation='write' (which replaces "
+            f"the directory entry) if you mean to rewrite THIS name only.",
+            reason_code="hard_linked")
+    canon = _canonical_fd_path(fd)
+    if not canon:
+        return None
+    parts = Path(canon).parts
+    # Components under the sandbox roots only: a `.git` ABOVE the root is
+    # the host's business, not a write into repository internals (r4).
+    try:
+        for r in _edit_roots(Path(str(sandbox_dir))):
+            if Path(canon) == r or r in Path(canon).parents:
+                parts = Path(canon).relative_to(r).parts
+                break
+    except Exception:                                       # noqa: BLE001
+        pass
+    if any(str(p).lower() == ".git" for p in parts):
+        return ToolOutcome.rejected(
+            f"SYSTEM BLOCK: '{filename}' is a name for a file inside a "
+            f"`.git` directory ({canon}) and cannot be modified. Repository "
+            f"internals are never edited by hand. Nothing was changed.",
+            reason_code="dotgit_write_blocked")
+    try:
+        rb = _released_write_block(project_store, sandbox_dir, canon)
+    except Exception:                                       # noqa: BLE001
+        rb = None
+    return rb
+
+
+def _read_regular_nofollow(real: Path, *, filename: str = "",
+                           sandbox_dir=None, project_store=None):
+    """Open ``real`` WITHOUT following a final-component symlink, prove it is
+    a regular file on the OPEN fd, run the inode-aware write guards, read it
+    whole. Returns ``(bytes, stat)`` or raises OSError / `_InodeDenied`.
+    The stat is the identity the write later checks.
+
+    O_NONBLOCK so a FIFO swapped in does not wedge the open (the check is
+    on the fd, after). A size cap is enforced from the fd's own stat so a
+    file grown after the path stat cannot be read past it.
+    """
+    flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_NONBLOCK", 0))
+    fd = os.open(str(real), flags)
+    try:
+        st = os.fstat(fd)
+        if not stat_mod.S_ISREG(st.st_mode):
+            raise _NotRegular()
+        if st.st_size > _EDIT_MAX_BYTES:
+            raise _TooLarge(st.st_size)
+        _deny = _inode_write_refusal(fd, filename, sandbox_dir, project_store)
+        if _deny is not None:
+            raise _InodeDenied(_deny)
+        chunks, remaining = [], st.st_size
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 1 << 20))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks), st
+    finally:
+        os.close(fd)
+
+
+class _NotRegular(Exception):
+    pass
+
+
+class _TooLarge(Exception):
+    pass
+
+
+def _read_text_guarded(real: Path, expect: os.stat_result, *,
+                       encoding: str = "utf-8", errors: str = "surrogateescape") -> str:
+    """`Path.read_text` semantics (universal newlines) through an O_NOFOLLOW
+    fd that must be the inode the guard cleared (§4KC r5: `replace`'s
+    by-path re-reads after the guard followed a planted symlink on the read
+    side and a planted FIFO wedged the loop). Raises OSError on a swap or a
+    non-regular file so `replace`'s existing read-error arms report it."""
+    flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_NONBLOCK", 0))
+    fd = os.open(str(real), flags)
+    try:
+        st = os.fstat(fd)
+        if not stat_mod.S_ISREG(st.st_mode):
+            raise OSError(_errno.EINVAL, "not a regular file")
+        if (st.st_dev, st.st_ino) != (expect.st_dev, expect.st_ino):
+            raise _FileChangedUnderneath()
+        chunks, remaining = [], st.st_size
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 1 << 20))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    finally:
+        os.close(fd)
+    return io.TextIOWrapper(io.BytesIO(b"".join(chunks)), encoding=encoding,
+                            errors=errors, newline=None).read()
+
+
+def _write_edit_nofollow(real: Path, data: bytes, expect: os.stat_result) -> None:
+    """Write ``data`` over ``real`` through an O_NOFOLLOW fd whose identity
+    AND contents-stamp match the read (`st_dev`/`st_ino`/`st_size`/
+    `st_mtime_ns`). Raises `_FileChangedUnderneath` BEFORE truncating when
+    they do not, so a symlink swapped in after the safe-path check, or a
+    concurrent writer, never receives the edit. No O_TRUNC in the open
+    flags: the truncate happens only after the identity check passes.
+
+    Deliberately NOT tmp+rename: that would succeed on a read-only file
+    (only the directory needs to be writable), and a 0444 bit is a
+    statement this tool should respect. A failure after the truncate can
+    leave a shorter file; the caller measures that by reading back.
+    """
+    flags = (os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_NONBLOCK", 0))
+    try:
+        fd = os.open(str(real), flags)
+    except OSError as _oe:
+        # ELOOP = the final component is now a symlink: swapped in after
+        # the check. Nothing was opened, nothing written — same verdict as
+        # a changed identity, and the caller says so.
+        if _oe.errno in (_errno.ELOOP, getattr(_errno, "EMLINK", -1)):
+            raise _FileChangedUnderneath() from _oe
+        raise
+    try:
+        st = os.fstat(fd)
+        # `st_ctime_ns` is in the stamp because `st_mtime_ns` alone is
+        # forgeable: a same-size rewrite + `os.utime` with the original
+        # nanoseconds restored every other field (§4KC r3); ctime cannot
+        # be set from userland.
+        if ((st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+                != (expect.st_dev, expect.st_ino, expect.st_size,
+                    expect.st_mtime_ns, expect.st_ctime_ns)):
+            raise _FileChangedUnderneath()
+        os.ftruncate(fd, 0)
+        view = memoryview(data)
+        while view:
+            n = os.write(fd, view)
+            view = view[n:]
+    finally:
+        os.close(fd)
+
+
+async def tool_edit_text(filename: str, old_string: Any, new_string: Any,
+                         sandbox_dir: Path, *, replace_all: bool = False,
+                         post_edit: bool = False, project_store=None):
+    """Exact, unique, in-place edit — the ledger wrapper (see §4KC above).
+
+    Mirrors `tool_replace_text`: the impl writes into ``telem`` and this is
+    the single place a row is written, so no return path can go unrecorded.
+    """
+    telem: Dict[str, Any] = {"strategies": [], "blocks_total": 0,
+                             "blocks_applied": 0, "file_len": 0}
+    _search_len = len(old_string) if isinstance(old_string, str) else 0
+    try:
+        result = await _edit_text_impl(
+            filename, old_string, new_string, sandbox_dir,
+            replace_all=replace_all, post_edit=post_edit, telem=telem,
+            project_store=project_store)
+    except BaseException as exc:                            # noqa: BLE001
+        record_edit(path=str(filename), op="edit", applied=False,
+                    reason=f"exception:{type(exc).__name__}",
+                    search_len=_search_len,
+                    file_len=int(telem.get("file_len") or 0),
+                    req_id=str(request_id_context.get() or ""))
+        raise
+    applied = _edit_applied(result, telem)
+    record_edit(
+        path=str(filename), op="edit", applied=applied,
+        strategies=list(telem.get("strategies") or []),
+        reason=("" if applied else
+                str(_outcome_reason(result) or telem.get("reason") or "")),
+        search_len=_search_len,
+        file_len=int(telem.get("file_len") or 0),
+        blocks_total=int(telem.get("blocks_total") or 0),
+        blocks_applied=int(telem.get("blocks_applied") or 0),
+        req_id=str(request_id_context.get() or ""),
+    )
+    return result
+
+
+async def _edit_text_impl(filename: str, old_string: Any, new_string: Any,
+                          sandbox_dir: Path, *, replace_all: bool = False,
+                          post_edit: bool = False,
+                          telem: Optional[Dict[str, Any]] = None,
+                          project_store=None):
+    """The edit. Every refusal leaves the file untouched and says so.
+
+    Argument checks come FIRST and are done here, not only in the schema:
+    the JSON schema's `required` is per-tool, not per-operation, and the
+    native tool-call path does not enforce it anyway.
+
+    Every refusal is a `ToolOutcome` with a `reason_code` (a bare "Error:"
+    string is booked by the ledger with an empty reason — fresh-eye §4KC
+    round 2), and nothing here lets an exception escape to the model: a
+    traceback carries no "unchanged" statement.
+    """
+    if telem is None:
+        telem = {}
+    pretty_log("File Edit", filename, icon=Icons.TOOL_FILE_W)
+    if old_string is None or (isinstance(old_string, str) and old_string == ""):
+        return ToolOutcome.rejected(
+            f"SYSTEM INSTRUCTION: operation='edit' needs 'old_string' — the "
+            f"exact text that is in '{filename}' NOW, copied byte-for-byte "
+            f"from a read. Nothing was changed. To create a file or rewrite "
+            f"one completely, use operation='write' with the FULL file in "
+            f"'content' instead.", reason_code="missing_old_string")
+    if new_string is None:
+        return ToolOutcome.rejected(
+            f"SYSTEM INSTRUCTION: operation='edit' needs 'new_string' — the "
+            f"text that takes the place of old_string in '{filename}'. Pass "
+            f"an empty string to delete old_string. Nothing was changed.",
+            reason_code="missing_new_string")
+    if not isinstance(old_string, str) or not isinstance(new_string, str):
+        # A dict/list/int here is a transport or generation fault, not text
+        # to write; `str()`-ing it wrote a Python repr into the file.
+        return ToolOutcome.rejected(
+            f"SYSTEM INSTRUCTION: operation='edit' takes old_string and "
+            f"new_string as TEXT; got {type(old_string).__name__} and "
+            f"{type(new_string).__name__}. Nothing was changed in "
+            f"'{filename}'.", reason_code="non_string_argument")
+    old, new = old_string, new_string
+    if old == new:
+        return ToolOutcome.rejected(
+            f"REJECTED: old_string and new_string are identical "
+            f"({len(old)} chars) — there is nothing to change in "
+            f"'{filename}'. Nothing was changed.",
+            reason_code="identical_edit")
+    if "\x00" in new:
+        # `ast.parse` refuses NUL with a ValueError the syntax guard treats
+        # as "cannot judge", so a NUL landed in a .py with a clean SUCCESS.
+        return ToolOutcome.rejected(
+            f"REJECTED: new_string contains a NUL byte, which no text file "
+            f"should carry. '{filename}' is unchanged.",
+            reason_code="nul_in_new_string")
+    for _which, _text in (("old_string", old), ("new_string", new)):
+        _env = _edit_envelope_refusal(filename, _which, _text)
+        if _env is not None:
+            return _env
+
+    # ── the target ────────────────────────────────────────────────────
+    try:
+        path = _get_safe_path(sandbox_dir, filename)
+        real = path.resolve()
+        _roots = _edit_roots(sandbox_dir)
+        if not any(real == r or r in real.parents for r in _roots):
+            raise ValueError(f"Security Error: Path '{filename}' attempts "
+                             f"to access outside sandbox.")
+    except ValueError as ve:
+        # A ToolOutcome, not the bare string `replace` returns: a bare
+        # string with no "Error:" prefix is booked as neither a failure nor
+        # a rejection by the outcome classifier.
+        return ToolOutcome.rejected(str(ve), reason_code="unsafe_path")
+    except (OSError, RuntimeError) as _re:
+        # ENAMETOOLONG from resolve(); RuntimeError("Symlink loop").
+        return ToolOutcome.rejected(
+            f"Security Error: cannot resolve '{filename}' ({_re}). Nothing "
+            f"was changed.", reason_code="unsafe_path")
+    try:
+        _exists = real.exists()
+    except OSError as _se:
+        # Python < 3.12 `exists()` only swallows ENOENT-class errors;
+        # EACCES on a parent dir and ENAMETOOLONG propagate.
+        return ToolOutcome.failed(
+            f"Error: cannot stat '{filename}' ({_se}). '{filename}' is "
+            f"unchanged.", world_changed=False, reason_code="stat_failed")
+    if not _exists:
+        fb = _scoped_root_fallback(sandbox_dir, filename)
+        if fb is not None:
+            _cp = _to_container_path(sandbox_dir, fb)
+            return ToolOutcome.rejected(
+                f"REJECTED: '{filename}' is not in the current project's "
+                f"workspace, but it DOES exist at the sandbox ROOT as "
+                f"'{_cp}'. Re-issue the edit with path='{_cp}' to edit that "
+                f"file. Nothing was changed.", reason_code="file_not_found")
+        return ToolOutcome.rejected(
+            _missing_file_message(filename, sandbox_dir)
+            + " operation='edit' changes an EXISTING file and never creates "
+              "one — to create it, use operation='write'.",
+            reason_code="file_not_found")
+    # ONE path-level check BEFORE any open (FIFO wedge — see
+    # `_nonregular_refusal`), then the same check again on the OPEN fd,
+    # which is the one a swap cannot beat.
+    _nr = _nonregular_refusal(real, filename)
+    if _nr:
+        return ToolOutcome.failed(_nr, world_changed=False,
+                                  reason_code="not_a_regular_file")
+    try:
+        _orig_bytes, _st0 = await asyncio.to_thread(
+            _read_regular_nofollow, real, filename=filename,
+            sandbox_dir=sandbox_dir, project_store=project_store)
+    except _InodeDenied as _d:
+        return _d.outcome
+    except _NotRegular:
+        return ToolOutcome.failed(
+            f"Error: '{filename}' is not a regular file (it is a FIFO, "
+            f"device, socket or directory), so it cannot be read or written "
+            f"as text. '{filename}' is unchanged.",
+            world_changed=False, reason_code="not_a_regular_file")
+    except _TooLarge as _tl:
+        return ToolOutcome.failed(
+            f"Error: '{filename}' is {int(_tl.args[0]) // (1024*1024)} MB; "
+            f"'edit' refuses files larger than 50 MB. Use 'execute' with a "
+            f"Python streaming script instead.",
+            world_changed=False, reason_code="too_large")
+    except OSError as oe:
+        # ELOOP here = a symlink was swapped in after the safe-path check.
+        return ToolOutcome.failed(
+            f"Error: failed to read '{filename}' for edit ({oe}). "
+            f"'{filename}' is unchanged.",
+            world_changed=False, reason_code="read_failed")
+    if _looks_like_binary(_orig_bytes[:8192]):
+        return ToolOutcome.failed(
+            f"Error: '{filename}' appears to be a binary file and cannot be "
+            f"text-edited.", world_changed=False, reason_code="binary")
+    # BYTES, decoded — never `read_text`: universal newlines would turn
+    # every CRLF into LF on read and the write would put LF back on every
+    # line (`replace` has always done this). `surrogateescape` never
+    # raises — a stray byte round-trips as a lone surrogate.
+    file_content = _orig_bytes.decode("utf-8", "surrogateescape")
+    telem["file_len"] = len(file_content)
+
+    # ── CRLF: the ONE invertible normalisation ────────────────────────
+    # The turn loop strips every `\r` from tool results before the model
+    # sees them, so the model can never produce a CRLF old_string — a
+    # byte-for-byte rule would make every CRLF file un-editable through
+    # the documented route (fresh-eye §4KC round 2). This is not a
+    # tolerant rung: it is the exact inverse of the transport's own strip,
+    # applied only when the file is CRLF, old_string carries no CR, and the
+    # CRLF form is what is present. Recorded as `exact:crlf` so the ledger
+    # can see it.
+    _crlf = False
+    if "\r\n" in file_content and "\r" not in old and "\n" in old \
+            and file_content.count(old) == 0:
+        _old_c = old.replace("\n", "\r\n")
+        if file_content.count(_old_c) > 0:
+            old, new, _crlf = _old_c, new.replace("\r\n", "\n").replace("\n", "\r\n"), True
+
+    _n_lines = len(file_content.splitlines())
+    _old_n_lines = len(old.splitlines())
+    if (_n_lines >= EDIT_WHOLE_FILE_MIN_LINES
+            and len(old) >= EDIT_WHOLE_FILE_SHARE * len(file_content)
+            and _old_n_lines >= EDIT_WHOLE_FILE_SHARE * _n_lines):
+        return ToolOutcome.rejected(
+            f"REJECTED: old_string is {_old_n_lines} of the {_n_lines} lines "
+            f"in '{filename}' — that is a rewrite, not an edit, and nothing "
+            f"was changed. Either narrow old_string to just the lines that "
+            f"change (several small 'edit' calls are fine), or, if you "
+            f"really mean to replace the whole file, use operation='write' "
+            f"with the FULL new file in 'content'.",
+            reason_code="whole_file_on_edit")
+
+    n = file_content.count(old)
+    if n == 0:
+        _why, _near_line = await asyncio.to_thread(
+            _edit_miss_diagnosis, file_content, old)
+        _near = (_snippet_at(file_content, _near_line) if _near_line
+                 else await asyncio.to_thread(_nearest_snippet, file_content, old))
+        return ToolOutcome.rejected(
+            f"REJECTED: old_string was not found in '{filename}' — 'edit' "
+            f"matches exactly, byte-for-byte, and nothing was changed."
+            + (f" {_why}" if _why else "")
+            + f"\nNearest region of the file (real line numbers):\n"
+            f"{_near}\n"
+            f"Copy the exact current text from a read (operation='read' "
+            f"with start_line/end_line) into old_string and retry. Do NOT "
+            f"rewrite the file with 'write'.",
+            reason_code="old_string_not_found")
+    # NON-overlapping, like `str.count`/`str.replace` — the overlapping
+    # walk named lines that no replacement touched.
+    _lines = _occurrence_lines(file_content, old, cap=_EDIT_AMBIGUITY_LINE_CAP,
+                               overlapping=False)
+    if n > 1 and not replace_all:
+        _where = ", ".join(str(x) for x in _lines)
+        _more = "" if n <= len(_lines) else f" — first {len(_lines)} shown"
+        return ToolOutcome.rejected(
+            f"REJECTED: old_string occurs {n} times in '{filename}' — at "
+            f"line(s) {_where}{_more} — so 'edit' cannot know which one you "
+            f"mean; nothing was changed. Include more surrounding lines in "
+            f"old_string so it is unique, or pass replace_all=true to "
+            f"change every occurrence.",
+            reason_code="old_string_ambiguous")
+
+    _count = n if replace_all else 1
+    if replace_all:
+        new_content = file_content.replace(old, new)
+    else:
+        _i = file_content.find(old)
+        new_content = file_content[:_i] + new + file_content[_i + len(old):]
+    telem["blocks_total"] = _count
+    # Set BEFORE the write, like the ladder does: a rung that matched and
+    # then failed to land must read "matched exact, did NOT apply".
+    telem["strategies"] = ["exact:crlf" if _crlf else "exact"] * _count
+    # Slot names carry `lines`/`count` on purpose and the PATH comes LAST:
+    # the verifier's producer/parser parity check renders this f-string
+    # and classifies each slot as a number or a path by its source text,
+    # and `_fs_path_ledger` (core/agent.py) parses the rendered line with
+    # an end-anchored pattern — a filename containing `' — replaced` could
+    # otherwise plant a phantom path in the ledger.
+    _at_lines = ", ".join(str(x) for x in _lines[:_count])
+    _more_lines = "" if _count <= len(_lines) else f" — first {len(_lines)} shown"
+    success = (f"SUCCESS: edited — replaced {_count} "
+               f"occurrence{'s' if _count != 1 else ''} of old_string "
+               f"(line{'s' if _count != 1 else ''} {_at_lines}{_more_lines}) "
+               f"in '{filename}'.")
+
+    async def _writer(payload: bytes) -> None:
+        await asyncio.to_thread(_write_edit_nofollow, real, payload, _st0)
+
+    try:
+        # `_FileChangedUnderneath` is handled INSIDE the guard (one site for
+        # both operations) and comes back as a REJECTED outcome.
+        result = await _write_replace_guarded(
+            real, file_content, new_content, filename, success,
+            post_edit=post_edit, marker_guard=False, writer=_writer)
+    except OSError as _we:
+        # The open had no O_TRUNC, so a failure at the OPEN leaves the file
+        # intact (EACCES on a 0444 file); a failure AFTER the truncate can
+        # leave a shorter — or same-length but different — file. MEASURE:
+        # read back and compare BYTES, not sizes (a same-size partial write
+        # of the new content read as "unchanged" under a size check).
+        try:
+            _now = await asyncio.to_thread(read_bytes_nofollow, real)
+        except OSError:
+            _now = None
+        _intact = _now == _orig_bytes
+        return ToolOutcome.failed(
+            f"Error: the write to '{filename}' failed after the edit was "
+            f"computed ({_we}); "
+            + (f"'{filename}' is unchanged on disk."
+               if _intact else
+               f"'{filename}' may be TRUNCATED or PARTIALLY written "
+               f"({len(_now) if _now is not None else 'unknown'} bytes now, "
+               f"{len(_orig_bytes)} before) — re-read it before retrying."),
+            world_changed=not _intact, reason_code="edit_write_failed")
+    if not getattr(result, "is_rejection", False):
+        telem["blocks_applied"] = _count
+    return result
+
+
+async def _replace_text_impl(filename: str, old_text: str, new_text: str,
+                             sandbox_dir: Path, *, post_edit: bool = False,
+                             telem: Optional[Dict[str, Any]] = None,
+                             project_store=None):
+    """The actual edit. See `tool_replace_text` for why `telem` exists.
+
+    ``post_edit`` is the `fs_batch` treatment flag — see
     `_write_replace_guarded`; keyword-only with a False default so every
     existing caller and recorded fixture keeps its exact current behaviour."""
+    if telem is None:
+        telem = {}
     pretty_log("File Replace", filename, icon=Icons.TOOL_FILE_W)
     if not old_text:
         # Name the legal alternative explicitly. Observed live 2026-07-08
@@ -2206,6 +3049,20 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
         )
 
     if not has_aider_blocks and new_text is None:
+        # C5: the auto-promote calls `write_text` directly, and the gate it
+        # was given used `is_file()` — FALSE for a FIFO — so it was skipped
+        # and the write blocked forever. The regular-file check further down
+        # sits BELOW this branch and never ran for it.
+        try:
+            _nr_ap = _nonregular_refusal(
+                _get_safe_path(sandbox_dir, filename), filename)
+            if _nr_ap:
+                return _nr_ap
+        except ValueError:
+            pass
+
+
+    if not has_aider_blocks and new_text is None:
         # Auto-promote path: if the caller forgot `replace_with` but their
         # `content` is a complete, parseable Python module, they almost
         # always meant operation='write' (the most common LLM misfire
@@ -2250,7 +3107,11 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
                 # the `failed(world_changed=True)` arm written for it was
                 # unreachable.
                 _wrote = True
-                await asyncio.to_thread(path.write_text, clean_content, encoding="utf-8")
+                # O_NOFOLLOW on the RESOLVED path: the promote is a whole-file
+                # overwrite, and this was the one write in the module that
+                # still followed a link planted after the check (§4KC r3).
+                await asyncio.to_thread(write_text_nofollow, path.resolve(),
+                                        clean_content, encoding="utf-8")
                 pretty_log(
                     "File Replace Auto-Promote",
                     f"replace→write on '{filename}' (content looked like a complete module)",
@@ -2258,6 +3119,8 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
                     icon=Icons.WARN,
                 )
                 _syn = await _syntax_feedback(path, filename)
+                telem["op"] = "replace_promoted_to_write"
+                telem["strategies"] = ["write_promote"]
                 _text = (
                     f"SUCCESS: auto-promoted operation='replace' to 'write' for "
                     f"'{filename}' because your 'content' was a complete Python "
@@ -2347,6 +3210,79 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
             file_size = path.stat().st_size
         except OSError as se:
             return f"Error: failed to stat '{filename}': {se}"
+        # ⚠ H2 (round 3): the SIZE and BINARY refusals run BEFORE the gate.
+        # Hoisting the gate above them turned two actionable errors into
+        # CLOSED LOOPS: a 60 MB file under strict said "you have not read it
+        # — read it first", and the read then said "too large to read
+        # entirely (limit 22.4 KB)"; a binary file said the same and the read
+        # said "appears to be a binary file". Refuse → "read it" → "cannot
+        # read it" → refuse, with no exit. A refusal must name the real
+        # obstacle, and these two do not need a receipt to be decided.
+        # ⚠ REGULAR FILES ONLY, and BEFORE anything opens the target.
+        # The hashing helper got this guard first; the binary sniff two lines
+        # below did NOT, and `_read_head` on a FIFO blocks forever exactly
+        # like `open()` does — so the H2 fix re-introduced the very wedge H1
+        # had just closed, one call earlier. One check, before any open.
+        try:
+            _st = os.stat(path)
+        except OSError as _e:
+            return f"Error: failed to stat '{filename}': {_e}"
+        if not stat_mod.S_ISREG(_st.st_mode):
+            return (f"Error: '{filename}' is not a regular file "
+                    f"(it is a FIFO, device, socket or directory), so it "
+                    f"cannot be text-replaced. '{filename}' is unchanged.")
+        _pre_size = _st.st_size
+        # §4KC round 3: the same TOCTOU closure `edit` got in round 2. The
+        # stat above is the target's identity+stamp at read time; every
+        # guarded write below goes through an O_NOFOLLOW fd that must match
+        # it BEFORE truncating, so a symlink swapped in after the safe-path
+        # check (a reviewer rewrote a file outside the sandbox through this
+        # write site) or a concurrent writer is refused, nothing written.
+        _real = path.resolve()
+        # Inode-aware guards (§4KC r3): hardlinks and APFS folds the name
+        # checks cannot see. A short-lived O_NOFOLLOW fd; the streaming
+        # branch below re-opens its own.
+        def _inode_check():
+            _fd = os.open(str(_real), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                          | getattr(os, "O_NONBLOCK", 0))
+            try:
+                return (_inode_write_refusal(_fd, filename, sandbox_dir, project_store),
+                        os.fstat(_fd), os.read(_fd, 8192))
+            finally:
+                os.close(_fd)
+        _deny, _st_checked, _head = await asyncio.to_thread(_inode_check)
+        if _deny is not None:
+            return _deny
+        # §4KC r4: the identity the WRITE is bound to is the inode the GUARD
+        # cleared — not the earlier `os.stat`. With the two unbound, a name
+        # swapped away (guard sees a clean inode) and back (write lands on
+        # the original) passed the guard on one inode and wrote another.
+        # The pre-read stat and the guarded inode must also agree, or the
+        # name already moved between them.
+        if (_st_checked.st_dev, _st_checked.st_ino) != (_st.st_dev, _st.st_ino):
+            return ToolOutcome.rejected(
+                f"REJECTED: '{filename}' changed on disk while it was being "
+                f"checked, so the replace was NOT applied — nothing was "
+                f"written. Re-read the file and retry.",
+                reason_code="file_changed_underneath")
+        _st = _st_checked
+
+        async def _writer(payload: bytes) -> None:
+            await asyncio.to_thread(_write_edit_nofollow, _real, payload, _st)
+
+        if _pre_size > 50 * 1024 * 1024:
+            return (f"Error: '{filename}' is {_pre_size // (1024*1024)} MB; the "
+                    f"'replace' operation refuses files larger than 50 MB. Use "
+                    f"'execute' with a Python streaming script instead.")
+        try:
+            # the head the GUARD read, not a by-path re-open (§4KC r5)
+            if _looks_like_binary(_head):
+                return (f"Error: '{filename}' appears to be a binary file and "
+                        f"cannot be text-replaced.")
+        except OSError:
+            pass
+
+
         REPLACE_MAX_BYTES = 50 * 1024 * 1024
         STREAMING_THRESHOLD = 1 * 1024 * 1024  # 1 MB
 
@@ -2379,7 +3315,23 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
                         # bad bytes round-trip to their exact originals (matches
                         # the non-streaming path); errors="replace" used to
                         # corrupt them to U+FFFD on write-back.
-                        with open(path, 'r', encoding='utf-8', errors='surrogateescape') as f_in:
+                        # O_NOFOLLOW + a regular-file check on the fd: this
+                        # was the last read in the module that followed a
+                        # link planted after the check (§4KC r3).
+                        # O_RDWR: the KERNEL decides writability (uid, group,
+                        # ACLs), exactly as the other two writers' O_WRONLY —
+                        # an owner-bit test was the wrong proxy (r6)
+                        _sfd = os.open(str(_real), os.O_RDWR
+                                       | getattr(os, "O_NOFOLLOW", 0)
+                                       | getattr(os, "O_NONBLOCK", 0))
+                        _sst = os.fstat(_sfd)
+                        if not stat_mod.S_ISREG(_sst.st_mode):
+                            os.close(_sfd)
+                            raise OSError(_errno.EINVAL, "not a regular file")
+                        if (_sst.st_dev, _sst.st_ino) != (_st.st_dev, _st.st_ino):
+                            os.close(_sfd)
+                            raise _FileChangedUnderneath()
+                        with open(_sfd, 'r', encoding='utf-8', errors='surrogateescape') as f_in:
                             with tempfile.NamedTemporaryFile(mode='w', dir=path.parent,
                                                             suffix='.tmp', delete=False,
                                                             encoding='utf-8', errors='surrogateescape') as f_out:
@@ -2436,7 +3388,7 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
                             # for the regression check (bounded by the 50 MB
                             # replace cap, same as the non-streaming path).
                             _prev_c = await asyncio.to_thread(
-                                path.read_text, encoding="utf-8", errors="surrogateescape")
+                                _read_text_guarded, _real, _st)
                             _new_c = await asyncio.to_thread(
                                 _tmp.read_text, encoding="utf-8", errors="surrogateescape")
                             regression = _syntax_regression(_prev_c, _new_c, filename)
@@ -2455,6 +3407,12 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
                                     f"'{filename}' is unchanged on disk: "
                                     f"{regression}. Re-read the file and emit a "
                                     f"corrected surgical edit."))
+                        # keep the original's mode: a tmp file is 0600 and
+                        # `os.replace` carried that onto a 0644 script (r4)
+                        try:
+                            os.chmod(_tmp, stat_mod.S_IMODE(_st.st_mode) & 0o777)
+                        except OSError:
+                            pass
                         await asyncio.to_thread(os.replace, _tmp, path)
                         _committed = True
                     finally:
@@ -2463,8 +3421,29 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
                                 _tmp.unlink(missing_ok=True)
                             except Exception:
                                 pass
+                    # §4KB fix (fresh-eye review): this path applied a real
+                    # edit and recorded `applied: false` with no strategy,
+                    # so every >1 MB edit landed in the ledger's REJECTED
+                    # bucket and was invisible to the corrective-rate proxy.
+                    telem["op"] = "replace_streaming"
+                    telem["strategies"] = ["streaming"]
+                    # CHARS, like every other path. This recorded BYTES
+                    # (file_size), so one ledger column carried two units —
+                    # 1,843,200 vs 1,228,800 for the same file.
+                    telem["file_len"] = len(_chg_old) and sum(
+                        len(x) for x in _chg_old) or file_size
+                    telem["blocks_applied"] = replaced
                     return f"SUCCESS: Streaming replace applied to '{filename}' ({replaced} line(s) modified)."
                 # Fall through to heuristic match below
+            except _FileChangedUnderneath:
+                # r4: the source fd's inode differed from the guarded one —
+                # the same verdict the guarded writer gives, not a bare
+                # "Error: Streaming replace failed:" with an empty message.
+                return ToolOutcome.rejected(
+                    f"REJECTED: '{filename}' changed on disk between the "
+                    f"check and the read, so the replace was NOT applied — "
+                    f"nothing was written. Re-read the file and retry.",
+                    reason_code="file_changed_underneath")
             except Exception as e:
                 return f"Error: Streaming replace failed: {e}"
 
@@ -2477,7 +3456,16 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
             # streaming path). Previously errors="replace" persisted every bad
             # byte as U+FFFD on write-back, corrupting regions the edit never
             # touched (was a deferred finding).
-            file_content = await asyncio.to_thread(path.read_text, encoding="utf-8", errors="surrogateescape")
+            file_content = await asyncio.to_thread(_read_text_guarded, _real, _st)
+            telem["file_len"] = len(file_content)
+        except _FileChangedUnderneath:
+            # r6: the same verdict the guarded writer and the streaming
+            # branch give — not a bare read-error string
+            return ToolOutcome.rejected(
+                f"REJECTED: '{filename}' changed on disk between the check "
+                f"and the read, so the replace was NOT applied — nothing was "
+                f"written. Re-read the file and retry.",
+                reason_code="file_changed_underneath")
         except (UnicodeDecodeError, LookupError):
             return f"Error: '{filename}' appears to be a binary file and cannot be text-replaced."
         except OSError as oe:
@@ -2545,6 +3533,15 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
             if not blocks:
                 return ToolOutcome.rejected("SYSTEM INSTRUCTION: Found SEARCH/REPLACE markers but failed to parse them. Ensure you use <<<< SEARCH, ====, and >>>> correctly.", reason_code="unparsable_blocks")
             
+            telem["op"] = "replace_block"
+            telem["blocks_total"] = len(blocks)
+            # STRUCTURAL. The all-ambiguous header used to be selected by
+            # `e.startswith("Block REJECTED as AMBIGUOUS")` — a lexical match
+            # on this module's own rejection prose, so rewording the message
+            # silently fell back to the generic "None ... matched" header,
+            # whose prescribed repair (widen the search) is the OPPOSITE of
+            # the right one. Exactly the class §4KB claims to have avoided.
+            ambiguous_count = 0
             success_count = 0
             errors = []
             strategies = []
@@ -2619,6 +3616,26 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
                     errors.append(f"Could not find block:\n{search_str[:50]}...")
                     continue
                 matched_text, strategy = located
+                if matched_text is None:
+                    # AMBIGUOUS (§4KB). Reject the envelope, keep the rest of
+                    # the batch going — a partial apply plus a named reason
+                    # beats an all-or-nothing failure the model cannot act on.
+                    _n = 0
+                    try:
+                        _n = int(str(strategy).split(":", 1)[1])
+                    except Exception:                       # noqa: BLE001
+                        _n = file_content.count(search_str)
+                    telem["reason"] = "ambiguous_block"
+                    ambiguous_count += 1
+                    pretty_log(
+                        "Replace Rejected",
+                        f"{filename}: SEARCH block matched {_n}× (lines "
+                        f"{', '.join(str(x) for x in _occurrence_lines(file_content, search_str))}) "
+                        f"— ambiguous, this block NOT applied",
+                        icon=Icons.WARN, level="WARNING")
+                    errors.append(
+                        _ambiguous_block_error(file_content, search_str, _n))
+                    continue
                 if strategy == "flexible":
                     # Re-anchor the replacement's indentation to the matched
                     # region so the whitespace-flexible match doesn't corrupt
@@ -2637,6 +3654,8 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
                     matched_text, replacement, 1)
                 success_count += 1
                 strategies.append(strategy)
+                telem["strategies"] = list(strategies)
+                telem["blocks_applied"] = success_count
 
             if success_count > 0:
                 msg = f"SUCCESS: Applied {success_count} SEARCH/REPLACE blocks to '{filename}'."
@@ -2650,7 +3669,7 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
                     msg += f" SYSTEM INSTRUCTION: {len(errors)} blocks failed:\n" + "\n".join(errors)
                 _res = await _write_replace_guarded(
                     path, prev_content, file_content, filename, msg,
-                    post_edit=post_edit)
+                    post_edit=post_edit, writer=_writer)
                 if errors and not getattr(_res, "is_rejection", False):
                     # Some blocks landed and some did not: PARTIAL.
                     # ⚠ Only when the write actually LANDED. The guard can
@@ -2666,15 +3685,27 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
                         reason_code="some_replace_blocks_failed")
                 return _res
             else:
+                # "matched" would be a lie when the block matched N>1 times —
+                # the model's repair for "not found" (widen the search) is the
+                # OPPOSITE of the repair for "found twice" (add unique
+                # context), so the header must name which one happened.
+                if ambiguous_count and ambiguous_count == len(errors):
+                    telem["reason"] = "ambiguous_block"
+                    return ToolOutcome.rejected(
+                        f"SYSTEM INSTRUCTION: every SEARCH/REPLACE block in "
+                        f"'{filename}' matched MORE THAN ONCE — nothing was "
+                        f"changed.\n" + "\n".join(errors),
+                        reason_code="ambiguous_block")
                 return ToolOutcome.rejected(f"SYSTEM INSTRUCTION: None of the SEARCH/REPLACE blocks matched in '{filename}'.\n" + "\n".join(errors), reason_code="no_blocks_matched")
 
         # 1. Exact match attempt
         if old_text in file_content:
             occurrences = file_content.count(old_text)
             new_file_content = file_content.replace(old_text, new_text)
+            telem["strategies"] = ["exact"]
             msg = f"SUCCESS: Exact match found and replaced in '{filename}'."
             if occurrences > 1: msg += f" WARNING: Replaced {occurrences} identical occurrences."
-            return await _write_replace_guarded(path, file_content, new_file_content, filename, msg, post_edit=post_edit)
+            return await _write_replace_guarded(path, file_content, new_file_content, filename, msg, post_edit=post_edit, writer=_writer)
 
         # 2. Heuristic match (ignore arbitrary whitespace & newlines). The
         # match starts at the first token, so re-anchor the replacement's
@@ -2689,11 +3720,12 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
             # Replace only the FIRST occurrence (count=1), matching the
             # exact/fuzzy/anchor/aider paths — an unbounded replace would
             # clobber every later copy of an identical block.
+            telem["strategies"] = ["flexible"]
             new_file_content = file_content.replace(matches[0], reindented, 1)
             return await _write_replace_guarded(
                 path, file_content, new_file_content, filename,
                 f"SUCCESS: Flexible match found and replaced in '{filename}'.",
-                post_edit=post_edit)
+                post_edit=post_edit, writer=_writer)
         elif len(matches) > 1:
             return ToolOutcome.rejected("SYSTEM INSTRUCTION: Multiple instances of this text block found. Please provide a larger, more unique block of code in 'content' to ensure we replace the correct one.", reason_code="ambiguous_block")
 
@@ -2709,6 +3741,7 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
         fuzzy = _fuzzy_block_match(file_content, str(old_text))
         if fuzzy is not None:
             matched_text, ratio = fuzzy
+            telem["strategies"] = [f"fuzzy:{ratio:.0%}"]
             replacement = str(new_text)
             # The matched block was sliced with keepends, so it may carry a
             # trailing newline the model's replacement omits. Preserve it,
@@ -2722,7 +3755,7 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
                 f"SUCCESS: Fuzzy match ({ratio:.0%} similar) found and replaced "
                 f"in '{filename}'. Your `old_text` did not byte-match, but a single "
                 f"near-identical block was unambiguous.",
-                post_edit=post_edit)
+                post_edit=post_edit, writer=_writer)
             if res.startswith("SUCCESS"):
                 res = append_note(res, f" VERIFY the change is what you "
                                   f"intended:\n--- REPLACED BLOCK (was) ---\n"
@@ -2740,6 +3773,8 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
         anchor = _anchor_block_match(file_content, str(old_text))
         if anchor is not None:
             matched_text, info = anchor
+            telem["strategies"] = [
+                f"anchor:{info['start_line']}-{info['end_line']}"]
             replacement = str(new_text)
             if matched_text.endswith("\n") and not replacement.endswith("\n"):
                 replacement += "\n"
@@ -2750,7 +3785,7 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
                 f"{info['start_line']}–{info['end_line']} in '{filename}' "
                 f"(matched on its unique {'first+last lines' if info['strategy']=='first_last' else 'signature + balanced braces'}; "
                 f"the middle differed from your old_text).",
-                post_edit=post_edit)
+                post_edit=post_edit, writer=_writer)
             if res.startswith("SUCCESS"):
                 res = append_note(res, f" VERIFY the change:\n"
                                   f"--- REPLACED BLOCK (was) ---\n"
@@ -2823,6 +3858,64 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
     except ValueError as ve: return str(ve)
     except Exception as e: return f"Error: {e}"
 
+#: Occurrence line numbers are capped in the rejection message: the model
+#: needs enough to disambiguate, not a listing. Five is two more than the
+#: duplicate count that actually occurs in practice.
+_AMBIGUITY_LINE_CAP = 5
+
+
+def _occurrence_lines(file_content: str, needle: str,
+                      cap: int = _AMBIGUITY_LINE_CAP, *,
+                      overlapping: bool = True):
+    """1-based line numbers where ``needle`` STARTS, up to ``cap``.
+
+    Used to build the ambiguity rejection. A model told "this matched
+    3 times" still cannot act; told "lines 12, 48, 97" it can widen its
+    SEARCH block with the right neighbouring context on the first retry.
+
+    ``overlapping=False`` steps past each hit like `str.count`/`str.replace`
+    do, so the lines named agree with the count and with what a
+    replace_all actually touches (`x\nx\nx\nx` / `x\nx\n`: 2 hits at
+    lines 1 and 3, not 3 hits). The default keeps `replace`'s wording.
+    """
+    out = []
+    if not needle:
+        return out
+    step = 1 if overlapping else len(needle)
+    idx = file_content.find(needle)
+    while idx != -1 and len(out) < cap:
+        out.append(file_content.count("\n", 0, idx) + 1)
+        idx = file_content.find(needle, idx + step)
+    return out
+
+
+def _ambiguous_block_error(file_content: str, search_str: str,
+                           occurrences: int) -> str:
+    """The ONE message every rung emits for an ambiguous match (§4KB).
+
+    Before this existed the ladder told three different stories about the
+    same input: the whitespace-flexible rung REJECTED, the two-argument
+    exact path replaced EVERY occurrence with a loud warning, and the
+    block form's exact rung silently edited the FIRST one and reported
+    ``exact`` — a wrong-region edit with a success message, which is the
+    one outcome no downstream guard can detect (a first-occurrence edit is
+    syntactically valid, leaks no markers, and regresses no parse).
+    """
+    lines = _occurrence_lines(file_content, search_str)
+    where = ", ".join(str(n) for n in lines)
+    more = "" if occurrences <= len(lines) else f" (first {len(lines)} shown)"
+    head = str(search_str).strip().splitlines()[0][:60] if str(search_str).strip() else ""
+    return (
+        f"Block REJECTED as AMBIGUOUS: its SEARCH text occurs "
+        f"{occurrences} times in the file — at line(s) {where}{more}"
+        + (f" — starting `{head}`" if head else "")
+        + ". THIS BLOCK was not applied. (Other blocks in the same call may "
+        "have been — check the summary line.) Re-emit this envelope with "
+        "MORE surrounding context (the line above and below the region you "
+        "mean) so the SEARCH text appears exactly once."
+    )
+
+
 def _locate_block(file_content: str, search_str: str):
     """Full matching ladder shared by the SEARCH/REPLACE-block loop:
     exact → whitespace-flexible (unique) → fuzzy window → anchor block.
@@ -2830,8 +3923,22 @@ def _locate_block(file_content: str, search_str: str):
     Returns ``(matched_text, strategy)`` where ``matched_text`` is the
     ORIGINAL bytes in the file to replace and ``strategy`` is one of
     ``"exact"``, ``"flexible"``, ``"fuzzy:NN%"``, ``"anchor:L1-L2"`` — or
-    ``None`` when no matcher produces a unique, high-confidence hit."""
+    ``None`` when no matcher produces a unique, high-confidence hit.
+
+    ⚠ THIRD OUTCOME (§4KB): ``(None, "ambiguous:N")`` when the search text
+    is found but N>1 times. Every caller must branch on a ``None``
+    ``matched_text`` BEFORE using it — the previous contract had only two
+    outcomes, so the exact rung resolved a 2-occurrence search to the first
+    hit and called it ``exact``. Uniqueness is a property of the ladder, not
+    of the caller: `flexible` already required ``len(matches) == 1``,
+    `_fuzzy_block_match` requires a clear margin over the runner-up, and
+    `_anchor_block_match` requires both anchors to be unique. The exact rung
+    was the only one that did not check, and it is the rung that matches
+    most often."""
     if search_str in file_content:
+        n = file_content.count(search_str)
+        if n > 1:
+            return None, f"ambiguous:{n}"
         return search_str, "exact"
     words = [re.escape(w) for w in str(search_str).split()]
     if words:
@@ -3601,7 +4708,9 @@ def _would_be_snippet(new_content: str, regression: str,
 
 async def _write_replace_guarded(path: Path, prev_content: str, new_content: str,
                                  filename: str, success_msg: str, *,
-                                 post_edit: bool = False) -> str:
+                                 post_edit: bool = False,
+                                 marker_guard: bool = True,
+                                 writer=None) -> str:
     """Apply a replace result with a syntax-regression rollback guard.
 
     ``post_edit`` (experiment `fs_batch`, treatment arm only) appends the
@@ -3619,7 +4728,16 @@ async def _write_replace_guarded(path: Path, prev_content: str, new_content: str
     full-file rewrite. Otherwise the content is written and normal
     post-write syntax feedback is appended.
     """
-    leak = _marker_leak(prev_content, new_content)
+    # The receipt follows the file: after a write lands, the request HAS
+    # seen the new bytes, so a run of consecutive edits costs one read, not
+    # one read per edit. Stamped on the post-guard content only — a rolled
+    # back edit must not ground anything.
+    # ``marker_guard`` is OFF for operation='edit': the leak this guard
+    # catches is the ENVELOPE parser spilling its own markers into the file,
+    # and `edit` has no envelope — while a Markdown setext underline
+    # (`====`) is a line an edit must be allowed to write. `edit` refuses
+    # marker lines in its ARGUMENTS instead (see `_edit_envelope_refusal`).
+    leak = _marker_leak(prev_content, new_content) if marker_guard else ""
     if leak:
         pretty_log("Replace Rejected",
                    f"{filename}: edit would write SEARCH/REPLACE marker "
@@ -3669,7 +4787,45 @@ async def _write_replace_guarded(path: Path, prev_content: str, new_content: str
     # carry lone surrogates from bytes the surrogateescape READ preserved. Write
     # them back as the exact original bytes; a default (strict) write would raise
     # UnicodeEncodeError on those surrogates.
-    await asyncio.to_thread(path.write_text, new_content, encoding="utf-8", errors="surrogateescape")
+    # ⚠ ENCODE BEFORE TRUNCATING. `write_text` opens with 'w': it truncates
+    # first and encodes second, so a lone surrogate (U+D800-DBFF, which
+    # `surrogateescape` does NOT handle) left the file at ZERO BYTES — and
+    # the resulting UnicodeEncodeError is a ValueError, caught upstream and
+    # returned WITHOUT an "Error:" prefix, so the turn booked a success with
+    # world-changed credit and the wrapper stamped a receipt over the empty
+    # file. `tool_write_file` already had this guard; this path did not —
+    # "one-path fix ships half", and grounding was then hung off the
+    # unfixed one.
+    try:
+        _payload_bytes = new_content.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError as _ue:
+        return ToolOutcome.rejected(
+            f"REJECTED: the replacement text for '{filename}' contains "
+            f"characters that cannot be encoded as UTF-8 (lone surrogate "
+            f"{new_content[_ue.start:_ue.end]!r} at offset {_ue.start}). "
+            f"'{filename}' is UNCHANGED. Remove or re-escape those "
+            f"characters and retry.", reason_code="lone_surrogate")
+    # ``writer`` (operation='edit'): an fd-based O_NOFOLLOW write that
+    # re-checks the target's identity against the read before truncating,
+    # so a symlink swapped in after the safe-path check never receives the
+    # bytes. `replace` keeps the plain path write (its own review item).
+    if writer is not None:
+        try:
+            await writer(_payload_bytes)
+        except _FileChangedUnderneath:
+            pretty_log("Replace Rejected",
+                       f"{filename}: target changed between the read and the "
+                       f"write (another writer, or a swapped-in link) — "
+                       f"nothing written",
+                       icon=Icons.WARN, level="WARNING")
+            return ToolOutcome.rejected(
+                f"REJECTED: '{filename}' changed on disk between the read and "
+                f"the write (another process, or the path now points "
+                f"elsewhere), so the edit was NOT applied — nothing was "
+                f"written. Re-read the file and retry.",
+                reason_code="file_changed_underneath")
+    else:
+        await asyncio.to_thread(path.write_bytes, _payload_bytes)
     # Whole-file defs diff: symbols defined in the previous content but not
     # in the new content were removed by this edit; surviving references to
     # them get named in the result (see _orphaned_symbol_warning).
@@ -3710,7 +4866,7 @@ def note_full_rewrite(req_id: str, rel_path: str, prev_bytes: int) -> str:
         return ""
     return (f" NOTE: this is full rewrite #{n} of an existing {prev_bytes:,}-byte file in this request — "
             "each rewrite regenerates the whole file (minutes of generation). For further changes use "
-            "operation='replace' with a SEARCH/REPLACE block of just the lines that change.")
+            "operation='edit' (old_string = just the lines that change, new_string = their replacement).")
 
 
 async def tool_write_file(filename: str, content: Any, sandbox_dir: Path):
@@ -3745,6 +4901,20 @@ async def tool_write_file(filename: str, content: Any, sandbox_dir: Path):
             content = extract_code_from_markdown(content, filename=filename)
 
         path = _get_safe_path(sandbox_dir, filename)
+
+        # §4KB: a whole-file WRITE over an EXISTING file is the most
+        # destructive edit shape there is — it discards everything the model
+        # did not re-emit. Gated on the same receipt as `replace`. A write
+        # that CREATES a file is never gated: there are no bytes to have
+        # read, and new-file creation is the leaf's normal first move.
+        # ⚠ `is_file()` is FALSE for a FIFO/device, so this gate used to
+        # be SKIPPED for exactly the targets `replace` refuses outright — and
+        # the atomic write then replaced the FIFO with a regular file, ungated.
+        # Refuse a non-regular existing target the same way, before the gate.
+        if path.exists() and not path.is_file():
+            return (f"Error: '{filename}' exists and is not a regular file "
+                    f"(it is a FIFO, device, socket or directory), so it "
+                    f"cannot be written as text. '{filename}' is unchanged.")
 
         # SELF-HEALING: Auto-create parent directories
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -4738,6 +5908,7 @@ _PROJECT_DIR_RE = re.compile(r"projects/([0-9a-f]{12})(?:/|$)")
 #: miss a newly-added mutating one; a deny-list of guarded ones always can.
 _READ_ONLY_OPS = frozenset({
     "read", "read_file", "read_chunked", "read_document", "inspect",
+    "outline", "symbols",
     "search", "find", "list", "list_files", "ls", "dir", "tree", "list_dir",
     "list_directory",
 })
@@ -4754,13 +5925,38 @@ def _released_write_block(project_store, sandbox_dir, target) -> Optional[str]:
     try:
         if project_store is None:
             return None
+        # ⚠ IDs from the RESOLVED path's components, every one of them, any
+        # case — not the first regex hit on the raw spelling. The raw form
+        # let `Projects/`, `AAAA…` (APFS is case-insensitive), `projects//`,
+        # `projects/zz/../<id>` and, from an ACTIVE scope, `projects/<released>`
+        # through, because the first hit was the active id (fresh-eye §4KC
+        # round 2, seven confirmed bypasses).
+        cands = set()
+        sd = Path(str(sandbox_dir))
+        part_lists = []
+        try:
+            part_lists.append(sd.resolve().parts)
+        except Exception:                                   # noqa: BLE001
+            part_lists.append(sd.parts)
+        if target is not None and str(target).strip():
+            try:
+                part_lists.append(_get_safe_path(sd, str(target)).resolve().parts)
+            except Exception:                               # noqa: BLE001
+                # unresolvable (a traversal the safe-path helper refused):
+                # judge the NORMALISED raw spelling, so `zz/../<id>` counts
+                part_lists.append(Path(os.path.normpath(f"{sd}/{target}")).parts)
+        for parts in part_lists:
+            low = [str(p).lower() for p in parts]
+            for i in range(len(low) - 1):
+                if low[i] == "projects" and re.fullmatch(r"[0-9a-f]{12}", low[i + 1]):
+                    cands.add(low[i + 1])
         hay = f"{sandbox_dir}/{'' if target is None else target}"
-        m = _PROJECT_DIR_RE.search(str(hay).replace("\\", "/"))
-        if not m:
-            return None
-        pid = m.group(1)
-        proj = project_store.get_project(pid)
-        if proj and str(proj.get("status", "")).upper() == "RELEASED":
+        for m in _PROJECT_DIR_RE.finditer(str(hay).replace("\\", "/").lower()):
+            cands.add(m.group(1))
+        pid = next((c for c in sorted(cands)
+                    if str((project_store.get_project(c) or {}).get("status", "")).upper() == "RELEASED"),
+                   None)
+        if pid is not None:
             return (
                 ToolOutcome.rejected(f"SYSTEM BLOCK: project {pid} is RELEASED (human-attested, "
                 f"immutable) — this write was NOT applied. To change it, "
@@ -4768,7 +5964,7 @@ def _released_write_block(project_store, sandbox_dir, target) -> Optional[str]:
                 f"action=create_version project_id={pid} "
                 f"description=\"<the requested change>\", then edit the new "
                 f"version's workspace. The released version keeps running "
-                f"untouched."))
+                f"untouched.", reason_code="released_write_blocked"))
     except Exception:
         return None
     return None
@@ -4942,7 +6138,72 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
 
         return await tool_download_file(url=str(url), sandbox_dir=sandbox_dir, tor_proxy=kwargs.get("tor_proxy"), filename=target_path)
 
-    if not target_path: 
+    #: §4KB: operations that act on the PROJECT, not on one file. They must
+    #: be exempt from the path requirement below, which would otherwise
+    #: reject them before their own argument check ever runs — the model
+    #: would be told to name a file for a whole-project symbol lookup.
+    _PATHLESS_OPS = frozenset({"symbols"})
+
+    # ══════════════════════════════════════════════════════════════════
+    # NO MUTATION INSIDE `.git`. §4KB round 4.
+    #
+    # Rounds 2, 3 and 4 each closed a git escape and each was an INSTANCE
+    # fix: a `.git` FILE, then `core.worktree`/`core.hooksPath`/`commondir`/
+    # `alternates`, then `diff.external` and `filter.*.clean` — and git has
+    # many more keys that name a program to run (`core.pager`,
+    # `sequence.editor`, `*.textconv`, `credential.helper`,
+    # `core.sshCommand`, `alias.*`, `uploadpack.packObjectsHook`). Enumerating
+    # them is unwinnable, and three rounds of trying is the evidence.
+    #
+    # Every one of those escapes needs the SAME precondition: the model
+    # writing inside `.git`. Nothing legitimate does — git's own plumbing is
+    # reached through the `git` tool, and a workspace's repository internals
+    # are not a place an agent edits by hand. So the precondition is what
+    # gets removed, at the one place every mutating operation passes through.
+    #
+    # This is deliberately a DENY on a path COMPONENT, not on a filename:
+    # `.git/config`, `.git/objects/info/alternates`, `a/b/.git/hooks/pre-commit`
+    # and a `.git` file itself are all refused. `_get_safe_path` has already
+    # resolved traversal, so `../.git/config` cannot slip past.
+    if operation not in _READ_ONLY_OPS and target_path:
+        try:
+            _probe = _get_safe_path(sandbox_dir, target_path)
+            # Lower-cased: the data volume is APFS (case-insensitive), so
+            # `.GIT/config` IS `.git/config` on disk (fresh-eye §4KC r2).
+            _parts = {str(p).lower() for p in _probe.parts} | {
+                p.lower() for p in
+                str(target_path).replace("\\", "/").split("/")}
+            if ".git" in _parts:
+                pretty_log(
+                    "Write Blocked",
+                    f"{target_path}: refused — a repository's internals are "
+                    f"not editable by hand",
+                    icon=Icons.SHIELD, level="WARNING")
+                return ToolOutcome.rejected(
+                    f"SYSTEM BLOCK: '{target_path}' is inside a `.git` "
+                    f"directory and cannot be created, modified or removed. "
+                    f"Repository internals are never edited by hand: a "
+                    f"hand-written git config can redirect the repository "
+                    f"out of this workspace or name a program for git to "
+                    f"execute. Use `execute` to run git commands. Nothing "
+                    f"was changed.",
+                    reason_code="dotgit_write_blocked")
+        except ValueError:
+            pass            # path escape: the operation's own guard reports it
+        except (OSError, RuntimeError) as _pe:
+            # ENAMETOOLONG, or a symlink LOOP (`resolve()` raises
+            # RuntimeError). A path this check cannot resolve is one it
+            # cannot CLEAR either — a `.git` symlink pointing out of the
+            # sandbox landed here and the deny was silently skipped (§4KC
+            # r3). Only ValueError was caught before r2, so a looped link
+            # tracebacked out of every mutating op.
+            return ToolOutcome.rejected(
+                f"SYSTEM BLOCK: '{target_path}' could not be resolved for "
+                f"the write-safety checks ({_pe}), so nothing was changed. "
+                f"Name the file by a plain relative path.",
+                reason_code="unresolvable_path")
+
+    if not target_path and operation not in _PATHLESS_OPS:
         return ToolOutcome.rejected(f"SYSTEM INSTRUCTION: The 'path' (target filename) is missing for the '{operation}' operation. You MUST specify WHICH file to {operation}.", reason_code="missing_path")
     
     if operation == "read":
@@ -4984,16 +6245,77 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
                     f"operation='search', a ranged read, or an 'execute' "
                     f"digest script.")
         _ck = await tool_read_document_chunked(target_path, sandbox_dir, page=page, chunk_size=chunk_size, max_context=max_context)
-        if (read_budget is not None and isinstance(_ck, str)
-                and not _ck.startswith("Error")):
-            read_budget.charge(len(_ck))
+        if isinstance(_ck, str) and not _ck.startswith("Error"):
+            if read_budget is not None:
+                read_budget.charge(len(_ck))
         return _ck
+    elif operation == "outline":
+        # §4KB step 5a. A MAP, never grounding: an outline does not return
+        # file content, so it deliberately does NOT stamp a read receipt —
+        # knowing a function is at line 120 is not having seen line 120.
+        from .outline import outline_source, render_outline
+        pretty_log("File Outline", str(target_path), icon=Icons.TOOL_FILE_O)
+        try:
+            _p = _get_safe_path(sandbox_dir, target_path)
+        except ValueError as ve:
+            return str(ve)
+        if not _p.exists() or not _p.is_file():
+            return _missing_file_message(target_path, sandbox_dir)
+        try:
+            _src = await asyncio.to_thread(
+                _p.read_text, encoding="utf-8", errors="replace")
+        except OSError as oe:
+            return f"Error: failed to read '{target_path}': {oe}"
+        _syms, _method = await asyncio.to_thread(
+            outline_source, _src, str(target_path))
+        return render_outline(_syms, str(target_path), _method)
+    elif operation == "symbols":
+        # §4KB step 5b. Project-wide DEFINITION lookup. Uses is a different
+        # question with a better existing answer (`search` is ripgrep), and
+        # the renderer says so rather than shipping a weaker duplicate.
+        from .outline import build_symbol_index, render_definitions
+        _name = str(kwargs.get("name") or pattern or "").strip()
+        pretty_log("Symbol Lookup", _name or "(no name given)",
+                   icon=Icons.TOOL_FILE_O)
+        if not _name:
+            return ToolOutcome.rejected(
+                "SYSTEM INSTRUCTION: operation='symbols' needs `name` — the "
+                "symbol you are looking for (a function, class or constant). "
+                "To search for arbitrary TEXT, use operation='search'.",
+                reason_code="missing_symbol_name")
+        _idx = await asyncio.to_thread(build_symbol_index, Path(sandbox_dir))
+        # M3: `render_definitions` calls difflib.get_close_matches, measured
+        # at 24 ms on the real 32,398-name index — blocked loop, 20x the
+        # substring scan it augments. The index build was already threaded;
+        # the render was not.
+        return await asyncio.to_thread(render_definitions, _idx, _name)
     elif operation == "inspect":
         # `lines` used to be dropped here, so the model could never widen the
         # peek; tool_inspect_file coerces bad values back to the default.
         return await tool_inspect_file(target_path, sandbox_dir,
                                        lines=kwargs.get("lines", 10))
-    elif operation == "write": return await tool_write_file(target_path, final_content, sandbox_dir)
+    elif operation == "write":
+        return await tool_write_file(target_path, final_content, sandbox_dir)
+    elif operation == "edit":
+        # §4KC: NO aliases, by design. The alias fan-out on `replace` is
+        # where its interface failures lived (`content` holding a whole
+        # file, `replace_with` missing). A call that reaches for the old
+        # names is told the new ones, not healed into them.
+        _old_s = kwargs.get("old_string")
+        _new_s = kwargs.get("new_string")
+        if _old_s is None and _new_s is None and (
+                final_content is not None or replace_with is not None):
+            return ToolOutcome.rejected(
+                "SYSTEM INSTRUCTION: operation='edit' takes 'old_string' "
+                "(the exact text in the file now) and 'new_string' (its "
+                "replacement) — not 'content'/'replace_with'. Re-issue with "
+                "those two parameters. Nothing was changed.",
+                reason_code="edit_wrong_params")
+        _ra = kwargs.get("replace_all")
+        _ra = _ra is True or str(_ra or "").strip().lower() in ("true", "1", "yes")
+        return await tool_edit_text(target_path, _old_s, _new_s, sandbox_dir,
+                                    replace_all=_ra, post_edit=_fs_batch,
+                                    project_store=kwargs.get("project_store"))
     elif operation == "replace":
         # Accept the param-name variants the model routinely reaches for
         # (the live run's FIRST replace failed purely because it passed
@@ -5008,7 +6330,8 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
             _new = (kwargs.get("new_text") or kwargs.get("new_string")
                     or kwargs.get("new") or kwargs.get("replacement"))
         return await tool_replace_text(target_path, _old, _new, sandbox_dir,
-                                       post_edit=_fs_batch)
+                                       post_edit=_fs_batch,
+                                       project_store=kwargs.get("project_store"))
     
     if operation == "copy":
         copy_target = destination or final_content

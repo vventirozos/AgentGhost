@@ -1381,5 +1381,41 @@ PYTHONPATH=src python scripts/verify_bench.py --tier private --two-stage both</p
   <p><strong>§4IV:</strong> the §4IR cap's ground now includes <em>echo</em> facts — a figure, year or name that rests only on the agent's own earlier words (an expanded episode's OUTCOME, a session's assistant lines, an earlier reply of this conversation); the ledger row's <code>capped</code> lists them and the reasoning reads "in neither evidence nor context, or only in the agent's own earlier words". See <a href="claim_binding.html">claim_binding §4IV</a>.</p>
   <p><strong>§4IX (fresh-eye review):</strong> the confirm-first lift no longer overrides an UNCERTAIN that the truncation guard made out of a cheap REFUTED (<code>truncation_guarded</code>) — the binder confirmed over the same cut digest and cannot see what the judge said was missing. The refute appeal builds the supplement off the loop and passes it as a kwarg to the objection tier (absence branch only); the strong judge and the rebuttal view still read the spliced evidence.</p>
   <p><strong>§4IY (wide review):</strong> the verdict word is parsed at the start of the judge's text only (<code>\s*(CONFIRMED|REFUTED?|UNCERTAIN)\b</code> — a REFUTED quoted inside a CONFIRMED rationale no longer flips it); <code>_parse_json</code> prefers the fragment that carries both a verdict and a confidence; a placeholder issue ("N/A", "none", "-") is not a finding (<code>_PLACEHOLDER_ITEM_RE</code>); the truncation guard stamps its own reason (<code>truncation_guard</code>) and the confirm-first lift excludes <code>escalation_downgraded</code> as well; the ledger's rebuttal keeps the rule's <em>why</em> ("arithmetic: …") and <code>strong_call</code> is None on every mechanical outcome; a rebuttal quote must be mostly verbatim (≥ 60 % of its length matched); the marked-evidence cap slices at a block boundary (<code>_slice_evidence_body</code>); the strong judge in <code>_escalate_refute</code> sees the spliced raw sources while the rules see the digest, and the splice is built off the loop (<code>asyncio.to_thread</code>); the shadow spawn passes <code>raw_sources</code>; a voted verdict is built as strong only when the main model was forced (<code>strong=bool(force_main)</code>); the escalate flag is <code>GHOST_VERIFY_ESCALATE_CONFIRM</code>. Benches bit-identical after the batch.</p>
+
+  <h2 id="4kc-gate-prior">The unverified-mutation gate is a PRIOR, and a late CONFIRMED may lift it <span class="tag">2026-09-23 &sect;4KC round 5</span></h2>
+  <p>Measured on two live one-line edits (reqs <code>07c0c588</code>, <code>3b827526</code>): the model read the file,
+  applied the change (SUCCESS with a post-edit view), and finalised. No verdict existed yet (the critic runs
+  async), the last substantive tool was a mutation of a <code>.py</code>, so the gate fired its "actually RUN it"
+  repair round; the model — correctly — had nothing to run for a one-line library edit and finalised again; the gate
+  then booked <code>failed · 0.17</code> with the "⚠ Unverified … INCOMPLETE" footer. Thirty seconds later the
+  verifier landed <strong>CONFIRMED 100%</strong> with FILE-ARTIFACT present — and the corpus row stayed
+  <code>failed</code>, because at record time the backfill had been stamped <code>"verifier refuted"</code>, the one
+  reason class <code>resolve_turn_outcome</code> never upgrades. The identical request with a trailing verify-<code>read</code>
+  (req <code>81dbd7cd</code>) was booked <code>verified · 0.85</code>: the durable label depended on whether the model's
+  last action happened to be a read, which is evidence of nothing.</p>
+  <p>The gate's verdict is a prior in the absence of a verdict, not a refutation. It now books
+  <code>UNVERIFIED_MUTATION_REASON</code>, which carries the structural-failure prefix, and the trajectory record
+  receives the backfill's reason (<code>verifier_reason</code>) so <code>_backfilled_failure_reason</code> stamps the row by
+  CLASS: a structural-class backfill keeps its reason (liftable by a &ge;0.7 late CONFIRMED through the existing
+  <code>_backfill_trajectory_outcome</code> path); a genuine refutation is still "verifier refuted" and never lifts.
+  Pins: <code>tests/test_unverified_gate_is_a_prior.py</code>.</p>
+  <p><strong>Then the operator narrowed the gate to whole-file writes (2026-09-23).</strong> The gate was written
+  for req_C0 — a 33-minute build finishing on an untested <code>write</code> — and a targeted edit of an existing
+  library module has nothing to "run": the forced repair round ended every such turn <code>failed · 0.17</code>.
+  <code>_is_unverified_mutation</code> now returns False for every TARGETED-edit confirmation shape the tool emits
+  (<code>Exact/Flexible/Fuzzy/Anchor match … replaced</code>, <code>Applied N SEARCH/REPLACE blocks</code>,
+  <code>Streaming replace applied</code>, <code>edited — replaced</code>) and still fires for <code>Wrote</code> and the
+  replace→write auto-promote; an UNRECOGNISED SUCCESS carrying a mutation marker stays guarded, so a reworded message
+  cannot silently disarm it. A pin renders the tool's own f-strings and asserts every content-mutation shape is either
+  whole-file or exempt, and every exemption matches an emitted shape. The three older pins that expected a
+  <code>replace</code> into code to fire were updated to the policy.</p>
+  <p><strong>And a size threshold (2026-09-23, same session).</strong> The narrowed gate still fired on a 69-character
+  three-line helper written whole, with "do not run it" in the request and a 100% late CONFIRMED — not the req_C0
+  shape either. <code>UNVERIFIED_WRITE_MIN_CHARS = 2048</code>: a whole-file write below it does not trip the gate.
+  The size is the tool's own <code>Wrote N chars</code> figure, read over the leading run of SUCCESS lines; a run
+  containing any other shape (the replace→write auto-promote, whose size is unstated, or an unrecognised wording)
+  keeps the guard, conservatively, and one <code>Wrote</code> at or above the threshold keeps it for the whole run.
+  Pinned with boundary values (2047/2048), mixed runs, and a parity-style check that every emitted
+  <code>Wrote</code> shape parses — a reword blinds the threshold loudly (the guard stays ON), never silently.</p>
 </body>
 </html>

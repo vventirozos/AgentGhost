@@ -256,5 +256,20 @@
   <p>Every lesson record now carries <code>origin</code>: <code>"user"</code> (written during a real user request), <code>"auto"</code> (idle machinery — reflection, dream, post-mortem, distillation — or an internal sched-/job-/sub- turn), <code>"probe"</code> (a diagnostic; must never teach, stamped so a leak is visible), <code>"bench"</code>, or <code>""</code> for legacy rows. It is derived ONCE inside the write chokepoint (<code>_derive_lesson_origin</code>, from the request-id contextvar the turn loop sets first thing — the default <code>"SYSTEM"</code> outside any request is "auto"), so no caller has to know; an explicit <code>learn_lesson(..., origin=)</code> wins. The learning-health report counts lessons by origin and flags any probe-origin lesson. Motivation: HEARTBEAT (arXiv 2603.23064) — background activity promoted into long-term memory 91% of the time; this agent's idle loop writes lessons from web-derived content, and §4FB found a diagnostic probe sitting in the playbook as lesson 49. No retrieval filter is applied yet: the operator's B3 ablation showed idle-loop lessons earn their keep, so this ships as observability first. Tests: <code>tests/test_4fd_provenance.py</code>.</p>
 
 </main>
+
+  <h2 id="4kd-slack">Slack never teaches <span class="tag">2026-09-24 &sect;4KD</span></h2>
+  <p>Open-channel Slack mode feeds channel members' prompts into a single-tenant playbook: on 2026-09-23, 4 of 257
+  lessons had a stranger's Slack message as their <code>task</code>. The rule is the probe rule's shape: the bot mints
+  its request ids with the <code>slack-</code> prefix (the same id its feedback reactions correlate on, so nothing
+  server-side rewrites it; <code>X-Ghost-Origin: slack</code> is the fallback for any other Slack-side caller), and
+  <code>is_slack_request_id</code> is the one predicate. The population stays <code>user</code> — Slack is real
+  traffic — but the turn may not TEACH: <code>turn_may_teach(context)</code> (false for probe and slack) gates the
+  outcome attribution, Perfect-It (deferred and foreground) and the post-mortem — which is simply not queued, because
+  the queue consumer runs under the "SYSTEM" request id and could not know; the model's explicit
+  <code>learn_skill</code> is refused at dispatch (<code>lesson_channel_blocked</code>); and the writer itself,
+  <code>SkillMemory</code>, refuses EVERY playbook mutation when the derived lesson origin is <code>slack</code>
+  (<code>playbook_writes_blocked()</code> as the first statement of all eleven mutators — an enumeration pin walks the
+  class and fails when a new mutator lacks it). Per-requester scoping of autobio/recall for Slack — the tenant-bleed
+  root cause — is a separate design, not done here.</p>
 </body>
 </html>

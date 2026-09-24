@@ -403,17 +403,18 @@ def participant_write_violation(constraints: List[str],
     active and the write body embeds move-selection logic; ``None``
     otherwise. Pure function (agent.py calls it before dispatching the
     tool) so the whole guard is unit-testable without an agent loop.
-    Scans ``content`` AND ``replace_with``: the replace→write
-    auto-promotion means either argument can become the full file body.
+    Scans ``content`` AND ``replace_with`` (the replace→write
+    auto-promotion means either argument can become the full file body)
+    AND ``new_string`` (operation='edit', §4KC).
     """
     if not constraints or not has_participant_constraint(list(constraints)):
         return None
     args = tool_args or {}
     op = str(args.get("operation") or "")
-    if op not in ("write", "replace"):
+    if op not in ("write", "edit", "replace"):
         return None
     body = "\n".join(str(args.get(k) or "")
-                     for k in ("content", "replace_with"))
+                     for k in ("content", "replace_with", "new_string"))
     if not body.strip():
         return None
     hits = find_engine_patterns(body)

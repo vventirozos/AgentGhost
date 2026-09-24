@@ -90,8 +90,8 @@ def test_the_system_prompt_names_the_two_step_route_not_just_the_tool():
 
 # ── 2. a turn that ate its own write cannot certify the file ──────────────
 
-NOTE = _dropped_mutation_note(["file_system"], ["/workspace/out.md"])
-
+NOTE = _dropped_mutation_note(["file_system"], ["/workspace/out.md"],
+                              creating=["/workspace/out.md"])
 EVIDENCE_ROW = {
     "role": "tool", "tool_call_id": "c1", "name": "web_search",
     "content": ToolOutcome.ok(
@@ -303,3 +303,191 @@ def test_the_schema_offers_the_extra_phrasings():
     assert props["extra_queries"]["items"]["type"] == "string"
     desc = _tool_def("darkweb_search")["description"].lower()
     assert "same round" in desc and "extra_queries" in desc
+
+
+# ---------------------------------------------------------------------------
+# §4KC (2026-09-23, req 76b3602e): the note must not disclaim what DID land
+# ---------------------------------------------------------------------------
+
+def test_a_landed_edit_is_not_disclaimed_by_a_later_drop():
+    """Live: one `edit` succeeded at +40 s, a redundant second file_system
+    call was dropped at the finish line, and the reply said "nothing
+    described above as written … was actually written" over a file that was
+    verifiably changed. Fails in that world."""
+    note = _dropped_mutation_note(["file_system"], ["/b.md"],
+                                  landed=["kc_probe.py"], creating=["/b.md"])
+    assert note.startswith("\n\n" + agent_mod._DROPPED_NOTE_HEAD)
+    assert "file_system" in note[:400]              # the §4GH strip/detect contract
+    assert "kc_probe.py" in note and "DID land" in note
+    assert "nothing described above" not in note
+    assert "/b.md" in note and "does NOT exist" in note   # the drop is still named
+    # with nothing landed, the original full disclaimer is unchanged
+    assert "written, saved or created was actually written" in \
+        _dropped_mutation_note(["file_system"], ["/b.md"], landed=[])
+
+
+def test_both_drop_sites_pass_what_landed():
+    """Wiring, read from the AST: every finish-line `_dropped_mutation_note`
+    call in the turn loop is handed `landed=` from the tool results."""
+    import ast
+    import inspect
+    tree = ast.parse(inspect.getsource(agent_mod))
+    calls = [n for n in ast.walk(tree)
+             if isinstance(n, ast.Call)
+             and getattr(n.func, "id", "") == "_dropped_mutation_note"]
+    assert len(calls) == 2, len(calls)
+    for c in calls:
+        kw = {k.arg: k.value for k in c.keywords}
+        assert "landed" in kw, ast.dump(c)[:200]
+        assert getattr(kw["landed"].func, "id", "") == "_files_mutated_this_turn"
+        # §4KC r3: BOTH sites hand over the dropped paths and which of them
+        # are creating ops — site 2 used to pass names only, so a forced-
+        # final-dropped WRITE read "was not changed" instead of "does NOT
+        # exist" and the landed-reconciliation was inoperative there.
+        assert "creating" in kw, ast.dump(c)[:200]
+        assert not (isinstance(kw["creating"], ast.List) and not kw["creating"].elts), "creating=[] literal"
+        assert len(c.args) >= 2, "paths positional missing"
+        assert not (isinstance(c.args[1], ast.List) and not c.args[1].elts), "paths=[] literal"
+
+
+def test_a_dropped_read_produces_no_disclaimer_and_a_dropped_edit_says_not_changed():
+    """[§4KC r2] Neither the gate nor the path list looked at `operation`:
+    a dropped verify-`read` produced the full "nothing was written" note,
+    and a dropped `edit` on an existing file was told it "does NOT exist"."""
+    from ghost_agent.core.agent import (_dropped_fs_calls,
+                                        _dropped_mutating_names)
+    read = [{"function": {"name": "file_system",
+                          "arguments": {"operation": "read", "path": "README.md"}}}]
+    assert _dropped_mutating_names(read) == []
+    assert _dropped_write_paths(read) == []
+    assert _dropped_mutation_note(_dropped_mutating_names(read),
+                                  _dropped_write_paths(read)) == ""
+
+    edit = [{"function": {"name": "file_system",
+                          "arguments": {"operation": "edit", "path": "app.py",
+                                        "old_string": "a", "new_string": "b"}}}]
+    assert _dropped_mutating_names(edit) == ["file_system"]
+    assert _dropped_fs_calls(edit) == [("edit", "app.py")]
+    note = _dropped_mutation_note(["file_system"], ["app.py"])
+    assert "`app.py` was not changed" in note and "does NOT exist" not in note
+
+    # a dropped call on a file that ALSO landed this turn is not "missing"
+    # and not "unchanged" — the earlier call changed it; only the note's
+    # "final pending action" clause remains
+    note = _dropped_mutation_note(["file_system"], ["app.py"], landed=["app.py"])
+    assert "DID land" in note and "app.py" in note
+    assert "does NOT exist" not in note and "was not changed" not in note
+    # other tools keep their name-based gate
+    assert _dropped_mutating_names([{"function": {"name": "execute", "arguments": {}}}]) == ["execute"]
+
+
+def test_round3_the_note_names_destinations_dedupes_and_reconciles_redone_writes():
+    """[§4KC r3] copy/rename/move create at the DESTINATION (the note said
+    the SOURCE "does NOT exist"); aliased spellings of one file were listed
+    thrice; and a write dropped on a forced-final miss then RE-DONE by the
+    repair re-entry was still disclaimed."""
+    from ghost_agent.core.agent import (_dropped_entries, _dropped_fs_calls,
+                                        _still_pending_drops)
+    copy = [{"function": {"name": "file_system",
+                          "arguments": {"operation": "copy", "path": "src.md",
+                                        "destination": "dst.md"}}}]
+    assert _dropped_fs_calls(copy) == [("copy", "dst.md")]
+    note = _dropped_mutation_note(["file_system"], ["dst.md"], creating=["dst.md"])
+    assert "`dst.md` does NOT exist" in note and "src.md" not in note
+    # the dispatcher's alias chain
+    alias = [{"function": {"name": "file_system",
+                           "arguments": {"operation": "write", "filename": "b.md"}}}]
+    assert _dropped_write_paths(alias) == ["b.md"]
+    # dedupe by normalised key
+    note = _dropped_mutation_note(["file_system"], ["a.md", "a.md", "/workspace/a.md"],
+                                  creating=["a.md"])
+    assert note.count("a.md") == 1, note
+    # reconcile: a later file_system SUCCESS retires the dropped fs entry
+    entries = _dropped_entries(alias, tools_seen=2)
+    assert entries == [("file_system", "write", "b.md", 2)]
+    runs = [{"name": "file_system", "content": "read stuff"},
+            {"name": "web_search", "content": "…"},
+            {"name": "file_system", "content": "SUCCESS: Wrote 3 chars to 'b.md'. Script-side path (from sandbox cwd): 'b.md'."}]
+    assert _still_pending_drops(entries, runs) == []
+    assert _still_pending_drops(entries, runs[:2]) == entries
+    # [r4 pre-fix] a later SUCCESS on an UNRELATED file must not retire it
+    other = runs[:2] + [{"name": "file_system", "content":
+                         "SUCCESS: Wrote 3 chars to 'z.md'. Script-side path (from sandbox cwd): 'z.md'."}]
+    assert _still_pending_drops(entries, other) == entries
+    # …but the same file under the tool's other spelling does
+    alias_hit = runs[:2] + [{"name": "file_system", "content":
+                             "SUCCESS: edited — replaced 1 occurrence of old_string (line 1) in '/workspace/b.md'."}]
+    assert _still_pending_drops(entries, alias_hit) == []
+    # a non-file_system drop has no such signal and stays pending
+    ex = _dropped_entries([{"function": {"name": "execute", "arguments": {}}}], 0)
+    assert _still_pending_drops(ex, runs) == ex
+    assert "pending last" not in _dropped_mutation_note(["file_system"], ["x.md"], landed=["y.md"])
+
+
+def test_round4_every_op_reconciles_and_a_delete_has_its_own_verb():
+    """[§4KC r4] the reconcile knew only the produce shapes, so a re-done
+    copy/rename/delete stayed pending; and a dropped delete read "was not
+    changed"."""
+    from ghost_agent.core.agent import (_confirmed_paths_any_op,
+                                        _dropped_entries, _still_pending_drops)
+    def entry(op, path):
+        return [(("file_system", op, path, 0))]
+    assert _still_pending_drops(entry("copy", "b.md"),
+        [{"name": "file_system", "content": "SUCCESS: Copied 'a.md' to 'b.md'."}]) == []
+    assert _still_pending_drops(entry("rename", "b.md"),
+        [{"name": "file_system", "content": "SUCCESS: Renamed/Moved 'a.md' to 'b.md'."}]) == []
+    assert _still_pending_drops(entry("delete", "old.md"),
+        [{"name": "file_system", "content": "SUCCESS: Deleted 'old.md'."}]) == []
+    assert _still_pending_drops(entry("write", "b.md"),
+        [{"name": "file_system", "content": "[FAILURE BANNER] x\nSUCCESS: Wrote 3 chars to 'b.md'. Script-side path (from sandbox cwd): 'b.md'."}]) == []
+    # unrelated names never retire
+    assert _still_pending_drops(entry("copy", "b.md"),
+        [{"name": "file_system", "content": "SUCCESS: Copied 'a.md' to 'c.md'."}]) == entry("copy", "b.md")
+    assert _confirmed_paths_any_op("REJECTED: nope") == set()
+    note = _dropped_mutation_note(["file_system"], ["old.md"], deleting=["old.md"])
+    assert "`old.md` was not deleted" in note and "not changed" not in note
+    note = _dropped_mutation_note(["file_system"], ["a.md", "old.md", "new.md"],
+                                  creating=["new.md"], deleting=["old.md"])
+    assert "`new.md` does NOT exist" in note and "`old.md` was not deleted" in note \
+        and "`a.md` was not changed" in note
+
+
+def test_round4_both_drop_sites_pass_deleting():
+    import ast
+    import inspect
+    tree = ast.parse(inspect.getsource(agent_mod))
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+             and getattr(n.func, "id", "") == "_dropped_mutation_note"]
+    assert len(calls) == 2
+    for c in calls:
+        kw = {k.arg: k.value for k in c.keywords}
+        assert "deleting" in kw and not (isinstance(kw["deleting"], ast.List) and not kw["deleting"].elts)
+
+
+def test_round5_reconcile_is_op_aware_and_a_landed_delete_is_named():
+    """[§4KC r5] a dropped WRITE was retired by a later `Deleted` of the same
+    name (the file is gone — the note must stand); a dropped DELETE of a
+    file that landed this turn was filtered out of the note entirely."""
+    from ghost_agent.core.agent import _still_pending_drops
+    w = [("file_system", "write", "a.md", 0)]
+    d = [("file_system", "delete", "a.md", 0)]
+    deleted = [{"name": "file_system", "content": "SUCCESS: Deleted 'a.md'."}]
+    wrote = [{"name": "file_system", "content":
+              "SUCCESS: Wrote 3 chars to 'a.md'. Script-side path (from sandbox cwd): 'a.md'."}]
+    moved = [{"name": "file_system", "content": "SUCCESS: Renamed/Moved 'a.md' to 'b.md'."}]
+    assert _still_pending_drops(w, deleted) == w          # write not satisfied by a delete
+    assert _still_pending_drops(d, wrote) == d            # delete not satisfied by a write
+    assert _still_pending_drops(d, deleted) == []
+    assert _still_pending_drops(d, moved) == []           # moved away = gone
+    assert _still_pending_drops(w, wrote) == []
+    note = _dropped_mutation_note(["file_system"], ["a.md"], landed=["a.md"], deleting=["a.md"])
+    assert "`a.md` was not deleted" in note
+
+
+def test_round6_a_landed_file_is_never_also_missing():
+    """[R6] a dropped write AND a dropped delete of a file that landed said
+    "DID land" and "does NOT exist" in one sentence."""
+    note = _dropped_mutation_note(["file_system"], ["b.txt"], landed=["b.txt"],
+                                  creating=["b.txt"], deleting=["b.txt"])
+    assert "DID land" in note and "does NOT exist" not in note
+    assert "`b.txt` was not deleted" in note

@@ -34,8 +34,9 @@ def _row(msg: str) -> dict:
      "req_C0: the defect the gate was written for — untested code"),
     ("SUCCESS: Wrote 25000 chars to 'webos/index.html'.", True,
      "markup can be rendered, so it must be"),
-    ("SUCCESS: Exact match found and replaced in 'app.py'.", True, "code"),
-    ("SUCCESS: Wrote 300 chars to 'Makefile'.", True,
+    ("SUCCESS: Exact match found and replaced in 'app.py'.", False,
+     "a targeted edit of code is not the req_C0 shape (operator, 2026-09-23)"),
+    ("SUCCESS: Wrote 3000 chars to 'Makefile'.", True,
      "extensionless: unknown stays guarded, the conservative default"),
 ])
 def test_the_gate_asks_what_was_written_not_merely_that_something_was(msg, fires, why):

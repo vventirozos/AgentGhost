@@ -417,7 +417,7 @@ class TestGenerateEndpoint:
 
 # ================================================================ §4JV editing
 # Reference-image editing rides the same node. Measured 2026-09-22: one
-# reference at 768x512 = 14.2 s/step and 6.7 GB peak, so the cap is ONE
+# reference at 768x512 = 28 s/step (measured 2026-09-22; an earlier 14.2 figure was per-forward) and 6.7 GB peak, so the cap is ONE
 # on this box. Transparency is deliberately NOT exposed: sd.cpp does not
 # decode the alpha matte for this model yet (measured: α noise ≈ opaque).
 _PNG_1x1 = base64.b64decode(
@@ -907,12 +907,21 @@ class TestSeedReporting:
 
         llm.generate_image = gen
         out = asyncio.run(tool_generate_image(prompt="a cat", llm_client=llm, sandbox_dir=tmp_path))
-        assert "Seed: 123456" in out and "seed=123456" in out
-        # It must NOT promise that a re-roll preserves this scene: measured, it
-        # does not (different composition), and saying so sent the model down
-        # the wrong path for "fix this picture".
-        assert "different composition" in out
-        assert "reference_images" in out                    # the honest route for a fix
+        # §4KD: the seed is REPORTED as a record, and the result suggests no
+        # next action — the reuse-vs-edit facts live in the tool DESCRIPTION
+        # (read when an action is chosen), not in the result (read when the
+        # model decides what to do next): a Slack member's `emp1` after an
+        # image turn resolved into the old "Reuse seed=N … ANOTHER TAKE".
+        assert "Seed 123456" in out
+        assert "reuse seed" not in out.lower() and "another take" not in out.lower()
+        from ghost_agent.tools.registry import get_active_tool_definitions
+        _ctx = MagicMock()
+        _ctx.llm_client.image_gen_clients = ["http://gpu"]
+        seed_desc = next(t for t in get_active_tool_definitions(_ctx)
+                         if t.get("function", {}).get("name") == "image_generation"
+                         )["function"]["parameters"]["properties"]["seed"]["description"]
+        assert "different composition" in seed_desc
+        assert "reference_images" in seed_desc                    # the honest route for a fix
 
     def test_an_edit_result_does_not_advertise_a_reroll(self, tmp_path):
         # Re-rolling a seed cannot reproduce someone else's image, so the
@@ -932,7 +941,7 @@ class TestSeedReporting:
         llm.generate_image = gen
         out = asyncio.run(tool_generate_image(prompt="x", llm_client=llm, sandbox_dir=tmp_path,
                                               reference_images=["a.png"]))
-        assert "Seed: 999" not in out
+        assert "Seed 999" not in out and "seed" not in out.lower()
 
 
 def test_queue_wait_fits_inside_the_clients_timeout(monkeypatch):

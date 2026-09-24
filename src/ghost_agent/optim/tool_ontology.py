@@ -568,7 +568,7 @@ def _shares_target(calls: Sequence[Any]) -> Optional[str]:
 # only the two the macro actually implements.
 _FS_TOOL = "file_system"
 _FS_BATCH_READ_OP = "read"
-_FS_POST_EDIT_OPS = frozenset({"replace"})
+_FS_POST_EDIT_OPS = frozenset({"replace", "edit"})   # §4KC: `edit` rides the same view
 
 
 def _call_field(call: Any, key: str) -> Any:
@@ -615,7 +615,7 @@ def collapse_fs_batch(calls: Sequence[Any], *,
     1. a run of consecutive ``file_system(operation='read')`` calls becomes
        ONE call (the `paths` batch), in chunks of ``max_batch``;
     2. a ``file_system(operation='read')`` immediately following a
-       ``file_system(operation='replace')`` on the SAME target is DROPPED —
+       ``file_system(operation='replace'/'edit')`` on the SAME target is DROPPED —
        the post-edit view makes that verify-read unnecessary.
 
     Everything else is passed through untouched. Notably NOT collapsed:

@@ -51,8 +51,11 @@
       <tr><td>read</td><td><code>tool_read_file</code></td><td>Binary sniff first 8 KB; errors on binary; clamps to <code>max_context · 3.5 · 0.5</code> chars. <strong>Line-ranged read (2026-07-07):</strong> pass <code>start_line</code>/<code>end_line</code> for a 1-based, line-number-prefixed slice that is <em>exempt</em> from the whole-file size cap and streamed (stops at <code>end_line</code>, ≤ 2000-line span) — the cheap recovery after a failed replace or a too-large-file error, and it chains directly from <code>search</code> line numbers. Both the too-large error and the large-file replace-failure guidance now point at it. Accepts aliases (<code>start</code>/<code>from_line</code>, <code>end</code>/<code>to_line</code>).</td></tr>
       <tr><td>read_chunked</td><td><code>tool_read_document_chunked</code></td><td>PyMuPDF for PDF pages; text-file byte chunking with overlap.</td></tr>
       <tr><td>inspect</td><td><code>tool_inspect_file</code></td><td>First N lines (default 10). The dispatcher now forwards the model's <code>lines</code> argument (it used to be dropped, so the peek could never widen); bad values coerce back to 10. <strong>Binary files are sniffed first (2026-09-06):</strong> a JPEG peek used to return its first ten newline-delimited runs of JFIF/Exif/ICC bytes as text (req <code>2422eb25</code>); it now returns a factual, <em>non-error</em> line &mdash; <code>'photo.jpg' exists: JPEG image, 1,234,567 bytes &mdash; binary, so no text lines to show. Use 'vision_analysis' to look at it.</code> &mdash; because the model peeks images to confirm they exist before vision, and an <code>Error:</code> prefix would count as a strike.</td></tr>
+      <tr><td>outline</td><td><code>outline.outline_source</code></td><td>A symbol MAP of one file: <code>line kind name signature</code>. Python via <code>ast</code> (exact — it knows a <code>def</code> inside a docstring is not a function); every other language via line heuristics, and the output <em>says which</em>, every time.</td></tr>
+      <tr><td>symbols</td><td><code>outline.build_symbol_index</code></td><td>Project-wide DEFINITION lookup by <code>name</code>. The one operation that needs no <code>path</code>. A miss suggests near names and redirects to <code>search</code> for USES, because a bare "not found" invites the model to conclude the symbol does not exist.</td></tr>
       <tr><td>write</td><td><code>tool_write_file</code></td><td>Auto-serialise JSON, strip markdown, auto-create parent dirs, fixture summary for data files. Writes are always <code>encoding="utf-8"</code> (never the process locale — which mojibaked non-ASCII and truncated the file on an encode error). Rejects an empty payload or the literal Python <code>None</code>, but not the legit word <q>none</q>. A lone-surrogate payload returns an <code>Error:</code> with the file untouched, and writes are tmp-then-rename atomic (2026-07-20 — see below).</td></tr>
-      <tr><td>replace</td><td><code>tool_replace_text</code></td><td>Exact → flexible (whitespace-insensitive) → fuzzy (difflib, unique high-confidence) → <strong>anchor block</strong> (stable boundaries, drifted middle) → size-aware nearest-snippet guidance; auto-promote to write if missing target. Accepts param aliases (<code>old_text</code>/<code>old_string</code>/<code>search</code>, <code>replace_with</code>/<code>new_text</code>/<code>new</code>). The streaming path cleans its temp file on no-match/error (previously leaked <code>.tmp</code> orphans). <strong>Bad-byte round-trip (2026-07-07):</strong> the read + the guarded write + the streaming path use <code>errors="surrogateescape"</code>, so a mostly-text file with stray non-UTF-8 bytes stays editable AND the untouched bad bytes are re-encoded to their exact originals — previously <code>errors="replace"</code> persisted every one as U+FFFD, corrupting regions the edit never touched. The syntax-regression guard fails open when <code>ast.parse</code> chokes on a lone surrogate. <strong>Marker-leak + js/html rollback (2026-07-14):</strong> multi-edit envelopes are rejected at parse time, a count-aware <code>_marker_leak</code> backstop refuses any result that would add <code>====</code>/<code>&lt;&lt;&lt;&lt; SEARCH</code>/<code>&gt;&gt;&gt;&gt;</code> lines to the file, and the syntax-regression rollback now also covers <code>.js</code> and inline <code>&lt;script&gt;</code> in <code>.html</code> via <code>node --check</code> (node resolved launchd-safely by <code>_find_node</code>).</td></tr>
+      <tr><td><strong>edit</strong></td><td><code>tool_edit_text</code></td><td><strong>The way to change an existing file (§4KC, 2026-09-23).</strong> <code>old_string</code> → <code>new_string</code>, both REQUIRED and validated in the tool; exact and unique or REJECTED with evidence (the nearest real lines with numbers, and WHY the match missed — CRLF, indentation, case, or which line diverged). Optional <code>replace_all</code>. No ladder, no aliases, no envelope, no auto-promote; a whole-file <code>old_string</code> on a ≥30-line file is refused naming <code>write</code>. Reads and writes BYTES through O_NOFOLLOW fds with an identity check before the truncate, so line endings outside the edit are preserved and a swapped-in symlink never receives the bytes; a CRLF file is edited through the one invertible normalisation (<code>exact:crlf</code>, see round 2). Shares the syntax-regression rollback and the lone-surrogate guard with <code>replace</code>; the envelope marker-leak guard is off (a Markdown <code>====</code> underline must be writable). Every call is one ledger row with <code>op="edit"</code>. See <a href="#4kc-edit">below</a>.</td></tr>
+      <tr><td>replace</td><td><code>tool_replace_text</code></td><td><em>Older form of <code>edit</code>, kept for one measurement cycle (§4KC).</em> Exact → flexible (whitespace-insensitive) → fuzzy (difflib, unique high-confidence) → <strong>anchor block</strong> (stable boundaries, drifted middle) → size-aware nearest-snippet guidance; auto-promote to write if missing target. Accepts param aliases (<code>old_text</code>/<code>old_string</code>/<code>search</code>, <code>replace_with</code>/<code>new_text</code>/<code>new</code>). The streaming path cleans its temp file on no-match/error (previously leaked <code>.tmp</code> orphans). <strong>Bad-byte round-trip (2026-07-07):</strong> the read + the guarded write + the streaming path use <code>errors="surrogateescape"</code>, so a mostly-text file with stray non-UTF-8 bytes stays editable AND the untouched bad bytes are re-encoded to their exact originals — previously <code>errors="replace"</code> persisted every one as U+FFFD, corrupting regions the edit never touched. The syntax-regression guard fails open when <code>ast.parse</code> chokes on a lone surrogate. <strong>Marker-leak + js/html rollback (2026-07-14):</strong> multi-edit envelopes are rejected at parse time, a count-aware <code>_marker_leak</code> backstop refuses any result that would add <code>====</code>/<code>&lt;&lt;&lt;&lt; SEARCH</code>/<code>&gt;&gt;&gt;&gt;</code> lines to the file, and the syntax-regression rollback now also covers <code>.js</code> and inline <code>&lt;script&gt;</code> in <code>.html</code> via <code>node --check</code> (node resolved launchd-safely by <code>_find_node</code>).</td></tr>
       <tr><td>search</td><td><code>tool_file_search</code></td><td>ripgrep with 40 KB output cap (head 10 KB + tail 30 KB). Default (no path) targets the <em>active workspace's</em> container path (<code>/workspace</code>, or <code>/workspace/projects/&lt;id&gt;</code> when scoped) — the old literal <code>.</code> ran at the container root and swept every other project too. <strong>Exit-1 normalization (2026-07-14):</strong> rg's "no matches" exit 1 (incl. the docker layer's <code>[SYSTEM ERROR] … (Exit 1)</code> sentinel) returns <code>Report: No matches found…</code> instead of a tool failure; real errors (exit 2) pass through.</td></tr>
       <tr><td>find</td><td><code>tool_find_files</code></td><td><code>find(1)</code> with 100-result limit; filters hidden / node_modules / __pycache__. Same active-workspace default path as <code>search</code>.</td></tr>
       <tr><td>download</td><td><code>tool_download_file</code></td><td>curl_cffi (Chrome impersonation) or httpx; 50 MB cap; Tor + identity refresh on 401/403/503 (httpx path used to rotate the identity <em>twice</em> per failed attempt — fixed 2026-07-14, one rotation per attempt). <strong>SSRF-on-redirect closed (2026-07-07):</strong> both clients used to auto-follow redirects, so a non-Tor 302 → 169.254.169.254 / 127.0.0.1 / a LAN host bypassed the original-URL SSRF check. Auto-redirect is now OFF; each hop's <code>Location</code> is resolved (<code>urljoin</code>) and re-validated (<code>_download_redirect_target</code>) before fetching, bounded at <code>_MAX_DOWNLOAD_REDIRECTS</code> (5) against loops.</td></tr>
@@ -175,6 +178,16 @@ SyntaxError: Unexpected identifier 't'</pre>
   <p><strong>Bug 2 — no rollback on introduced breakage.</strong> Every replace path wrote first and syntax-checked second, so a replace that turned a parsing file into a non-parsing one was <em>persisted</em> (reported SUCCESS + a warning). That destroyed the known-good anchor state the model needed for its next surgical edit — every subsequent SEARCH block then failed to match the now-corrupted file, which is what turned one broken edit into a multi-turn rewrite spiral. <code>_write_replace_guarded()</code> now checks the result in-memory <em>before</em> writing: if it would introduce a syntax error that the previous content didn't have (<code>.py</code> via <code>ast.parse</code>, <code>.json</code> via <code>json.loads</code>), the file is left <strong>unchanged</strong> and the model gets a <code>REJECTED</code> message steering it to a tight single-line edit instead of a rewrite. An already-broken file is still editable (the guard only fires on parse → no-parse), and non-Python/JSON files are never blocked. All five content-landing paths (aider, exact, flexible, fuzzy, anchor) route through the guard. Covered by <code>tests/test_file_replace_indent_and_rollback.py</code> and the updated <code>tests/test_write_syntax_check.py</code>.</p>
 
   <h2>Replace-argument corruption guard + block-form parity (2026-07-05)</h2>
+  <p>⚠ <strong>Steering retired 2026-09-23.</strong> From 2026-07-05 the tool description told the model to
+  <em>prefer</em> the <code>&lt;&lt;&lt;&lt; SEARCH / ==== / &gt;&gt;&gt;&gt;</code> envelope "because it survives
+  argument-transport corruption". That corruption was root-caused and fixed on <strong>2026-07-31</strong> (the agent's
+  own legacy XML prompt riding the native path — see <code>tests/test_native_tool_header.py</code>); repair fires have
+  been ≈0 since. The description kept steering into the envelope for two months after its reason was gone, and the edit
+  ledger priced what that cost: on 102 real edits, <strong>13 of 47 rejections were <code>missing_replace_with</code></strong>
+  (the schema literally said "OMIT replace_with") and <strong>27% of applied edits were whole-file rewrites through
+  <code>replace</code></strong>. The three descriptions now say the plain thing — <code>content</code> = exact existing
+  text, <code>replace_with</code> = new text, both required — and the schema shrank from 4,454 to 3,601 chars. The
+  envelope parser is still accepted; it is no longer recommended. The guards below stay.</p>
   <p>Trajectory measurement over 5 days (2026-07-01 → 07-05): of 99 <code>replace</code> calls, 34 failed "search block NOT found" — and <strong>27 of those 34 arrived with <code>content</code> and <code>replace_with</code> byte-identical</strong>. The upstream native-tools argument transport (the same llama-server parser that once merged multi-tool replies into one call's args — the <code>introspect</code> incident) delivers the model's NEW block in <em>both</em> arguments, so the tool searches for text that doesn't exist in the file yet. No matcher improvement can rescue that. Worse, ~23 more identical-args calls "succeeded" as <em>silent no-ops</em>: the identical text still matched the file and was replaced with itself, leaving the model convinced a fix landed that never did. The operator-visible symptom was misdiagnosed for days as "the model writes sloppy SEARCH blocks".</p>
   <ul>
     <li><b>Identical-args guard.</b> <code>content == replace_with</code> (non-aider form) is rejected before any file I/O — covering both the NOT-found path and the silent no-op path — with a ⚠️ <code>File Replace Corruption Guard</code> log line and a SYSTEM INSTRUCTION that teaches the single-argument form verbatim. <code>replace_with=""</code> (a legitimate deletion) is unaffected.</li>
@@ -362,6 +375,299 @@ SyntaxError: Unexpected identifier 't'</pre>
   <p>All 7 corpus rejections for a missing <code>pattern</code> had the glob in <code>path</code>. A literal directory is never spelled with <code>*</code> or <code>?</code>, so the glob is read as the pattern and the directory as the root; a plain directory with no pattern is still rejected — guessing one would be an invention. Covered by <code>tests/test_file_system_find_glob_path.py</code>.</p>
   <h2 id="4jp">The rewrite hint <span class="tag">2026-09-21 &sect;4JP</span></h2>
   <p>Req <code>fd89fd6d</code> rewrote a 15–30 KB file from scratch seven times in one request (126 KB generated, ~15 of its 30 minutes) while <code>replace</code> was used twice. <code>note_full_rewrite</code> counts full writes of an existing file ≥ <code>REWRITE_HINT_MIN_BYTES</code> (8,000) per request and path; from <code>REWRITE_HINT_AT</code> (3) the success line says so and names <code>operation='replace'</code>. Small files, first writes and other requests never count. Pins: <code>tests/test_fd89fd6d_rewrite_hint_and_webgl_note_2026_09_21.py</code>.</p>
+
+  <h2 id="4kb-ledger">The tolerance ladder is now PRICED <span class="tag">2026-09-23 &sect;4KB</span></h2>
+  <p><code>_locate_block</code> always computed which rung matched (<code>exact</code> / <code>flexible</code> /
+  <code>fuzzy:NN%</code> / <code>anchor:L1-L2</code>) and the caller threw it away — the rung reached the model as an
+  advisory sentence and the operator not at all. So the question that decides whether the ladder is an asset or a
+  liability could not be asked: <em>how often does an applied edit rest below <code>exact</code>, and is it corrected
+  immediately afterwards?</em> The 07-14 and 07-19 corruption incidents were both tolerant matching landing in the wrong
+  region and reporting SUCCESS; every guard added since checks the RESULT (marker leak, syntax regression) and none of
+  them can see a fuzzy match that lands somewhere syntactically valid and semantically wrong.</p>
+  <p><code>utils/edit_ledger.py</code> appends one row per <code>tool_replace_text</code> call to
+  <code>&lt;GHOST_HOME&gt;/system/edits/ladder.jsonl</code> — the <code>rubric_shadow.jsonl</code> idiom, joinable by
+  <code>req_id</code>, never raising. Recording lives in a thin WRAPPER around the ~20-return-path implementation rather
+  than at each rung, so a future return path cannot go unrecorded;
+  <code>tests/test_edit_ladder_ledger.py</code> enumerates every return family and asserts exactly one row each.
+  A rolled-back edit records the rung that matched with <code>applied: false</code> — otherwise every rollback would
+  have been tallied as a tolerance success. Read it with <code>scripts/edit_ladder_report.py</code>, whose
+  corrective-rate is explicitly a PROXY: read the delta between rungs, never the level.</p>
+
+  <h2 id="4kb-ambiguity">An ambiguous SEARCH block is REJECTED <span class="tag">2026-09-23 &sect;4KB</span></h2>
+  <p><strong>The defect.</strong> The exact rung returned on <code>search_str in file_content</code> with no occurrence
+  count, and the block loop then applied <code>.replace(matched, repl, 1)</code>. A SEARCH text occurring twice therefore
+  edited the FIRST occurrence and reported strategy <code>exact</code> — a wrong-region edit carrying a success message,
+  invisible to every downstream guard because the result leaks no markers and parses fine.</p>
+  <p>Uniqueness is a property of the LADDER, not of its callers: <code>flexible</code> already required
+  <code>len(matches) == 1</code>, <code>_fuzzy_block_match</code> requires a clear margin over the runner-up, and
+  <code>_anchor_block_match</code> requires both anchors unique. The exact rung was the only one that did not check —
+  and it is the rung that matches most often. <code>_locate_block</code> now has a THIRD outcome,
+  <code>(None, "ambiguous:N")</code>, and the rejection names the line numbers, because a model told "matched 2 times"
+  still cannot act while one told "lines 12, 48" can widen its block on the first retry. "Not found" and "found twice"
+  need opposite repairs, so the batch verdict distinguishes them (<code>ambiguous_block</code> vs
+  <code>no_blocks_matched</code>).</p>
+  <p><strong>The two call forms deliberately differ, and that is pinned as a table.</strong> The block form is surgical
+  and must be unique-or-nothing; the two-argument form is bulk and replaces every occurrence while saying how many.
+  Neither is silent — the defect was that the block form was. <code>tests/test_edit_ambiguity_rule.py</code>.</p>
+
+  <h2 id="4kb-r2">What fresh-eye review found in the §4KB fixes <span class="tag">2026-09-23 round 2</span></h2>
+  <p>The §4KB batch shipped green — 24,231 tests, six new batteries, a 21-mutant battery at 100%. Three read-only
+  reviewers then found defects in it that none of that could see. The ones that touched this module:</p>
+  <ul>
+    <li><strong>The gate sat BELOW the size branches.</strong> Any file over <code>STREAMING_THRESHOLD</code> (1 MB)
+      with a newline-free <code>old_text</code> took the streaming path and returned before the receipt check ever ran —
+      so the stated property ("every edit APPLIED to an existing file is traceable to a read") did not hold for a whole
+      class of files. The gate is now the FIRST thing <code>replace</code> does.</li>
+    <li><strong>The receipt hashed DECODED TEXT.</strong> The read path decodes with <code>errors="replace"</code>
+      (U+FFFD) and the write path with <code>errors="surrogateescape"</code> (U+DCFF), so for any file containing a
+      non-UTF-8 byte the two could never match: every edit was refused <code>stale_receipt</code> with the FALSE message
+      "it CHANGED since you read it", and the repair that message prescribes reproduced it — an unbounded loop. The
+      receipt is now the sha256 of the file's <strong>raw bytes</strong>, streamed.</li>
+    <li><strong>One <code>read_chunked</code> disabled the gate process-wide.</strong> Its reader falls back to the
+      sandbox root while the stamping site re-derived the project-scoped path, so the stamp hit a non-existent file,
+      raised, and latched <code>_RECEIPTS_DEGRADED</code> for the rest of the process — in both arms, with one WARNING
+      line as the only evidence. A missing file no longer latches anything, and <code>read_chunked</code> no longer
+      grounds an edit at all (one page is a partial view, like <code>inspect</code>).</li>
+    <li><strong>The write gate failed OPEN on an unreadable file</strong> — the most destructive edit shape there is,
+      ungated exactly when its previous bytes were unknowable. It now refuses with <code>unreadable_target</code>.</li>
+    <li><strong>The ledger mis-recorded both directions.</strong> A successful streaming edit was logged
+      <code>applied: false</code>; a write that RAISED after a rung matched was logged <code>applied: true</code> over a
+      byte-identical file. Both fixed, both pinned.</li>
+    <li><strong>Stamping ran on every read, in both arms, on the event loop</strong> — 16 ms of blocked loop per ranged
+      read of a 38 MB file, negating the ranged read's whole purpose. It is now gated on the arm and runs in a thread,
+      so control traffic pays nothing.</li>
+    <li><strong>A mixed batch claimed the file was UNCHANGED while it had changed</strong>, and the all-ambiguous
+      verdict was selected by a prefix match on this module's own rejection prose — the same lexical-proxy class §4KB
+      congratulated itself for avoiding. Both now structural.</li>
+  </ul>
+  <p>Pins: <code>tests/test_4kb_review_fixes.py</code> (23). Round-2 mutation battery: 13 mutants, 13 killed.</p>
+
+  <h2 id="4kb-r5">The <code>.git</code> write block <span class="tag">2026-09-23 &sect;4KB round 5</span></h2>
+  <p>No mutating operation may touch a path with a <code>.git</code> component — <code>write</code>,
+  <code>edit</code>, <code>replace</code>, <code>delete</code>, <code>copy</code>, <code>rename</code>, <code>move</code>,
+  <code>download</code>. Reads are unaffected, so diagnosis still works.</p>
+  <p>This outlived the tool it was written for. The <code>git</code> tool has been removed (see
+  <code>docs/core/coding_loop.html</code>), but <code>execute</code> can still run git inside the sandbox, and
+  <code>.git</code> is a configuration surface that names programs to run: <code>core.hooksPath</code>,
+  <code>diff.external</code>, <code>filter.*.clean</code>, <code>core.pager</code>, <code>sequence.editor</code>,
+  <code>credential.helper</code>, <code>alias.*</code>. Four review rounds tried to deny those keys one at a time and
+  lost every round. Removing the precondition — the model writing inside <code>.git</code> — is one deny at the single
+  choke point every mutating operation already passes through, and it is the reason this check is kept rather than
+  deleted with the tool. Pins: <code>tests/test_4kb_round4_fixes.py</code> (operation &times; path-shape table).</p>
+
+  <h2 id="4kc-edit">operation='edit' — exact, unique, or refused with evidence <span class="tag">2026-09-23 &sect;4KC</span></h2>
+  <p><strong>Why.</strong> The §4KB ledger over 102 real <code>replace</code> calls: 46% rejected, and the rejections
+  were INTERFACE failures, not matching failures — <code>missing_replace_with</code> 13/47, not-found 11/47, and 27% of
+  the applies were whole files pushed through the envelope (<code>write_promote</code>). The envelope's justification
+  (survive native tool-call argument corruption) died on 2026-07-31 when the transport was fixed; the tolerance rungs
+  applied 4/61 times and are the only edits no result guard can see land in the wrong region. So the interface is the
+  defect, and <code>edit</code> is the claude-code shape and nothing else.</p>
+  <p><strong>Contract.</strong> <code>old_string</code> + <code>new_string</code>, both required and checked in the tool
+  (the schema's <code>required</code> is per-tool, not per-operation, and the native path does not enforce it).
+  Exact and unique or REJECTED: a miss returns the nearest region with real line numbers <em>and a diagnosis</em>
+  (<code>_edit_miss_diagnosis</code>: CRLF vs LF, indentation/spacing, letter case, or "the first line occurs at line
+  N but the block diverges after it"); an ambiguity names the occurrence lines and offers <code>replace_all</code>.
+  Diagnosis is never applied — that would be the ladder under another name. No aliases: a call carrying
+  <code>content</code>/<code>replace_with</code> is told the right names (<code>edit_wrong_params</code>), not healed
+  into them. No envelope: <code>&lt;&lt;&lt;&lt; SEARCH</code> in either argument is refused. No auto-promote: a
+  complete module with no <code>new_string</code> is a missing argument, and an <code>old_string</code> covering ≥80% of
+  a ≥30-line file is refused naming <code>write</code> (<code>whole_file_on_edit</code>). Reason codes:
+  <code>missing_old_string</code>, <code>missing_new_string</code>, <code>identical_edit</code>,
+  <code>envelope_on_edit</code>, <code>unsafe_path</code>, <code>file_not_found</code>, <code>whole_file_on_edit</code>,
+  <code>old_string_not_found</code>, <code>old_string_ambiguous</code>, <code>edit_write_failed</code>, plus the shared
+  <code>syntax_regression_rolled_back</code> / <code>lone_surrogate</code> / <code>dotgit_write_blocked</code>.</p>
+  <p><strong>What building it found.</strong> The first CRLF test PASSED with a SUCCESS: <code>Path.read_text</code>
+  opens with universal newlines, so an LF <code>old_string</code> matched a file that has no LF in it, and the guarded
+  write then put LF on every line. <code>replace</code> has always done this — every replace on a CRLF file rewrites
+  its line endings. <code>edit</code> reads <code>read_bytes().decode("utf-8", "surrogateescape")</code>, which never
+  raises and never translates. And the first envelope check refused a Markdown setext underline (<code>=====</code>);
+  the only unambiguous envelope signature is <code>&lt;&lt;&lt;&lt; SEARCH</code>, and that is all it matches now.</p>
+  <p><strong>Measured on one yardstick.</strong> <code>_edit_applied</code> is the single rule that decides whether a
+  ledger row says <em>applied</em>, shared by both wrappers; <code>scripts/edit_ladder_report.py</code> prints a Q4
+  table per <code>op</code>. Every consumer that enumerates mutating file operations knows <code>edit</code> — the
+  sandbox-listing cache invalidation and the mutating-tool classifier in <code>agent.py</code>, the participant-mode
+  engine guard (which now scans <code>new_string</code>), <code>replay_engine._PRODUCING_FS_OPS</code>, the
+  <code>.git</code> block and the released-project block — and <code>tests/test_edit_operation.py</code> pins each.
+  One more consumer the first full suite found rather than the enumeration: the verifier's
+  <code>_fs_path_ledger</code> (<code>core/agent.py</code>) parses <code>file_system</code> SUCCESS lines BY SHAPE to
+  learn which files a turn produced, and its producer/parser parity battery (<code>tests/test_grounded_file_verify.py</code>)
+  tripped on the new <code>SUCCESS: edited '…' — replaced N occurrence…</code> line; the pattern is in
+  <code>_FS_PRODUCE_RES</code> now, and the message's slot names carry <code>lines</code>/<code>count</code> so the
+  renderer classifies the filename as the only path slot.
+  That battery also drives every one of <code>_edit_text_impl</code>'s 17 return statements once (a count tripwire
+  fails when one is added), asserts exactly one ledger row and an untouched file for each refusal, and pins the
+  no-ladder property by CONTRAST: the same whitespace-drifted call that <code>replace</code> applies on its flexible
+  rung is refused by <code>edit</code>. Mutation battery: 20 mutants killed, 0 survived (uniqueness, whole-file, bytes read, marker
+  guard, aliases, replace_all spellings, ledger ordering, write-failure status, diagnosis, FIFO guard, path escape,
+  schema enum, participant guard ×2, ambiguity lines, root-fallback scope crossing, write-failure status ×3); the first write-failure mutant SURVIVED and bought the truncation-measurement fix + two pins, and one first-form scope-crossing mutant was EQUIVALENT (it fell through to the not-found return) — corrected, not counted.</p>
+
+  <h2 id="4kc-r2">§4KC round 2: three fresh-eye lenses on <code>edit</code> <span class="tag">2026-09-23</span></h2>
+  <p>Three reviewers with fresh context (implementation, consumer wiring, security + test quality) read the §4KC batch
+  that was green on 24,311 tests and a 20/20 mutation battery. ~30 findings; the ones that changed the design:</p>
+  <ul>
+    <li><strong>CRLF files were un-editable through the documented route.</strong> The turn loop strips every <code>\r</code>
+      from tool results, so the model can never produce the byte-for-byte <code>old_string</code> the refusal asked for.
+      The ONE invertible normalisation now applies: when the file is CRLF and <code>old_string</code> carries no CR, the
+      CRLF form is matched and <code>new_string</code> is written CRLF; recorded as <code>exact:crlf</code> (family
+      <code>exact</code>) so the ledger can see it. Not a tolerant rung — the transport's own strip, inverted.</li>
+    <li><strong>TOCTOU on the write (CRITICAL, pre-existing on <code>replace</code>).</strong> <code>path.write_bytes</code>
+      followed whatever the path was at write time; a symlink planted between the safe-path check and the write (a
+      138 ms window on a <code>.js</code> edit, through <code>node --check</code>) rewrote a file outside the sandbox.
+      <code>edit</code> now reads through an <code>O_NOFOLLOW|O_NONBLOCK</code> fd whose <code>fstat</code> proves a
+      regular file and gives an identity, and writes through a second <code>O_NOFOLLOW</code> fd that must match that
+      identity AND stamp (<code>st_dev/st_ino/st_size/st_mtime_ns</code>) BEFORE it truncates — a swap or a concurrent
+      writer is refused with <code>file_changed_underneath</code> and nothing is written. Deliberately not tmp+rename:
+      that would succeed on a 0444 file. <code>replace</code> keeps its plain write (its own item).</li>
+    <li><strong>Release immutability was bypassable by spelling (CRITICAL, pre-existing).</strong> The block regex-matched
+      the RAW string, first hit, case-sensitively: <code>Projects/</code>, <code>AAAA…</code> (APFS is case-insensitive),
+      <code>projects//</code>, <code>projects/zz/../&lt;id&gt;</code>, and from an ACTIVE scope any
+      <code>projects/&lt;released&gt;</code> all landed. It now takes every <code>projects/&lt;id&gt;</code> component of the
+      RESOLVED path (normalised raw spelling when unresolvable), any case, and blocks if ANY is RELEASED. Same class:
+      the <code>.git</code> deny lower-cases its components.</li>
+    <li><strong>The verifier's consumers read the echo.</strong> <code>_is_unverified_mutation</code> substring-scanned the
+      whole result, so a REJECTED miss whose nearest-region echo contained "successfully edited" booked the turn as
+      failed over a file nothing touched; it and <code>_written_paths_from_confirmation</code> now read only a
+      <code>SUCCESS</code>-prefixed confirmation line. The success line puts the path LAST and the ledger pattern is
+      end-anchored, so a filename containing <code>' — replaced 1 occurrence</code> plants no phantom path.</li>
+    <li><strong>The dropped-call note lied twice.</strong> It did not look at the operation (a dropped verify-<code>read</code>
+      produced "nothing was written"), and after the first-round fix it could say a file both "DID land" and "does NOT
+      exist". It now disclaims only dropped MUTATING calls, says "does NOT exist" only for creating ops, "was not
+      changed" for the rest, and drops paths that also landed.</li>
+    <li><strong>The <code>fs_batch</code> treatment arm (traffic 1.0) steered back to envelopes.</strong> Its schema suffix
+      told half of live requests to pack <code>&lt;&lt;&lt;&lt; SEARCH</code> envelopes into <code>replace</code> and omitted
+      <code>edit</code> from the path-required list — the very comparison the ledger exists to make, confounded by arm.
+      Reworded to <code>edit</code>.</li>
+    <li>Smaller, all pinned: <code>Path.exists()</code> on 3.10 let ENAMETOOLONG/EACCES escape as a traceback (and the
+      dispatcher's <code>.git</code> probe let a symlink loop out of every mutating op); the truncation check compared sizes,
+      so a same-size partial write read as "unchanged" — it compares bytes now; the whitespace diagnosis fired on a
+      diverging tail, a missing EOF newline and a BOM — it compares normalised LINE LISTS as a contiguous slice and names
+      the EOF-newline case; the case-insensitive diagnosis computed its line from an offset into <code>.lower()</code>;
+      overlapping matches made the lines named disagree with the count; the whole-file gate counted a phantom line and
+      measured chars only (a minified line was "a rewrite"); NUL in <code>new_string</code> landed in a <code>.py</code> with a
+      clean SUCCESS; non-string arguments were <code>str()</code>-ed and written; plain-string refusals logged an empty
+      ledger reason — every refusal is a typed outcome now; the diagnosis runs in a thread and over a 4 MB head.</li>
+  </ul>
+  <p><strong>Accepted, not fixed:</strong> the participant-mode engine guard scans ARGUMENTS, so a forbidden identifier
+  assembled across two edits (or by <code>replace_all</code> on a fragment) passes it — the guard's own docstring calls it
+  narrow by design, and the post-write steer and verifier layers are the backstop. The leaf executor still emits
+  <code>operation='replace'</code>. Directory-symlink races above the final component are outside <code>O_NOFOLLOW</code>.
+  <code>reply_smoothing</code> does not strip the dropped-call note before judges read the reply.</p>
+  <p>Pins: <code>tests/test_edit_operation.py</code> now drives all 22 return paths and asserts each label lands on ITS
+  reason code (the first table pinned label↔return only by a reviewer's trace); the released-spelling table; the
+  swapped-symlink and concurrent-writer races; the treatment-arm suffix; the dropped-note operation filter; the
+  parity fixtures. Mutation battery for this round: see the journal.</p>
+
+  <h2 id="4kc-r3">§4KC round 3: the guards decide on the INODE <span class="tag">2026-09-23</span></h2>
+  <p>Two fresh reviewers on round 2's fixes only. Security found three MAJORs with one root: every write guard
+  decided on the <em>requested path string</em>, while the in-place fd writers mutate an <em>inode</em> that string
+  need not faithfully name — <code>ln .git/config cfg.ini</code> carried no <code>.git</code> component and the write
+  landed a <code>hooksPath</code>; a hardlink at the sandbox root into a RELEASED project's file carried no
+  <code>projects/&lt;id&gt;</code>; and <code>project&#383;/</code> (LATIN SMALL LETTER LONG S) opens the real
+  <code>projects</code> directory on APFS while <code>str.lower()</code> leaves it alone. Closure, for both
+  <code>edit</code> and <code>replace</code>: <code>_inode_write_refusal</code> runs on the OPENED fd — a shared inode
+  (<code>st_nlink &gt; 1</code>) is refused for in-place writers (<code>hard_linked</code>; <code>write</code> is tmp+rename
+  and breaks the link, so it needs no such rule), and the <code>.git</code> / released decisions are re-derived from
+  the kernel's canonical path of the fd (<code>F_GETPATH</code>, <code>/proc/self/fd</code> on Linux). The identity
+  stamp gained <code>st_ctime_ns</code>: a same-size rewrite plus <code>os.utime</code> with the original nanoseconds
+  restored every other field, and ctime cannot be set from userland. The streaming <code>replace</code> reader — the
+  last read in the module that followed a planted link — opens O_NOFOLLOW with a regular-file check on the fd. A path
+  the dispatcher's <code>.git</code> probe cannot resolve is now DENIED (<code>unresolvable_path</code>) rather than
+  skipped; the released block carries <code>released_write_blocked</code>.</p>
+  <p><strong>Also today: <code>replace</code> got the same race closure</strong> — its five guarded writes and the
+  auto-promote go through the identity-checked O_NOFOLLOW writer, with the pre-read <code>os.stat</code> as the
+  identity; <code>_FileChangedUnderneath</code> is handled once, inside <code>_write_replace_guarded</code>, for both
+  operations.</p>
+  <p>Correctness found 12 (11 inside round 2's fixes): the dropped-call note named the SOURCE of a dropped
+  <code>copy</code>/<code>rename</code>/<code>move</code> as "does NOT exist" (the destination is what is missing);
+  its forced-final list carried names only and was never reconciled, so a write RE-DONE by the verifier repair
+  re-entry was still disclaimed (<code>_still_pending_drops</code> retires a dropped <code>file_system</code> entry
+  followed by a later SUCCESS); aliased spellings of one file were listed thrice; the argument alias chain differed
+  from the dispatcher's; two dead ops (<code>unzip</code>, <code>git_clone</code>) sat in the sets; a
+  <code>[FAILURE BANNER]</code>-prefixed result lost the inert-artifact exemption; the ledger's head was not stripped
+  so a trailing space defeated the new <code>$</code> anchor; the diagnosis called a one-line <code>old_string</code>
+  inside a longer line "a later line was misremembered", blamed indentation for MIXED line endings, and said the
+  same for an <code>old_string</code> longer than the file; and one of round 2's own pins (the crafted-filename
+  phantom) passed with the anchor removed — the crafted name is <code>a'.md</code> now.</p>
+  <p><strong>Still open, deliberately:</strong> the streaming <code>replace</code> commit has no identity re-check
+  (lost update only — <code>os.replace</code> swaps the directory entry, so nothing outside is reachable); directory
+  symlink races above the final component; the participant engine guard's split-payload gap (operator decision:
+  leave it). Pins in <code>tests/test_edit_operation.py</code> §10 and the appended
+  <code>test_4gn_route_dropped_write_and_breadth.py</code> test; the return-path tables are 22 (edit) and 36 (replace)
+  ledger paths.</p>
+
+  <h2 id="4kc-r4">§4KC round 4: one reviewer on round 3's fixes <span class="tag">2026-09-23</span></h2>
+  <p>Scope: the inode guard and the pending-drop reconciliation only. 2 MAJOR, 3 MINOR, 3 NOTE — no CRITICAL.
+  <strong>MAJOR by trace:</strong> <code>replace</code> took its write identity from an <code>os.stat</code> taken
+  BEFORE the inode guard opened its own fd, so the guard and the write were bound to nothing — a name swapped away
+  (guard sees a clean inode) and back (write lands on the original) passed the guard on one inode and wrote
+  another. The identity is now the guarded fd's <code>fstat</code>, and it must agree with the pre-read stat
+  (<code>file_changed_underneath</code> otherwise). <strong>MAJOR confirmed:</strong> the reconcile that retires a
+  dropped call once the repair re-entry re-does it knew only the produce shapes, so a re-done
+  <code>copy</code>/<code>rename</code>/<code>delete</code> stayed "pending" — <code>_confirmed_paths_any_op</code> reads
+  every confirmation shape (produced, copied/moved TO, deleted), banner-stripped. MINOR: a dropped
+  <code>delete</code> read "was not changed" (now "was not deleted"); the PART-of-a-longer-line verdict fired on a line
+  that IS the text when <code>old_string</code> carried a trailing blank line (verified per line now); the ends-at
+  sentence was gated on the wrong comparison; the streaming commit carried the tmp file's 0600 onto a 0644 script
+  and read whatever inode the name held (mode preserved, source inode checked against the guard). NOTE: the
+  canonical <code>.git</code> test ran over the whole host path (scoped to components under the sandbox roots);
+  the pair-alts head is stripped like its siblings. Measured on the live sandbox: 0 of 4,988 files have more than one
+  link, so the <code>st_nlink</code> rule refuses nothing legitimate today.</p>
+  <p><strong>What the round-4 battery taught about its own pins.</strong> The first swap pins renamed the FILES, which
+  bumps their inode ctime — so the ctime stamp refused the write under every mutation and the pins proved nothing;
+  the reviewer's scenario was a DIRECTORY swap, which leaves the inode untouched, and the pins now do that. The
+  streaming pin then failed on the real code: an open-counting hook swapped at the wrong open, and the two
+  "kills" it had produced were hollow — it triggers from the caller's frame now. Chasing it also showed the streaming
+  branch turned the refusal into a bare <code>Error: Streaming replace failed:</code> with an empty message; it
+  returns the guard's own <code>file_changed_underneath</code> outcome. One first-form mutant (the per-line PART
+  check) was EQUIVALENT — the contiguous-slice compare above it already proved the property — and the dead guard was
+  removed rather than counted.</p>
+
+  <h2 id="4kc-r5">§4KC round 5: the stopping rule is met <span class="tag">2026-09-23</span></h2>
+  <p>One reviewer on round 4's ~60 lines: <strong>0 CRITICAL, 0 MAJOR inside the fixes</strong>, 5 MINOR, 3 NOTE —
+  the series' stopping rule. One PRE-EXISTING MAJOR surfaced that contradicted a round-3 claim: <code>replace</code>
+  still re-read the target BY PATH after its guard (<code>_read_head</code>, <code>path.read_text</code>), so a symlink
+  planted in that window was followed on the READ side — an outside file's text copied into the sandbox file — and a
+  FIFO planted there wedged the loop (the read ran on the main thread). Every read in <code>replace</code> now goes
+  through <code>_read_text_guarded</code>: an O_NOFOLLOW fd that must be the inode the guard cleared, with
+  <code>Path.read_text</code>'s universal-newline semantics reproduced on the bytes; the binary sniff uses the head the
+  guard's fd read. MINORs, all fixed and pinned: the reconcile was op-blind (a dropped WRITE was retired by a later
+  <code>Deleted</code> of the same name — the file is gone, the note must stand); a dropped delete of a file that
+  LANDED was filtered out of the note entirely; the popped-trailing-blank case traded one false sentence for another
+  (it has its own true one now); the ends-at sentence ran before the slice compare; the streaming path rewrote a
+  0444 file via tmp+rename while the other two writers refuse EACCES (refused now; the chmod is masked to
+  <code>0o777</code>); the r4 race pin was satisfied by either half of the fix (each half has its own pin). NOTEs kept
+  as documentation: the pair-alts <code>.strip()</code> is a no-op; a wrong-CASE <code>sandbox_dir</code> spelling makes
+  the canonical <code>.git</code> scope fail closed; a filename containing the literal <code>'.</code> truncates the
+  older Deleted/Copied captures; the streaming commit checks dev/ino but no stamp (lost update only).</p>
+  <p><strong>The series.</strong> r2: 2 CRITICAL + 6 MAJOR · r3: 0 + 6 · r4: 0 + 2 · r5: 0 + 0 inside the fixes.
+  Total across five rounds: ~75 findings on an operation whose first version was green on 24,311 tests, a 20/20
+  mutation battery and two live probes.</p>
+
+  <h2 id="4kb-r3">Round 3: what was still wrong <span class="tag">2026-09-23</span></h2>
+  <ul>
+    <li><strong>The replace→write auto-promote was a FOURTH write site</strong>, above the gate — reachable with no
+      receipt at all, and it did not stamp, so a <em>grounded</em> promote poisoned the next edit with "this file
+      CHANGED since you read it", which this tool had written one step earlier. Enumerating write sites kept failing
+      (round 1 said one, round 2 said three, it was four), so the stamp now lives in the WRAPPER, keyed on the one fact
+      that means the bytes moved: <code>applied</code>. A new write path inherits it.</li>
+    <li><strong>The batch read grounded nothing.</strong> Round 2 made stamping opt-in and wired it only at the
+      single-path call site, so under <code>fs_batch</code> (traffic 1.0) a multi-path read returned full contents and
+      the next edit was refused "you have not read it" — falsely, with a repair that re-entered the same batch path.</li>
+    <li><strong>A FIFO in the workspace wedged the whole agent.</strong> <code>open()</code> on a FIFO blocks forever,
+      and the gate ran it on the request path; reachable with <code>rm f &amp;&amp; mkfifo f</code> between a read and an
+      edit. <code>TimeoutError</code> is an <code>OSError</code>, so even an alarm-based rescue would have been
+      swallowed — the check must precede the open. Non-regular targets are now refused by TYPE on both the replace and
+      write paths, before anything opens them.</li>
+    <li><strong>The gate hoist created two closed loops.</strong> A &gt;50 MB or binary file under strict said "you have
+      not read it — read it first", and the read then said "too large to read entirely" / "appears to be a binary
+      file": refuse → "read it" → "cannot read it" → refuse, no exit. Size and type refusals now run BEFORE the gate;
+      they never needed a receipt to be decided.</li>
+    <li><strong>The gate itself still hashed on the event loop</strong> — the same 16 ms stall round 2 claimed to have
+      removed by threading the <em>stamp</em>. And a partially-scanned symbol index rendered a HIT list with no caveat,
+      which reads as complete.</li>
+  </ul>
+  <p>Pins: <code>tests/test_4kb_round3_fixes.py</code> (24). Combined mutation batch across all three rounds: 44
+  mutants, 44 killed, controls correct.</p>
 </main>
 </body>
 </html>

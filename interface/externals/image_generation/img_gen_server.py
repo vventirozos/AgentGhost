@@ -81,6 +81,7 @@ import secrets
 import re as _re
 import shlex
 import subprocess
+import threading
 import time
 import uuid
 from io import BytesIO
@@ -133,11 +134,13 @@ MAX_VRAM_GIB = "4.5"          # sd-cli managed budget; at 768×512 the DiT stays
 GEN_TIMEOUT_S = 1500.0        # an edit (CFG × refs) runs ~11 min at 20 steps; 25 min is the hard stop
 # How long a queued request waits for the single GPU before 503. Sized against
 # the CLIENT's own ceiling, not by feel: the agent's image pool uses httpx
-# timeout=1200 s, and the longest generation here is an edit at ~660 s, so a
-# request that waits this long and then runs still answers inside the client's
-# window (400 + 660 + overhead < 1200). The old 180 s was ~4.5x a 40 s SD1.5
-# generation; kept literally, it now fails a request that only needed to wait
-# out one edit — the agent can and does issue two image calls in one turn.
+# timeout=1200 s, and the worst generation the node PERMITS is an edit at
+# MAX_EDIT_STEPS (935 s, derived below), so a request that waits BUSY_WAIT_
+# TIMEOUT and then runs still answers inside the client's window. The old
+# 180 s was ~4.5x a 40 s SD1.5 generation; kept literally, it failed a request
+# that only needed to wait out one edit — the agent can and does issue two
+# image calls in one turn. (An earlier version of this comment said "~660 s"
+# and "400 + 660": stale figures, corrected §4KD.)
 CLIENT_TIMEOUT_S = 1200.0     # what core/llm.py gives the image pool
 # MEASURED: a 768x512 edit is ~28 s/step (CFG's two forwards are already in
 # that number) plus ~95 s of fixed overhead — 20 steps came to 654 s and 628 s
@@ -371,7 +374,40 @@ def wrap_transparent(prompt: str) -> str:
 
 
 # --- reference images (editing) ----------------------------------------------------
-_IMAGE_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"RIFF")   # png / jpeg / webp
+_IMAGE_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff")   # png / jpeg; webp is checked below
+
+
+def _is_supported_image(data: bytes) -> bool:
+    """PNG, JPEG, or WEBP — a RIFF container is WEBP only when bytes 8-12 say
+    so (a WAV header passed the old prefix test and reached sd-cli, §4KD)."""
+    if data.startswith(_IMAGE_MAGIC):
+        return True
+    return data[:4] == b"RIFF" and data[8:12] == b"WEBP"
+
+
+def _header_pixels(data: bytes) -> "int | None":
+    """w*h from the image HEADER only (no pixel decode), None if unreadable."""
+    px = png_size(data)
+    if px:
+        return px[0] * px[1]
+    try:
+        from PIL import Image
+        with Image.open(BytesIO(data)) as im:
+            w, h = im.size
+            return w * h if w and h else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _public(msg) -> str:
+    """An error body a caller may see: server paths reduced to basenames.
+    sd-cli's tail names model files and the temp dir (§4KD review)."""
+    s = str(msg)
+    for p in (str(OUT_DIR.resolve()) if OUT_DIR else "", str(OUT_DIR), SD_CLI, DIT_PATH,
+              TE_PATH, VAE_PATH, MMPROJ_PATH):
+        if p and p in s:
+            s = s.replace(p, Path(p).name)
+    return s
 
 
 def decode_reference_images(items) -> "list[bytes]":
@@ -394,8 +430,21 @@ def decode_reference_images(items) -> "list[bytes]":
             raise ValueError(f"reference image {i} decoded to zero bytes")
         if len(data) > MAX_REFERENCE_BYTES:
             raise ValueError(f"reference image {i} exceeds {MAX_REFERENCE_BYTES // (1024 * 1024)} MB")
-        if not data.startswith(_IMAGE_MAGIC):
+        if not _is_supported_image(data):
             raise ValueError(f"reference image {i} is not a PNG/JPEG/WEBP")
+        # a header-only decompression-bomb check HERE, before the GPU lock: the
+        # full decode in `fit_reference` used to be the first to notice, after
+        # the lock, `sync` and the page-cache drop (§4KD)
+        _px = _header_pixels(data)
+        if _px is None:
+            raise ValueError(f"reference image {i} is not a decodable image")
+        try:
+            from PIL import Image
+            _limit = int(Image.MAX_IMAGE_PIXELS or 89_478_485)
+        except Exception:  # noqa: BLE001
+            _limit = 89_478_485
+        if _px > _limit:
+            raise ValueError(f"reference image {i} is too large ({_px:,} pixels)")
         out.append(data)
     return out
 
@@ -416,12 +465,23 @@ def fit_reference(data: bytes, width: int, height: int) -> bytes:
     if png_size(data) == (width, height):
         return data
     try:
-        from PIL import Image
+        from PIL import Image, ImageOps
         with Image.open(BytesIO(data)) as im:
+            # §4KD: a phone portrait is STORED landscape with EXIF orientation
+            # 6; ignoring it edited the reference sideways. Transpose first,
+            # and never pass the raw bytes through when a transpose applied —
+            # sd-cli's stb decoder ignores EXIF too.
+            _orient = 1
+            try:
+                _orient = int(im.getexif().get(0x0112, 1) or 1)
+            except Exception:  # noqa: BLE001
+                pass
+            im = ImageOps.exif_transpose(im) or im
             im = im.convert("RGB")
-            if im.size == (width, height):
+            if im.size == (width, height) and _orient == 1:
                 return data
-            im = im.resize((width, height), Image.LANCZOS)
+            if im.size != (width, height):
+                im = im.resize((width, height), Image.LANCZOS)
             buf = BytesIO()
             im.save(buf, format="PNG")
             return buf.getvalue()
@@ -461,9 +521,10 @@ def image_size(data: bytes) -> "tuple[int, int] | None":
     if px:
         return px
     try:
-        from PIL import Image
+        from PIL import Image, ImageOps
         with Image.open(BytesIO(data)) as im:
-            w, h = im.size
+            # the DISPLAYED geometry (EXIF orientation applied), §4KD
+            w, h = (ImageOps.exif_transpose(im) or im).size
             return (w, h) if w and h else None
     except Exception:      # unreadable → caller falls back to the default size
         return None
@@ -486,12 +547,17 @@ def _resolve_size(req: "ImageRequest", fallback: "tuple[int, int] | None" = None
     fit the pixel budget while preserving aspect ratio, clamp per-side,
     and snap to multiples of 32 (a sd.cpp requirement for this model)."""
     w, h = req.width, req.height
+    if (w is None) != (h is None):
+        raise ValueError("give both width and height, or neither")
     if (not w or not h) and req.size and "x" in req.size.lower():
         try:
             a, b = req.size.lower().split("x", 1)
             w, h = int(a.strip()), int(b.strip())
         except (ValueError, AttributeError):
             w = h = None
+    if (w is not None and w <= 0) or (h is not None and h <= 0):
+        # `-768x512` used to be silently mapped to a portrait (§4KD)
+        raise ValueError("width and height must be positive")
     if (not w or not h) and fallback:
         w, h = fallback
     if not w or not h:
@@ -604,20 +670,78 @@ def _spawn_sidecar(pid: int):
         return None
 
 
+# ── cancellation on client disconnect (§4KD, operator request) ─────────────
+# One GPU, one render at a time, so ONE handle: the sd-cli process of the
+# render in flight. `cancel_current_render()` is called from the event loop
+# when the request's client has gone away; `run_sd_cli` registers its process
+# here and re-checks the flag right after Popen so a cancel that arrives
+# before the process exists is not lost. Before this, a disconnect let the
+# render run to completion — up to 15 GPU-minutes for a reader that had left,
+# with every other request 503-busy behind it.
+_RENDER = {"proc": None, "cancelled": False}
+_RENDER_LOCK = threading.Lock()
+
+
+class RenderCancelled(RuntimeError):
+    """The render in flight was killed because its client disconnected."""
+
+
+def _kill_render_proc(proc) -> None:
+    """Kill the render and everything it spawned: the process is started in
+    its own session, so the whole group goes — a child left holding the
+    stdout pipe would otherwise keep `communicate()` waiting for EOF."""
+    try:
+        import signal
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:  # noqa: BLE001 — fall back to the process itself
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def cancel_current_render(reason: str = "client disconnected") -> bool:
+    """Kill the render in flight (if any). Returns whether a process was
+    killed. Safe from any thread; idempotent."""
+    with _RENDER_LOCK:
+        _RENDER["cancelled"] = True
+        _RENDER["reason"] = reason
+        proc = _RENDER.get("proc")
+    if proc is not None and proc.poll() is None:
+        _kill_render_proc(proc)
+        return True
+    return False
+
+
+def _arm_render() -> None:
+    """Called by the endpoint BEFORE the GPU task exists: a fresh render is
+    not cancelled until its own client says so."""
+    with _RENDER_LOCK:
+        _RENDER["cancelled"] = False
+        _RENDER["reason"] = ""
+        _RENDER["proc"] = None
+
+
 def run_sd_cli(args: "list[str]", timeout: float = GEN_TIMEOUT_S) -> None:
     """Blocking: run one sd-cli generation with the page-cache sidecar.
     Raises RuntimeError with the tail of sd-cli's output on failure or
-    timeout. Runs on the GPU thread."""
+    timeout, RenderCancelled when the client disconnected. Runs on the GPU
+    thread."""
     if not _drop_caches_now():
         _log("WARN: drop_caches unavailable (no passwordless sudo?) — running without it")
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, errors="replace")
+                            text=True, errors="replace", start_new_session=True)
+    with _RENDER_LOCK:
+        _RENDER["proc"] = proc
+        _already = bool(_RENDER.get("cancelled"))
+    if _already:
+        _kill_render_proc(proc)           # the cancel came before we existed
     sidecar = _spawn_sidecar(proc.pid)
     out = ""
     try:
         out, _ = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        _kill_render_proc(proc)
         out, _ = proc.communicate()
         raise RuntimeError(f"sd-cli timed out after {timeout:.0f}s")
     finally:
@@ -629,7 +753,7 @@ def run_sd_cli(args: "list[str]", timeout: float = GEN_TIMEOUT_S) -> None:
         # NvMap `error 12` regime this whole module is built to avoid.
         if proc.poll() is None:
             try:
-                proc.kill()
+                _kill_render_proc(proc)
                 proc.wait(timeout=10)
             except Exception:       # noqa: BLE001 — best effort; never mask the original error
                 pass
@@ -648,9 +772,49 @@ def run_sd_cli(args: "list[str]", timeout: float = GEN_TIMEOUT_S) -> None:
                     pass
             except Exception:       # noqa: BLE001
                 pass
+    with _RENDER_LOCK:
+        _cancelled = bool(_RENDER.get("cancelled"))
+        _reason = str(_RENDER.get("reason") or "client disconnected")
+        _RENDER["proc"] = None
+    if _cancelled:
+        raise RenderCancelled(f"render cancelled: {_reason}")
     if proc.returncode != 0:
         tail = "\n".join((out or "").strip().splitlines()[-6:])
         raise RuntimeError(f"sd-cli exit {proc.returncode}: {tail}")
+
+
+async def _client_gone(request) -> bool:
+    """`request.is_disconnected()` guarded: a test client or a proxy that
+    cannot answer must never cancel a render by accident."""
+    try:
+        fn = getattr(request, "is_disconnected", None)
+        if fn is None:
+            return False
+        r = fn()
+        if asyncio.iscoroutine(r):
+            r = await r
+        return bool(r)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def _await_render(gpu_task, request, poll_s: float = 1.0):
+    """Wait for the GPU task; every ``poll_s`` ask whether the client is
+    still there, and if it is not, kill the render and wait for the task to
+    unwind (so the GPU lock is released in order). Raises RenderCancelled."""
+    while True:
+        done, _ = await asyncio.wait({gpu_task}, timeout=poll_s)
+        if done:
+            return gpu_task.result()
+        if await _client_gone(request):
+            cancel_current_render("client disconnected")
+            try:
+                await gpu_task
+            except RenderCancelled:
+                raise
+            except Exception as e:  # noqa: BLE001 — the kill surfaced as a plain exit
+                raise RenderCancelled(f"render cancelled: client disconnected ({type(e).__name__})") from e
+            raise RenderCancelled("render cancelled: client disconnected")
 
 
 def _generate_png(prompt: str, width: int, height: int, steps: int, *,
@@ -762,44 +926,67 @@ app = FastAPI(title="Jetson ImgGen Node (Qwen-Image-2.1)", lifespan=lifespan)
 MAX_BODY_BYTES = 24 * 1024 * 1024
 
 
-@app.middleware("http")
-async def _cap_request_body(request: Request, call_next):
-    """Refuse an oversized body BEFORE anything parses it.
+class _BodyTooLarge(Exception):
+    pass
+
+
+async def _send_413(send) -> None:
+    body = b'{"detail":"request body too large"}'
+    await send({"type": "http.response.start", "status": 413,
+                "headers": [(b"content-type", b"application/json"),
+                            (b"content-length", str(len(body)).encode())]})
+    await send({"type": "http.response.body", "body": body})
+
+
+class _BodyCapMiddleware:
+    """Refuse an oversized body BEFORE anything parses it — as PURE ASGI.
 
     ⚠ `_require_key` cannot defend this. `req: ImageRequest` is a body
     parameter, so Starlette has already buffered the whole body, json.loads
     has built a str from it and pydantic has copied it into the model —
     several multiples of the payload resident — before the handler's first
-    line runs. On an 8 GB node that is an unauthenticated OOM: a LAN caller
-    with no key POSTs a 2 GB body and the OOM killer takes the unit. The
-    handler-level `MAX_REFERENCE_BYTES` check is also too late for the same
-    reason: it runs after `base64.b64decode` has allocated the decoded bytes.
-    The cap has to sit in front of parsing, which is what this is — modelled
-    on the agent's own `api/body_limit.py`, which exists for this exact
-    lesson. Content-Length is refused outright; a chunked body is counted as
-    it arrives.
+    line runs. On an 8 GB node that is an unauthenticated OOM. The cap has
+    to sit in front of parsing (modelled on the agent's `api/body_limit.py`).
+    Content-Length is refused outright; a chunked body is counted as it
+    arrives.
+
+    ⚠ PURE ASGI, not `BaseHTTPMiddleware` (§4KD, disconnect-cancel). The
+    HTTP-middleware form hands the endpoint a `receive` of its own, so
+    `request.is_disconnected()` never sees uvicorn's `http.disconnect` —
+    measured on ghost: with the old form a killed client was never noticed
+    and the render ran to completion; with this form it is seen within one
+    poll. The counting `receive` below forwards every message untouched.
     """
-    if request.method in ("POST", "PUT", "PATCH"):
-        declared = request.headers.get("content-length")
-        if declared and declared.isdigit() and int(declared) > MAX_BODY_BYTES:
-            return JSONResponse({"detail": "request body too large"}, status_code=413)
-        if not declared:
-            received = 0
-            chunks = []
-            async for chunk in request.stream():
-                received += len(chunk)
-                if received > MAX_BODY_BYTES:
-                    return JSONResponse({"detail": "request body too large"},
-                                        status_code=413)
-                chunks.append(chunk)
-            body = b"".join(chunks)
 
-            async def _replay():            # hand the buffered body to the app
-                return {"type": "http.request", "body": body, "more_body": False}
+    def __init__(self, app):
+        self.app = app
 
-            request._receive = _replay      # noqa: SLF001 — the documented Starlette pattern
-    return await call_next(request)
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or scope.get("method") not in ("POST", "PUT", "PATCH"):
+            return await self.app(scope, receive, send)
+        headers = {k.lower(): v for k, v in scope.get("headers", [])}
+        declared = headers.get(b"content-length", b"").decode("ascii", "replace")
+        if declared.isdigit() and int(declared) > MAX_BODY_BYTES:
+            return await _send_413(send)
+        seen = {"n": 0}
 
+        async def counting_receive():
+            msg = await receive()
+            if msg.get("type") == "http.request":
+                seen["n"] += len(msg.get("body") or b"")
+                if seen["n"] > MAX_BODY_BYTES:
+                    raise _BodyTooLarge()
+            return msg                      # `http.disconnect` flows through
+
+        try:
+            await self.app(scope, counting_receive, send)
+        except _BodyTooLarge:
+            # the body is read before any handler runs, so no response has
+            # started yet and the 413 is still ours to send
+            await _send_413(send)
+
+
+app.add_middleware(_BodyCapMiddleware)
 
 class ImageRequest(BaseModel):
     prompt: str
@@ -819,7 +1006,7 @@ class ImageRequest(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "ready": _ready, "load_error": _load_error}
+    return {"ok": True, "ready": _ready, "load_error": (_public(_load_error) if _load_error else _load_error)}
 
 
 @app.get("/ready")
@@ -854,7 +1041,20 @@ async def generate_image(req: ImageRequest, request: Request):
     if len(req.prompt or "") > MAX_PROMPT_CHARS:
         raise HTTPException(status_code=400,
                             detail=f"prompt exceeds {MAX_PROMPT_CHARS} characters")
-    width, height = _resolve_size(req, fallback)
+    # §4KD: the SAME cap on negative_prompt — under CFG (every edit) it goes
+    # through the quadratic attention-syntax parser on the GPU thread WITH THE
+    # LOCK HELD and no timeout (36 s at 100 KB, hours at the 24 MB body cap)
+    if len(req.negative_prompt or "") > MAX_PROMPT_CHARS:
+        raise HTTPException(status_code=400,
+                            detail=f"negative_prompt exceeds {MAX_PROMPT_CHARS} characters")
+    if "\x00" in (req.prompt or "") or "\x00" in (req.negative_prompt or ""):
+        raise HTTPException(status_code=400, detail="prompt contains a NUL byte")
+    if not strip_attention_syntax(req.prompt or "").strip():
+        raise HTTPException(status_code=400, detail="prompt is empty")
+    try:
+        width, height = _resolve_size(req, fallback)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     editing = bool(references)
     steps = resolve_steps(req.steps, editing)
     guidance = resolve_guidance(req.guidance_scale, editing)
@@ -871,18 +1071,25 @@ async def generate_image(req: ImageRequest, request: Request):
         t0 = time.monotonic()
         _log(f"GEN start: {width}x{height} steps={steps} cfg={guidance:g} seed={seed} "
              f"refs={len(references)} rgba={int(req.transparent)} prompt={prompt[:48]!r}")
-        png = await _run_on_gpu(lambda: _generate_png(
+        _arm_render()
+        _gpu_task = asyncio.ensure_future(_run_on_gpu(lambda: _generate_png(
             prompt, width, height, steps, seed=seed,
             guidance=guidance, negative_prompt=req.negative_prompt,
-            references=references))
+            references=references)))
+        png = await _await_render(_gpu_task, request)
         img_str = base64.b64encode(png).decode("utf-8")
         _log(f"GEN done in {time.monotonic() - t0:.1f}s")
         # `seed` is reported so a caller can reproduce or re-roll this image.
         return {"data": [{"b64_json": img_str}], "seed": seed,
                 "width": width, "height": height, "steps": steps}
+    except RenderCancelled as e:
+        _log(f"GEN cancelled after {time.monotonic() - t0:.1f}s: {e} — GPU released")
+        # 499: the client closed the request (nginx's convention); nobody is
+        # listening, but the log and the lock release are the point
+        raise HTTPException(status_code=499, detail="render cancelled: client disconnected")
     except Exception as e:
         _log(f"GEN failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Image generation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Image generation failed: {_public(e)}")
     finally:
         _gpu_lock.release()
 

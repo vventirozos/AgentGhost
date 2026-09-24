@@ -24,6 +24,7 @@ from ..utils.helpers import get_utc_timestamp
 from ..utils.helpers import env_positive
 import logging
 from ..utils.logging import (Icons, pretty_log, ORIGIN_PROBE, PROBE_REQUEST_PREFIX, is_probe_request_id,
+                             ORIGIN_SLACK, SLACK_REQUEST_PREFIX, is_slack_request_id,
                              client_deadline_context)
 
 logger = logging.getLogger("GhostAgent")
@@ -1066,6 +1067,13 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                 str(request_id or "").strip() or uuid.uuid4().hex[:8])
         # (§4FF's `X-Ghost-Prompt-Variant` probe header was retired here on
         # 2026-09-21, §4JG — no prompt variant exists to select.)
+    # §4KD: `X-Ghost-Origin: slack` — a Slack client that did not mint the
+    # prefix itself. The bot does (so its feedback correlation keeps the id);
+    # this is the fallback for any other Slack-side caller.
+    elif (request.headers.get("X-Ghost-Origin") or "").strip().lower() == ORIGIN_SLACK:
+        if not is_slack_request_id(request_id):
+            request_id = SLACK_REQUEST_PREFIX + (
+                str(request_id or "").strip() or uuid.uuid4().hex[:8])
 
     # §4JP: the client's own timeout, when it says so (the web interface
     # sends GHOST_CHAT_TIMEOUT). The turn loop reserves the last minutes of

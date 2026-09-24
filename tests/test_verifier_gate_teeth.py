@@ -59,10 +59,12 @@ def test_write_success_is_unverified_mutation():
     assert _is_unverified_mutation(tool) is True
 
 
-def test_replace_success_is_unverified_mutation():
+def test_replace_success_is_a_targeted_edit_not_the_gates_shape():
+    # Operator decision 2026-09-23 (§4KC): the gate is for WHOLE-FILE writes;
+    # a targeted replace/edit of an existing file does not force a run.
     tool = {"name": "file_system",
             "content": "SUCCESS: Exact match found and replaced in 'index.html'."}
-    assert _is_unverified_mutation(tool) is True
+    assert _is_unverified_mutation(tool) is False
 
 
 def test_file_read_is_not_a_mutation():

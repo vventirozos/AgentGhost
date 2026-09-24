@@ -69,6 +69,20 @@
     Pins: <code>tests/test_4gq_round8.py</code>; battery <code>scripts/mutate_4gq.py</code> — 6 mutants + 4 controls, 6/6 killed. The battery's per-file controls earned their place immediately: the first run reported 10/10 KILLED because a fixture in the new pin file <code>del</code>-eted <code>ServiceSupervisor.host_dir</code> instead of restoring it, breaking 43 tests in every run including the controls.
   </p>
 
-</main>
+
+  <h2 id="4kb-git">The git tool was added here, and REMOVED <span class="tag">2026-09-23 &sect;4KB round 5</span></h2>
+  <p><code>LEAF_ALLOWED_TOOLS</code> briefly included <code>git</code> so the leaf could read its own patch and
+  checkpoint working code. It is back to <code>("file_system", "execute")</code>. Four review rounds over the §4KB
+  change set produced nine sandbox escapes and <strong>every one of them came from the git tool</strong>: a
+  <code>.git</code> file, <code>core.worktree</code>, <code>core.hooksPath</code>, <code>.git/commondir</code>,
+  <code>objects/info/alternates</code> (single, nested and quoted), a symlinked object store, <code>diff.external</code>
+  and <code>filter.*.clean</code>. Each fix closed a vector; the next round found another, because
+  <code>.git</code> is a configuration surface that names programs to run and the model can write files.</p>
+  <p>The one payoff that justified it — handing a real patch to the verifier (&sect;4GW) — was never wired, and
+  <code>workspace_patch()</code> itself turned out to carry none of the hardening (it executed
+  <code>diff.external</code> in testing). The leaf reads its diff through <code>execute</code>, as it did before.
+  What was KEPT is the part that is useful without the tool: <code>file_system</code> refuses to MUTATE any path with
+  a <code>.git</code> component, so the agent cannot corrupt a repository by hand.</p>
+  </main>
 </body>
 </html>

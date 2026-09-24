@@ -1,7 +1,7 @@
 """Image-gen node auth (2026-07-15, closes the §4B "no auth on 0.0.0.0 GPU
 servers" residual for the image node).
 
-Server side (interface/externals/img_gen_server.py — deployed to the Jetson
+Server side (interface/externals/image_generation/img_gen_server.py — deployed to the Jetson
 as ~/Data/AI/ImgGen/server.py): /generate requires the fleet X-Ghost-Key;
 /health and /ready stay open for monitoring/warmup polling. Key resolution
 mirrors the agent's main.py: GHOST_API_KEY env wins (explicit '' knowingly

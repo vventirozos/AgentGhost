@@ -56,7 +56,7 @@ def _agent(monkeypatch, *, write_first: bool):
     monkeypatch.setenv("GHOST_EVIDENCE_GATE", "0")
     ctx = make_context()
     agent = GhostAgent(ctx)
-    fs = AsyncMock(return_value="SUCCESS: Wrote 20 chars to 'app.py'.")
+    fs = AsyncMock(return_value="SUCCESS: Wrote 5000 chars to 'app.py'.")  # ≥ UNVERIFIED_WRITE_MIN_CHARS: the latch is the subject here
     mp = AsyncMock(return_value=DONE_READBACK)
     ex = AsyncMock(return_value="ok\nEXIT CODE: 0")
     agent.available_tools = {"file_system": fs, "manage_projects": mp, "execute": ex}

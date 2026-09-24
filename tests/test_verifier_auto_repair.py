@@ -235,7 +235,7 @@ async def test_web_confirmed_without_exec_is_capped_and_repaired(
         lambda ctx, stateful=False: (tmp_path, "/workspace"),
     )
     agent.available_tools["file_system"] = AsyncMock(
-        return_value="SUCCESS: Wrote 1000 chars to 'index.html'.")
+        return_value="SUCCESS: Wrote 5000 chars to 'index.html'.")  # ≥ UNVERIFIED_WRITE_MIN_CHARS: the repair round is the subject here
     # Text verifier is confidently wrong BOTH times (finalisation + the
     # post-loop recompute after the repair round reset the cache).
     verifier, vmock = _make_verifier([

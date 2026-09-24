@@ -262,9 +262,12 @@ class TestEveryDeclarationIsTheRightOne:
         )
         assert _looks_like_complete_python_module(module)
 
-        def _boom(self, *a, **k):
+        def _boom(*a, **k):
             raise OSError(28, "No space left on device")
-        monkeypatch.setattr(Path, "write_text", _boom)
+        # §4KC r3: the promote writes through `write_text_nofollow` (an
+        # O_NOFOLLOW fd on the resolved path), not `Path.write_text`.
+        from ghost_agent.tools import file_system as _fs
+        monkeypatch.setattr(_fs, "write_text_nofollow", _boom)
 
         # no `replace_with` + a complete module => the auto-promote branch
         out = await tool_replace_text("mod.py", module, None, tmp_path)

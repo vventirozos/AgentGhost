@@ -187,7 +187,7 @@ _PRODUCING_TOOLS = frozenset({"execute", "report_pdf"})
 #: `file_system` operations that can leave something on disk for a
 #: validator to inspect. Everything else (read, list_files, search,
 #: inspect) observes without producing.
-_PRODUCING_FS_OPS = frozenset({"write", "replace", "append", "create",
+_PRODUCING_FS_OPS = frozenset({"write", "edit", "replace", "append", "create",
                                "insert", "mkdir", "move", "copy",
                                "download", "extract"})
 

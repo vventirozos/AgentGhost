@@ -592,14 +592,14 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "file_system",
-            "description": "Unified file manager. ALWAYS use this to list, read, write. Use operation='search' for instantaneous high-performance ripgrep text searching across the codebase. Use operation='find' to locate files by wildcard name (e.g. '*.py'). LARGE FILES: do NOT emit a huge file (more than ~500 lines / ~40KB) in a single 'write' — a tool call that big frequently exceeds the JSON arg limit and fails to parse (the content is then lost). Instead write a compact SKELETON first, then grow it with successive operation='replace' edits that insert one section at a time. Build big single-file apps incrementally, not in one mega-write.",
+            "description": "Unified file manager. ALWAYS use this to list, read, write. Use operation='search' for instantaneous high-performance ripgrep text searching across the codebase. Use operation='find' to locate files by wildcard name (e.g. '*.py'). To change an existing file use operation='edit' (old_string → new_string, exact and unique). LARGE FILES: do NOT emit a huge file (more than ~500 lines / ~40KB) in a single 'write' — a tool call that big frequently exceeds the JSON arg limit and fails to parse (the content is then lost). Instead write a compact SKELETON first, then grow it with successive operation='edit' calls that insert one section at a time. Build big single-file apps incrementally, not in one mega-write.",
             "parameters": {
                 "type": "object",
-                "properties": {
+                "properties": {"name": {"type": "string", "description": "operation='symbols' ONLY: the symbol (function / class / constant) whose DEFINITION you want to locate across the project."}, 
                     "operation": {
                         "type": "string",
-                        "enum": ["read", "read_chunked", "inspect", "search", "find", "list_files", "write", "replace", "download", "copy", "rename", "move", "delete"],
-                        "description": "The exact operation to perform. Use 'write' to create a new file OR completely overwrite an existing one (provide the FULL file in 'content'). Use 'replace' for TARGETED edits to a small region of an existing file — ALWAYS PREFER the single-argument form: put ONE block in 'content' shaped exactly like `<<<< SEARCH\\n<exact current text>\\n====\\n<new text>\\n>>>>` and OMIT 'replace_with' entirely (this form survives argument-transport corruption; concatenate several blocks for multiple edits in one call). The legacy two-argument form (content=old block + replace_with=new block) still works but is fragile in transport. If you are rewriting the whole file, always use 'write', not 'replace'."
+                        "enum": ["read", "read_chunked", "outline", "symbols", "inspect", "search", "find", "list_files", "write", "edit", "replace", "download", "copy", "rename", "move", "delete"],
+                        "description": "The exact operation to perform. 'write' creates a file or REPLACES ONE WHOLE (put the FULL file in 'content'). 'edit' changes an EXISTING file in place — THE way to modify a file: 'old_string' = the exact text that is in the file now (copy it byte-for-byte from a read; it must occur exactly once unless replace_all=true), 'new_string' = what it becomes. BOTH are required; the edit is refused if the text is not found or is not unique, and the refusal shows the nearest real lines. To change several regions, make several 'edit' calls. Never send a whole file through 'edit' — use 'write'. ('replace' is the older form of 'edit' taking 'content'/'replace_with'; prefer 'edit'.)"
                     },
                     "path": {
                         "type": "string",
@@ -607,7 +607,7 @@ TOOL_DEFINITIONS = [
                     },
                     "start_line": {
                         "type": "integer",
-                        "description": "Optional for operation='read': 1-based first line of a LINE-RANGE read. Returns only that slice with line-number prefixes and is EXEMPT from the whole-file size cap — the cheap way to re-read one region after a failed 'replace' or a too-large-file error. Chains directly from 'search' line numbers. Pair with end_line."
+                        "description": "Optional for operation='read': 1-based first line of a LINE-RANGE read. Returns only that slice with line-number prefixes and is EXEMPT from the whole-file size cap — the cheap way to re-read one region after a failed 'edit' or a too-large-file error. Chains directly from 'search' line numbers. Pair with end_line."
                     },
                     "end_line": {
                         "type": "integer",
@@ -623,7 +623,19 @@ TOOL_DEFINITIONS = [
                     },
                     "content": {
                         "type": "string",
-                        "description": "MANDATORY for 'write': the FULL new file contents. MANDATORY for 'replace': PREFERRED — an Aider-style block `<<<< SEARCH\\n<exact current text>\\n====\\n<new text>\\n>>>>` with 'replace_with' omitted (immune to argument-transport corruption); LEGACY — the exact EXISTING code block to find, paired with 'replace_with'. If you want to rewrite the whole file, use operation='write', not 'replace'."
+                        "description": "For 'write': the FULL new file contents. For 'replace' (older form of 'edit'): the exact EXISTING text to find, copied byte-for-byte from a read — small and unique, never the whole file."
+                    },
+                    "old_string": {
+                        "type": "string",
+                        "description": "REQUIRED for 'edit': the exact text that is in the file NOW, copied byte-for-byte from a read (same indentation, same line breaks). Keep it small — just the lines that change plus enough neighbouring lines to make it occur exactly once. Never the whole file."
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "REQUIRED for 'edit': the text that takes the place of old_string. Must differ from old_string. Pass an empty string to delete old_string."
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Optional for 'edit' (default false): change EVERY occurrence of old_string instead of refusing when it occurs more than once — e.g. renaming a variable."
                     },
                     "destination": {
                         "type": "string",
@@ -635,7 +647,7 @@ TOOL_DEFINITIONS = [
                     },
                     "replace_with": {
                         "type": "string",
-                        "description": "For the LEGACY two-argument 'replace' form only: the new code/text that takes the place of the existing block in 'content'. PREFER omitting this entirely and putting Aider-style `<<<< SEARCH ==== >>>>` block(s) inside 'content' — the old→new pairs then live in ONE argument, which survives argument-transport corruption. NEVER send the same text in 'content' and 'replace_with'; such a call is rejected. If you meant to rewrite the whole file, use operation='write' instead."
+                        "description": "For 'replace': the new text that takes the place of the block in 'content'. REQUIRED for 'replace'. It must differ from 'content'."
                     },
                     "url": {
                         "type": "string",
@@ -1074,11 +1086,9 @@ _FS_BATCH_PATHS_PROP = {
 
 _FS_BATCH_DESC_SUFFIX = (
     " FEWER CALLS, SAME WORK: when you need several files, pass them all in "
-    "ONE operation='read' via 'paths' rather than one call each. When you "
-    "need several edits to ONE file, put every `<<<< SEARCH … ==== … >>>>` "
-    "envelope in ONE operation='replace' 'content'. A successful 'replace' "
-    "hands back the post-edit view of the changed lines, so you do NOT need "
-    "a follow-up read to check it landed."
+    "ONE operation='read' via 'paths' rather than one call each. A "
+    "successful 'edit' hands back the post-edit view of the changed lines, "
+    "so you do NOT need a follow-up read to check it landed."
     # Restores parity with the control arm: only a `paths` batch read may omit
     # `path` among the ops that NEED one. Without this the treatment arm is
     # ALSO told that write/replace/delete need no path — a difference
@@ -1090,7 +1100,7 @@ _FS_BATCH_DESC_SUFFIX = (
     # whole tree). An emphatic rule stricter than the handler is just a
     # different arm-difference — it swaps one confound for another.
     " 'path' is still REQUIRED for read, read_chunked, inspect, write, "
-    "replace, delete, copy, rename and move — the ONLY read that may omit it "
+    "edit, replace, delete, copy, rename and move — the ONLY read that may omit it "
     "is a 'paths' batch. (list_files / search / find never needed one.)"
 )
 
@@ -1274,13 +1284,13 @@ def get_active_tool_definitions(context, query: str = None, *,
             "type": "function",
             "function": {
                 "name": "image_generation",
-                "description": "Generate an image on the external GPU node (Qwen-Image-2.1 — a prompt-faithful model: it renders every object, count and spatial relation you describe, in any style: photorealistic, fantasy, surreal, cartoon/illustration; pick the style in the prompt). It can render LEGIBLE TEXT: put the exact words in double quotes (a sign that reads \"OPEN\"). Write the prompt as natural-language prose in any language (Greek works); do NOT use attention-weight syntax like (x:1.2) or [x] — its text encoder is an LLM and reads that as literal characters. Follow 3 modes: 1) EXACT: use prompt exactly as-is, 2) ENHANCED: append style/quality enhancements matching the intended look, 3) IMAGINATION: create a high-entropy prompt. Preserve the user's exact subject description in modes 1 and 2. LONG prompts are fully used. A generation takes about 3-4 MINUTES — call it ONCE and wait; never re-call because it seems slow. A SPECIFIC REAL PERSON OR OBJECT — YOU MUST PASS A PHOTO. The model draws a likeness from PIXELS, never from a name and never from a description. Naming someone who is not globally famous, or describing their face in words (including from a `vision_analysis` caption), yields a generic stranger — it does NOT matter how detailed the description is. So to put a real person anywhere (in space, in a costume, in another city): get a photo into the sandbox first (`file_system` operation=download, or the user uploads one), then pass that filename in `reference_images` with a prompt describing the SCENE you want them in. Same for a specific product, building or pet. EDITING: to change an EXISTING image (fix a detail, change the text on a sign, restyle, add/remove an object, change the background) pass its sandbox filename in `reference_images` and describe THE CHANGE in the prompt ('Change the sign so it reads \"OPEN\"; keep everything else the same') — the model preserves the rest, including people's identity; an edit re-renders at the reference's SHAPE (nearest supported size to its aspect, not its exact pixels) and takes about 11 MINUTES (it runs guidance, which doubles the work per step) — so make the instruction count on the first try. CRITICAL: If the user says the generated image is WRONG or needs fixing, DO NOT blind-guess what to change. You MUST use the `vision_analysis` tool first on the previously generated image to explicitly 'see' what went wrong — then EDIT it with `reference_images` rather than regenerating from scratch.",
+                "description": "Generate an image on the external GPU node (Qwen-Image-2.1 — a prompt-faithful model: it renders every object, count and spatial relation you describe, in any style: photorealistic, fantasy, surreal, cartoon/illustration; pick the style in the prompt). It can render LEGIBLE TEXT: put the exact words in double quotes (a sign that reads \"OPEN\"). Write the prompt as natural-language prose in any language (Greek works); do NOT use attention-weight syntax like (x:1.2) or [x] — its text encoder is an LLM and reads that as literal characters. Follow 3 modes: 1) EXACT: use prompt exactly as-is, 2) ENHANCED: append style/quality enhancements matching the intended look, 3) IMAGINATION: create a high-entropy prompt. Preserve the user's exact subject description in modes 1 and 2. Prompts up to ~8000 characters are fully used (longer is truncated). A generation takes about 3-4 MINUTES — call it ONCE and wait; never re-call because it seems slow. A SPECIFIC REAL PERSON OR OBJECT — YOU MUST PASS A PHOTO. The model draws a likeness from PIXELS, never from a name and never from a description. Naming someone who is not globally famous, or describing their face in words (including from a `vision_analysis` caption), yields a generic stranger — it does NOT matter how detailed the description is. So to put a real person anywhere (in space, in a costume, in another city): get a photo into the sandbox first (`file_system` operation=download, or the user uploads one), then pass that filename in `reference_images` with a prompt describing the SCENE you want them in. Same for a specific product, building or pet. EDITING: to change an EXISTING image (fix a detail, change the text on a sign, restyle, add/remove an object, change the background) pass its sandbox filename in `reference_images` and describe THE CHANGE in the prompt ('Change the sign so it reads \"OPEN\"; keep everything else the same') — the model preserves the rest, including people's identity; an edit re-renders at the reference's SHAPE (nearest supported size to its aspect, not its exact pixels) and takes about 11 MINUTES (it runs guidance, which doubles the work per step) — so make the instruction count on the first try. CRITICAL: If the user says the generated image is WRONG or needs fixing, DO NOT blind-guess what to change. You MUST use the `vision_analysis` tool first on the previously generated image to explicitly 'see' what went wrong — then EDIT it with `reference_images` rather than regenerating from scratch.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "prompt": {
                             "type": "string",
-                            "description": "The final image generation prompt, written as natural-language prose (sentences, not tag salad; no (x:1.2) weights). 1) EXACT: Provide the user's requested subject EXACTLY as they described it, without filtering or altering it. 2) ENHANCED: Append descriptive style sentences matching the intended look (photographic terms, painterly terms, cartoon terms, …). 3) IMAGINATION: Generate a high-entropy prompt. Detail is rewarded — the full prompt is used however long it is. Text to appear IN the image goes in double quotes."
+                            "description": "The final image generation prompt, written as natural-language prose (sentences, not tag salad; no (x:1.2) weights). 1) EXACT: Provide the user's requested subject EXACTLY as they described it, without filtering or altering it. 2) ENHANCED: Append descriptive style sentences matching the intended look (photographic terms, painterly terms, cartoon terms, …). 3) IMAGINATION: Generate a high-entropy prompt. Detail is rewarded — the full prompt is used, up to ~8000 characters. Text to appear IN the image goes in double quotes."
                         },
                         "steps": {
                             "type": "integer",
@@ -1309,7 +1319,7 @@ def get_active_tool_definitions(context, query: str = None, *,
                         },
                         "seed": {
                             "type": "integer",
-                            "description": "Optional. Omit for a fresh random image — the result tells you the seed it used. Pass that seed back with the SAME prompt to reproduce an image exactly; with a TWEAKED prompt it gives another take on the idea, NOT the same picture with an edit (measured: the composition changes). To alter an existing picture, use `reference_images`."
+                            "description": "Optional. Omit for a fresh random image — the result records the seed it used (for a new image; an edit's result does not, since re-rolling cannot reproduce an edit). Only pass a seed back when the USER asks for a reproducible re-run of a specific image: the SAME prompt + that seed reproduces it exactly; a TWEAKED prompt + that seed is a different composition (measured), i.e. another take on the idea (~3 min), NOT the same picture changed. To keep THIS picture and change one thing, use `reference_images` (an edit, ~11 min). Never re-run the tool because a result mentioned a seed."
                         },
                         "reference_images": {
                             "type": "array",

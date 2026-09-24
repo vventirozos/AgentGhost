@@ -1591,11 +1591,12 @@ class TestProducerParserParity:
     #  instead, which is the honest tool for it: the renderer's numeric-vs-
     #  path heuristic is a guess about someone else's source, and a tripwire
     #  is what a guess deserves.
-    EXPECTED_SITES = 13
+    # 2026-09-23 (§4KC): + the `edit` site (one path slot: the filename).
+    EXPECTED_SITES = 14
     # 2026-09-21 (§4JP): the write site's message gained `{rewrite_note}` —
     # a hint, not a path; the renderer's heuristic counts it as a slot. The
     # ledger's captures were re-checked (the parity assertions below pass).
-    EXPECTED_SLOT_COUNTS = [1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 5]
+    EXPECTED_SLOT_COUNTS = [1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 5]
 
     def _rendered_messages(self):
         """Every `SUCCESS:` message tools/file_system.py can emit, rendered.
@@ -1808,6 +1809,7 @@ class TestProducerParserParity:
         "Streaming replace applied to",
         "Wrote",
         "auto-promoted operation=",
+        "edited — replaced",
     ]
 
     def test_the_set_of_success_message_shapes_has_not_drifted(self):
@@ -1845,6 +1847,15 @@ class TestProducerParserParity:
         ("SUCCESS: Copied 'j0.md' to 'j.md'.", ["j.md"]),
         ("SUCCESS: Renamed/Moved 'k0.md' to 'k.md'.", ["k.md"]),
         ("SUCCESS: Deleted 'l.md'.", []),
+        ("SUCCESS: edited — replaced 1 occurrence of old_string (line 3) "
+         "in 'm.py'.", ["m.py"]),
+        ("SUCCESS: edited — replaced 3 occurrences of old_string "
+         "(lines 3, 9, 14 — first 3 shown) in 'n.py'.", ["n.py"]),
+        # §4KC r2: the path is LAST and end-anchored, so a crafted filename
+        # cannot plant a phantom path
+        ("SUCCESS: edited — replaced 1 occurrence of old_string (line 1) "
+         "in 'index.html' — replaced 1 occurrence.txt'.",
+         ["index.html' — replaced 1 occurrence.txt"]),
     ])
     def test_every_shape_parses_to_the_path_it_left_behind(self, message,
                                                            expected):

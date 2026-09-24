@@ -21,7 +21,7 @@ import pytest
 #: Ops that CHANGE the sandbox. Each must invalidate, or the next turn is
 #: shown a stale workspace listing.
 MUTATING_OPS = [
-    "write", "replace", "download", "delete", "move", "rename",
+    "write", "edit", "replace", "download", "delete", "move", "rename",
     "unzip", "git_clone", "copy",
 ]
 READ_ONLY_OPS = ["read", "list_files", "find"]

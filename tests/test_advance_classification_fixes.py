@@ -234,4 +234,5 @@ def test_file_system_description_warns_against_mega_write():
           if t.get("function", {}).get("name") == "file_system"][0]
     desc = fs["function"]["description"].lower()
     assert "large file" in desc
-    assert "skeleton" in desc and "replace" in desc
+    # §4KC: the incremental-growth steer names `edit`, not `replace`.
+    assert "skeleton" in desc and "operation='edit'" in desc

@@ -194,6 +194,9 @@ const ICON_CLASS = {
     '💾': 'memory',   // TOOL_FILE_W
     '📖': 'memory',   // TOOL_FILE_R
     '📙': 'memory',   // TOOL_FILE_M — multi-path batch read
+    '🔖': 'memory',   // TOOL_FILE_O — code outline / symbol map (§4KB)
+
+    '🌿': 'memory',   // VCS_GIT — local git over the workspace (§4KB)
     '🔍': 'memory',   // TOOL_FILE_S
     '👀': 'memory',   // TOOL_FILE_I
     '📝': 'memory',   // MEM_SAVE

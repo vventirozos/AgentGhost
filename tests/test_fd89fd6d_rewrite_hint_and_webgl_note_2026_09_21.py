@@ -44,7 +44,7 @@ async def test_hint_from_the_third_full_rewrite_of_a_large_existing_file(sandbox
     r4 = await tool_write_file("sponza_renderer.html", BIG + "d", sandbox)        # and every one after
     assert all("SUCCESS" in str(r) for r in (r0, r1, r2, r3, r4))
     assert "NOTE: this is full rewrite" not in str(r0) + str(r1) + str(r2)
-    assert f"full rewrite #{REWRITE_HINT_AT} of an existing" in str(r3) and "operation='replace'" in str(r3)
+    assert f"full rewrite #{REWRITE_HINT_AT} of an existing" in str(r3) and "operation='edit'" in str(r3)
     assert f"full rewrite #{REWRITE_HINT_AT + 1}" in str(r4)
 
 

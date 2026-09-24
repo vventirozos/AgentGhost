@@ -307,5 +307,12 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/com.local.ghost-slackbot.
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
+
+  <h2 id="4kd-slack">Requests are minted <code>slack-…</code> and never teach <span class="tag">2026-09-24 &sect;4KD</span></h2>
+  <p>The bot mints every chat request id as <code>slack-&lt;8 hex&gt;</code>. The agent reads that prefix
+  (<code>is_slack_request_id</code>) as "this turn must not write to the playbook" — see
+  <a href="../memory/skills.html#4kd-slack">Slack never teaches</a>. Feedback reactions keep correlating on the same id,
+  which is why the prefix is minted here rather than rewritten by the server. Deploy: <code>sudo launchctl kickstart -k
+  system/com.local.ghost-slackbot</code>.</p>
 </body>
 </html>

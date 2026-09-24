@@ -45,6 +45,23 @@ client_deadline_context = contextvars.ContextVar("client_deadline_s", default=0.
 PROBE_REQUEST_PREFIX = "probe-"
 ORIGIN_PROBE = "probe"
 
+#: §4KD (2026-09-24): a request that arrived through the Slack bot. The bot
+#: mints its request ids with this prefix (and keeps using the same id for
+#: feedback correlation, so nothing server-side rewrites it). Slack is REAL
+#: traffic — `turn_origin` still says "user" — but it must never TEACH: the
+#: open-channel mode feeds strangers' prompts into a single-tenant playbook
+#: (4 of 257 lessons on 2026-09-23 had a stranger's Slack message as their
+#: task). One predicate, read by every playbook writer.
+SLACK_REQUEST_PREFIX = "slack-"
+ORIGIN_SLACK = "slack"
+
+
+def is_slack_request_id(req_id) -> bool:
+    try:
+        return str(req_id or "").startswith(SLACK_REQUEST_PREFIX)
+    except Exception:  # noqa: BLE001
+        return False
+
 
 def is_probe_request_id(req_id) -> bool:
     """True iff ``req_id`` carries the diagnostic-probe prefix."""
@@ -467,6 +484,11 @@ class Icons:
     TOOL_FILE_W  = "💾"
     TOOL_FILE_R  = "📖"
     TOOL_FILE_M  = "📙"   # MULTI-path batch read (distinct from the single 📖)
+    TOOL_FILE_O  = "🔖"   # code OUTLINE / symbol map — an INDEX into a file
+                          # (distinct from 📖 read and 🔍 search: a map, not
+                          # bytes). NOT 📐 — that is METACOG_CALIB.
+    VCS_GIT      = "🌿"   # local version control (branch); distinct from 💾 write
+                          # and 🐚 shell — git is neither a file write nor a shell
     TOOL_FILE_S  = "🔍"
     TOOL_FILE_I  = "👀"
     TOOL_DOWN    = "📥"   # download / incoming (wide-base; was ⬇️)

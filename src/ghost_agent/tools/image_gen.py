@@ -23,6 +23,15 @@ from ..utils.logging import Icons, pretty_log
 # stops the model spending a quarter-hour of GPU on a guaranteed failure.
 MAX_REFERENCES = 1
 MAX_REFERENCE_BYTES = 12 * 1024 * 1024   # mirrors the node's own cap
+MAX_PROMPT_CHARS = 8000                  # mirrors the node's `MAX_PROMPT_CHARS` (a 400 above it)
+_IMAGE_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff")
+
+
+def _is_supported_image(data: bytes) -> bool:
+    """PNG / JPEG / WEBP by magic — the node's own test, run HERE so a bad
+    file is a clear error now, not a 400 after it crossed the LAN (§4KD)."""
+    return bool(data) and (data.startswith(_IMAGE_MAGIC)
+                           or (data[:4] == b"RIFF" and data[8:12] == b"WEBP"))
 _REF_KEYS = ("reference_images", "reference_image", "references", "input_image",
              "image_path", "source_image", "base_image")
 
@@ -92,6 +101,13 @@ def _resolve_reference(name, sandbox_dir) -> Path:
 async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=None, steps: int = 0, width: int = 0, height: int = 0, seed=None, negative_prompt: str = "", reference_images=None, transparent=False, **kwargs):
     # --- PARAMETER HALLUCINATION HEALING ---
     prompt = prompt or kwargs.get("image") or kwargs.get("description") or kwargs.get("subject") or kwargs.get("text")
+    # §4KD: a list prompt went to the node verbatim (422 ×3), an int crashed
+    # the log slice, and whitespace burned a render. Text in, text out.
+    if isinstance(prompt, (list, tuple)):
+        prompt = " ".join(str(x) for x in prompt if x is not None)
+    elif prompt is not None and not isinstance(prompt, str):
+        prompt = str(prompt)
+    prompt = (prompt or "").strip()
     if not prompt:
         # Extreme fallback: If they hallucinated `<parameter name="imagination_prompt">`, grab the longest string passed
         longest_str = ""
@@ -106,6 +122,13 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
 
     if not prompt:
         return "SYSTEM ERROR: The 'prompt' parameter is MANDATORY for image generation. You must provide a description of the image."
+    _prompt_note = ""
+    if len(prompt) > MAX_PROMPT_CHARS:
+        # the node refuses longer prompts with a 400; truncating here keeps
+        # the request alive and SAYS so
+        prompt = prompt[:MAX_PROMPT_CHARS]
+        _prompt_note = (f"NOTE: the prompt was truncated to {MAX_PROMPT_CHARS} characters "
+                        f"(the node's limit); the tail was dropped. ")
 
     # Steps: 0/absent = defer to the NODE's tuned default (30 — measured
     # indistinguishable from 40 on Qwen-Image-2.1 at 768x512, §4JU). The
@@ -127,9 +150,10 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
     # was supplied, send no size at all and let the node use its default.
     def _as_int(v):
         try:
-            return int(v)
+            n = int(v)
         except (TypeError, ValueError):
             return 0
+        return n if n > 0 else 0          # `-5x-5` passed through as a size (§4KD)
 
     # Coerce the direct width/height first: a hallucinated "1024px" / "large"
     # is truthy but not int-able; coercing here keeps a ValueError from
@@ -150,7 +174,7 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
     # from the sandbox NOW so a bad name is a clear error, not a 400 from
     # the node after minutes of queueing.
     refs_in = reference_images
-    if refs_in is None:
+    if not refs_in:                       # `[]` plus a synonym was a plain generation (§4KD)
         for k in _REF_KEYS[1:]:
             if kwargs.get(k):
                 refs_in = kwargs[k]
@@ -178,6 +202,9 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
                             f"the node accepts at most {MAX_REFERENCE_BYTES // (1024*1024)} MB. "
                             f"Use a smaller image.")
                 data = await asyncio.to_thread(_ref_path.read_bytes)
+                if not _is_supported_image(data):
+                    return (f"ERROR: reference image {name!r} is empty or not a PNG/JPEG/WEBP "
+                            f"({len(data)} bytes). Pass an image file.")
             except ValueError as e:
                 return f"ERROR: {e}. Use the exact filename a previous image_generation result gave you (e.g. gen_1a2b3c4d.png)."
             except (OSError, TypeError, MemoryError) as e:
@@ -219,7 +246,7 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
         if steps > 0:
             payload["steps"] = steps        # omitted → node's tuned default
         try:
-            if seed is not None:
+            if seed is not None and not isinstance(seed, bool):
                 payload["seed"] = int(seed)  # reproducible variations
         except (TypeError, ValueError):
             pass
@@ -270,26 +297,29 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
         _asked = (f" (you asked for {raw_w}x{raw_h}; the node renders the nearest size it "
                   f"supports — tell the user the actual size if they asked for a specific one)"
                   if size_requested and (_rw, _rh) != (raw_w, raw_h) else "")
+        _steps_used = resp_data.get("steps")
         _size_note = (
-            (f"Rendered at {_rw}x{_rh}" if _rw and _rh else "Rendered")
+            _prompt_note
+            + (f"Rendered at {_rw}x{_rh}" if _rw and _rh else "Rendered")
+            + (f" in {int(_steps_used)} steps" if isinstance(_steps_used, (int, float)) and _steps_used else "")
             + _asked
             + ("; edited from the reference image" if len(ref_b64) == 1 else
                f"; edited from {len(ref_b64)} reference images" if ref_b64 else "")
             + ("; NOTE: transparency was requested but this backend does not decode an alpha matte — the background will be opaque" if transparent else "")
             + ".\n\n"
             # The node picks a random seed when none was given and reports it.
-            # ⚠ MEASURED, not assumed: re-running the same seed with a tweaked
-            # prompt does NOT reproduce this scene with the change — the prompt
-            # shifts the whole trajectory (mean abs pixel diff 30/255 on the
-            # bakery→cafe test). It is a fresh take at full quality in ~3 min,
-            # which is the right tool for "another one like this", while only an
-            # edit keeps the actual picture. Saying otherwise sent the model
-            # down the wrong path, so the wording states both plainly.
-            + (f"Seed: {used_seed}. Reuse seed={used_seed} with a tweaked prompt for "
-               f"ANOTHER TAKE on the same idea (~3 min, full quality) — but expect a "
-               f"different composition; the seed does not preserve this scene. To keep "
-               f"THIS picture and change one thing in it, pass its filename in "
-               f"reference_images instead (an edit: ~11 min, slightly softer).\n\n"
+            # §4KD: this line is INFORMATION, not a next action. It used to end
+            # with "Reuse seed=N with a tweaked prompt for ANOTHER TAKE", and
+            # a one-token follow-up (`emp1`, Slack, 2026-09-23) resolved into
+            # exactly that — a second image nobody asked for. A tool result is
+            # read when the model decides what to do NEXT; advice about the
+            # seed-vs-edit choice belongs in the tool DESCRIPTION, which is
+            # read when the model chooses an action (it is there, under
+            # `seed` and `reference_images`). The measured facts stay in the
+            # description too: same seed + tweaked prompt = a different
+            # composition; only an edit keeps this picture.
+            + (f"(Seed {used_seed} — a record for reproducibility; the result "
+               f"is saved and this request is complete.)\n\n"
                if used_seed is not None and not ref_b64 else "")
         )
         # An EDIT that did not apply must not start a retry loop: every attempt

@@ -95,6 +95,9 @@ ICON_CLASS = {
     "💾": "memory",
     "📖": "memory",
     "📙": "memory",   # TOOL_FILE_M — multi-path batch read
+"🔖": "memory",   # TOOL_FILE_O — outline / symbols (§4KB)
+
+"🌿": "memory",   # VCS_GIT — local git over the workspace (§4KB)
     "🔍": "memory",
     "👀": "memory",
     "📝": "memory",

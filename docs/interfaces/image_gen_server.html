@@ -49,8 +49,8 @@
   <h2>Tunables (measured, §4JT)</h2>
   <ul>
     <li>Sizes: default 768×512, per-side cap 768, area budget 768×512 px, sides snapped to /32. At this size one image takes <strong>~3.3 min at 30 steps</strong> (768×768 would be ~6.7 min, 1024² ~15 min — the operator chose 768×512).</li>
-    <li>Steps: default 30 (indistinguishable from 40 on this model at this size), floor 15, cap 50; ~6 s per step.</li>
-    <li>Queued requests wait up to 180 s for the GPU, then 503. A generation is killed after 900 s.</li>
+    <li>Steps: default 30 for a new image (indistinguishable from 40 on this model at this size), 20 for an edit; floor 15, cap 50 for a new image and <code>MAX_EDIT_STEPS</code> = 30 for an edit (anything higher is reduced); ~6 s per step T2I, ~28 s per step for an edit (CFG's two forwards) plus ~95 s fixed overhead — 654 s measured at 20 steps, 935 s permitted at 30.</li>
+    <li>Queued requests wait up to <code>BUSY_WAIT_TIMEOUT</code> (derived: 1200 − 935 − 30 = 235 s) for the GPU, then 503. A generation is killed after <code>GEN_TIMEOUT_S</code> = 1500 s. Prompts and negative prompts are capped at <code>MAX_PROMPT_CHARS</code> = 8000 (400 above), the body at 24 MB (413, before auth). The response carries <code>seed</code>, <code>width</code>, <code>height</code> and <code>steps</code> as rendered.</li>
   </ul>
 
   <h2>Boot &amp; resilience</h2>
@@ -128,5 +128,36 @@
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
+
+  <h2 id="4kd-review">Node review <span class="tag">2026-09-24 &sect;4KD</span></h2>
+  <p>Confirmed and fixed (pins in <code>tests/test_4kd_image_pipeline_review.py</code>): <strong><code>negative_prompt</code>
+  was uncapped</strong> — under CFG (every edit) it goes through the quadratic attention-syntax parser on the GPU thread
+  with the lock held and no timeout (0.9 s at 16 KB, 36 s at 100 KB, hours at the 24 MB body cap) — same
+  <code>MAX_PROMPT_CHARS</code> 400 now; <strong>EXIF orientation was ignored</strong> — a phone portrait stored 400×200
+  with orientation 6 rendered landscape from a sideways reference — <code>image_size</code> and
+  <code>fit_reference</code> transpose first and never pass raw bytes through when a transpose applied (sd-cli's stb
+  decoder ignores EXIF too); a NUL in either prompt and a 20000² decompression bomb reached the GPU lock before failing
+  as a 500 — both are 400s at decode time; any <code>RIFF</code> file passed as WEBP (a WAV reached sd-cli) — bytes 8–12
+  must say <code>WEBP</code>; negative and one-sided sizes were silently mapped to a legal shape — 400; error bodies
+  (and <code>/health</code>'s <code>load_error</code>) carried absolute server paths — basenames only. NOTEs kept: base64 with line breaks is refused; an empty prompt is a 400 now.</p>
+  <p><strong>A client disconnect now cancels the render (operator request, same day).</strong> The render in flight is
+  ONE handle (<code>_RENDER</code>: one GPU, one render at a time): <code>run_sd_cli</code> starts <code>sd-cli</code> in its
+  own session and registers the process; the endpoint arms a fresh render (<code>_arm_render</code>), runs the GPU task
+  and awaits it through <code>_await_render</code>, which polls <code>request.is_disconnected()</code> every second and, when
+  the client is gone, kills the render's whole process group (<code>cancel_current_render</code> → <code>killpg</code> —
+  killing only the leader left a child holding the stdout pipe and <code>communicate()</code> waiting for EOF), waits for
+  the task to unwind so the GPU lock is released in order, logs <code>GEN cancelled after Ns … GPU released</code> and
+  answers 499. A cancel that arrives before the process exists is not lost (the runner re-checks the flag right after
+  <code>Popen</code>); arming clears a stale flag; a test client that cannot answer <code>is_disconnected</code> never cancels
+  by accident. Pins drive a real subprocess (<code>tests/test_4kd_image_pipeline_review.py</code> §5).</p>
+  <p><strong>Why the first deploy of this did nothing.</strong> The live test showed the client leave and the render
+  run on. A 20-line probe under the same uvicorn/starlette proved <code>is_disconnected()</code> works — until a
+  <code>BaseHTTPMiddleware</code> is in the chain, whereupon the endpoint's <code>receive</code> is the middleware's own
+  and <code>http.disconnect</code> never reaches it. The body cap WAS that middleware. It is a pure ASGI middleware now
+  (<code>_BodyCapMiddleware</code>: Content-Length refused before the app, a chunked body counted through a forwarding
+  <code>receive</code>, 413 either way — the same two pins), and the second live test cancelled 1.6 s after the client
+  left: <code>GEN cancelled after 16.6s … GPU released</code>, <code>/ready</code> true immediately.</p>
+  <p> <strong>Deploy note:</strong> this file is the node's server; it runs on
+  <code>ghost</code> and is restarted only with the operator's OK.</p>
 </body>
 </html>

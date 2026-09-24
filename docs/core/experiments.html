@@ -572,6 +572,20 @@ radius = σ̂ · sqrt( 2(nρ² + 1) / (n²ρ²) · log( sqrt(nρ² + 1) / α ) )
   </p>
 
   <p class="footnote">Not to be confused with <code>core/prune_overrides.py</code>, whose "arm" means an ablation MATRIX CONFIG (a whole-process boot flag). These arms are per-request.</p>
-</main>
+
+  <h2 id="strict-edit">`strict_edit` — REGISTERED, BENCHED, REMOVED <span class="tag">2026-09-23 &sect;4KB</span></h2>
+  <p>The arm required a bulk read of a file, by the same request, whose sha256 still matched disk, before an edit to it.
+  It was registered at <code>traffic: 0.0</code> and never enrolled live traffic.</p>
+  <p><strong>The bench ran and the answer was no.</strong> app suite, 6 leaves &times; 2 arms with the gate pinned by a
+  flag file and its state verified against the RUNNING PROCESS before each arm: control 6/6, treatment 6/6,
+  McNemar p = 1.0, and <strong>zero receipt refusals across 16 leaf edits</strong>. The gate never fired, because the
+  coding leaf always reads before it edits. Its premise — "the dominant small-model edit failure is editing from a
+  MEMORY of a file" — was not observed once.</p>
+  <p>It was removed. No measured benefit on the only population measured, and its implementation had produced four
+  CRITICALs across three review rounds (a &gt;1&nbsp;MB bypass, a process-wide latch, a fail-open write gate, an
+  encoding loop). ⚠ Two instrument lessons outlived it: <code>leaf_bench</code> cannot test a live ARM at all
+  (coding leaves are <code>sub-leaf-*</code>, excluded from enrolment by design), and a DISCRIMINATING smoke must drive
+  the same route the run will drive — the first attempt passed while both arms ran the incumbent.</p>
+  </main>
 </body>
 </html>

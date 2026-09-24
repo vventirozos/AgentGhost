@@ -46348,3 +46348,1131 @@ was run SERIALLY (24 min and still going) and without `env -u FORCE_COLOR`, beca
 `/Users/vasilis/Data/AI/.agent.venv`, and `-n 8 --dist loadfile` is the documented default. An
 activation that fails quietly leaves you running SOMETHING, which is why the earlier run died on
 `GHOST_API_KEY is set but EMPTY` instead.
+
+
+## §4KB — The edit loop: receipts, uniqueness, and the cost of tolerance (2026-09-23) — R0 scope, written first
+
+**Trigger.** Operator, after a competitor evaluation: *"i'm more interested in this: Code editing
+(diff/LSP/AST/git) — how can we improve the agent to match claude code?"* → the five-step plan
+below → *"create a detailed implementation plan for 1 → 2 → 3 → 4 → 5 and start implementing it.
+standard verification protocol."*
+
+**The finding that set the scope.** Claude Code's edit reliability does NOT come from a diff
+format, an LSP, or an AST index — it has none of those. Its editing surface is read / exact-string
+edit / write / shell / glob / grep. The reliability comes from two invariants this agent does not
+have: **a file cannot be edited unless it was read by the same conversation** (and re-read if it
+changed since), and **an ambiguous match is a hard error, never a guess**. Ghost went the opposite
+way — a four-rung tolerance ladder (exact → whitespace-flexible → fuzzy → anchor) to compensate
+for a 35B that cannot reproduce exact strings. That is a defensible trade for this model, but it
+is the trade that produced the 2026-07-14 and 2026-07-19 file-corruption incidents, and it is
+currently **unmeasured**: `_locate_block` computes the rung that applied and the caller throws it
+away.
+
+### R0 — scope
+
+**Property under review.** Every edit this agent APPLIES to an existing file is
+(a) **grounded** — traceable to a read, by the same request, of that file's CURRENT bytes;
+(b) **unambiguous** — no replacement is applied when the SEARCH text locates more than one region;
+(c) **accounted** — the matching rung that applied it is recorded, so the ladder's tolerance can be
+priced from data instead of assumed.
+
+**Threat model.**
+*Trusted:* the bytes on disk; `_get_safe_path` path resolution; the syntax checkers
+(`_syntax_regression`, `_syntax_regression_js_html`) and the marker-leak backstop — all four were
+hardened in 2026-07 and are re-verified here only through the R5 table.
+*Untrusted:* every argument the model supplies — `old_text` / `new_text` / `path`, the operation
+aliases, the envelope dialect (4-char and 7-char git-conflict forms both reach the parser).
+And the one this round exists for: **the model's BELIEF about a file's contents**, which today is
+accepted as ground truth by every rung below `exact`.
+
+**Out of scope.**
+- The SEARCH/REPLACE envelope parser itself (hardened 2026-07-14, re-hardened 2026-07-20 after the
+  7-char dialect recurrence). This round does not touch the regexes.
+- The `execute` sandbox, egress, and Tor.
+- `coding_executor.build_coding_task` (the SPEC executor). Only the agentic leaf is in scope.
+- Retuning the fuzzy/anchor ALGORITHMS. This round measures and gates them; it does not change
+  what they match.
+- A real LSP / type-checker. Deferred by design — see step 5c.
+- SWE-bench as a target. The field reports it saturated and contaminated; `leaf_bench.py
+  --suite app` is the instrument here.
+
+**Instrument.** `scripts/leaf_bench.py --suite app` (paired per leaf, exact McNemar, ≥3 repeats) —
+already written for §4FG/§4FI and already the deciding bench for the agentic leaf. R6 applies: it
+gets a no-op control and a known-bad control before any verdict is read off it.
+
+### The plan (5 steps, in order)
+
+1. **Price the ladder.** `_locate_block` already returns the rung; record it. New ledger
+   `system/edits/ladder.jsonl` (the `rubric_shadow.jsonl` idiom: append-only, never raises,
+   joinable by `req_id`). Answers three questions nothing can answer today: what fraction of
+   APPLIED edits are non-exact; how often a non-exact apply is followed by a corrective edit to
+   the same file within N steps (the "landed wrong" proxy); and whether that differs by rung.
+2. **Uniqueness (live defect).** The `exact` rung returns on `search_str in file_content` with no
+   occurrence count, and the caller applies `.replace(matched, repl, 1)` — two identical blocks
+   means the FIRST is silently edited and "exact" is reported. The two-argument path already
+   rejects this; the block path, the one the tool description steers the model toward, does not.
+   Ships unconditionally: a silent wrong-region edit is a correctness bug, not a tuning choice.
+3. **Read receipts + staleness**, behind experiment arm `strict_edit`. A mutating op on an
+   EXISTING file requires a receipt from a read by the same request whose sha256 still matches.
+   Class closed by a dispatch-table enumeration over the complement of `_READ_ONLY_OPS`, so a
+   newly-added mutating operation fails the test instead of shipping ungated.
+4. **`git` as a tool.** Local-only (no network → no egress conflict): status / diff / log / show /
+   add / commit / revert / stash. Two payoffs beyond convenience — the agentic leaf currently
+   detects touched files by diffing the workspace before/after, which becomes `git diff` and
+   yields the actual PATCH; and that patch is the artifact §4GW's code lens never got.
+5. **Structure.** (a) `operation="outline"` — `ast` for Python, tree-sitter elsewhere → symbol map;
+   (b) a project symbol index refreshed on write, giving definition/reference lookup with no
+   daemon; (c) a real LSP — DEFERRED until (a)/(b) show the model actually uses structural info.
+   Both (a) and (b) ride inside `file_system`, so `LEAF_ALLOWED_TOOLS = ("file_system",
+   "execute")` picks them up unchanged.
+
+**Falsifiable prediction, recorded before the bench runs.** Strictness ALONE will lose on a 35B
+(more rejections, more steps); strictness WITH receipts will win, because the receipt puts the
+exact bytes in context immediately before the edit, which is what makes exact matching cheap for a
+large model. If receipts-plus-strict does not beat the ladder, the ladder stays and that is the
+finding.
+
+### §4KB outcome — SHIPPED, mutation 21/21 (one survivor proven equivalent, its dead code deleted)
+
+**All five steps landed.** Full suite **24,231 passed / 67 skipped / 0 failed** (8:34, `-n 8 --dist loadfile`),
+run ONCE after the last change per R7.3. Deployed by launchd kickstart: listener 11265 → 39559, exactly one
+instance, `system ready` count stable at 5 over 60 s (no respawn loop).
+
+| step | what shipped | pins |
+|---|---|---|
+| 1 | `utils/edit_ledger.py` + `scripts/edit_ladder_report.py`; the rung that applied is recorded, one row per call, from a WRAPPER so no return path can escape it | `test_edit_ladder_ledger.py` (21), `test_edit_ladder_report.py` (9) |
+| 2 | the uniqueness defect: `_locate_block`'s exact rung now returns a third outcome `(None, "ambiguous:N")`; the rejection names the occurrence lines | `test_edit_ambiguity_rule.py` (10) |
+| 3 | read receipts + staleness behind the `strict_edit` arm; dispatch-table enumeration over the complement of `_READ_ONLY_OPS` | `test_edit_read_receipts.py` (22) |
+| 4 | `tools/vcs.py` — local-only allow-listed `git`, in `LEAF_ALLOWED_TOOLS` | `test_vcs_git_tool.py` (27) |
+| 5 | `tools/outline.py` — `operation='outline'` (ast for Python, labelled heuristics elsewhere) and `operation='symbols'` | `test_outline_and_symbols.py` (25) |
+
+**R2 mutation score.** 21 real mutants across four batteries; **20 killed, 1 survivor PROVEN EQUIVALENT and its
+dead code deleted** → 100% per R7.1. Three no-op controls survived correctly. The survivor is the finding worth
+keeping: **M18 deleted the heuristic reader's `_COMMENT_LINE` filter and no test noticed**, because every pattern
+is anchored at `^\s*` followed by a keyword/identifier class that cannot match `/`, `#`, `*` or `<` — a comment
+line could never have reached a pattern. The filter was an unfalsifiable guard and the test pinning it was
+vacuous (it passed in both worlds, R4's most common reject). Guard deleted, test kept and re-documented as what
+actually holds the property: it now fails only if someone adds an UNANCHORED pattern, which is the real risk.
+
+**R8 — defects found INSIDE this work's own fixes: 7 of ~12 total findings**, the same ≈half ratio §4DZ reported.
+1. **A lexical proxy, committed inside the fix that exists to stop trusting unverified beliefs.** The receipt
+   reason code was computed as `"stale_receipt" if "CHANGED" in msg else "no_receipt"` — and the UNGROUNDED
+   message says the file is "UNCHANGED", which contains "CHANGED". Every ungrounded edit was logged as stale.
+   Now returned structurally beside the message.
+2. **Fail-CLOSED hazard.** A receipt store that cannot stamp would have refused every edit forever: the model
+   reads, the stamp silently fails, the edit is refused for "you have not read it", and the turn loops to the
+   step cap. `_RECEIPTS_DEGRADED` latches the gate OPEN with a WARNING. Both 1 and 2 were caught by the pins'
+   FIRST run — five red tests on a batch I believed was finished.
+3. **`_stamp_receipt` inside the atomic-write try**, after `os.replace`. It cannot raise today, but the handler
+   unlinks `_tmp` (already renamed) and re-raises — a stamp failure would have reported a FAILED write over a
+   file that had landed. `labelling-is-not-blocking` in latent form; moved outside the block.
+4. The dead `_COMMENT_LINE` guard above.
+5. Rust `pub fn` was invisible to the outline (visibility alternation lacked `pub`) — "this file has no functions".
+6. Glyph collisions: `📐` is **METACOG_CALIB** and `🧾` is **BELIEF_SCALES**. Replaced with `🔖`/`🪪`.
+7. **A THIRD icon surface.** `interface/externals/clockwork_ghost/turnstatus.py` carries its own ICON_CLASS that
+   must match the web client's. I updated `logging.py` and `app.js` and thought the R5 table was closed; the full
+   suite found the uConsole. Cross-surface consistency is not two surfaces because you have looked at two.
+
+**R6 — an instrument that measured nothing.** The first step-3 mutation battery printed `no tests ran` for every
+mutant, because zsh does not word-split an unquoted `$PINS`, so pytest received one glued argument. Read
+carelessly that is a page of survivors. Re-run with the list inlined: 6/6 killed. *Confirm the harness can fail
+before trusting that it passed* — the failure mode here was the harness not running at all while looking busy.
+
+**Live verification (post-deploy, real turns through `/api/chat`).**
+- `operation='outline'` on a planted file → `MAX_RETRIES, connect, Pool, Pool.acquire, Pool.release` (exact AST),
+  log line `🔖 file outline`.
+- `operation='symbols' name='connect'` → `kb_probe.py:4`.
+- `git operation='status'` in a non-repo workspace → the ancestor-repo refusal, live.
+- **The defect fix, live:** a SEARCH block matching twice was REJECTED with `ambiguous_block`, the file
+  byte-identical on disk. Before today that turn silently edited the first occurrence and reported SUCCESS.
+- The production ledger recorded it with the real `req_id` (`865079f9`); `edit_ladder_report.py` reads it.
+
+**Logging.** Every new path is visible and distinct: `🔖 file outline` / `symbol lookup`, `🪪 edit refused` /
+`write refused`, `🔶 replace rejected` (naming the occurrence lines), `🔶 tolerant match` (the event the ledger
+exists to price — exact applies stay quiet), `🌿 git` with the paths for `add`/`restore` and the message head for
+`commit`, `restore` at WARNING. Registered in all three icon surfaces.
+
+**What was NOT done, and why.**
+- **`strict_edit` is registered at `traffic: 0.0` — it enrols NOBODY.** Verified: 0/2000 synthetic requests, other
+  arms unaffected, registry not degraded. Gating edits is a real behaviour change on the operator's own agent, so
+  opening it is the operator's call: set `traffic` to 1.0 in `system/experiments.json` (hot-reloads on mtime).
+  **The paired bench has therefore NOT been run, and the prediction above is still unfalsified.**
+- **The §4GW payoff is available but not automatic.** `vcs.workspace_patch()` exists and `git` is in the leaf's
+  toolset, but `coding_loop` does not CALL it — the leaf can read its own patch, nothing yet attaches that patch
+  to verifier evidence. That is a built-but-unwired edge, named here rather than left to be discovered.
+- **No LSP** (step 5c), deferred by design until outline/symbols show the model uses structural information.
+- Non-Python outlines are line heuristics, not a parser: `tree_sitter` is installed but its grammar bundle is not.
+  The output says `heuristic` every time and tells the reader absence is not proof.
+
+### §4KB round 2 — what three fresh-eye reviewers found in round 1's fixes
+
+Round 1 shipped green: **24,231 tests, six new batteries, a 21-mutant battery at 100%**, docs written,
+deployed and live-verified. Three read-only reviewers (code / docs-vs-code / pin-quality) then found
+**15 + 13 + 13 findings**, including two CRITICALs, and proved the round's headline property false.
+
+**The property did not hold as shipped.** R0 said *"every edit APPLIED to an existing file is
+traceable to a read"*. Four independent holes: files >1 MB took the streaming branch and returned
+BEFORE the gate; one `read_chunked` latched the gate off process-wide; the write gate failed OPEN on
+an unreadable file; and the receipt hashed DECODED TEXT, so any file with a non-UTF-8 byte was
+permanently un-editable behind a FALSE "it CHANGED since you read it" and an unbounded retry loop.
+
+**Two CRITICALs, both in `git`, both reproduced end to end.**
+1. **A `.git` FILE made the workspace boundary model-controlled.** A gitfile holds
+   `gitdir: <path>` and git follows it ANYWHERE — `GIT_CEILING_DIRECTORIES` stops only the upward
+   WALK, which never happens with an explicit pointer. And the model can write the pointer itself:
+   `file_system(operation='write', path='.git', …)` is a NEW file, so even the receipt gate does not
+   apply. A `commit` through it moved an OUTER repository's `main`. `_is_repo_root` now requires a
+   `.git` DIRECTORY and refuses a symlink.
+2. **`rev` was an option-injection hole.** `--` protects PATH lists; `rev` sits before it and
+   `git show` accepts diff options, so `rev="--output=/elsewhere"` wrote git's output to an arbitrary
+   absolute path outside the workspace and returned OK with `world_changed=False`. Closed as a CLASS:
+   any model-supplied element that cannot sit behind `--` is rejected if it begins with `-`, with an
+   enumeration over every operation.
+
+**A live performance regression I had shipped without noticing.** Stamping re-read and hashed the
+WHOLE FILE on every read, in BOTH arms, on the event loop — measured at 16 ms of blocked loop per
+ranged read of a 38 MB file, which is precisely what a ranged read exists to avoid. Now gated on the
+arm (control pays nothing) and run in a thread.
+
+**Defects inside round 1's own fixes: 7 of ~12 in round 1, and round 2 found 15 more.** The
+self-referential ones are the point:
+- I congratulated §4KB for avoiding the lexical-proxy class, then selected the all-ambiguous verdict
+  with `e.startswith("Block REJECTED as AMBIGUOUS")` — a prefix match on my own prose.
+- I wrote "the SINGLE write site" in code, docs and the journal. There are **three**.
+- My class-closure test walked **7 of `_replace_text_impl`'s 30 returns** and was described as a
+  closure. An auditor added an early return to the wrapper and all 21 tests stayed green. The table
+  is now 19 labels plus an AST tripwire on the return COUNT — a hand-written list is a sample.
+- `test_network_verbs_are_unreachable` claimed to pin the ALLOW-LIST. A deny-list implementation
+  passed all 34 tests. It pinned the refusal SHAPE. Now an UNKNOWN future verb must also be refused.
+- `_RECEIPT_STAMPING_OPS` listed `read_file`/`read_document`, which the dispatcher never routes —
+  a declarative table nothing exercised, describing stamping that could not happen.
+- My explanatory COMMENT quoted a `SUCCESS:` literal and the producer/parser tripwire correctly read
+  it as a phantom emitter.
+- `_sha_text` became dead code the moment `_sha_file` landed; deleted per R2.
+
+**Mutation, round 2:** 13 mutants, 11 killed on the first pass; **2 survivors were real pin gaps, not
+equivalents** (the `log` clamp and the RANGED read's arm-gating, which had its own stamping site while
+only the whole-file one was pinned). Both closed → **13/13**, no-op control survived.
+
+**Suite:** 24,283 passed / 65 skipped / 0 failed. Deployed: listener 39559 → 22787, one instance,
+`system ready` stable at 6. Live re-verified: `outline` returned `compute`; `git status` refused in a
+non-repo workspace.
+
+**Still open, stated rather than discovered later.**
+- `strict_edit` remains at `traffic: 0.0` in BOTH the registry file and `DEFAULT_SPECS` (the fallback
+  pointed the wrong way — a broken registry would have armed an un-benched gate at 100%). **The
+  paired bench has still not run.**
+- `workspace_patch()` is still unwired — the leaf reaches its patch through the tool, but nothing
+  attaches it to verifier evidence, so §4GW is closable and not closed.
+- Weak pins the audit named and I did NOT fix: `_read_line_range`'s error-prefix pin covers 2 of 5
+  failure modes; `test_every_rung_refuses_an_ambiguous_input` genuinely exercises 3 of 4 rungs (no
+  case has a ≥2-line target, so `anchor` refuses on length rather than on ambiguity);
+  `test_every_operation_builds_an_argv_or_a_reason`'s stated failure world is unreachable by
+  construction. None is load-bearing; all are recorded so the next reader does not re-derive them.
+- A one-line ranged read still grounds an edit anywhere in the file. That is the gate as designed,
+  but it means the recorded prediction's MECHANISM ("the receipt puts the exact bytes in context
+  immediately before the edit") does not hold in general — worth remembering when the bench runs.
+
+**The lesson worth keeping.** A green suite, six purpose-built batteries and a 100% mutation score
+certified a change set whose headline property was false in four ways and which contained two
+sandbox escapes. What found them was three readers who had not written the code, asking
+*"does the documentation claim anything the code does not do?"*, *"revert each fix and confirm the
+test goes red"*, and *"reproduce it"*. The instruments measured what I had thought to measure.
+
+### §4KB round 3 — the stopping rule, and what it caught
+
+Round 2 ended with a 24,283-green suite and a 13/13 mutation battery. Three of §R's four stopping
+conditions were nonetheless UNMET, and saying so is what produced this round: **no single batch had
+ever scored every round's fixes together** (round 2 replaced much of the code round 1's mutants were
+scored against), **no enumeration had been deliberately fired**, and **round 2 had produced 41
+findings**, so R7.4 could not hold.
+
+**R7.1 — the gate that had never been run.** One batch, 44 real mutants over ALL THREE rounds'
+fixes against current code: **44 killed, 0 survivors.** No-op control survived, known-bad died. The
+first pass was 38/44 and every survivor was a real pin gap, not an equivalent:
+- **The released-project guard was entirely unpinned** — disabling it broke nothing. Its test was
+  vacuous twice over: the assertion was `is_rejection OR "released" not in result` (true for any
+  outcome) and the project id `proj-abc` could never match `_PROJECT_DIR_RE`, which needs **12 hex
+  characters**. The guard could not fire and the test could not fail.
+- The symlinked-`.git` refusal, the trigger's tool-name check, the `log` clamp and the ranged read's
+  arm-gating were all unpinned. `_sha_file`'s type guard survived because both callers now check
+  first — pinned at the FUNCTION instead, since its contract ("hash a file, never hang") should hold
+  independently of who calls it.
+
+**R7.2 — all 7 class enumerations were made to go red** by introducing the defect each exists to
+catch: an unclassified dispatcher op, a table listing an op that never stamps, a table listing an op
+the dispatcher cannot route, a rung resolving an ambiguous search, a deny-list replacing the
+allow-list, model input placed before `--`, and a new return path.
+
+**Three CRITICALs inside round 2's fixes.**
+1. **My gitfile fix was an INSTANCE fix — R1 forbids exactly this.** Requiring a `.git` DIRECTORY
+   closed one vector. The model can `git init` a real `.git` and then write *inside* it with the
+   ordinary `file_system` tool (`.git/config` is a NEW file, so not even the receipt gate applies).
+   Five vectors reproduced on git 2.54, one of them **arbitrary code execution**: a `core.hooksPath`
+   pre-commit hook ran and created a file outside the workspace. Also `core.worktree`,
+   `.git/commondir`, `objects/info/alternates`, and a symlinked `.git`. The guard is now: hooks
+   disabled and the work tree pinned on the command line (`-c` beats every config file), every
+   `GIT_*` override stripped from the inherited environment, and the repository git ACTUALLY
+   resolved verified to live inside the workspace.
+2. **The replace→write auto-promote was a FOURTH write site**, above the gate — ungated, and it did
+   not stamp, so a *grounded* promote poisoned the next edit with "this file CHANGED since you read
+   it", written by this tool one step earlier. Round 1 said one write site, round 2 said three, it
+   was four. **Enumerating write sites kept failing, so the stamp moved to the WRAPPER**, keyed on
+   `applied` — the one fact that means the bytes moved. A new write path inherits it.
+3. **The batch read grounded nothing.** Round 2 made stamping opt-in and wired it only at the
+   single-path call site; under `fs_batch` (traffic 1.0) a multi-path read returned full contents and
+   the next edit was refused "you have not read it", falsely, with a repair that re-entered the same
+   batch path.
+
+**Plus:** a FIFO in the workspace **wedged the entire event loop forever** (reachable with
+`rm f && mkfifo f`; `TimeoutError` is an `OSError`, so even an alarm rescue was swallowed); the gate
+hoist created two **closed loops** (>50 MB and binary: refuse → "read it" → "cannot read it" →
+refuse); and the gate itself still hashed on the event loop — the same 16 ms stall round 2 claimed to
+have removed by threading the *stamp*.
+
+**And a defect inside a round-3 fix, found within minutes.** The H2 fix put a binary sniff
+(`_read_head`) BEFORE the gate — re-introducing the FIFO wedge one call earlier than the guard that
+had just closed it. The check now precedes every open on that path, on both replace and write.
+
+**Suite:** 24,311 passed / 65 skipped / 0 failed. Deployed: listener 22787 → 88462, one instance,
+`system ready` stable at 7. Live: `outline` → `MAX_RETRIES, connect`; `symbols` → `r3probe/svc.py:4`;
+`git status` refused in a non-repo workspace.
+
+**Where the stopping rule now stands.** R7.1 ✅ (44/44 combined). R7.2 ✅ (7/7 fired). R7.3 ✅.
+**R7.4 ✗ — round 3 produced three CRITICALs, so it is not the last round.** The protocol is explicit
+that a clean reviewer is never the stopping condition; the honest position is that round 4 should
+mutate round 3's fixes first, and the base rate (§4DZ: rounds 3–8 each found criticals inside the
+previous fix) says it will find something.
+
+**Still open:** `strict_edit` at `traffic: 0.0` in both places, bench NOT run;
+`workspace_patch()` still unwired; `L2` (a landed edit booked as a rejection when `_syntax_feedback`
+raises after the write) and `L5` accepted and recorded rather than fixed.
+
+### §4KB round 4 — five CRITICALs, and the point at which enumeration was abandoned
+
+Round 3 satisfied three of four stopping conditions and failed R7.4 with three CRITICALs. Round 4
+was scoped narrowly (mutate round 3's fixes first, one fresh-eye pass on the git hardening and the
+wrapper-stamp refactor) and found **five more CRITICALs plus four HIGHs**.
+
+**R3 first — and the round-3 fixes scored 5/15.** My round-3 pins asserted OUTCOMES ("nothing runs
+or is modified outside"), which survive removing any SINGLE layer because the layers are redundant.
+Ten mutants survived. Each layer is now pinned individually, and the DOUBLE mutant (no worktree pin
+AND no containment check) is pinned too, so the redundancy is verified rather than assumed. One
+survivor needed a refactor to become testable at all: `_alternates_escape` was extracted from
+`tool_git` because inline, a relative entry resolved against the process CWD by accident, so the
+mutant that dropped the resolution still passed — fixed and broken worlds agreed.
+
+**THE finding: my round-3 fix was ALSO an instance fix.** `_HARDENING` disabled `core.hooksPath`
+and the write-up called the class closed ("hooks disabled outright"). Round 4 reproduced RCE through
+**`diff.external`** and **`filter.*.clean`** — and git has many more keys that name a program
+(`core.pager`, `sequence.editor`, `*.textconv`, `credential.helper`, `core.sshCommand`, `alias.*`,
+`uploadpack.packObjectsHook`). **Three consecutive rounds of denying keys one at a time is the
+evidence that enumerating them does not work.**
+
+**So the enumeration was abandoned for two structural guards.**
+1. **`file_system` refuses to MUTATE any path with a `.git` component.** Every escape in every
+   round — gitfile, `core.worktree`, `hooksPath`, `commondir`, `alternates`, `diff.external`,
+   `filter.clean` — needed that write. One deny, at the single choke point every mutating operation
+   passes through. Reads still work, so diagnosis is unaffected.
+2. **`git` ALLOW-LISTS the repository's own config.** `execute` shares the workspace, so the config
+   is still reachable there. This agent's git usage is nine local subcommands on a scratch repo and
+   needs only the keys `git init` writes; anything else is refused. **Verified against ten
+   program-naming keys, NONE of which is denied by name anywhere in the code** — including
+   `sequence.editor`, `credential.helper` and `alias.x`, which I never enumerated. That is the
+   difference between an allow-list and a deny-list, demonstrated rather than asserted.
+
+**The other four CRITICALs.**
+- **A symlinked `.git/objects` both discloses AND WRITES into a foreign repository.** `rev-parse`
+  reports the same toplevel and git-common-dir, so containment could not see it; the agent's blob,
+  tree and commit landed in another repo's store, reported OK. The object store is now checked for
+  containment itself.
+- **Alternates are followed TRANSITIVELY** (git's depth is 5). The check read one hop, so a first
+  hop inside could point at a second outside. Now recursive with a cycle guard. ⚠ The first attempt
+  at this recursion was wrong — it passed `ap.parent` as a common dir when an alternates entry
+  already IS an objects dir — and the two-hop leak survived until the reproduction caught it.
+- **A lone surrogate destroyed the file, was booked OK, and round 3's wrapper stamped a receipt over
+  the wreckage.** `write_text` truncates then encodes; `UnicodeEncodeError` is a `ValueError`,
+  returned without an `Error:` prefix, so the turn took world-changed credit and grounding was
+  certified against an empty file. `tool_write_file` already had this guard — "one-path fix ships
+  half", and grounding was hung off the unfixed path.
+- **The FIFO wedge was still open in three more places** (`read`'s own sniff, the auto-promote's
+  `write_text`, the symbol indexer). Closed three times and reopened three times; there is now ONE
+  `_nonregular_refusal` helper used at every site that opens a model-named path.
+
+**Suite:** 24,365 passed / 67 skipped / 0 failed. Deployed: listener 88462 → 68401, one instance.
+Live: `outline` returned `MAX, connect`; a `.git/config` write was refused with SYSTEM BLOCK.
+
+**Stopping rule: R7.4 still fails.** Four rounds, four sets of CRITICALs, every one inside the
+previous round's fix. The severity trend is real but so is the base rate. What changed this round is
+the SHAPE of the fix: the first three rounds patched vectors, this one removed the precondition and
+replaced a deny-list with an allow-list — and the allow-list's first act was to refuse keys I had
+never heard of. That is the only evidence so far that the class is actually closed rather than
+thinned.
+
+### §4KB round 5 — the `git` tool is REMOVED
+
+Four review rounds over the §4KB change set produced **nine sandbox escapes, and every single one came
+from the `git` tool**: a `.git` FILE, `core.worktree`, `core.hooksPath`, `.git/commondir`,
+`objects/info/alternates` (single, nested and quoted), a symlinked object store, `diff.external`, and
+`filter.*.clean`. Each round closed its vector and declared the class shut; the next round found
+another. The reason is structural: **`.git` is a configuration surface that names programs to run,
+and the model can write files.**
+
+Round 4's two structural guards did hold — the allow-list refused ten program-naming keys, none of
+them denied by name anywhere in the code, including `sequence.editor`, `credential.helper` and
+`alias.x`. That was the first real evidence a class was closed rather than thinned. But the honest
+accounting is: `git` was step 4 of a five-step plan, the *most optional* of the five, and it produced
+**100% of the security findings in this work**. The one payoff that justified it — handing a real
+patch to the verifier (§4GW) — was never wired, and `workspace_patch()` itself carried none of the
+hardening (it executed `diff.external` under test). The leaf reads its diff through `execute`, as it
+did before the tool existed.
+
+**Removed:** `src/ghost_agent/tools/vcs.py`, `tests/test_vcs_git_tool.py`, `docs/tools/vcs.html`, the
+registry entry and dispatch lambda, the nav links and the reference card. `LEAF_ALLOWED_TOOLS` is
+back to `("file_system", "execute")`, and the exact-set pin that should have caught `git` entering
+the leaf now guards the two-tool set again.
+
+**KEPT, because it is useful without the tool:** `file_system` refuses to MUTATE any path with a
+`.git` component. `execute` can still run git inside the sandbox, so the precondition is still worth
+removing, and the check is one deny at the single choke point every mutating operation already passes
+through. Reads are unaffected. Also kept: the `_nonregular_refusal` helper (the FIFO wedge was a
+`file_system` bug, closed three times before one helper covered every open site), the lone-surrogate
+guard on the replace write path, the receipt/ladder work, and `outline`/`symbols`.
+
+**Suite:** 24,281 passed / 67 skipped / 0 failed. Deployed: listener 68401 → 31764, one instance,
+`system ready` stable at 9. Live: `outline` → `LIMIT, ping`; `symbols` → `r5/n.py:4`; a `.git/config`
+write refused with SYSTEM BLOCK.
+
+**What §4KB delivered in the end:** step 1 (ladder ledger + report), step 2 (the ambiguity defect —
+the one live correctness bug the whole exercise started from), step 3 (`strict_edit` receipts, still
+at traffic 0.0 and still un-benched), step 5 (`outline` / `symbols`). Step 4 was built, reviewed four
+times, and removed. That is a real outcome, not a failure: the review found the escapes before the
+operator's agent ran on a repository that mattered, and the cheapest correct response to a feature
+whose risk keeps exceeding its value is to stop carrying it.
+
+### §4KB — the `strict_edit` bench is VOID: coding leaves cannot enrol in an experiment
+
+Operator: *"run the leaf_bench to settle the strict_edit prediction."* It was run. **It settles
+nothing, because both arms were the same arm.**
+
+**What was built.** `scripts/strict_edit_bench.py` — pairs on the ARM rather than the executor
+(`leaf_bench` hardcodes `for kind in ("spec","agentic")`), pinning each arm through
+`ExperimentSpec.weights` (`[1.0,0.0]` → all control, `[0.0,1.0]` → all treatment) in the live
+registry, which hot-reloads on mtime. §4U gates: `RunProgress` for OBSERVABLE/BOUNDED/RESUMABLE
+(read with `runstatus.py`, never derived), a `--smoke` DISCRIMINATING gate, a 1-leaf pilot for
+MEASURED, and `restore_registry()` in a `finally`.
+
+**Result.** app suite, 6 leaves × 2 arms: control 6/6 DONE, treatment 6/6 DONE, 0 discordant pairs,
+McNemar p = 1.0, **0 gate refusals in the treatment arm**.
+
+**Why it is void.** The zero-refusal count was the tell, and the ledger distinguished the two
+explanations it could have had. During the run the leaf produced **34 edit rows with
+`req_id = sub-leaf-*`** — 22 applied, rungs `exact` 13 / `flexible` 1 / `write_promote` 8 — so the
+leaf genuinely uses `replace` and the ledger sees it. Yet not one `no_receipt` or `stale_receipt`.
+A direct probe settled it:
+
+    req-normal-1   strict_active: un-enrolled=False  after enrol=True
+    sub-leaf-1     strict_active: un-enrolled=False  after enrol=False
+    sub-leaf-9     strict_active: un-enrolled=False  after enrol=False
+
+`enroll_request` (core/experiments.py) excludes `INTERNAL_REQUEST_PREFIXES = ("sched-", "job-",
+"sub-")` **by design** — *"they are not the traffic the experiment is about… enrolling them would
+dilute the effect with a population the change was never meant for."* Coding leaves run as
+`sub-leaf-*`. So **`leaf_bench` — the harness §4KB named as its deciding instrument, in the journal
+and in three docs pages — structurally cannot test a live-scoped arm.** Both arms ran the ungated
+ladder; the 6/6 vs 6/6 is one configuration measured twice.
+
+**The gate that should have caught this did not, and why.** §4U's DISCRIMINATING check passed: my
+`--smoke` proved `strict=True` and `strict=False` differ. But it exercised the `strict=` PARAMETER,
+not the path that decides it. *A discriminating gate has to drive the same route the run will.* This
+is the §4U lesson ("the ~8h ablation whose arms were byte-identical") recurring one level up — the
+smoke discriminated, the mechanism under it did not.
+
+**Honest scope, restated.** The recorded prediction contrasts "strictness ALONE" with "strictness
+WITH receipts". Only the second was ever built, so even a working bench could only have settled the
+narrower half. **The prediction remains unfalsified, and now it is known that the named instrument
+cannot falsify it.**
+
+**What would actually settle it** (not done, needs an operator decision): a `GHOST_STRICT_EDIT=1|0`
+process-level override consulted by `_strict_edit_active`, in the shape of the existing
+`GHOST_VERIFY_DEPTH_ROUTING=0` kill switch. Env reaches the leaf because it is process-wide, so the
+arm no longer depends on enrolment. Cost: two agent restarts (one per arm) plus ~25 min of bench.
+The alternative — benching on ordinary user turns — has no paired structure and far worse power.
+
+**Also recorded:** control 6/6 means this suite is at CEILING for the agentic executor. Even a
+working arm comparison could only have detected HARM here, never improvement; settling the
+prediction's "wins" half needs a harder suite. Scratch projects deleted, registry restored to
+`traffic: 0.0`.
+
+### §4KB — the `strict_edit` bench, RUN AND VALID: the gate is a NO-OP on the leaf workload
+
+The first attempt was void (arms never differed). This one was not: the flag-file override reaches
+the daemon, and the bench asked the RUNNING PROCESS what it had resolved before each arm
+(`strict_edit_override=False` / `True` printed in the log) — the check whose absence produced the
+void run.
+
+**Why the override is a FILE, not the env.** `launchctl setenv` is refused under System Integrity
+Protection ("Operation not permitted while System Integrity Protection is engaged"), so the env var
+cannot reach a launchd-supervised daemon without editing a system plist twice to run one bench.
+`<GHOST_HOME>/system/strict_edit.flag` needs no sudo, no plist edit and no restart: it is re-read on
+mtime, like `system/experiments.json`. The env var is still honoured and wins, for tests and manual
+runs.
+
+**Result — app suite, 6 leaves x 2 arms, agentic executor.**
+
+| | control (gate off) | treatment (gate ON, verified live) |
+|---|---|---|
+| leaves DONE | 6/6 | 6/6 |
+| replace calls | 14 (5 applied) | 16 (10 applied) |
+| **receipt-gate refusals** | — | **ZERO** |
+| wall clock | 895 s | 713 s |
+
+McNemar p = 1.0, 0 discordant pairs.
+
+**The finding: the gate never fired.** Not once in 16 leaf edits under a verified-live gate. The
+leaf always reads before it edits, so `no_receipt` and `stale_receipt` had nothing to fire on. The
+gate costs nothing here — and buys nothing here either.
+
+**So the prediction is answered, and the answer is no.** The recorded claim was *"strictness WITH
+receipts will win, because the receipt puts the exact bytes in context immediately before the
+edit."* It did not win. Its PREMISE — *"the dominant small-model edit failure is editing from a
+MEMORY of a file"* — was not observed at all in this workload. The other half, "strictness ALONE
+will lose", remains untestable: it was never built.
+
+**Do not read the wall clock as a win.** Treatment was 182 s faster, but three control-ONLY runs of
+the same suite totalled 548 s / 692 s / 895 s, and single leaves swung 2.4x between identical
+configurations (`page` 67 s → 160 s). 713 s sits inside the noise the control arm generates by
+itself. At n=6 this bench cannot measure speed.
+
+**Honest limits.** One suite, one repeat, agentic executor only, and the leaf's own prompt says
+*"Read what exists before editing"* — which is very likely WHY the gate never fires. Interactive
+user turns, where the premise came from, are a different population this bench does not sample.
+Control also scored 6/6, so the suite is at CEILING and could only ever have detected harm.
+
+**Recommendation: leave `strict_edit` at `traffic: 0.0`, and consider deleting it.** There is no
+evidence it helps on the only population that has been measured, and its implementation produced
+four CRITICALs across three review rounds (a >1 MB bypass, a process-wide latch, a fail-open write
+gate, an encoding loop). A mechanism with no measured benefit and a demonstrated defect rate is a
+liability. Keeping it dark costs nothing; turning it on costs a failure surface.
+
+**The measurement that may outlast the feature.** 119 edits are now recorded, and the tolerant rungs
+(`flexible`/`fuzzy`/`anchor`) fired on **4 of 61 matched edits = 7%**, `exact` on 38. The tolerance
+ladder — carried since 2026-06, and the direct cause of the 07-14 and 07-19 corruption incidents —
+is load-bearing about one time in fourteen. That is the first evidence for SIMPLIFYING the editor
+rather than adding to it, and it came from step 1, not step 3.
+
+Scratch projects deleted; flag removed; live gate back to `None` (deferring to an arm that enrols
+nobody).
+
+### §4KB — `strict_edit` REMOVED (the bench decided it, not a prediction)
+
+Acted on the recommendation the bench produced. The receipt gate is gone: the spec, the trigger key
+and its stamping, `_fs_call_is_mutating`, `_strict_edit_active`, the env/flag override, the health
+field, the whole receipt store (`_READ_RECEIPTS`, `_RECEIPTS_DEGRADED`, `_sha_file`,
+`_stamp_receipt`, `_receipt_refusal`, the three op tables), every `strict=` / `stamp=` parameter and
+call site, `tests/test_edit_read_receipts.py`, `scripts/strict_edit_bench.py`, the live registry
+entry and the docs sections. Two imports (`hashlib`, `pathlib`) went dead with it and were dropped —
+the lint gate caught both.
+
+**Why:** the bench ran with the gate verified live and it **never fired once in 16 leaf edits**
+(6/6 vs 6/6, p = 1.0). No measured benefit on the only population measured, against an
+implementation that had produced four CRITICALs across three review rounds.
+
+**KEPT, because each stands on its own without the gate:**
+- the **ambiguity fix** — the one live correctness defect this whole exercise found;
+- the **edit ledger** and `edit_ladder_report.py` — 120 rows now, and the 7% finding;
+- `_nonregular_refusal` and every FIFO guard — a **pre-existing** wedge that hung the whole agent;
+- the **lone-surrogate** guard on the replace path — a **pre-existing** zero-byte truncation;
+- the size/binary refusals hoisted above the edit path (they never needed a receipt);
+- `outline` / `symbols`;
+- the **`.git` write block** — `execute` can still run git, so the precondition is still worth removing.
+
+**Suite:** 24,229 passed / 67 skipped / 0 failed. Deployed (listener 98973 → 53743, one instance).
+Live: `outline` → `ping`; a replace applied on the exact rung; a `.git/x` write refused with SYSTEM
+BLOCK; `strict_edit_override` absent from `/api/health`; the ledger recorded the live edit (120).
+
+**Scoreboard for §4KB as a whole.** Step 1 (ledger) SHIPPED. Step 2 (ambiguity) SHIPPED — the only
+live bug. Step 3 (receipts) BUILT, BENCHED, REMOVED. Step 4 (git) BUILT, REVIEWED 4x, REMOVED.
+Step 5 (outline/symbols) SHIPPED. Two of five shipped, two removed on evidence, one is a
+measurement. The honest read is that the allocation was wrong — the opening evaluation ranked the
+model bake-off, MCP and a second external benchmark ABOVE all five steps, and none of those moved.
+
+
+## §4KC — `operation='edit'`: exact, unique, or refused with evidence (2026-09-23, 15:40–18:10)
+
+**R0 scope, written first.** Build the claude-code-shaped edit: `old_string` + `new_string`, both
+required and validated IN THE TOOL; exact and unique or REJECTED with the evidence a model needs to
+fix the call; no aliases, no envelope, no ladder, no auto-promote; refuse whole-file payloads naming
+`write`; one ledger row per call with `op="edit"` so `edit` and `replace` sit on one yardstick.
+Threat model: the interface failures the §4KB ledger measured (46% of 102 real `replace` calls
+rejected; `missing_replace_with` 13/47; whole files through the envelope = 27% of applies), and the
+class this project keeps re-learning — a new mutating op is a change to EVERY consumer that
+enumerates mutating ops. Out of scope: removing `replace` (one measurement cycle first), the leaf
+executor's `find`/`replace` spec path (`coding_executor.py` still emits `operation='replace'` — a
+deliberate confound to name when Q4 is read), the model bake-off, MCP.
+
+**What shipped.** `tools/file_system.py`: `tool_edit_text` (ledger wrapper) + `_edit_text_impl`
+(17 return paths), `_edit_applied` (the ONE applied-rule, now shared with `tool_replace_text`),
+`_edit_miss_diagnosis` → `(why, line)`, `_snippet_at`, `_first_line_at`, `_edit_envelope_refusal`;
+`_write_replace_guarded(..., marker_guard=False)` for this path; dispatcher branch with
+`edit_wrong_params`; reason codes `missing_old_string`, `missing_new_string`, `identical_edit`,
+`envelope_on_edit`, `unsafe_path`, `file_not_found`, `whole_file_on_edit`, `old_string_not_found`,
+`old_string_ambiguous`, `edit_write_failed`. Schema: `edit` in the enum (after `write`, before
+`replace`), `old_string`/`new_string`/`replace_all` params, the operation/tool descriptions steer to
+`edit` and demote `replace` to "older form" (3,601 → 4,726 chars). Stale text fixed on the way: the
+`.git` block message still named the removed `git` tool; the §4JP rewrite hint named `replace`.
+
+**The class, enumerated (R1) — and what the enumeration MISSED (R8).** Consumers I found by grep
+before the first suite: `agent.py` `is_sandbox_mutation` + `is_mutating` lists, the participant-mode
+engine guard (`op in (...)` + `constraints.py` body keys, now scanning `new_string`),
+`replay_engine._PRODUCING_FS_OPS`, the cache-invalidation test table, the `.git` table. Consumers
+the FIRST FULL SUITE found instead (6 failures, all pins doing their job): the op-set identity pin,
+the rewrite-hint pin, the mega-write description pin — and the one that mattered: the verifier's
+`_fs_path_ledger` parses `file_system` SUCCESS lines BY SHAPE and had no pattern for
+`SUCCESS: edited …`, so FILE-ARTIFACT would have gone blind to every edit; `_FS_PRODUCE_RES` gained
+the pattern and the message's slot names were chosen (`_at_lines`, `_count`) so the parity renderer
+classifies the filename as the only path slot. Consumers the LIVE PROBE found: `_WRITE_VERBS`
+(session write counter) and `_FILE_MUTATION_MARKERS` (unverified-mutation gate) both matched the new
+message only through the substring "replace" in "replaced" — accidentally right; "edited" added to
+both. `optim/tool_ontology._FS_POST_EDIT_OPS` gained `edit`. Count: 6 sites by enumeration, 4 by
+the suite, 3 by the probe. The grep was the weaker instrument.
+
+**Two defects the new battery found in its own subject (R6 — instruments that can fail did).**
+(1) The first CRLF test PASSED WITH A SUCCESS: `Path.read_text` opens with universal newlines, so an
+LF `old_string` matched a file with no LF in it and the guarded write put LF on every line.
+`replace` has always done this — every replace on a CRLF file rewrites its line endings; not fixed
+there (retiring), recorded here. `edit` reads `read_bytes().decode("utf-8","surrogateescape")`.
+(2) The first envelope check refused a Markdown setext underline (`=====`); the only unambiguous
+envelope signature is `<<<< SEARCH`. And the write-failure arm returned a REJECTED outcome claiming
+"untouched" — a mutant survived on it; 'wb' truncates before it writes, so the outcome now MEASURES
+(post-failure size vs pre-size) and sets `world_changed` from that (EACCES fails the open → intact).
+
+**R2 mutation battery** (isolated copy, `__pycache__` purged, no-op + known-bad controls; the first
+run's no-op control FAILED because the copy lacked `pytest.ini` — the harness was fixed before any
+verdict was read): 20 mutants killed, 0 survive. The one first-round survivor (write-failure status)
+bought the measurement fix and two pins; one first-form mutant (root-fallback scope crossing) was
+EQUIVALENT — it fell through to the not-found return — and was corrected, not counted.
+`tests/test_edit_operation.py`: 70 tests; every return path driven once with exactly one ledger row
+and an untouched file; the no-ladder property pinned by CONTRAST (the whitespace-drifted call
+`replace` applies on its flexible rung is refused by `edit`); every enumeration pinned.
+
+**Live (three deploys: 53743 → 48022 → 71540, one instance each, no crash loop).**
+Probe 1 (req 76b3602e): the model chose `edit` unprompted; exact rung at +40 s; ledger row
+`op=edit applied=true strategies=['exact']`; FILE-ARTIFACT "1 of 1 written file(s) read, present"
+(the parser wiring works live). BUT a redundant second `file_system` call was dropped at the finish
+line and the reply said "nothing described above as written … was actually written" over a file
+that was verifiably changed — `_dropped_mutation_note` was unconditional. Fixed: it takes
+`landed=_files_mutated_this_turn(...)` (tool results, not prose) and disclaims only the dropped
+action; pinned + AST-wired at both call sites. Probe A after the fix (req 5e9051bd): read → edit
+at +47.8 s, 75 s wall. Probe B (req 75488203, a rename that occurs in two functions): the model
+made TWO context-unique edits (+28.5 s, +36.6 s) rather than hit the ambiguity refusal; 48 s wall;
+file correct. Both turns booked `failed · 0.17` by the pre-existing unverified-mutation gate
+("never run/rendered") although the request said no run was needed — identical for `replace`,
+out of scope, noted because every code edit that ends without a run feeds the outcome-gated loop
+as a FAILURE.
+
+**Q4 today** (`scripts/edit_ladder_report.py`, live ledger): `edit` 3 rows / 3 applied;
+`replace` 79 / 22 (27.8%), `replace_block` 22 / 19, `replace_promoted_to_write` 16 / 16. Not a
+comparison yet — three rows — and the two populations differ by workload (the leaf executor pins
+`replace`). Read it after a cycle; the decision to remove `replace` is the ledger's, not a
+prediction's (§4KB `strict_edit`).
+
+**Suite:** 24,311 passed / 67 skipped / 0 failed (run three times because each earlier run found a
+consumer; the last one is the one that counts). Lint OK (182 = baseline). Docs:
+`docs/tools/file_system.html` (table row, §4KC section), `docs/core/agent.html` (participant guard).
+
+
+### §4KC round 2 — three fresh-eye lenses on `edit` (2026-09-23, 18:15–20:30)
+
+**Why a round 2.** The operator asked "do you need to fresh eye review your changes?" — and the
+§4KA memory answers it: 38 defects, 4 security, in work that was green with a 100% battery. Three
+reviewers with FRESH context (not forks), one lens each: implementation, consumer wiring, security +
+test quality. Instructed to reproduce before reporting. ~30 findings on work that was green at
+24,311 tests, a 20/20 mutation battery and two live probes. Tally by lens: impl 12 (0 CRITICAL,
+3 MAJOR, 9 MINOR; 11 in the new code), consumers 9 (3 MAJOR), security 9 (2 CRITICAL, 3 MAJOR).
+
+**The finding that changed the design.** *CRLF files were un-editable through the documented
+route.* The turn loop strips every `\r` from tool results before the model sees them, so the
+byte-for-byte `old_string` my refusal demanded can never be produced. `replace` handled CRLF by
+accident (universal-newline read, then wrote LF everywhere). `edit` now applies the ONE invertible
+normalisation — file is CRLF, old_string carries no CR, the CRLF form is present → match it, write
+new_string CRLF — recorded as `exact:crlf` (family `exact`) so the ledger can see it. Not a tolerant
+rung: the transport's own strip, inverted.
+
+**Two CRITICALs, both pre-existing, both reachable through the new door.**
+(1) TOCTOU on the write: `path.write_bytes` followed whatever the path was at write time; a symlink
+planted between the safe-path check and the write (138 ms window on a `.js` edit, through
+`node --check`) rewrote a file outside the sandbox with a SUCCESS line — reproduced by the reviewer.
+`edit` now reads through an `O_NOFOLLOW|O_NONBLOCK` fd (fstat proves S_ISREG and gives an identity)
+and writes through a second `O_NOFOLLOW` fd that must match `st_dev/st_ino/st_size/st_mtime_ns`
+BEFORE it truncates; a swap or a concurrent writer → `file_changed_underneath`, nothing written.
+Deliberately not tmp+rename (that succeeds on a 0444 file). `replace` keeps its plain write — its own
+item. (2) Release immutability bypassable by spelling: the block regex-matched the RAW string,
+first hit, case-sensitively — `Projects/`, `AAAA…` (APFS is case-insensitive), `projects//`,
+`projects/zz/../<id>`, and from an ACTIVE scope any `projects/<released>`: seven confirmed bypasses.
+Now every `projects/<id>` component of the RESOLVED path (normalised raw spelling when
+unresolvable), any case, ANY released → block. Same class: `.git` deny lower-cases its components
+(`.GIT/config` landed a hooksPath).
+
+**MAJORs.** `_is_unverified_mutation` substring-scanned the WHOLE result — a REJECTED miss whose
+nearest-region echo contained "successfully edited" booked the turn as failed over a file nothing
+touched; it and `_written_paths_from_confirmation` now read only the leading run of
+`SUCCESS:`-prefixed lines (a run, not the head: the §4GL mixed-write pin needs the runnable artifact
+after the inert one). The success line puts the path LAST with an end-anchored ledger pattern — a
+filename containing `' — replaced 1 occurrence` planted a phantom path. The dropped-call note did
+not look at the operation (a dropped verify-`read` produced "nothing was written") and, after my
+round-1 fix, could say a file both "DID land" and "does NOT exist"; it now disclaims only dropped
+MUTATING calls, "does NOT exist" only for creating ops, "was not changed" for the rest, and drops
+paths that also landed. The `fs_batch` TREATMENT-ARM schema suffix (traffic 1.0 — half of live
+requests) still told the model to pack envelopes into `replace` and omitted `edit` from its
+path-required list: my "no GEPA shadowing" check looked at the wrong schema-mutating path. The
+participant engine guard scans ARGUMENTS, so a forbidden identifier assembled across two edits
+passes it — ACCEPTED: the guard's own docstring calls it narrow by design; the post-write steer and
+verifier are the backstop.
+
+**MINORs, all fixed and pinned.** `Path.exists()` on 3.10 let ENAMETOOLONG/EACCES escape as a
+traceback, and the dispatcher's `.git` probe let a symlink LOOP traceback out of EVERY mutating op
+(caught only `ValueError`). The truncation check compared sizes — a same-size partial write read as
+"unchanged"; it compares bytes. The whitespace diagnosis fired on a diverging tail, a missing EOF
+newline and a BOM — it now compares normalised LINE LISTS as a contiguous slice and names the
+EOF-newline case; the case-insensitive line came from an offset into `.lower()` (wrong for `İ`);
+overlapping matches made the lines named disagree with `str.count`; the whole-file gate counted a
+phantom line and measured chars only (a 5000-char minified line was "a rewrite"); NUL in
+`new_string` landed in a `.py` with a clean SUCCESS (`ast.parse` ValueError = fail-open); non-string
+arguments were `str()`-ed and written; plain-string refusals logged an EMPTY ledger reason — every
+refusal is a typed outcome now; the diagnosis blocked the loop 0.4 s on 22 MB — threaded, 4 MB head.
+Test quality: the return-path table pinned label↔return only by the reviewer's trace — it now
+asserts each label's reason code; three mutation survivors the reviewer found (snippet context,
+ambiguity cap, the dispatcher's `post_edit` wiring) are pinned.
+
+**R2/R3 battery on the round-2 fixes** (isolated copy WITH `pytest.ini` this time; no-op and
+known-bad controls): 24 mutants — 22 killed; 2 single-edit survivors (released-block case fold;
+write O_NOFOLLOW) were REDUNDANCY, proven by multi-edit mutants that strip every copy and die.
+`tests/test_edit_operation.py`: 107 tests, 22 return paths each landing on its own reason code.
+
+**Suite:** 24,350 passed / 67 skipped / 0 failed (run twice: the first surfaced the §4GL mixed-write
+pin against the head-only parser; the leading-run rule satisfied both). Lint OK. Deployed
+(listener 71540 → 27466, one instance). Live: probe A one-line edit, exact at +23.7 s, `verified ·
+0.85`; probe B rename in two functions → ONE `replace_all` edit over 4 occurrences,
+`strategies=["exact"]*4`; probe C a CRLF `.ini` — `beta=2` → `beta=20` with every `\r\n` preserved
+(`od -c` checked). Three ledger rows, all `op=edit applied=true`; FILE-ARTIFACT "1 of 1 written
+file(s) read, present" on each.
+
+**Consumer count, final.** 6 sites by grep, 4 by the first suite, 3 by the first live probe, ~8 by
+fresh eyes. The grep was the weakest instrument in the set; the reader who did not write it was the
+strongest. Recorded in memory as the rule for the next new operation.
+
+
+### §4KC round 3 — the guards decide on the inode; `replace` gets the race closure (2026-09-23, 20:45–23:15)
+
+**Scope (R3: mutate and review the previous round's fixes first).** Two fresh reviewers, on round 2's
+fixes ONLY, plus today's operator-requested change: `replace` routed through the identity-checked
+O_NOFOLLOW writer (its five guarded writes + the auto-promote; `_FileChangedUnderneath` handled
+once, inside `_write_replace_guarded`, for both ops). Operator decisions recorded: leave the
+participant engine guard's split-payload gap (narrow by design; steer + verifier are the backstop);
+fix the `replace` TOCTOU.
+
+**Security lens: 6 findings (3 MAJOR, 3 MINOR), 5 inside round-2's fixes.** One root for the three
+MAJORs: every write guard decided on the REQUESTED PATH STRING while the in-place fd writers mutate
+an INODE the string need not faithfully name. Confirmed: `ln .git/config cfg.ini` → no `.git`
+component → the fd write landed a `hooksPath` in the real config; a hardlink at the sandbox root
+into a RELEASED project's file → no `projects/<id>` component → released artifact mutated;
+`projectſ/<id>/x.py` (LATIN SMALL LETTER LONG S) → APFS opens the real `projects` dir,
+`str.lower()` leaves it alone → released file mutated. Round 2's "lower-case because APFS is
+case-insensitive" was the wrong fold: `.lower()` ≠ the filesystem's. Closure, both ops:
+`_inode_write_refusal(fd, …)` on the OPENED fd — `st_nlink > 1` is refused for in-place writers
+(`hard_linked`; `write` is tmp+rename and breaks the link), and the `.git`/released decisions are
+re-derived from the kernel's canonical path of the fd (`F_GETPATH` on macOS, `/proc/self/fd` on
+Linux). MINORs: the identity stamp lacked `st_ctime_ns` — a same-size rewrite + `os.utime` with the
+original nanoseconds restored every other field (ctime cannot be set from userland) — added; the
+streaming `replace` reader was the last read in the module that followed a planted link — O_NOFOLLOW
++ S_ISREG on the fd; a `.git` symlink out of the sandbox made the dispatcher probe's resolve raise
+and the broad except SKIPPED the deny — an unresolvable path is now DENIED (`unresolvable_path`);
+the released block carried no reason code (`released_write_blocked`).
+
+**Correctness lens: 12 findings (3 MAJOR, 9 MINOR), 11 inside round-2's fixes.** The dropped-call
+note named the SOURCE of a dropped `copy`/`rename`/`move` as "does NOT exist" (the destination is
+what is missing); `_forced_final_dropped` carried names only and was never reconciled, so a write
+RE-DONE by the verifier repair re-entry was still disclaimed on the shipped reply — entries are now
+`(name, op, path, tools_seen)` and `_still_pending_drops` retires a `file_system` entry followed by a
+later SUCCESS; site 2 passed no paths/creating at all (the landed-reconciliation was inoperative
+there); aliased spellings of one file listed thrice; the argument alias chain differed from the
+dispatcher's; `unzip`/`git_clone` were dead entries; a `[FAILURE BANNER]` result lost the
+inert-artifact exemption (the parser got the raw content); the ledger's head was not stripped so a
+trailing space defeated the `$` anchor; the diagnosis called a one-line `old_string` inside a longer
+line "a later line was misremembered", blamed indentation for MIXED endings, and for an
+`old_string` longer than the file; and one of round 2's own pins — the crafted-filename phantom —
+PASSED WITH THE ANCHOR REMOVED (the crafted name is `a'.md` now: a pin that cannot fail is a pin
+that pinned nothing).
+
+**R2 battery on round 3's fixes** (isolated copy, controls): 18 mutants, 18 killed — after three of
+MY mutants were corrected (a `pass` inserted BEFORE a `return` mutates nothing; a two-line match;
+and one genuine gap: nothing pinned site 2's `creating`/paths arguments → the AST wiring pin now
+requires both at both sites). `tests/test_edit_operation.py`: 22 edit return paths, each landing on
+its own reason code; `tests/test_edit_ladder_ledger.py`: 36 replace ledger paths (+`inode_denied`).
+
+**Suite:** 24,361 passed / 67 skipped / 0 failed. Lint OK. Deployed (listener 27466 → 59602, one
+instance). Live: `edit` exact at +25.2 s, `verified · 0.85`; `replace` (forced by the prompt) exact
+at +28.8 s through the shared identity-checked writer, `ok · 0.85`; both ledger rows applied; no
+tracebacks.
+
+**Still open, deliberately:** the streaming `replace` commit has no identity re-check (lost-update
+only — `os.replace` swaps the directory entry, nothing outside is reachable); directory-symlink
+races above the final component; `reply_smoothing` does not strip the dropped-call note before
+judges read it; the treatment-arm suffix's path list omits `outline`.
+
+**Convergence.** Round 1 → 2: 2 CRITICAL + 6 MAJOR. Round 2 → 3: 0 CRITICAL + 6 MAJOR, ALL inside
+the previous round's fixes. The series is narrowing but has not hit the stopping rule (a round that
+finds nothing above MINOR inside the fixes). Round 3's own fixes are ~150 lines — the inode guard
+and the pending-drop reconciliation — and are, again, the least-reviewed code in the tree.
+
+
+### §4KC round 4 — one reviewer on round 3's fixes (2026-09-23, 23:20–01:10)
+
+**Scope.** The inode guard (`_inode_write_refusal`, `_canonical_fd_path`) and its two call sites,
+the ctime stamp, the streaming reader, the unresolvable-path deny, the round-3 diagnosis sentences,
+and the pending-drop reconciliation (`_dropped_entries`, `_still_pending_drops`) — plus one fix I
+made before launching: `_still_pending_drops` retired a dropped entry on ANY later `file_system`
+SUCCESS, not one naming the same file (path-aware by `_fs_norm` now).
+
+**Findings: 2 MAJOR, 3 MINOR, 3 NOTE, 0 CRITICAL; 8 inside round 3's fixes, 1 pre-existing.**
+MAJOR by trace: `replace`'s write identity came from an `os.stat` taken BEFORE the inode guard
+opened its own fd — the guard and the write were bound to nothing. A name swapped away (guard
+clears a clean inode) and back (write lands on the original) passed the guard on one inode and
+wrote another; an `unlink`/`link` swap bumps ctime and is caught, a DIRECTORY swap is not. Fixed:
+the identity is the guarded fd's `fstat`, which must also agree with the pre-read stat. MAJOR
+confirmed: the reconcile knew only the produce shapes, so a re-done `copy`/`rename`/`delete` stayed
+"pending" and its destination was declared missing — `_confirmed_paths_any_op` reads every
+confirmation shape (produced, copied/moved TO, deleted), banner-stripped. MINOR: a dropped `delete`
+read "was not changed" (→ "was not deleted", `deleting=` at both sites); the PART-of-a-longer-line
+verdict fired on a line that IS the text when `old_string` carried a trailing blank line; the
+ends-at sentence was gated on the wrong comparison; the streaming commit carried the tmp file's
+0600 onto a 0644 script and read whatever inode the name held (mode preserved; source inode checked
+against the guard; its refusal returned as the guard's outcome, not a bare "Error: Streaming replace
+failed:" with an empty message — that last one was found by the mutation battery, not the review).
+NOTE: the canonical `.git` test ran over the whole host path (scoped under the sandbox roots now);
+the pair-alts head is stripped like its siblings. Measured on the live sandbox, read-only: 0 of
+4,988 files have more than one link — the `st_nlink` rule refuses nothing legitimate today.
+
+**The battery on round 4's fixes taught more about pins than about code.** Four first-form
+survivors. Two (identity rebind; agreement check) were each other's redundancy AND my swap pins
+renamed the FILES — which bumps inode ctime, so the ctime stamp refused the write under every
+mutation and the pins proved nothing; rewritten to swap DIRECTORIES, both single mutants and the
+pair die. One (streaming source check) exposed a pin whose open-counting hook swapped at the wrong
+open: it FAILED on the real code once corrected to trigger from the caller's frame, and the two
+"kills" it had produced were hollow. One (per-line PART check) was EQUIVALENT — the contiguous-slice
+compare above it already proved the property — and the dead guard was removed. Final: 10 mutants,
+10 killed, 1 equivalent removed; no-op control green.
+
+**Suite:** 24,370 passed / 67 skipped / 0 failed. Lint OK. Deployed (listener 59602 → 88720, one
+instance). Live: `edit` exact at +40.8 s; `replace` exact at +47.6 s through the rebound writer;
+both ledger rows applied; no tracebacks. (Both turns booked `failed · 0.17` by the pre-existing
+unverified-mutation gate — the request said no run was needed; same as before, out of scope.)
+
+**Convergence.** Round 2: 2 CRIT + 6 MAJ. Round 3: 0 CRIT + 6 MAJ. Round 4: 0 CRIT + 2 MAJ (one by
+trace), 3 MINOR — all inside the previous round's fixes. Round 4's own fixes are ~60 lines: a
+two-line identity rebind, a 20-line confirmation-shape reader, three sentence gates, a chmod. The
+series has not formally hit the stopping rule ("nothing above MINOR inside the fixes") but the
+surface it can find things in is now smaller than the review's own cost of a round.
+
+
+### §4KC round 5 — the stopping rule is met; and what the verifier did to the probes (2026-09-23, 01:15–03:40)
+
+**Round 5 (one reviewer on round 4's ~60 lines): 0 CRITICAL, 0 MAJOR inside the fixes; 5 MINOR,
+3 NOTE.** The series' stopping rule. One PRE-EXISTING MAJOR surfaced that contradicted my round-3
+claim ("the last read that followed a planted link"): `replace` still re-read the target BY PATH
+after its guard — `_read_head(path)` and `path.read_text` — so a symlink planted in that window was
+followed on the READ side (an outside file's text copied into the sandbox file, reproduced) and a
+FIFO planted there wedged the main thread (the sniff ran synchronously in the coroutine). Every read
+in `replace` now goes through `_read_text_guarded` — an O_NOFOLLOW|O_NONBLOCK fd that must be the
+inode the guard cleared, `Path.read_text`'s universal-newline semantics reproduced on the bytes —
+and the binary sniff uses the head the guard's own fd read. MINORs, fixed and pinned: the reconcile
+was op-blind (a dropped WRITE retired by a later `Deleted` of the same name — the file is gone, the
+note must stand); a dropped delete of a file that LANDED was filtered out of the note; the popped
+trailing-blank case traded one false sentence for another (own true sentence now); the ends-at
+sentence ran before the slice compare; the streaming path rewrote a 0444 file via tmp+rename while
+the other two writers refuse EACCES (refused; chmod masked to 0o777); the r4 race pin was satisfied
+by EITHER half of the fix (each half has its own pin now). NOTEs kept as documentation.
+
+**R2 battery on round 5's fixes:** 11 mutants, 11 killed — after two hollow results were made
+honest: the read-window pin first passed under the inode-compare mutant because the WRITE-side
+identity check refused the plain directory swap anyway (the reviewer's case is swap-AND-BACK: read
+from the other inode, write to the guarded one — the pin does that now and fails on real code only
+when the assertion assumes a layout it cannot know); the FIFO pin accepted a "not found" over an
+empty non-blocking read (it demands the "not a regular file" sentence). The by-path-read mutant was
+killed by a WEDGE: the planted-FIFO pin hung the main thread and the subprocess timed out — the
+defect demonstrating itself.
+
+**The pin-quality ratchet caught me:** three source-text regex pins in the new gate test — R4
+hard-rejects them (a mutant that deletes the code and leaves the string in a comment survives) —
+rewritten as AST pins: the assignment `verifier_backfill = ("failed", UNVERIFIED_MUTATION_REASON)`,
+a `_record_turn_trajectory` call carrying `verifier_reason=`, a `failure_reason =` assignment whose
+value is the helper call.
+
+**What happened to the verifier on the probes (operator question).** Timeline of reqs 07c0c588 /
+3b827526: read → edit/replace (SUCCESS, post-edit view) → model finalises. The critic runs ASYNC,
+so at finalise there is NO verdict; the last substantive tool is a mutation of a `.py`; the
+unverified-mutation gate fires its "actually RUN it" repair round; the model — correctly — has
+nothing to run for a one-line library edit and finalises again; the gate books `failed · 0.17`
+with the "⚠ Unverified … INCOMPLETE" footer. ~30 s later the verifier lands CONFIRMED 100% with
+FILE-ARTIFACT "1 of 1 written file(s) present" — and the corpus row STAYED `failed`: at record time
+the backfill had been stamped `failure_reason="verifier refuted"`, the one class
+`resolve_turn_outcome` never upgrades (rule 2). The identical request with a trailing
+verify-`read` (req 81dbd7cd) was booked `verified · 0.85` — the durable label depended on whether
+the model's last action happened to be a read, which is evidence of nothing. Corrections sidecar
+confirmed: entries for 8f19…, e132…, 1e8b…, 3c15… (the read-last probes) and none for 53c4… /
+039b… (the edit-last ones).
+
+**Fix (§4GL gate is a PRIOR, not a refutation):** `UNVERIFIED_MUTATION_REASON` carries the
+structural-failure prefix; `_record_turn_trajectory` receives `verifier_reason` and
+`_backfilled_failure_reason` stamps the row BY CLASS — a structural-class backfill keeps its reason
+(liftable by a ≥0.7 late CONFIRMED through the existing `_backfill_trajectory_outcome` path); a
+genuine refutation is still "verifier refuted" and never lifts. Verified live after deploy (req
+d5162795): booked `failed · 0.17` at finalise, row stamped `structural failure:unverified
+mutation…`, LATE CONFIRMED 100% → corrections sidecar `passed` for trajectory 76babf43 — the first
+edit-last probe whose label was lifted. Left as is, deliberately (policy, the operator's): the gate
+still fires, the repair round still asks for a run, the footer still ships, and the live "turn
+outcome" line is not re-emitted (the stream's late-correction line did not print here — worth a
+look if it matters). Docs: `docs/core/verifier.html` §4kc-gate-prior; pins:
+`tests/test_unverified_gate_is_a_prior.py`.
+
+**Suite:** 24,381 passed / 67 skipped / 0 failed (three runs: the ratchet caught the source pins;
+a pin was edited after launch; the last is the one that counts). Lint OK. Deployed (listener
+88720 → 61598, one instance).
+
+**The series, closed.** r2: 2 CRITICAL + 6 MAJOR · r3: 0 + 6 · r4: 0 + 2 · r5: 0 + 0 inside the
+fixes (1 pre-existing MAJOR found and fixed). ~75 findings over five rounds on an operation whose
+first version was green on 24,311 tests, a 20/20 mutation battery and two live probes. Five
+mutation batteries, ~80 mutants; the batteries found six defects the reviews did not (hollow pins,
+an equivalent guard, a bare-string refusal) — the review found what the code did wrong, the
+battery found what the pins did wrong.
+
+
+### §4KC — the unverified-mutation gate is narrowed to whole-file writes (2026-09-23, 03:45–04:30, operator decision)
+
+**Decision.** The §4GL gate was written for req_C0 — a 33-minute build finishing on an untested
+`write` — and a targeted edit of an existing library module has nothing to "run"; the forced
+repair round ended every edit-last turn `failed · 0.17` with the "⚠ Unverified" footer (see the
+round-5 entry). `_is_unverified_mutation` now returns False for every TARGETED-edit confirmation
+shape the tool emits — `Exact/Flexible/Fuzzy/Anchor match … replaced`, `Applied N SEARCH/REPLACE
+blocks`, `Streaming replace applied`, `edited — replaced` — and still fires for `Wrote` and the
+replace→write auto-promote. An UNRECOGNISED SUCCESS carrying a mutation marker stays guarded (the
+§4GL "a reword must not silently disarm it" pin holds). Pins: a policy table over every shape, and
+a parity-style pin that renders `tools/file_system.py`'s own f-strings and asserts every
+content-mutation shape is either whole-file or exempt AND every exemption matches an emitted shape
+— so a new confirmation shape cannot slip past the narrowing unclassified. Three older pins that
+expected a `replace` into code to fire were updated to the policy (`test_verifier_gate_teeth`,
+`test_4gl_unverified_write_and_ocr`, `test_edit_operation`).
+
+**Suite:** 24,392 passed / 67 skipped / 0 failed. Lint OK. Deployed (listener 61598 → 85639, one
+instance). Live, both directions: edit-last turn (req d9…) → `edit` at +23.2 s, NO repair round, NO
+footer, `verified · 0.86`; whole-file `write` of `kc_tool.py` (req 96…) → gate fires as before
+(`failed · 0.17`, footer), LATE CONFIRMED 100% — which the round-5 fix now lets lift the row.
+Docs: `docs/core/verifier.html` §4kc-gate-prior.
+
+**What this closes.** Every code edit through `edit`/`replace` that ends without a run was being
+booked a FAILURE at record time and, until round 5, stayed one — feeding the outcome-gated learning
+loop, calibration (`0.0 source=turn`) and the self-model's "stuck" mood with a signal that measured
+whether the model's last action was a read. That instrument is now pointed at the shape it was
+built for.
+
+
+### §4KC — write-size threshold on the gate, and round 6, the last (2026-09-23, 04:35–06:20)
+
+**Threshold (operator decision).** The narrowed gate still fired on a 69-character three-line
+helper written whole, with "do not run it" in the request and a 100% late CONFIRMED — not the
+req_C0 shape either. `UNVERIFIED_WRITE_MIN_CHARS = 2048`: a whole-file write below it does not trip
+the gate. The size is the tool's own `Wrote N chars` figure over the leading run of SUCCESS lines;
+any other shape in the run (the replace→write auto-promote, whose size is unstated; an unrecognised
+wording) keeps the guard, and one `Wrote` at or above the threshold keeps it for the whole run.
+Pinned at the boundary (2047/2048), on mixed runs, and with a parity-style check that every
+emitted `Wrote` shape parses — a reword blinds the threshold LOUDLY (the guard stays on). Two
+integration pins whose write fixtures (1000, 20 chars) tested the repair mechanism, not the size,
+were raised above the threshold; the `Makefile` extensionless pin likewise.
+
+**Round 6 (final; one reviewer over everything since round 5's review: the round-5 fixes, the
+gate-as-prior change, the narrowing, the threshold): 0 CRITICAL, 0 MAJOR; 5 MINOR, 3 NOTE inside
+the batch, 1 NOTE pre-existing. The stopping rule is met.** MINORs, fixed: the popped-trailing-blank
+sentence fired when the file DID have blank lines there (now states the count, and names a
+whitespace-only trailing line); two of the round-5 diagnosis pins were BLIND to the changes they
+claimed — the raw-slice gate and the slice-before-ends-at order both reverted cleanly (each has a
+case that fails under exactly one revert now); the non-streaming read's identity mismatch came
+back as a bare `Error: … [Errno 70]` string while the same swap one open earlier was the guard's
+rejected outcome (`_read_text_guarded` raises `_FileChangedUnderneath`; both sites return
+`file_changed_underneath`; +1 replace ledger path, 40); a file both created and deleted among
+dropped calls that had LANDED read "DID land" and "does NOT exist" in one sentence; the streaming
+path's `S_IWUSR` test was the OWNER bit, not the caller's permission — the source fd is opened
+`O_RDWR` and the kernel decides, as the other two writers do. NOTEs kept: the head/run asymmetry
+for a multi-line SUCCESS run (no producer emits one); CR + trailing blank converges in two retries;
+`& 0o777` drops setuid/setgid/sticky on the streaming commit (intended); the remaining by-path
+operations after the guard are the tool's own tmp file, the `os.replace` commit (no stamp — lost
+update only) and the post-write syntax read.
+
+**Verified about the gate-as-prior change (reviewer B6):** the late path's `cached` is the
+in-process trajectory stamped AFTER the consolidation, so `resolve_turn_outcome` sees the
+structural-class reason and returns PASSED; the only other consumer of the prefix,
+`_row_shape_failed`, now reads False for gate rows — so a late CONFIRMED re-prints the operator
+line as `verified` and `record_shape_failure` no longer fires for gate turns. Both right for a prior.
+
+**R2 battery on the round-6 fixes:** 9 mutants, 9 killed — including the two reverts (M7, M8) that
+had survived every pin before this round. **Suite:** 24,403 passed / 67 skipped / 0 failed (two
+runs: the first found the two sub-threshold integration fixtures). Lint OK. Deployed (listener
+85639 → 37398, one instance). Live, both directions: a 69-char `write` of `kc_tool.py` →
+`verified · 0.87`, no repair round, no footer; a 3,061-char `write` of a CLI (`kc_big.py`) → gate
+fires, repair round, footer, `failed · 0.17`, LATE CONFIRMED — liftable.
+
+**The series, closed for good.** r2: 2 CRIT + 6 MAJ · r3: 0 + 6 · r4: 0 + 2 · r5: 0 + 0 (one
+pre-existing MAJOR) · r6: 0 + 0. Six mutation batteries, ~95 mutants. Across the series the
+batteries found eight things the reviews did not, all of them about PINS — hollow kills, blind
+pins, equivalent guards, a bare-string refusal. The review finds what the code does wrong; the
+battery finds what the tests fail to see.
+
+
+## §4KD — Image pipeline review; clarify-first after a costly turn; the seed hint; Slack never teaches (2026-09-24) — R0 scope, written first
+
+**Source.** The 2026-09-23 Slack open-channel diagnosis (memory `slack-open-channel-tenant-bleed`): a
+stranger's `emp1` after an image turn produced a SECOND image — the tool result ended with a ready
+next action ("Reuse seed=N with a tweaked prompt for ANOTHER TAKE") and an unintelligible
+follow-up resolved into it; and `skills_playbook.json` had ingested lessons whose `task` IS a
+stranger's Slack prompt (4 of 257). Four operator tasks.
+
+**Scope.**
+1. *Review the new image pipeline* — `tools/image_gen.py` (generation + edit), `core/llm.py
+   generate_image`, the node server `interface/externals/image_generation/img_gen_server.py`
+   (893 lines: seed resolution, size ladder, references/CFG, drop-cache sidecar, auth), the schema
+   in `registry.py`, the pins (`tests/test_image_gen*.py`). Fresh-eye readers (§4KA rule), two
+   lenses; then fix, mutate, suite once.
+2. *Clarify-first after a costly tool turn.* A one-token or unintelligible user message that
+   follows a turn which ran a COSTLY tool (`image_generation`: minutes of the only GPU) must not
+   re-run a costly tool; the turn asks what the user meant. Deterministic pre-dispatch guard, like
+   the participant engine guard — not a prompt line ("If you lack information, ASK" already lost).
+   Exemption: the previous assistant message asked a question (then "ok"/"yes" is an answer).
+   Costly-previous-turn is read from the conversation itself (the assistant's own image link) AND
+   an in-process per-conversation record, so it survives a client that resends only text.
+3. *The seed hint is information, not a suggested action.* Move the seed to a neutral
+   "Seed: N (report this if the user wants a reproducible re-run)" line; the reuse-vs-edit advice
+   goes to the tool DESCRIPTION (read when choosing an action) rather than the RESULT (read when
+   deciding what to do next) — the instrument-teaches-the-agent pattern.
+4. *Slack never writes lessons.* The bot mints request ids with a `slack-` prefix (its feedback
+   correlation keeps using the same id, so no server-side rewrite); `is_slack_request_id` is the
+   one predicate; population stays `user` (`turn_origin` unchanged — Slack is real traffic). Every
+   playbook writer is gated: the post-mortem is not enqueued for a slack turn (the queue consumer
+   runs outside the request context, so the item cannot be trusted to know); Perfect-It (deferred
+   and foreground) and outcome attribution use the same predicate the probe rule uses; the
+   `learn_skill` tool is refused at dispatch; and the writer itself (`SkillMemory`) refuses every
+   playbook mutation when the derived lesson origin is `slack` — the backstop for the writer I did
+   not enumerate.
+
+**Threat model / what would make each wrong.** (2) a guard that blocks a legitimate one-word
+answer to the agent's own question, or that reads "costly" from a proxy the client does not
+resend; (3) a reworded hint that still reads as an instruction, or a description change the
+GEPA/experiment schema paths shadow (§4KC round 2: `_FS_BATCH_DESC_SUFFIX`); (4) a writer reached
+through a queue/idle path where the request id is "SYSTEM" — enumerate by grep AND by the writer's
+own chokepoint; an id prefix that some reader parses as internal (`INTERNAL_REQUEST_PREFIXES` =
+sched-/job-/sub-: `slack-` is not one).
+
+**Out of scope.** Per-requester scoping of autobio/recall/"lately" for Slack (the tenant-bleed root
+cause — a separate design); mining slack turns as self-play challenges (not enqueued here as a
+side effect, noted); the leaf executor.
+
+
+### §4KD — outcome (2026-09-24, 06:30–23:20)
+
+**Task 4 — Slack never teaches (shipped).** The bot mints `slack-<8hex>` request ids (its feedback
+reactions keep using the same id, so nothing server-side rewrites it; `X-Ghost-Origin: slack` is the
+fallback for any other Slack-side caller). `is_slack_request_id` is the one predicate; the
+population stays `user` (`turn_origin` untouched). `turn_may_teach(context)` (false for probe and
+slack) gates the outcome attribution, Perfect-It (deferred + foreground) and the post-mortem —
+which is simply not queued (the queue consumer runs under the "SYSTEM" id and could not know); the
+model's `learn_skill` is refused at dispatch (`lesson_channel_blocked`); and the writer itself
+refuses every playbook mutation when the derived lesson origin is `slack`
+(`playbook_writes_blocked()` first in all ELEVEN mutators — the enumeration pin walks the class and
+found seven I had not listed: `_update_lesson_fields`, `retract_lessons_from_trajectory`,
+`credit_recent_retrievals`, `prune_low_utility`, `quarantine_lesson`, `unquarantine_lesson`,
+`remove_by_trigger`). Live (req `slack-kd4probe`): trajectory `task_kind=user_request`, outcome
+passed, zero lesson/post-mortem/Perfect-It lines. ⚠ The Slack bot itself is NOT running: its
+launchd service is absent from every domain (`launchctl` cannot find it) though the plist is still
+in `/Library/LaunchDaemons`; its last log line is 16:42 ("processing failed for req 16017dbf:
+Server disconnected" — one of my agent restarts dropped a Slack request mid-flight). That looks
+like a deliberate bootout, so I did not start it; the prefix change is in `main.py` and is live the
+moment the bot is next started.
+
+**Task 3 — the seed line is information (shipped).** Result:
+`(Seed N — a record for reproducibility; the result is saved and this request is complete.)`; the
+reuse-vs-edit facts moved to the `seed` / `reference_images` descriptions, ending "Never re-run the
+tool because a result mentioned a seed." One older pin (`test_tool_surfaces_the_seed_for_a_lossless_
+revision`) asserted the old wording and was moved to the description; the review found a second
+(`test_an_edit_result_does_not_advertise_a_reroll`) had gone VACUOUS with the new wording — fixed.
+
+**Task 2 — clarify-first (shipped).** Pure rule `_clarify_first_block(fname, user_text, messages,
+costly_record)`: costly tool + one-token/unintelligible message + previous turn costly (the image
+tool's own link in the last assistant message, root OR project-scoped after the review caught the
+project form, OR the in-process per-conversation record `_note_costly_turn`) + the previous
+assistant message did not ask a question → REJECTED `clarify_first`, strike, the model asks.
+Wired next to the participant guard. Battery 16/16 after two pin fixes (the question exemption
+was never the deciding condition in its own test; the recorder is a method now with its own pins).
+
+**Task 1 — the image pipeline review (two fresh lenses; ~28 findings).** Agent side, 4 MAJOR: the
+client threw the node's `detail` away on every HTTP error; every 4xx was retried three times (a
+413 re-sent 16 MB thrice) and a read timeout re-posted the job the node was still rendering — only
+node faults retry now; the schema promised "LONG prompts fully used" while the node 400s above
+8,000 chars — truncated at the node's cap with a note; the clarify-first fallback missed
+project-scoped links. MINORs: list/int/whitespace prompts, 0-byte and non-image references
+crossing the LAN, `[]` + synonym running a plain generation, negative sizes, bool seeds, the
+rendered `steps` unreported. Node side, 2 MAJOR: `negative_prompt` uncapped — under CFG (every
+edit) it hit the quadratic attention parser on the GPU thread WITH THE LOCK HELD and no timeout
+(36 s at 100 KB); EXIF orientation ignored — a phone portrait edited sideways. MINORs: NUL and a
+20000² bomb reaching the lock as 500s; any `RIFF` accepted as WEBP (a WAV reached sd-cli);
+negative/one-sided sizes silently mapped; error bodies and `/health` carrying server paths; an
+empty prompt occupying the GPU. Docs drift fixed (235 s / 1500 s / 28 s per step / 935 s cap;
+`MAX_PROMPT_CHARS`, body cap, `steps` in the response). NOTEs kept: a client disconnect does not
+cancel a render; two image calls in one turn can exceed the client's retry budget behind a
+max-steps edit. Pins: `tests/test_4kd_image_pipeline_review.py` (server, client, tool, guard).
+Battery: 21 mutants, 20 killed, 1 REDUNDANT (the 4xx clause in the retry predicate duplicates
+`_is_node_fault`'s own 4xx exclusion — kept as defence in depth, documented).
+
+**Suite:** 24,456 passed / 65 skipped / 0 failed. Lint OK. Deployed: agent (listener 37398 →
+71926, one instance); the node server to **ghost** (`~/Data/AI/ImgGen/server.py`, backup
+`server.pre-4kd.bak.py`; md5 matches the repo; preflight OK, ready in 15 s) — the operator said
+"deploy it to nova", but the service, the models and the file are on ghost and nova has none of
+them, so ghost it was. Live on the node: `negative_prompt` > 8000 → 400, NUL → 400, empty → 400,
+negative size → 400, WAV reference → 400, node still ready. Clarify-first live probe: below.
+
+**Clarify-first live probe (after deploy).** Turn 1: "Generate an image of a small bakery at dusk
+…" → `gen_6982fc85.png`, 256 s, `verified · 0.85`; the result's seed line is the record, no next
+action. Turn 2, same conversation, `emp1`: the model reached for `image_generation` again, the
+guard blocked it (`clarify first — image_generation blocked — one-token/unintelligible follow-up
+('emp1') after a costly turn`), and the reply was "What would you like me to do — adjust the bakery
+image, generate a new one, or something else?" in 11 s. No second render. One correction from that
+probe: the block was wired like the participant guard, WITH a strike, and the clarification turn was
+booked `failed · 0.85` — a turn that asks instead of spending three GPU-minutes is the correct
+turn, so the strike is gone (REJECTED row only; pinned by AST — no `_strike_synthetic` under the
+clarify branch). Suite 24,454 / 0 failed; redeployed (listener 71926 → 96887); replayed `emp1`:
+this time the model asked without attempting the tool at all — `ok · 0.88 · no tools`, 9 s.
+
+**Closed.** All four tasks shipped. Open for the operator: the Slack bot is not running (see
+above); per-requester scoping for Slack (the tenant-bleed root cause) is a separate design.
+
+### §4KD — Slack bot restarted; a client disconnect cancels the render (2026-09-24, 23:30–00:10)
+
+**Slack bot:** the operator confirmed it was stopped deliberately; `launchctl bootstrap system
+/Library/LaunchDaemons/com.local.ghost-slackbot.plist` → pid 389, Bolt session established, poller
+on, no warnings; the running file mints the `slack-` prefix.
+
+**Disconnect cancels the render (node).** ONE handle for the render in flight (`_RENDER`, one GPU,
+one render at a time): `run_sd_cli` starts sd-cli in its own session and registers the process;
+the endpoint arms a fresh render, runs the GPU task and awaits it through `_await_render`, which
+polls `request.is_disconnected()` every second and, when the client is gone, kills the render's
+whole process group (`cancel_current_render` → `killpg`), waits for the task to unwind so the GPU
+lock is released in order, logs `GEN cancelled after Ns … GPU released` and answers 499. A cancel
+that arrives before the process exists is not lost (the runner re-checks the flag after `Popen`);
+arming clears a stale flag. Two things the pins taught: killing only the leader left a `sleep`
+child holding the stdout pipe and `communicate()` waiting 30 s for EOF (→ `start_new_session` +
+`killpg`); and the first live deploy CANCELLED NOTHING — a probe under the same uvicorn/starlette
+showed `is_disconnected()` works until a `BaseHTTPMiddleware` sits in the chain, whereupon the
+endpoint's `receive` is the middleware's own and `http.disconnect` never arrives. The body cap was
+that middleware; it is pure ASGI now (`_BodyCapMiddleware`, same two 413 pins, a forwarding
+`receive`), and the second live test cancelled 1.6 s after the client left (`GEN cancelled after
+16.6s`), sd-cli gone, `/ready` true at once. Battery 8/8 (the three ~33 s kills are pins timing
+out an uncancelled render — the defect demonstrating itself). Pins drive a real subprocess.
+Deployed to ghost (backups `server.pre-cancel.bak.py`, `server.pre-asgi.bak.py`; md5 matches).

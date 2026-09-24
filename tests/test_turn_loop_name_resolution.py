@@ -291,7 +291,7 @@ def test_the_two_sandbox_op_lists_stay_identical(block):
     )
     # CONTENT, not just equality — dropping an op from BOTH lists kept them
     # equal and left `delete` no longer invalidating the sandbox cache.
-    expected = {"write", "replace", "download", "delete", "move", "rename",
+    expected = {"write", "edit", "replace", "download", "delete", "move", "rename",
                 "unzip", "git_clone", "copy"}
     assert seen[0] == expected, (
         f"the file_system mutating-op set changed: "

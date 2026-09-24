@@ -51,6 +51,11 @@ ToolRunner = Callable[[str, Dict[str, Any]], Awaitable[str]]
 
 from ..utils.helpers import env_positive
 
+# §4KB (round 5): `git` was added here and then REMOVED. Four review rounds
+# produced nine sandbox escapes and every one of them came from the git tool
+# — `.git` is a configuration surface that names programs to run, and the
+# model can write files. The leaf reads its own diff through `execute` as it
+# always did. See PROJECT_JOURNAL.md §4KB round 5.
 LEAF_ALLOWED_TOOLS = ("file_system", "execute")
 LEAF_MAX_TURNS = int(env_positive("GHOST_LEAF_MAX_TURNS", 14.0))
 LEAF_TIMEOUT_S = env_positive("GHOST_LEAF_TIMEOUT_S", 600.0)

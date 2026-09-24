@@ -296,6 +296,22 @@ def _normalize_lesson(lesson: dict) -> dict:
 LESSON_ORIGIN_USER = "user"
 LESSON_ORIGIN_AUTO = "auto"
 LESSON_ORIGIN_PROBE = "probe"
+LESSON_ORIGIN_SLACK = "slack"
+
+
+def playbook_writes_blocked() -> bool:
+    """§4KD: is the population writing RIGHT NOW one that must never teach?
+
+    The backstop inside the writer: every call site that creates a lesson,
+    attributes an outcome to one, or credits a retrieval also checks the
+    request population, but a writer reached through a path nobody
+    enumerated (the §4KB lesson) lands HERE. Slack today; the probe rule
+    stays at the call sites because probe post-mortems are already not
+    enqueued. Never raises."""
+    try:
+        return _derive_lesson_origin() == LESSON_ORIGIN_SLACK
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _derive_lesson_origin() -> str:
@@ -316,6 +332,12 @@ def _derive_lesson_origin() -> str:
     try:
         if is_probe_request_id(rid):
             return LESSON_ORIGIN_PROBE
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from ..utils.logging import is_slack_request_id
+        if is_slack_request_id(rid):
+            return LESSON_ORIGIN_SLACK
     except Exception:  # noqa: BLE001
         pass
     try:
@@ -1231,6 +1253,8 @@ class SkillMemory:
         callers can tell a real write from a silent drop.
         Backward-compatible: pre-existing callers ignore the return value.
         """
+        if playbook_writes_blocked():        # §4KD: Slack never teaches
+            return None
         try:
             origin = origin or _derive_lesson_origin()
             effective_trigger = trigger or task or ""
@@ -1646,6 +1670,8 @@ class SkillMemory:
         The mutator receives the normalized lesson and should mutate
         it in place. Returns True if a lesson was updated, False otherwise.
         """
+        if playbook_writes_blocked():        # §4KD: Slack never teaches
+            return False
         with self._get_lock():
             playbook = self._load_playbook()
             for idx, raw in enumerate(playbook):
@@ -1684,6 +1710,8 @@ class SkillMemory:
         (defensive against legacy lessons whose
         ``source_trajectory_id`` was never set).
         """
+        if playbook_writes_blocked():        # §4KD: Slack never teaches
+            return 0
         if not isinstance(trajectory_id, str) or not trajectory_id:
             return 0
         removed = 0
@@ -1793,6 +1821,8 @@ class SkillMemory:
         `source_challenge_hash` / `source` so the "is this self-play
         lesson ever actually used?" question has data to answer.
         """
+        if playbook_writes_blocked():        # §4KD: Slack never teaches
+            return None
         if not trigger:
             return False
 
@@ -1820,6 +1850,8 @@ class SkillMemory:
         """Mark that the most-recent retrieval of `trigger` preceded a
         successful outcome. Increments helpful_retrievals and lightly
         bumps confidence."""
+        if playbook_writes_blocked():        # §4KD: Slack never teaches
+            return None
         if not trigger:
             return False
 
@@ -1880,6 +1912,8 @@ class SkillMemory:
         we stamp `last_credited_at` so a second success inside the same
         window does not double-count.
         """
+        if playbook_writes_blocked():        # §4KD: Slack never teaches
+            return 0
         if window_seconds <= 0:
             return 0
         cutoff = datetime.now() - timedelta(seconds=window_seconds)
@@ -2003,6 +2037,8 @@ class SkillMemory:
         #     structurally guaranteed to be deleted once it reaches
         #     `min_retrievals` — the two subsystems fight each other.
         # Re-enable with GHOST_SKILL_PRUNE=1 only after both are fixed.
+        if playbook_writes_blocked():        # §4KD: Slack never teaches
+            return 0
         if os.getenv("GHOST_SKILL_PRUNE", "0").strip().lower() not in (
                 "1", "true", "yes", "on"):
             return 0
@@ -2225,6 +2261,8 @@ class SkillMemory:
         empty needle lifts any). The reason and timestamp are kept on the
         row as `unquarantined_from` / `unquarantined_at` so a review can
         still see the episode. Returns lessons updated."""
+        if playbook_writes_blocked():        # §4KD: Slack never teaches
+            return 0
         key = (trigger or "").strip().lower()
         if not key:
             return 0
@@ -2262,6 +2300,8 @@ class SkillMemory:
         """Mark every lesson matching ``trigger`` (case-insensitive) as
         quarantined — excluded from prompt injection, kept on disk with
         the reason + timestamp for review. Returns lessons updated."""
+        if playbook_writes_blocked():        # §4KD: Slack never teaches
+            return 0
         key = (trigger or "").strip().lower()
         if not key:
             return 0
@@ -2300,6 +2340,8 @@ class SkillMemory:
         the lock once, bumps every matching lesson, and saves once. Returns
         the number of lessons updated. Duplicate/empty triggers are ignored.
         """
+        if playbook_writes_blocked():        # §4KD: Slack never teaches
+            return 0
         keys = {t.strip().lower() for t in (triggers or []) if t and str(t).strip()}
         if not keys:
             return 0
@@ -2371,6 +2413,8 @@ class SkillMemory:
         Mirrors ``record_retrievals_bulk``: one lock, one save. Duplicate /
         empty triggers are ignored. Returns lessons updated.
         """
+        if playbook_writes_blocked():        # §4KD: Slack never teaches
+            return 0
         keys = {t.strip().lower() for t in (triggers or []) if t and str(t).strip()}
         if not keys:
             return 0
@@ -2777,6 +2821,8 @@ class SkillMemory:
         if one was removed. Used when verification proves a lesson
         unhelpful / actively harmful. When `memory_system` is given, the
         lesson's embedded vector twin is deleted too (no orphan)."""
+        if playbook_writes_blocked():        # §4KD: Slack never teaches
+            return False
         if not trigger:
             return False
         target = trigger.strip().lower()

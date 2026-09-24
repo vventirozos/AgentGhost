@@ -59,5 +59,31 @@
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
+
+  <h2 id="4kd-seed">The seed line is information, not a next action <span class="tag">2026-09-24 &sect;4KD</span></h2>
+  <p>The SUCCESS result used to end with <em>"Seed: N. Reuse seed=N with a tweaked prompt for ANOTHER TAKE …"</em>.
+  A tool result is read at the moment the model decides what to do NEXT, and on 2026-09-23 a Slack member's
+  unintelligible follow-up (<code>emp1</code>) after an image turn resolved into exactly that action — a second image
+  nobody asked for (the instrument-teaches-the-agent pattern). The result now records
+  <code>(Seed N — a record for reproducibility; the result is saved and this request is complete.)</code> and suggests
+  nothing. The measured facts — same seed + tweaked prompt = a different composition; only an edit keeps THIS picture
+  — moved to the <code>seed</code> and <code>reference_images</code> parameter descriptions, which the model reads when
+  it CHOOSES an action, ending with "Never re-run the tool because a result mentioned a seed." Paired with the
+  clarify-first guard in <a href="../core/agent.html#4kd-clarify">the turn loop</a>. Pins:
+  <code>tests/test_4kd_clarify_first_and_slack_lessons.py</code>, <code>tests/test_image_gen_model_swap.py</code>.</p>
+
+  <h2 id="4kd-review">The pipeline review — tool and client <span class="tag">2026-09-24 &sect;4KD</span></h2>
+  <p>Two fresh-eye reviewers (agent side; node side) over generation AND edit. Agent side, fixed and pinned in
+  <code>tests/test_4kd_image_pipeline_review.py</code>: the client threw the node's <code>detail</code> away on every
+  HTTP error (a 400 "reference image 0 is not a PNG/JPEG/WEBP" reached the model as "400 Bad Request" and an MDN
+  link — <code>_node_error_detail</code> is used now); every 4xx was retried three times (a 413 re-sent a 16 MB body
+  thrice) and a read timeout was re-posted while the node was still rendering that very job — only node faults
+  (503, connect errors, other 5xx) retry now; the schema said "LONG prompts are fully used" while the node 400s above
+  8,000 characters — the tool truncates at the node's cap and SAYS so; a list prompt went to the node verbatim, an
+  int crashed the log slice, whitespace burned a render — text in, text out; a 0-byte or non-image reference
+  crossed the LAN to be refused — magic-checked here; <code>reference_images=[]</code> plus a synonym silently ran a
+  plain generation; negative sizes passed through; a boolean seed became 1; the rendered <code>steps</code> are
+  reported ("Rendered at 768x512 in 30 steps"); and the clarify-first guard's link fallback missed project-scoped
+  links. One pin in <code>test_image_gen_model_swap.py</code> had gone vacuous with the §4KD seed wording.</p>
 </body>
 </html>

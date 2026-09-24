@@ -1461,7 +1461,16 @@ class LLMClient:
                 # and missed here (R2 lens B, item 5).
                 if node.get("url") and _is_node_fault(e):
                     self.circuit_breaker.record_failure(node["url"])
-                if attempt < 2:
+                # §4KD: only a NODE fault is worth a second try. A 4xx repeats
+                # identically (a 413 re-sent a 16 MB body three times; a 422
+                # cost three round trips), and a read TIMEOUT means the node
+                # is still rendering THIS job — re-posting it queues a twin
+                # behind it and discards the first.
+                _status = getattr(getattr(e, "response", None), "status_code", None)
+                _retryable = (_is_node_fault(e)
+                              and not isinstance(e, httpx.TimeoutException)
+                              and not (_status is not None and 400 <= int(_status) < 500))
+                if attempt < 2 and _retryable:
                     # A 503 is the node WARMING UP or GPU-busy, and the wait
                     # has to match what the node actually does.
                     # ⚠ The old 8 s x 3 was sized for a "~5-10 s model load"
@@ -1474,8 +1483,7 @@ class LLMClient:
                     # starting. GPU-busy is the other 503 and is worth waiting
                     # on too — a generation runs minutes, so a short backoff
                     # helps nobody.
-                    _is_503 = getattr(getattr(e, "response", None),
-                                      "status_code", None) == 503
+                    _is_503 = _status == 503
                     _wait = self._IMAGE_WARMUP_BACKOFF[attempt] if _is_503 else 2 ** attempt
                     pretty_log("Image Node Retry",
                                f"Attempt {attempt+1} failed: {type(e).__name__}: {e}"
@@ -1485,7 +1493,12 @@ class LLMClient:
                     # Try to get next node if possible
                     node = self.get_image_gen_node()
                 else:
-                    raise Exception(f"Image generation failed after 3 attempts: {_err_text(e)}")
+                    # the node's own `detail` (a 400 "reference image 0 is not
+                    # a PNG/JPEG/WEBP") used to be thrown away here; the model
+                    # saw only "400 Bad Request" and an MDN link
+                    raise Exception(
+                        f"Image generation failed"
+                        f"{' after 3 attempts' if attempt >= 2 else ''}: {_node_error_detail(e)}")
 
     def _on_node_success(self, node: Dict[str, Any], resp: Any,
                          pool_leg: str, task_label: str = "",
