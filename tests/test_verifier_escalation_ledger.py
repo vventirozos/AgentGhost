@@ -206,7 +206,7 @@ class TestRefuteEscalationRecords:
         out = await v._escalate_refute(_res(VerifyVerdict.REFUTED, 0.9),
                                        "c", "e", "ctx",
                                        trace={"req_id": "rq"})
-        assert out.verdict == VerifyVerdict.REFUTED
+        assert out.verdict == VerifyVerdict.UNCERTAIN   # unchecked → not a verdict (2026-09-25 audit)
         assert _ledger(home)[0]["outcome"] == "unavailable"
 
     @pytest.mark.asyncio
@@ -224,7 +224,7 @@ class TestRefuteEscalationRecords:
         out = await v._escalate_refute(_res(VerifyVerdict.REFUTED, 0.9),
                                        "c", "e", "ctx",
                                        trace={"req_id": "rq"})
-        assert out.verdict == VerifyVerdict.REFUTED   # unchanged behaviour
+        assert out.verdict == VerifyVerdict.UNCERTAIN   # an unchecked cheap refute is not a verdict (2026-09-25 audit)
         assert _ledger(home)[0]["outcome"] == "unavailable"
         # The operator stream gets a WARNING line too (they watch the stream,
         # not the app log).

@@ -41,7 +41,7 @@ def test_prompt_includes_response_slot():
     rendered = _VERIFY_CODE_PROMPT.format(
         intent="x", code="y", output="z", response="r",
     )
-    assert "AGENT'S RESPONSE TO THE USER" in rendered
+    assert "<<<BEGIN RESPONSE" in rendered
     assert "r" in rendered  # response actually rendered
 
 
@@ -114,7 +114,7 @@ async def test_verify_code_output_passes_response_to_prompt():
     )
     assert result is not None
     assert result.verdict == VerifyVerdict.REFUTED
-    assert "AGENT'S RESPONSE TO THE USER" in captured["prompt"]
+    assert "<<<BEGIN RESPONSE" in captured["prompt"]
     assert "1,623 lines of code" in captured["prompt"]
     assert "just give me the code" in captured["prompt"]
 

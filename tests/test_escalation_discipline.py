@@ -292,7 +292,7 @@ async def test_unparseable_rebuttal_fails_closed(tmp_path):
     cheap = _refuted(["issue 24"])
     out = await v._escalate_refute(cheap, "claim", EVIDENCE, "ctx",
                                    trace={"req_id": "t1"})
-    assert out is cheap
+    assert out is cheap          # the rebuttal contract fails closed (kept by the 2026-09-25 review R16)
     assert _ledger_rows(tmp_path)[-1]["outcome"] == "unavailable"
 
 

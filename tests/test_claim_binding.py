@@ -1859,3 +1859,105 @@ def test_4iy_dates_speak_greek_ports_in_urls_and_the_figure_subject():
                 "[file_system] SUCCESS: Wrote 1704 chars to 'sample.log'. Script-side path (from sandbox cwd): 'sample.log'. | FIXTURE-COUNT: 14 non-empty lines") == [("13", "misreported")]
     # Z18: the figure offset inside a stripped sentence (the second sentence of a line)
     assert figs("Done. Server on port 8103 today.", "[file_system] const PORT = 8102;") == [("8103", "misreported")]
+
+
+# ── req 6ac65a41 (2026-09-25): a true before/after claim refuted ──
+# "The sandbox went from 84 entries down to 59" was TRUE; the packer quoted
+# only the final listing, so 84 was nowhere in the evidence. The turn's raw
+# output carried it. The fix reads the raw output ONLY to excuse a
+# disagreement (never to support), and only on a line that shares a claim word.
+
+_AFTER = "59 entries under / (files, excluding dotfiles):"
+_BEFORE_RAW = ("[file_system] CURRENT SANDBOX DIRECTORY STRUCTURE:\n84 entries under / (files, excluding dotfiles):\n  a.png\n"
+               "[file_system] SUCCESS: Deleted '/a.png'.\n"
+               "[file_system] CURRENT SANDBOX DIRECTORY STRUCTURE:\n" + _AFTER)
+
+
+def _bind(reply, quote, span, evidence, raw=""):
+    rows = [{"quote": quote, "kind": "number", "evidence_quote": span, "relation": "support"}]
+    return CB.run_binding(reply, evidence, json.dumps({"claims": rows}), raw_sources=raw)
+
+
+def test_the_live_before_after_claim_is_excused_by_the_turns_own_listing():
+    reply, quote = "The sandbox went from 84 entries down to 59.", "The sandbox went from 84 entries down to 59"
+    ev = "[file_system] CURRENT SANDBOX DIRECTORY STRUCTURE:\n" + _AFTER
+    assert _bind(reply, quote, _AFTER, ev).verdict == "REFUTED"               # the incident, without the raw output
+    r = _bind(reply, quote, _AFTER, ev, raw=_BEFORE_RAW)
+    assert r.verdict == "UNCERTAIN" and r.bindings[0].outcome == "unchecked"
+
+
+def test_the_raw_output_never_supports_a_claim():
+    """Downgrade-only: a wrong figure that also stands somewhere in the raw
+    output is UNCERTAIN, never CONFIRMED."""
+    r = _bind("The sandbox now has 84 entries.", "The sandbox now has 84 entries", _AFTER,
+              "[file_system] " + _AFTER, raw=_BEFORE_RAW)
+    assert r.verdict != "CONFIRMED"
+
+
+def test_an_unanchored_stray_figure_in_the_raw_output_excuses_nothing():
+    raw = "[system_utility] host status: 84 processes running, load normal\n[file_system] " + _AFTER
+    r = _bind("The sandbox now has 84 entries.", "The sandbox now has 84 entries", _AFTER, "[file_system] " + _AFTER, raw=raw)
+    assert r.verdict == "REFUTED"
+
+
+@pytest.mark.parametrize("reply,span", [
+    ("Tests: 118 of 120 passed.", "120 passed"),
+    ("Downloaded 250 MB of the 300 MB file.", "downloaded 300 MB"),
+    ("Coverage is 59% and there are 84 failures.", "59 failures"),
+])
+def test_part_of_whole_and_cross_unit_contradictions_still_refute(reply, span):
+    """The class two rejected binder-side fixes lost; the raw output here
+    carries nothing that states the other figure."""
+    assert _bind(reply, reply.rstrip("."), span, "[tool]\n" + span, raw="[tool] " + span).verdict == "REFUTED"
+
+
+@pytest.mark.parametrize("reply,span", [
+    ("The tests show 30 passed, 40 failed.", "30 passed, 30 failed in 2.1s"),
+    ("The disk has 12 GB used of 16 GB.", "12 GB used of 12 GB total"),
+])
+def test_a_half_matching_claim_is_never_confirmed(reply, span):
+    assert _bind(reply, reply.rstrip("."), span, "[tool]\n" + span).verdict != "CONFIRMED"
+
+
+def test_the_agents_own_earlier_words_in_the_raw_output_excuse_nothing():
+    """An expanded session in the turn's output quoting the agent's OWN
+    earlier reply ("84 entries") is an echo, not a source: masked before the
+    raw check, so the wrong figure still refutes."""
+    raw = ("[recall] SESSION web-1 — 2 msgs\nuser: how many entries?\n"
+           "assistant: The sandbox has 84 entries.\n[file_system] " + _AFTER)
+    r = _bind("The sandbox now has 84 entries.", "The sandbox now has 84 entries", _AFTER, "[file_system] " + _AFTER, raw=raw)
+    assert r.verdict == "REFUTED"
+
+
+@pytest.mark.parametrize("readback", [
+    "[execute] EXIT CODE: 0\n--- stdout ---\nRevenue grew to 5.2 million this year.",
+    "[file_system] # Summary\nRevenue grew to 5.2 million this year.",
+])
+def test_a_read_back_of_the_claims_own_sentence_excuses_nothing(readback):
+    """Review R15: the agent's draft read back (`cat report.md`) restates the
+    invented figure in the claim's own words — an echo, not a reading."""
+    span = "revenue: 4.8 million"
+    r = _bind("Revenue grew to 5.2 million this year.", "Revenue grew to 5.2 million this year", span,
+              "[web_search] " + span, raw="[web_search] " + span + "\n" + readback)
+    assert r.verdict == "REFUTED"
+
+
+def test_a_long_one_line_blob_excuses_nothing():
+    blob = '[execute] {"meta": "' + "x" * 700 + '", "entries": 84}'
+    r = _bind("The sandbox now has 84 entries.", "The sandbox now has 84 entries", _AFTER,
+              "[file_system] " + _AFTER, raw=blob + "\n[file_system] " + _AFTER)
+    assert r.verdict == "REFUTED"
+
+
+def test_the_tool_label_is_not_the_shared_word():
+    """Only the line's body anchors: a `[entries_tool]` label must not lend
+    the claim's word to an unrelated line."""
+    r = _bind("The sandbox now has 84 entries.", "The sandbox now has 84 entries", _AFTER,
+              "[file_system] " + _AFTER, raw="[entries] load 84 normal\n[file_system] " + _AFTER)
+    assert r.verdict == "REFUTED"
+
+
+def test_the_excuse_names_where_it_was_found():
+    r = _bind("The sandbox went from 84 entries down to 59.", "The sandbox went from 84 entries down to 59", _AFTER,
+              "[file_system] CURRENT SANDBOX DIRECTORY STRUCTURE:\n" + _AFTER, raw=_BEFORE_RAW)
+    assert "the turn's output also states" in r.bindings[0].detail

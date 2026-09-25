@@ -2202,6 +2202,21 @@ def _evidence_candidates(tools_run: Optional[list]) -> list:
     return candidates
 
 
+#: The refusal's own vocabulary never counts as overlap between a reply and a
+#: refused page — every refused page says "blocked"; only subject words do.
+_REFUSAL_VOCAB = frozenset({"blocked", "block", "blocks", "blocking", "refused", "refuse", "denied", "forbidden",
+                            "status", "fetch", "fetched", "site", "sites", "page", "pages", "website", "cloudflare",
+                            "captcha", "access", "error", "request", "server", "http", "returned"})
+_CLAIMS_REFUSAL_RE = re.compile(
+    r"cloudflare|captcha|paywall|bot[- ]protection|rate[- ]limited|access\s+(?:was\s+)?denied"
+    r"|\b(?:returned|got|gave|with|hit|failed\s+with)\s+(?:an?\s+)?(?:HTTP\s*)?(?:403|429)\b"
+    r"|\b(?:HTTP|status|error)\s*(?:code\s*)?(?:403|429)\b|\b(?:403|429)\s+(?:forbidden|errors?|responses?)\b"
+    r"|\b(?:site|page|server|request|fetch|website|domain)\w*\s+(?:was\s+|were\s+|is\s+|got\s+)?"
+    r"(?:blocked|blocking|blocks|refused|denied|forbidden)\b"
+    r"|\bblocked\s+(?:by|me|us|the\s+(?:request|fetch|page|crawler|agent))\b|\bblocks?\s+(?:automated|bots?|scrap\w*|crawl\w*)"
+    r"|μπλ[οό]κ\w*|απαγορε[υύ]\w*|απέρριψ\w*|αρνήθηκ\w*", re.IGNORECASE)
+
+
 def _collect_verifier_evidence(tools_run: Optional[list],
                                max_items: int = 3,
                                budget: int = 4000,
@@ -2332,6 +2347,31 @@ def _collect_verifier_evidence(tools_run: Optional[list],
                 picked.append(best)
                 pulled.append(best)
             claim_pulled = pulled[0] if pulled else None
+    # A reply about a site that refused it rests on the refused page: quote
+    # the most claim-relevant one as ONE extra item, never in place of live
+    # evidence (refute audit 2026-09-25, req d066a356 — "Cloudflare 403s"
+    # refuted after the digest dropped all four 403 results; review R16: the
+    # first cut reclassified every dead page as live).
+    if (claim_text and _CLAIMS_REFUSAL_RE.search(claim_text) and not any(_evidence_is_dead(t) for t in picked)
+            and len(picked) < len(_EVIDENCE_BUDGET_WEIGHTS)):
+        _dead_pages = [t for t in candidates if _evidence_is_dead(t)]
+        if _dead_pages:
+            # BOTH: the reply describes a refusal, and the refused page shares
+            # its words. Overlap alone quoted a refused page whose TITLE carried
+            # a success claim's tokens (§4IX); the regex alone missed most real
+            # refusals and fired on unrelated text (review R17)
+            _dct = _claim_tokens(claim_text) - _REFUSAL_VOCAB      # subject words only (review R18)
+            if _dct:
+                def _draw(t):
+                    return len(_dct & _claim_tokens(str(t.get("content", ""))[:4000]))
+                _best_dead = max(_dead_pages, key=lambda t: (_draw(t), -_dead_pages.index(t)))
+                if _draw(_best_dead) >= 1:          # one SUBJECT word (refusal vocabulary excluded)
+                    # its STATUS line only, labelled: a refused page's title or
+                    # snippet is never a source for the facts in it (review R18)
+                    _url = re.search(r"https?://[^\s)\]>\"']+", str(_best_dead.get("content", "")))
+                    picked.append({**_best_dead, "content": "[refused page — the site blocked this fetch; nothing here "
+                                                            "is a source for facts] STATUS: BLOCKED"
+                                                            + (f" {_url.group(0)[:200]}" if _url else "")})
     if not picked:
         return ""
     picked.reverse()  # chronological: oldest → newest
@@ -3816,6 +3856,105 @@ def _reconstruct_executed_code(
                     return v[:4000]
             return ""
     return ""
+
+
+def _tool_call_summary(messages: Optional[list], tool_msg: Optional[dict]) -> str:
+    """One line naming what a tool call was asked to do: the command/code
+    when `_reconstruct_executed_code` recovers one, else the call's
+    arguments (a file_system op, a path). Empty when unknown."""
+    code = _reconstruct_executed_code(messages, tool_msg)
+    if code:
+        return code
+    tool_id = (tool_msg or {}).get("tool_call_id")
+    if not tool_id:
+        return ""
+    for m in reversed(messages or []):
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        for tc in (m.get("tool_calls") or []):
+            if isinstance(tc, dict) and tc.get("id") == tool_id:
+                args = (tc.get("function") or {}).get("arguments")
+                return (args if isinstance(args, str) else json.dumps(args or {}, ensure_ascii=False))[:600]
+    return ""
+
+
+_EXEC_STEP_RE = re.compile(r"execute|postgres|file_system|shell|python")
+
+
+def _turn_execution_transcript(messages: Optional[list], tools_run: Optional[list],
+                               *, code_budget: int = 3500, output_budget: int = 4000) -> tuple:
+    """(code_text, output_text) covering EVERY step the turn ran, in order,
+    for the code-output lens — or ("", "") when the turn ran one step (the
+    caller then keeps its single-command input, byte-identical).
+
+    Refute audit 2026-09-25: the lens was handed the LAST tool's command and
+    output only, so every create → measure → clean-up turn was judged on the
+    clean-up: "failed to execute `echo alpha`" (the first call printed
+    alpha), "never created or counted the file" (it did; the last call was
+    `rm`), "the macro was never called" (only the final script was shown).
+    6 of the route's 11 false refutes. Outputs are tail-weighted (the last
+    step keeps the most) and every step is labelled so the judge can
+    attribute a failure to one of them."""
+    # Execution and file steps only — the ones a code turn's answer rests on.
+    # An unrelated earlier page (a browser read, a search) stays out of this
+    # lens, as it always has (test_code_path_keeps_single_output_view).
+    steps = [t for t in (tools_run or []) if isinstance(t, dict) and not t.get("_synthetic")
+             and _EXEC_STEP_RE.search(str(t.get("name", "")).lower())]
+    if len(steps) < 2:
+        return "", ""
+    code_lines = []
+    n = len(steps)
+
+    _NOTE = "\n…[step output elided]…\n"
+
+    def _cut(body: str, cap: int) -> str:
+        if len(body) <= cap:
+            return body
+        keep = max(0, cap - len(_NOTE))           # the note counts toward the cap
+        return body[: keep // 3] + _NOTE + body[len(body) - (keep - keep // 3):]
+
+    for i, t in enumerate(steps, 1):
+        name = str(t.get("name", "tool"))[:60]
+        what = _tool_call_summary(messages, t).strip()
+        code_lines.append(f"# --- step {i}/{n}: {name} ---\n{what}" if what else f"# --- step {i}/{n}: {name} ---")
+    # The LAST step is never cut to make room (review R16: at 13+ steps the
+    # tail — where a failure lands — was cut away while the earlier "ok"
+    # steps stayed). It keeps half the budget; earlier steps share the rest,
+    # newest first, and whatever does not fit is named, not silently dropped.
+    last = steps[-1]
+    last_part = f"[step {n}/{n}: {str(last.get('name', 'tool'))[:60]}]\n" + _cut(str(last.get("content", "")), output_budget // 2)
+    room = output_budget - len(last_part) - 2
+    earlier = []
+    per = max(160, room // max(1, n - 1) - 40)
+    for i in range(n - 1, 0, -1):                      # newest earlier step first
+        t = steps[i - 1]
+        part = f"[step {i}/{n}: {str(t.get('name', 'tool'))[:60]}]\n" + _cut(str(t.get("content", "")), per)
+        if len(part) + 2 > room:
+            earlier.insert(0, f"…[steps 1–{i} elided: output budget]…")
+            break
+        earlier.insert(0, part)
+        room -= len(part) + 2
+    # hard cap, the elision notice included (review R17: the uncounted
+    # notice pushed the joined text past the cap and the consumer's [:4000]
+    # cut the LAST step's tail). Only earlier parts are ever dropped.
+    earlier = [e for e in earlier if not e.startswith("…[steps")]
+    dropped = n - 1 - len(earlier)
+
+    def _joined() -> str:
+        head = [f"…[steps 1–{dropped} elided: output budget]…"] if dropped else []
+        return "\n\n".join(head + earlier + [last_part])
+    while earlier and len(_joined()) > output_budget:
+        earlier.pop(0)
+        dropped += 1
+    out = _joined()
+    if len(out) > output_budget:                      # only the notice + the last step remain
+        out = out[len(out) - output_budget:]
+    code_text = "\n".join(code_lines)
+    if len(code_text) > code_budget:
+        _cnote = "\n…[earlier steps elided]…\n"
+        _ck = code_budget - len(_cnote)                 # the note counts toward the cap (review R19)
+        code_text = code_text[: _ck // 3] + _cnote + code_text[len(code_text) - (_ck - _ck // 3):]
+    return code_text, out
 
 
 # ── The artifact the turn actually produced (§4GW, 2026-09-14) ───────
@@ -14195,8 +14334,17 @@ class GhostAgent:
             "req_id": str(req_id or ""),
             "trajectory_id": str(trajectory_id or ""),
         }
+        _multi_code, _multi_out = "", ""
         if "execute" in tool_name.lower() or "postgres" in tool_name.lower():
             code_text = _reconstruct_executed_code(messages, last_tool)
+            if code_text:
+                # every step, not only the last (refute audit 2026-09-25)
+                _multi_code, _multi_out = _turn_execution_transcript(
+                    messages, tools_run_this_turn,
+                    # the ledger block rides the same 4000-char OUTPUT slot (review R17)
+                    output_budget=max(800, 4000 - len(ledger_block) - 1) if ledger_block else 4000)
+                if _multi_code:
+                    code_text = _multi_code
             # §4GW: the command is what the turn RAN; the files are what it
             # BUILT. The auditor is asked about both and used to see only
             # the first. Augment, never replace — and only when a command
@@ -14227,10 +14375,10 @@ class GhostAgent:
                 # block entirely and reproduced the unchecked-completion
                 # blind spot. Reserve tail room inside verify_code_output's
                 # own output[:4000] cap so the ledger survives.
-                _code_output = tool_output
+                _code_output = _multi_out or tool_output
                 if ledger_block:
                     _lroom = 4000 - len(ledger_block) - 1
-                    _code_output = ((tool_output[:_lroom] + "\n" + ledger_block)
+                    _code_output = (((_multi_out or tool_output[:_lroom]) + "\n" + ledger_block)
                                     if _lroom > 0 else ledger_block)
                 with verify_purpose("turn gate"):
                     # NO `deep=` here on purpose: this route has no

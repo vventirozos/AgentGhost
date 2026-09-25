@@ -119,16 +119,18 @@ class TestEscalationBehaviour:
         assert (await v._escalate_refute(cheap, "c", "e", "ctx")) is cheap
 
     @pytest.mark.asyncio
-    async def test_escalation_error_keeps_original_verdict(self, v, monkeypatch):
-        """Escalation can only REDUCE false refutes — never make the gate
-        less available than before."""
+    async def test_escalation_error_ships_the_unchecked_refute_as_uncertain(self, v, monkeypatch):
+        """2026-09-25 refute audit: 30 refutes whose escalation was
+        unavailable split 14 false / 12 true — an unchecked cheap refute is a
+        coin flip, so it ships UNCERTAIN (issues kept), never REFUTED."""
         async def _explode(*a, **k):
             raise RuntimeError("main model down")
         monkeypatch.setattr(v, "_verify_claim_two_stage", _explode)
         monkeypatch.setattr(v, "_call_llm", _explode)
         cheap = _res(VerifyVerdict.REFUTED, 0.9, ["x"])
         out = await v._escalate_refute(cheap, "c", "e", "ctx")
-        assert out.verdict == VerifyVerdict.REFUTED
+        assert out.verdict == VerifyVerdict.UNCERTAIN and out.confidence <= 0.5
+        assert out.issues == ["x"] and out.escalation == "unavailable"
 
     @pytest.mark.asyncio
     async def test_kill_switch_disables_escalation(self, v, monkeypatch):

@@ -94,10 +94,35 @@ _NO_ANSWER_HEAD_RE = re.compile(
 #: The user asked for the raw thing: not a non-answer, an answer (review
 #: §4FN minor 8). No live instance yet; the exemption exists so one cannot
 #: be refuted at 0.9 when it appears.
+#: Refute audit 2026-09-25: 3 live probes asked "reply with the tool output
+#: verbatim" / "the EXIT CODE line the tool reported, verbatim" — the word
+#: AFTER the noun — and were refuted as raw dumps after the code judge had
+#: CONFIRMED them. "verbatim" / "word for word" anywhere in the request is
+#: the request for the raw thing (Greek too: lexical guards speak one
+#: language otherwise).
 _RAW_REQUEST_RE = re.compile(
     r"\b(?:raw|verbatim|exact|full|unmodified|complete)\s+(?:tool\s+)?(?:output|result|log|stdout)\b"
-    r"|\bas[- ]is\b|\bdon'?t\s+(?:summari[sz]e|interpret)\b",
+    r"|\bverbatim\b|\bword[- ]for[- ]word\b"
+    r"|\bas[- ]is\b|\bdon'?t\s+(?:summari[sz]e|interpret)\b"
+    r"|αυτολεξεί|κατά\s+λέξη",
     re.IGNORECASE)
+
+
+_NEGATED_BEFORE_RE = re.compile(r"(?:\bdon'?t|\bdo\s+not|\bnot|\bno|\bnever|\bwithout|\bμην|\bόχι)\b", re.IGNORECASE)
+
+
+def _raw_requested(request: str) -> bool:
+    """A raw-output request that is not negated ("don't paste it verbatim,
+    summarise" asks for the opposite — review R16)."""
+    for m in _RAW_REQUEST_RE.finditer(request):
+        clause = re.split(r"[.?!;:,—\n]", request[:m.start()])[-1]
+        # a negation GOVERNS the phrase only when it sits within the last few
+        # words before it ("don't paste it verbatim", "no raw output") — not
+        # "Do not add anything and paste the output verbatim" (review R19)
+        near = " ".join(clause.split()[-4:])
+        if not _NEGATED_BEFORE_RE.search(near):
+            return True
+    return False
 
 
 def refute_no_answer_fallback(reply: str) -> List[str]:
@@ -135,7 +160,7 @@ def refute_raw_tool_dump(reply: str, request: str = "", n_real_tools=None) -> Li
     m = _DUMP_HEAD_RE.match(text)
     if not m:
         return []
-    if request and _RAW_REQUEST_RE.search(str(request)):
+    if request and _raw_requested(str(request)):
         return []
     head_txt = m.group(0).strip().strip("`").strip()
     if head_txt in (FALLBACK_HEADS["success"], FALLBACK_HEADS["failed"], FALLBACK_HEADS["running"]) and not _DUMP_BODY_RE.search(text):

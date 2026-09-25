@@ -818,6 +818,36 @@ def figure_elsewhere(q: Quantity, evidence: str, *, hedged: bool) -> Optional[st
     return None
 
 
+def figure_elsewhere_in_turn(q: Quantity, claim_quote: str, raw: str, *, hedged: bool) -> Optional[str]:
+    """`figure_elsewhere` over the turn's WHOLE raw output, for a line that
+    also shares a content word with the claim (a lexical anchor, so a stray
+    "84" in an unrelated output does not count).
+
+    req 6ac65a41 (2026-09-25): "The sandbox went from 84 entries down to 59"
+    was TRUE, but the packer quoted only the final listing, so "84 entries"
+    — printed by the turn's first listing — was nowhere in the evidence and
+    the shared-word path REFUTED it. Downgrade-only by construction: the
+    caller uses it to turn a disagreement into UNCHECKED, never to support a
+    claim, so an echo found here can cost a refute, never earn a confirm.
+    Three designs that changed the comparison or the packer were rejected in
+    review (false CONFIRMs; lost "N of M" refutes; the packer quoting the
+    agent's own read-backs to the judge)."""
+    for ln in str(raw or "").splitlines():
+        body = _strip_label(ln)
+        if len(body) > MAX_ANCHOR_LINE_CHARS:
+            continue                    # a one-line JSON/CSV blob anchors everything (review R15)
+        if not lexical_anchor(claim_quote, body):
+            continue
+        if _aligned(claim_quote, body):
+            # the claim's own sentence, read back: `cat report.md` of the
+            # agent's draft restating the invented figure (review R15) — an
+            # echo of the claim, never an independent reading of it
+            continue
+        if any(quantities_agree(q, s, hedged=hedged) for s in extract_quantities(body)):
+            return ln.strip()
+    return None
+
+
 def _typo_shaped_disagreement(claim_quote: str, span: str) -> bool:
     """True when some claim figure and a same-family span figure, written
     in the claim's unit at the claim's precision, have the same length and
@@ -1104,7 +1134,7 @@ def _with_reply_lead(quote: str, reply: str) -> str:
     return (m.group(0) + q) if m else q
 
 
-def bind(reply: str, evidence: str, rows: List[Dict[str, str]]) -> Tuple[List[Binding], int]:
+def bind(reply: str, evidence: str, rows: List[Dict[str, str]], *, raw: str = "") -> Tuple[List[Binding], int]:
     """Validate every row against the texts and grade each bound pair.
     Returns (bindings, dropped) — dropped = rows whose claim quote was not
     in the reply (a hallucinated claim is not a claim)."""
@@ -1138,11 +1168,15 @@ def bind(reply: str, evidence: str, rows: List[Dict[str, str]]) -> Tuple[List[Bi
         outcome, detail, dq, ds = _compare(_with_reply_lead(b.quote, reply), b.evidence_quote)
         compared = outcome
         elsewhere = figure_elsewhere(dq, evidence, hedged=_hedged(b.quote)) if dq is not None else None
+        _where = "the evidence"
+        if elsewhere is None and dq is not None and outcome == "disagree" and raw:
+            elsewhere = figure_elsewhere_in_turn(dq, b.quote, raw, hedged=_hedged(b.quote))
+            _where = "the turn's output"
         if outcome == "disagree" and elsewhere:
             # the claim's own figure stands in another evidence line: the
             # reply may be reporting THAT reading and the binder bound the
             # wrong one — not a contradiction, not a confirmation
-            outcome, detail = "unchecked", f"figures differ ({detail}) but the evidence also states {elsewhere[:120]!r}"
+            outcome, detail = "unchecked", f"figures differ ({detail}) but {_where} also states {elsewhere[:120]!r}"
         elif (outcome == "disagree"
                 and not (lexical_anchor(b.quote, b.evidence_quote) and _single_comparable(dq, b.evidence_quote))
                 and not (_typo_shaped_disagreement(b.quote, b.evidence_quote)
@@ -1591,7 +1625,9 @@ def run_binding(reply: str, evidence: str, raw_model_output: Any, *, raw_sources
     ev_bind = _strip_marks(mask_self_echo(evidence))      # the packer's own marks are blanked too (§4IY)
     echo = self_echo_text(evidence) if self_echo_spans(evidence) else ""
     raw_bind = source_text(raw_sources) if raw_sources else ""
-    bindings, dropped = bind(reply, ev_bind, rows)
+    # the turn's whole output, own earlier words masked — read ONLY to excuse a
+    # disagreement whose claim figure the packer did not quote (req 6ac65a41)
+    bindings, dropped = bind(reply, ev_bind, rows, raw=mask_self_echo(raw_sources) if raw_sources else "")
     audit = (audit_numbers(reply, ev_bind, context) + audit_identifiers(reply, ev_bind, context)
              + audit_years(reply, ev_bind, context))
     entities = audit_entities(reply, ev_bind, context)

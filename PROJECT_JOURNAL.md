@@ -48388,3 +48388,68 @@ member "what is my name?" → "I don't know your name"; owner "what is my name? 
 with no value to READ the name, and the empty-value path DELETES (`delete root.name` — no such field, so no damage;
 the name memory survived); the member reply offered to "remember it for next time", which a member turn cannot do;
 the bare question skips memory hydration while "… one word." hydrates.
+
+**§4KJ addendum — req 6ac65a41 false LATE REFUTED (2026-09-25).** "The sandbox went from 84 entries down to 59" was
+TRUE (first listing 84, final 59, 25 deletes). The evidence digest (6 of 27 items) never quoted the first listing — the
+claim pull scores WORDS and that listing's words duplicate the final one's — so the binder saw only "59 entries" and
+its shared-word path called 84 a contradiction; the binding REFUTED overrode the strong model's UNCERTAIN.
+FIX (claim binder, downgrade-only): when a disagreement's claim figure is nowhere in the packed evidence,
+`figure_elsewhere_in_turn` reads the turn's WHOLE raw output (own earlier words masked) for a line sharing a claim word
+that states the figure; a hit makes the row UNCHECKED through the existing `figure_elsewhere` branch. It can cost a
+refute, never earn a confirm. Replayed on the recorded turn: REFUTED → UNCERTAIN; the judge's evidence is unchanged.
+**Four review rounds, three rejected designs.** (1) Excluding claim-matched span figures inside `_compare` → AGREE →
+false CONFIRMs ("30 passed, 40 failed" vs "30 passed, 30 failed"). (2) `_claim_states` first on every `bind()` path →
+lost the refute of every "N of M" claim ("118 of 120 passed" vs "120 passed") and cross-unit ones. (3) A packer FIGURE
+pull (pull the older item carrying the claim's number) → quoted the agent's own write receipts, then read-backs of its
+own files (`cat report.md`) once receipts were excluded, and "before the first write" as the echo proxy both leaked
+and missed turns that write first. Lesson: a fix that ADDS evidence the judge sees can manufacture support; a fix that
+can only EXCUSE a contradiction fails safe. Battery 86: 6/6 killed.
+Round 4 review (1 MAJOR, fixed): a read-back of the agent's own draft (`cat report.md` restating the invented figure)
+excused the refute of that figure → a raw line whose skeleton ALIGNS with the claim is its echo and is skipped; lines
+over MAX_ANCHOR_LINE_CHARS (a one-line JSON blob) are skipped; the tool label never anchors; the detail says "the
+turn's output". Battery 87: 10/10 killed. Replay of all 218 claim-binding shadow rows: cf2171aa is the ONLY verdict
+change. KNOWN residual (accepted, downgrade-only): an unrelated line sharing a claim word and figure ("84 files
+changed" in a git log vs a claim "84 files") can excuse a real refute to UNCERTAIN; the number audit and the residual
+judge (GHOST_CLAIM_BINDING_RESIDUAL, OFF live) still read only the digest.
+The already-written consequences are NOT reversed: trajectory cf2171aa stays FAILED, its lessons were scrubbed.
+
+## §4KK — False-refute audit and fixes (2026-09-25)
+
+**Audit.** All 104 turns whose final verdict was REFUTED (verdict store, 08-16 →) were adjudicated by five
+independent readers against the turns' own tool outputs: 58 TRUE, 42 FALSE, 4 unclear. Since the 09-17 thinking-cap
+fix: 17 of 41 false. Worst routes: code_output (11 false / 6 true) and "strong model unavailable" (cheap refute
+shipped unchecked: 14 false / 12 true over all dates). turn-state was right every time. 50 earlier refutes
+superseded by a later verdict (25 by a post-repair CONFIRMED) cannot be adjudicated: the first-attempt reply is not
+stored. Labels: `$CLAUDE_JOB_DIR/tmp/labels.json`; harness `scripts/refute_replay.py` (live, sequential, temp
+GHOST_HOME).
+
+**Shipped (four review rounds, batteries 88–93).**
+- Code lens: every execution/file step in order (`_turn_execution_transcript`); last step keeps half the budget and
+  is never cut; oldest steps dropped under a counted notice; sized to leave the project-ledger room.
+- Prompts fenced (`<<<BEGIN/END …>>>`); `_defang_fences` neutralises fence-shaped text (any case, `_`, zero-width)
+  in claim, evidence, request, code/output/response, the raw-source supplement and the cheap judge's issues;
+  merge-conflict markers untouched.
+- Claim prompt: an independent later check (vision, an existing test suite) outranks an earlier SUCCESS line; a
+  read-back of the agent's own file or a script it wrote this turn is not a check.
+- `_unchecked_refute`: escalation raised / no strong verdict → cheap REFUTED ships UNCERTAIN (≤0.5, issues kept);
+  the claim-binding lift refuses to confirm it; the rebuttal contract's unparseable path still fails closed.
+- Reply-shape: "verbatim"/"word for word"/Greek anywhere is a raw-output request unless a negation sits within the
+  four words before it.
+- A reply describing a refusal (`_CLAIMS_REFUSAL_RE`) that shares a subject word with a refused page gets that page
+  as ONE extra item — its status line and URL only, labelled "not a source for facts".
+**Rejected in review:** a written-file evidence block and a profile evidence block — the agent's own report, and
+values it had written into the profile, made its invented figures "supported" through the binder to CONFIRMED.
+Also rejected: a blanket `<<<` neutraliser (hid merge markers, lost a true refute) and a vocabulary regex alone for
+refusals (missed 13/20, fired on 10/12).
+
+**Measured (live replay, old vs new code, same 100 labelled cases, paired):**
+FALSE refutes still REFUTED: old 20 → new 10 (11 fixed, 1 new). TRUE refutes still REFUTED: old 41 → new 44 —
+none lost. The old code itself reproduces only 20/42 false and 41/58 true (judge noise + replay limits: tool
+results cut at 4000 chars, no history), so only the paired comparison is meaningful. The replay ran the round-18
+code; round-19 edits (fence variants, negation window, rule wording) are unit/battery-pinned only.
+Suite: 24,999 passed; 3 failures fixed (two text pins made the ratchet grow → removed/behavioural; one test pinned
+the old single-command code view → relaxed); the logging mirror-delta timing flake recurred and passes on rerun.
+Deployed (listener 363 → 60947).
+**Not fixed:** a refused page that fills an ordinary positional slot is still quoted in full (older behaviour; its
+title is external page data, not an echo). Judge misreads with the fact present in the evidence (≈9 of 42) have
+no mechanical fix.

@@ -828,3 +828,22 @@ def test_4iy_rebuttal_quote_must_be_mostly_verbatim():
     ev = "[web_search] Athens now: 34°C, sunny, humidity 28%, wind 13 km/h with gusts to 22 km/h. Source: openweather."
     assert V._quote_supported_by_evidence("humidity 28%, wind 13 km/h", ev) is True
     assert V._quote_supported_by_evidence("humidity 28%, wind 40 km/h with gusts to 80 km/h and hail", ev) is False   # one 15-char run is not a quote
+
+
+@pytest.mark.asyncio
+async def test_an_unchecked_cheap_refute_is_never_lifted_to_confirmed(monkeypatch, tmp_path):
+    """Refute audit review R16 CRIT: a cheap REFUTED whose escalation failed
+    ships UNCERTAIN (`escalation="unavailable"`) — the binder's CONFIRMED must
+    not lift it: that would turn an unchecked refute into a confirm."""
+    monkeypatch.setenv("GHOST_CLAIM_BINDING_REFUTE_FIRST", "1")
+    monkeypatch.setenv("GHOST_CLAIM_BINDING_CONFIRM_FIRST", "1")
+
+    async def _unavailable(self, result, *a, **k):
+        out = V._unchecked_refute(result, "exception:ReadTimeout")
+        out.escalation = "unavailable"
+        return out
+    monkeypatch.setattr(V.Verifier, "_escalate_refute", _unavailable)
+    r = await V.Verifier(llm_client=_Stub([CLASSIC_REFUTE, BINDER_JSON])).verify_claim(REPLY, EV1, "weather in Athens?", trace={"req_id": "un1"})
+    row = _ledger(tmp_path)[-1]
+    assert row["claim_binding"]["verdict"] == "CONFIRMED", row
+    assert r.verdict.value == "UNCERTAIN" and r.escalation == "unavailable" and r.binder_decided is False

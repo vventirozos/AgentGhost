@@ -465,7 +465,9 @@ class TestTheWiringIntoTheTurnGate:
             final_ai_content="ran it", last_user_content="run x.py",
             lc="run x.py")
         assert captured["route"] == "code"
-        assert captured["code"] == "python3 x.py"
+        # the lens now lists every step (refute audit 2026-09-25); the
+        # command is still there, the verdict still produced
+        assert "python3 x.py" in captured["code"]
 
 
 class TestWhatStillCatchesAFabricatedFile:

@@ -149,14 +149,14 @@ class TestEscalationUnavailableIsLoud:
         with patch("ghost_agent.utils.logging.pretty_log") as plog:
             out = await v._escalate_refute(cheap, "claim", "evidence", "ctx",
                                            trace={"req_id": "r1"})
-        assert out is cheap                                   # refute stands
+        assert out.verdict == VerifyVerdict.UNCERTAIN          # unchecked → not a verdict (2026-09-25)
         rows = [r for r in _ledger(tmp_path) if r["outcome"] == "unavailable"]
         assert len(rows) == 1
         assert rows[0]["rebuttal"] == "strong_none:length:0c"
         msgs = [c_.args[1] for c_ in plog.call_args_list
                 if c_.kwargs.get("level") == "WARNING"]
         assert any("strong judge returned no verdict (strong_none:length:0c)" in m
-                   and "stands UNCHECKED" in m for m in msgs)
+                   and "→ UNCERTAIN (unchecked)" in m for m in msgs)
         # the strong call itself was asked without thinking
         assert c.payloads and c.payloads[-1].get("chat_template_kwargs") == {
             "enable_thinking": False}
