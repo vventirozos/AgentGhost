@@ -383,8 +383,8 @@ def _count_user_turns(home: Path, window_h: float) -> tuple:
                 o = origin_rx.search(line)
                 if o is None:
                     unstamped += 1
-                elif o.group(1) == "user":
-                    n += 1
+                elif o.group(1) == "user" and " role=member" not in line:
+                    n += 1              # a member's turn feeds no owner store (§4KJ R10)
     except OSError:
         return (None, 0, "no-log")
     if unstamped:

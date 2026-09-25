@@ -2449,6 +2449,9 @@ def summarize_streaming(trajectories: Iterable[Any], *,
     stated intent) while retired/disabled/unknown names — whose stamps
     were collected under THIS population — keep rendering.
     """
+    # A member's turn is never a sample of the owner's experiments (§4KJ R9).
+    from ..memory.skills import iter_teachable as _iter_teachable
+    trajectories = _iter_teachable(trajectories)
     all_stats: Dict[str, Dict[str, ArmStats]] = {}
     trig_stats: Dict[str, Dict[str, ArmStats]] = {}
     admit = tuple(admit_task_kinds or ("user_request",))

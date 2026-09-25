@@ -4,6 +4,7 @@ import datetime
 import errno
 import functools
 import json
+import re
 import secrets
 import shutil
 import stat as _stat
@@ -24,8 +25,8 @@ from ..utils.helpers import get_utc_timestamp
 from ..utils.helpers import env_positive
 import logging
 from ..utils.logging import (Icons, pretty_log, ORIGIN_PROBE, PROBE_REQUEST_PREFIX, is_probe_request_id,
-                             ORIGIN_SLACK, SLACK_REQUEST_PREFIX, is_slack_request_id,
-                             client_deadline_context)
+                             client_deadline_context, parse_requester_role,
+                             requester_role_context)
 
 logger = logging.getLogger("GhostAgent")
 
@@ -1097,13 +1098,14 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                 str(request_id or "").strip() or uuid.uuid4().hex[:8])
         # (§4FF's `X-Ghost-Prompt-Variant` probe header was retired here on
         # 2026-09-21, §4JG — no prompt variant exists to select.)
-    # §4KD: `X-Ghost-Origin: slack` — a Slack client that did not mint the
-    # prefix itself. The bot does (so its feedback correlation keeps the id);
-    # this is the fallback for any other Slack-side caller.
-    elif (request.headers.get("X-Ghost-Origin") or "").strip().lower() == ORIGIN_SLACK:
-        if not is_slack_request_id(request_id):
-            request_id = SLACK_REQUEST_PREFIX + (
-                str(request_id or "").strip() or uuid.uuid4().hex[:8])
+    # Who is asking (multi-user surfaces only). Anything but "member" is the
+    # owner — the API key is the owner's credential; a client that serves
+    # other people MUST send "member" per request. No request-id prefix
+    # means anything to the agent.
+    # Set in the request's own context (no reset needed: each request runs in
+    # its own task context). The agent reads it via `requester_is_member()`;
+    # the streamed final re-enters it inside its generator.
+    requester_role_context.set(parse_requester_role(request.headers.get("X-Ghost-Requester")))
 
     # §4JP: the client's own timeout, when it says so (the web interface
     # sends GHOST_CHAT_TIMEOUT). The turn loop reserves the last minutes of
@@ -1124,6 +1126,8 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
     # can't double the history. Absent `session_id`, behaviour is exactly as
     # before (fully client-carried), so every existing client keeps working.
     _session_id = body.get("session_id")
+    if parse_requester_role(request.headers.get("X-Ghost-Requester")) == "member":
+        _session_id = None     # a stored session is the owner's history (§4KJ R9)
     _sess_store = None
     _new_msgs = []
     if _session_id:
@@ -2532,7 +2536,8 @@ async def feedback(request: Request):
         return JSONResponse(result)
     # Status from the machine-readable code, not the error prose — rewording
     # a message must never reroute a client's retry logic.
-    status = {"bad_request": 400, "not_found": 404}.get(
+    status = {"bad_request": 400, "not_found": 404,
+              "member_turn": 403}.get(          # final: a client must not retry it (§4KJ R10)
         str(result.get("code") or ""), 503)
     return JSONResponse(result, status_code=status)
 
@@ -2998,7 +3003,19 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
     # Reject path traversal AND the absent-filename case explicitly.
     if not file.filename or ".." in file.filename or file.filename.startswith("/"):
         raise HTTPException(status_code=400, detail="Invalid filename")
-    file_path = (sandbox_dir / file.filename).resolve()
+    _hdrs = getattr(request, "headers", None) or {}
+    _member_upload = parse_requester_role(_hdrs.get("X-Ghost-Requester")) == "member"
+    if _member_upload:
+        # A member's attachment never overwrites the owner's files (R6, CRIT):
+        # a fresh name at the sandbox ROOT, registered as a member file.
+        import uuid as _uuid
+        _root_dir = getattr(agent.context, "sandbox_dir", None)
+        sandbox_dir = Path(_root_dir) if _root_dir is not None else sandbox_dir
+        _safe = re.sub(r"[^\w.\-]", "_", Path(file.filename).name)[:120] or "upload"
+        stored_name = f"mu_{_uuid.uuid4().hex[:8]}_{_safe}"
+    else:
+        stored_name = file.filename
+    file_path = (sandbox_dir / stored_name).resolve()
     # ⚠ Containment is checked against the TRUE sandbox root, not against
     # `sandbox_dir`. `sandbox_dir` is DERIVED from the client-supplied
     # `?project_id=`, so checking the file against it validated an
@@ -3020,12 +3037,30 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         with open(file_path, "wb") as buffer:
             buffer.write(body)
     await asyncio.to_thread(_write_file)
-    return {"status": "success", "filename": file.filename}
+    if _member_upload:
+        try:
+            agent._note_member_files({stored_name})
+        except Exception:  # noqa: BLE001
+            pass
+    return {"status": "success", "filename": stored_name}
 
 @router.get("/api/download/{filename:path}", dependencies=[Security(verify_api_key)])
 async def download_file(request: Request, filename: str):
     agent = get_agent(request)
     sandbox_dir = agent.context.sandbox_dir
+    # A download on behalf of a MEMBER (the client says so, as on chat) may
+    # fetch only images generated on members' turns (§4KJ R4).
+    _hdrs = getattr(request, "headers", None) or {}
+    if parse_requester_role(_hdrs.get("X-Ghost-Requester")) == "member":
+        _mf = getattr(agent, "_member_generated_files", None)
+        if not isinstance(_mf, (set, dict)) and callable(getattr(agent, "_member_file_store", None)):
+            try:
+                _mf = agent._member_file_store()     # load the persisted set after a restart (R8)
+            except Exception:  # noqa: BLE001
+                _mf = None
+        if (not isinstance(_mf, (set, dict)) or "/" in filename or "\\" in filename
+                or filename not in _mf):             # exactly a member file's name (R8)
+            raise HTTPException(status_code=404, detail="File not found")
     # Reject traversal explicitly (parity with /api/upload) then containment-check.
     if ".." in filename or filename.startswith("/"):
         raise HTTPException(status_code=404, detail="File not found")
@@ -3035,7 +3070,8 @@ async def download_file(request: Request, filename: str):
     # often emits a BARE link (`/api/download/plot.png`). If the bare path
     # isn't at the root, retry under the active project's scoped dir so the
     # link still resolves. Containment is re-checked below.
-    if not file_path.exists() and "/" not in filename:
+    if (not file_path.exists() and "/" not in filename
+            and parse_requester_role(_hdrs.get("X-Ghost-Requester")) != "member"):   # never an owner project for a member (R9)
         # Prefer an explicit ?project_id= (race-free) over the process-global,
         # which a concurrent conversation's switch could have moved.
         _qp = getattr(request, "query_params", None)

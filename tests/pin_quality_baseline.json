@@ -98,7 +98,6 @@
     "test_dream_replay_triage.py": 1,
     "test_dream_selfplay_seeds.py": 2,
     "test_dream_trajectory_seeds.py": 2,
-    "test_dual_sampling_profile.py": 4,
     "test_egress_failclosed_4gi.py": 2,
     "test_env_timeout_constants.py": 1,
     "test_escalation_discipline.py": 1,
@@ -199,7 +198,6 @@
     "test_qwen35_adaptations.py": 8,
     "test_registry_guard_4gi.py": 5,
     "test_release_immutability_ops.py": 1,
-    "test_reply_smoothing.py": 3,
     "test_repro_first_nudge.py": 8,
     "test_req50855398_fixes.py": 13,
     "test_research_failure_honesty.py": 2,
@@ -273,5 +271,5 @@
     "test_workspace_cleanup_deletion_guards.py": 1,
     "test_workspace_tidy.py": 3
   },
-  "total_textual": 1334
+  "total_textual": 1327
 }

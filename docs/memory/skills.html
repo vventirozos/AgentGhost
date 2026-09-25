@@ -257,7 +257,12 @@
 
 </main>
 
-  <h2 id="4kd-slack">Slack never teaches <span class="tag">2026-09-24 &sect;4KD</span></h2>
+  <h2 id="4kd-slack">A member never teaches <span class="tag">2026-09-24 &sect;4KD, de-Slacked in &sect;4KJ</span></h2>
+  <p><strong>Superseded the same evening:</strong> the rule below was first keyed on the <code>slack-</code> request-id
+  prefix. The agent no longer knows any client's name — <code>is_slack_request_id</code>, <code>SLACK_REQUEST_PREFIX</code>,
+  <code>ORIGIN_SLACK</code> and <code>LESSON_ORIGIN_SLACK</code> are gone; the same gates now read
+  <code>utils.logging.requester_is_member()</code> (the <code>X-Ghost-Requester</code> header) and the lesson origin is
+  <code>LESSON_ORIGIN_MEMBER</code>. Read "Slack turn" below as "a member's turn on any client".</p>
   <p>Open-channel Slack mode feeds channel members' prompts into a single-tenant playbook: on 2026-09-23, 4 of 257
   lessons had a stranger's Slack message as their <code>task</code>. The rule is the probe rule's shape: the bot mints
   its request ids with the <code>slack-</code> prefix (the same id its feedback reactions correlate on, so nothing
@@ -270,6 +275,66 @@
   <code>SkillMemory</code>, refuses EVERY playbook mutation when the derived lesson origin is <code>slack</code>
   (<code>playbook_writes_blocked()</code> as the first statement of all eleven mutators — an enumeration pin walks the
   class and fails when a new mutator lacks it). Per-requester scoping of autobio/recall for Slack — the tenant-bleed
-  root cause — is a separate design, not done here.</p>
+  root cause — is a separate design; its minimum cut landed in §4KJ (below).</p>
+
+  <h2 id="4kj-member">The idle phases, and the member rule <span class="tag">2026-09-24 &sect;4KJ</span></h2>
+  <p><strong>The idle-phase gap.</strong> §4KD's gates read the request-id contextvar, which the idle phases
+  (reflection, dream seeds, macro mining, distillation, post-mortem) run WITHOUT — under <code>"SYSTEM"</code>, which
+  <code>_derive_lesson_origin</code> calls <code>auto</code>. Nine hours after the request-time gate had blocked a channel
+  member's turn, the reflection cycle acquired a playbook skill from that same trajectory ("create schematics for…").
+  The trajectory carries its own request id as <code>session_id</code>, so <code>trajectory_may_teach(traj)</code>
+  (Slack session ids never teach; task KINDS stay with <code>core.admissibility</code>) and
+  <code>iter_teachable(trajectories)</code> now sit in every trajectory-reading lesson producer:
+  <code>Reflector._is_reflectable</code>, <code>dream.trajectory_dream_fragments</code>,
+  <code>Dreamer._propose_macros_sync</code>, and the post-mortem and skills-auto sources in
+  <code>GhostAgent._biological_tick</code>. An enumeration pin (<code>tests/test_trajectory_may_teach.py</code>) walks every
+  <code>.iter_trajectories()</code> consumer under <code>src/</code>: each is either a classified teacher that names the
+  filter or on an explicit non-teaching allowlist (router/PRM training, bench, health, fingerprints); a new consumer fails
+  the pin until classified.</p>
+  <p><strong>The member rule.</strong> The Slack bot now sends <code>X-Ghost-Requester: owner | member</code>
+  (<code>requester_role_header(requester, OWNER_ID)</code> — fail-closed: an unresolved owner makes everyone a member);
+  the API parses it (<code>parse_requester_role</code>) into <code>handle_chat(…, requester_role=)</code>, which sets
+  <code>requester_role_context</code> for the request. <code>utils.logging.requester_is_member()</code> is the one predicate:
+  role <code>member</code> → yes; <code>owner</code> → no; unknown → yes iff the request id is a <code>slack-</code> id. Three
+  consumers in the agent read it (the USER PROFILE block becomes <code>(not available for this channel)</code>, the
+  autobiographical handle is withheld, both <code>smart_memory</code> writers skip), and two here:
+  <code>turn_may_teach</code> and the writer backstop <code>playbook_writes_blocked</code> are false for a member on ANY
+  client; and on the tool side (R3 review) <code>update_profile</code>, <code>unified_forget</code> and
+  the location readers refuse or withhold for a member. Pins: <code>tests/test_requester_role.py</code>. The
+  enumeration pin over trajectory readers now sees any call shape — a kwargs call, a bare-attribute alias, a
+  <code>getattr</code> — matches wrappers by exact name, and exempts a training read only when its receiver is bound
+  to a <code>…Trainer(...)</code> in the same function.</p>
+  <p><strong>De-Slacked (the same evening).</strong> The operator: a client "might not exist tomorrow", so the agent
+  keeps no code for it. The one multi-user signal is the role header; <strong>no header means the owner</strong>
+  (the API key is the owner's credential), and a client that serves other people must send <code>member</code> per
+  request — the Slack bot's request code is the template. The idle-phase filter (<code>trajectory_may_teach</code>)
+  reads <code>extra["requester_role"]</code>, which <code>_record_turn_trajectory</code> stamps on every trajectory,
+  not the id's spelling. <strong>The member data wall.</strong> Live that evening two channel members asked "what is
+  my name?" and were told the owner's: the profile block was withheld, but <code>introspect overview</code> (the
+  self-model names the owner), the memory-bus recall and a silent placeholder let the model assume the asker was
+  him. Now: the placeholder <em>states the boundary</em> ("this request comes from a channel MEMBER… any profile,
+  memory, autobiography or project context you hold describes the OWNER and must never be presented as this
+  user's"), on both prompt paths. <strong>A member's turn carries none of the owner's context</strong>: no memory-bus
+  recall, no playbook (execution AND planner), no scratchpad, no recurring-uncertainty block, no auto-learned skills,
+  no workspace/activity prefix, no selfhood block, and no project (the turn runs with no project bound; the owner's
+  binding is untouched). <strong>A member may use only an ALLOWLIST of tools</strong>
+  (<code>core/agent._MEMBER_ALLOWED_TOOLS</code>: web_search, darkweb_search, image_generation, vision_analysis,
+  abort_attempt, replan) — everything else in the dispatch table is refused (one REJECTED row, reason
+  <code>owner_data_blocked</code>). An allowlist because the first blocklist of 17 names left file_system, execute,
+  browser, manage_projects, workspace, jobs, manage_services, create_skill, delegate… open: a member could
+  <code>cat</code> the owner's project maps or delete a project (R4 review). <code>vision_analysis</code> may target
+  only an http(s) URL or an image generated for a member, and <code>image_generation</code> may reference only such
+  images (<code>_member_tool_refusal</code>). The deterministic "dream mode" / "self play" shortcut is off for members.
+  <strong>Nothing a member does is written into the owner's stores</strong>: no smart memory, no episodic memory, no
+  context-prune archive, no autobiography capture, no playbook or post-mortem (streamed path included), no promotion
+  footer. <strong>Files:</strong> a member's reply may link only images generated for a member (every other
+  <code>/api/download/…</code> link is replaced by "[file not available]" — a client downloads every link in a reply
+  with the owner's key), and <code>/api/download</code> refuses a member-role request for anything else. The
+  conversation identity includes the role, so a member never inherits the owner's queued corrections. Belts inside
+  introspect/recall/remember/knowledge_base/update_profile/unified_forget remain for any caller that bypasses
+  dispatch. <strong>Data cleanup:</strong> <code>scripts/member_data_cleanup_4kj.py</code> stamped the 20 legacy
+  <code>slack-</code> trajectories (recorded before the role field) as member and retracted the three playbook lessons
+  (and their vector copies) whose task was a member's request. <strong>Known limit:</strong> a member's own
+  attachments land in the shared sandbox and cannot be read back on a member turn (only their generated images can).</p>
 </body>
 </html>

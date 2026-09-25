@@ -110,14 +110,21 @@ def test_coding_tool_turn_sub_classifies_balanced_for_plain_code():
 # ---------------------------------------------------------------------------
 
 def test_agent_call_site_passes_is_tool_turn():
+    """AST: the assignment to `is_tool_turn` at the sampling call site ORs
+    the conversational classification with the thread's tool activity
+    (`_history_shows_tool_activity(messages)`), and the call forwards it."""
+    import ast
     from pathlib import Path
-    src = (
-        Path(__file__).resolve().parents[1]
-        / "src/ghost_agent/core/agent.py"
-    ).read_text()
-    assert "is_tool_turn = not turn_is_conversational" in src, (
-        "agent.py must derive is_tool_turn from turn_is_conversational"
-    )
-    assert "get_sampling_params(\n                        is_tool_turn" in src or (
-        "is_tool_turn," in src and "is_coding=has_coding_intent" in src
-    ), "call site must forward is_tool_turn + is_coding to get_sampling_params"
+    src = (Path(__file__).resolve().parents[1] / "src/ghost_agent/core/agent.py").read_text()
+    tree = ast.parse(src)
+    assigns = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
+               and any(isinstance(t, ast.Name) and t.id == "is_tool_turn" for t in n.targets)]
+    assert assigns, "no is_tool_turn assignment"
+    good = [n for n in assigns if isinstance(n.value, ast.BoolOp) and isinstance(n.value.op, ast.Or)
+            and any(isinstance(v, ast.Call) and isinstance(v.func, ast.Name)
+                    and v.func.id == "_history_shows_tool_activity" for v in n.value.values)]
+    assert good, "is_tool_turn must OR in _history_shows_tool_activity(messages)"
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+             and n.func.id == "get_sampling_params"]
+    assert calls and all(any(isinstance(a, ast.Name) and a.id == "is_tool_turn" for a in c.args)
+                         and any(k.arg == "is_coding" for k in c.keywords) for c in calls)

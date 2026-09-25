@@ -92,3 +92,23 @@ async def test_without_a_repair_the_latch_still_drops_a_late_tool_call(monkeypat
     body = {"messages": [{"role": "user", "content": "start task 1"}]}
     await agent.handle_chat(body, FakeBgTasks())
     ex.assert_not_awaited()
+
+
+
+@pytest.mark.parametrize("pinned", ["1", "0"])
+async def test_after_the_repair_ran_the_latch_turn_is_told_it_is_final(monkeypatch, pinned):
+    """R4 review: once the repair's tool ran, the one-task latch re-forced the
+    final — but AFTER the schema-side decision of the same iteration, so that
+    turn got the full tool header with no final directive while every call it
+    made was dropped. The schema decision now honours the latch."""
+    monkeypatch.setenv("GHOST_PIN_TOOL_SCHEMAS", pinned)
+    agent, ex = _agent(monkeypatch, write_first=True)
+    body = {"messages": [{"role": "user", "content": "start task 1"}]}
+    await agent.handle_chat(body, FakeBgTasks())
+    ex.assert_awaited_once()
+    calls = agent.context.llm_client.chat_completion.call_args_list
+    assert len(calls) >= 4
+    after_repair = calls[3]                      # the turn after the repair's execute ran
+    payload = after_repair.args[0] if after_repair.args and isinstance(after_repair.args[0], dict) else after_repair.kwargs
+    text = "\n".join(str(m.get("content") or "") for m in payload.get("messages", []) if isinstance(m, dict))
+    assert "DO NOT emit any" in text or "DO NOT USE TOOLS" in text, text[-600:]

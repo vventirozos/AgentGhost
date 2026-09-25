@@ -2845,9 +2845,10 @@ async def lifespan(app):
                 # blocking torch on today's 1,482 turns (and the trajectory
                 # cap allows far more). The other two retrain sites already
                 # use to_thread; this one did not.
+                from .memory.skills import iter_teachable as _iter_teachable_boot
                 boot_clf, boot_report = await asyncio.to_thread(
                     bootstrap_router,
-                    traj_collector.iter_trajectories(),
+                    _iter_teachable_boot(traj_collector.iter_trajectories()),   # member turns never train the router (§4KJ R7)
                     save_path=router_ckpt_path,
                     # §4AA: gate on the operating point THIS process will
                     # deploy — the flag the dispatcher below is built with,

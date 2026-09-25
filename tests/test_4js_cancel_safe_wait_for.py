@@ -339,14 +339,24 @@ async def test_the_verifier_repair_fires_on_the_planning_arm(monkeypatch):
 
 
 def test_the_planners_done_signal_is_a_forced_final_not_a_stop():
-    """AST: the `if` on the DONE plan sets `force_final_response = True`
-    and never `force_stop`."""
+    """AST: the `if` on the DONE plan asks the shared converge rule
+    (`_latch_forces_final(_plan_signals_done, _repair_reentry_active)` —
+    2026-09-24, so a running verifier repair keeps its tools), sets
+    `force_final_response = True` and never `force_stop`."""
     from ghost_agent.core import agent as ag
     tree = ast.parse(open(ag.__file__, encoding="utf-8").read())
     sites = [n for n in ast.walk(tree) if isinstance(n, ast.If)
-             and isinstance(n.test, ast.Name) and n.test.id == "_plan_signals_done"]
+             and isinstance(n.test, ast.Call)
+             and isinstance(n.test.func, ast.Name) and n.test.func.id == "_latch_forces_final"
+             and n.test.args and isinstance(n.test.args[0], ast.Name)
+             and n.test.args[0].id == "_plan_signals_done"]
     assert len(sites) == 1
+    assert isinstance(sites[0].test.args[1], ast.Name) and sites[0].test.args[1].id == "_repair_reentry_active"
     assigned = {(t.id, getattr(a.value, "value", None)) for a in ast.walk(sites[0])
                 if isinstance(a, ast.Assign) for t in a.targets if isinstance(t, ast.Name)}
     assert ("force_final_response", True) in assigned
     assert not any(name == "force_stop" for name, _ in assigned)
+    # and no bare `if _plan_signals_done:` bypasses the rule
+    bare = [n for n in ast.walk(tree) if isinstance(n, ast.If)
+            and isinstance(n.test, ast.Name) and n.test.id == "_plan_signals_done"]
+    assert bare == []

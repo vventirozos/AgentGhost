@@ -259,3 +259,17 @@ def test_the_helper_never_raises():
         calibration_tracker=types.SimpleNamespace(
             load_params=lambda: (_ for _ in ()).throw(RuntimeError("boom"))))
     assert a._label_request_note(_reading(0.1), None) == ""
+
+
+
+def test_a_members_turn_never_spends_the_owners_thumb_ask(_fitted):
+    """§4KJ R8: the one daily ask for a human label is the OWNER's; a
+    channel member's low-scored turn must not consume it. Control: the same
+    reading on the owner's turn is asked about."""
+    from ghost_agent.utils.logging import requester_role_context
+    tok = requester_role_context.set("member")     # FIRST: an owner ask would start the rate limit
+    try:
+        assert _agent(_fitted)._label_request_note(_reading(0.01), None) == ""
+    finally:
+        requester_role_context.reset(tok)
+    assert _agent(_fitted)._label_request_note(_reading(0.01), None)

@@ -65,8 +65,12 @@ def _delivery_channels(context) -> list:
     try:
         consumers_path = (Path(str(context.memory_dir)).parent
                           / "notify_consumers.json")
-        if load_consumer_offset(consumers_path, "slack") is not None:
-            channels.append("Slack DM (bot poller, ≤30s)")
+        import json as _json
+        _names = sorted((_json.loads(consumers_path.read_text(encoding="utf-8")) or {}).keys()) \
+            if consumers_path.exists() else []
+        for _n in _names:
+            if load_consumer_offset(consumers_path, _n) is not None:
+                channels.append(f"the operator's '{_n}' client (poller, ≤30s)")
     except Exception:  # noqa: BLE001
         pass
     channels.append("next-turn digest")

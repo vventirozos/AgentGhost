@@ -52,13 +52,36 @@ ORIGIN_PROBE = "probe"
 #: open-channel mode feeds strangers' prompts into a single-tenant playbook
 #: (4 of 257 lessons on 2026-09-23 had a stranger's Slack message as their
 #: task). One predicate, read by every playbook writer.
-SLACK_REQUEST_PREFIX = "slack-"
-ORIGIN_SLACK = "slack"
 
 
-def is_slack_request_id(req_id) -> bool:
+# Who is asking, on a surface that more than one person can use. The API
+# sets it from the `X-Ghost-Requester` header ("owner" | "member") in the
+# request's context; "" everywhere else (CLI, web, bench, idle phases). The
+# agent knows nothing about WHICH client sends it: a client that serves
+# people other than the owner must send "member" per request (the Slack bot
+# is the template); no header means the owner, because the API key is the
+# owner's credential (2026-09-24, the tenant-bleed cut; de-Slacked the same
+# evening — no request-id prefix carries meaning in the agent).
+requester_role_context = contextvars.ContextVar("requester_role", default="")
+REQUESTER_OWNER = "owner"
+REQUESTER_MEMBER = "member"
+
+
+def parse_requester_role(raw) -> str:
+    """Normalise a client's requester header: "owner" | "member" | "" (unknown)."""
     try:
-        return str(req_id or "").startswith(SLACK_REQUEST_PREFIX)
+        v = str(raw or "").strip().lower()
+    except Exception:  # noqa: BLE001
+        return ""
+    return v if v in (REQUESTER_OWNER, REQUESTER_MEMBER) else ""
+
+
+def requester_is_member() -> bool:
+    """True iff the request being served declared itself a MEMBER's — the
+    one multi-user signal. No declaration is the owner (the API key is the
+    owner's credential); the client that serves others must say so."""
+    try:
+        return str(requester_role_context.get() or "").strip().lower() == REQUESTER_MEMBER
     except Exception:  # noqa: BLE001
         return False
 
@@ -956,6 +979,11 @@ def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str =
         # cross-client sync. Absent `origin` emits the pre-08-11 shape, and
         # the probe reports that as UNCLASSIFIED rather than guessing.
         suffix = f" origin={origin}" if origin else ""
+        if suffix and requester_is_member():
+            # §4KJ R10: a member's turn is real traffic but not the owner's —
+            # the liveness denominator must not count it (the owner-only
+            # stores it interprets are gated for members).
+            suffix += " role=member"
         _mirror(req_id, "request started", f"{req_id[:8]} at {ts}{suffix}",
                 "INFO", delta="+0.00s")
         atomic_print(line)

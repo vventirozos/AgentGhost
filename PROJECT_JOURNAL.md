@@ -47952,3 +47952,439 @@ first the operator will ever receive from this mechanism, and it was exercised o
 
 **What remains manual, by the operator's choice:** the update itself (`bin/update-youtube-stack.sh`, then the
 run endpoint to get the RECOVERED notice).
+
+## §4KI — Ornith-1.5 vs Qwen3.6 on the box, at last (2026-09-24, 10:40–11:35) — STOPPED EARLY, verdict Qwen
+
+**Context.** The head-to-head the September sweeps chose on paper and never ran (§4KB). Operator swapped the
+launcher to `start-llama-server.sh.moe.ornith` (Sep 11) and restarted at 10:41. Note the swap carried a config
+delta besides the model: the Ornith launcher lacked `--chat-template-kwargs '{"preserve_thinking":true}'` that
+the Qwen launcher has had since Sep 18 (added to both Ornith launcher files at 11:20 without a restart, so the
+measurements below ran WITHOUT preserved thinking — a confound in Ornith's disfavour for multi-step turns, not
+enough to explain what follows).
+
+**Plan (the cheap fact, as agreed):** 12 real Greek prompts from the log replayed single-turn through the live
+agent (`probe-` ids, out of the learning corpus) against their recorded Qwen replies; the §4GX hard band of
+`if_bench` (25 items × 2, paired per item against the Sep 14 Qwen ledgers); throughput per model era from
+`llama-server.log`. The planner replay was unavailable (no recordings on disk — `GHOST_LLM_RECORD` off).
+
+**What the box said before the plan finished.** Server log, thousands of calls per era: Ornith (Sep 9–18,
+older launcher) prefill median 937 t/s but decode median **206 t/s** and draft acceptance 0.70; Qwen (Sep
+18–24) prefill 787, decode **380 t/s**, acceptance 0.80 (n = 2.8k vs 8.2k decode samples). Greek pair 1:
+Ornith 139 s vs Qwen 204 s, comparable reply, both Greek. Greek pair 2 (a follow-up replayed without its
+context): Ornith **661 s, 41 tool calls** (22 searches, 16 browser), a browser timeout, a no-progress
+loop-breaker, and a final reply that ends "let me do a couple more targeted searches" — narrating intent
+instead of finishing; Qwen's original: 7 searches, 160 s. Then the operator saw a live turn end at 390 s with
+"I ran out of this turn's budget before writing an answer" and called it: overthinking.
+
+**Measured across every turn of each era (agent log; Ornith n is tiny and biased by the replays, stated):**
+
+| | Qwen (Sep 18–24) | Ornith (today) |
+|---|---|---|
+| turns | 624 | 4 |
+| LLM calls per turn | 3.4 | **174** |
+| tool calls per tool-using turn, median / p90 | 2 / 10 | **87 / 87** |
+| reasoning tokens per LLM call, median / p90 | 64 / 259 | 74 / 435 |
+| generation seconds per LLM call, median | 8.4 | 13.8 |
+| turn wall time, median / p90 | 43 s / 174 s | **264 s / 661 s** |
+| budget-exhausted final replies | 7 (1.1%) | 1 (25%) |
+
+**Reading.** Per call, Ornith thinks a little longer and generates slower; per TURN it acts an order of
+magnitude more — dozens of tool calls where Qwen stops at two, and it does not conclude. That is the agentic
+post-training showing as over-action inside a loop tuned on Qwen (tool descriptions, loop-breakers, verifier
+budgets all calibrated to Qwen's stopping behaviour). Whether preserved thinking or a re-tune would close the
+gap is unmeasured; on the box as it is, Qwen finishes turns and Ornith burns them. The operator stopped the
+test at 11:30 — "qwen probably is better for more uses than ornith" — and the data agrees. Verdict for the
+record: **keep Qwen3.6 as MAIN**; Ornith stays a candidate only with a re-tune budget attached.
+
+**Artifacts.** Greek pairs + replies: session scratchpad `greek_ornith.jsonl` (2 of 12 completed); if_bench
+Ornith run did not start. The two Ornith launcher files carry the `preserve_thinking` kwarg now, so a future
+attempt starts from an equal config.
+
+### §4KI addendum — the launchers swapped names (2026-09-24, 11:23–11:35)
+
+While preparing the Qwen switch-back the operator's edits left `~/Data/AI/bin/start-ghost-agent.sh` holding
+the LLAMA-SERVER launcher (Qwen, 5.6 KB) and `start-llama-server.sh` holding the AGENT launcher (23.8 KB), with
+the backups deleted. Both plists point at those names, so the next kickstart of either daemon would have started
+the wrong program (the agent's plist → a second llama-server that cannot bind 8088; the llama plist → a second
+agent). Nothing was lost: the content had swapped, not vanished. Recovery: identified each file by its header
+and exec line, verified the agent script's exec flags against the RUNNING agent's argv (`ps -o args=`) and its
+exported environment (`ps -E`) — the process is the reference copy of a launcher when the file is in doubt —
+then swapped the names back with timestamped `.bak-20260924-1126-*` copies. `start-llama-server.sh` is now the
+Qwen launcher (array form, template file + `preserve_thinking`, quoted, header corrected; `.moe.qwen` is its
+twin, `.moe.ornith` the Ornith variant). No daemon was restarted: Ornith is still being served until the
+operator kickstarts `com.local.llama-server`, and the agent still runs from the 10:49 launch.
+
+Two deltas between the restored agent script and the running process, left for the operator: the file now
+exports `GHOST_LLM_RECORD=1` (process: `0`) and its exec line no longer carries `--metacog-cpu-high 101`.
+
+## §4KJ — The last eight requests: vision thinking cap, repair under a DONE plan, two refutes that were not contradictions, blind regeneration, the member rule (2026-09-24, 18:20–) — R0 scope, written first
+
+**Source.** Operator: "read the last 5-6 requests, search and report any defects" → then "fix all defects, usual
+verification protocol", with the tenant problem first excluded, then re-included as the minimum cut ("omit the USER
+PROFILE block and the autobiographical handle, and gate smart-memory and playbook writes, when the requester is not the
+owner"). The eight user-origin requests 16:36–18:09: two web turns (clean) and a six-turn Slack image thread from a
+non-owner channel member.
+
+**Property under review.** A live turn's instruments tell the truth about what happened: a caption comes back when the
+node is healthy; a repair round can run the tool its directive demands; a refute names a contradiction, not an inability
+or a term the sources contain; an image reply is not CONFIRMED by a judge that never saw pixels; a second image is not
+generated blind; a channel member's turn carries none of the owner's profile, autobiography or memory; a judged text is
+the delivered text.
+
+**Threat model.** Trusted: the tool results the agent's own tools return, llama-server's timing lines, the sandbox
+files. Untrusted: the judge's issue prose (it has lied plausibly before — §4GK, §4IJ), the model's self-narration ("I
+navigated to it in the browser"), a Slack sender's identity beyond what the bot resolves.
+
+**Out of scope.** Per-requester scoping of recall/"lately"/playbook HYDRATION for Slack (only writes are gated here);
+mining Slack turns as self-play seeds or PRM/router training rows (`NON_TEACHING_ALLOWLIST` in the enumeration pin names
+them); an HTML-aware element count for the present-term guard (the count is a floor); the image EDIT path's second call.
+
+**Defects (from the log, each confirmed at source before fixing).**
+1. `tools/vision.py`: no-think only on `verify_ui`; 5 of 6 `describe_picture` calls returned EMPTY — llama-server:
+   ~410-token prompts, exactly 4096 generated, 44 s each; the verifier's no-think visual call: 3.4 s. The error said
+   "retry once" → each failure bought a second. FIX: `_VISION_NO_THINK` on every action; `finish_reason == "length"`
+   + empty content → `vision_thinking_cap`, "do NOT retry"; contention keeps its one retry.
+2. `core/agent.py` planner-DONE branch re-armed the forced final during a verifier repair re-entry (the §4KA latch fix
+   one path over); the live case (slack-23a1fa85) took the `Focus: none` / `required_tool=none` path, which the first
+   cut missed — the e2e pin caught it. FIX: both branches ask `_latch_forces_final(done, _repair_reentry_active)`;
+   `is_final_generation` ignores `required_tool=none` while a repair runs.
+3. Two late refutes reached the requester as "⚠️ Correction": an inability ("vision tool returned empty results, so
+   the agent could not verify") and an absence complaint over a term the file held ("'Six spec cards'" — six
+   `spec-card` divs, read by the FILE-ARTIFACT lens). FIX: `_stand_down_instrument_failure_refute`,
+   `_stand_down_refute_on_present_term` (UNCERTAIN ≤ 0.6, issues kept; never confirm), after §4FZ's stand-down.
+4. Five of six image turns CONFIRMED 0.9–1.0 with no pixel check — "Create an image depicting…" matched no visual
+   word. FIX: `_turn_generated_images` opens the gate; no pixel verdict on an image turn → CONFIRMED capped to
+   UNCERTAIN (`_cap_unseen_image_confirm`).
+5. Three requests in a row generated a second image (~200 s each) without inspecting the first. FIX: dispatch guard
+   `_blind_regeneration_block` (REJECTED until inspected or the user asked for more than one).
+6. Tenant bleed, minimum cut: `X-Ghost-Requester` from the bot → API → `handle_chat(requester_role=)` →
+   `requester_is_member()`; profile placeholder, empty autobiographical handle, both smart-memory writers and the
+   playbook writers gated. Plus the idle-phase gap: reflection acquired a skill from the member's trajectory 9 h after
+   the request-time gate blocked it → `trajectory_may_teach` / `iter_teachable` in every lesson producer.
+7. Minor: "Now I have sufficient data…" survived smoothing (beat vocabulary); the in-loop verdict was recomputed after
+   finalise trimmed the text (judge the `delivery_view`, one gate `smooth_gated`); "Seriously ?" sampled at temp 1.0
+   in an image thread (`_history_shows_tool_activity`); background LLM calls parked through 200 s image renders
+   (`main_slot_idle()` window, `GHOST_BG_DURING_IMAGE_WAIT`).
+
+**Own-code defects found while pinning (R8 count so far: 3).** (a) `_quoted_term_present` accepted "Nine spec
+cards" over six — the bare last-token count saw CSS rules and prose; now an adjacent-phrase FLOOR, honestly named as such.
+(b) A quoted FILE NAME in the issue ('dvda_schematic.html') made the present-term guard refuse the live case against a
+synthetic source; file names/paths name a SOURCE and are skipped. (c) The first cut of fix 2 covered only the DONE
+branch; the live path was `required_tool=none`.
+
+**Pins.** 9 new files (`test_vision_thinking_cap`, `test_planner_done_yields_to_repair`, `test_blind_regeneration_guard`,
+`test_sampling_thread_aware`, `test_bg_during_image_wait`, `test_requester_role`, `test_trajectory_may_teach`,
+`test_verifier_stand_downs_2026_09_24`, `test_judged_text_is_delivered_text`); 5 existing pins of the OLD behaviour
+inverted or re-anchored (`test_vision_verify_ui`, `test_vision_hardening`, `test_reply_smoothing` wiring, `test_4js`
+AST, `test_dual_sampling_profile`); two enumeration pins (every `.iter_trajectories()` consumer classified; both
+smart-memory writers guarded). Touched set: 857 passed.
+
+**Battery (round 72, `.mutation-battery/specs72.py`, 42 mutants + NOOP/KNOWNBAD).** First run VOID: NOOP was KILLED —
+the tree's `interface/` copy was from Aug 26 and the Slack-bot pin failed regardless of the mutant (R6: the instrument
+could not fail differently). Re-synced with `interface`; NOOP SURVIVED, KNOWNBAD KILLED; results below.
+Round 72 result: **42 / 42 KILLED** (V1–V4 vision, A1–A21 agent incl. both smart-memory writers and the three
+planner/final-generation paths, S1–S3 skills, R1 reflection, D1 dream, L1–L4 llm, RS1–RS2 smoothing, LG1–LG2 logging);
+NOOP SURVIVED, KNOWNBAD KILLED. Every mutant ran the full 20-file touched set (`-x`), ~7 s each.
+
+**Round 2 — two fresh-eye reviewers (code lens; pins lens), 2 CRIT + 6 MAJOR + pins.** Every finding was inside
+this session's own fixes (R3 held, again):
+- CRIT `_stand_down_refute_on_present_term` (a) exempted every quoted FILE NAME ("'results.csv' does not exist" stood
+  down — the §4CG class) and (b) took "present somewhere in 600k chars" as evidence for a bare value ('founded 1966',
+  '$24.99'; 7 of the reviewer's 10 grounded refutes downgraded), and (c) did not reach the incident: the production
+  write receipt never echoes content, so "spec card" was not in `_raw_turn_sources`; the six cards were in the
+  FILE-ARTIFACT lens, which runs AFTER the stand-down. FIX: only quoted COUNTED terms qualify; sources = tool outputs +
+  the written files read back off disk (`_written_sources_for_audit`, own 240k budget). The count stays a floor.
+- CRIT `_stand_down_instrument_failure_refute` stood down the AGENT's failure to verify ("did not verify the build; it
+  reported the tests as passing anyway" — 8 of 10 downgraded; the markers missed nonetheless/anyway/although/then).
+  FIX: the inability must be the instrument's — a failed tool row this turn (`_failed_instrument_rows`) or an
+  honest-inability reply — and the marker set grew (plus any digit).
+- MAJOR the schema-side `_is_final_generation_for_schema` still built "DO NOT emit any <tool_call>" next to "actually
+  RUN it" on the repair turn (pins passed only because the scripted model ignores prompts). FIX + the pin now reads the
+  repair turn's prompt and `tool_choice`.
+- MAJOR `_repair_reentry_active` never cleared — dead-code-equivalent when it gated only the latch, live once it parked
+  the planner's converge signals: a model calling tools after its repair was never asked to finish. FIX: cleared once
+  the re-entry's tool batch ran (`_repair_reentry_tools_at`), pinned by a second `execute` under a DONE plan (dropped).
+- MAJOR the new `_BEAT_RE` alternative deleted delivered conclusions ("I have enough evidence to say the leak is in the
+  pump."). FIX: the continuation decides (…to compile/write/build… only).
+- MAJOR the blind-regeneration guard keyed on a vision CALL, not an answered one — today's own cap-hit failure would
+  have unlocked it; `_MULTI_IMAGE_ASK_RE` was Greek-blind and over-matched ("make it more blue", "each", digits).
+  FIX: inspection = a `tool` row with the call's `tool_call_id` carrying a vision RESULT; Greek added; more/each/
+  different/digits/options/series dropped; project-prefixed paths matched by basename.
+- MAJOR the trivial fast path (`_handle_trivial_chat`) has its own profile reader — a member's "hi" carried the owner's
+  address. FIX + the member e2e now runs "hi" / "thanks" / the full loop.
+- MAJOR (latent) the streamed final's `stream_wrapper` runs after `handle_chat`'s finally reset the contextvars: the
+  drain's smart-memory write and late verdict read "SYSTEM" / no role. FIX: the wrapper re-enters `request_id_context`
+  and `requester_role_context` (carried on `StreamState.requester_role`); pinned with a streamed member turn on a WEB id.
+- Pins lens: the enumeration over `.iter_trajectories()` missed five kwargs callers and a bypass (`iter_trajectories(
+  day=None)`) → AST over any call shape, wrapped-or-allowlisted per call, training reads (`trainer.run`) exempt by shape,
+  and a bypass test that plants a new consumer; the smart-memory enumeration missed a double-quoted spelling → AST with
+  a parent walk; two source-text pins (bot header, routes) → AST; two vacuous ones dropped/converted; near-miss negatives
+  for the ask regex; the "3.4 s" and "26.7 s" figures are from the agent log (rotated since) — kept as recorded, not
+  re-derived. Own-code defects this round (R8): 8 in code + 6 in pins → **17 for the session**.
+
+**Battery round 73 (`specs73.py`, the round-2 fixes, R3): 19 / 19 KILLED** after two pin repairs and one deletion —
+A34/A35 (stream contextvars, the StreamState role) SURVIVED the first pass because the streamed pin was vacuous (the
+`stream: true` body never reached the streamed final: a conversational ask skips the planner, so no `required_tool:
+none`; the pin passed in both worlds — the fifth instance of [[verify-cannot-distinguish]] this month); now driven
+through the §4BZ harness AND through `handle_chat` on the planning arm with an action-verb ask, member-on-web-id vs
+owner-on-slack-id. A26b (an any-digit contradiction marker) survived and was proven equivalent (every digit-bearing
+negative already carries a word marker) → deleted. NOOP SURVIVED / KNOWNBAD KILLED on every pass. Session total:
+**61 / 61 mutants killed across rounds 72–73**, 1 equivalent mutant deleted, both instruments proven able to fail.
+
+**Full suite, first pass: 21 failed / 24,725 passed / 67 skipped (9:10).** 14 seen (the tail); all in this session's
+own surface: (a) the API's new `requester_role=` kwarg 500'd every test fake with a fixed `handle_chat` signature
+(api_corner_cases, client_deadline ×5, streaming_partial_error) → the API now SETS `requester_role_context` in the
+request scope and passes nothing; `handle_chat`'s kwarg stays for direct callers and falls back to the context;
+(b) renaming the stream body to `_stream_body` broke three §4O/§4BZ sentinel-ordering pins and a fields-unpack pin →
+the body keeps its name `stream_wrapper`, the contextvar re-entry is the new outer `_stream_in_request_context`, and
+`requester_role = ss.requester_role` is unpacked like every other field; (c) the pin ratchet: 10 of my "AST" pins
+still had a textual use of the source string (a `get_source_segment`, an `in fn_src`) → rewritten to pure AST
+(Dict/Call/Name shape checks), and the baseline re-written (7 fewer text pins, digest committed); (d) two old
+source pins on the sampling call site re-anchored. While fixing (b) a file surgery on `test_requester_role.py` cut
+off the two `handle_chat` streaming pins appended after the function it replaced — A35 SURVIVED again, which is how
+it was noticed (R6 doing its job); restored, A34/A35 KILLED. Own-code defects this round: 4 code + 12 pins.
+
+**Full suite, second pass (after the fixes above, the ONE run for this change set): 24,746 passed / 0 failed /
+67 skipped (8:31).** Deployed 2026-09-24 evening: `launchctl kickstart -k system/com.local.ghost-agent`, listener
+59154 → 48761 in 10 s, `/api/health` ok (`memory_system_loaded`, `biological_watchdog_alive`), one `src.ghost_agent.main`
+process, `system ready` count stable over 60 s (no respawn loop).
+
+**R7 stopping rule.** Mutation: rounds 72 + 73 = 61 mutants, 61 killed (one equivalent mutant deleted rather than
+left standing), NOOP/KNOWNBAD behaved on every pass; enumerations exist and were seen to fire (the trajectory-consumer
+pin surfaced five kwargs callers and a planted bypass; the ratchet caught ten textual pins); full suite green once
+after the last edit; the last review round yielded only pins-lens findings on the previous round's own fixes. Not
+converged in the strict sense — no third fresh-eye round was run after round 2's fixes; the round-2 fixes were
+mutation-tested (round 73) and suite-tested, not re-reviewed. **R8:** 17 (round 1) + 16 (suite pass) = **33 defects
+found inside this session's own fixes**, 4 of them CRIT/MAJOR false-positive classes in the two new verifier guards.
+
+**Open, for the operator.** (1) The Slack bot is NOT running (last heartbeat 17:58; no process, no launchd service
+in the system domain): the `X-Ghost-Requester` header ships when it is next started — until then every `slack-`
+request is a member's by the fail-closed rule, including the owner's DMs. (2) Per-requester scoping of recall /
+"lately" / lesson HYDRATION for Slack is still the separate design. (3) The present-term stand-down's count is a
+floor (six vs twelve, not six vs nine) — an HTML-aware element count would close it. (4) `tools/system.py` weather /
+location reads the owner's profile for a member's "weather?" (pre-existing, noted by the reviewer). (5) The image
+EDIT path pays one forced inspection before a second call in the same request.
+
+**Round 3 — two fresh-eye reviewers on the round-2 fixes (operator: "proceed"). 2 CRIT + 4 MAJOR + 9 pin findings,
+every one inside the previous round's fixes (R3 held a third time).**
+- CRIT present-term guard, again: "mentioned ≥ N times" is not "present N times" — any counted noun the sources are
+  full of met the floor (5 of the reviewer's 10 grounded count disputes stood down: "'3 tests' claimed, 1 passed"
+  over a pytest log; "'three files' claimed, only one written" — the incident's mirror image). FIX: the guard is now
+  exactly the incident — a FILE-COUNT complaint (`_FILE_COUNT_COMPLAINT_RE`) over a counted NON-file term — plus a
+  trailing word boundary ("card"/"cards", never "cardigan"), and the source pack is built only once a REFUTED exists.
+- CRIT instrument-failure guard, again: the precondition was a turn-level "some tool failed" bit (an unrelated grep
+  exiting 1 stood down "the agent never ran the health check": 9 of 10), and `_honest_inability` accepted "the tests
+  failed at first but I fixed them". FIX: the VISION instrument only — every issue names vision/the image, and a
+  `vision_analysis` row failed this turn (banner-prefixed heads included); the honest-reply leg is gone; the marker
+  set drops claim/state/then/still (they made "the claim about the image could not be verified" a contradiction).
+- MAJOR the repair-flag clear ran AFTER the schema-side final decision in the same iteration (tools on schemas,
+  calls dropped, for one turn) and counted synthetic rows (a REJECTED block "ran its tools"). FIX: cleared before the
+  schema decision, counting REAL rows (`_real_tool_rows`); the duplicated dataclass field removed.
+- MAJOR `_BEAT_RE`: complete/proceed/make/prepare are answer verbs as often as beat verbs ("…to complete your order
+  — it ships Tuesday." deleted). FIX: the sentence must END at the verb phrase (≤ 6 plain words, no clause after).
+- MAJOR a member could WRITE and DELETE the owner's profile and memory through `update_profile` / `unified_forget`
+  (no requester gate anywhere under `tools/`), and the weather / location readers served the owner's location. FIX:
+  `tools/memory._member_block` (REJECTED, `profile_channel_blocked`) on both tools; the location readers withhold.
+- MAJOR the narrowed ask regex blocked 11 of 12 legitimate multi-image asks ("a couple of options", "3 different
+  logos", "one for each season", "and also a cat"; Greek plurals/compounds). FIX: counts / each / different / more
+  are allowed when BOUND to an image noun; plurals and compounds in Greek; "and also", "a second one", "one more".
+- Pins lens: all three AST pins had bypasses (a stray dict beside `headers=AUTH_HEADERS`; a `.set` under `if False`
+  or after the call; an inverted-polarity guard) → the headers VALUE is resolved, the `.set` must be a direct body
+  statement before the call, the guard must be `not requester_is_member()`; the trajectory scanner missed `getattr`
+  and bare-attribute aliases, matched wrappers by substring, and exempted training by a variable NAME → any shape,
+  exact names, exemption by `…Trainer(...)` construction, five planted bypasses pinned; `_quoted_term_present` had no
+  trailing boundary ("cardigan" ×6 counted six cards) → pinned; the converge test's OR hid that the answer-now retry
+  never fires on that path → pinned as the world that exists (the honest dropped-call note, 9 model calls); the
+  `tool_choice` clause was vacuous with native tools off → parametrised; two "kept" smoothing rows were identity →
+  given delivery paragraphs; the production write-receipt text now in the fixture. Own-code defects this round:
+  6 code + 9 pins → **48 for the session**.
+
+**Battery round 74 (`specs74.py`, the round-3 fixes): 15 / 15 KILLED** after four pin repairs on first-pass
+survivors: the PHRASE count's trailing boundary needed a multi-token case ("spec card" + "spec cardigan"×5 — the
+per-token boundary alone hid it); the vision-NAME check needed an `execute` row echoing "Vision API Error" text; the
+synthetic-row clear needed a repair turn whose only call is REJECTED (a member's `learn_skill`; an unknown tool would
+have rebuilt the tool table and replaced the mocks — a harness trap, noted); the REFUTED-only source pack needed a spy
+on `_written_sources_for_audit` under a CONFIRMED verdict. NOOP SURVIVED / KNOWNBAD KILLED. Session total:
+**76 / 76 mutants killed across rounds 72–74**, 1 equivalent deleted.
+
+**Round 4 — the member data wall and the de-Slacking (2026-09-24, 20:50–).** Live, with the bot back up: two channel
+members asked "what is my name?" and were told the owner's. Both turns ran with the profile withheld (prompt
+20,342 chars vs the owner's 21,128) — the name came from `introspect action=overview` (the self-model names the
+owner), from the memory-bus recall, and from a placeholder that said nothing about WHO is asking. Operator: "members
+except the owner shouldn't have access to my data", then "I'm not sure I want code FOR Slack in the agent" → agreed.
+- **The wall.** The placeholder states the boundary (a member, not the owner; everything held describes the owner and
+  is never presented as this user's) on both prompt paths; a member's turn hydrates no memory-bus recall and no
+  playbook; every tool that reads or writes the owner's stores is refused at dispatch (`_MEMBER_BLOCKED_TOOLS`, by
+  REGISTERED name — the document/forget/remember functions ride `knowledge_base` actions — reason
+  `owner_data_blocked`), with belts inside introspect/recall/remember/knowledge_base/update_profile/unified_forget.
+  Working tools stay. Left for the operator: projects/workspace files as owner data (the sandbox is shared today).
+- **De-Slacked.** `is_slack_request_id`, `SLACK_REQUEST_PREFIX`, `ORIGIN_SLACK`, `LESSON_ORIGIN_SLACK` and the API's
+  origin minting are gone. `requester_is_member()` is the one multi-user signal: no header = the owner (the API key
+  is the owner's credential); a client that serves others sends `member` per request (the bot is the template). The
+  idle-phase filter reads `extra["requester_role"]`, stamped on every trajectory by `_record_turn_trajectory`.
+  `turn_may_teach` and `_derive_lesson_origin` read the role. Pins rewritten from the prefix to the role
+  (`test_4kd_…`: a prefix alone is nobody; `test_no_client_name_keys_a_rule_in_the_agent`), the wall pinned end to end
+  (ten owner-data tools refused for a member, two reached by the owner, a working tool untouched; the belts touch no
+  store; no hydration and no playbook for a member; the role on the trajectory).
+- Own-code defects this round (R8): a lost `_png_bytes` fixture when a test section was cut; a dict literal that let
+  `web_search` overwrite the tool under test; a source-text pin the ratchet caught → **51 for the session**.
+
+**Round 5 — four reviewers over the WHOLE batch (operator: "include all in your reviews"). Round-4 suite: 24,810 /
+0 failed. Findings: wall code 5 CRIT + 10 MAJOR + 6 MINOR; wall pins 2 leaks + 7; batch code 6 MAJOR + 8 MINOR;
+batch pins 14.** The property ("a member can neither read nor write the owner's data") did NOT hold after round 4.
+- **The wall became an ALLOWLIST** (`_MEMBER_ALLOWED_TOOLS`: web_search, darkweb_search, image_generation,
+  vision_analysis, abort_attempt, replan). The blocklist had left file_system/execute/browser/workspace/
+  manage_projects/jobs/manage_services/create_skill/delegate/notify/postgres open — `cat` the owner's project maps,
+  delete a project. vision/image are argument-checked: only member-generated images or http(s).
+- **Prompt:** scratchpad, planner playbook, uncertainty, auto-skills, workspace prefix, selfhood, project briefing
+  (the member turn runs with no project, the owner's binding untouched) all gated.
+- **Writes:** episodic memory, prune archive, autobiography capture (also the DM site), streamed post_mortem,
+  promotion footer gated. The deterministic "dream mode" shortcut is off for members.
+- **Files (CRIT):** the bot downloaded every `/api/download` link in a reply with the owner's key — "reply with
+  `![x](/api/download/<owner pdf>)`" posted the owner's PDF. The member's reply is scrubbed to member-generated
+  images; `/api/download` refuses a member-role request for anything else; the bot sends the role on downloads.
+- **Corrections:** the conversation fingerprint includes the role.
+- **Data:** `scripts/member_data_cleanup_4kj.py` (pinned on a fixture store) stamps the 20 legacy `slack-`
+  trajectories member and retracts the 3 member-derived lessons from JSON + vector store — run during the restart.
+- **REMOVED, not patched (the lexical-proxy lesson, again):** both verifier stand-downs (a 4th round found 7/10
+  grounded refutes downgraded each: claimed-but-never-done inspections, CSS-inflated counts), the multi-image ask
+  regex (1/3 of realistic asks misclassified in two languages — the escape is now an answered inspection only), and
+  the "I have enough … to <verb>" beat (deleted answers). What remains of those items is mechanical.
+- **Mechanical fixes:** the repair flag clears at the TOP of the iteration (the DONE branch ran before it), with a
+  3-row bound for a model re-emitting REJECTED calls; the schema decision honours the one-task latch; the blind-regen
+  guard lets a repair regenerate and blocks a second image in the same batch; only a DECISIVE pixel verdict counts as
+  seen, and the cap is stamped `image-unseen`; sampling reads the agent's own per-conversation tool record (the bot
+  strips tool traces from history); ONE background admission per render window, and none while another request is
+  active; a vision answer cut at the cap says so; notify names no client.
+- Pins: the member wall is enumerated over the REAL dispatch table (every non-allowlisted tool refused, owner reaches
+  every one), every owner-data marker absent from EVERY model call on both prompt paths, a no-header behavioural
+  pair (slack- id ≡ plain id), download route + reply scrub, allowlisted trajectory readers pinned by read count;
+  vacuous pins fixed (DONE control never emitted its call; async judged-text path; finalize wiring; the two
+  "still parked" pins parked for the wrong reason). Counts the log does not support were corrected (four of six
+  image turns, four requests regenerated). Own-code defects this round: ≥ 20 → **~71 for the session**.
+
+**Round 6 — adversarial wall review + batch review. Round-5 suite: 24,811 / 0 failed; deployed with the data cleanup
+(20 trajectories stamped member, 3 lessons retracted from JSON + vector store; the first `bootstrap` after `bootout`
+returned "Input/output error", a retry loaded it).**
+- Wall, 4 CRIT: (1) a LEADING SPACE turned a vision URL into a local path (the check stripped, the tool did not) —
+  OCR of any owner PDF; (2) six synonym keys (`image_path`, `source_image`…) and a `https://x/../../` value carried
+  owner photos into `image_generation`; (3) a stale `conversation_key` made every project-scoped path fall back to
+  the owner's bound project — member images written there, owner constraints in the member's verifier, a refute's
+  "next step" filed as an owner task; (4) the bot's upload (owner key, no role) overwrote owner files by name. Plus:
+  owner filenames via the sandbox listings, the autobiography still captured member turns (a pin REQUIRED it), the
+  full tool catalogue advertised the owner's skills, member thumbs relabelled owner calibration/PRM/diary, dream
+  replay unfiltered, owner/member thread history unattributed.
+- FIX (structural, not more string checks): argument-KEY allowlists for the two sandbox-touching member tools (an
+  unknown key is refused; a file value must be EXACTLY a member file's name — no strip, no separator, no `..` — or a
+  well-formed URL); the owner's scope (project + conversation key) is SAVED and RESTORED around a member turn; a
+  member's upload gets `mu_<hex>_<name>` at the root and is a member file; listings withheld; catalogue = allowlist;
+  autobiography, refute follow-ups, feedback labels and replay gated; the bot sends the uploader's role and prefixes
+  other members' EARLIER messages as untrusted context (never the current request).
+- Batch (0 CRIT, 1 MAJOR pins + minors): the 3-row bound's plumbing was only structurally pinned (a behavioural pin
+  now); batch counting and inspection matched RAW tool names (canonical / alias-aware now); a repair could batch
+  several images (batch check first); the web UI's streamed ending never noted the tool conversation; the render
+  window compared renders to requests (now: exactly one active request); the image cap sat inside a `try` (moved out);
+  the newest file on disk was judged instead of the generated image; a planner `required_tool: null` read as "none"
+  on the schema side; the cap error still suggested "ONE retry". Stale docs fixed.
+- Pins: 20+ new (vision/image argument tables incl. whitespace/tab/traversal/synonyms, scope save/restore, upload
+  non-overwrite, catalogue, feedback, listing, bot AST, row-bound behaviour, repair regeneration e2e, alias batch,
+  cap-on-exception, generated-image-judged, TTL). Own-code defects this round: ~25.
+
+**Round 6 deployed** (suite 24,845 / 0 failed; listener 67648 → 15596; bot kickstarted, connected). Live member probes
+(probe origin, nothing teaches): "what is my name?" → "I don't know your name yet"; the leading-space vision attack →
+refused at the gate; an injected `![x](/api/download/<owner pdf>)` → "[file not available]"; "dream mode" → no dream
+ran (the model still SAID "Entering dream mode": the base prompt describes owner-only commands — a false statement,
+not a leak; noted). Owner: "Vasilis".
+
+**Round 7 — adversarial wall + round-6 correctness. 3 CRIT + 3 MAJOR (wall); 3 MAJOR + minors + 6 pin gaps (fixes).**
+- CRIT: a PERCENT-ENCODED `..` in an `https://` reference reached owner photos (image_generation resolves every
+  reference as a sandbox path and percent-decodes it) → for members, references must be exactly a member file's name,
+  never a URL; `%` refused. CRIT ×2: the "while you were away" PROJECT digest and the ACTIVITY digest were prepended to
+  a member's reply and their watermarks consumed → gated.
+- MAJOR: the notify-promise backstop let a member write into the owner's notification feed; `projects/<id>` in a
+  member's message pulled the owner's project constraints; the bot re-uploaded the OWNER's earlier attachments (owner
+  role) during a member's turn → all gated (the bot re-uploads only the requester's own files on a member turn).
+- MINOR→fixed: member turns fed calibration, router/PRM (re)training, the online PRM update and the tool-description
+  fixture miner → `iter_teachable` on every training read; `_record_calibration_safe` gated. Stale route comment.
+- Correctness (second reviewer): the bot's prefix changed a member thread's IDENTITY on turn 2 (their own first message
+  was prefixed as history → the conversation fingerprint moved) → only OTHER people's earlier messages are prefixed;
+  the planner's "AVAILABLE NATIVE TOOLS" list bypassed the member catalogue filter → filtered; image rows matched by
+  NAME missed alias calls (member images scrubbed from their own reply, cap and guard blind) → matched by the image
+  tool's success head; a rejected image call blocked the next in the batch → counted only when queued; the member
+  file set was memory-only and trimmed arbitrarily → persisted (`system/member_files.json`), oldest first; the member
+  file note named tools a member cannot use → names vision_analysis; `required_tool: null` normalised at the source.
+- Pins for all, incl. the six the reviewer found vacuous (uploader identity, server filename, current/own-message
+  prefix, root override with a project bound, scratchpad scope restore). Own-code defects this round: ~17.
+
+**Round 7 deployed** (suite 24,864 / 0 failed; agent listener → 67664; bot restarted). Live member probes as round 6.
+
+**Round 8 — adversarial enumeration OUTSIDE tool dispatch (5 CRIT, 3 MAJOR) + round-7 correctness (0 CRIT, 2 MAJOR
+pins, 5 MINOR).** The round-7 wall held at dispatch; the leaks were whole SUBSYSTEMS a member turn still entered.
+- CRIT: the verifier ran on member turns (its arms resolve images across the sandbox and read the profile; its issues
+  reach the member verbatim) → `_compute_verifier_verdict` returns early. CRIT: "No, that's wrong" from a member
+  relabelled the OWNER's prior turn (the correction cache is keyed by the prior reply's TEXT) → the correction hook is
+  skipped (`_SkipMemberCorrection`). CRIT: the contradiction-log belief history ("the owner's sons …") was injected into
+  a member's prompt → gated. CRIT: System-3 executes LLM-written shell at the sandbox ROOT steered by the member's
+  words → returns `{}`. CRIT: the visual verifier and profile claim check — covered by the verifier gate.
+- MAJOR: hedges went into the owner's uncertainty log (both paths); a planted-file vector through the download route's
+  basename fallback → the download must be EXACTLY a member file's name (no separator); the streamed drain ran after
+  `handle_chat`'s finally restored the owner's scope → members do not stream (string reply).
+- MINOR→fixed: competence context, turn-15/30 scratchpad checkpoints, the daily thumb ask (`_label_request_note`).
+- Round-7 correctness (second reviewer): nothing pinned the bot's `requester=` wiring → the builder now FAILS CLOSED
+  (no requester = not the owner) + an AST pin on both call sites; the router/PRM training wrappers were exempted as
+  "feeds a Trainer" → behavioural pins on `_teachable` / `_iter_teachable_train` + an AST pin that every trainer corpus
+  (incl. `to_thread(bootstrap_router, …)`) sits inside a wrapper; a download after a restart 404'd until the member set
+  was loaded → the route loads the store; an OWNER correction of a MEMBER's reply fed the member trajectory to the
+  online PRM step → `trajectory_may_teach(traj)` gate; a corrupt `member_files.json` was silently overwritten → moved
+  aside to `.json.corrupt` and logged; `required_tool` null normalisation and the `_file_note(member=)` flag pinned.
+  Not fixed: the retrain fingerprint counts member rows (a wasted retrain on an identical teachable set — perf only).
+- Own-code defect: FOUR gates had been inserted ABOVE their function docstrings (System-3, thumb ask, refute
+  follow-ups, episodic write), turning each docstring into a dead string expression → moved below; an AST scan found
+  no others.
+- Battery 79: 20/20 killed, NOOP survived, KNOWNBAD killed. The first run's one survivor (thumb ask) was a pin with no
+  owner control, and the obvious control was itself vacuous (an owner ask first starts the rate limit) → member first,
+  owner second.
+
+**Round 9 — review of round 8 (0 CRIT, 1 MAJOR, 6 MINOR).** Every round-8 gate fired for members and not for the
+owner; a 31-store mocked probe found only these writes.
+- MAJOR: a member's tool outcomes fed the owner's metacog competence profile and runtime budget (`record_outcome`) —
+  failing member searches would lower the owner's web prior and shift confidence on the owner's own turns → gated.
+- MINOR→fixed: member calls were predicted/resolved into the foresight ledger (whose heads reach owner prompts as
+  precedent) → the predict loop stops for members; the foresight boot seed and self-play cluster counts now read
+  through `iter_teachable` (moved from the allowlist to TEACHING_SITES); every A/B reader goes through
+  `summarize_streaming`, which now filters once; a member-role chat carrying `session_id` got the owner's stored
+  session → ignored for members; the member download could fall back to an owner project folder → skipped for members;
+  `tool_update_profile` still had its gate above the docstring; the streamed-path hedge gate (unreachable while members
+  don't stream) had no pin → pinned by flipping the role after `handle_chat` chose to stream. A stale "X-Ghost-Origin:
+  slack" route comment removed.
+- Battery 80: 8/8 killed, NOOP survived, KNOWNBAD killed.
+
+**Round 10 — review of round 9 (0 CRIT, 0 MAJOR, 5 MINOR + 1 feature bug).** All round-9 fixes held (8/8 of the
+reviewer's own mutants killed). Fixed: the liveness denominator counted member turns as the owner's user turns (so
+the now-gated foresight/rrf stores read as silent) → the request-start mirror line carries ` role=member` and
+`_count_user_turns` skips it; latent reads/writes behind OFF switches — the imagination pre-flight (owner error text
+into a member's context), the rubric-shadow ledger, and the journal writer (backstop for its `turn_may_teach` callers)
+→ member gates; a refused member thumb mapped to 503, so the bot retried and warned on every reaction → 403; a
+member's pasted `data:` image was saved but never registered as a member file, so their own vision call was refused
+→ registered. Data: the cleanup script gained a foresight step (rows whose `req_id` is a member trajectory's session
+id; dry run 141 rows). The competence profile holds only per-domain Beta counts, so its member share cannot be
+separated — left as is (members made ~150 tool calls against ~11k observations).
+- Battery 81: 7/7 killed, NOOP survived, KNOWNBAD killed.
+
+**Round 11 — review of round 10 (0 CRIT, 0 MAJOR, 5 MINOR) → CONVERGED.** Fixed: the bot logged every refused member
+thumb as a FAILED WARNING in the launchd .err → 403 logs at INFO (a real failure still warns); pasted `data:` images
+got a random name on EVERY model call (thread history re-sends them), so a member's image thread wrote and registered
+copies until older member files were evicted from the 500-name allowlist → named by content hash, written once; the
+round-10 image test wrote into the shared /tmp/sandbox and never checked placement → its own sandbox, an owner project
+bound, the file asserted at the root; the cleanup script kept 20 ledger rows of a legacy slack- id with no trajectory
+→ step 1's rule applies to ledger ids (unless a trajectory says owner); a non-string/empty `req_id` is handled.
+Battery 82: 7/7 real mutants killed; one equivalent mutant (a clause the new ledger rule made redundant) → the clause
+was deleted. Live dry run: 161 foresight rows.
+
+**Deployed after round 11** (suite 24,901 passed / 0 failed; agent listener 67664 → 11872 with the agent stopped while
+the foresight cleanup applied — 161 rows, backups kept; bot restarted and connected). Live probes (probe origin):
+member "what is my name?" → "I don't know your name"; owner "what is my name? one word." → "Vasilis".
+**Found live, NOT fixed (operator's call):** the owner's bare "what is my name?" made the model call `update_profile`
+with no value to READ the name, and the empty-value path DELETES (`delete root.name` — no such field, so no damage;
+the name memory survived); the member reply offered to "remember it for next time", which a member turn cannot do;
+the bare question skips memory hydration while "… one word." hydrates.

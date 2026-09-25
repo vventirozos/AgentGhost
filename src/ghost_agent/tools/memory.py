@@ -13,6 +13,31 @@ from ..memory.scratchpad import Scratchpad
 from ..memory.temporal import anchor as _anchor_temporal
 from .outcome import ToolOutcome
 
+
+_MEMBER_BLOCK = ("SYSTEM BLOCK: the profile and memory are not available for this channel — "
+                 "nothing was changed. Continue without saving or forgetting.")
+
+
+def _teachable(trajectories):
+    """Member turns never train the owner's router / PRM (§4KJ R7: the member
+    controls the text)."""
+    from ..memory.skills import iter_teachable
+    return iter_teachable(trajectories)
+
+
+def _member_block():
+    """R3 review (2026-09-24): a channel member's "remember that I'm vegan"
+    / "forget X" wrote into and deleted from the OWNER's profile and memory.
+    One predicate (`utils.logging.requester_is_member`), one refusal."""
+    try:
+        from ..utils.logging import requester_is_member
+        if requester_is_member():
+            return ToolOutcome.rejected(_MEMBER_BLOCK, reason_code="owner_data_blocked")
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
 #: Trailing path separators to strip from a model-supplied target. A literal
 #: `"/" + os.sep` is `"//"` on POSIX — `rstrip` takes a CHARACTER SET, so the
 #: duplicate was a no-op tell that the argument was misread as a suffix.
@@ -194,6 +219,9 @@ async def tool_remember(text: str = None, memory_system=None, graph_memory=None,
     dispatched through `publish_fact("insert_fact", ...)` so the tool stays
     ignorant of which subsystems exist; otherwise the legacy direct path
     runs (kept for backward compatibility with existing tests/callers)."""
+    _blocked = _member_block()
+    if _blocked is not None:
+        return _blocked
     # Same contract as tool_unified_forget: 'text' is THIS function's
     # parameter name and is not a name the knowledge_base schema accepts.
     # The dispatcher guards insert_fact before reaching here.
@@ -1360,6 +1388,9 @@ def _graph_edges_on_topic(query: str, edges):
 
 
 async def tool_recall(query: str = None, memory_system=None, graph_memory=None, **kwargs):
+    _blocked = _member_block()
+    if _blocked is not None:
+        return _blocked
     if not query:
         return "SYSTEM ERROR: The 'query' parameter is MANDATORY. You must specify it."
     pretty_log("Memory Recall", query, icon=Icons.MEM_READ)
@@ -1542,6 +1573,9 @@ async def tool_expand_evidence(ref=None, episodic_memory=None,
 
 
 async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memory_system=None, profile_memory=None, graph_memory=None):
+    _blocked = _member_block()
+    if _blocked is not None:
+        return _blocked
     # NOTE: this message names THIS function's parameter and is meant for a
     # DIRECT caller. A model reaching this tool goes through
     # `tool_knowledge_base`, which guards the argument itself and builds its
@@ -2169,6 +2203,9 @@ async def tool_update_profile(category: str = None, key: str = None, value: str 
     """Persist a profile field. Bus-aware path emits an `update_profile`
     event so the bus handles every downstream commit (vector smart-update +
     graph triplet); legacy direct path retained for tests."""
+    _blocked = _member_block()
+    if _blocked is not None:
+        return _blocked
     category = category or kwargs.get("category", "root")
     key = key or kwargs.get("key")
     value = value or kwargs.get("value")
@@ -2528,6 +2565,9 @@ def _kb_unknown_action_error(action: str) -> str:
 
 
 async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memory_system=None, memory_bus=None, **kwargs):
+    _blocked = _member_block()
+    if _blocked is not None:
+        return _blocked
     if not action:
         return _kb_unknown_action_error("")
     # --- ACTION ALIASES ---------------------------------------------------
@@ -3260,7 +3300,7 @@ def _maybe_retrain_prm(context) -> None:
     trainer = PRMTrainer()
     from ..core.admissibility import iter_bench_trajectories
     report = trainer.run(
-        trajectories=traj_collector.iter_trajectories(),
+        trajectories=_teachable(traj_collector.iter_trajectories()),
         save_path=save_path,
         bench_trajectories=iter_bench_trajectories(
             "prm", getattr(context, "args", None)),
@@ -3322,7 +3362,7 @@ def _maybe_retrain_router(context) -> None:
         confidence_threshold=getattr(dispatcher, "confidence_threshold", None))
     from ..core.admissibility import iter_bench_trajectories
     report = trainer.run(
-        trajectories=traj_collector.iter_trajectories(),
+        trajectories=_teachable(traj_collector.iter_trajectories()),
         save_path=save_path,
         bench_trajectories=iter_bench_trajectories(
             "router", getattr(context, "args", None)),

@@ -241,7 +241,7 @@ def test_call_site_routes_tool_turns_to_precise_profile():
     duplicate-call regression back.
     """
     src = inspect.getsource(agent_module)
-    assert "is_tool_turn = not turn_is_conversational" in src
+    assert "is_tool_turn = (not turn_is_conversational" in src
     assert "get_sampling_params(" in src
     assert "is_coding=has_coding_intent and not is_meta_task" in src
 

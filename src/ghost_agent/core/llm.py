@@ -4,6 +4,7 @@ import time
 import logging
 import copy
 import os
+import contextlib
 from contextlib import asynccontextmanager
 from functools import partial
 from typing import List, Dict, Any, Optional
@@ -47,6 +48,13 @@ _STREAM_ERROR_BODY_TIMEOUT = env_positive(
 # Kept in sync with utils/notify.py's `url_needs_tor`, which makes the same
 # call for outbound push targets.
 _LAN_SUFFIXES = (".local", ".lan", ".home", ".internal", ".arpa")
+
+
+def _bg_during_image_wait_enabled() -> bool:
+    """GHOST_BG_DURING_IMAGE_WAIT (default on): may a parked background LLM
+    call run while the foreground request is blocked on the image node?"""
+    return os.getenv("GHOST_BG_DURING_IMAGE_WAIT", "1").strip().lower() not in (
+        "0", "false", "no", "off")
 
 
 def _socks5h(tor_proxy: str) -> str:
@@ -580,6 +588,13 @@ class LLMClient:
         # counters. Plain int (not lock-guarded): all writers live on the
         # one event loop and the readers tolerate one-tick staleness.
         self.foreground_requests = 0
+        # Windows inside an active user request during which the MAIN slot
+        # is provably idle: the foreground is blocked on a NON-LLM node (the
+        # image node's ~200 s render). `_wait_for_foreground_clear` admits a
+        # parked background call while this is > 0 and no LLM call is in
+        # flight (2026-09-24: bg calls sat parked for the whole 200-500 s of
+        # every image turn). Kill switch: GHOST_BG_DURING_IMAGE_WAIT=0.
+        self.main_slot_idle_windows = 0
         # Guards mutations of `foreground_tasks`. Without this the biological
         # watchdog could observe a stale (negative or stuck) value and either
         # spin forever or fire mid-request. Asyncio.Lock is sufficient because
@@ -1443,8 +1458,9 @@ class LLMClient:
         for attempt in range(3):
             try:
                 pretty_log("Image Compute", f"Routing to Image Node ({node['model']})", level="INFO", icon=Icons.IMAGE_GEN)
-                async with self._node_slot(node, wait_timeout=_img_slot_wait_now):
-                    resp = await node["client"].post("/v1/images/generations", json=payload)
+                with self.main_slot_idle():              # neither the wait for the node nor the render holds an LLM slot
+                    async with self._node_slot(node, wait_timeout=_img_slot_wait_now):
+                        resp = await node["client"].post("/v1/images/generations", json=payload)
                 resp.raise_for_status()
                 # Record breaker success/failure like every other node path —
                 # without it the image-gen breaker never trips, so
@@ -2866,6 +2882,20 @@ class LLMClient:
 
         raise Exception("Max retries exceeded")
 
+    @contextlib.contextmanager
+    def main_slot_idle(self):
+        """Mark a window in which the foreground request holds no LLM slot
+        (it is waiting on the image node). Counter, not flag: nested or
+        concurrent windows must not un-mark each other."""
+        self.main_slot_idle_windows = getattr(self, "main_slot_idle_windows", 0) + 1
+        self._idle_window_admits = 1
+        try:
+            yield
+        finally:
+            self.main_slot_idle_windows = max(0, self.main_slot_idle_windows - 1)
+            if self.main_slot_idle_windows == 0:
+                self._idle_window_admits = 0
+
     async def _wait_for_foreground_clear(self):
         """Park a background caller until the foreground is idle.
 
@@ -2889,6 +2919,30 @@ class LLMClient:
                     return
             if not request_active and waited >= 30.0:
                 return
+            # The request is active but blocked on a non-LLM node and no LLM
+            # call is in flight: the main slot is idle, let ONE caller in per
+            # render window. The residual is that one background generation,
+            # which the next foreground call may queue behind.
+            if (request_active
+                    and self.foreground_tasks <= 0
+                    # every active request must be inside a render window —
+                    # the window is process-global, and request B's gap
+                    # between its own tool calls is not idle time (R4 pins
+                    # review: the req-70 starvation pattern)
+                    # exactly ONE active request, and it is inside a render
+                    # (R6: counting windows against requests let request A's
+                    # two renders open request B's gaps)
+                    and self.foreground_requests == 1
+                    and getattr(self, "main_slot_idle_windows", 0) > 0
+                    and _bg_during_image_wait_enabled()):
+                async with self._foreground_lock:
+                    # ONE admission per render window (R4 review: every
+                    # parked caller polled the same flag and all of them
+                    # passed in the same tick — a backlog then kept
+                    # dispatching after the render ended).
+                    if getattr(self, "_idle_window_admits", 0) > 0:
+                        self._idle_window_admits -= 1
+                        return
             # One visibility line per long park: a background call waiting
             # minutes for the slot is normal under load, but the operator
             # watching the stream should be able to SEE it — a silent

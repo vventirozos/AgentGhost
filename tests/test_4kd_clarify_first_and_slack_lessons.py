@@ -26,11 +26,12 @@ from ghost_agent.core.agent import (COSTLY_TOOLS, _clarify_first_block,
                                     turn_may_teach)
 from ghost_agent.memory import skills as skills_mod
 from ghost_agent.memory.skills import SkillMemory
-from ghost_agent.utils.logging import (SLACK_REQUEST_PREFIX, is_slack_request_id,
+from ghost_agent.utils.logging import (requester_role_context,
                                        request_id_context)
 
 REPO = Path(__file__).resolve().parents[1]
 BOT_PATH = REPO / "interface" / "externals" / "slack_bot" / "main.py"
+from tests.test_4kd_image_pipeline_review import _png_bytes   # the seed-line pin's fixture (shared)
 
 
 # ---------------------------------------------------------------------------
@@ -171,24 +172,30 @@ def test_the_costly_record_is_written_for_real_calls_only_and_is_bounded():
 
 
 # ---------------------------------------------------------------------------
-# 3. Slack never teaches
+# 3. A member never teaches (de-Slacked 2026-09-24 evening: the agent knows
+#    "owner" and "member", never a client's name — the role header is the
+#    only multi-user signal, and no request-id prefix carries meaning)
 # ---------------------------------------------------------------------------
 
-def test_the_predicate_and_the_prefix():
-    assert is_slack_request_id("slack-1a2b3c4d") and not is_slack_request_id("1a2b3c4d")
-    assert not is_slack_request_id(None) and not is_slack_request_id("probe-slack-1")
-    assert SLACK_REQUEST_PREFIX == "slack-"
+def _as(role):
+    return requester_role_context.set(role)
 
 
 def test_turn_may_teach_by_population():
     ctx = MagicMock()
     ctx.turn_origin_label = None
     ctx.skill_memory.is_read_only = False
-    tok = request_id_context.set("slack-1a2b3c4d")
+    tok = request_id_context.set("slack-1a2b3c4d"); rt = _as("member")
     try:
         assert turn_may_teach(ctx) is False
-        # …and the population is still USER: Slack is real traffic
+        # …and the population is still USER: a member's turn is real traffic
         assert agent_mod.turn_origin(ctx) == "user"
+    finally:
+        requester_role_context.reset(rt); request_id_context.reset(tok)
+    # the same id with NO role is the owner's: the prefix means nothing
+    tok = request_id_context.set("slack-1a2b3c4d")
+    try:
+        assert turn_may_teach(ctx) is True
     finally:
         request_id_context.reset(tok)
     tok = request_id_context.set("1a2b3c4d")
@@ -208,12 +215,12 @@ def _playbook(tmp_path, lessons):
     return SkillMemory(tmp_path)
 
 
-def test_the_writer_itself_refuses_every_playbook_mutation_for_a_slack_turn(tmp_path):
+def test_the_writer_itself_refuses_every_playbook_mutation_for_a_member_turn(tmp_path):
     """The backstop: a writer nobody enumerated still cannot write. Fails in
     the world where only the call sites are gated."""
     sm = _playbook(tmp_path, [{"trigger": "parse json", "correct_pattern": "use json.loads"}])
     before = (tmp_path / "skills_playbook.json").read_text()
-    tok = request_id_context.set("slack-1a2b3c4d")
+    tok = request_id_context.set("web-1a2b3c4d"); rt = _as("member")
     try:
         assert skills_mod.playbook_writes_blocked() is True
         assert sm.learn_lesson("a stranger's task", "mistake", "solution") is None
@@ -222,9 +229,9 @@ def test_the_writer_itself_refuses_every_playbook_mutation_for_a_slack_turn(tmp_
         assert sm.record_retrieval("parse json") is None
         assert sm.record_helpful_retrieval("parse json") is None
     finally:
-        request_id_context.reset(tok)
+        requester_role_context.reset(rt); request_id_context.reset(tok)
     assert (tmp_path / "skills_playbook.json").read_text() == before
-    # a user turn writes as before
+    # the owner's turn writes as before
     tok = request_id_context.set("1a2b3c4d")
     try:
         assert skills_mod.playbook_writes_blocked() is False
@@ -256,20 +263,25 @@ def test_every_playbook_mutator_carries_the_backstop():
             guarded.append(fn.name)
     assert writers, "no playbook writers found — the enumeration is broken"
     missing = sorted(set(writers) - set(guarded))
-    assert not missing, f"playbook writers without the Slack backstop: {missing}"
+    assert not missing, f"playbook writers without the member backstop: {missing}"
 
 
-def test_the_lesson_origin_derivation_names_slack():
-    tok = request_id_context.set("slack-1a2b3c4d")
+def test_the_lesson_origin_derivation_names_the_member():
+    tok = request_id_context.set("web-1a2b3c4d"); rt = _as("member")
     try:
-        assert skills_mod._derive_lesson_origin() == skills_mod.LESSON_ORIGIN_SLACK
+        assert skills_mod._derive_lesson_origin() == skills_mod.LESSON_ORIGIN_MEMBER
+    finally:
+        requester_role_context.reset(rt); request_id_context.reset(tok)
+    tok = request_id_context.set("slack-1a2b3c4d")          # a prefix alone is nobody
+    try:
+        assert skills_mod._derive_lesson_origin() == skills_mod.LESSON_ORIGIN_USER
     finally:
         request_id_context.reset(tok)
 
 
-def test_the_bot_mints_the_prefix_itself():
-    """AST pin on the bot's request-id minting: the prefix is the bot's, so
-    its feedback correlation keeps the same id (no server-side rewrite)."""
+def test_the_bot_mints_its_own_request_id():
+    """AST pin on the bot's request-id minting: the id is the bot's, for its
+    feedback correlation — it carries no meaning in the agent."""
     tree = ast.parse(BOT_PATH.read_text(encoding="utf-8"))
     mints = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
              and any(getattr(t, "id", "") == "request_id" for t in n.targets)
@@ -278,55 +290,14 @@ def test_the_bot_mints_the_prefix_itself():
     assert mints, "the bot does not mint a slack- prefixed request id"
 
 
-class TestRouteHeaderFallback:
-    """`X-Ghost-Origin: slack` from a client that did not mint the prefix."""
-
-    def _client(self):
-        from fastapi import FastAPI
-        from fastapi.testclient import TestClient
-        from ghost_agent.api import routes as routes_module
-        app = FastAPI()
-        fake = MagicMock()
-        fake.context.args.api_key = None
-        fake.context.args.model = "test-model"
-        fake.handle_chat = AsyncMock(side_effect=RuntimeError("stop"))
-        app.state.agent = fake
-        app.state.args = MagicMock()
-        app.state.args.model = "test-model"
-        app.include_router(routes_module.router)
-        return TestClient(app), fake
-
-    BODY = {"messages": [{"role": "user", "content": "hi"}], "stream": False}
-
-    def _rid_for(self, headers):
-        client, fake = self._client()
-        client.post("/api/chat", json=self.BODY, headers=headers)
-        assert fake.handle_chat.called
-        return fake.handle_chat.call_args.kwargs.get("request_id")
-
-    def test_header_prefixes_a_bare_id(self):
-        assert self._rid_for({"X-Ghost-Origin": "slack", "X-Request-ID": "77"}) == "slack-77"
-
-    def test_a_minted_id_is_not_doubled(self):
-        assert self._rid_for({"X-Ghost-Origin": "slack", "X-Request-ID": "slack-77"}) == "slack-77"
-
-    def test_probe_still_wins_and_a_plain_id_passes(self):
-        assert self._rid_for({"X-Ghost-Origin": "probe", "X-Request-ID": "slack-77"}) == "probe-slack-77"
-        assert self._rid_for({"X-Request-ID": "77"}) == "77"
-
-
-# ---------------------------------------------------------------------------
-# 4. The seed line is information, not a next action
-# ---------------------------------------------------------------------------
-
-def _png_bytes(w, h):
-    def chunk(t, d):
-        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
-    raw = b"".join(b"\x00" + b"\x00\x00\x00" * w for _ in range(h))
-    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
-            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
-
-
+def test_no_client_name_keys_a_rule_in_the_agent():
+    """The agent's src carries no Slack request-id predicate, prefix or
+    origin constant any more: the role header is the only multi-user
+    signal (2026-09-24)."""
+    import ghost_agent.utils.logging as lg
+    for name in ("is_slack_request_id", "SLACK_REQUEST_PREFIX", "ORIGIN_SLACK"):
+        assert not hasattr(lg, name), name
+    assert not hasattr(skills_mod, "LESSON_ORIGIN_SLACK")
 def test_the_seed_line_states_a_record_and_suggests_nothing(tmp_path):
     """Fails in the world where the result ends with 'Reuse seed=N … for
     ANOTHER TAKE' — the ready next action an unintelligible follow-up

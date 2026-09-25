@@ -7,13 +7,29 @@ from pathlib import Path
 from ..utils.logging import Icons, pretty_log
 from .file_system import _get_safe_path, _download_redirect_target, _MAX_DOWNLOAD_REDIRECTS
 
-# Thinking suppression for the verdict-shaped `verify_ui` action. Same
-# failure mode (and same env knob) as the verifier's visual gate: on a
-# thinking vision model the <think> prelude can consume the whole token
-# budget and the JSON verdict never appears. A verdict is a tiny object —
-# it does not need a reasoning prelude. GHOST_VISUAL_NO_THINK=0 restores
-# thinking for BOTH paths.
-_VERIFY_UI_NO_THINK = os.getenv("GHOST_VISUAL_NO_THINK", "1").strip().lower() not in ("0", "false", "no")
+# Thinking suppression for EVERY vision action. The same env knob as the
+# verifier's visual gate: on a thinking vision model the <think> prelude can
+# consume the whole token budget and the content never appears. This used
+# to cover only the verdict-shaped `verify_ui`; `describe_picture` kept
+# thinking and, live on 2026-09-24, five of six captions came back EMPTY —
+# each one a ~410-token prompt that generated exactly `max_tokens` (4096)
+# tokens of reasoning in 44 s (llama-server timing lines), while the
+# verifier's own no-think visual call on the same node answered in 3.4 s.
+# A caption is prose about pixels; it does not need a reasoning prelude
+# either. GHOST_VISUAL_NO_THINK=0 restores thinking for every path.
+_VISION_NO_THINK = os.getenv("GHOST_VISUAL_NO_THINK", "1").strip().lower() not in ("0", "false", "no")
+
+
+def _hit_token_cap(resp_data) -> bool:
+    """True iff the first choice stopped on the generation cap. Read
+    defensively: a stub or an odd server shape is "no" (contention path),
+    never an exception in a tool result."""
+    try:
+        choice = (resp_data.get("choices") or [{}])[0]
+        return str(choice.get("finish_reason") or "").strip().lower() == "length"
+    except Exception:  # noqa: BLE001
+        return False
+
 
 # Magic-byte signatures for the formats vision servers actually accept.
 # Used to (a) type local files that lack a useful extension and (b) refuse
@@ -358,10 +374,10 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
                 "screen, a start MENU instead of the running app), answer "
                 "UNCERTAIN and say why in `evidence` — do NOT guess."
             )
-            if _VERIFY_UI_NO_THINK:
-                final_prompt += "\n\n/no_think"
         else:
             final_prompt = prompt if prompt else default_prompt
+        if _VISION_NO_THINK:
+            final_prompt += "\n\n/no_think"
 
         content_array = [{"type": "text", "text": final_prompt}]
         for mime, b64 in b64_images:
@@ -376,11 +392,12 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
             "temperature": 0.1,
             "max_tokens": 4096
         }
-        if action == "verify_ui" and _VERIFY_UI_NO_THINK:
+        if _VISION_NO_THINK:
             # Hard-switch companion to the /no_think soft-switch above —
             # without it a thinking vision model spends the whole budget on
             # the <think> prelude and content comes back empty (the exact
-            # silent failure that kept the verifier's VISUAL gate inert).
+            # silent failure that kept the verifier's VISUAL gate inert, and
+            # that emptied five of six live captions on 2026-09-24).
             payload["chat_template_kwargs"] = {"enable_thinking": False}
 
         resp_data = await llm_client.chat_completion(payload, use_vision=True)
@@ -391,9 +408,21 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
         # An empty answer must not ship under a success banner: live req
         # 2c5ec4b5 got "" back from a contended node and the agent had to
         # NOTICE the emptiness itself before retrying (57s lost). Name the
-        # failure so the retry decision has signal.
+        # failure so the retry decision has signal — and name the RIGHT
+        # failure: an empty answer whose generation stopped on the token
+        # cap (`finish_reason == "length"`) is the model thinking past its
+        # budget, which a retry of the same call reproduces exactly (live
+        # 2026-09-24: 44 s × 5 retries on one request). Only an empty
+        # answer that did NOT hit the cap is contention worth one retry.
         if not analysis.strip():
             from .outcome import ToolOutcome
+            if _hit_token_cap(resp_data):
+                return ToolOutcome.failed(
+                    "Vision API Error: the vision model spent its whole token "
+                    "budget reasoning and returned NO answer (finish_reason="
+                    "length). Do NOT retry this call — the same call gives "
+                    "the same result. Present the image to the user as-is.",
+                    world_changed=False, reason_code="vision_thinking_cap")
             return ToolOutcome.failed(
                 "Vision API Error: the vision node returned an EMPTY result "
                 "(node contention or truncation — the image itself was "
@@ -402,9 +431,10 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
                 world_changed=False, reason_code="vision_empty_result")
         # Truncation must never be silent (same policy as file listings): a
         # 50-page PDF analysed as if complete misleads every downstream step.
-        page_note = ""
+        page_note = ("\nNOTE: this answer was cut at the model's token cap — it may be incomplete."
+                     if _hit_token_cap(resp_data) else "")
         if pdf_total_pages > pdf_pages_analyzed:
-            page_note = (
+            page_note += (
                 f"\nNOTE: this PDF has {pdf_total_pages} pages; only the first "
                 f"{pdf_pages_analyzed} were analyzed. For the rest, use "
                 f"file_system(operation='read_chunked', path='{target}', "

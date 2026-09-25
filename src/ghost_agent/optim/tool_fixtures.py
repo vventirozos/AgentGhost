@@ -312,7 +312,8 @@ def _trajectory_index(trajectory_root: Path) -> Dict[str, Any]:
     On duplicate session_ids the latest timestamp wins."""
     collector = TrajectoryCollector(root=trajectory_root, session_id="reader")
     index: Dict[str, Any] = {}
-    for traj in collector.iter_trajectories():
+    from ..memory.skills import iter_teachable
+    for traj in iter_teachable(collector.iter_trajectories()):   # member turns never tune tool descriptions (§4KJ R7)
         sid = getattr(traj, "session_id", "") or ""
         if not sid:
             continue

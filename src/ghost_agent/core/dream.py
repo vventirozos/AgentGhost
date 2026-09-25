@@ -1038,7 +1038,8 @@ def trajectory_dream_fragments(context, limit: int = 40):
         collector = getattr(context, "trajectory_collector", None)
         if collector is None:
             return [], []
-        trajs = list(collector.iter_trajectories())
+        from ..memory.skills import iter_teachable
+        trajs = list(iter_teachable(collector.iter_trajectories()))
     except Exception:
         return [], []
     ids, docs = [], []
@@ -3271,7 +3272,8 @@ Return ONLY valid JSON:
                 return result
 
             # Bound the walk so a huge log can't dominate the REM cycle.
-            trajs = list(deque(collector.iter_trajectories(), maxlen=max_trajectories))
+            from ..memory.skills import iter_teachable
+            trajs = list(deque(iter_teachable(collector.iter_trajectories()), maxlen=max_trajectories))
             if len(trajs) < 3:
                 return result
 
@@ -4098,8 +4100,9 @@ Return ONLY a JSON object with:
                         _tracker_state = frontier_tracker._load()
                         _seen_clusters = set(_tracker_state.get("clusters", {}).keys())
                         _candidate_clusters = sorted(set(_TEMPLATES.keys()) | _seen_clusters)
+                        from ..memory.skills import iter_teachable
                         _counts = count_trajectories_by_cluster(
-                            _traj_collector.iter_trajectories()
+                            iter_teachable(_traj_collector.iter_trajectories())   # member turns never steer self-play (§4KJ R9)
                         )
                         _unc = compute_cluster_uncertainty(_prm_scorer, _candidate_clusters)
                         _rar = compute_cluster_rarity(_counts, _candidate_clusters)

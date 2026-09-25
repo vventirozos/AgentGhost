@@ -99,7 +99,7 @@ async def test_verify_ui_suppresses_thinking(tmp_path, monkeypatch):
     the env is read at import, so an operator shell exercising the
     documented GHOST_VISUAL_NO_THINK=0 kill must not turn this red."""
     import ghost_agent.tools.vision as vision_mod
-    monkeypatch.setattr(vision_mod, "_VERIFY_UI_NO_THINK", True)
+    monkeypatch.setattr(vision_mod, "_VISION_NO_THINK", True)
     (tmp_path / "img.png").write_bytes(PNG_BYTES)
     llm = _llm()
     await tool_vision_analysis(
@@ -113,7 +113,7 @@ async def test_verify_ui_suppresses_thinking(tmp_path, monkeypatch):
 
 async def test_verify_ui_flag_off_restores_thinking(tmp_path, monkeypatch):
     import ghost_agent.tools.vision as vision_mod
-    monkeypatch.setattr(vision_mod, "_VERIFY_UI_NO_THINK", False)
+    monkeypatch.setattr(vision_mod, "_VISION_NO_THINK", False)
     (tmp_path / "img.png").write_bytes(PNG_BYTES)
     llm = _llm()
     await tool_vision_analysis(
@@ -157,18 +157,28 @@ async def test_verify_ui_result_header_is_distinct(tmp_path):
     assert _VERDICT in out
 
 
-async def test_other_actions_unaffected_by_no_think(tmp_path):
-    """describe_picture keeps its open-ended shape: no forced JSON schema,
-    no thinking suppression — deep looking is allowed there."""
+async def test_other_actions_also_suppress_thinking(tmp_path, monkeypatch):
+    """describe_picture keeps its open-ended shape (no forced JSON schema)
+    but, since 2026-09-24, it too runs without a thinking prelude: live,
+    five of six captions came back EMPTY because the model spent all
+    4096 tokens in <think> (llama-server: ~410-token prompts, exactly
+    4096 generated, 44 s each) while the verifier's no-think visual call
+    on the same node answered in 3.4 s."""
+    import importlib
+    import ghost_agent.tools.vision as vmod
+    monkeypatch.delenv("GHOST_VISUAL_NO_THINK", raising=False)
+    importlib.reload(vmod)                               # the DEFAULT must be on, whatever the shell exports
+    assert vmod._VISION_NO_THINK is True
     (tmp_path / "img.png").write_bytes(PNG_BYTES)
     llm = _llm("a pinball table")
-    out = await tool_vision_analysis(
+    out = await vmod.tool_vision_analysis(
         action="describe_picture", target="img.png",
         llm_client=llm, sandbox_dir=tmp_path)
     payload = llm.chat_completion.await_args[0][0]
     text = payload["messages"][1]["content"][0]["text"]
-    assert "/no_think" not in text
-    assert "chat_template_kwargs" not in payload
+    assert text.count("/no_think") == 1
+    assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "Respond ONLY with a JSON object" not in text
     assert out.startswith("VISION ANALYSIS RESULT")
 
 

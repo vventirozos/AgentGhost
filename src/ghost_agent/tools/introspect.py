@@ -786,6 +786,23 @@ def _truthy(value) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _member_block():
+    """A channel member never reads the agent's self-model: the overview and
+    the autobiography name the owner (2026-09-24, two members were told
+    "Vasilis" through this tool)."""
+    try:
+        from ..utils.logging import requester_is_member
+        if requester_is_member():
+            from .outcome import ToolOutcome
+            return ToolOutcome.rejected(
+                "SYSTEM BLOCK: introspection reads the owner's self-model and this request is from a "
+                "channel member. It is not available; never present the owner's details as this user's.",
+                reason_code="owner_data_blocked")
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
 async def tool_introspect(
     action: str = None,
     query: str = None,
@@ -831,6 +848,9 @@ async def tool_introspect(
     # it must keep working when selfhood is disabled, so it branches before
     # the self_model gate. This is the on-demand home of the maintenance
     # records the finalize banner no longer auto-surfaces (2026-07-17):
+    _blocked = _member_block()
+    if _blocked is not None:
+        return _blocked
     # "what did you do while I was away?" lands here.
     if raw_action == "activity":
         # Guarded here (it returns before the selfhood try below): this

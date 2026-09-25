@@ -104,13 +104,17 @@ class TestDeliveryChannelHonesty:
             message="hi", context=_ctx(tmp_path, notifier=notifier)))
         assert "push (webhook/ntfy)" in out
 
-    def test_reports_slack_only_after_consumer_has_polled(self, tmp_path):
+    def test_reports_a_client_only_after_its_consumer_has_polled(self, tmp_path):
+        """No client name is special (§4KJ, de-Slacked): any consumer that has
+        polled is reported by the name it registered under."""
         ctx = _ctx(tmp_path)
-        save_consumer_offset(
-            Path(str(ctx.memory_dir)).parent / "notify_consumers.json",
-            "slack", 0)
+        out0 = asyncio.run(tool_notify_operator(message="hi", context=ctx))
+        assert "'slack' client" not in out0 and "'pager' client" not in out0
+        for name in ("slack", "pager"):
+            save_consumer_offset(
+                Path(str(ctx.memory_dir)).parent / "notify_consumers.json", name, 0)
         out = asyncio.run(tool_notify_operator(message="hi", context=ctx))
-        assert "Slack DM" in out
+        assert "'slack' client" in out and "'pager' client" in out
 
 
 class TestWiring:

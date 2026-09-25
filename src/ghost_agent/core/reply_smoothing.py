@@ -66,6 +66,9 @@ _BEAT_RE = re.compile(
     r"^(?:let me\b|let's\b|good[,.! ]|okay\b|ok[,.! ]|alright\b|"
     r"great[,.! ]|perfect[,.! ]|time to\b|"
     r"i'll\b|i will\b|i need to\b)",
+    # §4KJ added an "I have enough data to <verb>…" alternative; four review
+    # rounds found it deleting delivered answers ("…to complete the booking.")
+    # — a lexical proxy for "is this a beat?". Removed.
     re.IGNORECASE,
 )
 _TEMPORAL_LEAD_RE = re.compile(
@@ -1275,12 +1278,40 @@ def treat_reply(text: str, *, n_real_tools: int) -> str:
     narration only. Non-strings and empty text pass through untouched."""
     if not isinstance(text, str) or not text:
         return text
-    out = strip_unparsed_tool_calls(text)
+    return smooth_gated(strip_unparsed_tool_calls(text), n_real_tools)
+
+
+def smooth_gated(text: str, n_real_tools: int) -> str:
+    """`smooth_reply` behind the two guards every delivered view applies:
+    the ≥ `SMOOTHING_MIN_TOOLS` real-tool gate (2026-07-17: a single-tool
+    turn's "First… Then… Finally…" are instructions, not beats) and the
+    narration-only revert (2026-07-25: never reduce a reply to its one
+    "Let me search…" line). The ONE implementation behind `treat_reply`
+    (the streamed view), `delivery_view` (finalise and the in-loop
+    verifier gate)."""
+    if not isinstance(text, str) or not text:
+        return text
     if n_real_tools >= SMOOTHING_MIN_TOOLS:
-        smoothed = smooth_reply(out)
-        if not is_narration_only_trim(smoothed, out):
-            out = smoothed
-    return out
+        smoothed = smooth_reply(text)
+        if not is_narration_only_trim(smoothed, text):
+            return smoothed
+    return text
+
+
+def delivery_view(text: str, tools_run) -> str:
+    """The reply as it will be DELIVERED: `smooth_reply` behind the two
+    guards finalisation applies — the ≥2-real-tool gate (2026-07-17: a
+    single-tool turn's "First… Then… Finally…" are instructions, not beats)
+    and the narration-only revert (2026-07-25: never reduce a reply to its
+    one "Let me search…" line). ONE implementation, two readers: finalise
+    (what ships) and the in-loop verifier gate (what is judged), so the
+    judged text and the delivered text agree and a verdict is not thrown
+    away for a fingerprint mismatch (live 2026-09-24: 26.7 s of in-loop
+    verification recomputed after a 502→219-char trim). Never raises."""
+    try:
+        return smooth_gated(text, count_real_tools(tools_run or []))
+    except Exception:  # noqa: BLE001
+        return text
 
 
 def count_real_tools(tools_run) -> int:

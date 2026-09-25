@@ -506,7 +506,7 @@ def test_override_provenance_is_chained_by_one_helper():
     # directly; reply-shape and turn-state stamp through `_merge_mechanical_refute`
     # on BOTH paths (§4FY review: the tool-free path used to exit on the shape
     # alone), so they appear as that helper's constant tags, twice each
-    assert tags == {"memory-claim", "visual", "web-exec", "file-artifact"}, tags
+    assert tags == {"memory-claim", "visual", "web-exec", "file-artifact", "image-unseen"}, tags
     merges = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
               and ast.unparse(n.func) == "self._merge_mechanical_refute"]
     mtags = sorted(n.args[2].value for n in merges if len(n.args) > 2 and isinstance(n.args[2], ast.Constant))

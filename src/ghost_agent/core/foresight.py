@@ -699,7 +699,8 @@ class Foresight:
         for day in days:
             if n_calls >= _SEED_CALL_CAP:
                 break
-            for traj in collector.iter_trajectories(day=day):
+            from ..memory.skills import iter_teachable
+            for traj in iter_teachable(collector.iter_trajectories(day=day)):   # never a member's turn (§4KJ R9)
                 # Real user work only: self-play/reflection trajectories
                 # are synthetic by construction (and mostly excluded
                 # upstream anyway — the collector is detached in dream's

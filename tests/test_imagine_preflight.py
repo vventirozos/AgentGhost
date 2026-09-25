@@ -458,3 +458,16 @@ def test_a_request_without_an_id_is_never_deferred(monkeypatch, tmp_path):
     for i in range(2):
         assert agent._imagine_preflight_note(
             "execute", _ARGS, f"h{i}", "req-real") is not None
+
+
+def test_a_members_call_never_sees_the_owners_precedent(monkeypatch, tmp_path):
+    """§4KJ R10: the precedent names the OWNER's past errors; a member's turn
+    gets no pre-flight note. Control: the owner's identical call does."""
+    from ghost_agent.utils.logging import requester_role_context
+    _open_the_gate(tmp_path)
+    tok = requester_role_context.set("member")
+    try:
+        assert _agent(monkeypatch)._imagine_preflight_note("execute", _ARGS, "h1", "req-1") is None
+    finally:
+        requester_role_context.reset(tok)
+    assert _agent(monkeypatch)._imagine_preflight_note("execute", _ARGS, "h1", "req-1") is not None

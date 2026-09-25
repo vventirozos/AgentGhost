@@ -33,7 +33,8 @@ from .triggers import (
     guard_key_target,
     looks_mutating_command,
 )
-from ..utils.logging import Icons, ORIGIN_PROBE, pretty_log, request_id_context, request_origin_context, atomic_print, verify_purpose
+from ..utils.logging import (Icons, ORIGIN_PROBE, pretty_log, request_id_context, request_origin_context, atomic_print, verify_purpose,
+                             requester_role_context, requester_is_member, parse_requester_role)
 from ..utils import logging as _glog
 from ..utils.constraints import extract_constraints, render_constraint_block
 # Live randomized arms + the risk governor that is measured by one of them.
@@ -265,6 +266,36 @@ def prm_consumer_is_live(ctx) -> bool:
 #    system prompt every turn. Injects no facts/tools/constraints — cosmetic
 #    voice that only adds tokens/latency. OFF on the request path.
 _SELFHOOD_PREFIX_ENABLED = False
+# What a channel member's turn sees where the owner's profile would be.
+# It STATES the boundary (2026-09-24, live: two channel members asked "what
+# is my name?" and were told the owner's — the profile was withheld but the
+# introspect overview and recalled memories name the owner, and a silent
+# placeholder let the model assume the asker was him). It must not describe
+# the owner, and it must not read as an error to "fix" by asking who the
+# user is.
+_MEMBER_PROFILE_PLACEHOLDER = (
+    "(not available: this request comes from a channel MEMBER, not the owner. You do not "
+    "know this person's name or details. Any profile, memory, autobiography or project "
+    "context you hold describes the OWNER — a different person — and must never be "
+    "presented as this user's, quoted to them, or used to answer questions about them.)")
+# A MEMBER's turn may use only these tools; every other dispatchable tool is
+# refused (one REJECTED row, reason `owner_data_blocked`). An ALLOWLIST, not a
+# blocklist (R4 review, 2026-09-24): the sandbox, the projects, the jobs, the
+# services, the scratchpad, the activity log and the skills are all the
+# OWNER's, and a blocklist of 17 names left file_system / execute / browser /
+# manage_projects / workspace / jobs / manage_services / create_skill /
+# delegate… open — a member could `cat` the owner's project maps or delete a
+# project. New tools are closed to members until someone adds them here.
+# The two sandbox-touching entries are argument-checked
+# (`_member_tool_refusal`): a member may inspect / reference only images
+# generated for a member, never the owner's files.
+_MEMBER_ALLOWED_TOOLS = frozenset({
+    "web_search", "darkweb_search", "image_generation", "vision_analysis",
+    "abort_attempt", "replan",
+})
+_MEMBER_TOOL_BLOCK = ("SYSTEM BLOCK: this tool reads or writes the owner's data and this request is "
+                      "from a channel member. It is not available; answer from the conversation and "
+                      "the tools that remain, and never present the owner's details as this user's.")
 
 # §4N D-MAJOR-1: the live system slot ends with this instruction, appended
 # AFTER {{PROFILE}}+working_memory and before the \r-strip (see the KV-stable
@@ -1164,14 +1195,16 @@ def _browser_loaded_but_never_extracted(tools_run, target: str) -> bool:
 
 def _latch_forces_final(task_closed_this_req: bool,
                         repair_reentry_active: bool) -> bool:
-    """The one-task-per-turn latch, as a decision the loop re-asks every
-    iteration: once a project task closed DONE this request the turn must
-    converge to a final answer — UNLESS a verifier auto-repair re-entry is
-    running (2026-09-13). The repair directive ("actually RUN it", or
-    "fix the refuted claim") needs tools; re-forcing the final while it
-    runs issued that directive into a `tool_choice: none` turn whose every
-    emitted call was dropped. Pinned as a table in
-    `tests/test_repair_reentry_latch.py`."""
+    """The ONE rule for every "converge now" signal the loop re-asks each
+    iteration — the one-task-per-turn latch (a project task closed DONE
+    this request) and, since 2026-09-24, the planner's DONE plan: the turn
+    must converge to a final answer — UNLESS a verifier auto-repair
+    re-entry is running (2026-09-13). The repair directive ("actually RUN
+    it", or "fix the refuted claim") needs tools; re-forcing the final
+    while it runs issued that directive into a `tool_choice: none` turn
+    whose every emitted call was dropped. The planner branch had the same
+    defect one path over (slack-23a1fa85). Pinned as a table in
+    `tests/test_repair_reentry_latch.py`; both callers pinned end to end."""
     return bool(task_closed_this_req) and not bool(repair_reentry_active)
 
 
@@ -1353,16 +1386,17 @@ def turn_origin(context) -> str:
 
 
 def turn_may_teach(context) -> bool:
-    """§4KD: may THIS turn write to the playbook? False for a diagnostic
-    probe (§4FB/§4FS) and for a Slack turn (`slack-` request-id prefix —
-    real traffic, so `turn_origin` still says "user", but a channel member's
-    prompt must not become the owner's lesson). The writer itself has the
-    same rule as a backstop (`memory.skills.playbook_writes_blocked`)."""
+    """§4KD/§4KJ: may THIS turn write to the playbook? False for a
+    diagnostic probe (§4FB/§4FS) and for a MEMBER's turn (real traffic, so
+    `turn_origin` still says "user", but a non-owner's prompt must not
+    become the owner's lesson). The writer itself has the same rule as a
+    backstop (`memory.skills.playbook_writes_blocked`). No client name
+    appears here: the role header is the only multi-user signal."""
     try:
         if turn_origin(context) == "probe":
             return False
-        from ..utils.logging import is_slack_request_id, request_id_context
-        return not is_slack_request_id(request_id_context.get())
+        from ..utils.logging import requester_is_member
+        return not requester_is_member()
     except Exception:  # noqa: BLE001
         return True
 
@@ -1410,6 +1444,9 @@ def rubric_shadow_eligible(context, traj) -> bool:
             return False
         if turn_origin(context) != "user":
             return False
+        from ..utils.logging import requester_is_member as _is_member
+        if _is_member():
+            return False        # the rubric-shadow ledger is the owner's (§4KJ R10)
         if str(getattr(traj, "task_kind", "") or "") != "user_request":
             return False
         if getattr(traj, "tool_calls", None):
@@ -4092,6 +4129,39 @@ def _is_factual_query(query: str) -> bool:
     return False
 
 
+_TOOL_ACTIVITY_CONTENT_RE = re.compile(
+    r"!\[[^\]]*\]\(/api/download/|<tool_call>|<tool_response|EXIT CODE:")
+_TOOL_ACTIVITY_LOOKBACK = 12
+
+
+def _history_shows_tool_activity(messages) -> bool:
+    """Did the recent thread run tools? A `tool`-role row, an assistant
+    row carrying `tool_calls`, or content that only a tool turn produces (an
+    `/api/download/` image line, a tool-call/response marker, an EXIT CODE)
+    inside the last `_TOOL_ACTIVITY_LOOKBACK` history rows BEFORE the
+    pending user message. Slack forwards the bot's own earlier replies as
+    plain history rows, so the content markers are what carry the signal
+    there. A pure conversation (greetings, Q&A with no tools) is False."""
+    try:
+        rows = [m for m in (messages or []) if isinstance(m, dict)]
+    except Exception:  # noqa: BLE001
+        return False
+    if rows and rows[-1].get("role") == "user":
+        rows = rows[:-1]
+    for m in rows[-_TOOL_ACTIVITY_LOOKBACK:]:
+        role = str(m.get("role") or "")
+        if role == "tool":
+            return True
+        if role == "assistant" and m.get("tool_calls"):
+            return True
+        c = m.get("content")
+        if isinstance(c, list):                      # multimodal rows: text blocks
+            c = " ".join(str(b.get("text") or "") for b in c if isinstance(b, dict))
+        if role in ("assistant", "user") and isinstance(c, str) and _TOOL_ACTIVITY_CONTENT_RE.search(c):
+            return True
+    return False
+
+
 def get_sampling_params(is_tool_turn: bool, query: str = "", is_coding: bool = False) -> dict:
     """Return the sampling profile for the current turn.
 
@@ -6598,6 +6668,8 @@ def _notify_promise_backstop(context, *, last_user_content, tools_run,
     steer), the agent keeps the promise itself, honestly labelled. Respects
     notify_tool's rate limit; never raises; returns True when a record was
     written."""
+    if requester_is_member():
+        return False        # a member never writes into the owner's notification feed (R7)
     try:
         if not _user_asked_for_notification(last_user_content):
             return False
@@ -6910,6 +6982,146 @@ def _previous_turn_was_costly(messages, costly_record: bool) -> bool:
     return bool(_COSTLY_RESULT_RE.search(_last_assistant_text(messages)))
 
 
+_GENERATED_IMAGE_LINE_RE = re.compile(r"!\[generated image\]\(/api/download/([^)\s]+)\)")
+_DOWNLOAD_LINK_RE = re.compile(r"(!?\[[^\]]*\]\()?/api/download/([^)\s\"'>]+)\)?")
+
+
+def _scrub_member_download_links(text, allowed) -> str:
+    """Drop every `/api/download/<name>` link (markdown image, markdown link
+    or bare path) whose basename is not in `allowed` — the images generated
+    for a member. Never raises; non-strings pass through."""
+    if not isinstance(text, str) or "/api/download/" not in text:
+        return text
+    allowed_base = {os.path.basename(str(a)) for a in (allowed or ())}
+
+    def _sub(m):
+        name = m.group(2)
+        return m.group(0) if ("/" not in name and name in allowed_base) else "[file not available]"
+    try:
+        return _DOWNLOAD_LINK_RE.sub(_sub, text)
+    except Exception:  # noqa: BLE001
+        return text
+
+
+def _iter_teachable_train(trajectories):
+    """Member turns never train the owner's router / PRM / online PRM update
+    (§4KJ R7: the member controls the text)."""
+    from ..memory.skills import iter_teachable
+    return iter_teachable(trajectories)
+
+
+class _SkipMemberCorrection(Exception):
+    """Control flow: a member's turn skips the correction hooks."""
+
+
+def _real_tool_rows(tools_run_this_turn) -> int:
+    """Tool rows that actually ran — the loop's synthetic rows (a REJECTED
+    block, a parse error) are not evidence."""
+    return sum(1 for t in (tools_run_this_turn or [])
+               if isinstance(t, dict) and not t.get("_synthetic"))
+
+
+def _turn_generated_images(tools_run_this_turn) -> List[str]:
+    """Download names of the images `image_generation` produced this
+    request, in order — read off the tool's own SUCCESS result (the
+    markdown line it tells the model to echo)."""
+    out: List[str] = []
+    for t in (tools_run_this_turn or []):
+        try:
+            if not isinstance(t, dict) or t.get("_synthetic"):
+                continue
+            # by CONTENT, not name: a row carries the raw name the model used
+            # (an alias like `imagegen`), and only the image tool writes this
+            # success head (R7)
+            body = str(t.get("content") or "")
+            if not body.lstrip().startswith("SUCCESS: Image generated"):
+                continue
+            for m in _GENERATED_IMAGE_LINE_RE.finditer(body):
+                name = m.group(1).strip()
+                if name and name not in out:
+                    out.append(name)
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+_VISION_OK_RESULT_RE = re.compile(r"^\s*(?:VISION ANALYSIS RESULT|UI VERIFICATION RESULT)")
+
+
+def _images_inspected_this_turn(messages) -> set:
+    """Basenames the model passed to `vision_analysis` this request AND
+    got an answer for: the call is read off the assistant rows' tool_calls
+    (where the arguments live) and counts only when a `tool` row with the
+    same `tool_call_id` carries a vision RESULT — a call the node answered
+    empty (`vision_thinking_cap` / `vision_empty_result`) is not a look
+    (R2 review: today's own failure mode would have unlocked the guard)."""
+    answered: set = set()
+    for m in (messages or []):
+        if isinstance(m, dict) and m.get("role") == "tool" and m.get("tool_call_id"):
+            if _VISION_OK_RESULT_RE.search(str(m.get("content") or "")):
+                answered.add(str(m.get("tool_call_id")))
+    seen: set = set()
+    for m in (messages or []):
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        for tc in (m.get("tool_calls") or []):
+            try:
+                if str(tc.get("id") or "") not in answered:
+                    continue
+                fn = tc.get("function") or {}
+                if not re.sub(r"[^a-z]", "", str(fn.get("name") or "").lower()).startswith("vision"):
+                    continue                     # vision_analysis and its aliases (R6)
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    args = json.loads(args)
+                if not isinstance(args, dict):
+                    continue
+                for key in ("target", "path", "image", "file", "image_path", "url"):
+                    v = args.get(key)
+                    if isinstance(v, str) and v.strip():
+                        seen.add(os.path.basename(v.strip()))
+            except Exception:  # noqa: BLE001
+                continue
+    return seen
+
+
+def _blind_regeneration_block(fname, tools_run_this_turn, messages, user_text,
+                              *, repair_active: bool = False, batch_images: int = 0) -> Optional[str]:
+    """The SYSTEM BLOCK for a second `image_generation` this request whose
+    earlier output was not inspected by an ANSWERED `vision_analysis` call,
+    else None. No reading of the user's words (R4 review: the multi-image
+    ask regex misclassified a third of realistic asks in two languages — a
+    lexical proxy); a user who wants several images pays one fast caption
+    between them. A verifier repair re-entry may regenerate (its own pixel
+    check was the inspection), and a second image in the SAME batch is
+    blind by construction."""
+    if str(fname or "") != "image_generation":
+        return None
+    prior = _turn_generated_images(tools_run_this_turn)
+    if batch_images > 0:
+        # a second image in the SAME batch is blind, repair or not (R6)
+        return ("SYSTEM BLOCK — no second image blind: one image per batch. Present or inspect "
+                "the first one before generating another; each generation occupies the image "
+                "node for minutes.")
+    if repair_active:
+        return None
+    if not prior:
+        return None
+    inspected = _images_inspected_this_turn(messages)
+    uninspected = [p for p in prior if os.path.basename(p) not in inspected]
+    if not uninspected:
+        return None
+    first = os.path.basename(uninspected[-1])
+    return (
+        f"SYSTEM BLOCK — no second image blind: you generated {first} this request and "
+        "have not looked at it. Either present it NOW "
+        f"with the markdown line ![generated image](/api/download/{first}) and a one-line "
+        f"description, or inspect it first — vision_analysis(action='describe_picture', "
+        f"target='{first}') — and only then decide whether a second take is needed. "
+        "Each generation occupies the image node for minutes."
+    )
+
+
 def _clarify_first_block(fname, user_text, messages, costly_record: bool):
     """The SYSTEM BLOCK for a costly tool call that a one-token follow-up
     cannot justify, else None."""
@@ -7122,6 +7334,8 @@ class InternalTurnState:
     _origin_token: Any = None
     _proj_task_closed_this_req: Any = None
     _repair_reentry_active: Any = None
+    _repair_reentry_tools_at: Any = 0
+    _repair_reentry_rows_at: Any = 0
     _request_constraint_block: Any = None
     _request_constraints: Any = None
     _request_sys3_fired_once: Any = None
@@ -7251,6 +7465,9 @@ class TurnState:
     # keys experiment state must read this field instead (round-2
     # foresight review finding #2). Defaulted for older constructions.
     req_id: Any = ""
+    # read-only: a verifier repair re-entry is running (§4KJ R4 — the
+    # blind-regeneration guard lets the repair regenerate)
+    repair_reentry_active: Any = False
 
     MUTATED_FIELDS = ('_constraint_steer_pending', '_proj_task_closed_this_req', '_request_sys3_fired_once', '_request_sys3_prev_justification', 'consecutive_parse_errors', 'current_plan_json', 'execution_failure_count', 'final_ai_content', 'fname', 'force_final_response', 'force_stop', 'forget_was_called', 'last_was_failure', 'preflight_blocks_this_request', 'request_sandbox_state', 'transient_failure_count')
 
@@ -7340,6 +7557,8 @@ class StreamState:
     # _project_work_pending). Defaulted so pre-existing constructors
     # (tests) stay valid; the build site always passes it explicitly.
     pressure_lockdown: Any = False
+    requester_role: Any = ""
+
 
 
 # The System-2 planner runs inline on the user's turn. Without a budget it
@@ -7432,6 +7651,13 @@ class GhostAgent:
     def __init__(self, context: GhostContext):
         self.context = context
         self.disabled_tools = set()
+        #: §4KJ: images generated / files uploaded on MEMBERS' turns (name →
+        #: first seen), loaded lazily from `system/member_files.json`.
+        self._member_generated_files = None
+        #: §4KJ: the owner's (project, conversation key) while a member turn runs.
+        self._member_saved_scope = None
+        #: §4KJ: conversation fingerprint → last time a turn ran real tools.
+        self._tool_convs = {}
         #: §4KD: conversation fingerprint -> monotonic-ish wall time of the
         #: last turn that ran a COSTLY tool (bounded; consulted by the
         #: clarify-first guard when the client resends text only).
@@ -8107,7 +8333,8 @@ class GhostAgent:
             summary += str(summary_data["choices"][0]["message"].get("content") or "No summary generated.")
 
             from ..utils.helpers import get_utc_timestamp
-            if self.context.memory_system and "Summarization unavailable" not in summary:
+            if (self.context.memory_system and "Summarization unavailable" not in summary
+                    and not requester_is_member()):   # a member's conversation is not archived into the owner's memory (R4)
                 episode_text = f"EPISODIC ARCHIVE (Past Conversation Summary):\n{summary}"
                 # Hold a reference to this fire-and-forget archive write:
                 # asyncio keeps only a weak ref to bare tasks, so an
@@ -9154,8 +9381,9 @@ class GhostAgent:
                         # IDENTICAL generator 130 lines below with the comment
                         # "stalls the event loop for seconds otherwise" — this
                         # site simply never got the same treatment.
+                        from ..memory.skills import iter_teachable as _iter_teachable_refl
                         _refl_trajs = await asyncio.to_thread(
-                            lambda: list(traj_collector.iter_trajectories()))
+                            lambda: list(_iter_teachable_refl(traj_collector.iter_trajectories())))
                         report = await reflector.run(
                             failed_source=lambda: _refl_trajs,
                             sink=_sink,
@@ -9254,8 +9482,9 @@ class GhostAgent:
                             "Agent is idle. Running post-mortem on worst recent failures...",
                             icon=Icons.BRAIN_THINK,
                         )
+                        from ..memory.skills import iter_teachable as _iter_teachable_pm
                         pm_report = await engine.run(
-                            source=lambda: traj_collector.iter_trajectories(),
+                            source=lambda: _iter_teachable_pm(traj_collector.iter_trajectories()),
                         )
                         pretty_log(
                             "Biological Hook",
@@ -9294,8 +9523,9 @@ class GhostAgent:
                         # large trajectory log the iterate + extract + consolidate
                         # pipeline stalls the event loop for seconds otherwise
                         # (matching the to_thread pattern phases 2.7c/2.95 use).
+                        from ..memory.skills import iter_teachable as _iter_teachable_sa
                         trajs = await asyncio.to_thread(
-                            lambda: list(traj_collector.iter_trajectories())
+                            lambda: list(_iter_teachable_sa(traj_collector.iter_trajectories()))
                         )
                         if trajs:
                             candidates, report = await asyncio.to_thread(
@@ -9742,7 +9972,7 @@ class GhostAgent:
                             trainer = PRMTrainer()
                             report = await asyncio.to_thread(
                                 trainer.run,
-                                trajectories=traj_collector.iter_trajectories(),
+                                trajectories=_iter_teachable_train(traj_collector.iter_trajectories()),
                                 save_path=save_path,
                                 bench_trajectories=iter_bench_trajectories(
                                     "prm", getattr(ctx, "args", None)),
@@ -9864,7 +10094,7 @@ class GhostAgent:
                             trainer = RouterTrainer(confidence_threshold=_thr)
                             report = await asyncio.to_thread(
                                 trainer.run,
-                                trajectories=traj_collector.iter_trajectories(),
+                                trajectories=_iter_teachable_train(traj_collector.iter_trajectories()),
                                 save_path=save_path,
                                 bench_trajectories=iter_bench_trajectories(
                                     "router", getattr(ctx, "args", None)),
@@ -12403,6 +12633,11 @@ class GhostAgent:
                 self._agent_ref.context, query=query or "",
                 disabled=getattr(self._agent_ref, "disabled_tools",
                                  None)) or []
+            if requester_is_member():
+                # A member is advertised only the allowlist: the owner's
+                # acquired-skill names and descriptions are owner data (R6).
+                defs = [d for d in defs
+                        if ((d or {}).get("function") or {}).get("name") in _MEMBER_ALLOWED_TOOLS]
             self._active_tool_defs_resolved = defs
             return defs
 
@@ -12445,10 +12680,11 @@ class GhostAgent:
                 # Scope the ambient listing to the active project's dir so the
                 # model is shown the SAME working set its file_system/execute
                 # operate on (else it sees a root listing and fumbles paths).
-                self._sandbox_state = await tool_list_files(
+                self._sandbox_state = ("(not available for this channel)" if requester_is_member()
+                                       else await tool_list_files(
                     sandbox_dir=project_scoped_sandbox(self._agent_ref.context)[0],
                     memory_system=getattr(self._agent_ref.context, "memory_system", None),
-                )
+                ))
             except Exception:
                 self._sandbox_state = ""
             return self._sandbox_state
@@ -12918,6 +13154,8 @@ class GhostAgent:
         except Exception:
             profile_context = ""
         profile_context = (profile_context or "").replace("\r", "")
+        if requester_is_member():
+            profile_context = _MEMBER_PROFILE_PLACEHOLDER   # a member's greeting gets the boundary, not the profile
 
         profile_block = ""
         if profile_context:
@@ -13543,8 +13781,10 @@ class GhostAgent:
         merged = list(request_constraints or [])
         seen = {c.lower() for c in merged}
         added = 0
-        pools = [self._active_project_constraints(request_text=user_text or "")]
-        referenced = list(dict.fromkeys(re.findall(
+        # a member's request never pulls the OWNER's project constraints in
+        # ("what rules apply to projects/<id>/?" — R7 review)
+        pools = [] if requester_is_member() else [self._active_project_constraints(request_text=user_text or "")]
+        referenced = [] if requester_is_member() else list(dict.fromkeys(re.findall(
             r"\bprojects/([0-9a-f]{6,32})\b", (user_text or "").lower())))
         for pid in referenced[:3]:
             pools.append(self._project_constraints_for(pid))
@@ -13735,6 +13975,13 @@ class GhostAgent:
         # at all, so nothing is scrubbed/backfilled/repaired.
         if getattr(getattr(self, "context", None), "args", None) is not None and \
                 getattr(self.context.args, "no_verifier", False) is True:
+            return None, last_tool
+        # A MEMBER's turn is not verified at all (R8, CRIT ×2): the verifier's
+        # evidence arms read the OWNER's world — the visual arm resolves image
+        # names across the whole sandbox, the memory-claim check quotes the
+        # owner's profile — and its issues reach the member verbatim (inline
+        # note, correction banner). One gate for the whole subsystem.
+        if requester_is_member():
             return None, last_tool
         # §4FN: the reply's SHAPE, before any evidence question. A raw tool
         # dump pasted as the answer is refuted mechanically for tool turns
@@ -14035,6 +14282,11 @@ class GhostAgent:
         # §4FZ: the judge's own SHAPE refute on an honest inability report
         # is stood down — the same exemption the mechanical tier carries.
         v_result = self._stand_down_shape_refute_on_inability(v_result, _claim_src)
+        # §4KJ tried two mechanical stand-downs here (an "inability" refute
+        # and a "fabricated count" refute). Four review rounds each found a
+        # new class of GROUNDED refutes they downgraded — a lexical proxy for
+        # "is this issue a contradiction?" (the [[lexical-proxy]] lesson). Both
+        # were deleted; the judge's own errors belong to the judge.
         # §4BR: carry the vote counters ACROSS the ground-truth overrides.
         #
         # `verify_claim` already re-stamps them onto its own return value
@@ -14055,12 +14307,24 @@ class GhostAgent:
              getattr(v_result, "self_consistency_drawn", None))
             if v_result is not None else None)
         # Visual ground-truth override (unchanged from the inline gate).
+        # An image the agent GENERATED this turn is visual evidence whether
+        # or not the ask used a visual word: four of six image turns on
+        # 2026-09-24 were CONFIRMED at 0.9-1.0 by a text judge that never saw
+        # the pixels, and the requester's next message was "Seriously?".
+        # The cap below sits OUTSIDE the try (R6: an exception before it
+        # skipped the cap exactly when vision broke).
+        _gen_imgs = _turn_generated_images(tools_run_this_turn)
+        _visual_seen = False
         try:
-            if _is_visual_intent(last_user_content):
+            if _is_visual_intent(last_user_content) or _gen_imgs:
                 _sbx = self._scoped_sandbox_for(project_id)
                 _before_img, _after_img = _select_visual_evidence(
                     messages, last_user_content or "", _sbx,
                 )
+                if _gen_imgs:
+                    # the image to judge is the one GENERATED this turn, not the
+                    # newest file on disk (R6: a later screenshot lifted the cap)
+                    _after_img = _resolve_image_path(_gen_imgs[-1], _sbx) or _after_img
                 if _after_img:
                     _vv = await verifier.verify_visual(
                         symptom=last_user_content or "",
@@ -14069,6 +14333,8 @@ class GhostAgent:
                         before_image=_before_img,
                     )
                     if _vv is not None:
+                        _visual_seen = (_vv.confidence >= 0.7 and _vv.verdict in
+                                        (VerifyVerdict.CONFIRMED, VerifyVerdict.REFUTED))
                         if _vv.confidence >= 0.7 and (
                                 _vv.verdict == VerifyVerdict.REFUTED or v_result is None):
                             v_result = _vv
@@ -14104,6 +14370,10 @@ class GhostAgent:
                 f"VISUAL check error: {type(_vv_exc).__name__}: {_vv_exc}",
                 icon=Icons.WARN, level="WARNING",
             )
+        if _gen_imgs and not _visual_seen:
+            v_result = self._cap_unseen_image_confirm(v_result)
+            if getattr(v_result, "unseen_image_capped", False):
+                self._chain_override(v_result, "image-unseen")
         # §4FN reply-shape override: the finalize fallback / a pasted tool
         # result is not an answer. Applied HERE — before the ground-truth
         # overrides and the verdict recording below — so those merge into it
@@ -15456,8 +15726,12 @@ class GhostAgent:
                     if isinstance(i, dict) and i.get("type") == "text"
                 )
             import hashlib
+            # The role is part of the conversation's identity (R4): a member
+            # whose first message matches the owner's ("hi") must not share
+            # the owner's queued corrections or costly-turn record.
+            _role = "member:" if requester_is_member() else ""
             return hashlib.sha1(
-                str(first_user)[:2000].encode("utf-8", "ignore")
+                (_role + str(first_user)[:2000]).encode("utf-8", "ignore")
             ).hexdigest()[:16]
         except Exception:
             return ""
@@ -16131,6 +16405,8 @@ class GhostAgent:
         defect-reopen churn budget (``defect_reopens``) so verdict-driven
         reopens can't grind past the same cap user reports respect.
         ``GHOST_REFUTE_FOLLOWUP_TASKS=0`` kills the feature."""
+        if requester_is_member():
+            return              # a member's refute never files tasks on the owner's projects (R6)
         if os.getenv("GHOST_REFUTE_FOLLOWUP_TASKS", "1").strip().lower() in (
                 "0", "false", "no"):
             return
@@ -17764,6 +18040,8 @@ class GhostAgent:
             if os.getenv("GHOST_IMAGINE", "0").strip().lower() not in (
                     "1", "true", "yes", "on"):
                 return None
+            if requester_is_member():
+                return None     # its precedent is the owner's past errors (§4KJ R10)
             if os.getenv("GHOST_IMAGINE_PREFLIGHT", "1").strip().lower() in (
                     "0", "false", "no", "off"):
                 return None
@@ -18148,6 +18426,7 @@ class GhostAgent:
                         level="WARNING", icon=Icons.STOP,
                     )
 
+            _batch_image_calls = 0          # image_generation calls seen earlier in THIS batch (canonical names)
             for _tc_idx, tool in enumerate(tool_calls):
                 # Strike cap inside the per-tool loop. The outer cap
                 # at the top of the turn loop only runs at turn
@@ -18222,13 +18501,26 @@ class GhostAgent:
                 # the writers' own backstop.
                 if _cname == "learn_skill" and not turn_may_teach(self.context):
                     pretty_log("Local Guard",
-                               "learn_skill refused — this turn must not teach (probe/slack)",
+                               "learn_skill refused — this turn must not teach (probe/member)",
                                icon=Icons.STOP, level="WARNING")
                     err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname,
                                "content": _TO.rejected(
                                    "SYSTEM BLOCK: lessons are not recorded from this "
                                    "channel. Continue without saving a lesson.",
                                    reason_code="lesson_channel_blocked")}
+                    messages.append(err_msg)
+                    tools_run_this_turn.append({**err_msg, "_synthetic": True})
+                    continue
+
+                _member_refusal = (self._member_tool_refusal(
+                    _cname, tool["function"].get("arguments"), tools_run_this_turn)
+                    if requester_is_member() else None)
+                if _member_refusal:
+                    pretty_log("Local Guard",
+                               f"{_cname} refused — {_member_refusal}",
+                               icon=Icons.STOP, level="WARNING")
+                    err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname,
+                               "content": _TO.rejected(_MEMBER_TOOL_BLOCK, reason_code="owner_data_blocked")}
                     messages.append(err_msg)
                     tools_run_this_turn.append({**err_msg, "_synthetic": True})
                     continue
@@ -18255,6 +18547,29 @@ class GhostAgent:
                     # of GPU on a guess is the correct turn, and a strike booked
                     # it `failed` for the outcome-gated learning loops (live
                     # probe, 2026-09-24). The REJECTED row alone steers.
+                    continue
+
+                # 2026-09-24: no second image BLIND. Four Slack requests
+                # generated a second image (~200 s of the node each)
+                # without ever looking at the first — the model reinterpreted
+                # the ask and re-rolled. The tool result already says
+                # "respond directly"; prose loses. Mechanical: a second
+                # image_generation this request is refused until the first
+                # output was inspected by an ANSWERED vision_analysis
+                # call; a second image in one batch is always refused.
+                _br_block = _blind_regeneration_block(
+                    _cname, tools_run_this_turn, messages, last_user_content,
+                    repair_active=bool(getattr(ts, "repair_reentry_active", False)),
+                    batch_images=_batch_image_calls)
+                if _br_block:
+                    pretty_log("Blind Regeneration",
+                               f"{_cname} blocked — a generated image from this request "
+                               "was never inspected or shown",
+                               icon=Icons.STOP, level="WARNING")
+                    err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname,
+                               "content": _TO.rejected(_br_block, reason_code="blind_regeneration")}
+                    messages.append(err_msg)
+                    tools_run_this_turn.append({**err_msg, "_synthetic": True})
                     continue
 
                 if fname == "system_parse_error":
@@ -18895,6 +19210,8 @@ class GhostAgent:
                         # from a write, and the row is the only thing its
                         # readers see.
                         tool_call_metadata.append((fname, tool["id"], a_hash, is_mutating, primary_target_from_args(t_args), is_idempotent_setter, str(t_args.get("operation") or t_args.get("action") or ""), str(t_args.get("path") or ""), _pf_world_mut, dict(t_args) if isinstance(t_args, dict) else {}))
+                        if _cname == "image_generation":
+                            _batch_image_calls += 1     # only a call QUEUED to run counts (R7: a rejected one blocked the next)
                         try:
                             from .foresight import call_target as _fs_ct
                             _fs_call_targets.append(_fs_ct(
@@ -18984,6 +19301,8 @@ class GhostAgent:
                         "is_read_only", False) is True
                     for _fs_i, (_fs_task, _fs_meta) in enumerate(
                             zip(tool_tasks, tool_call_metadata)):
+                        if requester_is_member():
+                            break      # the foresight ledger is the owner's precedent (R9)
                         if _fs_task is None:
                             continue   # batch-dedup placeholder — the
                                        # executed instance carries the grade
@@ -19662,7 +19981,9 @@ class GhostAgent:
                             _is_sim = getattr(
                                 getattr(self.context, "skill_memory", None),
                                 "is_read_only", False) is True
-                            if not _outcome.is_rejection and not _is_sim:
+                            # A member's outcomes are not the owner's competence (R9, MAJOR:
+                            # failing member searches lowered the owner's web prior).
+                            if not _outcome.is_rejection and not _is_sim and not requester_is_member():
                                 _mc.record_outcome(fname, success=not _tool_failed, duration_s=_dur)
                         except Exception as _mcexc:
                             logger.debug("metacog outcome hook failed: %s", _mcexc)
@@ -20941,7 +21262,8 @@ class GhostAgent:
                             fallback_hint = f"\n\n{hint}"
 
                     from ..tools.file_system import tool_list_files, project_scoped_sandbox
-                    sandbox_state = await tool_list_files(project_scoped_sandbox(self.context)[0], self.context.memory_system)
+                    sandbox_state = ("(not available for this channel)" if requester_is_member()
+                                     else await tool_list_files(project_scoped_sandbox(self.context)[0], self.context.memory_system))
                     # Re-anchor on the LIVE request. This diagnostic floods
                     # several KB of user-role text (failure context + full
                     # sandbox listing) into a long turn, and the model has
@@ -21572,34 +21894,34 @@ class GhostAgent:
         # ("I'll forget the PDF." then "Done"), but pass 1 also deletes
         # "First, back up… / Then restore… / Finally, verify…" — two of
         # three instructions after one file read (review, 2026-09-09).
-        if sum(1 for t in tools_run_this_turn
-               if t and not t.get("_synthetic")) >= 2:
-            try:
-                from .reply_smoothing import smooth_reply
-                _smoothed = smooth_reply(final_ai_content)
-                # Never reduce a reply to narration-only (2026-07-25 live:
-                # a 317-char answer containing real findings was trimmed to
-                # exactly its one "Let me search more specifically…" line —
-                # the user received pure narration and none of the
-                # substance). If what SURVIVES the trim is a short
-                # working-narration line, the trim picked the wrong part —
-                # deliver the original.
-                if _is_narration_only_trim(_smoothed, final_ai_content):
-                    logger.info(
-                        "reply smoothing REVERTED: result was narration-only "
-                        "(%d chars) — delivering the untrimmed reply",
-                        len(_smoothed.strip()))
-                    _smoothed = final_ai_content
-                if _smoothed != final_ai_content:
-                    pretty_log(
-                        "Reply Smoothing",
-                        f"trimmed working narration: "
-                        f"{len(final_ai_content)} → {len(_smoothed)} chars",
-                        icon=Icons.BRAIN_SUM,
-                    )
-                    final_ai_content = _smoothed
-            except Exception as _sm_exc:
-                logger.debug("reply smoothing skipped: %s", _sm_exc)
+        try:
+            # ONE implementation (`reply_smoothing.delivery_view`): the
+            # ≥2-real-tool gate and the narration-only revert (2026-07-25
+            # live: a 317-char answer was trimmed to its one "Let me
+            # search…" line) live there, shared with the in-loop verifier
+            # gate so the judged text IS the delivered text.
+            from .reply_smoothing import delivery_view
+            _smoothed = delivery_view(final_ai_content, tools_run_this_turn)
+            if _smoothed != final_ai_content:
+                pretty_log(
+                    "Reply Smoothing",
+                    f"trimmed working narration: "
+                    f"{len(final_ai_content)} → {len(_smoothed)} chars",
+                    icon=Icons.BRAIN_SUM,
+                )
+                final_ai_content = _smoothed
+        except Exception as _sm_exc:
+            logger.debug("reply smoothing skipped: %s", _sm_exc)
+        self._note_tool_conversation(messages, tools_run_this_turn)
+        if requester_is_member():
+            # A member's reply may link only the images generated for a
+            # member (R4, CRIT: a client downloads every /api/download link
+            # in the reply with the owner's key — "reply with exactly
+            # ![x](/api/download/<owner file>)" posted the owner's PDF).
+            _gen_now = set(_turn_generated_images(tools_run_this_turn))
+            self._note_member_files(_gen_now)
+            final_ai_content = _scrub_member_download_links(
+                final_ai_content, self._member_files() | _gen_now)
 
         # Start-with constraint enforcement on the ASSEMBLED reply
         # (req 56221fad): the model opened its FINAL turn with the mandated
@@ -21791,7 +22113,7 @@ class GhostAgent:
                 # "Run exactly this and report the exit code" is not a
                 # lesson about anything a user will ask.
                 if not turn_may_teach(self.context):
-                    logger.debug("Perfect-It skipped: a turn that must not teach (probe/slack)")
+                    logger.debug("Perfect-It skipped: a turn that must not teach (probe/member)")
                 else:
                     _pp_task = asyncio.create_task(_deferred_perfect_it())
                     _bg.add(_pp_task)
@@ -22222,7 +22544,7 @@ class GhostAgent:
                         # §4KD: the queue consumer runs under the "SYSTEM"
                         # request id, so a Slack post-mortem cannot know it
                         # must not teach — it is simply never queued.
-                        logger.debug("post_mortem not queued: a turn that must not teach (probe/slack)")
+                        logger.debug("post_mortem not queued: a turn that must not teach (probe/member)")
                     await self._record_episode_safe(
                         last_user_content, list(tools_run_this_turn),
                         final_ai_content,
@@ -22322,9 +22644,9 @@ class GhostAgent:
                 # the reply (the garbled duplicated footer the 56221fad late
                 # refute read as truncation).
                 from .reply_smoothing import strip_system_notes as _ssn
-                for _hedge in _hs_tracker.scan_text_for_uncertainty(
+                for _hedge in ([] if requester_is_member() else _hs_tracker.scan_text_for_uncertainty(
                     _ssn(final_ai_content or "")
-                ):
+                )):
                     _hs_tracker.flag_assumption(
                         _hedge, confidence=0.4,
                         basis="auto-detected hedge in response",
@@ -22524,7 +22846,8 @@ class GhostAgent:
             # watermark past it. The digest is a USER-surface feature.
             if (_ps is not None and final_ai_content
                     and turn_origin(self.context) == "user"
-                    and not _is_internal_req(fs.req_id)):
+                    and not _is_internal_req(fs.req_id)
+                    and not requester_is_member()):   # the owner's digest, never a member's reply (R7, CRIT)
                 from pathlib import Path as _Path
                 from .project_digest import (
                     summarize_since, render_digest,
@@ -22655,7 +22978,8 @@ class GhostAgent:
             _alog = _get_alog(self.context)
             if (_alog is not None and final_ai_content
                     and turn_origin(self.context) == "user"
-                    and not _is_internal_req2(fs.req_id)):
+                    and not _is_internal_req2(fs.req_id)
+                    and not requester_is_member()):   # the owner's activity digest, never a member's reply (R7, CRIT)
                 from pathlib import Path as _Path
                 _act_wm_path = (_Path(str(self.context.memory_dir)).parent
                                 / "activity_digest.json")
@@ -22704,7 +23028,8 @@ class GhostAgent:
             # framing-purity class the user_request override fixed).
             if (getattr(self.context, "current_project_id", None) is None
                     and final_ai_content
-                    and turn_origin(self.context) == "user"):
+                    and turn_origin(self.context) == "user"
+                    and not requester_is_member()):
                 _sp = getattr(self.context, "scratchpad", None)
                 _already = False
                 try:
@@ -23195,6 +23520,8 @@ class GhostAgent:
         (`_entropy_norm_pending`) that this fallback consumes, so real
         entropy reaches calibration on BOTH delivery paths. Never
         raises."""
+        if requester_is_member():
+            return          # a member's turn is not a calibration sample for the owner's agent (R7)
         # §4O R2 MAJOR-2: a TRUNCATED (upstream-aborted) turn must not
         # become a calibration sample — the earlier fix guarded only the
         # STASH (_calib_pending), but this method's compute-now fallback
@@ -23563,6 +23890,8 @@ class GhostAgent:
         _origin_token = rs._origin_token
         _proj_task_closed_this_req = rs._proj_task_closed_this_req
         _repair_reentry_active = rs._repair_reentry_active
+        _repair_reentry_tools_at = rs._repair_reentry_tools_at
+        _repair_reentry_rows_at = rs._repair_reentry_rows_at
         _request_constraint_block = rs._request_constraint_block
         _request_constraints = rs._request_constraints
         _request_sys3_fired_once = rs._request_sys3_fired_once
@@ -24992,6 +25321,8 @@ class GhostAgent:
                         force_final_response = True
                         force_stop = False
                         _repair_reentry_active = True
+                        _repair_reentry_tools_at = _real_tool_rows(tools_run_this_turn)
+                        _repair_reentry_rows_at = len(tools_run_this_turn or [])
                         final_ai_content = ""
                         _verdict_is_fresh = False
                         _verifier_verdict_cache = None
@@ -25053,6 +25384,14 @@ class GhostAgent:
                     # runs post-semaphore, where the global belongs to
                     # whoever runs next.
                     _rv_pid = self._captured_project_id()
+                    # Judge the DELIVERED view (the same smoothing finalise
+                    # applies), and fingerprint THAT: otherwise a trim at
+                    # finalise invalidates the in-loop verdict and it is
+                    # recomputed (live 2026-09-24: 26.7 s, then 23.3 s again
+                    # for one reply). The raw accumulation stays in
+                    # `final_ai_content` for the repair-round slicing.
+                    from .reply_smoothing import delivery_view as _delivery_view
+                    _judge_text = _delivery_view(final_ai_content, tools_run_this_turn)
                     try:
                         from .verifier import VerifyVerdict as _VV
                         if self._critic_async_enabled():
@@ -25101,7 +25440,7 @@ class GhostAgent:
                                         self._compute_verifier_verdict(
                                             tools_run_this_turn=tools_run_this_turn,
                                             messages=list(messages),
-                                            final_ai_content=final_ai_content,
+                                            final_ai_content=_judge_text,
                                             last_user_content=last_user_content,
                                             lc=lc,
                                             req_id=req_id,
@@ -25125,7 +25464,7 @@ class GhostAgent:
                                         # the user never receives.
                                         _verifier_verdict_cache = (
                                             _vr, _lt,
-                                            hash(final_ai_content))
+                                            hash(_judge_text))
                                         _verdict_is_fresh = True
                                         _refuted = (
                                             _vr is not None
@@ -25144,7 +25483,7 @@ class GhostAgent:
                                         )
                                         _verifier_verdict_cache = (
                                             None, _lt,
-                                            hash(final_ai_content))
+                                            hash(_judge_text))
                                         _verdict_is_fresh = True
                                         # §4BF R2 triage bit 2: the
                                         # verdict EXISTS but missed
@@ -25192,7 +25531,7 @@ class GhostAgent:
                                 project_id=_rv_pid,
                                 tools_run_this_turn=tools_run_this_turn,
                                 messages=messages,
-                                final_ai_content=final_ai_content,
+                                final_ai_content=_judge_text,
                                 last_user_content=last_user_content,
                                 lc=lc,
                                 req_id=req_id,
@@ -25204,7 +25543,7 @@ class GhostAgent:
                             # stamp the judged-text fingerprint here
                             # too.
                             _verifier_verdict_cache = (
-                                _vr, _lt, hash(final_ai_content))
+                                _vr, _lt, hash(_judge_text))
                             _verdict_is_fresh = True
                             _refuted = (
                                 _vr is not None
@@ -25362,6 +25701,8 @@ class GhostAgent:
                         repair_round += 1
                         force_final_response = False
                         _repair_reentry_active = True
+                        _repair_reentry_tools_at = _real_tool_rows(tools_run_this_turn)
+                        _repair_reentry_rows_at = len(tools_run_this_turn or [])
                         if _refuted:
                             # REFUTED: discard the WHOLE accumulated
                             # narration, not just this turn's tail.
@@ -25398,7 +25739,7 @@ class GhostAgent:
                 # rationale as the streaming-path gate above).
                 from .autonomous_activity import (
                     is_internal_request as _is_int_req_m2)
-                if self.context.args.smart_memory > 0.0 and last_user_content and not forget_was_called and not last_was_failure and not _is_int_req_m2(req_id):
+                if self.context.args.smart_memory > 0.0 and last_user_content and not forget_was_called and not last_was_failure and not _is_int_req_m2(req_id) and not requester_is_member():
                     recent_arc = _build_memory_arc(
                         messages, final_ai_content,
                         tools_run=tools_run_this_turn)
@@ -25415,6 +25756,8 @@ class GhostAgent:
             rs._work_nudge_used = _work_nudge_used
             rs._meta_nudge_fired = _meta_nudge_fired
             rs._repair_reentry_active = _repair_reentry_active
+            rs._repair_reentry_tools_at = _repair_reentry_tools_at
+            rs._repair_reentry_rows_at = _repair_reentry_rows_at
             rs._verdict_is_fresh = _verdict_is_fresh
             rs._verifier_verdict_cache = _verifier_verdict_cache
             rs._vr = _vr
@@ -25434,9 +25777,15 @@ class GhostAgent:
             rs.tool_calls = tool_calls
             rs.ui_content = ui_content
 
-    async def handle_chat(self, body: Dict[str, Any], background_tasks, request_id: Optional[str] = None):
+    async def handle_chat(self, body: Dict[str, Any], background_tasks, request_id: Optional[str] = None,
+                          requester_role: str = ""):
         req_id = request_id or str(uuid.uuid4())[:8]
         token = request_id_context.set(req_id)
+        # Who is asking on a multi-user surface ("owner" | "member" | "").
+        # Read through `utils.logging.requester_is_member()` by the profile
+        # block, the autobiographical handle and the smart-memory writers.
+        _role_token = requester_role_context.set(
+            parse_requester_role(requester_role) or requester_role_context.get())
         # §4EZ (2026-09-06): the turn's POPULATION rides a second contextvar
         # so every pretty_log line of this turn — including the ones below
         # that precede the BEGIN frame, and the spawn_bg work that inherits
@@ -25514,6 +25863,12 @@ class GhostAgent:
                                f"the last {DEADLINE_REPORT_FLOOR_S:.0f}s are the report's",
                                icon=Icons.WARN, level="INFO")
                 messages, model, stream_response = body.get("messages", []), body.get("model", "qwen-3.6-35b-a3"), body.get("stream", False)
+                if requester_is_member():
+                    # A member's turn does not stream (R8): the streamed drain
+                    # runs AFTER handle_chat's finally has restored the
+                    # owner's scope, so its late writers would see the
+                    # owner's project. The API serves a string reply fine.
+                    stream_response = False
 
                 # Pre-allocate the trajectory id for THIS turn. Several
                 # in-turn paths (Perfection-Protocol's lesson save, the
@@ -25670,9 +26025,29 @@ class GhostAgent:
                     from ..tools.projects import (
                         conversation_fingerprint, reconcile_conversation,
                     )
-                    reconcile_conversation(
-                        self.context, conversation_fingerprint(messages)
-                    )
+                    if requester_is_member():
+                        # A member's turn runs with NO project and NO
+                        # conversation binding: the projects are the owner's,
+                        # reconciling would let a member rebind (take over)
+                        # the owner's active project by naming it (R4), and a
+                        # stale `conversation_key` made every project-scoped
+                        # path fall back to the owner's bound project (R6:
+                        # member images written into it, owner constraints in
+                        # the member's verifier, follow-up tasks filed there).
+                        # The owner's scope is SAVED and restored when the
+                        # member turn ends (`handle_chat`'s finally), so the
+                        # owner's background paths never see it nulled.
+                        self._member_saved_scope = (
+                            getattr(self.context, "current_project_id", None),
+                            getattr(self.context, "conversation_key", ""))
+                        self.context.current_project_id = None
+                        self.context.conversation_key = ""
+                        from ..tools.projects import _set_scratchpad_scope as _sss
+                        _sss(getattr(self.context, "scratchpad", None), None)
+                    else:
+                        reconcile_conversation(
+                            self.context, conversation_fingerprint(messages)
+                        )
                 except Exception as e:
                     logger.debug(f"project conversation reconcile skipped: {e}")
                 # Work-log accumulators for THIS request (read by the
@@ -25829,6 +26204,13 @@ class GhostAgent:
                 # the backstop to trigger. Non-fatal: a failure here
                 # must never break the user turn.
                 try:
+                    # A member's message never relabels a prior turn (R8, CRIT:
+                    # the correction cache is keyed by the prior REPLY's text,
+                    # so "No, that's wrong" in an open thread failed the
+                    # OWNER's turn, rewrote the autobiography and filed an
+                    # owner calibration negative).
+                    if requester_is_member():
+                        raise _SkipMemberCorrection()
                     _contradicts = await self._adjudicate_correction(
                         messages, last_user_content)
                     self._maybe_promote_prior_turn_via_user_correction(
@@ -26019,6 +26401,12 @@ class GhostAgent:
                 # one-and-done per request instead of per-turn.
                 request_state = GhostAgent._RequestState(self)
                 profile_context = await request_state.get_profile_str()
+                if requester_is_member():
+                    # A channel member's turn does not carry the owner's
+                    # profile (name, address, company…) into the prompt.
+                    # Live 2026-09-24: a stranger's Slack thread ran with
+                    # the owner's full profile in its system prompt.
+                    profile_context = _MEMBER_PROFILE_PLACEHOLDER
 
                 # Metacog: reset per-request arbitration counter so the
                 # MAX_ARBITRATIONS_PER_REQUEST cap is enforced per user
@@ -26075,7 +26463,7 @@ class GhostAgent:
                 try:
                     from ..selfhood import SelfModel as _SelfModel
                     self_model = getattr(self.context, 'self_model', None)
-                    if (_SELFHOOD_PREFIX_ENABLED
+                    if (_SELFHOOD_PREFIX_ENABLED and not requester_is_member()
                             and isinstance(self_model, _SelfModel)
                             and getattr(self_model, 'enabled', False)):
                         # Pass the current request as `query` so the
@@ -26100,7 +26488,8 @@ class GhostAgent:
                 try:
                     from ..workspace import WorkspaceModel as _WorkspaceModel
                     workspace_model = getattr(self.context, 'workspace_model', None)
-                    if isinstance(workspace_model, _WorkspaceModel) and getattr(workspace_model, 'enabled', False):
+                    if (isinstance(workspace_model, _WorkspaceModel) and getattr(workspace_model, 'enabled', False)
+                            and not requester_is_member()):          # the activity log is the OWNER's (R4)
                         # Keep the model's active-project pointer in sync so
                         # both recorded events and the wake-up prefix are
                         # scoped to THIS project — a prior project's research
@@ -26138,7 +26527,7 @@ class GhostAgent:
                 # footer. Non-fatal: must never break a user turn.
                 try:
                     _utracker = getattr(self.context, 'uncertainty_tracker', None)
-                    if _utracker is not None:
+                    if _utracker is not None and not requester_is_member():
                         _uctx = _utracker.persisted_context()
                         # isinstance(str) guard: under MagicMock test
                         # contexts `persisted_context()` returns a mock,
@@ -26161,7 +26550,8 @@ class GhostAgent:
                 try:
                     _mc_comp = getattr(self.context, 'metacog', None)
                     _comp = getattr(_mc_comp, 'competence', None) if _mc_comp is not None else None
-                    if _comp is not None and hasattr(_comp, 'get_context_string'):
+                    if (_comp is not None and hasattr(_comp, 'get_context_string')
+                            and not requester_is_member()):   # the owner's competence history (R8)
                         _roll = _comp.by_domain()
                         _total_n = sum(n for _, n in _roll.values()) if _roll else 0
                         if _total_n >= self._COMPETENCE_MIN_OBS:
@@ -26178,7 +26568,7 @@ class GhostAgent:
                 # gets reused instead of sitting unread on disk. Non-fatal.
                 try:
                     _askstore = getattr(self.context, 'auto_skill_store', None)
-                    if _askstore is not None and last_user_content:
+                    if _askstore is not None and last_user_content and not requester_is_member():
                         # §4CT: `surfaced_for_prompt` returns the block AND
                         # the hashes it listed. `format_for_prompt` threw the
                         # hashes away, which is why this loop reported
@@ -26455,6 +26845,8 @@ class GhostAgent:
                             )
 
                     bus = self._get_memory_bus()
+                    if bus is not None and requester_is_member():
+                        bus = None                       # the memory bus is the OWNER's recall
                     if bus is not None:
                         try:
                             # Pass llm_client so RAG-Fusion's query-decomposition
@@ -26515,8 +26907,8 @@ class GhostAgent:
                 # previously thought X, updated to Y." Inject the explanation
                 # alongside the hydrated memory, query-scoped to the user's
                 # message, so it can. Best-effort.
-                if last_user_content and should_fetch_memory:
-                    _clog = getattr(self.context, "contradiction_log", None)
+                if last_user_content and should_fetch_memory and not requester_is_member():
+                    _clog = getattr(self.context, "contradiction_log", None)   # the OWNER's belief history (R8, CRIT)
                     if _clog is not None:
                         try:
                             _belief = await asyncio.to_thread(
@@ -26712,11 +27104,16 @@ class GhostAgent:
                 # next iteration's volatile-state assembly: the "actually RUN
                 # it" directive was issued into a tool-suppressed turn
                 # (`tool_choice: none`, every emitted call dropped), and a
-                # REFUTED repair could never gather evidence. Never cleared:
-                # after the repair's own final answer the gate either
-                # repairs again (sets it again) or the loop exits, so a
-                # reset would be dead code (its mutant is equivalent).
+                # REFUTED repair could never gather evidence. Cleared (R2
+                # review, 2026-09-24) once the re-entry's tool batch has
+                # run — `_repair_reentry_tools_at` remembers the tool count
+                # at re-entry — because since §4KJ the flag also parks the
+                # planner's converge signals, and a model that keeps
+                # calling tools after its repair would otherwise never be
+                # asked to finish.
                 _repair_reentry_active = False
+                _repair_reentry_tools_at = 0
+                _repair_reentry_rows_at = 0
                 _verifier_verdict_cache = None
                 _verdict_is_fresh = False
                 _final_len_at_turn_start = 0
@@ -26813,6 +27210,23 @@ class GhostAgent:
                         break
 
                     turn_is_conversational = is_conversational and turn == 0
+
+                    # The repair flag clears at the TOP of the iteration —
+                    # before the planner's DONE branch, the schema-side final
+                    # decision and the volatile block's latch (R3/R4 reviews:
+                    # clearing it between any two of them gave one turn with
+                    # tools offered and calls dropped). It clears once the
+                    # re-entry has run a REAL tool, or after three rows of any
+                    # kind (a model re-emitting a REJECTED call must not park
+                    # the converge signals until the turn budget runs out).
+                    if _repair_reentry_active:
+                        _at = int(_repair_reentry_tools_at or 0)
+                        if (_real_tool_rows(tools_run_this_turn) > _at
+                                or len(tools_run_this_turn or []) - int(_repair_reentry_rows_at or 0) >= 3):
+                            pretty_log("Verifier Gate",
+                                       "repair re-entry has run its tools — converge signals re-armed",
+                                       icon=Icons.VERIFIER_LAB)
+                            _repair_reentry_active = False
 
                     if turn > 2: was_complex_task = True
                     if force_stop: break
@@ -26988,6 +27402,8 @@ class GhostAgent:
                             and getattr(self, "thinking_budget_override", None) != "selfplay")
                         else None
                     )
+                    if _det_tool is not None and requester_is_member():
+                        _det_tool = None                 # a member never runs the owner's dream / self-play (R4)
                     if _det_tool is not None and _det_tool in self.available_tools:
                         pretty_log(
                             "Terminal Tool",
@@ -27037,7 +27453,8 @@ class GhostAgent:
                     # At turn milestones, save a structured progress summary
                     # to the scratchpad so earlier context can be pruned
                     # without losing key progress state.
-                    if turn in (15, 30) and getattr(self.context, 'scratchpad', None):
+                    if (turn in (15, 30) and getattr(self.context, 'scratchpad', None)
+                            and not requester_is_member()):   # the owner's scratchpad (R8)
                         try:
                             checkpoint_items = []
                             for m in messages[-10:]:
@@ -27062,7 +27479,9 @@ class GhostAgent:
                         except Exception:
                             pass
 
-                    scratch_data = self.context.scratchpad.list_all() if getattr(self.context, 'scratchpad', None) else "None."
+                    scratch_data = (self.context.scratchpad.list_all()
+                                    if getattr(self.context, 'scratchpad', None) and not requester_is_member()
+                                    else "None.")        # the scratchpad is the OWNER's (R4)
                     # Bound the scratchpad at the SOURCE (2026-07-20). The
                     # per-turn `dynamic_state` injection below embeds this raw
                     # and uncapped (the planner path caps its own copy, but the
@@ -27087,7 +27506,8 @@ class GhostAgent:
                                 "sandbox_dir": project_scoped_sandbox(self.context)[0],
                                 "memory_system": self.context.memory_system
                             }
-                            request_sandbox_state = await tool_list_files(**params)
+                            request_sandbox_state = ("(not available for this channel)" if requester_is_member()
+                                                     else await tool_list_files(**params))
                         sandbox_state = request_sandbox_state
                     else:
                         sandbox_state = "N/A"
@@ -27226,6 +27646,9 @@ class GhostAgent:
                             # turn. §4DA round 16.
                             for t in get_active_tool_definitions(
                                 self.context, serve_tuned=False)
+                            # a member's planner sees only the allowlist (R7)
+                            if not requester_is_member()
+                            or t['function']['name'] in _MEMBER_ALLOWED_TOOLS
                         ])
                         state_limit = max(1500, int(char_budget * 0.05))
                         safe_scratch = str(scratch_data)
@@ -27241,7 +27664,7 @@ class GhostAgent:
                         # same query — both hits are served from the
                         # per-query cache so we pay the cost once.
                         planner_playbook = ""
-                        if self.context.skill_memory:
+                        if self.context.skill_memory and not requester_is_member():
                             try:
                                 planner_playbook = await request_state.get_skill_playbook(
                                     last_user_content or ""
@@ -27521,7 +27944,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             thought_content = plan_json.get("thought", "No thought provided.")
                             tree_update = plan_json.get("tree_update", {})
                             next_action_id = plan_json.get("next_action_id", "")
-                            required_tool = plan_json.get("required_tool", "all")
+                            required_tool = plan_json.get("required_tool") or "all"   # a planner's `null` is "all" (R6/R7)
 
                             # §4IA — a VERBATIM repeat after a new tool result.
                             # Measured: byte-identical consecutive monologues
@@ -27573,7 +27996,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     thought_content = _re_thought
                                     tree_update = _re_json.get("tree_update", tree_update)
                                     next_action_id = _re_json.get("next_action_id", next_action_id)
-                                    required_tool = _re_json.get("required_tool", required_tool)
+                                    required_tool = _re_json.get("required_tool") or required_tool or "all"
                                     pretty_log("Planner Repeat",
                                                "re-ask produced a new plan — adopted",
                                                icon=Icons.RETRY)
@@ -27627,7 +28050,19 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 task_tree.root_id
                                 and task_tree.nodes[task_tree.root_id].status == TaskStatus.DONE
                                 and turn > 0)
-                            if _plan_signals_done:
+                            # …and the DONE plan is a "converge now" signal
+                            # like the one-task latch: it yields to a running
+                            # verifier repair re-entry through the SAME rule
+                            # (`_latch_forces_final`). Live 2026-09-24
+                            # (slack-23a1fa85): the gate opened a repair round
+                            # for an untested write, this branch re-armed the
+                            # forced final on the very next turn, the model's
+                            # browser call was dropped, and the reply then
+                            # said it had "navigated to it in the browser to
+                            # check". Pinned end to end in
+                            # `tests/test_planner_done_yields_to_repair.py`.
+                            if _latch_forces_final(_plan_signals_done,
+                                                   _repair_reentry_active):
                                 pretty_log("Finalizing", "Agent signaled completion — final generation, tools off", icon=Icons.OK)
                                 force_final_response = True
                         except Exception as e:
@@ -27806,16 +28241,22 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # the "answer directly" directive rides the VOLATILE block
                     # instead of flipping the pinned front (2026-07-22).
                     _pin_stable = os.getenv("GHOST_PIN_TOOL_SCHEMAS", "0").strip().lower() not in ("0", "false", "no")
-                    _early_required_tool = locals().get("required_tool", "all")
+                    _early_required_tool = locals().get("required_tool") or "all"   # a planner's `null` is "all" everywhere (R6)
                     _early_next_action_id = locals().get("next_action_id", "")
+                    # …and (R2 review, 2026-09-24) neither planner signal
+                    # counts while a verifier repair re-entry runs: the
+                    # "DO NOT emit any <tool_call>" directive was still
+                    # built next to the "actually RUN it" one.
                     _is_final_generation_for_schema = (
                         force_final_response
-                        or str(_early_required_tool).lower() == "none"
-                        or (
-                            use_plan and not turn_is_conversational
-                            and bool(locals().get("thought_content"))
-                            and str(_early_next_action_id).strip().lower() == "none"
-                        )
+                        or _latch_forces_final(_proj_task_closed_this_req, _repair_reentry_active)   # R4: the latch, decided HERE too
+                        or (not _repair_reentry_active and (
+                            str(_early_required_tool).lower() == "none"
+                            or (
+                                use_plan and not turn_is_conversational
+                                and bool(locals().get("thought_content"))
+                                and str(_early_next_action_id).strip().lower() == "none"
+                            )))
                     )
                     _native_tools_active = bool(
                         getattr(self.context.args, "native_tools", False)
@@ -27916,7 +28357,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         _req_tool = locals().get("required_tool", "none")
                         if use_plan and not turn_is_conversational and _req_tool not in ["none", "all"]:
                             skill_query = f"Tool: {_req_tool} - Context: {thought_content}"
-                        playbook = await request_state.get_skill_playbook(skill_query or "")
+                        playbook = ("" if requester_is_member()
+                                    else await request_state.get_skill_playbook(skill_query or ""))
                         if playbook:
                             fetched_playbook = f"### SKILL PLAYBOOK:\n{playbook}\n\n"
 
@@ -28024,7 +28466,21 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         # delivered as narration plus a note.
                         _plan_req_tool = str(locals().get("required_tool", "all") or "all").strip().lower()
                         _plan_focus_none = str(next_action_id).strip().lower() == "none"
-                        if _plan_focus_none or _plan_req_tool == "none":
+                        if (_plan_focus_none or _plan_req_tool == "none") and _repair_reentry_active:
+                            # 2026-09-24: the plan says "deliver", the
+                            # verifier's repair directive says "RUN it" —
+                            # the repair wins for this one turn, tools on,
+                            # neither planner instruction injected (the
+                            # directive is the instruction). Same rule as
+                            # the DONE-plan branch above; the live case
+                            # (slack-23a1fa85) took THIS path: Focus: none.
+                            pretty_log(
+                                "Planner",
+                                "plan routes to the final answer, but a verifier repair "
+                                "re-entry is running — tools stay on for this turn",
+                                icon=Icons.BRAIN_PLAN,
+                            )
+                        elif _plan_focus_none or _plan_req_tool == "none":
                             _focus_note = ("" if _plan_focus_none else
                                            f" FOCUS TASK {next_action_id} is the delivery itself (required_tool=none).")
                             dynamic_state += ("CRITICAL INSTRUCTION: DO NOT USE TOOLS this turn. Answer the user "
@@ -28055,7 +28511,11 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # If the model returns tool_calls, the turn loop below will handle them.
                     # str(... or "all"): planners routinely emit `"required_tool": null`,
                     # which arrives here as None — .lower() on it would 500 the request.
-                    is_final_generation = force_final_response or str(target_tool or "all").lower() == "none"
+                    # …unless a verifier repair re-entry is running: its
+                    # directive demands tools, and `required_tool: none` on
+                    # the same turn used to drop every call it made (2026-09-24).
+                    is_final_generation = force_final_response or (
+                        str(target_tool or "all").lower() == "none" and not _repair_reentry_active)
 
                     # Translate messages to bypass strict API validation and emulate Qwen-Agent
                     # Replayed calls are rendered in the dialect of the ACTIVE
@@ -28098,15 +28558,23 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                                     if img_url.startswith("data:"):
                                                         header, encoded = img_url.split(",", 1)
                                                         img_data = __base64.b64decode(encoded)
-                                                        filename = f"vision_{uuid.uuid4().hex[:8]}.jpg"
+                                                        # Named by CONTENT (R11): this translation runs on every
+                                                        # model call and thread history re-sends images, so a
+                                                        # random name wrote (and, for a member, registered) a new
+                                                        # copy each time — evicting the member's own older files.
+                                                        filename = f"vision_{hashlib.sha256(img_data).hexdigest()[:12]}.jpg"
                                                         # Save into the active project's dir so the scoped
                                                         # vision_analysis finds it by bare name and it shows
                                                         # in the scoped listing (vision also has a root
                                                         # fallback as a safety net).
                                                         from ..tools.file_system import project_scoped_sandbox
                                                         tmp_path = project_scoped_sandbox(self.context)[0] / filename
-                                                        with open(tmp_path, "wb") as f:
-                                                            f.write(img_data)
+                                                        if not tmp_path.exists():
+                                                            with open(tmp_path, "wb") as f:
+                                                                f.write(img_data)
+                                                        if requester_is_member():
+                                                            # the member's own pasted image is a member file (R10)
+                                                            self._note_member_files({filename})
                                                         text_parts.append(f"[Image attached. SAVED LOCALLY to '{filename}'. You MUST use the `vision_analysis` tool with target='{filename}' to see it!]")
                                                     else:
                                                         text_parts.append(f"[Image attached at URL: {img_url}. You MUST use the `vision_analysis` tool with target='{img_url}' to see it!]")
@@ -28242,7 +28710,15 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # chit-chat). The coding sub-profile (creative/precise/
                     # balanced) still applies when the task IS coding — that
                     # routing lives inside `get_sampling_params`.
-                    is_tool_turn = not turn_is_conversational
+                    # A turn is sampled as chit-chat only when NEITHER the
+                    # query nor the thread points at tools: "Seriously ?"
+                    # after two image turns was sampled at temperature 1.0 /
+                    # presence 1.5 and then made an image_generation call
+                    # (slack-3e…, 2026-09-24) — the query-only classifier
+                    # cannot see the thread it sits in.
+                    is_tool_turn = (not turn_is_conversational
+                                    or _history_shows_tool_activity(messages)
+                                    or self._conversation_ran_tools_recently(messages))
                     sampling_params = get_sampling_params(
                         is_tool_turn,
                         query=last_user_content if 'last_user_content' in locals() else "",
@@ -28536,6 +29012,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             self.context._project_work_pending = None
 
                         ss = StreamState(
+                            requester_role=requester_role_context.get(),
                             created_time=created_time,
                             current_trajectory_id=current_trajectory_id,
                             execution_failure_count=execution_failure_count,
@@ -28596,6 +29073,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         _origin_token=_origin_token,
                         _proj_task_closed_this_req=_proj_task_closed_this_req,
                         _repair_reentry_active=_repair_reentry_active,
+                        _repair_reentry_tools_at=_repair_reentry_tools_at,
+                        _repair_reentry_rows_at=_repair_reentry_rows_at,
                         _request_constraint_block=_request_constraint_block,
                         _request_constraints=_request_constraints,
                         _request_sys3_fired_once=_request_sys3_fired_once,
@@ -28669,6 +29148,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         _work_nudge_used = _its._work_nudge_used
                         _meta_nudge_fired = _its._meta_nudge_fired
                         _repair_reentry_active = _its._repair_reentry_active
+                        _repair_reentry_tools_at = _its._repair_reentry_tools_at
+                        _repair_reentry_rows_at = _its._repair_reentry_rows_at
                         _verdict_is_fresh = _its._verdict_is_fresh
                         _verifier_verdict_cache = _its._verifier_verdict_cache
                         _vr = _its._vr
@@ -28695,6 +29176,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # match what the inline code would have left behind.
                     _ts = TurnState(
                         req_id=req_id,
+                        repair_reentry_active=bool(_repair_reentry_active),
                         _constraint_steer_pending=_constraint_steer_pending,
                         _proj_task_closed_this_req=_proj_task_closed_this_req,
                         _request_sys3_fired_once=_request_sys3_fired_once,
@@ -28885,6 +29367,19 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 request_origin_context.reset(_origin_token)
             except Exception:  # noqa: BLE001 — cross-context reset; never break the finally
                 pass
+            try:
+                requester_role_context.reset(_role_token)
+            except Exception:  # noqa: BLE001 — same
+                pass
+            _saved = getattr(self, "_member_saved_scope", None)
+            if _saved is not None:
+                self._member_saved_scope = None
+                try:
+                    self.context.current_project_id, self.context.conversation_key = _saved
+                    from ..tools.projects import _set_scratchpad_scope as _sss
+                    _sss(getattr(self.context, "scratchpad", None), _saved[0])
+                except Exception:  # noqa: BLE001 — restoring must never break the finally
+                    pass
 
     # Banners this agent DETERMINISTICALLY prepends to a reply, all sharing
     # this exact separator and all stacked in FRONT of the answer body:
@@ -29022,7 +29517,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # sample. The guard was therefore biased toward
                     # accepting the step, not merely weakened.
                     _tid = getattr(traj, "id", None)
-                    recent = [t for t in collector.iter_trajectories()
+                    recent = [t for t in _iter_teachable_train(collector.iter_trajectories())
                               if _tid is None or getattr(t, "id", None) != _tid
                               ][-50:]
                     holdout_X, holdout_y = samples_to_xy(recent)
@@ -29218,6 +29713,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
 
         Never raises: a solicitation that breaks a turn is not worth a label.
         """
+        if requester_is_member():
+            return ""           # the owner's daily thumb ask is not spent on a member (R8)
         try:
             hours = float(os.getenv("GHOST_LABEL_ASK_HOURS",
                                     self._LABEL_ASK_MIN_HOURS) or 0)
@@ -29445,6 +29942,189 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             )
             return None
         except Exception:  # noqa: BLE001 — a guard must never break a verdict
+            return v_result
+
+    _MEMBER_FILES_MAX = 500
+    _TOOL_CONV_TTL_S = 3600.0
+
+    def _conversation_ran_tools_recently(self, messages) -> bool:
+        """Did an earlier turn of THIS conversation run real tools (within
+        the hour)? The agent's own record — a client may strip every tool
+        trace from the history it resends (R4 review: the Slack bot removes
+        the image lines, so "Seriously ?" after two images looked like chat)."""
+        try:
+            fp = self._conversation_fingerprint(messages)
+            rec = getattr(self, "_tool_convs", None)
+            return bool(fp and isinstance(rec, dict) and time.time() - rec.get(fp, 0.0) < self._TOOL_CONV_TTL_S)
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _note_tool_conversation(self, messages, tools_run) -> None:
+        try:
+            if _real_tool_rows(tools_run) <= 0:
+                return
+            fp = self._conversation_fingerprint(messages)
+            if not fp:
+                return
+            rec = getattr(self, "_tool_convs", None)
+            if not isinstance(rec, dict):
+                rec = {}
+                self._tool_convs = rec
+            rec[fp] = time.time()
+            if len(rec) > 500:
+                for k in sorted(rec, key=rec.get)[:len(rec) - 500]:
+                    rec.pop(k, None)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _member_file_store(self):
+        """name → first-seen time, insertion-ordered, persisted beside the
+        system state so a member's files survive a restart (R7)."""
+        d = getattr(self, "_member_generated_files", None)
+        if isinstance(d, dict):
+            return d
+        d = {}
+        if isinstance(getattr(self, "_member_generated_files", None), (set, list, tuple)):
+            d = {n: 0.0 for n in self._member_generated_files}
+        else:
+            p = None
+            try:
+                p = self._member_files_path()
+                if p is not None and p.exists():
+                    d = dict(json.loads(p.read_text(encoding="utf-8")) or {})
+            except Exception as e:  # noqa: BLE001
+                # Fail closed (no member file is reachable) but keep the bad
+                # file aside: the next note would otherwise overwrite every
+                # earlier member name for good (R8b).
+                d = {}
+                try:
+                    if p is not None and p.exists():
+                        os.replace(p, p.with_suffix(".json.corrupt"))
+                except Exception:  # noqa: BLE001
+                    pass
+                logger.warning("member_files.json unreadable (%s: %s) — moved aside, starting empty",
+                               type(e).__name__, e)
+        self._member_generated_files = d
+        return d
+
+    def _member_files_path(self):
+        try:
+            md = getattr(self.context, "memory_dir", None)
+            if not isinstance(md, (str, Path)) or not str(md):
+                return None               # a mock or unset memory dir persists nothing
+            return Path(str(md)).parent / "member_files.json"
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _member_files(self) -> set:
+        """Basenames of the images generated or uploaded on members' turns —
+        the only sandbox files a member's turn (or a member-role download)
+        may touch."""
+        return set(self._member_file_store())
+
+    def _note_member_files(self, names) -> None:
+        d = self._member_file_store()
+        new = False
+        for n in names or ():
+            b = os.path.basename(str(n))
+            if b and b not in d:
+                d[b] = time.time()
+                new = True
+        while len(d) > self._MEMBER_FILES_MAX:
+            d.pop(next(iter(d)))          # the OLDEST first (R7)
+        if new:
+            try:
+                p = self._member_files_path()
+                if p is not None:
+                    tmp = p.with_suffix(".json.tmp")
+                    tmp.write_text(json.dumps(d), encoding="utf-8")
+                    os.replace(tmp, p)
+            except Exception:  # noqa: BLE001
+                pass
+
+    # The ONLY argument keys a member's call to these two tools may carry
+    # (R6 review: path checks lost twice — a leading space turned a URL into a
+    # local path, and six synonym keys carried a reference the check never
+    # read). Key allowlists close the class: an unknown key is refused.
+    _MEMBER_VISION_KEYS = frozenset({"action", "target", "prompt", "question"})
+    _MEMBER_IMAGE_KEYS = frozenset({"prompt", "negative_prompt", "width", "height", "steps",
+                                    "seed", "transparent", "size", "reference_images"})
+    _MEMBER_URL_RE = re.compile(r"https?://[^\s/]+(?:/[^\s]*)?", re.IGNORECASE)
+
+    def _member_file_value_ok(self, value, ok) -> bool:
+        """EXACTLY a member file's basename (no separators, no whitespace),
+        or a well-formed remote URL with no `..` segment."""
+        v = value if isinstance(value, str) else ""
+        if not v or v != v.strip() or ".." in v:
+            return False             # no traversal (a URL is fetched remotely; a member
+                                     # file name is exact — `%` cannot reach a local path)
+        if self._MEMBER_URL_RE.fullmatch(v):
+            return True
+        return "/" not in v and "\\" not in v and v in ok
+
+    def _member_tool_refusal(self, cname, raw_args, tools_run_this_turn):
+        """Why a MEMBER may not make this call, or None. Tools outside
+        `_MEMBER_ALLOWED_TOOLS` are refused; `vision_analysis` and
+        `image_generation` may carry only allowlisted argument keys, and any
+        file they name must be EXACTLY a member-owned image (a member must not
+        caption — or restyle — the owner's files)."""
+        name = str(cname or "")
+        if name not in _MEMBER_ALLOWED_TOOLS:
+            return "the owner's data is not available to a channel member"
+        if name not in ("vision_analysis", "image_generation"):
+            return None
+        try:
+            args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args or {})
+        except Exception:  # noqa: BLE001
+            return "the call's arguments could not be read"
+        if not isinstance(args, dict):
+            return "the call's arguments could not be read"
+        ok = self._member_files() | {os.path.basename(p) for p in _turn_generated_images(tools_run_this_turn)}
+        if name == "vision_analysis":
+            if set(args) - self._MEMBER_VISION_KEYS:
+                return "only an image generated for this channel, or a web URL, can be inspected"
+            tgt = args.get("target")
+            if tgt is None:
+                return None
+            return None if self._member_file_value_ok(tgt, ok) else \
+                "only an image generated for this channel, or a web URL, can be inspected"
+        if set(args) - self._MEMBER_IMAGE_KEYS:
+            return "only images generated for this channel can be used as references"
+        refs = args.get("reference_images") or []
+        refs = [refs] if not isinstance(refs, list) else refs
+        # image_generation cannot FETCH a URL — it resolves every reference as
+        # a sandbox path (percent-decoding it), so for a member a reference
+        # must be exactly a member file's name, never a URL (R7, CRIT:
+        # `https://x/%2e%2e/%2e%2e/projects/p1/photo.jpg` reached the owner's photo)
+        if not all(isinstance(r, str) and not self._MEMBER_URL_RE.fullmatch(r)
+                   and self._member_file_value_ok(r, ok) for r in refs):
+            return "only images generated for this channel can be used as references"
+        return None
+
+    @staticmethod
+    def _cap_unseen_image_confirm(v_result):
+        """On a turn that GENERATED an image, a CONFIRMED that no pixel
+        check backs (the vision call failed or found no after-image) is a
+        text judge vouching for pixels it never saw — capped to UNCERTAIN
+        (≤ 0.6), reasoning says why. A REFUTED / UNCERTAIN / None passes."""
+        try:
+            from .verifier import VerifyVerdict
+            if v_result is None or getattr(v_result, "verdict", None) != VerifyVerdict.CONFIRMED:
+                return v_result
+            v_result.verdict = VerifyVerdict.UNCERTAIN
+            v_result.confidence = min(float(getattr(v_result, "confidence", 0.0) or 0.0), 0.6)
+            v_result.reasoning = ("image generated this turn but no pixel check ran — the "
+                                  "text judge cannot vouch for the image's content: "
+                                  + str(getattr(v_result, "reasoning", "") or ""))[:600]
+            v_result.unseen_image_capped = True
+            pretty_log(
+                "Verifier",
+                "CONFIRMED capped to UNCERTAIN — an image was generated this turn and no "
+                "visual check ran (vision unavailable or no after-image)",
+                icon=Icons.VERIFIER_LAB,
+            )
+            return v_result
+        except Exception:  # noqa: BLE001
             return v_result
 
     @staticmethod
@@ -29888,7 +30568,9 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         # and the imbalance is recorded here so the next reader does not
         # have to re-measure it.
         try:
-            if getattr(getattr(ctx, "args", None), "prm_online_update", False) is True:
+            from ..memory.skills import trajectory_may_teach as _may_teach
+            if (getattr(getattr(ctx, "args", None), "prm_online_update", False) is True
+                    and _may_teach(traj)):   # a member's trajectory never trains (R8b)
                 from ..prm.scorer import PRMScorer as _PRMScorer
                 scorer = getattr(ctx, "prm_scorer", None)
                 if isinstance(scorer, _PRMScorer) and scorer.has_model:
@@ -29997,6 +30679,16 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
 
 
     def _stream_final_generation(self, ss: "StreamState"):
+        # The wrapper below runs AFTER handle_chat's finally has reset the
+        # request contextvars; everything the drain does (the smart-memory
+        # write, the late verdict, the playbook backstop) would otherwise
+        # read "SYSTEM" / no role (R2 review, 2026-09-24).
+        requester_role = ss.requester_role
+        _stream_req_id = ss.req_id
+        _stream_role = str(requester_role or "")
+        if _stream_role == "member":
+            self._note_member_files(_turn_generated_images(ss.stream_tools_snapshot))
+        self._note_tool_conversation(ss.messages, ss.stream_tools_snapshot)   # R6: the web UI's common ending
         # #5 step 4a: the client-facing SSE branch, extracted verbatim from
         # handle_chat. This is SYNC (like the original inline branch): it only
         # DEFINES the nested async generators and returns the response tuple —
@@ -30853,7 +31545,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                                     # markup is not the model
                                                     # hedging to the user.
                                                     _ssn2(_treated_content or "")
-                                                ):
+                                                ) if not requester_is_member() else []:
                                                     _utk.flag_assumption(
                                                         _hedge, confidence=0.4,
                                                         basis="auto-detected hedge in response",
@@ -30985,7 +31677,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 # request's routing calls (2026-07-12).
                 from .autonomous_activity import (
                     is_internal_request as _is_int_req_m1)
-                if self.context.args.smart_memory > 0.0 and last_user_content and not forget_was_called and not last_was_failure and not _is_int_req_m1(req_id):
+                if self.context.args.smart_memory > 0.0 and last_user_content and not forget_was_called and not last_was_failure and not _is_int_req_m1(req_id) and not requester_is_member():
                     recent_arc = _build_memory_arc(
                         stream_messages_snapshot, _treated_content,
                         tools_run=stream_tools_snapshot)
@@ -31035,7 +31727,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         # vector the episode write already closed.
                         if (getattr(self.context, 'journal', None)
                                 and self.context.args.smart_memory > 0.0
-                                and not forget_was_called):
+                                and not forget_was_called
+                                and turn_may_teach(self.context)):     # R4: same gate as the non-streamed path
                             await self._journal_append_safe('post_mortem', {'user': last_user_content, 'tools': stream_tools_snapshot, 'ai': _treated_content, 'model': stream_model})  # §4FV
                         if self.context.args.smart_memory > 0.0 and not forget_was_called:
                             # No verdict is available on the streamed path — the
@@ -31511,7 +32204,23 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 except Exception:  # noqa: BLE001 — never break a drain
                     pass
 
-        return (_stream_then_unregister(stream_wrapper()),
+        async def _stream_in_request_context():
+            # Re-enter the request's contextvars for the drain (see the
+            # note at the top of this method); `stream_wrapper` keeps the
+            # body and its [DONE] sentinel unchanged.
+            _rid_tok = request_id_context.set(_stream_req_id)
+            _role_tok = requester_role_context.set(_stream_role)
+            try:
+                async for _chunk in stream_wrapper():
+                    yield _chunk
+            finally:
+                try:
+                    requester_role_context.reset(_role_tok)
+                    request_id_context.reset(_rid_tok)
+                except Exception:  # noqa: BLE001 — cross-context reset; never break the drain
+                    pass
+
+        return (_stream_then_unregister(_stream_in_request_context()),
                 created_time, req_id)
 
     async def _journal_append_safe(self, kind: str, payload: dict,
@@ -31539,6 +32248,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         # kind and every future append site inherits it.
         if turn_origin(self.context) == ORIGIN_PROBE:
             logger.debug("journal append('%s') skipped: probe turns never teach", kind)
+            return
+        if requester_is_member():
+            # The one writer backstops its callers' `turn_may_teach` (§4KJ R10).
+            logger.debug("journal append('%s') skipped: a member's turn never teaches", kind)
             return
         try:
             await asyncio.wait_for(
@@ -31639,6 +32352,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         grouped everything as ``general``, and every injected episode line
         rendered a bare ``[]`` tag.
         """
+        if requester_is_member():
+            return              # the episodic store is the OWNER's recall (R4)
         em = getattr(self.context, "episodic_memory", None)
         if em is None:
             return
@@ -32228,6 +32943,13 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         # flags a regression, this is the candidate set; without it,
         # attribution is unrecoverable after the fact.
         _extra: Dict[str, Any] = {}
+        # The requester's role rides the trajectory so the idle phases
+        # (reflection, dream, distillation) can refuse a member's turn as a
+        # lesson source without knowing which client it came from.
+        try:
+            _extra["requester_role"] = str(requester_role_context.get() or "")
+        except Exception:  # noqa: BLE001
+            pass
         # req_id stamped explicitly (§4L, 2026-08-07): the late-verdict
         # path joins its calibration correction through it, and lens C
         # found a live trajectory with req_id nowhere in extra.
@@ -32588,7 +33310,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             # also nulls self_model on the isolate (suspenders).
             if (isinstance(self_model, _SelfModel)
                     and getattr(self_model, 'enabled', False)
-                    and turn_origin(self.context) == "user"):
+                    and turn_origin(self.context) == "user"
+                    and not requester_is_member()):     # a member's turn is not the owner's autobiography (R6)
                 # Best-effort user handle: pull "root.name" from the
                 # profile memory. Anonymous installations or missing
                 # profile-memory leave it blank; the autobio writer
@@ -32600,7 +33323,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     if pm is not None and hasattr(pm, "load"):
                         prof = pm.load() or {}
                         root = prof.get("root") if isinstance(prof, dict) else None
-                        if isinstance(root, dict):
+                        if isinstance(root, dict) and not requester_is_member():
                             user_handle = str(root.get("name") or "")
                 except Exception:
                     user_handle = ""
@@ -32642,7 +33365,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             _sm_dm = getattr(self.context, 'self_model', None)
             if (isinstance(_sm_dm, _SelfModelDM)
                     and getattr(_sm_dm, 'enabled', False)
-                    and turn_origin(self.context) == "user"):
+                    and turn_origin(self.context) == "user"
+                    and not requester_is_member()):
                 # See the docstring: None = in-semaphore caller, read
                 # live; the SSE drain passes its semaphore-time snapshot.
                 _plock = (pressure_lockdown
@@ -32672,6 +33396,12 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
 
     async def _run_system_3_pivot(self, task_context: str, error_context: str, sandbox_state: str, model: str) -> dict:
         """System 3 Crisis Pivot: generate 3 alternative strategies and pick the safest one."""
+        if requester_is_member():
+            # A member's turn never runs System-3 (R8, CRIT): its grounding
+            # executes LLM-written shell commands at the sandbox ROOT (the
+            # owner's projects) steered by the member's words, and reads the
+            # owner's episodic recoveries.
+            return {}
         try:
             # Deep-reason prelude: when --deep-reason is on, generate and
             # narrow root-cause hypotheses BEFORE drafting strategies. Feeding

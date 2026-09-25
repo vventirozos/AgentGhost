@@ -674,3 +674,36 @@ async def test_the_proxy_booking_is_released_on_a_base_exception():
             await R.catch_all(req, "v1/chat/completions")
     assert llm.foreground_tasks == 0, "the booking leaked past the BaseException"
     assert llm._own_inflight(llm.upstream_url) == 0
+
+
+@pytest.mark.parametrize("role,consulted", [("owner", True), ("member", False)])
+async def test_a_member_request_never_reads_the_stored_session(monkeypatch, role, consulted):
+    """§4KJ R9: a stored session is the owner's history; a member-role request
+    carrying `session_id` must not have it merged in (nor its turn appended).
+    The wedged store is the probe: consulting it answers 504."""
+    monkeypatch.setattr(R, "_STORE_CALL_TIMEOUT_S", 0.2)
+    started, stuck = _wedged_store()
+    from ghost_agent.core import sessions as S
+    monkeypatch.setattr(S, "get_session_store",
+                        lambda ctx: SimpleNamespace(get=stuck, append_turn=stuck))
+    agent = _chat_agent()
+    agent.handle_chat = AsyncMock(return_value=("hi", 0, "r1"))
+    req = _Req({"messages": [{"role": "user", "content": "hi"}], "stream": False, "session_id": "s1"},
+               headers={"X-Ghost-Requester": role})
+    with patch.object(R, "get_agent", return_value=agent):
+        resp = await R.chat_proxy(req, MagicMock())
+    assert started.is_set() is consulted, role
+    assert (resp.status_code == 504) is consulted, resp.status_code
+
+
+async def test_a_refused_member_label_is_final_not_retryable(monkeypatch):
+    """§4KJ R10: `member_turn` mapped to 503, so the bot retried every such
+    reaction after 5 s and logged a WARNING each time."""
+    from ghost_agent.core import feedback as FB
+    monkeypatch.setattr(FB, "apply_human_label",
+                        lambda *a, **k: {"ok": False, "code": "member_turn", "error": "x"})
+    agent = _chat_agent()
+    req = _Req({"request_id": "r1", "signal": "positive"})
+    with patch.object(R, "get_agent", return_value=agent):
+        resp = await R.feedback(req)
+    assert resp.status_code == 403

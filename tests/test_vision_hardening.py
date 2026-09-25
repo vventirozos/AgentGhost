@@ -194,7 +194,7 @@ async def test_prompt_aliases_are_healed(tmp_path):
         question="How many cats are in this picture?")
     payload = llm.chat_completion.await_args[0][0]
     texts = [c["text"] for c in payload["messages"][1]["content"] if c["type"] == "text"]
-    assert texts[0] == "How many cats are in this picture?"
+    assert texts[0].split("\n\n/no_think")[0] == "How many cats are in this picture?"
 
 
 # ----------------------------------------------------------------- PDF cap

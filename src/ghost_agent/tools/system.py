@@ -7,7 +7,7 @@ try:
     from curl_cffi import requests as curl_requests
 except ImportError:
     curl_requests = None
-from ..utils.logging import Icons, pretty_log
+from ..utils.logging import Icons, pretty_log, requester_is_member
 from ..utils.helpers import request_new_tor_identity
 from ..utils.egress_guard import resolve_egress_proxy
 
@@ -25,7 +25,7 @@ def _server_name(resp) -> str:
 
 
 async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = None):
-    if not location and profile_memory:
+    if not location and profile_memory and not requester_is_member():   # a member's "weather?" gets no owner location (R3)
         # Narrow to Exception (was a bare `except:` catching BaseException —
         # it swallowed CancelledError/KeyboardInterrupt and hid every
         # profile-load failure).
@@ -248,6 +248,8 @@ def _find_location_in_profile(data: dict) -> str:
     return None
 
 async def tool_check_location(profile_memory):
+    if requester_is_member():
+        return "User Location: not available for this channel."
     if not profile_memory: return "Error: Profile memory not loaded."
     try:
         data = profile_memory.load()

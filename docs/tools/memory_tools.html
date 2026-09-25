@@ -546,5 +546,7 @@
     <strong>Graph edges, per edge.</strong> <code>get_neighborhood</code> matches any query word over three characters, so the year token <code>2026</code> pulled in every edge ending in a 2026 date — July news headlines, the operator's family profile — and put fifteen of them at the <em>top</em> of a Revolut recall. Corpus: 111 of 336 graph edges shown (33%) share no non-numeric content word with their query. <code>_graph_edges_on_topic</code> now keeps an edge only if it shares a folded (Unicode, accent-stripped), non-stopword, non-numeric content word with the query; the section is omitted when nothing survives and still leads the result when something does. A query with no content words passes edges through — nothing to judge, nothing rejected. Covered by <code>tests/test_recall_episode_refs_and_graph_filter.py</code>.
   </p>
 </main>
+  <h2 id="member">Not for a channel member <span class="tag">2026-09-24 &sect;4KJ</span></h2>
+  <p><code>recall</code>, <code>remember</code>, <code>knowledge_base</code>, <code>update_profile</code> and <code>unified_forget</code> read or write the OWNER's stores. A request that declared itself a member's is refused at dispatch (every tool outside <code>core/agent._MEMBER_ALLOWED_TOOLS</code>) and, as a belt, inside each tool (<code>_member_block</code>, reason <code>owner_data_blocked</code>, nothing touched). Pins: <code>tests/test_requester_role.py</code>.</p>
 </body>
 </html>

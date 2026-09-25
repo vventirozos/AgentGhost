@@ -365,6 +365,16 @@ class Reflector:
         # yield transient tooling trivia, not task knowledge.
         if _is_recovery_scaffold(traj):
             return False
+        # 2026-09-24: a Slack (or probe) trajectory never teaches — not at
+        # request time (§4KD) and not from an idle phase nine hours later.
+        try:
+            from ..memory.skills import trajectory_may_teach
+            if not trajectory_may_teach(traj):
+                return False
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("reflection: teach predicate unavailable (%s) — "
+                           "reflecting nothing", exc)
+            return False
         # §4FB (2026-09-06): only ADMITTED populations teach. Reflection is
         # a REAL_ONLY consumer (core/admissibility), so a bench, self-play,
         # reflection or PROBE trajectory in the corpus must never mint a

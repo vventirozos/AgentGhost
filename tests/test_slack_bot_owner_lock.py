@@ -226,7 +226,9 @@ class TestThreadContextFilter:
             ]}),
             raising=False,
         )
-        msgs = asyncio.run(bot.build_thread_context("D1", "1.0", "2.0"))
+        # the handlers always name the requester; with none, the builder
+        # fails closed to a member's view (§4KJ R8b)
+        msgs = asyncio.run(bot.build_thread_context("D1", "1.0", "2.0", requester=OWNER))
         assert "report.csv" in msgs[0]["content"]
         assert msgs[1]["content"] == "summarise it"
 

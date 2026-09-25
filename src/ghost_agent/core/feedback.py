@@ -195,6 +195,11 @@ def apply_human_label(agent: Any, request_id: str, signal: str,
                     "code": "unavailable"}
 
         traj = find_trajectory_for_request(collector, rid)
+        if traj is not None and str(((getattr(traj, "extra", None) or {}).get("requester_role") or "")).lower() == "member":
+            # A member's turn never teaches (§4KJ R6): a thumb on it must not
+            # relabel the owner's calibration, the PRM or the diary.
+            return {"ok": False, "code": "member_turn",
+                    "error": "labels on a channel member's turn are not recorded"}
         if traj is None:
             # ⚠ THE LOSS PATH THAT MATTERS, and it logged NOTHING: the
             # client raced the trajectory write, or the id never matched.

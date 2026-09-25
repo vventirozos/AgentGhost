@@ -296,7 +296,7 @@ def _normalize_lesson(lesson: dict) -> dict:
 LESSON_ORIGIN_USER = "user"
 LESSON_ORIGIN_AUTO = "auto"
 LESSON_ORIGIN_PROBE = "probe"
-LESSON_ORIGIN_SLACK = "slack"
+LESSON_ORIGIN_MEMBER = "member"      # a non-owner's turn, on any client
 
 
 def playbook_writes_blocked() -> bool:
@@ -309,9 +309,38 @@ def playbook_writes_blocked() -> bool:
     stays at the call sites because probe post-mortems are already not
     enqueued. Never raises."""
     try:
-        return _derive_lesson_origin() == LESSON_ORIGIN_SLACK
+        return _derive_lesson_origin() == LESSON_ORIGIN_MEMBER
     except Exception:  # noqa: BLE001
         return False
+
+
+def iter_teachable(trajectories):
+    """The trajectories a lesson producer may read: `trajectory_may_teach`
+    applied to an iterable (or a collector's `iter_trajectories()` result).
+    The ONE filter every idle-phase lesson producer goes through."""
+    for t in (trajectories or []):
+        if trajectory_may_teach(t):
+            yield t
+
+
+def trajectory_may_teach(traj) -> bool:
+    """The member rule applied to a STORED trajectory: may a lesson be
+    derived from it later, by an idle phase? The request-time gates
+    (`turn_may_teach`, `playbook_writes_blocked`) read the request
+    context, which idle phases (reflection, dream, distillation,
+    post-mortem) run WITHOUT — under "SYSTEM" — so on 2026-09-24 the
+    reflection cycle acquired a playbook skill from a channel member's
+    turn nine hours after the request-time gate had blocked it. The
+    trajectory carries the requester's role in `extra["requester_role"]`
+    (recorded by `_record_turn_trajectory`); no client name is involved.
+    Task KINDS (probe, bench, self-play…) stay with `core.admissibility`.
+    One predicate, every trajectory-reading lesson producer (pinned by
+    enumeration in `tests/test_trajectory_may_teach.py`). Never raises."""
+    try:
+        extra = getattr(traj, "extra", None) or {}
+        return str(extra.get("requester_role") or "").strip().lower() != "member"
+    except Exception:  # noqa: BLE001
+        return True
 
 
 def _derive_lesson_origin() -> str:
@@ -335,9 +364,9 @@ def _derive_lesson_origin() -> str:
     except Exception:  # noqa: BLE001
         pass
     try:
-        from ..utils.logging import is_slack_request_id
-        if is_slack_request_id(rid):
-            return LESSON_ORIGIN_SLACK
+        from ..utils.logging import requester_is_member
+        if requester_is_member():
+            return LESSON_ORIGIN_MEMBER
     except Exception:  # noqa: BLE001
         pass
     try:

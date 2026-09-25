@@ -132,18 +132,23 @@ class TestConservativeInvariants:
 
 class TestWiring:
     def test_finalize_gates_on_multi_tool_turns(self):
-        """Smoothing must ride _finalize_and_return behind the ≥2
-        substantive-tools gate — conversational and single-tool replies
-        are never rewritten."""
-        src = (Path(__file__).resolve().parents[1]
-               / "src" / "ghost_agent" / "core" / "agent.py").read_text()
-        assert "from .reply_smoothing import smooth_reply" in src
-        idx = src.find("from .reply_smoothing import smooth_reply")
-        window = src[idx - 600:idx]
-        # ≥2 real tool runs: the 2026-07-17 decision, kept after a one-day
-        # trial of ≥1 (§4FS review: pass 1 ate numbered instructions in
-        # single-tool turns).
-        assert ">= 2" in window and "_synthetic" in window
+        """Smoothing rides _finalize_and_return through the ONE shared gate
+        (`reply_smoothing.delivery_view` → `smooth_gated`): ≥2 substantive
+        tools, else the reply is never rewritten — conversational and
+        single-tool replies pass through byte-identical (the 2026-07-17
+        decision, kept after a one-day trial of ≥1)."""
+        from ghost_agent.core.reply_smoothing import delivery_view, treat_reply
+        text = ("Let me check the second file.\n\nThe config sets the port to "
+                "8080 and the timeout to 30 s, both as documented.")
+        one = [{"name": "file_system"}]
+        two = one + [{"name": "file_system"}]
+        assert delivery_view(text, one) == text
+        assert delivery_view(text, one + [{"name": "x", "_synthetic": True}]) == text
+        trimmed = delivery_view(text, two)
+        assert trimmed != text and "Let me check" not in trimmed
+        # the streamed view applies the same gate
+        assert treat_reply(text, n_real_tools=1) == text
+        assert treat_reply(text, n_real_tools=2) == trimmed
 
     def test_prompt_forbids_repeated_summaries(self):
         from ghost_agent.core.prompts import SYSTEM_PROMPT

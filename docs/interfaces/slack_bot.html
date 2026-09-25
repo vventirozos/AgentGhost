@@ -138,6 +138,7 @@
   <h2>Per-message flow</h2>
   <ol>
     <li>Generate an 8-char <code>request_id</code>, sent as <code>X-Request-ID</code>.</li>
+    <li>Say who is asking: <code>X-Ghost-Requester: owner | member</code> (§4KJ, 2026-09-24 — <code>requester_role_header(requester, OWNER_ID)</code>, "owner" iff the Slack user id is the resolved owner, else "member", including when the owner is unresolved). The agent withholds the owner's profile, autobiographical handle, smart memory, recall, playbook and every owner-data tool from a member's turn; see <a href="../memory/skills.html#4kd-slack">the member rule</a>. This header is the ONLY thing the agent knows about who is asking — it keeps no Slack-specific code — so this request builder is the template for any future multi-user client.</li>
     <li>Spawn <code>tail_logs</code> for live emoji status (below).</li>
     <li>Ingest the owner's attachments via <strong><code>POST /api/upload</code></strong>
     (multipart, <code>X-Ghost-Key</code>) — the old path wrote directly into a
@@ -306,6 +307,7 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/com.local.ghost-slackbot.
   emoji map) and <code>tests/test_autonomous_activity.py</code> (no-op watermark writes).</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+<section><h3>Thread builder fails closed (§4KJ R8)</h3><p><code>build_thread_context</code> treats a missing <code>requester</code> as not-the-owner: other people's earlier attachments are not re-uploaded and file notes take the member form. Files attached by another channel member are always marked as untrusted, whoever is asking. A thumb on a member's reply is refused by the agent with 403. The bot logs that at INFO, because it is not a failure.</p></section>
 </main>
 
   <h2 id="4kd-slack">Requests are minted <code>slack-…</code> and never teach <span class="tag">2026-09-24 &sect;4KD</span></h2>

@@ -60,6 +60,20 @@
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 
+  <h2 id="4kj-blind">No second image blind <span class="tag">2026-09-24 &sect;4KJ</span></h2>
+  <p>Four Slack requests (slack-e6…, slack-3e…, slack-15…) generated a SECOND image — ~200&nbsp;s of the image
+  node each — without ever looking at the first: the model reinterpreted the ask between turns and re-rolled. The
+  result's "Respond DIRECTLY to the user" lost every time; prose loses to a re-read of the ask. The rule is mechanical
+  now, at dispatch next to the §4KD clarify-first block (<code>core/agent._blind_regeneration_block</code>): a second
+  <code>image_generation</code> in one request is REJECTED (reason <code>blind_regeneration</code>) until the earlier
+  output — read off this tool's own SUCCESS line — was inspected with a <code>vision_analysis</code> call the node
+  ANSWERED (the call read off the assistant rows' <code>tool_calls</code>, its result matched by <code>tool_call_id</code>;
+  an empty or cap-hit answer is not a look). The user's words never decide (a multi-image ask regex was built and
+  removed — it misclassified a third of realistic asks in two languages); a verifier repair may regenerate, and a
+  second image in the same batch is always blocked. The block names the file and the ways out. With the vision caption fixed on the same day
+  (<a href="vision.html">no-think for every action</a>), "inspect first" is once again a ~4&nbsp;s call rather than a
+  44&nbsp;s empty one. Pins: <code>tests/test_blind_regeneration_guard.py</code>.</p>
+
   <h2 id="4kd-seed">The seed line is information, not a next action <span class="tag">2026-09-24 &sect;4KD</span></h2>
   <p>The SUCCESS result used to end with <em>"Seed: N. Reuse seed=N with a tweaked prompt for ANOTHER TAKE …"</em>.
   A tool result is read at the moment the model decides what to do NEXT, and on 2026-09-23 a Slack member's
