@@ -48453,3 +48453,35 @@ Deployed (listener 363 → 60947).
 **Not fixed:** a refused page that fills an ordinary positional slot is still quoted in full (older behaviour; its
 title is external page data, not an echo). Judge misreads with the fact present in the evidence (≈9 of 42) have
 no mechanical fix.
+
+**§4KK addendum — generated images are judged by their pixels first (2026-09-25, req slack-5e).** Live: on every
+image turn the cheap text judge refuted the reply's description ("the image generation tool output does not
+explicitly confirm the action…") because the image tool returns only a status line; the strong model overturned it
+(a main-model call + a WARNING per image turn) and the vision check then CONFIRMED at 100%. Latent worse case: a
+wrong refute the escalation UPHELD was never lifted by the later visual CONFIRMED (the visual arm replaced only a
+REFUTED or an empty verdict). Fix: on a turn that generated EXACTLY ONE image, `_visual_check_generated` runs vision
+BEFORE the text judge; `_vision_evidence_block` appends "[vision_check] (…pixels of <name>; covers ONLY what that
+image shows…) the pixels MATCH / DO NOT MATCH the reply's description of this image (conf)" for decisive (≥0.7)
+verdicts; the claim prompt says not to refute a description a block covers; the visual arm reuses the early verdict.
+Two review rounds: R20 CRIT — the first cut carried vision's REASONING, which restates the reply (the prompt asks
+"what you see vs what the response claims"), and made the reply's figures/names "supported" in the binder audit →
+verdict only; R20 MAJOR — the verdict read as covering the whole reply → scoped; multi-image turns (vision sees only
+the last) keep the old order; R21 — the fallback image could stand in for the generated one under its name → no
+block unless the generated file resolves; "CONFIRMED" was the judge's own answer word → MATCH / DO NOT MATCH.
+Batteries 94–96 all killed. Suite 25,016 / 0. Deployed (listener 65584 → 18479).
+**Fresh-eye rounds R22 (two lenses) + R23 (confirming).** R22 found: the block's "(90%)" supported a reply's "90%" in
+the number audit (→ confidence in words: "clearly"/"probably"); the image rule lived only in the classic prompt while
+the DEFAULT cheap judge is two-stage — which is why the live probes still refuted "clean, minimalist style" (→ one
+shared "IMAGE DESCRIPTIONS" rule in classic + adjudicate, a do-not-name line in enumerate, an adjudicate required
+marker; scoped: a MATCH covers how the image LOOKS, never figures/names/dates/events presented as image content);
+image-then-command turns never showed the code lens the vision verdict (→ `_tail` = ledger + vision block rides the
+code OUTPUT slot too, and the code prompt says how to read it); re-slicing after the ledger pushed the ledger out and
+re-measured the cut against the already-cut digest (→ vision runs BEFORE packing and the packer reserves `_tail`;
+one PACKER CUT mark, measured against the source). R23: no CRIT/MAJOR; pins added for the remaining budget/fallback
+guards. Batteries 98–99 all killed. Also fixed a test harness: tests/test_4kd_image_pipeline_review.py patched
+`asyncio.sleep` module-wide and the node-capacity probe hit the network (HTTP library's sleep(0) failed the test
+when run alone) → the probe is stubbed. Suite 25,021 / 0. Deployed (listener 20296 → 50437). Live probe: a
+single-image turn describing "clean, photorealistic style" → vision first, text judge CONFIRMED, NO escalation.
+Open: the rebuttal-contract prompt (GHOST_VERIFY_OVERTURN_QUOTE, off by default) has no image rule.
+Operational note: that deploy restarted the agent while user request 9d8f2424 (image generation, started 19:21)
+was in flight — interrupted.

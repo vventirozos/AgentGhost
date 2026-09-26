@@ -3858,6 +3858,35 @@ def _reconstruct_executed_code(
     return ""
 
 
+def _vision_evidence_block(vv, image_path) -> str:
+    """A DECISIVE vision verdict on the turn's generated image, as a labelled
+    claim-evidence block — or "" (no verdict, or below 0.7)."""
+    try:
+        if vv is None or float(vv.confidence or 0) < 0.7:
+            return ""
+        v = getattr(vv.verdict, "value", vv.verdict)
+        if v not in ("CONFIRMED", "REFUTED"):
+            return ""
+        name = os.path.basename(str(image_path or "")) or "the generated image"
+        # The VERDICT only: vision was asked to compare the pixels with the
+        # reply, so its reasoning restates the reply — figures and names the
+        # binder would then count as "supported" (the echo class). A refute's
+        # issues are kept: they can only weigh against the reply.
+        # verdict only, for both outcomes: a refute's issues restate the reply
+        # too (review R20) — and the scope is said, so it is never read as a
+        # verdict on the reply's OTHER facts (web figures, names)
+        # "MATCH / DO NOT MATCH", not the judge's own answer word (review R21)
+        match = "the pixels MATCH the reply's description of this image" if v == "CONFIRMED" \
+            else "the pixels DO NOT MATCH the reply's description of this image"
+        # confidence in WORDS: "(90%)" supported a reply's "90%" in the number
+        # audit (review R22)
+        strength = "clearly" if float(vv.confidence) >= 0.9 else "probably"
+        return (f"[vision_check] (an independent look at the pixels of {name}; it covers ONLY what "
+                f"that image shows, never the reply's other facts) {strength}: {match}")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _tool_call_summary(messages: Optional[list], tool_msg: Optional[dict]) -> str:
     """One line naming what a tool call was asked to do: the command/code
     when `_reconstruct_executed_code` recovers one, else the call's
@@ -14241,14 +14270,40 @@ class GhostAgent:
         _claim_src = strip_system_notes(str(final_ai_content or ""))
         ledger_block = _project_ledger_evidence(
             self.context, tools_run_this_turn, project_id=project_id)
+        # A GENERATED image is judged by its pixels, first (2026-09-25, req
+        # slack-5e): the text judge cannot see an image, so it refuted every
+        # description of one ("the tool output does not confirm the action"),
+        # costing a strong-model escalation per image turn — and a wrong refute
+        # the escalation upheld was never lifted by the visual CONFIRMED that
+        # followed. The vision verdict joins the evidence (claim AND code
+        # lens) as an independent check and is reused by the visual arm below.
+        # Computed BEFORE packing so its room is reserved and the digest is
+        # the only thing cut — re-slicing afterwards pushed the project ledger
+        # out (review R22).
+        _early_visual = None
+        _early_visual_img = None
+        _early_visual_done = False
+        _vblock = ""
+        if len(_turn_generated_images(tools_run_this_turn)) == 1:
+            # ONE image: the look covers it. With several, vision would see only
+            # the last, and the rule excusing descriptions must not reach the
+            # others (review R20) — those turns keep the old order.
+            try:
+                _early_visual, _early_visual_img = await self._visual_check_generated(
+                    tools_run_this_turn, messages, last_user_content, _claim_src, project_id)
+                _early_visual_done = _early_visual_img is not None   # it looked (even if vision returned nothing)
+            except Exception as _ev_exc:  # noqa: BLE001 — the visual arm below retries and caps
+                logger.warning("early visual check failed (the visual arm retries): %s", _ev_exc)
+            _vblock = _vision_evidence_block(_early_visual, _early_visual_img)
+        _tail = "\n".join(b for b in (ledger_block, _vblock) if b)
         _ev_budget, _ev_items = _evidence_budget_for(tools_run_this_turn)  # §4HO
         claim_evidence = _collect_verifier_evidence(
             tools_run_this_turn,
             max_items=_ev_items,
-            budget=(_ev_budget - len(ledger_block) - 1) if ledger_block else _ev_budget,
+            budget=(_ev_budget - len(_tail) - 1) if _tail else _ev_budget,
             claim_text=_claim_src) or tool_output
-        if ledger_block:
-            _room = _ev_budget - len(ledger_block) - 1
+        if _tail:
+            _room = _ev_budget - len(_tail) - 1
             # Through the marked slicer, not a bare `[:_room]`: this is
             # the SAME silent-head-cut defect the packer just fixed,
             # one line later (fresh-eye MINOR, 2026-08-06). The digest
@@ -14257,8 +14312,8 @@ class GhostAgent:
             # claim-relevance-aware like every other cut.
             claim_evidence = (
                 (_slice_evidence_body(claim_evidence, _room, _claim_src)
-                 + "\n" + ledger_block)
-                if _room > 0 else ledger_block)
+                 + "\n" + _tail)
+                if _room > 0 else _tail)
         _log_evidence_digest(claim_evidence, tools_run_this_turn, _ev_budget, _ev_items)  # §4HS
         # HIGH-STAKES flag for the CONFIRM escalation. Computed HERE — the
         # single place every verdict is produced (finalize gate, in-loop
@@ -14342,7 +14397,7 @@ class GhostAgent:
                 _multi_code, _multi_out = _turn_execution_transcript(
                     messages, tools_run_this_turn,
                     # the ledger block rides the same 4000-char OUTPUT slot (review R17)
-                    output_budget=max(800, 4000 - len(ledger_block) - 1) if ledger_block else 4000)
+                    output_budget=max(800, 4000 - len(_tail) - 1) if _tail else 4000)
                 if _multi_code:
                     code_text = _multi_code
             # §4GW: the command is what the turn RAN; the files are what it
@@ -14376,10 +14431,13 @@ class GhostAgent:
                 # blind spot. Reserve tail room inside verify_code_output's
                 # own output[:4000] cap so the ledger survives.
                 _code_output = _multi_out or tool_output
-                if ledger_block:
-                    _lroom = 4000 - len(ledger_block) - 1
-                    _code_output = (((_multi_out or tool_output[:_lroom]) + "\n" + ledger_block)
-                                    if _lroom > 0 else ledger_block)
+                if _tail:
+                    # the ledger AND the vision verdict ride the OUTPUT slot: a
+                    # turn that generated an image then ran a command was judged
+                    # by the code lens with no word of the pixels (review R22)
+                    _lroom = 4000 - len(_tail) - 1
+                    _code_output = (((_multi_out or tool_output[:_lroom]) + "\n" + _tail)
+                                    if _lroom > 0 else _tail)
                 with verify_purpose("turn gate"):
                     # NO `deep=` here on purpose: this route has no
                     # two-stage leg (one _call_llm, by design — see
@@ -14474,12 +14532,15 @@ class GhostAgent:
                     # newest file on disk (R6: a later screenshot lifted the cap)
                     _after_img = _resolve_image_path(_gen_imgs[-1], _sbx) or _after_img
                 if _after_img:
-                    _vv = await verifier.verify_visual(
-                        symptom=last_user_content or "",
-                        claim=_claim_src,
-                        after_image=_after_img,
-                        before_image=_before_img,
-                    )
+                    if _gen_imgs and _early_visual_done:      # same resolver, same image
+                        _vv = _early_visual            # already looked at these pixels, before the text judge
+                    else:
+                        _vv = await verifier.verify_visual(
+                            symptom=last_user_content or "",
+                            claim=_claim_src,
+                            after_image=_after_img,
+                            before_image=_before_img,
+                        )
                     if _vv is not None:
                         _visual_seen = (_vv.confidence >= 0.7 and _vv.verdict in
                                         (VerifyVerdict.CONFIRMED, VerifyVerdict.REFUTED))
@@ -30248,6 +30309,24 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                    and self._member_file_value_ok(r, ok) for r in refs):
             return "only images generated for this channel can be used as references"
         return None
+
+    async def _visual_check_generated(self, tools_run, messages, last_user_content, claim_src, project_id):
+        """(verdict, image_path) of the vision verifier on the turn's LAST
+        generated image — the same inputs the visual arm uses."""
+        verifier = getattr(self.context, "verifier", None)
+        gen = _turn_generated_images(tools_run)
+        if verifier is None or not gen:
+            return None, None
+        sbx = self._scoped_sandbox_for(project_id)
+        before, _other = _select_visual_evidence(messages, last_user_content or "", sbx)
+        after = _resolve_image_path(gen[-1], sbx)
+        if not after:
+            # never another file's pixels under this image's name (review R21):
+            # the visual arm below falls back as it always has, and caps
+            return None, None
+        vv = await verifier.verify_visual(symptom=last_user_content or "", claim=claim_src,
+                                          after_image=after, before_image=before)
+        return vv, after
 
     @staticmethod
     def _cap_unseen_image_confirm(v_result):

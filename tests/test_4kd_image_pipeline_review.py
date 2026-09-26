@@ -168,6 +168,13 @@ def _node_client(monkeypatch, exc_factory):
         posts["n"] += 1
         raise exc_factory()
     client.image_gen_clients[0]["client"].post = post
+
+    async def _cap(node):
+        return 1
+    # no real /props probe to a fake host: the HTTP library's own sleep(0)
+    # landed in the patched module-level sleep and failed the test depending
+    # on the network (found 2026-09-25)
+    client._node_capacity = _cap
     sleeps = []
 
     async def fake_sleep(s):
