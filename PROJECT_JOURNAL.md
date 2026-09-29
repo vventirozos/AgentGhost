@@ -48801,3 +48801,4 @@ no repair yields an answer there. **Real traffic:** 0/2,239 user replies end in 
 ends inside an open code span; a prompt rule to name control tags in words) await the operator.
 **Decision (operator, 2026-09-29): leave it.** Model behaviour, 0/2,239 in real traffic; no guard, no prompt rule.
 Re-open only if real replies start ending inside an open code span.
+**ClockworkPi deploy (2026-09-29 22:54).** `deploy.sh` → device client sha256 matches the repo (ec2519c5…), one client running (pid 6701), face up; backup `~/bin/client.py.bak-20260929-225427`.
