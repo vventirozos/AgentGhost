@@ -244,7 +244,7 @@ class TestClientAndCorpusAgree:
 
     def test_the_restamp_is_on_the_streamed_final_branch(self):
         src = (_ROOT / "src/ghost_agent/api/routes.py").read_text(encoding="utf-8")
-        branch = src[src.index("if hasattr(content, '__aiter__'):"):src.index("_persist_session(\"\".join(_acc))")]
+        branch = src[src.index("if hasattr(content, '__aiter__'):"):src.index("await _persist_session(_pre_text + strip_raw_orphan_reasoning(")]   # §4KO wrapped the persist
         assert "yield _restamp_sse_request_id(chunk, req_id)" in branch
         assert "yield chunk\n" not in branch, "a raw yield survived on the streamed-final branch"
 

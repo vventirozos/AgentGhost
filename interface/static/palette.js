@@ -39,7 +39,7 @@ export function initPalette(ctx) {
                     const last = [...history].reverse().find(m => m.role === 'assistant');
                     if (!last) { toast('No reply to copy', 'error'); return; }
                     const text = Core.stripInternalTags(
-                        typeof last.content === 'string' ? last.content : '');
+                        typeof last.content === 'string' ? last.content : '', last.prefixLen);
                     try { await navigator.clipboard.writeText(text); toast('Copied last reply'); }
                     catch (e) { toast('Copy failed', 'error'); }
                 },

@@ -204,6 +204,9 @@ async def test_agent_streaming_flush(agent):
     chunks = []
     async for chunk in stream_gen:
         chunks.append(chunk)
+    # §4KP: no reasoning channel in this fake stream → the hint frame precedes
+    # the answer (pinned in test_4kp_think_split_and_clients)
+    chunks = [c for c in chunks if b'"reasoning_unparsed"' not in c]
 
     first_chunk = chunks[0].decode('utf-8')
     assert "Here is an image: ![Image](/api/download/foo.jpg)\\n\\n" in first_chunk

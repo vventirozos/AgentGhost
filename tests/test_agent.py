@@ -152,7 +152,12 @@ async def test_agent_streaming(mock_agent):
     chunks = []
     async for chunk in result_content:
         chunks.append(chunk)
-        
+    # §4KP: this fake stream has no reasoning channel (thinking on), so the
+    # agent sends its `reasoning_unparsed` hint first — pinned in
+    # test_4kp_think_split_and_clients; the content frames are this test's subject.
+    assert sum(b'"reasoning_unparsed"' in c for c in chunks) == 1
+    chunks = [c for c in chunks if b'"reasoning_unparsed"' not in c]
+
     assert len(chunks) == 2
 
     # The stream-scrub path (enabled on final-generation turns, which

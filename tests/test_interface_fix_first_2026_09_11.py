@@ -119,8 +119,9 @@ globalThis.requestAnimationFrame = (fn) => { fn(); return 1; };
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestBubbleRevealsOnVisibleText:
-    def _run(self, app_js, acc):
-        fn = (extract_js_function(app_js, "_stripInternalTags")
+    def _run(self, app_js, acc, prefix_len=0):
+        fn = (extract_js_function(app_js, "_stripOrphanThinkClose")      # §4KO: called by _stripInternalTags
+              + extract_js_function(app_js, "_stripInternalTags")
               + extract_js_function(app_js, "_revealAgentBubble")
               + extract_js_function(app_js, "_renderStreamingContent"))
         pre = _DOM_SHIM + f"""
@@ -129,6 +130,7 @@ let currentAgentMessageDiv = _el('div');
 currentAgentMessageDiv.className = 'message agent thinking';
 currentAgentMessageDiv.appendChild(_el('span'));   // the typing indicator
 let currentAccumulatedContent = {acc!r};
+let currentStreamPrefixLen = {prefix_len};
 function renderMarkdown(t) {{ return '<p>' + t + '</p>'; }}
 function setTurnStatusDesc(t, i) {{ status.push(t); }}
 const activeFace = {{ setPhase(p) {{ status.push('phase:' + p); }} }};   // 2026-09-11: the reveal sets the write gait
@@ -153,6 +155,15 @@ function decorateCodeBlocks() {{}}
         assert out["kids"] == 1, "the typing indicator was torn down"
         assert out["html"] == "", "an empty render replaced the indicator"
         assert out["status"] == [], "'writing the reply' was claimed with nothing to show"
+
+    def test_the_stream_prefix_survives_a_leaked_reasoning_cut(self, app_js):
+        """§4KO R3: the renderer passes the prefix length — a correction banner
+        before leaked reasoning is shown, the reasoning is not."""
+        banner = "**Correction:** the mean is 14.\n\n---\n\n"
+        acc = banner + "Let me look it up.\n</think>\n\nThe answer."
+        out = self._run(app_js, acc, prefix_len=len(banner))
+        assert "Correction:" in out["html"] and "The answer." in out["html"]
+        assert "Let me look it up" not in out["html"]
 
     def test_first_visible_character_reveals_once(self, app_js):
         out = self._run(app_js, "<think>a</think>Hi")
@@ -182,6 +193,8 @@ function decorateCodeBlocks() {{}}
         window = app_js_nc[i:i + 900]
         assert "_revealAgentBubble(currentAgentMessageDiv)" in window
         assert "No reply text" in window
+        # §4KO: the history sent back to the server loses a leaked reasoning prefix
+        assert "content: _historyContent(currentAccumulatedContent, currentStreamPrefixLen)" in window
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -726,7 +739,7 @@ class TestStopIsOneCall:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def test_touched_modules_bumped(index_html, app_js):
-    assert "app.js?v=13.3" in index_html and "style.css?v=6.4" in index_html
-    assert "workspace.js?v=8.6" in app_js and "matrix_graph.js?v=13.3" in app_js
+    assert "app.js?v=13.6" in index_html and "style.css?v=6.4" in index_html
+    assert "workspace.js?v=8.8" in app_js and "matrix_graph.js?v=13.6" in app_js
     ws = (_STATIC / "workspace.js").read_text(encoding="utf-8")
     assert "notifications.js?v=7.0" in ws

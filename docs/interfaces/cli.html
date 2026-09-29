@@ -354,6 +354,8 @@
   partial-reply-on-error case). Live network paths are exercised manually
   (verified 2026-07-17: upload → reference → fetch → half-block render against the running
   agent).</p>
+  <h2 id="4kp-hold">A reply flagged <code>reasoning_unparsed</code> <span class="tag">2026-09-29 &sect;4KP</span></h2>
+  <p>When the agent's final stream carries no reasoning channel with thinking on, it sends an empty-delta frame with <code>{"ghost": {"reasoning_unparsed": true}}</code>: the reply's opening may be reasoning that ends in an orphan <code>&lt;/think&gt;</code>. A terminal cannot take printed text back, so both the REPL (<code>stream_reply</code>) and the one-shot path hold such a reply and print it only after the stream's own <code>[DONE]</code> with no error (an abort, an error frame or a stream that just ends prints nothing of it) through <code>strip_orphan_think_close</code> &mdash; a copy of the agent's <code>_strip_orphan_think_close</code>, pinned to it by the §4KO parity table. An unflagged reply streams exactly as before.</p>
 </main>
 </body>
 </html>

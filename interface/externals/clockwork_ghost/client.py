@@ -123,6 +123,33 @@ GHOST_API_KEY = _resolve_ghost_api_key()
 # ============================================================================
 # THEME — central palette + stylesheet builders
 # ============================================================================
+
+# §4KP: the agent's `ghost.reasoning_unparsed` frame says this reply's opening
+# may be reasoning that ends in an orphan </think> (the model server did not
+# route it to the reasoning channel). Printed text cannot be taken back, so
+# the reply is held until complete and stripped here — the mirror of
+# agent._strip_orphan_think_close (a parity test pins the two together).
+_ORPHAN_CLOSE_RE = re.compile(r'\A.*?(?:\A|\n)</think(?:ing)?[ \t]*>[ \t]*\r?\n[ \t]*\r?\n',
+                              re.DOTALL | re.IGNORECASE)
+_FENCE_SPAN_RES = (re.compile(r"```.*?```", re.DOTALL), re.compile(r"~~~.*?~~~", re.DOTALL))
+
+
+def strip_orphan_think_close(text):
+    if not isinstance(text, str) or "</think" not in text.lower() or text.lstrip().startswith("{"):
+        return text
+    fences = []
+
+    def _shield(m):
+        fences.append(m.group(0))
+        return f"\x00FENCE{len(fences) - 1}\x00"
+    shielded = text
+    for rx in _FENCE_SPAN_RES:
+        shielded = rx.sub(_shield, shielded)
+    out = _ORPHAN_CLOSE_RE.sub("", shielded, count=1)
+    for i in range(len(fences) - 1, -1, -1):          # outer shields hold inner ones
+        out = out.replace(f"\x00FENCE{i}\x00", fences[i])
+    return out
+
 class T:
     """Glass UI over the live face (2026-08-02 restyle).
 
@@ -1172,18 +1199,38 @@ class MainWindow(QWidget):
                         self.update_chat_signal.emit("error", f"HTTP {response.status_code}")
                         return
 
-                    async for chunk in response.aiter_text():
+                    held = None           # §4KP: a list while the reply is held
+                    saw_done = got_error = False
+                    err_msg = None        # the FIRST fault, shown once after the reply
+                    after_err = []        # content the agent sends after a fault (its fallback)
+                    # one SSE line per item (§4KP: aiter_text yields socket chunks,
+                    # and two frames in one chunk failed json.loads together)
+                    async for chunk in response.aiter_lines():
                         if chunk.startswith("data: "):
                             data_str = chunk[6:].strip()
                             if data_str == "[DONE]":
+                                saw_done = True
                                 break
                             try:
                                 data = json.loads(data_str)
+                                if data.get("error") and "choices" not in data:
+                                    got_error = True       # §4KP: a cut reply is not released
+                                    if err_msg is None:
+                                        _e = data["error"]
+                                        err_msg = str(_e.get("message") if isinstance(_e, dict) else _e)
+                                    continue       # the agent may still send its fallback sentence
+                                if (data.get("ghost") or {}).get("reasoning_unparsed") is True and held is None:
+                                    held = []
                                 content = data.get("message", {}).get("content", "")
                                 if not content and "choices" in data:
                                     delta = data["choices"][0].get("delta", {})
                                     content = delta.get("content", "")
-                                    
+
+                                if content and held is not None:
+                                    # spoken and shown once complete; after a fault
+                                    # only the agent's own fallback is kept
+                                    (after_err if got_error else held).append(content)
+                                    continue
                                 if content:
                                     self.update_chat_signal.emit("update_response", content)
                                     self.web_face.pulse()
@@ -1206,7 +1253,20 @@ class MainWindow(QWidget):
                                         match = re.search(r'([.?!]+[\s\n]+)', self.tts_buffer)
                             except json.JSONDecodeError:
                                 pass
-                                
+                    if held is not None and saw_done:
+                        text = strip_orphan_think_close("".join(after_err if got_error else held))
+                        if text:
+                            self.update_chat_signal.emit("update_response", text)
+                            self.tts_buffer += text
+                            for sentence in re.split(r'(?<=[.?!])\s+', self.tts_buffer)[:-1]:
+                                clean = re.sub(r'[*`_#]', '', re.sub(r'!\[.*?\]\(.*?\)', '', sentence)).strip()
+                                if clean and self.tts_enabled:
+                                    audio_queue.put_nowait(clean)
+                            self.tts_buffer = re.split(r'(?<=[.?!])\s+', self.tts_buffer)[-1]
+
+                    if err_msg is not None:
+                        self.update_chat_signal.emit("error", err_msg)   # once, after the reply
+
             final_sentence = self.tts_buffer.strip()
             if final_sentence:
                 clean = re.sub(r'!\[.*?\]\(.*?\)', '', final_sentence)

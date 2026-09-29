@@ -363,6 +363,34 @@ def _flush_point(text: str, start: int) -> int:
     return point
 
 
+
+# §4KP: the agent's `ghost.reasoning_unparsed` frame says this reply's opening
+# may be reasoning that ends in an orphan </think> (the model server did not
+# route it to the reasoning channel). Printed text cannot be taken back, so
+# the reply is held until complete and stripped here — the mirror of
+# agent._strip_orphan_think_close (a parity test pins the two together).
+_ORPHAN_CLOSE_RE = re.compile(r'\A.*?(?:\A|\n)</think(?:ing)?[ \t]*>[ \t]*\r?\n[ \t]*\r?\n',
+                              re.DOTALL | re.IGNORECASE)
+_FENCE_SPAN_RES = (re.compile(r"```.*?```", re.DOTALL), re.compile(r"~~~.*?~~~", re.DOTALL))
+
+
+def strip_orphan_think_close(text):
+    if not isinstance(text, str) or "</think" not in text.lower() or text.lstrip().startswith("{"):
+        return text
+    fences = []
+
+    def _shield(m):
+        fences.append(m.group(0))
+        return f"\x00FENCE{len(fences) - 1}\x00"
+    shielded = text
+    for rx in _FENCE_SPAN_RES:
+        shielded = rx.sub(_shield, shielded)
+    out = _ORPHAN_CLOSE_RE.sub("", shielded, count=1)
+    for i in range(len(fences) - 1, -1, -1):          # outer shields hold inner ones
+        out = out.replace(f"\x00FENCE{i}\x00", fences[i])
+    return out
+
+
 class _StreamPrinter:
     """Progressive streaming renderer: the reply FLOWS INTO THE NORMAL
     SCROLL like any terminal program (operator requirement — "use the
@@ -1197,6 +1225,19 @@ class GhostCLI:
         self._turn_interrupted = ""    # cleared per turn; set on every exit
                                        # branch that leaves the reply partial
         printer = _StreamPrinter()
+        held = None                    # §4KP: a list while the reply is held
+        saw_done = False               # the stream's own terminal frame arrived
+
+        def _release() -> None:
+            nonlocal held, waiting
+            if held is None:
+                return
+            text, held = strip_orphan_think_close("".join(held)), None
+            if text:
+                if waiting:
+                    status_spin.stop()
+                    waiting = False
+                printer.feed(text)
 
         def _settle() -> None:
             """Idempotent screen hand-off: stop the spinner/live tail and
@@ -1231,6 +1272,7 @@ class GhostCLI:
                         continue          # SSE comments & `event:` names
                     data = line[6:]
                     if data == "[DONE]":
+                        saw_done = True
                         break
                     try:
                         obj = json.loads(data)
@@ -1244,9 +1286,14 @@ class GhostCLI:
                     # Control-char stripping lives in _StreamPrinter.feed —
                     # the single point where reply text becomes output and
                     # becomes self.text (→ history, → /save).
+                    if (obj.get("ghost") or {}).get("reasoning_unparsed") is True and held is None:
+                        held = []
                     chunk = ((obj.get("choices") or [{}])[0]
                              .get("delta", {}).get("content", ""))
                     if not chunk:
+                        continue
+                    if held is not None:
+                        held.append(chunk)
                         continue
                     if waiting:            # first token: spinner down
                         status_spin.stop()
@@ -1265,6 +1312,9 @@ class GhostCLI:
             self._turn_interrupted = "error"
             self.notice(f"✖ {type(e).__name__}: {e}", "err")
         finally:
+            if self._turn_interrupted or not saw_done:
+                held = None            # §4KP: never the unfiltered reasoning of a cut reply
+            _release()
             _settle()
         return printer.text
 
@@ -1988,6 +2038,8 @@ def one_shot(api: GhostAPI, prompt: str, session_id: str | None) -> int:
                 print(f"ghost: HTTP {resp.status_code}: {detail}", file=sys.stderr)
                 return 1
             got_error = False
+            held = None                        # §4KP: a list while the reply is held
+            saw_done = False
             for raw in resp.iter_lines():
                 if not raw:
                     continue
@@ -1996,6 +2048,7 @@ def one_shot(api: GhostAPI, prompt: str, session_id: str | None) -> int:
                     continue
                 data = line[6:]
                 if data == "[DONE]":
+                    saw_done = True
                     break
                 try:
                     obj = json.loads(data)
@@ -2008,10 +2061,22 @@ def one_shot(api: GhostAPI, prompt: str, session_id: str | None) -> int:
                 # Sanitized HERE, not in feed(): the piped branch below
                 # bypasses the printer entirely, and `ghost -p q | less -R`
                 # is still a terminal on the other end.
+                if (obj.get("ghost") or {}).get("reasoning_unparsed") is True and held is None:
+                    held = []
                 chunk = _safe((obj.get("choices") or [{}])[0]
                               .get("delta", {}).get("content", ""))
                 if not chunk:
                     continue
+                if held is not None:           # §4KP: complete, then strip
+                    held.append(chunk)
+                    continue
+                if render:
+                    printer.feed(chunk)
+                else:
+                    sys.stdout.write(chunk)
+                    sys.stdout.flush()
+            if held is not None and saw_done and not got_error:
+                chunk, held = strip_orphan_think_close("".join(held)), None
                 if render:
                     printer.feed(chunk)
                 else:

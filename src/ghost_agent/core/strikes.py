@@ -356,6 +356,10 @@ class StrikeLedger:
         # steer fires once per request when the run reaches SEARCH_YIELD_STEER.
         self.search_run: int = 0
         self.search_yield_steered: bool = False
+        # §4KL: consecutive tool batches that refused a member call and ran
+        # nothing (no non-synthetic row) — a model that keeps trying after it
+        # has read the refusal. A batch in which any call executed resets it.
+        self.member_refused_batches: int = 0
 
     # -- failure path ------------------------------------------------------
 

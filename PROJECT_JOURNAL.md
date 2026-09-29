@@ -48485,3 +48485,319 @@ single-image turn describing "clean, photorealistic style" → vision first, tex
 Open: the rebuttal-contract prompt (GHOST_VERIFY_OVERTURN_QUOTE, off by default) has no image rule.
 Operational note: that deploy restarted the agent while user request 9d8f2424 (image generation, started 19:21)
 was in flight — interrupted.
+
+## §4KL — A member's impossible task: the silent wall, the withheld steer, the bare abort (2026-09-29) — R0 scope, written first
+
+**Incident.** Req slack-61cc5f5a (09:45–09:48, channel member U6809BSKW): "attack the problem… try to decrypt
+[Linear A] once and for all". 17 `web_search` calls over 10 steps, never an open, then
+`[ATTEMPT_ABORTED_CROSS_TURN_LOOP] The solver opened three consecutive turns…` shipped verbatim as the Slack reply.
+From turn 4 the planner knew the target (mwenge/lineara.xyz, raw.githubusercontent URL pattern) and planned a
+`file_system` download every turn; the solver searched again every turn. Root cause: the §4KJ member allowlist
+(`_MEMBER_ALLOWED_TOOLS`: web_search, darkweb_search, image_generation, vision_analysis, abort_attempt, replan)
+correctly filtered file_system/execute/browser out of both the solver defs and the planner list — and nothing told
+either model. `_MEMBER_TOOL_BLOCK` explains the wall only on a CALL to a blocked tool, which an un-advertised tool
+never receives. The search-yield steer (§4JJ) fired at 10 in the CONTROL arm (withheld); its treatment text names
+`browser`, which a member cannot call. The cross-turn breaker overwrote the reply with the marker (no
+`_with_abort_note`, no evidence) — the two sibling breakers already report.
+
+**Scope (three fixes, operator-approved 2026-09-29).**
+1. A member turn is TOLD its capability boundary, on both the system slot (both handle_chat paths + specialist) and
+   the planner's tool list (full + aligned transient). Property: no member prompt advertises, and every member
+   prompt names as unavailable, each capability the allowlist withholds; the notice cannot drift from the allowlist.
+2. The search-yield steer on a member turn is not randomized and never names a tool outside the allowlist: at the
+   same threshold it always fires, answer-from-snippets only, tools kept (§4JJ's no-stop rationale holds). The
+   member turn is not stamped as an arm observation. Owner behaviour and the experiment unchanged.
+3. The cross-turn breaker closes as a REPORT (tools off, `blocker_report_alert`) when a turn is left, and ships the
+   §4II evidence digest with the marker as a trailer when none is, or when the report turn itself repeats. Property:
+   no path ships the marker as the whole reply; the marker still reaches the corpus on every abort.
+**Threat model.** A member turn must still reach nothing new (no tool added to the allowlist). A notice that
+contradicts the allowlist (names a tool the member has, or omits one it lacks) is a defect. A report turn must not
+re-open tools. Out of scope: other steers' prose naming blocked tools to members (surveyed, listed as open), the
+risk-governor arm, a member page reader (operator's call).
+
+### §4KL — outcome (2026-09-29) — SHIPPED; eight review rounds, batteries 100–106
+
+**Shipped (src/ghost_agent/core/agent.py unless noted).**
+1. `_MEMBER_CAPABILITY_NOTICE` in `_MEMBER_PROFILE_PLACEHOLDER` (every member system slot) and `_member_tools_note`
+   after the planner tool list in both planner shapes. Pinned against the real dispatch table: grants = allowlist minus
+   abort_attempt/replan; every denied capability maps to real tools none of which are allowlisted.
+2. Search-yield steer on a member turn: no arm, no stamp, always `member_search_yield_steer(run)` (answer from the
+   snippets, names no tool a member lacks), tools kept, once per request.
+3. Cross-turn breaker: with a turn left and no forced final → placeholder + `blocker_report_alert("repetition loop")`,
+   tools/thinking off; else `cross_turn_loop_fallback` = §4II digest under the new `FALLBACK_HEADS["no_answer_loop"]`
+   (reply_shape_check: read as the honest non-answer, own refute reason) + the marker as a trailer, `force_stop` (keeps
+   the abort out of the post-mortem learner). `repeated_turn_is_an_answer` lets a repeated opening that ends in a plain
+   answer finish (conservative: native call, the parser's openers `<tool_call`/`<tool`+non-word/`<function …`/
+   `<function=`/`<function_name`, a leading `{`, content-free narration, or nothing visible = not an answer; pinned by
+   running every dialect sample through `_parse_assistant_tool_calls`). An answer turn and a verifier content-repair
+   re-entry reset `cross_turn_repeat_hits`.
+4. Member refusals: an allowlisted tool refused for its ARGUMENTS gets the specific reason (bad keys named with the
+   allowed list) and "the tool is still available"; refused rows carry `_member_refused` (also a member's learn_skill
+   refusal and a member's disabled off-allowlist call; never a parse error, which takes its own branch);
+   `StrikeLedger.member_refused_batches` (strikes.py) counts consecutive batches that refused a member call and ran
+   none; at `MEMBER_REFUSAL_REPORT_AT` = 3 the tools-off report ("channel limits") is forced. Not a strike.
+
+**Review (R8).** Round 1 two lenses (code, pins), rounds 2–8 one confirming reviewer each. Defects found INSIDE this
+review's own fixes: round 2 → 2 MAJOR + 6 pins gaps (answer discarded pre-parse; stale repeat count after repair),
+round 3 → 2 MAJOR (`tool\b` never matched `<tool_call`; refusals unbounded), round 4 → 1 MAJOR (the strike I added
+mislabelled a correct answer as a failed turn), round 5 → 1 MAJOR (request-wide count forced a report on a first
+fan-out), round 6 → 2 MAJOR (MagicMock ledger crash in an existing test; member learn_skill unmarked), round 7 →
+1 MAJOR (member parse errors taken as owner-data refusals), round 8 → MINORs only. **Every MAJOR after round 1 was in
+the previous round's fix.**
+**Mutation (R2/R7).** Batteries 100–106 re-run on a tree verified identical to the source before and after:
+**80/80 killed**, NOOP survived and KNOWNBAD killed in every round. Equivalent mutants deleted as dead code (6):
+clearing the repeated turn's `msg`, the language-regeneration repeat reset, a mid-text raw-JSON check, the role check
+on the refusal limit, `(not _ran)` in the refused condition, the `force_stop` guard on the refusal report. One
+battery run was SIGKILLed by the tool timeout and left mutant Y8 in tree/ (exit 137 skips `finally`); its results
+were discarded and every round re-run — memory `battery-sigkill-leaves-a-mutant`.
+**Suite:** 25,102 passed / 65 skipped / 0 failed (8:41), once, after the last code change. Pins:
+tests/test_4kl_member_capability.py (79); edited tests/test_cross_turn_repetition.py (3 calls when the no-progress
+breaker already forced the final; marker never leads) and tests/test_4ji_request_echo_narration.py (13 armed
+forced-final sites, two §4KL markers).
+
+**Open (not fixed).** (a) At least 3 of 41 SYSTEM ALERT texts still name tools a member lacks (browser, file_system,
+execute). (b) `note_search_yield` ignores `darkweb_search` — counting it changes the owner experiment's trigger
+mid-run. (c) A report that closes a loop is filed as an ordinary success (same as every breaker's report). (d) A
+member's call to a disabled tool still strikes and sets `last_was_failure` — unreachable today (the Slack-serving
+agent has no disabled tools). (e) An alternating answer/tool loop that guards keep sending back costs a few turns
+(each guard fires once; strike cap and turn cap bound it). (f) `narration_only` misses single long planning
+sentences (140–300 chars) — pre-existing. (g) `_breaker_forced_final` stays set across a verifier repair re-entry
+for every breaker — pre-existing. (h) The trailer `[ATTEMPT_ABORTED_CROSS_TURN_LOOP] …` is still visible to a member.
+**Deployed** 2026-09-29 12:39 (listener 25767 → 47761, one process, no respawn over 60 s). **Live** (probe-63,
+member role, the slack-61 ask plus the repo name): 11 web_searches, the member search-yield steer fired at 11,
+reply opens "I can't download the corpus or run my own analysis on this channel — I don't have file download,
+sandbox, or code execution tools available to a channel member" and answers from the searches; outcome ok, 64 s
+(the incident: 180 s and the raw marker). Open (i): the reply invites the member to "share the data with me" — an
+uploaded non-image file cannot be read by a member turn; pasted text can.
+
+## §4KM — The §4KL open items (2026-09-29, operator: "fix the open items too") — R0 scope, written first
+
+**Scope (the nine items listed at the end of the §4KL outcome).**
+(a) Steer texts naming tools a member lacks → ONE choke point: the main call's message translation loop appends
+    one caveat line to a member's SYSTEM ALERT/BLOCK that names a non-allowlisted tool (owner bytes unchanged).
+(b) `darkweb_search` counts toward the search-yield run on a MEMBER turn only (owner experiment trigger unchanged).
+(c) A loop the breaker closed with a report (cross-turn, member refusals) is a BEHAVIOURAL failure: stamped
+    `extra["loop_breaker"]`, promoted by `classify_chat_outcome` to a non-structural FAILED that the verifier
+    never upgrades (the 07-31 honest-failure rule's own exception: shape failures stay FAILED). Reply unchanged.
+(d) A member's call to a disabled off-allowlist tool is a member refusal: no strike, no failure labels.
+(e) `repeated_turn_is_an_answer` waves at most N answers per request; after that the breaker acts.
+(f) The predicate treats a single-paragraph reply that opens with a work beat / ends on an action promise as not
+    an answer (safe direction — the report turn re-writes a real answer).
+(g) A verifier repair re-entry that gives the tools back clears `_breaker_forced_final`.
+(h) A member's HTTP response has `[ATTEMPT_ABORTED_*]` tokens stripped at the API route; the corpus keeps them.
+(i) The capability notice tells a member that data can be PASTED as text; uploaded non-image files cannot be read.
+**Threat model.** Owner prompts, owner outcomes and the §4JJ experiment must not change; nothing may widen the
+member allowlist; a label change may only ever demote a breaker-closed loop, never an ordinary turn.
+
+### §4KM — outcome (2026-09-29) — SHIPPED; six review rounds, batteries 107–111
+
+**Shipped.** (a) `member_steer_caveat` at the main call's message translation + the planner transcript
+(`_get_recent_transcript`): a member's steer whose head matches `_MEMBER_STEER_HEAD_RE` (the whole "SYSTEM <WORDS>"
++ `:`/`(`/`—`/`#` family and AUTO-DIAGNOSTIC:, bare or inside `<tool_response>`) and names a non-allowlisted tool gets
+`MEMBER_STEER_CAVEAT` once; owner bytes unchanged. (b) member `darkweb_search` extends the search-yield run (owner
+unchanged). (c) `stamp_loop_breaker(context, req_id, kind)` / `loop_breaker_for` — keyed by request id (a streamed
+final records after the semaphore is released), capped at 64, cleared on id reuse — at the cross-turn report tier,
+the cross-turn last-turn fallback and the member-refusal report; recorded as `extra["loop_breaker"]`;
+`classify_chat_outcome` 1b → non-structural FAILED (never upgraded). (d) a member's disabled off-allowlist call is a
+refusal, no strike. (e) `CROSS_TURN_ANSWERS_WAVED_MAX` = 2 per request. (f) `repeated_turn_is_an_answer` uses the ONE
+shared narration definition (`reply_smoothing.narration_only`, with the request) + a single work-beat sentence ≤ 600
+chars; a text-only turn the breaker acts on keeps its text in history for the report turn. (g) the verifier content
+repair clears `_breaker_forced_final`. (h) `api/routes._member_copy` → `strip_abort_markers` (outside ``` fences and
+inline spans) on both chat branches. (i) paste-don't-upload guidance in the capability notice. Memory index trimmed
+26.0 KB → 23.5 KB, all 265 links kept.
+
+**Review (R8).** R1 two lenses: 2 MAJOR (the first plan rule discarded real answers; the context-flag stamp raced the
+streamed drain) + a source gap (steer heads) + 7 weak pins. R2: 1 MAJOR (every-sentence-a-beat shipped narration).
+R3: 2 MAJOR (beats + short filler discarded "Let me check. It is Paris."; abbreviations split sentences) → stopped
+patching a lexical rule (memory: lexical proxy for a semantic property) and moved onto the shared detector. R4: 2
+MAJOR, both in that round's own mitigations (prepending model text to the fallback dodged the leak scrubbers and the
+\A-anchored shape head; not stamping a text-only trip let a tool loop dodge its label) → reverted. R5: 1 MAJOR (the
+fallback's marker can be cut by the bleed scrubber when the digest echoes a bleed phrase → the fallback is stamped
+too). R6: nothing in scope. **Every MAJOR after R1 was inside the previous round's fix.** Also caught by tests, not
+review: an unbound `req_id` in the batch function (the member-refusal stamp would have raised); a helper inserted
+between `chat_proxy`'s route decorators (422 on every chat) — its first pin was source-shape and missed it; replaced
+by a real HTTP test.
+**Mutation.** Batteries 100–111 re-run on a tree verified identical to the source before and after: **123/123
+killed**, NOOP survived / KNOWNBAD killed in every round. Equivalent mutants deleted as dead code this section: the
+planner-transcript role check, popping the stamp at record time (kept as a read). The battery tree needs `docs/`
+(tests/test_4gi_api_routes.py reads it — NOOP died without it; memory updated).
+**Suite:** run once after the last code change — 25,176 passed / 67 skipped / 1 failed: the pin-quality ratchet
+(`test_source_text_pins_never_grow`) caught the steer-head enumeration reading source TEXT; migrated to an `ast.parse`
+walk (test-only change), ratchet + §4KM file re-run green (115 passed), H1–H3 mutants still killed.
+
+**Open (not fixed).** (1) `narration_only`'s glue rule (a ≤140-char non-beat after a beat is filler) reads "Let me
+check. It is Paris." as narration — the delivery smoothing strips that paragraph from ANY reply for the same reason;
+retuning it moves every consumer and needs a corpus measurement first. (2) The thinking-loop forced-final fallback
+(`forced_final_loop_fallback`) puts its marker last with no stamp — same bleed-cut exposure (pre-existing). (3) A
+report forced by the member-refusal breaker whose report turn then trips the cross-turn fallback re-stamps
+`member_refusals` as `cross_turn` (both FAILED; only the reason string changes). (4) "Yes. Let me check." style
+answers can be read as plans by the shared detector (safe direction: the report turn restates).
+**Deployed** 2026-09-29 14:55 (listener 47761 → 7321, one process, no respawn over 60 s). **Live** (probe-f6, member
+role, "download this CSV and average it; if you cannot, tell me how to get you the data"): 3 web_searches, no refused
+calls, 30 s; the reply says it cannot download on this channel and asks for the data PASTED into the chat (the §4KM i
+notice working); no abort marker. **New finding (pre-existing, not one of the nine items):** turn 1 carried 137 chars
+of content — planning text ending in an ORPHAN `</think>` (no opening tag) — and the turn loop's accumulated visible
+text shipped it at the top of the reply ("…Let me look it up.\n</think>\n\n"). `_strip_think_blocks` fast-paths any
+text without `<think` and no later scrubber handles an orphan close tag. Open: strip everything up to an orphan
+`</think>` in accumulated/visible content (all roles), with its own review cycle.
+
+## §4KN — The orphan `</think>` (2026-09-29, operator: "fix it") — R0 scope, written first
+
+**Incident.** Live probe-f6 (member, non-streamed): turn 1's content was reasoning ending in a bare `</think>` (the
+template opens the block in the prompt) plus a web_search call; the accumulated visible text shipped
+"…Let me look it up.\n</think>\n\n" at the top of the reply. `_strip_think_blocks` fast-paths any text without
+`<think`, and nothing downstream handles an orphan close.
+**Scope.** `_strip_think_blocks` (the single stripper every non-streamed consumer uses: parser visible text, history
+copy, reply accumulator, breaker, finalize) drops everything up to an orphan close — `</think>`/`</thinking>` with no
+opener before it, ending its line, not in backticks, not in a ``` fence. Property: no orphan close or the reasoning
+before it reaches a non-streamed reply; a mid-sentence or quoted mention of the tag is prose and stays.
+**Out of scope, stated.** The LIVE stream (owner web UI) emits content deltas as they arrive: text before an orphan
+close has already been sent when the tag arrives; fixing that needs held-back streaming (separate design). The
+stream's trajectory/treated copy is in scope only if it passes through `_strip_think_blocks` (check).
+
+### §4KN — outcome (2026-09-29) — SHIPPED; four review rounds, battery 112
+
+**Shipped.** `_strip_orphan_think_close(text, *, call_turn=False)` (agent.py) removes everything from the start
+through the FIRST `</think>`/`</thinking>` that starts its own line and is followed by a blank line — or, when
+`call_turn`, by nothing (a call turn's visible text is narration before the call). ``` and ~~~ fences shielded
+(restored inner-last), CRLF tolerated, a raw-JSON body left alone. Applied at two sites only: the per-turn visible
+text (`call_turn=bool(tool_calls) and not is_final_generation`) and the streamed final's no-answer retry
+(`call_turn` = the scrub removed call markup). `_strip_think_blocks` is UNCHANGED (it also strips the parser's target).
+Corpus: of 3,232 recorded final replies it changes exactly the 3 genuine leaks.
+
+**Review (R8).** R1: CRIT — the first cut lived in `_strip_think_blocks`, and the parser uses it: a file written
+with a line ending in the tag dropped the call (`<function_name=`, raw JSON) silently; + prose cuts, + a
+`<tool_call>` MENTION in the reasoning blocked the strip → redesigned (visible text only, the leaks' own shape).
+Also caught before review, by me: the same parser hazard for the XML dialect → first exclusion attempt (superseded).
+R2: MAJOR — the streamed final's no-answer retry bypassed the strip; minors: reply ending with the tag emptied,
+indented code, ~~~, raw-JSON fragment → tightened (column 0, blank line required, ~~~ shield, `{` guard) — which
+broke the live shape itself (a call turn's text ENDS with the tag) → `call_turn`. R3: MAJOR — the retry often
+re-writes its call; after the scrub it ends with the tag → retry `call_turn` from the scrub; weak pin — `call_turn`
+at the site was unpinned (forcing True passed) → end-to-end pins; minor — a final generation drops its calls, its
+text is the reply → excluded. R4: nothing in scope (LOW: the scrub also removes an echoed `<tool_response>`, so a
+retry with no call can count as a call turn — safe direction).
+**Mutation.** Battery 112: 14/14 killed (NOOP survived, KNOWNBAD killed); 5 equivalent guards deleted across the
+rounds (backtick lookbehind, opener exclusion, count=1, and the first design's parser exclusions went with it). One
+run was VOID: the runner's T1 list is written with single quotes and my edit to append the new pin file silently
+did not apply — KNOWNBAD survived and exposed it.
+**Suite:** 25,209 passed / 67 skipped / 0 failed (8:34), once, after the last change.
+**Open.** A markdown explanation in exactly the leak shape (tag alone at column 0, blank line after) is stripped;
+unbalanced fences are not shielded; the LIVE stream, its durable record and the verifier's claim on the streamed
+path are not stripped (text already sent).
+
+## §4KO — The orphan `</think>` on the LIVE stream (2026-09-29, operator: "fix the streaming path too") — R0 scope
+
+**Problem.** §4KN left the streamed final (owner web UI) out: its content deltas reach the client as they arrive,
+so reasoning before an orphan close has already left when the tag does. **Design.** The tell is the reasoning
+channel: with thinking on, llama-server's parser sends reasoning as `reasoning_content` first; content with NO
+reasoning before it may be raw reasoning. `stream_wrapper` holds such content (`_orphan_hold`; armed on the scrub
+path when `_stream_orphan_watch(payload)` — thinking not disabled — and disarmed by a truthy `reasoning_content`
+delta); cuts it at an orphan close (`_orphan_close_cut` → the §4KN shape; the cut prefix is never sent); releases it
+past `STREAM_ORPHAN_HOLD_MAX_CHARS` (1500) or at the end. The durable record, the retry base and the verifier claim
+are re-stripped when a cut happened. **Property:** no orphan-closed reasoning reaches the client or the record; a
+stream whose reasoning channel works, or with thinking off, is byte- and chunk-identical to before; a held stream
+without the tag delivers the same text. **Threat model:** a normal stream held (latency), an answer dropped, the
+seam / empty-reply / retry accounting broken by the cut, a severed think loop shipping the wrong fallback.
+
+**R0 superseded (R1 review).** The hold above was BUILT and REJECTED: it delayed every thinking-on final answer,
+its release rule leaked multi-paragraph reasoning, and a cut measured on partial text mis-handled fences. It is fully
+reverted; the wire is untouched.
+
+## §4KO — outcome
+
+**Design shipped.** The fix lives where the text is displayed and where it is recorded. (1) Display: the web UI
+re-renders from the accumulated text each frame through `_stripInternalTags` → `_stripOrphanThinkClose` (JS mirror of
+§4KN's visible rule; PARITY table). (2) RAW surfaces — durable record / retry base / verifier claim
+(`stream_wrapper`), the route's stored session, the UI's history push (`_historyContent`) — get
+`strip_raw_orphan_reasoning` / `_stripRawOrphanReasoning`: cut only a pure-prose prefix (no call/think opener, no
+fence) ending in the tag + blank line or + a call opener (RAW_PARITY table; `re.ASCII` so `\b` agrees with JS).
+(3) The stream prefix (prior text + the one-shot correction banner) is marked `ghost.stream_prefix` on its frame;
+every surface cuts only after it. **Review rounds:** R1 rejected the hold; R2 MAJOR — the visible rule on raw text
+cut a written file's content and hid the unparsed-call note → the raw rule; R3 MAJOR — session, history and display
+erased the correction banner (one-shot, so the model could repeat the corrected claim) → the prefix marker; LOW —
+Python Unicode `\b` vs JS; R4 two MINORs — a re-render of stored history (reload / reconcile / Copy last reply) cut from 0 and erased the banner when the raw rule had declined, and the abort push skipped the raw rule (leak back as history, and the 👎 label lost in the merge) → a client-only `prefixLen` on the history entry + `_historyContent` on abort. **Battery:** 113 = 18/18; 114 = 17/17 after 5 survivors in the UI stream loop / frame
+detector got pins; 115 = 7/7; R5: no wire/drift/offset defect, one weak pin (content gate on the carry) pinned (NOOP survived, KNOWNBAD killed each run). **Open:** TTS may speak the prefix before the tag
+arrives; a reply ADOPTED from the server (reconcile recovery, session switch, another device, workspace zip) has no `prefixLen` — the server does not store it — so a re-render cuts from 0 when the raw rule declined (R5; a server-side length is the real fix); `prefixLen` is carried only with a `reqId` (R5 nit); other streaming clients get the raw stream; the prefix is visible mid-stream until the tag + blank line.
+**Deploy (2026-09-29).** Full suite: 25,235 passed, 2 failed (palette.js cache-bust not bumped; one new source-text pin)
+→ fixed (app.js/matrix_graph 13.4, workspace 8.7, palette 7.3; the Copy pin now runs `commandList` under node); interface
+files re-run 1,040 passed. Kickstart: listener 84675 → 50153, one process, "system ready". Live streamed probe
+(probe-ff2dd1d7) delivered cleanly. The prefix frame was not exercised live (it needs an intermediate turn or a
+correction banner). **New, separate finding:** llama-server's reasoning parser splits CONTENT at a literal `</think>`
+the model writes in its answer — asked what the tag does, the reply lost "A closing `" to `reasoning_content` and began
+"` tag signals…". Upstream (the parser), pre-existing, the opposite direction of §4KN/§4KO; not fixed.
+
+
+## §4KP — The four §4KO open items (2026-09-29, operator: "fix these 4 items") — R0 scope + build
+
+**1. The split (root cause of the live probe).** llama-server's reasoning parser ends reasoning at the FIRST `</think>`,
+including one the model writes. Measured live (streamed and non-streamed): a real close leaves `reasoning_content`
+ending in `\n`; a mention split leaves it mid-line ("…specifically `") and content resumes the line ("`)\n …").
+`core/think_split.py` at the LLM client (`chat_completion` both branches, `stream_chat_completion`): mid-line
+reasoning at the first content delta → hold content until a real close (tag at line start + newline: text before →
+reasoning, after → answer) or the end (answer inside the reasoning → rebuilt from the last reasoning paragraph + tag +
+content, ONLY with an open inline code span on that line; else unchanged). Unaffected streams are chunk-identical.
+**2. Speech.** `stream_wrapper` sends `ghost.reasoning_unparsed` (empty delta) before the first content when no
+reasoning arrived and `thinking_disabled(payload)` is false; the web UI holds TTS (`currentSpeechHold`) and speaks the
+stripped display at the end (`_speechSentences`). **3. Stored prefix.** `append_turn(prefix_len)` → `prefixLen` on the
+stored reply; `_clean_messages` keeps it (assistant, int, ≤ len); `model_messages` strips it before the agent;
+`resyncCurrent` compares wire shapes on both sides. **4. Clients.** CLI (REPL + one-shot) and ClockworkPi hold a
+flagged reply and emit `strip_orphan_think_close` (copy of the agent rule; PARITY-pinned). **Threat model:** a normal
+stream altered or delayed; a hold that never ends or drops frames; the hint firing on normal finals (TTS always
+held); `prefixLen` reaching the model or breaking the merge. **Battery 116:** 30/30 real mutants after 2 pins (K3 fence
+opener, K8 keepalive-early-decision); controls valid after excluding the operator-symlink test from the copied tree.
+**R1 review (§4KP).** MAJOR — the non-streamed repair turned TOKEN-CAPPED reasoning into an answer (content "" +
+mid-line reasoning with an open backtick; `tools/vision.py`'s cap detection would ship it) → empty content is never
+repaired and a `finish_reason: length` generation is never rebuilt (both paths). MINORs: a silent hold froze the
+consumer's cancel checks / loop detector / heartbeat → one `: held` SSE comment per held frame; quadratic re-scan
+(40k deltas 30.5 s → 0.07 s) → scan only the new tail; CLI printed held reasoning after an abort/error notice → released
+only on a clean end; web UI spoke it on any exit → clean post-loop path only, `!streamHadError`, prefix not spoken
+twice; ClockworkPi `aiter_text` coalesced the hint with content → `aiter_lines`; `prefixLen` in code points vs JS
+UTF-16 (a 🚀 prefix cut mid-surrogate) → `utf16_len`; synthesized frames copied logprobs → dropped. Left: held frames'
+own logprobs are not forwarded (entropy sample loss, rare); Gemma-4 on Nova ends reasoning without a newline, so a
+thinking-on Nova reply would always be held (no caller enables thinking there today). Battery 117: 13/13 after one pin.
+**R2 review (§4KP).** MAJOR — fix #1 was partial: a stream cut by a stall/abort ERROR frame, or one that just ended,
+still rebuilt an answer from reasoning → only a `finish_reason: stop` end may rebuild; the post-loop flush never does.
+MINORs: ClockworkPi released held text after an error frame (no error handling at all) → error frames shown and the
+hold dropped; a hold starved the content-fed guards (900 native tool_calls held to the end) → the first `tool_calls`
+frame ends the hold, and a hold past 8,000 chars is released unchanged; clients treated an end without `[DONE]` as clean
+(a cancel/relay teardown) → the web UI, the CLI (both paths) and ClockworkPi release/speak a held reply only after the
+stream's own `[DONE]`; the fixed 32-char look-back missed a padded close until the end → scan from the last held
+newline (exact); the blank line after a mid-stream close leaked a leading newline → trimmed. The UI end block is now a
+function (`_heldSpeech`), and ClockworkPi's real `send_chat_request` runs in the tests. Battery 118: 13/13 after 3 pins.
+**R3 review (§4KP).** No MAJOR. MINORs: a newline-only frame after a close was swallowed with its finish_reason /
+tool_calls → kept via `_without_content`; a close just past the 8,000-char bound left a blank line, and a mention cut at
+a line start by the bound was taken as a close → an early release decides with the OPEN-text rule and trims the lead;
+a non-dict delta raised out of the stream → `_delta` returns {}; ClockworkPi's error `break` dropped the agent's
+scrub-fallback sentence (sent AFTER an abort frame) → `continue`. Six unpinned behaviours (trim reset, indent, the web
+`[DONE]` flag, …) pinned. Battery 119: 11/11 after one pin.
+**R4 review (§4KP), converged.** No MAJOR. MINORs: a CUT stream ending in "\n</think>" still took it as the close →
+only a `stop` end decides on complete text (the post-loop flush never does); ClockworkPi's `continue` showed partial
+text twice and two fault lines, and dropped the agent's fallback in a held reply → the first fault is shown ONCE after
+the reply, and content sent after a fault is released (it is the agent's own fallback). Battery 120: 5/5.
+**Deploy (2026-09-29).** Full suite: 25,324 passed, 5 failed → fixed (zero-width spaces in the think_split docstring
+tripped the lint gate; two streaming tests counted the new hint frame; one timing test passed on re-run, load). Kickstart:
+listener 50153 → 17492, one process, "system ready". Live probes (the probe-ff2dd1d7 question, 3 runs): 2/3 correct —
+one with the literal `</think>` intact in the answer, one where the reasoning mention split was repaired (the log shows
+the draft back in reasoning, the reply is the real answer). 1/3 ended the ANSWER at "A closing `" (content 11 chars,
+reasoning closed normally, no split, no hold): the upstream stopped emitting at the literal tag. Not reproducible
+directly against llama-server (content continued past the tag in every direct probe); open, separate from §4KP.
+The reasoning_unparsed hint did not fire on these normal finals (reasoning arrived first), as designed.
+
+## §4KQ — The answer cut off at a literal `</think>` (2026-09-29, operator: "look into the cut-off replies") — investigation
+
+**Method.** Loopback packet capture of agent↔llama-server traffic during 5 live probes (no agent change), then replays
+of the captured request. 3/5 probes went wrong: #5 cut ("A closing `"), #4 leaked reasoning then cut, #2 had an
+empty "``" hole. **Finding 1 — the cut is the MODEL ending its turn.** `timings.predicted_n` accounts for every token
+(nothing generated was dropped). `</think>` (token 248069) is not a stop on either endpoint: forced 25× with a
+logit bias it repeats to the length limit on `/completion` and on `/v1/chat/completions` (thinking on/off, tools
+on/off). At "…answer.\n</think>\n\nA closing `" the next-token distribution is `\n` 0.34, `think` 0.26,
+**`<|im_end|>` (248046) 0.22**, `</` 0.06, `</think>` 0.04 — the model ends its turn one time in five right where the
+literal tag would go. Not llama-server, not the agent, not §4KP. **Finding 2 — a §4KP gap.** In #4 the model wrote a
+NEWLINE before the mentioned tag, so the reasoning channel ended in "\n" (the real-close tell) and the split went
+unrepaired; the content then resumed the code span ("` tag does …"). The tell could add "the last reasoning line
+opens a code span and the content starts with a backtick" — but in #4 the content was more reasoning and then cut, so
+no repair yields an answer there. **Real traffic:** 0/2,239 user replies end in this shape; 2 contain a literal
+`</think>`; 1 has an empty `` span. **Status:** root cause identified, no code change; options (retry an answer that
+ends inside an open code span; a prompt rule to name control tags in words) await the operator.
+**Decision (operator, 2026-09-29): leave it.** Model behaviour, 0/2,239 in real traffic; no guard, no prompt rule.
+Re-open only if real replies start ending inside an open code span.

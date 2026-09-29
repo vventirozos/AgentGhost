@@ -105,12 +105,16 @@ class TestCrossTurnRepetition:
                    return_value=[{"function": {"name": "noop"}}]):
             final, _, _ = await agent.handle_chat(body, FakeBgTasks())
 
-        # The abort fires on the THIRD call (2 consecutive Jaccard hits
-        # against turns 1 and 2). Turn 4+ must never reach the LLM.
+        # The breaker fires on the THIRD call (2 consecutive Jaccard hits
+        # against turns 1 and 2). The identical `noop` results have already
+        # made turn 3 a forced final (no-progress breaker), so there is no
+        # report turn to ask for: the evidence digest ships with the marker
+        # as a trailer (§4KL). Turn 4+ must never reach the LLM.
         assert turn_calls["n"] == 3, (
             f"Agent made {turn_calls['n']} LLM calls. Expected abort on turn 3."
         )
         assert "ATTEMPT_ABORTED_CROSS_TURN_LOOP" in final
+        assert not final.startswith("[ATTEMPT_ABORTED_CROSS_TURN_LOOP]")
 
 
     @pytest.mark.asyncio

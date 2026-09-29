@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=13.3';
+import * as matrixGraphFace from './matrix_graph.js?v=13.6';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -310,6 +310,15 @@ let currentReqId = null;
 // could never land (§4EX). The bubble then gets no thumbs at all instead
 // of an error on every tap. Reset wherever currentReqId is.
 let currentTurnUnlabelable = false;
+// §4KO R3: length of the stream prefix (prior text, a correction banner) the
+// agent marks `ghost.stream_prefix` — not this generation's text, so the
+// leaked-reasoning cuts start after it. Reset wherever the accumulator is.
+let currentStreamPrefixLen = 0;
+// §4KP: the server's `ghost.reasoning_unparsed` — this reply's reasoning did not
+// arrive on the reasoning channel, so its opening may be reasoning the display
+// strips once the orphan </think> arrives. Speech waits for the whole reply
+// and speaks what the display shows. Reset wherever the accumulator is.
+let currentSpeechHold = false;
 // The text of the turn this tab most recently sent — the only identifier
 // available when durable sessions are off. See `_resolveOwnTurnId`.
 let _lastSentUserText = '';
@@ -1211,12 +1220,72 @@ function renderMarkdown(text) {
 // what the TTS engine speaks — previously the display stripped only
 // <tool_call>, so raw reasoning leaked into the chat bubble while being
 // suppressed in audio.
-function _stripInternalTags(text) {
-    return String(text ?? "")
+// `keepLen` (§4KO R3): the stream prefix — the orphan-close cut starts after it.
+function _stripInternalTags(text, keepLen = 0) {
+    const tags = (t) => t
         .replace(/<think>[\s\S]*?<\/think>/gi, '')   // closed reasoning
         .replace(/<think>[\s\S]*$/i, '')             // unclosed (still streaming)
-        .replace(/<tool_call[\s\S]*?(?:<\/tool_call>|$)/gi, '')
-        .trim();
+        .replace(/<tool_call[\s\S]*?(?:<\/tool_call>|$)/gi, '');
+    const s = String(text ?? "");
+    const n = Math.min(Math.max(0, Number(keepLen) || 0), s.length);
+    return (tags(s.slice(0, n)) + _stripOrphanThinkClose(tags(s.slice(n)))).trim();
+}
+
+// §4KO: the mirror of agent.strip_raw_orphan_reasoning, for RAW text (history
+// sent back to the server keeps inline <think> blocks): cut only a pure-prose
+// prefix — no call opener, think opener or fence before the orphan close — that
+// ends in a close followed by a blank line or directly by a call opener.
+function _stripRawOrphanReasoning(text) {
+    const s = String(text ?? "");
+    if (!/<\/think/i.test(s)) return s;
+    const m = s.match(/^([\s\S]*?)(?:^|\n)<\/think(?:ing)?[ \t]*>[ \t]*(?:\r?\n[ \t]*\r?\n|\r?\n(?=[ \t]*<(?:tool_call\b|tool\b|function\b)))/i);
+    if (!m || /<(?:tool_call|tool|function|think)\b|```|~~~/i.test(m[1])) return s;
+    return s.slice(m[0].length);
+}
+
+// §4KP: display text → the sentences speech queues, cleaned like the live
+// voice path (markup, emphasis, brackets and links dropped).
+function _speechSentences(text) {
+    const clean = String(text ?? "").replace(/(<think>[\s\S]*?<\/think>|<tool_call[\s\S]*?(?:<\/tool_call>|$)|<[^>]+>|\*|_|`|#|\[|\]|\(|\)|!\[.*?\]\(.*?\))/gi, "");
+    return clean.split(/(?<=[.?!;])\s+/).map(t => t.trim()).filter(t => /[\p{L}\p{N}]/u.test(t));
+}
+
+// §4KP: what a held reply speaks at its clean end — the prefix's unspoken
+// remainder (the live voice path spoke it up to its last full sentence), then
+// the generation as the display shows it.
+function _heldSpeech(buffer, text, prefixLen) {
+    const s = String(text ?? "");
+    const n = Math.min(Math.max(0, Number(prefixLen) || 0), s.length);
+    return [..._speechSentences(buffer), ..._speechSentences(_stripInternalTags(s.slice(n)))];
+}
+
+// §4KO: the streamed reply as history sent back to the server — a leaked
+// reasoning prefix cut by the raw rule, the stream prefix (R3: prior text, a
+// correction banner) kept whole.
+function _historyContent(text, prefixLen) {
+    const s = String(text ?? "");
+    const n = Math.min(Math.max(0, Number(prefixLen) || 0), s.length);
+    return s.slice(0, n) + _stripRawOrphanReasoning(s.slice(n));
+}
+
+// §4KO: reasoning that leaked into the reply CONTENT and ends in an orphan
+// </think> (the chat template opens the block in the prompt, so there is no
+// opener). The mirror of agent._strip_orphan_think_close: everything before the
+// FIRST </think> that starts its own line and is followed by a blank line is
+// reasoning; ``` and ~~~ fences are shielded; a raw-JSON body is left alone.
+// Streamed bytes cannot be recalled, so the display does it: the whole reply is
+// re-rendered from the accumulated text every frame, and the leaked prefix
+// disappears as soon as the tag and its blank line arrive.
+function _stripOrphanThinkClose(text) {
+    const s = String(text ?? "");
+    // a raw-JSON body (it opens with a left brace) is a tool call, not prose
+    if (!/<\/think/i.test(s) || s.trimStart().charAt(0) === "\u007B") return s;
+    const fences = [];
+    const shield = (m) => { fences.push(m); return `\u0000FENCE${fences.length - 1}\u0000`; };
+    const shielded = s.replace(/```[\s\S]*?```/g, shield).replace(/~~~[\s\S]*?~~~/g, shield);
+    let out = shielded.replace(/^[\s\S]*?(?:^|\n)<\/think(?:ing)?[ \t]*>[ \t]*\r?\n[ \t]*\r?\n/i, '');
+    for (let i = fences.length - 1; i >= 0; i--) out = out.split(`\u0000FENCE${i}\u0000`).join(fences[i]);
+    return out;
 }
 
 // Day separators: a live conversation spanning midnight gets a quiet
@@ -1538,7 +1607,7 @@ function _ensureFeedbackRow(div) {
 // clean-server JSON and read "drifted" on every focus, wiping the labels).
 function toWireMessage(m) {
     if (!m || typeof m !== 'object') return m;
-    const { reqId, feedback, unlabelable, ...rest } = m;
+    const { reqId, feedback, unlabelable, prefixLen, ...rest } = m;
     return rest;
 }
 
@@ -1575,6 +1644,7 @@ function mergeClientLabelKeys(serverMsgs) {
             out[i].reqId = loc.reqId;
             if (loc.feedback) out[i].feedback = loc.feedback;
             if (loc.unlabelable) out[i].unlabelable = true;
+            if (loc.prefixLen) out[i].prefixLen = loc.prefixLen;   // §4KO R4
         }
     }
     return out;
@@ -1782,7 +1852,7 @@ function _revealAgentBubble(div) {
 
 function _renderStreamingContent() {
     if (!currentAgentMessageDiv || currentAccumulatedContent === "") return;
-    const displayContent = _stripInternalTags(currentAccumulatedContent);
+    const displayContent = _stripInternalTags(currentAccumulatedContent, currentStreamPrefixLen);
     // Reasoning only so far (an open <think> block): keep the typing dots.
     // Rendering the empty string here is what blanked the bubble for the
     // whole thinking phase.
@@ -1903,7 +1973,7 @@ function renderHistoryToLog(history) {
                 displayContent = texts.join(" ") + " \n*[Image Attached]*";
             }
             if (typeof displayContent === 'string') {
-                let cleanContent = _stripInternalTags(displayContent);
+                let cleanContent = _stripInternalTags(displayContent, msg.prefixLen);   // §4KO R4: the stream prefix
                 if (cleanContent) {
                     const div = document.createElement('div');
                     div.className = `message ${roleClass}`;
@@ -2301,6 +2371,8 @@ async function resumeOrReconcileInflightTurn() {
             currentTaskId = h.taskId;
             currentChunkIndex = 0;
             currentAccumulatedContent = "";
+            currentStreamPrefixLen = 0;
+            currentSpeechHold = false;
             saveInflightHandle();
             ensureAgentBubbleForResume();
             sendMessage(true);
@@ -2676,6 +2748,8 @@ async function sendMessage(isResume = false) {
         currentTaskId = null;
         currentChunkIndex = 0;
         currentAccumulatedContent = "";
+        currentStreamPrefixLen = 0;
+        currentSpeechHold = false;
         currentReqId = null;
         currentTurnUnlabelable = false;
         _turnVerdict = null;
@@ -2770,6 +2844,8 @@ async function sendMessage(isResume = false) {
         if (resuming && currentTaskId) {
             currentTTSMutedLength = currentAccumulatedContent.length;
             currentAccumulatedContent = "";
+            currentStreamPrefixLen = 0;
+            currentSpeechHold = false;
             currentChunkIndex = 0;
             response = await fetch(`/api/chat/resume/${currentTaskId}?offset=0`, {
                 signal: currentChatController.signal
@@ -2814,6 +2890,9 @@ async function sendMessage(isResume = false) {
         // "No response" assistant reply that would otherwise be pushed into
         // chatHistory and persisted (see the finalize branch below).
         let streamHadError = false;
+        // §4KP: the stream's own terminal frame arrived — a cancel or a relay
+        // teardown ends the read with no error and no [DONE].
+        let streamSawDone = false;
         // Reset per turn: the network-resume attempts below are bounded so a
         // down proxy cannot spin a silent retry loop forever.
         _netResumeTries = 0;
@@ -2834,7 +2913,7 @@ async function sendMessage(isResume = false) {
                 if (!trimmedLine || !trimmedLine.startsWith("data: ")) continue;
 
                 const dataStr = trimmedLine.substring(6).trim();
-                if (dataStr === "[DONE]") continue;
+                if (dataStr === "[DONE]") { streamSawDone = true; continue; }
 
                 try {
                     const data = JSON.parse(dataStr);
@@ -2848,6 +2927,7 @@ async function sendMessage(isResume = false) {
                     // The route marks a reply that has no trajectory behind
                     // it (trivial fast path): no thumbs for this bubble.
                     if (data.ghost && data.ghost.labelable === false) currentTurnUnlabelable = true;
+                    if (data.ghost && data.ghost.reasoning_unparsed === true) currentSpeechHold = true;   // §4KP
 
                     if (data.choices && data.choices[0] && data.choices[0].delta && data.choices[0].delta.content) {
                         chunkContent = data.choices[0].delta.content;
@@ -2891,9 +2971,12 @@ async function sendMessage(isResume = false) {
                         }
 
                         currentAccumulatedContent += chunkContent;
+                        if (data.ghost && data.ghost.stream_prefix === true) {
+                            currentStreamPrefixLen = currentAccumulatedContent.length;
+                        }
 
                         // --- Voice Intercept Logic ---
-                        if (isTTSActive && currentAccumulatedContent.length > currentTTSMutedLength) {
+                        if (isTTSActive && !currentSpeechHold && currentAccumulatedContent.length > currentTTSMutedLength) {
                             ttsBuffer += chunkContent;
                             
                             let openThink = ttsBuffer.lastIndexOf('<think>') > ttsBuffer.lastIndexOf('</think>');
@@ -2937,13 +3020,24 @@ async function sendMessage(isResume = false) {
         // even if an rAF was still pending when the stream ended.
         _renderStreamingContent();
 
+        if (isTTSActive && currentSpeechHold && streamSawDone && !streamHadError) {
+            // §4KP: a CLEAN end only (an abort, a drop or an error frame never
+            // reaches here with the reply complete). The prefix was spoken live
+            // up to its last full sentence; speak its remainder, then the
+            // generation as the display shows it (leaked reasoning stripped).
+            const _held = _heldSpeech(ttsBuffer, currentAccumulatedContent, currentStreamPrefixLen);
+            ttsBuffer = "";
+            for (const sentence of _held) queueTTS(sentence);
+        }
+
         // Push the final concatenated message to chat history. On the
         // resume path the partial assistant turn was never pushed when it
         // dropped, so a plain push is correct in both cases. `reqId` is
         // client-only bookkeeping (stripped from wire payloads) that lets
         // the 👍/👎 label buttons survive a reload.
         if (currentAccumulatedContent) {
-            chatHistory.push({ role: "assistant", content: currentAccumulatedContent,
+            chatHistory.push({ role: "assistant", content: _historyContent(currentAccumulatedContent, currentStreamPrefixLen),
+                               prefixLen: currentStreamPrefixLen || undefined,   // §4KO R4: client-only, for re-renders
                                reqId: currentReqId || undefined,
                                unlabelable: currentTurnUnlabelable || undefined });
             _stampHistoryIndex(currentAgentMessageDiv, chatHistory.length - 1);
@@ -3014,7 +3108,8 @@ async function sendMessage(isResume = false) {
                 // Keep the reqId: a reply aborted BECAUSE it was going
                 // wrong is a prime 👎 target, and the trajectory exists.
                 chatHistory.push({ role: "assistant",
-                                   content: currentAccumulatedContent + "\n\n*[Aborted]*",
+                                   content: _historyContent(currentAccumulatedContent, currentStreamPrefixLen) + "\n\n*[Aborted]*",
+                                   prefixLen: currentStreamPrefixLen || undefined,
                                    reqId: currentReqId || undefined,
                                    unlabelable: currentTurnUnlabelable || undefined });
                 if (currentAgentMessageDiv && currentAgentMessageDiv.isConnected) {
@@ -5385,7 +5480,7 @@ window.GhostCore = {
     toggleLogConsole: () => { if (logToggleBtn) logToggleBtn.click(); },
 };
 
-import('./workspace.js?v=8.6').catch(e => {
+import('./workspace.js?v=8.8').catch(e => {
     // ⚠ VISIBLE, not console-only. This module owns the sessions rail, and
     // with it `window.__ghostSessionId` — so when it fails to load, every
     // turn silently reverts to CLIENT-CARRIED history: no durable session,

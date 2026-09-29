@@ -59,6 +59,11 @@ FALLBACK_HEADS = {
     # check follows any rewording, like `no_answer`.
     "text_only": ("I prepared a tool call but this turn was routed as "
                   "text-only, so it wasn't executed."),
+    # §4KL: the cross-turn breaker's fallback — the same honest non-answer as
+    # `no_answer`, naming the real cause (a loop, not the budget).
+    "no_answer_loop": ("I kept repeating the same approach without making "
+                       "progress, so I stopped; here is the evidence I "
+                       "gathered instead of a summary I did not write."),
 }
 FALLBACK_OUTPUT_MARKER = "### Final Output:"
 
@@ -78,7 +83,7 @@ _TOOL_FRAMINGS = (
 # framing after them — the real fallback always carries "### Final Output:".
 _DUMP_HEAD_RE = re.compile(
     r"\A\s*(?:```\w*\s*)?(?:"
-    + "|".join([re.escape(h) for k, h in FALLBACK_HEADS.items() if k not in ("no_answer", "text_only")]
+    + "|".join([re.escape(h) for k, h in FALLBACK_HEADS.items() if k not in ("no_answer", "no_answer_loop", "text_only")]
                + [re.escape(FALLBACK_OUTPUT_MARKER)]
                + [r"--- EXECUTION RESULT ---", r"--- COMMAND RESULT ---", r"EXIT CODE:\s*-?\d+\s*(?=\n|$|STDOUT|---|\|)", r"\[sandbox job \d+ finished"])
     + r")")
@@ -89,6 +94,7 @@ _DUMP_BODY_RE = re.compile(r"### Final Output:|--- (?:EXECUTION|COMMAND) RESULT 
 #: could not answer twice — nothing to repair, no judge to consult.
 _NO_ANSWER_HEAD_RE = re.compile(
     r"\A\s*(?:" + re.escape(FALLBACK_HEADS["no_answer"]) + "|"
+    + re.escape(FALLBACK_HEADS["no_answer_loop"]) + "|"
     + re.escape(FALLBACK_HEADS["text_only"]) + ")")
 
 #: The user asked for the raw thing: not a non-answer, an answer (review
@@ -129,6 +135,13 @@ def refute_no_answer_fallback(reply: str) -> List[str]:
     """One issue when ``reply`` is the §4GH forced-final fallback."""
     if not _NO_ANSWER_HEAD_RE.match(reply or ""):
         return []
+    if (reply or "").lstrip().startswith(FALLBACK_HEADS["no_answer_loop"]):
+        return ["the reply is the loop-breaker fallback — the attempt kept "
+                "repeating itself and stopped without writing an answer; it "
+                "carries the last evidence, not a finding"]
+    if (reply or "").lstrip().startswith(FALLBACK_HEADS["text_only"]):
+        return ["the reply is the text-only fallback — a prepared tool call "
+                "was not executed on a text-only turn; it is not a finding"]
     return ["the reply is the forced-final fallback — the turn ran out of "
             "budget twice without writing an answer; it carries the last "
             "evidence, not a finding"]

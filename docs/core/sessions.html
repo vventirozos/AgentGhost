@@ -192,6 +192,8 @@
     the real <code>SessionStore.append_turn</code> with append-only clients) and
     <code>tests/test_sessions_and_cancel.py</code>.</li>
   </ul>
+  <h2 id="4kp-prefix-len">The stream prefix length <span class="tag">2026-09-29 &sect;4KP</span></h2>
+  <p>A streamed reply can open with the stream prefix &mdash; the prior turn's text and a one-shot correction banner &mdash; which is not that generation's text; a re-render cuts leaked reasoning only AFTER it. The chat route persists the prefix length with the reply (<code>append_turn(..., prefix_len)</code>) as the assistant message's <code>prefixLen</code>; <code>_clean_messages</code> keeps it only on an assistant message, as an int within the content's length. <code>GET /api/sessions/{id}</code> returns it, so a reply adopted from the server (another device, a session switch, a reconcile) re-renders with its banner. It is a CLIENT key: the route passes the merged history through <code>model_messages</code>, which drops it, before the agent sees it. Matching (<code>_msg_key</code>) is role + content, so it never affects the merge.</p>
 </main>
 </body>
 </html>

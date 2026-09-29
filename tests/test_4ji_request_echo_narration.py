@@ -303,14 +303,16 @@ def test_every_breaker_force_final_arms_the_flag():
                 bare.append(test_src)
     assert bare == [], f"force-final site(s) that neither arm the flag nor are a named non-breaker: {bare}"
     assert len(exempt) == 6                                   # +2 on 2026-09-22: §4JR language regeneration, §4JS planner DONE
-    assert len(armed) == 11                                   # +1 on 2026-09-21: the client-deadline report (§4JP)
+    assert len(armed) == 13                                   # +2 on 2026-09-29: cross-turn loop report, member refusals (§4KL)
     # the six §4JI sites, by their enclosing condition
     for marker in ("execution_failure_count >= 6 or total_fail >= 8",     # Failure Cap
                    "_acnt >= _hard_n and _nav_case",                    # never-extracted navigate
                    "_exec_same_err and _acnt >= _hard_n",               # §4IB same-error report
                    "preflight_blocks_this_request >= 2",                # blocked preflight
                    "_readwrite_loop",                                   # no-progress hard stop (its else)
-                   "deadline_needs_report("):                           # §4JP client-deadline report
+                   "deadline_needs_report(",                            # §4JP client-deadline report
+                   "not force_final_response and second_cap_reports(",   # §4KL cross-turn loop report
+                   "MEMBER_REFUSAL_REPORT_AT"):                          # §4KL member refusals
         assert any(marker in a for a in armed), marker
     assert sum("execution_failure_count >= 6" == a for a in armed) == 1      # Think-Loop Halt
 

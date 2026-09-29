@@ -526,7 +526,7 @@ export function initSessions(ctx) {
             // not.
             const adopted = Core.reconcileWithLocal(messages, local);
             const drifted = adopted.length !== local.length
-                || JSON.stringify(adopted[adopted.length - 1] || null)
+                || JSON.stringify(wire(adopted[adopted.length - 1] || null))   // §4KP: server copies carry prefixLen too
                     !== JSON.stringify(wire(local[local.length - 1]));
             if (drifted && messages.length && seq === loadSeq
                     && id === currentId && !Core.isProcessing()) {

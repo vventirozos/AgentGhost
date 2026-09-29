@@ -594,6 +594,18 @@ def classify_chat_outcome(
             reason=f"runtime abort marker {marker}",
         )
 
+    # 1b. §4KM: a loop breaker closed the attempt with a report (the reply
+    # carries no marker — it is the model's honest write-up). The loop is a
+    # BEHAVIOURAL failure: a non-structural reason, so a verifier PASS on the
+    # report never upgrades it (resolve_turn_outcome rule 2).
+    _extra = getattr(traj, "extra", None)
+    _lbr = _extra.get("loop_breaker") if isinstance(_extra, dict) else None
+    if isinstance(_lbr, str) and _lbr:
+        return FailureClassification(
+            outcome=Outcome.FAILED.value,
+            reason=f"loop breaker closed the attempt ({_lbr})",
+        )
+
     # 2. Repeated browser selector — agent stuck clicking same thing.
     # Per the module contract (signal 2), the repeats only count as
     # "stuck" when there was NO observable progress between them: a

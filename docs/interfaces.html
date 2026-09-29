@@ -126,6 +126,8 @@
     <strong>Who it answers.</strong> <em>Direct messages are owner-only, always.</em> In ordinary channels the bot has answered any human in its own workspace since 2026-08-13 (<code>GHOST_SLACK_OPEN_CHANNEL</code>, default on) — that grant was added deliberately to bring real traffic into the outcome ledgers, and it is scoped to channels you put the bot in. Set <code>GHOST_SLACK_OPEN_CHANNEL=0</code> to restore the strict single-user lock. This matters because the bot can run code on your machine, and a shared Slack channel is not an access-control boundary.
   </div>
 
+  <p><strong>What someone else in the channel can ask for.</strong> Anyone who is not you gets web search and images, nothing else: no files, no downloads, no running code, no browser, no memory of you. Ghost is told this at the start of their request, so a task that needs more gets a plain "that can't be done on this channel" and whatever the search results support, rather than a string of searches for a way around it. Data they want analysed has to be pasted into the message as text — uploaded documents can't be read on their requests. If it does get stuck repeating itself, it stops and writes up what it found instead of sending an internal error line.</p>
+
   <h3>Shadow banning</h3>
   <p>Set <code>GHOST_SLACK_SHADOW_BAN</code> to a comma-separated list of Slack user IDs. Their messages, mentions <em>and reactions</em> are dropped as if the bot never saw them — no reply, no error, nothing that distinguishes being banned from the bot simply being idle.</p>
   <pre class="shell">GHOST_SLACK_SHADOW_BAN=U0123ABCD,U0456EFGH</pre>

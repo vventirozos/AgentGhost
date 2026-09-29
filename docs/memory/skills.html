@@ -297,7 +297,7 @@
   <code>requester_role_context</code> for the request. <code>utils.logging.requester_is_member()</code> is the one predicate:
   role <code>member</code> → yes; <code>owner</code> → no; unknown → yes iff the request id is a <code>slack-</code> id. Three
   consumers in the agent read it (the USER PROFILE block becomes <code>(not available for this channel)</code>, the
-  autobiographical handle is withheld, both <code>smart_memory</code> writers skip), and two here:
+  autobiographical handle is withheld, both <code>smart_memory</code> writers skip; since §4KL the placeholder also carries <code>_MEMBER_CAPABILITY_NOTICE</code>, which names what the member's turn can and cannot do), and two here:
   <code>turn_may_teach</code> and the writer backstop <code>playbook_writes_blocked</code> are false for a member on ANY
   client; and on the tool side (R3 review) <code>update_profile</code>, <code>unified_forget</code> and
   the location readers refuse or withhold for a member. Pins: <code>tests/test_requester_role.py</code>. The

@@ -344,6 +344,7 @@ def _node_error_detail(exc) -> str:
 
 
 from .node_throughput import NodeThroughput, DistillPlan
+from .think_split import repair_message as _repair_think_split, repair_stream as _repair_think_split_stream
 
 
 class NodeCircuitBreaker:
@@ -3017,6 +3018,7 @@ class LLMClient:
                     await self._wait_for_foreground_clear()
                     await _bg_stack.enter_async_context(self._bg_queue_sem)
                 _result = await self._do_chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, use_critic, timeout, off_main_only, task_label, require_healthy, slot_wait, total_budget)
+                _repair_think_split(_result)     # §4KP: a mentioned </think> is not the close
                 self._note_usage(_result)
                 _leg = served_leg(_result)
                 _served = _leg.get("served_by") or ""
@@ -3034,6 +3036,7 @@ class LLMClient:
                 self.foreground_tasks += 1
             try:
                 _result = await self._do_chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, use_critic, timeout, off_main_only, task_label, require_healthy, slot_wait, total_budget)
+                _repair_think_split(_result)     # §4KP: a mentioned </think> is not the close
                 self._note_usage(_result)
                 # ⚠ Record WHICH LEG SERVED IT, not which was requested. The
                 # meta used to carry the caller's flags verbatim, so a
@@ -3794,13 +3797,14 @@ class LLMClient:
         if is_background:
             await self._wait_for_foreground_clear()
             async with self._bg_queue_sem:
-                async for chunk in self._do_stream_chat_completion(payload, use_coding):
+                # §4KP: a mentioned </think> is not the close
+                async for chunk in _repair_think_split_stream(self._do_stream_chat_completion(payload, use_coding)):
                     yield chunk
         else:
             async with self._foreground_lock:
                 self.foreground_tasks += 1
             try:
-                async for chunk in self._do_stream_chat_completion(payload, use_coding):
+                async for chunk in _repair_think_split_stream(self._do_stream_chat_completion(payload, use_coding)):
                     yield chunk
             finally:
                 async with self._foreground_lock:

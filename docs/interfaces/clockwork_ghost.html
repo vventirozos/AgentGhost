@@ -396,6 +396,8 @@
   <code>~/.ghost_api_key</code> (mode 600).</div>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+  <h2 id="4kp-hold">A reply flagged <code>reasoning_unparsed</code> <span class="tag">2026-09-29 &sect;4KP</span></h2>
+  <p>Same contract as the CLI: on <code>{"ghost": {"reasoning_unparsed": true}}</code> the client holds the reply &mdash; neither shown nor spoken &mdash; until the stream's own <code>[DONE]</code>, then emits and speaks <code>strip_orphan_think_close(reply)</code> (a copy of the agent's rule, pinned by the parity table). Speech cannot be taken back, which is why the hold exists. An error frame is now shown (the client used to ignore it); reading continues, because the agent may still send its fallback sentence after an abort frame, but a held reply is never released after one. The stream is read one SSE line at a time (<code>aiter_lines</code>). Unflagged replies stream and speak as before.</p>
 </main>
 </body>
 </html>

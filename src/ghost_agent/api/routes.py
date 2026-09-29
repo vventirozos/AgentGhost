@@ -453,6 +453,22 @@ def _sse_delta_text(chunk) -> str:
         return ""
 
 
+def _sse_is_stream_prefix(chunk) -> bool:
+    """§4KO R3: the agent marks the frame that replays the stream prefix (prior
+    intermediate text, a correction banner) with ``ghost.stream_prefix`` — text
+    that is not this generation's, so no leaked-reasoning cut may touch it."""
+    try:
+        if isinstance(chunk, (bytes, bytearray)):
+            chunk = chunk.decode("utf-8", "replace")
+        for line in str(chunk).splitlines():
+            payload = line.strip()[len("data:"):].strip() if line.strip().startswith("data:") else ""
+            if payload.startswith("{") and (json.loads(payload).get("ghost") or {}).get("stream_prefix") is True:
+                return True
+    except Exception:  # noqa: BLE001 — accounting must never break the stream
+        return False
+    return False
+
+
 # User-Agent marker the agent's own functional suite sends on its
 # deliberate auth-rejection probes. Recognised ONLY from loopback (see
 # verify_api_key) — it lowers a log level, it never grants access and never
@@ -931,6 +947,17 @@ async def api_generate(request: Request):
             "done": True
         }
 
+
+def _member_copy(request, content):
+    """What a channel member receives: the reply without the loop breakers'
+    internal `[ATTEMPT_ABORTED_*]` tokens (§4KM h). The owner's reply and the
+    trajectory keep them; a member has no stored session (§4KJ R9)."""
+    if parse_requester_role(request.headers.get("X-Ghost-Requester")) != "member":
+        return content
+    from ..core.agent import strip_abort_markers
+    return strip_abort_markers(content)
+
+
 @router.post("/chat", dependencies=[Security(verify_api_key)])
 @router.post("/v1/chat/completions", dependencies=[Security(verify_api_key)])
 @router.post("/api/chat", dependencies=[Security(verify_api_key)])
@@ -1158,10 +1185,12 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
             # tail, so `_persist_session` early-returned and the user's
             # message and the reply were SILENTLY NEVER PERSISTED.
             _merged, _new_msgs = merge_history_detail(_stored, messages)
+            from ..core.sessions import model_messages
+            _merged = model_messages(_merged)     # §4KP: client keys never reach the model
             body["messages"] = _merged
             messages = _merged
 
-    async def _persist_session(assistant_text: str) -> None:
+    async def _persist_session(assistant_text: str, prefix_len: int = 0) -> None:
         """Append this turn (new user messages + the reply) to the session.
         Runs AFTER the turn, so a failed turn never leaves a dangling user
         message with no reply. Never raises into the response path."""
@@ -1180,7 +1209,7 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
             # `append_turn` writes and fsyncs — on the loop it stalled every
             # other request for the duration of a disk sync (§4GJ round 3).
             await _store_call(_sess_store.append_turn, str(_session_id),
-                              _new_msgs, str(assistant_text or ""))
+                              _new_msgs, str(assistant_text or ""), prefix_len)
         except Exception:  # noqa: BLE001 — a persist failure never breaks the reply
             _log_internal_error("session append")
 
@@ -1244,16 +1273,23 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                     # session records what the user actually saw (this path
                     # bypasses the finalize tail, so nothing else knows the
                     # text). Parse-failure of a chunk just contributes nothing.
-                    _acc = []
+                    _acc, _pre = [], []
                     async for chunk in content:
                         content_started = True
-                        _acc.append(_sse_delta_text(chunk))
+                        (_pre if _sse_is_stream_prefix(chunk) else _acc).append(_sse_delta_text(chunk))
                         # The frames are llama-server's, with llama's id;
                         # the feedback contract is OUR id (see the helper).
                         yield _restamp_sse_request_id(chunk, req_id)
-                    await _persist_session("".join(_acc))
+                    # §4KO: a leaked reasoning prefix is not stored as history;
+                    # the stream prefix (a correction banner) is kept whole
+                    from ..core.agent import strip_raw_orphan_reasoning
+                    from ..core.sessions import utf16_len
+                    _pre_text = "".join(_pre)
+                    await _persist_session(_pre_text + strip_raw_orphan_reasoning("".join(_acc)),
+                                           utf16_len(_pre_text))   # §4KP: JS string units, any device
                 else:
                     await _persist_session(content)
+                    content = _member_copy(request, content)
                     # A trivial-fast-path reply has NO trajectory (by
                     # design), so no label can ever land on it: say so on
                     # the wire and the UI renders no thumbs (§4EX). `is
@@ -1330,6 +1366,7 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
         _mark_foreground(agent, -1)
 
     await _persist_session(content)
+    content = _member_copy(request, content)
 
     # Token cost for the whole turn, summed across every upstream call it
     # made (tool rounds + verifier) — NOT one completion's usage. Surfaced

@@ -114,8 +114,32 @@ def _clean_messages(messages) -> List[dict]:
         for k in ("tool_calls", "tool_call_id", "name"):
             if k in m:
                 keep[k] = m[k]
+        # §4KP: where the stream prefix (prior text, a correction banner) ends
+        # in a streamed reply — a CLIENT key: re-renders cut leaked reasoning
+        # only after it. Never sent to the model (`model_messages`).
+        _pl = m.get(PREFIX_LEN_KEY)
+        if role == "assistant" and type(_pl) is int and 0 < _pl <= utf16_len(content if isinstance(content, str) else ""):
+            keep[PREFIX_LEN_KEY] = _pl
         out.append(keep)
     return out
+
+
+PREFIX_LEN_KEY = "prefixLen"
+
+
+def utf16_len(text: str) -> int:
+    """Length in UTF-16 code units — the unit a JS string index counts (an
+    emoji outside the BMP is 2 there, 1 in Python). `prefixLen` is consumed
+    by the web client, so it is stored in these units."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def model_messages(messages) -> List[dict]:
+    """§4KP: the stored conversation as the model sees it — the client-only
+    keys removed. Messages without one are returned as the same objects."""
+    return [({k: v for k, v in m.items() if k != PREFIX_LEN_KEY}
+             if isinstance(m, dict) and PREFIX_LEN_KEY in m else m)
+            for m in (messages or [])]
 
 
 def derive_title(messages) -> str:
@@ -635,7 +659,7 @@ class SessionStore:
     # -- turn append --------------------------------------------------------
 
     def append_turn(self, session_id: str, user_messages: List[dict],
-                    assistant_content: str) -> bool:
+                    assistant_content: str, prefix_len: int = 0) -> bool:
         """Append this turn's new user message(s) + the assistant reply.
 
         Called by the chat route AFTER the turn completes, so a failed turn
@@ -670,8 +694,10 @@ class SessionStore:
         while new_msgs and new_msgs[-1].get("role") == "assistant":
             new_msgs.pop()
         if assistant_content:
-            new_msgs.append({"role": "assistant",
-                             "content": str(assistant_content)})
+            _reply = {"role": "assistant", "content": str(assistant_content)}
+            if type(prefix_len) is int and 0 < prefix_len <= utf16_len(_reply["content"]):
+                _reply[PREFIX_LEN_KEY] = prefix_len       # §4KP
+            new_msgs.append(_reply)
         if not new_msgs:
             return False
         sess.messages.extend(new_msgs)

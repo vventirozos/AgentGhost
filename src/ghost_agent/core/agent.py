@@ -273,11 +273,29 @@ _SELFHOOD_PREFIX_ENABLED = False
 # placeholder let the model assume the asker was him). It must not describe
 # the owner, and it must not read as an error to "fix" by asking who the
 # user is.
+# What a member's turn is told it CAN do. The allowlist below removes tools
+# from the advertised set without a word, and `_MEMBER_TOOL_BLOCK` explains
+# only a CALL to a blocked tool — which an unadvertised tool never gets. Live
+# 2026-09-29 (slack-61cc5f5a): the planner planned a `file_system` download
+# for eight turns, the solver searched for one seventeen times, and the loop
+# breaker shipped its marker as the reply. Every name here must be in
+# `_MEMBER_ALLOWED_TOOLS` and every capability it denies must be one the
+# allowlist withholds (tests/test_4kl_member_capability.py enumerates both).
+_MEMBER_CAPABILITY_NOTICE = (
+    "On this request you can ONLY search the web (web_search, darkweb_search) and create "
+    "or look at images (image_generation, vision_analysis). You CANNOT open or read web "
+    "pages, download files, run code, read or write files, or use the sandbox, the browser, "
+    "memory or projects — those tools do not exist for a channel member. When a task needs "
+    "one of them, do not look for a way around it and do not search for download links: "
+    "say plainly that it cannot be done on this channel, then answer as far as search "
+    "results allow. Data the user wants you to work on must be pasted as text into the "
+    "message — uploaded documents and data files cannot be read here, so never ask for one.")
 _MEMBER_PROFILE_PLACEHOLDER = (
     "(not available: this request comes from a channel MEMBER, not the owner. You do not "
     "know this person's name or details. Any profile, memory, autobiography or project "
     "context you hold describes the OWNER — a different person — and must never be "
-    "presented as this user's, quoted to them, or used to answer questions about them.)")
+    "presented as this user's, quoted to them, or used to answer questions about them.)\n"
+    + _MEMBER_CAPABILITY_NOTICE)
 # A MEMBER's turn may use only these tools; every other dispatchable tool is
 # refused (one REJECTED row, reason `owner_data_blocked`). An ALLOWLIST, not a
 # blocklist (R4 review, 2026-09-24): the sandbox, the projects, the jobs, the
@@ -1059,6 +1077,25 @@ FORCED_FINAL_LOOP_MARKER = "[ATTEMPT_ABORTED_THINKING_LOOP]"
 _ABORT_MARKER_RE = re.compile(r"\[ATTEMPT_ABORTED_[A-Z_]+\]")
 
 
+def strip_abort_markers(text):
+    """§4KM (h): a reply without its internal `[ATTEMPT_ABORTED_*]` tokens —
+    for a channel member's copy only; the corpus and the owner keep them. A
+    marker inside code (a ``` fence or an inline `span`) is content and stays;
+    a reply that is nothing but a marker keeps it (never an empty reply)."""
+    if not isinstance(text, str) or not _ABORT_MARKER_RE.search(text):
+        return text
+
+    def _drop(m):
+        seg, a, b = m.string, m.start(), m.end()
+        inner = a > 0 and b < len(seg) and seg[a - 1] not in "\n" and seg[b] not in "\n"
+        return " " if inner and (m.group(1) or m.group(2)) else ""
+
+    parts = re.split(r"(```.*?```|`[^`\n]*`)", text, flags=re.S)
+    out = "".join(p if i % 2 else re.sub(r"([ \t]*)\[ATTEMPT_ABORTED_[A-Z_]+\]([ \t]*)", _drop, p)
+                  for i, p in enumerate(parts)).strip()
+    return out or text
+
+
 def reply_carries_abort_marker(text) -> bool:
     """True when a reply carries a runtime abort marker anywhere (the same
     shape `distill.outcome_heuristics` reads)."""
@@ -1085,6 +1122,83 @@ def forced_final_loop_fallback(fallback: str, *, flood: bool = False) -> str:
     return (f"{fallback}\n\n{FORCED_FINAL_LOOP_MARKER} The report turn itself "
             f"entered {what} and was killed; the text above is the last "
             "evidence, not a finished report.")
+
+
+CROSS_TURN_LOOP_MARKER = "[ATTEMPT_ABORTED_CROSS_TURN_LOOP]"
+# The parser's openers only: `<tool_call…`, `<tool` + any non-word (its heal is
+# `<tool\b[^>]*>` — `<tool>`, `<tool …>`, `<tool-x>`, `<tool/>`), `<function …`
+# /`<function=`/`<function_name`. Not `\b` (`_` is a word character, so
+# `tool\b` missed `<tool_call` — round 3) and not a bare prefix either
+# (`<Toolbar>`, `Array<Function>` are answers — round 4).
+_TOOL_MARKUP_RE = re.compile(
+    r"<\s*/?\s*(?:tool_call|tool(?=[^\w]|$)|function(?=[\s=]|_name))", re.IGNORECASE)
+
+
+#: §4KM (c): request id → the breaker that closed it with a report. Keyed, not a
+#: context flag: a streamed final records after the next request has started.
+_LOOP_BREAKER_REPORTS_MAX = 64
+
+
+def stamp_loop_breaker(context, req_id, kind: str) -> None:
+    d = getattr(context, "_loop_breaker_reports", None)
+    if not isinstance(d, dict):
+        d = {}
+        context._loop_breaker_reports = d
+    d[str(req_id or "")] = kind
+    while len(d) > _LOOP_BREAKER_REPORTS_MAX:
+        d.pop(next(iter(d)))
+
+
+def loop_breaker_for(context, req_id, *, pop: bool = False) -> str:
+    d = getattr(context, "_loop_breaker_reports", None)
+    if not isinstance(d, dict):
+        return ""
+    key = str(req_id or "")
+    v = d.pop(key, "") if pop else d.get(key, "")
+    return v if isinstance(v, str) else ""
+
+
+#: §4KM (f): the longest single-paragraph plan the answer check reads as a plan.
+REPEATED_PLAN_MAX_CHARS = 600
+#: §4KM (e): repeated-opening answers the cross-turn breaker lets through per
+#: request; past this, a guard that keeps sending answers back is a loop too.
+CROSS_TURN_ANSWERS_WAVED_MAX = 2
+
+
+def repeated_turn_is_an_answer(content: str, native_tool_calls, *, request: str = "") -> bool:
+    """§4KL: is a turn the cross-turn breaker caught a plain text answer?
+    NOT an answer: anything the parser could read as a call (a native call,
+    `<tool…`/`<function…` markup, a reply that opens with `{` — the only place
+    the parser's raw-JSON fallback accepts one), no visible text, narration by
+    the ONE shared definition (`reply_smoothing.narration_only`, which every
+    other narration guard uses), or (§4KM f) a single work-beat sentence of up
+    to REPEATED_PLAN_MAX_CHARS — the one shape narration_only's 300-char block
+    cap lets through. Three bespoke plan rules were tried and each failed a
+    review in the opposite direction; see PROJECT_JOURNAL §4KM."""
+    if native_tool_calls:
+        return False
+    visible = _strip_think_blocks(str(content or "")).strip()
+    if not visible or visible.startswith("{") or _TOOL_MARKUP_RE.search(visible):
+        return False
+    try:
+        from .reply_smoothing import narration_only, _is_work_beat, _SENT_SPLIT_RE
+        if narration_only(visible, request=request):
+            return False
+        one = [x for x in _SENT_SPLIT_RE.split(visible) if x.strip()]
+        if (len(one) == 1 and "\n" not in visible and len(visible) <= REPEATED_PLAN_MAX_CHARS
+                and _is_work_beat(visible)):
+            return False
+        return True
+    except Exception:  # noqa: BLE001 — unsure is not an answer
+        return False
+
+
+def cross_turn_loop_fallback(fallback: str) -> str:
+    """§4KL — the reply when the cross-turn breaker gives up with no report:
+    the evidence fallback FIRST, the abort marker LAST (the outcome
+    heuristics read it anywhere in the text)."""
+    return (f"{fallback}\n\n{CROSS_TURN_LOOP_MARKER} The text above is what I "
+            "gathered, not a finished answer.")
 
 
 def evidence_digest(tools_run, *, ask: str = "") -> str:
@@ -1145,7 +1259,7 @@ def evidence_digest(tools_run, *, ask: str = "") -> str:
     return "\n\n".join(parts)
 
 
-def _no_answer_fallback_reply(tools_run, *, ask: str = "") -> str:
+def _no_answer_fallback_reply(tools_run, *, ask: str = "", head_key: str = "no_answer") -> str:
     """The honest reply when a forced final produced nothing twice: the
     §4GH fallback head (refuted by the shape check as the non-answer it is)
     plus — §4II — the system's evidence digest, so the user gets what
@@ -1153,7 +1267,7 @@ def _no_answer_fallback_reply(tools_run, *, ask: str = "") -> str:
     ifs21133…: "Last evidence gathered: SUCCESS: Wrote 936 chars to
     'probe.py'" after 24 steps)."""
     from .reply_shape_check import FALLBACK_HEADS
-    head = FALLBACK_HEADS["no_answer"]
+    head = FALLBACK_HEADS[head_key]
     digest = evidence_digest(tools_run, ask=ask)
     if not digest:
         asked = (" ".join(str(ask).split())[:400] + "\n\n") if str(ask or "").strip() else ""
@@ -4753,6 +4867,31 @@ def futility_tier(script_iter: dict, steer_done: bool, report_done: bool):
     return ("", None, None)
 
 
+def thinking_disabled(payload: Any) -> bool:
+    """§4KP: the payload switches the model's reasoning off — the chat-template
+    flag or the `/no_think` soft switch on the last user message."""
+    if not isinstance(payload, dict):
+        return False
+    if (payload.get("chat_template_kwargs") or {}).get("enable_thinking") is False:
+        return True
+    msgs = payload.get("messages") or []
+    last = msgs[-1] if msgs and isinstance(msgs[-1], dict) else {}
+    return last.get("role") == "user" and str(last.get("content") or "").rstrip().endswith("/no_think")
+
+
+def reasoning_unparsed_frame(req_id: str, created: int, model: str) -> bytes:
+    """§4KP: an empty-delta frame saying this reply's reasoning did not arrive
+    on the reasoning channel (thinking was on), so its opening may be
+    reasoning that ends in an orphan `</think>`. A client that cannot take
+    output back — speech, a terminal — holds the reply until it is complete
+    and strips it; the web display re-renders and needs nothing."""
+    return ("data: " + json.dumps({
+        "id": f"chatcmpl-{req_id}", "object": "chat.completion.chunk", "created": created, "model": model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+        "ghost": {"reasoning_unparsed": True},
+    }) + "\n\n").encode("utf-8")
+
+
 def report_turn_payload(payload: dict) -> dict:
     """§4IF — the LLM payload for a breaker-forced / reserved report turn:
     thinking disabled by BOTH switches the model honours (the chat-template
@@ -4792,6 +4931,49 @@ def blocker_report_alert(kind: str, detail: str) -> str:
         "expected — you will NOT act on it this turn; do not plan more work, "
         "do not think it through: write the report."
     )
+
+
+#: §4KM (a): the heads of a model-facing steer, and the tools a steer may name that
+#: are always blocked for a member even when not registered in this process.
+#: Every steer family: "SYSTEM <WORDS>" + ":", "(", "—" or "#" (ALERT, BLOCK, HINT,
+#: ESCAPE HATCH, PREFLIGHT, PAUSE, OVERRIDE, INSTRUCTION, 3 PIVOT, …) and
+#: AUTO-DIAGNOSTIC, also inside a translated `<tool_response …>` wrapper.
+_MEMBER_STEER_HEAD_RE = re.compile(
+    r"\A\s*(?:<tool_response[^>]*>\s*)?(?:SYSTEM [A-Z0-9][A-Z0-9 _-]{0,30}?\s*[:(\u2014#]|AUTO-DIAGNOSTIC:)")
+_MEMBER_STEER_KNOWN_TOOLS = ("browser", "deep_research", "execute", "file_system", "workspace")
+MEMBER_STEER_CAVEAT = (
+    "\n(On this channel only " + ", ".join(sorted(set(_MEMBER_ALLOWED_TOOLS) - {"abort_attempt", "replan"}))
+    + " exist — ignore any other tool named above and use what those give you.)")
+
+
+def member_steer_caveat(text, blocked_names) -> str:
+    """A member's copy of a steer: unchanged unless it is a steer (by its head)
+    that names a tool the member lacks, which gets the caveat once."""
+    s = str(text or "")
+    if not _MEMBER_STEER_HEAD_RE.match(s) or MEMBER_STEER_CAVEAT in s:
+        return text
+    names = [re.escape(n) for n in blocked_names if n]
+    if not names or not re.search(r"(?<![\w])(?:" + "|".join(names) + r")(?![\w])", s):
+        return text
+    return s + MEMBER_STEER_CAVEAT
+
+
+#: §4KL R4: refused member calls in one request before the report is forced.
+MEMBER_REFUSAL_REPORT_AT = 3
+
+
+def member_search_yield_steer(run: int) -> str:
+    """§4KL: the search-yield steer for a channel member's turn — the
+    answer-from-snippets half only; the owner's text sends the model to
+    `browser`, which a member cannot call."""
+    return (
+        f"SYSTEM ALERT: you have run {run} web searches in a row. On this request "
+        "you cannot open pages or download files, so search snippets are all the "
+        "text you will get, and another query of the same kind will not add "
+        "any. Write your answer NOW from the snippets you already have: state what "
+        "they support, and name plainly each part of the question you could NOT "
+        "confirm and what would be needed to confirm it. Do NOT run another "
+        "web_search or darkweb_search.")
 
 
 def planner_repeat_steer(tool_name: str, tool_head: str) -> str:
@@ -5946,6 +6128,21 @@ _THINK_UNCLOSED_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 _FENCE_SPAN_RE = re.compile(r"```.*?```", re.DOTALL)
+# An ORPHAN close (live 2026-09-29, probe-f6): the chat template opens the think
+# block in the prompt, so a turn's content can carry reasoning that ends in a bare
+# `</think>` — "…Let me look it up.\n</think>\n\nI cannot…". In every leak on record
+# (3 of 3,232 final replies) the tag stands at the START of its own line followed by
+# a blank line; prose ("closes with </think>", "- close: </think>"), an indented code
+# line, or a reply that merely ENDS with the tag never has that shape. Applied to the USER-VISIBLE text only, after the
+# tool-call markup is scrubbed — never to the parser's target (§4KN review).
+_THINK_ORPHAN_CLOSE_RE = re.compile(
+    r'\A.*?(?:\A|\n)</think(?:ing)?[ \t]*>[ \t]*\r?\n[ \t]*\r?\n',
+    re.DOTALL | re.IGNORECASE)
+# On a call turn the visible text may END with the tag (nothing after it but the
+# scrubbed call) — the one place the end of the text also counts.
+_THINK_ORPHAN_CLOSE_AT_END_RE = re.compile(
+    r'\A.*?(?:\A|\n)</think(?:ing)?[ \t]*>\s*\Z', re.DOTALL | re.IGNORECASE)
+_TILDE_FENCE_SPAN_RE = re.compile(r"~~~.*?~~~", re.DOTALL)
 
 def _head_insert_below_start_with(block: str, reply: str, sw_active_phrase) -> str:
     """§4EC — the `_head_insert` closure of `_finalize_and_return`, extracted so
@@ -6052,12 +6249,61 @@ def _unmask_cdata_calls(tool_calls, tokens):
     return out
 
 
+# §4KO: the RAW text of a streamed final (record, retry base, verifier claim, a
+# persisted session) still holds call markup and inline <think> blocks, so the
+# visible-text rule cannot run on it. This one cuts only a PURE-PROSE prefix: no
+# call opener, no think opener, no fence before the orphan close (leaked reasoning
+# always comes first and is plain prose). The close is followed by a blank line,
+# or — the call-turn shape — directly by a call opener.
+_RAW_ORPHAN_CLOSE_RE = re.compile(
+    r'\A(.*?)(?:\A|\n)</think(?:ing)?[ \t]*>[ \t]*'
+    r'(?:\r?\n[ \t]*\r?\n|\r?\n(?=[ \t]*<(?:tool_call\b|tool\b|function\b)))',
+    re.DOTALL | re.IGNORECASE | re.ASCII)          # ASCII `\b`, as in the JS mirror
+_RAW_PREFIX_NOT_PROSE_RE = re.compile(r'<(?:tool_call|tool|function|think)\b|```|~~~',
+                                      re.IGNORECASE | re.ASCII)
+
+
+def strip_raw_orphan_reasoning(text: str) -> str:
+    """§4KO: ``text`` without a leaked pure-prose reasoning prefix that ends in
+    an orphan `</think>`; unchanged whenever the prefix is anything but prose."""
+    if not isinstance(text, str) or '</think' not in text.lower():
+        return text
+    m = _RAW_ORPHAN_CLOSE_RE.match(text)
+    if not m or _RAW_PREFIX_NOT_PROSE_RE.search(m.group(1)):
+        return text
+    return text[m.end():]
+
+
+def _strip_orphan_think_close(text: str, *, call_turn: bool = False) -> str:
+    """§4KN: the user-visible text without reasoning that ends in an orphan
+    `</think>` (at the start of its own line, then a blank line). ``` and ~~~
+    fences are shielded; a raw-JSON body and text without the tag are
+    returned unchanged."""
+    if (not isinstance(text, str) or '</think' not in text.lower()
+            or text.lstrip().startswith("{")):          # a raw-JSON call is not prose
+        return text
+    fences: list = []
+
+    def _shield(m):
+        fences.append(m.group(0))
+        return f"\x00FENCE{len(fences) - 1}\x00"
+    shielded = _TILDE_FENCE_SPAN_RE.sub(_shield, _FENCE_SPAN_RE.sub(_shield, text))
+    out = _THINK_ORPHAN_CLOSE_RE.sub('', shielded, count=1)
+    if call_turn and out == shielded:
+        out = _THINK_ORPHAN_CLOSE_AT_END_RE.sub('', shielded, count=1)
+    for i in range(len(fences) - 1, -1, -1):          # outer shields hold inner ones
+        out = out.replace(f"\x00FENCE{i}\x00", fences[i])
+    return out
+
+
 def _strip_think_blocks(text: str) -> str:
     """Remove `<think>…</think>` reasoning, preferring the real close tag so a
     quoted `<tool_call>` mention inside the reasoning can't truncate the block
     (see block comment). Handles an unclosed `<think>` by stripping to the
     first real tool-call opening or EOS. Returns the input unchanged when there
-    is no think block (cheap fast-path)."""
+    is no think block (cheap fast-path). An orphan `</think>` is NOT handled here
+    — this also strips the parser's target, where a call's own content may hold
+    the tag; see `_strip_orphan_think_close` for the user-visible text."""
     if not isinstance(text, str) or '<think' not in text.lower():
         return text
     # a block written inside a ``` fence is documentation (review §4IY): shield the fences,
@@ -7946,6 +8192,7 @@ class GhostAgent:
         char_limit = max(200, int(char_limit))
 
         recent_transcript = ""
+        _member_blocked = self._member_blocked_tool_names() if requester_is_member() else None
         transcript_msgs = [m for m in messages if m.get("role") in ["user", "assistant", "tool"]][-msg_limit:]
         for m in transcript_msgs:
             content_val = m.get('content') or ""
@@ -7963,8 +8210,17 @@ class GhostAgent:
             role = m['role'].upper()
             if role == "TOOL":
                 role = f"TOOL ({m.get('name', 'unknown')})"
-            recent_transcript += f"{role}: {content_str[:char_limit]}\n"
+            _line = content_str[:char_limit]
+            if _member_blocked is not None:
+                _line = member_steer_caveat(_line, _member_blocked)   # §4KM (a): the planner's copy too
+            recent_transcript += f"{role}: {_line}\n"
         return recent_transcript
+
+    def _member_blocked_tool_names(self) -> List[str]:
+        """§4KM (a): tools a member's steer may name that the member lacks —
+        sorted, so the member's prompt bytes are stable across turns."""
+        return sorted((set(getattr(self, "available_tools", None) or {})
+                       | set(_MEMBER_STEER_KNOWN_TOOLS)) - set(_MEMBER_ALLOWED_TOOLS))
 
     def _project_services_brief(self, project_id) -> Optional[list]:
         """Registry-only service facts for the project briefing's SERVICES
@@ -18397,6 +18653,7 @@ class GhostAgent:
         raw_tools_called = ts.raw_tools_called
         tool_usage = ts.tool_usage
         tools_run_this_turn = ts.tools_run_this_turn
+        _rows_at_batch_start = len(tools_run_this_turn or [])
         request_state = ts.request_state
         try:
             # Capture the end-of-prior-iteration boundary so we
@@ -18699,7 +18956,12 @@ class GhostAgent:
                 if hasattr(self, 'disabled_tools') and fname in self.disabled_tools:
                     err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": _TO.rejected(f"SYSTEM ERROR: Tool '{fname}' is explicitly disabled in this context.", reason_code="tool_disabled")}
                     messages.append(err_msg)
-                    tools_run_this_turn.append({**err_msg, "_synthetic": True})
+                    _dis_member = requester_is_member() and fname not in _MEMBER_ALLOWED_TOOLS
+                    tools_run_this_turn.append({**err_msg, "_synthetic": True,
+                                                **({"_member_refused": True} if _dis_member else {})})
+                    if _dis_member:
+                        # A member refusal, not a strike (§4KM d, the §4KL R4 rule).
+                        continue
                     execution_failure_count += 1
                     _strike_synthetic(fname, "tool_disabled")
                     last_was_failure = True
@@ -18718,20 +18980,36 @@ class GhostAgent:
                                    "channel. Continue without saving a lesson.",
                                    reason_code="lesson_channel_blocked")}
                     messages.append(err_msg)
-                    tools_run_this_turn.append({**err_msg, "_synthetic": True})
+                    # A member's learn_skill is a member refusal too (it is off the
+                    # allowlist); it must count toward the refusal limit (§4KL R6).
+                    tools_run_this_turn.append({**err_msg, "_synthetic": True,
+                                                **({"_member_refused": True} if requester_is_member() else {})})
                     continue
 
+                # A parse error is not a call: it takes its own recovery branch
+                # below, never the owner-data block (§4KL R7).
                 _member_refusal = (self._member_tool_refusal(
                     _cname, tool["function"].get("arguments"), tools_run_this_turn)
-                    if requester_is_member() else None)
+                    if requester_is_member() and fname != "system_parse_error" else None)
                 if _member_refusal:
                     pretty_log("Local Guard",
                                f"{_cname} refused — {_member_refusal}",
                                icon=Icons.STOP, level="WARNING")
+                    # An allowlisted tool refused for its ARGUMENTS is still
+                    # available; "not available" would contradict the notice
+                    # and lose the tool for the rest of the request (§4KL).
+                    _mblock = (f"SYSTEM BLOCK: {_member_refusal}. The {_cname} tool itself "
+                               "is available on this channel — call it again within that "
+                               "limit, or answer without it."
+                               if _cname in _MEMBER_ALLOWED_TOOLS else _MEMBER_TOOL_BLOCK)
                     err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname,
-                               "content": _TO.rejected(_MEMBER_TOOL_BLOCK, reason_code="owner_data_blocked")}
+                               "content": _TO.rejected(_mblock, reason_code="owner_data_blocked")}
                     messages.append(err_msg)
-                    tools_run_this_turn.append({**err_msg, "_synthetic": True})
+                    # Not a strike: a strike sets the execution-failure labels
+                    # and would file a correct answer after one refusal as a
+                    # failed turn (§4KL R4). Retries are bounded after the
+                    # batch by `MEMBER_REFUSAL_REPORT_AT`.
+                    tools_run_this_turn.append({**err_msg, "_synthetic": True, "_member_refused": True})
                     continue
 
                 # §4KD: clarify-first. A one-token or unintelligible follow-up
@@ -21017,8 +21295,14 @@ class GhostAgent:
                 try:
                     from . import strikes as _sy_strk
                     _sy_run = 0
+                    # A member has two search tools and no opener; both extend
+                    # the run (§4KM b). The owner's run — the experiment's
+                    # trigger — is unchanged.
+                    _sy_member = requester_is_member()
                     for _sy_meta in tool_call_metadata:
-                        _sy_run = strikes.note_search_yield(_sy_meta[0])
+                        _sy_run = strikes.note_search_yield(
+                            "web_search" if _sy_member and _sy_meta[0] == "darkweb_search"
+                            else _sy_meta[0])
                     if (_sy_run >= _sy_strk.SEARCH_YIELD_STEER
                             and not strikes.search_yield_steered
                             and not force_stop and not force_final_response):
@@ -21026,8 +21310,20 @@ class GhostAgent:
                         from . import experiments as _sy_exp
                         _sy_req = str(getattr(ts, "req_id", "")
                                       or request_id_context.get() or "")
-                        _sy_arm = _sy_exp.arm_for(self.context, "search_yield_steer", _sy_req)
-                        if _sy_arm:
+                        if requester_is_member():
+                            # A member cannot open a result (no browser, no
+                            # download), so "open one" is not an option and
+                            # a withheld steer leaves nothing but more
+                            # searches. Not an arm observation either: the
+                            # experiment readers drop member turns (§4KJ R9).
+                            pretty_log(
+                                "Search Yield",
+                                f"{_sy_run} web searches in a row — member turn, no page "
+                                "reader: steering to answer from the snippets (tools kept)",
+                                level="WARNING", icon=Icons.WARN)
+                            messages.append({"role": "user",
+                                             "content": member_search_yield_steer(_sy_run)})
+                        elif (_sy_arm := _sy_exp.arm_for(self.context, "search_yield_steer", _sy_req)):
                             _sy_treat = (_sy_arm == _sy_exp.TREATMENT)
                             _sy_exp.mark_trigger(self.context, _sy_req,
                                                  "search_yield_steer_fired", _sy_treat)
@@ -21541,6 +21837,7 @@ class GhostAgent:
                             last_was_failure = False
                             _request_sys3_prev_justification = sys3_result.get('justification', '')
                             messages.append({"role": "user", "content": f"SYSTEM 3 PIVOT #{pivot_num}: The previous approach failed. The strategy has been entirely rewritten. Justification: {sys3_result.get('justification')}. Follow the new plan."})
+                            strikes.member_refused_batches = 0   # this batch ran a call (§4KL); the tail is skipped
                             return False  # was `continue` — the region is the loop-body tail
 
                     if execution_failure_count >= 6 or total_fail >= 8:
@@ -21668,6 +21965,33 @@ class GhostAgent:
                             icon=Icons.STOP,
                         )
                         return True  # was `break` — exit the turn loop
+            # §4KL R4/R5: a member who keeps making refused calls AFTER reading
+            # the refusal ends in a report, not the turn cap. Counted in whole
+            # batches (a first fan-out of three refused calls is one batch the
+            # model has not yet seen answered), reset by any batch that ran a
+            # call. Only a member's turn marks refused rows.
+            # "Ran a call" = a row that is not synthetic; another guard's block
+            # (clarify-first, blind regeneration) is not progress (§4KL R7).
+            _batch_rows = (tools_run_this_turn or [])[_rows_at_batch_start:]
+            _ran = any(not _t.get("_synthetic") for _t in _batch_rows)
+            _refused = any(_t.get("_member_refused") for _t in _batch_rows)
+            if _ran:
+                strikes.member_refused_batches = 0
+            elif _refused:
+                strikes.member_refused_batches += 1
+                if (not force_final_response
+                        and strikes.member_refused_batches >= MEMBER_REFUSAL_REPORT_AT):
+                    force_final_response = True
+                    self.context._breaker_forced_final = True  # §4JI: a tool call on this forced final IS the no-answer
+                    stamp_loop_breaker(self.context, str(getattr(ts, "req_id", "") or ""),
+                                       "member_refusals")
+                    pretty_log("Local Guard",
+                               f"{MEMBER_REFUSAL_REPORT_AT} batches of refused member calls — forcing the report",
+                               level="WARNING", icon=Icons.STOP)
+                    messages.append({"role": "user", "content": blocker_report_alert(
+                        "channel limits",
+                        f"your last {MEMBER_REFUSAL_REPORT_AT} rounds of tool calls were all refused "
+                        "because they cannot be made on this channel — no more will be attempted")})
             return False  # loop-body tail: fall through to the next turn
         finally:
             ts._constraint_steer_pending = _constraint_steer_pending
@@ -24716,20 +25040,81 @@ class GhostAgent:
                             f"Turn opening overlaps prior turn by {_jac:.0%} (hit {cross_turn_repeat_hits}/2).",
                             level="WARNING", icon=Icons.WARN,
                         )
-                        if cross_turn_repeat_hits >= 2:
+                        _waved = getattr(self.context, "_cross_turn_answers_waved", 0)
+                        _waved = _waved if isinstance(_waved, int) else 0
+                        if (cross_turn_repeat_hits >= 2 and _waved < CROSS_TURN_ANSWERS_WAVED_MAX
+                                and repeated_turn_is_an_answer(
+                                    merged_content, msg.get("tool_calls"), request=last_user_content)):
+                            self.context._cross_turn_answers_waved = _waved + 1
+                            # The check runs before the turn is parsed; a
+                            # repeated OPENING that ends in a plain answer ends
+                            # the loop by itself — breaking here discarded it.
+                            pretty_log(
+                                "Cross-Turn Repetition",
+                                "repeated opening, but the turn is a plain answer — letting it finish",
+                                level="INFO", icon=Icons.WARN,
+                            )
+                            # A guard that sends this answer back for one more
+                            # step (notify, filler, promise) starts the count over.
+                            cross_turn_repeat_hits = 0
+                        elif cross_turn_repeat_hits >= 2:
+                            prev_turn_opening_words = _stream_opening_words
+                            # §4KL (slack-61cc5f5a): this used to REPLACE the
+                            # reply with the marker — three turns of real
+                            # search results became one internal error line
+                            # on a member's Slack thread. Same two tiers as
+                            # the thinking-loop breaker (§4IH): with a turn
+                            # left, stop the repeated work and ask for the
+                            # report; on the last turn, or when the report
+                            # turn repeats too, ship the evidence digest
+                            # with the marker as a trailer.
+                            if (not force_final_response
+                                    and second_cap_reports(turn, effective_max_turns)):
+                                pretty_log(
+                                    "Loop Breaker",
+                                    f"Cross-turn repetition loop (Jaccard {_jac:.0%}) — closing "
+                                    "the loop: next turn is the report (tools off)",
+                                    level="WARNING", icon=Icons.STOP,
+                                )
+                                # A text-only turn made no call: keep its text so a
+                                # misjudged answer reaches the report turn. A call turn
+                                # is dropped unrun. Either way the two repeated turns
+                                # before this one were the loop: stamp it (§4KM R4).
+                                _ct_visible = _strip_think_blocks(str(merged_content or "")).strip()
+                                _ct_text_only = (not msg.get("tool_calls") and _ct_visible
+                                                 and not _ct_visible.startswith("{")
+                                                 and not _TOOL_MARKUP_RE.search(_ct_visible))
+                                messages.append({"role": "assistant", "content": (
+                                    _ct_visible if _ct_text_only else
+                                    "[This turn repeated the previous turns' reasoning; "
+                                    "its tool calls were not run.]")})
+                                force_final_response = True
+                                self.context._breaker_forced_final = True
+                                stamp_loop_breaker(self.context, req_id, "cross_turn")
+                                messages.append({"role": "user", "content": blocker_report_alert(
+                                    "repetition loop",
+                                    "your last three turns opened with the same reasoning "
+                                    "and did not move the task forward — no more tool calls "
+                                    "will be made")})
+                                return "continue"
                             pretty_log(
                                 "Loop Breaker",
-                                "Cross-turn repetition loop — aborting attempt.",
+                                "Cross-turn repetition loop "
+                                + ("on the report turn" if force_final_response else "on the last turn")
+                                + " — shipping the evidence digest with the abort marker",
                                 level="WARNING", icon=Icons.STOP,
                             )
-                            final_ai_content = (
-                                "[ATTEMPT_ABORTED_CROSS_TURN_LOOP] The solver opened "
-                                "three consecutive turns with near-identical reasoning "
-                                f"(Jaccard {_jac:.0%}). Further retries would repeat "
-                                "the same derivation. Stopping."
-                            )
+                            # Digest only: the head must open the reply (the shape
+                            # check anchors on it) and unscrubbed model text here
+                            # would dodge the leak scrubbers (§4KM R4 review).
+                            # Stamped too: the digest echoes the ask and a tool
+                            # output, and a bleed phrase in either lets finalize
+                            # cut the trailing marker (§4KM R5 review).
+                            stamp_loop_breaker(self.context, req_id, "cross_turn")
+                            final_ai_content = cross_turn_loop_fallback(
+                                _no_answer_fallback_reply(tools_run_this_turn, ask=last_user_content,
+                                                          head_key="no_answer_loop"))
                             force_stop = True
-                            prev_turn_opening_words = _stream_opening_words
                             return "break"
                     else:
                         cross_turn_repeat_hits = 0
@@ -24966,7 +25351,13 @@ class GhostAgent:
 
             tool_calls, ui_content, parse_failure_reason = self._parse_assistant_tool_calls(content, msg)
 
-            ui_content = _strip_think_blocks(ui_content).strip()
+            # A call turn's visible text is narration before the call, never the
+            # answer: there the reasoning may end with the tag itself (probe-f6).
+            # On a final generation the calls are dropped and this text IS the
+            # reply, so it is not narration before a call (§4KN R3).
+            ui_content = _strip_orphan_think_close(
+                _strip_think_blocks(ui_content),
+                call_turn=bool(tool_calls) and not is_final_generation).strip()
 
             # --- HALLUCINATION & LEAK SCRUBBERS ---
             if ui_content:
@@ -25910,6 +26301,11 @@ class GhostAgent:
                         repair_round += 1
                         force_final_response = False
                         _repair_reentry_active = True
+                        cross_turn_repeat_hits = 0    # a repair round is a fresh attempt (§4KL)
+                        # The repair has its tools back: the breaker's report
+                        # shaping (thinking off, a tool call = no answer) must
+                        # not ride its final turn (§4KM g).
+                        self.context._breaker_forced_final = False
                         _repair_reentry_tools_at = _real_tool_rows(tools_run_this_turn)
                         _repair_reentry_rows_at = len(tools_run_this_turn or [])
                         if _refuted:
@@ -26300,6 +26696,11 @@ class GhostAgent:
                 # one report the tier could never fire again).
                 self.context._futility_report_done = False
                 self.context._breaker_forced_final = False
+                # §4KM (c)/(e): which breaker closed this request with a report
+                # (a behavioural failure for the corpus), and how many repeated-
+                # opening answers the cross-turn breaker has let through.
+                loop_breaker_for(self.context, req_id, pop=True)   # a reused id starts clean
+                self.context._cross_turn_answers_waved = 0
                 # Context-pressure lockdown: set after the SECOND overflow in
                 # one request (read budget drops to zero for its remainder).
                 self.context._ctx_pressure_lockdown = False
@@ -27859,6 +28260,8 @@ class GhostAgent:
                             if not requester_is_member()
                             or t['function']['name'] in _MEMBER_ALLOWED_TOOLS
                         ])
+                        _member_tools_note = ("\n" + _MEMBER_CAPABILITY_NOTICE
+                                              if requester_is_member() else "")
                         state_limit = max(1500, int(char_budget * 0.05))
                         safe_scratch = str(scratch_data)
                         if len(safe_scratch) > state_limit: safe_scratch = safe_scratch[:state_limit] + "\n...[TRUNCATED]"
@@ -27896,7 +28299,7 @@ User Request: {last_user_content}
 Last Tool Output: {last_tool_output}
 {planner_playbook_block}
 ### AVAILABLE NATIVE TOOLS
-[{available_tools_list}]
+[{available_tools_list}]{_member_tools_note}
 CRITICAL INSTRUCTION: If an action requires a tool, explicitly name the native JSON tool you intend to use. DO NOT plan to write Python scripts for tasks that have a dedicated native tool. If the user is just asking a question or requesting a code/SQL explanation, set "next_action_id" to "none" and do NOT plan to use a tool.
 
 ### TEMPORAL ANCHOR (READ CAREFULLY)
@@ -27979,7 +28382,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                                   if current_plan_json else "No plan yet.")
                             _aligned_transient = (
                                 f"{planner_playbook_block}"
-                                f"### AVAILABLE NATIVE TOOLS\n[{available_tools_list}]\n"
+                                f"### AVAILABLE NATIVE TOOLS\n[{available_tools_list}]{_member_tools_note}\n"
                                 "CRITICAL INSTRUCTION: If an action requires a tool, explicitly name the "
                                 "native JSON tool you intend to use. DO NOT plan to write Python scripts "
                                 "for tasks that have a dedicated native tool. If the user is just asking "
@@ -28906,6 +29309,15 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # lives in the launcher (the real prod path), not here.
                     # (`_pin_stable` is computed once, higher up, because the
                     # final-gen assembly above depends on it.)
+                    if requester_is_member():
+                        # §4KM (a): steers were written for the owner and some name
+                        # tools a member lacks ("load the page in the browser").
+                        # One choke point instead of forty texts.
+                        _blocked = self._member_blocked_tool_names()
+                        req_messages = [
+                            {**m, "content": member_steer_caveat(m.get("content"), _blocked)}
+                            if m.get("role") == "user" and isinstance(m.get("content"), str) else m
+                            for m in req_messages]
                     req_messages = self._compose_injection(
                         req_messages, _stable_injection, dynamic_state, _pin_stable,
                         # The CURRENT request (not the session's first message):
@@ -30291,14 +30703,16 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         ok = self._member_files() | {os.path.basename(p) for p in _turn_generated_images(tools_run_this_turn)}
         if name == "vision_analysis":
             if set(args) - self._MEMBER_VISION_KEYS:
-                return "only an image generated for this channel, or a web URL, can be inspected"
+                return ("on this channel vision_analysis takes only the arguments "
+                        + ", ".join(sorted(self._MEMBER_VISION_KEYS)))
             tgt = args.get("target")
             if tgt is None:
                 return None
             return None if self._member_file_value_ok(tgt, ok) else \
                 "only an image generated for this channel, or a web URL, can be inspected"
         if set(args) - self._MEMBER_IMAGE_KEYS:
-            return "only images generated for this channel can be used as references"
+            return ("on this channel image_generation takes only the arguments "
+                    + ", ".join(sorted(self._MEMBER_IMAGE_KEYS)))
         refs = args.get("reference_images") or []
         refs = [refs] if not isinstance(refs, list) else refs
         # image_generation cannot FETCH a URL — it resolves every reference as
@@ -30972,7 +31386,11 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             if stream_prefix:
                 start_chunk = {
                     "id": f"chatcmpl-{req_id}", "object": "chat.completion.chunk", "created": created_time,
-                    "model": stream_model, "choices": [{"index": 0, "delta": {"content": stream_prefix}, "finish_reason": None}]
+                    "model": stream_model, "choices": [{"index": 0, "delta": {"content": stream_prefix}, "finish_reason": None}],
+                    # §4KO R3: the prefix (prior text, a correction banner) is
+                    # not this generation's output — every surface that cuts
+                    # a leaked reasoning prefix must start after it.
+                    "ghost": {"stream_prefix": True},
                 }
                 yield f"data: {json.dumps(start_chunk)}\n\n".encode('utf-8')
                 full_content += stream_prefix
@@ -31078,6 +31496,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 except Exception as _etx:
                     logger.debug("entropy tracker init failed: %s", _etx)
 
+            _saw_reasoning = False          # §4KP: the reasoning channel spoke first
+            _unparsed_decided = False
             async for chunk in _stream_or_abort_frames(
                     self.context.llm_client.stream_chat_completion(
                         payload, use_coding=has_coding_intent)):
@@ -31132,9 +31552,18 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             )
                         if "choices" in chunk_data and len(chunk_data["choices"]) > 0:
                             delta = chunk_data["choices"][0].get("delta", {})
+                            if delta.get("reasoning_content"):
+                                _saw_reasoning = True
                             if "content" in delta and delta["content"] is not None:
                                 _is_content_chunk = True
                                 _new_text = delta["content"]
+                                if (_new_text and not _unparsed_decided):
+                                    # §4KP: no reasoning channel before the answer
+                                    # with thinking on → its opening may be
+                                    # reasoning; append-only clients hold.
+                                    _unparsed_decided = True
+                                    if not _saw_reasoning and not thinking_disabled(payload):
+                                        yield reasoning_unparsed_frame(req_id, created_time, stream_model)
                                 full_content += _new_text
                             # Metacog: pipe top-logprobs into
                             # the entropy tracker. Lives in
@@ -31390,6 +31819,13 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             # when the whole reply was scrubbed tool-XML, so the trajectory
             # corpus stores the ANSWER the user saw, not tag-soup (which
             # then trained the self-improvement loop on garbage).
+            # §4KO: the record, the retry base and the verifier claim lose a leaked
+            # pure-prose reasoning prefix (the web UI hides the same text; streamed
+            # bytes cannot be recalled). Raw text: call markup, inline think blocks
+            # and the unparsed-call checks downstream stay untouched.
+            _prefix_len = len(stream_prefix or "")
+            full_content = full_content[:_prefix_len] + strip_raw_orphan_reasoning(
+                full_content[_prefix_len:])
             _stream_effective_content = full_content
             _scrub_fallback_emitted = False
             _scrub_fallback_deferred = False
@@ -31581,7 +32017,12 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # think block ("tools are off, so I must not emit a <tool_call>") was scrubbed to
                     # end-of-string, the answer with it, and the honest fallback shipped
                     _ff_candidate = _strip_think_blocks(str(_ff_msg.get("content") or ""))
+                    _ff_unscrubbed = _ff_candidate
                     _ff_candidate = _MODULE_SCRUB_RE.sub("", _ff_candidate).strip()
+                    # the retry often re-writes the call it was told not to make: once
+                    # that markup is scrubbed, it is a call turn's text (§4KN R3)
+                    _ff_candidate = _strip_orphan_think_close(
+                        _ff_candidate, call_turn=_ff_candidate != _ff_unscrubbed.strip()).strip()
                     if _ff_candidate and not _ff_narr(_ff_candidate):
                         _ff_retry_text = _ff_candidate
                     else:
@@ -33177,6 +33618,12 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             _extra["requester_role"] = str(requester_role_context.get() or "")
         except Exception:  # noqa: BLE001
             pass
+        # §4KM (c): a breaker closed THIS request with a report. Keyed by the
+        # request id: the streamed drain records after the semaphore is
+        # released, when another request may already be running.
+        _lbr = loop_breaker_for(self.context, req_id)
+        if _lbr:
+            _extra["loop_breaker"] = _lbr
         # req_id stamped explicitly (§4L, 2026-08-07): the late-verdict
         # path joins its calibration correction through it, and lens C
         # found a live trajectory with req_id nowhere in extra.
