@@ -48802,3 +48802,15 @@ ends inside an open code span; a prompt rule to name control tags in words) awai
 **Decision (operator, 2026-09-29): leave it.** Model behaviour, 0/2,239 in real traffic; no guard, no prompt rule.
 Re-open only if real replies start ending inside an open code span.
 **ClockworkPi deploy (2026-09-29 22:54).** `deploy.sh` → device client sha256 matches the repo (ec2519c5…), one client running (pid 6701), face up; backup `~/bin/client.py.bak-20260929-225427`.
+
+## §4KR — Web-client TLS cert auto-renewal (2026-09-29, operator: "make the cert renew automatically") — SHIPPED
+**Trigger.** Chip DEGRADED = `tlsWarning()`: `eva.taila2b1d.ts.net` had 10.06 days left (not_after 2026-10-09). Renewed by hand
+(`tailscale cert`, TERM uvicorn pid 384 → launchd respawn pid 29901, served cert verified on the wire) → **2026-12-09**.
+**Automation.** `bin/renew-ghost-cert.sh` + LaunchAgent `com.local.ghost-cert-renew` (daily 04:17 + RunAtLoad; login agent because
+the Tailscale CLI talks to the GUI app). No-op above 30 days; under 30: `tailscale cert --min-validity 744h` into a temp dir →
+validate (parses, SAN names domain, key matches, outlives current) → install (`*.prev` kept) → TERM the :8080 listener ONLY if its
+argv is our uvicorn serving this cert → success only when a NEW pid serves the new SHA-256 fingerprint. Failures exit 1 and leave
+live files untouched; the 14-day chip warning is the alarm (~16 retries first). Log `~/Data/AI/Logs/ghost-cert-renew.log`.
+**Tests.** `tests/test_cert_renewal.py` 19 executed tests (stub tailscale + fake web client under a respawn loop); mutation 9/9
+killed after adding the stale-cert-respawn and TERM-ignoring-server cases (the wire check and pid-change check each survived first).
+Docs: `docs/interfaces/web_server.html#tls-renewal`. Live: agent bootstrapped, first run exit 0 "not due".
