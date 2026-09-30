@@ -1083,6 +1083,7 @@ CRITICAL: You MUST explicitly define the EXACT expected stdout output format for
 # 5. VERY IMPORTANT: If using json.dump, ensure dates are cast to strings (e.g. default=str) as datetime objects are NOT JSON serializable.
 # 6. SCHEMA CONSISTENCY: If using SQLite, the number of VALUES in INSERT must EXACTLY match the number of columns in CREATE TABLE. If using csv.writer, each writerow() call must have the EXACT same number of fields as the header row. Double-check your column counts before writing.
 # 7. SELF-TEST: Mentally trace through your script line by line. If a CREATE TABLE has columns (a, b, c, d), then INSERT must have 4 values, not 1. If a CSV header is "id,name,price", then each row must have 3 fields.
+# 8. LINE BREAKS: separate records with a REAL line break — `"\\n".join(rows)` or `f.write(line + "\\n")`, ONE backslash. A doubled backslash (`"\\\\n"`) writes the two characters backslash-n, the whole file becomes a single line, and the challenge is discarded.
 </setup_script>
 
 <validation_script>

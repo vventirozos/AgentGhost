@@ -255,6 +255,34 @@
   <h2 id="lesson-origin">Lesson provenance (§4FD, 2026-09-07)</h2>
   <p>Every lesson record now carries <code>origin</code>: <code>"user"</code> (written during a real user request), <code>"auto"</code> (idle machinery — reflection, dream, post-mortem, distillation — or an internal sched-/job-/sub- turn), <code>"probe"</code> (a diagnostic; must never teach, stamped so a leak is visible), <code>"bench"</code>, or <code>""</code> for legacy rows. It is derived ONCE inside the write chokepoint (<code>_derive_lesson_origin</code>, from the request-id contextvar the turn loop sets first thing — the default <code>"SYSTEM"</code> outside any request is "auto"), so no caller has to know; an explicit <code>learn_lesson(..., origin=)</code> wins. The learning-health report counts lessons by origin and flags any probe-origin lesson. Motivation: HEARTBEAT (arXiv 2603.23064) — background activity promoted into long-term memory 91% of the time; this agent's idle loop writes lessons from web-derived content, and §4FB found a diagnostic probe sitting in the playbook as lesson 49. No retrieval filter is applied yet: the operator's B3 ablation showed idle-loop lessons earn their keep, so this ships as observability first. Tests: <code>tests/test_4fd_provenance.py</code>.</p>
 
+  <!-- 4KS:evidence -->
+  <h2 id="4ks">A frequency bump needs new evidence <span class="tag">2026-09-30 &sect;4KS</span></h2>
+  <p>
+    <code>frequency</code> is read as "how many independent times this lesson was learned": it lifts the utility score and, at three,
+    makes a lesson eligible for graduation. Both dedup branches (exact trigger and vector match) bumped it on every re-learn,
+    whatever the re-learn was derived from. In one day's log a distilled lesson stood at <strong>84 "from 5 cases"</strong>
+    (re-synthesised each time its cluster changed), a dream heuristic went 13&nbsp;&rarr;&nbsp;16 by re-reading a 60-fragment window
+    of which 57 were unchanged, and a replay of the same self-play challenge bumped its lesson again.
+  </p>
+  <p>
+    A re-learn now names what it was derived from &mdash; the trajectory id, the challenge hash, <code>source_refs</code>, and the new
+    <code>evidence_refs</code> &mdash; which is digested and remembered on the lesson (<code>evidence_keys</code>, newest 240). A dedup
+    hit counts only if it brings a key the lesson has not seen (<code>evidence_is_new</code>). For a window a caller re-reads, the
+    caller asks for a share: the dream passes its fragment window with <code>evidence_min_new_fraction=0.5</code>, so a re-derived
+    heuristic counts again only once half the window is fragments it has not been derived over; a re-detected
+    <code>[Pattern]</code> names the pattern and its support, so it counts again only when the support changed. A re-learn that
+    names no evidence bumps as before &mdash; unknown provenance is not stale provenance. Rows written before this carry no keys;
+    their own provenance fields count as seen.
+  </p>
+  <p>
+    <strong>What this costs.</strong> Replayed over four days of dream cycles, 29 bumps become 2. A period with only self-play
+    traffic adds few fresh fragments, so dream heuristics stop climbing during it &mdash; that is the intent, but it also means a
+    rule that is genuinely re-confirmed by the same material gains nothing.
+  </p>
+  <p class="note">Pins: <code>tests/test_4ks_log_review_fixes.py</code> (block H, both dedup branches), with an AST enumeration
+  that every <code>frequency</code> assignment in <code>learn_lesson</code> sits under the evidence test.</p>
+  <!-- /4KS:evidence -->
+
 </main>
 
   <h2 id="4kd-slack">A member never teaches <span class="tag">2026-09-24 &sect;4KD, de-Slacked in &sect;4KJ</span></h2>

@@ -1835,6 +1835,253 @@ _SELFPLAY_PROTECTED_NAMES = frozenset({
 _SNAPSHOT_INCOMPLETE = "__ghost_selfplay_snapshot_incomplete__"
 
 
+#: §4KS — self-play failures that mean "the GENERATED challenge was
+#: defective, found in the sandbox before the solver ran". Each used to forfeit
+#: the whole idle slot (2026-09-30 02:2x: three generations, ~290 s, then a
+#: setup-script IndexError and nothing); the 3×-quality-gate path already falls
+#: back to a template for the same reason.
+TEMPLATE_RETRY_REASONS = frozenset({
+    "selfplay_setup_syntax", "selfplay_setup_failed",
+    "selfplay_setup_malformed_data", "selfplay_generation_failed",
+})
+
+
+#: A caller that bounds the whole call (`asyncio.wait_for`) says so on the
+#: dreamer — ``dreamer.cycle_budget_s = <its timeout>`` — and a first run
+#: that used more than this share of it
+#: leaves no room for a second (solve p95 ≈ 264 s of the tools' 600 s). The
+#: idle loop sets no bound and passes none: its retry is never refused for
+#: time (R2 review — the incident this exists for took ~297 s of generation,
+#: 3 s under a flat 300 s cap that only the bounded callers needed).
+TEMPLATE_RETRY_BUDGET_SHARE = 0.5
+
+
+def _template_fallback_on_defective_challenge(fn):
+    """Re-run ``synthetic_self_play`` ONCE on a deterministic template when
+    the challenge the LLM GENERATED this run turned out defective in the
+    sandbox. The first run has fully returned (its sandbox is torn down)
+    before the second starts. Not when the first run's challenge was itself
+    a template, a journal challenge, a replay or a bench item
+    (``self.last_challenge_origin``); not when the sandbox, rather than the
+    challenge, failed; not when the caller's ``cycle_budget_s`` leaves no
+    time for a second; never twice (the second run calls the function
+    itself)."""
+    @functools.wraps(fn)
+    async def _wrapper(self, *args, **kwargs):
+        import time as _time
+        _t0 = _time.monotonic()
+        out = await fn(self, *args, **kwargs)
+        cycle_budget_s = getattr(self, "cycle_budget_s", None)
+        if (getattr(out, "reason_code", None) in TEMPLATE_RETRY_REASONS
+                and getattr(self, "last_challenge_origin", "") == "generated"
+                and "[SANDBOX INFRA ERROR" not in str(out)
+                and (cycle_budget_s is None
+                     or (_time.monotonic() - _t0)
+                     <= float(cycle_budget_s) * TEMPLATE_RETRY_BUDGET_SHARE)):
+            pretty_log(
+                "Self-Play Template",
+                f"the generated challenge was defective in the sandbox "
+                f"({getattr(out, 'reason_code', '')}) — re-running on a "
+                f"deterministic template instead of forfeiting the idle slot",
+                level="WARNING", icon=Icons.WARN,
+            )
+            kwargs["force_template"] = True
+            return await fn(self, *args, **kwargs)
+        return out
+    return _wrapper
+
+
+#: Share of a dream window that must be fragments a heuristic has not been
+#: derived over before its re-derivation counts as a new observation (§4KS).
+DREAM_EVIDENCE_MIN_NEW_FRACTION = 0.5
+
+
+#: Temperature of LLM challenge generation: low for structured XML, raised
+#: only after a near-duplicate rejection.
+CHALLENGE_GEN_TEMPERATURE = 0.3
+
+
+def challenge_generation_temperature(duplicate_rejections: int) -> float:
+    """§4KS: at 0.3 the generator re-derives the challenge it was just told
+    is a duplicate — live 2026-09-30 a retry after a 0.61-overlap rejection
+    came back at 0.92 (of 11 generations that night, 5 were near-duplicates).
+    The banned-token feedback names what to avoid; the sampling has to be
+    able to leave. 0.3 → 0.6 → 0.9, one step per duplicate rejection in this
+    run; every other rejection kind keeps 0.3 (its fix is a specific edit,
+    not a different idea)."""
+    try:
+        n = max(0, int(duplicate_rejections))
+    except (TypeError, ValueError):
+        n = 0
+    return min(0.9, CHALLENGE_GEN_TEMPERATURE + 0.3 * n)
+
+
+#: Field separators a record file uses; one of them must occur the SAME
+#: number of times (≥ 1) in every record for the pieces to be records.
+_RECORD_DELIMITERS = (b"|", b",", b"\t", b";", b" ", b":")
+#: Fewest records (pieces between literal backslash-n) for the rule to speak.
+DATA_DEFECT_MIN_RECORDS = 4
+
+
+#: Share of the pieces that must carry the same separator count. Not 1.0: a
+#: challenge about malformed rows plants a few on purpose (live: 114 of 116).
+DATA_DEFECT_RECORD_SHARE = 0.9
+
+
+def _pieces_are_records(pieces, delim: bytes) -> bool:
+    """Do the pieces share a record shape under ``delim`` — the same count
+    of it, at least one, in at least ``DATA_DEFECT_RECORD_SHARE`` of them?"""
+    counts = [p.count(delim) for p in pieces]
+    common = max(set(counts), key=counts.count)
+    return common >= 1 and counts.count(common) >= DATA_DEFECT_RECORD_SHARE * len(counts)
+
+
+def setup_data_defect(snapshot: Optional[dict]) -> Optional[str]:
+    """A mock data file the setup script wrote with ESCAPED newlines —
+    ``"\\n".join(rows)`` — instead of line breaks: the whole dataset is one
+    line whose records are separated by the two characters backslash-n.
+    Returns a one-line reason, or None.
+
+    §4KS (2026-09-30, sim 684205e6): ``transaction_ledger.txt`` came out
+    that way, the solver spent an attempt discovering it, and a lesson —
+    "Parsing non-standard delimited data with literal escape…" — was minted
+    at confidence 0.95 from the generator's own bug.
+
+    The rule asks for the defect's SHAPE, not for the mere presence of a
+    literal ``\n`` (R1 review: the first version flagged Windows paths, a
+    regex list, minified JS and a two-line JSONL): the file has NO real line
+    break, is not valid JSON, and splitting it on the literal yields at
+    least ``DATA_DEFECT_MIN_RECORDS`` pieces that are RECORDS — one field
+    separator occurs the same number of times, at least once, in (nearly)
+    every piece. Measured on the 23 live replay-ledger challenges whose
+    setup writes this defect (each run in an isolated container): 23
+    flagged (a 24th writer, found in the R2 review, is flagged too); on
+    nine legitimate single-line shapes: none.
+
+    Known edges, accepted (a false positive costs one generated challenge
+    its slot, or one replay its lesson): a one-line file that IS a list of
+    records with escaped newlines by design — a `printf "a,1\\nb,2\\n…"`
+    shell one-liner, a one-line Python repr — is flagged; a file with a
+    real line break inside it is never flagged, even when the rest of it is
+    joined by the literal."""
+    for name, blob in (snapshot or {}).items():
+        if not isinstance(blob, (bytes, bytearray)) or name == _SNAPSHOT_INCOMPLETE:
+            continue
+        base = str(name).rsplit("/", 1)[-1]
+        body = bytes(blob).strip()
+        if (base.startswith(".") or len(body) < 40 or b"\x00" in body[:4096]
+                or b"\n" in body):
+            continue
+        pieces = body.split(b"\\n")
+        while pieces and not pieces[-1].strip():
+            pieces.pop()                  # a trailing literal separator
+        if len(pieces) < DATA_DEFECT_MIN_RECORDS:
+            continue
+        try:
+            text = body.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        try:
+            json.loads(text)
+            continue                      # valid JSON: the escapes are its own
+        except Exception:  # noqa: BLE001
+            pass
+        if not any(_pieces_are_records(pieces, d) for d in _RECORD_DELIMITERS):
+            continue                      # the pieces are not records
+        return (f"{name}: {len(pieces)} records separated by a literal "
+                f"'\\n' and no line break — the setup script wrote an "
+                f"escaped newline where it meant a line break, so the "
+                f"dataset is a single line")
+    return None
+
+
+def data_defect_policy(origin: str) -> str:
+    """What a malformed mock dataset means for a run, by where its challenge
+    came from: ``"discard"`` for one the LLM generated this run (the slot
+    goes to a template); ``"no_lesson"`` for a replay (it still runs — it
+    is winnable, and a regression recheck is the only path that restores a
+    quarantined lesson — but teaches nothing); ``""`` for a template, a
+    journal-mined challenge and a bench item, which are not checked."""
+    return {"generated": "discard", "replay": "no_lesson"}.get(str(origin or ""), "")
+
+
+def challenge_origin(*, bench_meta, injected_challenge, journal_source,
+                     template_used) -> str:
+    """Where the challenge a run is about to solve CAME FROM — one reading,
+    for every decision that depends on it (§4KS R1: `_tpl is not None` was
+    read as "a template is in use", but the seed cluster's template is
+    looked up even when an injected challenge is what runs, so ~12% of
+    replays were treated as templates).
+
+    ``bench`` (an external bank item) · ``replay`` (an injected past
+    challenge) · ``journal`` (mined from a real post-mortem) · ``template``
+    (hand-written) · ``generated`` (the LLM wrote it this run)."""
+    if bench_meta:
+        return "bench"
+    if injected_challenge:
+        return "replay"
+    if journal_source:
+        return "journal"
+    if template_used:
+        return "template"
+    return "generated"
+
+
+#: The three replies `handle_chat` returns when the upstream LLM died (it
+#: does not raise) — `core/agent.py`, the turn loop's request `except` arms.
+#: An AST pin fails if an emitter there stops matching one of these.
+UPSTREAM_OUTAGE_BANNERS = (
+    "CRITICAL: The upstream LLM server is unreachable",
+    "CRITICAL: Upstream error ",
+    "CRITICAL: An unexpected error occurred while communicating with the LLM",
+)
+
+
+def reply_is_upstream_outage(final_text) -> bool:
+    """Does the reply carry one of `handle_chat`'s outage banners? Matched
+    as the banners themselves, anywhere in the reply: not the bare word
+    "CRITICAL:" (a solver reply that quotes a log line — "CRITICAL: disk
+    full" — is an answer; §4KS R2), and not only at the head (a deferred
+    correction banner is inserted ABOVE the outage text; §4KS R4)."""
+    text = str(final_text or "")
+    return any(b in text for b in UPSTREAM_OUTAGE_BANNERS)
+
+
+#: Other replies of a verify run that did not come to an answer: the
+#: context-overflow recovery message, the cancelled-turn note, and any of the
+#: turn loop's hard aborts (`[ATTEMPT_ABORTED_…]`: strike cap, no progress,
+#: thinking loop). Matched ANYWHERE: an abort marker is appended after any
+#: narration, and the finalizer can insert a banner above all of them.
+#: An aborted run MAY have worked with the lesson in hand before it died;
+#: it is still not counted as disproof — the choice is conservative: the
+#: lesson stays, unverified, rather than being discarded on a run that
+#: ended in a loop guard. An AST pin ties each marker to its emitter.
+_VERIFY_NOT_MEASURED_MARKERS = ("I hit my context limit while",
+                                "[ATTEMPT_ABORTED_",
+                                "_(Turn cancelled:")
+#: …and the sandbox's own banner in the validator output.
+_VERIFY_NOT_MEASURED_OUTPUT = ("[SANDBOX INFRA ERROR",)
+
+
+def verify_run_measured(final_text, validator_output, exit_code=None,
+                        graded_on: str = "artifact") -> bool:
+    """Did a lesson-verification re-run actually put the lesson to the test?
+    False for an upstream outage, a turn that overflowed its context, was
+    cancelled or hit one of the turn loop's hard aborts, a sandbox fault, or
+    the text-graded validator's "answer.txt missing" exit 5 (§4KS R1: these
+    read as "the lesson did not help" and discarded it)."""
+    final = str(final_text or "")
+    out = str(validator_output or "")
+    if (reply_is_upstream_outage(final)
+            or any(m in final for m in _VERIFY_NOT_MEASURED_MARKERS)):
+        return False
+    if any(m in out for m in _VERIFY_NOT_MEASURED_OUTPUT):
+        return False
+    if graded_on == "final_response" and exit_code == 5:
+        return False
+    return True
+
+
 def _snapshot_mocks(sandbox_path: Path) -> dict:
     """Recursively snapshot the mock files the setup script produced, as
     ``{relative_posix_path: bytes}``.
@@ -2489,6 +2736,16 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                             memory_system=self.memory,
                             trigger=_h_task,
                             source="dream",
+                            # §4KS: the window this heuristic was read out
+                            # of. A re-dream needs only REDREAM_MIN_NEW_
+                            # FRAGMENTS fresh fragments, so the same rule is
+                            # re-derived from a window that is ~95% the one
+                            # it was derived from last time; it counts as a
+                            # new observation only once at least half the
+                            # window is fragments this lesson has not been
+                            # derived over.
+                            evidence_refs=[str(i) for i in (ids or [])],
+                            evidence_min_new_fraction=DREAM_EVIDENCE_MIN_NEW_FRACTION,
                         )
                         kept_heuristics += 1
 
@@ -2509,6 +2766,10 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                             # Provenance tag — detect_tool_patterns skips
                             # these so its counts can't self-reinforce.
                             source="dream_pattern",
+                            # §4KS: the same pattern over the same lessons
+                            # is re-detected every REM cycle; it counts
+                            # again only when its support changed.
+                            evidence_refs=[f"{p['pattern_name']}#{p.get('frequency')}"],
                         )
                         patterns_found += 1
             except Exception as pe:
@@ -3812,6 +4073,10 @@ Return ONLY a JSON object with:
         for no signal.
         """
         from pathlib import Path as _P
+        # §4KS: set ONLY when the lesson-injected run actually reached the
+        # validator and failed it — a measured negative, as distinct from
+        # "could not run" (exception) and "nothing to verify".
+        self.last_lesson_verify_disproved = False
         if not lesson:
             return False
         trigger = lesson.get("trigger") or lesson.get("task") or ""
@@ -3930,6 +4195,9 @@ Return ONLY a JSON object with:
             return False
 
         if not verify_passed:
+            # Only a run that MEASURED the lesson can disprove it.
+            self.last_lesson_verify_disproved = verify_run_measured(
+                _verify_final, output, exit_code, graded_on)
             return False
 
         # Verified only if the outcome is strictly better than the
@@ -3992,8 +4260,9 @@ Return ONLY a JSON object with:
         except Exception as e:  # noqa: BLE001
             logger.debug("bench trajectory outcome write-back skipped: %s", e)
 
+    @_template_fallback_on_defective_challenge
     async def synthetic_self_play(self, model_name: str = "qwen-3.6-35b-a3", is_background: bool = False, injected_challenge: dict = None,
-                                  bench_meta: dict = None):
+                                  bench_meta: dict = None, *, force_template: bool = False):
         """``bench_meta`` (§4BF Track 1b, admissions per 1c): marks this run
         as a BENCH-BANK item — an externally-graded task injected via
         ``injected_challenge``. Effects: a real TrajectoryCollector is
@@ -4021,6 +4290,9 @@ Return ONLY a JSON object with:
         # Pre-cleared like the other outcome surfaces: None = "no bench
         # run concluded" so the idle phase never reads a stale result.
         self.last_bench_result = None
+        # §4KS: where this run's challenge came from — read by the template
+        # fallback. "" until the challenge is chosen.
+        self.last_challenge_origin = ""
 
         # Curiosity signal — defaults to 0 so early-return paths (bad
         # XML, setup failure, validator syntax error) don't leave a stale
@@ -4267,6 +4539,11 @@ Return ONLY a JSON object with:
         gen_attempt_limit = 3
         rejection_feedback = ""
         gen_ok = False
+        # §4KS: consecutive near-duplicate rejections — the streak the
+        # NEXT attempt's temperature follows. A rejection of another kind
+        # ends it (its fix is a specific edit, at 0.3).
+        _dup_rejections = 0
+        _last_reject_dup = False
 
         # --- Counterfactual injection seam (2026-07-17) ---------------------
         # A replay hands in a PERSISTED past challenge verbatim; every
@@ -4365,6 +4642,21 @@ Return ONLY a JSON object with:
         # cluster to None and the LLM generated something novel, while
         # cold-start random templates (no seed cluster) were never tracked.
         _used_template_cluster = ""
+        # §4KS: the second run after a defective generated challenge — a
+        # template, never another LLM generation.
+        if force_template and _tpl is None and not gen_ok:
+            _tpl = pick_random_template(
+                exclude_clusters=_saturated, tier_resolver=_resolve_tier,
+                cluster_weights=_template_weights(),
+            ) or pick_random_template(
+                # every cluster saturated: any template beats a forfeited slot
+                exclude_clusters=[], tier_resolver=_resolve_tier,
+                cluster_weights=_template_weights(),
+            )
+            _tpl_source = "setup_failure_fallback"
+            if _tpl is not None:
+                _used_template_cluster = str(
+                    getattr(_ct_mod, "_LAST_TEMPLATE_KEY", "") or "")
         # §4BF 1c (R1 review): a bench item's cluster comes from the BANK,
         # not from the frontier seed picked before injection — without
         # this, resolve_cluster_key fell to seed["cluster_key"] (the
@@ -4482,6 +4774,8 @@ Return ONLY a JSON object with:
             )
 
         for gen_attempt in range(gen_attempt_limit if not gen_ok else 0):
+            _dup_rejections = (_dup_rejections + 1) if _last_reject_dup else 0
+            _last_reject_dup = False
             prompt_body = system_message
             if rejection_feedback:
                 # Route the retry addendum by rejection KIND. The previous
@@ -4554,7 +4848,8 @@ Return ONLY a JSON object with:
             # tightly-structured output while staying above greedy (0.0)
             # sampling's tendency to repeat itself on near-ties.
             _challenge_sampling = dict(CODING_SAMPLING_PARAMS)
-            _challenge_sampling["temperature"] = 0.3
+            _challenge_sampling["temperature"] = \
+                challenge_generation_temperature(_dup_rejections)
             # Non-thinking mode: structured-XML emission gains nothing
             # from the model's <think> preamble — it just burns 100+
             # seconds of reasoning before the first XML tag appears.
@@ -4807,6 +5102,7 @@ Return ONLY a JSON object with:
                     _dup_sim, _dup_head = 0.0, ""
                 if _dup_sim >= 0.60:
                     ok = False
+                    _last_reject_dup = True
                     # Name the SHARED identifier tokens explicitly — "be
                     # different" retries kept landing 0.6+ again; a banned-
                     # token list gives the regen a concrete target
@@ -5175,6 +5471,14 @@ Return ONLY a JSON object with:
         # loud false WARNING per run.
         _pre_verified_shape = bool(
             journal_source or _tpl is not None or injected_challenge)
+        # §4KS: ONE reading of where the challenge came from. `_tpl` alone
+        # does not say a template is IN USE — the seed cluster's template is
+        # looked up above even when an injected challenge runs.
+        _challenge_origin = challenge_origin(
+            bench_meta=bench_meta, injected_challenge=injected_challenge,
+            journal_source=journal_source, template_used=_tpl is not None)
+        self.last_challenge_origin = _challenge_origin
+        _lesson_blocked_by_data = ""     # set when a replay's data is malformed
 
         # The read-only memory façades + the background-LLM wrapper moved
         # to `core/isolation.py` on 2026-08-22 (§4CL S1) — VERBATIM, so
@@ -5440,6 +5744,45 @@ Return ONLY a JSON object with:
                     # this, attempt 1 can mutate the mock data and attempt 2
                     # validates against a corrupted input → false failure.
                     setup_snapshot = await asyncio.to_thread(_snapshot_mocks, Path(temp_sandbox))
+                    # §4KS: a setup script the GENERATOR wrote that put its
+                    # dataset on one line with escaped newlines. Hand-written
+                    # shapes (templates, journal-mined, bench bank) are not
+                    # policed. A freshly generated challenge is DISCARDED
+                    # (the slot goes to a template). A REPLAY of one is run
+                    # anyway — R1 review, measured on the live ledger: 23 of
+                    # 694 persisted challenges carry this, most are
+                    # consistent and winnable, and two are confirmed
+                    # regressions whose recheck is the only path that
+                    # restores 7 quarantined lessons — but it teaches
+                    # nothing: no lesson is drawn from a malformed dataset.
+                    _defect_policy = data_defect_policy(_challenge_origin)
+                    _data_defect = (setup_data_defect(setup_snapshot)
+                                    if _defect_policy else None)
+                    if _data_defect and _defect_policy == "no_lesson":
+                        _lesson_blocked_by_data = _data_defect
+                        pretty_log(
+                            "Self-Play Replay",
+                            f"malformed mock data ({_data_defect[:90]}) — "
+                            "replaying for the verdict, no lesson will be "
+                            "drawn from it",
+                            icon=Icons.WARN)
+                        _data_defect = None
+                    if _data_defect:
+                        pretty_log("Self-Play Error",
+                                   f"Setup script wrote malformed data: {_data_defect}",
+                                   level="WARNING", icon=Icons.WARN)
+                        from ..tools.outcome import ToolOutcome
+                        return ToolOutcome.failed(
+                            "Synthetic challenge generation failed: the setup "
+                            f"script wrote malformed mock data — {_data_defect}. "
+                            "The challenge has been discarded.\n\nSYSTEM "
+                            "INSTRUCTION: This setup script ran in a temporary, "
+                            "isolated sandbox that has now been destroyed. DO NOT "
+                            "try to fix `.setup.py` using the file_system tool. "
+                            "DO NOT call the `self_play` tool again. Inform the "
+                            "user that generation failed.",
+                            world_changed=False,
+                            reason_code="selfplay_setup_malformed_data")
 
                 validator_path = Path(temp_sandbox) / ".validator.py"
                 await asyncio.to_thread(validator_path.write_text, validation_script)
@@ -6102,13 +6445,13 @@ Return ONLY a JSON object with:
                     full_simulation_transcript += f"\n\n--- ATTEMPT {attempt + 1} ---\n{current_attempt_transcript}"
 
                     # Early abort if the agent gets hopelessly stuck or blows out context
-                    if "SYSTEM ALERT: You have failed" in final_ai_content or "CRITICAL:" in final_ai_content:
+                    if "SYSTEM ALERT: You have failed" in final_ai_content or reply_is_upstream_outage(final_ai_content):
                         # "CRITICAL:" is what agent.py emits for "the upstream
                         # LLM server is unreachable" — an INFRA outage, not a
                         # solver failure. Breaking without the flag recorded a
                         # llama-server restart as the agent failing the
                         # challenge, with all the durable consequences above.
-                        if "CRITICAL:" in final_ai_content:
+                        if reply_is_upstream_outage(final_ai_content):
                             validator_infra_crash = True
                             pretty_log(
                                 "Self-Play Infra",
@@ -6688,6 +7031,10 @@ Return ONLY a JSON object with:
                 report_val = ""
                 learned_lesson: dict = {}
                 verified_flag = False
+                _lesson_disproved = False   # §4KS: verification ran and failed
+                if _lesson_blocked_by_data and should_write_skill:
+                    should_write_skill = False
+                    gate_reason = "replay of a challenge with malformed mock data"
                 if self.context.skill_memory and should_write_skill:
                     learned_lesson = await self._extract_structured_lesson(
                         model_name=model_name,
@@ -6768,6 +7115,21 @@ Return ONLY a JSON object with:
                     # "the solution sounds plausible but doesn't help"
                     # gap the old design had no signal for.
                     #
+                    #
+                    # §4KS: "otherwise discard" was not what the code did —
+                    # a failed verification only withheld the +0.2 bonus, so
+                    # the lesson was saved at the extractor's own 0.95 and an
+                    # existing twin's frequency was bumped (2026-09-30: "did
+                    # NOT improve the outcome" followed by "bumped lesson
+                    # freq=3"). For a STRUGGLED-THEN-WON run the lesson claims
+                    # "this gets it right the first time"; injected exactly as
+                    # production injects it, it did not — that lesson is now
+                    # discarded. Two cases keep the old behaviour (saved
+                    # unverified, no bonus): a run that FAILED outright, whose
+                    # lesson records a mistake rather than a fix and cannot be
+                    # disproved by one more failure; and a verification that
+                    # could not RUN (exception).
+                    #
                     # Skip verification when the lesson is a templated
                     # fallback (`fallback_synthesized=True`): the
                     # fallback is a known-generic baseline, not an
@@ -6775,6 +7137,10 @@ Return ONLY a JSON object with:
                     # Verification's purpose is to prove the LLM's
                     # claim — it adds zero signal for a templated
                     # lesson and would double the cycle wall-clock.
+                    # Cleared HERE, before anything below can raise or be
+                    # skipped: a True left by an earlier run must not
+                    # discard this one's lesson (§4KS).
+                    self.last_lesson_verify_disproved = False
                     if (
                         lesson_is_viable
                         and (not passed or attempt > 0)
@@ -6808,8 +7174,12 @@ Return ONLY a JSON object with:
                             verify_agent.disabled_tools = set(temp_agent.disabled_tools)
                             for t in verify_agent.disabled_tools:
                                 verify_agent.available_tools.pop(t, None)
-                            verify_agent.max_turns_override = 10
-                            verify_agent.max_thinking_chars_override = 8000
+                            # §4KS: the SOLVER's own budget. The re-run now
+                            # decides whether the lesson is kept, so it must
+                            # not fail for having 10 turns where the run it
+                            # is compared with had 15.
+                            verify_agent.max_turns_override = temp_agent.max_turns_override
+                            verify_agent.max_thinking_chars_override = temp_agent.max_thinking_chars_override
                             verify_agent.thinking_budget_override = "selfplay"
                             verify_agent.suppress_meta_task_nudges = True
                             # Reconstruct the original challenge_msg.
@@ -6842,6 +7212,19 @@ Return ONLY a JSON object with:
                         except Exception as ve:
                             logger.debug(f"Verification run errored: {ve}")
                             verified_flag = False
+                        # (the marker is only ever set by a run that did NOT
+                        # verify, so it needs no `not verified_flag` beside it)
+                        if (passed and getattr(
+                                self, "last_lesson_verify_disproved", False) is True):
+                            lesson_is_viable = False
+                            _lesson_disproved = True
+                            pretty_log(
+                                "Self-Play Lesson",
+                                "NOT saved — the solver won this challenge on a "
+                                "later attempt, and re-running it with the "
+                                "lesson injected failed the validator",
+                                icon=Icons.WARN,
+                            )
 
                     if lesson_is_viable:
                         # Bump confidence on verified lessons; cap at 1.0.
@@ -6908,7 +7291,9 @@ Return ONLY a JSON object with:
                             f"Challenge: {challenge[:150]}...\n"
                             f"Status: {status_str}\n"
                             f"Cluster: {cluster_key}  Score: {cw_score:+.3f}\n"
-                            f"No viable lesson extracted (empty trigger/pattern or confidence=0)."
+                            + ("Lesson discarded: its verification re-run failed the validator."
+                               if _lesson_disproved else
+                               "No viable lesson extracted (empty trigger/pattern or confidence=0).")
                         )
                 else:
                     # Either skill_memory is missing, or the curiosity gate

@@ -181,6 +181,27 @@ _NUMBER_ONLY_RES = (
     re.compile(r"\b(?:just|only)\s+the\s+number\b(?!\s+of\b)", re.IGNORECASE),
     re.compile(r"^\s*(?:the\s+)?number\s+only\s*[.!]?\s*$", re.IGNORECASE),
 )
+#: §4KS (2026-09-30): a number-only phrase that names a LINE governs that
+#: line, not the reply. The gsm8k_text bench prompt reads "Work the problem
+#: out step by step … End your reply with the FINAL NUMERIC ANSWER on its own
+#: last line (just the number — no units … on that line)"; `just the number`
+#: matched, the whole step-by-step reply was REFUTED ("the request asked for
+#: just the number, but the reply is 53 words of explanation") and repaired
+#: down to "98" — 3 of 3 runs, each after a 22–42 s judge call that had
+#: CONFIRMED it. The REQUEST is read for where the number goes — the whole
+#: request, not the clause: "Show your work. Put your answer on the last
+#: line. Just the number." states the scope one sentence before the rule
+#: (R2 review). Reading too much as a line scope only ever relaxes this
+#: refute-only check.
+_NUMBER_LINE_SCOPE_RE = re.compile(
+    # the LAST line of a longer reply, or "that line" of one named earlier.
+    # "one line" / "its own line" alone are not here: they leave "only the
+    # number" governing the whole reply, which the unscoped rule checks.
+    # "the last line OF data.csv" names a line of a FILE, not of the reply
+    r"\b(?:last|final)\s+line\b(?!\s+(?:of|in|from)\b)|\bon\s+that\s+line\b",
+    re.IGNORECASE)
+#: Constraint value for a line-scoped number-only rule.
+NUMBER_ON_LAST_LINE = "last_line"
 _WORD_CAP_RES = (
     re.compile(r"\b(?P<n>" + _NUM + r")\s+words?\s+or\s+(?:fewer|less)\b", re.IGNORECASE),
     re.compile(r"\b(?:at\s+most|no\s+more\s+than|max(?:imum)?(?:\s+of)?|up\s+to)\s+(?P<n>" + _NUM + r")\s+words?\b" + _CAP_TAIL, re.IGNORECASE),
@@ -300,7 +321,11 @@ def mechanical_constraints(request: str) -> List[Constraint]:
                     m = rx.search(clause)
                     if m and not _quoted(clause, m.start()):
                         seen.add("number_only")
-                        out.append(Constraint("number_only", None, clause[:120]))
+                        out.append(Constraint(
+                            "number_only",
+                            (NUMBER_ON_LAST_LINE
+                             if _NUMBER_LINE_SCOPE_RE.search(text) else None),
+                            clause[:120]))
                         break
             if "word_cap" not in seen and not deliverable and not two_part:
                 for rx in _WORD_CAP_RES:
@@ -543,6 +568,24 @@ def _check_number_only(body: str) -> Optional[str]:
     return None
 
 
+def _check_number_last_line(body: str) -> Optional[str]:
+    """The line-scoped form (§4KS): the LAST non-empty line must pass the
+    number-only rule; everything above it is the working the request asked
+    for. It is `_check_number_only` applied to that line — one rule, so a
+    value that passes as a whole reply ("3/4", "Answer: 98") passes as a
+    last line too (R2 review: a separate, stricter pattern refuted them)."""
+    lines = [l for l in _unfenced_lines(body) if l.strip()]
+    if not lines:
+        return "the request asked for the number on its own last line, but the reply has no text line"
+    if _check_number_only(lines[-1]) is None:
+        return None
+    shown = lines[-1].strip()
+    if len(shown) > 60:
+        shown = shown[:59] + "…"
+    return (f"the request asked for the number alone on the last line, "
+            f"but the last line is: {shown!r}")
+
+
 def _check_word_cap(body: str, cap: int) -> Optional[str]:
     n = len(_words(body))
     if n > cap:
@@ -734,7 +777,9 @@ def refute_turn_state(*, request: str, reply: str,
                 elif c.kind == "exact":
                     msg = _check_exact(body, tuple(c.value))
                 elif c.kind == "number_only":
-                    msg = _check_number_only(body)
+                    msg = (_check_number_last_line(body)
+                           if c.value == NUMBER_ON_LAST_LINE
+                           else _check_number_only(body))
                 elif c.kind == "word_cap":
                     msg = _check_word_cap(body, int(c.value))
                 elif c.kind == "line_cap":

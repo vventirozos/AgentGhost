@@ -137,8 +137,14 @@ docker info --format '{{.ServerVersion}}'</pre>
   <h3>"It can't reach my app on localhost:3000"</h3>
   <p>Correct — and not a bug. The sandbox has its own network namespace, so its <code>127.0.0.1</code> is not yours. Ghost cannot see services you run on your machine, and cannot stop or restart your processes. If you need it to test a local app, have Ghost start that app itself inside the sandbox.</p>
 
+  <!-- 4KS:loopback -->
+  <h3>It says the app is running, but the link won't open</h3>
+  <p>The app is probably listening only on the sandbox's own loopback address. Ghost publishes a small range of sandbox ports to your machine, but a published port only reaches an app that listens on all interfaces. Many development servers — Flask's <code>app.run()</code> is the usual one — listen on <code>127.0.0.1</code> unless told otherwise, and inside the sandbox that address is the sandbox's, not yours. Everything Ghost checks from inside the sandbox still works, so from there the app looks healthy.</p>
+  <p>Ghost looks at the address the app actually bound and says so in the service report: the fix is for the app to bind <code>0.0.0.0</code> (the <code>HOST</code> and <code>PORT</code> variables are set for it) and to be restarted. If the report instead says the port is not published, ask for the service to be stopped and started again on one of the published ports — a restart keeps the port it had.</p>
+  <!-- /4KS:loopback -->
+
   <h3>Web search returns nothing, repeatedly</h3>
-  <p>Usually search operators. The scraper backends Ghost reaches over Tor don't support <code>site:</code>, quoted phrases, or <code>AND</code>/<code>OR</code> — including any of them returns zero results rather than an error. Plain keywords only.</p>
+  <p>Often search operators. The scraper backends Ghost reaches over Tor don't support <code>site:</code>, quoted phrases, or <code>AND</code>/<code>OR</code>, so Ghost removes them before searching and keeps the words. When a <code>site:</code> filter is dropped this way the agent is told so in the search result, along with the query that actually ran — a <code>site:</code> search is not a restriction to that site. To aim at a site, name it as an ordinary keyword. Plain keywords work best.</p>
   <p>For dark-web search specifically, zero results is normal. Onion search engines are unreliable and reachability varies by exit node; an empty result is not a reason to retry the same query.</p>
 
   <h3>It won't do something, and explains why instead</h3>

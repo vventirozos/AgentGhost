@@ -48814,3 +48814,109 @@ live files untouched; the 14-day chip warning is the alarm (~16 retries first). 
 **Tests.** `tests/test_cert_renewal.py` 19 executed tests (stub tailscale + fake web client under a respawn loop); mutation 9/9
 killed after adding the stale-cert-respawn and TERM-ignoring-server cases (the wire check and pid-change check each survived first).
 Docs: `docs/interfaces/web_server.html#tls-renewal`. Live: agent bootstrapped, first run exit 0 "not due".
+
+## §4KS — One operator log, read end to end (2026-09-30, operator: "look at this agent's logfile … fix all found failures, defects and bugs, usual verification protocol") — R0 scope
+
+**Source.** `~/Data/AI/Logs/ghost-agent.log`, the run since the 2026-09-29 22:59 restart (2,836 lines: 10 user turns, 8 bench, 14
+self-play), read whole, then checked against the source, the day's trajectories, `llama-server.log` and the running sandbox.
+**R0 — the property.** Every line the agent printed about its own state in that log is true of the state it describes, and
+nothing a defective input produced (a 404 page, a malformed dataset, a re-read window, a go-ahead message) is recorded as a
+success, a lesson, or evidence. **Threat model.** Untrusted: model-written code and service commands, generated challenges and
+their setup scripts, search results and their URLs, user messages (incl. a channel member's), and the wording of requests the
+lexical readers parse. Trusted: the operator's config, the supervisor's own probes (`ss` inside the sandbox), the playbook file.
+**Out of scope (said, not fixed).** Model behaviour with no mechanical cause (the agent never played a turn of the app it built;
+a member reply that conflated two sources — prompt sentence added, no guard); the Greek final draft (req ba2753bb) — the §4JR guard
+fired as designed, one discarded generation is its documented cost; the judge running before the free lexical check on a bench
+turn (a judge verdict before the repair round lets one repair fix both kinds of issue); the router's low confidence on real
+traffic (a training-data matter); hydration precision (2/21, 6/23 used); the healthy no-op idle phases (reflection dup-skips all
+256, post-mortem has no candidates, calibration refits on unchanged data).
+**One finding of mine was wrong, and is withdrawn:** "the prefix cache misses on every request". `llama-server.log` shows the
+opposite — a turn-1 call evaluates ~7.3k of ~28.4k prompt tokens (`n_tokens = 28440`, 7,324 evaluated), i.e. the ~21k-token
+stable prefix IS restored from the server's prompt cache and the 9–12 s is the request's own new context. I read "7k tokens
+evaluated" as "the whole prompt" without looking at the prompt's size. No change.
+(This R0 was written after the build and before the reviewers' results came back — later than §R asks.)
+
+## §4KS — outcome (2026-09-30)
+
+**Shipped** (pins in `tests/test_4ks_log_review_fixes.py`; docs `#4ks` on services / verifier / search / skills / dream / logging):
+- **Services.** A published port whose listener is loopback-only is reported as NOT reachable from the host (`_listen_addrs` →
+  `_host_unreachable_bind` → `loopback_bind_warning`; start report + status) instead of "published to the host". `restart`
+  REFUSES a port other than the stored one before stopping anything (`_same_port`), and the refusal carries what a move needs
+  (resolved key, stored workdir, full stored command, "change a port named inside the command"); the unpublished-port warning
+  and the status line of an unpublished live row say stop-then-start and print the stored command + workdir in full.
+  `sim.py` in the sandbox now binds `$HOST`.
+- **Verifier.** WEB-EXEC counts only a `STATUS: OK` browser result as a load (`_web_exec_loaded`); a page that did not load,
+  could not be read, raised in the browser call, or is fetch-backed with no running service is inconclusive and no longer ends
+  the probe; a page that throws refutes in any order. `_no_verdict_reason` (member / deferred / landed / lost / empty / skipped)
+  is the one reading behind the finalize line (`_no_verdict_level`); no verdict task is spawned for a member at any of the
+  three sites. `number_only` is scoped to the last line when the REQUEST says so (one rule for line and reply).
+- **Self-play.** Template retry after a defective GENERATED challenge (`challenge_origin` read once; bounded callers state
+  `dreamer.cycle_budget_s`); duplicate-streak temperature 0.3/0.6/0.9; `setup_data_defect` (record-shape rule) →
+  `data_defect_policy`: generated = discard, replay = runs but teaches nothing; a struggled-then-won lesson that fails its
+  lesson-injected re-run is discarded only when the re-run MEASURED it (`verify_run_measured`: not an upstream outage —
+  `reply_is_upstream_outage` over `UPSTREAM_OUTAGE_BANNERS`, shared with the solve loop — not a context overflow, a
+  cancellation, or any `[ATTEMPT_ABORTED_…]` hard abort). The lesson minted from the generator's bug was archived (292 → 291).
+- **Playbook.** A frequency bump needs unseen evidence (`evidence_keys`, both dedup branches); the dream asks for half its
+  window fresh; a re-detected pattern counts only when its support changed.
+- **Search.** `site_operator_note` tells the model its `site:`/`-site:` filter was dropped; deep research skips search-results
+  pages before its limit of 8 (`is_search_results_url`: 47 of 9,624 stored URLs flagged, no document among them).
+- **Log lines.** Turn Outcome confidence stamped per request; a lone `<` kept in displayed thinking; request tags from the
+  minted hex id; Macro Mint said once; streamed turns record their elapsed and print `Final Reply`; router reason wording.
+
+**Built, measured, REMOVED** (nine designs; the log finding behind 3–5 stays open):
+1. *site: → the site's name as a keyword* (R1: noise on 11/43, IP octets, an excluded site became a search term) → note only.
+2. *Research skips off-topic results* (R1: cut 16.6% of 1,750 replayed batches incl. both FIA PDFs).
+3. *Verifier request view for "yes proceed"* (R1: unrelated in 6/18 real turns, one false REFUTE).
+4. *Episode trigger "yes proceed (re: <offer>)"* (R2: a banner in 3/17, offer in the tail ≥12/17, wrong after a prune, assistant
+   prose into a forget-protected vector row).
+5. *Keyword retry instead of "how to …"* — head words (R1), then subject words (R2: 94/187 kept ≤ half the content tokens).
+6. *WEB-EXEC service-root fallback* — any page (R1), then index-only (R2: `/` certified pages never loaded).
+7. *A restart that MOVES the port* — killed-then-refused (R1), rewrote every occurrence (R2), wrong on a taken port (R3),
+   wrong on a plain moved restart + a note wrong both ways (R4) → restart refuses another port; the move is stop + start.
+8. *"The service is DOWN" for a relaunch refused after the stop* (R5 said of a dead service, R6 missed orphans/unknown, R7
+   claimed a stop under a probe fault) → removed; pre-existing behaviour kept.
+9. *"restart port=… stops nothing and prints the recipe" pointer* (R7: resolved to another service under a bound project).
+
+**Verification.** Eight independent read-only review rounds against real data (trajectory corpus 3,255 rows / 2,043 queries /
+9,683 URLs; the replay ledger's setup scripts run in isolated containers; real `tool_browser`; fake-sandbox service matrices):
+MAJOR per round **11 · 4 · 1 · 2 · 1 · 0 · 0 · 0** — **19 MAJOR defects found inside this work's own fixes**, plus the withdrawn
+prefix-cache finding. Rounds 6–8 found 4, 4 and 1 MINOR. ⚠ R7's stopping rule ("a round yields only out-of-scope findings")
+was NOT met: round 8 still had 1 MINOR + 5 NIT in the delta; they were fixed and covered by battery 129, with no ninth review.
+Mutation batteries on the copy tree (NOOP survives / KNOWNBAD dies in each; tree == src after each; first-pass → final):
+**121** 143: 140 → 141 + 2 dead guards deleted · **122** 125: 118 → 125 · **123** 44: 43 + 1 equivalent · **124** 26: 23 → 25 +
+1 equivalent · **125** 21: 21 · **126** 23: 22 → 23 · **127** 17: 16 → 17 · **128** 19: 19 · **129** 8: 8 · **130** 3: 3 (the
+live-found wording). Enumerations (AST): one
+deferral emitter, one `Macro Mint` emitter, every `frequency` bump evidence-gated, every `selfplay_*` reason classified, every
+bounded self-play caller states its budget, one writer/reader of `last_confidence`, every outage reply the turn loop assigns is
+a known banner, every abort note the turn loop writes reads as not measured. `tests/test_verifier_web_exec.py` migrated to the
+browser tool's real result shapes (13 tests had fed the probe a string the tool never emits).
+Full suite: run once with every change in — 25,798 passed, 4 failed; one failure was mine (`tests/lint_baseline.json`
+tolerated a finding this work removed → `scripts/lint.py --write-baseline`), three are `tests/test_clockwork_facestate.py`
+reading the repo's `interface/externals/clockwork_ghost/webface/face.html` (Aug 12 copy, 5 forms; the test wants ≥ 8 incl.
+`embedding`) — pre-existing, untouched. The live-found wording fix (below) forced one more full run: 25,803 passed, the same
+3 pre-existing failures.
+
+**Deploy / live.** Agent idle (no foreground request, no bench) → `launchctl kickstart -k` twice (pid 25455 → 50953 → 75424;
+one `src.ghost_agent.main`; "system ready" grew by exactly one per restart). Live turns on the new code:
+(1) `manage_services status` reported war-sim "bound to loopback only inside the sandbox: NOT reachable from the host" — the
+real `ss` row inside the container, the line the original run could not print; (2) `restart war-sim` (sim.py now binds `$HOST`)
+→ "published to the host at http://127.0.0.1:8100", and `curl` FROM THE HOST answered HTTP 200 / 24,554 bytes — the failure
+req 43199788 reported as "live" is closed end to end; verifier CONFIRMED, `Final Reply` printed; (3) a `site:` web search
+carried the note into the model (it quoted it) and the finalize line said "verdict deferred" only because a task WAS running
+— it landed as LATE REFUTED (a forced-final reply). Turn 3 also found a defect in this work's own note: the word "cannot"
+is a failure word to `strikes.error_line`, so the successful search result was listed under "Distinct errors hit"; the note
+(and a pre-existing "cannot open it" in the unpublished-port warning) were reworded and pinned against the real
+`error_line` (battery 130), the suite re-run, the agent restarted again, and the turn repeated: the model answered "the engines do not support `site:` … all 8 results are general web results, not limited
+to blogs.lupyd.com", CONFIRMED (100%), no error line, no strike. Verified: `_execute_web_artifact` / `_no_verdict_reason` /
+member-turn / self-play / playbook paths are covered by pins only — no live bench or sim turn was driven (the idle loop will).
+
+**Not fixed, said:** the agent never played a turn of the app it built; judge-before-lexical order on bench turns; Greek draft
+(§4JR by design); router confidence on real traffic; hydration precision; "yes proceed" episodes and recall; "how to
+<keywords>" retry; WEB-EXEC on framework-served templates and beyond its 4-page cap; `deep_research` / `fact_check` /
+`darkweb_search` carry no site note; ~27 site-internal listing URLs unrecognised; request tags: ~2% of hex ids are all digits
+and keep their prefix, `sub-chess-<digits>` stays `SU`; trajectory `temperature` field; no Turn Outcome line on streamed
+turns; REM heuristics stop climbing in self-play-only periods (29 bumps → 2 over four replayed days). Pre-existing, met on the
+way: a relaunch refused after the stop is booked as a refusal; `start` rewrites every occurrence of a port number when the
+allocator moves it, and none when the requested port is granted; a project-less service name can resolve to the bound
+project's same-named service; `replay_engine` grades an outage leg as a failed arm; `[TURN BUDGET …]` endings and the
+cancelled-turn reply shape are not tied to `verify_run_measured` by a behavioural pin.

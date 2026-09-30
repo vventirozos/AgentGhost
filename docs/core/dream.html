@@ -521,6 +521,59 @@
   </p>
   <p class="note">Pins: <code>tests/test_4gq_round8.py</code>.</p>
 
+  <!-- 4KS:dream -->
+  <h2 id="4ks">Self-play: what one night's log showed <span class="tag">2026-09-30 &sect;4KS</span></h2>
+  <p>
+    <strong>A defective challenge forfeited the slot.</strong> Three generations (about 290&nbsp;s) ended in a setup script that raised
+    <code>IndexError</code> in the sandbox, and the idle slot was lost. The 3&times;-quality-gate path already falls back to a
+    template for this reason; a defect found <em>in the sandbox</em> did not. <code>synthetic_self_play</code> is now wrapped: when it
+    returns one of <code>TEMPLATE_RETRY_REASONS</code> it runs once more with <code>force_template=True</code> &mdash; only when the
+    challenge was <em>generated</em> this run (<code>challenge_origin</code>: bench / replay / journal / template / generated, one
+    reading stored as <code>last_challenge_origin</code>) and only when the challenge rather than the sandbox failed. A caller that
+    bounds the whole call with a timeout states it (<code>dreamer.cycle_budget_s</code>, the two self-play tools), and the retry
+    then runs only if the first run used at most half of it; the idle loop sets no bound and its retry is never refused for time.
+    Never twice. An AST enumeration fails if a new <code>selfplay_*</code> reason code is added
+    without being classified.
+  </p>
+  <p>
+    <strong>A duplicate retry came back more duplicated.</strong> Generation samples at 0.3. A retry after a 0.61-overlap rejection
+    returned at 0.92: the banned-token feedback names what to avoid, but the sampling could not leave. A <em>streak</em> of
+    near-duplicate rejections now raises the next attempt one step each, 0.3&nbsp;&rarr;&nbsp;0.6&nbsp;&rarr;&nbsp;0.9
+    (<code>challenge_generation_temperature</code>); any other rejection kind resets it to 0.3, because its fix is a specific edit.
+  </p>
+  <p>
+    <strong>A lesson was learned from the generator's bug.</strong> A setup script wrote its dataset with
+    <code>"\\n".join(rows)</code> &mdash; literal backslash-n, one line. The solver spent an attempt discovering it and a lesson about
+    "literal escape sequences" was minted at confidence 0.95. <code>setup_data_defect</code> asks for the defect's shape in the files
+    the setup script actually wrote: no real line break, not valid JSON, and splitting on the literal <code>\n</code> yields at
+    least four pieces that are <em>records</em> &mdash; one field separator occurs the same number of times in at least 90% of them.
+    (The mere presence of a literal <code>\n</code> flagged Windows paths, regex lists and minified JS.) Measured on the 23 live
+    replay-ledger challenges that carry the defect: 23 flagged; on nine legitimate single-line shapes: none.
+  </p>
+  <p>
+    What follows depends on where the challenge came from (<code>data_defect_policy</code>). A <em>generated</em> challenge that
+    trips it is discarded before the solver runs, and the slot goes to a template. A <em>replay</em> of one still runs &mdash; it is internally consistent and winnable, and a regression recheck is the only path
+    that restores a quarantined lesson &mdash; but no lesson is drawn from it. Templates, journal-mined challenges and bench items
+    are not checked. The generation prompt gained a rule saying how to write a line break. The minted lesson was archived and
+    removed.
+  </p>
+  <p>
+    <strong>A lesson that failed its own re-run was kept.</strong> The comment said a lesson is kept only if the lesson-injected
+    re-run improves the outcome; the code only withheld a +0.2 bonus. For a struggled-then-won run, a re-run with the lesson injected
+    that fails the validator now discards the lesson (<code>last_lesson_verify_disproved</code>) &mdash; provided the re-run
+    actually measured it (<code>verify_run_measured</code>): an upstream outage (the reply carries one of the three
+    banners <code>handle_chat</code> emits &mdash; <code>reply_is_upstream_outage</code> over <code>UPSTREAM_OUTAGE_BANNERS</code>,
+    which the solve loop now shares: a solver reply that merely quotes a <code>CRITICAL:</code> log line is an answer, and an
+    outage text sitting under a correction banner is still an outage), a turn that overflowed its context, was cancelled, or
+    ended in one of the turn loop's hard aborts (<code>[ATTEMPT_ABORTED_&hellip;]</code>; matched anywhere in the reply, since an
+    abort marker is appended after any narration &mdash; such a run may have worked before it died, and is still not counted as
+    disproof: the lesson stays, unverified), a sandbox fault, or the text-graded validator's "answer.txt missing" exit are not disproof. A run that failed outright keeps its lesson &mdash; it records a mistake, and one
+    more failure does not disprove it. The re-run uses the solver's own turn and thinking budgets.
+  </p>
+  <p class="note">Pins: <code>tests/test_4ks_log_review_fixes.py</code> (blocks F, G), most of them through the real
+  <code>synthetic_self_play</code> with the sandbox and solver doubled; the data rule is pinned on verbatim container outputs.</p>
+  <!-- /4KS:dream -->
+
 </main>
 </body>
 </html>

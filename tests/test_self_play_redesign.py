@@ -248,7 +248,10 @@ class TestChallengeGenSpeedup:
     def test_challenge_gen_uses_lower_temperature(self):
         src = DREAM_SRC.read_text()
         # The challenge-gen payload overrides temperature to 0.3.
-        assert '_challenge_sampling["temperature"] = 0.3' in src
+        # §4KS: 0.3 is the base of `challenge_generation_temperature`.
+        from ghost_agent.core.dream import challenge_generation_temperature
+        assert challenge_generation_temperature(0) == 0.3
+        assert "challenge_generation_temperature(_dup_rejections)" in src
 
     def test_challenge_gen_stops_after_validator_close(self):
         src = DREAM_SRC.read_text()

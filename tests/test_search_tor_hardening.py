@@ -104,6 +104,8 @@ def test_proxy_for_attempt_none_passthrough():
      'elite dangerous federal corvette combat build gimbal gimbaled'),
     # site: operator with its argument is removed entirely.
     ('site:wikipedia.org python asyncio', 'python asyncio'),
+    # §4KS: an EXCLUSION goes with its minus sign (it left a stray "-").
+    ('python asyncio tutorial -site:pinterest.com', 'python asyncio tutorial'),
     # Quoted phrase: quotes go, words stay.
     ('"exact phrase" something', 'exact phrase something'),
     # Uppercase boolean operator removed; lowercase stopword too.

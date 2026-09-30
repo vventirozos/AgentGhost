@@ -236,6 +236,100 @@ def _lesson_is_structured(lesson: dict) -> bool:
     return any(k in lesson for k in _STRUCTURED_KEYS)
 
 
+# ── §4KS: a frequency bump needs NEW evidence ──────────────────────────
+# `frequency` is read as "how many independent times this lesson was
+# learned" — it lifts the utility score and, at the graduation threshold
+# (`core.dream._GRADUATION_MIN_FREQUENCY`), makes a lesson eligible for
+# graduation. Both dedup branches bumped it on EVERY re-learn, whatever
+# the re-learn was derived from: the failure distiller re-synthesised one
+# cluster's lesson each time the cluster changed by a case and it stood at
+# freq=84 "from 5 cases"; a dream re-reading a 60-fragment window of which 57
+# were unchanged bumped the same heuristic 13 → 14 → 15 → 16 in a day; a
+# replay of the SAME self-play challenge bumped its lesson again. Evidence is
+# now named (trajectory id, challenge hash, source refs, the caller's
+# ``evidence_refs``), digested, and remembered on the lesson; a re-learn
+# whose evidence is all known keeps the frequency. A caller that names NO
+# evidence bumps as before — provenance unknown is not provenance stale.
+EVIDENCE_KEYS_MAX = 240
+
+
+def _evidence_digest(ref) -> str:
+    import hashlib as _hl
+    return _hl.sha1(str(ref).encode("utf-8", "ignore")).hexdigest()[:12]
+
+
+def incoming_evidence(source_refs=None, source_trajectory_id: str = "",
+                      source_challenge_hash: str = "",
+                      evidence_refs=None) -> list:
+    """Ordered, de-duplicated digests of every evidence handle a re-learn
+    names. Empty list = the caller named none."""
+    raw = []
+    for group in (source_refs, evidence_refs):
+        if isinstance(group, (list, tuple, set, frozenset)):
+            raw.extend(sorted(group, key=str) if isinstance(group, (set, frozenset))
+                       else group)
+        elif group:
+            raw.append(group)
+    raw.extend([source_trajectory_id, source_challenge_hash])
+    out, seen = [], set()
+    for r in raw:
+        r = str(r or "").strip()
+        if not r:
+            continue
+        d = _evidence_digest(r)
+        if d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
+
+
+def seen_evidence(lesson: dict) -> set:
+    """Digests of everything this lesson is already known to rest on: the
+    remembered keys, plus the provenance fields a pre-§4KS row carries."""
+    lesson = lesson if isinstance(lesson, dict) else {}
+    seen = {str(k) for k in (lesson.get("evidence_keys") or []) if k}
+    seen.update(incoming_evidence(
+        lesson.get("source_refs"),
+        str(lesson.get("source_trajectory_id") or ""),
+        str(lesson.get("source_challenge_hash") or "")))
+    return seen
+
+
+def evidence_is_new(lesson: dict, incoming: list,
+                    min_new_fraction: float = 0.0) -> bool:
+    """Does ``incoming`` add evidence this lesson has not counted?
+
+    * no incoming evidence → True (unknown provenance bumps, as before);
+    * every key already seen → False;
+    * otherwise True when the unseen share reaches ``min_new_fraction`` —
+      0.0 for discrete evidence (one new case is one new observation), and
+      e.g. 0.5 for a WINDOW a caller re-reads (the dream), where a re-derived
+      heuristic can be credited to fresh fragments only once most of the
+      window is fresh."""
+    if not incoming:
+        return True
+    seen = seen_evidence(lesson)
+    unseen = [k for k in incoming if k not in seen]
+    if not unseen:
+        return False
+    try:
+        need = float(min_new_fraction or 0.0)
+    except (TypeError, ValueError):
+        need = 0.0
+    return (len(unseen) / len(incoming)) >= need
+
+
+def remember_evidence(lesson: dict, incoming: list) -> None:
+    """Fold ``incoming`` into the lesson's remembered keys. Bounded at
+    ``EVIDENCE_KEYS_MAX``: the most recently ADDED are kept."""
+    if not incoming:
+        return
+    keys = [str(k) for k in (lesson.get("evidence_keys") or []) if k]
+    have = set(keys)
+    keys.extend(k for k in incoming if k not in have)
+    lesson["evidence_keys"] = keys[-EVIDENCE_KEYS_MAX:]
+
+
 def _normalize_lesson(lesson: dict) -> dict:
     """Fill in missing schema fields with defaults without dropping
     existing ones. Safe to call on both legacy and new-style lessons."""
@@ -1263,6 +1357,8 @@ class SkillMemory:
         source_refs=None,
         dimension: str = "",
         origin: str = "",
+        evidence_refs=None,
+        evidence_min_new_fraction: float = 0.0,
     ):
         """Write a lesson to the playbook. Accepts both legacy positional
         args (task/mistake/solution) and the new structured kwargs.
@@ -1273,6 +1369,12 @@ class SkillMemory:
         canonical on-disk entry contains BOTH representations so older
         readers (pattern-matching on `task/mistake/solution`) keep
         working unchanged.
+
+        ``evidence_refs`` / ``evidence_min_new_fraction`` (§4KS): what this
+        re-learn was derived FROM, beyond the provenance fields — a dedup
+        hit bumps ``frequency`` only when it brings evidence the lesson has
+        not counted (see ``evidence_is_new``). They are digested, never
+        stored verbatim, and do not touch ``source_refs``.
 
         Returns a short status string on success — ``"written"`` for a new
         playbook entry (including the orphan-heal path: a vector twin with
@@ -1351,6 +1453,9 @@ class SkillMemory:
                     _thresh = float(os.getenv("GHOST_RULE_DEDUP_DIST", "0.21") or 0.21)
                 except (TypeError, ValueError):
                     _thresh = 0.21
+            _incoming_ev = incoming_evidence(
+                source_refs, source_trajectory_id, source_challenge_hash,
+                evidence_refs)
             duplicate = self._find_duplicate_lesson(
                 effective_trigger, effective_anti, effective_correct,
                 memory_system, vector_threshold=_thresh,
@@ -1382,7 +1487,11 @@ class SkillMemory:
                         )
                         if idx is not None:
                             existing = _normalize_lesson(playbook[idx])
-                            existing["frequency"] = int(existing.get("frequency") or 1) + 1
+                            _counted = evidence_is_new(
+                                existing, _incoming_ev, evidence_min_new_fraction)
+                            if _counted:
+                                existing["frequency"] = int(existing.get("frequency") or 1) + 1
+                                remember_evidence(existing, _incoming_ev)
                             # Prefer the new solution if it's richer or
                             # if the caller marked it verified.
                             if len(effective_correct) > len(existing.get("solution") or ""):
@@ -1428,7 +1537,9 @@ class SkillMemory:
                             self._save_playbook_unlocked(playbook)
                             pretty_log(
                                 "SKILL REINFORCED",
-                                f"Merged duplicate lesson: {effective_trigger[:30]}... (freq={existing['frequency']})",
+                                (f"Merged duplicate lesson: {effective_trigger[:30]}... (freq={existing['frequency']})"
+                                 if _counted else
+                                 f"Re-derived from known evidence — freq kept at {existing['frequency']}: {effective_trigger[:30]}..."),
                                 icon=Icons.MEM_REINFORCE,
                             )
                             return "reinforced"
@@ -1490,7 +1601,11 @@ class SkillMemory:
                                 )
                         if idx is not None:
                             existing = _normalize_lesson(playbook[idx])
-                            existing["frequency"] = int(existing.get("frequency") or 1) + 1
+                            _counted = evidence_is_new(
+                                existing, _incoming_ev, evidence_min_new_fraction)
+                            if _counted:
+                                existing["frequency"] = int(existing.get("frequency") or 1) + 1
+                                remember_evidence(existing, _incoming_ev)
                             if len(effective_correct) > len(existing.get("solution") or ""):
                                 existing["solution"] = effective_correct
                                 existing["correct_pattern"] = effective_correct
@@ -1532,7 +1647,9 @@ class SkillMemory:
                             bumped = True
                             pretty_log(
                                 "SKILL REINFORCED",
-                                f"Vector-dedup: bumped lesson freq={existing['frequency']}: {effective_trigger[:30]}...",
+                                (f"Vector-dedup: bumped lesson freq={existing['frequency']}: {effective_trigger[:30]}..."
+                                 if _counted else
+                                 f"Vector-dedup: re-derived from known evidence — freq kept at {existing['frequency']}: {effective_trigger[:30]}..."),
                                 icon=Icons.MEM_REINFORCE,
                             )
                         else:
@@ -1579,6 +1696,7 @@ class SkillMemory:
                 dimension=effective_dim,
                 origin=origin,
             )
+            remember_evidence(new_lesson, _incoming_ev)   # §4KS
 
             with self._get_lock():
                 before = [new_lesson] + self._load_playbook()

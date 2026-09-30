@@ -416,6 +416,53 @@ bin/unserve-remote.sh 8100    # tear down (or `… all` to reset every mapping)<
   </p>
   <p class="note">Pins: <code>tests/test_4gq_round8.py</code> (the stale-survival case and its control, where a real survival in THIS call still stands).</p>
 
+  <!-- 4KS:loopback -->
+  <h2 id="4ks">A published port is not a reachable service <span class="tag">2026-09-30 &sect;4KS</span></h2>
+  <p>
+    <strong>The live failure.</strong> Req <code>43199788</code>: the agent built a Flask app, started it with
+    <code>manage_services</code>, was told <em>"listening &#10003; &hellip; Remote access: published to the host at
+    http://127.0.0.1:8100"</em>, and replied <em>"The simulation is live"</em>. From the host the URL returned an empty reply.
+    The app ran <code>app.run(port=PORT)</code>, which binds <code>127.0.0.1</code> &mdash; the loopback <em>inside</em> the container.
+    Docker forwards a published port to the container's external interface, where nothing was listening. Every check the supervisor ran
+    was made from inside the container (a connect to <code>127.0.0.1</code>, the in-sandbox browser), and a loopback listener answers
+    all of them.
+  </p>
+  <p>
+    <strong>What.</strong> <code>_listen_addrs(port)</code> reads the <em>address</em> the listener holds
+    (<code>ss -H -ltn 'sport = :PORT'</code>), and <code>_host_unreachable_bind(port)</code> is true when the port is published, the
+    sandbox is in bridge mode, and every listening address is loopback (<code>loopback_only</code>: <code>127.x</code>,
+    <code>::1</code>, the v4-mapped <code>::ffff:127.x</code>, each with or without an interface scope; one wildcard listener is enough
+    to make it false; a probe that answers nothing never produces the warning). In that case the start
+    report and <code>status</code> carry <code>loopback_bind_warning</code> &mdash; bind <code>$HOST</code>, restart, and do not tell
+    the user it is live &mdash; <em>instead of</em> the remote-access hint. In host network mode the container's loopback is the host's,
+    so nothing is said.
+  </p>
+  <p>
+    <strong>Restart is not how a service is moved &mdash; and now says so.</strong> In the same turn the model, told port 5000
+    was not published, called <code>restart</code> to move the service and got port 5000 back, silently. <code>restart</code>
+    relaunches the stored command with the stored port as its preference; a <code>port</code> that differs from the stored one is
+    refused <em>before anything is stopped</em> ("Nothing was stopped"). The refusal carries everything the move needs, because
+    <code>stop</code> deletes the row that holds it: the resolved service key, the stored workdir, the stored command in full,
+    and the reminder that a port number written <em>inside</em> the command has to be changed too (a <code>start</code> whose
+    requested port is granted does not rewrite the command). The unpublished-port warning in a start (or restart) report and
+    the <code>status</code> line of a live service on an unpublished port name the same two calls, repeat that reminder, and
+    print the stored command and workdir in full as well &mdash; <code>status</code> otherwise cuts the command at 80 characters. (A restart that really moved the port was built and removed:
+    the command rewrite it needs &mdash; which occurrences of the old number are "the port"? &mdash; did the wrong thing in each
+    of four review rounds. The allocator's own fallback is unchanged: if the stored port was taken while the service was down,
+    the restart is granted another and the hardcoded literal is rewritten, as for any start.)
+  </p>
+  <p>
+    <strong>Not changed: a relaunch refused after the stop.</strong> When <code>restart</code> has stopped the process and
+    <code>start</code> then refuses (the stored workdir is gone, say), the result is still the bare <code>Error:</code> from
+    <code>start</code>, which the tool layer books as a refusal; the registration is preserved. A "the service is DOWN"
+    declaration was built for this and removed: what the stop actually did cannot be known under a probe fault, and it claimed a
+    stop that had not happened.
+  </p>
+  <p class="note">Pins: <code>tests/test_4ks_log_review_fixes.py</code> (block A &mdash; the address table, the parser against each
+  <code>ss</code> row shape, the start report in each of the four worlds, status, restart with the stored / another / no port,
+  what the start report and status print for an unpublished port, the tool).</p>
+  <!-- /4KS:loopback -->
+
 </main>
 </body>
 </html>

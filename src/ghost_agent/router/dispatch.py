@@ -109,6 +109,13 @@ class ComplexityDispatcher:
         self.disabled = bool(disabled)
         self._embed_fn = embed_fn
 
+    def _cleared_reason(self) -> str:
+        """Why a decision was NOT escalated — the one fact there is: the
+        score cleared the threshold. This read "high-confidence hard
+        (conf=0.41)" for anything above 0.30 (§4KS); the label and the score
+        are already on the line that prints this."""
+        return f"at or above the {self.confidence_threshold:.2f} confidence threshold"
+
     def route(
         self,
         user_request: str,
@@ -175,12 +182,12 @@ class ComplexityDispatcher:
                 label="easy",
                 confidence=confidence,
                 escalated=False,
-                reason=f"high-confidence easy (conf={confidence:.2f})",
+                reason=self._cleared_reason(),
             )
         return RoutingDecision(
             allowed_pools=list(self.HARD_POOLS),
             label="hard",
             confidence=confidence,
             escalated=False,
-            reason=f"high-confidence hard (conf={confidence:.2f})",
+            reason=self._cleared_reason(),
         )

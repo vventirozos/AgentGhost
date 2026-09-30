@@ -289,7 +289,15 @@ _MEMBER_CAPABILITY_NOTICE = (
     "one of them, do not look for a way around it and do not search for download links: "
     "say plainly that it cannot be done on this channel, then answer as far as search "
     "results allow. Data the user wants you to work on must be pasted as text into the "
-    "message — uploaded documents and data files cannot be read here, so never ask for one.")
+    "message — uploaded documents and data files cannot be read here, so never ask for one. "
+    # §4KS (2026-09-30): slack-b4c319b1 opened a joke with "I can do this without
+    # tools — here goes:"; slack-8f0ef540 "evaluated" a linked post it could not
+    # open by presenting another project's search snippet as that post's claims.
+    "When a request can be answered without any tool, just answer — do not mention tools or "
+    "these limits. When the user links a page, you have NOT read it (text they pasted "
+    "into the message is theirs to give you and is the exception): report only what a "
+    "search result says about that exact page, keep every other result under its own "
+    "source, and never present another site's text as the linked page's content.")
 _MEMBER_PROFILE_PLACEHOLDER = (
     "(not available: this request comes from a channel MEMBER, not the owner. You do not "
     "know this person's name or details. Any profile, memory, autobiography or project "
@@ -3434,7 +3442,70 @@ _REMOVAL_MARK_FRESH_WINDOW_S = 900
 
 _PROJECT_ID_UNCAPTURED = object()
 
-_DOWNLOAD_ROUTE_PREFIXES = ("/api/download/", "api/download/")
+#: `_no_verdict_reason` kinds that are the system working as designed.
+_NO_VERDICT_BENIGN = frozenset({"member", "deferred", "landed"})
+
+
+def _no_verdict_level(kind: str) -> str:
+    """Log level of the finalize line for a `_no_verdict_reason` kind: a
+    member turn, a verdict still coming and one that landed are routine; a
+    verdict that was lost, came back empty or was skipped is a WARNING."""
+    return "INFO" if kind in _NO_VERDICT_BENIGN else "WARNING"
+
+# §4KS — the WEB-EXEC probe reads the outcome the browser tool DECLARES in
+# its header (`tools/browser.py`): the line under `--- BROWSER RESULT ---`.
+_WEB_EXEC_STATE_RE = re.compile(
+    r"\A\s*--- BROWSER RESULT ---[ \t]*\r?\nSTATUS:[ \t]*([A-Z]+)")
+
+
+def _web_exec_loaded(result) -> bool:
+    """Did the browser tool declare this navigation a LOAD? True only for a
+    `STATUS: OK` header on a result that is not a failed ToolOutcome.
+    `STATUS: BLOCKED` (a 4xx/5xx or a challenge page), `STATUS: ERROR` and
+    any shape without the header are not loads: an unknown shape must never
+    read as clean."""
+    m = _WEB_EXEC_STATE_RE.match(str(result or ""))
+    _declared = str(getattr(getattr(result, "status", None), "value", "") or "")
+    return bool(m) and m.group(1) == "OK" and _declared in ("", "ok")
+
+
+def macro_mint_skip_is_new(ctx, name, why) -> bool:
+    """First time THIS process sees this (candidate, reason) skip? §4KS: the
+    skills-auto phase re-walks the same trajectories every idle cycle and
+    printed the same sixteen "Macro Mint — skipped …" lines each time — 112 of
+    2,836 lines in one 15 h log. The first occurrence is news; a repeat is
+    silent. Bounded; a new reason for the same candidate is news again."""
+    try:
+        seen = getattr(ctx, "_macro_mint_skips_seen", None)
+        if not isinstance(seen, dict):
+            seen = {}
+            ctx._macro_mint_skips_seen = seen
+        key = (str(name or ""), str(why or ""))
+        if key in seen:
+            return False
+        if len(seen) >= 512:
+            seen.pop(next(iter(seen)))
+        seen[key] = True
+        return True
+    except Exception:  # noqa: BLE001 — a log gate must never break the phase
+        return True
+
+
+def report_macro_mint_skip(ctx, name, seq, why) -> bool:
+    """Log a skills-auto macro-mint skip — the first time only. Returns
+    whether the line was printed. The ONE emitter of that line in this
+    module; a repeat is silent."""
+    if not macro_mint_skip_is_new(ctx, name, why):
+        return False
+    pretty_log(
+        "Macro Mint",
+        f"skipped {name} ({' → '.join(str(t) for t in (seq or ()))}): {why}",
+        icon=Icons.BRAIN_PLAN,
+    )
+    return True
+
+
+_DOWNLOAD_ROUTE_PREFIXES =("/api/download/", "api/download/")
 
 
 def _sandbox_shaped(name: str) -> bool:
@@ -4972,7 +5043,9 @@ def member_search_yield_steer(run: int) -> str:
         "text you will get, and another query of the same kind will not add "
         "any. Write your answer NOW from the snippets you already have: state what "
         "they support, and name plainly each part of the question you could NOT "
-        "confirm and what would be needed to confirm it. Do NOT run another "
+        "confirm and what would be needed to confirm it. Keep each statement with "
+        "the result it came from: a snippet from another site is that site's claim, "
+        "not the content of a page the user linked. Do NOT run another "
         "web_search or darkweb_search.")
 
 
@@ -6527,6 +6600,44 @@ def _is_think_tag_fragment(token: str, accumulated_with_token: str) -> bool:
     return False
 
 
+class ThinkTagDisplayFilter:
+    """Stateful front of `_is_think_tag_fragment` for ONE displayed stream.
+
+    §4KS: the per-token rule drops every lone ``<`` / ``</`` as a possible
+    tag opener — but whether it opens a tag is only known from the NEXT
+    token. The model emits `` <`` as its own token in ordinary reasoning, so
+    "x < 71" was logged as "x 71" and "value < 0" as "value 0" (2026-09-30,
+    three of three uses). The opener is HELD for one token: dropped when the
+    next token continues a think tag, shown when it does not. Display-only,
+    like the rule it fronts: the accumulated stream is never touched.
+    """
+
+    _OPENERS = ("<", "</")
+    _CONTINUATIONS = ("think", "think>")
+
+    def __init__(self):
+        self._held = ""
+
+    def feed(self, token: str, accumulated_with_token: str) -> str:
+        """The text to DISPLAY for this token ('' to show nothing yet)."""
+        t = token.strip().lower()
+        if t in self._OPENERS:
+            # a second opener releases the first ("a < < b")
+            out, self._held = self._held, token
+            return out
+        held, self._held = self._held, ""
+        if _is_think_tag_fragment(token, accumulated_with_token):
+            # the held opener belonged to this tag only when the token
+            # CONTINUES one; a whole tag token ("<think>") stands alone
+            return "" if t in self._CONTINUATIONS else held
+        return held + token
+
+    def flush(self) -> str:
+        """The opener still held when the stream ends (it opened nothing)."""
+        out, self._held = self._held, ""
+        return out
+
+
 def _scan_json_braces(t: str) -> int:
     """Opens minus closes, counting only braces OUTSIDE string literals.
 
@@ -6999,6 +7110,7 @@ class GhostContext:
         # Set per tool-turn under --enable-metacog; read at turn end by
         # the calibration spine to pair confidence with outcome.
         self.last_confidence = None
+        self.last_confidence_req = ""   # §4KS: the request that produced it
         self.last_entropy_reading = None
         # Calibration spine (core.calibration). Populated by main.py
         # lifespan; pairs confidence with realized outcome, measures
@@ -10077,12 +10189,12 @@ class GhostAgent:
                                                         _tpl, _slots, _why = mint_param_schema(
                                                             _seq, _obs)
                                                     if _why:
-                                                        pretty_log(
-                                                            "Macro Mint",
-                                                            f"skipped {getattr(_cand, 'name', 'skill')} "
-                                                            f"({' → '.join(_seq)}): {_why}",
-                                                            icon=Icons.BRAIN_PLAN,
-                                                        )
+                                                        # §4KS: said ONCE per
+                                                        # (candidate, reason); a
+                                                        # repeat is silent.
+                                                        report_macro_mint_skip(
+                                                            ctx, getattr(_cand, 'name', 'skill'),
+                                                            _seq, _why)
                                                         raise _MacroMintSkipped(_why)
                                                     _steps = [
                                                         {"tool": _t,
@@ -13912,9 +14024,10 @@ class GhostAgent:
         page(s) (comma-joined when clean, the failing page on error) and
         ``error_block`` is "" only when ALL located pages loaded with no
         uncaught JS exception — or ``None`` when the check cannot run (no
-        page on disk, no browser tool, or ANY located page failed to
-        navigate; a partially-run probe must stay inconclusive, never read
-        as "clean"). Single-page probing was the 2026-07-19 gap: the turn
+        page on disk, no browser tool) or ANY located page failed to load
+        and none threw: a partially-run probe is inconclusive, never
+        "clean". A page that THROWS is conclusive whatever else failed to
+        load, in whichever order the pages come (§4KS R2). Single-page probing was the 2026-07-19 gap: the turn
         created minesweeper.html AND corrupted index.html via replace, the
         probe picked the first page only, and the mutated index.html was
         never loaded. JS-only edits load the conventional ``index.html``
@@ -13961,6 +14074,7 @@ class GhostAgent:
         # _WEB_EXEC_SKIP_CONF_CAP (0.6) then caps any text-only CONFIRMED
         # below every consumption gate.
         served_urls: dict = {}
+        unserved: set = set()    # fetch-backed pages no running service covers
         for host in hosts:
             try:
                 _head = host.read_text(encoding="utf-8", errors="replace")[:60000]
@@ -13977,7 +14091,11 @@ class GhostAgent:
                             "Confidence will be capped.",
                             icon=Icons.VERIFIER_LAB,
                         )
-                        return None
+                        # §4KS R3: inconclusive for THIS page — the others
+                        # are still loaded (this used to end the probe, so a
+                        # crash on a static neighbour went unseen).
+                        unserved.add(str(host))
+                        continue
                     served_urls[str(host)] = _surl
                     pretty_log(
                         "Verifier",
@@ -13987,9 +14105,15 @@ class GhostAgent:
                         icon=Icons.VERIFIER_LAB,
                     )
             except Exception:
-                pass
+                # §4KS R4: a page that cannot even be read is not known to
+                # be loadable by file:// — it used to fall through to a
+                # file:// load and could read "clean".
+                unserved.add(str(host))
         clean_pages: list = []
+        inconclusive = bool(unserved)    # a located page that was not loaded
         for host in hosts:
+            if str(host) in unserved:
+                continue
             try:
                 page_rel = host.resolve().relative_to(root.resolve()).as_posix()
             except Exception:
@@ -14003,18 +14127,43 @@ class GhostAgent:
             # HTTP URL instead — same navigation, same JS-exception marker.
             url = served_urls.get(str(host)) \
                 or "file://" + _to_container_path(sbx, host)
-            res = await browser(
-                operation="navigate",
-                url=url,
-                wait_until="domcontentloaded",
-            )
+            try:
+                res = await browser(
+                    operation="navigate",
+                    url=url,
+                    wait_until="domcontentloaded",
+                )
+            except Exception:  # noqa: BLE001 — §4KS R4: a raise is this
+                inconclusive = True        # page's failure, not the probe's
+                continue
             text = str(res)
-            if text.lstrip().startswith("Error") or "[BROWSER_ERR]" in text:
-                return None
+            # §4KS (2026-09-30, req 43199788). The browser tool DECLARES how
+            # a navigation went in its own header: `STATUS: OK`, `STATUS:
+            # BLOCKED (HTTP 404)` for a document that answered 4xx/5xx or a
+            # challenge page, `STATUS: ERROR` for one that never loaded. This
+            # probe used to test `startswith("Error")` / "[BROWSER_ERR]" —
+            # shapes the tool does not emit (R1 review, run against the real
+            # tool: a refused connection read "clean") — and nothing at all
+            # for a status: it loaded .../templates/index.html (the file's
+            # path used as a URL; Flask serves that template at `/`), got a
+            # 404 page, which throws no JS, and reported "WEB-EXEC clean".
+            # Only `STATUS: OK` is a load; anything else leaves the probe
+            # INCONCLUSIVE (None → the confidence cap), never clean.
+            #
+            # A page served by a framework at a ROUTE rather than at its file
+            # path therefore stays inconclusive. Two attempts to look for it
+            # at the service root were removed (R1/R2 reviews): `/` certified
+            # pages it never loaded — any `index.html` that 404s, whatever
+            # `/` actually serves.
+            if not _web_exec_loaded(res):
+                inconclusive = True
+                continue        # keep probing: a later page may still throw
             marker = "UNCAUGHT JS EXCEPTIONS"
             if marker in text:
                 return page_rel, text[text.index(marker):][:1200]
             clean_pages.append(page_rel)
+        if inconclusive or not clean_pages:
+            return None
         return ", ".join(clean_pages), ""
 
     def _project_constraints_for(self, pid, limit: int = 5) -> List[str]:
@@ -14888,8 +15037,8 @@ class GhostAgent:
                     _wx_inconclusive = True
                     pretty_log(
                         "Verifier",
-                        "WEB-EXEC check skipped (no loadable entry page "
-                        "or navigation failed)",
+                        "WEB-EXEC inconclusive (no browser or entry page, or "
+                        "a written page was not loaded and none threw)",
                         icon=Icons.VERIFIER_LAB,
                     )
                 else:
@@ -16124,7 +16273,7 @@ class GhostAgent:
                 project_id=_vp_project_id,
             )
 
-        task = _glog.spawn_task(self._compute_verifier_verdict(
+        _verdict_call = self._compute_verifier_verdict(
             tools_run_this_turn=tools_run_this_turn,
             messages=messages,
             final_ai_content=final_ai_content,
@@ -16133,7 +16282,14 @@ class GhostAgent:
             req_id=req_id,
             trajectory_id=trajectory_id,
             project_id=_vp_project_id,
-        ))
+        )
+        if requester_is_member():
+            # §4KS R2: a member's turn is never verified — the computation
+            # returns at once. Handed to the late handler it became a task
+            # that "landed" EMPTY: the finalize line said "nothing will land
+            # late" and a late WARNING followed it.
+            return await _verdict_call
+        task = _glog.spawn_task(_verdict_call)
 
         if gate > 0:
             # asyncio.wait does NOT cancel on timeout — the task keeps
@@ -16201,6 +16357,105 @@ class GhostAgent:
         except Exception:
             return ""
 
+    def _set_last_confidence(self, reading, req_id) -> None:
+        """The ONE writer of ``context.last_confidence`` — stamped with the
+        request that produced it (§4KS)."""
+        self.context.last_confidence = reading
+        self.context.last_confidence_req = str(req_id or "")
+
+    def _turn_confidence(self, req_id):
+        """THIS request's confidence composite, or None when this request
+        computed none. ``context.last_confidence`` outlives its turn: sim and
+        Slack turns compute no reading, and the Turn Outcome line printed the
+        previous request's — every sim said 0.88 until a user turn computed
+        0.78, then every sim and every Slack member turn said 0.78
+        (2026-09-30). A member's line carried the owner's number."""
+        if not req_id or str(getattr(self.context, "last_confidence_req", "")
+                             or "") != str(req_id):
+            return None
+        return getattr(getattr(self.context, "last_confidence", None),
+                       "composite", None)
+
+    def _no_verdict_reason(self, trajectory_id):
+        """``(kind, text)`` — why a finished turn that HAD verifiable evidence
+        carries no verdict. One decision, read by the finalize line.
+
+        * ``member``   — a channel member's turn is never verified (the
+          verifier reads the OWNER's world; see `_compute_verifier_verdict`);
+        * ``deferred`` — a verdict task for THIS turn is attached and still
+          running: a LATE line will follow;
+        * ``landed``   — that task already finished and printed its own line;
+        * ``lost``     — that task was cancelled or died (it logged why);
+        * ``empty``    — async mode, no task for this turn: the verdict was
+          computed in-loop and came back empty. Nothing will land;
+        * ``skipped``  — sync mode, no task, no verdict.
+
+        §4KS (slack-8f0ef540, 2026-09-30): this was one branch on
+        `_critic_async_enabled()`, so a member's turn — and any in-loop None —
+        printed "verdict deferred — verifying asynchronously after the reply"
+        and nothing ever arrived. A member's turn is named first (no verdict
+        task is spawned for one); after that the TASK decides, whatever the
+        mode: the sync path also hands a slow verdict to the late handler."""
+        if requester_is_member():
+            return ("member",
+                    "no verdict — member turn: the verifier does not run for "
+                    "a channel member (by design); nothing will land late")
+        key = str(trajectory_id or "")
+        if key and self._late_verdict_running().get(key, 0) > 0:
+            return ("deferred",
+                    "verdict deferred — verifying asynchronously after the "
+                    "reply (off the critical path)")
+        ended = self._late_verdict_ended().get(key) if key else None
+        if ended == "landed":
+            return ("landed",
+                    "the late verdict task finished after the reply was "
+                    "composed — see its line above")
+        if ended is not None:
+            return ("lost",
+                    f"no verdict — the late verdict task {ended} before "
+                    "producing one; nothing will land")
+        if not self._critic_async_enabled():
+            return ("skipped", "no verdict produced — gate skipped")
+        return ("empty",
+                "no verdict — computed in-loop and came back empty (trivial "
+                "chat, a stood-down shape refute, or a verifier error); "
+                "nothing is running late")
+
+    def _late_verdict_running(self) -> dict:
+        """``{trajectory_id: tasks still running}`` — a COUNT, because a turn
+        can hand the late handler more than one task."""
+        running = getattr(self, "_late_verdict_running_map", None)
+        if not isinstance(running, dict):
+            running = {}
+            self._late_verdict_running_map = running
+        return running
+
+    def _late_verdict_ended(self):
+        """``{trajectory_id: "landed" | "was cancelled" | "died"}`` for
+        recently finished verdict tasks (bounded). "landed" means
+        `_record_late_verdict` ran — and printed its own line."""
+        from collections import OrderedDict
+        ended = getattr(self, "_late_verdict_ended_map", None)
+        if not isinstance(ended, OrderedDict):
+            ended = OrderedDict()
+            self._late_verdict_ended_map = ended
+        return ended
+
+    def _late_verdict_finished(self, key: str, how: str) -> None:
+        running = self._late_verdict_running()
+        left = running.get(key, 0) - 1
+        if left > 0:
+            running[key] = left
+        else:
+            running.pop(key, None)
+        ended = self._late_verdict_ended()
+        # a verdict that LANDED is not overwritten by a sibling that did not
+        if not (ended.get(key) == "landed" and how != "landed"):
+            ended[key] = how
+            ended.move_to_end(key)
+        while len(ended) > 64:
+            ended.popitem(last=False)
+
     def _attach_late_verdict_handler(self, task, trajectory_id, conv_fp="",
                                      force_correction=False, n_tools=None,
                                      project_id=None):
@@ -16223,6 +16478,15 @@ class GhostAgent:
         (non-async) config would be scrubbed/backfilled but the user
         would never hear about it.
         """
+        # §4KS: WHICH turn has a verdict in flight. The finalize line
+        # "verdict deferred — verifying asynchronously" used to be printed
+        # from the MODE (`_critic_async_enabled()`), not from a task: a member
+        # turn, whose verdict is None by design, was announced as deferred and
+        # nothing ever landed (slack-8f0ef540, 2026-09-30).
+        _pending_key = str(trajectory_id or "")
+        _running = self._late_verdict_running()
+        _running[_pending_key] = _running.get(_pending_key, 0) + 1
+
         def _on_done(t):
             # Release the finalize-burst stagger (see
             # _judge_hydration_safe) as soon as the verdict lands.
@@ -16231,8 +16495,10 @@ class GhostAgent:
             try:
                 v_result, _lt = t.result()
             except asyncio.CancelledError:
+                self._late_verdict_finished(_pending_key, "was cancelled")
                 return
             except Exception as exc:
+                self._late_verdict_finished(_pending_key, "died")
                 # This used to be a bare silent return — which hid the fact
                 # that the async verdict NEVER completed in production (the
                 # live log had 5 "verdict deferred" lines and 0 "LATE …"
@@ -16246,6 +16512,10 @@ class GhostAgent:
                     icon=Icons.WARN, level="WARNING",
                 )
                 return
+            # "landed" is recorded BEFORE the side effects run: the LATE line
+            # is theirs to print, and a fault in them must not leave the
+            # turn reading as still in flight.
+            self._late_verdict_finished(_pending_key, "landed")
             self._record_late_verdict(v_result, trajectory_id, conv_fp,
                                       last_tool=_lt,
                                       force_correction=force_correction,
@@ -23004,21 +23274,18 @@ class GhostAgent:
                                 "(--no-verifier); nothing will land late",
                                 icon=Icons.WARN, level="WARNING",
                             )
-                        elif self._critic_async_enabled():
-                            # Async mode: the verdict was deliberately
-                            # deferred, not missing — it's running on the
-                            # critic node now and will land as LATE …
-                            pretty_log(
-                                "Verifier",
-                                "verdict deferred — verifying asynchronously "
-                                "after the reply (off the critical path)",
-                                icon=Icons.VERIFIER_LAB,
-                            )
                         else:
+                            # §4KS: ONE decision (`_no_verdict_reason`) for
+                            # why a turn with evidence has no verdict — the
+                            # line used to say "deferred" from the MODE alone.
+                            _nv_kind, _nv_text = self._no_verdict_reason(
+                                current_trajectory_id)
                             pretty_log(
-                                "Verifier",
-                                "no verdict produced — gate skipped",
-                                icon=Icons.WARN, level="WARNING",
+                                "Verifier", _nv_text,
+                                icon=(Icons.VERIFIER_LAB
+                                      if _no_verdict_level(_nv_kind) == "INFO"
+                                      else Icons.WARN),
+                                level=_no_verdict_level(_nv_kind),
                             )
         except Exception as e:
             logger.debug(f"Verifier gate skipped: {e}")
@@ -23861,7 +24128,7 @@ class GhostAgent:
             # the note and the WARNING level carry that (§4O's promise).
             if _budget_exhausted and not _state.startswith("partial"):
                 _recovered_note += " · budget exhausted"
-            _conf = getattr(getattr(self.context, "last_confidence", None), "composite", None)
+            _conf = self._turn_confidence(req_id)
             _tnames = [t.get("name") for t in (tools_run_this_turn or [])
                        if isinstance(t, dict) and t.get("name")]
             pretty_log(
@@ -24181,7 +24448,7 @@ class GhostAgent:
                             outcome_penalty=_outcome_penalty,
                             effort=_effort,
                         )
-                        self.context.last_confidence = _pending
+                        self._set_last_confidence(_pending, req_id)
                         # §4BF 1c (R5 review MAJOR): the metacog BUNDLE is
                         # shared production state — `_last_confidence` is
                         # the gate `arbitrate_tool_calls` reads on the NEXT
@@ -24618,8 +24885,27 @@ class GhostAgent:
                             continue
                         break
 
+                # One display filter per displayed stream (§4KS).
+                _reason_display = ThinkTagDisplayFilter()
+                _content_display = ThinkTagDisplayFilter()
+
+                def _mute_display(flt, stop_token: str):
+                    """The display stops at a stop marker. An opener held at
+                    that moment is PROSE when the marker arrived whole
+                    (" <" then "</think>") and is shown; when the marker was
+                    completed by this token ("<" then "/think>") the opener
+                    is its first character and is not."""
+                    held = flt.flush()
+                    if held and str(stop_token).lstrip().startswith("<"):
+                        _emit_thinking(held)
+
                 def _flush_thinking():
                     nonlocal thinking_line_buf
+                    # an opener still held at the end opened no tag — show it
+                    # (once the display is muted nothing is fed, and the
+                    # mute itself settles what was held: `_mute_display`)
+                    for _flt in (_reason_display, _content_display):
+                        thinking_line_buf += _flt.flush()
                     if thinking_line_buf:
                         if thinking_line_buf.strip():
                             pretty_log("thinking", thinking_line_buf.strip(), icon=Icons.BRAIN_THINK, level="DEBUG", no_truncate=True)
@@ -24694,11 +24980,13 @@ class GhostAgent:
                                     if not stop_printing:
                                         if _tail_has_stop_marker(reasoning_content, r_token):
                                             stop_printing = True
+                                            _mute_display(_reason_display, r_token)
                                         if not stop_printing:
-                                            if _is_think_tag_fragment(r_token, reasoning_content):
-                                                pass  # Cosmetic: skip printing fragmented XML tags
-                                            else:
-                                                clean_token = r_token.replace("<think>\n", "").replace("<think>", "")
+                                            # Cosmetic: fragmented think tags are not
+                                            # printed; a lone "<" is (§4KS).
+                                            _shown = _reason_display.feed(r_token, reasoning_content)
+                                            if _shown:
+                                                clean_token = _shown.replace("<think>\n", "").replace("<think>", "")
                                                 _emit_thinking(clean_token)
 
                                 if "content" in delta and delta["content"] is not None:
@@ -24707,13 +24995,15 @@ class GhostAgent:
                                     if not stop_printing:
                                         if _tail_has_stop_marker(full_content, text_chunk):
                                             stop_printing = True
+                                            _mute_display(_content_display, text_chunk)
                                         if not stop_printing and not reasoning_content:
-                                            if (text_chunk.strip().lower() in ("<function", "<parameter")
-                                                    or _is_think_tag_fragment(text_chunk, full_content)):
+                                            if text_chunk.strip().lower() in ("<function", "<parameter"):
                                                 pass  # Cosmetic: skip printing fragmented XML tags
                                             else:
-                                                clean_token = text_chunk.replace("<think>\n", "").replace("<think>", "")
-                                                _emit_thinking(clean_token)
+                                                _shown = _content_display.feed(text_chunk, full_content)
+                                                if _shown:
+                                                    clean_token = _shown.replace("<think>\n", "").replace("<think>", "")
+                                                    _emit_thinking(clean_token)
 
                                     # Tool-call generation-collapse detector.
                                     # Specialised fail-fast probe for the
@@ -26033,8 +26323,12 @@ class GhostAgent:
                             # BLOCKING await (pure defer — verdict still
                             # lands via the late handler); see
                             # _should_await_repair_verdict.
+                            # (§4KS R3: never for a channel member — the
+                            # verifier does not run for one, so there is no
+                            # verdict to await and no task to spawn.)
                             if _should_await_repair_verdict(
-                                    _rbudget, _lt, _unverified):
+                                    _rbudget, _lt, _unverified) \
+                                    and not requester_is_member():
                                 try:
                                     _vtask = _glog.spawn_task(
                                         self._compute_verifier_verdict(
@@ -32256,7 +32550,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                         uncertainty_pressure=_upress,
                                         effort=_eff,
                                     )
-                                    self.context.last_confidence = _cr
+                                    self._set_last_confidence(_cr, req_id)
                                     # Stash for the turn-end calibration
                                     # record (paired with the realized
                                     # outcome). Last reading of the turn
@@ -32460,6 +32754,14 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     _traj_content = _treated_content
                     if (isinstance(_traj_content, str)
                             and _traj_content.strip()):
+                        # §4KS: the streamed turn's reply, on the operator's
+                        # stream — finalize prints this line for every other
+                        # turn; a streamed one ended with "request finished"
+                        # and no record of what it said. The RECORDED view
+                        # (scrubbed/smoothed), like the row it precedes;
+                        # printed first so a recorder fault cannot drop it.
+                        pretty_log("Final Reply", _traj_content,
+                                   icon=Icons.LLM_REPLY)
                         self._record_turn_trajectory(
                             messages=messages,
                             final_content=_traj_content,
@@ -32475,6 +32777,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             # the live flag here belongs to whichever
                             # request runs NOW, not this turn.
                             pressure_lockdown=pressure_lockdown,
+                            # The request clock is closed by now (§4KS).
+                            elapsed_s=time.monotonic() - _req_t0,
                         )
                 except Exception as _sbf_exc:
                     logger.debug(
@@ -32657,6 +32961,16 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             "Verifier",
                             "stream gate: empty claim after "
                             "think-strip — skipped",
+                            icon=Icons.VERIFIER_LAB)
+                    elif requester_is_member():
+                        # §4KS R2: never verified (see
+                        # `_compute_verifier_verdict`) — no task, and no
+                        # "verdict deferred" for a verdict that cannot come.
+                        pretty_log(
+                            "Verifier",
+                            "stream gate: no verdict — member turn "
+                            "(the verifier does not run for a channel "
+                            "member, by design)",
                             icon=Icons.VERIFIER_LAB)
                     else:
                         if _sv_tool is None:
@@ -33480,6 +33794,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         verifier_reason: str = "",
         execution_failed: bool = False,
         pressure_lockdown: Optional[bool] = None,
+        elapsed_s: Optional[float] = None,
     ) -> Optional["Trajectory"]:
         """Build and persist a Trajectory for the turn that just finished.
         Returns the row it wrote (None when the collector is not wired), so
@@ -33598,9 +33913,15 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         # on every chat turn, so per-turn latency was invisible to the
         # corpus consumers (PRM features, reflection). None (request
         # already closed / sim context) keeps the default.
+        # ``elapsed_s`` (§4KS): the STREAMED drain records after the END
+        # frame closed the request clock, so the lookup below returns None
+        # there and every streamed turn — the web UI's common path — was
+        # stored with duration 0.0 (req ba2753bb: 147 s on the wire). That
+        # caller passes the wall-clock it measured itself.
         try:
-            _elapsed = _glog.request_elapsed_s(req_id or "")
-            if _elapsed is not None:
+            _elapsed = (float(elapsed_s) if elapsed_s is not None
+                        else _glog.request_elapsed_s(req_id or ""))
+            if _elapsed is not None and _elapsed >= 0:
                 traj_kwargs["duration_s"] = round(_elapsed, 3)
         except Exception:
             pass

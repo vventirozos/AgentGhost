@@ -1375,6 +1375,56 @@ PYTHONPATH=src python scripts/verify_bench.py --tier private --two-stage both</p
     repair-directive site count (one &rarr; two sites, both passing the current request), the &sect;4FY one-predicate pin (both sites), and two
     &sect;4IY fixtures that answer an English ask in Greek to exercise the abbreviation list &mdash; a <code>reply_language</code> fire there is now by design.
   </p>
+  <!-- 4KS:verifier -->
+  <h2 id="4ks">Three things the verifier said that were not so <span class="tag">2026-09-30 &sect;4KS</span></h2>
+  <p>
+    <strong>WEB-EXEC certified a page that never loaded.</strong> The probe loads each written page headless and looks for an uncaught
+    JS exception. It decided whether the page had loaded by testing for result shapes the browser tool does not emit, so anything
+    &mdash; a 404, a refused connection &mdash; read as a load. In req <code>43199788</code> it fetched
+    <code>http://127.0.0.1:8100/templates/index.html</code> (Flask serves that template at <code>/</code>), got a 404 page, which
+    throws no JS, and the line read <em>"WEB-EXEC clean"</em>. The probe now reads the outcome the browser tool itself declares
+    (<code>_web_exec_loaded</code>: <code>STATUS: OK</code> under <code>--- BROWSER RESULT ---</code>, on a result that is not a
+    failed <code>ToolOutcome</code>). <code>BLOCKED</code>, <code>ERROR</code> and any shape it does not recognise are not loads.
+  </p>
+  <p>
+    A page that did not load &mdash; including one the browser call raised on &mdash; or a fetch-backed page that no running
+    service covers (or a page whose file could not be read to find out), which is not loaded at all,
+    makes the probe <em>inconclusive</em> (the confidence cap), never clean, but it no longer ends the probe: the remaining pages
+    are still loaded, and one that throws refutes whatever else failed to load, in whichever order the files were written. (The
+    cap of four pages per probe is unchanged: pages beyond it are not loaded.) <strong>Known gap:</strong> a template a framework serves at a route rather than at its file path
+    (Flask's <code>templates/index.html</code>) answers 404 and stays inconclusive. Two attempts to look for it at the service root
+    were removed: <code>/</code> certified pages it had never loaded.
+  </p>
+  <p>
+    <strong>"Verdict deferred" with no verdict coming.</strong> The finalize line was printed from the mode
+    (<code>_critic_async_enabled()</code>), not from a task. A channel member's turn is never verified, and an in-loop verdict can come
+    back empty; both were announced as <em>"verdict deferred &mdash; verifying asynchronously after the reply"</em> and nothing ever
+    landed (<code>slack-8f0ef540</code>). <code>_attach_late_verdict_handler</code> now counts the tasks in flight per turn and
+    records how each ended, and <code>_no_verdict_reason(trajectory_id)</code> is the one decision the line reads:
+    <code>member</code>; <code>deferred</code> (a task for this turn is still running); <code>landed</code> (it finished and printed
+    its own line); <code>lost</code> (it was cancelled or died); <code>empty</code> (nothing is running late); or
+    <code>skipped</code> (sync mode, no task). The last three are warnings (<code>_no_verdict_level</code>). No verdict task is
+    spawned for a member at all &mdash; not by the in-loop repair await, not by the gated call, and not by the stream gate, which
+    prints its own "member turn" line.
+  </p>
+  <p>
+    <strong>"Just the number &hellip; on that line" refuted the whole reply.</strong> The text-graded GSM8K prompt asks for the working,
+    then <em>"the FINAL NUMERIC ANSWER on its own last line (just the number &mdash; no units &hellip; on that line)"</em>. The
+    <code>number_only</code> rule matched <em>just the number</em> and refuted the step-by-step reply as
+    <em>"53 words of explanation"</em> &mdash; three runs of three, each after a 22&ndash;42&nbsp;s judge call that had confirmed it
+    &mdash; and the repair sent back a bare <code>98</code>. When the request names the <em>last/final line</em>, or <em>that
+    line</em> &mdash; anywhere in it, not only in the clause that says "just the number" &mdash; the constraint value is
+    <code>last_line</code>, and the ordinary number-only rule is applied to the last non-empty line instead of the whole reply (one
+    rule: <code>3/4</code>, <code>Answer: 98</code> and <code>\boxed{98}</code> pass in both places &mdash; and so does any short
+    line carrying a number, as it does for a whole reply: this is a refute-only check and it is deliberately lenient). <em>"On one line"</em> and
+    <em>"on its own line"</em> alone still govern the whole reply, and <em>"the last line of/in/from data.csv"</em> names a line
+    of a file.
+  </p>
+  <p class="note">Pins: <code>tests/test_4ks_log_review_fixes.py</code> (blocks B, C, E), the probe driven through the real
+  <code>tool_browser</code> over a stub runner, and an AST enumeration that the deferral announcement has exactly one emitter on
+  the non-streamed path. <code>tests/test_verifier_web_exec.py</code> now feeds the probe the browser's real result shapes.</p>
+  <!-- /4KS:verifier -->
+
 </main>
   <h2>Conflicting evidence and internal contradiction (§4IJ, 2026-09-17)</h2>
   <p><strong>The blind spot.</strong> The stage-2 "support" rule read: REAL only if the fact appears in NO tool output or directly contradicts one. A fact that IS in the output therefore passed even when the same output also said otherwise — the bench fault <code>omitted_contradiction</code> (§4IA: the evidence line carrying a claim number is copied with the number perturbed and appended as another row of the same output; the claim reports one value) was CONFIRMED 23/23 at mean confidence 0.96, and the stage-1 pass had often <em>named</em> the conflict ("Evidence shows two different temperatures: 34°C and 35°C") only for stage 2 to dismiss it as supported. The live twin (probe <code>ifs21382…</code>): a reply stating "~10 km nominal resolution" and "the nearest grid point is ~86 km away" — both numbers printed by its own script, whose longitudes were radians labelled as degrees — CONFIRMED at 0.90.</p>

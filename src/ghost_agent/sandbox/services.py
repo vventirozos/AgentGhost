@@ -166,8 +166,14 @@ def remote_access_hint(port: int) -> str:
     )
 
 
+# ⚠ The service texts below go into TOOL RESULTS that `strikes.error_line`
+# reads line by line for failure words (`cannot`, `failed`, `not found`, …):
+# a warning that says "cannot" turns a successful start into an error line
+# for the strike counter and the evidence digest (found live, §4KS).
 def unpublished_port_warning(port: int, published_ports: Optional[set] = None,
-                             spec: Optional[str] = None) -> str:
+                             spec: Optional[str] = None,
+                             command: Optional[str] = None,
+                             workdir: Optional[str] = None) -> str:
     """The other half of ``remote_access_hint`` (2026-09-03). A service on a
     port docker did NOT publish is reachable ONLY inside the sandbox: the
     in-sandbox browser and execute see it, the operator's browser does not,
@@ -182,14 +188,58 @@ def unpublished_port_warning(port: int, published_ports: Optional[set] = None,
         span = spec or os.environ.get("GHOST_SANDBOX_SERVICE_PORTS", SUGGESTED_PORTS)
     else:
         span = "none"
+    _stored = ""
+    if command:
+        _stored = (f"\nStored command: {command}"
+                   + (f"\nStored workdir: {workdir}" if workdir else ""))
     return (
         f"⚠ NOT reachable from the host: port {port} is not published by the "
         f"sandbox (published: {span}), so http://127.0.0.1:{port} exists only "
-        f"INSIDE the sandbox — the user's browser cannot open it and "
+        f"INSIDE the sandbox — the user's browser can't open it and "
         f"`{REMOTE_SERVE_SCRIPT} {port}` would map the tailnet onto an empty "
-        f"port. For user/remote access restart it on a published port: omit "
-        f"the port from the command (a free one from {SUGGESTED_PORTS} is "
-        f"leased and exported as $PORT) or name one in that range."
+        f"port. For user/remote access it has to MOVE to a published port "
+        f"(one of {SUGGESTED_PORTS}): action='stop', then action='start' "
+        f"with the new port and the same command and workdir — and if the "
+        f"command itself names {port}, change it there too, or make the app "
+        f"bind $PORT. A restart KEEPS port {port}." + _stored
+    )
+
+
+#: Local addresses that are loopback INSIDE the container's network namespace.
+_LOOPBACK_ADDR_RE = re.compile(
+    # 127.x, ::1, and the v4-mapped form a dual-stack runtime reports; `ss`
+    # may append a scope (`127.0.0.1%lo`)
+    r"^(?:(?:::ffff:)?127(?:\.\d{1,3}){3}|::1)(?:%[\w.-]+)?$",
+    re.IGNORECASE)
+
+
+def loopback_only(addrs) -> bool:
+    """True when every listening address in ``addrs`` is loopback — the app
+    bound 127.0.0.1/::1 and nothing else. Empty / unknown → False: the
+    warning it gates must never fire on a probe that answered nothing."""
+    addrs = [str(a).strip().strip("[]") for a in (addrs or []) if str(a).strip()]
+    return bool(addrs) and all(_LOOPBACK_ADDR_RE.match(a) for a in addrs)
+
+
+def loopback_bind_warning(port: int) -> str:
+    """§4KS (2026-09-30, req 43199788). A PUBLISHED port whose app bound the
+    container's loopback is unreachable from the host: docker forwards the
+    published port to the container's external interface, where nothing
+    listens. The in-sandbox probe and browser still answer (they ARE inside),
+    so the report said "listening ✓ … published to the host" and the reply
+    told the user "Live at http://127.0.0.1:8100" — the host got an empty
+    reply. Flask's ``app.run(port=…)`` and most dev servers default to
+    127.0.0.1."""
+    return (
+        f"⚠ NOT reachable from the host: the app bound port {port} on "
+        f"loopback only (127.0.0.1 / ::1 INSIDE the sandbox). Port {port} is published, but docker "
+        f"forwards it to the container's external interface, where nothing "
+        f"listens — the user's browser gets an empty reply while the "
+        f"in-sandbox browser works. Bind 0.0.0.0: HOST=0.0.0.0 and "
+        f"PORT={port} are exported to the app (e.g. Flask "
+        f"`app.run(host=os.environ.get('HOST', '0.0.0.0'), "
+        f"port=int(os.environ['PORT']))`), then action='restart'. Do NOT tell "
+        f"the user it is live until this warning is gone."
     )
 
 
@@ -336,6 +386,26 @@ def substitute_command_port(command, old_port, new_port) -> str:
     the port the report doesn't name. Word-boundary, all occurrences."""
     return re.sub(rf"\b{int(old_port)}\b", str(int(new_port)),
                   str(command or ""))
+
+
+def _same_port(port, entry: dict) -> bool:
+    """Is ``port`` (as a caller wrote it) the port ``entry`` already has?
+    Read the way `start` reads a port — 8100, "8100", 8100.0 are one port;
+    0 / "none" / "no" / "off" name a portless entry. Anything else (a bool,
+    a word, another port) is not the stored one."""
+    text = str(port).strip().lower()
+    try:
+        as_float = float(text)
+        number = int(as_float) if as_float == int(as_float) else None
+    except (TypeError, ValueError, OverflowError):
+        number = None
+    stored = entry.get("port")
+    if stored is None:
+        return number == 0 or text in ("none", "no", "off")
+    try:
+        return number is not None and number == int(stored)
+    except (TypeError, ValueError):
+        return False
 
 
 from ..tools.outcome import ToolOutcome
@@ -674,6 +744,39 @@ class ServiceSupervisor:
             timeout=10)
         holder = (out or "").strip()
         return int(holder) if holder.isdigit() else None
+
+    def _listen_addrs(self, port) -> Optional[list]:
+        """Local ADDRESSES listening on <port> in the container (``ss``), e.g.
+        ``["127.0.0.1"]`` or ``["0.0.0.0"]``; None when the probe gave no
+        answer. `_port_listening` connects to 127.0.0.1, which a loopback
+        bind and a wildcard bind both answer — only the address tells a
+        service the HOST can reach from one it cannot (§4KS)."""
+        out, code = self._exec(
+            "sh -c \"ss -H -ltn 'sport = :%d' 2>/dev/null\"" % int(port),
+            timeout=10)
+        if code != 0 or not (out or "").strip():
+            return None
+        addrs = []
+        for line in out.splitlines():
+            cols = line.split()
+            if len(cols) < 4:
+                continue
+            local = cols[3]
+            addr, _, port_s = local.rpartition(":")
+            if not port_s.isdigit() or int(port_s) != int(port):
+                continue
+            addrs.append(addr.strip("[]") or "*")
+        return addrs or None
+
+    def _host_unreachable_bind(self, port) -> bool:
+        """The app on a PUBLISHED port listens on loopback only, in bridge
+        mode — the host cannot reach it. False whenever that cannot be
+        established (host netns, unpublished port, probe silent)."""
+        if self._binds_host_netns():
+            return False
+        if not is_published_port(port, published_ports=self._published_ports()):
+            return False
+        return loopback_only(self._listen_addrs(port))
 
     def _pid_ownership(self, target, owner) -> Optional[bool]:
         """Does <target> belong to <owner>'s process tree? True when it IS
@@ -1368,8 +1471,8 @@ class ServiceSupervisor:
                 f"'{name}' — it most likely failed to bind (address already "
                 f"in use). What answers on http://127.0.0.1:{port} is NOT "
                 f"this service. Stop whatever holds the port (action='status' "
-                f"to check registered services) or restart '{name}' on "
-                f"another port.\n--- {name} log tail ---\n{tail}",
+                f"to check registered services) or stop '{name}' and start "
+                f"it on another port.\n--- {name} log tail ---\n{tail}",
                 # the process exists, so something DID change
                 world_changed=True, reason_code="service_port_hijacked")
 
@@ -1396,12 +1499,20 @@ class ServiceSupervisor:
                 f"execute tools reach it there (listening ✓). The port is "
                 f"exported to the app as $PORT.")
             _pub = self._published_ports()
-            if is_published_port(port, published_ports=_pub):
+            if self._host_unreachable_bind(port):
+                # §4KS: published, but bound to the container's loopback —
+                # the remote-access hint here would be a false "reachable".
+                lines.append(loopback_bind_warning(port))
+            elif is_published_port(port, published_ports=_pub):
                 lines.append(remote_access_hint(port))
             elif not self._binds_host_netns():
                 # Bridge mode and an unpublished port: say so — silence here
                 # read as "reachable" to the model AND the operator (2026-09-03).
-                lines.append(unpublished_port_warning(port, published_ports=_pub))
+                # …with the command and workdir as STORED in the row: a later
+                # reader of this report (a restart in another session) has
+                # neither.
+                lines.append(unpublished_port_warning(
+                    port, published_ports=_pub, command=_cmd_str, workdir=wd))
         lines.append(
             f"Logs: action='logs' name='{name}' · stop: action='stop'. "
             f"It survives across turns until stopped (or the sandbox "
@@ -1710,7 +1821,21 @@ class ServiceSupervisor:
             parts.append(f"Cleared (already dead): {', '.join(cleared)}.")
         return " ".join(parts)
 
-    def restart(self, name: str, project_id=None) -> str:
+    def restart(self, name: str, project_id=None, port=None) -> str:
+        """Stop the service and relaunch it with its STORED command, port and
+        workdir. It is not the way to move a service to a port of the
+        caller's choosing: that is `stop` then `start` with the new port
+        (and command). (The stored port is still only a preference — if
+        something took it while the service was down, the allocator grants
+        another and says so, as it does for any start.)
+
+        ``port`` is only CHECKED: a port other than the stored one is refused
+        before anything is stopped, with the two calls that do move it.
+        §4KS (2026-09-30): told its port was unpublished, the model called
+        restart to "move" the service and got the same port back, silently.
+        (A restart that really moved the port was built and removed: the
+        command rewrite it needs did the wrong thing in each of four review
+        rounds.)"""
         # ⚠ VALIDATE BOTH HALVES. `":" not in name` skipped validation
         # ENTIRELY for a scoped key — the same escape hatch `start()` was
         # patched for, still open in stop/restart/logs. `logs()` then tailed
@@ -1738,6 +1863,25 @@ class ServiceSupervisor:
             if entry is None:
                 return (f"Error: no service named '{name}' to restart "
                         f"(use action='start' with a command).")
+            if (port is not None and str(port).strip() != ""
+                    and not _same_port(port, entry)):
+                # Everything `start` needs to bring it back elsewhere is
+                # printed here: `stop` deletes the row that holds it (R5
+                # review).
+                _stored = ("no port" if entry.get("port") is None
+                           else f"port {entry.get('port')}")
+                _wd = str(entry.get("workdir") or "")
+                return (f"Error: restart relaunches '{name}' as stored "
+                        f"({_stored}); it cannot move it to {port!r}. To "
+                        f"move it: action='stop' name='{key}', then "
+                        f"action='start' name='{key}' port=<the new port>"
+                        + (f" workdir='{_wd}'" if _wd else "")
+                        + " command=<the stored command below — if it names "
+                        "a port number itself, change that to the new port "
+                        "(or make the app read $PORT): start does not "
+                        "rewrite a command whose requested port was granted>."
+                        f"\nStored command: {entry.get('command') or ''}"
+                        "\nNothing was stopped.")
             # §4GK round 6: `stop()` now PUTS A SURVIVOR'S ROW BACK, so a
             # discarded return meant `start()` below found a live entry and
             # answered "already running … use action='restart'" — advice to do
@@ -1755,9 +1899,9 @@ class ServiceSupervisor:
             # 2026-07-30: port=None was ambiguous, so restart force-granted
             # a lease to workers that need none (and hard-failed when the
             # range was full).
+            _new_port = 0 if entry.get("portless") else entry.get("port")
             out = self.start(key, entry.get("command") or "",
-                             port=(0 if entry.get("portless")
-                                   else entry.get("port")),
+                             port=_new_port,
                              workdir=entry.get("workdir"),
                              project_id=entry.get("project_id"))
             if out.startswith("Error:"):
@@ -1790,6 +1934,7 @@ class ServiceSupervisor:
         lines = []
         _dead = 0
         for n, e in entries.items():
+            _show_full = False
             _st = self._entry_state(e)
             alive = _st is True
             if _st is False:
@@ -1807,21 +1952,39 @@ class ServiceSupervisor:
                     _lp = self._port_listening(e['port'])
                     part += (f", http://127.0.0.1:{e['port']} "
                              f"{'listening ✓' if _lp else 'NOT listening ✗'}")
-                    if _lp and is_published_port(
+                    if _lp and self._host_unreachable_bind(e['port']):
+                        # Same story as the start report (§4KS).
+                        part += (" · ⚠ bound to loopback only inside the sandbox: "
+                                 "NOT reachable from the host (bind 0.0.0.0 — "
+                                 "$HOST — and restart)")
+                    elif _lp and is_published_port(
                             e['port'], published_ports=self._published_ports()):
                         part += (f" · remote: {REMOTE_SERVE_SCRIPT} "
                                  f"{e['port']}")
                     elif _lp and not self._binds_host_netns():
                         # Same story as the start report (2026-09-03).
                         part += (" · ⚠ in-sandbox only: port not published "
-                                 "to the host (restart on one of "
-                                 f"{SUGGESTED_PORTS} for user/remote access)")
+                                 "to the host (to move it: action='stop', "
+                                 "then action='start' on one of "
+                                 f"{SUGGESTED_PORTS} with the command and "
+                                 "workdir shown here in full — if the command "
+                                 f"itself names {e['port']}, change it there "
+                                 "too, or make the app bind $PORT; a restart "
+                                 "keeps the port)")
+                        _show_full = True
                 else:
                     part += f", port {e['port']} (kept for restart)"
             up = time.time() - float(e.get("started_at") or 0)
             if alive and up > 0:
                 part += f", up {int(up // 60)}m"
-            part += f" · cmd: {str(e.get('command') or '')[:80]}"
+            _cmd_full = str(e.get('command') or '')
+            if _show_full:
+                # the row `stop` is about to delete: print what `start` needs
+                part += (f" · cmd: {_cmd_full}"
+                         + (f" · workdir: {e.get('workdir')}"
+                            if e.get("workdir") else ""))
+            else:
+                part += f" · cmd: {_cmd_full[:80]}"
             lines.append(part)
         if _dead and name is None:
             lines.append(f"({_dead} dead — action='restart' brings one back "
@@ -2185,6 +2348,7 @@ __all__ = [
     "ServiceSupervisor", "default_service_ports", "publishable_service_ports",
     "get_service_supervisor", "active_service_ports",
     "is_published_port", "remote_access_hint",
+    "loopback_only", "loopback_bind_warning",
     "REMOTE_SERVE_SCRIPT", "REMOTE_UNSERVE_SCRIPT",
     "entry_key", "split_key", "extract_command_port",
     "substitute_command_port", "valid_service_token",

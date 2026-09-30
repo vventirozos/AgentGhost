@@ -1177,6 +1177,7 @@ _DELIBERATE_KEEPERS = {
     # process/host state a turn cannot reach outward through
     "tor_proxy", "_tor_guard_uninstall", "last_activity_time",
     "cached_sandbox_state", "last_user_content", "last_confidence",
+    "last_confidence_req",     # §4KS: the request stamp of last_confidence
     "last_entropy_reading", "_calib_pending", "biological_task",
     # containment markers this module sets
     "_replay_forbidden_tools", "_subagent_allowed_tools",

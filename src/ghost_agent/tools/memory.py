@@ -2989,6 +2989,9 @@ async def tool_self_play(context):
         )
         return _SELF_PLAY_INTENT_REFUSAL
     dreamer = Dreamer(context)
+    # §4KS: the whole call is bounded below, so a template retry after a
+    # defective generated challenge must fit what is left of that bound.
+    dreamer.cycle_budget_s = SELF_PLAY_CYCLE_TIMEOUT_S
     try:
         result = await asyncio.wait_for(
             dreamer.synthetic_self_play(is_background=False),
@@ -3124,6 +3127,7 @@ async def _run_self_play_loop(context, *, model_name: str, max_cycles: int, stop
     """
     from ..core.dream import Dreamer
     dreamer = Dreamer(context)
+    dreamer.cycle_budget_s = SELF_PLAY_CYCLE_TIMEOUT_S   # §4KS: each cycle is bounded below
     cycles_done = 0
     lessons_before = _count_playbook(context)
     # PRM retrain cadence inside the loop. 20 is enough fresh

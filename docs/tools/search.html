@@ -224,6 +224,47 @@
     <li><strong>Merge.</strong> <code>merge_wiki_first</code>: the article first, the web batch after (duplicate URL dropped); when every web ticket failed the article alone is the answer, before reformulation. Logged as <code>Wiki Supplement</code>.</li>
   </ul>
   <p>Pins: <code>tests/test_search_wiki_supplement_2026_09_21.py</code> (12: the gate, the subject rule against the any-token rule, the lookup with the HTTP client stubbed — proxies, cap, URL — the merge, and three runs through <code>tool_search_ddgs</code> with the race double: article first, article alone on a dead web, Latin never asks and an error never sinks). Battery 10 mutants + 2 controls, 10/10 killed. Survey harness: scratch <code>engine_survey.py</code> (the numbers above); re-run it before adding any engine.</p>
+  <!-- 4KS:search -->
+  <h2 id="4ks">A dropped site filter, and what research reads <span class="tag">2026-09-30 &sect;4KS</span></h2>
+  <p>
+    <strong>A <code>site:</code> filter was dropped silently.</strong> The scrapers cannot honour operators, so
+    <code>_sanitize_query</code> strips them. <code>site:blogs.lupyd.com postgres with quic</code> ran as
+    <code>postgres with quic</code>, the wave answered with quic-go, and nothing told the model its restriction was gone &mdash; it
+    issued six more searches to find out. A <code>web_search</code> result now ends with a note (<code>site_operator_note</code>;
+    worded around the strike counter's failure words &mdash; a first wording said the engines "cannot" restrict, and every such
+    result became an error line for the strike counter and the evidence digest, found on the first live turn):
+    which <code>site:</code>/<code>inurl:</code> operators were removed, that the results are therefore not limited to (or cleared
+    of) that site, and that a site can only be aimed at by adding its name as a plain keyword. The note names no query: on a
+    reformulated retry the result states the query itself. An exclusion (<code>-site:pinterest.com</code>) is removed with its
+    minus sign; it used to leave a stray <code>-</code>. Nothing is reported when nothing was removed &mdash; the operator is the
+    whole query (it is mined for keywords), or the query goes out as typed. <code>deep_research</code>, <code>fact_check</code>
+    and <code>darkweb_search</code> sanitise the same way and do not carry the note (no recorded query on those tools has used an
+    operator).
+  </p>
+  <p>
+    <strong>Deep research read search pages.</strong> The first eight results were fetched as they came. In req
+    <code>ba2753bb</code> two were another site's search-results pages for the query (<code>clipzui.cc/?q=&hellip;</code>), distilled
+    into facts. <code>select_research_sources</code> skips search-results pages <em>before</em> the limit of eight, so the slot goes
+    to the next result. <code>is_search_results_url</code> recognises two shapes: a search key in the query string
+    (<code>q</code>, <code>query</code>, <code>keywords</code>, &hellip;; <code>s</code>/<code>k</code> only on the site root)
+    whose value is a query &mdash; not a path (<code>/?q=node/123</code>, <code>search?q=cache:site/page</code>) and not a bare
+    number &mdash; and a query in the path (<code>/search/greek+flag</code>, <code>/search/label/A+B</code>). A
+    <code>search</code> path segment alone is not one: on the URLs in the trajectory store that rule flagged course pages,
+    dictionary entries and <code>developers.google.com/search/docs/&hellip;</code>. The rule errs toward reading: of 9,624 stored
+    URLs it flags 47, none of them a document, and leaves about 27 site-internal listings with a one-word or hyphenated query
+    unrecognised. A batch of nothing but search pages is read as it came. Nothing else
+    is dropped.
+  </p>
+  <p>
+    <em>Tried and removed</em>, each after measurement on the recorded queries and result batches: appending the site's name to
+    the query (noise words, leaked IP octets, an excluded site turned into a search term); skipping off-topic results in research
+    (it dropped primary sources); and two replacements for the <code>how to &hellip;</code> retry of a short keyword query
+    (the query's first words, then its "subject" words &mdash; both lost the subject on real queries). The retry is unchanged.
+  </p>
+  <p class="note">Pins: <code>tests/test_4ks_log_review_fixes.py</code> (block P, including <code>tool_search</code> and
+  <code>tool_deep_research</code> runs over the live batches, and real URLs from the store).</p>
+  <!-- /4KS:search -->
+
 </main>
   <p><strong>Distinctive-token relevance (§4IL, 2026-09-18).</strong> The wave's off-topic check read "not one content word of the query appears anywhere in the batch" — so an engine answering a different question won whenever one common word overlapped: "How to get help in Windows" for <code>eckit Grid reduced_gg spec format nxacc pl python</code> (shared word: <em>format</em>), Doha for <code>Χρυσοί Σκούφοι Βραβεία Γαστρονομίας</code>, NHL standings for a Revolut-breach query. Replayed over 798 recorded searches (2026-08/09): 53 batches (6.6%) were such answers. <code>distinctive_tokens(query)</code> keeps the query's subject-bearing words — the first non-year content word unless it is query framing (<code>_WEAK_LEADING</code>: best, top, number, list…), any token with a digit or underscore, any word the system dictionary (<code>/usr/share/dict/words</code>, stem-aware) does not know; years never. <code>result_on_topic</code> matches a result on any distinctive token, as a substring of the folded text (title, body, URL slug) or fuzzily (ratio ≥ 0.8, tokens of 6+ chars) so a one-letter typo still finds its page. The wave counts a batch as off-topic when no result carries one (bare rows without text are not evidence; a query with no distinctive token keeps the old batch rule), and <code>rank_on_topic</code> re-orders the winner on-topic first — nothing is dropped (11.3% of recorded batches re-rank). Pins: <code>tests/test_search_distinctive_relevance.py</code>.</p>
 </body>

@@ -176,6 +176,12 @@ idle 1..10s   …and round again, forever</code></pre>
   </ul>
   <p>Skills are also re-tested later rather than trusted forever. A skill is only as good as the moment it was learned, and tools get renamed, libraries upgrade, and the model itself drifts. Re-verification decides whether each one stays active, gets deprecated, or is kept under watch.</p>
 
+  <!-- 4KS:lessons -->
+  <h3>What makes a lesson count</h3>
+  <p>Each lesson carries a count of how often it has been learned, and that count matters: it raises the lesson's standing, and from three it can be turned into a reusable skill. The count only rises when the lesson is learned again <em>from something new</em> — a different conversation, a different practice challenge, a new failure case. Re-reading the same material and arriving at the same rule does not count. Without that, a rule could climb to the top simply because the nightly review kept re-deriving it from the same notes.</p>
+  <p>Practice lessons are also put to the test. When the agent needed more than one attempt at a practice challenge, the lesson it draws is tried immediately: the challenge is run once more with the lesson in hand. If that run fails, the lesson is thrown away — unless the run failed for a reason that has nothing to do with the lesson, such as the model being unreachable. And no lesson is drawn from a practice challenge whose own data turns out to be malformed.</p>
+  <!-- /4KS:lessons -->
+
   <h3>The two small models it trains</h3>
   <p>Both are plain logistic regression in numpy, saved as JSON. That's a deliberate ceiling: they're trained on a few thousand of the agent's own turns, which is not enough data to justify anything bigger, and a model you can read as a list of weights is one you can debug.</p>
   <p>The router in particular is built to fail safe — a low-confidence prediction escalates to the full pool rather than gambling on the cheap path. The worst it can do is fail to save you a call. It never blocks a request.</p>

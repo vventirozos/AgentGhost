@@ -286,7 +286,11 @@ def test_synthetic_self_play_uses_coding_sampling_params():
     assert "**_challenge_sampling" in src, \
         "synthetic_self_play must spread the challenge sampling dict into its payload"
     # The deliberate temperature override.
-    assert '_challenge_sampling["temperature"] = 0.3' in src, (
+    # §4KS: the value now comes from `challenge_generation_temperature`
+    # (0.3 unless a near-duplicate rejection raised it) — pinned on the
+    # function, not on the assignment's text.
+    assert dream_module.challenge_generation_temperature(0) == 0.3
+    assert "challenge_generation_temperature(_dup_rejections)" in src, (
         "synthetic_self_play must lower temperature to 0.3 for challenge gen "
         "— 0.6 wanders too much and extends generation latency"
     )

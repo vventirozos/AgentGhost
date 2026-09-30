@@ -64,6 +64,15 @@ def test_empty_and_none_are_safe():
 
 
 # ── headless execution of the entry page ─────────────────────────────
+# §4KS: the shape the real browser tool returns for a loaded page
+# (`tools/browser.py`). These fixtures used "SUCCESS: navigated", a string
+# the tool never emits — and the probe read ANYTHING that did not start with
+# "Error" as a clean load, including the tool's real "STATUS: ERROR".
+_NAV_OK = ("--- BROWSER RESULT ---\nSTATUS: OK\nOP: navigate\n"
+           "URL: file:///workspace/index.html\nHTTP_STATUS: 200\nTITLE: x")
+# …and for a navigation that failed (`_browser_error` in tools/browser.py).
+_NAV_ERR = "--- BROWSER RESULT ---\nSTATUS: ERROR\n"
+
 def _bare_agent(tmp_path, browser_result, monkeypatch):
     agent = GhostAgent.__new__(GhostAgent)
     agent.context = MagicMock()
@@ -79,7 +88,7 @@ def _bare_agent(tmp_path, browser_result, monkeypatch):
 async def test_html_artifact_clean_load(tmp_path, monkeypatch):
     (tmp_path / "index.html").write_text("<html></html>")
     agent, browser = _bare_agent(
-        tmp_path, "SUCCESS: navigated. Title: 'x'", monkeypatch)
+        tmp_path, _NAV_OK, monkeypatch)
     res = await agent._execute_web_artifact(["index.html"])
     assert res == ("index.html", "")
     assert browser.await_count == 1
@@ -89,7 +98,7 @@ async def test_html_artifact_clean_load(tmp_path, monkeypatch):
 async def test_html_artifact_with_uncaught_exception_returns_block(
         tmp_path, monkeypatch):
     (tmp_path / "index.html").write_text("<html></html>")
-    diag = ("SUCCESS: navigated.\n⚠ UNCAUGHT JS EXCEPTIONS (2) — these "
+    diag = (_NAV_OK + "\n⚠ UNCAUGHT JS EXCEPTIONS (2) — these "
             "crash the page silently:\n  • SyntaxError: Unexpected "
             "identifier 't'")
     agent, _ = _bare_agent(tmp_path, diag, monkeypatch)
@@ -102,7 +111,7 @@ async def test_html_artifact_with_uncaught_exception_returns_block(
 async def test_js_only_edit_loads_sibling_index(tmp_path, monkeypatch):
     (tmp_path / "index.html").write_text("<html></html>")
     (tmp_path / "game.js").write_text("var x = 1;")
-    agent, browser = _bare_agent(tmp_path, "SUCCESS: navigated", monkeypatch)
+    agent, browser = _bare_agent(tmp_path, _NAV_OK, monkeypatch)
     res = await agent._execute_web_artifact(["game.js"])
     assert res is not None and res[0] == "index.html"
 
@@ -113,7 +122,7 @@ async def test_navigate_url_is_absolute_container_path(tmp_path, monkeypatch):
     build and a throwing page still got a text CONFIRMED. The URL must be an
     absolute ``file:///workspace/...`` path."""
     (tmp_path / "index.html").write_text("<html></html>")
-    agent, browser = _bare_agent(tmp_path, "SUCCESS: navigated", monkeypatch)
+    agent, browser = _bare_agent(tmp_path, _NAV_OK, monkeypatch)
     await agent._execute_web_artifact(["index.html"])
     url = browser.call_args.kwargs["url"]
     assert url.startswith("file:///workspace/"), url
@@ -126,7 +135,7 @@ async def test_navigate_url_scoped_project(tmp_path, monkeypatch):
     proj = tmp_path / "projects" / "abc123"
     proj.mkdir(parents=True)
     (proj / "index.html").write_text("<html></html>")
-    agent, browser = _bare_agent(proj, "SUCCESS: navigated", monkeypatch)
+    agent, browser = _bare_agent(proj, _NAV_OK, monkeypatch)
     monkeypatch.setattr(
         "ghost_agent.tools.file_system.project_scoped_sandbox",
         lambda ctx, stateful=False: (proj, "/workspace"),
@@ -146,7 +155,7 @@ async def test_binding_gap_finds_deliverable_in_project_subdir(
     (tmp_path / "projects" / "reuse99").mkdir(parents=True)
     (tmp_path / "projects" / "reuse99" / "index.html").write_text("<html></html>")
     # sandbox reads as the bare root (binding gap)
-    agent, browser = _bare_agent(tmp_path, "SUCCESS: navigated", monkeypatch)
+    agent, browser = _bare_agent(tmp_path, _NAV_OK, monkeypatch)
     monkeypatch.setattr(
         "ghost_agent.tools.file_system.project_scoped_sandbox",
         lambda ctx, stateful=False: (tmp_path, "/workspace"),
@@ -170,7 +179,7 @@ async def test_stale_fallback_file_does_not_certify(tmp_path, monkeypatch):
     # age it well past the freshness window
     past = time.time() - 4000
     os.utime(stale, (past, past))
-    agent, browser = _bare_agent(tmp_path, "SUCCESS: navigated", monkeypatch)
+    agent, browser = _bare_agent(tmp_path, _NAV_OK, monkeypatch)
     monkeypatch.setattr(
         "ghost_agent.tools.file_system.project_scoped_sandbox",
         lambda ctx, stateful=False: (tmp_path, "/workspace"),
@@ -183,15 +192,16 @@ async def test_stale_fallback_file_does_not_certify(tmp_path, monkeypatch):
 
 async def test_no_entry_page_is_inconclusive(tmp_path, monkeypatch):
     (tmp_path / "lonely.js").write_text("var x = 1;")
-    agent, _ = _bare_agent(tmp_path, "SUCCESS", monkeypatch)
+    agent, browser = _bare_agent(tmp_path, _NAV_OK, monkeypatch)
     assert await agent._execute_web_artifact(["lonely.js"]) is None
+    browser.assert_not_awaited()       # nothing to load — not "loaded and failed"
 
 
 async def test_failed_navigation_is_inconclusive_not_clean(
         tmp_path, monkeypatch):
     (tmp_path / "index.html").write_text("<html></html>")
     agent, _ = _bare_agent(
-        tmp_path, "Error: browser crashed before navigation", monkeypatch)
+        tmp_path, _NAV_ERR + "browser crashed before navigation", monkeypatch)
     assert await agent._execute_web_artifact(["index.html"]) is None
 
 
@@ -359,7 +369,7 @@ async def test_no_web_writes_no_cap():
 # loaded and the corruption shipped behind "WEB-EXEC clean". Every located
 # html page written this turn must now load clean.
 
-def _multi_agent(tmp_path, results_by_url, monkeypatch, default="SUCCESS: navigated"):
+def _multi_agent(tmp_path, results_by_url, monkeypatch, default=_NAV_OK):
     """Agent whose browser mock answers per-URL from ``results_by_url``."""
     agent = GhostAgent.__new__(GhostAgent)
     agent.context = MagicMock()
@@ -379,7 +389,7 @@ def _multi_agent(tmp_path, results_by_url, monkeypatch, default="SUCCESS: naviga
 async def test_second_page_exception_refutes(tmp_path, monkeypatch):
     (tmp_path / "minesweeper.html").write_text("<html></html>")
     (tmp_path / "index.html").write_text("<html></html>")
-    diag = ("SUCCESS: navigated.\n⚠ UNCAUGHT JS EXCEPTIONS (1):\n"
+    diag = (_NAV_OK + "\n⚠ UNCAUGHT JS EXCEPTIONS (1):\n"
             "  • SyntaxError: Unexpected token '='")
     agent, browser = _multi_agent(
         tmp_path,
@@ -410,7 +420,7 @@ async def test_one_unloadable_page_is_inconclusive(tmp_path, monkeypatch):
     (tmp_path / "b.html").write_text("<html></html>")
     agent, _ = _multi_agent(
         tmp_path,
-        {"file:///workspace/b.html": "Error: net::ERR_FILE_NOT_FOUND"},
+        {"file:///workspace/b.html": _NAV_ERR + "net::ERR_FILE_NOT_FOUND"},
         monkeypatch,
     )
     assert await agent._execute_web_artifact(["a.html", "b.html"]) is None
@@ -457,7 +467,7 @@ def _fake_supervisor(monkeypatch, entries, alive=True):
 async def test_fetch_page_probed_via_running_service(tmp_path, monkeypatch):
     (tmp_path / "index.html").write_text(FETCH_PAGE)
     agent, browser = _bare_agent(
-        tmp_path, "SUCCESS: navigated. Title: 'x'", monkeypatch)
+        tmp_path, _NAV_OK, monkeypatch)
     _fake_supervisor(monkeypatch, [
         {"name": "app", "port": 8101, "workdir": "/workspace"}])
     res = await agent._execute_web_artifact(["index.html"])
@@ -471,7 +481,7 @@ async def test_fetch_page_service_exception_refutes_via_http(
     (tmp_path / "index.html").write_text(FETCH_PAGE)
     agent, browser = _bare_agent(
         tmp_path,
-        "Navigated.\nUNCAUGHT JS EXCEPTIONS\nTypeError: DataStore.ready "
+        _NAV_OK + "\nUNCAUGHT JS EXCEPTIONS\nTypeError: DataStore.ready "
         "is not a function", monkeypatch)
     _fake_supervisor(monkeypatch, [
         {"name": "app", "port": 8101, "workdir": "/workspace"}])
@@ -485,20 +495,21 @@ async def test_fetch_page_service_exception_refutes_via_http(
 async def test_fetch_page_without_service_stays_inconclusive(
         tmp_path, monkeypatch):
     (tmp_path / "index.html").write_text(FETCH_PAGE)
-    agent, browser = _bare_agent(tmp_path, "SUCCESS", monkeypatch)
+    agent, browser = _bare_agent(tmp_path, _NAV_OK, monkeypatch)
     monkeypatch.setattr(
         "ghost_agent.sandbox.services.get_service_supervisor",
         lambda sm: None,
     )
     res = await agent._execute_web_artifact(["index.html"])
     assert res is None                 # inconclusive, conf cap applies
+    assert browser.await_count == 0    # …without a file:// load that proves nothing
     assert browser.await_count == 0
 
 
 async def test_fetch_page_dead_service_stays_inconclusive(
         tmp_path, monkeypatch):
     (tmp_path / "index.html").write_text(FETCH_PAGE)
-    agent, browser = _bare_agent(tmp_path, "SUCCESS", monkeypatch)
+    agent, browser = _bare_agent(tmp_path, _NAV_OK, monkeypatch)
     _fake_supervisor(monkeypatch, [
         {"name": "app", "port": 8101, "workdir": "/workspace"}],
         alive=False)
@@ -512,7 +523,7 @@ async def test_fetch_page_longest_workdir_service_wins(tmp_path, monkeypatch):
     proj.mkdir(parents=True)
     (proj / "index.html").write_text(FETCH_PAGE)
     agent, browser = _bare_agent(
-        tmp_path, "SUCCESS: navigated.", monkeypatch)
+        tmp_path, _NAV_OK, monkeypatch)
     _fake_supervisor(monkeypatch, [
         {"name": "root", "port": 8000, "workdir": "/workspace"},
         {"name": "app", "port": 8101,
@@ -527,7 +538,7 @@ async def test_plain_page_still_uses_file_url(tmp_path, monkeypatch):
     # No fetch/XHR → the file:// probe is sufficient; no service lookup.
     (tmp_path / "index.html").write_text("<html><body>static</body></html>")
     agent, browser = _bare_agent(
-        tmp_path, "SUCCESS: navigated.", monkeypatch)
+        tmp_path, _NAV_OK, monkeypatch)
     _fake_supervisor(monkeypatch, [
         {"name": "app", "port": 8101, "workdir": "/workspace"}])
     res = await agent._execute_web_artifact(["index.html"])

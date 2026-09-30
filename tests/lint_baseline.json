@@ -148,7 +148,6 @@
     "unused-variable|src/ghost_agent/core/agent.py|Unused variable 'target_path'": 1,
     "unused-variable|src/ghost_agent/core/calibration.py|Unused variable 'brier_base'": 1,
     "unused-variable|src/ghost_agent/core/dream.py|Unused variable 'challenge_head'": 1,
-    "unused-variable|src/ghost_agent/core/dream.py|Unused variable 'output'": 1,
     "unused-variable|src/ghost_agent/core/dream.py|Unused variable 'slots'": 1,
     "unused-variable|src/ghost_agent/core/isolation.py|Unused variable 'files'": 1,
     "unused-variable|src/ghost_agent/core/replay_engine.py|Unused variable 'out'": 1,

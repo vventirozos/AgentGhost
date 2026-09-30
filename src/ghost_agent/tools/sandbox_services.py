@@ -107,8 +107,10 @@ async def tool_manage_services(action: str = None, name: str = None,
         if action == "stop":
             return _declare(await asyncio.to_thread(sup.stop, name, project_id))
         if action == "restart":
+            # §4KS: restart keeps the stored port; a DIFFERENT one is refused
+            # before anything is stopped (it used to be dropped silently).
             return _declare(await asyncio.to_thread(
-                sup.restart, name, project_id))
+                lambda: sup.restart(name, project_id, port=port)))
         if action == "stop-all":
             return _declare(await asyncio.to_thread(sup.stop_all))
         if action == "adopt":
@@ -199,7 +201,9 @@ MANAGE_SERVICES_TOOL_DEFINITION = {
                         "granted port is exported as the PORT env var — "
                         "bind that (`port=int(os.environ.get('PORT', "
                         "<default>))`). Pass 0 ONLY for a service that "
-                        "listens on no port at all. adopt: REQUIRED — the "
+                        "listens on no port at all. restart: omit — it "
+                        "keeps the stored port (to MOVE a service: stop, "
+                        "then start with the new port). adopt: REQUIRED — the "
                         "port the existing listener holds. "
                         "(8000/8080/8088/9050/9051 are reserved.)"
                     ),

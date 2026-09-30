@@ -132,7 +132,10 @@ def _sanitize_query(query: str) -> str:
     _operands = re.findall(
         r'\b(?:site|inurl|intitle|filetype|ext)\s*:\s*(\S+)', q,
         flags=re.IGNORECASE)
-    q = re.sub(r'\b(?:site|inurl|intitle|filetype|ext)\s*:\s*\S+', ' ', q, flags=re.IGNORECASE)
+    # `-?`: an EXCLUSION (`-site:x.com`) goes with its minus sign — the
+    # operator used to be cut out from under it, leaving a stray `-` in
+    # the query (§4KS).
+    q = re.sub(r'(?<!\w)-?\b(?:site|inurl|intitle|filetype|ext)\s*:\s*\S+', ' ', q, flags=re.IGNORECASE)
     # Drop standalone boolean operators. Case-insensitive but boundary-gated,
     # so only the free-standing token `or`/`and`/`OR`/`AND` goes — never an
     # `or` buried inside a word, and the loss of a stopword in natural prose
@@ -161,7 +164,54 @@ def _sanitize_query(query: str) -> str:
     return mined or query
 
 
-#: URL furniture that carries no search signal once the path is split.
+_SITE_OPERATOR_RE = re.compile(r'(?<!\w)-?\b(?:site|inurl)\s*:\s*(\S+)', re.IGNORECASE)
+
+
+def removed_site_operators(query: str) -> List[str]:
+    """The `site:` / `inurl:` operators `_sanitize_query` removed from a
+    query that has other keywords left — i.e. a restriction the model asked
+    for and did NOT get. Empty when the operator is the whole query (it is
+    then mined for keywords, and the search is about it) and when the query
+    goes out as typed (nothing was removed)."""
+    q = str(query or "")
+    found = [m.group(0).strip().strip('"“”\'()').replace('"', '')
+             for m in _SITE_OPERATOR_RE.finditer(q)]
+    if not found:
+        return []
+    rest = _SITE_OPERATOR_RE.sub(" ", q)
+    rest = re.sub(r'(?<!\w)(?:or|and)(?!\w)', ' ', rest, flags=re.IGNORECASE)
+    if not re.search(r"\w", rest):
+        return []
+    sent = str(_sanitize_query(q) or "").lower()
+    return [op for op in found if op.lower() not in sent]
+
+
+def site_operator_note(query: str) -> str:
+    """One line telling the model its site restriction was not applied.
+
+    §4KS (slack-8f0ef540): `site:blogs.lupyd.com postgres with quic` ran as
+    `postgres with quic`, the results were about quic-go, and nothing said
+    the restriction had been dropped — the model issued six more searches
+    to find out. The engines cannot restrict (or exclude) by site; the
+    honest fix is to SAY so. The note states only that: not which query
+    ran (on a reformulated retry that is a different one, and the result
+    names it itself). (A first version appended the site's name as a
+    keyword instead; measured on real queries it added noise words, leaked
+    IP octets and excluded sites, and made every page on that domain count
+    as on-topic — R1 review. Removed.)"""
+    ops = removed_site_operators(query)
+    if not ops:
+        return ""
+    shown = ", ".join(f"`{o}`" for o in ops[:3])
+    # ⚠ Worded around `strikes._ERROR_LINE_RE`: a note saying the engines
+    # "cannot" restrict made every such search result an ERROR line to the
+    # strike counter and the evidence digest (found live, 2026-09-30).
+    return (f"[Note: these search engines do not support site restrictions — "
+            f"{shown} {'were' if len(ops) > 1 else 'was'} removed, so these "
+            f"results are NOT limited to (or cleared of) that site. To aim at "
+            f"a site, add its name as a plain keyword.]")
+
+
 _OPERAND_STOPWORDS = frozenset({
     "www", "com", "org", "net", "edu", "gov", "io", "co", "uk", "html",
     "htm", "php", "aspx", "index", "http", "https", "amp", "r", "wiki",
@@ -1095,8 +1145,12 @@ def _reformulate_query(query: str) -> List[str]:
         if trimmed and len(trimmed) > 5 and trimmed not in reformulations:
             reformulations.append(trimmed)
     elif words and words[0].lower() not in {"how", "what", "why", "when", "where", "who", "which", "is", "can", "does"}:
-        question = f"how to {query}"
-        reformulations.append(question)
+        # (§4KS: two mechanical alternatives to this form for a KEYWORD
+        # query — its first words, then its "subject" words — were built
+        # and removed; each lost the query's subject on real queries. The
+        # model is told the search failed and is better placed to re-word
+        # it.)
+        reformulations.append(f"how to {query}")
     elif len(words) > 3:
         # Already a question — try simplifying. For a 4-5 word question the
         # first-5-words "simplification" IS the original query; re-running it
@@ -1293,12 +1347,88 @@ async def tool_search(query: Optional[str] = None, anonymous: bool = False, tor_
                 pass
     # Tavily support removed. Always using DDGS.
     out = await tool_search_ddgs(query, tor_proxy)
+    _site_note = site_operator_note(query)
+    if _site_note and isinstance(out, str):
+        from .outcome import append_note
+        out = append_note(out, "\n\n" + _site_note)
     rel = _record_project_findings(context, query, out)
     if rel and isinstance(out, str):
         # Tell the model where the results now live, so it can point a
         # build at them instead of re-searching.
         out = out.rstrip() + f"\n\n(saved to {rel} in the active project — coding leaves read it)"
     return out
+
+#: Query-string keys that carry a SEARCH QUERY. (`search` itself is not
+#: one: `…/passage/?search=Genesis+17` is a document.)
+_SEARCH_PAGE_KEYS = frozenset({
+    "q", "query", "search_query", "keyword", "keywords", "_nkw",
+})
+#: One-letter keys that mean "search" only on a site's ROOT (`/?s=…` is a
+#: WordPress search; `/results?s=2026` is a season).
+_SEARCH_PAGE_ROOT_KEYS = frozenset({"s", "k"})
+#: Sources a research call reads, at most.
+RESEARCH_MAX_SOURCES = 8
+
+
+def is_search_results_url(url: str) -> bool:
+    """A page of SEARCH RESULTS on some site — ``clipzui.cc/?q=turkey+vs+
+    greece``, ``github.com/search?q=…``, ``avito.ru/moskva?q=…`` — rather
+    than a document. Two shapes:
+
+    * a search key in the query string whose value is a QUERY: not a path
+      (``/?q=node/123`` is a Drupal document, ``search?q=cache:site/page`` a
+      cached one) and not a bare number (``/article?q=1``);
+    * ``…/search/…/<words+joined+by+plus>`` — a query in the path.
+
+    It errs toward reading: on the 9,683 URLs in the trajectory store it
+    flags 47 and none is a document, while about 27 site-internal listings
+    with a one-word or hyphenated query (``/search/<slug>``,
+    ``yelp.com/search?find_desc=…``) are not recognised. A document URL
+    that carries a highlight query (``…/details/x?q=term``) would be
+    skipped; none was seen.
+
+    A ``search`` path segment alone is not one (R2 review, measured on the
+    9,624 URLs in the trajectory store: ``developers.google.com/search/
+    docs/…``, ``…/courses/search/postgraduate/<university>/<course>/<id>``
+    and ``…/wiki/Search`` are documents)."""
+    try:
+        from urllib.parse import urlsplit, parse_qsl
+        parts = urlsplit(str(url or ""))
+        path = parts.path or "/"
+        keys = {k.lower() for k, v in parse_qsl(parts.query)
+                if "/" not in v and not v.strip().isdigit()}
+        if keys & _SEARCH_PAGE_KEYS:
+            return True
+        if path == "/" and keys & _SEARCH_PAGE_ROOT_KEYS:
+            return True
+        segs = [seg for seg in path.split("/") if seg]
+        return ("search" in [seg.lower() for seg in segs[:-1]]
+                and bool(re.search(r"\+|%20", segs[-1])))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def select_research_sources(results: List[Dict],
+                            limit: int = RESEARCH_MAX_SOURCES) -> List[Dict]:
+    """The results deep research will actually FETCH and distill.
+
+    §4KS (2026-09-30, req ba2753bb): the first eight results were taken as
+    they came, and two were another site's search-results pages for the
+    query (``clipzui.cc/?q=…``, ``videomon.biz/?q=…``) — "distilled" into
+    facts. A search-results page is not a source; it is skipped BEFORE the
+    limit, so the slot goes to the next result. If that would leave nothing
+    the batch is read as it came.
+
+    Nothing else is dropped. The wave already ranks on-topic results first
+    (§4IL: re-ranked, never dropped); a second rule that left off-topic
+    results unread cut 16.6% of 1,750 replayed real batches and dropped
+    primary sources whose title lacked the query's leading word (both FIA
+    regulation PDFs for an F1 query) — R1 review. Removed."""
+    pool = [r for r in (results or []) if isinstance(r, dict)]
+    kept = [r for r in pool
+            if not is_search_results_url(r.get('href') or r.get('url') or '')]
+    return (kept or pool)[:max(1, int(limit))]
+
 
 def source_block_failed(block: str) -> bool:
     """True when a ``### SOURCE: <url>`` block is one the FETCHER wrote as a
@@ -1371,7 +1501,7 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
             # source vanished and the model was told nothing. Same class
             # this file already fixes at :267, :599 and :916.
             urls = [(r.get('href') or r.get('url') or '')
-                    for r in valid_results[:8]]
+                    for r in select_research_sources(valid_results)]
             urls = [u for u in urls if u]
             break
         if wave == 0:

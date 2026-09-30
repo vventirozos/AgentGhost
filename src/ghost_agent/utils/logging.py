@@ -3,6 +3,7 @@ import datetime
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import textwrap
@@ -338,11 +339,33 @@ def _req_color(req_id: str, origin: Optional[str] = None) -> str:
     return f"\033[38;5;{fam[h]}m"
 
 
+_HEX_WORD_RE = re.compile(r"^[0-9a-fA-F]+$")
+#: A dash-separated part that is a minted hex id: six or more hex characters
+#: with at least one letter (an epoch stamp and an attempt suffix are not).
+_HEX_ID_PART_RE = re.compile(r"^(?=.*[a-fA-F])[0-9a-fA-F]{6,}$")
+
+
 def _req_tag(req_id: str) -> str:
-    """Two-char visual tag derived from the request id."""
+    """Two-char visual tag derived from the request id.
+
+    §4KS: a PREFIXED id that carries a hex id (``bench-39ab…``,
+    ``slack-b4c3…``, ``job-job-7f3a…``, ``sub-leaf-<sha8>-a1``) takes its
+    tag from the LAST such part. The first two characters of the id made
+    every bench request ``BE`` and every Slack request ``SL``, so a LATE
+    verdict line could not be matched to its request when two benches ran
+    an hour apart. What the prefix named is still on the line — the colour
+    family and the frame's origin suffix. A plain hex id, a uuid, and a
+    prefixed id with no hex-id part (``sched-task_…``, ``kg-live``,
+    ``probe-imggen-<epoch>``) keep the first two characters."""
     if req_id == "SYSTEM":
         return "**"
-    return req_id[:2].upper()
+    rid = req_id or ""
+    parts = rid.split("-")
+    if len(parts) > 1 and not _HEX_WORD_RE.match(parts[0]):
+        for part in reversed(parts[1:]):
+            if _HEX_ID_PART_RE.match(part):
+                return part[:2].upper()
+    return rid[:2].upper()
 
 
 # Per-request lifecycle state (start time, monotonic). Lives only between

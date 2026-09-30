@@ -342,6 +342,38 @@
   from the operator's blues. They run exactly like user turns and never teach &mdash;
   see <a href="core/agent.html">core/agent</a>.</p>
 
+  <!-- 4KS:logging -->
+  <h2 id="4ks">Five lines that misreported <span class="tag">2026-09-30 &sect;4KS</span></h2>
+  <ul>
+    <li><strong>Turn Outcome confidence.</strong> <code>context.last_confidence</code> outlives its turn. Sim and Slack turns compute
+    no reading, so their Turn Outcome line printed the previous request's: every sim said 0.88 until a user turn computed 0.78, then
+    every sim and every member turn said 0.78. The reading is now stamped with its request
+    (<code>_set_last_confidence</code>) and the line prints it only for that request (<code>_turn_confidence</code>); otherwise the
+    field is omitted.</li>
+    <li><strong>A lone <code>&lt;</code> in thinking.</strong> The display filter dropped every token that was just
+    <code>&lt;</code> as a possible <code>&lt;think&gt;</code> opener, so "x &lt; 71" was shown as "x 71". Whether it opens a tag is
+    only known from the next token: <code>ThinkTagDisplayFilter</code> holds it for one token and shows it unless the next one
+    continues a think tag. Display only; the recorded text never lost it.</li>
+    <li><strong>Request tags.</strong> The two-character tag was the first two characters of the id, so every bench request was
+    <code>BE</code> and every Slack request <code>SL</code>. A prefixed id that carries a hex id &mdash; a dash-separated part of
+    six or more hex characters with at least one letter &mdash; now takes its tag from the last such part:
+    <code>bench-39ab&hellip;</code> &rarr; <code>39</code>, <code>slack-b4c3&hellip;</code> &rarr; <code>B4</code>,
+    <code>job-job-7f3a&hellip;</code> &rarr; <code>7F</code>, <code>sub-leaf-3fa2b1c9-a1</code> &rarr; <code>3F</code>. Plain hex
+    ids, uuids, and prefixed ids with no such part (<code>sched-task_&hellip;</code>, <code>sub-chess-&lt;digits&gt;</code>, <code>kg-live</code>,
+    <code>probe-imggen-&lt;epoch&gt;</code>, if_bench's <code>probe-ifb-&hellip;</code>) keep their first two characters. The origin
+    is still on the line as the colour family and the frame suffix.</li>
+    <li><strong>Macro Mint.</strong> The skills-auto phase re-walks the same trajectories every idle cycle and printed the same
+    sixteen "skipped" lines each time. A skip is printed the first time this process sees that candidate and reason
+    (<code>report_macro_mint_skip</code>, the one emitter of that line); a repeat is silent.</li>
+    <li><strong>A streamed turn.</strong> Its trajectory was stored with duration 0.0 (the request clock is closed by the time the
+    drain records) and the stream showed no reply. The drain now passes the wall-clock it measured and prints
+    <code>Final Reply</code> &mdash; before the record, so a recorder fault cannot drop the line.</li>
+  </ul>
+  <p>The router's reason for a decision it did not escalate read "high-confidence hard (conf=0.41)" for anything above the 0.30
+  threshold; it now says the score cleared the threshold.</p>
+  <p class="note">Pins: <code>tests/test_4ks_log_review_fixes.py</code> (blocks I, K, L, M, N, O).</p>
+  <!-- /4KS:logging -->
+
 </main>
 </body>
 </html>
