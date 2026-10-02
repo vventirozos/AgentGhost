@@ -2,6 +2,15 @@ import pytest
 from unittest.mock import MagicMock, AsyncMock
 from ghost_agent.tools.tasks import tool_schedule_task, tool_list_tasks, tool_stop_task
 
+@pytest.fixture(autouse=True)
+def _runner_hook(monkeypatch):
+    """Every test here needs the proactive-task runner wired (main.py does it
+    at boot). One test used to set it by assignment and the next one relied on
+    that leak (§4KW: found once conftest stopped leaks between tests)."""
+    from ghost_agent.tools import tasks
+    monkeypatch.setattr(tasks, "run_proactive_task_fn", MagicMock())
+
+
 @pytest.fixture
 def mock_scheduler():
     scheduler = MagicMock()
@@ -13,9 +22,6 @@ def mock_scheduler():
 
 @pytest.mark.asyncio
 async def test_schedule_task_cron(mock_scheduler, mock_context):
-    from ghost_agent.tools import tasks
-    tasks.run_proactive_task_fn = MagicMock()
-    
     mock_context.scheduler = mock_scheduler
     
     # Actual sig: tool_schedule_task(task_name, prompt, cron_expression, scheduler, memory_system)

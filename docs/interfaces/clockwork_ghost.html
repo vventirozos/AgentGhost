@@ -34,7 +34,12 @@
   <div class="scroll"><table>
     <thead><tr><th>Endpoint</th><th>Purpose</th></tr></thead>
     <tbody>
-      <tr><td><code>POST /api/chat</code></td><td>Streaming chat. SSE chunks accumulated in <code>conversation_history</code>; sentence boundaries (<code>.?!</code>) push to TTS queue.</td></tr>
+      <tr><td><code>POST /api/chat</code></td><td>Streaming chat, with a <code>session_id</code> (the conversation is durable on the agent) and an <code>X-Request-ID</code> minted by the client (so the turn can be stopped before its first frame). The stream is read to its end; replies are spoken sentence by sentence through <code>speech.SpeechChunker</code>. See <a href="#4ku">§4KU</a>.</td></tr>
+      <tr><td><code>GET /api/sessions</code> · <code>/api/sessions/{id}</code></td><td>Restore this device's conversation at startup; <code>/sessions</code> and <code>/open N</code>.</td></tr>
+      <tr><td><code>POST /api/turn/cancel</code></td><td>Stop — by this turn's own request id, never "whatever is running".</td></tr>
+      <tr><td><code>GET /api/turns</code></td><td>Every 15&nbsp;s: is the agent reachable (the status dot), and does a turn that is not ours hold the lock (the face's second breath).</td></tr>
+      <tr><td><code>POST /api/feedback</code></td><td>A rating for the last reply (<code>source: "clockwork"</code>).</td></tr>
+      <tr><td><code>GET /api/notifications/pending</code> · <code>POST …/ack</code></td><td>Every 60&nbsp;s, consumer <code>clockwork</code>: what the agent did while nobody was asking.</td></tr>
       <tr><td><code>POST /api/workspace/save · /load</code></td><td>State zip.</td></tr>
       <tr><td><code>POST $STT_SERVER_URL</code> → <code>https://eva:8080/api/stt</code></td><td>multipart audio upload (<code>arecord</code> writes 16&nbsp;kHz mono WAV — already the wanted format). Needs <code>X-Ghost-Key</code>.</td></tr>
       <tr><td><code>POST $TTS_SERVER_URL</code> → <code>https://eva:8080/api/tts</code></td><td>JSON text → <code>audio/wav</code>, piped to <code>aplay -q -</code>. Needs <code>X-Ghost-Key</code>.</td></tr>
@@ -54,13 +59,16 @@
     <code>overlay</code> above it.
   </p>
   <ul>
-    <li><strong>Top row</strong>: workspace (<code>◇</code>/<code>◆</code>), face-form cycle
-      (<code>◈</code>), fullscreen-face toggle (<code>◐</code>/<code>○</code>).</li>
+    <li><strong>Top row</strong>: rate the last reply (<code>▲ GOOD</code> / <code>▼ BAD</code>) on
+      the left; on the right <code>◇ LOAD</code> and <code>◆ SAVE</code> (two chips — the single
+      one flipped from load to save and could not load once anything had been said),
+      <code>◈ FORM</code>, <code>◐ FACE</code>. Every chip carries a word since 2026-10-01.</li>
     <li><strong>Middle</strong>: <code>left_widget</code> → the transcript, as real
       <code>QLabel</code> bubbles (operator right, agent left). <strong>This is the only item in
       the column with a stretch factor.</strong></li>
-    <li><strong>Bottom row</strong>: text input (with up/down history) sharing one row with camera
-      snap, push-to-talk, TTS toggle and the stats readout.</li>
+    <li><strong>Bottom row</strong>: text input (with up/down history) sharing one row with
+      <code>■ STOP</code> (shown only while a turn runs), camera snap, push-to-talk, TTS toggle
+      and the status readout.</li>
   </ul>
 
   <h3 id="fullscreen">Fullscreen face (<code>◐</code> / F11)</h3>
@@ -169,18 +177,29 @@
   </ul>
 
   <h3>Camera</h3>
-  <p><code>CameraPreviewDialog</code> via OpenCV <code>VideoCapture</code> on <code>/dev/video0</code> at 1920×1080 60 fps MJPG. Ctrl+Esc snaps a frame; the user can optionally upload + add a prompt.</p>
+  <p><code>CameraPreviewDialog</code> via OpenCV <code>VideoCapture</code> on <code>/dev/video0</code> at 1280×720 MJPG (<code>GHOST_CAM_W</code>/<code>_H</code>/<code>_FPS</code>), previewed about 15 times a second. It was forced to 1920×1080 at 60&nbsp;fps with a 16&nbsp;ms timer — a 6&nbsp;MB frame converted on the UI thread of a CM4 up to 60 times a second. With no camera attached the dialog says so (it used to be a black rectangle and a dead CAPTURE button), and every way out of it — including the Escape key, which used to skip the cleanup — releases the camera. Ctrl+Esc snaps a frame; the user can optionally upload + add a prompt.</p>
 
   <h3>Input shortcuts</h3>
   <ul>
-    <li><code>Esc</code> — toggle PTT recording.</li>
+    <li><code>Esc</code> — tap to toggle recording, or hold to talk and let go to send.</li>
     <li><code>Alt+Esc</code> — toggle TTS.</li>
     <li><code>Ctrl+Esc</code> — snap camera.</li>
-    <li>Slash commands: <code>/clear</code>, <code>/shutdown</code>, <code>/reboot</code>, <code>/exit</code>.</li>
+    <li><code>Shift+Esc</code> — stop the running turn (again to force).</li>
+    <li><code>PgUp</code> / <code>PgDn</code>, or <code>Shift+↑</code> / <code>Shift+↓</code> — scroll the transcript.</li>
+    <li><code>Ctrl+↑</code> / <code>Ctrl+↓</code> — rate the last reply good / bad.</li>
+    <li><code>F11</code> — face only (any key returns).</li>
+    <li>Slash commands — <code>/help</code> lists them: <code>/new</code> (<code>/clear</code>),
+      <code>/stop</code>, <code>/sessions</code>, <code>/open N</code>, <code>/good</code>,
+      <code>/bad [why]</code>, <code>/bright</code>, <code>/vol</code>, <code>/tts</code>,
+      <code>/face</code>, and <code>/shutdown</code>, <code>/reboot</code>, <code>/exit</code>, which must be
+      typed twice. The rules for what counts as a command are in <a href="#4ku-commands">§4KU</a>.</li>
   </ul>
 
   <h3>Stats</h3>
-  <p>Timer every 5 s reads battery from <code>/sys/class/power_supply/*/capacity</code> and shows time + battery + network icon.</p>
+  <p>Timer every 5 s: <code>● ▂▄▆  ⚡ 100%  10:30 AM</code>. The dot is the <em>agent</em> (green when it
+  answered the last poll, red when it did not, dim before the first), the bars are wifi quality from
+  <code>/proc/net/wireless</code>, the bolt appears only while charging (it used to be printed always),
+  and the percentage turns red under 15% on battery. All of it is <code>devstatus.status_html</code>.</p>
 
   <h3>Concurrency</h3>
   <p><code>qasync.QEventLoop</code> wraps the QApplication so asyncio and Qt cooperate. Async tasks for <code>audio_fetch_task()</code>, <code>audio_worker_task()</code>, <code>send_chat_request()</code>. Signal/slot pattern for cross-thread UI updates.</p>
@@ -189,8 +208,9 @@
   <p>
     The three QPainter faces below were <strong>removed</strong>. The handheld now runs the
     <em>same</em> <code>matrix_graph.js</code> the browser does (<code>webface.py</code> +
-    <code>webface/</code>), so it gets the thermal two-pole palette, all eight forms
-    (abyssal · horizon · cortex · vortex · lattice · stack · embedding · descent), the immersion
+    <code>webface/</code>), so it gets the thermal two-pole palette, every form the browser has
+    (cube · tesseract · vortex · descent · empty since 2026-09-22; eight different ones when this
+    shipped), the immersion
     dive, pulses and error flinches — and future work on the web face lands here for free instead
     of the two drifting into forks. The <code>◈</code> chip now cycles <em>forms</em> rather than
     swapping renderers.
@@ -389,15 +409,242 @@
   <div class="note warn"><strong>Deploy note:</strong> the LIVE client on the device is
   <code>~/bin/client.py</code> (launched by <code>~/bin/launch_ghost.sh</code>, which sources the
   <code>~/gui_env</code> venv and sets <code>QT_QPA_PLATFORM=xcb</code>) — <em>not</em>
-  <code>~/clockwork_ghost/</code>. Deploy with <code>scp</code> to <code>~/bin/client.py</code>, keeping a
-  timestamped backup, and restart with
-  <code>setsid env DISPLAY=:0 XAUTHORITY=~/.Xauthority ~/bin/launch_ghost.sh</code>. Always diff the
-  device copy against the repo copy first — device-deployed externals can drift. The API key lives at
+  <code>~/clockwork_ghost/</code>. Deploy with <code>deploy.sh</code>, never by hand: it stages the
+  build in <code>~/bin/.stage</code>, compiles and <strong>probes it there</strong>
+  (<code>device_probe.py</code>), and installs only if that passes (<a href="#4ku-deploy">§4KU</a>).
+  ⚠ Since 2026-10-01 the launcher <em>restarts a crashed client</em>: to stop the client by hand,
+  kill <code>launch_ghost.sh</code> first, then the client — a hand relaunch on top of a live
+  launcher is two clients fighting over one GPU. Always diff the device copy against the repo copy
+  first — device-deployed externals can drift. The API key lives at
   <code>~/.ghost_api_key</code> (mode 600).</div>
 
   <footer><a href="../index.html">← Back to index</a></footer>
   <h2 id="4kp-hold">A reply flagged <code>reasoning_unparsed</code> <span class="tag">2026-09-29 &sect;4KP</span></h2>
   <p>Same contract as the CLI: on <code>{"ghost": {"reasoning_unparsed": true}}</code> the client holds the reply &mdash; neither shown nor spoken &mdash; until the stream's own <code>[DONE]</code>, then emits and speaks <code>strip_orphan_think_close(reply)</code> (a copy of the agent's rule, pinned by the parity table). Speech cannot be taken back, which is why the hold exists. An error frame is now shown (the client used to ignore it); reading continues, because the agent may still send its fallback sentence after an abort frame, but a held reply is never released after one. The stream is read one SSE line at a time (<code>aiter_lines</code>). Unflagged replies stream and speak as before.</p>
+
+  <h2 id="4ku">The UI/UX pass <span class="tag">2026-10-01 &sect;4KU</span></h2>
+  <p>
+    A review of the client on the device (code, a screenshot, CPU samples) found five visible
+    defects and a dozen daily-use gaps; fixing them found two worse ones that had been there all
+    along. What changed, and where each piece lives:
+  </p>
+
+  <h3>Where the logic went</h3>
+  <p>
+    <code>client.py</code> and <code>chatlog.py</code> import PyQt6, which exists only on the
+    handheld, so nothing in them can be executed by the test suite. The decisions were therefore
+    moved out into five modules that import no Qt and are unit-tested
+    (<code>tests/test_clockwork_ux.py</code>):
+  </p>
+  <div class="scroll"><table>
+    <thead><tr><th>Module</th><th>What it decides</th></tr></thead>
+    <tbody>
+      <tr><td><code>markup.py</code></td><td>What a bubble draws: markdown &rarr; HTML, chat-sized
+        typography per tag, wrapping for code and long unbroken runs, escaping.</td></tr>
+      <tr><td><code>speech.py</code></td><td>What is said aloud (<code>SpeechChunker</code>), and
+        the chime.</td></tr>
+      <tr><td><code>devstatus.py</code></td><td>Battery, wifi, the status readout, backlight,
+        volume, the panel, and the face's frame rate.</td></tr>
+      <tr><td><code>agentapi.py</code></td><td>Sessions, stop, ratings, notifications, frame
+        parsing, error wording.</td></tr>
+      <tr><td><code>commands.py</code></td><td>What counts as a slash command, and which must be
+        typed twice.</td></tr>
+    </tbody>
+  </table></div>
+  <p>
+    What only a real Qt can show is checked by <code>device_probe.py</code>
+    (<a href="#4ku-deploy">below</a>).
+  </p>
+
+  <h3>Two crashes that were already there</h3>
+  <ul>
+    <li><strong>A turn that failed before its first token killed the client.</strong>
+      <code>ChatLog.end_agent</code> removed the empty waiting bubble by looking up
+      <code>bubble.parentWidget().layout()</code> &mdash; which is not the bubble's row but the
+      transcript's whole column &mdash; and unparenting it. The next message added to the log
+      segfaulted. That path runs whenever the agent is unreachable, answers an HTTP error, or
+      refuses the key: exactly when the client most needs to stay up. Reproduced on the device
+      against the build then live. The bubble now removes its own row.</li>
+    <li><strong>Every turn left the stream half-closed.</strong> The loop did
+      <code>break</code> at <code>[DONE]</code>, which leaves httpx's chain of async generators
+      suspended; qasync installs no async-generator finalizer, so they were torn down by the
+      garbage collector mid-await ("async generator ignored GeneratorExit", anyio's "exit cancel
+      scope in a different task"). It went unseen because the client's stderr went nowhere. The
+      loop now reads to the end of the stream, which the agent closes straight after
+      <code>[DONE]</code>.</li>
+  </ul>
+  <p>
+    Also fixed in the stream loop: a frame whose <code>choices</code> is an empty list (the usage
+    frame) raised <code>IndexError</code> out of the stream. Frame parsing is
+    <code>agentapi.frame_content</code> now and accepts any shape.
+  </p>
+
+  <h3>The transcript</h3>
+  <ul>
+    <li><strong>Bubbles shrink again.</strong> <code>QLabel.sizeHint()</code> is expanded to the
+      widget's <code>minimumSize()</code>, so once <code>fit()</code> had pinned a width the
+      "natural" width could never come back smaller. Every reply opens as a waiting caption
+      (~540&nbsp;px), so every short answer stayed 540&nbsp;px wide ("Hello!": 540&nbsp;px after
+      a caption, 120&nbsp;px fresh). <code>fit()</code> releases the pin before measuring.</li>
+    <li><strong>Nothing is clipped.</strong> A word-wrapped QLabel wraps at word boundaries only
+      and a <code>&lt;pre&gt;</code> not at all: a 1,078&nbsp;px code line in a 670&nbsp;px column
+      ran off the edge with no way to scroll to it. Code is
+      <code>white-space: pre-wrap</code> (indentation kept), and a run of more than 40
+      non-space characters gets a zero-width break every 20. ⚠ Those breaks are real characters:
+      text <em>copied</em> out of a bubble carries them.</li>
+    <li><strong>The view follows new content only while you are at the bottom.</strong> It used
+      to jump to the end on every streamed token. Scrolling up stops the following; returning to
+      the bottom (or sending) resumes it. <code>PgUp</code>/<code>PgDn</code> and
+      <code>Shift+↑/↓</code> scroll from the input, which never loses focus.</li>
+    <li>The agent's bubbles may take 70% of the width (was 56% &mdash; a briefing left nearly half
+      the panel empty); the operator's stay at 56%. <code>GHOST_BUBBLE_AGENT</code> /
+      <code>GHOST_BUBBLE_USER</code>.</li>
+    <li>The operator's own text is escaped (a typed <code>&lt;</code> used to be swallowed as
+      markup), as are error messages, notification text and session titles.</li>
+  </ul>
+
+  <h3>One turn at a time, and a way to stop it</h3>
+  <p>
+    There was no guard: Enter during a reply started a second stream into the same bubble.
+    Every message now goes through <code>_submit</code>, which refuses while a turn runs
+    &mdash; at the moment of commitment, because the camera dialog is modal and a turn can start
+    underneath it. The text stays in the input.
+  </p>
+  <p>
+    <code>■ STOP</code> / <code>Shift+Esc</code> / <code>/stop</code> cancels the turn
+    <em>on the agent</em> (<code>/api/turn/cancel</code>), by the request id this client minted
+    for it and nothing else. The first press asks the agent to stop at its next boundary; a second
+    forces it. ⚠ An earlier draft fell back, on a 404, to "the turn in my session" and "the turn
+    whose text starts like mine" and a reviewer cancelled a browser's turn with it; a 404 now
+    only ever leads to one retry of the <em>same</em> id (the turn may not have registered yet).
+  </p>
+
+  <h3>Sessions</h3>
+  <p>
+    The conversation used to live only in the process: a restart, a crash or a reboot lost it.
+    Every turn now carries a <code>session_id</code> (kept in <code>~/.ghost_session_id</code>),
+    the agent stores the conversation under it, and the client restores it at startup.
+    <code>/new</code> (or <code>/clear</code>) starts a <em>new id</em> &mdash; reusing the old
+    one would bring every earlier message back into the next turn. <code>/sessions</code> lists
+    recent conversations from any client and <code>/open N</code> continues one, which is how a
+    chat started in the browser is picked up on the handheld.
+  </p>
+
+  <h3 id="4ku-commands">Commands</h3>
+  <p>
+    The old test was <code>text.startswith('/clear')</code>: <code>/clearly that is wrong</code>
+    wiped the conversation and <code>/shutdown</code> powered the device off on Enter. The rule
+    now turns on what <em>follows</em> the word (<code>commands.parse</code>):
+  </p>
+  <ul>
+    <li>a command alone, or with the argument it takes &rarr; the command;</li>
+    <li>a no-argument command followed by one stray word (<code>/stop it</code>) &rarr; nothing
+      runs, the text stays in the input;</li>
+    <li>a command word followed by a <em>sentence</em> (<code>/new idea: use a queue</code>,
+      <code>/help me fix the parser</code>) &rarr; a message, and it is sent;</li>
+    <li>an unknown word alone, or a near miss with one argument (<code>/hlep</code>,
+      <code>/brigth 5</code>) &rarr; answered locally with a suggestion, text kept;</li>
+    <li>anything with a second slash (<code>/etc/hosts</code>) &rarr; a message.</li>
+  </ul>
+  <p><code>/shutdown</code>, <code>/reboot</code> and <code>/exit</code> must be typed twice
+    within 10&nbsp;s, with nothing else in between.</p>
+
+  <h3>Voice</h3>
+  <ul>
+    <li><strong>What is spoken.</strong> The old splitter read everything: code symbol by symbol,
+      table rows, URLs. <code>SpeechChunker</code> skips fenced code and tables, reads a link as
+      its label and a bare URL as "a link" &mdash; and gives the same utterances however the
+      token stream is cut (the tests fuzz that).</li>
+    <li><strong>Barge-in.</strong> Starting a recording stops playback and drops what was queued,
+      and nothing is queued while recording (the agent used to talk into the open microphone).</li>
+    <li><strong>A moment to correct.</strong> A transcript sits in the input for 2.5&nbsp;s
+      (<code>GHOST_STT_REVIEW_S</code>) before it sends itself; any key but Enter stops the
+      countdown. In face-only mode it sends at once.</li>
+    <li><strong>Tap or hold.</strong> A tap of Esc toggles the recording (tap again to send);
+      Esc <em>held</em> for 0.4&nbsp;s or more (<code>GHOST_PTT_HOLD_S</code>) is push-to-talk
+      &mdash; letting go sends. ⚠ Holding Esc used to be a storm: a QShortcut auto-repeats while
+      its key is held and this one is a toggle, so the recording started and stopped some
+      twenty-five times a second, each stop uploading the file the next start was already
+      rewriting ("STT Error: Too much data for declared Content-Length", eleven in a row on the
+      device). No shortcut auto-repeats now, every recording has a file of its own, and the clip
+      is read into memory and its file removed before the upload begins. A recording shorter
+      than 0.3&nbsp;s is a slip of the key and is not uploaded.</li>
+    <li>The PTT chip shows elapsed time, and a recording ends itself at 120&nbsp;s
+      (<code>GHOST_PTT_MAX_S</code>) &mdash; a tapped recording can be left on by accident.</li>
+    <li>A voice failure is shown once in the transcript; it used to be a <code>print()</code> per
+      sentence into a log that did not exist.</li>
+  </ul>
+
+  <h3>The face: slower when nobody is looking</h3>
+  <p>
+    Measured with nothing happening, before: client 47% of a core, web renderer 32.5%, compositor
+    and XWayland about 8% &mdash; the face redrawing at full rate behind glass that re-blends on
+    every frame. <code>devstatus.face_rate</code> now picks a rate from activity:
+  </p>
+  <div class="scroll"><table>
+    <thead><tr><th>State</th><th>Rate</th><th>Knob</th></tr></thead>
+    <tbody>
+      <tr><td>turn in flight, speech, recording, or input in the last 45&nbsp;s</td><td>full</td>
+        <td><code>GHOST_FACE_IDLE_S</code></td></tr>
+      <tr><td>idle</td><td>10&nbsp;fps (5 on battery)</td>
+        <td><code>GHOST_FACE_IDLE_FPS</code> / <code>GHOST_FACE_BATTERY_FPS</code></td></tr>
+      <tr><td>idle past 600&nbsp;s (the panel has blanked)</td><td>paused</td>
+        <td><code>GHOST_FACE_SLEEP_S</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>
+    Measured at the 10&nbsp;fps cap on the device: client 18&ndash;19%, renderer 12%, compositor and
+    XWayland about 3% &mdash; roughly 33% of a core in place of 88%. The cap is
+    <code>webface/throttle.js</code>, a wrapper around <code>requestAnimationFrame</code> loaded
+    before the face module (which stays a byte-for-byte copy of the browser's). Two things about
+    it: it is a <em>ceiling</em> (10 draws about 9), and below 20&nbsp;fps the face runs in
+    <em>slow motion</em>, not just choppily, because <code>matrix_graph.js</code> clamps a time
+    step at three frames. Any key lifts the cap at once.
+  </p>
+  <p>
+    The face also now gets the browser's signal layer &mdash; a gait per step class, a kick per
+    tool call, a comet per recall, a verdict-shaped release, a second breath while a background
+    turn holds the lock &mdash; from the log lines the client already received
+    (<code>turnstatus.face_signals_for_ticker</code>, a port of <code>app.js</code>'s; the test
+    runs the original under node and compares).
+  </p>
+
+  <h3>Small things the kiosk could not do</h3>
+  <ul>
+    <li><code>/bright 1-9 | + | -</code> (never 0: at zero the panel is black and the command to
+      undo it is typed blind) and <code>/vol 0-100 | + | - | ±N</code>.</li>
+    <li>A reply that lands on a dark panel wakes it (<code>wlopm --on</code>), and chimes if the
+      turn took 20&nbsp;s or more or the panel was off (<code>GHOST_CHIME_AFTER_S</code>, 0 = off;
+      never when replies are spoken).</li>
+    <li><code>▲ GOOD</code> / <code>▼ BAD</code> (<code>Ctrl+↑/↓</code>, <code>/good</code>,
+      <code>/bad why</code>) rate the last reply through <code>/api/feedback</code>. Off while a
+      new reply is arriving, and for a reply the agent filed no trajectory for.</li>
+    <li>What the agent did while nobody was asking
+      (<code>/api/notifications/pending</code>, consumer <code>clockwork</code>) appears in the
+      transcript, and is spoken when TTS is on. The ack rules are the Slack bot's.</li>
+  </ul>
+
+  <h3 id="4ku-deploy">Launcher and deploy</h3>
+  <ul>
+    <li><strong><code>launch_ghost.sh</code> owns the log and restarts a crash.</strong> The
+      autostart entry ran it with its output going nowhere, so after an ordinary boot
+      <code>/tmp/ghost_ui.log</code> did not exist. It now writes the log itself (the previous
+      run is kept as <code>.1</code>) and restarts the client when it <em>crashes</em>: exit 0
+      (<code>/exit</code>), 130 and 143 (a deliberate signal) stop; anything else restarts, with
+      a doubling wait, and five crashes in a row give up.</li>
+    <li><strong><code>deploy.sh</code> stages, probes, then installs.</strong> The build is
+      copied to <code>~/bin/.stage</code>, compiled, and <code>device_probe.py</code> is run
+      there; only if it passes is anything installed. The launcher is replaced by rename (it is a
+      running script), the three newest backups are kept, and the restart is confirmed by the
+      <em>same pid six seconds apart</em> and no <code>CRASHED</code> line &mdash; "a client is
+      alive" passed on a crash loop, because the launcher had restarted it.</li>
+    <li><strong><code>device_probe.py</code></strong> builds the real <code>MainWindow</code>
+      offscreen on the device, with the WebGL face replaced by a recorder and the agent by a fake
+      served from a thread, and drives real turns through it: 98 checks. It replaces the three
+      things the client does to the device (killing playback, running helpers, power commands)
+      with recorders, so it is safe beside the live client. Broken on purpose 29 ways, it failed
+      29 times.</li>
+  </ul>
 </main>
 </body>
 </html>

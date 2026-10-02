@@ -97,6 +97,112 @@ def _detect_paragraph_loop(reasoning_buf: str) -> bool:
     return False
 
 
+# --- sentence-frame run detector (thinking channel only) --------------------
+# §4KV (req slack-124c85b8, 2026-10-01): a loop that repeats one sentence
+# FRAME with one word changing — "I will check for any genius he has been
+# praised as. I will check for any genius he has been admired as. …" — never
+# repeats a 200-char window and never repeats a line, so both probes above
+# stayed silent for 15,564 chars / 47.6 s (about 290 sentences) until the
+# model happened to emit the same word six times. The same request's second
+# loop ("I will stop. I will exit. I will finish. …") ran 4,014 chars.
+#
+# The signature is the run: N newest completed PROSE sentences in a row that
+# open with the same two words. Measured on the main loop's reasoning in the
+# detailed log (5,775 healthy turns of 300+ chars, 49 killed ones), at EVERY
+# sentence end, not only on the probe's 500-char cadence (whose phase drifts
+# in production): the longest such run in any healthy turn is 5; the two
+# slack-12 loops die between about 1,600 and 2,150 chars at every phase
+# (instead of 15,564 and 4,014).
+#
+# What does NOT count, by construction — each of these ENDS a run:
+#   * a line that ends without sentence punctuation (a data row, a code
+#     line, a heading): enumerating forty log rows is work, not a loop;
+#   * a sentence that does not open with a letter (a bullet of any glyph, a
+#     quoted line, a numbered item): twenty "- Test that …" bullets are a plan;
+#   * a sentence whose DIGITS differ from the run's: "For i = 3, total
+#     becomes 6." then "For i = 4, …" — a hand simulation or a case table
+#     varies an INDEX, the loops this probe exists for vary a WORD (review,
+#     §4KV: twenty iterations of a hand simulation fired the first cut; the
+#     corpus's longest healthy run, 12, was one). Digits that stay the SAME
+#     through the run ("… the 2024 laureate has been praised as.") are part
+#     of the frame and count (second review: refusing every digit let the
+#     slack-12 loop escape with one year added to it);
+#   * a sentence shorter than the opener.
+# A script written without spaces yields no two-word opener and the probe
+# abstains. NOT caught, left to the other probes and the hard cap: sentences
+# that end in `."`, `.)` or `.**`; a frame with an abbreviation in it ("Dr. "
+# reads as a sentence end); two frames alternating; one stray sentence every
+# nineteen; sentences averaging over 300 chars (twenty do not fit the window). A density rule that catches the last two fired on 3 healthy turns.
+#
+# Known cost: reasoning that legitimately writes twenty sentences in a row
+# with one opener and no moving number is killed — a drafted anaphora, "If
+# the input is …" over twenty cases, "The server on port 8080 …" twenty
+# times. None in the corpus (longest: 5, "Let me …" planning).
+#
+# THINKING CHANNEL ONLY, MAIN LOOP ONLY — same reasons as the paragraph
+# probe above; it has not been measured on coding-leaf spec thinking. (The
+# corpus is the log's copy of the reasoning, which flattens line breaks
+# inside a block: real streams have MORE line structure, and every
+# line-structure rule here can only end a run.)
+SENTENCE_RUN_THRESHOLD = 20        # consecutive same-opener sentences = loop
+SENTENCE_RUN_OPENER_WORDS = 2      # the opener is the first N words
+SENTENCE_RUN_TAIL = 6_000          # only the newest N chars are examined
+
+# Where a piece ends: a sentence terminator followed by whitespace, or a line
+# break. Pieces are cut BETWEEN boundaries in one linear pass. Two patterns
+# were quadratic and are pinned out: one that matched whole sentences
+# ("[^.!?\n]*[.!?]+(?=\s)", 200 ms a probe on a punctuation-free data
+# dump) and a greedy terminator run ("[.!?]+(?=\s)", 145 ms on a window of
+# punctuation with no whitespace).
+_SENTENCE_END_RE = re.compile(r"[.!?](?=\s)|\n")
+_DIGITS_RE = re.compile(r"\d+")
+
+
+def _sentence_opener_run(reasoning_buf: str) -> int:
+    """Length of the run of newest COMPLETED prose sentences that open with
+    the same ``SENTENCE_RUN_OPENER_WORDS`` words (case-folded). The trailing,
+    possibly still-streaming fragment is never counted."""
+    tail = reasoning_buf[-SENTENCE_RUN_TAIL:]
+    pieces, start = [], 0
+    for m in _SENTENCE_END_RE.finditer(tail):
+        pieces.append(tail[start:m.end()])
+        start = m.end()
+    # (The window's first piece may be cut mid-sentence. It is read last, and
+    # by then it can only end a run or lengthen one that already fills the
+    # whole window — nothing to correct.)
+    run, key = 0, None
+    for piece in reversed(pieces):
+        s = piece.strip()
+        if not s:
+            continue                   # a blank line is not a sentence
+        if s[-1] not in ".!?":
+            break                      # a row / code line / heading: not prose
+        if not s[0].isalpha():
+            break                      # a list item, a quoted line
+        words = s.split()
+        if len(words) < SENTENCE_RUN_OPENER_WORDS:
+            break                      # a fragment
+        # The frame: its opener AND its digits. An index that moves is not
+        # the same frame; a constant year or version number is.
+        frame = (" ".join(words[:SENTENCE_RUN_OPENER_WORDS]).lower(),
+                 tuple(_DIGITS_RE.findall(s)))
+        if key is None:
+            key = frame
+        elif frame != key:
+            break
+        run += 1
+    return run
+
+
+def _detect_sentence_run_loop(reasoning_buf: str) -> bool:
+    """True when the thinking stream's newest ``SENTENCE_RUN_THRESHOLD``
+    completed sentences all open with the same two words — a frame loop.
+    O(tail) per probe; runs on the n-gram probe's cadence."""
+    if not reasoning_buf:
+        return False
+    return _sentence_opener_run(reasoning_buf) >= SENTENCE_RUN_THRESHOLD
+
+
 # --- tool-call generation-collapse detector ---------------------------------
 # Qwen has been observed emitting 8000+ consecutive `<tool_call>` tokens with
 # zero `</tool_call>` / `<function>` / `<parameter>`, burning 300+ s of decoder

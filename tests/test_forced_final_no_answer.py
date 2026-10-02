@@ -529,17 +529,21 @@ async def test_the_announcement_nudge_fires_once_and_a_real_answer_is_untouched(
     agent2, ctx2 = _agent(monkeypatch, [_resp("The sender is unknown; the card shows no name."), _resp("(unreachable)")])
     out2, _, _ = await agent2.handle_chat({"messages": [{"role": "user", "content": "who is the sender?"}]}, FakeBgTasks())
     assert ctx2.llm_client.chat_completion.await_count == 1 and "unknown" in out2
-    # after a tool ran, an announcement-only reply is the §4GH shape: it ships and the shape check refutes it —
-    # this nudge is for the ZERO-tool turn only
+    # §4KW (2): after a tool ran, an announcement-only reply gets the same single nudge — the §4GH shape
+    # refute it was left to does not run for a member and, live (async critic), lands NEXT turn while the
+    # announcement ships now (7 reached users)
     agent3, ctx3 = _agent(monkeypatch, [
         _resp("Let me search.", [_tc("c0", "web_search", {"query": "revolut"})]),
         _resp("Let me search more specifically for the sender domain."),
+        _resp("The sender domain is not in any result."),
         _resp("(unreachable)"),
     ])
-    await agent3.handle_chat({"messages": [{"role": "user", "content": "find the sender domain"}]}, FakeBgTasks())
+    out3, _, _ = await agent3.handle_chat({"messages": [{"role": "user", "content": "find the sender domain"}]}, FakeBgTasks())
+    seen = []
     for c in ctx3.llm_client.chat_completion.call_args_list:
         p = c.kwargs.get("messages") or (c.args[0].get("messages") if c.args and isinstance(c.args[0], dict) else c.args[0])
-        assert all(_ANNOUNCED_WORK_DIRECTIVE not in str(m.get("content")) for m in p)
+        seen.append(any(_ANNOUNCED_WORK_DIRECTIVE in str(m.get("content")) for m in p))
+    assert seen[:2] == [False, False] and True in seen[2:], seen
 
 
 def test_the_caveat_only_banner_is_a_system_note():

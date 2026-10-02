@@ -433,6 +433,37 @@
   <h2>Test builders (2026-07-07, #26)</h2>
   <p>The suite (~6,500 tests) had accreted heavy per-file duplication — measured 22 separate <code>def agent()</code> fixtures, ~94 files hand-constructing <code>GhostAgent</code>, 233 <code>SimpleNamespace</code> fakes, 17 copies of a <code>FakeBgTasks</code> shim — each re-deriving the same <code>GhostContext</code> shape. That coupled the suite to the monolith's internals, so any constructor change fanned out across ~90 files (which actively deterred the <a href="core/agent.html">agent.py</a> extraction). <code>tests/helpers.py</code> centralizes the shape: <code>make_context(**overrides)</code> (a fully-wired, inert <code>GhostContext</code> mock with every field overridable), <code>make_agent(**overrides)</code> (a real <code>GhostAgent</code> built through the normal <code>__init__</code> so init-time wiring is exercised), and the shared <code>FakeBgTasks</code>. Both are exposed as the <code>agent_context</code> / <code>built_agent</code> conftest fixtures. New tests use these; existing session-named files migrate opportunistically when touched. Covered by <code>tests/test_canonical_builders.py</code>.</p>
 
+  <h2 id="4kw-test-isolation">One test's state is not the next test's <span class="tag">2026-10-02 &sect;4KW</span></h2>
+  <p>The full suite runs with <code>-n 8 --dist loadfile</code>: every file shares a process with whichever files xdist packed
+  beside it. Seven <code>test_claim_binding_verifier.py</code> tests failed in some full runs and never alone: two other files
+  <code>importlib.reload</code> the verifier, which rebuilds <code>VerifyVerdict</code>, and an <code>is</code> comparison against the
+  class imported at collection then failed. A per-file leak detector over the whole suite found the wider class: files left
+  environment variables (<code>GHOST_VERIFY_TWO_STAGE=1</code>, a stale <code>GHOST_HOME</code>) and rebound module globals
+  (<code>core.agent.request_id_context = MagicMock()</code>, the logging mirror bound to a test's temp file, the foresight
+  singleton, the task-runner hooks) for every later file; one test (<code>test_schedule_task_interval</code>) passed only because an
+  earlier test leaked the hook it needed.</p>
+  <ul>
+    <li><code>tests/conftest.py</code> <code>_StateIsolation</code>, a global plugin: after each test, <code>os.environ</code> and every
+    rebound global of a loaded <code>ghost_agent</code> module (a reload's rebuilt classes included) are restored to the baseline.
+    What a session/module/class fixture's setup or teardown changes &mdash; and only that, measured as a diff around it &mdash; is
+    folded into the baseline (a first cut folded the whole state at teardown and kept the last test's leaks in 37 files). Registered
+    globally because a conftest-level hook is not called for session-scoped fixtures, whose node is above <code>tests/</code>.</li>
+    <li><strong>Contents</strong> of every module-level <code>dict</code>/<code>list</code>/<code>set</code>/<code>deque</code> are restored
+    too, in place (other modules hold the same object), compared by member identity. A measurement found 44 such containers carrying
+    one file's entries into the next (the search result cache, notify rate-limit timestamps, the experiment-registry cache, the optim
+    loader's epochs and pins). Excluded, by name and pinned to exist: containers that hold or record LIVE state outside the module
+    &mdash; the one-time patch of the <code>ddgs</code> library (restoring it produced "patch NOT applied" warnings), open database
+    connections and their locks (database, project-advancer locks), references keeping running asyncio tasks alive. The egress
+    guard's <code>_INSTALLED</code>/<code>_ORIGINALS</code> globals are likewise never restored: they describe a socket class the guard
+    has patched, and restoring them left a patched socket with no originals (<code>KeyError</code> on the next connect). Cost: a few
+    milliseconds per test.</li>
+    <li>Not covered: attributes a test adds; mutation one level deeper (a dict inside a dict); state outside <code>ghost_agent</code>
+    modules; env set at collection time &mdash; measured, and all of it deliberate (test modules point the push/UI/VAPID files at temp
+    paths for the whole worker). One script set an env var at import through a module fixture; that fixture now restores it.</li>
+    <li>One test (<code>test_tasks_extended.py::test_schedule_task_interval</code>) passed only because an earlier test leaked the
+    task-runner hook; it now sets it itself.</li>
+  </ul>
+
   <footer><a href="index.html">← Back to index</a></footer>
 </main>
 </body>

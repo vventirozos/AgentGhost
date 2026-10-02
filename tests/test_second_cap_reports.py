@@ -178,7 +178,11 @@ async def test_two_caps_then_a_report_turn_that_goes_back_to_work_ships_the_hone
          patch("ghost_agent.core.agent.get_active_tool_definitions",
                return_value=[{"function": {"name": "noop"}}]):
         final, _, _ = await agent.handle_chat(body, FakeBgTasks())
-    assert calls["n"] == 4                      # cap, cap → report turn → retry → fallback
+    # §4KV: no tool has run when the first cap lands on this non-coding
+    # request, so the retry is the no-think ANSWER turn — which this fake
+    # answers with a tool call (it runs: tools are still on), and the
+    # second cap comes one turn later.
+    assert calls["n"] == 5        # cap → answer retry (runs noop) → cap → report turn → retry → fallback
     assert "ATTEMPT_ABORTED" not in final
     from ghost_agent.core.reply_shape_check import FALLBACK_HEADS
     assert FALLBACK_HEADS["no_answer"][:40] in final

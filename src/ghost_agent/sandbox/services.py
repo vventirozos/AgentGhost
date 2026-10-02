@@ -166,10 +166,10 @@ def remote_access_hint(port: int) -> str:
     )
 
 
-# ⚠ The service texts below go into TOOL RESULTS that `strikes.error_line`
-# reads line by line for failure words (`cannot`, `failed`, `not found`, …):
-# a warning that says "cannot" turns a successful start into an error line
-# for the strike counter and the evidence digest (found live, §4KS).
+# (The service texts below go into TOOL RESULTS. Until §4KT the evidence
+# digest read every line of them for failure words, and a warning that said
+# "cannot" made a successful start an "error hit"; a service report is
+# content now and is not scanned — the plain wording is kept.)
 def unpublished_port_warning(port: int, published_ports: Optional[set] = None,
                              spec: Optional[str] = None,
                              command: Optional[str] = None,

@@ -35,7 +35,13 @@ class TestEmitClosuresNotVerboseGated:
         # The old gate was `if not _glog.VERBOSE_MODE: return`. A comment
         # may legitimately mention VERBOSE_MODE — assert the CODE gate.
         assert "_glog.VERBOSE_MODE" not in body
-        assert "pretty_log(\"thinking\"" in body or "pretty_log('thinking'" in body
+        # §4KV: the three emissions go through ONE logger, `_log_shown`
+        # (it picks the title: "thinking", or "drafting" for a reply written
+        # with thinking off) — the gate must be absent there too.
+        assert body.count("_log_shown(block)") == 2
+        shown = self._closure_src("_log_shown")
+        assert "_glog.VERBOSE_MODE" not in shown
+        assert "pretty_log(\"thinking\"" in shown and "pretty_log(\"drafting\"" in shown
 
     def test_flush_thinking_not_gated(self):
         body = self._closure_src("_flush_thinking")
@@ -81,6 +87,9 @@ class TestPrettyLogPipelineForThinking:
         import inspect
         import ghost_agent.core.agent as agent_mod
         src = inspect.getsource(agent_mod)
-        # All three thinking emissions must carry the exemption.
-        assert src.count('pretty_log("thinking"') == 3
-        assert src.count("no_truncate=True") >= 3
+        # Every emission must carry the exemption. §4KV: the three emit
+        # sites share one logger with two titles — both carry it.
+        assert src.count('pretty_log("thinking", block, icon=Icons.BRAIN_THINK, '
+                         'level="DEBUG", no_truncate=True)') == 1
+        assert src.count('pretty_log("drafting", block, icon=Icons.LLM_REPLY, '
+                         'level="DEBUG", no_truncate=True)') == 1

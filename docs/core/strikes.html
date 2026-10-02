@@ -97,6 +97,45 @@
     different target or a different result is its own observation, <code>note_world_changed</code> still forgets everything, and a caller
     that never opens a batch keeps the old counting. Pinned in <code>tests/test_breaker_batch_duplicates.py</code>.
   </p>
+  <!-- 4KT:error-line -->
+  <h2 id="4kt">The error line is for program output, not content <span class="tag">2026-09-30 &sect;4KT</span></h2>
+  <p>
+    <code>error_line</code> scanned every line of every tool result for failure words (<code>cannot</code>, <code>failed</code>,
+    <code>not found</code>, <code>*Error</code>, &hellip;). For a script's output that is the point (&sect;4IB: the script caught its
+    own error and printed it under exit 0). For everything else it read the <em>subject</em> of the result as a failure: measured on
+    the 9,119 tool results in the trajectory corpus, 96 of 1,750 successful searches ("terror" in a news snippet, "not found" in a
+    man page), 324 of 761 loaded pages (a page's own console <code>[error]</code> lines), 450 of 1,399 file reads, 134 of 571 project
+    records and 81 of 135 introspect lines yielded an "error line" &mdash; and the evidence digest listed a note appended to a clean
+    search under "Distinct errors hit" on the first live turn after &sect;4KS.
+  </p>
+  <p>
+    <code>error_line(output, tool=&hellip;)</code> now asks what kind of result it is reading. A declared failure wins first (a
+    <code>ToolOutcome</code> whose status is not OK &mdash; FAILED, REJECTED, PARTIAL &mdash; or a result the turn loop marked
+    <code>[FAILURE BANNER] &lt;label&gt;</code>): never the loop's marker or label (the R1 review found the digest printing
+    <code>[FAILURE BANNER] Traceback (most recent call last):</code> where it used to print the <code>ModuleNotFoundError</code>
+    underneath). For program output the line named is the LAST failure-word line; for a content tool it is the declared head
+    (a browser status or its message, a failure prefix) or else the FIRST failure-word line &mdash; the tool's own statement,
+    which precedes its hint prose, console bullets and file snippets (the R2 review found the last line naming the
+    <code>--- HINT ---</code> sentence on 80 of 212 corpus browser failures). A browser <em>interact</em> failure keeps a
+    <code>STATUS: OK</code> header, and its <code>ACTIONS: 2 OK, 1 error</code> summary and a <code>NOTE:</code> nudge come before the
+    per-action lines, so a declared interact failure is named by its first <code>[n] ERR &hellip;</code> action (R3 review: 11 of 11
+    corpus interact failures were named by the summary; the runner's implicit-goto abort is index <code>-1</code>, R4). Fingerprints
+    also collapse <code>http(s)://</code> and <code>file://</code> URLs now (one <code>net::ERR_HTTP2_PROTOCOL_ERROR</code> was eleven
+    keys, one per page; quotes stay outside the URL so a quoted literal after a quoted URL still collapses), and the exception
+    signature accepts Playwright's bare <code>Error</code> class &mdash; only when no named class such as <code>ValueError</code> follows
+    (R5: a bare label before the class would otherwise split the &sect;4IE harness shape), and with the runner's parenthesised
+    <code>(Error):</code> folded to <code>Error:</code>. <code>PROGRAM_OUTPUT_TOOLS</code> (<code>execute</code>, <code>jobs</code>) &mdash; and
+    an unnamed caller &mdash; keep the scan, last failure line wins. Any other tool returns content and fails only by what it
+    declares: a status, the banner, a failure head (<code>tool_failure.result_is_failure</code> &mdash; the turn loop's own
+    vocabulary, not a third one) or a browser <code>STATUS: ERROR/BLOCKED</code>. The exception-name alternative is now case-sensitive: <code>ValueError</code>
+    and <code>error:</code> match, "terror" does not. After the change the success-shaped false positives are 0 and the execute
+    exit-0 class keeps 220 of its 221 hits. Both consumers &mdash; the evidence digest and the execute same-error breaker &mdash;
+    pass the tool name; an AST pin fails if a caller omits it.
+  </p>
+  <p class="note">Pins: <code>tests/test_4kt_strikes_and_recorder.py</code> (verbatim corpus heads, the declared-status rule on both
+  sides, the digest at its call site, the enumeration).</p>
+  <!-- /4KT:error-line -->
+
 </main>
   <p><strong>The error is the exception, not the label in front of it (§4IE, 2026-09-17).</strong> Second re-test of the IFS/Oxford ask (probe <code>ifs18371…</code>): 36 <code>execute</code> runs, most of them probe harnesses printing one line per attempt — <code>dict npts=31: ERR RuntimeError: SpecError: [pl]</code>, <code>ERR  dict nxacc=16: RuntimeError: SpecError: [pl]</code> — all exit 0, all the same dead end. The labels are UNQUOTED, so the quoted-literal collapse never applied and every run fingerprinted as a new error: no steer at 3, no report at 5, 39 turns to the reserved report. <code>exception_signature(line)</code> now cuts the error line at its first exception name (<code>_EXC_TOKEN_RE</code>: <code>RuntimeError</code>, <code>eckit.SpecError</code>, <code>ModuleNotFoundError</code>…) and <code>error_line_fingerprint</code> hashes that; a line naming no exception (<code>not found</code>, a traceback header) is kept whole. Pins: <code>tests/test_same_error_probe_labels.py</code>.</p>
   <p><strong>A rewrite that reproduces the error is not progress (§4IG, 2026-09-17).</strong> Fourth re-test (probe <code>ifs19450…</code>): six runs ended in the identical <code>RuntimeError: SpecError: [pl]</code>, yet the same-error breaker never fired — each run followed a NEW probe file (probe6.py … probe19.py) and <code>StrikeLedger.note_world_changed</code>, right for the no-progress class where a mutation makes a re-observation legitimate, wiped the same-error count with every write. It now keeps the signatures <code>is_same_error_signature</code> recognises (target ending in <code>SAME_ERROR_TARGET_SUFFIX</code>): that count grows only when the same error line recurs, and a rewrite that fixed it produces a different line. Pins: <code>tests/test_same_error_survives_writes.py</code>.</p>

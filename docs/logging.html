@@ -374,6 +374,55 @@
   <p class="note">Pins: <code>tests/test_4ks_log_review_fixes.py</code> (blocks I, K, L, M, N, O).</p>
   <!-- /4KS:logging -->
 
+  <!-- 4KT:turn-outcome -->
+  <h2 id="4kt">Streamed turns print a Turn Outcome line, and rows carry their temperature <span class="tag">2026-09-30 &sect;4KT</span></h2>
+  <p>
+    <strong>Turn Outcome on streamed turns.</strong> The line existed only on the non-streamed finalize path; a web-UI turn (which
+    streams) ended with <code>Final Reply</code> and no success/fail summary, and had no entry in the ring a late verdict corrects.
+    The line is now printed by one method, <code>_emit_turn_outcome_line</code>, from both paths: the same label rule
+    (<code>_turn_outcome_label</code>: refute &gt; shape FAILED &gt; verifier PASS &gt; terminal execution failure; budget exhaustion
+    as a note and a WARNING), the same "recovered N strike(s)" / "honestly reported" suffix, the same confidence stamp, and the same
+    correction ring. On the streamed path no inline verdict exists (the stream gate's verdict is late), so the label is
+    execution- and shape-based and the late verdict corrects it through the ring, as on every turn. It is printed after the
+    calibration record, as on finalize: the emitter's shape re-label joins the turn's calibration sample, and the confidence stamp
+    it prints is written by that record. A streamed turn returns from inside the turn loop, so it is never a budget-exhausted
+    (for-else) turn and carries no such flag.
+  </p>
+  <p>
+    <strong>Trajectory temperature.</strong> Every recorded user, probe and leaf row (2,993 of 2,993) carried the schema default
+    <code>temperature: 0.0</code> while the turns ran at 1.0 (conversational) or 0.6 (tool turns). The recorder now stores the
+    temperature of the request that produced the reply (<code>_sampling_temperature(payload)</code>), on both the finalize and the
+    streamed path; a row with no request behind it (an aborted turn) keeps the default. A reply no model sampled (a fallback
+    sentence, an abort marker) records the last request's temperature, which is the closest thing to true.
+  </p>
+  <p class="note">Pins: <code>tests/test_4kt_strikes_and_recorder.py</code> (a real non-streamed turn's row against the logged
+  <code>Temp</code>, the streamed drain's line, level, ring entry and budget note, one emitter reached from both paths).</p>
+  <!-- /4KT:turn-outcome -->
+
+  <!-- 4KV:drafting -->
+  <h2 id="4kv">A reply is not a thought <span class="tag">2026-10-01 &sect;4KV</span></h2>
+  <p>
+    The turn loop mirrors the model's stream to the log as it arrives. Content that arrives with no reasoning was mirrored under
+    the same title and icon as reasoning, and counted in the same counter: request <code>slack-124c85b8</code>'s report turn ran
+    with thinking <em>off</em>, and its 597-char reply appeared as three <code>&#128173; thinking</code> lines followed by
+    <code>thought &mdash; reasoning: 125 tokens / 0 chars | content: 597 chars</code>.
+  </p>
+  <ul>
+    <li><strong><code>drafting</code> (&#129302;, <code>Icons.LLM_REPLY</code>).</strong> When the payload switched thinking off
+    (<code>thinking_disabled(payload)</code>: a report turn, a thinking-loop retry), mirrored content is the reply being written
+    and is logged under this title. With thinking <em>on</em>, reasoning-less content keeps the <code>thinking</code> title: it may
+    be reasoning that lost its opener (&sect;4KP), and the runtime cannot tell. The icon is one every client already maps
+    (Slack: "LLM responding&hellip;").</li>
+    <li><strong>The <code>thought</code> line counts each channel.</strong>
+    <code>reasoning: N tokens / C chars | content: M tokens / D chars | T s</code> &mdash; chunks counted where they arrive, not
+    where they are displayed.</li>
+    <li><strong>The liveness probe skips both titles.</strong> <code>verifier.outcomes</code> excluded <code>thinking &mdash;</code>
+    lines because the model's prose about the verifier is not the verifier running; a drafted reply is the same prose.</li>
+  </ul>
+  <p class="note">Pins: <code>tests/test_4kv_slack12_fixes.py</code> (the report turn's lines and counts through a real turn; the
+  thinking-on cases; the probe).</p>
+  <!-- /4KV:drafting -->
+
 </main>
 </body>
 </html>

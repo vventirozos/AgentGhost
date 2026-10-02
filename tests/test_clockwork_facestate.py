@@ -9,6 +9,7 @@ Like turnstatus.py, facestate.py is deliberately Qt-free, so this imports the
 real module instead of reading its source.
 """
 
+import re
 import sys
 from pathlib import Path
 
@@ -99,8 +100,16 @@ def test_write_is_atomic_and_leaves_no_litter(state):
 
 # ── validation against the face's own FORMS list ────────────────────────────
 def test_known_forms_are_read_from_the_deployed_face_module():
+    """The roster is whatever the face module beside the client declares — it
+    was eight forms in August and five after the 2026-09-20/22 rework, and a
+    count or a name pinned here goes stale the next time it changes. So the
+    parser is held to a second, looser reading of the same array: every quoted
+    name in it must come back, none dropped."""
     forms = fs.known_forms(_FACE_DIR)
-    assert "descent" in forms and "vortex" in forms and len(forms) >= 8
+    src = (_FACE_DIR / "matrix_graph.js").read_text()
+    declared = re.findall(r"'([^']+)'", re.search(r"const FORMS = \[(.*?)\];", src, re.S).group(1))
+    assert declared, "no FORMS array in the face module"
+    assert forms == declared
 
 
 def test_the_fallback_is_a_form_the_face_actually_has():
@@ -110,14 +119,22 @@ def test_the_fallback_is_a_form_the_face_actually_has():
 def test_a_form_that_no_longer_exists_is_dropped(state):
     """A form renamed in matrix_graph.js would otherwise be handed to
     `setForm`, which no-ops silently and leaves the face on the JS default."""
-    fs.save_form("tesseract", path=state)
+    gone = "renamedaway"
+    # The stand-in must be a well-formed name the roster lacks, or the None
+    # below is the corruption check answering instead ("tesseract" stood here
+    # until it became a real form on 2026-09-22).
+    assert gone not in fs.known_forms(_FACE_DIR)
+    assert fs.save_form(gone, path=state) is True
     assert fs.load_form(face_dir=_FACE_DIR, path=state) is None
     assert fs.startup_form(face_dir=_FACE_DIR, path=state, env={}) == fs.FALLBACK_FORM
 
 
 def test_a_real_form_passes_validation(state):
-    fs.save_form("embedding", path=state)
-    assert fs.load_form(face_dir=_FACE_DIR, path=state) == "embedding"
+    # Drawn from the roster, never named: "embedding" stood here and was
+    # removed from the face.
+    for real in fs.known_forms(_FACE_DIR):
+        fs.save_form(real, path=state)
+        assert fs.load_form(face_dir=_FACE_DIR, path=state) == real
 
 
 def test_unparseable_face_module_does_not_reject_the_memory(state, tmp_path):

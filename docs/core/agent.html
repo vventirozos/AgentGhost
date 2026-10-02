@@ -1535,6 +1535,138 @@
   <p>
     <strong>A brace count is not a finish reason.</strong> <code>salvage_truncated_plan</code> logged "TRUNCATED at max_tokens" for every unparseable, unbalanced planner reply. Live, a 3,647-char reply with one unescaped quote — nowhere near the 8,192-token cap, whose real hits run 25–37&nbsp;k chars — was reported as a cap cut; 4 of 84 such labels in the corpus could not have been. The diagnosis now follows the response's <code>finish_reason</code> (the salvage is unchanged), and only a <em>real</em> cap hit arms a one-turn steer in the next planner tail asking for changed tasks only — safe because <code>TaskTree.load_from_json</code> is a stateful merge by id. Covered by <code>tests/test_planner_truncation_diagnosis.py</code>.
   </p>
+
+  <!-- 4KV:slack-12 -->
+  <h2 id="4kv">One Slack request, read end to end <span class="tag">2026-10-01 &sect;4KV</span></h2>
+  <p>
+    Request <code>slack-124c85b8</code>: a channel member's one-line remark, the twelfth message of a thread, took 70&nbsp;s and
+    four model calls and was answered with a concession about a point from five hours earlier. Eight defects, each fixed as a
+    class. Three of them are in the log and the accounting (see <a href="../logging.html#4kv">logging</a> and
+    <a href="llm.html#4kv">the LLM client</a>); the five below are in the turn loop.
+  </p>
+  <p>
+    <strong>A loop the guards could not see.</strong> "I will check for any genius he has been praised as. I will check for any
+    genius he has been admired as. &hellip;" repeats no 200-char window (the n-gram probe) and no line (the paragraph probe): it ran
+    15,564 chars / 47.6&nbsp;s. <code>stream_guards._detect_sentence_run_loop</code> is the third probe on the reasoning channel of the
+    main loop: it fires when the newest <code>SENTENCE_RUN_THRESHOLD</code> (20) completed prose sentences all open with the same
+    two words. Four things <em>end</em> a run, so that work is not mistaken for a loop: a line that ends without sentence
+    punctuation (a data row, a code line, a heading); a sentence that does not open with a letter (a bullet of any glyph, a quoted
+    line); a sentence whose digits differ from the run's ("For i = 3, total becomes 6." then "For i = 4, &hellip;" &mdash; a hand
+    simulation varies an index, the loop varies a word; digits that stay the same, a year or a version, are part of the frame);
+    and a one-word fragment. Calibrated on the reasoning in the detailed log, at every sentence end: across 5,775
+    healthy turns the longest such run is 5 and nothing fires; both slack-12 loops die at about 2,000 chars at any probe phase
+    (were 15,564 and 4,014). The pass is linear and bounded by a 6,000-char tail. Known cost: twenty sentences in a row
+    with one opener and no moving number (a drafted anaphora) are killed. Not caught: a frame with an abbreviation in it
+    ("Dr. " reads as a sentence end), two frames alternating, sentences that end in <code>."</code>. Not used in the coding executor (not measured there), and never on the content
+    channel.
+  </p>
+  <p>
+    <strong>The label on the message the context block rides.</strong> With <code>GHOST_PIN_TOOL_SCHEMAS=1</code> the stable block
+    is prefixed onto the conversation's <em>first</em> user message, and was followed by <code>[USER INSTRUCTION]</code>
+    unconditionally &mdash; in a thread, the opening question from hours ago, under a block that says "focus entirely on the user
+    instruction". Turn&nbsp;1 set out to answer it. <code>_carrier_label</code> now writes <code>[USER INSTRUCTION]</code> only when
+    the carrier message's text is the pending request (or, when only one user message arrived, contains it &mdash; an image part
+    is flattened into a note before the block is placed); otherwise a label that is true of any message
+    (<code>[CONVERSATION START &mdash; the request to answer now is the user's MOST RECENT message &hellip;]</code>; on the unpinned
+    path, <code>[NEWEST MESSAGE &hellip;]</code> on a tool result). The label depends only on the request, so the pinned prefix is
+    byte-identical across a request's turns. <em>Not measured:</em> thirty replays of turn&nbsp;1 with each label produced no
+    misread at all, so the replay cannot show that the label caused it &mdash; the change stands on the label having been false.
+  </p>
+  <p>
+    <strong>After the first kill, on a turn that has observed nothing.</strong> The steer orders "ONE grounding tool call" &mdash;
+    right for a debugging loop, which is missing an observation. Before any tool has run on a request that is not a coding task,
+    the loop was the model drafting its reply, and the order invents work: replayed 15 times on this thread it produced a web
+    search about a named person's marriage 14 times. That case now gets <code>thinking_loop_answer_steer</code> (the request
+    quoted; "your next output is the reply itself &mdash; or exactly ONE tool call, only if the reply needs a fact you do not
+    have") and the one turn that reads it runs with thinking off, tools on. <code>loop_retry_is_no_think</code> recognises that
+    turn from the history itself &mdash; the newest assistant message is the abort note and a user message after it is that steer
+    exactly as built for this request &mdash; so there is no flag to go stale, and a user who pastes the steer's words cannot
+    switch their own turn's thinking off. (It holds until the assistant next records a message: a reply the loop discards
+    unrecorded &mdash; the checklist nudge &mdash; is regenerated under the same switch.) Replayed 20 times: 18 direct replies,
+    2 searches, no second loop (19 and 1 with the final wording);
+    with thinking left on, two wordings re-looped 5 times in 30. A coding request, or a loop after a tool has run, keeps the
+    grounding steer and keeps thinking. "Coding request" is <code>detect_coding_intent</code>, an English keyword test: a coding
+    request it does not recognise gets the answer steer, which still allows the one tool call.
+  </p>
+  <p>
+    <strong>The forced report says whose it is and which request it serves.</strong> The report turn (thinking off) read "your
+    reasoning entered a self-repeating loop &hellip; be specific and honest" as the user's complaint and answered <em>that</em>.
+    Every <code>blocker_report_alert</code> (seven sites, each passing the loop's <code>last_user_content</code>) now carries
+    <code>_ALERT_PROVENANCE</code> ("from the runtime, not from the user &hellip; do not reply to it, agree with it or apologise
+    for it") and the request line the refute directive already used (<code>_which_request_line</code>). The thinking-loop
+    breaker asks for the <em>answer</em> (<code>answer_first</code>): a thinking loop is the one breaker with no blocker in the
+    world, and a remark deserves a reply, not a three-part work report. Replayed 30 times per text on the real report turn: the
+    old ask shipped a third-person report 4 times, facts the search had not found 4 times and a stale concession once (9/30); the
+    new one, none (0/30, and 0/30 again after the review reworded two clauses).
+  </p>
+  <p>
+    <strong>The record.</strong> The thinking-loop breaker stamps the request
+    (<code>stamp_loop_breaker(&hellip;, "thinking_loop")</code>) like the cross-turn and member-refusal breakers, so the corpus
+    files it under rule&nbsp;1b (a behavioural failure, never upgraded) and the Turn Outcome line reads <code>failed</code>
+    instead of <code>ok &middot; recovered 1 strike(s)</code>. <em>Left as it was:</em> the same branch's six-strike halt
+    ("Think-Loop Halt") appends a steer ordering a tool call and then forces a final &mdash; but the Strike Cap at the top of the
+    next iteration tests the same count and aborts first, so that final never generates (found in review; a pin records it).
+  </p>
+  <p class="note">Pins: <code>tests/test_4kv_slack12_fixes.py</code> &mdash; the request's own two reasoning streams
+  (<code>tests/fixtures/4kv_slack12_thinking_loops.json</code>, the two real names replaced), the whole sequence driven through
+  <code>handle_chat</code> against a scripted streaming model, and AST enumerations of the alert sites. Operator decision (2026-10-01): the agent may search about anything; no guard is built, and the steer change above removes an
+  <em>ordered</em> tool call, not the model's freedom to search.</p>
+  <!-- /4KV:slack-12 -->
+
+  <!-- 4KW:announced-work -->
+  <h2 id="4kw">A reply that only announces work, asked about instead of listed <span class="tag">2026-10-02 &sect;4KW</span></h2>
+  <p>
+    The &sect;4IW guard gives the model one continuation when a turn that ran no tool ends on an announcement ("Let me search&hellip;",
+    "&Theta;&alpha; &kappa;&alpha;&nu;&omega; &#941;&nu;&alpha; poster&hellip;"). Its detector is a list of openers and work verbs; on the recorded
+    corpus it caught 1 of the 4 real announcements among 155 tool-free replies. Overnight it missed two: a member was told
+    "I'll make a poster" and had to write "you didn't provide a poster"; another got "Let me research this specifically." and
+    no research.
+  </p>
+  <p>
+    <code>core/announced_work.worker_finds_announcement</code> asks the small worker model one bounded question &mdash; does the reply
+    end by announcing work it did not do? &mdash; only when the list says no, only for a reply of at most 800 characters, and only
+    when no tool ran. A YES triggers the same single continuation ("make the tool call(s) now, or answer directly"). No worker,
+    a failed or slow call (8&nbsp;s budget) or an answer that is not YES/NO keeps the old behaviour. Measured before shipping
+    (Gemma&nbsp;4 E4B): 4/4 real announcements and 0 false alarms on the other 151 corpus replies (a first wording flagged clarifying
+    questions three times and was replaced); on a hand-written held-out set, three runs, 9/12 announcements and 0/16 false alarms.
+    Cost: about 1&nbsp;s on each checked reply (median, uncached; 1.4&nbsp;s p90; 0.7&ndash;1.1&nbsp;s live), paid inside the turn and
+    bounded at 3&nbsp;s (<code>CHECK_BUDGET_S</code>) <em>by cancellation from outside</em>: as <code>route()</code>'s own timeout the
+    budget either fell under the client's 3&nbsp;s request floor (the call was declined before it left the process, every time) or,
+    above it, turned a slow answer into a ReadTimeout that counts as a node fault &mdash; and the worker shares its circuit breaker
+    with the critic, so three slow checks could take the critic off the node for 60&nbsp;s. A cancelled call is never counted
+    against the node; <code>route()</code> keeps its ordinary 12&nbsp;s timeout. A wording with the fixed question first, to let the worker cache it, was
+    measured and rejected: no faster, and 24 instead of 11 YES on the tool-turn replies, mostly false alarms.
+  </p>
+  <p>
+    <strong>When it is not asked</strong> (review): again about the same reply text, more than twice per request (a NO about one
+    reply says nothing about a different reply a later regeneration writes, so a changed text is asked about once more), or once the
+    older pending-promise steer has fired (one "you only promised" nudge per request, from either guard); on self-play and bench turns (nobody waits, and the
+    worker is the critic's node too); on the &sect;4KV no-think retry after a thinking loop (its continuation would run with
+    thinking back on, the setting that re-looped 5 times in 30); and with <code>GHOST_ANNOUNCED_WORK_CHECK=0</code>.
+  </p>
+  <p>
+    <strong>The outcome line of a turn with no row.</strong> A request a loop breaker closed is FAILED (corpus rule 1b); the line
+    read that from the trajectory row, so a turn that records none (a sim) printed <code>ok &middot; recovered N strike(s)</code> over
+    the breaker and the fallback it shipped. <code>_emit_turn_outcome_line</code> now reads the breaker stamp itself.
+  </p>
+  <p>
+    <strong>Also after a tool ran (same day).</strong> &sect;4IW checked only tool-free turns and left an announcement after real
+    tool calls to the &sect;4GH shape refute &mdash; which does not run for a channel member and, live (async critic), lands on the
+    NEXT turn while the announcement ships now. Asked over the 617 recorded tool-turn replies of at most 800 characters, the worker
+    flagged 11: 7 real announcements that had reached users (a member told "&Theta;&alpha; &kappa;&alpha;&tau;&epsilon;&beta;&#940;&sigma;&omega; &mu;&iota;&alpha;
+    &kappa;&alpha;&theta;&alpha;&rho;&#942; &phi;&omega;&tau;&omicron;&gamma;&rho;&alpha;&phi;&#943;&alpha; &hellip; &kappa;&alpha;&iota; &theta;&alpha; &xi;&alpha;&nu;&alpha;&phi;&tau;&iota;&#940;&xi;&omega; &tau;&eta;&nu;
+    &epsilon;&iota;&kappa;&#972;&nu;&alpha;", "Let me try alternative sources"), one false alarm ("Shall I proceed …?") and three shapes this
+    guard never sees. The guard now runs on those turns too, and the worker is told that tools ran. The directive no longer says
+    "nothing happened" (on such a turn something did) but "the step it announces did not happen".
+  </p>
+  <p>
+    <strong>The outcome line without a row, completed.</strong> Besides the breaker stamp, the line now reads the corpus's first rule
+    itself &mdash; an <code>[ATTEMPT_ABORTED_*]</code> marker in the reply &mdash; so a sim that shipped one no longer prints
+    <code>ok &middot; recovered 2 strike(s)</code> (18 such sims in the log). It reads the reply <em>as recorded</em>: on finalize the
+    previous turn's correction banner is prepended after the record, and a banner that quotes a marker does not fail this turn.
+  </p>
+  <p class="note">Pins: <code>tests/test_4kw_announced_work_and_outcome.py</code>.</p>
+  <!-- /4KW:announced-work -->
 </main>
 
   <h2 id="4kd-clarify">Clarify-first after a costly tool turn <span class="tag">2026-09-24 &sect;4KD</span></h2>

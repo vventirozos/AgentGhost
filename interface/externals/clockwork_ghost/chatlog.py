@@ -15,11 +15,15 @@ it needs while a long one wraps at the cap.
 Layout mirrors the web UI: the operator's messages align RIGHT, the agent's
 LEFT, system notes centre, and everything floats over the face with nothing
 opaque behind it.
+
+The typography (``style_markup``) lives in ``markup.py``, which is Qt-free and
+therefore unit-tested; what is left here is the part only a real Qt can check,
+and ``device_probe.py`` checks it on the handheld at every deploy.
 """
 
 from __future__ import annotations
 
-import re
+import os
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -27,61 +31,29 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from markup import SANS, soften_long_tokens, style_markup
 
-# Prose is set in a SANS face; only the operator's own input, inline code and
-# code blocks stay monospace. This mirrors the web UI, where agent messages
-# inherit the sans body font and `.message.user` overrides to mono — reading a
-# briefing in 21px monospace is what made long answers feel wrong.
-SANS = "'DejaVu Sans', 'Liberation Sans', 'Cantarell', 'Noto Sans', sans-serif"
-
-# Markdown → HTML arrives as bare <h2>/<p>/<ol>, and Qt's rich text applies its
-# OWN defaults to those: <h1> renders at roughly 2x the base size and <h2> at
-# 1.5x, so a briefing's headings came out enormous next to 21px body text.
-# QLabel gives no hook for a document stylesheet, so the styles are injected
-# inline, per tag. Headings sit only slightly above body size — in a chat
-# bubble a heading is a label, not a page title.
-_TAG_STYLES = {
-    "h1": "font-size:22px; font-weight:700; margin:12px 0 6px 0;",
-    "h2": "font-size:21px; font-weight:700; margin:11px 0 5px 0;",
-    "h3": "font-size:20px; font-weight:700; margin:10px 0 4px 0;",
-    "h4": "font-size:19px; font-weight:700; margin:9px 0 4px 0;",
-    "h5": "font-size:19px; font-weight:600; margin:8px 0 3px 0;",
-    "h6": "font-size:19px; font-weight:600; margin:8px 0 3px 0;",
-    "p": "margin:0 0 9px 0; line-height:148%;",
-    "ul": "margin:2px 0 9px 0; -qt-list-indent:1;",
-    "ol": "margin:2px 0 9px 0; -qt-list-indent:1;",
-    "li": "margin:0 0 4px 0; line-height:145%;",
-    "blockquote": "margin:6px 0 8px 6px; padding-left:11px;",
-    "hr": "margin:10px 0;",
-    "table": "margin:6px 0 9px 0;",
-    "th": "padding:3px 11px 3px 0; font-weight:700;",
-    "td": "padding:3px 11px 3px 0;",
-}
-_TAG_RE = re.compile(r"<([a-zA-Z][a-zA-Z0-9]*)((?:\s[^>]*?)?)(/?)>")
+# Qt's QWIDGETSIZE_MAX. Spelled out because PyQt6 does not export the macro on
+# every build, and a missing name here would be an ImportError at startup.
+_NO_MAX = 16777215
 
 
-def style_markup(html: str, mono_font: str, accent: str, dim: str) -> str:
-    """Give markdown-generated HTML sane, chat-sized typography."""
-    code_style = (f"font-family:{mono_font}; font-size:18px;"
-                  f" background-color:rgba(0,0,0,0.30);")
-    per_tag = dict(_TAG_STYLES)
-    per_tag["code"] = code_style + " padding:0 3px;"
-    per_tag["pre"] = (f"font-family:{mono_font}; font-size:17px;"
-                      f" background-color:rgba(0,0,0,0.32); margin:7px 0 9px 0;")
-    per_tag["a"] = f"color:{accent}; text-decoration:none;"
-    per_tag["blockquote"] = (_TAG_STYLES["blockquote"] + f" color:{dim};"
-                             f" border-left:2px solid {accent};")
+def _ratio(name: str, default: float) -> float:
+    try:
+        return max(0.3, min(0.95, float(os.environ.get(name, default))))
+    except (TypeError, ValueError):
+        return default
 
-    def _inject(m):
-        tag, attrs, close = m.group(1).lower(), m.group(2) or "", m.group(3)
-        style = per_tag.get(tag)
-        # Leave anything that already carries a style alone — the image links
-        # client.py builds are styled at the source.
-        if not style or "style=" in attrs.lower():
-            return m.group(0)
-        return f"<{m.group(1)}{attrs} style=\"{style}\"{close}>"
 
-    return _TAG_RE.sub(_inject, html)
+# How much of the window's width a bubble may take. The agent's is wider than
+# the operator's: its messages are the long ones, and at 0.56 a briefing left
+# nearly half the panel empty and took twice the scrolling. Both are env knobs
+# (tune on the device, no redeploy).
+AGENT_RATIO = _ratio("GHOST_BUBBLE_AGENT", 0.70)
+USER_RATIO = _ratio("GHOST_BUBBLE_USER", 0.56)
+
+# Within this many pixels of the end counts as "at the bottom".
+STICK_PX = 28
 
 
 class _Bubble(QLabel):
@@ -111,7 +83,18 @@ class _Bubble(QLabel):
         self.fit(max_width)
 
     def fit(self, cap: int) -> None:
-        """Size to the content, bounded by `cap`."""
+        """Size to the content, bounded by `cap`.
+
+        ⚠ The pin from the PREVIOUS fit must be released before measuring.
+        ``QLabel.sizeHint()`` is expanded to the widget's ``minimumSize()``, so
+        with the old pin in place the "natural" width could never come back
+        smaller than it — a bubble could grow and never shrink. Every reply
+        opens as a waiting caption (~540 px) and so every short answer stayed
+        540 px wide: measured on the device 2026-10-01, "Hello!" was 540 px
+        after a caption and 120 px in a fresh bubble.
+        """
+        self.setMinimumWidth(0)
+        self.setMaximumWidth(_NO_MAX)
         self.setWordWrap(False)
         natural = self.sizeHint().width()      # width if it never wrapped
         self.setWordWrap(True)
@@ -126,15 +109,23 @@ class ChatLog(QScrollArea):
 
     link_clicked = pyqtSignal(str)
 
-    def __init__(self, palette, max_width_ratio: float = 0.56, parent=None):
+    def __init__(self, palette, max_width_ratio: float | None = None, parent=None):
         super().__init__(parent)
         self.T = palette
-        self._ratio = max_width_ratio
+        # An explicit ratio pins BOTH roles (the old single-knob behaviour).
+        self._agent_ratio = max_width_ratio or AGENT_RATIO
+        self._user_ratio = max_width_ratio or USER_RATIO
         self._current_agent: _Bubble | None = None
+        # True while the view follows new content. Cleared by scrolling up,
+        # set again by returning to the bottom (or by sending a message).
+        self._stick = True
 
         self.setWidgetResizable(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setFrameShape(QScrollArea.Shape.NoFrame)
+        # The transcript is scrolled from the keyboard by the client (the
+        # input keeps the focus); it must not take focus itself.
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         # The container must be transparent all the way down — a scroll area
         # paints its viewport, so styling only the QScrollArea leaves an
         # opaque rectangle over the face.
@@ -166,8 +157,12 @@ class ChatLog(QScrollArea):
         self._col.addStretch(1)
         self.setWidget(self._body)
 
+        bar = self.verticalScrollBar()
+        bar.valueChanged.connect(self._on_scroll_value)
+        bar.rangeChanged.connect(self._on_scroll_range)
+
     # ── styling ──────────────────────────────────────────────────────────
-    def _max_width(self) -> int:
+    def _max_width(self, role: str = "agent") -> int:
         """Width cap for a bubble.
 
         Falls back to the SCREEN width when the scroll area has not been laid
@@ -180,7 +175,8 @@ class ChatLog(QScrollArea):
         if w < 400:
             screen = QApplication.primaryScreen()
             w = screen.geometry().width() if screen else 1280
-        return max(320, int(w * self._ratio))
+        ratio = self._user_ratio if role == "user" else self._agent_ratio
+        return max(320, int(w * ratio))
 
     def _style(self, role: str) -> str:
         T = self.T
@@ -215,9 +211,11 @@ class ChatLog(QScrollArea):
 
     # ── public API ───────────────────────────────────────────────────────
     def add(self, html: str, role: str = "system") -> _Bubble:
-        if role != "user":
-            html = self._styled(html)
-        bubble = _Bubble(html, self._style(role), self._max_width())
+        # The operator's text is already escaped by the caller; it still needs
+        # break opportunities, or a pasted URL runs off the bubble.
+        html = soften_long_tokens(html) if role == "user" else self._styled(html)
+        bubble = _Bubble(html, self._style(role), self._max_width(role))
+        bubble._role = role
         bubble.linkActivated.connect(self.link_clicked.emit)
 
         row = QHBoxLayout()
@@ -234,7 +232,10 @@ class ChatLog(QScrollArea):
             row.addStretch(1)
         # insert before the trailing stretch that bottom-aligns the log
         self._col.insertLayout(self._col.count() - 1, row)
-        self._scroll_soon()
+        bubble._row = row          # end_agent() removes exactly this row
+        if role == "user":
+            # Sending is "take me to the end" — whatever was being re-read.
+            self.scroll_to_end()
         return bubble
 
     def start_agent(self, placeholder: str = "") -> None:
@@ -247,25 +248,37 @@ class ChatLog(QScrollArea):
         self._current_agent.setText(self._styled(html))
         # Re-fit on every token: a reply that ends up short must not be left
         # in a bubble sized for the longest line it briefly had.
-        self._current_agent.fit(self._max_width())
-        self._scroll_soon()
+        self._current_agent.fit(self._max_width("agent"))
 
     def end_agent(self, drop_if_empty: bool = True) -> None:
         """Close the streaming bubble, discarding it if nothing arrived."""
         bubble = self._current_agent
         self._current_agent = None
         if bubble is not None and drop_if_empty and not bubble.text().strip():
-            row = bubble.parentWidget().layout() if bubble.parentWidget() else None
+            # ⚠ Remove the bubble's OWN row. This used to look the row up as
+            # `bubble.parentWidget().layout()` — which is not the row at all
+            # but the transcript's whole column layout — and then call
+            # `setParent(None)` on it. The next message added to the log
+            # SEGFAULTED the client (reproduced on the device against the
+            # build then live, 2026-10-01). And this path runs whenever a turn
+            # ends with no text: the agent unreachable, an HTTP error, a
+            # refused key — exactly when the operator most needs the client
+            # to stay up and say what went wrong.
+            row = getattr(bubble, "_row", None)
+            if row is not None:
+                self._col.removeItem(row)
+                while row.count():
+                    row.takeAt(0)
+                row.deleteLater()
             bubble.setParent(None)
             bubble.deleteLater()
-            if row is not None:
-                row.setParent(None)
 
     def has_open_agent(self) -> bool:
         return self._current_agent is not None
 
     def clear(self) -> None:
         self._current_agent = None
+        self._stick = True
         while self._col.count() > 1:          # keep the trailing stretch
             item = self._col.takeAt(0)
             if item.widget():
@@ -278,17 +291,38 @@ class ChatLog(QScrollArea):
                 item.layout().setParent(None)
 
     # ── scrolling ────────────────────────────────────────────────────────
-    def _scroll_soon(self) -> None:
-        # Deferred: the layout has not resized yet when a bubble is added, so
-        # scrolling immediately lands short of the true bottom.
+    # The view FOLLOWS new content only while the operator is at the bottom.
+    # It used to jump to the end on every streamed token, so scrolling up to
+    # re-read something during a long reply was undone a few times a second.
+    def _on_scroll_value(self, value: int) -> None:
+        self._stick = value >= self.verticalScrollBar().maximum() - STICK_PX
+
+    def _on_scroll_range(self, _lo: int, hi: int) -> None:
+        # The content grew (or shrank). A range change does not move the
+        # value, so `_stick` still says where the operator was BEFORE it.
+        if self._stick:
+            self.verticalScrollBar().setValue(hi)
+
+    def is_following(self) -> bool:
+        return self._stick
+
+    def scroll_to_end(self) -> None:
+        self._stick = True
+        # Deferred as well: the layout has not resized yet when a bubble is
+        # added, so scrolling immediately lands short of the true bottom.
         QTimer.singleShot(0, self._scroll_to_bottom)
 
     def _scroll_to_bottom(self) -> None:
         bar = self.verticalScrollBar()
         bar.setValue(bar.maximum())
 
+    def scroll_page(self, direction: int) -> None:
+        """Scroll most of a screenful: -1 up, +1 down (PgUp / PgDn)."""
+        bar = self.verticalScrollBar()
+        step = max(60, int(bar.pageStep() * 0.85))
+        bar.setValue(bar.value() + (step if direction > 0 else -step))
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        cap = self._max_width()
         for bubble in self._body.findChildren(_Bubble):
-            bubble.fit(cap)
+            bubble.fit(self._max_width(getattr(bubble, "_role", "agent")))

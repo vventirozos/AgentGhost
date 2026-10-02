@@ -203,9 +203,10 @@ def site_operator_note(query: str) -> str:
     if not ops:
         return ""
     shown = ", ".join(f"`{o}`" for o in ops[:3])
-    # ⚠ Worded around `strikes._ERROR_LINE_RE`: a note saying the engines
-    # "cannot" restrict made every such search result an ERROR line to the
-    # strike counter and the evidence digest (found live, 2026-09-30).
+    # (Worded without failure words: a note saying the engines "cannot"
+    # restrict was an ERROR line to the evidence digest on the first live
+    # turn, 2026-09-30 — §4KT then stopped scanning search results for
+    # words at all; the plain wording is kept.)
     return (f"[Note: these search engines do not support site restrictions — "
             f"{shown} {'were' if len(ops) > 1 else 'was'} removed, so these "
             f"results are NOT limited to (or cleared of) that site. To aim at "

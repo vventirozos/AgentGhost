@@ -701,8 +701,10 @@ async def test_agent_query_expansion_uses_router_when_available():
     }
     await agent.handle_chat(body, MagicMock())
     agent.context.llm_client.route.assert_awaited()
-    call = agent.context.llm_client.route.await_args
-    assert call.kwargs.get("task") == "EXPAND_QUERY"
+    # §4KW: the reply (no tool ran) is then checked for an announcement by
+    # the same worker, so the expansion is no longer the LAST routed call.
+    tasks = [c.kwargs.get("task") for c in agent.context.llm_client.route.await_args_list]
+    assert tasks[0] == "EXPAND_QUERY", tasks
     # The bus's vector search must have been called with the rewritten query.
     search_args = agent.context.memory_system.search_items.call_args
     if search_args is not None:

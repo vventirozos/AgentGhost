@@ -785,7 +785,9 @@ PROBES: List[Probe] = [
                      window_h=24.0,
                      # The agent REASONING about the verifier is not the
                      # verifier running. 12/1370 matches were such prose.
-                     exclude=r"thinking —"),
+                     # §4KV: a reply drafted with thinking off is the same
+                     # prose under its own title ("drafting —").
+                     exclude=r"(?:thinking|drafting) —"),
           denominator=DEN_REQUESTS),
     Probe("router.decisions", EXPECT_PERIODIC,
           "system/ghost-agent.log — complexity-router lines",

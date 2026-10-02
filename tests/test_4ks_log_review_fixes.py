@@ -218,7 +218,9 @@ def test_a_service_warning_is_not_an_error_line(text):
     the start report of an unpublished-port service an error line for the
     strike counter and the evidence digest."""
     from ghost_agent.core.strikes import error_line
-    assert error_line(text) == "", error_line(text)
+    # (§4KT: a service report is CONTENT — its words are not scanned at all;
+    # the wording is kept plain regardless.)
+    assert error_line(text, tool="manage_services") == "", error_line(text)
 
 
 def test_loopback_warning_tells_the_model_not_to_announce_it():
@@ -2603,8 +2605,8 @@ def test_the_site_note_is_not_an_error_line():
     "Distinct errors hit"."""
     from ghost_agent.core.strikes import error_line
     for q in ("site:blogs.lupyd.com postgres with quic", "x -site:a.com site:b.com"):
-        assert error_line(site_operator_note(q)) == "", site_operator_note(q)
-        assert error_line("### 1. r\n[Source: https://a/]\n\n" + site_operator_note(q)) == ""
+        note = site_operator_note(q)
+        assert error_line("### 1. r\n[Source: https://a/]\n\n" + note, tool="web_search") == ""
 
 
 async def test_web_search_tells_the_model_its_site_filter_was_dropped(monkeypatch):

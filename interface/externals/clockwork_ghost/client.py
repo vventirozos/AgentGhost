@@ -8,24 +8,91 @@ import httpx
 import re
 import datetime
 import subprocess
+import time
 import cv2
 from PyQt6.QtCore import Qt, pyqtSignal, QEvent, QTimer
-from PyQt6.QtGui import QPixmap, QFont, QShortcut, QKeySequence, QImage
+from PyQt6.QtGui import QPixmap, QFont, QShortcut, QKeySequence, QImage, QCursor
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QHBoxLayout, QVBoxLayout, 
+    QApplication, QWidget, QHBoxLayout, QVBoxLayout,
     QTextBrowser, QLineEdit, QDialog, QLabel, QPushButton, QFileDialog, QStackedWidget
 )
-import markdown
 import qasync
 
 from webface import WebFaceWidget
 from chatlog import ChatLog
 from turnstatus import (
     TurnTicker, caption_html as _caption_html, log_ws_url, stream_log_lines,
+    face_signals_for_ticker,
 )
+import agentapi
+import commands
+import devstatus
+from markup import (
+    escape_user, render_reply, reply_images, transcript_items,
+)
+from speech import SpeechChunker, chime_wav, clock_label, should_chime
 
 audio_queue = asyncio.Queue()
 playback_queue = asyncio.Queue()
+# Bumped by MainWindow._silence(): a sentence whose audio was requested before
+# a silence is stale when it arrives, and is dropped rather than played.
+_speech_epoch = 0
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+# The agent itself (chat, sessions, cancel, feedback, notifications). Plain
+# HTTP inside the tailnet, as it always was — only the voice and log channels
+# go through the interface's TLS port.
+AGENT_BASE = os.environ.get("GHOST_AGENT_BASE", "http://eva:8000").rstrip("/")
+
+# A voice transcript sits in the input for this long before it sends itself,
+# so a misheard word can be fixed (any key cancels the countdown). 0 sends at
+# once — which is also what happens in face-only mode, where there is no input
+# to look at.
+STT_REVIEW_S = _env_float("GHOST_STT_REVIEW_S", 2.5)
+# A recording that was never stopped (Esc is a TOGGLE) ends itself here.
+PTT_MAX_S = _env_float("GHOST_PTT_MAX_S", 120)
+# Esc held at least this long is push-to-talk: letting go sends. A shorter
+# press is a tap, and toggles (press again to send).
+PTT_HOLD_S = _env_float("GHOST_PTT_HOLD_S", 0.4)
+# A recording shorter than this is a slip of the key, not speech: not uploaded.
+PTT_MIN_S = 0.3
+# Chime when a reply lands after at least this long. 0 disables the chime.
+CHIME_AFTER_S = _env_float("GHOST_CHIME_AFTER_S", 20)
+# Seconds between polls: agent reachability + who holds the turn lock, and
+# the agent's pending notifications. 0 disables a poll.
+LINK_POLL_S = _env_float("GHOST_LINK_POLL_S", 15)
+NOTIFY_POLL_S = _env_float("GHOST_NOTIFY_POLL_S", 60)
+# Camera capture size. It was forced to 1920x1080@60 with a 16 ms timer: a
+# 6 MB frame decoded and colour-converted on the UI thread, on a CM4, up to
+# 60 times a second, to show a 640x480 preview. 720p is ample for the vision
+# model and for framing a shot.
+CAM_W = int(_env_float("GHOST_CAM_W", 1280))
+CAM_H = int(_env_float("GHOST_CAM_H", 720))
+CAM_FPS = int(_env_float("GHOST_CAM_FPS", 30))
+CAM_PREVIEW_MS = 66        # ~15 previews a second is plenty for framing a shot
+
+INPUT_PLACEHOLDER = "speak to the ghost…   ( /help )"
+
+
+def _power(argv):
+    """Run a command that ends the session (shutdown, reboot).
+
+    One function so there is exactly one place that can power the device off —
+    and so `device_probe.py`, which drives the real /shutdown path on the real
+    device at every deploy, can do it with GHOST_DRY_POWER=1 and get a log
+    line instead of a dark screen.
+    """
+    if os.environ.get("GHOST_DRY_POWER") == "1":
+        print(f"[power] DRY RUN: {' '.join(argv)}", flush=True)
+        return
+    subprocess.Popen(argv)
 
 # ── Voice endpoints (repointed 2026-08-02) ──────────────────────────────
 # WAS `http://192.168.0.24:8000/{tts,stt}` — a Raspberry-Pi voice server
@@ -210,13 +277,39 @@ def chip_style(fg=T.TEXT_DIM, border=T.HAIRLINE, hover=T.GLASS_HOT):
             letter-spacing: 1px;
         }}
         QPushButton:hover {{
-            background-color: {hover};
-            color: {T.ACCENT};
             border: 1px solid {T.HAIRLINE_HOT};
         }}
         QPushButton:pressed {{
-            background-color: {T.GLASS_HOT};
+            background-color: {hover};
             color: {T.TEXT};
+        }}
+        QPushButton:disabled {{
+            color: rgba(236, 235, 246, 0.22);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }}
+    """
+
+
+def chip_style_on(fg=None, fill="rgba(159, 227, 184, 0.16)"):
+    """A chip whose function is ON (spoken replies, a latched rating).
+
+    Hover used to recolour a chip to the accent and fill it — on a device
+    whose pointer is a trackball that stays wherever it was last left, a chip
+    under the parked pointer looked switched on. Hover now only brightens the
+    border; a FILL means on, and nothing else does.
+    """
+    fg = fg or T.OK
+    return f"""
+        QPushButton {{
+            background-color: {fill};
+            color: {fg};
+            border: 1px solid {fg};
+            border-radius: 12px;
+            padding: 9px 16px;
+            font-family: {T.FONT};
+            font-size: 18px;
+            font-weight: bold;
+            letter-spacing: 1px;
         }}
     """
 
@@ -323,7 +416,9 @@ def _restore_note(data) -> str:
         bits.append(f"{len(ur)} file(s) could NOT be written")
     if nc:
         bits.append(f"{len(nc)} path(s) survived the wipe (stale content)")
-    names = [str(u.get("path", u)) if isinstance(u, dict) else str(u)
+    def _esc(text):         # member paths come from the archive: not markup
+        return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    names = [_esc(u.get("path", u)) if isinstance(u, dict) else _esc(u)
              for u in list(ur) + list(nc)][:3]
     return (f"{NOTE_WARN}workspace restored INCOMPLETE — {'; '.join(bits)}. "
             f"First few: {', '.join(names)}.</i></div>")
@@ -455,31 +550,44 @@ class CameraPreviewDialog(QDialog):
         self.layout.addWidget(self.review_controls)
         
         self.resize(700, 600)
-        
+
         self.cap = cv2.VideoCapture(0)
 
-        # --- HIGH QUALITY WEBCAM CONFIGURATION ---
-        # 1. Force MJPG codec so USB bandwidth allows high FPS at high resolutions (fixes shakiness)
+        # MJPG so USB bandwidth allows a usable frame rate at this size; the
+        # size itself is modest on purpose (see CAM_W above).
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-        # 2. Set to 1080p resolution (increase to 3840x2160 if you want full 4K and your machine can handle it)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-        # 3. Attempt to lock in a smooth 60 FPS
-        self.cap.set(cv2.CAP_PROP_FPS, 60)
-        # 4. Ensure autofocus is on
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_W)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
+        self.cap.set(cv2.CAP_PROP_FPS, CAM_FPS)
         self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
-        # -----------------------------------------
 
-        self.timer = QTimer()
+        self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_frame)
-        self.timer.start(16) # 16ms target for ~60 FPS
         self.current_frame = None
         self.result_data = None
-        
+        self._opened_at = time.monotonic()
+        self._released = False
+
+        # No camera is an ordinary state on this device (the BRIO is on a USB
+        # cable): say so. It used to be a black rectangle and a CAPTURE button
+        # that did nothing.
+        if not self.cap.isOpened():
+            self._no_camera("no camera found — is it plugged in?")
+        else:
+            self.timer.start(CAM_PREVIEW_MS)
+
         self.snap_state = 0
         self.snap_shortcut = QShortcut(QKeySequence("Ctrl+Escape"), self)
         self.snap_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self.snap_shortcut.activated.connect(self.handle_snap_shortcut)
+
+    def _no_camera(self, message):
+        self.timer.stop()
+        self.capture_btn.setEnabled(False)
+        self.video_label.setText(message)
+        self.video_label.setStyleSheet(
+            f"background-color: #000; color: {T.TEXT_DIM}; font-family: {T.FONT};"
+            f" font-size: 18px; border: 1px solid {T.BORDER_HOT}; border-radius: 8px;")
 
     def update_frame(self):
         if not self.cap.isOpened():
@@ -493,40 +601,57 @@ class CameraPreviewDialog(QDialog):
             qimg = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
             # Preview remains safely scaled down for UI
             self.video_label.setPixmap(QPixmap.fromImage(qimg).scaled(640, 480, Qt.AspectRatioMode.KeepAspectRatio))
-            
+        elif self.current_frame is None and time.monotonic() - self._opened_at > 3.0:
+            # Opened, but never delivered a frame (busy device, wrong node).
+            self._no_camera("the camera opened but sent no picture")
+
     def handle_snap_shortcut(self):
         if self.snap_state == 0:
-            self.take_picture()
-            self.snap_state = 1
+            if self.take_picture():
+                self.snap_state = 1
         elif self.snap_state == 1:
             self.upload_picture()
 
     def take_picture(self):
+        if self.current_frame is None:
+            return False          # nothing to freeze on yet
         self.timer.stop()
         self.live_controls.hide()
         self.review_controls.show()
         self.prompt_input.setFocus()
-        
+        return True
+
     def download_picture(self):
         if self.current_frame is not None:
             filename, _ = QFileDialog.getSaveFileName(self, "Save Picture", "/home/vasilis/snapshot.jpg", "Images (*.jpg)")
             if filename:
                 cv2.imwrite(filename, self.current_frame)
-                
+
     def upload_picture(self):
         if self.current_frame is not None:
             ret, buffer = cv2.imencode('.jpg', self.current_frame)
             if ret:
                 b64_str = base64.b64encode(buffer).decode('utf-8')
                 self.result_data = (b64_str, self.prompt_input.text().strip())
-                if self.cap.isOpened():
-                    self.cap.release()
                 self.accept()
-                
-    def close_and_stop(self):
+
+    def _release(self):
+        if self._released:
+            return
+        self._released = True
         self.timer.stop()
         if self.cap.isOpened():
             self.cap.release()
+
+    def done(self, result):
+        # EVERY way out of a QDialog ends here — accept, the close chip, and
+        # the Escape key, which calls reject() directly and so used to skip
+        # close_and_stop(): the timer kept reading and the camera stayed
+        # claimed (its light on) until the client was restarted.
+        self._release()
+        super().done(result)
+
+    def close_and_stop(self):
         self.reject()
 
 class MainWindow(QWidget):
@@ -544,16 +669,50 @@ class MainWindow(QWidget):
         self.input_history = []
         self.history_index = -1
         self.is_recording = False
-        
+
+        # ── the turn in flight ───────────────────────────────────────────
+        # ONE at a time. There was no guard: Enter during a reply started a
+        # second stream that shared `current_response_text` and the open
+        # bubble with the first, and the two interleaved.
+        self._turn_task = None
+        self._turn_rid = None          # this turn's request id (minted here)
+        self._turn_verdict = None      # the verifier's verdict, if it logged one
+        self._stop_asked = 0           # 0 none, 1 asked, 2 forced
+        self._stop_took = False        # the agent accepted the stop (or it was forced)
+        self._stop_pending = False     # a stop was sent and not yet answered
+        self._busy_noted = False
+        # The last finished reply's id, when it can take a rating.
+        self._last_reply_rid = None
+        self._rated = None             # "positive" / "negative" once rated
+
+        # ── the conversation's durable id (see agentapi) ─────────────────
+        self.session_id = agentapi.load_session_id() or agentapi.new_session_id()
+        agentapi.save_session_id(self.session_id)
+        self._sessions_listed = []     # what /sessions last showed, for /open
+
+        self.confirmer = commands.Confirmer()
+        self.speech = SpeechChunker()
+        self._voice_fault_shown = False
+        self._agent_ok = None          # None until the first poll answers
+        self._last_input_at = time.monotonic()
+        self._last_cursor = None
+        self._rec_started = 0.0
+        self._rec_path = None          # the file THIS recording is written to
+        self._rec_seq = 0
+        self._transcribing = False
+        self._review_left = 0.0
+        self._on_battery = False
+
         self.initUI()
         self.update_chat_signal.connect(self._update_chat)
         self.show_image_signal.connect(self._show_image_popup)
         self.update_workspace_signal.connect(self.update_workspace_btn_state)
-        
+
         # The waiting bubble's caption: elapsed clock + what the agent is doing
         # right now, fed by the log socket (see turnstatus.py). The timer only
         # advances the CLOCK — the description changes when a log line arrives.
         self.ticker = TurnTicker()
+        self.ticker.on_step = self._on_turn_step
         self.thinking_timer = QTimer(self)
         self.thinking_timer.timeout.connect(self._animate_thinking)
         self.is_thinking = False
@@ -562,6 +721,20 @@ class MainWindow(QWidget):
         self.tts_monitor = QTimer(self)
         self.tts_monitor.timeout.connect(self._check_tts_done)
         self.tts_monitor.start(500)
+
+        # Recording clock (the chip shows elapsed time, and a recording that
+        # was never stopped ends itself) and the voice-review countdown.
+        self.rec_timer = QTimer(self)
+        self.rec_timer.timeout.connect(self._tick_recording)
+        self.review_timer = QTimer(self)
+        self.review_timer.timeout.connect(self._tick_review)
+
+        # Face frame rate follows activity (devstatus.face_rate). 3 s is the
+        # resolution of "idle for 45 s" that matters; waking is immediate
+        # because every input path calls _note_activity() itself.
+        self.face_timer = QTimer(self)
+        self.face_timer.timeout.connect(self._apply_face_rate)
+        self.face_timer.start(3000)
 
     def initUI(self):
         screen_geometry = QApplication.primaryScreen().geometry()
@@ -593,7 +766,6 @@ class MainWindow(QWidget):
         self.faces = (self.web_face,)
         # Face state the client owns (the face itself is async JS now).
         self._face_mood = "idle"
-        self._face_error = False
 
         # Everything else lives on a transparent sheet ON TOP of the face.
         self.overlay = QWidget(self)
@@ -625,39 +797,65 @@ class MainWindow(QWidget):
         self.chat_display.link_clicked.connect(self.handle_link_clicked)
 
         self.text_input = QLineEdit()
-        self.text_input.setPlaceholderText("speak to the ghost…")
+        self.text_input.setPlaceholderText(INPUT_PLACEHOLDER)
         self.text_input.setStyleSheet(INPUT_STYLE)
         self.text_input.returnPressed.connect(self.handle_input)
         self.text_input.installEventFilter(self)
-        
+        # textEdited fires for the OPERATOR's edits only (not setText), which
+        # is exactly what cancels a voice-review countdown; textChanged drives
+        # the face's lean toward the composer.
+        self.text_input.textEdited.connect(self._on_text_edited)
+        self.text_input.textChanged.connect(
+            lambda t: self.web_face.set_gaze(bool(t.strip())))
+
         # Only the transcript lives in this container now; the input moved to
         # the bottom bar so it can share that row with the action chips.
         left_layout.addWidget(self.chat_display)
 
-        self.fs_btn = QPushButton("◐")
+        # Every chip carries a WORD. The top row used to be three bare glyphs
+        # (◆ ◈ ◐) whose meaning lived in tooltips — which need a hover, on a
+        # device with a trackball.
+        self.fs_btn = QPushButton("◐  FACE")
         self.fs_btn.setStyleSheet(chip_style())
-        self.fs_btn.setToolTip("Toggle fullscreen face")
+        self.fs_btn.setToolTip("Face only — any key brings the controls back (F11)")
         self.fs_btn.clicked.connect(self.toggle_fullscreen_face)
 
-        self.switch_face_btn = QPushButton("◈")
+        self.switch_face_btn = QPushButton("◈  FORM")
         self.switch_face_btn.setStyleSheet(chip_style())
-        self.switch_face_btn.setToolTip("Cycle face form")
+        self.switch_face_btn.setToolTip("Next face form")
         self.switch_face_btn.clicked.connect(self.toggle_face_style)
 
         top_right_layout = QHBoxLayout()
         top_right_layout.setContentsMargins(0, 0, 0, 0)
         top_right_layout.setSpacing(8)
+
+        # Rate the last reply. Geometric glyphs, like every other chip.
+        self.good_btn = QPushButton("▲  GOOD")
+        self.good_btn.setToolTip("The last reply was right (Ctrl+Up)")
+        self.good_btn.clicked.connect(lambda: self.rate_last("positive"))
+        self.bad_btn = QPushButton("▼  BAD")
+        self.bad_btn.setToolTip("The last reply was wrong (Ctrl+Down)")
+        self.bad_btn.clicked.connect(lambda: self.rate_last("negative"))
+        top_right_layout.addWidget(self.good_btn)
+        top_right_layout.addWidget(self.bad_btn)
         top_right_layout.addStretch()
 
-        self.workspace_btn = QPushButton("◇")
-        self.workspace_btn.setStyleSheet(chip_style())
-        self.workspace_btn.setToolTip("Load Workspace")
-        self.workspace_btn.clicked.connect(self.handle_workspace)
+        # Two chips, not one that flips. The single chip was LOAD only while
+        # the conversation was empty and SAVE ever after, so a workspace could
+        # not be loaded once anything had been said.
+        self.load_btn = QPushButton("◇  LOAD")
+        self.load_btn.setStyleSheet(chip_style())
+        self.load_btn.setToolTip("Load a workspace archive")
+        self.load_btn.clicked.connect(self.load_workspace)
+        self.workspace_btn = QPushButton("◆  SAVE")
+        self.workspace_btn.setToolTip("Save the workspace and this conversation")
+        self.workspace_btn.clicked.connect(self.save_workspace)
 
+        top_right_layout.addWidget(self.load_btn)
         top_right_layout.addWidget(self.workspace_btn)
         top_right_layout.addWidget(self.switch_face_btn)
         top_right_layout.addWidget(self.fs_btn)
-        
+
         # Bottom row: the input keeps its left position, the action chips and
         # the status readout keep theirs on the right — now sharing one row
         # instead of sitting in two separate columns.
@@ -665,6 +863,13 @@ class MainWindow(QWidget):
         stats_layout.setContentsMargins(0, 0, 0, 0)
         stats_layout.setSpacing(8)
         stats_layout.addWidget(self.text_input, 1)
+
+        # Shown only while a turn runs — the one moment it means anything.
+        self.stop_btn = QPushButton("■  STOP")
+        self.stop_btn.setStyleSheet(chip_style(fg=T.DANGER, border=T.DANGER))
+        self.stop_btn.setToolTip("Stop the running turn (Shift+Esc)")
+        self.stop_btn.clicked.connect(self.request_stop)
+        self.stop_btn.hide()
 
         self.snap_btn = QPushButton("◉  SNAP")
         self.snap_btn.setStyleSheet(chip_style())
@@ -679,11 +884,14 @@ class MainWindow(QWidget):
         self.tts_btn.setStyleSheet(chip_style(fg=T.TEXT_DIM))
         self.tts_btn.clicked.connect(self.toggle_tts)
 
+        stats_layout.addWidget(self.stop_btn)
         stats_layout.addWidget(self.snap_btn)
         stats_layout.addWidget(self.ptt_btn)
         stats_layout.addWidget(self.tts_btn)
 
-        self.stats_label = QLabel("⚡ --%   ··:··")
+        self.stats_label = QLabel("●   --%   ··:··")
+        self.stats_label.setTextFormat(Qt.TextFormat.RichText)
+        self.stats_label.setToolTip("agent link · wifi · battery · time")
         self.stats_label.setStyleSheet(f"color: {T.TEXT_DIM}; font-family: {T.FONT}; font-size: 18px; font-weight: bold; padding: 0 12px; letter-spacing: 1px;")
         stats_layout.addWidget(self.stats_label)
 
@@ -705,12 +913,37 @@ class MainWindow(QWidget):
         self.stats_timer.start(5000) # Every 5s
         self.update_stats()
 
+        self.update_workspace_btn_state()
+        self._refresh_rating_chips()
+
         self.esc_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
         self.esc_shortcut.activated.connect(self.toggle_ptt)
-        
+
         self.tts_shortcut = QShortcut(QKeySequence("Alt+Escape"), self)
         self.tts_shortcut.activated.connect(self.toggle_tts)
-        
+
+        # The Esc family: Esc talks, Alt+Esc speaks, Ctrl+Esc looks, and
+        # Shift+Esc stops. ApplicationShortcut so it also works in face-only
+        # mode, where a long turn is most likely to be waited out.
+        self.stop_shortcut = QShortcut(QKeySequence("Shift+Escape"), self)
+        self.stop_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self.stop_shortcut.activated.connect(self.request_stop)
+
+        self.good_shortcut = QShortcut(QKeySequence("Ctrl+Up"), self)
+        self.good_shortcut.activated.connect(lambda: self.rate_last("positive"))
+        self.bad_shortcut = QShortcut(QKeySequence("Ctrl+Down"), self)
+        self.bad_shortcut.activated.connect(lambda: self.rate_last("negative"))
+
+        # ⚠ ONE action per key press. A QShortcut auto-repeats while its key
+        # is held, and every one of these is a TOGGLE: holding Esc — the
+        # natural way to use a chip that says "PTT" — started and stopped the
+        # recording some twenty-five times a second, each stop uploading a
+        # file the next start was already rewriting ("STT Error: Too much
+        # data for declared Content-Length", eleven in a row on the device).
+        for _sc in (self.esc_shortcut, self.tts_shortcut, self.stop_shortcut,
+                    self.good_shortcut, self.bad_shortcut):
+            _sc.setAutoRepeat(False)
+
         self.snap_shortcut = QShortcut(QKeySequence("Ctrl+Escape"), self)
         self.snap_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self.snap_shortcut.activated.connect(self.take_picture)
@@ -723,44 +956,47 @@ class MainWindow(QWidget):
         self.fullscreen_shortcut = QShortcut(QKeySequence(Qt.Key.Key_F11), self)
         self.fullscreen_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self.fullscreen_shortcut.activated.connect(self.toggle_fullscreen_face)
+        self.snap_shortcut.setAutoRepeat(False)
+        self.fullscreen_shortcut.setAutoRepeat(False)
 
     def update_workspace_btn_state(self):
+        """SAVE is live only when there is a conversation to put in the archive."""
         if not hasattr(self, 'workspace_btn'):
             return
-        if not self.conversation_history:
-            self.workspace_btn.setToolTip("Load Workspace")
-            self.workspace_btn.setText("◇")
-            self.workspace_btn.setStyleSheet(chip_style(fg=T.OK))
-        else:
-            self.workspace_btn.setToolTip("Save Workspace")
-            self.workspace_btn.setText("◆")
-            self.workspace_btn.setStyleSheet(chip_style(fg=T.ACCENT_WARM))
+        has_history = bool(self.conversation_history)
+        self.workspace_btn.setEnabled(has_history)
+        self.workspace_btn.setStyleSheet(
+            chip_style(fg=T.ACCENT_WARM if has_history else T.TEXT_DIM))
 
-    def handle_workspace(self):
-        options = QFileDialog.Option.DontUseNativeDialog
-        dialog_style = FILEDIALOG_STYLE
-        if not self.conversation_history:
-            dialog = QFileDialog(self, "Load Workspace", os.path.expanduser("~"), "Zip Files (*.zip)")
-            dialog.setOption(options)
-            dialog.setStyleSheet(dialog_style)
-            dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
-            if dialog.exec() == QDialog.DialogCode.Accepted:
-                filename = dialog.selectedFiles()[0]
-                asyncio.ensure_future(self._async_load_workspace(filename))
-        else:
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            default_path = os.path.join(os.path.expanduser("~"), f"ghost_workspace_{timestamp}.zip")
-            dialog = QFileDialog(self, "Save Workspace", default_path, "Zip Files (*.zip)")
-            dialog.setOption(options)
-            dialog.setStyleSheet(dialog_style)
-            dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+    def _workspace_dialog(self, title, start, save):
+        dialog = QFileDialog(self, title, start, "Zip Files (*.zip)")
+        dialog.setOption(QFileDialog.Option.DontUseNativeDialog)
+        dialog.setStyleSheet(FILEDIALOG_STYLE)
+        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave if save
+                             else QFileDialog.AcceptMode.AcceptOpen)
+        if save:
             dialog.setDefaultSuffix("zip")
-            if dialog.exec() == QDialog.DialogCode.Accepted:
-                filename = dialog.selectedFiles()[0]
-                asyncio.ensure_future(self._async_save_workspace(filename))
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selectedFiles():
+            return dialog.selectedFiles()[0]
+        return None
+
+    def load_workspace(self):
+        if self._busy():
+            self._note("a turn is running — stop it before loading a workspace", NOTE_WARN)
+            return
+        filename = self._workspace_dialog("Load Workspace", os.path.expanduser("~"), save=False)
+        if filename:
+            asyncio.ensure_future(self._async_load_workspace(filename))
+
+    def save_workspace(self):
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_path = os.path.join(os.path.expanduser("~"), f"ghost_workspace_{timestamp}.zip")
+        filename = self._workspace_dialog("Save Workspace", default_path, save=True)
+        if filename:
+            asyncio.ensure_future(self._async_save_workspace(filename))
 
     async def _async_save_workspace(self, filename):
-        url = "http://eva:8000/api/workspace/save"
+        url = f"{AGENT_BASE}/api/workspace/save"
         headers = {"X-Ghost-Key": GHOST_API_KEY}
         payload = {"chat_history": self.conversation_history}
         self.update_chat_signal.emit("append", f"<br>{NOTE_DIM}archiving workspace…</i></div>")
@@ -782,14 +1018,14 @@ class MainWindow(QWidget):
                             f"archived → {filename}, but {_omitted} file(s) could "
                             f"NOT be read and are MISSING from it (see omitted.json)")
                     else:
-                        self.update_chat_signal.emit("append", f"<br>{NOTE_OK}archived → {filename}</i></div>")
+                        self.update_chat_signal.emit("append", f"<br>{NOTE_OK}archived → {escape_user(filename)}</i></div>")
                 else:
                     self.update_chat_signal.emit("error", f"Save failed: HTTP {response.status_code}")
         except Exception as e:
             self.update_chat_signal.emit("error", f"Save error: {str(e)}")
 
     async def _async_load_workspace(self, filename):
-        url = "http://eva:8000/api/workspace/load"
+        url = f"{AGENT_BASE}/api/workspace/load"
         headers = {"X-Ghost-Key": GHOST_API_KEY}
         self.update_chat_signal.emit("append", f"<br>{NOTE_DIM}restoring workspace…</i></div>")
         try:
@@ -798,40 +1034,119 @@ class MainWindow(QWidget):
                     files = {'file': (os.path.basename(filename), f, 'application/zip')}
                     response = await client.post(url, files=files, headers=headers)
                     
-                if response.status_code == 200:
+                if response.status_code == 200 and self._busy():
+                    self._note("the workspace files were restored, but a turn started "
+                               "meanwhile — this conversation was left as it is", NOTE_WARN)
+                elif response.status_code == 200:
                     data = response.json()
-                    self.conversation_history = data.get("chat_history", [])
-                    self.chat_display.clear()
+                    history = data.get("chat_history", [])
+                    # A NEW session id: the archive's conversation is not the
+                    # one stored under the current id, and replaying it there
+                    # would append it to whatever was being said before.
+                    self._begin_session(agentapi.new_session_id(),
+                                        history if isinstance(history, list) else [])
                     # §4GK round 7: a restore can be INCOMPLETE and still be a
                     # 200 — `_restore_note` reads the fields that say so.
                     self.chat_display.add(_restore_note(data), "system")
-                    for msg in self.conversation_history:
-                        role = msg.get("role")
-                        content = msg.get("content", "")
-                        if role == "user":
-                            if isinstance(content, list):
-                                text_part = next((item["text"] for item in content if item.get("type") == "text"), "[Image Attached]")
-                                self.update_chat_signal.emit("user", (text_part))
-                            else:
-                                self.update_chat_signal.emit("user", (content))
-                        elif role == "assistant":
-                            display_content = re.sub(r'<tool_call[\s\S]*?(?:</tool_call>|$)', '', content, flags=re.IGNORECASE | re.DOTALL).strip()
-                            if display_content:
-                                processed_text = re.sub(
-                                    r'!\[(.*?)\]\((/api/download/[^\)]+)\)',
-                                    r'<br><a href="\2" style="text-decoration:none; font-size:28px;" title="View Image: \1">🖼️</a>',
-                                    display_content
-                                )
-                                html = markdown.markdown(processed_text, extensions=['fenced_code', 'tables'])
-                                self.update_chat_signal.emit("agent", html)
-                                matches = re.findall(r'!\[.*?\]\((/api/download/[^\)]+)\)', display_content)
-                                for image_path in matches:
-                                    self.show_image_signal.emit(image_path)
-                    self.update_workspace_signal.emit()
+                    self._render_history(self.conversation_history)
                 else:
                     self.update_chat_signal.emit("error", f"Load failed: HTTP {response.status_code}")
         except Exception as e:
             self.update_chat_signal.emit("error", f"Load error: {str(e)}")
+
+    # ── conversation: sessions, history, notes ───────────────────────────
+    def _note(self, text, tone=None):
+        """One dim line in the transcript. `text` is plain; it is escaped."""
+        self.chat_display.add(f"{tone or NOTE_DIM}{escape_user(text)}</i></div>", "system")
+
+    def _begin_session(self, session_id, history=None):
+        """Switch to `session_id` with `history` as the local conversation."""
+        self.session_id = session_id
+        agentapi.save_session_id(session_id)
+        self.conversation_history = list(history or [])
+        self.current_response_text = ""
+        self._last_reply_rid = None
+        self._rated = None
+        self.chat_display.clear()
+        self._refresh_rating_chips()
+        self.update_workspace_btn_state()
+
+    def _render_history(self, messages):
+        """Draw a stored conversation. Its images are NOT popped open again —
+        restoring a session used to mean a stack of image dialogs, one per
+        picture ever generated in it; each stays a tap away on its 🖼️."""
+        for role, text in transcript_items(messages):
+            if role == "user":
+                self.chat_display.add(escape_user(text), "user")
+            else:
+                self.shown_images.update(reply_images(text))
+                self.chat_display.add(render_reply(text), "agent")
+        self.chat_display.scroll_to_end()
+
+    async def restore_session(self):
+        """At startup: bring back the conversation this device was having.
+
+        The transcript lived only in this process, so a restart, a crash or a
+        reboot lost it — while the agent had the whole thing stored under the
+        session id all along.
+        """
+        sid = self.session_id
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            messages, status = await agentapi.fetch_session(
+                client, AGENT_BASE, GHOST_API_KEY, sid)
+        # Re-checked AFTER the await: the operator may have typed, or started
+        # a /new conversation, while the fetch was out — and the stored
+        # conversation must not be poured into a different session.
+        if (status != "ok" or not messages or sid != self.session_id
+                or self.conversation_history or self._busy()):
+            return
+        self.conversation_history = agentapi.history_for_model(messages)
+        self._render_history(messages)
+        self._note("conversation restored — /new starts a fresh one")
+        self.update_workspace_btn_state()
+
+    async def _show_sessions(self):
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            rows = await agentapi.list_sessions(client, AGENT_BASE, GHOST_API_KEY)
+        self._sessions_listed = rows
+        self.chat_display.scroll_to_end()
+        if not rows:
+            self._note("no stored conversations (or the agent did not answer)", NOTE_WARN)
+            return
+        lines = []
+        for i, s in enumerate(rows, 1):
+            here = "  ← this one" if s.get("id") == self.session_id else ""
+            title = escape_user(str(s.get("title") or "untitled")[:60])
+            lines.append(f"<b>{i}</b>&nbsp; {title} "
+                         f"<span style='color:{T.TEXT_DIM};'>· {s.get('message_count', 0)} msgs"
+                         f" · {agentapi.age_text(s.get('updated_at'))}{here}</span>")
+        self.chat_display.add("<br>".join(lines) + f"<br>{NOTE_DIM}/open N to continue one</i></div>",
+                              "system")
+
+    async def _open_session(self, arg):
+        try:
+            n = int(arg)
+        except ValueError:
+            n = 0
+        if not 1 <= n <= len(self._sessions_listed):
+            self._note("usage: /open N — a number from /sessions", NOTE_WARN)
+            return
+        row = self._sessions_listed[n - 1]
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            messages, status = await agentapi.fetch_session(
+                client, AGENT_BASE, GHOST_API_KEY, row["id"])
+        if status != "ok":
+            self._note(f"could not open that conversation ({status})", NOTE_ERR)
+            return
+        if self._busy():
+            # A message was sent while the fetch was out. Switching now would
+            # swap the session under the running turn.
+            self._note("a turn started meanwhile — the conversation was not opened", NOTE_WARN)
+            return
+        self._begin_session(row["id"], agentapi.history_for_model(messages))
+        self._render_history(messages)
+        self._note(f"opened: {str(row.get('title') or 'untitled')[:60]}")
+        self.update_workspace_btn_state()
 
     def toggle_ptt(self):
         if self.is_recording:
@@ -839,53 +1154,143 @@ class MainWindow(QWidget):
         else:
             self.start_recording()
 
+    # ── activity → face frame rate ───────────────────────────────────────
+    def _note_activity(self):
+        """The operator did something: the face is back at full rate NOW,
+        not at the next 3-second tick."""
+        self._last_input_at = time.monotonic()
+        self._apply_face_rate()
+
+    def _apply_face_rate(self):
+        # The pointer is the one input no key handler sees. Polled here (one
+        # call every 3 s) rather than tracked by an application-wide event
+        # filter, which would put a Python call on every paint and timer
+        # event of a 60 fps window.
+        pos = QCursor.pos()
+        if self._last_cursor is not None and pos != self._last_cursor:
+            self._last_input_at = time.monotonic()
+        self._last_cursor = pos
+        busy = (self._busy() or self.is_recording or self.review_timer.isActive()
+                or self._face_mood in ("think", "speak", "listen"))
+        idle_s = time.monotonic() - self._last_input_at
+        self.web_face.set_rate(
+            devstatus.face_rate(idle_s, busy, self._on_battery))
+
+    def _silence(self):
+        """Stop speaking now and forget what was queued to be said."""
+        global _speech_epoch
+        # A sentence already being fetched lands AFTER the purge below; the
+        # epoch lets audio_fetch_task see that it is stale and drop it.
+        _speech_epoch += 1
+        while not audio_queue.empty():
+            try: audio_queue.get_nowait(); audio_queue.task_done()
+            except Exception: break
+        while not playback_queue.empty():
+            try: playback_queue.get_nowait(); playback_queue.task_done()
+            except Exception: break
+        self._kill_playback()
+
+    def _kill_playback(self):
+        # Its own method so device_probe.py can run the real _silence() beside
+        # the live client without killing the live client's audio.
+        subprocess.Popen(['pkill', 'aplay'])
+
     def start_recording(self):
         """Triggered when the PTT button is held down."""
         if self.is_recording:
             return
+        if self._transcribing:
+            self._note("still transcribing the last recording…")
+            return
+        self._cancel_review()
+        self._note_activity()
+        # Barge-in: the agent stops talking when the operator starts. It used
+        # to keep speaking, straight into the microphone it was recording.
+        self._silence()
         self.is_recording = True
-        self.ptt_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: rgba(255, 51, 68, 0.18);
-                color: {T.REC};
-                border: 1px solid {T.REC};
-                border-radius: 6px;
-                padding: 6px 12px;
-                font-family: {T.FONT};
-                font-size: 18px;
-                font-weight: bold;
-                letter-spacing: 1px;
-            }}
-        """)
-        self.ptt_btn.setText("●  REC")
+        self._rec_started = time.monotonic()
+        self.ptt_btn.setStyleSheet(chip_style_hot(T.REC, T.REC))
+        self.ptt_btn.setText("●  0:00")
+        self.rec_timer.start(500)
         self.set_face_mood("listen")
+        # Its OWN file per recording. They all used to be written to
+        # /tmp/ghost_stt.wav, so an upload still reading the last one saw the
+        # next one being written underneath it.
+        self._rec_seq += 1
+        self._rec_path = f"/tmp/ghost_stt_{os.getpid()}_{self._rec_seq}.wav"
+        self._start_arecord(self._rec_path)
 
+    def _start_arecord(self, path):
         # Kill any lingering recording processes just in case
         subprocess.Popen(['pkill', 'arecord']).wait()
-        
         # Start recording 16kHz mono audio to a temporary file
         self.record_proc = subprocess.Popen(
-            ['arecord', '-f', 'S16_LE', '-r', '16000', '-c', '1', '/tmp/ghost_stt.wav'],
+            ['arecord', '-f', 'S16_LE', '-r', '16000', '-c', '1', path],
             stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
         )
+
+    def _stop_arecord(self):
+        if hasattr(self, 'record_proc') and self.record_proc:
+            self.record_proc.terminate()
+            self.record_proc.wait()
+
+    def _tick_recording(self):
+        if not self.is_recording:
+            self.rec_timer.stop()
+            return
+        elapsed = time.monotonic() - self._rec_started
+        self.ptt_btn.setText(f"●  {clock_label(elapsed)}")
+        if PTT_MAX_S > 0 and elapsed >= PTT_MAX_S:
+            # Esc is a toggle, so a recording can be left running by accident.
+            self._note(f"recording stopped at the {int(PTT_MAX_S)} s limit")
+            self.stop_recording()
 
     def stop_recording(self):
         """Triggered when the PTT button is released."""
         if not self.is_recording:
             return
         self.is_recording = False
+        self.rec_timer.stop()
         self.ptt_btn.setStyleSheet(chip_style())
         self.ptt_btn.setText("●  PTT")
-        
-        # Stop recording
-        if hasattr(self, 'record_proc') and self.record_proc:
-            self.record_proc.terminate()
-            self.record_proc.wait()
-            
+        self._stop_arecord()
+        path, self._rec_path = self._rec_path, None
+        if time.monotonic() - self._rec_started < PTT_MIN_S:
+            # A slip of the key, not speech: nothing worth a transcription.
+            self._discard_recording(path)
+            self.set_face_mood("idle")
+            return
         # Trigger the async upload task
-        asyncio.ensure_future(self.process_stt_audio())
+        asyncio.ensure_future(self.process_stt_audio(path))
+
+    @staticmethod
+    def _discard_recording(path):
+        try:
+            if path:
+                os.unlink(path)
+        except OSError:
+            pass
+
+    def _ptt_released(self, event):
+        """Esc was let go. A TAP toggles (press again to send); a HOLD is
+        push-to-talk — letting go sends. True if this ended a recording."""
+        if (event.key() == Qt.Key.Key_Escape and not event.isAutoRepeat()
+                and event.modifiers() == Qt.KeyboardModifier.NoModifier
+                and self.is_recording
+                and time.monotonic() - self._rec_started >= PTT_HOLD_S):
+            self.stop_recording()
+            return True
+        return False
+
+    def keyReleaseEvent(self, event):
+        if not self._ptt_released(event):
+            super().keyReleaseEvent(event)
 
     def take_picture(self):
+        if self._busy():
+            self._note("still working on the last message — Shift+Esc stops it", NOTE_WARN)
+            return
+        self._note_activity()
         dialog = CameraPreviewDialog(self)
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.result_data:
             b64_img, prompt_text = dialog.result_data
@@ -897,19 +1302,27 @@ class MainWindow(QWidget):
                 {"type": "text", "text": prompt_text},
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
             ]
-            
-            self.update_chat_signal.emit("user", (f"{prompt_text}<br><span style='color:{T.TEXT_DIM};'><i>[ optic capture attached ]</i></span>"))
-            
-            self.conversation_history.append({"role": "user", "content": content})
-            self.update_workspace_signal.emit()
-            asyncio.ensure_future(self.send_chat_request())
+            # _submit re-checks: a turn may have started while the dialog was
+            # open (it is modal, but timers and tasks keep running under it).
+            if not self._submit(content, f"{escape_user(prompt_text)}<br><span style='color:{T.TEXT_DIM};'><i>[ optic capture attached ]</i></span>"):
+                self._note("the picture was not sent — a turn was already running", NOTE_WARN)
 
-    async def process_stt_audio(self):
+    async def process_stt_audio(self, path):
         """Uploads the audio and forwards the transcribed text to the chat."""
-        if not os.path.exists('/tmp/ghost_stt.wav'):
+        # The whole clip is read into memory FIRST (it is small: 16 kHz mono,
+        # ~32 KB a second) and the file removed. Handing httpx the open file
+        # let the declared Content-Length and the bytes actually read differ
+        # whenever the file changed in between.
+        try:
+            with open(path, 'rb') as f:
+                audio = f.read()
+        except OSError:
             self.set_face_mood("idle")
             return
+        finally:
+            self._discard_recording(path)
 
+        self._transcribing = True
         self.text_input.setPlaceholderText("Transcribing audio...")
         self.text_input.setEnabled(False)
 
@@ -919,12 +1332,11 @@ class MainWindow(QWidget):
             # writes 16kHz mono WAV — exactly what the endpoint wants — so the
             # server-side transcode is a cheap passthrough.
             async with httpx.AsyncClient(timeout=60.0, verify=VOICE_VERIFY_TLS) as client:
-                with open('/tmp/ghost_stt.wav', 'rb') as f:
-                    # Standard multipart file upload format
-                    files = {'file': ('ghost_stt.wav', f, 'audio/wav')}
-                    response = await client.post(
-                        STT_SERVER_URL, files=files,
-                        headers={"X-Ghost-Key": GHOST_API_KEY})
+                # Standard multipart file upload format
+                files = {'file': ('ghost_stt.wav', audio, 'audio/wav')}
+                response = await client.post(
+                    STT_SERVER_URL, files=files,
+                    headers={"X-Ghost-Key": GHOST_API_KEY})
 
                 if response.status_code == 200:
                     data = response.json()
@@ -932,8 +1344,7 @@ class MainWindow(QWidget):
                     text = data.get("text", "").strip()
                     if text:
                         self.text_input.setText(text)
-                        # immediately send it as a message
-                        self.handle_input()
+                        self._after_transcript()
                     else:
                         # Empty transcription — return to idle
                         self.set_face_mood("idle")
@@ -953,29 +1364,95 @@ class MainWindow(QWidget):
             self.update_chat_signal.emit("error", f"STT Error: {str(e)}")
             self.set_face_mood("idle")
         finally:
-            self.text_input.setPlaceholderText("")
+            self._transcribing = False
+            # The REAL placeholder, not "": this used to blank it for the rest
+            # of the session after the first transcription.
+            self.text_input.setPlaceholderText(INPUT_PLACEHOLDER)
             self.text_input.setEnabled(True)
             self.text_input.setFocus()
 
+    # ── voice review: a moment to fix a misheard word ────────────────────
+    def _after_transcript(self):
+        """The transcript is in the input. Send it — after a short, visible
+        countdown when the operator can see and fix it."""
+        if STT_REVIEW_S <= 0 or not self.overlay.isVisible():
+            # Face-only mode has no input to review; hands-free means send.
+            self.handle_input()
+            return
+        self.set_face_mood("idle")
+        self._review_left = STT_REVIEW_S
+        self.ptt_btn.setStyleSheet(chip_style_on())
+        self._show_review()
+        self.review_timer.start(250)
+
+    def _show_review(self):
+        self.ptt_btn.setText(f"↵  {max(0.0, self._review_left):.0f}s")
+
+    def _tick_review(self):
+        self._review_left -= 0.25
+        if self._review_left <= 0:
+            self._cancel_review()
+            self.handle_input()
+        else:
+            self._show_review()
+
+    def _cancel_review(self):
+        if self.review_timer.isActive():
+            self.review_timer.stop()
+            if not self.is_recording:
+                self.ptt_btn.setStyleSheet(chip_style())
+                self.ptt_btn.setText("●  PTT")
+
+    def _on_text_edited(self, _text):
+        # The operator touched the transcript: it is theirs now, and it goes
+        # when they press Enter.
+        self._note_activity()
+        self._cancel_review()
+
     def update_stats(self):
         now = datetime.datetime.now().strftime("%I:%M %p")
-        
-        bat_pct = "--"
-        try:
-            for ps in os.listdir("/sys/class/power_supply/"):
-                if "bat" in ps.lower() or "axp" in ps.lower():
-                    cap_path = f"/sys/class/power_supply/{ps}/capacity"
-                    if os.path.exists(cap_path):
-                        with open(cap_path, 'r') as f:
-                            bat_pct = f.read().strip()
-                        break
-        except Exception:
-            pass
+        pct, state = devstatus.read_battery()
+        self._on_battery = devstatus.on_battery(state)
+        self.stats_label.setText(devstatus.status_html(
+            self._agent_ok, devstatus.read_wifi(), pct, state, now,
+            ok=T.OK, danger=T.DANGER, dim=T.TEXT_DIM))
 
-        self.stats_label.setText(f"⚡ {bat_pct}%   {now}")
+    def _scroll_key(self, event):
+        """PgUp / PgDn (and Shift+Up / Shift+Down, for keyboards where the
+        page keys sit behind Fn) scroll the transcript. True if handled.
+
+        The input keeps the focus, so the transcript never saw a key: reading
+        back meant steering the trackball onto an 8-pixel scrollbar.
+        """
+        key = event.key()
+        shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        if key == Qt.Key.Key_PageUp or (shift and key == Qt.Key.Key_Up):
+            self.chat_display.scroll_page(-1)
+            return True
+        if key == Qt.Key.Key_PageDown or (shift and key == Qt.Key.Key_Down):
+            self.chat_display.scroll_page(+1)
+            return True
+        return False
 
     def eventFilter(self, obj, event):
+        if obj == self.text_input and event.type() == QEvent.Type.KeyRelease:
+            if self._ptt_released(event):
+                return True
         if obj == self.text_input and event.type() == QEvent.Type.KeyPress:
+            self._note_activity()
+            if event.key() not in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                # ANY key but Enter stops a voice transcript's countdown:
+                # moving the caret to the misheard word must not race it, and
+                # recalling an old message with Up must not be auto-sent.
+                self._cancel_review()
+            if self._scroll_key(event):
+                return True
+            ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            if ctrl and event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+                # Normally the Ctrl+Up / Ctrl+Down shortcuts fire first; this
+                # is the same action if the key reaches the input instead.
+                self.rate_last("positive" if event.key() == Qt.Key.Key_Up else "negative")
+                return True
             if event.key() == Qt.Key.Key_Up:
                 if self.input_history:
                     if self.history_index == -1:
@@ -996,6 +1473,7 @@ class MainWindow(QWidget):
         return super().eventFilter(obj, event)
 
     def keyPressEvent(self, event):
+        self._note_activity()
         # Escape hatch. With the glass UI hidden there is no visible control to
         # bring it back and this is a frameless always-on-top kiosk, so ANY key
         # restores it rather than only the documented F11. Escape/Alt+Escape/
@@ -1004,6 +1482,9 @@ class MainWindow(QWidget):
         # the point of a face-only mode.
         if not self.overlay.isVisible():
             self._restore_overlay()
+            return
+
+        if self._scroll_key(event):
             return
 
         if not self.text_input.hasFocus() and len(event.text()) > 0 and event.text().isprintable():
@@ -1031,20 +1512,14 @@ class MainWindow(QWidget):
 
     def toggle_tts(self):
         self.tts_enabled = not self.tts_enabled
+        self._voice_fault_shown = False
         if self.tts_enabled:
             self.tts_btn.setText("◉  TTS")
-            self.tts_btn.setStyleSheet(chip_style(fg=T.OK))
+            self.tts_btn.setStyleSheet(chip_style_on())
         else:
             self.tts_btn.setText("◌  TTS")
             self.tts_btn.setStyleSheet(chip_style(fg=T.TEXT_DIM))
-            # Clear queue immediately
-            subprocess.Popen(['pkill', 'aplay'])
-            while not audio_queue.empty():
-                try: audio_queue.get_nowait(); audio_queue.task_done()
-                except: pass
-            while not playback_queue.empty():
-                try: playback_queue.get_nowait(); playback_queue.task_done()
-                except: pass
+            self._silence()
 
     def set_face_mood(self, mood):
         """Set the face mood, and remember it.
@@ -1061,11 +1536,11 @@ class MainWindow(QWidget):
             pass
 
     def toggle_face_style(self):
-        """Cycle the face FORM (vortex → cortex → lattice → …).
+        """Cycle the face FORM.
 
         This used to swap between three separate QPainter renderers. Those are
-        gone; the web face carries the same eight forms the browser has, so the
-        button now walks that list and the two clients stay in step.
+        gone; the web face carries the browser's own FORMS list, so the button
+        walks that list and the two clients stay in step.
         """
         try:
             self.web_face.cycle_form()
@@ -1101,7 +1576,7 @@ class MainWindow(QWidget):
         """
         if self.overlay.isVisible():
             self.overlay.hide()
-            self.fs_btn.setText("○")
+            self.fs_btn.setText("○  FACE")
             self.setFocus()          # so keyPressEvent reaches the window
         else:
             self._restore_overlay()
@@ -1110,94 +1585,304 @@ class MainWindow(QWidget):
         """Bring the glass UI back and put the caret where the operator left it."""
         self.overlay.show()
         self.overlay.raise_()        # the face must never composite over it
-        self.fs_btn.setText("◐")
+        self.fs_btn.setText("◐  FACE")
         self.text_input.setFocus()
 
+    # ── one turn at a time ───────────────────────────────────────────────
+    def _busy(self):
+        return self._turn_task is not None and not self._turn_task.done()
+
+    def _submit(self, content, shown_html):
+        """Send a message. The ONLY way one is sent — and it refuses while a
+        turn is running.
+
+        The check is HERE, at the moment of commitment, not at each caller:
+        the camera dialog is modal, and a voice transcript's countdown can
+        start a turn while it is open; a caller that checked `_busy()` before
+        opening it would then start a second stream into the first one's
+        reply bubble. Returns whether the message went.
+        """
+        if self._busy():
+            if not self._busy_noted:
+                self._busy_noted = True
+                self._note("still working on the last message — Shift+Esc (or /stop) "
+                           "stops the turn", NOTE_WARN)
+            return False
+        self._silence()
+        self.update_chat_signal.emit("user", shown_html)
+        self.conversation_history.append({"role": "user", "content": content})
+        self.web_face.wake()
+        self.update_workspace_signal.emit()
+        self._start_turn()
+        return True
+
+    def _start_turn(self):
+        self._stop_asked = 0
+        self._stop_took = False
+        self._stop_pending = False
+        self._busy_noted = False
+        # The chips rate the LAST FINISHED reply; while a new one is arriving
+        # they would label the previous turn, under the operator's eyes on the
+        # new one. Off until this turn ends.
+        self._last_reply_rid = None
+        self._rated = None
+        self._refresh_rating_chips()
+        self.stop_btn.show()
+        self._turn_task = asyncio.ensure_future(self.send_chat_request())
+
+    def request_stop(self):
+        """Stop the running turn — on the AGENT, not just here.
+
+        The first press asks the agent to stop at its next boundary (it
+        returns what it has). A second press forces it: the agent cancels the
+        task outright and this client stops listening.
+        """
+        self._note_activity()
+        if not self._busy():
+            self._note("nothing is running")
+            return
+        self._stop_asked += 1
+        hard = self._stop_asked >= 2
+        self._stop_pending = True
+        self._silence()                 # stop means stop talking, too
+        self._note("forcing the stop…" if hard else "stopping… (again to force)")
+        asyncio.ensure_future(self._stop_turn(hard))
+
+    async def _stop_turn(self, hard):
+        task = self._turn_task
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            # By THIS turn's request id and nothing else — never "whatever is
+            # running", which can be a dream or another client's turn.
+            outcome, detail = await agentapi.cancel_turn(
+                client, AGENT_BASE, GHOST_API_KEY, self._turn_rid, hard=hard)
+        if task is None or task is not self._turn_task:
+            return                      # a different turn by now
+        self._stop_pending = False
+        if outcome == "cancelled":
+            self._stop_took = True
+        if task.done():
+            return                      # it ended while we were asking
+        if outcome == "failed":
+            self._note(f"the agent did not take the stop ({detail})", NOTE_ERR)
+        elif outcome == "unknown":
+            self._note("this turn has no id yet — nothing was cancelled on the agent",
+                       NOTE_WARN)
+        if hard:
+            self._stop_took = True
+            task.cancel()
+
+    # ── rating the last reply ────────────────────────────────────────────
+    def _refresh_rating_chips(self):
+        can = bool(self._last_reply_rid)
+        for btn, signal, fg, fill in (
+                (self.good_btn, "positive", T.OK, "rgba(159, 227, 184, 0.16)"),
+                (self.bad_btn, "negative", T.DANGER, "rgba(255, 123, 145, 0.16)")):
+            btn.setEnabled(can)
+            btn.setStyleSheet(chip_style_on(fg, fill) if can and self._rated == signal
+                              else chip_style())
+
+    def rate_last(self, signal, note=""):
+        """A human label for the last reply — the scarcest signal the agent's
+        learning has, and one this device never produced."""
+        self._note_activity()
+        if not self._last_reply_rid:
+            self._note("no reply to rate yet (a quick greeting cannot be rated)")
+            return
+        if self._rated == signal and not note:
+            return
+        asyncio.ensure_future(self._send_rating(self._last_reply_rid, signal, note))
+
+    async def _send_rating(self, rid, signal, note):
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            ok, detail = await agentapi.send_feedback(
+                client, AGENT_BASE, GHOST_API_KEY, rid, signal, note)
+        if rid != self._last_reply_rid:
+            return              # a newer reply owns the chips now
+        if ok:
+            self._rated = signal
+            self._refresh_rating_chips()
+        else:
+            self._note(f"rating not recorded: {detail}", NOTE_ERR)
+
+    # ── device controls ──────────────────────────────────────────────────
+    def _set_brightness(self, arg):
+        result = devstatus.set_backlight(arg)
+        if result is None:
+            self._note("usage: /bright 1-9, /bright + or /bright -  "
+                       "(or this device has no backlight control)", NOTE_WARN)
+        else:
+            self._note(f"brightness {result[0]} of {result[1]}")
+
+    async def _set_volume(self, arg):
+        env = devstatus.panel_env()
+
+        async def run(*argv):
+            proc = await asyncio.create_subprocess_exec(
+                *argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            out, _ = await proc.communicate()
+            return out.decode(errors="replace")
+
+        try:
+            current = devstatus.parse_volume(
+                await run("wpctl", "get-volume", devstatus.SINK))
+            if current is None:
+                self._note("no audio output found", NOTE_WARN)
+                return
+            argv = devstatus.volume_command(arg, current)
+            if argv is None and (arg or "").strip():
+                self._note("usage: /vol 0-100, /vol + or /vol -", NOTE_WARN)
+                return
+            reading = ""
+            if argv:
+                await run(*argv)
+            reading = await run("wpctl", "get-volume", devstatus.SINK)
+            current = devstatus.parse_volume(reading)
+            self.chat_display.scroll_to_end()
+            self._note(f"volume {current}%"
+                       + ("  (muted)" if devstatus.volume_muted(reading) else ""))
+        except OSError as e:
+            self._note(f"volume control unavailable: {e}", NOTE_ERR)
+
+    def _new_conversation(self):
+        if self._busy():
+            self._note("a turn is running — /stop it first", NOTE_WARN)
+            return
+        # A NEW session id, not just an empty screen: the agent keeps the
+        # conversation under the id, and reusing it would bring every earlier
+        # message back into the next turn.
+        self._begin_session(agentapi.new_session_id())
+        self._note("new conversation.", NOTE_WARN)
+        self.set_face_mood("idle")
+        self._silence()
+
+    def _run_command(self, cmd):
+        name, arg = cmd
+        if name in commands.CONFIRM:
+            if not self.confirmer.confirm(name):
+                self._note(f"/{name} — type it again within "
+                           f"{int(commands.CONFIRM_WINDOW_S)} s to confirm", NOTE_WARN)
+                return
+        else:
+            self.confirmer.disarm()
+
+        # A command is the operator asking for something: its answer is
+        # shown, wherever the transcript happened to be scrolled.
+        self.chat_display.scroll_to_end()
+        if name == "extra":
+            self._note(f"/{arg} takes nothing after it — nothing was done", NOTE_WARN)
+        elif name == "help":
+            self.chat_display.add(commands.help_html(T.TEXT_DIM, T.ACCENT, T.FONT), "system")
+        elif name in ("new", "clear"):
+            self._new_conversation()
+        elif name == "stop":
+            self.request_stop()
+        elif name == "sessions":
+            asyncio.ensure_future(self._show_sessions())
+        elif name == "open":
+            if self._busy():
+                self._note("a turn is running — /stop it first", NOTE_WARN)
+            else:
+                asyncio.ensure_future(self._open_session(arg))
+        elif name == "good":
+            self.rate_last("positive")
+        elif name == "bad":
+            self.rate_last("negative", arg)
+        elif name == "bright":
+            self._set_brightness(arg)
+        elif name == "vol":
+            asyncio.ensure_future(self._set_volume(arg))
+        elif name == "tts":
+            self.toggle_tts()
+        elif name == "face":
+            self.toggle_face_style()
+        elif name == "shutdown":
+            self._note("powering down hardware…", NOTE_WARN)
+            _power(['sudo', 'shutdown', '-h', 'now'])
+        elif name == "reboot":
+            self._note("rebooting hardware…", NOTE_WARN)
+            _power(['sudo', 'reboot'])
+        elif name == "exit":
+            self._note("detaching from cyberdeck…", NOTE_WARN)
+            QApplication.quit()
+        else:
+            near = commands.suggestion(arg)
+            self._note(f"unknown command /{arg}"
+                       + (f" — did you mean /{near}?" if near else "")
+                       + "   (/help lists them)", NOTE_WARN)
+
     def handle_input(self):
+        self._cancel_review()
+        self._note_activity()
         text = self.text_input.text().strip()
         if not text:
             return
-            
-        if text.startswith('/clear'):
-            self.conversation_history.clear()
-            self.update_workspace_signal.emit()
-            self.chat_display.clear()
-            self.chat_display.add(f"{NOTE_WARN}context wiped.</i></div>", "system")
-            self.text_input.clear()
-            self.set_face_mood("idle")
-            
-            while not audio_queue.empty():
-                try: audio_queue.get_nowait(); audio_queue.task_done()
-                except: pass
-            while not playback_queue.empty():
-                try: playback_queue.get_nowait(); playback_queue.task_done()
-                except: pass
-            subprocess.Popen(['pkill', 'aplay'])
+
+        cmd = commands.parse(text)
+        if cmd is not None:
+            if cmd.name not in ("unknown", "extra"):
+                # A mistyped command stays in the input to be corrected — it
+                # may be a whole sentence that only LOOKED like a command.
+                self.input_history.append(text)
+                self.history_index = -1
+                self.text_input.clear()
+            self._run_command(cmd)
             return
+        self.confirmer.disarm()
 
-        if text.startswith('/shutdown'):
-            self.update_chat_signal.emit("append", f"{NOTE_WARN}powering down hardware…</i></div>")
+        # While a turn runs the text STAYS in the input: sending it would
+        # start a second stream into the reply that is still arriving.
+        if self._submit(text, escape_user(text)):
+            self.input_history.append(text)
+            self.history_index = -1
             self.text_input.clear()
-            subprocess.Popen(['sudo', 'shutdown', '-h', 'now'])
-            return
 
-        if text.startswith('/reboot'):
-            self.update_chat_signal.emit("append", f"{NOTE_WARN}rebooting hardware…</i></div>")
-            self.text_input.clear()
-            subprocess.Popen(['sudo', 'reboot'])
-            return
-
-        if text.startswith('/exit'):
-            self.update_chat_signal.emit("append", f"{NOTE_WARN}detaching from cyberdeck…</i></div>")
-            self.text_input.clear()
-            QApplication.quit()
-            return
-
-        while not audio_queue.empty():
-            try: audio_queue.get_nowait(); audio_queue.task_done()
-            except: pass
-        while not playback_queue.empty():
-            try: playback_queue.get_nowait(); playback_queue.task_done()
-            except: pass
-        subprocess.Popen(['pkill', 'aplay'])
-
-        self.input_history.append(text)
-        self.history_index = -1
-        self.text_input.clear()
-
-        self.update_chat_signal.emit("user", (text))
-
-        self.conversation_history.append({"role": "user", "content": text})
-        self.web_face.wake()
-        self.update_workspace_signal.emit()
-        
-        asyncio.ensure_future(self.send_chat_request())
+    def _say(self, sentences):
+        # Not while recording: barge-in silenced what was queued, and a reply
+        # still streaming must not start talking again into the open
+        # microphone (it would be transcribed and sent back as the operator's
+        # words).
+        if self.tts_enabled and not self.is_recording:
+            for sentence in sentences:
+                audio_queue.put_nowait(sentence)
 
     async def send_chat_request(self):
-        url = "http://eva:8000/api/chat"
-        headers = {
-            "X-Ghost-Key": GHOST_API_KEY
-        }
-        # Get the text directly from the last user input
-        text = self.conversation_history[-1]["content"] if self.conversation_history else ""
+        url = f"{AGENT_BASE}/api/chat"
+        # The request id is minted HERE, so the turn can be stopped before the
+        # agent has sent a frame (the whole thinking phase). The agent may
+        # uniquify it; the frames carry the id it actually used.
+        self._turn_rid = agentapi.new_request_id()
+        self._turn_verdict = None
+        headers = agentapi.headers(GHOST_API_KEY, self._turn_rid)
         payload = {
             # model omitted on purpose — the agent uses its configured model;
             # pinning a name here 404s (ModelNotFound) whenever the model is upgraded
             "messages": self.conversation_history,
+            # Durable session: the agent stores the conversation under this id
+            # and merges a replayed history tolerantly, so sending the whole
+            # local history (as the web UI does) can never double it.
+            "session_id": self.session_id,
             "stream": True
         }
         
         self.update_chat_signal.emit("start_response", "")
-        self._face_error = False
         self.set_face_mood("think")
-        self.tts_buffer = ""
+        self.speech = SpeechChunker()
+        started = time.monotonic()
+        frame_rid = None          # the id the agent filed this turn under
+        unlabelable = False
+        writing = False
+        recorded = False
         
         try:
             async with httpx.AsyncClient(timeout=3600.0) as client:
                 async with client.stream("POST", url, headers=headers, json=payload) as response:
                     if response.status_code != 200:
-                        self.update_chat_signal.emit("error", f"HTTP {response.status_code}")
+                        body = (await response.aread()).decode(errors="replace")
+                        self.web_face.note_error(body)
+                        self.update_chat_signal.emit(
+                            "error", agentapi.describe_http_error(response.status_code, body))
                         return
+                    self._set_agent_ok(True)
 
                     held = None           # §4KP: a list while the reply is held
                     saw_done = got_error = False
@@ -1205,26 +1890,45 @@ class MainWindow(QWidget):
                     after_err = []        # content the agent sends after a fault (its fallback)
                     # one SSE line per item (§4KP: aiter_text yields socket chunks,
                     # and two frames in one chunk failed json.loads together)
+                    #
+                    # ⚠ The loop does NOT `break` at [DONE]; it reads on to the end of
+                    # the stream (which the agent closes right after). A `break` leaves
+                    # httpx's chain of async generators suspended, and under qasync —
+                    # which installs no async-generator finalizer — they are torn down
+                    # by the garbage collector mid-await: "async generator ignored
+                    # GeneratorExit" and anyio's "exit cancel scope in a different
+                    # task", on every turn. Found by device_probe.py; the old client
+                    # did it silently, its stderr going nowhere. Closing the line
+                    # iterator does not help: the generators nested under it are not
+                    # closed with it.
                     async for chunk in response.aiter_lines():
+                        if saw_done:
+                            continue
                         if chunk.startswith("data: "):
                             data_str = chunk[6:].strip()
                             if data_str == "[DONE]":
                                 saw_done = True
-                                break
+                                continue
                             try:
                                 data = json.loads(data_str)
-                                if data.get("error") and "choices" not in data:
+                                if not isinstance(data, dict):
+                                    continue       # `data: 12` is not a frame
+                                _rid = agentapi.frame_request_id(data)
+                                if _rid:
+                                    frame_rid = self._turn_rid = _rid
+                                if agentapi.frame_unlabelable(data):
+                                    unlabelable = True
+                                _err = agentapi.frame_error(data)
+                                if _err is not None:
                                     got_error = True       # §4KP: a cut reply is not released
                                     if err_msg is None:
-                                        _e = data["error"]
-                                        err_msg = str(_e.get("message") if isinstance(_e, dict) else _e)
+                                        err_msg = _err
                                     continue       # the agent may still send its fallback sentence
                                 if (data.get("ghost") or {}).get("reasoning_unparsed") is True and held is None:
                                     held = []
-                                content = data.get("message", {}).get("content", "")
-                                if not content and "choices" in data:
-                                    delta = data["choices"][0].get("delta", {})
-                                    content = delta.get("content", "")
+                                # Any frame shape: a usage-only frame has an
+                                # EMPTY `choices` (see agentapi.frame_content).
+                                content = agentapi.frame_content(data)
 
                                 if content and held is not None:
                                     # spoken and shown once complete; after a fault
@@ -1232,62 +1936,173 @@ class MainWindow(QWidget):
                                     (after_err if got_error else held).append(content)
                                     continue
                                 if content:
+                                    if not writing:
+                                        writing = True
+                                        self.web_face.set_phase("write")
                                     self.update_chat_signal.emit("update_response", content)
                                     self.web_face.pulse()
                                     # Network auto-spawns its own pulses in think mode;
                                     # just feed it a token-activity signal instead of
                                     # stacking extra full MoE cascades on every token.
                                     self.web_face.feed_audio(0.5)
-                                    self.tts_buffer += content
-                                    
-                                    match = re.search(r'([.?!]+[\s\n]+)', self.tts_buffer)
-                                    while match:
-                                        split_idx = match.end()
-                                        sentence = self.tts_buffer[:split_idx].strip()
-                                        if sentence:
-                                            clean = re.sub(r'!\[.*?\]\(.*?\)', '', sentence)
-                                            clean = re.sub(r'[*`_#]', '', clean)
-                                            if clean.strip() and self.tts_enabled:
-                                                audio_queue.put_nowait(clean.strip())
-                                        self.tts_buffer = self.tts_buffer[split_idx:]
-                                        match = re.search(r'([.?!]+[\s\n]+)', self.tts_buffer)
+                                    self._say(self.speech.feed(content))
                             except json.JSONDecodeError:
                                 pass
                     if held is not None and saw_done:
                         text = strip_orphan_think_close("".join(after_err if got_error else held))
                         if text:
                             self.update_chat_signal.emit("update_response", text)
-                            self.tts_buffer += text
-                            for sentence in re.split(r'(?<=[.?!])\s+', self.tts_buffer)[:-1]:
-                                clean = re.sub(r'[*`_#]', '', re.sub(r'!\[.*?\]\(.*?\)', '', sentence)).strip()
-                                if clean and self.tts_enabled:
-                                    audio_queue.put_nowait(clean)
-                            self.tts_buffer = re.split(r'(?<=[.?!])\s+', self.tts_buffer)[-1]
+                            self._say(self.speech.feed(text))
 
                     if err_msg is not None:
+                        self.web_face.note_error(err_msg)
                         self.update_chat_signal.emit("error", err_msg)   # once, after the reply
 
-            final_sentence = self.tts_buffer.strip()
-            if final_sentence:
-                clean = re.sub(r'!\[.*?\]\(.*?\)', '', final_sentence)
-                clean = re.sub(r'[*`_#]', '', clean)
-                if clean.strip() and self.tts_enabled:
-                    audio_queue.put_nowait(clean.strip())
-                                
-            self.conversation_history.append({"role": "assistant", "content": self.current_response_text})
-            self.update_workspace_signal.emit()
+            self._say(self.speech.flush())
+            if self.current_response_text:
+                self.conversation_history.append({"role": "assistant", "content": self.current_response_text})
+                self.update_workspace_signal.emit()
+            recorded = True
             
+        except asyncio.CancelledError:
+            # A forced stop (request_stop, second press). Not an error: the
+            # operator asked for exactly this.
+            pass
         except Exception as e:
-            self.web_face.startle()
-            self._face_error = True
-            self.update_chat_signal.emit("error", f"{type(e).__name__}: {str(e)}")
+            self.web_face.note_error(f"{type(e).__name__}: {e}")
+            if agentapi.is_unreachable(e):
+                self._set_agent_ok(False)
+            self.update_chat_signal.emit("error", agentapi.describe_error(e, AGENT_BASE))
         finally:
+            if not recorded and self.current_response_text:
+                # A reply that was cut (stopped, or the link dropped) is still
+                # what the operator read: it stays in the conversation.
+                self.conversation_history.append(
+                    {"role": "assistant", "content": self.current_response_text})
+                self.update_workspace_signal.emit()
             self.update_chat_signal.emit("stop_thinking", "")
-            if not self._face_error:
-                if self.tts_enabled and (not audio_queue.empty() or not playback_queue.empty()):
-                    self.set_face_mood("speak")
-                else:
-                    self.set_face_mood("idle")
+            self.stop_btn.hide()
+            if self._stop_took or self._stop_pending:
+                # When the agent TOOK the stop (or this client forced it) —
+                # or the stream ended while the stop was still on its way,
+                # which is the same thing arriving in the other order. A stop
+                # that was REFUSED, followed by a normal finish, is not
+                # "stopped".
+                self._note("stopped.")
+            # How the turn ended shapes how the face lets go, then the gait clears.
+            self.web_face.note_verdict(self._turn_verdict or "stop")
+            self.web_face.set_phase(None)
+            # The reply can be rated when the agent filed a trajectory for it.
+            self._last_reply_rid = (frame_rid if frame_rid and not unlabelable
+                                    and self.current_response_text else None)
+            self._rated = None
+            self._refresh_rating_chips()
+            # ALWAYS leave "think". A failed turn used to skip this (so the
+            # error flinch would show) and the mood stayed "think" until the
+            # next successful turn — a face that looks busy forever, and one
+            # the frame-rate policy therefore never slowed. The flinch is its
+            # own signal (note_error) and does not need the mood held.
+            if self.tts_enabled and (not audio_queue.empty() or not playback_queue.empty()):
+                self.set_face_mood("speak")
+            else:
+                self.set_face_mood("idle")
+            self._last_input_at = time.monotonic()
+            asyncio.ensure_future(self._reply_landed(time.monotonic() - started))
+
+    # ── when a reply lands: wake the panel, and say so ───────────────────
+    async def _run_quiet(self, *argv, env=None, stdin=None):
+        """Run a small helper; returns (returncode, stdout). Never raises."""
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv, env=env,
+                stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            out, _ = await asyncio.wait_for(proc.communicate(stdin), timeout=6)
+            return proc.returncode, out.decode(errors="replace")
+        except Exception:  # noqa: BLE001 — tool missing, not Wayland, timeout
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.kill()             # a timed-out helper is not left running
+                except ProcessLookupError:
+                    pass
+            return None, ""
+
+    async def _reply_landed(self, elapsed_s):
+        """A long turn used to end in silence on a dark screen: the panel
+        blanks after 10 idle minutes whether or not a turn is running, and
+        nothing brought it back. Wake it, and chime if the wait was long."""
+        env = devstatus.panel_env()
+        _rc, out = await self._run_quiet("wlopm", env=env)
+        was_off = devstatus.panel_is_off(out) is True
+        if was_off:
+            await self._run_quiet("wlopm", "--on", "*", env=env)
+        if CHIME_AFTER_S > 0 and should_chime(elapsed_s, was_off, self.tts_enabled,
+                                              min_elapsed_s=CHIME_AFTER_S):
+            await self._run_quiet("aplay", "-q", "-", stdin=chime_wav())
+
+    # ── the face's signal layer ──────────────────────────────────────────
+    def _on_turn_step(self, title, icon, detail):
+        """One step line of THIS turn (TurnTicker has already filtered out
+        other corridors and plumbing): give the face its gait and kicks."""
+        f = face_signals_for_ticker(title, icon, detail)
+        if f["phase"]:
+            self.web_face.set_phase(f["phase"])
+        if f["tool"]:
+            self.web_face.note_tool()
+        if f["recall"]:
+            now = time.monotonic()
+            if now - getattr(self, "_last_recall_at", 0.0) > 1.5:
+                self._last_recall_at = now
+                self.web_face.note_recall()
+        if f["verdict"]:
+            self._turn_verdict = f["verdict"]
+
+    # ── link: is the agent there, and is it busy with itself? ────────────
+    def _set_agent_ok(self, ok):
+        if ok != self._agent_ok:
+            self._agent_ok = ok
+            self.update_stats()
+
+    async def link_loop(self):
+        """Every LINK_POLL_S: one cheap call that answers two questions — is
+        the agent reachable (the status dot), and does a turn that is not
+        ours hold the lock (the face's second, slower breath)."""
+        if LINK_POLL_S <= 0:
+            return
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            while True:
+                try:
+                    payload = await agentapi.fetch_turns(client, AGENT_BASE, GHOST_API_KEY)
+                    # While our own turn streams, the stream is the evidence.
+                    if not self._busy():
+                        self._set_agent_ok(payload is not None)
+                    self.web_face.set_background_busy(agentapi.background_busy(
+                        payload, self.session_id, self._turn_rid if self._busy() else None))
+                except Exception as e:  # noqa: BLE001 — a poll must never end the loop
+                    print(f"[link] poll failed: {e}", flush=True)
+                await asyncio.sleep(LINK_POLL_S)
+
+    # ── what the agent did while nobody was asking ───────────────────────
+    def _deliver_notifications(self, records):
+        for rec in records:
+            line = agentapi.format_notification(rec)
+            self.chat_display.add(
+                f"<span style='color:{T.ACCENT};'>◆</span>&nbsp; {escape_user(line)}", "system")
+            self._say([str(rec.get("summary") or "")] if rec.get("summary") else [])
+        self.web_face.wake()
+
+    async def notify_loop(self):
+        if NOTIFY_POLL_S <= 0:
+            return
+        poller = agentapi.NotifyPoller(AGENT_BASE, GHOST_API_KEY)
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            while True:
+                try:
+                    await poller.cycle(client, self._deliver_notifications)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[notify] poll failed: {e}", flush=True)
+                await asyncio.sleep(NOTIFY_POLL_S)
 
     def _animate_thinking(self):
         if getattr(self, 'is_thinking', False):
@@ -1361,16 +2176,9 @@ class MainWindow(QWidget):
                 self.ticker.stop()
             self.current_response_text += data
 
-            processed_text = re.sub(
-                r'!\[(.*?)\]\((/api/download/[^\)]+)\)',
-                r'<br><a href="\2" style="text-decoration:none; font-size:28px;" title="View Image: \1">🖼️</a>',
-                self.current_response_text
-            )
-            html = markdown.markdown(processed_text, extensions=['fenced_code', 'tables'])
-            self.chat_display.update_agent(html)
+            self.chat_display.update_agent(render_reply(self.current_response_text))
 
-            matches = re.findall(r'!\[.*?\]\((/api/download/[^\)]+)\)', self.current_response_text)
-            for image_path in matches:
+            for image_path in reply_images(self.current_response_text):
                 self.show_image_signal.emit(image_path)
 
         elif action == "stop_thinking":
@@ -1378,8 +2186,10 @@ class MainWindow(QWidget):
             return
         elif action == "error":
             self._close_thinking()
+            # `data` is a server message or an exception's text — escaped, or a
+            # `<` in it would be swallowed as markup.
             self.chat_display.add(
-                f"<span style='color:{T.DANGER};'>fault → {data}</span>", "system")
+                f"<span style='color:{T.DANGER};'>fault → {escape_user(data)}</span>", "system")
 
     def _show_image_popup(self, image_path):
         if image_path in self.shown_images:
@@ -1388,21 +2198,46 @@ class MainWindow(QWidget):
         asyncio.ensure_future(self._download_and_show_image(image_path))
 
     async def _download_and_show_image(self, image_path):
-        url = f"http://eva:8000{image_path}"
+        url = f"{AGENT_BASE}{image_path}"
         headers = {"X-Ghost-Key": GHOST_API_KEY}
+        # A failed fetch used to be a print() nobody saw: the reply said an
+        # image was attached and tapping it did nothing.
         try:
             async with httpx.AsyncClient(timeout=60.0) as client:
                 r = await client.get(url, headers=headers)
                 if r.status_code == 200:
                     pixmap = QPixmap()
-                    pixmap.loadFromData(r.content)
-                    self._display_image_dialog(pixmap)
+                    if pixmap.loadFromData(r.content):
+                        self._display_image_dialog(pixmap)
+                    else:
+                        self._note("that image could not be decoded", NOTE_ERR)
+                else:
+                    self._note(f"image not available (HTTP {r.status_code})", NOTE_ERR)
         except Exception as e:
-            print(f"Image fetch failed: {e}")
+            self._note(f"image fetch failed: {agentapi.describe_error(e, AGENT_BASE)}", NOTE_ERR)
+
+    # ── voice faults, said once ──────────────────────────────────────────
+    def note_voice_fault(self, message):
+        """Spoken replies failed. It used to be a print() per sentence into a
+        log that did not exist: TTS on, silence, and no reason given."""
+        if self._voice_fault_shown:
+            return
+        self._voice_fault_shown = True
+        self._silence()
+        self._note(f"voice unavailable — {message}", NOTE_ERR)
+
+    def note_voice_ok(self):
+        self._voice_fault_shown = False
 
     def _display_image_dialog(self, pixmap):
         dialog = ImageViewer(pixmap, self)
         dialog.show()
+
+# Set in __main__ to the window's note_voice_fault / note_voice_ok. Module
+# level because the two audio tasks below are free functions.
+_voice_fault = lambda _message: None   # noqa: E731
+_voice_ok = lambda: None               # noqa: E731
+
 
 async def audio_fetch_task():
     # verify=VOICE_VERIFY_TLS: the voice endpoints moved to the interface's
@@ -1416,18 +2251,23 @@ async def audio_fetch_task():
                     continue
                 
                 payload = {"text": text_chunk}
+                epoch = _speech_epoch
                 resp = await client.post(
                     TTS_SERVER_URL, json=payload, timeout=60.0,
                     headers={"X-Ghost-Key": GHOST_API_KEY})
                 if resp.status_code == 200:
                     # audio/wav from the macOS synthesiser; `aplay -q -` reads
                     # a WAV header off stdin, same as the old Piper output.
-                    await playback_queue.put(resp.content)
+                    if epoch == _speech_epoch:      # not silenced meanwhile
+                        await playback_queue.put(resp.content)
+                    _voice_ok()
                 else:
                     print(f"TTS Fetch Err: HTTP {resp.status_code} "
-                          f"{(resp.text or '')[:160]}")
+                          f"{(resp.text or '')[:160]}", flush=True)
+                    _voice_fault(agentapi.describe_http_error(resp.status_code, resp.text or ""))
             except Exception as e:
-                print(f"TTS Fetch Err: {e}")
+                print(f"TTS Fetch Err: {e}", flush=True)
+                _voice_fault(agentapi.describe_error(e, VOICE_BASE_URL))
             finally:
                 try:
                     audio_queue.task_done()
@@ -1454,7 +2294,8 @@ async def audio_worker_task():
                 proc.stdin.close()
             await proc.wait()
         except Exception as e:
-            print(f"TTS Play Err: {e}")
+            print(f"TTS Play Err: {e}", flush=True)
+            _voice_fault(f"playback failed ({e})")
         finally:
             try:
                 playback_queue.task_done()
@@ -1474,9 +2315,15 @@ if __name__ == "__main__":
     
     window = MainWindow()
     window.show()
+    _voice_fault, _voice_ok = window.note_voice_fault, window.note_voice_ok
     
     loop.create_task(audio_fetch_task())
     loop.create_task(audio_worker_task())
+    # The conversation this device was having, the agent's reachability, and
+    # what it did while nobody was asking. Each loop survives its own errors.
+    loop.create_task(window.restore_session())
+    loop.create_task(window.link_loop())
+    loop.create_task(window.notify_loop())
     # Live turn status. Started unconditionally: the reader reconnects forever
     # and never raises, so an interface that is down (or a device without the
     # `websockets` package) just leaves the waiting bubble on its offline

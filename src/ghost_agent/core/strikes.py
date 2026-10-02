@@ -64,6 +64,12 @@ _VOLATILE_RES = (
     (re.compile(r"\b\d{4}-\d{2}-\d{2}\b"), "DATE"),
     (re.compile(r"\b(?:pid|PID)[ =:]+\d+\b"), "pid=N"),
     (re.compile(r"/tmp/[\w.\-]+"), "/tmp/X"),
+    # §4KT R3: a URL is the thing that was tried, not the error — one
+    # `net::ERR_HTTP2_PROTOCOL_ERROR` keyed as eleven, one per page.
+    # (No quotes in the class: the quote rules below still collapse a
+    # quoted literal that follows a quoted URL. `file://` too — one
+    # `net::ERR_FILE_NOT_FOUND` was a key per file.)
+    (re.compile(r"(?:https?|file)://[^\s'\"]+"), "URL"),
     # The model's own `print(f"ERR: {spec!r} -> {e}")` puts the THING IT
     # TRIED inside quotes — the one part that changes per attempt while the
     # error stays the same. Quoted literals collapse.
@@ -71,11 +77,89 @@ _VOLATILE_RES = (
     (re.compile(r'"[^"\n]{0,200}"'), '"…"'),
 )
 _ERROR_LINE_RE = re.compile(
-    r"(?:Traceback \(most recent call last\)|\b[A-Za-z]*(?:Error|Exception)\b|"
+    # An exception NAME is CamelCase (`ValueError`, `TimeoutError`) — matched
+    # case-sensitively (§4KT: under IGNORECASE `[A-Za-z]*error` matched
+    # "terror" in a news snippet); a bare `error` / `exception` word in any
+    # case (`error:`, `[error]`, `ERROR`) is still one.
+    r"(?:Traceback \(most recent call last\)|(?-i:\b[A-Za-z]*(?:Error|Exception)\b)|"
+    r"\b(?:error|exception)\b|"
     r"\bcannot\b|\bfailed\b|\bfailure\b|No module named|No such file|not found|"
     r"\bKilled\b|\bERR[:\s]|\bexit(?:\s*code)?\s*[=:]\s*[1-9]|EXIT CODE:\s*[1-9])",
     re.IGNORECASE,
 )
+#: Tools whose result is a PROGRAM'S OUTPUT — the one kind of text whose
+#: failure words mean the tool call failed (a script that caught its own
+#: error and printed it, §4IB). Every other tool returns CONTENT: page text,
+#: a file's bytes, JSON records, search snippets, prose — where "not found",
+#: "cannot" and "terror" are the subject matter. §4KT (2026-09-30), measured
+#: on 9,119 corpus results: 96/1,750 successful searches, 324/761 loaded
+#: pages and 450/1,399 file reads yielded an "error line".
+PROGRAM_OUTPUT_TOOLS = frozenset({"execute", "jobs"})
+#: The turn loop's own mark on a result its failure gate rejected
+#: (`[FAILURE BANNER] <label>\n<result>`): the LABEL is the loop's reading
+#: of the head, the failure itself is in the result under it.
+_FAILURE_BANNER = "[FAILURE BANNER]"
+_BROWSER_FAILURE_STATUS_RE = re.compile(r"^STATUS:\s*(?:ERROR|BLOCKED)\b")
+
+
+#: The formatter's per-action failure line (`tools/browser.py`: `[{idx}]
+#: {status} {act}: {error}`); the runner's implicit-goto abort is index -1.
+_BROWSER_ACTION_ERR_RE = re.compile(r"^\[-?\d+\]\s+ERR\b")
+
+
+def _content_failure_head(lines: list, declared: bool = False) -> str:
+    """The line a CONTENT tool's failure names, read from the tool's own
+    structure — the first choice for a declared failure and the only one
+    for an undeclared result: the failure head the tools write
+    (`tool_failure.result_is_failure` — one vocabulary, shared with the
+    turn loop's failure gate); a browser result whose header says
+    ERROR/BLOCKED (for ERROR, the message under it); or a browser interact
+    result's first failed action when the result is a DECLARED failure
+    (`[n] ERR …` — its header says OK, and the `ACTIONS: 2 OK, 1 error`
+    summary and a `NOTE:` nudge come before the per-action lines; §4KT R3
+    review). Only for a declared failure: a failed action is reported by
+    the tool's status, never inferred from an OK result's text."""
+    if not lines:
+        return ""
+    head = lines[0]
+    if head.startswith("--- BROWSER RESULT ---"):
+        if len(lines) > 1 and _BROWSER_FAILURE_STATUS_RE.match(lines[1]):
+            # `STATUS: ERROR` is followed by the message itself
+            # (`_browser_error`); `STATUS: BLOCKED (HTTP 403 …)` names it.
+            if lines[1].startswith("STATUS: ERROR") and len(lines) > 2:
+                return lines[2][:240]
+            return lines[1][:240]
+        if declared:
+            for s in lines:
+                if _BROWSER_ACTION_ERR_RE.match(s):
+                    return s[:240]
+        return ""
+    from ..tools.tool_failure import result_is_failure
+    return head[:240] if result_is_failure(head) else ""
+
+
+def _first_failure_word_line(lines: list) -> str:
+    """The FIRST line naming a failure — for a content tool's declared
+    failure, the tool's own statement comes first and its hint prose,
+    console bullets and file snippets after it (§4KT R2 review: the LAST
+    such line named the hint)."""
+    for s in lines:
+        if s.startswith("Traceback (most recent call last)"):
+            continue        # a header: the exception line follows it
+        if _ERROR_LINE_RE.search(s):
+            return s[:240]
+    return ""
+
+
+def _last_failure_word_line(lines: list) -> str:
+    """The LAST line naming a failure (a traceback opens with its header and
+    ends with the exception that matters; a probe script prints its verdict
+    after its attempts); "" when none does."""
+    found = ""
+    for s in lines:
+        if _ERROR_LINE_RE.search(s):
+            found = s[:240]
+    return found
 #: The target suffix the dispatch pipeline keys the execute same-error
 #: class under (`"<head> (same error)"`); `note_world_changed` keeps those.
 SAME_ERROR_TARGET_SUFFIX = "(same error)"
@@ -105,27 +189,52 @@ def normalise_volatile(text: str) -> str:
     return out
 
 
-def error_line(output: str) -> str:
-    """The LAST line of a tool result that names a failure, or "" when no
-    line does (a clean result is not an error, however long). Last, not
-    first: a traceback opens with its header and ends with the exception
-    that matters; a probe script prints its verdict after its attempts."""
-    found = ""
+def error_line(output: str, *, tool: "str | None" = None) -> str:
+    """The line of a tool result that names its failure, or "" when the
+    result reports none.
+
+    * A DECLARED failure (a `ToolOutcome` whose status is not ok/unresolved
+      — a refusal, a failed or partial run) is an error whatever its prose
+      says. Read the status, never only the text (the outcome-consumers R3
+      rule). The turn loop's `[FAILURE BANNER] <label>` mark is skipped:
+      it is the loop's reading, not the tool's line (§4KT R1 review: the
+      digest printed the marker itself). The line named: for program
+      output the LAST failure-word line; for a content tool the declared
+      head (a browser status/message, a failure prefix) or else the FIRST
+      failure-word line — the tool's own statement, which precedes its
+      hint prose, console bullets and file snippets (R2 review) — and,
+      failing both, the first line of the body.
+    * A PROGRAM-OUTPUT tool (`PROGRAM_OUTPUT_TOOLS`, or an unnamed caller)
+      is scanned for failure words, and the LAST such line wins. This is
+      how a script that caught its own error and printed it under exit 0
+      is still counted (§4IB).
+    * Any other tool returns CONTENT, and its failure is only what the
+      tool itself declares — a status, the loop's banner, or a failure
+      head (`tool_failure.result_is_failure`, a browser `STATUS:
+      ERROR/BLOCKED`). The words inside a page, a file, a record or a
+      snippet are its subject, not a failure (§4KT: "the user's browser
+      cannot open it" in a successful start report, "terror" in a news
+      snippet and a page's console `[error]` lines were all "errors hit").
+    """
     lines = [ln.strip() for ln in str(output or "").splitlines() if ln.strip()]
-    for s in lines:
-        if _ERROR_LINE_RE.search(s):
-            found = s[:240]
-    if found:
-        return found
-    # A DECLARED failure (a `ToolOutcome` whose status is not ok/unresolved
-    # — a refusal, a failed run) is an error whatever its prose says: its
-    # first line is the failure it names. Read the status, never only the
-    # text (the outcome-consumers R3 rule).
+    if not lines:
+        return ""
+    bannered = lines[0].startswith(_FAILURE_BANNER)
+    body = lines[1:] if bannered else lines
     _st = getattr(output, "status", None)
     _sv = getattr(_st, "value", _st)
-    if _sv is not None and str(_sv) not in ("ok", "unresolved") and lines:
-        return lines[0][:240]
-    return ""
+    declared = _sv is not None and str(_sv) not in ("ok", "unresolved")
+    content = tool is not None and str(tool) not in PROGRAM_OUTPUT_TOOLS
+    if declared or bannered:
+        if content:
+            named = (_content_failure_head(body, declared=True)
+                     or _first_failure_word_line(body))
+        else:
+            named = _last_failure_word_line(body)
+        return (named or (body[0] if body else lines[0]))[:240]
+    if content:
+        return _content_failure_head(lines)
+    return _last_failure_word_line(lines)
 
 
 #: The first exception NAME on an error line (`RuntimeError`, `SpecError`,
@@ -137,21 +246,34 @@ def error_line(output: str) -> str:
 #: The error IS the exception and what follows it; the label is the thing
 #: that was tried.
 _EXC_TOKEN_RE = re.compile(r"\b[A-Za-z_][\w.]*(?:Error|Exception)\b")
+#: …and, only when no CLASS is named, a bare `Error` / `Exception` label
+#: (Playwright's own class is `Error`: `[0] ERR goto: Error: Page.goto: …`;
+#: §4KT R4). A bare label BEFORE a class (`Error item_16: ValueError: …`,
+#: the §4IE harness shape with another word) must not win over it — R5.
+_BARE_EXC_TOKEN_RE = re.compile(r"\b(?:Error|Exception)\b")
 
 
 def exception_signature(line: str) -> str:
     """`line` from its first exception name onward; the whole line when it
     names none (a `No module named x` / `not found` line has no label to
     strip and stays as it is)."""
-    m = _EXC_TOKEN_RE.search(str(line or ""))
-    return str(line or "")[m.start():] if m else str(line or "")
+    text = str(line or "")
+    m = _EXC_TOKEN_RE.search(text) or _BARE_EXC_TOKEN_RE.search(text)
+    if not m:
+        return text
+    sig = text[m.start():]
+    # `initial navigation failed (Error): Page.goto: …` — the runner's
+    # parenthesised class is the same class as `Error: Page.goto: …`.
+    if sig[m.end() - m.start():].startswith(")"):
+        sig = sig[:m.end() - m.start()] + sig[m.end() - m.start() + 1:]
+    return sig
 
 
-def error_line_fingerprint(output: str) -> str:
+def error_line_fingerprint(output: str, *, tool: "str | None" = None) -> str:
     """Fingerprint of the result's error line under `normalise_volatile`
     and `exception_signature`; "" when the result has no error line. This
     — not the whole output — is what an `execute` run is counted under."""
-    line = error_line(output)
+    line = error_line(output, tool=tool)
     if not line:
         return ""
     norm = re.sub(r"\s+", " ", exception_signature(normalise_volatile(line))).strip().lower()

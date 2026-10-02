@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import functools
 import http.server
+import json
 import logging
 import os
 import socket
@@ -106,6 +107,16 @@ class WebFaceWidget(QWidget):
         super().__init__(parent)
         self._view = None
         self._ready = False
+        # Three states the client re-asserts often (the frame-rate policy runs
+        # every few seconds), so only a CHANGE crosses into the page. `_want`
+        # is what the client last asked for, `_sent` what the page was told —
+        # kept apart because a call made before the page exists goes nowhere
+        # (`window.ghostFace &&` is false), and recording it as sent meant an
+        # early "busy" or "rate" was never repeated.
+        self._want = {"rate": 0, "busy": False, "gaze": False}
+        self._sent = {"rate": 0, "busy": False, "gaze": False}
+        self._polls = 0
+        self._errors_seen = 0
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
@@ -132,17 +143,31 @@ class WebFaceWidget(QWidget):
                            "widget — use the face switch button", exc)
 
     # ── readiness ────────────────────────────────────────────────────────
+    # How long to keep asking before saying, once, that the face never came up.
+    READY_POLLS = 120          # x 500 ms
+
     def _check_ready(self):
         if not self._view:
             self._poll.stop()
             return
 
-        def _cb(val):
+        def _cb(raw):
+            try:
+                state = json.loads(raw) if raw else {}
+            except (TypeError, ValueError):
+                state = {}
+            # A face that failed to start is otherwise SILENT: the page stays
+            # black, every call is queued forever, and nothing on the Python
+            # side ever read `window.__faceErrors`. deploy.sh greps for this.
+            errors = state.get("errors") or []
+            for err in errors[self._errors_seen:]:
+                print(f"[face] ERROR {err}", flush=True)
+            self._errors_seen = len(errors)
             # `not self._ready` is load-bearing: runJavaScript is ASYNC, so the
             # 500 ms poll can fire again before the first answer comes back and
             # a second callback would apply (and log) the form twice. The
             # doubled `[face]` line is what revealed it.
-            if val and not self._ready:
+            if state.get("ready") and not self._ready:
                 self._ready = True
                 self._poll.stop()
                 # Resolved HERE, not at import: the operator may have cycled
@@ -157,8 +182,16 @@ class WebFaceWidget(QWidget):
                       f"(remembered={facestate.load_form(FACE_DIR)!r})",
                       flush=True)
                 self.set_form(form)
+                self._sync()
 
-        self._view.page().runJavaScript("!!window.__faceReady", _cb)
+        self._polls += 1
+        if self._polls == self.READY_POLLS and not self._ready:
+            print(f"[face] NOT READY after {self.READY_POLLS // 2} s — the face is "
+                  f"blank (panel asleep, or the page failed; see [face] ERROR above)",
+                  flush=True)
+        self._view.page().runJavaScript(
+            "JSON.stringify({ready: !!window.__faceReady, "
+            "errors: window.__faceErrors || []})", _cb)
 
     def _js(self, script: str):
         """Fire-and-forget JS. The harness queues calls made before init, so
@@ -192,6 +225,56 @@ class WebFaceWidget(QWidget):
             lvl = 0.0
         self._js(f"window.ghostFace && ghostFace.audio({lvl})")
 
+    # ── the signal layer (2026-10-01) ────────────────────────────────────
+    # What the browser's face has reacted to since 2026-09-11. Arguments go
+    # through json.dumps, not repr(): an error message is arbitrary text, and
+    # Python's repr of a string is not always a JavaScript literal.
+    def _call(self, op: str, *args):
+        self._js(f"window.ghostFace && ghostFace.{op}("
+                 f"{', '.join(json.dumps(a) for a in args)})")
+
+    def set_phase(self, name):
+        self._call("phase", name)
+
+    def note_tool(self):
+        self._call("tool")
+
+    def note_recall(self):
+        self._call("recall")
+
+    def note_verdict(self, kind: str):
+        self._call("verdict", kind)
+
+    def note_error(self, message: str = ""):
+        self._call("error", str(message or "")[:300])
+
+    def _sync(self):
+        """Tell the page whichever of rate / busy / gaze it has not been told."""
+        if not self._ready:
+            return
+        for key, op in (("rate", "rate"), ("busy", "busy"), ("gaze", "gaze")):
+            if self._want[key] != self._sent[key]:
+                self._sent[key] = self._want[key]
+                self._call(op, self._want[key])
+                if key == "rate":
+                    rate = self._want[key]
+                    print(f"[face] rate → "
+                          f"{'paused' if rate < 0 else ('full' if rate == 0 else f'{rate} fps')}",
+                          flush=True)
+
+    def set_background_busy(self, busy: bool):
+        self._want["busy"] = bool(busy)
+        self._sync()
+
+    def set_gaze(self, active: bool):
+        self._want["gaze"] = bool(active)
+        self._sync()
+
+    def set_rate(self, rate: int):
+        """0 = full rate, n > 0 = at most n fps, n < 0 = paused."""
+        self._want["rate"] = int(rate)
+        self._sync()
+
     # ── extras specific to this face ─────────────────────────────────────
     def set_form(self, name: str):
         self._js(f"window.ghostFace && ghostFace.form({name!r})")
@@ -220,21 +303,3 @@ class WebFaceWidget(QWidget):
 
         QTimer.singleShot(120, lambda: self._view.page().runJavaScript(
             "window.__face ? window.__face.getForm() : ''", _got))
-
-    def set_rendering(self, active: bool):
-        """Pause/resume the render loop.
-
-        A QStackedWidget HIDES pages, it does not stop their timers — a
-        documented trap with the existing faces, and far more expensive here
-        where the hidden page is a whole browser compositing WebGL. Hidden
-        pages are throttled to a stopped animation loop instead.
-        """
-        if self._view is None:
-            return
-        # `visible` on the page drives Chromium's own rAF throttling.
-        try:
-            self._view.page().setLifecycleState(
-                self._view.page().LifecycleState.Active if active
-                else self._view.page().LifecycleState.Frozen)
-        except Exception:  # noqa: BLE001 — older Qt lacks lifecycle control
-            self._js("window.__face && window.__face.setWorkingState(false)")

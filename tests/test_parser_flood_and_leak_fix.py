@@ -922,5 +922,6 @@ class TestThoughtTelemetryFormat:
         # The misleading merged form must be gone.
         assert "{thinking_token_count} tokens · {chars} chars" not in src
         # The separated form must be present.
-        assert "reasoning: {thinking_token_count} tokens / {reasoning_chars} chars" in src
-        assert "content: {content_chars} chars" in src
+        # §4KV: each channel carries its own token count.
+        assert "reasoning: {reasoning_token_count} tokens / {reasoning_chars} chars" in src
+        assert "content: {content_token_count} tokens / {content_chars} chars" in src

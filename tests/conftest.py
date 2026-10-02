@@ -877,3 +877,249 @@ def make_httpx_stream_client(resps):
     client = AsyncMock()
     client.stream = MagicMock(side_effect=_stream)
     return client
+
+
+# (§4KW: a first fix, `_restore_reloaded_modules`, undid `importlib.reload`;
+# the battery showed `_StateIsolation` below already restores every global a
+# reload rebinds, classes included — removed as redundant. The reload pins in
+# tests/test_4kw_announced_work_and_outcome.py hold the general mechanism.)
+
+
+# ── §4KW: what one test changes, the next test must not inherit ─────────────
+# Measured with a per-file leak detector over the full suite (2026-10-02):
+# test files left behind env vars (`GHOST_VERIFY_TWO_STAGE=1`, a stale
+# `GHOST_HOME`, `GHOST_API_KEY`) and replaced module globals
+# (`core.agent.request_id_context = MagicMock()`, `utils.logging._MIRROR_LOGGER`
+# bound to a test's tmp file, the `core.foresight` singleton, `tools.tasks`
+# hooks) for every later file on the same xdist worker — which made results
+# depend on how `--dist loadfile` happened to pack the files (the 7
+# claim-binding failures were one such case; `test_logging_stream_fixes`
+# failed once the same way). Per-file conventions ("pair every set with a
+# restore") held until the next file; this restores both, after EVERY test,
+# outermost (a hookwrapper around setup+call+teardown):
+#   * os.environ — back to what it was before the test's setup;
+#   * every loaded `ghost_agent` / `src.ghost_agent` module global that
+#     existed before the test and was REBOUND during it.
+# Not restored: attributes a test ADDS, mutation inside an object (a dict's
+# contents), and state outside these modules.
+import sys
+import types as _types
+
+
+def _ghost_module_globals():
+    snap = {}
+    for name, mod in list(sys.modules.items()):
+        if not isinstance(mod, _types.ModuleType):
+            continue
+        if not (name == "ghost_agent" or name.startswith("ghost_agent.")
+                or name == "src.ghost_agent" or name.startswith("src.ghost_agent.")):
+            continue
+        try:
+            snap[name] = (mod, dict(vars(mod)))
+        except TypeError:
+            continue
+    return snap
+
+
+import collections as _collections
+
+_CONTAINER_TYPES = (dict, list, set, _collections.deque)
+
+
+def _container_contents(v):
+    """Shallow contents, compared by IDENTITY of the members (never `==` on
+    test objects: a MagicMock or a numpy array compares strangely)."""
+    if isinstance(v, dict):
+        return list(v.items())
+    return list(v)
+
+
+def _same_contents(a, b):
+    if len(a) != len(b):
+        return False
+    for x, y in zip(a, b):
+        if isinstance(x, tuple) and isinstance(y, tuple) and len(x) == 2 == len(y):
+            if x[0] is not y[0] and x[0] != y[0]:
+                return False
+            if x[1] is not y[1]:
+                return False
+        elif x is not y:
+            return False
+    return True
+
+
+def _restore_contents(v, contents):
+    if isinstance(v, dict):
+        v.clear()
+        v.update(contents)
+    elif isinstance(v, list):
+        v[:] = contents
+    else:                                  # set / deque
+        v.clear()
+        (v.update if isinstance(v, set) else v.extend)(contents)
+
+
+#: Containers that hold or record LIVE state outside the module — restoring
+#: their contents would make the module disagree with the world it tracks:
+#:   * search._ddgs_patch_state — a one-time patch applied to the ddgs LIBRARY
+#:     (restored → "patch NOT applied" warnings: the library stays patched);
+#:   * database._connection_pool / _conn_locks — open connections and their locks;
+#:   * swarm._swarm_tasks / _swarm_task_registry, routes._STORE_INFLIGHT —
+#:     references that keep running asyncio tasks alive.
+_LIVE_STATE_CONTAINERS = frozenset({
+    "tools.search._ddgs_patch_state",
+    "tools.database._connection_pool", "tools.database._conn_locks",
+    "core.project_advancer._project_locks",
+    "tools.swarm._swarm_tasks", "tools.swarm._swarm_task_registry",
+    "api.routes._STORE_INFLIGHT", "utils.logging._BG_TASKS",
+})
+#: Module globals (rebinding) that record live outside state: the egress
+#: guard's `_INSTALLED` / `_ORIGINALS` — the real socket methods while the
+#: guard has PATCHED the socket class (restored → KeyError on connect, and a
+#: later install captures the guarded functions as "originals"). `_ORIGINALS`
+#: is rebound by install(), never mutated, so the contents list need not name it.
+_LIVE_STATE_GLOBALS = frozenset({
+    "utils.egress_guard._INSTALLED", "utils.egress_guard._ORIGINALS",
+})
+
+
+def _ghost_containers(mods):
+    """id → (container, shallow contents) for every module-level dict / list
+    / set / deque of the given module snapshot (§4KW open item: 44 such
+    containers carried one file's entries into the next — the search result
+    cache, notify rate-limit timestamps, the experiment-registry cache, the
+    optim loader's epochs/pins)."""
+    out = {}
+    for _name, (_mod, ns) in mods.items():
+        _short = _name.split("ghost_agent.", 1)[-1]
+        for attr, v in ns.items():
+            if attr.startswith("__") or not isinstance(v, _CONTAINER_TYPES):
+                continue
+            if f"{_short}.{attr}" in _LIVE_STATE_CONTAINERS:
+                continue
+            try:
+                out[id(v)] = (v, _container_contents(v))
+            except Exception:  # noqa: BLE001 — a container that cannot be read is skipped
+                continue
+    return out
+
+
+# The baseline a test is restored to. Session/module/class-scoped fixtures
+# legitimately set env vars and globals for MANY tests (the detached-job
+# registry fixture sets GHOST_TEST_JOB_REGISTRY for the session): what they
+# set during setup is folded into the baseline, and what their finalizers
+# restore is folded back, so only the TEST's own changes are undone.
+_BASELINE = {"env": None, "mods": None, "conts": None}
+
+
+def _state_now():
+    env = dict(os.environ)
+    env.pop("PYTEST_CURRENT_TEST", None)
+    mods = _ghost_module_globals()
+    return env, mods, _ghost_containers(mods)
+
+
+def _fold_diff(before):
+    """Fold into the current test's baseline exactly what changed between
+    ``before`` and now — the effect of one wider-scoped fixture's setup or
+    teardown — and nothing else."""
+    env, mods, conts = _BASELINE["env"], _BASELINE["mods"], _BASELINE["conts"]
+    if env is None:
+        return
+    env_b, mods_b, conts_b = before
+    env_a, mods_a, conts_a = _state_now()
+    for key, (v, now_contents) in conts_a.items():
+        was = conts_b.get(key)
+        try:
+            changed = was is None or not _same_contents(was[1], now_contents)
+        except Exception:  # noqa: BLE001 — a member whose `!=` raises: treat as changed
+            changed = True
+        if changed:
+            conts[key] = (v, now_contents)
+    for k in set(env_b) | set(env_a):
+        if env_b.get(k, _MISSING) != env_a.get(k, _MISSING):
+            if k in env_a:
+                env[k] = env_a[k]
+            else:
+                env.pop(k, None)
+    for name, (mod, ns_a) in mods_a.items():
+        ns_b = mods_b.get(name, (mod, {}))[1]
+        base = mods.get(name)
+        if base is None:
+            mods[name] = (mod, dict(ns_a))           # a module this fixture imported
+            continue
+        for attr, val in ns_a.items():
+            if ns_b.get(attr, _MISSING) is not val:
+                base[1][attr] = val
+
+
+class _StateIsolation:
+    """Registered as a GLOBAL plugin (`pytest_configure` below): a hook
+    defined at module level in this conftest is not called for session-
+    scoped fixtures — their node is the Session, which sits above tests/ —
+    so their setup could not be folded into the baseline."""
+
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_fixture_setup(self, fixturedef, request):
+        before = _state_now() if fixturedef.scope != "function" else None
+        yield
+        if before is not None:
+            _fold_diff(before)
+            # Finalizers run LIFO: one added NOW runs before the fixture's
+            # own teardown, so it records the state the teardown starts from.
+            fixturedef.addfinalizer(
+                lambda fd=fixturedef: self._pre_fin.__setitem__(id(fd), _state_now()))
+
+    def pytest_fixture_post_finalizer(self, fixturedef, request):
+        if fixturedef.scope != "function":
+            before = self._pre_fin.pop(id(fixturedef), None)
+            if before is not None:
+                # Fold ONLY what this teardown changed — not the whole state:
+                # it runs inside the LAST test's protocol, and folding
+                # everything kept that test's own leaks (review §4KW: every
+                # last test of a TestCase class or a module with a wider-
+                # scoped fixture — 37 files — leaked again).
+                _fold_diff(before)
+
+    def __init__(self):
+        self._pre_fin = {}
+
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_runtest_protocol(self, item, nextitem):
+        _BASELINE["env"], _BASELINE["mods"], _BASELINE["conts"] = _state_now()
+        try:
+            yield
+        finally:
+            env_before, mods_before, conts_before = (
+                _BASELINE["env"], _BASELINE["mods"], _BASELINE["conts"])
+            _BASELINE["env"] = _BASELINE["mods"] = _BASELINE["conts"] = None
+            for k in list(os.environ):
+                if k not in env_before and k != "PYTEST_CURRENT_TEST":
+                    del os.environ[k]
+            for k, v in env_before.items():
+                if os.environ.get(k) != v:
+                    os.environ[k] = v
+            for _name, (mod, before) in mods_before.items():
+                ns = vars(mod)
+                _short = _name.split("ghost_agent.", 1)[-1]
+                for attr, val in before.items():
+                    if attr.startswith("__") or f"{_short}.{attr}" in _LIVE_STATE_GLOBALS:
+                        continue
+                    if ns.get(attr, _MISSING) is not val:
+                        ns[attr] = val
+            # contents of module-level containers, restored IN PLACE (other
+            # modules hold references to the same object)
+            for _key, (v, contents) in conts_before.items():
+                try:
+                    if not _same_contents(_container_contents(v), contents):
+                        _restore_contents(v, contents)
+                except Exception:  # noqa: BLE001
+                    continue
+
+
+def pytest_configure(config):
+    if not config.pluginmanager.has_plugin("ghost-state-isolation"):
+        config.pluginmanager.register(_StateIsolation(), "ghost-state-isolation")
+
+
+_MISSING = object()

@@ -48893,7 +48893,8 @@ browser tool's real result shapes (13 tests had fed the probe a string the tool 
 Full suite: run once with every change in — 25,798 passed, 4 failed; one failure was mine (`tests/lint_baseline.json`
 tolerated a finding this work removed → `scripts/lint.py --write-baseline`), three are `tests/test_clockwork_facestate.py`
 reading the repo's `interface/externals/clockwork_ghost/webface/face.html` (Aug 12 copy, 5 forms; the test wants ≥ 8 incl.
-`embedding`) — pre-existing, untouched. The live-found wording fix (below) forced one more full run: 25,803 passed, the same
+`embedding`) — pre-existing, untouched (⚠ wrong diagnosis, corrected 2026-10-01 at the end of §4KT: the face module was
+current, the TESTS were stale). The live-found wording fix (below) forced one more full run: 25,803 passed, the same
 3 pre-existing failures.
 
 **Deploy / live.** Agent idle (no foreground request, no bench) → `launchctl kickstart -k` twice (pid 25455 → 50953 → 75424;
@@ -48920,3 +48921,478 @@ way: a relaunch refused after the stop is booked as a refusal; `start` rewrites 
 allocator moves it, and none when the requested port is granted; a project-less service name can resolve to the bound
 project's same-named service; `replay_engine` grades an outage leg as a failed arm; `[TURN BUDGET …]` endings and the
 cancelled-turn reply shape are not tied to `verify_run_measured` by a behavioural pin.
+
+## §4KT — Two subsystems from the §4KS residue (2026-09-30, operator: "do 1 and 5") — R0 scope
+**Scope.** (1) `core/strikes.py::error_line` — the failure-WORD detector over tool results, with its two consumers
+(`evidence_digest` for every tool; the execute same-error breaker under exit 0). (2) The trajectory recorder's `temperature`
+field and the missing `Turn Outcome` line on streamed turns (`_record_turn_trajectory` and its three call sites; the drain).
+**R0 — the property.** (1) A tool result that reports success never yields an error line, and a result that reports failure
+always yields the line that names it; a program's own printed error under exit 0 is still found (§4IB). Baseline, measured on
+the 9,119 tool results in the trajectory corpus: success-shaped results yield an error line for `web_search` 96/1,750
+("terror", snippet text), `browser` OK loads 324/761 (console `[error]` lines of a loaded page), `file_system` reads 450/1,399
+(file content), `manage_projects` 134/571 (JSON records), `introspect` 81/135 (prose), `execute` exit-0 221/1,154 (the §4IB
+class, with HTML dumps and "was NOT killed" among them). (2) Every recorded row's `temperature` is the sampling temperature of
+the call that produced its reply (baseline: 2,250/2,250 user rows, 677/677 probe rows and 66/66 leaf rows record the schema
+default 0.0 while the turns ran at 1.0/0.6); a streamed turn prints the same `Turn Outcome` line, under the same label rule
+and late-correction ring, as a non-streamed one. **Threat model.** Untrusted: tool-result TEXT (page text, file content,
+JSON, prose, program output); the record sites' inputs are the turn's own state. Out of scope: the strike COUNTERS themselves
+(exit codes / declared status), `outcome_heuristics` (its own detectors), the schema's `0.0` default for rows with no known
+temperature (an aborted turn), and the late-verdict correction logic (reused, not changed).
+
+## §4KT — outcome (2026-10-01)
+**Shipped.** (1) `core/strikes.py::error_line(output, tool=)`: a declared failure (`ToolOutcome` not OK — FAILED / REJECTED /
+PARTIAL — or the loop's `[FAILURE BANNER]` mark) is named by its own line, never the marker; program output (`execute`,
+`jobs`, unnamed callers) keeps the last-failure-word rule; a content tool is named by its declared head
+(`tool_failure.result_is_failure` — the loop's vocabulary, no third one; a browser `STATUS: ERROR` message / `STATUS:
+BLOCKED …`; a declared interact's first `[n] ERR …` action, index -1 included) or else its FIRST failure-word line, and an
+undeclared content result yields nothing. `_ERROR_LINE_RE`'s exception-name alternative is case-sensitive ("terror");
+fingerprints collapse `http(s)://` / `file://` URLs; `exception_signature` prefers a named class and folds the runner's
+`(Error):`. Both consumers pass the tool name (AST pin). Corpus, before → after: success-shaped results with an "error line"
+— web_search 96/1,750 → 0, browser OK loads 324/761 → 0, file_system reads 450/1,399 → 0, manage_projects 134/571 → 0,
+introspect 81/135 → 0; the §4IB execute exit-0 class 221 → 220 ("terror"); every failure-shaped result still names a line,
+and 212 browser failures fall to 59 keys (57 bot challenges = one key). (2) The trajectory `temperature` is the sampling
+temperature of the request that produced the reply (was the schema's 0.0 on 2,993/2,993 user/probe/leaf rows); a
+streamed turn prints the `Turn Outcome` line from the one emitter finalize uses (`_emit_turn_outcome_line`: same label
+rule, suffix, confidence stamp and late-correction ring), after its calibration record, in its own try.
+**Built and removed.** `StreamState.turn_budget_exhausted` (a streamed turn returns from inside the loop; the for-else
+flag can never be set for it); a third failure-head vocabulary (`_FAILURE_HEAD_RE`); the non-existent `execute_python`.
+**Verification.** Five review rounds (independent, read-only, corpus-measured): in-delta MAJOR 1 · 1 · 1 · 1 · 0 — each a
+result SHAPE the previous rule mis-named (the loop's banner; a content tool's hint prose under the LAST rule; a browser
+interact's `ACTIONS:` summary under the FIRST rule; the runner's index -1) — plus 3 · 0 · 1 · 2 · 3 MINOR. Round 5's three
+MINORs (a bare `Error` label before a named class; the `(Error):` twin key; docs) were fixed under battery only; no sixth
+round. Batteries (NOOP survives / KNOWNBAD dies; tree == src after each; first pass → final): **131** 27: 25 → 27 +
+1 dead regex alternative deleted · **132** 15: 13 → 15 · **133** 9: 8 → 9 · **134** 5: 5 · **135** 5: 5 · **136** 6: 4 → 6.
+Pins: `tests/test_4kt_strikes_and_recorder.py` (104 tests: verbatim corpus heads, the formatter's interact shapes, the
+digest at its call site, a real non-streamed turn's row against the logged `Temp`, the drain's line/ring/order, three
+enumerations). Docs: `docs/core/strikes.html#4kt`, `docs/logging.html#4kt`. Full suite (once, everything in): 25,908 passed, 4 failed — the 3 pre-existing
+`test_clockwork_facestate.py` rows (stale external face module — ⚠ wrong, see the correction at the end of this section) and `test_log_timing_visibility.py::…not_since_boot`, a
+sleep-timed comparison that passes 3/3 alone (a parallel-load flake; the formatter it times was not touched).
+**Deploy / live.** Agent idle (last activity an idle self-play cycle) → `launchctl kickstart -k` (pid 75424 → 65473; one
+`src.ghost_agent.main`; "system ready" +1). Live STREAMED turn (`stream: true`, an `execute` of `ls <missing>; echo done`):
+the operator stream now shows `turn outcome | ok · confidence 0.85 · tools: execute · 201 chars` after `final reply` — the
+first such line on a streamed turn — followed by the stream gate's "verdict deferred" for a task that is running; the row
+in `system/trajectories/` carries `temperature: 0.6` (the turn's `Temp 0.60`), where every earlier user row had 0.0. The
+`ls: cannot access …` line inside a successful execute stays program output (§4IB) — "cannot" is read there by design.
+**Not fixed, said.** `Average Error: 1.2226` (a numeric print) is still an execute "error line" for the digest; an
+undeclared composed-skill `PARTIAL/FAIL` with no exit code yields no line (3 corpus rows); `browser.py` writes `TEXT:`
+previews unescaped although its comment says otherwise; an aborted turn's row keeps `temperature: 0.0`; a reply no model
+sampled (a fallback sentence) records the last request's temperature.
+
+### Correction — the three `test_clockwork_facestate.py` failures were stale TESTS, not a stale face module (2026-10-01)
+
+§4KS and §4KT both carried these as "pre-existing: the repo's webface copy is an Aug 12 file with 5 forms". Measured:
+`interface/externals/clockwork_ghost/webface/matrix_graph.js` is byte-identical (`cmp`) to the canonical
+`interface/static/matrix_graph.js` — `deploy.sh` re-copied it on 2026-09-29. Five forms IS the roster since the
+2026-09-20/22 rework (`cube, tesseract, vortex, descent, empty`); the tests still described August's eight. One asserted
+`len(forms) >= 8`; one used `tesseract` as its made-up "form that no longer exists" (a real form since 09-22); one used
+`embedding` as its "real form" (removed). They went red only when the 09-29 deploy re-copied the module, a week after the
+roster changed — which is why the copy looked like the suspect.
+**Fix (tests only; `facestate.py` and the device are untouched):** the roster test holds `known_forms` to a second, looser
+parse of the same `FORMS` array (every quoted name must come back) instead of a count; the "gone" test uses a stand-in
+and asserts its own precondition (well-formed, written, absent from the roster), so the `None` cannot come from the
+corruption check; the "real" test walks the roster instead of naming a form. 31/31 pass. Mutants on a scratch copy (tree
+== src after): a name-dropping `_NAME_RE` → 3 fail; roster check removed → 1 fails; roster check inverted → 2 fail.
+Docs: `docs/interfaces/clockwork_ghost.html` named the eight August forms as current → the live five.
+**Not fixed, said.** `client.py:1067`'s docstring still says "the same eight forms" — left, because the device copy is
+sha-matched to the repo and a comment is not worth a deploy; fold it into the next one. `FALLBACK_FORM` on the handheld is
+still `descent` while the browser's default became `cube` on 2026-09-20 — an operator pick, not touched.
+
+
+## §4KU — ClockworkPi client: the UI/UX pass (2026-10-01, operator: "look for UI / UX and quality of live improvements for clockwork" → "proceed with everythng") — R0 scope
+
+**Scope.** `interface/externals/clockwork_ghost/` only: the client, its transcript widget, the face host, the
+launcher and the deploy. No agent code. **Property:** the 17 findings of the review (five visible defects, an idle
+power draw, six daily-use gaps, three parity gaps with the web UI, housekeeping) are fixed without breaking what the
+client already did. **Threat model:** `client.py` and `chatlog.py` import PyQt6, which exists only on the handheld —
+so a change to them is checked by reading unless something executes it ON the device; and the device is one the
+operator is using.
+
+## §4KU — outcome (2026-10-01)
+
+**Shape of the work.** The decisions were moved OUT of the two Qt files into five Qt-free modules that the suite can
+import (`markup`, `speech`, `devstatus`, `agentapi`, `commands`), and what only a real Qt can show got its own
+instrument: `device_probe.py` builds the real `MainWindow` offscreen on the device (the WebGL face replaced by a
+recorder, the agent by a fake served from a thread) and drives real turns through it. `deploy.sh` runs it in a
+STAGING directory and installs only if it passes.
+
+**Two crashes that were already live**, both found by the probe on its first runs:
+1. **A turn that failed before its first token segfaulted the client.** `ChatLog.end_agent` looked the empty bubble's
+   row up as `bubble.parentWidget().layout()` — the transcript's whole column — and unparented it; the next
+   `add()` crashed. Reproduced against the build then on the device (`rc=139`). That path runs when the agent is
+   unreachable, on an HTTP error, on a refused key. With no supervisor and no log, a dead kiosk and no reason.
+2. **Every turn tore httpx's generator chain down in the garbage collector.** `break` at `[DONE]` leaves the chain
+   suspended, qasync installs no async-generator finalizer → "async generator ignored GeneratorExit" + anyio's
+   "exit cancel scope in a different task", silently (stderr went nowhere). `aclosing()` on the line iterator does
+   NOT fix it (the generators nested under it are not closed with it — tried, measured, removed); the loop now reads
+   to the end of the stream.
+Also pre-existing, found by review: `data["choices"][0]` on a frame whose `choices` is `[]` (the usage frame) raised
+IndexError out of the stream → `agentapi.frame_content`.
+
+**What shipped** (docs: `docs/interfaces/clockwork_ghost.html#4ku`):
+* transcript — bubbles shrink again (`QLabel.sizeHint()` is expanded to `minimumSize()`, so `fit()`'s own pin made
+  every reply as wide as its waiting caption: 540 px vs 120 px for "Hello!"); code wraps (`pre-wrap`) and long runs
+  break (ZWSP every 20 — measured 1,078 px and 1,614 px in a 670 px column before); the view follows new content
+  only at the bottom; PgUp/PgDn and Shift+↑/↓ scroll; agent bubbles 70% wide; operator text escaped;
+* one turn at a time — every message goes through `_submit`, which refuses while a turn runs; `■ STOP` /
+  `Shift+Esc` / `/stop` cancels on the AGENT by this turn's own request id (minted here, re-read off the frames);
+  second press forces;
+* sessions — `session_id` on every turn, restored at startup, `/new` = a NEW id, `/sessions` + `/open N`;
+* commands — `commands.parse` (what follows the word decides); `/shutdown` `/reboot` `/exit` typed twice;
+* voice — `SpeechChunker` (no code, tables or URLs read aloud; chunk-invariant), barge-in, a 2.5 s review countdown,
+  a recording timer and a 120 s limit, voice faults shown once;
+* face — `devstatus.face_rate`: full when active, 10 fps idle (5 on battery), paused past 600 s, via
+  `webface/throttle.js` (a `requestAnimationFrame` wrapper under the unmodified `matrix_graph.js`); the browser's
+  signal layer (phase / tool / recall / verdict / background-busy) from the log lines the client already had;
+* kiosk — `/bright`, `/vol`, a reply wakes a dark panel and chimes after a long turn, `▲ GOOD` / `▼ BAD` ratings
+  (`/api/feedback`, source `clockwork`), pending notifications (consumer `clockwork`), a status readout with an
+  agent-reachable dot, wifi bars and a charging-only bolt; camera at 720p, "no camera" said, released on every exit;
+* launcher — owns its log, restarts a CRASH (not rc 0/130/143) with a doubling wait, gives up after five in a row;
+* deploy — stage → compile → probe → install (launcher by rename, 3 backups kept) → restart → same pid 6 s apart
+  and no `CRASHED`/`[face] ERROR` in the log.
+
+**Review.** Three fresh readers (client wiring / logic modules / deploy+launcher+probe+face JS), told not to trust
+the comments: **41 findings**, 38 of them in this session's own code. The ones that mattered:
+stop fell back on a 404 to "the turn in my session / whose text starts like mine" and cancelled a browser's turn
+(run against the real `TurnRegistry`) → ownership is the request id only; a second turn could still start through the
+modal camera dialog and through `/open` racing a turn → the gate moved into `_submit`; `/new idea: use a queue`
+started a new conversation (the `/clearly` defect one space later) → the rule turns on what follows the word; a line
+STARTING with inline ``` toggled a "fence" and silenced the rest of a spoken reply, and a `?` inside a link label cut
+the markdown in half → CommonMark fence rules + links resolved before the split; the deploy's "one client is alive"
+check passed on a crash loop (the launcher had restarted it); the probe itself ran the real `pkill aplay` six times
+per deploy and could wake the panel → three recorders. Five more defects in my own fixes were found by the probe
+and by a chunk-invariance fuzz (the first probe imported qasync before PyQt6 and ran the loop on PyQt5; a
+count-based "is a link open" check; a table-header hold that depended on how the stream was cut).
+
+**Verification.**
+* Mutation battery on a scratch copy (NOOP survives, KNOWN-BAD dies, tree == pristine after every chunk):
+  **260 / 260 killed** on the final pass. Survivors on the way: 15 on the first pass (150 mutants), 19 more on the
+  reworked code — each ended as a stronger pin or as dead code deleted (`_RULE_RE`, the `final` parameter, the CRLF
+  replace, the link-strip in `_link_open`). The NOOP control caught a broken harness once (a scratch tree whose
+  tests could not be collected reported every mutant "killed").
+* The device probe mutated ON THE DEVICE: **24 / 24** broken builds failed it (one survivor first — a dropped
+  partial reply — until a forced-stop scenario was added). 88 checks.
+* Suite pins: `tests/test_clockwork_ux.py` (401 tests: the five modules, the face page and its throttle under node,
+  the launcher run for real with a stub client, the deploy run end to end against a fake device, AST enumerations
+  of "one way to send a message" and "one way to power off"); `tests/test_4kp_think_split_and_clients.py` harness
+  extended to the reworked loop. The pin-quality ratchet rejected 5 text reads in the first draft → a node-side
+  runner and an AST walk; the three `test_clockwork_facestate.py` rows carried as "pre-existing" since §4KS are
+  fixed (they were stale TESTS — see the correction above).
+* Full suite (once, everything in): **26,310 passed, 3 failed** — the ratchet (mine, fixed and re-run green) and two
+  load flakes that pass alone (`test_cert_renewal …on_the_wire`, `test_log_timing_visibility …not_since_boot`).
+  The pin migration after it was re-run on its own files (715 passed) and the docs tests (112 passed). ⚠ A second
+  full run was started by accident (an empty zsh glob left `pytest` with no file arguments) and was killed part-way;
+  the agent process was checked afterwards (one, listening).
+* **Deploy / live** (13:27): probe 88/88 in staging → installed → one launcher + one client, pid stable, twelve
+  file hashes equal to the repo, 3 backups left of 22, `/tmp/ghost_ui.log` exists and carries `[launch]`, `[tls]`,
+  `[face] opening on 'tesseract'`, `[face] rate → 10 fps`. Idle CPU, same method before and after
+  (`top`, 5 s samples): client 47.0% → 18–19%, renderer 32.5% → 12%, labwc + XWayland 8.2% → 3% — about 88% of a
+  core → about 33%. A probe turn (`X-Ghost-Origin: probe`) through `agentapi` against the live agent: reply
+  streamed, session stored and re-read, `cancel` after the end → `finished`, `/api/turns` read, and
+  `notify_consumers.json` now has `clockwork` at the current watermark (the device's own poller baselined and acked).
+  ⚠ The frames of a PROBE turn carry `probe-<id>`, not the minted id — which is why the client re-reads the id off
+  the frames before it stops or rates anything.
+
+**Not fixed, said.** In face-only mode a transcript that arrives while a turn runs is parked in the hidden input.
+Text copied out of a bubble carries the zero-width breaks. Indented (4-space) code blocks and abbreviations
+("e.g.", "Dr.") are still spoken / split. Below 20 fps the face runs in slow motion (`matrix_graph.js` clamps its
+time step), by design of the idle tier. `device_probe.py` cannot load the real face (no GPU offscreen) — the
+deploy's `[face] ERROR` check is what covers it. The launcher's log is rotated only at launcher start. Whether the
+live model server ever emits a `choices: []` frame was not observed (the probe turn took the fast path); the client
+no longer cares. Battery (5 fps) and paused tiers were not measured on the device (it was on the charger).
+
+
+### §4KU addendum — the recording storm, found on the device after the deploy (2026-10-01)
+
+Twelve minutes after the first deploy the operator (ssh from another Mac) restarted the client by hand and tried
+voice; a screenshot taken to verify the deploy showed **eleven consecutive `fault → STT Error: Too much data for
+declared Content-Length`**. Cause, pre-existing: Esc is a QShortcut TOGGLE and a QShortcut auto-repeats while its key
+is held — and the chip says "PTT", so holding it is the natural thing to do. Each repeat started or stopped the
+recording; every stop scheduled an upload of `/tmp/ghost_stt.wav`, which the next start was already rewriting, and
+httpx (which declares Content-Length from the file's size when the request is built, then streams the file) died on
+the difference. **Fix, as a class:** no shortcut in the window auto-repeats (AST-enumerated: every `QShortcut` made
+in `MainWindow` must be given `setAutoRepeat(False)`); a tap of Esc toggles and a HOLD (≥ 0.4 s) is real
+push-to-talk — letting go sends; every recording is written to a file of its own; the clip is read into memory and
+its file removed before the request is built; a recording under 0.3 s is not uploaded; and a new recording is
+refused while one is being transcribed. **In my own fix:** the edit script cut a method by "from `def stop_recording`
+to `def take_picture`" — and the camera dialog has a `take_picture` EARLIER in the file, so the slice ran backwards
+and duplicated 650 lines, a second `class MainWindow` included. `py_compile` passed; pylint's
+`function-redefined` caught it. Repaired and diffed against the deployed build (only the intended change).
+**Verification:** probe now **98 checks** (the microphone replaced by a recorder, a fake `/api/stt`): five broken
+versions of this fix run on the device — four failed it at once, the fifth (all recordings sharing one file) only
+after a check was added → **29 / 29** device mutants in total. Suite: two AST enumerations added
+(`tests/test_clockwork_ux.py`, 441 tests); battery **265 / 265** (five mutants added). Handheld files, ratchet, lint
+and docs tests re-run: 706 + 441 passed; the full suite was not run again for this follow-up. **Redeployed 13:51:**
+probe 98/98 in staging, launcher + client supervised, hashes equal to the repo, and the operator's conversation came
+back on screen ("conversation restored") — the first live exercise of the session restore. ⚠ The panel was asleep
+at deploy time, so the face did not come up until it was woken (`wlopm --on`, then put back off): the deploy's
+"(face not ready yet — panel asleep?)" line was the true reading. Hold-to-talk itself is verified only through
+synthetic key events in the probe; whether the device delivers the Esc RELEASE to the client has not been seen with
+a real key press.
+
+## §4KV — One Slack request, read end to end (2026-10-01, operator: "look at request 12 slack-12 … what happened there?" → "dig into it and fix all deficiencies") — R0 scope
+
+**The request.** `slack-124c85b8`, 19:16:31, a channel member's one-line remark (the twelfth message of a thread):
+70.1 s, four model calls, two thinking-loop kills, a forced report turn, and a reply that answered nothing the
+member had said — it re-conceded two points from five hours earlier ("You're absolutely right — I missed that …
+You win this round"). Printed `ok · recovered 1 strike(s)`.
+
+**In scope — eight defects, each stated as a class:**
+(A) *A loop the guards cannot see.* One sentence frame with one word changing ("I will check for any genius he has
+been X as.") repeats no 200-char window and no line: 15,564 chars / 47.6 s before a kill. Class: frame loops in the
+main loop's reasoning channel.
+(B) *The context block labels the conversation's FIRST message "[USER INSTRUCTION]"* (pin mode, live) and tells the
+model to "focus entirely on the user instruction". Turn 1 set out to answer the thread's opening question. Class:
+every label that rides an injected block must say what its carrier message is — pin path and legacy path.
+(C) *The steer after a first kill orders "ONE grounding tool call"* whatever the request is. On a remark it produced
+a web search about a named person's marriage. Class: first-kill steers before any tool has run.
+(D) *The forced report names neither the request nor whose message it is, and asks for a work report.* Class: every
+`blocker_report_alert` site (8) for the first two; the thinking-loop breakers for the third.
+(E) *The halt (`execution_failure_count >= 6`) orders a tool call and then turns the tools off* — found reading (C).
+(F) *A breaker-closed request recorded as a clean success*: no `loop_breaker` stamp on the thinking-loop breaker,
+so the corpus said UNKNOWN and the line said `ok · recovered`.
+(G) *The reply of a thinking-off turn is logged as 💭 thinking and counted as reasoning tokens.*
+(H) *Killed calls are missing from the accounting*: `llm_calls: 2`, `tokens_out: 220` for four calls / ~5,200 tokens.
+
+**Out of scope, said now:** (1) the thinking-loop guards of the coding executor (not measured there — the
+paragraph probe's calibration history says why); (2) a verifier for member turns (off by design); (3) **whether the
+agent should web-search a private individual's personal life on a channel member's say-so** — a policy decision that
+is the operator's; (C) removes the steer that forced this particular search, nothing here adds a guard; (4) the
+Slack bot (the thread it sent was correct); (5) every design removed in §4KS.
+
+**Method.** Each prompt change is measured on the request itself, replayed against the live model (thread verbatim,
+the two real names replaced), old text against new, before it is written into the source; the probe is calibrated
+on the detailed log's reasoning corpus (healthy and killed turns). Then pins, an independent review, a mutation
+battery with NOOP and KNOWN-BAD controls on a scratch copy, the suite once, deploy, and a live check.
+
+## §4KV — outcome (2026-10-01)
+
+**Shipped — seven of the eight, as classes; one (E) reverted in review.**
+
+**(A) The frame probe.** `stream_guards._detect_sentence_run_loop`: fires when the newest 20 completed prose
+sentences open with the same two words. What ends a run: a line without sentence punctuation; a sentence that does
+not start with a letter (bullets of any glyph, quotes); a sentence whose DIGITS differ from the run's (an index
+moves, a frame's constants do not); a one-word fragment. Reasoning channel, main loop only. **Calibration** on the
+detailed log's reasoning (rebuilt per request-turn, 13,253 turns): over 5,775 healthy turns of 300+ chars, measured
+at every sentence end, the longest run is 5 ("Let me …" planning) and nothing fires; the two slack-12 loops die at
+~1,600–2,150 chars at every probe phase (were 15,564 and 4,014: about 39 s and 8 s back). Of the 49 historically
+killed turns it adds one more early kill (9b7b5e23: 4,000 vs 5,543). ⚠ The corpus is the log's copy, which flattens
+in-block newlines; every line-structure rule can only end a run, so real streams fire no more often than measured.
+
+**(B) The label.** `_carrier_label`: `[USER INSTRUCTION]` only when the carrier message is the pending request
+(equal text; or, when one user message arrived, containing it and not a tool row — an image part is flattened into
+a note before placement). Otherwise `[CONVERSATION START — the request to answer now is the user's MOST RECENT
+message …]` (pin path) or `[NEWEST MESSAGE …]` (legacy path), both true of any message. Byte-identical across a
+request's turns. **Not measured:** 30 replays of turn 1 per label gave 0 misreads in BOTH arms — the replay cannot
+show the label caused the misread (live: 1 of 12 turns in that thread). The change stands on the label having been
+false, not on a demonstrated effect.
+
+**(C) The steer after a first kill.** Replayed on the thread (real names replaced), old steer: **14/15** emitted
+`web_search` about the named person's wife — the search in the live request was induced by OUR alert ("your next
+output must be ONE grounding tool call"). New: `thinking_loop_answer_steer` when no tool has run and the request is
+not a coding one, and the one turn that reads it runs thinking-off, tools on (`loop_retry_is_no_think`: the newest
+assistant message is the abort note and a user message after it is that steer exactly as built for this request —
+no flag). Measured: thinking ON with two wordings re-looped **5/30**; thinking OFF **18 replies, 2 searches, 0
+loops in 20** (final wording: 19 / 1 / 0). A coding request or a loop after a tool ran keeps the grounding steer.
+
+**(D) The forced report.** All seven `blocker_report_alert` sites pass the request; every alert says whose message
+it is. The thinking-loop breaker asks for the answer first. Replay of the real report turn, 30 per text, read and
+classified by hand: old **9/30** bad (third-person work report ×4, facts the search had not found ×4, stale
+concession ×1); new **0/30**, and **0/30** again after review reworded two clauses. (Taking the user's premise as
+given happens in both arms and was not counted.)
+
+**(F) The record.** The second-cap report stamps `thinking_loop` → corpus rule 1b FAILED, Turn Outcome `failed`.
+**(G) The log.** `drafting` (🤖) for content mirrored on a thinking-off turn; `thought` counts each channel;
+the liveness probe skips both titles. **(H) Accounting.** A stream with deltas and no usage frame is one call, its
+output estimated by chunk count (`unmetered_calls`, `tokens_out_estimated`; record extras only when present).
+
+**Reviews — three rounds, independent readers. MAJOR per round: 2 · 1 · 0.**
+- *Round 1 (two readers):* **my fix (E) was inoperative** — the Strike Cap at the top of the next iteration tests the
+  same count and aborts before the halt's forced final generates; reverted to the original block, a pin records the
+  pre-emption, left open. **The probe killed healthy hand simulations** ("For i = 3, total becomes 6." × 20; the
+  corpus's true longest healthy run was 12, not 5 — I had measured only on the 500-char cadence). Also: a legacy pin
+  of the old `thought` format (suite red); image requests lost the instruction label (the vision flatten); the
+  no-think recognition matched a USER quoting the steer; the alert asserted "has not criticised you"; the
+  answer-first alert ended "write the report."; the boundary regex was still quadratic on punctuation without
+  whitespace (145 ms a probe); a malformed usage frame was half-applied and then also filed as unmetered.
+- *Round 2:* **refusing every digit let the request's own loop escape** with one year added → the run key is now
+  (opener, digit strings). `first_user_is_request` overrode the text test (a translated tool row labelled as the
+  instruction) → evidence, not proof. An unreadable `cached_tokens` rejected the whole frame.
+- *Round 3:* no MAJOR. A text-less newest message (image alone) re-labelled a thread's opener; a tool row that echoes
+  the request; `OverflowError`. Fixed under battery. Stopped here: §R's rule (a round with only out-of-scope
+  findings) is not strictly met.
+- **Defects inside my own fixes: 19** (2 found by me before review — the first probe pattern was quadratic at 200 ms
+  a probe, and a window correction that corrected nothing; 17 by the readers: 9 · 5 · 3).
+
+**Battery.** Scratch copy of `src` + `tests` + `interface`; NOOP passes, KNOWN-BAD fails, tree == pristine after
+every run, scratch sources byte-equal to the repo's. 88 mutants in the final list: every one killed in its latest
+run (passes: 60/63 → 78/79 → 83/84 → 39/40 on the lines touched in round 3). Six survivors on the way, each turned
+into a pin: a data row skipped instead of ending a run; a line break not a boundary; the steer dropping the request
+(my assertion matched the volatile block's quote, not the steer's); the terminal set widened to `: ; ,`; every
+conversation treated as single-message; an empty request "equal" to an empty carrier.
+
+**Open, said plainly.**
+1. ~~Should the agent web-search a private individual's life on a channel member's say-so?~~ **Closed by the
+   operator, 2026-10-01: "the agent should be able to search about anything, this request was part of the
+   uncensored-testing."** No guard, none to be proposed. (C) removes the alert that ORDERED this search (93% →
+   5–10% in replay); the model searches when it chooses to.
+2. The Think-Loop Halt is dead behind the Strike Cap (so is the second-cap report when the count reaches 6).
+3. The probe misses: an abbreviation in the frame ("Dr. "), two frames alternating, `."` endings, sentences over
+   ~300 chars. Known cost: twenty same-opener sentences with no moving number (none in the corpus).
+4. `detect_coding_intent` is English keywords: a coding request it misses gets the answer steer (one tool call still
+   allowed). 5. The no-think switch holds until the assistant next RECORDS a message (a reply the checklist nudge
+   discards is regenerated no-think). 6. The unmetered count lands a few loop turns after the kill; the
+   client-streamed final path was not measured; `/v1` usage returned to an API client now includes the estimate.
+7. A single request with text on BOTH sides of an image gets the weaker (true) label. 8. `verifier.outcomes` still
+   counts prose under other titles (`memory save` 75, `planner monologue` 9 — predates this).
+9. With no thinking, the report turn sometimes takes a member's unverified claim as given (3–4 of 30 replies,
+   either text) — the alert forbids inventing, it cannot forbid believing.
+
+**Method notes.** Replays went straight to the model server (single slot, between live requests), 20–30 samples an
+arm, thread and system prompt from the day's trajectories with the two real names replaced by invented ones, payload
+placement by the agent's own builders; outputs stayed in the scratchpad.
+
+**Suite.** Run 1: **26,438 passed, 7 failed** — all seven in `tests/test_claim_binding_verifier.py`, a file this
+change does not touch. They did not reproduce: the file alone (61 passed), under `-n 8` twice, with the new pin file
+in one process, in a 9,391-test neighbouring subset, and in a second full run — **26,445 passed, 0 failed, 68
+skipped**. Run 1's output was piped through `tail` and its failure detail was lost, so the cause is NOT known; a
+state leak from whichever file shared that worker is the likely shape. ⚠ Keep the suite's full output in a file.
+Pins: `tests/test_4kv_slack12_fixes.py` (132 tests); four legacy pins updated (the `thought` format ×2 files, the
+report-payload AST site, a call count that the answer retry moves); pin-quality ratchet unchanged.
+
+**Deployed 21:50 (2026-10-01).** Health showed no foreground request and no bench item; `launchctl kickstart -k`;
+listener pid 1813 → 77525 in ~8 s; one `src.ghost_agent.main`; "system ready" once per start. **Live check — two
+probe turns** (`X-Ghost-Origin: probe`, bounded prompts): a single-message turn replied `PONG-4KV` exactly; a
+three-message conversation ("my code word is HERON" → "NOTED" → "which code word?") replied `HERON`, its turn-1
+reasoning opening on the NEWEST message. The log carries the new line
+(`thought — reasoning: 48 tokens / 198 chars | content: 5 tokens / 8 chars`); both rows have `llm_calls` and no
+estimate keys. **Not exercised live:** a thinking loop cannot be provoked at will, so the probe's kill, the answer
+steer, the no-think retry, the answer-first report, the `thinking_loop` stamp, the `drafting` title and the
+unmetered count are verified by the scripted-stream pins and by the replays against the live model, not by a live
+loop. The next real loop in `ghost-agent.log` ("repeated-sentence-frame", "thinking-loop retry — thinking OFF") is
+the first live exercise.
+
+## §4KW — Two defects from the overnight log (2026-10-02, operator: "look at the agents log … look for bugs" → "fix both, usual verification protocol") — R0 scope
+
+**(1) A tool-free reply that only announced work shipped as the answer.** slack-3120ad1e ("Έχεις δίκιο … Θα κάνω
+ένα ριμεντάρι poster …" — the member had to write "you didn't provide a poster" 50 min later) and slack-541256be
+("*Investigating cache hit rate…* … Let me research this specifically." — no research ever happened). The §4IW
+guard exists for exactly this; its detector (`reply_smoothing.narration_only`, an opener + work-verb list) missed
+both. On the recorded corpus it catches 1 of the 4 real announcements in 155 tool-free replies. Class: a verb list
+is a lexical proxy (§4KM lesson) — the fix is NOT more verbs. **Fix:** when the list says no, ask the worker model
+one bounded YES/NO question (`core/announced_work.py`), measured before wiring.
+**(2) A loop-breaker-closed request printed `ok · recovered N strike(s)`** when no trajectory row is written (sim
+18f014a7): the outcome line got its failed/ok decision from the row only. Class: every turn the stamp is on.
+**Out of scope:** the report turn that asks for a tool twice (pre-dates §4KV; the fallback handles it); the
+streamed-final delivery path unless review shows the guard is needed there.
+
+## §4KW — outcome (2026-10-02)
+
+**(1) Shipped.** `core/announced_work.worker_finds_announcement`: when the §4IW opener/verb list says a tool-free
+reply is not an announcement, the worker model (Gemma 4 E4B on Nova) is asked one YES/NO question; YES gives the
+same single do-it-or-answer continuation. Bounds: reply ≤ 800 chars, no tool ran, 8 s budget, thinking off, asked at
+most ONCE per request, never on sim/bench turns or on the §4KV no-think retry, off with
+`GHOST_ANNOUNCED_WORK_CHECK=0`. **Measured before wiring:** corpus of 155 tool-free replies with a request id — the
+list caught 1 of 4 real announcements; wording v1 caught 5 but raised 3 false alarms (clarifying questions); wording
+v2 (shipped) **4/4, 0/151 false alarms**. Held-out hand-written set, 3 runs: **9/12, 0/16**, stable. Latency
+median ~1.5–3 s (live: 1.1 s and 0.9 s). ⚠ Tuned on the same 155 it was measured on; the held-out set is mine.
+**(2) Shipped.** `_emit_turn_outcome_line` reads the loop-breaker stamp: a breaker-closed turn with no row prints
+`failed`.
+**(3) Found by this change's full run, fixed:** the 7 `test_claim_binding_verifier.py` failures of §4KV run 1 are an
+order dependence, not flakiness — `test_verifier_offmain.py` / `test_verifier_two_stage.py` `importlib.reload` the
+verifier, rebuilding `VerifyVerdict`; a later file in the same worker compares against the class it imported at
+collection (`is` fails between two "equal" members). Reproduced by running either file first (7 failed). Fix as a
+class: conftest's autouse `_restore_reloaded_modules` restores the namespace of every module a test reloads (14 files,
+29 reload calls). Control without it: 9 failures; with it: 0.
+
+**Review (one independent reader): MAJOR 0.** MINOR, all fixed: the check re-ran on every tool-free regeneration
+(now once per request); after the §4KV no-think retry the continuation turned thinking back on (now skipped there);
+latency inside the global turn semaphore for every chat reply, sims and bench included (sims/bench excluded, a
+switch added; the per-reply cost stays). NIT: no switch (added); an unreachable 1,200-char cut (removed).
+Not re-reviewed after these fixes (small, each pinned and mutated).
+**Battery** (scratch copy, NOOP passes, KNOWN-BAD fails, tree == pristine): **34/34 killed**; 3 survivors on the way
+(the worker never shown the request; the NO not remembered; asked on every regeneration) became pins.
+**Suite:** run 1 26,486 passed / 8 failed (the 7 above + the known `test_log_timing_visibility` load flake); after
+the conftest fix **26,496 passed, 0 failed**. Pins: `tests/test_4kw_announced_work_and_outcome.py` (51).
+**Deployed 08:07**, listener 77525 → 87320, one process. **Live probes:** a plain tool-free reply → the check ran
+(1.1 s), NO, shipped; slack-541256be's exact text → the check ran (0.9 s), YES, continuation logged
+"(worker check)". (The probe told the model to send that text, so its continuation argued — the mechanism, not a
+real announcement, was what was exercised.)
+**Open:** the per-reply latency is the user's (inside the turn); a check that answers NO is not re-asked even if a
+later regeneration in the same request announces; the report turn that asks for a tool (pre-§4KV) is untouched.
+
+## §4KW follow-up — "search for any other similar deficiencies and fix them" (2026-10-02) — R0 scope
+
+The same three classes, searched beyond the two cases: (A) announcements shipped on paths the §4IW guard does not
+cover — measured by asking the worker over all 617 recorded tool-turn replies ≤ 800 chars; (B) operator outcome
+lines that read the trajectory row only — searched by joining every `turn outcome` line with its `final reply` in the
+detailed log; (C) test-state leaks like the reload — searched with a per-file leak detector (env vars, sys.modules,
+identities of every `ghost_agent` module global) over the full suite. Out of scope: the detector's attribute-
+mutation blind spot (contents of dicts); the report-turn-asks-for-a-tool behaviour.
+
+## §4KW follow-up — outcome (2026-10-02)
+
+**(A) Announcements after tools ran — found and fixed.** The worker, asked over the 617 recorded tool-turn replies
+≤ 800 chars, flagged 11: **7 real announcements that had reached users** (slack-7cf7753e "Θα κατεβάσω μια καθαρή
+φωτογραφία … και θα ξαναφτιάξω την εικόνα", 384b4f7e "Let me try alternative sources…", 3a2afac2, e69cab30,
+f76620e1, 7ef39622, fd4c8e32), 1 false alarm ("Shall I proceed …?"), 3 shapes the guard never sees. The lexical list
+flagged 2 (both real; 7 of 1,922 at any length, all real — review). §4IW had excluded tool-ran turns on purpose,
+leaving them to the §4GH shape refute — which does not run for members and, live (async critic), lands NEXT turn.
+Now the guard runs after tools too; the worker is told tools ran (wording measured: the 617 above); the directive
+says "the step it announces did not happen" (not "nothing happened"). Side-effect safety measured: 8 confirmations
+after scheduling/background/delete/project tools, 2 runs — 0 YES. One nudge per request across this guard and the
+older English-only pending-promise guard (review: both fired on one request, 4 generations).
+**(B) Outcome line without a row — completed.** 18 sims printed "ok · recovered 2 strike(s)" over
+`[ATTEMPT_ABORTED_THINKING_LOOP]`; 3 August user turns printed "ok · recovered 6 strike(s)" after the strike cap
+(those were fixed by §4GO on 09-14: today's code records them FAILED). The line now also reads the abort marker
+(corpus rule 1), every marker in the store pinned.
+**(C) Test-state leaks — found and fixed as a class.** Per-file leak detector over the whole suite: leaked env
+(`GHOST_VERIFY_TWO_STAGE=1`, stale `GHOST_HOME`, `GHOST_API_KEY`, `TEST_ENV`) and rebound globals
+(`core.agent.request_id_context = MagicMock()`, `utils.logging._MIRROR_LOGGER`, the foresight singleton, task-runner
+hooks, …). `tests/conftest.py` `_StateIsolation` (global plugin) restores env + every rebound `ghost_agent` global
+after each test, folding in exactly what wider-scoped fixtures' setup/teardown change. It replaced the reload-only
+fixture (battery: redundant). It exposed one test that passed only through a leak (`test_schedule_task_interval`,
+fixed) and one import-time leak (`scripts/optimize_verifier.py` via a module fixture, now restored). Re-measured
+at the next file's start: no leaks left except the session fixture's own variable.
+**Review (independent): MAJOR 1** — inside my own fix: the first post-finalizer fold copied the WHOLE state at a
+wider fixture's teardown, keeping the last test's leaks in 37 files (TestCase classes, module fixtures); now folds
+only the teardown's diff. MINOR: two nudges on one request (fixed); latency now also on tool turns ≤ 800 chars
+(~64% of tool requests; 0.9–3 s; accepted, stated); a theoretical marker in a prepended correction banner (not fixed:
+no instance, store cannot show one); vacuous GHOST_HOME pin clause (replaced); stale log/docstring text (fixed).
+**Battery:** 43/43 killed (NOOP passes, KNOWN-BAD fails, tree == pristine). On the way: a NOOP that FAILED because
+the scratch tree lacked `scripts/` (rebuilt — the known trap), 5 survivors → 2 redundancies removed (a second
+one-nudge line; the reload fixture), 2 pins strengthened (a CHANGED env var; the one-nudge sequence).
+**Suite:** 26,515 passed, 0 failed (644 s; earlier runs with the plugin 573–624 s, without 560–633 s).
+**Deployed 09:39**, listener 87320 → 16955, one process. Live probe with a tool: the check ran after `web_search`
+(0.9 s), NO; the 37 s that followed were the existing verifier refuting a made-up version and repairing it.
+**Open:** latency on short tool-turn replies; the prepended-banner case; attribute MUTATION (dict contents) and
+import-time state are outside the test isolation; a worker NO is not re-asked if a later regeneration announces.
+
+## §4KW open items — closed (2026-10-02, operator: "fix the open items")
+
+**(1) The check's latency.** Measured: ~1.0 s median / 1.4 s p90 per uncached call, 0.7–1.1 s live; the earlier
+"1.5–3 s" was with 3 calls in parallel. A cacheable wording (fixed question first) was measured on all three sets
+and REJECTED: no faster (1.0 s) and 24 vs 11 YES on the tool-turn replies (false alarms on system notes). Fix: the
+user's worst-case wait is now 3 s, enforced BY CANCELLATION outside `route()`. Two traps found on the way, both
+reproduced: as `route()`'s own budget, 3 s fell under `_MIN_HTTP_FLOOR` (3 s) and EVERY call was declined before
+leaving the process; 4 s (review MAJOR) turned a slow answer into a ReadTimeout = NODE FAULT, and the worker shares
+its breaker URL with the critic — 3 slow checks opened it for 60 s. A cancellation is not counted against the node.
+**(2) The correction-banner case.** The line reads the reply AS RECORDED (`marker_text=_recorded_reply`, captured
+before the previous turn's banner is prepended on finalize). The streamed path records the banner with the reply,
+and its line reads the same text: they agree (the corpus's own behaviour there is out of scope).
+**(3) Test isolation gaps.** Measured over the full suite: 44 module-level containers carried one file's entries
+into the next; env set at collection time was all deliberate (temp paths for push/UI/VAPID files). `_StateIsolation`
+now restores container CONTENTS in place (identity comparison), except containers/globals that track LIVE outside
+state — found by failures and review: the ddgs library patch record, DB connections/locks, project locks, task
+references, the egress guard's socket originals (restoring those broke the next connect).
+**(4) A NO not re-asked.** Asked again when the text changed, at most twice a request, never after the
+pending-promise steer (review MAJOR: re-asking re-opened the two-directives case). Decision extracted into
+`_aw_next_ask` (pure, pinned by behaviour).
+**Review (independent): MAJOR 2, both inside this round's fixes** (the 4 s budget as a node fault; re-asking after
+the pending-promise steer). MINOR: egress-guard state, cold-probe skip (budget now outside route, so the probe no
+longer eats it), weak pins (cap, budget) — all fixed/pinned.
+**Battery:** 45/45 killed after removing one redundancy (`_ORIGINALS` in the contents list); controls fine; 5 stale
+anchors repaired. **Suite:** see deploy line below.
+**Suite:** 26,531 passed, 0 failed (708 s — the container restore costs time: earlier runs 573–644 s).
+**Deployed 11:04**, listener 16955 → 22692, one process. Live: a tool-free probe (check ran, ~1.1 s to the
+outcome, NO, shipped) and a `web_search` probe (check ran after the tool, NO; verified). No "Worker Node Failed",
+no breaker line.

@@ -82,7 +82,13 @@ def test_main_turn_applies_the_report_payload_only_on_breaker_forced_finals():
                     and getattr(st.value.func, "id", "") == "report_turn_payload"
                     and getattr(st.targets[0], "id", "") == "payload"):
                 hits.append(n)
-    assert len(hits) == 1
+    # §4KV: a second, deliberate site — the turn that reads the thinking-loop
+    # answer steer — hangs off the first as its `elif` and reads nothing but
+    # `loop_retry_is_no_think(messages, last_user_content)`.
+    assert len(hits) == 2
+    hits.sort(key=lambda n: n.lineno)
+    assert hits[0].orelse == [hits[1]]
+    assert ast.unparse(hits[1].test) == "loop_retry_is_no_think(messages, last_user_content)"
     test = ast.unparse(hits[0].test)
     assert "is_final_generation" in test and "_breaker_forced_final" in test
     assert not any(isinstance(u, ast.UnaryOp) and isinstance(u.op, ast.Not)

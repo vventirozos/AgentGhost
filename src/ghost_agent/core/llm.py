@@ -470,6 +470,7 @@ class RoutingTask:
     EXPAND_QUERY = "EXPAND_QUERY"          # bus.py, agent.py
     CLASSIFY_FAILURE = "CLASSIFY_FAILURE"  # failure_dimension.py
     DISTILL_PATTERN = "DISTILL_PATTERN"    # failure_distill.py
+    CHECK_ANNOUNCEMENT = "CHECK_ANNOUNCEMENT"  # announced_work.py (§4KW)
 
 
 # Human-readable stream labels. The ROUTING label stays the canonical string
@@ -3081,58 +3082,103 @@ class LLMClient:
             self._usage_by_req = ring
         return ring
 
-    def _note_usage(self, result: Any) -> None:
-        """Fold one response's `usage` into the current request's running
-        total. Tolerant by contract — `result` may be a str (the `route`
-        path), None, or a dict with no usage at all."""
+    def _usage_slot(self, req_id: str) -> Dict[str, int]:
+        """The running-total slot for one request (created on first use)."""
+        ring = self._usage_ring()
+        slot = ring.get(req_id)
+        if slot is None:
+            slot = {"tokens_in": 0, "tokens_out": 0,
+                    "cached_tokens": 0, "calls": 0}
+            ring[req_id] = slot
+            while len(ring) > self._USAGE_RING_MAX:
+                ring.popitem(last=False)
+        ring.move_to_end(req_id)
+        return slot
+
+    def _note_unmetered_stream(self, req_id: str, delta_chunks: int) -> None:
+        """§4KV: count a stream that ended WITHOUT its usage frame.
+
+        The usage block rides the stream's final chunk, so a stream the
+        consumer walks away from — every thinking-loop / tool-flood kill —
+        was never counted at all: req slack-124c85b8 made four model calls
+        and generated ~5,200 tokens, and its record said `llm_calls: 2`,
+        `tokens_out: 220`, because the two killed calls (3,765 and 1,284
+        tokens) had no final chunk. Such a stream is one call; its output is
+        ESTIMATED as its delta-chunk count (the upstream streams a token per
+        chunk) and kept apart in `tokens_out_estimated`, and its prompt is
+        unknown — `unmetered_calls` says how many prompts `tokens_in` lacks.
+        Takes the request id explicitly: this runs from the generator's
+        `finally`, possibly at finalisation, outside the request's context."""
         try:
-            if not isinstance(result, dict):
+            if not req_id or delta_chunks <= 0:
                 return
-            usage = result.get("usage")
-            if not isinstance(usage, dict):
-                return
-            from ..utils.logging import request_id_context
-            req_id = request_id_context.get()
-            if not req_id:
-                return
-            ring = self._usage_ring()
-            slot = ring.get(req_id)
-            if slot is None:
-                slot = {"tokens_in": 0, "tokens_out": 0,
-                        "cached_tokens": 0, "calls": 0}
-                ring[req_id] = slot
-                while len(ring) > self._USAGE_RING_MAX:
-                    ring.popitem(last=False)
-            ring.move_to_end(req_id)
-            slot["tokens_in"] += int(usage.get("prompt_tokens") or 0)
-            slot["tokens_out"] += int(usage.get("completion_tokens") or 0)
-            details = usage.get("prompt_tokens_details")
-            if isinstance(details, dict):
-                # Prefill-cache hits. The log reports the system prompt's
-                # CHARACTER count today; this is the first real measure of
-                # whether that cache is actually being hit.
-                slot["cached_tokens"] += int(details.get("cached_tokens") or 0)
+            slot = self._usage_slot(req_id)
             slot["calls"] += 1
+            slot["tokens_out"] += int(delta_chunks)
+            slot["unmetered_calls"] = int(slot.get("unmetered_calls") or 0) + 1
+            slot["tokens_out_estimated"] = (
+                int(slot.get("tokens_out_estimated") or 0) + int(delta_chunks))
         except Exception:  # noqa: BLE001 — accounting must never break a turn
             pass
 
-    def _note_usage_from_sse(self, line: str) -> None:
-        """Fold the usage block out of one raw SSE line. Separate from
-        `_stream_rec_accumulate` because that one is gated on the opt-in
-        recorder; token accounting has to run on every stream."""
+    def _note_usage(self, result: Any) -> bool:
+        """Fold one response's `usage` into the current request's running
+        total; True when a usage block was counted. Tolerant by contract —
+        `result` may be a str (the `route` path), None, or a dict with no
+        usage at all."""
+        try:
+            if not isinstance(result, dict):
+                return False
+            usage = result.get("usage")
+            if not isinstance(usage, dict):
+                return False
+            from ..utils.logging import request_id_context
+            req_id = request_id_context.get()
+            if not req_id:
+                return False
+            # Read everything BEFORE touching the slot (§4KV review): a frame
+            # with one unreadable number used to add its prompt tokens, raise,
+            # and — now that an uncounted stream is filed as unmetered — be
+            # counted a second time as an estimate.
+            _in = int(usage.get("prompt_tokens") or 0)
+            _out = int(usage.get("completion_tokens") or 0)
+            details = usage.get("prompt_tokens_details")
+            # Prefill-cache hits. The log reports the system prompt's
+            # CHARACTER count today; this is the first real measure of
+            # whether that cache is actually being hit.
+            try:    # optional detail: an unreadable one must not cost the call
+                _cached = (int(details.get("cached_tokens") or 0)
+                           if isinstance(details, dict) else 0)
+            except (TypeError, ValueError, OverflowError):
+                _cached = 0
+            slot = self._usage_slot(req_id)
+            slot["tokens_in"] += _in
+            slot["tokens_out"] += _out
+            slot["cached_tokens"] += _cached
+            slot["calls"] += 1
+            return True
+        except Exception:  # noqa: BLE001 — accounting must never break a turn
+            return False
+
+    def _note_usage_from_sse(self, line: str) -> bool:
+        """Fold the usage block out of one raw SSE line; True when one was
+        counted. Separate from `_stream_rec_accumulate` because that one is
+        gated on the opt-in recorder; token accounting has to run on every
+        stream."""
         try:
             if isinstance(line, (bytes, bytearray)):
                 line = line.decode("utf-8", "replace")
             if not line or not line.startswith("data:"):
-                return
+                return False
             body = line[5:].strip()
             if not body or body == "[DONE]":
-                return
+                return False
             chunk = json.loads(body)
             if isinstance(chunk, dict) and isinstance(chunk.get("usage"), dict):
-                self._note_usage(chunk)
+                return self._note_usage(chunk)
         except Exception:  # noqa: BLE001 — a malformed chunk is not fatal
             pass
+        return False
 
     def usage_for(self, req_id: str) -> Dict[str, int]:
         """Running token totals for one request. Empty dict when unknown —
@@ -3439,6 +3485,14 @@ class LLMClient:
         # We wrap in a generic retry similar to the non-streaming one if it fails at the start.
         # But once bytes are yielded, if it fails mid-stream, it breaks.
         yielded_any = False
+        # §4KV: the request this stream belongs to, read while the caller's
+        # context is certainly current (the accounting in `finally` may run
+        # at generator finalisation).
+        try:
+            from ..utils.logging import request_id_context as _rid_ctx
+            _usage_req_id = _rid_ctx.get() or ""
+        except Exception:  # noqa: BLE001
+            _usage_req_id = ""
         # Stream-side recording (§4F Phase 2b): checked ONCE per call so the
         # off path costs one import + one getenv. When on, deltas are folded
         # into `_rec_acc` as they pass through and ONE reassembled record is
@@ -3503,6 +3557,10 @@ class LLMClient:
             # bounded; this stops the SECOND one from re-paying the same
             # timeout for a body that has already proven it will not arrive.
             _body_read_ok = True
+            # §4KV: per attempt — did the usage frame arrive, and how many
+            # delta chunks went by (see `_note_unmetered_stream`).
+            _usage_seen = False
+            _delta_chunks = 0
             try:
                 # ⚠ THE PERMIT IS HELD ACROSS `yield`s, AND THAT IS THE POINT.
                 # A node slot is occupied for the whole GENERATION, not the
@@ -3668,7 +3726,11 @@ class LLMClient:
                                 # so the test must not assume either.
                                 if b'"usage"' in chunk if isinstance(chunk, (bytes, bytearray)) \
                                         else '"usage"' in str(chunk):
-                                    self._note_usage_from_sse(chunk)
+                                    if self._note_usage_from_sse(chunk):
+                                        _usage_seen = True
+                                if b'"delta"' in chunk if isinstance(chunk, (bytes, bytearray)) \
+                                        else '"delta"' in str(chunk):
+                                    _delta_chunks += 1
                                 # ⚠ NOT `f"{chunk}"` WHEN `chunk` IS BYTES. The
                                 # pre-filter two lines up already says a chunk
                                 # "is str on the real `aiter_lines` path but
@@ -3690,6 +3752,10 @@ class LLMClient:
                                     payload, _rec_resp,
                                     kind="chat_completion_stream")
                     finally:
+                        # Before the close: a close that raises must not cost
+                        # the count. Sync, and it never raises.
+                        if not _usage_seen:
+                            self._note_unmetered_stream(_usage_req_id, _delta_chunks)
                         await resp.aclose()
                 if node is not None:
                     self.circuit_breaker.record_success(node["url"])

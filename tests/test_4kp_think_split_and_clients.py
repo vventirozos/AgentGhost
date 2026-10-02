@@ -664,19 +664,30 @@ def test_a_cli_reply_that_ends_without_done_is_not_released(monkeypatch):
     assert "Let me look it up" not in captured.getvalue()
 
 
-def _clockwork_send(lines):
+def _clockwork_send(lines, **attrs):
     """Run the real `send_chat_request` (no Qt: the method needs only the
-    objects stubbed here) — the reviewer's R2 harness."""
+    objects stubbed here) — the reviewer's R2 harness. `attrs` are set on the
+    stand-in window first (e.g. `is_recording=True`); the window itself is
+    left on `_clockwork_send.window` for a test that needs its state after."""
     import re as _re
     import textwrap
+    import sys as _sys
+    import time as _time
     src = (ROOT / CLOCKWORK).read_text()
     tree = ast.parse(src)
-    ns = {"re": _re, "json": json}
+    # The Qt-free modules the method leans on are the REAL ones (2026-10-01:
+    # request ids, the speech chunker) — only Qt and the network are doubles.
+    _sys.path.insert(0, str((ROOT / CLOCKWORK).parent))
+    import agentapi as _agentapi
+    from speech import SpeechChunker as _SpeechChunker
+    ns = {"re": _re, "json": json, "time": _time, "asyncio": asyncio, "agentapi": _agentapi,
+          "SpeechChunker": _SpeechChunker, "AGENT_BASE": "http://agent.test"}
     keep = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name == "strip_orphan_think_close")
             or (isinstance(n, ast.Assign) and any(getattr(t, "id", "") in ("_ORPHAN_CLOSE_RE", "_FENCE_SPAN_RES")
                                                   for t in n.targets))]
     exec(compile(ast.Module(body=keep, type_ignores=[]), CLOCKWORK, "exec"), ns)
     meth = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == "send_chat_request")
+    say = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_say")
 
     class Resp:
         status_code = 200
@@ -726,22 +737,59 @@ def _clockwork_send(lines):
             return lambda *a, **k: None
 
     class Self:
-        conversation_history = [{"role": "user", "content": "q"}]
         tts_enabled = True
         current_response_text = ""
+        session_id = "cw-test"
+        _stop_asked = 0
+        _stop_took = False
+        _stop_pending = False
+        is_recording = False
 
         def __init__(self):
+            self.conversation_history = [{"role": "user", "content": "q"}]
             self.update_chat_signal = Sig()
             self.update_workspace_signal = Sig()
             self.web_face = Face()
+            self.stop_btn = Face()
+            self.notes = []
 
         def set_face_mood(self, m):
+            pass
+
+        def _set_agent_ok(self, ok):
+            pass
+
+        def _refresh_rating_chips(self):
+            pass
+
+        def _note(self, text, tone=None):
+            self.notes.append(text)
+
+        async def _reply_landed(self, elapsed_s):
             pass
     audio = Q()
     ns.update(httpx=type("httpx", (), {"AsyncClient": Client}), audio_queue=audio, playback_queue=Q(),
               GHOST_API_KEY="k")
     exec(textwrap.dedent(ast.get_source_segment(src, meth)), ns)
+    exec(textwrap.dedent(ast.get_source_segment(src, say)), ns)
+    Self._say = ns["_say"]                 # the real method: what is SPOKEN is under test
     me = Self()
+    for _k, _v in attrs.items():
+        setattr(me, _k, _v)
+    _clockwork_send.window = me
+
+    # The display half of `update_response` — the real method reads the text
+    # the window accumulated, to decide what the conversation and the rating
+    # may keep.
+    _emit = me.update_chat_signal.emit
+
+    def emit(*a):
+        if a and a[0] == "start_response":
+            me.current_response_text = ""
+        elif a and a[0] == "update_response":
+            me.current_response_text += a[1]
+        _emit(*a)
+    me.update_chat_signal.emit = emit
     asyncio.run(ns["send_chat_request"](me))
     shown = "".join(a[1] for a in me.update_chat_signal.ev if a[0] == "update_response")
     return shown, audio.items, me.update_chat_signal.ev

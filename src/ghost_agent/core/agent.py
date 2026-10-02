@@ -1041,9 +1041,9 @@ _FORCED_FINAL_ANSWER_DIRECTIVE = (
 # first turn that stops at the announcement shipped as the answer. One
 # continuation, tools on: do the work or answer — never narrate.
 _ANNOUNCED_WORK_DIRECTIVE = (
-    "SYSTEM ALERT: your last message only ANNOUNCED work ('Let me search…', "
-    "'I'll check…', 'Ας κάνω έρευνα…') and ended the turn with NO tool call — "
-    "nothing happened, and the user would receive only the announcement. Either "
+    "SYSTEM ALERT: your last message ended by ANNOUNCING work ('Let me search…', "
+    "'I'll check…', 'Ας κάνω έρευνα…') with NO tool call — the step it announces "
+    "did not happen, and the user would receive only the announcement. Either "
     "make the tool call(s) now, or answer directly from what you already know. "
     "Do NOT describe work you have not done."
 )
@@ -1066,6 +1066,41 @@ def _announced_work_without_acting(this_turn_text: str, request: str = "") -> bo
     from .reply_smoothing import narration_only, strip_system_notes
     body = strip_system_notes(str(this_turn_text or "")).strip()
     return bool(body) and narration_only(body, request=request)
+
+
+#: §4KW: worker announcement checks per request (each is a round-trip the user waits for).
+_AW_MAX_ASKS = 2
+
+
+def _aw_next_ask(state, text: str, max_chars: int):
+    """§4KW: the announced-work state after asking the worker about ``text``,
+    or None when it must not be asked — no text, too long, the same text it
+    already judged, or `_AW_MAX_ASKS` asks used. ``state`` is the request's
+    `_work_nudge_used` (False / {"asks", "last"} / True)."""
+    if state is True or not text or len(text) > max_chars:
+        return None
+    seen = state if isinstance(state, dict) else {"asks": 0, "last": None}
+    key = hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()
+    if seen.get("asks", 0) >= _AW_MAX_ASKS or seen.get("last") == key:
+        return None
+    return {"asks": seen.get("asks", 0) + 1, "last": key}
+
+
+def _worker_check_applies(messages, pending_request) -> bool:
+    """§4KW: may the announced-work guard ask the worker model on this turn?
+    Not when ``GHOST_ANNOUNCED_WORK_CHECK=0``; not on a self-play or bench
+    turn (nobody waits for the reply, and the worker is the critic's node
+    too); not on the §4KV no-think retry after a thinking loop — its
+    continuation would run with thinking back on, the setting that re-looped
+    5 times in 30 (review §4KW)."""
+    if os.getenv("GHOST_ANNOUNCED_WORK_CHECK", "1").strip().lower() in ("0", "false", "no", "off"):
+        return False
+    if str(request_origin_context.get() or "") in ("sim", "bench"):
+        return False
+    try:
+        return not loop_retry_is_no_think(messages, pending_request)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _forced_final_has_no_answer(this_turn_text: str, accumulated: str,
@@ -1235,8 +1270,8 @@ def evidence_digest(tools_run, *, ask: str = "") -> str:
     order = []
     last_clean = None
     for t in runs:
-        content = str(t.get("content") or "")
-        line = error_line(content)
+        content = t.get("content") or ""        # the object: a declared status counts
+        line = error_line(content, tool=str(t.get("name") or "") or None)
         if line:
             key = " ".join(exception_signature(normalise_volatile(line)).split())[:200]
             if key not in errors:
@@ -1992,10 +2027,7 @@ def _render_refute_directive(crit: str, pending_request="",
     tool-grounded diagnosis. ``pending_request`` is the loop's
     ``last_user_content``; the quote is bounded by ``_pending_request_head``.
     """
-    head = _pending_request_head(pending_request)
-    which = (f'THE REQUEST YOU ARE ANSWERING (unchanged): "{head}".' if head
-             else "The request you are answering is the user's most recent "
-                  "one (unchanged).")
+    which = _which_request_line(pending_request)
     if shape_only:
         return (
             "SYSTEM ALERT — the verifier REFUTED the SHAPE of your previous "
@@ -2057,6 +2089,18 @@ def _pending_request_head(request_text) -> str:
     return text
 
 
+def _which_request_line(pending_request) -> str:
+    """The one sentence that names the request a runtime alert is about —
+    shared by the refute directive (req 2422eb25) and, since §4KV, every
+    forced-report alert and the thinking-loop steer: an alert is a user-role
+    message, and a model that is not told which request it serves answers
+    the alert, or the conversation, instead."""
+    head = _pending_request_head(pending_request)
+    return (f'THE REQUEST YOU ARE ANSWERING (unchanged): "{head}".' if head
+            else "The request you are answering is the user's most recent "
+                 "one (unchanged).")
+
+
 def _render_volatile_block(dynamic_state: str, pending_request="") -> str:
     """The ONLY assembler of a ``<system_state_update>`` block.
 
@@ -2085,6 +2129,71 @@ def _render_volatile_block(dynamic_state: str, pending_request="") -> str:
         "pending request.)\n"
         f"{_VOLATILE_BLOCK_CLOSE}"
     )
+
+
+# ── §4KV: the label between the injected context and the user text it rides on.
+# The pinned <session_context> block is prefixed onto the FIRST user message
+# (a position that never moves, for the KV cache) and used to be followed by
+# "[USER INSTRUCTION]" unconditionally. In a conversation with history the
+# first user message is NOT the instruction: req slack-124c85b8 (2026-10-01)
+# was the twelfth message of a Slack thread, the block told the model to
+# "focus entirely on the user instruction", the message under that label was
+# the thread's opening question from five hours earlier — and turn 1 set out
+# to answer it ("The user wants to know if George Delaportas is a genius").
+# The label now says what the message IS: the instruction only when its text
+# is the pending request; otherwise a line that is true of any message.
+_INSTRUCTION_LABEL = "[USER INSTRUCTION]"
+_CONVERSATION_START_LABEL = (
+    "[CONVERSATION START — the request to answer now is the user's MOST RECENT "
+    "message (quoted as PENDING REQUEST in the state update at the end), which "
+    "is not necessarily this one]")
+_NEWEST_MESSAGE_LABEL = (
+    "[NEWEST MESSAGE — the request to answer is the one quoted above as "
+    "PENDING REQUEST]")
+
+
+def _message_text(content) -> str:
+    """The text of a message's content (a string, or the text parts of a
+    structured list), whitespace-collapsed — the form two copies of one
+    request are compared in."""
+    if isinstance(content, list):
+        content = " ".join(str(i.get("text", "")) for i in content
+                           if isinstance(i, dict) and i.get("type") == "text")
+    return " ".join(str(content or "").split())
+
+
+def _carrier_label(carrier_content, pending_request, otherwise: str, *,
+                   holds_request: bool = False) -> str:
+    """The label for the message an injected block is prefixed onto:
+    ``[USER INSTRUCTION]`` when that message is the pending request (or
+    ``pending_request`` is None — a caller that names none), else
+    ``otherwise``.
+
+    ``holds_request``: the caller knows only ONE user message arrived. Then
+    the carrier is the request if it merely CONTAINS the request's text — a
+    request whose image part was flattened into an "[Image attached …]" note
+    no longer equals it. Containment is not trusted without that knowledge
+    (in a thread, the newest "ok" is contained in half the earlier
+    messages), and the count is not trusted without containment (the first
+    user-role message can be a translated tool row, or what an emergency
+    prune left).
+
+    Both ``otherwise`` labels are true of ANY message, so a comparison that
+    fails because the request was rewritten on the way in costs a weaker
+    label, never a false one; an earlier message with the request's exact
+    text gets the instruction label, which is harmless — it is the same
+    instruction."""
+    if pending_request is None:                  # a caller that names no request
+        return _INSTRUCTION_LABEL
+    want = _message_text(pending_request)
+    have = _message_text(carrier_content)
+    # A request with no text at all (an image alone) equals nothing; it is
+    # the carrier only when it is the one message that arrived. A translated
+    # tool row is never the request, whatever it echoes (third review).
+    if (have == want and want) or (holds_request and want in have
+                                   and not have.startswith("<tool_response")):
+        return _INSTRUCTION_LABEL
+    return otherwise
 
 
 def _squeeze_evidence_noise(text: str) -> str:
@@ -4983,25 +5092,123 @@ def report_turn_payload(payload: dict) -> dict:
     return out
 
 
-def blocker_report_alert(kind: str, detail: str) -> str:
+#: §4KV: whose message a runtime alert is. Req slack-124c85b8's report turn
+#: (thinking off) read "your reasoning entered a self-repeating loop … be
+#: specific and honest" as the USER's complaint and answered it — "You're
+#: absolutely right … you've successfully pointed out where my reasoning was
+#: flawed" — instead of the user's message. The same defect as req 4dab5067's
+#: repair turn (`_REPAIR_STANDALONE_SUFFIX`), on the breakers' path.
+_ALERT_PROVENANCE = (
+    "This alert is from the runtime, not from the user: the user did not "
+    "write it and cannot see it — do not reply to it, agree with it or "
+    "apologise for it. ")
+
+_REPORT_ASK = "Write your FINAL answer now as a report: "
+#: §4KV: a thinking loop is the one breaker with no blocker in the world —
+#: the evidence in the conversation may already answer the request, and a
+#: remark or a question deserves its answer, not a three-part work report.
+#: Measured on the slack-12 report turn replayed 30× per text against the
+#: live model: the report ask shipped a third-person work report 4×,
+#: invented facts the search had not found 4× and a stale concession 1×
+#: (9/30); this ask shipped none of those (0/30).
+_ANSWER_FIRST_ASK = (
+    "Write your FINAL reply to that request now, from what is already in "
+    "this conversation: answer it directly, in the form it calls for. State "
+    "as fact only what the conversation and its tool results support — where "
+    "a search found nothing, say so; never invent details to fill a gap. "
+    "Only if the request was a task that is not finished, write a report "
+    "instead: ")
+_REPORT_BODY = (
+    "(1) what the user asked "
+    "and what you delivered so far (name the files that exist); (2) what "
+    "you tried and the exact error or gap that stopped you; (3) what "
+    "would unblock it (a different library or approach, a version, "
+    "information from the user). Be specific and honest — do not claim "
+    "progress you did not verify, do not describe what you are "
+    "'about to' do, and (4) do not predict outputs or counts you did "
+    "not observe — code you never ran is labelled UNTESTED, never "
+    "'the fix' or 'the complete solution'. If the system state still "
+    "lists the task as pending or says you have turns left, that is "
+    "expected — you will NOT act on it this turn; do not plan more work, "
+    "do not think it through: "
+)
+
+
+def blocker_report_alert(kind: str, detail: str, pending_request="", *,
+                         answer_first: bool = False) -> str:
     """The forced-report instruction shared by the breakers' second tier
     and the reserved last turn. ONE wording — the model reads the same
-    ask wherever the loop gives up on tools."""
+    ask wherever the loop gives up on tools.
+
+    §4KV: every alert says whose message it is (`_ALERT_PROVENANCE`) and
+    which request it serves (`_which_request_line` — `pending_request` is
+    the loop's ``last_user_content``). ``answer_first`` is the thinking-loop
+    breakers' ask (`_ANSWER_FIRST_ASK`)."""
     return (
         f"SYSTEM ALERT ({kind}): {detail}. Tools are OFF for this turn. "
-        "Write your FINAL answer now as a report: (1) what the user asked "
-        "and what you delivered so far (name the files that exist); (2) what "
-        "you tried and the exact error or gap that stopped you; (3) what "
-        "would unblock it (a different library or approach, a version, "
-        "information from the user). Be specific and honest — do not claim "
-        "progress you did not verify, do not describe what you are "
-        "'about to' do, and (4) do not predict outputs or counts you did "
-        "not observe — code you never ran is labelled UNTESTED, never "
-        "'the fix' or 'the complete solution'. If the system state still "
-        "lists the task as pending or says you have turns left, that is "
-        "expected — you will NOT act on it this turn; do not plan more work, "
-        "do not think it through: write the report."
+        + _ALERT_PROVENANCE + _which_request_line(pending_request) + " "
+        + (_ANSWER_FIRST_ASK if answer_first else _REPORT_ASK)
+        + _REPORT_BODY
+        # the last imperative must not contradict the ask (review, §4KV)
+        + ("write your reply." if answer_first else "write the report.")
     )
+
+
+#: §4KV: the sentence that makes a steer the thinking-loop ANSWER steer;
+#: `loop_retry_is_no_think` keys on it.
+_LOOP_ANSWER_STEER_MARK = "Your next output is the reply to that request itself"
+
+
+def thinking_loop_answer_steer(pending_request) -> str:
+    """§4KV — the steer after a thinking loop killed a turn BEFORE any tool
+    ran, on a request that is not a coding task. The general steer orders
+    "ONE grounding tool call" (a debugging loop is missing an observation);
+    here nothing has been observed yet and the loop was the model drafting
+    its reply, so a forced tool call invents work: replayed 15× on the
+    slack-12 thread, that order produced a web search about a named
+    person's marriage 14 times. This text, with thinking off for the one
+    turn that reads it (`loop_retry_is_no_think`), produced 18 direct
+    replies, 2 searches and no second loop in 20; with thinking left ON two
+    wordings re-looped 5 times in 30."""
+    return (
+        "SYSTEM ALERT: Your previous turn entered a self-repeating thinking "
+        "loop and was killed; that reasoning is discarded. This alert is from "
+        "the runtime, not from the user: the user did not write it and cannot "
+        f"see it. {_which_request_line(pending_request)} Do NOT start that "
+        "reasoning again. "
+        f"{_LOOP_ANSWER_STEER_MARK} — or exactly ONE tool call, only if the "
+        "reply needs a fact you do not have or work you have not done. State "
+        "as fact only what you know or a tool returned; never invent details "
+        "to fill a gap.")
+
+
+#: The assistant-role note left in the history where a killed thinking loop was.
+_THINKING_ABORTED_NOTE = "[Internal thinking aborted: runaway loop detected.]"
+
+
+def loop_retry_is_no_think(messages, pending_request) -> bool:
+    """§4KV: is the turn about to be generated the one that answers a
+    `thinking_loop_answer_steer`? True when the newest assistant message is
+    the abort note and the user-role messages after it include that steer
+    EXACTLY as built for this request — so it needs no flag, and a user who
+    quotes the steer's words (a pasted log line) cannot switch their own
+    turn's thinking off: a message cannot be the steer that quotes it.
+
+    It holds until the assistant next adds a message to the history —
+    normally one generation. A reply the loop DISCARDS without recording
+    (the checklist nudge appends only its reminder) is regenerated under
+    the same switch: still no thinking, still tools on (second review)."""
+    steer = thinking_loop_answer_steer(pending_request)
+    seen = False
+    for m in reversed(messages or []):
+        if not isinstance(m, dict):
+            return False
+        if m.get("role") != "user":
+            return (seen and m.get("role") == "assistant"
+                    and m.get("content") == _THINKING_ABORTED_NOTE)
+        if m.get("content") == steer:
+            seen = True
+    return False
 
 
 #: §4KM (a): the heads of a model-facing steer, and the tools a steer may name that
@@ -5705,10 +5912,12 @@ from .stream_guards import (  # noqa: E402
     THINKING_LOOP_PROBE_EVERY, THINKING_LOOP_WINDOW, THINKING_LOOP_THRESHOLD,
     TOOL_CALL_LOOP_THRESHOLD, TOOL_CALL_LOOP_PROBE_EVERY,
     PARAGRAPH_LOOP_MIN_LINE, PARAGRAPH_LOOP_THRESHOLD,
+    SENTENCE_RUN_THRESHOLD,
     TOOL_CALL_BATCH_CEILING, NATIVE_TOOL_CALL_REPEAT,
     _STREAM_STOP_MARKERS,
     _detect_thinking_loop, _tail_has_stop_marker, _detect_tool_call_loop,
-    _detect_paragraph_loop, _detect_native_tool_call_flood,
+    _detect_paragraph_loop, _detect_sentence_run_loop,
+    _detect_native_tool_call_flood,
     _native_call_identity,
 )
 
@@ -15892,7 +16101,7 @@ class GhostAgent:
 
     @staticmethod
     def _compose_injection(req_messages, stable_injection, dynamic_state, pin,
-                           pending_request=""):
+                           pending_request=None, first_user_is_request=False):
         """Place the per-turn stable + volatile context into ``req_messages``.
 
         Returns the (mutated) list. ``pending_request`` is the CURRENT
@@ -15934,10 +16143,13 @@ class GhostAgent:
             transient_injection = f"{stable_injection}\n\n{dynamic_state.strip()}"
             if req_messages and req_messages[-1]["role"] == "user":
                 original_msg = req_messages[-1]["content"]
+                # §4KV: on turn >= 2 the last user-role message is a tool
+                # result or a steer, not the instruction.
                 req_messages[-1]["content"] = _prefix_content(
                     original_msg,
                     _render_volatile_block(transient_injection, pending_request)
-                    + "\n\n[USER INSTRUCTION]",
+                    + "\n\n" + _carrier_label(original_msg, pending_request,
+                                               _NEWEST_MESSAGE_LABEL),
                 )
             else:
                 req_messages.append({
@@ -15961,9 +16173,18 @@ class GhostAgent:
             req_messages.insert(ins, {"role": "user", "content": stable_block})
             first_user_idx = ins
         else:
+            # §4KV: the first user message is the instruction only when it
+            # is the pending request. `pending_request` is constant over a
+            # request's turns, so the pinned prefix stays byte-identical.
+            # `first_user_is_request` is the caller's own count (one user
+            # message arrived): the equality test alone misses a request
+            # whose image was flattened into a "[Image attached …]" note.
+            _first = req_messages[first_user_idx]["content"]
             req_messages[first_user_idx]["content"] = _prefix_content(
-                req_messages[first_user_idx]["content"],
-                f"{stable_block}\n\n[USER INSTRUCTION]",
+                _first,
+                f"{stable_block}\n\n"
+                + _carrier_label(_first, pending_request, _CONVERSATION_START_LABEL,
+                                 holds_request=first_user_is_request),
             )
         # The volatile block ALWAYS rides its own trailing message — it is
         # never folded into an existing one.
@@ -20603,7 +20824,8 @@ class GhostAgent:
                             messages.append({"role": "user", "content": blocker_report_alert(
                                 "edit churn",
                                 f"you kept editing '{_churn_t}' without verifying "
-                                f"after {_churn['steers']} warnings")})
+                                f"after {_churn['steers']} warnings",
+                                last_user_content)})
                         elif _churn_verdict == "steer":
                             messages.append({
                                 "role": "user",
@@ -21226,7 +21448,8 @@ class GhostAgent:
                                 messages.append({"role": "user", "content": blocker_report_alert(
                                     "futility",
                                     f"'{_bn}' has been rewritten {_rec['writes']} times and "
-                                    f"rerun {_rec['runs']} times without reaching the goal")})
+                                    f"rerun {_rec['runs']} times without reaching the goal",
+                                    last_user_content)})
                             if _ft_kind == "steer":
                                 if _bn is not None:
                                     if _rec is not None:
@@ -21343,7 +21566,7 @@ class GhostAgent:
                             try:
                                 from . import strikes as _strk_mod
                                 from .foresight import command_head as _cmd_head
-                                _efp = _strk_mod.error_line_fingerprint(str_res)
+                                _efp = _strk_mod.error_line_fingerprint(str_res, tool="execute")
                                 if _efp:
                                     _ehead = _cmd_head(str(
                                         (_recorded_args or {}).get("command") or ""
@@ -21361,7 +21584,7 @@ class GhostAgent:
                                     if not isinstance(_lines, dict):
                                         _lines = {}
                                         strikes.exec_error_lines = _lines
-                                    _lines[_esig] = _strk_mod.error_line(str_res)
+                                    _lines[_esig] = _strk_mod.error_line(str_res, tool="execute")
                                     _heads = getattr(strikes, "exec_error_heads", None)
                                     if not isinstance(_heads, dict):
                                         _heads = {}
@@ -22261,7 +22484,8 @@ class GhostAgent:
                     messages.append({"role": "user", "content": blocker_report_alert(
                         "channel limits",
                         f"your last {MEMBER_REFUSAL_REPORT_AT} rounds of tool calls were all refused "
-                        "because they cannot be made on this channel — no more will be attempted")})
+                        "because they cannot be made on this channel — no more will be attempted",
+                        last_user_content)})
             return False  # loop-body tail: fall through to the next turn
         finally:
             ts._constraint_steer_pending = _constraint_steer_pending
@@ -23951,6 +24175,7 @@ class GhostAgent:
                 model=model,
                 trajectory_id=current_trajectory_id,
                 user_request=last_user_content,
+                temperature=self._sampling_temperature(payload),
                 # Consolidate the corpus outcome with the same signals
                 # calibration + selfhood use (was heuristics-only here).
                 verifier=(verifier_backfill[0] if verifier_backfill else None),
@@ -24035,6 +24260,7 @@ class GhostAgent:
         # Deterministically prepend any deferred async-verdict
         # correction staged at turn start (GHOST_CRITIC_ASYNC).
         # § R1 A-F2: respects an active start-with head via _head_insert.
+        _recorded_reply = final_ai_content or ""   # §4KW: what the row saw, for the outcome line
         final_ai_content = _head_insert(self._take_active_correction(),
                                         final_ai_content or "")
         # §4IT: what the sources did not say — one italic line after the
@@ -24055,135 +24281,21 @@ class GhostAgent:
         except Exception as _cav_exc:  # noqa: BLE001 — a caveat never costs the reply
             logger.debug("source caveat skipped: %s", _cav_exc)
 
-        # Consolidated TURN OUTCOME — one grep-able summary per turn so a reader
-        # (or the operator's eye) gets success/fail + confidence + the tools
-        # used, without replaying the whole turn. (Non-streamed path; streamed
-        # turns get their late verdict via _backfill_trajectory_outcome.)
-        try:
-            _verifier_failed = bool(verifier_backfill and verifier_backfill[0] == "failed")
-            _verifier_passed = bool(verifier_backfill and verifier_backfill[0] == "passed")
-            # "failed" requires the failure to be TERMINAL (last call still
-            # failing), matching the trajectory-corpus rule at
-            # _record_turn_trajectory: `execution_failure_count` is a
-            # decayed-strike ledger, and labelling any residual strike
-            # "failed" branded RECOVERED turns as failures in the
-            # operator's eye (probe req d02db9d6: one spurious mid-turn
-            # strike, correct verified answer, line said "failed · 0.86"
-            # while both late verdicts CONFIRMED 100%). Recovered strikes
-            # stay visible via the suffix below instead.
-            # Priority lives in _turn_outcome_label — SHARED with the
-            # late-verdict correction so the printed line and its correction
-            # can never disagree. It mirrors resolve_turn_outcome: refute >
-            # shape FAILED > verifier PASS > terminal execution failure
-            # (budget exhaustion is a note, not a valence — §4EE).
-            # `_exec_terminal` and `_unacked` were both computed above, before
-            # the deferred-correction prepend; never re-derived here.
-            _budget_exhausted = bool(getattr(fs, "turn_budget_exhausted", False))
-            _unacked = _unacked_turn
-            # §4EE F2: the corpus row for this turn was written just above.
-            # Its verdict is what the operator line must mirror, including
-            # the shape heuristics (rule 2) the line's own inputs cannot see.
-            # The ROW is used when the recorder returned it (bench rows are
-            # never stashed in the correction cache, and a same-fingerprint
-            # neighbour can evict a stashed one — R3 review); the cache is
-            # the fallback for callers that recorded elsewhere.
-            _shape_failed = (self._row_shape_failed(_rec_row)
-                             if _rec_row is not None
-                             else self._recorded_shape_failed(current_trajectory_id))
-            # §4EE R3 — the THIRD mirror. The calibration sample was written
-            # before the row existed, so a shape-heuristic FAILED graded as
-            # the unverified prior (0.83) or, with an inline PASS, as 1.0
-            # while the corpus recorded FAILED. Re-label it at the
-            # `shape_failure` rank; the tier joins the turn sample and reuses
-            # its features (no leakage), like every other retro tier.
-            if _shape_failed:
-                try:
-                    _ct_sh = getattr(self.context, "calibration_tracker", None)
-                    if _ct_sh is not None and hasattr(_ct_sh, "record_shape_failure"):
-                        _ct_sh.record_shape_failure(str(req_id or ""))
-                except Exception:  # noqa: BLE001 — labelling must not break finalize
-                    pass
-            _state = self._turn_outcome_label(
-                verifier_failed=_verifier_failed,
-                verifier_passed=_verifier_passed,
-                budget_exhausted=_budget_exhausted,
-                exec_terminal=_exec_terminal,
-                unacked_total_failure=_unacked,
-                shape_failed=_shape_failed,
-            )
-            # Name what actually happened. "recovered" is only true when a
-            # later call succeeded; when the LAST call failed and the answer
-            # was verified honest, say that instead — this line exists to make
-            # mislabels visible, so it must not invent a recovery.
-            if execution_failure_count > 0 and _state != "failed":
-                _recovered_note = (
-                    f" · {execution_failure_count} tool failure(s), honestly reported"
-                    if _exec_terminal
-                    else f" · recovered {execution_failure_count} strike(s)")
-            else:
-                _recovered_note = ""
-            # §4EE R3: budget exhaustion no longer decides the valence (the
-            # corpus and the grade never let it), but a 40/40-turn
-            # working-state reply must still not READ as a clean success —
-            # the note and the WARNING level carry that (§4O's promise).
-            if _budget_exhausted and not _state.startswith("partial"):
-                _recovered_note += " · budget exhausted"
-            _conf = self._turn_confidence(req_id)
-            _tnames = [t.get("name") for t in (tools_run_this_turn or [])
-                       if isinstance(t, dict) and t.get("name")]
-            pretty_log(
-                "Turn Outcome",
-                _state
-                + (f" · confidence {_conf:.2f}" if isinstance(_conf, (int, float)) else "")
-                + (f" · tools: {', '.join(_tnames)}" if _tnames else " · no tools")
-                + f" · {len(final_ai_content or '')} chars"
-                + _recovered_note,
-                icon=(Icons.FAIL if _state == "failed"
-                      else (Icons.STOP if _state.startswith("partial") else Icons.OK)),
-                level=("WARNING" if (_state == "failed"
-                                     or _state.startswith("partial")
-                                     or _budget_exhausted) else "INFO"))
-            # §LOG-3 (2026-08-20): the turn's single most important artifact
-            # never reached the log — the operator watched minutes of
-            # reasoning and never saw what was SAID, and the durable
-            # mirror's "reconstruct a turn" contract was false for the
-            # answer itself. Console shows the head (60-char budget);
-            # the mirror gets the full text (redacted like everything).
-            if final_ai_content:
-                pretty_log("Final Reply", final_ai_content,
-                           icon=Icons.LLM_REPLY)
-            # Snapshot what we just printed so a LATE verdict can correct
-            # the stream (async-critic mode prints this BEFORE any verdict
-            # exists). Bounded ring — this is a logging aid, never a store.
-            if current_trajectory_id and not _verifier_failed and not _verifier_passed:
-                try:
-                    from collections import OrderedDict as _OD
-                    _ring = getattr(self.context, "_recent_turn_outcome", None)
-                    if _ring is None:
-                        _ring = _OD()
-                        self.context._recent_turn_outcome = _ring
-                    _ring[current_trajectory_id] = {
-                        "state": _state,
-                        "confidence": _conf,
-                        "tools": _tnames,
-                        "chars": len(final_ai_content or ""),
-                        "exec_failures": execution_failure_count,
-                        "exec_terminal": _exec_terminal,
-                        "budget_exhausted": _budget_exhausted,
-                        # Carried so the LATE correction re-renders under the
-                        # same shape rule the printed line used. Recomputing
-                        # it there is impossible (the tool list and reply are
-                        # gone by then) and re-deriving it differently is the
-                        # drift this ring exists to avoid.
-                        "unacked_total_failure": _unacked,
-                        "shape_failed": _shape_failed,
-                    }
-                    while len(_ring) > 32:
-                        _ring.popitem(last=False)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        # Consolidated TURN OUTCOME — one grep-able summary per turn (§4KT:
+        # ONE emitter, shared with the streamed drain; the line and its late
+        # correction read the same label rule and the same ring).
+        _budget_exhausted = bool(getattr(fs, "turn_budget_exhausted", False))
+        _shape_failed = (self._row_shape_failed(_rec_row)
+                         if _rec_row is not None
+                         else self._recorded_shape_failed(current_trajectory_id))
+        self._emit_turn_outcome_line(
+            req_id=req_id, trajectory_id=current_trajectory_id,
+            final_content=final_ai_content, tools=tools_run_this_turn,
+            execution_failure_count=execution_failure_count,
+            exec_terminal=_exec_terminal, unacked_total_failure=_unacked_turn,
+            budget_exhausted=_budget_exhausted, shape_failed=_shape_failed,
+            verifier_backfill=verifier_backfill, print_reply=True,
+            marker_text=_recorded_reply)
         # § context R1 B1: request-END disarm of the per-batch read budget —
         # the registry resolves `context._read_budget` AT CALL TIME, so a
         # leftover (possibly zero/spent) budget from this request would
@@ -24835,6 +24947,25 @@ class GhostAgent:
                 # stream end emits whatever remains.
                 _THINK_FLUSH_CHARS = 400
 
+                # §4KV: what the displayed stream IS. With thinking switched
+                # off in the payload (a report turn, a thinking-loop retry)
+                # the content channel is the reply being written, and it was
+                # logged under the thinking title and counted as reasoning
+                # tokens: slack-12's report turn printed its 597-char reply
+                # as three 💭 lines and "reasoning: 125 tokens / 0 chars".
+                # With thinking ON, reasoning-less content stays "thinking":
+                # it may be reasoning that lost its opener (§4KP).
+                reasoning_token_count = 0
+                content_token_count = 0
+                _content_is_reply = thinking_disabled(payload)
+                _shown_as_reply = [False]
+
+                def _log_shown(block: str):
+                    if _shown_as_reply[0]:
+                        pretty_log("drafting", block, icon=Icons.LLM_REPLY, level="DEBUG", no_truncate=True)
+                    else:
+                        pretty_log("thinking", block, icon=Icons.BRAIN_THINK, level="DEBUG", no_truncate=True)
+
                 def _emit_thinking(text: str):
                     nonlocal thinking_line_buf, thinking_token_count
                     if not text:
@@ -24862,7 +24993,7 @@ class GhostAgent:
                             block = thinking_line_buf[:para_idx].strip()
                             thinking_line_buf = thinking_line_buf[para_idx + 2:]
                             if block:
-                                pretty_log("thinking", block, icon=Icons.BRAIN_THINK, level="DEBUG", no_truncate=True)
+                                _log_shown(block)
                             continue
                         # No paragraph boundary yet — flush only
                         # when the buffer exceeds the budget,
@@ -24881,7 +25012,7 @@ class GhostAgent:
                                 block = thinking_line_buf[:last_nl].strip()
                                 thinking_line_buf = thinking_line_buf[last_nl + 1:]
                             if block:
-                                pretty_log("thinking", block, icon=Icons.BRAIN_THINK, level="DEBUG", no_truncate=True)
+                                _log_shown(block)
                             continue
                         break
 
@@ -24908,7 +25039,7 @@ class GhostAgent:
                         thinking_line_buf += _flt.flush()
                     if thinking_line_buf:
                         if thinking_line_buf.strip():
-                            pretty_log("thinking", thinking_line_buf.strip(), icon=Icons.BRAIN_THINK, level="DEBUG", no_truncate=True)
+                            _log_shown(thinking_line_buf.strip())
                         thinking_line_buf = ""
 
                 stop_printing = False
@@ -24977,6 +25108,7 @@ class GhostAgent:
                                 if "reasoning_content" in delta and delta["reasoning_content"] is not None:
                                     r_token = delta["reasoning_content"]
                                     reasoning_content += r_token
+                                    reasoning_token_count += 1
                                     if not stop_printing:
                                         if _tail_has_stop_marker(reasoning_content, r_token):
                                             stop_printing = True
@@ -24992,6 +25124,7 @@ class GhostAgent:
                                 if "content" in delta and delta["content"] is not None:
                                     text_chunk = delta["content"]
                                     full_content += text_chunk
+                                    content_token_count += 1
                                     if not stop_printing:
                                         if _tail_has_stop_marker(full_content, text_chunk):
                                             stop_printing = True
@@ -25003,6 +25136,7 @@ class GhostAgent:
                                                 _shown = _content_display.feed(text_chunk, full_content)
                                                 if _shown:
                                                     clean_token = _shown.replace("<think>\n", "").replace("<think>", "")
+                                                    _shown_as_reply[0] = _content_is_reply
                                                     _emit_thinking(clean_token)
 
                                     # Tool-call generation-collapse detector.
@@ -25122,6 +25256,18 @@ class GhostAgent:
                                         thinking_loop_detected = True
                                         pretty_log("Thinking Loop", f"Detected repeated-paragraph loop at {len(reasoning_content)} chars. Aborting turn.", level="WARNING", icon=Icons.STOP)
                                         break
+                                    # §4KV: one sentence FRAME with one
+                                    # word changing ("I will check for
+                                    # any genius he has been X as.")
+                                    # repeats no window and no line —
+                                    # slack-12 ran 15.5K chars / 47 s
+                                    # under both probes above. THINKING
+                                    # channel only, like the paragraph
+                                    # probe.
+                                    if reasoning_content and _detect_sentence_run_loop(reasoning_content):
+                                        thinking_loop_detected = True
+                                        pretty_log("Thinking Loop", f"Detected repeated-sentence-frame loop ({SENTENCE_RUN_THRESHOLD}+ sentences with one opener) at {len(reasoning_content)} chars. Aborting turn.", level="WARNING", icon=Icons.STOP)
+                                        break
 
                                 if "tool_calls" in delta and delta["tool_calls"]:
                                     if not msg.get("tool_calls"):
@@ -25208,8 +25354,8 @@ class GhostAgent:
                     # just a long `execute` tool_call body.
                     pretty_log(
                         "thought",
-                        f"reasoning: {thinking_token_count} tokens / {reasoning_chars} chars "
-                        f"| content: {content_chars} chars "
+                        f"reasoning: {reasoning_token_count} tokens / {reasoning_chars} chars "
+                        f"| content: {content_token_count} tokens / {content_chars} chars "
                         f"| {thinking_duration:.1f}s",
                         icon=Icons.BRAIN_SUM,
                     )
@@ -25385,7 +25531,8 @@ class GhostAgent:
                                     "repetition loop",
                                     "your last three turns opened with the same reasoning "
                                     "and did not move the task forward — no more tool calls "
-                                    "will be made")})
+                                    "will be made",
+                                    last_user_content)})
                                 return "continue"
                             pretty_log(
                                 "Loop Breaker",
@@ -25444,7 +25591,7 @@ class GhostAgent:
                     messages.append({"role": "assistant", "content": (
                         "[Tool-call generation aborted: a runaway burst of tool "
                         "calls was discarded unrun.]" if tool_call_flood_detected
-                        else "[Internal thinking aborted: runaway loop detected.]")})
+                        else _THINKING_ABORTED_NOTE)})
                     # Escalation: on the SECOND cap/loop event in
                     # the same attempt, stop retrying. The solver
                     # is stuck in a self-consistent but unwinnable
@@ -25476,11 +25623,16 @@ class GhostAgent:
                             )
                             force_final_response = True
                             self.context._breaker_forced_final = True
+                            # §4KV: recorded like every other breaker that
+                            # closes a request (slack-12 printed "ok ·
+                            # recovered 1 strike(s)" and carried no stamp).
+                            stamp_loop_breaker(self.context, req_id, "thinking_loop")
                             messages.append({"role": "user", "content": blocker_report_alert(
                                 "thinking loop",
                                 f"your reasoning entered a self-repeating loop {thinking_cap_events} "
                                 "times this request and was killed each time — no more "
-                                "derivation will be attempted")})
+                                "derivation will be attempted",
+                                last_user_content, answer_first=True)})
                             return "continue"
                         pretty_log(
                             "Loop Breaker",
@@ -25502,6 +25654,14 @@ class GhostAgent:
                     # the strike cap below) keeps both shapes on one
                     # recovery path, so a later edit cannot fix one and
                     # leave the other behind.
+                    # §4KV: before any tool has run on a non-coding request
+                    # there is no observation to go back to — the loop was
+                    # the model drafting its reply — and ordering a tool
+                    # call invents work (see `thinking_loop_answer_steer`).
+                    _answer_retry = (
+                        not tool_call_flood_detected and not has_coding_intent
+                        and not any(isinstance(_t, dict) and not _t.get("_synthetic")
+                                    for _t in (tools_run_this_turn or [])))
                     _loop_steer = (
                         "SYSTEM ALERT: Your previous turn emitted a runaway burst of "
                         "tool calls and was killed before any of them ran. "
@@ -25511,9 +25671,15 @@ class GhostAgent:
                         "were quoting a rule about tool calls, do not quote the "
                         "`<tool_call>` syntax — just make the call. Do not write a "
                         "long <think> block."
-                    ) if tool_call_flood_detected else "SYSTEM ALERT: Your previous turn entered a self-repeating thinking loop and was killed. STOP re-deriving the same paragraph. Do NOT resume hypothesizing from memory — a killed loop means your mental model is missing a fact only OBSERVATION can supply. Your next output must be ONE grounding tool call: execute the code, load the page in the browser, or re-read the exact error/output you are reasoning about — then base the next step on what it returns. If a self-generated test assertion disagrees with your function's output, the TEST is likely wrong — re-read the spec and fix the assertion before changing the function. If you have ALREADY proven the task cannot be solved as specified (e.g. the validator has a structural bug), call `abort_attempt` now with a specific reason. Do not write a long <think> block."
+                    ) if tool_call_flood_detected else (
+                        thinking_loop_answer_steer(last_user_content) if _answer_retry
+                        else "SYSTEM ALERT: Your previous turn entered a self-repeating thinking loop and was killed. STOP re-deriving the same paragraph. Do NOT resume hypothesizing from memory — a killed loop means your mental model is missing a fact only OBSERVATION can supply. Your next output must be ONE grounding tool call: execute the code, load the page in the browser, or re-read the exact error/output you are reasoning about — then base the next step on what it returns. If a self-generated test assertion disagrees with your function's output, the TEST is likely wrong — re-read the spec and fix the assertion before changing the function. If you have ALREADY proven the task cannot be solved as specified (e.g. the validator has a structural bug), call `abort_attempt` now with a specific reason. Do not write a long <think> block.")
                     messages.append({"role": "user", "content": _loop_steer})
                     if execution_failure_count >= 6:
+                        # (§4KV, found in review: the Strike Cap at the top of
+                        # the next iteration tests the same count and aborts
+                        # first — this forced final never generates. Left as
+                        # it was; PROJECT_JOURNAL §4KV, open items.)
                         pretty_log("Think-Loop Halt", "Forcing final response after repeated thinking loops", icon=Icons.STOP, level="WARNING")
                         force_final_response = True
                         self.context._breaker_forced_final = True  # §4JI: a tool call on this forced final IS the no-answer
@@ -25873,15 +26039,55 @@ class GhostAgent:
                 # on working narration — the model announced the search it
                 # never made. One continuation with the directive; a second
                 # miss ships (the shape check and the caveat see it then).
+                # §4KW: the opener/verb list first; when it says no, the
+                # worker model is asked (`core/announced_work.py` — the list
+                # caught 1 of 4 real announcements on the corpus).
+                # `_work_nudge_used`: False → nothing yet; a dict → the worker
+                # said no ({"asks": n, "last": <hash of the reply it judged>});
+                # True → the continuation was given. A NO about one reply says
+                # nothing about a DIFFERENT reply a later regeneration (a
+                # notify or language steer) writes, so it is asked again when
+                # the text changed — at most `_AW_MAX_ASKS` times a request,
+                # each costing a round-trip (§4KW open item).
+                _aw_by = ""
+                # §4KW (2): no longer for tool-free turns only. After a tool
+                # ran, §4IW left an announcement to the §4GH shape refute —
+                # which does not run for a member and, live (async critic),
+                # lands NEXT turn while the announcement ships now: 7 such
+                # replies reached users (slack-7cf7753e "Θα κατεβάσω μια
+                # καθαρή φωτογραφία … και θα ξαναφτιάξω την εικόνα").
+                _aw_tools_ran = bool(_count_real_tools_safe(tools_run_this_turn))
                 if (clean_ui and not is_final_generation and not force_final_response
-                        and not force_stop and not _count_real_tools_safe(tools_run_this_turn)
-                        and not _work_nudge_used and turn < effective_max_turns - 1
-                        and _announced_work_without_acting(clean_ui, request=str(last_user_content or ""))):
+                        and not force_stop
+                        # one "you only promised" nudge per request, either
+                        # guard first (review: asking again on a changed
+                        # reply after the pending-promise steer fired gave
+                        # two directives on one request)
+                        and not pending_promise_steer_fired
+                        and _work_nudge_used is not True and turn < effective_max_turns - 1):
+                    if _announced_work_without_acting(clean_ui, request=str(last_user_content or "")):
+                        _aw_by = "reply shape"
+                    else:
+                        from .announced_work import MAX_CHECKED_CHARS as _AW_MAX_CHARS, worker_finds_announcement
+                        from .reply_smoothing import strip_system_notes as _aw_strip
+                        _aw_text = _aw_strip(clean_ui).strip()
+                        _aw_next = _aw_next_ask(_work_nudge_used, _aw_text, _AW_MAX_CHARS)
+                        if _aw_next is not None and _worker_check_applies(messages, last_user_content):
+                            _work_nudge_used = _aw_next
+                        else:
+                            _aw_text = ""
+                        if _aw_text and await worker_finds_announcement(
+                                self.context.llm_client, str(last_user_content or ""),
+                                _aw_text, tools_ran=_aw_tools_ran,
+                                model=str(getattr(self.context.args, "model", "") or "default")):
+                            _aw_by = "worker check"
+                if _aw_by:
                     _work_nudge_used = True
                     pretty_log(
                         "Turn Budget",
-                        "the reply only announces work and no tool ran — one "
-                        "continuation with the do-it-or-answer directive",
+                        "the reply ends by announcing work it did not do — one "
+                        f"continuation with the do-it-or-answer directive ({_aw_by}"
+                        f"{', tools ran' if _aw_tools_ran else ', no tool ran'})",
                         level="WARNING", icon=Icons.WARN,
                     )
                     messages.append(msg)
@@ -26030,7 +26236,12 @@ class GhostAgent:
                 # the action now or state plainly that it was NOT
                 # done. `has_run_tools` keeps pure conversation exempt;
                 # "let me know…" is explicitly excluded.
+                # ONE "you only promised" nudge per request: the §4KW
+                # continuation above steers the same shape, and two
+                # directives that disagree ("answer from what you know" /
+                # "state it was NOT done") cost a fourth generation (review).
                 if (clean_ui and not pending_promise_steer_fired
+                        and _work_nudge_used is not True
                         and not force_final_response
                         and not is_final_generation
                         and not force_stop
@@ -26810,6 +27021,12 @@ class GhostAgent:
                     last_user_content = " ".join([i.get("text", "") for i in last_user_content_raw if isinstance(i, dict) and i.get("type") == "text"])
                 else:
                     last_user_content = str(last_user_content_raw)
+                # §4KV: one user message arrived. Evidence, with the text
+                # test, that the block's carrier is the request
+                # (`_carrier_label`); not proof on its own — the first
+                # user-ROLE message sent upstream can be a translated tool row.
+                _one_user_message_arrived = sum(
+                    1 for m in messages if isinstance(m, dict) and m.get("role") == "user") == 1
                 lc = last_user_content.lower()
                 # Expose the current turn's user text to tools via the
                 # context. Tools that need to validate user intent
@@ -28150,7 +28367,8 @@ class GhostAgent:
                         messages.append({"role": "user", "content": blocker_report_alert(
                             "turn budget",
                             f"this is your last turn ({turn + 1} of {effective_max_turns}) "
-                            "and the task is not finished")})
+                            "and the task is not finished",
+                            last_user_content)})
                     # §4JP — the CLIENT's deadline is a budget too. The web
                     # interface closes its connection at GHOST_CHAT_TIMEOUT
                     # (1800 s); the loop never knew, so req fd89fd6d spent
@@ -28172,7 +28390,8 @@ class GhostAgent:
                         messages.append({"role": "user", "content": blocker_report_alert(
                             "client deadline",
                             f"the client will close its connection in about {int(max(0.0, _remaining_s))} seconds "
-                            "and the task is not finished — say where the work stands and where the files are")})
+                            "and the task is not finished — say where the work stands and where the files are",
+                            last_user_content)})
 
                     # --- RISK GOVERNOR (core/risk.py, experiment-gated) ------
                     # Depth is this agent's strongest measured failure
@@ -29618,6 +29837,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         # the block quotes it so a lone trailing state message
                         # can never read as "no pending question" (req 2422eb25).
                         pending_request=last_user_content,
+                        first_user_is_request=_one_user_message_arrived,
                     )
 
                     # Precise sampling for any tool-using turn; warm/creative
@@ -29773,6 +29993,15 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         payload = report_turn_payload(payload)
                         pretty_log("Turn Budget",
                                    "report turn — thinking OFF (a report needs no derivation)",
+                                   icon=Icons.WARN, level="WARNING")
+                    elif loop_retry_is_no_think(messages, last_user_content):
+                        # §4KV: the turn that reads the thinking-loop answer
+                        # steer. With thinking left on, the slack-12 retry
+                        # re-looped 5 times in 30 replays; off, 0 in 20.
+                        # Tools stay on — one call is still allowed.
+                        payload = report_turn_payload(payload)
+                        pretty_log("Turn Budget",
+                                   "thinking-loop retry — thinking OFF for this turn (tools stay on)",
                                    icon=Icons.WARN, level="WARNING")
                     pretty_log("LLM Request", f"Turn {turn+1} | Temp {sampling_params['temperature']:.2f}", icon=Icons.LLM_ASK)
 
@@ -32736,6 +32965,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 # finalize never wrote). The verifier runs LATE below
                 # and backfills the outcome by `current_trajectory_id`,
                 # so pass verifier=None here.
+                _stream_row = None
                 try:
                     # §4FS: the web UI streams and returns before
                     # _finalize_and_return, so its PERSISTED reply — what
@@ -32762,7 +32992,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         # printed first so a recorder fault cannot drop it.
                         pretty_log("Final Reply", _traj_content,
                                    icon=Icons.LLM_REPLY)
-                        self._record_turn_trajectory(
+                        _stream_row = self._record_turn_trajectory(
                             messages=messages,
                             final_content=_traj_content,
                             req_id=req_id,
@@ -32779,7 +33009,9 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             pressure_lockdown=pressure_lockdown,
                             # The request clock is closed by now (§4KS).
                             elapsed_s=time.monotonic() - _req_t0,
+                            temperature=self._sampling_temperature(payload),
                         )
+
                 except Exception as _sbf_exc:
                     logger.debug(
                         "streamed trajectory record skipped: %s",
@@ -32880,6 +33112,44 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     user_request=last_user_content or "",
                     truncated=stream_aborted,   # §4O R2 MAJOR-2
                 )
+                # §4KT: the streamed turn's `Turn Outcome` line — the same
+                # emitter, label rule and correction ring as finalize. No
+                # inline verdict exists here (the stream gate's verdict is
+                # late), so the label is execution- and shape-based and the
+                # late verdict corrects it through the ring, as on every
+                # turn. AFTER the calibration record, as on finalize: the
+                # emitter's shape re-label joins the `turn` sample by
+                # req_id, and the confidence stamp is written by that
+                # record's compute-now fallback (R1 review). A streamed
+                # turn is never a for-else (budget-exhausted) turn: the
+                # stream branch returns from inside the loop.
+                try:
+                    _s_exec_terminal = (execution_failure_count > 0
+                                        and bool(last_was_failure))
+                    try:
+                        from ..distill.outcome_heuristics import (
+                            unacknowledged_total_failure as _s_unacked_fn)
+                        _s_unacked = _s_exec_terminal and _s_unacked_fn(
+                            tools=stream_tools_snapshot,
+                            final_response=_treated_content or "",
+                            user_request=last_user_content or "",
+                        )
+                    except Exception:  # noqa: BLE001 — labelling never breaks the drain
+                        _s_unacked = False
+                    self._emit_turn_outcome_line(
+                        req_id=req_id, trajectory_id=current_trajectory_id,
+                        final_content=_treated_content,
+                        tools=stream_tools_snapshot,
+                        execution_failure_count=execution_failure_count,
+                        exec_terminal=_s_exec_terminal,
+                        unacked_total_failure=bool(_s_unacked),
+                        budget_exhausted=False,
+                        # (the row, or False: a recorder that returned none
+                        # cached nothing for a lookup to find — R2 review)
+                        shape_failed=self._row_shape_failed(_stream_row),
+                        verifier_backfill=None, print_reply=False)
+                except Exception as _tol_exc:  # noqa: BLE001
+                    logger.debug("streamed Turn Outcome line skipped: %s", _tol_exc)
 
                 # Streamed-turn tracker reset (2026-07-27): the finalize
                 # surfacing block (footer/verify/reset) never runs on this
@@ -33781,6 +34051,149 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             logger.warning("aborted-turn record skipped for %s: %s: %s",
                            req_id, type(_exc).__name__, _exc)
 
+    def _emit_turn_outcome_line(self, *, req_id, trajectory_id, final_content,
+                                tools, execution_failure_count: int,
+                                exec_terminal: bool, unacked_total_failure: bool,
+                                budget_exhausted: bool, shape_failed: bool,
+                                verifier_backfill=None,
+                                print_reply: bool = False,
+                                marker_text=None) -> None:
+        """The one `Turn Outcome` line, for the non-streamed finalize AND
+        the streamed drain (§4KT: streamed turns printed none — a whole
+        class of turns had no success/fail summary in the operator's
+        stream and no ring entry for a late correction to amend).
+
+        The label comes from `_turn_outcome_label` — SHARED with the
+        late-verdict correction so the printed line and its correction can
+        never disagree; it mirrors resolve_turn_outcome: refute > shape
+        FAILED > verifier PASS > terminal execution failure (budget
+        exhaustion is a note, not a valence — §4EE). `exec_terminal` and
+        `unacked_total_failure` are the caller's — computed before any
+        deferred-correction prepend, never re-derived here. Never raises."""
+        try:
+            # §4KW: a request a loop breaker closed is FAILED (corpus rule 1b,
+            # never upgraded). The row says so when one is written, but a turn
+            # that records no row (a sim) read `shape_failed=False` and printed
+            # "ok · recovered N strike(s)" over the breaker and the no-answer
+            # fallback it shipped (sim 18f014a7). The stamp is the fact.
+            # The same for the corpus's FIRST rule, an `[ATTEMPT_ABORTED_*]`
+            # marker in the reply: 18 sims in the log printed "ok · recovered
+            # 2 strike(s)" over "[ATTEMPT_ABORTED_THINKING_LOOP] …" (§4KW).
+            # Both are what `classify_chat_outcome` reads first, without a row.
+            # `marker_text`: the reply AS RECORDED — on finalize the previous
+            # turn's correction banner is prepended after the record, and a
+            # banner that quoted a marker must not fail this turn (§4KW open
+            # item; the corpus row reads the text without it).
+            shape_failed = (bool(shape_failed) or bool(loop_breaker_for(self.context, req_id))
+                            or reply_carries_abort_marker(
+                                final_content if marker_text is None else marker_text))
+            _verifier_failed = bool(verifier_backfill and verifier_backfill[0] == "failed")
+            _verifier_passed = bool(verifier_backfill and verifier_backfill[0] == "passed")
+            # §4EE R3 — the THIRD mirror. The calibration sample was written
+            # before the row existed, so a shape-heuristic FAILED graded as
+            # the unverified prior (0.83) or, with an inline PASS, as 1.0
+            # while the corpus recorded FAILED. Re-label it at the
+            # `shape_failure` rank; the tier joins the turn sample and reuses
+            # its features (no leakage), like every other retro tier.
+            if shape_failed:
+                try:
+                    _ct_sh = getattr(self.context, "calibration_tracker", None)
+                    if _ct_sh is not None and hasattr(_ct_sh, "record_shape_failure"):
+                        _ct_sh.record_shape_failure(str(req_id or ""))
+                except Exception:  # noqa: BLE001 — labelling must not break finalize
+                    pass
+            _state = self._turn_outcome_label(
+                verifier_failed=_verifier_failed,
+                verifier_passed=_verifier_passed,
+                budget_exhausted=budget_exhausted,
+                exec_terminal=exec_terminal,
+                unacked_total_failure=unacked_total_failure,
+                shape_failed=shape_failed,
+            )
+            # Name what actually happened. "recovered" is only true when a
+            # later call succeeded; when the LAST call failed and the answer
+            # was verified honest, say that instead — this line exists to make
+            # mislabels visible, so it must not invent a recovery.
+            if execution_failure_count > 0 and _state != "failed":
+                _recovered_note = (
+                    f" · {execution_failure_count} tool failure(s), honestly reported"
+                    if exec_terminal
+                    else f" · recovered {execution_failure_count} strike(s)")
+            else:
+                _recovered_note = ""
+            # §4EE R3: budget exhaustion no longer decides the valence (the
+            # corpus and the grade never let it), but a 40/40-turn
+            # working-state reply must still not READ as a clean success —
+            # the note and the WARNING level carry that (§4O's promise).
+            if budget_exhausted and not _state.startswith("partial"):
+                _recovered_note += " · budget exhausted"
+            _conf = self._turn_confidence(req_id)
+            _tnames = [t.get("name") for t in (tools or [])
+                       if isinstance(t, dict) and t.get("name")]
+            pretty_log(
+                "Turn Outcome",
+                _state
+                + (f" · confidence {_conf:.2f}" if isinstance(_conf, (int, float)) else "")
+                + (f" · tools: {', '.join(_tnames)}" if _tnames else " · no tools")
+                + f" · {len(final_content or '')} chars"
+                + _recovered_note,
+                icon=(Icons.FAIL if _state == "failed"
+                      else (Icons.STOP if _state.startswith("partial") else Icons.OK)),
+                level=("WARNING" if (_state == "failed"
+                                     or _state.startswith("partial")
+                                     or budget_exhausted) else "INFO"))
+            # §LOG-3 (2026-08-20): the turn's single most important artifact
+            # never reached the log — the operator watched minutes of
+            # reasoning and never saw what was SAID. Console shows the head
+            # (60-char budget); the mirror gets the full text. (The streamed
+            # drain prints its reply before the record, so it passes False.)
+            if print_reply and final_content:
+                pretty_log("Final Reply", final_content,
+                           icon=Icons.LLM_REPLY)
+            # Snapshot what we just printed so a LATE verdict can correct
+            # the stream (async-critic mode prints this BEFORE any verdict
+            # exists). Bounded ring — this is a logging aid, never a store.
+            if trajectory_id and not _verifier_failed and not _verifier_passed:
+                try:
+                    from collections import OrderedDict as _OD
+                    _ring = getattr(self.context, "_recent_turn_outcome", None)
+                    if _ring is None:
+                        _ring = _OD()
+                        self.context._recent_turn_outcome = _ring
+                    _ring[trajectory_id] = {
+                        "state": _state,
+                        "confidence": _conf,
+                        "tools": _tnames,
+                        "chars": len(final_content or ""),
+                        "exec_failures": execution_failure_count,
+                        "exec_terminal": exec_terminal,
+                        "budget_exhausted": budget_exhausted,
+                        # Carried so the LATE correction re-renders under the
+                        # same shape rule the printed line used. Recomputing
+                        # it there is impossible (the tool list and reply are
+                        # gone by then) and re-deriving it differently is the
+                        # drift this ring exists to avoid.
+                        "unacked_total_failure": unacked_total_failure,
+                        "shape_failed": shape_failed,
+                    }
+                    while len(_ring) > 32:
+                        _ring.popitem(last=False)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    @staticmethod
+    def _sampling_temperature(payload) -> Optional[float]:
+        """The temperature of the request `payload` the turn last sent — the
+        one the recorded reply was sampled at. None when the payload has
+        none (a caller without a request)."""
+        try:
+            _t = (payload or {}).get("temperature") if isinstance(payload, dict) else None
+            return float(_t) if isinstance(_t, (int, float)) and not isinstance(_t, bool) else None
+        except Exception:  # noqa: BLE001
+            return None
+
     def _record_turn_trajectory(
         self,
         *,
@@ -33795,6 +34208,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         execution_failed: bool = False,
         pressure_lockdown: Optional[bool] = None,
         elapsed_s: Optional[float] = None,
+        temperature: Optional[float] = None,
     ) -> Optional["Trajectory"]:
         """Build and persist a Trajectory for the turn that just finished.
         Returns the row it wrote (None when the collector is not wired), so
@@ -34109,8 +34523,21 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 # different animal from one that re-prefilled every round.
                 _extra["llm_calls"] = int(_usage.get("calls") or 0)
                 _extra["cached_tokens"] = int(_usage.get("cached_tokens") or 0)
+                # §4KV: calls whose stream ended without a usage frame (a
+                # killed thinking loop). Their output is counted by chunk —
+                # an estimate, kept apart — and their prompt tokens are NOT
+                # in tokens_in.
+                if int(_usage.get("unmetered_calls") or 0) > 0:
+                    _extra["unmetered_llm_calls"] = int(_usage.get("unmetered_calls") or 0)
+                    _extra["tokens_out_estimated"] = int(_usage.get("tokens_out_estimated") or 0)
         except Exception:  # noqa: BLE001 — accounting never breaks a turn
             pass
+        # §4KT: the sampling temperature the reply was produced at (the
+        # schema's 0.0 default stood on 2,993 of 2,993 user/probe/leaf rows
+        # while the turns ran at 1.0 / 0.6). None = unknown: an aborted
+        # turn with no request keeps the default.
+        if temperature is not None:
+            traj_kwargs["temperature"] = float(temperature)
         if _extra:
             traj_kwargs["extra"] = _extra
         # Use the pre-allocated id from `handle_chat` when present so

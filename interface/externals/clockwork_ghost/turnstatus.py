@@ -197,6 +197,46 @@ TICKER_VERBS = {
     "delegation": "delegating a subtask",
 }
 
+# ── what a step means to the FACE (port of app.js, 2026-10-01) ──────────────
+# The browser's face has had a gait per step class, a kick per tool call, a
+# comet per memory recall and a verdict-shaped release since 2026-09-11; the
+# handheld showed the same face with none of them, although it already
+# receives the lines that drive them. `_FACE_PHASE_BY_TITLE` and
+# `faceSignalsForTicker` in app.js are the originals — the drift test runs the
+# JS under node and compares, so change them together.
+FACE_PHASE_BY_TITLE = {
+    "web search": "search", "web read": "read", "browser": "search",
+    "memory search": "search", "hydrated context": "read", "file read": "read",
+    "sandbox tree": "read", "vision": "read", "sandbox exec": "tool",
+    "execution task": "tool", "file write": "tool", "worker compute": "tool",
+    "delegation": "tool", "memory save": "tool", "graph updated": "tool",
+    "verifier": "verify", "tool call": "tool",
+}
+_CONFIRMED_RE = re.compile(r"^\s*CONFIRMED", re.I)
+_REFUTED_RE = re.compile(r"^\s*REFUTED", re.I)
+
+
+def face_signals_for_ticker(title, icon, detail) -> dict:
+    """``{phase, tool, recall, verdict}`` for one step line."""
+    out = {"phase": None, "tool": False, "recall": False, "verdict": None}
+    t = str(title or "").lower()
+    d = str(detail or "")
+    if t in FACE_PHASE_BY_TITLE:
+        out["phase"] = FACE_PHASE_BY_TITLE[t]
+    if t == "tool call" or icon == "🧰":
+        out["phase"] = "tool"
+        out["tool"] = True
+    if icon in ("🔎", "📍") or t == "memory search":
+        out["recall"] = True
+    if icon == "🧪" or t.startswith("verify"):
+        out["phase"] = "verify"
+        if _CONFIRMED_RE.match(d):
+            out["verdict"] = "pass"
+        elif _REFUTED_RE.match(d):
+            out["verdict"] = "refute"
+    return out
+
+
 # Shown before the first corridor line lands. "starting…" mirrors the web UI;
 # the old "cogitating" is kept for the case where the log stream is DOWN, so an
 # unreachable interface degrades to the previous behaviour instead of lying
@@ -266,6 +306,10 @@ class TurnTicker:
         self.req_id = None
         self.icon = ICON_STARTING
         self.desc = DESC_OFFLINE
+        # Called with (title, icon, detail) for EVERY step line of the adopted
+        # corridor — including one that leaves the caption unchanged: two
+        # identical tool calls in a row are one caption and two kicks.
+        self.on_step = None
 
     # ── lifecycle ────────────────────────────────────────────────────────
     def start(self) -> None:
@@ -346,7 +390,13 @@ class TurnTicker:
         detail = " ".join(parts[ti + 1:]).strip()
         if detail:
             desc += f" · {detail[:30]}" + ("…" if len(detail) > 30 else "")
-        return self._set(icon, desc)
+        changed = self._set(icon, desc)
+        if self.on_step is not None:
+            try:
+                self.on_step(title, icon, detail)
+            except Exception:  # noqa: BLE001 — the face must never break the caption
+                pass
+        return changed
 
     def _set(self, icon: str, desc: str) -> bool:
         if (icon, desc) == (self.icon, self.desc):

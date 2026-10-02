@@ -526,6 +526,35 @@
   <h2 id="4kp-think-split">A mentioned &lt;/think&gt; is not the close <span class="tag">2026-09-29 &sect;4KP</span></h2>
   <p>llama-server's reasoning parser ends the reasoning at the FIRST <code>&lt;/think&gt;</code> it sees &mdash; including one the model merely writes ("reasoning blocks end with <code>`&lt;/think&gt;`</code>"). Everything after that mention reached the agent as content: the rest of the reasoning, the real close, the answer. Live probe <code>probe-ff2dd1d7</code> shipped "<code>` tag signals&hellip;</code>" &mdash; the answer's head had gone to <code>reasoning_content</code>. Measured on the live server, streamed and not: a real close leaves the reasoning ending in a newline; a mention split leaves it ending mid-line, and the content resumes that same line.</p>
   <p><code>core/think_split.py</code> repairs it at this client, the one choke point: <code>chat_completion</code> (both branches) runs <code>repair_message</code>, <code>stream_chat_completion</code> wraps the upstream in <code>repair_stream</code>. When the reasoning channel stops mid-line at the first content delta, content is HELD until a real close (the tag starting its own line, then a newline) &mdash; what is before it goes back to <code>reasoning_content</code>, what is after it is the answer &mdash; or until the end of the generation, where an answer written INSIDE the reasoning is rebuilt from the last reasoning paragraph + the tag + the content, but only when the tag sat in an open inline code span on that line. Anything else is left as the server sent it. Frames that arrive during a hold (usage, a keepalive) are released after the resolved content, in order; an end frame that also carried content keeps its <code>finish_reason</code>. Every stream without a mid-line split is yielded chunk for chunk. While a hold lasts, each held upstream frame yields an SSE comment (<code>: held</code>), so the consumer's per-chunk work &mdash; cancel checks, the loop detector, the activity heartbeat &mdash; keeps running; the close search restarts at the last held newline. A hold ends at the close, at the end of the generation, at the first native <code>tool_calls</code> frame (the flood guards must see the calls), or past 8,000 characters (released unchanged). Only a generation that ended with <code>finish_reason: stop</code> may have its answer rebuilt from the reasoning; one cut by its token cap, a stall/abort error frame or a stream that simply ends, and an EMPTY non-streamed content, are never rebuilt into an answer: that is the cap cutting the reasoning, which callers such as the vision tool detect by the empty content. Known limits: held frames' own logprobs are not forwarded; a model whose real close does not end the reasoning in a newline (Gemma&nbsp;4 on Nova, measured) would have every thinking-on reply held &mdash; no caller enables thinking there today.</p>
+  <!-- 4KV:unmetered -->
+  <h2 id="4kv">A killed stream is still a call <span class="tag">2026-10-01 &sect;4KV</span></h2>
+  <p>
+    The usage block rides a stream's <em>final</em> chunk. A stream the consumer walks away from &mdash; every thinking-loop or
+    tool-flood kill &mdash; never delivers it, so the call was not counted at all: request <code>slack-124c85b8</code> made four
+    model calls and generated about 5,200 tokens, and its record said <code>llm_calls: 2</code>, <code>tokens_out: 220</code>
+    (the two killed calls were 3,765 and 1,284 tokens).
+  </p>
+  <p>
+    <code>_do_stream_chat_completion</code> now remembers, per attempt, whether a usage frame was counted and how many delta
+    chunks went by. In the <code>finally</code> that closes the response, a stream that delivered chunks but no usage frame is
+    counted by <code>_note_unmetered_stream</code>: one call, its output <strong>estimated</strong> as the chunk count (the
+    upstream streams a token per chunk). The estimate is added to <code>tokens_out</code> and kept apart in
+    <code>tokens_out_estimated</code>; <code>unmetered_calls</code> says how many calls' prompts <code>tokens_in</code> lacks
+    (the prompt size of a killed call is not known). The request id is read when the stream is opened, because the
+    <code>finally</code> may run at generator finalisation, outside the request's context. The trajectory carries
+    <code>extra.unmetered_llm_calls</code> and <code>extra.tokens_out_estimated</code> only when there were such calls.
+  </p>
+  <p>
+    <strong>Limits, stated.</strong> The estimate counts frames that carry a <code>delta</code>, so it includes the role and
+    finish frames (one or two too many per call). A stream that delivered no delta at all (a prefill stall) is not a call. The
+    count is written when the stream's generator is finalised, a few event-loop turns after the consumer's <code>break</code>;
+    every record measured carried it, but the client-streamed final path was not measured. <code>_note_usage</code> now reads
+    every number of a usage block before adding any: a block with one unreadable number used to add its prompt tokens and stop.
+  </p>
+  <p class="note">Pins: <code>tests/test_4kv_slack12_fixes.py</code> (a stream the consumer breaks out of, a finished one, the
+  two mixed in one request, a stream closed under another request's context, a stream with no chunks, and the record).</p>
+  <!-- /4KV:unmetered -->
+
 </main>
 </body>
 </html>

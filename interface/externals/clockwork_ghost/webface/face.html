@@ -14,6 +14,9 @@
   "three/addons/": "./vendor/jsm/"
 }}
 </script>
+<!-- Before the module graph: wraps requestAnimationFrame so the face can be
+     slowed when nobody is looking. See throttle.js. -->
+<script src="./throttle.js"></script>
 <style>
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
   /* The face is ATMOSPHERE — it sits behind the UI and must never grab
@@ -31,6 +34,7 @@
 // leave the face stuck in whatever state it happened to start in.
 const pending = [];
 let face = null;
+const throttle = window.__faceThrottle || { setFps() { return 0; } };
 
 const API = {
   mood(name) { call('mood', name); },
@@ -40,6 +44,17 @@ const API = {
   wake() { call('wake'); },
   form(name) { call('form', name); },
   cycle() { call('cycle'); },
+  // The signal layer the browser has had since 2026-09-11 (see
+  // turnstatus.face_signals_for_ticker for where these come from).
+  phase(name) { call('phase', name); },
+  tool() { call('tool'); },
+  recall() { call('recall'); },
+  verdict(kind) { call('verdict', kind); },
+  error(message) { call('error', message); },
+  busy(on) { call('busy', on); },
+  gaze(on) { call('gaze', on); },
+  // Frame rate: 0 = full, n > 0 = at most n frames a second, n < 0 = paused.
+  rate(n) { call('rate', n); },
 };
 
 function call(op, arg) {
@@ -48,6 +63,9 @@ function call(op, arg) {
 }
 
 function apply(op, arg) {
+  // An older face module may lack a signal; a missing function is skipped
+  // rather than thrown, so one absent hook cannot take the others with it.
+  const fn = (name, ...a) => (typeof face[name] === 'function' ? face[name](...a) : undefined);
   switch (op) {
     case 'mood':
       // The web UI separates "the agent is busy" (workingState) from "the
@@ -66,6 +84,22 @@ function apply(op, arg) {
     // Walks the same FORMS list the browser's face button uses, so the two
     // clients offer the same shapes in the same order.
     case 'cycle':   face.cycleForm(); break;
+    case 'phase':   fn('setPhase', arg || null); break;
+    case 'tool':    fn('noteToolCall'); break;
+    case 'recall':  fn('noteRecall'); break;
+    case 'verdict': fn('noteVerdict', arg); break;
+    // The error's KIND shapes the flinch: a network drop flickers, a refusal
+    // freezes, a timeout fades. The face module owns the classification.
+    case 'error':   face.noteError(fn('errorKindFor', String(arg || ''), '') || 'generic'); break;
+    case 'busy':    fn('setBackgroundBusy', !!arg); break;
+    case 'gaze':    fn('setComposerGaze', !!arg); break;
+    case 'rate': {
+      const n = Number(arg) || 0;
+      if (n < 0) { fn('setAnimationPaused', true); break; }
+      throttle.setFps(n);
+      fn('setAnimationPaused', false);
+      break;
+    }
   }
 }
 

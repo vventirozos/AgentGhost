@@ -34,11 +34,18 @@ from ghost_agent.eval.verify_bench import (
 
 @pytest.fixture(scope="module")
 def ov():
+    """The script forces `GHOST_VERIFY_TWO_STAGE=1` (and telemetry vars) into
+    os.environ at IMPORT — right for a CLI run, a leak into every later test
+    file on this worker otherwise (§4KW leak scan). Restored at teardown."""
+    env_before = dict(os.environ)
     spec = importlib.util.spec_from_file_location(
         "ov_under_test", "scripts/optimize_verifier.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod
+    yield mod
+    for k in [k for k in os.environ if k not in env_before]:
+        del os.environ[k]
+    os.environ.update(env_before)
 
 
 def _adapter(ov, **kw):
