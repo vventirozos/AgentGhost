@@ -77,6 +77,35 @@ def parse_requester_role(raw) -> str:
     return v if v in (REQUESTER_OWNER, REQUESTER_MEMBER) else ""
 
 
+# WHERE the reply goes (§4KY): "public" when a client posts it somewhere other
+# people read (a Slack channel thread), "" otherwise (DM, web, CLI). Set from
+# the `X-Ghost-Surface` header. An OWNER turn on a public surface does not
+# pull the owner's private profile and memory into the prompt (review: "what
+# should I cook tonight?" in a channel could weave in family and health).
+reply_surface_context = contextvars.ContextVar("reply_surface", default="")
+SURFACE_PUBLIC = "public"
+
+#: The labels the Slack bot puts on OTHER people's thread messages. A line
+#: carrying one was not written by the requester: it never feeds the
+#: requester's memory (§4KY review: a member's "I have type 1 diabetes" in the
+#: owner's thread reached the owner's smart-memory extraction).
+FOREIGN_MESSAGE_LABELS = ("[message from another channel member", "[message from the owner of this assistant")
+
+
+def parse_reply_surface(raw) -> str:
+    try:
+        return SURFACE_PUBLIC if str(raw or "").strip().lower() in ("public", "channel") else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def reply_is_public() -> bool:
+    try:
+        return reply_surface_context.get() == SURFACE_PUBLIC
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def requester_is_member() -> bool:
     """True iff the request being served declared itself a MEMBER's — the
     one multi-user signal. No declaration is the owner (the API key is the

@@ -1101,8 +1101,7 @@ def test_update_profile_legacy_path_mints_canonical_graph_edge():
         category="misc", key="vehicle", value="BMW",
         profile_memory=profile, graph_memory=graph))
     assert "SUCCESS" in out
-    triplets = graph.add_triplets.call_args[0][0]
-    assert triplets[0]["predicate"] == "HAS_CAR"      # canonical, not HAS_VEHICLE
+    assert graph.sync_owner_field.call_args.args[0] == "car"      # canonical, not vehicle (§4KZ: synced mirror)
 
 
 def test_bus_partial_write_logs_a_warning(caplog):
@@ -1436,7 +1435,7 @@ def test_update_profile_delete_scrubs_canonical_vector_fact():
         category="misc", key="vehicle", value="",       # §4KW: only "" deletes
         profile_memory=prof, memory_system=vec))
     assert "Removed" in out
-    vec.delete_fragment.assert_called_once_with("User car is BMW")
+    assert vec.sync_owner_field.call_args.args[0] == "car"      # §4KZ: the canonical field's mirror is synced
 
 
 def test_forget_archive_rows_carry_weight_and_timestamp(tmp_path):

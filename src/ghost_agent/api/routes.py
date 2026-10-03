@@ -1133,6 +1133,9 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
     # its own task context). The agent reads it via `requester_is_member()`;
     # the streamed final re-enters it inside its generator.
     requester_role_context.set(parse_requester_role(request.headers.get("X-Ghost-Requester")))
+    # §4KY: is the reply posted where other people read it?
+    from ..utils.logging import parse_reply_surface, reply_surface_context
+    reply_surface_context.set(parse_reply_surface(request.headers.get("X-Ghost-Surface")))
 
     # §4JP: the client's own timeout, when it says so (the web interface
     # sends GHOST_CHAT_TIMEOUT). The turn loop reserves the last minutes of

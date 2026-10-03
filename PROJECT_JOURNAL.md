@@ -49777,3 +49777,195 @@ missing/orphan/duplicate/stale. Release rule re-applied: calendar 4/6 entries im
 empty-path check), NOOP clean, tree pristine. Full suite once: 27,280 passed, 0 failed (the release write-bit fix came after:
 its 3 files re-run, 179 passed). Deployed; probes (labelled): read-only `find -exec grep` in a released project runs; a
 subshell write into it is refused, no file created; the calendar's db accepts a write (rolled back, data unchanged).
+
+## §4KX — owner-memory writes and the lesson producers reviewed and fixed (2026-10-03, operator: "proceed, review and fix your findings, usual verification protocol")
+**Reviews (2 fresh readers): memory writes 4 MAJOR + 4 MINOR + 3 NIT; lesson producers 7 MAJOR + 3 MINOR + 2 NIT.**
+*Memory writes.* (1) The forget EXPANSION followed any relation: `forget Leonidas` reached `fotini` through IS_SON_OF and
+deleted the owner's wife's profile fields, `user MARRIED_TO fotini` and every fact naming her → only identity edges, anchored
+on the exact node (aliases both ways; IS_A thing → class only — `forget postgresql` had reached the owner's company).
+(2) The profile sweep deleted whole fields that merely MENTIONED the target ("BMW" took all three vehicles, "Athens" the
+address, "name" the owner's name, "son" three keys) → `_forget_profile`: explicit `category.key`; one exact key for a specific
+word; a list item alone; a scalar only when the value IS the target; everything else listed, not deleted; owner identity
+fields only by explicit name. (3) `forget user` expired 469 of 1,016 edges → the graph leg skips hub/attribute words and the
+owner's own name. (4) Graph decay would have deleted the owner's marriage, children and vehicles from 10-19 (weight-1 edges
+older than 45 days; ~400 user edges already pruned since 09-09) → owner facts (subject/object `user`, family/ownership/
+residence/name/work relations) never decay. Also: the profile store refuses empty values (null was stored as "None");
+a replaced single-value field keeps one `previous` and says "(was: …)"; update_profile refuses `[]`/`{}`/"null"/zero-width,
+its delete removes the `user HAS_<KEY>` edge (new `delete_edge`, archived) and every list value's fragment, its dedup reads
+the canonical field; `reset_all` runs only when the turn's request asks to wipe all memory; forget gained an episode leg
+(archived to `episodes_forgotten.jsonl` first). son/daughter/child stay single-valued (deliberate, pinned): a replaced child
+is now kept as `previous`, not lost.
+*Producers.* (1) "None observed …" mistakes skipped the only fix check → no-mistake phrasings recognised; a fix identical to
+its mistake refused. (2) self-play/bench rules came straight from the validator → harness-framed rules refused; a general rule
+must not restate its source (`generality_context`: the challenge, the dream window, the episodes, the request for
+learn_skill). (3) failed journal-mined challenges minted lessons from real user requests → no journal lesson, pass or fail.
+(4) the distilled producer left another pattern's fix beside its mistake → a replaced fix brings its mistake. (5) any
+cross-producer twin became a row → under distance 0.08 it is the same lesson. (6) retracted lessons were re-minted →
+tombstones (archive reasons other than cap-trim) and a persisted dream window cache. (7) self-play harness nudges became dream
+rules → `_strip_harness`. Also: half-LLM lessons no longer patched with templates; pattern lessons counted only when written;
+the episode prompt says REQUEST, not TRIGGER.
+**Data r6** (`scripts/lesson_repair_4kw_r6.py`, trial on a copy first): 10 retracted (self-play observations, a harness rule,
+the "final turn" dream rule, the mismatched distilled row), 4 rules rephrased to pass the gate, 29 dream/episode rows re-keyed
+to their fix → 186 lessons, every general row passes the current gate, 34 scoped (all reachable), twins 186/186, none stale.
+**Verification.** Battery 36 mutants: 29 killed, 6 survivors → tests → 35/35 killed, NOOP clean, tree pristine. Full suite
+once: 27,338 passed, 2 failed (the reset_all refusal was a bare string → ToolOutcome.rejected; re-run green, 162). Measured on
+copies of the live profile/graph: the reviewer's forget repro now deletes nothing outside the target; decay keeps 321 owner
+edges. Deployed; probe (labelled): wife, sons and vehicles recalled intact.
+
+## §4KX — re-review of the §4KX fixes; every finding fixed (2026-10-03, operator: "fix them and verify everything")
+**Re-review (3 fresh readers): 8 MAJOR in §4KX itself.** (1) the forget EXPANSION ran for hub words and the owner's name, and
+through a CLASS link (`hermes IS_A llm`) swept every edge, fact and profile item naming "llm" (5 owner edges) → aliases only
+(ALSO_KNOWN_AS/AKA/NICKNAME/SAME_AS…, exact node, both ways), from a target that names an entity and is not the owner; expanded
+names checked the same way. (2) the new episode leg deleted by MENTION (python 30, athens 18) → deleted only for the owner's
+family member (`GraphMemory.is_owner_family`, decided before any leg deletes), archived WITH actions, under the lock; otherwise
+counted and kept. (3) a harness rule was minted live 13 min after deploy → `_strip_harness` removes any fragment of the injected
+directives (final-turn, constraint check, participant steer); framing words include self-play/coded stand-in/final turn —
+applied to UNATTENDED producers only. (4) the generality gate refused what producers exist for (7/10 learn_skill, dream rules
+naming their error, self-play API names) → a name is a capitalised non-dictionary, non-ALL-CAPS word (hyphen parts alone); only
+file-like dotted tokens/addresses are specific; numbers don't count against a window; a request-shaped learn_skill lesson is
+written request-scoped. (5) tombstones caught automatic removals → only `removed_by_trigger`, rotated archives read, never
+against a live row or a request-scoped plan. (6) 26 surviving reviewer mutants → pinned. Also: graph leg = `forget_entity`
+(a node IS the entity, or entity + version/model; owner life facts that mention it are kept and reported, unless forgetting a
+family member); "Mortimer the iguana"/"Tesla Model 3" forgotten again (value starts with the entity, not a list); attribute
+targets list their fields; a replaced `previous` value is reachable by forget; update_profile reports "(was: …)"; "none"/"N/A"
+are answers; decay protects durable relation TOKENS + profile `user HAS_*` (chatter decays again; 60 of 739 weight-1 edges
+protected, not 460); reset_all gate rewritten (negation, memory card, data files) and its message says what it erases;
+no-mistake = the whole statement; a replaced fix always brings its mistake; dream counters/logs; dream cache keeps every
+namespace; wipe fixture scoped by test name; AST source-shape test replaced by `_stamp_dream_cache` behaviour; stale docs
+marked superseded + current-rules sections; the model-facing forget description updated.
+**Corrections to the §4KX entry:** decay had pruned 357 owner-subject edges (not ~400) since 09-09; marriage/children were due
+on 10-20 (not 10-19), vehicles 11-05; none were restored then. Restored now (`scripts/memory_repair_4kx_r7.py`): 4 owner life
+facts (residence, home, address, a vehicle) — the project/skill noise among them was not.
+**Data r7:** 3 harness-minted dream rules retracted, 2 rules with the leaked "the trigger" wording rewritten, 4 edges restored →
+184 lessons, all passing the gate, twins 184/184, none stale.
+**Verification.** Battery 51 mutants: 41 → 49 → 50/50 non-control killed (one test had to use a non-substring alias), NOOP
+clean, tree pristine. Full suite once: 27,409 passed, 1 failed (the wipe fixture read test source → selected by name; re-run
+green). Deployed; probe (labelled): residence, wife, sons, vehicles recalled.
+
+## §4KX r8 — forget and reset_all become preview → confirm; re-review findings fixed (2026-10-03, operator: "proceed with your recommendations")
+**Why a change of approach.** Three review rounds kept finding wrong deletions inside a forget that GUESSED intent (13 MAJOR
+in the last re-review: "Fotini's birthday" took the marriage; Greek, dotted and hyphenated names reached no store; a public
+person's facts were "yours"; some owner facts could be removed by no tool; the reset_all wording gate opened on negations and
+questions and refused "yes"). Patching the heuristics again was the loop; the user now sees the list.
+**forget** (`knowledge_base(action='forget', target=X)`) = PREVIEW: the same sweep runs in plan mode (`_FORGET_PLAN`, recording
+store proxies), deletes nothing, returns numbered items + "also found" (listed, picked by number) + a token. Confirm =
+`confirm=<token>, items='all'|'1,3'`, refused in the previewing turn and from job-/sched-/sub- turns; single-use, 1 h TTL. The
+executor re-checks files at delete time (symlink, sandbox, RELEASED lock); graph via `delete_edge` (live rows only, archived),
+episodes via `delete_episodes` (archived with actions). Direct Python callers keep execute mode. **reset_all** = counts + token,
+wipe only on the token in a later turn; `_FULL_WIPE_RE` removed.
+**Matching:** one entity for every leg (`_entity_of`: dots/hyphens kept, folded); `profile.mentions` + `_node_is` +
+episode scan fold case/accents in any script (SQLite LIKE was ASCII-only); a qualifier AFTER the entity or with "of" narrows
+to that attribute (stem match: birthdate ~ HAS_BIRTHDAY), a category before it does not; family forget takes `fotini_*` keys;
+`root.*` fields listed like the graph owner fact they mirror; kept "facts about you" = durable AND `user` at one end;
+degraded profile reported. **Producers:** a dictated learn_skill lesson (remember/from now on/θυμήσου…) stays general; the
+model's own request-shaped one is scoped and the tool says so; learn_skill rows never absorbed into another producer's row;
+harness framing = the challenge's validator (not "pydantic validators"); no-mistake unless a failure is named after it;
+GitHub/YouTube/PostgreSQL (inner capital) and node.js-style libraries are not request names/files; -ing/-ed stems; harness
+scrap threshold 8; self-play share 0.75. **Decay:** health/profession/companion tokens + LOCATED_IN durable; TEST/PROBE/…
+`user HAS_*` noise decays. YouTube hints no longer say "forget it first" as a same-turn step.
+**Correction to the §4KX re-review entry:** decay protected 54 of 739 weight-1 edges at the time (not 60).
+**Data r8** (`scripts/memory_repair_4kx_r8.py`, trialled on a copy with the agent stopped, then live; backup
+`memory.pre-4kx-r8-20261003T123718.bak`): restored 6 owner facts the decay had pruned — HAS_CONDITION heart failure / blood
+clot, HAS_MEDICATION + TAKES_MEDICATION entresto, HAS_PROFESSION doctor, HAS_COMPANION fotini. Not restored: the Kyllini trip.
+**Verification.** Battery 60 mutants: 48/58 → 56/58 non-control killed (2 equivalent: a reset token carries no items; the
+possessive strip was dead code → removed), NOOP clean, KNOWN-BAD killed, tree pristine. New tests: test_forget_confirm_r8.py
+(81), test_memory_repair_r8_script.py (3); 44 tests of the old contract rewritten (wipe tests run preview → confirm via
+tests/_wipe_confirm.py). Full suite once: 27,478 passed, 2 failed (unused import; the schema lost its EXACT/relative-path
+sentences) → fixed, those files green. Deployed (single process, new "system ready"). Probe (labelled, read-only): companion
+Fotini and blood clot recalled; heart failure and Entresto NOT — the edges are live, but recall seeds the graph from query
+words that are NODES, and "health/medication" are PREDICATES of `user` edges (pre-existing recall gap, open).
+**r8 fresh-eye review (3 reviewers, same day): 8 MAJOR, 16 MINOR — all fixed, redeployed.**
+Preview/confirm: the preview dropped the sweep's warnings/partial names and said "Nothing stored matches" (→ notes kept,
+partial files/docs are "also found" items); the plan's previous-value check was unfolded (→ `mentions`); executor ✅ on
+"not found" and deleted the CANONICAL field instead of the one shown (→ `delete(exact=True)`, "already gone"); TTL never
+checked at confirm, SYSTEM/bench-/replay- and previews from unseen turns confirmable, list `items` dropped, token-store race
+(→ `_take_plan`/`_store_plan` under a lock, `_not_the_user`, bad parts refuse the whole confirm). Matching: qualified targets
+defaulted owner facts; a 4-letter stem took COMPANION for "company" (→ predicate-only, inflection or `_QUALIFIER_SYNONYMS`,
+birthday ~ BORN); `user HAS_FOTINI_DESCRIPTION` outlived a family forget (→ `owner_field_edges`); "my wife Fotini" skipped
+her fields; ASCII prefilter missed "René" (→ full scan, 6/21 ms); "g.o." trailing dot; "vale of tempe" lost its inner word;
+accented owner name; blind profile let the graph default owner edges (→ graph/episodes held back); LOCATED_IN protected
+research chatter (→ owner only). Producers: dictation regex matched 17/30 real non-dictating requests and Greek substrings
+(→ clause-initial imperatives, Greek word boundaries); a learn_skill row made every rewording a new row (→ only the INCOMING
+learn_skill lesson is kept apart); scope attribute raced 39/40 under gather (→ `LessonWrite` return + bus `skill_scope`;
+dropped legacy write = FAILED); dictated follow-up refused (→ promotes); "satisfy validators"; camelCase/stems let
+McDonald/EvolMonkey/Harding through (→ window-only / sentence-initial-only).
+**Verification:** battery 40 mutants: 31 → 39/39 non-control killed (1 equivalent, dead code removed), controls OK, tree
+pristine; tests now 138 in test_forget_confirm_r8.py. Full suite once: 27,538 passed, 1 failed (test_clockwork_ux deploy
+timing under load; 403/403 alone, untouched code). Redeployed; probe (labelled, read-only): wife and both sons recalled.
+**Recall gap closed (operator: "proceed").** The r8 probe recalled blood clot and Fotini but not heart failure/Entresto: the
+graph tier seeds on query words that NAME nodes, and "health"/"medication" are PREDICATES of `user` edges. New
+`GraphMemory.owner_facts_matching(query)`: `user` edges whose predicate names a query word (or inflection) or a category it
+covers (health, medication, job, family, home, car, birthday; Greek υγεία/φάρμακα/δουλειά/οικογένεια); a category never
+reaches WORKS_ON/IS_WORKING_ON. Merged ahead of the neighbourhood edges in `tool_recall`. Measured on a live-graph copy:
+health → 4 facts, meds → Entresto, job → WORKS_AT + HAS_PROFESSION (was 10 incl. project WORKS_ON before the task rule),
+4 unrelated questions → 0. Tests: test_recall_owner_facts.py (15); battery 13 mutants → 11/11 non-control killed after 2
+tests added; full suite once 27,553 passed, 0 failed. Deployed; probe (labelled, read-only): heart failure, blood clots,
+Entresto, Fotini all recalled. Note for the operator: the graph holds `user HAS_PROFESSION doctor` (restored in r8) beside
+`user WORKS_AT evolmonkey` — check whether "doctor" is really the owner's.
+**Correction (operator: "im not a doctor").** `user HAS_PROFESSION doctor` — one of the six edges r8 restored — was wrong:
+removed with the agent stopped via `delete_edge` (archived, reason delete_edge); it was the only trace (no vector fact,
+profile field or episode). Taken off `scripts/memory_repair_4kx_r8.py`'s list so a re-run can never restore it (test
+updated). Probe (labelled, read-only): job → EvolMonkey, PostgreSQL services. Lesson: a restore from a deletion archive
+brings back WRONG facts with the right ones — list restored facts to the operator for confirmation.
+
+## §4KY — the background writers of owner memory, and member/public scoping (2026-10-03, operator: "proceed with both. usually verification protocol")
+**Review** (3 fresh-eye reviewers, read-only on copies): fact extraction 5 MAJOR/3 MINOR, dream consolidation 4/5, member
+scoping 2/1. Provenance of `user HAS_PROFESSION doctor`: the owner's QUESTION "i'm a doctor/medicine denialist, is this male
+privilege?" (req 89073191, 08-13); the extractor wrote a graph edge, an identity fact, and dream folded it into a synthesis.
+**Fixes.** (1) `memory/attribution.py` — WHO SAID IT: an owner fact (triplet with `user` at either end, profile value,
+user-naming vector fact) is written only from the owner's own USER: lines (never a member-labelled one), in a first-person
+or imperative sentence that is not a question, role-play/hypothetical or quote; a NEGATED one is a correction →
+`GraphMemory.owner_edges_naming` + `delete_edge`. Agent/project-state predicates never become owner facts and no longer
+decay-protected. Pre-filter passes "im"/Greek; CURRENT TIME given; HAS_PROFESSION & co. single-valued; "is not a" negation
+phrases. (2) Tools: update_profile/insert_fact refuse probe/job/sched/sub turns; journal gate names sim/bench. (3) Dream:
+`_consolidation_refusal` (≥2 offered sources, shorter, no new claims, one topic, newest value kept); sources deleted only
+when the synthesis LANDED; newest source's timestamp; malformed output skipped; provenance kept on refresh. (4) Slack:
+`X-Ghost-Surface` (public outside 1:1 DMs) → an owner turn on a public surface carries only the root name + a PUBLIC REPLY
+notice, no memory hydration; member-labelled lines never reach the smart-memory arc or the compaction archive; a member's
+copy of the bot's labels is defused.
+**Verification:** battery 37 mutants: 27/34 → all non-control killed (2 equivalent → dead code removed: "not" in the
+pre-filter, the non-list guard), controls OK, tree pristine. New tests: test_4ky_writers_review.py (51),
+test_4ky_slack_surface.py (6), test_memory_repair_4ky_script.py (3); 4 dream fixtures and 2 extraction fixtures made
+realistic (the gates refused "A"*200 merges and unprefixed episodes). Full suite once: 27,610 passed, 0 failed.
+**Data (operator: "delete a b c heart attack is wrong"):** `scripts/memory_repair_4ky.py`, trialled on a copy with the agent
+stopped, then live (backup memory.pre-4ky-20261003T164929.bak): 152 owner edges removed (A probe/test 44, B agent/project
+state 92, C third-party/game 15 — listed verbatim in the script — plus `user EXPERIENCED heart attack`) and 4 profile fields;
+group D (33 unclear) and the 73 life facts kept. Owner edges 468 → 316. Agent + Slack bot restarted. Probe (labelled,
+read-only): health = heart failure, blood clot, Entresto; job EvolMonkey; wife and both sons — no doctor, no heart attack.
+
+## §4KZ — when an owner fact changes: profile authority, synced mirrors, no model-judged deletion (2026-10-03, operator: "proceed, usual verification prot")
+**Review** (3 fresh-eye reviewers, read-only on copies): update path 10 MAJOR/3 MINOR, contradiction engine 7/3, live
+consistency + ranking 4/2. Measured: 5 of the engine's 7 live deletions since 08-08 wrong (Fotini's birth date erased); the
+ledger injected wrong birth dates into owner prompts; a weekend in Kyllini replaced the home (live 08-15); Athens→Berlin→
+Athens dropped by the process-wide bus LRU with SUCCESS; my §4KY gate refused every age update (checked after anchoring);
+"X, not Y" and "we …" dropped; stale synthesis/auto "name is" rows outranked corrections; the vector store has had 0
+identity rows since ≥09-24.
+**Design change** (instead of patching heuristics): (1) the LLM belief-revision engine is REMOVED and the ledger no longer
+injected; (2) the PROFILE is the authority: `sync_owner_mirrors` makes `GraphMemory.sync_owner_field` (user HAS_<KEY>, raw
+predicate) and `VectorMemory.sync_owner_field` (identity rows by EXACT key, add-before-delete, refused → PARTIAL) equal the
+field after every write — tool (bus or direct, incl. delete) and extractor (now independent of the fact score); (3) graph:
+canonical predicates (spouse/birthdate/residence/medication synonyms), ages not stored, LIVES_IN = home, LOCATED_IN & co =
+presence (not single-valued, not durable), `add_triplets(as_of)` — an older statement never replaces a newer one (journal
+items carry ts); corrections same-predicate (removal verbs all); owner facts newest-first with dates, wife/sons categories,
+also in hydration; (4) attribution: role-play per TURN, negation per CLAUSE, PREDICATE_CUES for single-valued facts, profile
+value gated raw, every personal fact gated, we/Greek-plural pre-filter, sale = removal; (5) ranking: identity −15 above
+synthesis −10, name boost only identity/manual, labels by type, age from statement time, real query batch first; (6) bus
+dedup per request; "is now N years old" / Greek ages anchor cleanly.
+**Verification:** battery 41 mutants: 31/40 → all non-control killed (3 equivalent → dead code removed: raw-fact gate,
+short-plural rule, presence branch of the decay rule), controls OK, tree pristine. New tests test_4kz_update_path.py (35);
+~20 old-contract tests rewritten (engine source pins → one behaviour test; mirrors instead of delete_fragment/add_triplets;
+new tiers); pin baseline −3 and lint baseline lowered. Full suite once: 27,644 passed, 1 failed (a source pin naming the
+removed judge's task label → updated). Deployed; probe (labelled, read-only): home, wife, both sons' birth dates correct.
+**Data:** NOT changed — the consistency cleanup (5 wrong, ~40 duplicates, owner questions, vector identity backfill) awaits
+the operator's answers.
+**§4KZ data (operator: "delete 1 2 4 8, rebuild copies, rest later"):** `scripts/memory_repair_4kz.py` (rows listed verbatim;
+every kept canonical edge verified live first; test_memory_repair_4kz_script.py), trialled on a copy with the agent stopped,
+then live (backup memory.pre-4kz-20261003T183121.bak): 67 owner edges removed — 1 wrong (Kyllini location + hotel stay,
+"thodoris BORN ~2017-02", stored ages ×4), 2 duplicates (37: spouse/sons/birthdates/residence/vehicles/medication/hobby/
+preference synonyms; one canonical edge each kept), 4 one-off search topics stored as wants/interests (11), 8 noise (12:
+car-wash tasks, a deadline, a considered helmet, assistant-event logs); `PREFER download` → `PREFERS`; profile fields
+son_thodoris_birthdate, son_lleonidas_birthdate (typo) and cli_tools.info removed (duplicates); the lesson "how much time is
+from here to home ?" (told the model to doubt the owner's home) retracted; vector identity copies of all 11 profile fields
+rebuilt (the store had none since ≥09-24). Owner edges 316 → 267. Left for later (operator): RUNS evolmonkey, birth dates
+to the profile, helmets, IBKR account. Probe (labelled, read-only): home answered from the address without doubting it;
+sons' birth dates correct.

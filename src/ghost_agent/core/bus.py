@@ -98,9 +98,18 @@ class MemoryBus:
             stable["metadata"] = {
                 k: v for k, v in fact_data["metadata"].items() if k != "timestamp"
             }
+        # …and on the REQUEST (§4KZ): the LRU outlived the request it was
+        # built for (the 9x loop was one request), so a value changed BACK in
+        # a later turn (Athens → Berlin → Athens) was dropped as a repeat and
+        # still reported SUCCESS.
+        try:
+            from ..utils.logging import request_id_context as _rid
+            _req = str(_rid.get() or "")
+        except Exception:  # noqa: BLE001
+            _req = ""
         try:
             blob = json.dumps(
-                {"event_type": event_type, "fact": stable},
+                {"event_type": event_type, "fact": stable, "request": _req},
                 sort_keys=True,
                 default=str,
             )
@@ -849,7 +858,18 @@ class MemoryBus:
             logger.warning(f"MemoryBus graph fetch failed: {type(e).__name__}: {e}")
             return []
         if not isinstance(edges, list):
-            return []
+            edges = []
+        # the OWNER's facts asked for by their kind ("where do I live?") —
+        # newest first, dated (§4KZ: hydration only seeded on node names and
+        # returned Elden Ring task edges for "where do I live?")
+        _own = getattr(self.graph, "owner_facts_matching", None)
+        if callable(_own):
+            try:
+                owned = await asyncio.to_thread(_own, query, 8)
+                if isinstance(owned, list):
+                    edges = list(dict.fromkeys([e for e in owned if isinstance(e, str)] + edges))
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"MemoryBus owner-fact fetch failed: {e}")
         return [{"source": "graph", "text": e} for e in edges if e]
 
     async def _fetch_skill(self, query: str, scope_request: str = "") -> List[Dict[str, Any]]:
@@ -1404,12 +1424,18 @@ class MemoryBus:
                 results["skill"] = "skip"
                 return
             try:
+                # the model's own lesson (learn_skill): tagged, and a GENERAL
+                # rule must not restate the request in hand (producers review:
+                # "Count lines in a specific file path provided by the user.")
+                from ..memory.lesson_scope import current_request as _cur_req
                 _written = await asyncio.to_thread(
                     self.skill.learn_lesson,
                     lesson.get("task"),
                     lesson.get("mistake"),
                     lesson.get("solution"),
                     memory_system=self.vector,
+                    source="learn_skill",
+                    generality_context=str(_cur_req.get() or ""),
                 )
                 # `learn_lesson` returns "written"/"reinforced" on a real
                 # write and None on every drop path (quality gate, dedup that
@@ -1421,6 +1447,9 @@ class MemoryBus:
                 results["skill"] = ("ok" if _written
                                     else "error: lesson was not written "
                                          "(dropped by the playbook)")
+                if _written:
+                    # where it applies, per call (r8 review)
+                    results["skill_scope"] = str(getattr(_written, "scope", "") or "general")
             except Exception as e:
                 results["skill"] = f"error: {e}"
 

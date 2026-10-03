@@ -291,36 +291,73 @@ def is_general_text(text, request, *, max_shared_share: float = 0.5) -> bool:
         return True
     if _SPECIFIC_RE.search(t):
         return False
-    if set(_NUMBER_RE.findall(t)) & set(_NUMBER_RE.findall(str(request or ""))):
+    # a number from the request — but not against a whole WINDOW of text
+    # (max_shared_share >= 1), where "403" or "429" in a rule is the error it
+    # was mined from, not one request's data (producers re-review)
+    if max_shared_share < 1.0 and set(_NUMBER_RE.findall(t)) & set(_NUMBER_RE.findall(str(request or ""))):
         return False
     tw, rw = content_words(t), content_words(request)
     if not tw:
         return False
-    # a FILE or dotted name from the request ("report.txt", "kc_probe.py",
-    # "10.0.0.1") is that request's, however general the rest (fourth review)
-    if any("\u2024" in w and not re.fullmatch(r"[a-z]\u2024[a-z]", w) for w in tw & rw):   # not "e.g."
+    # a FILE name or an address from the request ("report.txt", "kc_probe.py",
+    # "10.0.0.1") is that request's; a dotted API name ("json.loads",
+    # "threading.Event") is how a general rule names its tool
+    if any(_is_file_like(w) for w in tw & rw):
         return False
     # a NAME from the request, even misspelled ("Panerythraikos" for
     # "panerithraikos"), makes the text specific however many general words
-    # dilute the ratio (third review)
-    names = {normalize_request(m) for m in re.findall(r"(?<!^)(?<![.!?]\s)\b[A-ZΑ-Ω][\w'-]{3,}", t)}
-    # a sentence-initial capital is a name too when it is no English word
-    # (fourth review: "Panerithraikos questions: …" escaped the check)
-    for m in re.findall(r"(?:^|[.!?]\s+)([A-ZΑ-Ω][\w'-]{3,})", t):
-        if not _is_english_word(m):
-            names.add(normalize_request(m))
+    # dilute the ratio. A name is a capitalised word that is neither ALL CAPS
+    # ("GROUP", "HTTP") nor an English word ("Python's", "Producer-Consumer")
+    # — each hyphen/possessive part judged alone ("Leonidas-style").
+    parts = set()
+    for m in re.finditer(r"(?:(^|[.!?]\s+)|\b)([A-ZΑ-Ω][\w'-]{3,})", t):
+        initial = m.group(1) is not None
+        for part in re.split(r"[-']", m.group(2)):
+            if len(part) < 4 or part.isupper() or part[:1].islower():
+                continue
+            # a capital INSIDE the word is a product's spelling ("GitHub",
+            # "YouTube", "PostgreSQL") — but only against a WINDOW of text
+            # (dream): against one request it may be that request's name
+            # ("McDonald", "EvolMonkey", "ZachXBT" — r8 review)
+            if max_shared_share >= 1.0 and any(c.isupper() for c in part[1:]):
+                continue
+            # inflection stems only for a sentence-initial word ("Determining");
+            # a capitalised "Harding"/"Fielding" mid-sentence is a name (r8 review)
+            if _is_english_word(part, stems=initial) and (_ENGLISH or initial):
+                continue
+            parts.add(normalize_request(part))
     rwords = [w for w in rw if len(w) >= 4]
-    # each part of a hyphenated name counts ("Leonidas-style", fifth review)
-    parts = {p for n in names for p in n.split() if len(p) >= 4}
     if any(any(p == w or difflib.SequenceMatcher(None, p, w).ratio() >= 0.8 for w in rwords) for p in parts):
         return False
     return len(tw & rw) / len(tw) <= max_shared_share
 
 
+_FILE_EXTS = frozenset("""txt md py js ts json csv tsv xml html htm css yaml yml toml ini cfg conf log sql db sqlite
+pdf doc docx xls xlsx ppt pptx png jpg jpeg gif svg webp mp3 mp4 wav mov zip tar gz tgz sh bat ps1 c h cpp hpp java
+go rs rb php swift kt env lock""".split())
+
+
+def _is_file_like(word: str) -> bool:
+    """A dotted token that names a FILE ("report\u2024txt") or an address
+    ("10\u20240\u20240\u20241") — not "e.g." and not a dotted API name."""
+    if "\u2024" not in word or re.fullmatch(r"[a-z]\u2024[a-z]", word):
+        return False
+    segs = word.split("\u2024")
+    if len(segs) == 2 and segs[1] == "js" and segs[0] in _JS_PRODUCTS:
+        return False
+    return segs[-1] in _FILE_EXTS or all(x.isdigit() for x in segs)
+
+
+#: libraries NAMED with ".js" — a product, not a file (re-review: "Node.js"
+#: made a general rule about Node specific to the request that named it)
+_JS_PRODUCTS = frozenset("""node vue next nuxt three d3 react express chart moment angular ember backbone socket p5
+alpine svelte deno bun pixi phaser leaflet anime babylon""".split())
+
+
 _ENGLISH = None
 
 
-def _is_english_word(word: str) -> bool:
+def _is_english_word(word: str, stems: bool = True) -> bool:
     """In the system word list (an inflection stripped), or — without one —
     assumed to be (the pre-fourth-review behaviour)."""
     global _ENGLISH
@@ -335,5 +372,20 @@ def _is_english_word(word: str) -> bool:
     w = word.lower().strip("'-")
     if not w.isascii():
         return False
-    return any(x in _ENGLISH for x in (w, w[:-1] if w.endswith("s") else w, w[:-2] if w.endswith(("es", "ed")) else w,
-                                       w[:-3] if w.endswith("ing") else w, w[:-3] + "y" if w.endswith("ies") else w))
+    forms = {w}
+    if w.endswith("s"):
+        forms.add(w[:-1])
+    if w.endswith(("es", "ed")):
+        forms.add(w[:-2])                             # "boxes" → box
+    if w.endswith("ies"):
+        forms.add(w[:-3] + "y")
+    if not stems:
+        return any(x in _ENGLISH for x in forms)
+    if w.endswith("ed"):
+        forms.add(w[:-1])                             # "used" → use
+    if w.endswith("ing"):
+        # "Determining" → determine, "running" → run (re-review)
+        forms |= {w[:-3], w[:-3] + "e"} | ({w[:-4]} if len(w) > 5 and w[-4] == w[-5] else set())
+    if w.endswith("ed") and len(w) > 4 and w[-3] == w[-4]:
+        forms.add(w[:-3])                             # "stopped" → stop
+    return any(x in _ENGLISH for x in forms)

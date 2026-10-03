@@ -209,7 +209,7 @@ def test_huge_forget_expires_instead_of_hard_deleting(gm):
 def test_expansion_still_reaches_a_tight_alias(gm):
     gm.add_triplets([
         {"subject": "user", "predicate": "HAS_PET", "object": "mortimer"},
-        {"subject": "mortimer", "predicate": "IS_A", "object": "iguana"},
+        {"subject": "mortimer", "predicate": "ALSO_KNOWN_AS", "object": "iguana"},
     ])
     related = gm.get_connected_entities("mortimer")
     assert "iguana" in related
@@ -224,7 +224,7 @@ def test_expansion_skips_generic_hubs(gm):
         {"subject": "chessbot", "predicate": "PART_OF", "object": "project"},
         {"subject": "chessbot", "predicate": "HAS_STATUS", "object": "done"},
         {"subject": "system", "predicate": "HOSTS", "object": "chessbot"},
-        {"subject": "chessbot", "predicate": "IS_A", "object": "engine"},
+        {"subject": "chessbot", "predicate": "ALSO_KNOWN_AS", "object": "engine"},
     ])
     related = gm.get_connected_entities("chessbot")
     assert related == ["engine"]
@@ -237,7 +237,7 @@ def test_expansion_skips_high_degree_neighbours(gm):
         [{"subject": "webos", "predicate": "HAS_FEATURE", "object": f"feat{i}"}
          for i in range(12)]
         + [{"subject": "sidecar", "predicate": "TALKS_TO", "object": "webos"},
-           {"subject": "sidecar", "predicate": "IS_A", "object": "daemon"}]
+           {"subject": "sidecar", "predicate": "ALSO_KNOWN_AS", "object": "daemon"}]
     )
     related = gm.get_connected_entities("sidecar")
     assert "webos" not in related
@@ -247,15 +247,20 @@ def test_expansion_skips_high_degree_neighbours(gm):
 def test_expansion_ignores_substring_neighbours(gm):
     gm.add_triplets([
         {"subject": "testing", "predicate": "USES", "object": "pytest"},
-        {"subject": "tin", "predicate": "IS_A", "object": "metal"},
+        {"subject": "tin", "predicate": "ALSO_KNOWN_AS", "object": "metal"},
     ])
     assert gm.get_connected_entities("tin") == ["metal"]
 
 
 def test_expansion_ignores_expired_edges(gm):
-    gm.add_triplets([{"subject": "bob", "predicate": "LIVES_IN", "object": "london"}])
-    gm.add_triplets([{"subject": "bob", "predicate": "LIVES_IN", "object": "athens"}])
-    assert gm.get_connected_entities("bob") == ["athens"]
+    # an ALIAS edge (the only kind the expansion follows since the third
+    # memory-writes review); the first one is expired
+    import sqlite3
+    gm.add_triplets([{"subject": "bob", "predicate": "ALSO_KNOWN_AS", "object": "cat"}])
+    with sqlite3.connect(gm.db_path) as conn:
+        conn.execute("UPDATE triplets SET valid_until = 1 WHERE object = 'cat'")
+    gm.add_triplets([{"subject": "bob", "predicate": "ALSO_KNOWN_AS", "object": "dog"}])
+    assert gm.get_connected_entities("bob") == ["dog"]
 
 
 # ---------------------------------------- 4./5. compression: conflicts + loops
@@ -339,3 +344,15 @@ def test_seed_mapping_allows_close_fragment(gm):
     """A fragment that is nearly the whole word is still a legitimate seed."""
     gm.add_triplets([{"subject": "postgres", "predicate": "IS_A", "object": "database"}])
     assert gm._map_words_to_seeds(["postgresql"]) == ["postgres"]
+
+
+def test_a_functional_relation_supersedes_its_previous_value(gm):
+    """add_triplets expires the old object of a single-valued relation (the
+    coverage the expansion test used to carry)."""
+    import sqlite3
+    gm.add_triplets([{"subject": "bob", "predicate": "LIVES_IN", "object": "london"}])
+    gm.add_triplets([{"subject": "bob", "predicate": "LIVES_IN", "object": "athens"}])
+    with sqlite3.connect(gm.db_path) as conn:
+        live = conn.execute("SELECT object FROM triplets WHERE subject='bob' AND valid_until IS NULL").fetchall()
+    assert live == [("athens",)]
+

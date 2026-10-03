@@ -26,6 +26,13 @@ def _entity_pattern(target: str) -> "re.Pattern":
     return re.compile(r"(?<![^\W_])" + re.escape(target) + r"s?(?![^\W_])")
 
 
+
+def _fold(text) -> str:
+    """Case- and accent-folded text (Greek "Φωτεινή" ~ "φωτεινη")."""
+    import unicodedata
+    t = unicodedata.normalize("NFD", str(text or "").casefold())
+    return "".join(ch for ch in t if not unicodedata.combining(ch))
+
 class GraphMemory:
     """Knowledge graph with SQLite persistence + in-memory NetworkX routing.
 
@@ -46,9 +53,14 @@ class GraphMemory:
     #: are deliberately absent. Comparison is case-insensitive (uppercased).
     _FUNCTIONAL_PREDICATES = {
         # Biographical
-        "WORKS_AT", "LIVES_IN", "DRIVES", "MARRIED_TO",
-        "BORN_IN", "STUDIES_AT", "LOCATED_IN", "EMPLOYED_BY",
+        # (§4KZ: LOCATED_IN is PRESENCE — a weekend in Kyllini expired the
+        # owner's home; home is LIVES_IN, and a birth date is one date)
+        "WORKS_AT", "LIVES_IN", "DRIVES", "MARRIED_TO", "HAS_BIRTHDATE",
+        "BORN_IN", "STUDIES_AT", "EMPLOYED_BY",
         "HAS_AGE", "HAS_LOCATION",
+        # §4KY: a new profession REPLACES the old one ("I'm a DBA" left
+        # "doctor" live beside it)
+        "HAS_PROFESSION", "HAS_OCCUPATION", "WORKS_AS", "HAS_JOB",
         # Operational — written by the agent itself, single-valued by
         # construction (a process has one status/one pid at a time).
         "HAS_STATUS", "STATUS", "HAS_PID",
@@ -165,12 +177,37 @@ class GraphMemory:
 
     # ------------------------------------------------------------ public CRUD
 
-    def add_triplets(self, triplets: List[Dict[str, str]]):
+    #: §4KZ: ONE predicate per kind of fact. The live graph held the owner's
+    #: spouse six ways and each son's birth date three ways; correcting one
+    #: copy left the others live.
+    _CANONICAL_PREDICATES = {
+        "HAS_SPOUSE": "MARRIED_TO", "HAS_WIFE": "MARRIED_TO", "HAS_HUSBAND": "MARRIED_TO", "IS_MARRIED_TO": "MARRIED_TO",
+        "HAS_BIRTH_DATE": "HAS_BIRTHDATE", "BORN_ON": "HAS_BIRTHDATE", "WAS_BORN_ON": "HAS_BIRTHDATE",
+        "HAS_BIRTHDAY": "HAS_BIRTHDATE", "BIRTHDATE": "HAS_BIRTHDATE",
+        "RESIDES_IN": "LIVES_IN", "HAS_HOME_IN": "LIVES_IN", "LIVES_AT": "LIVES_IN",
+        "TAKES_MEDICATION": "HAS_MEDICATION", "HAS_SONS": "HAS_SON", "HAS_CHILDREN": "HAS_CHILD",
+    }
+    #: an AGE is a measurement that is wrong a year later — the birth date is
+    #: the fact (live: "Leonidas AGE 5" from "5 months")
+    _DECAYING_PREDICATES = {"AGE", "HAS_AGE", "IS_AGED", "AGED"}
+
+    @classmethod
+    def canonical_predicate(cls, predicate) -> str:
+        p = str(predicate or "").upper().strip()
+        return cls._CANONICAL_PREDICATES.get(p, p)
+
+    def add_triplets(self, triplets: List[Dict[str, str]], as_of: float = None, raw: bool = False):
+        """``as_of`` (epoch): WHEN the triplets were stated. A single-valued
+        edge stated EARLIER than the live one does not replace it (§4KZ: a
+        re-queued older journal item expired "lives in Patras" back to
+        Athens). ``raw``: the predicate as given (the profile's own mirror
+        edges, `sync_owner_field`)."""
         if not triplets:
             return 0
         added = 0
         import time as _time
         now = _time.time()
+        stated = float(as_of) if as_of else now
         with self._lock:
             with sqlite3.connect(self.db_path) as conn:
                 for t in triplets:
@@ -191,9 +228,11 @@ class GraphMemory:
                     if not (s and p and o):
                         continue
                     sn = str(s).lower().strip()
-                    pn = str(p).upper().strip()
+                    pn = str(p).upper().strip() if raw else self.canonical_predicate(p)
                     on = str(o).lower().strip()
                     if not (sn and pn and on):
+                        continue
+                    if pn in self._DECAYING_PREDICATES and not raw:
                         continue
                     try:
                         # Temporal conflict resolution: if the same subject+predicate
@@ -207,11 +246,18 @@ class GraphMemory:
                         if (pn in self._FUNCTIONAL_PREDICATES
                                 and sn not in self._EXPIRY_GENERIC_SUBJECTS):
                             conflicting = conn.execute(
-                                '''SELECT object FROM triplets
+                                '''SELECT object, valid_from FROM triplets
                                    WHERE subject = ? AND predicate = ? AND object != ?
                                    AND valid_until IS NULL''',
                                 (sn, pn, on)
                             ).fetchall()
+                            if any(float(vf or 0) > stated for _, vf in conflicting):
+                                # a NEWER value is live: this older statement
+                                # neither replaces it nor joins it
+                                logger.info("graph: %s %s '%s' is older than the live value — not applied",
+                                            sn, pn, on)
+                                continue
+                            conflicting = [(o_,) for o_, _ in conflicting]
                         if conflicting:
                             conn.execute(
                                 '''UPDATE triplets SET valid_until = ?
@@ -235,7 +281,7 @@ class GraphMemory:
                                VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, ?)
                                ON CONFLICT(subject, predicate, object)
                                DO UPDATE SET weight = weight + 1, timestamp = CURRENT_TIMESTAMP, valid_until = NULL''',
-                            (sn, pn, on, now)
+                            (sn, pn, on, stated)
                         )
                         if cursor.rowcount > 0:
                             added += 1
@@ -319,6 +365,267 @@ class GraphMemory:
             logger.error("graph archive-before-delete failed (%s): %s",
                          reason, e)
             return False
+
+    #: relation tokens of the owner's family
+    _FAMILY_TOKENS = {"MARRIED", "SPOUSE", "WIFE", "HUSBAND", "PARTNER", "CHILD", "CHILDREN", "SON", "DAUGHTER",
+                      "PARENT", "MOTHER", "FATHER", "SIBLING", "BROTHER", "SISTER", "FAMILY", "PET"}
+
+    def is_owner_family(self, name: str) -> bool:
+        """Is ``name`` a node the owner (``user``) is linked to by a family
+        relation (either direction, current edges)?"""
+        n = _fold(name).strip()
+        if not n:
+            return False
+        with self._lock:
+            with sqlite3.connect(self.db_path) as conn:
+                rows = conn.execute(
+                    """SELECT subject, predicate, object FROM triplets WHERE valid_until IS NULL AND
+                       (lower(subject)='user' OR lower(object)='user')""").fetchall()
+        return any(set(str(p or "").upper().split("_")) & self._FAMILY_TOKENS
+                   for s_, p, o_ in rows
+                   if _fold(o_ if str(s_).strip().lower() == "user" else s_).strip() == n)
+
+    def delete_edge(self, subject: str, predicate: str, obj: str) -> int:
+        """Delete ONE current edge (archived first, like every graph delete).
+        Used when `update_profile` deletes the field that minted it
+        (profile-writes review: `user HAS_<KEY> <value>` outlived the
+        field). Returns the number of rows removed."""
+        s_, p_, o_ = str(subject).lower().strip(), str(predicate).strip(), str(obj).lower().strip()
+        with self._lock:
+            with sqlite3.connect(self.db_path) as conn:
+                rows = conn.execute(
+                    """SELECT rowid, subject, predicate, object, COALESCE(weight, 1), timestamp FROM triplets
+                       WHERE valid_until IS NULL AND predicate=? AND (subject=? OR lower(subject)=?)
+                       AND (object=? OR lower(object)=?)""",
+                    (p_, str(subject).strip(), s_, str(obj).strip(), o_)).fetchall()
+                if not rows or not self._archive_rows("delete_edge", [r[1:] for r in rows]):
+                    return 0
+                conn.executemany("DELETE FROM triplets WHERE rowid = ?", [(r[0],) for r in rows])
+                conn.commit()
+                rows = [r[1:] for r in rows]
+            for r in rows:
+                self._remove_edge(r[0], r[1], r[2])
+        return len(rows)
+
+    @staticmethod
+    def _node_is(node: str, entity: str) -> bool:
+        """The node IS the entity, or a short name starting with it ("tesla
+        model 3" for "tesla") — not a phrase or list that mentions it
+        ("thrakomakedones near athens", "athens, greece")."""
+        # folded both sides (re-review: "Φωτεινή" never matched "φωτεινη")
+        # …and hyphen/underscore ~ space ("pista-gp" names "pista gp")
+        n = " ".join(re.sub(r"[-_]+", " ", _fold(node)).split()).rstrip(".,;:!?")
+        e = " ".join(re.sub(r"[-_]+", " ", _fold(entity)).split()).rstrip(".,;:!?")
+        if not n or not e:
+            return False
+        if n == e:
+            return True
+        if not n.startswith(e + " ") or re.search(r"[,;/&]|\band\b|\bnear\b|\bof\b|\bin\b", n):
+            return False
+        # a VERSION or MODEL after the name ("tesla model 3", "postgresql
+        # 17"), never a description ("postgresql services company")
+        rest = n[len(e):].split()
+        return len(rest) <= 3 and any(ch.isdigit() for ch in "".join(rest))
+
+    @staticmethod
+    def _entity_candidates(conn, e: str) -> list:
+        """Live rows that MAY name ``e`` (rowid, s, p, o, weight, ts).
+        sqlite's LIKE/lower() fold ASCII only, so every live row is read and
+        the folded `_node_is` decides."""
+        cols = "rowid, subject, predicate, object, COALESCE(weight, 1), timestamp"
+        # every live row: an ASCII entity ("rene lacoste") must still find a
+        # stored "rené lacoste" (r8 review) — 6 ms on the live 1k-edge graph
+        return conn.execute(f"SELECT {cols} FROM triplets WHERE valid_until IS NULL").fetchall()
+
+    def owner_field_edges(self, entity: str) -> list:
+        """Live `user HAS_<…>` edges whose PREDICATE names ``entity`` — the
+        graph twins of profile fields like `fotini_description` (r8 review:
+        they outlived a family forget and were not even listed)."""
+        words = [w for w in re.split(r"[\s_\-]+", _fold(entity)) if w]
+        if not words:
+            return []
+        with self._lock:
+            with sqlite3.connect(self.db_path) as conn:
+                rows = conn.execute("SELECT subject, predicate, object FROM triplets WHERE valid_until IS NULL "
+                                    "AND lower(subject) = 'user'").fetchall()
+        return [r for r in rows if set(words) <= set(_fold(r[1]).split("_"))]
+
+    #: a CATEGORY word in a question and the predicate words it covers
+    #: ("what health conditions do I have" → HAS_CONDITION, TAKES_MEDICATION)
+    _CATEGORY_WORDS = {
+        "health": {"condition", "conditions", "medication", "medications", "diagnosis", "diagnosed", "allergy",
+                   "allergies", "allergic", "disease", "health", "illness", "takes"},
+        "medical": {"condition", "medication", "diagnosis", "diagnosed", "allergy", "allergic", "disease", "health"},
+        "medicine": {"medication", "medications", "takes"}, "medicines": {"medication", "medications", "takes"},
+        "meds": {"medication", "medications", "takes"}, "drugs": {"medication", "medications"},
+        "pills": {"medication", "medications"}, "illness": {"condition", "disease", "illness", "diagnosis"},
+        "sick": {"condition", "disease", "illness"}, "allergic": {"allergy", "allergies", "allergic"},
+        "job": {"profession", "occupation", "works", "employed", "employer", "job"},
+        "work": {"profession", "occupation", "works", "employed", "employer", "work"},
+        "profession": {"profession", "occupation"}, "occupation": {"profession", "occupation"},
+        "family": {"married", "spouse", "wife", "husband", "son", "sons", "daughter", "daughters", "child",
+                   "children", "parent", "parents", "mother", "father", "sibling", "brother", "sister", "companion"},
+        "partner": {"married", "spouse", "wife", "husband", "partner", "companion"},
+        "wife": {"married", "spouse", "wife"}, "husband": {"married", "spouse", "husband"},
+        "spouse": {"married", "spouse", "wife", "husband"},
+        "sons": {"son", "sons", "child", "children"}, "son": {"son", "sons", "child", "children"},
+        "daughter": {"daughter", "daughters", "child", "children"},
+        "birthdays": {"birth", "birthday", "birthdate", "born"},
+        "kids": {"son", "sons", "daughter", "daughters", "child", "children"},
+        "children": {"son", "sons", "daughter", "daughters", "child", "children"},
+        "live": {"lives", "resides", "home", "address", "located"}, "home": {"lives", "resides", "home", "address"},
+        "address": {"address", "lives", "resides", "home"},
+        "own": {"owns", "owned", "own", "has"}, "car": {"car", "vehicle", "owns", "drives"},
+        "birthday": {"birth", "birthday", "birthdate", "born"},
+        # Greek (folded)
+        "υγεια": {"condition", "conditions", "medication", "medications", "diagnosis", "allergy", "disease", "health"},
+        "φαρμακα": {"medication", "medications", "takes"}, "φαρμακο": {"medication", "medications", "takes"},
+        "δουλεια": {"profession", "occupation", "works", "employed"}, "οικογενεια": {"married", "son", "sons",
+                                                                                   "daughter", "child", "children"},
+    }
+    _INFL = ("", "s", "es", "ed", "ing", "ies")
+
+    @classmethod
+    def _word_names_predicate_token(cls, w: str, tok: str) -> bool:
+        if w == tok:
+            return True
+        k = 0
+        for a, b in zip(w, tok):
+            if a != b:
+                break
+            k += 1
+        return k >= 4 and w[k:] in cls._INFL and tok[k:] in cls._INFL
+
+    def owner_facts_matching(self, query: str, limit: int = 20) -> List[str]:
+        """The owner's facts (`user …` edges) whose PREDICATE names a word of
+        the query or a category it covers — "what health conditions do I have"
+        finds `user HAS_CONDITION heart failure`. The neighbourhood lookup
+        seeds on NODE names, so a fact asked for by its kind was unreachable
+        (§4KX r8 probe: heart failure and Entresto were stored and never
+        recalled)."""
+        words = [w for w in re.findall(r"\w+", _fold(query)) if len(w) >= 3]
+        if not words:
+            return []
+        stop = {"has", "have", "the", "and", "what", "who", "which", "user", "you", "about"}
+        asked = set(words) - stop
+        implied = set()
+        for w in words:
+            implied |= self._CATEGORY_WORDS.get(w, set())
+        implied -= stop
+        with self._lock:
+            with sqlite3.connect(self.db_path) as conn:
+                # NEWEST first, and the date is shown (§4KZ: by weight, a
+                # stale "located at kyllini" outranked the current home and
+                # the model could not tell which was newer)
+                rows = conn.execute(
+                    "SELECT subject, predicate, object, COALESCE(weight, 1), timestamp FROM triplets "
+                    "WHERE valid_until IS NULL AND (lower(subject) = 'user' OR lower(object) = 'user') "
+                    "ORDER BY timestamp DESC").fetchall()
+        out = []
+        for s_, p_, o_, _w, _ts in rows:
+            raw = _fold(p_).split("_")
+            toks = [t for t in raw if t and t not in ("has", "is", "of", "to", "at", "in", "on")]
+            hit = any(self._word_names_predicate_token(w, t) for w in asked for t in toks)
+            # a category reaches only a fact ABOUT the owner, not a task in
+            # progress (`user WORKS_ON pinball.html` is not a job)
+            if not hit and "on" not in raw and "working" not in raw:
+                hit = any(self._word_names_predicate_token(w, t) for w in implied for t in toks)
+            if hit:
+                out.append(self._format_path(((s_, p_, o_),), 1) + (f" (as of {str(_ts)[:10]})" if _ts else ""))
+                if len(out) >= limit:
+                    break
+        return out
+
+    def owner_edges_naming(self, value: str, predicate: str = None) -> list:
+        """Live edges with `user` at one end whose OTHER end IS ``value``
+        (folded) — what an owner's correction ("I'm not a doctor") removes.
+        With ``predicate``, only that kind of fact (§4KZ: "I'm not going to
+        Athens" deleted LIVES_IN, BORN_IN and WORKS_IN athens)."""
+        v = str(value or "").strip()
+        _p = self.canonical_predicate(predicate) if predicate else None
+        if len(v) < 2:
+            return []
+        with self._lock:
+            with sqlite3.connect(self.db_path) as conn:
+                rows = conn.execute("SELECT subject, predicate, object FROM triplets WHERE valid_until IS NULL "
+                                    "AND (lower(subject) = 'user' OR lower(object) = 'user')").fetchall()
+        return [r for r in rows
+                if self._node_is(r[2] if str(r[0]).strip().lower() == "user" else r[0], v)
+                and (_p is None or self.canonical_predicate(r[1]) == _p)]
+
+    def sync_owner_field(self, key: str, values) -> tuple:
+        """Make the owner's ``user HAS_<KEY>`` edges EQUAL ``values`` (the
+        profile field, now): stale ones deleted (archived), missing ones
+        added. §4KZ: a profile change left the old HAS_WIFE/HAS_EMPLOYER/
+        HAS_LOCATION edges live beside the new. Returns (added, removed)."""
+        pred = "HAS_" + str(key or "").upper().replace(" ", "_")
+        want = {str(v).lower().strip() for v in (values if isinstance(values, list) else [values])
+                if v not in (None, "") and str(v).strip()}
+        with self._lock:
+            with sqlite3.connect(self.db_path) as conn:
+                live = [r[0] for r in conn.execute(
+                    "SELECT object FROM triplets WHERE valid_until IS NULL AND lower(subject) = 'user' "
+                    "AND predicate = ?", (pred,)).fetchall()]
+        removed = sum(self.delete_edge("user", pred, o) for o in live if str(o).lower().strip() not in want)
+        added = self.add_triplets([{"subject": "user", "predicate": pred, "object": v}
+                                   for v in want if v not in {str(o).lower().strip() for o in live}], raw=True)
+        return added, removed
+
+    def count_edges(self) -> int:
+        with self._lock:
+            with sqlite3.connect(self.db_path) as conn:
+                return conn.execute("SELECT COUNT(*) FROM triplets WHERE valid_until IS NULL").fetchone()[0] or 0
+
+    def preview_forget_entity(self, entity: str) -> tuple:
+        """What `forget_entity` WOULD do, deleting nothing:
+        ``(doomed_edges, kept_owner_facts)`` as (subject, predicate, object)."""
+        e = str(entity or "").strip().lower()
+        if len(e) < 3:
+            return [], []
+        family = self.is_owner_family(e)
+        with self._lock:
+            with sqlite3.connect(self.db_path) as conn:
+                rows = [r[1:4] for r in self._entity_candidates(conn, e)]
+        hits = [r for r in rows if self._node_is(r[0], e) or self._node_is(r[2], e)]
+        kept = [r for r in hits if self._is_owner_life_fact(*r) and not family]
+        return [r for r in hits if r not in kept], kept
+
+    @classmethod
+    def _is_owner_life_fact(cls, subject, predicate, obj) -> bool:
+        """A durable fact ABOUT THE OWNER (one end is `user`). `forget`
+        keeps these unless asked by name; another person's facts are not
+        the owner's (re-review: Ektoras Koufontinas's parents could not be
+        forgotten and were reported as "facts about you")."""
+        if "user" not in (str(subject or "").strip().lower(), str(obj or "").strip().lower()):
+            return False
+        return cls._is_owner_fact(subject, predicate, obj)
+
+    def forget_entity(self, entity: str) -> tuple:
+        """`forget`'s graph leg (third review): delete the edges where a node
+        IS ``entity`` (archived, as every graph delete). An OWNER fact (see
+        `_is_owner_fact`) is deleted only when its other end is the owner's
+        family member being forgotten; any other owner fact is returned as
+        kept, for the report. Returns ``(deleted, kept_owner_facts)``."""
+        e = str(entity or "").strip().lower()
+        if len(e) < 3:
+            return 0, []
+        family = self.is_owner_family(e)
+        with self._lock:
+            with sqlite3.connect(self.db_path) as conn:
+                rows = self._entity_candidates(conn, e)
+                hits = [r for r in rows if self._node_is(r[1], e) or self._node_is(r[3], e)]
+                kept = [r for r in hits if self._is_owner_life_fact(r[1], r[2], r[3]) and not family]
+                doomed = [r for r in hits if r not in kept]
+                if doomed:
+                    if not self._archive_rows("forget_entity", [(r[1], r[2], r[3], r[4], r[5]) for r in doomed]):
+                        return 0, [(r[1], r[2], r[3]) for r in kept]
+                    conn.executemany("DELETE FROM triplets WHERE rowid = ?", [(r[0],) for r in doomed])
+                    conn.commit()
+            for r in doomed:
+                self._remove_edge(r[1], r[2], r[3])
+        if doomed:
+            self._invalidate_node_cache()
+        return len(doomed), [(r[1], r[2], r[3]) for r in kept]
 
     def delete_by_target(self, target: str) -> int:
         if not target or len(target.strip()) < 3:
@@ -408,6 +715,10 @@ class GraphMemory:
     #: by the forget expansion (forgetting a chess bot must not reach `webos`).
     _EXPANSION_MAX_DEGREE = 8
 
+    #: predicates that name the SAME thing — the only edges the forget
+    #: expansion follows (both directions)
+    _ALIAS_PREDICATE_RE = re.compile(r"ALIAS|AKA|ALSO_KNOWN_AS|KNOWN_AS|NICKNAME\w*|HAS_NICKNAME|SAME_AS|HAS_ALIAS")
+
     def get_connected_entities(self, target: str, limit: int = 8) -> List[str]:
         """Return distinct entity names directly (1 hop) connected to
         ``target``.
@@ -429,19 +740,33 @@ class GraphMemory:
         with self._lock:
             with sqlite3.connect(self.db_path) as conn:
                 rows = conn.execute(
-                    '''SELECT subject, object FROM triplets
+                    '''SELECT subject, object, predicate FROM triplets
                        WHERE (subject LIKE ? OR object LIKE ?)
                        AND valid_until IS NULL''',
                     (like, like)
                 ).fetchall()
             out: List[str] = []
             seen = set()
-            for s, o in rows:
-                # Only follow an edge the target genuinely anchors, and only
-                # to the OTHER endpoint.
-                if self._entity_matches(s, t):
+            for s, o, pred in rows:
+                # only an IDENTITY edge names the same thing twice ("mortimer
+                # IS_A iguana"); a relationship names ANOTHER entity —
+                # `forget leonidas` followed IS_SON_OF to fotini and deleted
+                # the owner's wife's facts (profile-writes review)
+                _p = str(pred or "").upper()
+                # ALIASES only (another name for the same thing): a class
+                # link (`hermes IS_A llm`) led the forget to sweep every
+                # edge and fact naming the class word (third review)
+                if not self._ALIAS_PREDICATE_RE.fullmatch(_p):
+                    continue
+                # the target must BE the node (not a token of it: `forget
+                # postgresql` reached "evolmonkey IS_A postgresql services
+                # company"), and a class link runs one way only: the thing →
+                # its class ("mortimer IS_A iguana"); a class's instances are
+                # never followed. Aliases run both ways.
+                _sn, _on = str(s or "").lower().strip(), str(o or "").lower().strip()
+                if _sn == t:
                     neighbours = (o,)
-                elif self._entity_matches(o, t):
+                elif _on == t:
                     neighbours = (s,)
                 else:
                     continue
@@ -509,6 +834,11 @@ class GraphMemory:
                               AND timestamp < {cutoff_expr}""",
                         (int(keep_min_weight),),
                     ).fetchall()
+                    # an OWNER fact never decays by age (profile-writes review:
+                    # `user MARRIED_TO fotini`, `HAS_CHILD leonidas`, the
+                    # HAS_<KEY> edges update_profile writes, `user OWNS …` —
+                    # stated once, never reinforced, due to go at 45 days)
+                    rows = [r for r in rows if not self._is_owner_fact(r[0], r[1], r[2])]
                     # Unattended dream-driven scrub: archive or DON'T prune.
                     if not self._archive_rows("prune_stale_edges", rows):
                         return 0
@@ -525,6 +855,44 @@ class GraphMemory:
         except Exception as e:
             logger.warning("graph prune_stale_edges failed: %s", e)
         return removed
+
+    #: relation WORDS that describe a life (whole tokens of the predicate —
+    #: third review: `.*SON.*` matched PERSON/REASON/SEASON, `.*NAME.*`
+    #: HAS_NAME_SUGGESTIONS)
+    _DURABLE_TOKENS = {"MARRIED", "SPOUSE", "WIFE", "HUSBAND", "PARTNER", "CHILD", "CHILDREN", "SON", "SONS",
+                       "DAUGHTER", "DAUGHTERS", "PARENT", "PARENTS", "MOTHER", "FATHER", "SIBLING", "BROTHER",
+                       "SISTER", "FAMILY", "BIRTH", "BIRTHDATE", "BIRTHDAY", "BORN", "OWNS", "OWNED", "OWN",
+                       "RESIDES", "LIVES", "HOME", "ADDRESS", "EMPLOYED", "EMPLOYER", "PET", "PETS",
+                       # health and profession (re-review: decay had pruned the owner's
+                       # heart condition and medication)
+                       "CONDITION", "CONDITIONS", "MEDICATION", "MEDICATIONS", "DIAGNOSIS", "DIAGNOSED",
+                       "ALLERGY", "ALLERGIES", "ALLERGIC", "HEALTH", "DISEASE", "PROFESSION", "COMPANION"}
+    #: a `user HAS_<KEY>` written by a probe or a test is noise, not a fact
+    #: about the owner's life (re-review: HAS_TEST_COLOUR kept forever)
+    _NOISE_TOKENS = {"TEST", "TESTING", "PROBE", "DEMO", "EXAMPLE", "DUMMY", "TEMP", "TMP", "SAMPLE", "FAKE",
+                     # §4KY: the AGENT's / a project's state is not the owner's
+                     # life (48 of 96 protected owner edges were this)
+                     "PROJECT", "PROJECTS", "SKILL", "SKILLS", "TASK", "TASKS", "SANDBOX", "FILE", "FILES",
+                     "DOCUMENTATION", "STAT", "STATS", "LEARNING", "CODENAME", "WORKSPACE", "RESOURCE",
+                     "INTROSPECTION", "COMPETENCE", "SESSION"}
+    #: …and whole predicates (WORKS_ON a chat project is not employment)
+    #: (LOCATED_IN: where a place IS — not LOCATED_NEAR / IS_AT, a trip)
+    _DURABLE_PREDICATES = {"HAS_NAME", "IS_NAMED", "NAMED", "WORKS_AT", "WORKS_FOR"}
+
+    @classmethod
+    def _is_owner_fact(cls, subject, predicate, obj) -> bool:
+        """An edge decay must keep: a durable relation (family, birth,
+        ownership, residence, work, a name) whoever its subject, or a field
+        `update_profile` wrote (`user HAS_<KEY> …`). The owner's chatter
+        (`user GREETED ghost`, `user ASKED_ABOUT weather`) is not a fact
+        about the owner's life and still decays (third review: protecting
+        every `user` edge made the graph's main noise permanent)."""
+        p = str(predicate or "").upper()
+        if set(p.split("_")) & cls._NOISE_TOKENS:
+            return False
+        if p in cls._DURABLE_PREDICATES or set(p.split("_")) & cls._DURABLE_TOKENS:
+            return True
+        return str(subject or "").strip().lower() == "user" and p.startswith("HAS_")
 
     def get_recent_triplets(self, limit: int = 100) -> List[Dict[str, str]]:
         with self._lock:

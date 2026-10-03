@@ -171,8 +171,9 @@ async def test_hydrate_context_actually_concurrent(bus, mocks):
     assert timings["peak"] >= 3, (
         f"hydrate_context awaited its fetches sequentially — peak overlap "
         f"was {timings['peak']}, expected 3 concurrent")
-    assert timings["started"] == 4
-    assert timings["finished"] == 4
+    # (+1 since §4KZ: the graph fetch also reads the owner's facts by kind)
+    assert timings["started"] == 5
+    assert timings["finished"] == 5
     # Backstop only, deliberately loose: catches a pathological regression
     # (e.g. an accidental per-fetch retry loop) without re-introducing a
     # timing race on a loaded machine.
@@ -271,7 +272,9 @@ async def test_publish_fact_routes_skill_lesson(bus, mocks):
         "skill": {"task": "T", "mistake": "M", "solution": "S"},
     })
     mocks["skill"].learn_lesson.assert_called_once_with(
-        "T", "M", "S", memory_system=mocks["vector"]
+        "T", "M", "S", memory_system=mocks["vector"],
+        # tagged, and checked against the request in hand (producers review)
+        source="learn_skill", generality_context=""
     )
     assert rep["skill"] == "ok"
 

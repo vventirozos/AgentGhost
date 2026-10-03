@@ -574,6 +574,22 @@
   <code>synthetic_self_play</code> with the sandbox and solver doubled; the data rule is pinned on verbatim container outputs.</p>
   <!-- /4KS:dream -->
 
+  <h2 id="producers-review">Producers review <span class="tag">2026-10-03 memory-writes / producers review</span></h2>
+  <p>See <a href="../memory/skills.html#producers-review">skills: lesson producers</a>: journal-mined challenges never write a
+  lesson; <code>_strip_harness</code> removes the self-play harness's lines from stored mistakes and dream fragments;
+  <code>_patch_with_fallback</code> patches only a fully empty lesson; the fragment cache is persisted.</p>
+  <h2 id="r8">Harness scraps and the self-play share <span class="tag">2026-10-03 &sect;4KX r8</span></h2>
+  <p><code>_strip_harness</code> drops a fragment of 8+ characters found in the harness texts (it was 12: "YOU (e.g." survived).
+  Self-play lessons are checked against the challenge with a shared-word share of 0.75 — a challenge's topic words are the
+  skill's own vocabulary.</p>
+  <h2 id="4ky">Consolidation is a faithful merge <span class="tag">2026-10-03 &sect;4KY</span></h2>
+  <p><code>_consolidation_refusal</code>: a synthesis needs ≥2 OFFERED sources, must be shorter than them, may say only what
+  they say (85% of its words), must merge one topic (every source shares a word with another), and when the sources were
+  written at different times must keep the NEWEST source's new value (two of its new words). Refused: a sources-free "fact",
+  a one-id rewrite, "lives in Athens" kept over a later "moved to Berlin", a wife's allergy turned into the user's, the owner's
+  name folded into a stock-trading fact. The sources are deleted only when the synthesis LANDED (<code>add()</code> did not
+  refuse); the synthesis carries its newest source's timestamp, not "now"; malformed ids/consolidations are skipped, never
+  abort the cycle. <code>VectorMemory.add</code> keeps a repeated synthesis's earlier provenance.</p>
 </main>
 </body>
 </html>

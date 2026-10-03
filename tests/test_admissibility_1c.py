@@ -524,10 +524,11 @@ class TestLessonGate:
         assert self._gate(validator_infra_crash=True)[0] is False
         assert self._gate(mastered=True)[0] is False
         assert self._gate(journal_source="j", passed=True)[0] is False
-        # Journal FAILURES still fall through to the failure branches.
+        # Journal FAILURES write nothing either (producers review): the
+        # challenge is a real user request and the validator the lenient one.
         write, _ = self._gate(journal_source="j", passed=False,
                               is_new_cluster=True)
-        assert write is True
+        assert write is False
 
     def test_first_try_new_cluster_mints(self):
         assert self._gate(passed=True, attempt=0, is_new_cluster=True)[0]

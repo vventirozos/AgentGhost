@@ -576,7 +576,10 @@ class MemoryJournal:
         data = _redact_journal_data(data)
         with self._lock:
             journal = self.load()
-            journal.append({"type": item_type, "data": data})
+            # WHEN it was said (§4KZ): a re-queued older item must not
+            # overwrite a newer fact when it is finally consolidated
+            import time as _t
+            journal.append({"type": item_type, "data": data, "ts": _t.time()})
             if len(journal) > self.max_capacity:
                 # Was silently DROPPING the oldest until 2026-07-23 (~25
                 # back-to-back turns overflowed the old cap of 50 before the

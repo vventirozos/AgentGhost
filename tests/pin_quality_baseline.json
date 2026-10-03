@@ -57,7 +57,7 @@
     "test_auth_rejection_logging.py": 2,
     "test_autonomous_activity.py": 14,
     "test_batch_reply_integrity.py": 1,
-    "test_belief_revision_4r.py": 9,
+    "test_belief_revision_4r.py": 6,
     "test_bench_solve_loop_1c.py": 2,
     "test_bio_time_scale.py": 2,
     "test_boot_ready_ordering.py": 2,
@@ -271,5 +271,5 @@
     "test_workspace_cleanup_deletion_guards.py": 1,
     "test_workspace_tidy.py": 3
   },
-  "total_textual": 1324
+  "total_textual": 1321
 }

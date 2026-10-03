@@ -947,15 +947,20 @@ def lesson_gate_decision(*, aborted_by_solver: bool,
                        "agent failure) → no lesson")
     if mastered:
         return False, "cluster mastered — skipping skill write"
+    if journal_source and not passed:
+        # (producers review) a FAILED journal-mined run minted lessons too —
+        # its challenge text IS a real user request and its validator the
+        # lenient token check, so the lesson restated the request and the
+        # validator ("output must reference input tokens"). No lesson.
+        return False, ("journal-mined failure → the lesson would restate a real user request "
+                       "and the lenient validator; skill write suppressed")
     if journal_source and passed:
         # Journal-mined challenges use a deliberately lenient validator
         # (any stdout referencing a token from input.txt passes). A
         # "pass" therefore carries almost no correctness signal — the
         # compression delta / first-try-win would otherwise trigger a
-        # skill write derived from a trivially-solved run. Failures on
-        # the lenient validator ARE informative (the solver couldn't
-        # even produce any qualifying output) so those fall through to
-        # the failure branches below.
+        # skill write derived from a trivially-solved run. (Failures are
+        # suppressed above as well: their lesson restates the user request.)
         return False, ("journal-mined pass → lenient validator, "
                        "skill write suppressed")
     if passed and attempt > 0:
@@ -1072,6 +1077,150 @@ def trajectory_dream_fragments(context, limit: int = 40):
     return ids, docs
 
 
+#: a line the SELF-PLAY HARNESS wrote, not the agent's work (producers
+#: review: "SYSTEM ALERT: this is the FINAL turn…" became the dream rule
+#: "When a final turn is reached, always provide a direct answer")
+_HARNESS_LINE_RE = re.compile(
+    r"SYSTEM\s*(?:ALERT|BLOCK|INSTRUCTION|NOTE|ERROR)?\b\s*(?:\([^)]*\))?\s*:|\[System\b|\bFINAL turn\b|"
+    r"\bvalidator\b|\bhidden test\b|\bSYNTHETIC TRAINING EXERCISE\b|mbedded AI opponent\b|"
+    r"\bcoded stand-in\b|\bself[- ]play\b|\bPARTICIPANT-MODE\b", re.IGNORECASE)
+
+
+def _harness_texts() -> list:
+    """The directives the harness injects into a run (normalised): any
+    fragment of them in a stored tail is the harness speaking, not the agent
+    (third review: only the marker sentence went, and the rest of the
+    FINAL-turn directive became the dream rule "state the findings and name
+    the sources read")."""
+    out = []
+    try:
+        from .agent import _FORCED_FINAL_ANSWER_DIRECTIVE as _f
+        out.append(_f)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from ..utils.constraints import PARTICIPANT_STEER as _p
+        out.append(_p)
+    except Exception:  # noqa: BLE001
+        pass
+    out.append("SYSTEM ALERT (constraint check): you just wrote an artifact, and this request carries EXPLICIT "
+               "USER CONSTRAINTS: Before replying or marking anything done: re-read what you wrote and verify "
+               "NONE of these are violated. A coded stand-in for a role the user assigned to YOU (e.g. an "
+               "embedded AI opponent when the user said YOU will play) is a violation — fix the artifact NOW "
+               "if so, then continue.")
+    return [" ".join(str(t).split()).lower() for t in out if t]
+
+
+_CONSOL_STOP = frozenset("user users the a an and or of to in on at for with is are was were has have had be been "
+                         "their his her its this that who which as by from also now currently".split())
+
+
+def _consolidation_words(text: str) -> set:
+    return {w for w in re.findall(r"\w+", str(text or "").lower()) if len(w) >= 3 and w not in _CONSOL_STOP}
+
+
+def _same_word(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    k = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        k += 1
+    return k >= 4 and a[k:] in ("", "s", "es", "ed", "ing", "ies") and b[k:] in ("", "s", "es", "ed", "ing", "ies")
+
+
+def _consolidation_refusal(synthesis: str, sources: list):
+    """Why a proposed merge must not run, or None. ``sources`` are the
+    OFFERED fragments it names, as (text, metadata)."""
+    if len(sources) < 2:
+        return "fewer than two offered sources"
+    texts = [t for t, _ in sources]
+    if len(synthesis) > 0.95 * sum(len(t) for t in texts):
+        return "not shorter than its sources"
+    src_words = [_consolidation_words(t) for t in texts]
+    union = set().union(*src_words)
+    syn = _consolidation_words(synthesis)
+    if syn and sum(1 for w in syn if any(_same_word(w, u) for u in union)) / len(syn) < 0.85:
+        return "says things its sources do not"
+    # one topic: every source shares a word with another (a name merged into
+    # a stock-trading fact shares none)
+    for i, w in enumerate(src_words):
+        if not any(w & o for j, o in enumerate(src_words) if j != i):
+            return "merges unrelated facts"
+    # a correction keeps its NEW value: the newest source's own words survive
+    stamped = [(str(m.get("timestamp") or ""), k) for k, (_, m) in enumerate(sources)]
+    if len({t for t, _ in stamped if t}) > 1:
+        newest = max(stamped)[1]
+        older = set().union(*(src_words[k] for k in range(len(sources)) if k != newest))
+        fresh = src_words[newest] - older
+        # (two of its new words, or all when it has fewer: a correction's
+        # value is a name or two — "Berlin", "Kreuzberg")
+        if fresh and sum(1 for w in fresh if any(_same_word(w, x) for x in syn)) < min(2, len(fresh)):
+            return "drops the newest source's value"
+    return None
+
+
+def _strip_harness(text: str) -> str:
+    """The text without the harness's own lines, sentences and fragments."""
+    texts = _harness_texts()
+    parts = re.split(r"(?<=[.!?])\s+|\n", str(text or ""))
+    keep = []
+    for p in parts:
+        n = " ".join(p.split()).lower()
+        if not n or _HARNESS_LINE_RE.search(p):
+            continue
+        if len(n) >= 8 and any(n in t for t in texts):     # "YOU (e.g." scraps (re-review)
+            continue
+        keep.append(p.strip())
+    return " ".join(keep)
+
+
+def _dream_cache_path(context):
+    fp = getattr(getattr(context, "skill_memory", None), "file_path", None)
+    try:
+        from pathlib import Path as _P
+        return _P(fp).parent / "dream_fragment_cache.json" if isinstance(fp, (str, _P)) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _load_dream_cache(context) -> dict:
+    """The persisted per-namespace fragment window ({} when none)."""
+    import json as _json
+    path = _dream_cache_path(context)
+    try:
+        raw = _json.loads(path.read_text(encoding="utf-8")) if path is not None and path.exists() else {}
+        return {str(k): frozenset(map(str, v)) for k, v in raw.items() if isinstance(v, list)}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _save_dream_cache(context, cache: dict) -> None:
+    import json as _json
+    path = _dream_cache_path(context)
+    if path is None:
+        return
+    try:
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(_json.dumps({k: sorted(map(str, v)) for k, v in cache.items()}), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _stamp_dream_cache(context, namespace: str, fragment_key) -> dict:
+    """Record a dreamed window for ``namespace`` — in memory AND on disk,
+    keeping every other namespace (a restart must not re-dream any of
+    them)."""
+    cache = getattr(context, "_last_dream_fragment_ids", None)
+    cache = dict(cache) if isinstance(cache, dict) else _load_dream_cache(context)
+    cache[namespace] = frozenset(fragment_key)
+    context._last_dream_fragment_ids = cache
+    _save_dream_cache(context, cache)
+    return cache
+
+
 def selfplay_dream_fragments(context, limit: int = 20):
     """Digest recent self-play outcomes into REM seed fragments.
 
@@ -1122,7 +1271,7 @@ def selfplay_dream_fragments(context, limit: int = 20):
                 f" | OUTCOME: {'PASSED' if passed else 'FAILED'}"
                 f" | ATTEMPTS: {attempts}"
             )
-            mistake = " ".join(str(o.get("mistake") or "").split())
+            mistake = " ".join(_strip_harness(str(o.get("mistake") or "")).split())
             if mistake:
                 doc += f" | MISTAKE: {mistake[:200]}"
             ids.append(f"selfplay:{cluster_key}:{ts}")
@@ -1748,6 +1897,12 @@ def _patch_with_fallback(
     fix = (parsed.get("correct_pattern") or parsed.get("solution") or "").strip()
     if trig and fix:
         return parsed  # already viable; no patching needed
+    if trig or fix:
+        # half a lesson is not patched: a specific LLM trigger with a generic
+        # template fix (or the reverse) is a mismatched pair (producers
+        # review: "Parsing Apache logs with IPv6 addresses" → "On a
+        # regex_parse task …"). The cycle writes no lesson.
+        return parsed
 
     challenge_head = (challenge or "")[:200].strip().replace("\n", " ")
     cluster = cluster_key or "general"
@@ -1755,9 +1910,9 @@ def _patch_with_fallback(
     if outcome == "STRUGGLED_THEN_WON":
         fallback_trig = f"hard cases in the {cluster} cluster requiring retry-on-failure"
         fallback_pat = (
-            f"On a {cluster} task, when the first attempt fails the "
-            "validator, re-read the validator feedback (expected vs. "
-            "actual diff) and identify the specific mismatch — most "
+            f"On a {cluster} task, when the first attempt fails, "
+            "re-read the failure output (expected vs. actual) and "
+            "identify the specific mismatch — most "
             "common shapes are float formatting (`round()` vs. "
             "f-string), tie-break ordering, off-by-one bounds, and "
             "edge cases on empty / missing rows."
@@ -1793,12 +1948,9 @@ def _patch_with_fallback(
         return parsed  # FIRST_TRY_SUCCESS — don't fabricate.
 
     out = dict(parsed)
-    if not trig:
-        out["trigger"] = fallback_trig
-    if not fix:
-        out["correct_pattern"] = fallback_pat
-    if not out.get("anti_pattern"):
-        out["anti_pattern"] = fallback_anti
+    out["trigger"] = fallback_trig
+    out["correct_pattern"] = fallback_pat
+    out["anti_pattern"] = fallback_anti
     out.setdefault("domains", [cluster_key] if cluster_key in _KNOWN_DOMAINS else [])
     out.setdefault("confidence", 0.30)
     # Tag the fallback so we can audit later.
@@ -2460,6 +2612,16 @@ class Dreamer:
         # per seed source instead.
         seed_namespace = "traj_selfplay" if seeded_from_trajectories else "auto"
         _frag_cache = getattr(self.context, "_last_dream_fragment_ids", None)
+        if not isinstance(_frag_cache, (dict, frozenset)):
+            # (producers review) the cache lived in memory only: every
+            # restart re-dreamed the same window and re-minted the rules a
+            # repair had just retracted. It is persisted beside the playbook,
+            # and the loaded copy is ATTACHED so the next stamp keeps every
+            # namespace (re-review: the first stamp after a restart saved
+            # only its own namespace)
+            _frag_cache = _load_dream_cache(self.context)
+            if _frag_cache:
+                self.context._last_dream_fragment_ids = dict(_frag_cache)
         if isinstance(_frag_cache, frozenset):
             # Legacy single-set shape (pre-namespace): treat it as this
             # namespace's entry so an unchanged window still skips once.
@@ -2590,36 +2752,33 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             applied_consolidations = 0
             skipped_low_compression = 0
 
+            # §4KY (dream review): a consolidation is only a MERGE of offered
+            # facts — ≥2 real sources, shorter than them, saying nothing they
+            # do not say, about one topic, keeping the NEWEST value of a
+            # correction. The model fabricated sources-free "facts", merged a
+            # name into a stock-trading fact, and kept "lives in Athens" over
+            # the later "moved to Berlin".
+            _metas = results.get("metadatas") if isinstance(results, dict) else None
+            _metas = _metas if isinstance(_metas, list) and len(_metas) == len(ids) else [{}] * len(ids)
+            _offered = {str(i): (str(d or ""), (m or {}) if isinstance(m, dict) else {})
+                        for i, d, m in zip(ids, documents, _metas)}
             for c in consolidations:
-                synthesis = c.get("synthesis", "")
-                merged_ids = c.get("merged_ids", [])
+                if not isinstance(c, dict):
+                    continue
+                synthesis = str(c.get("synthesis") or "").strip()
+                _raw_ids = c.get("merged_ids")
+                merged_ids = [str(m) for m in _raw_ids] if isinstance(_raw_ids, list) else []
 
                 if not synthesis:
                     continue
-
-                # Compute compression ratio against the source fragments
-                if merged_ids and len(merged_ids) >= 2:
-                    source_chars = 0
-                    for mid in merged_ids:
-                        clean_id = mid.split(":")[-1].strip()
-                        # Look up the source text length from our original documents
-                        for doc_id, doc_text in zip(ids, documents):
-                            if doc_id == clean_id:
-                                source_chars += len(doc_text)
-                                break
-
-                    synthesis_chars = len(synthesis)
-                    if source_chars > 0:
-                        compression_ratio = 1.0 - (synthesis_chars / source_chars)
-                    else:
-                        compression_ratio = 0.0
-
-                    # Skip if compression is negligible (< 5%) — the synthesis
-                    # isn't adding value, it's just paraphrasing.
-                    if compression_ratio < 0.05 and source_chars > 0:
-                        skipped_low_compression += 1
-                        pretty_log("Dream Skip", f"Skipped low-compression consolidation ({compression_ratio:.1%}): {synthesis[:50]}...", icon=Icons.SKIP)
-                        continue
+                _src = list(dict.fromkeys(m.split(":")[-1].strip() for m in merged_ids))
+                _src = [i for i in _src if i in _offered]
+                _why = _consolidation_refusal(synthesis, [_offered[i] for i in _src])
+                if _why:
+                    skipped_low_compression += 1
+                    pretty_log("Dream Skip", f"Skipped consolidation ({_why}): {synthesis[:50]}...", icon=Icons.SKIP)
+                    continue
+                merged_ids = _src
 
                 # Tag syntheses as "synthesis" rather than "auto" so
                 # subsequent dream cycles don't recursively re-consolidate
@@ -2641,7 +2800,10 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                 # curation prunable type (its merged sources are deleted
                 # right below, so eviction loses the only copy).
                 from ..utils.helpers import get_utc_timestamp as _guts
-                _syn_meta = {"type": "synthesis", "timestamp": _guts()}
+                # the NEWEST source's time, not "now": a merge is not news, and
+                # a fresh stamp let a stale synthesis outrank a correction
+                _src_ts = [str(_offered[i][1].get("timestamp") or "") for i in merged_ids]
+                _syn_meta = {"type": "synthesis", "timestamp": max([t for t in _src_ts if t] or [_guts()])}
                 if _prov:
                     # Cap the LIST, not the serialized string: slicing the
                     # JSON at 1800 chars made it unparseable for ~12+
@@ -2663,7 +2825,13 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                                icon=Icons.SKIP)
                     continue
                 _syn_id = hashlib.md5(str(synthesis).encode("utf-8")).hexdigest()
-                await asyncio.to_thread(self.memory.add, synthesis, _syn_meta)
+                _added = await asyncio.to_thread(self.memory.add, synthesis, _syn_meta)
+                # the sources go only when the synthesis LANDED (dream review:
+                # a refused write still deleted the birth date and both sons)
+                if isinstance(_added, str) and _added.startswith("refused"):
+                    pretty_log("Dream Skip", f"Consolidation not stored ({_added}) — sources kept: {synthesis[:50]}...",
+                               icon=Icons.SKIP)
+                    continue
                 applied_consolidations += 1
                 # Log what was ACCEPTED, not only the rejections — before this,
                 # every "Dream Skip" logged while the actual work was silent,
@@ -2744,12 +2912,18 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                         # contribution by provenance. Retrieval is trigger/BM25-
                         # keyed, so a content-derived trigger is also findable.
                         _h_task = " ".join(str(h).split())[:80] or "Dream Heuristic"
-                        await asyncio.to_thread(
+                        _hw = await asyncio.to_thread(
                             self.context.skill_memory.learn_lesson,
                             _h_task, "none", h,
                             memory_system=self.memory,
                             trigger=_h_task,
                             source="dream",
+                            # the window it was read from: a name, number or file
+                            # taken from it makes the rule specific (producers
+                            # review — "e.g., Hetzner pricing pages"); against a
+                            # whole window only those markers count, not word share
+                            generality_context="\n".join(str(d) for d in (documents or []))[:20000],
+                            generality_max_share=1.0,
                             # §4KS: the window this heuristic was read out
                             # of. A re-dream needs only REDREAM_MIN_NEW_
                             # FRAGMENTS fresh fragments, so the same rule is
@@ -2761,7 +2935,8 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                             evidence_refs=[str(i) for i in (ids or [])],
                             evidence_min_new_fraction=DREAM_EVIDENCE_MIN_NEW_FRACTION,
                         )
-                        kept_heuristics += 1
+                        if _hw:
+                            kept_heuristics += 1   # counted only when written (re-review)
 
             # --- CROSS-EPISODE PATTERN DETECTION ---
             # Scan the skill playbook for recurring tool-call sequences
@@ -2771,7 +2946,7 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                 if hasattr(self.context, 'skill_memory') and self.context.skill_memory:
                     patterns = detect_tool_patterns(self.context.skill_memory)
                     for p in patterns:
-                        await asyncio.to_thread(
+                        _pw = await asyncio.to_thread(
                             self.context.skill_memory.learn_lesson,
                             f"[Pattern] {p['pattern_name']}",
                             "none",
@@ -2785,7 +2960,11 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                             # again only when its support changed.
                             evidence_refs=[f"{p['pattern_name']}#{p.get('frequency')}"],
                         )
-                        patterns_found += 1
+                        # counted only when WRITTEN (producers review: the gate
+                        # rejects "Recurring tool pattern …" text, yet every
+                        # pattern was counted as found)
+                        if _pw:
+                            patterns_found += 1
             except Exception as pe:
                 logger.debug(f"Pattern detection in dream failed: {pe}")
 
@@ -2848,7 +3027,7 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             if dropped_heuristics > 0:
                 metrics_note = f" ({dropped_heuristics} non-actionable heuristics dropped)"
             if skipped_low_compression > 0:
-                metrics_note += f" ({skipped_low_compression} low-compression consolidations skipped)"
+                metrics_note += f" ({skipped_low_compression} consolidations refused: not a faithful merge of ≥2 related sources)"
             if patterns_found > 0:
                 metrics_note += f" ({patterns_found} tool-call patterns detected)"
             if macros_proposed > 0:
@@ -2920,10 +3099,7 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             # against a valid retry. Stamped per seed namespace (see the
             # guard above).
             if parsed_ok:
-                _stamp_cache = getattr(self.context, "_last_dream_fragment_ids", None)
-                _stamp_cache = dict(_stamp_cache) if isinstance(_stamp_cache, dict) else {}
-                _stamp_cache[seed_namespace] = current_fragment_key
-                self.context._last_dream_fragment_ids = _stamp_cache
+                _stamp_dream_cache(self.context, seed_namespace, current_fragment_key)
             else:
                 pretty_log(
                     "Dream Mode",
@@ -3325,7 +3501,9 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             ) or "no tool calls"
             line = (
                 f"- EP{ep_id} [{ep.get('cluster_id') or 'general'}] "
-                f"TRIGGER: {str(ep.get('trigger', ''))[:120]} | "
+                # "REQUEST", not "TRIGGER" — the label leaked into rules ("When
+                # the trigger requires …", producers review)
+                f"REQUEST: {str(ep.get('trigger', ''))[:120]} | "
                 f"ACTIONS: {chain} | "
                 f"OUTCOME: {'SUCCESS' if ep.get('outcome_success') else 'FAILURE'}"
                 f" — {str(ep.get('outcome', ''))[:100]}"
@@ -3402,17 +3580,20 @@ Return ONLY valid JSON:
                 continue
             if hasattr(self.context, "skill_memory") and self.context.skill_memory:
                 _task = " ".join(str(s).split())[:80] or "Episode Strategy"
-                await asyncio.to_thread(
+                _w = await asyncio.to_thread(
                     self.context.skill_memory.learn_lesson,
                     _task, "none", s,
                     memory_system=self.memory,
                     trigger=_task,
                     source="episode",
+                    generality_context="\n".join(lines),
+                    generality_max_share=1.0,
                     # Drill-down provenance: the episode rows this batch
                     # generalized from ("ep:<id>" resolves via get_episode).
                     source_refs=[f"ep:{i}" for i in ep_ids[:20]],
                 )
-                learned += 1
+                if _w:
+                    learned += 1
 
         # A successful parse means the batch was considered — mark it even
         # when zero strategies survived the gate, otherwise the same rows
@@ -6906,7 +7087,8 @@ Return ONLY a JSON object with:
                             attempt + 1,
                             passed,
                             description_length,
-                            "" if passed else (full_simulation_transcript[-400:] if full_simulation_transcript else ""),
+                            "" if passed else (_strip_harness(full_simulation_transcript)[-400:]
+                                               if full_simulation_transcript else ""),
                             solution_source,
                             template_key,
                             solution_novelty,
@@ -7265,7 +7447,7 @@ Return ONLY a JSON object with:
                             # or "bench" for a bench-bank solve (§4BF 1c:
                             # lessons admit bench TAGGED; the tag is the
                             # audit/retract handle, retrieval never reads it).
-                            await asyncio.to_thread(
+                            _saved = await asyncio.to_thread(
                                 self.context.skill_memory.learn_lesson,
                                 learned_lesson.get("task") or trig,
                                 learned_lesson.get("mistake") or learned_lesson.get("anti_pattern", ""),
@@ -7279,9 +7461,16 @@ Return ONLY a JSON object with:
                                 source_challenge_hash=challenge_hash,
                                 verified=verified_flag,
                                 source=("bench" if bench_meta else "self_play"),
+                                # the challenge text: a rule restating its numbers,
+                                # names or files is not general (producers review)
+                                generality_context=str(challenge or ""),
+                                # a challenge's TOPIC words are the skill's own
+                                # vocabulary (re-review: 0.5 refused rules that
+                                # only named the topic)
+                                generality_max_share=0.75,
                             )
                             pretty_log(
-                                "Self-Play Lesson Saved",
+                                "Self-Play Lesson Saved" if _saved else "Self-Play Lesson Refused",
                                 f"trigger='{trig[:60]}' verified={verified_flag} "
                                 f"conf={final_conf:.2f} domains={domains}",
                                 icon=Icons.OK,

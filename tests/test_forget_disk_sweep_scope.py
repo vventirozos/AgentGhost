@@ -893,13 +893,13 @@ async def test_every_sweep_sees_the_same_normalised_target(tmp_path, spelling):
 
     graph = MagicMock()
     graph.get_connected_entities = MagicMock(return_value=[])
-    graph.delete_by_target = MagicMock(return_value=1)
+    graph.forget_entity = MagicMock(return_value=(1, []))
 
     await tool_unified_forget(
         spelling, sandbox_dir=tmp_path, memory_system=_memsys(),
         profile_memory=pm, graph_memory=graph)
 
-    assert graph.delete_by_target.call_args[0][0] == "atlas", (
+    assert graph.forget_entity.call_args[0][0] == "atlas", (
         f"{spelling!r} reached the graph sweep unnormalised"
     )
     assert "atlas" not in (pm.load().get("interests") or {}), (
@@ -967,7 +967,7 @@ async def test_a_trailing_slash_does_not_split_the_call(tmp_path):
         "notes/", sandbox_dir=tmp_path, memory_system=_memsys(),
         graph_memory=graph)
 
-    assert graph.delete_by_target.call_args[0][0] == "notes", (
+    assert graph.forget_entity.call_args[0][0] == "notes", (
         "the trailing slash reached the graph sweep"
     )
 
@@ -1074,7 +1074,7 @@ async def test_the_expansion_and_the_value_prune_see_the_same_target(
     # NO expansion: the value prune is then the only path that can remove
     # the entry, so this test cannot pass for some other sweep's reason.
     graph.get_connected_entities = MagicMock(return_value=[])
-    graph.delete_by_target = MagicMock(return_value=1)
+    graph.forget_entity = MagicMock(return_value=(1, []))
 
     report = await tool_unified_forget(
         spelling, sandbox_dir=tmp_path, memory_system=_memsys(),
@@ -1093,3 +1093,22 @@ async def test_the_expansion_and_the_value_prune_see_the_same_target(
     assert f"'{spelling}'" not in report or spelling == "mortimer", (
         f"the report names {spelling!r}, which no sweep consulted"
     )
+
+
+#: the tests here that run reset_all (by name: the fixture must not read source)
+_WIPE_TESTS = {'test_reset_all_never_touches_the_store_from_the_event_loop', 'test_reset_all_enumerates_once', 'test_reset_all_says_what_it_orphans', 'test_reset_all_with_nothing_protected_reports_plainly', 'test_a_failed_wipe_does_not_claim_to_have_removed_anything', 'test_a_partly_failed_wipe_does_not_empty_the_catalogue', 'test_reset_all_holds_the_vector_lock_across_the_WHOLE_wipe', 'test_an_odd_store_shape_neither_raises_nor_lies'}
+
+
+@pytest.fixture(autouse=True)
+def _a_user_who_confirms_the_wipe(request, monkeypatch):
+    """reset_all is preview → confirm in a later turn (§4KX r8); these tests
+    run the confirmed wipe. ONLY the tests that call it — a module-wide
+    wrapper would mask the preview step elsewhere (re-review)."""
+    if request.node.originalname in _WIPE_TESTS:
+        import ghost_agent.tools.memory as _m
+        from tests._wipe_confirm import confirming
+        _wrapped = confirming(_m.tool_knowledge_base)
+        monkeypatch.setattr(_m, "tool_knowledge_base", _wrapped)       # function-local imports
+        if hasattr(request.module, "tool_knowledge_base"):
+            monkeypatch.setattr(request.module, "tool_knowledge_base", _wrapped)
+    yield

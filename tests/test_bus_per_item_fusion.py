@@ -344,8 +344,10 @@ def test_identity_and_synthesis_types_scored_from_metadata(monkeypatch):
     ])
     kept = {item["mem_id"]: item for item in sel}
     # identity at dist .75 passes its .8 threshold; auto at .75 fails .55
-    assert "i1" in kept and kept["i1"]["p_score"] == -10
-    assert "s1" in kept and kept["s1"]["p_score"] == -15
+    # §4KZ: the profile's mirror (identity) is the CURRENT owner fact — above a
+    # synthesis of older fragments
+    assert "i1" in kept and kept["i1"]["p_score"] == -15
+    assert "s1" in kept and kept["s1"]["p_score"] == -10
     assert "a1" not in kept
 
 

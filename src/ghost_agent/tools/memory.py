@@ -38,6 +38,28 @@ def _member_block():
     return None
 
 
+def _owner_write_block():
+    """§4KY review: a PROBE (`probe-` id) or the agent's own background work
+    (`job-`/`sched-`/`sub-`) wrote `user HAS_PROFESSION pilot` and
+    `root.profession` through update_profile / insert_fact — "a probe never
+    teaches" held for the journal but not for the tools. Facts about the
+    owner come from the owner's own turns; a member is refused as before."""
+    _m = _member_block()
+    if _m is not None:
+        return _m
+    try:
+        from ..utils.logging import request_id_context, is_probe_request_id
+        from ..core.autonomous_activity import is_internal_request
+        rid = str(request_id_context.get() or "")
+        if is_probe_request_id(rid) or is_internal_request(rid):
+            return ToolOutcome.rejected(
+                "NOT written: facts about the owner come from the owner's own conversations — a diagnostic "
+                "probe or a background job does not write them.", reason_code="owner_write_not_owner_turn")
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
 #: Trailing path separators to strip from a model-supplied target. A literal
 #: `"/" + os.sep` is `"//"` on POSIX — `rstrip` takes a CHARACTER SET, so the
 #: duplicate was a no-op tell that the argument was misread as a suffix.
@@ -105,14 +127,8 @@ def _value_mentions_target(value, target_lc: str) -> bool:
     ``'Mortimer the iguana (removed)'``. Multi-word targets fall back to a
     plain substring test (token membership can't span spaces).
     """
-    import re
-    v = str(value).lower()
-    t = str(target_lc).strip()
-    if not t:
-        return False
-    if " " in t:
-        return t in v
-    return t in re.split(r"[^a-z0-9]+", v)
+    from ..memory.profile import mentions
+    return mentions(value, target_lc)
 
 
 class _NullCM:
@@ -204,6 +220,277 @@ def _target_word_coverage(fact: str, target: str):
         return None
 
 
+_OWNER_IDENTITY_KEYS = {"name", "email", "phone", "address", "location", "birthday", "birthdate", "age", "pronouns",
+                        "nationality", "timezone", "username", "nickname"}
+
+
+def _is_owner_name(profile_memory, target: str) -> bool:
+    """``target`` is the owner's own name (root.name, or one of its words)."""
+    try:
+        own = str(((profile_memory.load() or {}).get("root") or {}).get("name") or "").strip().lower() \
+            if profile_memory else ""
+    except Exception:  # noqa: BLE001
+        return False
+    from ..memory.profile import _fold
+    own, t = _fold(own).strip(), _fold(target).strip()       # (r8 review: "Βασίλης" vs its folded entity)
+    return bool(own) and bool(t) and (t == own or t in own.split())
+
+
+def _names_an_entity(target: str) -> bool:
+    """A target with a distinctive word that is not only an attribute noun
+    ("wife", "name", "home" name no entity) — profile-writes review."""
+    d = _distinct_words(target)
+    return bool(d) and not d <= _FORGET_ATTRIBUTE_WORDS
+
+
+def _current_request_text() -> str:
+    try:
+        from ..memory.lesson_scope import current_request
+        return str(current_request.get() or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _distinct_words(target: str) -> set:
+    """The target's words that can name a particular fact (not hub words)."""
+    try:
+        from ..memory.lesson_scope import content_words
+        return {w for w in content_words(target) if w not in _FORGET_HUB_WORDS and len(w) >= 2}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def _is_the_value(value, target_lc: str) -> bool:
+    """The stored value IS the target, or is ABOUT it — its distinctive words
+    are all the target's, or it is a single item that STARTS with the
+    target's entity words ("Mortimer the iguana", "Tesla Model 3" for "my old
+    car Tesla"). A value listing several things ("BMW 118i, Ducati …") is
+    not (third review: over-correction left Mortimer in the profile)."""
+    vw, tw = _distinct_words(str(value)), _distinct_words(target_lc)
+    if not vw or not tw:
+        return False
+    if vw <= tw:
+        return True
+    entity = [w for w in _ordered_words(target_lc) if w in tw and w not in _FORGET_ATTRIBUTE_WORDS]
+    if not entity or re.search(r"[,;/&]|\band\b", str(value), re.IGNORECASE):
+        return False
+    return _ordered_words(str(value))[:len(entity)] == entity
+
+
+def _ordered_words(text: str) -> list:
+    try:
+        from ..memory.lesson_scope import normalize_request
+        return [w for w in normalize_request(text).split() if w not in _FORGET_HUB_WORDS]
+    except Exception:  # noqa: BLE001
+        return str(text).lower().split()
+
+
+#: relation nouns name a PERSON ("my wife Fotini"); the other attribute nouns
+#: QUALIFY an entity ("Fotini's birthday") and narrow the forget to that fact
+_RELATION_WORDS = frozenset("wife husband son sons daughter daughters child children kids family".split())
+_QUALIFIER_WORDS = _FORGET_ATTRIBUTE_WORDS - _RELATION_WORDS
+
+
+def _entity_of(target: str) -> str:
+    """The entity a forget target names, as stored names spell it: hub,
+    attribute and function words dropped, possessives stripped, and dots and
+    hyphens KEPT ("node.js", "pista-gp") — re-review: the normalised words
+    turned "notes.md" into one U+2024 token and "x-ray" into "x ray", so a
+    dotted or hyphenated name never reached the graph."""
+    from ..memory.profile import _fold
+    # (a possessive's "s" is a one-letter token, dropped below)
+    toks = re.findall(r"\w(?:[\w.\-]*\w)?", _fold(target))
+    named = [i for i, w in enumerate(toks) if w not in _FORGET_HUB_WORDS and w not in _FORGET_ATTRIBUTE_WORDS
+             and _distinct_words(w)]
+    if not named:
+        return ""
+    # function words INSIDE the name stay ("vale of tempe", "messmer the
+    # impaler" — r8 review); hub/attribute words never do
+    span = toks[named[0]:named[-1] + 1]
+    return " ".join(w for w in span if w not in _FORGET_HUB_WORDS and w not in _FORGET_ATTRIBUTE_WORDS
+                    and (len(w) >= 2 or w.isdigit()))
+
+
+def _qualifiers_of(target: str) -> list:
+    """The attribute nouns that qualify the entity: AFTER it ("Fotini's
+    birthday", "Leonidas birthdate") or joined by "of" ("the birthday of
+    Fotini") — not a category before it ("my old car Tesla" is the car)."""
+    from ..memory.lesson_scope import normalize_request
+    words = _ordered_words(target)
+    ent = set(normalize_request(_entity_of(target)).split())
+    first = next((i for i, w in enumerate(words) if w in ent), None)
+    if first is None:
+        return []
+    of = re.search(r"\bof\b", str(target), re.IGNORECASE) is not None
+    return [w for i, w in enumerate(words) if w in _QUALIFIER_WORDS and (i > first or of)]
+
+
+#: an attribute's other names in keys and predicates (r8 review: BORN_ON was
+#: missed for "birthday"; a 4-letter stem took COMPANION for "company")
+_QUALIFIER_SYNONYMS = {
+    "birthday": {"birth", "birthday", "birthdate", "born", "dob"},
+    "birthdays": {"birth", "birthday", "birthdate", "born", "dob"},
+    "birthdate": {"birth", "birthday", "birthdate", "born", "dob"},
+    "job": {"job", "jobs", "occupation", "profession", "employed", "employer", "works"},
+    "work": {"work", "works", "worked", "employed", "employer", "occupation", "profession"},
+    "company": {"company", "employer", "employed", "works"},
+    "employer": {"company", "employer", "employed", "works"},
+    "name": {"name", "named", "called", "nickname"},
+    "home": {"home", "lives", "resides", "address"},
+    "address": {"address", "addresses", "lives", "resides"},
+    "city": {"city", "lives", "resides", "located"},
+    "town": {"town", "lives", "resides", "located"},
+    "location": {"location", "located", "lives", "resides"},
+    "phone": {"phone", "mobile", "number"},
+    "email": {"email", "emails", "mail"},
+}
+
+
+def _qualifier_matches(words, quals) -> bool:
+    """A key/predicate word names the qualifier: the same word, an
+    inflection of it (`_word_matches`), or one of its listed other names."""
+    for t in words:
+        t = str(t).lower()
+        for q in quals:
+            if t == q or _word_matches(q, t) or t in _QUALIFIER_SYNONYMS.get(q, ()):
+                return True
+    return False
+
+
+def _forget_profile(profile_memory, target: str, related: bool = False, qualifiers=(), family: bool = False) -> list:
+    """The profile leg of `forget` (profile-writes review). Deletes:
+      * an explicit ``category.key``;
+      * the ONE key named exactly by a specific target (not a hub or attribute
+        word: `forget name` no longer deleted the owner's name);
+      * a list ITEM naming the target, or a scalar whose value IS the target.
+    Lists, never deletes: a key that only partly matches (`son` →
+    `son_thodoris_birthdate`), several exact keys, and a scalar that MENTIONS
+    the target among other things (`Athens` in the home address, `BMW` in a
+    vehicles line). ``related``: an alias from the graph — values only."""
+    out, cands = [], []
+    target_lc = str(target).lower().strip()
+    data = profile_memory.load()
+    if getattr(profile_memory, "_degraded", False) is True:
+        return ["⚠️ Profile: the profile store could not be read — its fields were NOT searched."]
+    distinct = _distinct_words(target_lc)
+    if qualifiers and not related:
+        # (re-review) "Fotini's birthday" deleted the wife-name field and
+        # every edge about her: an attribute-qualified target removes only
+        # the fields naming BOTH the entity and the attribute; fields that
+        # merely mention the entity are listed
+        from ..memory.profile import _fold
+        ent = set(_entity_of(target).split())
+        hit, near = [], []
+        for cat, sub in data.items():
+            if not isinstance(sub, dict):
+                continue
+            for k, v in sub.items():
+                kw = _fold(k).replace("-", "_").split("_")
+                has_ent = bool(ent) and any(w in kw for w in ent)
+                if has_ent and _qualifier_matches(kw, qualifiers):
+                    hit.append((cat, k))
+                elif has_ent or (ent and any(_value_mentions_target(v, w) for w in ent)):
+                    near.append(f"{cat}.{k}")
+        for cat, k in hit:
+            out.append(_profile_line(profile_memory.delete(cat, k), f"Removed {cat}.{k}"))
+        cands += near
+        data = profile_memory.load()
+        _pl = _FORGET_PLAN.get()
+        if _pl is not None:
+            for c in dict.fromkeys(cands):
+                _cat, _k = c.split(".", 1)
+                _pl.add("profile_field", {"category": _cat, "key": _k},
+                        f"profile {c} = {str((data.get(_cat) or {}).get(_k))[:80]!r}", default=False)
+        if cands:
+            out.append("ℹ️ Profile: these fields mention '" + _entity_of(target) + "' — NOT changed: "
+                       + ", ".join(dict.fromkeys(cands)) + ".")
+        return out
+    tag = f" (related '{target}')" if related else ""
+    m = re.fullmatch(r"([a-z_]+)\.([a-z0-9_]+)", target_lc)
+    if m and not related:
+        cat, k = m.group(1), m.group(2)
+        if isinstance(data.get(cat), dict) and k in data[cat]:
+            return [_profile_line(profile_memory.delete(cat, k), f"Removed {cat}.{k}")]
+    handled = set()
+    if not related:
+        exact, partial = [], []
+        key_form = target_lc.replace(" ", "_").replace("-", "_")
+        # …and the ENTITY's form (r8 review: "my wife Fotini" listed
+        # `fotini_description` while "Fotini" deleted it)
+        ent_form = _entity_of(target_lc).replace(" ", "_").replace("-", "_")
+        forms = [f for f in dict.fromkeys((key_form, ent_form)) if len(f) >= 3]
+        for cat, sub in data.items():
+            if not isinstance(sub, dict):
+                continue
+            for k in sub:
+                kl = k.lower()
+                if kl == key_form:
+                    exact.append((cat, k))
+                elif any(f in kl.split("_") or kl.startswith(f + "_") or kl.endswith("_" + f) for f in forms):
+                    partial.append((cat, k))
+        if len(exact) == 1 and distinct and not distinct <= _FORGET_ATTRIBUTE_WORDS:
+            cat, k = exact[0]
+            out.append(_profile_line(profile_memory.delete(cat, k), f"Removed {cat}.{k}"))
+            handled.add(exact[0])
+        else:
+            cands += [f"{c}.{k}" for c, k in exact]
+        if family:
+            # forgetting a family PERSON takes the fields named after them
+            # too (re-review: `fotini_description` outlived the graph edges)
+            for c, k in partial:
+                if (c, k) not in handled:
+                    out.append(_profile_line(profile_memory.delete(c, k), f"Removed {c}.{k}"))
+                    handled.add((c, k))
+        cands += [f"{c}.{k}" for c, k in partial if (c, k) not in handled]
+        data = profile_memory.load()
+    if distinct and distinct <= _FORGET_ATTRIBUTE_WORDS and not related:
+        # an attribute word names no entity — list the fields it names
+        # ("forget my wife" → relationships.wife_name), never delete
+        for cat, sub in data.items():
+            if isinstance(sub, dict):
+                cands += [f"{cat}.{k}" for k in sub
+                          if any(a in k.lower().replace("-", "_").split("_") for a in distinct)]
+    if distinct and not distinct <= _FORGET_ATTRIBUTE_WORDS:
+        # a REPLACED value kept as `previous` is forgotten too
+        # the ENTITY decides a mention ("tesla" in "my old car Tesla"), dots
+        # and hyphens kept ("node.js" — r8 review: the normalised words made
+        # it one U+2024 token that matched nothing)
+        mention = _entity_of(target_lc) or target_lc
+        if hasattr(profile_memory, "drop_previous_mentioning"):
+            for line in profile_memory.drop_previous_mentioning(mention):
+                out.append(f"✅ Profile: {line}")
+        for cat, sub in list(data.items()):
+            if not isinstance(sub, dict):
+                continue
+            for k, v in list(sub.items()):
+                if (cat, k) in handled:
+                    continue
+                if isinstance(v, list):
+                    if any(_value_mentions_target(it, mention) for it in v):
+                        res = profile_memory.prune_value(cat, k, mention)
+                        out.append(_profile_line(res, f"{res}{tag}"))
+                elif _value_mentions_target(v, mention):
+                    # the owner's own identity fields go only when named
+                    # explicitly (`forget Vasilis` removed root.name)
+                    # (re-review) nor any root field: the graph keeps the
+                    # matching owner fact (`user WORKS_AT evolmonkey`), so
+                    # deleting `root.company` left the two disagreeing
+                    if _is_the_value(v, target_lc) and cat != "root":
+                        out.append(_profile_line(profile_memory.delete(cat, k), f"Removed {cat}.{k} (value match){tag}"))
+                    else:
+                        cands.append(f"{cat}.{k}")
+    _pl = _FORGET_PLAN.get()
+    if _pl is not None:
+        for c in dict.fromkeys(cands):
+            _cat, _k = c.split(".", 1)
+            _pl.add("profile_field", {"category": _cat, "key": _k},
+                    f"profile {c} = {str((data.get(_cat) or {}).get(_k))[:80]!r}", default=False)
+    if cands:
+        out.append("ℹ️ Profile: these fields mention or partly match '" + str(target) + "' — NOT changed: "
+                   + ", ".join(dict.fromkeys(cands)) + ". Forget one by its exact name (category.key), or update it.")
+    return out
+
+
 #: How a bus leg SAYS it did not write. Two vocabularies, one meaning: the
 #: leg raised ("error: …"), or the store declined the write and said so
 #: ("refused: …" — `MemoryBus._vector` emits that for `VectorMemory`'s own
@@ -282,7 +569,7 @@ async def tool_remember(text: str = None, memory_system=None, graph_memory=None,
     dispatched through `publish_fact("insert_fact", ...)` so the tool stays
     ignorant of which subsystems exist; otherwise the legacy direct path
     runs (kept for backward compatibility with existing tests/callers)."""
-    _blocked = _member_block()
+    _blocked = _owner_write_block()
     if _blocked is not None:
         return _blocked
     # Same contract as tool_unified_forget: 'text' is THIS function's
@@ -1540,6 +1827,12 @@ async def tool_recall(query: str = None, memory_system=None, graph_memory=None, 
                 # shown (33%) share no non-numeric content word with their
                 # query. Guarded at the boundary, whatever the lookup does.
                 edges = _graph_edges_on_topic(query, edges or [])
+                # the owner's facts asked for by their KIND ("my health
+                # conditions") — matched on the predicate, not a node (§4KX r8)
+                if hasattr(graph_memory, "owner_facts_matching"):
+                    _own = await asyncio.to_thread(graph_memory.owner_facts_matching, query)
+                    if isinstance(_own, list):
+                        edges = list(dict.fromkeys([e for e in _own if isinstance(e, str)] + list(edges)))
                 if edges:
                     valid_chunks.insert(0, "### TOPOLOGICAL GRAPH EDGES:\n" + "\n".join(edges))
             except asyncio.CancelledError:
@@ -1635,7 +1928,378 @@ async def tool_expand_evidence(ref=None, episodic_memory=None,
             f"(episode from EVIDENCE REFS) and '<session:the-id>'.")
 
 
-async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memory_system=None, profile_memory=None, graph_memory=None, project_store=None):
+# ── forget: preview, then confirm ───────────────────────────────────────────
+# The re-reviews kept finding wrong deletions in a forget that GUESSED what the
+# user meant ("Fotini's birthday" took the marriage edge; another person's
+# facts were kept as "yours"; Greek names were never found). The model-facing
+# forget is therefore two steps: a PREVIEW that runs the same sweep in plan
+# mode — every destructive call recorded as a numbered item, nothing deleted —
+# and, in a LATER turn after the user confirms, an EXECUTE of exactly the
+# chosen items. Direct callers of `tool_unified_forget` keep the immediate
+# behaviour.
+import contextvars as _cv
+
+_FORGET_PLAN = _cv.ContextVar("forget_plan", default=None)
+_FORGET_PLANS: dict = {}
+_PLAN_TTL_S = 3600
+import threading as _threading
+_PLANS_LOCK = _threading.Lock()      # previews are written from worker threads too (r8 review)
+
+
+def _store_plan(plan: dict) -> str:
+    import secrets
+    import time as _t
+    token = secrets.token_hex(4)
+    with _PLANS_LOCK:
+        now = _t.time()
+        for k in [k for k, v in _FORGET_PLANS.items() if now - v["ts"] > _PLAN_TTL_S]:
+            _FORGET_PLANS.pop(k, None)
+        _FORGET_PLANS[token] = plan
+    return token
+
+
+def _take_plan(token, kind: str):
+    """The live plan for ``token`` of ``kind``, or None (unknown, another
+    kind, or EXPIRED — the TTL is checked here, at confirm, r8 review)."""
+    import time as _t
+    with _PLANS_LOCK:
+        plan = _FORGET_PLANS.get(str(token or "").strip())
+        if plan is None or plan.get("kind") != kind:
+            return None
+        if _t.time() - plan["ts"] > _PLAN_TTL_S:
+            _FORGET_PLANS.pop(str(token).strip(), None)
+            return None
+        return plan
+
+
+def _drop_plan(token) -> None:
+    with _PLANS_LOCK:
+        _FORGET_PLANS.pop(str(token or "").strip(), None)
+
+
+class _Plan:
+    def __init__(self):
+        self.items: list = []
+        self._seen: set = set()
+
+    def add(self, kind: str, ref: dict, label: str, default: bool = True) -> None:
+        key = (kind, tuple(sorted((k, str(v)) for k, v in ref.items())))
+        if key in self._seen:
+            for it in self.items:                 # a later DEFAULT wins over a listed one
+                if it["key"] == key and default:
+                    it["default"] = True
+            return
+        self._seen.add(key)
+        self.items.append({"kind": kind, "ref": ref, "label": label, "default": default, "key": key})
+
+
+class _Passthrough:
+    def __init__(self, real, plan):
+        self._real, self._plan = real, plan
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class _PlanProfile(_Passthrough):
+    def delete(self, category, key):
+        v = ((self._real.load() or {}).get(category) or {}).get(key)
+        self._plan.add("profile_field", {"category": category, "key": key},
+                       f"profile {category}.{key} = {str(v)[:80]!r}")
+        return f"Removed {category}.{key}"
+
+    def prune_value(self, category, key, target):
+        v = ((self._real.load() or {}).get(category) or {}).get(key)
+        for item in (v if isinstance(v, list) else [v]):
+            if _value_mentions_target(item, str(target).lower()):
+                self._plan.add("profile_item", {"category": category, "key": key, "item": str(item)},
+                               f"profile {category}.{key} item {str(item)[:80]!r}")
+        return f"Pruned {category}.{key}"
+
+    def drop_previous_mentioning(self, target):
+        # the SAME rule as the store's (r8 review: an unfolded regex missed
+        # "José" for `jose` and every accented Greek name)
+        from ..memory.profile import mentions, unwrap
+        out = []
+        if len(str(target or "").strip()) < 3:
+            return out
+        for cat, sub in (self._real.load_raw() or {}).items():
+            for k, item in (sub.items() if isinstance(sub, dict) else []):
+                if isinstance(item, dict) and "previous" in item and mentions(unwrap(item["previous"]),
+                                                                                str(target).strip().lower()):
+                    self._plan.add("profile_previous", {"category": cat, "key": k},
+                                   f"profile {cat}.{k} previous value")
+                    out.append(f"Removed the previous value of {cat}.{k}")
+        return out
+
+
+class _PlanGraph(_Passthrough):
+    def forget_entity(self, entity):
+        doomed, kept = self._real.preview_forget_entity(entity)
+        for s_, p_, o_ in doomed:
+            self._plan.add("graph_edge", {"s": s_, "p": p_, "o": o_}, f"graph {s_} {p_} {o_}")
+        for s_, p_, o_ in kept:
+            self._plan.add("graph_edge", {"s": s_, "p": p_, "o": o_}, f"graph {s_} {p_} {o_} (a fact about you)",
+                           default=False)
+        return len(doomed), kept
+
+    def delete_by_target(self, target):
+        return self.forget_entity(target)[0]
+
+    def delete_edge(self, s_, p_, o_):
+        self._plan.add("graph_edge", {"s": s_, "p": p_, "o": o_}, f"graph {s_} {p_} {o_}")
+        return 1
+
+
+class _PlanEpisodes(_Passthrough):
+    def forget_mentions(self, target, vector_memory=None):
+        prev = self._real.mention_previews(target)
+        for i, trig in prev:
+            self._plan.add("episode", {"id": i}, f"episode #{i} {trig[:80]!r}")
+        return len(prev)
+
+    def count_mentions(self, target):
+        prev = self._real.mention_previews(target)
+        for i, trig in prev:
+            self._plan.add("episode", {"id": i}, f"episode #{i} {trig[:80]!r}", default=False)
+        return len(prev)
+
+
+class _PlanCollection(_Passthrough):
+    def __init__(self, real, plan):
+        super().__init__(real, plan)
+        self._docs: dict = {}
+
+    def query(self, *a, **k):
+        res = self._real.query(*a, **k)
+        try:
+            for i, d in zip((res.get("ids") or [[]])[0], (res.get("documents") or [[]])[0]):
+                self._docs[i] = d
+        except Exception:  # noqa: BLE001
+            pass
+        return res
+
+    def delete(self, ids=None, where=None, **k):
+        for i in ids or []:
+            self._plan.add("fact", {"id": i}, f"fact {str(self._docs.get(i, i))[:90]!r}")
+
+
+class _PlanVector(_Passthrough):
+    def __init__(self, real, plan):
+        super().__init__(real, plan)
+        self.collection = _PlanCollection(getattr(real, "collection", None), plan)
+
+    def delete_document_by_name(self, name):
+        self._plan.add("document", {"name": name}, f"document {name!r}")
+
+    def delete_fragment(self, text):
+        self._plan.add("fragment", {"text": text}, f"fact {str(text)[:90]!r}")
+
+
+async def forget_preview(target, sandbox_dir=None, memory_system=None, profile_memory=None, graph_memory=None,
+                         project_store=None, episodic_memory=None):
+    """Run the forget sweep in PLAN mode and return the numbered list plus a
+    confirmation token. Nothing is deleted."""
+    import time as _t
+    plan = _Plan()
+    tok = _FORGET_PLAN.set(plan)
+    try:
+        notes = await tool_unified_forget(target, sandbox_dir, memory_system, profile_memory, graph_memory,
+                                          project_store=project_store, episodic_memory=episodic_memory)
+    finally:
+        _FORGET_PLAN.reset(tok)
+    if not isinstance(notes, str):
+        notes = str(notes)
+    if notes.startswith(("SYSTEM ERROR", "Error", "Report:")) and not plan.items:
+        return notes
+    # the sweep's own warnings and refusals reach the user (r8 review: the
+    # preview dropped "⚠️ Vector Error", a degraded profile, ambiguous and
+    # partial file names, and then said "Nothing stored matches"). Its ✅
+    # lines are plan-mode fiction and are not shown.
+    warn = [ln for ln in notes.splitlines() if ln.startswith(("⚠️", "ℹ️"))]
+    if not plan.items:
+        head = (f"Nothing was changed, and nothing stored matches {target!r} exactly."
+                if warn else f"Nothing stored matches {target!r}. Nothing was changed.")
+        return "\n".join([head] + warn)
+    try:
+        from ..utils.logging import request_id_context
+        rid = str(request_id_context.get() or "")
+    except Exception:  # noqa: BLE001
+        rid = ""
+    token = _store_plan({"target": str(target), "items": plan.items, "rid": rid, "ts": _t.time(), "kind": "forget"})
+    main = [f"{n}. {it['label']}" for n, it in enumerate(plan.items, 1) if it["default"]]
+    extra = [f"{n}. {it['label']}" for n, it in enumerate(plan.items, 1) if not it["default"]]
+    lines = [f"PREVIEW — nothing was deleted. forget {target!r} would remove:"] + (main or ["(nothing by default)"])
+    if extra:
+        lines += ["Also found (kept unless the user picks them by number):"] + extra
+    if warn:
+        lines += ["Notes from the search:"] + warn
+    lines.append(f"Show this list to the user. Only after the USER confirms in their next message, call "
+                 f"knowledge_base(action='forget', confirm='{token}', items='all') — or items='1,3' for a "
+                 f"selection (numbers from either group). The token expires in an hour.")
+    return "\n".join(lines)
+
+
+def _reset_preview(memory_system, graph_memory) -> str:
+    import time as _t
+    try:
+        rows = memory_system.collection.count()
+    except Exception:  # noqa: BLE001
+        rows = "?"
+    edges = "?"
+    try:
+        if graph_memory is not None and hasattr(graph_memory, "count_edges"):
+            edges = graph_memory.count_edges()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from ..utils.logging import request_id_context
+        rid = str(request_id_context.get() or "")
+    except Exception:  # noqa: BLE001
+        rid = ""
+    token = _store_plan({"kind": "reset_all", "rid": rid, "ts": _t.time(), "items": []})
+    return (f"PREVIEW — nothing was deleted. reset_all would erase the WHOLE vector memory ({rows} rows: every "
+            f"fact, document and stored search copy) and the knowledge graph ({edges} facts). Ask the user to "
+            f"confirm. Only after the USER says yes in their next message, call "
+            f"knowledge_base(action='reset_all', confirm='{token}'). To remove something specific instead, use "
+            f"action='forget' with a target.")
+
+
+#: request ids that are not the user answering: no request, the agent's own
+#: background work, benchmark and replay traffic (r8 review: `SYSTEM`,
+#: `bench-`, `replay-` passed, and a preview made in a `job-` turn — one
+#: the user never saw — could be confirmed later)
+_NOT_THE_USER_PREFIXES = ("bench-", "replay-")
+
+
+def _not_the_user(rid: str) -> bool:
+    if not rid or rid == "SYSTEM" or rid.startswith(_NOT_THE_USER_PREFIXES):
+        return True
+    try:
+        from ..core.autonomous_activity import is_internal_request
+        return bool(is_internal_request(rid))
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _confirm_allowed(plan: dict):
+    """The confirmation must come from the USER, in a LATER turn than the
+    preview, and the preview must have been shown to the user: the model
+    cannot preview and confirm in the same breath, and no background turn
+    can say yes."""
+    try:
+        from ..utils.logging import request_id_context
+        rid = str(request_id_context.get() or "")
+    except Exception:  # noqa: BLE001
+        rid = ""
+    if _not_the_user(str(plan.get("rid") or "")):
+        return "that preview was made outside a conversation with the user — run the preview again in one"
+    if rid and rid == plan.get("rid"):
+        return ("the user has not answered yet — show them the list and wait for their reply; confirm in the "
+                "turn where they say yes")
+    if _not_the_user(rid):
+        return "only the user can confirm a deletion, in their own turn"
+    return None
+
+
+def _pick(items: list, selection):
+    """``(chosen, unknown_parts)``. 'all' = the default list; numbers pick from
+    either group; a list/int from a JSON call is accepted (r8 review)."""
+    # (a list from a JSON call renders "[1, 3]", which the split below reads)
+    sel = str(selection if selection is not None else "all").strip().lower()
+    if sel in ("all", "*", "yes", ""):
+        return [it for it in items if it["default"]], []
+    out, bad = [], []
+    for part in [p for p in re.split(r"[,\s\[\]]+", sel) if p]:
+        if "-" in part and all(x.isdigit() for x in part.split("-", 1)):
+            a, b = (int(x) for x in part.split("-", 1))
+            if not (1 <= a <= b <= len(items)):
+                bad.append(part)
+                continue
+            out += [items[i - 1] for i in range(a, b + 1)]
+        elif part.isdigit() and 1 <= int(part) <= len(items):
+            out.append(items[int(part) - 1])
+        else:
+            bad.append(part)
+    seen, uniq = set(), []
+    for it in out:
+        if id(it) not in seen:
+            seen.add(id(it))
+            uniq.append(it)
+    return uniq, bad
+
+
+async def forget_execute(token, selection="all", sandbox_dir=None, memory_system=None, profile_memory=None,
+                         graph_memory=None, project_store=None, episodic_memory=None):
+    """Delete exactly the confirmed items of a preview."""
+    plan = _take_plan(token, "forget")
+    if plan is None:
+        return ToolOutcome.rejected("Error: unknown or expired confirmation token — run the forget preview again.",
+                                    reason_code="forget_token_unknown")
+    why = _confirm_allowed(plan)
+    if why:
+        return ToolOutcome.rejected(f"NOT deleted: {why}.", reason_code="forget_not_confirmed")
+    chosen, bad = _pick(plan["items"], selection)
+    if bad:
+        return ToolOutcome.rejected(
+            f"NOT deleted: {', '.join(bad)} {'is' if len(bad) == 1 else 'are'} not on the list (items 1–"
+            f"{len(plan['items'])}). Nothing was changed; the token still works.", reason_code="forget_bad_selection")
+    if not chosen:
+        return ToolOutcome.rejected("NOT deleted: the selection names no listed item.", reason_code="forget_empty_selection")
+    _drop_plan(token)
+    report = []
+    for it in chosen:
+        try:
+            report.append(await asyncio.to_thread(_execute_item, it, memory_system, profile_memory, graph_memory,
+                                                  project_store, episodic_memory))
+        except Exception as e:  # noqa: BLE001
+            report.append(f"⚠️ {it['label']}: {e}")
+    return "\n".join(report)
+
+
+def _execute_item(it, memory_system, profile_memory, graph_memory, project_store, episodic_memory) -> str:
+    k, r = it["kind"], it["ref"]
+    if k == "file":
+        root, path = Path(r["root"]), Path(r["path"])
+        if path.is_symlink() or not _is_within_root(path.resolve(), root.resolve()):
+            return f"⚠️ Refused {it['label']} (link or outside the sandbox)"
+        from .file_system import _released_write_block
+        if _released_write_block(project_store, root, str(path.resolve().relative_to(root.resolve())), removes=True):
+            return f"⚠️ Refused {it['label']} — inside a RELEASED project (immutable)"
+        if path.is_file():
+            path.unlink()
+            return f"✅ Deleted {it['label']}"
+        return f"ℹ️ {it['label']} no longer exists"
+    if k == "document":
+        memory_system.delete_document_by_name(r["name"])
+        return f"✅ Removed {it['label']}"
+    if k == "fact":
+        memory_system.collection.delete(ids=[r["id"]])
+        return f"✅ Forgot {it['label']}"
+    if k == "fragment":
+        memory_system.delete_fragment(r["text"])
+        return f"✅ Forgot {it['label']}"
+    if k in ("profile_field", "profile_item", "profile_previous"):
+        if k == "profile_field":
+            res = profile_memory.delete(r["category"], r["key"], exact=True)
+        elif k == "profile_item":
+            res = profile_memory.remove_item(r["category"], r["key"], r["item"])
+        else:
+            res = profile_memory.drop_previous(r["category"], r["key"])
+        # (r8 review) "not found" was reported with a ✅
+        if isinstance(res, str) and res.lower().startswith(("profile key not found", "no item", "no previous")):
+            return f"ℹ️ {it['label']} was already gone"
+        return _profile_line(res, f"Removed {it['label'][8:]}")
+    if k == "graph_edge":
+        n = graph_memory.delete_edge(r["s"], r["p"], r["o"])
+        return f"✅ Removed {it['label']}" if n else f"ℹ️ {it['label']} was already gone"
+    if k == "episode":
+        n = episodic_memory.delete_episodes([r["id"]], memory_system, reason="forget")
+        return f"✅ Forgot {it['label']} (archived)" if n else f"ℹ️ {it['label']} was already gone"
+    return f"⚠️ unknown item kind {k}"
+
+
+async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memory_system=None, profile_memory=None, graph_memory=None, project_store=None, episodic_memory=None):
     _blocked = _member_block()
     if _blocked is not None:
         return _blocked
@@ -1654,6 +2318,14 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
     pretty_log("Memory Wipe", target, icon=Icons.MEM_WIPE)
     if not memory_system: return "Report: Memory disabled."
     report = []
+    _plan = _FORGET_PLAN.get()
+    if _plan is not None:
+        # PLAN MODE: every destructive call is recorded, nothing is deleted
+        # (the model-facing forget is preview → confirm)
+        memory_system = _PlanVector(memory_system, _plan)
+        profile_memory = _PlanProfile(profile_memory, _plan) if profile_memory is not None else None
+        graph_memory = _PlanGraph(graph_memory, _plan) if graph_memory is not None else None
+        episodic_memory = _PlanEpisodes(episodic_memory, _plan) if episodic_memory is not None else None
 
     # ⚠ ORDER. The `sandbox/` strip below removes a component, and the disk
     # sweep decides "did the caller name a PATH?" from the presence of a
@@ -1699,8 +2371,25 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
     # (user/pronouns) are filtered inside get_connected_entities so the
     # expansion can't snowball. Vector/profile expansion is LITERAL-mention
     # only (no semantic fuzz) so it stays precise.
+    # decided BEFORE any leg deletes the family edge it is read from
+    # ONE entity for every leg (re-review: the episode leg searched the raw
+    # target while the graph leg searched its entity words)
+    _entity = _entity_of(clean_target) or clean_target.strip().lower()
+    _quals = _qualifiers_of(clean_target) if _entity != clean_target.strip().lower() else []
+    _family_person = False
+    try:
+        if graph_memory is not None and hasattr(graph_memory, "is_owner_family"):
+            _family_person = bool(await asyncio.to_thread(graph_memory.is_owner_family, _entity))
+    except Exception:  # noqa: BLE001
+        _family_person = False
     expanded_targets: list = []
-    if graph_memory is not None:
+    # (third memory-writes review) the expansion ran for hub words and the
+    # owner's own name with none of the graph leg's guards, and through a
+    # CLASS link (`hermes IS_A llm`) it then swept every edge, fact and
+    # profile item naming the class word — five owner edges among them. It
+    # now follows ALIASES only (another name for the same thing), and only
+    # from a target that names an entity which is not the owner.
+    if graph_memory is not None and _names_an_entity(clean_target) and not _is_owner_name(profile_memory, clean_target):
         try:
             # `clean_target`, like every other sweep. This is the AMPLIFIER
             # of a forget — it is what reaches the alias tombstone
@@ -1714,6 +2403,8 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
             expanded_targets = []
     if not isinstance(expanded_targets, list):
         expanded_targets = []
+    expanded_targets = [x for x in expanded_targets
+                        if _names_an_entity(str(x)) and not _is_owner_name(profile_memory, str(x))]
 
     # 1. Disk Cleanup — recursive walk + safe-path validation.
     # Previous version only looked at the top-level directory, only deleted
@@ -1855,6 +2546,13 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
             # end. Name them separately.
             kept = [h for h in (_ambiguous + stem_hits + substr_hits)
                     if h not in chosen and not h.is_symlink()]
+            _pl = _FORGET_PLAN.get()
+            if _pl is not None:
+                # listed, deleted only when the user picks one (r8 review:
+                # the schema promised them under "also found")
+                for h in kept:
+                    _pl.add("file", {"path": str(h), "root": str(sandbox_root)},
+                            f"file {h.relative_to(sandbox_root)}", default=False)
             if kept:
                 # Print `./name` for a root-level candidate whose basename
                 # also occurs deeper in the tree: re-issuing a bare name
@@ -1915,6 +2613,11 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
                         report.append(f"⚠️ Disk: Refused '{victim}' — inside a RELEASED project (immutable)")
                         continue
                     if resolved.is_file():
+                        _pl = _FORGET_PLAN.get()
+                        if _pl is not None:
+                            _pl.add("file", {"path": str(resolved), "root": str(sandbox_root)},
+                                    f"file {resolved.relative_to(sandbox_root)}")
+                            continue
                         resolved.unlink()
                         report.append(f"✅ Disk: Deleted '{resolved.relative_to(sandbox_root)}'")
                 except Exception as de:
@@ -2000,6 +2703,10 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
         for match in doc_exact:
             await asyncio.to_thread(memory_system.delete_document_by_name, match)
             report.append(f"✅ Vector: Wiped document '{match}'.")
+        _pl = _FORGET_PLAN.get()
+        if _pl is not None:
+            for _d in sorted(doc_partial):
+                _pl.add("document", {"name": _d}, f"document {_d!r}", default=False)
         if doc_partial:
             # `+N more`, like the disk half. Naming 10 of N while telling the
             # caller to re-issue with one of the names shown leaves the rest
@@ -2129,6 +2836,10 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
                     deleted_local += 1
                     hits.append(f"✅ Sweep: Forgot matching fact: '{word_cands[0][1][:40]}...'")
                 elif word_cands:
+                    _pl = _FORGET_PLAN.get()
+                    if _pl is not None:
+                        for c in word_cands:
+                            _pl.add("fact", {"id": c[0]}, f"fact {str(c[1])[:90]!r}", default=False)
                     hits.append("ℹ️ Sweep: " + ("several stored facts match '" if len(word_cands) > 1
                                                   else "another stored fact matches '")
                                 + sweep_target_lc + "' — NOT deleted: "
@@ -2151,87 +2862,106 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
     #     much longer key (e.g. target="age" should NOT match "language")
     if profile_memory:
         try:
-            data = profile_memory.load()
-            target_lc = clean_target.lower().strip()
-            found_key = False
-            exact_hits: list[tuple[str, str]] = []
-            substr_hits: list[tuple[str, str]] = []
-            for cat, subdata in data.items():
-                if not isinstance(subdata, dict):
-                    continue
-                for k in list(subdata.keys()):
-                    k_lc = k.lower()
-                    if k_lc == target_lc:
-                        exact_hits.append((cat, k))
-                        continue
-                    # Substring match must hit a word boundary so "age"
-                    # doesn't wipe "language" but "python" still hits
-                    # "python_advanced". A boundary is the start, end, or
-                    # any `_`/`-`/space-delimited segment.
-                    if len(target_lc) < 3:
-                        continue
-                    parts = k_lc.replace("-", "_").replace(" ", "_").split("_")
-                    if (k_lc.startswith(target_lc)
-                            or k_lc.endswith(target_lc)
-                            or target_lc in parts):
-                        substr_hits.append((cat, k))
-            chosen_profile_hits = exact_hits or substr_hits
-            handled: set = set()
-            for cat, k in chosen_profile_hits:
-                report.append(_profile_line(profile_memory.delete(cat, k), f"Removed {cat}.{k}"))
-                handled.add((cat, k))
-                found_key = True
-
-            # --- VALUE SWEEP ---------------------------------------------
-            # The key-only sweep above misses the common case where the
-            # forgotten entity is stored as a VALUE, e.g.
-            #   assets.pets = ["Hanzo the dog", "Mortimer the iguana"]
-            # Here the key is "pets" — nothing matches `target="mortimer"`,
-            # so the row (which is injected into the system prompt every
-            # turn via get_context_string) survived forever and the model
-            # kept "remembering" the deleted pet. We now also match VALUES,
-            # with word-boundary logic (see `_value_mentions_target`) so the
-            # destructive greedy-substring behaviour the key-only rule was
-            # guarding against does NOT come back. Reload so the dict
-            # reflects the key deletions just performed.
-            data = profile_memory.load()
-            for cat, subdata in list(data.items()):
-                if not isinstance(subdata, dict):
-                    continue
-                for k, v in list(subdata.items()):
-                    if (cat, k) in handled:
-                        continue
-                    if isinstance(v, list):
-                        if any(_value_mentions_target(item, target_lc) for item in v):
-                            # `target_lc`, the same string the guard above
-                            # matched on. Normalising the guard and leaving
-                            # the argument raw made every value prune a
-                            # no-op that still reported a green tick.
-                            res = profile_memory.prune_value(cat, k, target_lc)
-                            report.append(_profile_line(res, str(res)))
-                            handled.add((cat, k))
-                            found_key = True
-                    elif _value_mentions_target(v, target_lc):
-                        report.append(_profile_line(profile_memory.delete(cat, k),
-                                                    f"Removed {cat}.{k} (value match)"))
-                        handled.add((cat, k))
-                        found_key = True
-
-            if not found_key and " " not in target:
-                 # usage: forget category key
-                 pass
+            report.extend(_forget_profile(profile_memory, clean_target, qualifiers=_quals,
+                                          family=_family_person and not _quals))
         except Exception as e: report.append(f"⚠️ Profile Error: {e}")
 
+    # (r8 review) an unreadable profile hides the owner's NAME, and every
+    # owner guard below reads it: the graph and episode legs hold back
+    _profile_blind = profile_memory is not None and getattr(
+        getattr(profile_memory, "_real", profile_memory), "_degraded", False) is True
+    if _profile_blind and (graph_memory or episodic_memory is not None):
+        report.append("⚠️ Graph/Episodes: not searched — the profile could not be read, so the owner's own name "
+                      "is unknown. Try again once it is readable.")
+        graph_memory = None
+        episodic_memory = None
     # 4. Knowledge Graph Cleanup
     if graph_memory:
         try:
             # `clean_target`, like every other sweep — the raw string
             # carried `./` / `sandbox/` / a trailing slash straight
             # into the graph, where it matched nothing.
-            deleted_edges = await asyncio.to_thread(graph_memory.delete_by_target, clean_target)
+            # a target of hub words only names no entity (profile-writes
+            # review: `forget user` expired 469 of 1,016 live edges)
+            _is_owner = _is_owner_name(profile_memory, _entity)
+            if _is_owner:
+                report.append("ℹ️ Graph: that is your own name — your relations were NOT removed. "
+                              "Forget the specific fact instead.")
+            deleted_edges = 0
+            if _names_an_entity(clean_target) and not _is_owner:
+                if _quals and hasattr(graph_memory, "preview_forget_entity"):
+                    # attribute-qualified: only the edges naming the attribute
+                    _d, _k = await asyncio.to_thread(graph_memory.preview_forget_entity, _entity)
+                    _fields = (await asyncio.to_thread(graph_memory.owner_field_edges, _entity)
+                               if hasattr(graph_memory, "owner_field_edges") else [])
+                    _all = list(dict.fromkeys(list(_d) + list(_k) + list(_fields)))
+                    # the PREDICATE names the attribute (r8 review: subject/
+                    # object words and a 4-letter stem took COMPANION)
+                    _sel = [e for e in _all if _qualifier_matches(str(e[1]).lower().split("_"), _quals)]
+                    # an owner fact is never in the default list (r8 review:
+                    # "EvolMonkey work" defaulted `user WORKS_AT evolmonkey`)
+                    _rest = [e for e in _all if e not in _sel or (e in _k and not _family_person)]
+                    _sel = [e for e in _sel if e not in _rest]
+                    for e in _sel:
+                        deleted_edges += int(await asyncio.to_thread(graph_memory.delete_edge, *e) or 0)
+                    _pl = _FORGET_PLAN.get()
+                    if _pl is not None:
+                        for e in _rest:
+                            _pl.add("graph_edge", {"s": e[0], "p": e[1], "o": e[2]}, "graph " + " ".join(e),
+                                    default=False)
+                    if _rest:
+                        report.append("ℹ️ Graph: other facts about '" + _entity + "' were kept: "
+                                      + "; ".join(" ".join(e) for e in _rest[:5])
+                                      + (" …" if len(_rest) > 5 else "") + ".")
+                elif hasattr(graph_memory, "forget_entity"):
+                    _res = await asyncio.to_thread(graph_memory.forget_entity, _entity)
+                    deleted_edges, _kept = _res if isinstance(_res, tuple) and len(_res) == 2 else (0, [])
+                    deleted_edges = deleted_edges if isinstance(deleted_edges, int) else 0
+                    # the owner's FIELDS named after the entity (`user
+                    # HAS_FOTINI_DESCRIPTION …`): a family member's go with
+                    # her, anyone else's are listed (r8 review)
+                    _fields = (await asyncio.to_thread(graph_memory.owner_field_edges, _entity)
+                               if hasattr(graph_memory, "owner_field_edges") else [])
+                    _fields = [e for e in _fields if isinstance(e, tuple) and len(e) == 3]
+                    if _family_person:
+                        for e in _fields:
+                            deleted_edges += int(await asyncio.to_thread(graph_memory.delete_edge, *e) or 0)
+                    else:
+                        _kept = list(_kept) + [e for e in _fields if e not in _kept]
+                        _pl = _FORGET_PLAN.get()
+                        if _pl is not None:
+                            for e in _fields:
+                                _pl.add("graph_edge", {"s": e[0], "p": e[1], "o": e[2]},
+                                        "graph " + " ".join(e) + " (a fact about you)", default=False)
+                    if _kept:
+                        report.append("ℹ️ Graph: facts about you that mention '" + _entity + "' were kept: "
+                                      + "; ".join(" ".join(k) for k in _kept[:5])
+                                      + (" …" if len(_kept) > 5 else "") + ".")
+                else:
+                    deleted_edges = await asyncio.to_thread(graph_memory.delete_by_target, _entity)
             if deleted_edges > 0:
                 report.append(f"✅ Graph: Severed {deleted_edges} topological edges related to '{clean_target}'.")
         except Exception as e: report.append(f"⚠️ Graph Error: {e}")
+
+    # 4b. Episodes that NAME the entity. An episode is the agent's record of
+    # a whole turn, so a MENTION is not a reason to delete it (third review:
+    # `forget python` would have removed 30, `forget athens` 18) — the same
+    # rule as the profile leg. Deleted only for a PERSON of the owner's
+    # family (the privacy case: `forget Fotini`); otherwise counted and kept.
+    if episodic_memory is not None and hasattr(episodic_memory, "forget_mentions"):
+        try:
+            if _names_an_entity(clean_target) and not _is_owner_name(profile_memory, _entity):
+                if _family_person and not _quals:
+                    n_ep = await asyncio.to_thread(episodic_memory.forget_mentions, _entity, memory_system)
+                    if n_ep:
+                        report.append(f"✅ Episodes: Forgot {n_ep} episode(s) naming '{_entity}' (archived).")
+                elif hasattr(episodic_memory, "count_mentions"):
+                    n_m = await asyncio.to_thread(episodic_memory.count_mentions, _entity)
+                    if n_m:
+                        report.append(f"ℹ️ Episodes: {n_m} episode(s) mention '{_entity}' — kept (an episode is "
+                                      f"a record of a whole turn, not a fact about it).")
+        except Exception as e:
+            report.append(f"⚠️ Episodes Error: {e}")
 
     # 5. Entity-aware secondary sweep over the target's graph neighbours.
     # LITERAL-mention only across vector + profile + graph so we excise the
@@ -2284,27 +3014,19 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
         # Graph: sever the neighbour's own edges too.
         if graph_memory:
             try:
-                d_extra = await asyncio.to_thread(graph_memory.delete_by_target, extra)
+                _rx = (await asyncio.to_thread(graph_memory.forget_entity, extra)
+                       if hasattr(graph_memory, "forget_entity") else None)
+                d_extra = _rx[0] if isinstance(_rx, tuple) and _rx and isinstance(_rx[0], int) else 0
                 if d_extra and d_extra > 0:
                     report.append(f"✅ Graph: Severed {d_extra} edge(s) for related entity '{extra}'.")
             except Exception:
                 pass
 
-        # Profile: value-prune the neighbour token across all entries.
+        # Profile: the alias's own values only — a field that merely mentions
+        # it among other things is listed, never deleted (profile-writes review)
         if profile_memory:
             try:
-                data2 = profile_memory.load()
-                for cat, subdata in list(data2.items()):
-                    if not isinstance(subdata, dict):
-                        continue
-                    for k, v in list(subdata.items()):
-                        if isinstance(v, list):
-                            if any(_value_mentions_target(it, extra_lc) for it in v):
-                                res = profile_memory.prune_value(cat, k, extra)
-                                report.append(_profile_line(res, f"{res} (related '{extra}')"))
-                        elif _value_mentions_target(v, extra_lc):
-                            report.append(_profile_line(profile_memory.delete(cat, k),
-                                                        f"Removed {cat}.{k} (related '{extra}')"))
+                report.extend(_forget_profile(profile_memory, extra, related=True))
             except Exception:
                 pass
 
@@ -2341,11 +3063,37 @@ async def tool_scratchpad(action: str = None, scratchpad: Scratchpad = None, key
         return scratchpad.clear()
     return "Error: Unknown action"
 
+async def sync_owner_mirrors(category, key, profile_memory, graph_memory=None, memory_system=None) -> list:
+    """§4KZ: the PROFILE is the authority for an owner field; its graph edges
+    (`user HAS_<KEY>`) and vector rows (`User <key> is …`) are MIRRORS made to
+    equal it after every write — by the tool, the bus or the background
+    extractor — instead of each writer adding its own copy (stale HAS_WIFE /
+    HAS_EMPLOYER / HAS_LOCATION edges stayed live beside the new value).
+    Returns the names of mirrors that could not be synced."""
+    from ..memory.profile import ProfileMemory as _PM
+    cat, k = _PM.canonicalize(str(category or "").strip().lower(), str(key or "").strip().lower())
+    try:
+        cur = ((profile_memory.load() or {}).get(cat) or {}).get(k)
+    except Exception:  # noqa: BLE001
+        return ["profile-read"]
+    values = cur if isinstance(cur, list) else ([] if cur in (None, "") else [cur])
+    lag = []
+    for name, store in (("graph", graph_memory), ("vector", memory_system)):
+        if store is None or not hasattr(store, "sync_owner_field"):
+            continue
+        try:
+            await asyncio.to_thread(store.sync_owner_field, k, values)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("owner mirror %s for %s.%s lagged: %s", name, cat, k, e)
+            lag.append(name)
+    return lag
+
+
 async def tool_update_profile(category: str = None, key: str = None, value: str = None, profile_memory=None, memory_system=None, graph_memory=None, memory_bus=None, **kwargs):
     """Persist a profile field. Bus-aware path emits an `update_profile`
     event so the bus handles every downstream commit (vector smart-update +
     graph triplet); legacy direct path retained for tests."""
-    _blocked = _member_block()
+    _blocked = _owner_write_block()
     if _blocked is not None:
         return _blocked
     category = category or kwargs.get("category", "root")
@@ -2361,10 +3109,14 @@ async def tool_update_profile(category: str = None, key: str = None, value: str 
     if value is None:
         return ("Error: 'value' is required. update_profile only WRITES; the profile is already in your "
                 "context. To delete a stored fact, pass value=\"\" explicitly. Nothing was changed.")
+    # (profile-writes review) `[]`, `{}`, "null", "None", a zero-width space
+    # were stringified and OVERWROTE the stored value. Only an exact ""
+    # deletes; any other empty-looking value changes nothing.
+    from ..memory.profile import _is_empty_value
+    if value != "" and _is_empty_value(value):
+        return "Error: 'value' is empty. To delete a stored fact, pass value=\"\" explicitly. Nothing was changed."
     if not isinstance(value, str):
         value = str(value)
-    if value != "" and not value.strip():
-        return "Error: 'value' is blank. To delete a stored fact, pass value=\"\" explicitly. Nothing was changed."
 
     if value == "":
         # DELETE path: an empty/omitted value removes the key — mirroring
@@ -2400,18 +3152,11 @@ async def tool_update_profile(category: str = None, key: str = None, value: str 
         msg = await asyncio.to_thread(prof.delete, category, key)
         if old_val is not None and isinstance(msg, str) and not msg.lower().startswith("error"):
             msg = f"{msg} (was: {str(old_val)[:200]!r})"
-        # Best-effort: scrub the derived vector fact ("User <key> is
-        # <value>") so semantic retrieval stops surfacing the deleted
-        # field. The canonical store is the JSON profile — a miss here is
-        # not a failure.
-        if (old_val is not None and memory_system is not None
-                and hasattr(memory_system, "delete_fragment")):
-            try:
-                await asyncio.to_thread(
-                    memory_system.delete_fragment,
-                    f"User {_key_c} is {old_val}")
-            except Exception:
-                pass
+        # the mirrors follow the profile (§4KZ: one sync, every value)
+        if isinstance(msg, str) and not msg.lower().startswith("error"):
+            await sync_owner_mirrors(category, key, prof,
+                                     graph_memory if graph_memory is not None else getattr(memory_bus, "graph", None),
+                                     memory_system if memory_system is not None else getattr(memory_bus, "vector", None))
         return msg
 
     pretty_log("Profile Update", f"{category}.{key}={value}", icon=Icons.USER_ID)
@@ -2432,6 +3177,7 @@ async def tool_update_profile(category: str = None, key: str = None, value: str 
     # where the model called update_profile(location=Athens, Greece) 9× in a
     # row. The agent-loop idempotency guard catches it within a request; this
     # check catches it across requests / cold reloads.
+    _was_note = ""
     profile_for_check = profile_memory
     if profile_for_check is None and memory_bus is not None:
         profile_for_check = getattr(memory_bus, "profile", None)
@@ -2439,12 +3185,18 @@ async def tool_update_profile(category: str = None, key: str = None, value: str 
         try:
             data = profile_for_check.load() if hasattr(profile_for_check, "load") else None
             if isinstance(data, dict):
-                cat_lc = str(category).strip().lower()
-                key_lc = str(key).strip().lower()
+                # the CANONICAL field (vehicle → assets.car), as the write files it
+                from ..memory.profile import ProfileMemory as _PMc
+                cat_lc, key_lc = _PMc.canonicalize(str(category).strip().lower(), str(key).strip().lower())
                 cat_data = data.get(cat_lc, {}) if isinstance(data.get(cat_lc), dict) else {}
                 existing = cat_data.get(key_lc)
                 if existing is not None and str(existing).strip() == str(value).strip():
                     return f"NOOP: Profile already has {category}.{key} = {value}. No change applied."
+                # a single-value field being REPLACED: the model is told what
+                # it overwrote (third review — "(was: …)" never reached it)
+                from ..memory.profile import _SINGLETON_KEYS as _SK
+                if existing is not None and not isinstance(existing, list) and key_lc in _SK:
+                    _was_note = f" (was: {str(existing)[:200]!r})"
         except Exception:
             pass
 
@@ -2457,16 +3209,9 @@ async def tool_update_profile(category: str = None, key: str = None, value: str 
         # canonical form now feeds all three stores.
         from ..memory.profile import ProfileMemory as _PM
         _cat_c, _key_c = _PM.canonicalize(category, key)
-        clean_key = str(_key_c).upper().replace(" ", "_")
         _report = await memory_bus.publish_fact("update_profile", {
-            "text": f"User {_key_c} is {value}",
-            "metadata": {"timestamp": get_utc_timestamp(), "type": "identity"},
+            # the profile only; its mirrors are SYNCED below (§4KZ)
             "profile_update": {"category": _cat_c, "key": _key_c, "value": value},
-            "triplets": [{
-                "subject": "user",
-                "predicate": f"HAS_{clean_key}",
-                "object": str(value).lower(),
-            }],
         })
         _fails = _bus_write_failures(_report)
         if _fails:
@@ -2476,7 +3221,12 @@ async def tool_update_profile(category: str = None, key: str = None, value: str 
             return _mk((f"{_head}: Profile update had failures — "
                     f"{'; '.join(_fails)}. Retrieval may not reflect the change."),
                     reason_code="profile_write_partial")
-        return f"SUCCESS: Profile updated."
+        _lag = await sync_owner_mirrors(_cat_c, _key_c, getattr(memory_bus, "profile", None),
+                                        getattr(memory_bus, "graph", None), getattr(memory_bus, "vector", None))
+        if _lag:
+            return ToolOutcome.partial(f"PARTIAL: Profile updated, but the {', '.join(_lag)} mirror lagged.",
+                                       reason_code="profile_graph_lag")
+        return f"SUCCESS: Profile updated.{_was_note}"
 
     # --- LEGACY DIRECT PATH ---
     if not profile_memory: return "Error: Profile memory not loaded."
@@ -2484,41 +3234,8 @@ async def tool_update_profile(category: str = None, key: str = None, value: str 
     if isinstance(msg, str) and msg.lower().startswith("error"):
         return ToolOutcome.failed(msg, reason_code="profile_write_refused")
 
-    # The vector + graph indexes are best-effort secondary writes;
-    # the canonical store is `profile_memory` (JSON). Track partial
-    # failures explicitly so the caller knows retrieval may not yet
-    # reflect the change. Previously bare `except: pass` silently
-    # masked these and we returned "SUCCESS" anyway — the agent and
-    # user both believed the fact was fully indexed when only the
-    # JSON profile actually got it.
-    partial_failures = []
-
-    if memory_system:
-        try:
-            await asyncio.to_thread(memory_system.smart_update, f"User {key} is {value}", "identity")
-        except Exception as e:
-            logger.warning(
-                "smart_update vector index missed for %s.%s: %s: %s",
-                category, key, type(e).__name__, e,
-            )
-            partial_failures.append("vector")
-
-    if graph_memory:
-        try:
-            # Deterministically map profile updates to graph edges without an LLM call!
-            # §4M (Lens C MAJOR-4): mint from the CANONICAL key — the
-            # profile leg above already stored under it.
-            from ..memory.profile import ProfileMemory as _PM
-            _, _key_c = _PM.canonicalize(category, key)
-            clean_key = str(_key_c).upper().replace(" ", "_")
-            triplet = [{"subject": "user", "predicate": f"HAS_{clean_key}", "object": str(value).lower()}]
-            await asyncio.to_thread(graph_memory.add_triplets, triplet)
-        except Exception as e:
-            logger.warning(
-                "graph triplet write missed for %s.%s: %s: %s",
-                category, key, type(e).__name__, e,
-            )
-            partial_failures.append("graph")
+    # the mirrors follow the profile (§4KZ)
+    partial_failures = await sync_owner_mirrors(category, key, profile_memory, graph_memory, memory_system)
 
     if partial_failures:
         return (
@@ -2526,7 +3243,7 @@ async def tool_update_profile(category: str = None, key: str = None, value: str 
             f"{', '.join(partial_failures)} index(es) lagged. "
             f"Semantic / graph retrieval may not yet reflect this change.", reason_code="profile_graph_lag")
         )
-    return f"SUCCESS: Profile updated."
+    return f"SUCCESS: Profile updated.{_was_note}"
 
 async def tool_learn_skill(task: str = None, mistake: str = None, solution: str = None, skill_memory=None, memory_system=None, memory_bus=None, **kwargs):
     """Save a learned lesson. Bus-aware path emits a `learn_skill` event
@@ -2568,11 +3285,26 @@ async def tool_learn_skill(task: str = None, mistake: str = None, solution: str 
             return _mk((f"{_head}: lesson write had failures — "
                     f"{'; '.join(_fails)}. It may not be in the playbook."),
                     reason_code="lesson_write_partial")
-        return "SUCCESS: Lesson learned and saved to the Skill Playbook and Vector Memory."
+        return _learn_skill_success((_report or {}).get("skill_scope") if isinstance(_report, dict) else "")
 
     # --- LEGACY DIRECT PATH ---
     if not skill_memory: return "Error: Skill memory not active."
-    skill_memory.learn_lesson(task, mistake, solution, memory_system=memory_system)
+    _w = skill_memory.learn_lesson(task, mistake, solution, memory_system=memory_system, source="learn_skill",
+                                   generality_context=_current_request_text())
+    if _w is None:
+        # (r8 review) a dropped lesson was reported as saved
+        return ToolOutcome.failed("FAILED: the lesson was not written (dropped by the playbook's quality gates).",
+                                  reason_code="lesson_write_partial")
+    return _learn_skill_success(getattr(_w, "scope", ""))
+
+
+def _learn_skill_success(scope) -> str:
+    """Say WHERE the lesson applies (re-review: a lesson scoped to this one
+    request was reported as a plain SUCCESS). ``scope`` is THIS call's."""
+    if isinstance(scope, str) and scope == "request":
+        return ("SUCCESS: Lesson saved — for THIS request only: it restates the request's own details, so it "
+                "will be recalled when this request comes up again, not for other tasks. To make it a general "
+                "rule, phrase it without this request's names, files and numbers.")
     return "SUCCESS: Lesson learned and saved to the Skill Playbook and Vector Memory."
 
 #: Every kwarg name the `knowledge_base` dispatcher accepts as the SUBJECT of
@@ -2792,14 +3524,23 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
             tor_proxy=kwargs.get("tor_proxy"), language=kwargs.get("language"))
 
     elif action == "forget":
+        # Two steps (§4KX r8): without `confirm` this is a PREVIEW that
+        # deletes nothing; with the token, in a later turn, it deletes
+        # exactly the confirmed items.
+        if kwargs.get("confirm"):
+            return await forget_execute(kwargs.get("confirm"), kwargs.get("items") or "all", sandbox_dir,
+                                        memory_system, kwargs.get("profile_memory"), kwargs.get("graph_memory"),
+                                        project_store=kwargs.get("project_store"),
+                                        episodic_memory=kwargs.get("episodic_memory"))
         subject, err = _kb_target_or_error(
             kwargs, action_as_called, "target",
             "pass the topic, entity or filename to erase",
             "<the topic to erase>")
         if err:
             return err
-        return await tool_unified_forget(subject, sandbox_dir, memory_system, kwargs.get("profile_memory"), kwargs.get("graph_memory"),
-                                         project_store=kwargs.get("project_store"))
+        return await forget_preview(subject, sandbox_dir, memory_system, kwargs.get("profile_memory"),
+                                    kwargs.get("graph_memory"), project_store=kwargs.get("project_store"),
+                                    episodic_memory=kwargs.get("episodic_memory"))
 
     elif action == "query":
         return await tool_query_document(
@@ -2868,6 +3609,27 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
 
     elif action == "reset_all":
         if not memory_system: return "Error: Memory system is disabled."
+        # (profile-writes review) one model call wiped the vector store and
+        # the graph. Only when THIS turn's request asks for it in words —
+        # never inferred from "clean up", "forget that", a lesson or a plan.
+        _blk = _member_block()
+        if _blk is not None:
+            return _blk
+        # (§4KX r8) the request-wording gate opened on negations, questions
+        # and scoped requests and refused plain "yes" confirmations. The
+        # wipe is now ALWAYS two steps: a preview with the counts and a
+        # token, then the token in a LATER turn after the user says yes.
+        _tok = str(kwargs.get("confirm") or "").strip()
+        if not _tok:
+            return await asyncio.to_thread(_reset_preview, memory_system, kwargs.get("graph_memory"))
+        _plan = _take_plan(_tok, "reset_all")
+        if _plan is None:
+            return ToolOutcome.rejected("NOT executed: unknown or expired reset_all token — run reset_all "
+                                        "without confirm to get a new preview.", reason_code="reset_token_unknown")
+        _why = _confirm_allowed(_plan)
+        if _why:
+            return ToolOutcome.rejected(f"NOT executed: {_why}.", reason_code="reset_not_confirmed")
+        _drop_plan(_tok)
         # OFF THE EVENT LOOP, and without materialising the store.
         # `collection.get()` with no `include` returns every document body
         # and metadata blob — live, ~8k rows including 7k manual chunks —

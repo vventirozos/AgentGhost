@@ -67,7 +67,7 @@
 
   <h2><code>unified_forget</code> — four-store sweep</h2>
   <p><code>forget(target)</code> sweeps four stores in order: disk (sandbox files), vector memory (fuzzy filename match + semantic sweep), the <a href="../memory/profile.html">profile</a>, and the <a href="../memory/graph.html">knowledge graph</a>. The profile pass is the one users notice, because the profile is injected into the system prompt every turn — so anything it misses keeps being "remembered".</p>
-  <p>The profile pass now runs in <strong>two stages</strong>:</p>
+  <p>The profile pass now runs in <strong>two stages</strong>: <em>(Superseded — see <a href="#rereview">the current rules</a>.)</em></p>
   <ol>
     <li><strong>Key sweep</strong> — exact key match, then word-boundary substring match on keys only (so <code>forget('age')</code> can't wipe a <code>language</code> key). Matched keys are deleted whole.</li>
     <li><strong>Value sweep</strong> — for every key not already handled, match the <em>values</em> with <code>_value_mentions_target</code> (token/word-boundary aware). A matching scalar deletes the key; matching list items are pruned via <code>ProfileMemory.prune_value</code>, dropping the key/category when emptied.</li>
@@ -77,7 +77,7 @@
   <h3>Vector sweep — literal-mention override</h3>
   <p>The semantic sweep originally deleted a candidate only when its L2 distance fell under a type-dependent threshold (<code>0.8</code> auto / <code>0.6</code> identity). That silently missed facts that <em>name</em> the entity outright — e.g. forgetting <code>iguana</code> left <em>"user previously had an iguana that was removed"</em> in place because the sentence-vs-word distance exceeded the bar. The sweep now also deletes any candidate whose text mentions the target as a word-boundary token, regardless of distance. <code>n_results</code> was raised 10 → 20 so more candidates are examined.</p>
 
-  <h3>Entity-aware expansion (alias tombstones)</h3>
+  <h3>Entity-aware expansion (alias tombstones) <em>(Superseded — see <a href="#rereview">the current rules</a>.)</em></h3>
   <p>A deleted entity often survives under a <em>synonym</em>: <code>forget('mortimer')</code> can't reach a fact stored under <code>iguana</code>. Before severing graph edges, <code>unified_forget</code> calls <code>GraphMemory.get_connected_entities(target)</code> to pull the target's direct (1-hop) neighbours — <code>mortimer → iguana</code> via a <code>mortimer IS_A iguana</code> edge — filtering generic hubs (<code>user</code>, pronouns). It then runs a <strong>literal-mention-only</strong> secondary sweep (vector + graph + profile values) for each neighbour, so the alias tombstone goes too without semantic over-reach.</p>
 
   <h3>Stopping tombstone regeneration</h3>
@@ -583,6 +583,104 @@
   <h2 id="4kw-r5">forget, fifth review <span class="tag">2026-10-03 &sect;4KW</span></h2>
   <p>After the facts naming the target are deleted, a fact that matches only some of its words is listed, never deleted ("wife's
   birthday" no longer takes "wife is named Maria"). Inflections are only -s/-es/-ed/-ing/-ies/-ly (Louis is not Louise, plan is not plant).</p>
+  <h2 id="writes-review">forget, update_profile, reset_all <span class="tag">2026-10-03 memory-writes / producers review</span></h2>
+  <ul>
+    <li><strong>Profile leg</strong> (<code>_forget_profile</code>): an explicit <code>category.key</code> is deleted; one key named exactly
+    by a specific word is deleted; a key that only partly matches, several exact keys, an attribute or hub word ("name", "son",
+    "user"), and a field that merely MENTIONS the target among other things ("BMW" in a vehicles line, "Athens" in the address)
+    are listed, not deleted. A list item naming the target is pruned alone. The owner's own identity fields (<code>root.name</code>,
+    email, address …) go only when named explicitly.</li>
+    <li><strong>Graph leg</strong>: skipped for a target of hub or attribute words and for the owner's own name. The neighbour
+    expansion follows only IDENTITY edges anchored on the exact node: <code>mortimer IS_A iguana</code> (thing → class) and
+    aliases both ways; never a relationship (<code>forget leonidas</code> no longer reaches his mother) and never a class's
+    instances.</li>
+    <li><strong>Episode leg</strong> (new): episodes that name a specific entity are archived to
+    <code>episodes_forgotten.jsonl</code>, then deleted with their vector twins.</li>
+    <li><s><strong>reset_all</strong> runs only when the turn's request explicitly asks to wipe all memory ("wipe all your memory",
+    "forget everything"); otherwise it is refused.</s> <em>Superseded by <a href="#confirm">preview, then confirm</a> (§4KX r8).</em></li>
+    <li><strong>update_profile</strong>: <code>[]</code>, <code>{}</code>, "null", "None", zero-width and other empty-looking values change
+    nothing (only an exact <code>""</code> deletes; <em>correction:</em> "none" and "N/A" are real answers and ARE stored); a delete also removes the <code>user HAS_&lt;KEY&gt;</code> graph edge and the vector
+    fragment of every value of a list key; the duplicate check reads the canonical field.</li>
+  </ul>
+  <h2 id="rereview">forget — rules after the re-review <span class="tag">2026-10-03 re-review</span></h2>
+  <p class="note">The matching rules below still decide what the PREVIEW proposes; since §4KX r8 nothing is deleted until the
+  user confirms — see <a href="#confirm">preview, then confirm</a>, which also supersedes the reset_all item.</p>
+  <ul>
+    <li><strong>Profile</strong>: an explicit <code>category.key</code> is deleted; one exact key for a specific word; a list item naming the
+    entity is pruned; a scalar is removed when it IS or STARTS WITH the entity ("Mortimer the iguana", "Tesla Model 3" for "my old car
+    Tesla") and is not a list ("BMW 118i, Ducati, Sym" is listed). Attribute words ("my wife") list the fields they name. A value
+    replaced earlier and kept as <code>previous</code> is forgotten too. Owner identity fields only by explicit name.</li>
+    <li><strong>Graph</strong> (<code>GraphMemory.forget_entity</code>): an edge goes when one of its nodes IS the entity (or the entity plus
+    a version/model: "tesla model 3"); an owner life fact that only mentions it is kept and reported, unless the entity is the
+    owner's family member being forgotten. Hub/attribute words and the owner's own name skip the graph.</li>
+    <li><strong>Expansion</strong>: aliases only (ALSO_KNOWN_AS, AKA, NICKNAME, SAME_AS …), anchored on the exact node, from a target
+    that names an entity and is not the owner; a class link (<code>hermes IS_A llm</code>) is never followed.</li>
+    <li><strong>Episodes</strong>: deleted (archived with their actions) only for a family member of the owner; otherwise their number
+    is reported and they are kept — an episode is a record of a whole turn.</li>
+    <li><s><strong>reset_all</strong>: runs when the request asks to wipe ALL memory ("clear your memory", "wipe everything", "forget
+    everything about me", "factory reset", Greek phrasings), never when negated, about a memory card or about data files; it
+    erases the vector memory and the graph (not the profile, episodes or playbook).</s> <em>Superseded (§4KX r8): two steps,
+    preview then confirm; what it erases is unchanged.</em></li>
+    <li><strong>update_profile</strong> tells the model what a single-value write replaced ("(was: …)"); "none"/"N/A" are real answers.</li>
+  </ul>
+  <h2 id="confirm">forget and reset_all: preview, then confirm <span class="tag">2026-10-03 &sect;4KX r8</span></h2>
+  <p class="note"><strong>Supersedes</strong> the reset_all wording gate and the "listed, re-issue by exact name" route in the two
+  sections above. Three rounds of reviews kept finding wrong deletions in a forget that <em>guessed</em> what the user meant, so the
+  model-facing forget no longer guesses alone: it shows the user the list.</p>
+  <ol>
+    <li><code>knowledge_base(action='forget', target=X)</code> is a <strong>PREVIEW</strong>. It runs the same sweep in plan mode
+    (<code>_FORGET_PLAN</code>; the stores are wrapped by recording proxies) and deletes nothing. It returns numbered items — files,
+    documents, facts, profile fields and list items, graph facts, episodes — and an "also found" group of related items that are
+    kept unless picked (fields that only mention X, facts about the owner, mention-only episodes), plus a token.</li>
+    <li>The model shows the list to the user. In the user's <strong>next</strong> turn it calls
+    <code>knowledge_base(action='forget', confirm='&lt;token&gt;', items='all')</code> or <code>items='1,3'</code> / <code>'2-5'</code>
+    (numbers from either group). The confirmation is refused in the turn that made the preview, and from an autonomous turn
+    (<code>job-</code>/<code>sched-</code>/<code>sub-</code>). A token is single-use and expires after an hour.</li>
+    <li>The executor (<code>forget_execute</code>) deletes exactly the chosen items and re-checks each file at delete time (no
+    symlink, inside the sandbox, not in a RELEASED project). Graph facts go through <code>delete_edge</code> and episodes through
+    <code>delete_episodes</code> — both archive first.</li>
+  </ol>
+  <p><strong>reset_all</strong> is the same two steps: the first call returns the row and fact counts and a token, the wipe runs
+  only with the token in a later turn. The old wording gate (<code>_FULL_WIPE_RE</code>) is gone — it opened on negations,
+  questions and "clear your memory of my wife", and refused a plain "yes".</p>
+  <p><strong>Matching</strong>, shared by every leg: one <em>entity</em> (<code>_entity_of</code>) — hub, attribute and function
+  words and possessives dropped, dots and hyphens kept ("node.js", "pista-gp"); accent- and case-folded, any script
+  (<code>profile.mentions</code>, <code>GraphMemory._node_is</code>, the episode scan), so Greek names are found. An attribute
+  word <em>after</em> the entity or joined by "of" narrows the forget to that attribute ("Fotini's birthday" takes the birthday
+  edge and <code>fotini_birthday</code>, not the marriage); a category before it does not ("my old car Tesla"). Forgetting a family
+  member also takes the profile keys named after them. A <code>root.*</code> field is listed, like the graph's owner fact it
+  mirrors. Another person's facts are theirs: only facts with <code>user</code> at one end are kept as "facts about you". A
+  read-degraded profile says it was not searched. Direct Python callers of <code>tool_unified_forget</code> keep the immediate
+  behaviour.</p>
+  <p><strong>learn_skill</strong>: a lesson the user dictates ("remember…", "from now on…", "θυμήσου…") is kept general with no
+  generality check; the model's own request-shaped lesson is kept for that request and the tool now says so.</p>
+  <h2 id="confirm-review">Preview/confirm — fresh-eye review fixes <span class="tag">2026-10-03 &sect;4KX r8</span></h2>
+  <ul>
+    <li>The preview keeps the sweep's warnings and refusals ("Notes from the search"); partial-name files and documents are
+    "also found" items, so the preview never says "nothing matches" while something does.</li>
+    <li>Confirmation: refused for no request id / <code>SYSTEM</code>, <code>bench-</code>, <code>replay-</code> and internal ids, and
+    for a preview made in a turn the user never saw. The one-hour TTL is checked at confirm; the token store is locked.
+    <code>items</code> accepts a list or number; a number not on the list refuses the whole confirm (nothing deleted, token kept).</li>
+    <li>The executor deletes the profile field AS SHOWN (<code>ProfileMemory.delete(exact=True)</code>, no canonical map) and says
+    "already gone" instead of ✅ when nothing was there.</li>
+    <li>Matching: the qualifier is matched on the PREDICATE only — same word, an inflection, or a listed other name
+    (<code>_QUALIFIER_SYNONYMS</code>: birthday ~ BORN/BIRTHDATE; "company" no longer takes COMPANION); an owner fact is never in a
+    qualified target's default list. The owner's fields named after a person (<code>user HAS_FOTINI_DESCRIPTION</code>,
+    <code>GraphMemory.owner_field_edges</code>) go with a family member and are listed otherwise. The entity keeps words inside the
+    name ("vale of tempe"); trailing dots are ignored ("g.o."); every live row is scanned, so "rene" finds "René". An unreadable
+    profile holds the graph and episode legs back (the owner's name is unknown).</li>
+  </ul>
+  <h2 id="recall-owner-facts">recall: the owner's facts by their kind <span class="tag">2026-10-03 &sect;4KX r8</span></h2>
+  <p>The graph tier seeded its search on query words that NAME a node, so a fact asked for by its kind — "what health
+  conditions do I have" — was unreachable: <code>user HAS_CONDITION heart failure</code> has no node called "health". Recall
+  now also adds the owner's facts whose PREDICATE names a query word (same word or an inflection) or a category it covers
+  (<code>GraphMemory.owner_facts_matching</code>: health, medication, job, family, home, car, birthday …, and Greek υγεία /
+  φάρμακα / δουλειά / οικογένεια). Only edges with <code>user</code> at one end; a category never reaches a task in progress
+  (<code>WORKS_ON</code>). Measured on a copy of the live graph: unrelated questions get none.</p>
+  <h2 id="4ky">Owner writes need an owner turn <span class="tag">2026-10-03 &sect;4KY</span></h2>
+  <p><code>update_profile</code> and <code>insert_fact</code> refuse probe and background turns
+  (<code>_owner_write_block</code>, reason <code>owner_write_not_owner_turn</code>) — a probe wrote
+  <code>user HAS_PROFESSION pilot</code>. See memory &rarr; attribution for the extractor's rule.</p>
 </main>
   <h2 id="member">Not for a channel member <span class="tag">2026-09-24 &sect;4KJ</span></h2>
   <p><code>recall</code>, <code>remember</code>, <code>knowledge_base</code>, <code>update_profile</code> and <code>unified_forget</code> read or write the OWNER's stores. A request that declared itself a member's is refused at dispatch (every tool outside <code>core/agent._MEMBER_ALLOWED_TOOLS</code>) and, as a belt, inside each tool (<code>_member_block</code>, reason <code>owner_data_blocked</code>, nothing touched). Pins: <code>tests/test_requester_role.py</code>.</p>

@@ -13,6 +13,7 @@ strategies while keeping the best exemplar intact.
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -34,6 +35,13 @@ def _doc_key(text) -> str:
     re-ingest the same episode forever (see `reconcile_vector_index`).
     """
     return str(text or "").strip()
+
+
+def _fold(text: str) -> str:
+    """Case- and accent-folded text (Greek "Ελένη" ~ "ελενη")."""
+    import unicodedata
+    t = unicodedata.normalize("NFD", str(text or "").casefold())
+    return "".join(ch for ch in t if not unicodedata.combining(ch))
 
 
 class EpisodicMemory:
@@ -1120,6 +1128,103 @@ class EpisodicMemory:
             "SELECT * FROM episodes ORDER BY timestamp DESC LIMIT ?", (limit,)
         )
         return [dict(row) for row in cursor]
+
+    def _mention_hits(self, conn, target: str) -> list:
+        t = str(target or "").strip().lower()
+        if len(t) < 3:
+            return []
+        rx = re.compile(r"(?<![\w])" + re.escape(_fold(t)) + r"(?![\w])")
+        # every row: an ASCII target must still find "René" (r8 review);
+        # 21 ms on the live 400-episode store
+        rows = conn.execute("SELECT id, trigger, context, outcome, lesson, timestamp FROM episodes").fetchall()
+        return [r for r in rows if any(rx.search(_fold(str(x or ""))) for x in r[1:5])]
+
+    def mention_previews(self, target: str) -> list:
+        """``[(id, trigger), …]`` of the episodes naming ``target``."""
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            return [(r[0], str(r[1] or "")) for r in self._mention_hits(conn, target)]
+
+    def delete_episodes(self, ids, vector_memory=None, reason: str = "") -> int:
+        """Delete the given episodes (archived with their actions to
+        ``episodes_forgotten.jsonl`` first — nothing is deleted when the
+        archive cannot be written) and their vector twins."""
+        import json as _json
+        ids = [int(i) for i in ids or []]
+        if not ids:
+            return 0
+        with self._lock, closing(sqlite3.connect(self.db_path)) as conn:
+            q = ",".join("?" * len(ids))
+            rows = conn.execute(f"SELECT id, trigger, context, outcome, lesson, timestamp FROM episodes WHERE id IN ({q})",
+                                ids).fetchall()
+            if not rows:
+                return 0
+            try:
+                with open(Path(self.db_path).parent / "episodes_forgotten.jsonl", "a", encoding="utf-8") as fh:
+                    for r in rows:
+                        acts = [dict(zip(("action_order", "tool_name", "tool_args", "result"), a)) for a in conn.execute(
+                            "SELECT action_order, tool_name, tool_args, result FROM episode_actions "
+                            "WHERE episode_id = ? ORDER BY action_order", (r[0],)).fetchall()]
+                        fh.write(_json.dumps({"id": r[0], "trigger": r[1], "context": r[2], "outcome": r[3],
+                                              "lesson": r[4], "timestamp": r[5], "actions": acts, "forgot": reason},
+                                             ensure_ascii=False) + "\n")
+            except OSError:
+                return 0
+            found = [r[0] for r in rows]
+            conn.executemany("DELETE FROM episode_actions WHERE episode_id = ?", [(i,) for i in found])
+            conn.executemany("DELETE FROM episodes WHERE id = ?", [(i,) for i in found])
+            conn.commit()
+        coll = getattr(vector_memory, "collection", None)
+        if coll is not None:
+            for i in found:
+                try:
+                    coll.delete(where={"$and": [{"type": "episode"}, {"episode_id": int(i)}]})
+                except Exception:  # noqa: BLE001
+                    pass
+        return len(found)
+
+    def count_mentions(self, target: str) -> int:
+        """How many episodes name ``target`` as a whole word."""
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            return len(self._mention_hits(conn, target))
+
+    def forget_mentions(self, target: str, vector_memory=None) -> int:
+        """Delete the episodes whose text NAMES ``target`` (a whole-word
+        match in trigger, context, outcome or lesson) — `forget`'s episode
+        leg, used for a person of the owner's family. Each row AND its
+        actions are archived to ``episodes_forgotten.jsonl`` first; nothing
+        is deleted when the archive cannot be written. Their vector twins
+        go too. Returns the number deleted."""
+        import json as _json
+        with self._lock, closing(sqlite3.connect(self.db_path)) as conn:
+            hits = self._mention_hits(conn, target)
+            if not hits:
+                return 0
+            ids = [r[0] for r in hits]
+            actions = {}
+            for i in ids:
+                actions[i] = [dict(zip(("action_order", "tool_name", "tool_args", "result"), a)) for a in conn.execute(
+                    "SELECT action_order, tool_name, tool_args, result FROM episode_actions WHERE episode_id = ? "
+                    "ORDER BY action_order", (i,)).fetchall()]
+            try:
+                with open(Path(self.db_path).parent / "episodes_forgotten.jsonl", "a", encoding="utf-8") as fh:
+                    for r in hits:
+                        fh.write(_json.dumps({"id": r[0], "trigger": r[1], "context": r[2], "outcome": r[3],
+                                              "lesson": r[4], "timestamp": r[5], "actions": actions.get(r[0], []),
+                                              "forgot": str(target).strip().lower()},
+                                             ensure_ascii=False) + "\n")
+            except OSError:
+                return 0
+            conn.executemany("DELETE FROM episode_actions WHERE episode_id = ?", [(i,) for i in ids])
+            conn.executemany("DELETE FROM episodes WHERE id = ?", [(i,) for i in ids])
+            conn.commit()
+        coll = getattr(vector_memory, "collection", None)
+        if coll is not None:
+            for i in ids:
+                try:
+                    coll.delete(where={"$and": [{"type": "episode"}, {"episode_id": int(i)}]})
+                except Exception:  # noqa: BLE001
+                    pass
+        return len(ids)
 
     def get_episode(self, episode_id: int) -> Optional[Dict]:
         """Retrieve a full episode with its actions."""

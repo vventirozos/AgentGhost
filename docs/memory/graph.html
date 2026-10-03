@@ -60,7 +60,7 @@
     <tbody>
       <tr><td><code>add_triplets(triplets) -&gt; int</code></td><td>Bulk insert / reinforce. Functional predicates (see below) auto-expire prior values — each expiry logged via <code>logger.warning</code>. Multi-valued predicates like <code>USES_LIBRARY</code> / <code>USES_TECHNIQUE</code> — the cross-project map (see <a href="../algorithms/cross_project_map.html">Cross-project map</a>) — plus <code>OWNS</code> / <code>IS</code> / the <code>HAS_*</code> family accumulate instead.</td></tr>
       <tr><td><code>delete_by_target(target) -&gt; int</code></td><td><strong>Word-boundary-confirmed deletion (2026-07-22)</strong>, not a raw substring wipe. <code>LIKE %target%</code> is only a cheap prefilter; each candidate is then confirmed by <code>_entity_matches</code> (whole-token, optional plural), so <code>forget("tin")</code> no longer hard-deletes <code>testing</code> / <code>printing</code> — it went from 83 unrelated rows to just the real entity. A forget matching ≥ <code>_FORGET_SOFT_EXPIRE_MIN_ROWS</code> (50) live rows is downgraded to a recoverable temporal EXPIRY (disappears from every read path like a delete, but recoverable via <code>get_expired_triplets</code>) rather than an unbounded hard delete. Covered by <code>tests/test_graph_dataloss_fixes.py</code>.</td></tr>
-      <tr><td><code>get_connected_entities(target, limit=8)</code></td><td>Distinct entity names 1 hop from <code>target</code>, fed back into <code>delete_by_target</code> by <a href="../tools/memory_tools.html"><code>forget</code></a> to expand a wipe to alias tombstones (<code>mortimer → iguana</code>). As the amplifier of any forget it is now bounded on three axes (2026-07-22): the anchor must match a WHOLE token of the node (not a substring), only CURRENT edges (<code>valid_until IS NULL</code>) are followed, and hub neighbours are skipped by an expanded stoplist (real hubs are operational nouns — <code>assistant</code>, <code>project</code>, <code>system</code>, <code>done</code> — not just pronouns) OR by measured degree &gt; <code>_EXPANSION_MAX_DEGREE</code> (8).</td></tr>
+      <tr><td><code>get_connected_entities(target, limit=8)</code></td><td><em>(Superseded: aliases only, exact node — see <a href="#writes-review">below</a>.)</em> Distinct entity names 1 hop from <code>target</code>, fed back into <code>delete_by_target</code> by <a href="../tools/memory_tools.html"><code>forget</code></a> to expand a wipe to alias tombstones (<code>mortimer → iguana</code>). As the amplifier of any forget it is now bounded on three axes (2026-07-22): the anchor must match a WHOLE token of the node (not a substring), only CURRENT edges (<code>valid_until IS NULL</code>) are followed, and hub neighbours are skipped by an expanded stoplist (real hubs are operational nouns — <code>assistant</code>, <code>project</code>, <code>system</code>, <code>done</code> — not just pronouns) OR by measured degree &gt; <code>_EXPANSION_MAX_DEGREE</code> (8).</td></tr>
       <tr><td><code>wipe_all()</code></td><td>Truncate.</td></tr>
       <tr><td><code>get_recent_triplets(limit)</code></td><td>Most recent edges.</td></tr>
       <tr><td><code>get_expired_triplets(subject, limit)</code></td><td>Superseded facts.</td></tr>
@@ -88,6 +88,7 @@
   <p><strong>OWNS / IS removed from the functional set (2026-07-22).</strong> Both were wrongly listed here and are MULTI-valued (you own many things; X <em>is</em> many things), so every new extraction expired a real prior fact: 19 of 21 live expired rows were OWNS — the operator's ownership history was silently lost, since restored. <code>HAS_PET</code> / <code>HAS_TASK</code> / <code>HAS_FEATURE</code> / <code>HAS_NAME</code> (written with the generic subject <code>project</code>) and <code>HAS_STATE</code> / <code>HAS_FEN</code> (position logs) are likewise deliberately absent. Conversely the genuinely single-valued operational predicates <strong>HAS_STATUS / STATUS / HAS_PID</strong> (and HAS_AGE / HAS_LOCATION) were MISSING and had been accumulating mutually-exclusive contradictions — now added. Every expiry is instrumented: <code>logger.warning</code> records <em>subject predicate old → new</em> on every supersession (write-time and merge-time), so an expiry is never silent. Covered by <code>tests/test_graph_dataloss_fixes.py</code>.</p>
 
   <h2>Forgetting — decay for the only uncapped tier (2026-07-07, #27c)</h2>
+  <p><em>Owner life facts are exempt since 2026-10-03 — see <a href="#writes-review">below</a>.</em></p>
   <p>Unlike vector (5000-cap), episodes (500) and skills (50), the graph had <em>no</em> bound: every non-functional predicate accumulated forever, and weight-1 edges (one-off extractor noise) diluted retrieval as the graph grew. <code>prune_stale_edges(max_age_days=45, keep_min_weight=1)</code> deletes currently-valid edges whose <code>weight &le; keep_min_weight</code> AND whose <code>timestamp</code> is older than the age threshold — from both SQLite and the mirror. Reinforced edges (weight &gt; threshold) survive regardless of age: <strong>weight IS the decay signal</strong>, previously stored but never used for forgetting. It runs from the <a href="../algorithms/dream_cycle.html">dream cycle</a> (best-effort, never fails a dream) and reports the count in the Dream-Complete line. Covered by <code>tests/test_graph_forgetting.py</code>. (A persistent token→node inverted index — replacing the substring/difflib scan entirely — remains a further optimization.)</p>
 
   <h2>Archive-before-delete (§4M, 2026-08-08)</h2>
@@ -109,6 +110,51 @@
   <p><strong>Malformed triplets can't abort the batch:</strong> <code>t.get("subject")</code> ran OUTSIDE the per-triplet try, so one list/tuple-shaped LLM triplet raised out of <code>add_triplets</code> — at the smart-memory call site that aborted the whole consolidation INCLUDING the turn's fact embed and profile write (graph runs first). Non-dicts are now skipped with a debug log; <code>relation</code> is accepted as a predicate-key fallback; the per-triplet except logs instead of <code>pass</code>. <strong>Generic-subject expiry guard:</strong> functional-predicate expiry (HAS_STATUS/STATUS/HAS_PID) is skipped for aggregate subjects (<code>_EXPIRY_GENERIC_SUBJECTS</code>: project/task/app/service/…) — live rows like <code>project HAS_STATUS done|active|needs_user</code> are three DIFFERENT projects' facts, and a new write would have expired every sibling. Same rationale that kept HAS_NAME out of the functional set. Tests: <code>::TestGraphTripletRobustness</code>.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+  <h2 id="writes-review">Owner facts never decay; forget expands only through identity <span class="tag">2026-10-03 memory-writes / producers review</span></h2>
+  <p><code>prune_stale_edges</code> skips edges about the owner (subject or object <code>user</code>) and family, ownership, residence,
+  name and work relations — stated once and never reinforced, they were due to be deleted after 45 days. <code>delete_edge</code>
+  removes one archived edge (used when a profile field is deleted). <code>get_connected_entities</code> follows only identity
+  edges (<code>_IDENTITY_PREDICATE_RE</code>; aliases both ways, a class link thing → class only), anchored on the exact node.</p>
+  <h2 id="rereview">Re-review <span class="tag">2026-10-03 re-review</span></h2>
+  <p>Decay keeps a durable relation (whole predicate tokens: family, birth, ownership, residence, home, address, pets; plus
+  <code>HAS_NAME</code>/<code>NAMED</code>/<code>WORKS_AT</code>/<code>WORKS_FOR</code>) whoever its subject, and any <code>user HAS_*</code> field;
+  the owner's chatter (<code>user GREETED</code>, <code>ASKED_ABOUT</code>) decays again. <code>forget_entity</code> replaces the word match
+  for forget; <code>is_owner_family</code> tells a family member. Four owner facts pruned before the exemption were restored.</p>
+  <h2 id="r8">Forget preview, folded matching, health facts <span class="tag">2026-10-03 &sect;4KX r8</span></h2>
+  <ul>
+    <li><code>preview_forget_entity(entity)</code> — what <code>forget_entity</code> would do, deleting nothing:
+    <code>(doomed, kept)</code>. The forget preview lists both; a kept fact can be picked by number.</li>
+    <li>Kept by <code>forget_entity</code>: <code>_is_owner_life_fact</code> — a durable fact with <code>user</code> at one end. A
+    public person's <code>WORKS_AT</code> or parents are not the owner's and go.</li>
+    <li><code>_node_is</code> folds case and accents and treats hyphen/underscore as space; <code>_entity_candidates</code> scans
+    every live row for a non-ASCII entity (SQLite's <code>lower()</code>/<code>LIKE</code> fold ASCII only); <code>is_owner_family</code>
+    compares folded names.</li>
+    <li><code>delete_edge</code> deletes exactly the live rows it archived (by rowid) — never an expired history row.
+    <code>count_edges()</code> feeds the reset_all preview.</li>
+    <li>Decay: health and profession predicates are durable (CONDITION, MEDICATION, DIAGNOSIS, ALLERGY, HEALTH, DISEASE,
+    PROFESSION, COMPANION), and <code>LOCATED_IN</code>; a trip (<code>IS_AT</code>, <code>LOCATED_NEAR</code>) still decays. A
+    <code>user HAS_*</code> carrying TEST/PROBE/DEMO/SAMPLE/… is noise and decays. <code>scripts/memory_repair_4kx_r8.py</code>
+    restored the six owner facts the decay had pruned (heart failure, blood clot, Entresto ×2, profession, companion).</li>
+  </ul>
+  <h2 id="r8-review">Review fixes <span class="tag">2026-10-03 &sect;4KX r8</span></h2>
+  <p><code>owner_field_edges(entity)</code>: live <code>user HAS_&lt;…&gt;</code> edges whose predicate names the entity. Entity
+  matching reads every live row and ignores a trailing dot. Decay: <code>LOCATED_IN</code> is durable only with <code>user</code> as
+  subject (other places' LOCATED_IN was research chatter kept forever).</p>
+  <p><code>owner_facts_matching(query)</code> — the owner's facts by predicate and category, for recall (see
+  memory_tools &rarr; "recall: the owner's facts by their kind").</p>
+  <h2 id="4kz">One predicate per fact, presence vs home, newest wins <span class="tag">2026-10-03 &sect;4KZ</span></h2>
+  <ul>
+    <li><code>_CANONICAL_PREDICATES</code>: spouse, birth-date, residence and medication synonyms are written as ONE predicate
+    (MARRIED_TO, HAS_BIRTHDATE, LIVES_IN, HAS_MEDICATION…). Ages (AGE/HAS_AGE) are not stored — the birth date is the fact.</li>
+    <li>LIVES_IN is home (single-valued); LOCATED_IN / LOCATED_AT / STAYS_AT / IS_AT / VISITING are PRESENCE — not single-valued,
+    not durable (a weekend in Kyllini replaced the owner's home on 08-15).</li>
+    <li><code>add_triplets(as_of=…)</code>: a single-valued edge stated EARLIER than the live one does not replace it (a re-queued
+    journal item expired "lives in Patras" back to Athens). Journal items carry <code>ts</code>.</li>
+    <li><code>owner_edges_naming(value, predicate)</code>: a correction removes only that kind of fact; a removal verb (sold,
+    gave away) removes every owner edge naming it.</li>
+    <li><code>owner_facts_matching</code>: newest first with "(as of …)", wife/husband/sons categories, short plurals; also feeds the
+    bus hydration graph tier.</li>
+  </ul>
 </main>
 </body>
 </html>

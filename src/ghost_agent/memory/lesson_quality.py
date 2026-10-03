@@ -109,10 +109,46 @@ def _is_actionable_heuristic(text) -> bool:
     return False
 
 
+#: a "mistake" that states there was none (producers review: "None
+#: observed; the solution was direct", "None.", "N/A - no mistake", "No
+#: mistakes were made" all passed as real corrections, so the fix was never
+#: checked — the main source of self-play junk)
+#: …but only the WHOLE statement "there was none" — not a real mistake that
+#: starts with the same word ("No error handling around json.loads", "None
+#: of the paths were quoted", "Nothing was flushed", "N/A values in the
+#: price column", "There was no retry after the 429" — re-review)
+_NO_MISTAKE_RE = re.compile(
+    r"^\W*(?:none|n/?a|nil|nothing|not\s+applicable)"
+    r"(?:\s+(?:(?:were|was)\s+)?(?:observed|found|noted|detected|identified|made)\b[^,;]*|\s*(?:[.;:!(–—-]|,(?!\s*but\b)|$))"
+    r"|^\W*no\s+(?:real\s+|significant\s+|obvious\s+|notable\s+)?(?:mistakes?|errors?|issues?|problems?|failures?)"
+    r"(?:\s+(?:(?:were|was)\s+)?(?:made|found|observed|detected|identified|noted|occurred)\b[^,;]*"
+    r"|\s*(?:[.;:!(–—-]|$))"
+    r"|^\W*there\s+(?:was|were)\s+no\s+(?:mistakes?|errors?|issues?|problems?)\b[^,;]*",
+    re.IGNORECASE)
+#: …nor a failure named after it ("None. The first try failed") — "no
+#: mistake" in the rest is still none
+_FAILURE_WORD_RE = re.compile(
+    r"(?<!\bno\s)(?<!\bnot\sa\s)\b(?:fail\w*|errors?|erroneous|wrong\w*|mistakes?|mistaken\w*|bugs?|buggy|broke\w*"
+    r"|incorrect\w*|miss(?:ed|ing)|forg[oe]t\w*|crash\w*|retr(?:y|ied|ies)\w*|timed?\s*out|exception\w*)\b",
+    re.IGNORECASE)
+#: "No errors, but the loop ran twice" names a mistake after all
+_BUT_RE = re.compile(r"[,;]?\s*\b(?:but|however|although|though|except)\b", re.IGNORECASE)
+
+
 def _is_mistake_less(mistake) -> bool:
     """A 'lesson' with no real mistake is a RULE or an OBSERVATION, not a
     mistake-and-fix correction."""
-    return (str(mistake or "").strip().lower() in ("none", "", "n/a"))
+    t = str(mistake or "").strip()
+    if not t:
+        return True
+    m = _NO_MISTAKE_RE.match(t)
+    # the WHOLE statement must say "no mistake" (re-review: "No errors, but
+    # …" and "None observed in the final path; the first try failed")
+    return bool(m) and not _BUT_RE.search(t) and not _FAILURE_WORD_RE.search(t[m.end():])
+
+
+def _same_text(a, b) -> bool:
+    return re.sub(r"\W+", " ", str(a or "")).strip().lower() == re.sub(r"\W+", " ", str(b or "")).strip().lower()
 
 
 # --- conversational-trigger detection (2026-07-18) -------------------------
@@ -218,6 +254,8 @@ def is_actionable_lesson(mistake, solution, task) -> bool:
     — the dream heuristics loop legitimately stores ``task = solution[:80]``,
     so equality is the normal shape of a valid short rule, not a degeneracy.
     """
+    if str(solution or "").strip() and _same_text(mistake, solution):
+        return False            # the "fix" repeats the mistake (producers review)
     if not _is_mistake_less(mistake):
         # Real correction — keep, UNLESS its retrieval key is raw chat
         # (see _is_conversational_trigger above). An empty task/trigger

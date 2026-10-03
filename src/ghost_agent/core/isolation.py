@@ -290,6 +290,8 @@ class ReadOnlyGraphMemory:
         return []
     def add_triplets(self, *args, **kwargs): return 0
     def delete_by_target(self, *args, **kwargs): return 0
+    def delete_edge(self, *args, **kwargs): return 0
+    def forget_entity(self, *args, **kwargs): return 0, []
     def wipe_all(self): pass
     def execute_graph_compression(self, *args, **kwargs): return 0
     # §4CL S1 review: unlike its two siblings this façade forwards by

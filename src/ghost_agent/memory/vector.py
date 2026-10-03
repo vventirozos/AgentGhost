@@ -1125,6 +1125,22 @@ class VectorMemory:
                 # `heal_missing_twins`, whose metadata dict omits it — the
                 # provenance mirror bulk retraction drives. Two measured
                 # facts, one decision: correct the claim, change no rows.
+                # a repeated SYNTHESIS keeps the provenance it already had —
+                # its earlier sources were deleted when it was first built,
+                # so replacing the list erased the only evidence (§4KY)
+                if isinstance(metadata, dict) and "provenance" in metadata and _old_meta.get("provenance"):
+                    try:
+                        _old_p = json.loads(_old_meta["provenance"])
+                        _new_p = json.loads(metadata["provenance"])
+                        _seen = {str(x.get("id")) for x in _new_p if isinstance(x, dict)}
+                        _merged = _new_p + [x for x in _old_p if isinstance(x, dict) and str(x.get("id")) not in _seen]
+                        _pj = json.dumps(_merged, ensure_ascii=False)
+                        while len(_merged) > 1 and len(_pj) > 1800:
+                            _merged = _merged[:-1]
+                            _pj = json.dumps(_merged, ensure_ascii=False)
+                        metadata = dict(metadata, provenance=_pj)
+                    except Exception:  # noqa: BLE001 — keep the new list
+                        pass
                 try:
                     self.collection.update(ids=[mem_id], metadatas=[metadata])
                 except Exception as e:
@@ -1233,6 +1249,39 @@ class VectorMemory:
         except Exception as e:
             logger.debug(f"Prune delete failed (non-critical): {e}")
             return 0
+
+    def sync_owner_field(self, key: str, values) -> tuple:
+        """Make the profile's mirror rows (`identity`, text ``User <key> is
+        <value>``) EQUAL ``values`` — the EXACT key, so `wife` never touches
+        `wife_birthdate` (§4KZ: `smart_update` replaced the nearest row by
+        embedding distance, which deleted the sibling key's row and left
+        other stale rows of the same key). The new rows are written FIRST and
+        the stale ones go only when they all landed — a refused write must
+        not take its predecessor with it (§4GK round 6). Returns
+        (added, removed)."""
+        prefix = f"User {key} is "
+        want = [str(v).strip() for v in (values if isinstance(values, list) else [values])
+                if v not in (None, "") and str(v).strip()]
+        try:
+            got = self.collection.get(where={"type": "identity"}, include=["documents"])
+        except Exception:  # noqa: BLE001
+            return 0, 0
+        docs = list(zip(got.get("ids") or [], got.get("documents") or []))
+        have = {str(d)[len(prefix):].strip() for _, d in docs if str(d).startswith(prefix)}
+        added = 0
+        for v in want:
+            if v in have:
+                continue
+            res = self.add(prefix + v, {"type": "identity", "timestamp": get_utc_timestamp()})
+            if res in self.ADD_REFUSALS:
+                raise MemoryWriteRefused(f"{prefix}{v}: {res}")
+            if res in self.ADD_LANDED:
+                added += 1
+        stale = [i for i, d in docs if str(d).startswith(prefix) and str(d)[len(prefix):].strip() not in want]
+        if stale:
+            with self._get_lock():
+                self.collection.delete(ids=stale)
+        return added, len(stale)
 
     def smart_update(self, text: str, type_label: str = "auto"):
         """Replace-or-add one same-type fragment.
@@ -1580,12 +1629,12 @@ class VectorMemory:
         m_type = item['meta'].get('type', 'auto').upper()
         doc_text = item['doc']
 
-        prefix = ""
-        if item['p_score'] <= -15: prefix = "**[MASTER SUMMARY]** "
-        elif item['p_score'] == -12: prefix = "**[EPISODE]** "
-        elif item['p_score'] <= -10: prefix = "**[IDENTITY]** "
-        elif item['p_score'] == -5: prefix = "**[DOCUMENT SOURCE]** "
-        elif item['p_score'] == 0: prefix = "**[USER PRIORITY]** "
+        # the label says what the row IS (§4KZ: a stale auto row was labelled
+        # MASTER SUMMARY by its score)
+        _t = item['meta'].get('type', 'auto')
+        prefix = {"identity": "**[IDENTITY]** ", "synthesis": "**[MASTER SUMMARY]** ",
+                  "document_summary": "**[MASTER SUMMARY]** ", "episode": "**[EPISODE]** ",
+                  "document": "**[DOCUMENT SOURCE]** ", "manual": "**[USER PRIORITY]** "}.get(_t, "")
 
         return f"[{ts}] ({m_type}) {prefix}{doc_text}"
 
@@ -1677,8 +1726,11 @@ class VectorMemory:
                         # **[MASTER SUMMARY]** render label. Identity-typed
                         # prose still ranks via is_identity_type (-10).
                         is_name_memory = (
-                            "name is" in doc_lower or
-                            "call me" in doc_lower
+                            ("name is" in doc_lower or "call me" in doc_lower)
+                            # §4KZ: only a CURATED row; a stale auto "wife's
+                            # name is Fotini" ranked as MASTER SUMMARY above
+                            # the correction
+                            and m_type in ("identity", "manual")
                         )
 
                         if is_name_memory:
@@ -1711,10 +1763,16 @@ class VectorMemory:
                         if include:
                             priority_score = 1
 
+                            # §4KZ: the profile's mirror rows (identity) are the
+                            # CURRENT owner facts — above a dream synthesis,
+                            # which only merged older fragments (a stale
+                            # synthesis always beat the fresh identity row).
+                            # The canned-probe batch confers NO tier: a row it
+                            # reached is ranked by its own type.
                             if is_name_memory: priority_score = -20
-                            elif is_summary or is_synthesis: priority_score = -15
+                            elif is_identity_type: priority_score = -15
                             elif is_episode: priority_score = -12
-                            elif is_identity_type or is_identity_batch: priority_score = -10
+                            elif is_summary or is_synthesis: priority_score = -10
                             elif m_type == 'document': priority_score = -5 # Elevate document priority above general manual/auto
                             elif m_type == 'manual': priority_score = 0
 
@@ -1736,8 +1794,12 @@ class VectorMemory:
                             seen_docs.add(doc)
 
                 if should_inject_identity:
-                    process_batch(0, is_identity_batch=True)
+                    # the REAL query first (§4KZ): the probe batch used to claim
+                    # the rows and the query batch then skipped them, so the bus
+                    # gate (query-batch distances only) saw nothing on "what is
+                    # my name?"
                     process_batch(1, is_identity_batch=False)
+                    process_batch(0, is_identity_batch=True)
                 else:
                     process_batch(0, is_identity_batch=False)
 
@@ -1752,8 +1814,11 @@ class VectorMemory:
                         # Retrieval reinforcement: use last_accessed if available,
                         # falling back to creation timestamp. Frequently-accessed
                         # memories stay fresh via spaced-repetition effect.
-                        last_accessed = c['meta'].get('last_accessed')
-                        effective_ts = last_accessed if last_accessed else c['timestamp']
+                        # §4KZ: age is WHEN THE FACT WAS STATED. Recall used
+                        # to reset it (`last_accessed`), so a stale value read
+                        # often looked fresher than a newer correction; being
+                        # used still stretches the half-life below.
+                        effective_ts = c['timestamp']
                         mem_time = parse_utc_timestamp(effective_ts)
                         age_days = (now - mem_time).total_seconds() / 86400.0
                         # Retrieval count stretches the half-life logarithmically:

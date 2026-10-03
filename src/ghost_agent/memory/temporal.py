@@ -123,6 +123,9 @@ _UNIT_ALIASES = {
     "month": "month", "months": "month", "mo": "month", "mos": "month",
     "week": "week", "weeks": "week", "wk": "week", "wks": "week",
     "day": "day", "days": "day",
+    # Greek (§4KZ)
+    "χρονών": "year", "χρονων": "year", "ετών": "year", "ετων": "year",
+    "μηνών": "month", "μηνων": "month", "εβδομάδων": "week", "εβδομαδων": "week",
 }
 
 # Ages beyond this are almost certainly a misparse (a year number, a count
@@ -219,7 +222,9 @@ def _fmt_anchor(d: datetime.date, unit: str) -> str:
 # Each pattern captures (count, unit-or-None). A leading copula is swept
 # into the match and dropped, so "Leonidas is 4 months old" becomes
 # "Leonidas born ~2026-02-20" rather than "Leonidas is born ~…".
-_COPULA = r"(?:\b(?:is|was|are|were|turns|turned)\s+)?"
+# (§4KZ: "is NOW 10 years old" left "is now" outside the match and produced
+# "Thodoris is now born ~2016-04")
+_COPULA = r"(?:\b(?:is|was|are|were|turns|turned)\s+(?:now\s+|already\s+|just\s+)?)?"
 
 #: The COUNT of an age phrase. The look-behind keeps a decimal's fraction
 #: ("9.5 years old" read as FIVE years; "5.8 months" — the checker's own
@@ -469,6 +474,9 @@ _AGE_PATTERNS = [
     # "age 9" / "aged 9" — a bare number after an age cue means YEARS
     (re.compile(r"\bage[d]?\s+" + _NUM + r"\b(?!\s*[-\s]?\s*(?:year|month|week|day))",
                 re.IGNORECASE), False),
+    # Greek: "είναι 10 χρονών" / "10 ετών" / "4 μηνών" (§4KZ)
+    (re.compile(r"(?:(?<!\w)(?:είναι|ειναι|έγινε|εγινε|κλείνει|κλεινει)\s+)?" + _NUM
+                + r"\s+(χρονών|χρονων|ετών|ετων|μηνών|μηνων|εβδομάδων|εβδομαδων)(?!\w)", re.IGNORECASE), True),
 ]
 
 # ATTRIBUTIVE form: a fully-hyphenated compound modifying (or standing in

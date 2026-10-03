@@ -96,15 +96,14 @@ class TestJournalSourcedSkillGate:
         assert write is False
         assert "journal" in reason
 
-    def test_journal_source_failure_still_writes(self):
-        # A failure even on the lenient validator IS informative —
-        # the solver couldn't even print any qualifying output —
-        # so writing the lesson is still useful.
+    def test_journal_source_failure_writes_nothing(self):
+        # Producers review: the lesson restated a real user request and the
+        # lenient validator ("output must reference input tokens").
         write, reason = self._branch_reached(
             journal_source=True, passed=False, attempt=2, is_new_cluster=True,
         )
-        assert write is True
-        assert "new cluster" in reason
+        assert write is False
+        assert "journal-mined failure" in reason
 
     def test_non_journal_first_try_pass_still_writes(self):
         write, _ = self._branch_reached(

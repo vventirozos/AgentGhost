@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>memory.attribution — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Memory</h3>
+    <a href="vector.html">vector</a>
+    <a href="graph.html">graph</a>
+    <a href="profile.html">profile</a>
+    <a href="temporal.html">temporal</a>
+    <a class="current" href="attribution.html">attribution</a>
+    <a href="skills.html">skills</a>
+    <a href="journal.html">journal</a>
+    <a href="scratchpad.html">scratchpad</a>
+    <a href="episodes.html">episodes</a>
+    <a href="frontier.html">frontier</a>
+    <a href="projects.html">projects</a>
+    <a href="adaptive_threshold.html">adaptive_threshold</a>
+    <a href="contradiction_log.html">contradiction_log</a>
+  </nav>
+</aside>
+<main>
+  <h1>memory.attribution — who said it <span class="tag">2026-10-03 &sect;4KY</span></h1>
+  <p>The background fact extractor (<code>GhostAgent.run_smart_memory_task</code>) used to write facts ABOUT THE OWNER from
+  anything in an episode. Live: the owner's QUESTION "i'm a doctor/medicine denialist, is this male privilege?" became
+  <code>user HAS_PROFESSION doctor</code>, a vector fact and (via dream) a synthesis; a role-play replaced the owner's wife and
+  home; a pasted bio replaced the employer; the agent's own stats, tasks and files became "the user has…"; a channel member's
+  words in the owner's thread reached the owner's graph.</p>
+  <h2>The rule</h2>
+  <p>A fact about the owner — a graph triplet with <code>user</code> at either end, a profile value, a vector fact naming the
+  user — is written only when the OWNER STATED it: in the owner's own <code>USER:</code> lines (never one carrying the bot's
+  other-member label), in a sentence that is first-person or an instruction ("Always use UTC"), and that is not a question, not
+  role-play or a hypothetical ("pretend", "imagine", "suppose"…, Greek "φαντάσου"), and not inside quotes or code.</p>
+  <ul>
+    <li><code>owner_statements(episode)</code> → <code>(sentence, negated)</code> for each such sentence (folded, any script).</li>
+    <li><code>owner_said(value, statements)</code> → <code>"stated"</code> / <code>"negated"</code> / None. Triplets and profile values
+    need half the value's words in one affirmative sentence; a vector fact needs one shared word (it paraphrases — the check is
+    WHO said it).</li>
+    <li>A value the owner NEGATED ("im not a doctor") is a correction: <code>GraphMemory.owner_edges_naming</code> finds the
+    owner edges whose other end IS it and they are deleted (archived); nothing "not a doctor" is stored.</li>
+    <li>Predicates naming the agent's or a project's state (PROJECT, SKILL, TASK, SANDBOX, FILES, STAT, LEARNING, CODENAME,
+    REQUESTED…) are never owner facts (<code>is_agent_state_predicate</code>); decay no longer protects them either.</li>
+  </ul>
+  <h2>Around it</h2>
+  <ul>
+    <li>The extractor's pre-filter passes "im"/"not" and Greek first-person words — the owner's correction never reached it.</li>
+    <li>The extractor is given the CURRENT TIME its temporal rule refers to.</li>
+    <li>HAS_PROFESSION / HAS_OCCUPATION / WORKS_AS / HAS_JOB are single-valued: a new profession replaces the old.</li>
+    <li>"is not a" / "isn't a" / "am not a" are negation phrases: such a fact is never stored as identity.</li>
+    <li><code>update_profile</code> and <code>insert_fact</code> refuse probe (<code>probe-</code>) and background
+    (<code>job-</code>/<code>sched-</code>/<code>sub-</code>) turns; the journal gate also names sim and bench.</li>
+    <li>The smart-memory arc and the compaction archive skip another person's labelled thread messages
+    (<code>FOREIGN_MESSAGE_LABELS</code>).</li>
+  </ul>
+  <p>Tests: <code>tests/test_4ky_writers_review.py</code>.</p>
+  <h2 id="4kz">Tightened <span class="tag">2026-10-03 &sect;4KZ</span></h2>
+  <ul>
+    <li>A turn that sets up role-play ANYWHERE contributes no owner statement ("Let's play a game. You are my wife Maria. We
+    live in London." passed sentence by sentence).</li>
+    <li>Negation is per clause: "spelled Φωτεινή, not Fotini" states Φωτεινή and corrects Fotini.</li>
+    <li><code>PREDICATE_CUES</code>: a single-valued owner fact needs a statement of its KIND (home needs live/moved/home…;
+    a shared word "Kyllini" is not enough).</li>
+    <li>Checked on the RAW value, before temporal anchoring ("is now 10" → "born ~…" made every age update fail).</li>
+    <li>Every PERSONAL fact is gated (one without "user" skipped it); "we/our" and Greek plural verbs pass the pre-filter;
+    "sold" is a removal.</li>
+  </ul>
+</main>
+</body>
+</html>

@@ -204,6 +204,14 @@ time_penalty = age_days / (30 · log(retrieval_count + e))</code></pre>
   <p><strong>A delete that precedes a refusal destroys what the refusal exists to protect.</strong> <code>smart_update</code> deleted the near neighbour and then delegated to <code>add()</code>, which refuses a write that would reclassify a row's type &mdash; and nothing undid the delete. Driven through the real profile update: the identity tier ended EMPTY while the user was told "retrieval may not reflect the change", which states the opposite of what happened. It now asks who owns the text BEFORE destroying anything. The same shape was found and fixed in the acquired-skill save, which deleted the old embedding and then lost the new one while logging "Permanently learned new tool".</p>
   <p><strong>A refused write is not a silent one.</strong> <code>add()</code> returns which of four things happened, the bus reports a refusal as a failed leg rather than an "ok", and the partial-write breadcrumb &mdash; the only durable record, since nothing rolls back &mdash; now covers a refusal as well as an error. The quarantine sidecar keeps one copy per DISTINCT corruption instead of one ever, and reads the bytes it already holds rather than re-reading a file that just failed to decode, which used to make every later outline write fail the same way forever.</p>
   <p><strong>Re-used ids after a store rebuild.</strong> When the episode database is deleted and the sequence restarts, an old twin can claim a live id and permanently masquerade as a new episode's twin, mapping semantic recall to the wrong row. The reconcile now validates the id-to-text pairing and only reaps a row that claims a live id, holds text that is not that episode's, and holds text no live episode has &mdash; and only when the episode read was not truncated.</p>
+  <h2 id="4kz">Ranking: the current owner fact first <span class="tag">2026-10-03 &sect;4KZ</span></h2>
+  <ul>
+    <li>Tiers: identity (the profile's mirror rows) −15 above synthesis −10; the "name is" boost only for identity/manual rows
+    (a stale auto "wife's name is Fotini" ranked as MASTER SUMMARY over the correction); labels name the row's TYPE.</li>
+    <li>Age counts from when the fact was STATED, not last read (a stale row read often looked fresher than a correction).</li>
+    <li>With an identity probe, the real query's batch is scored first — the probe batch claimed the rows and the bus gate then
+    saw nothing on "what is my name?"; the probe confers no tier.</li>
+  </ul>
 </main>
 </body>
 </html>

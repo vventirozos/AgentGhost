@@ -36,7 +36,7 @@ def mock_profile_memory():
     # value mentioned python). The fixture has 'target_color' as the key
     # so the test still exercises the profile-deletion path.
     prof.load.return_value = {
-        "preferences": {"music": "jazz", "target_color": "red"}
+        "preferences": {"music": "jazz", "target": "red"}
     }
     return prof
 
@@ -44,7 +44,7 @@ def mock_profile_memory():
 def mock_graph_memory():
     graph = MagicMock()
     # Mocking the delete_by_target method to return the count of deleted edges
-    graph.delete_by_target.return_value = 3
+    graph.forget_entity.return_value = (3, [])   # the graph leg's entry point (third memory-writes review)
     return graph
 
 @pytest.mark.asyncio
@@ -100,11 +100,12 @@ async def test_tool_unified_forget_integration(tmp_path, mock_memory_system, moc
         assert "Sweep: Forgot" in report
         
         # Verify 3: Profile swept on key match (not value match)
-        mock_profile_memory.delete.assert_called_once_with("preferences", "target_color")
-        assert "Profile: Removed preferences.target_color" in report
+        # an EXACT key (a partial one is listed, not deleted — profile-writes review)
+        mock_profile_memory.delete.assert_called_once_with("preferences", "target")
+        assert "Profile: Removed preferences.target" in report
         
         # Verify 4: Graph Memory swept
-        mock_graph_memory.delete_by_target.assert_called_once_with("target")
+        mock_graph_memory.forget_entity.assert_called_once_with("target")
         assert "Severed 3 topological edges" in report
 
 @pytest.mark.asyncio
@@ -130,3 +131,22 @@ async def test_reset_all_triggers_wipe_all(mock_memory_system, mock_graph_memory
         assert "Wiped clean" in result
         mock_memory_system.collection.delete.assert_called_with(ids=['1', '2'])
         mock_graph_memory.wipe_all.assert_called_once()
+
+
+#: the tests here that run reset_all (by name: the fixture must not read source)
+_WIPE_TESTS = {'test_reset_all_triggers_wipe_all'}
+
+
+@pytest.fixture(autouse=True)
+def _a_user_who_confirms_the_wipe(request, monkeypatch):
+    """reset_all is preview → confirm in a later turn (§4KX r8); these tests
+    run the confirmed wipe. ONLY the tests that call it — a module-wide
+    wrapper would mask the preview step elsewhere (re-review)."""
+    if request.node.originalname in _WIPE_TESTS:
+        import ghost_agent.tools.memory as _m
+        from tests._wipe_confirm import confirming
+        _wrapped = confirming(_m.tool_knowledge_base)
+        monkeypatch.setattr(_m, "tool_knowledge_base", _wrapped)       # function-local imports
+        if hasattr(request.module, "tool_knowledge_base"):
+            monkeypatch.setattr(request.module, "tool_knowledge_base", _wrapped)
+    yield

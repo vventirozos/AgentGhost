@@ -410,6 +410,63 @@
     wrong rules and plans, duplicates, mismatched triggers), 5 rewritten, the twins of every scoped row restamped
     <code>scope=request</code>; backups skip the older <code>*.bak</code> copies.</li>
   </ul>
+  <h2 id="producers-review">Lesson producers <span class="tag">2026-10-03 memory-writes / producers review</span></h2>
+  <ul>
+    <li><strong>Write gate</strong>: "None observed …", "N/A – no mistake", "No mistakes were made" count as NO mistake (the fix must
+    then be an actionable rule); a fix identical to its mistake is refused; a rule about the self-play harness (validator,
+    hidden test, <code>input.txt</code>, "satisfy the checker") is refused.</li>
+    <li><strong>Generality</strong>: producers pass their source text as <code>generality_context</code> — self-play/bench the
+    challenge, dream the fragment window, episode consolidation the episodes, <code>learn_skill</code> the request in hand — and a
+    general rule restating its names, numbers or files is refused (window-sized contexts check only those markers).</li>
+    <li><strong>Tombstones</strong>: a trigger the operator retracted (archive reasons other than cap-trim) is never re-learned.
+    The dream window cache is persisted (<code>dream_fragment_cache.json</code>), so a restart does not re-dream the same window.</li>
+    <li><strong>Merges</strong>: a replaced fix brings its mistake (a pair); a cross-producer twin closer than 0.08 is the same lesson
+    (evidence only) rather than a second row.</li>
+    <li><strong>Producers</strong>: journal-mined challenges write no lesson, pass or fail; self-play mistakes are stored without the
+    harness's own lines; a half LLM lesson is not patched with a template; pattern lessons are counted only when written; the
+    episode prompt labels the request "REQUEST".</li>
+    <li><strong>Data</strong> (<code>scripts/lesson_repair_4kw_r6.py</code>): 10 retracted, 4 rules rephrased to pass the gate, 29
+    dream/episode rows re-keyed to their fix's own head.</li>
+  </ul>
+  <h2 id="producers-rereview">Producers re-review <span class="tag">2026-10-03 re-review</span></h2>
+  <ul>
+    <li>Harness framing (validator, input.txt, self-play, coded stand-in, final turn …) is refused from UNATTENDED producers only
+    (self_play, bench, dream, episode, distilled); a user's own lesson about an input.txt is fine.</li>
+    <li>Generality: a name is a capitalised word that is neither ALL CAPS nor an English word; only file-like dotted tokens and
+    addresses are request-specific (<code>json.loads</code> is not); against a whole window, numbers do not count. A
+    <code>learn_skill</code> lesson that restates its request is written request-scoped instead of dropped.</li>
+    <li>Tombstones: only an operator retraction (<code>removed_by_trigger</code>), rotated archives included; never against a live row
+    or a request-scoped plan.</li>
+    <li>No-mistake means the whole statement ("None observed", "No mistakes were made"), not "No error handling…"; a replaced fix
+    always brings its mistake, even "none".</li>
+    <li><code>_strip_harness</code> removes any fragment of the injected directives (final-turn, constraint check, participant steer).</li>
+  </ul>
+  <h2 id="r8">Dictated lessons, harness framing, "no mistake" <span class="tag">2026-10-03 &sect;4KX r8</span></h2>
+  <ul>
+    <li>A <code>learn_skill</code> lesson whose request dictates it (<code>user_dictates_lesson</code>: remember, learn, note that,
+    from now on, always, never, θυμήσου, μάθε, στο εξής …) is general with no generality check. Otherwise a request-shaped one is
+    kept for that request; <code>learn_lesson</code> returns a <code>LessonWrite</code> carrying the scope of THAT call, so the tool says so (a shared attribute raced under <code>gather</code> — r8 review).</li>
+    <li>A <code>learn_skill</code> lesson is never absorbed into another producer's row, however close.</li>
+    <li>Harness framing (autonomous sources only) is the CHALLENGE's validator — "the validator", "validator expects…", hidden-tests,
+    graders, test harnesses, coded stand-ins — not "a pre-execution validator" or "pydantic validators".</li>
+    <li><code>_is_mistake_less</code>: "None observed in the final path", "No issues found" are no mistake; a failure named after it
+    ("No errors, but the loop ran twice", "None. The first try failed") is one.</li>
+    <li>Generality (<code>lesson_scope.is_general_text</code>): a word with an inner capital (GitHub, YouTube, PostgreSQL) is a
+    product, not a name; <code>node.js</code>-style libraries are not files; "-ing"/"-ed" inflections are English
+    ("Determining", "stopped").</li>
+  </ul>
+  <h2 id="r8-review">Producers — fresh-eye review fixes <span class="tag">2026-10-03 &sect;4KX r8</span></h2>
+  <ul>
+    <li>Dictation is an IMPERATIVE at a clause start ("Remember this:", "from now on, use…", "Always use UTC", "θυμήσου") with
+    word boundaries in Greek — measured: 17 of 30 real requests matched the first rule falsely ("the game never starts", "what do
+    you remember about…", αποτέλεσμα ⊃ ποτέ).</li>
+    <li>A dictated follow-up PROMOTES the request's own lesson to general instead of being refused.</li>
+    <li>Only an INCOMING learn_skill lesson is kept apart; other producers' rewordings of a learn_skill row merge into it.</li>
+    <li>The scope travels with the return value (<code>LessonWrite</code>) and the bus report (<code>skill_scope</code>); a dropped
+    legacy write reports FAILED.</li>
+    <li>Generality: the inner-capital (product) skip applies only to a dream WINDOW; inflection stems only to a sentence-initial
+    word ("Harding", "McDonald", "EvolMonkey" from a request stay names). Framing also catches "satisfy validators".</li>
+  </ul>
 </main>
 
   <h2 id="4kd-slack">A member never teaches <span class="tag">2026-09-24 &sect;4KD, de-Slacked in &sect;4KJ</span></h2>

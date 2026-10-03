@@ -798,6 +798,13 @@ async def build_thread_context(channel_id: str, thread_ts: str,
             if bot_user_id:
                 text = re.sub(f"<@{bot_user_id}>", "", text).strip()
             last_human = msg.get("user")
+            if text and msg.get("user") != OWNER_ID:
+                # §4KY review: a member could type the bot's own OWNER label
+                # and have it read as the owner's words in their next turn.
+                # Only the bot writes these labels; anyone else's copy is
+                # defused.
+                text = text.replace("[message from the owner", "(quoted text claiming: message from the owner")
+                text = text.replace("[message from another channel member", "(quoted text claiming: message from another channel member")
             if (text and requester and OWNER_ID and requester != OWNER_ID and not is_current
                     and msg.get("user") == OWNER_ID):
                 # §4KW (review): in a member's turn the owner's earlier words
@@ -1055,9 +1062,16 @@ def format_for_slack(text: str) -> str:
     return "".join(parts)
 
 
+def reply_surface_header(channel) -> str:
+    """`X-Ghost-Surface` for a reply posted in ``channel``: "dm" for a 1:1 DM
+    (ids start with D), "public" for anything other people read (§4KY)."""
+    return "dm" if str(channel or "").startswith("D") else "public"
+
+
 async def _process_message(messages: list, say, thread_ts: str | None = None,
                            event_files: list | None = None,
-                           requester: str | None = None):
+                           requester: str | None = None,
+                           surface: str = "dm"):
     # The `slack-` prefix names the surface in the agent's log; whether a turn
     # may teach is decided by the requester-role header (`turn_may_teach`),
     # not by this prefix (§4KW review: the comment said otherwise). The same
@@ -1110,7 +1124,10 @@ async def _process_message(messages: list, say, thread_ts: str | None = None,
                        # profile, autobiography and smart memory from a
                        # channel member's turn (2026-09-24). Fail-closed:
                        # an unresolved owner id makes everyone a member.
-                       "X-Ghost-Requester": requester_role_header(requester, OWNER_ID)}
+                       "X-Ghost-Requester": requester_role_header(requester, OWNER_ID),
+                       # where the reply is posted: an owner turn in a channel
+                       # does not load the owner's private context (§4KY)
+                       "X-Ghost-Surface": surface}
             response = await client.post(GHOST_API_URL, json=payload,
                                          headers=headers)
 
@@ -1266,7 +1283,10 @@ async def handle_mention(event, say):
         messages.append({"role": "user", "content": user_text})
 
     await _process_message(messages, say, thread_ts, event.get("files"),
-                           requester=event.get("user"))
+                           requester=event.get("user"),
+                           # §4KY: a reply in a channel or a group DM is read
+                           # by other people
+                           surface=reply_surface_header(event.get("channel")))
 
 
 @app.event("message")

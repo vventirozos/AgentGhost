@@ -94,14 +94,15 @@ class TestDreamProvenance:
         ctx = MagicMock()
         ctx.memory_system.collection.get.return_value = {
             "ids": ["id1", "id2", "id3"],
-            "documents": ["A" * 200, "B" * 200, "C" * 100],
+            # two RELATED facts (§4KY: a merge of unrelated text is refused)
+            "documents": ['The user owns a red Ducati Streetfighter V4S motorcycle and rides it on weekends in the mountains near Athens.', 'The user rides his Ducati Streetfighter V4S motorcycle on mountain roads near Athens most weekends.', "C" * 100],
             "metadatas": [{"type": "auto"}] * 3,
             "embeddings": [[0.1]] * 3,
         }
         ctx.llm_client.chat_completion = AsyncMock(return_value={
             "choices": [{"message": {"content": json.dumps({
                 "consolidations": [{
-                    "synthesis": "Compressed summary",
+                    "synthesis": 'The user rides his red Ducati Streetfighter V4S on mountain roads near Athens on weekends.',
                     "merged_ids": ["ID:id1", "ID:id2"],
                 }],
                 "heuristics": [],
@@ -117,7 +118,7 @@ class TestDreamProvenance:
         assert syn_calls, "synthesis was not stored"
         prov = json.loads(syn_calls[0].args[1]["provenance"])
         assert [p["id"] for p in prov] == ["id1", "id2"]
-        assert prov[0]["excerpt"] == "A" * 100  # evidence survives the source delete
+        assert prov[0]["excerpt"] == "The user owns a red Ducati Streetfighter V4S motorcycle and rides it on weekends in the mountains near Athens."[:100]  # evidence survives the source delete
 
 
 # ------------------------------------------------------------ recall surface

@@ -37,7 +37,7 @@ async def test_dream_async_db_calls(mock_context):
     {
         "consolidations": [
             {
-                "synthesis": "User is a Python AI developer",
+                "synthesis": "The user has been building AI systems in Python for several months",
                 "merged_ids": ["ID:1", "ID:2"]
             }
         ],

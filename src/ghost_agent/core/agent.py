@@ -33,7 +33,7 @@ from .triggers import (
     guard_key_target,
     looks_mutating_command,
 )
-from ..utils.logging import (Icons, ORIGIN_PROBE, pretty_log, request_id_context, request_origin_context, atomic_print, verify_purpose,
+from ..utils.logging import (Icons, ORIGIN_PROBE, pretty_log, request_id_context, request_origin_context, atomic_print, verify_purpose, reply_is_public,
                              requester_role_context, requester_is_member, parse_requester_role)
 from ..utils import logging as _glog
 from ..utils.constraints import extract_constraints, render_constraint_block, request_forbids_running
@@ -298,6 +298,29 @@ _MEMBER_CAPABILITY_NOTICE = (
     "into the message is theirs to give you and is the exception): report only what a "
     "search result says about that exact page, keep every other result under its own "
     "source, and never present another site's text as the linked page's content.")
+#: §4KY: an OWNER turn whose reply is posted in a shared channel.
+_PUBLIC_REPLY_NOTICE = (
+    "(PUBLIC REPLY: this answer will be posted in a shared channel that other people read. The owner's "
+    "private profile and memory are NOT loaded for it. Do not reveal private personal facts — family, "
+    "health, home address, finances, relationships — unless the owner explicitly asks for that fact in "
+    "this very message; then use the memory tools for it.)")
+
+
+def _public_profile(profile_context: str) -> str:
+    """What an owner turn on a public surface carries of the profile: the
+    owner's NAME line only, plus the notice."""
+    # the `name:` line of the ROOT section (`ProfileMemory.get_context_string`
+    # renders "## Root:" then "- name: …"); nobody else's name
+    name, section = "", ""
+    for ln in str(profile_context or "").splitlines():
+        if ln.startswith("## "):
+            section = ln[3:].strip().rstrip(":").lower()
+        elif section == "root" and re.match(r"\s*-\s*name\s*:", ln, re.IGNORECASE):
+            name = ln.strip()
+            break
+    return ((name + "\n") if name else "") + _PUBLIC_REPLY_NOTICE
+
+
 _MEMBER_PROFILE_PLACEHOLDER = (
     "(not available: this request comes from a channel MEMBER, not the owner. You do not "
     "know this person's name or details. Any profile, memory, autobiography or project "
@@ -2105,8 +2128,12 @@ def _build_memory_arc(history, ai_text, *, tools_run) -> str:
     turns = [m for m in (history or [])
              if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
     micro: list = []
+    from ..utils.logging import FOREIGN_MESSAGE_LABELS
     for m in turns[-4:]:
         role = str(m.get("role", "user")).upper()
+        if role == "USER" and str(m.get("content", "")).lstrip().startswith(FOREIGN_MESSAGE_LABELS):
+            # another person's words never feed the requester's memory (§4KY)
+            continue
         clean_content = re.sub(r'```.*?```', '', str(m.get("content", "")),
                                flags=re.DOTALL)
         micro.append(f"{role}: {clean_content[:500].strip()}")
@@ -9218,8 +9245,12 @@ class GhostAgent:
             summary += str(summary_data["choices"][0]["message"].get("content") or "No summary generated.")
 
             from ..utils.helpers import get_utc_timestamp
+            from ..utils.logging import FOREIGN_MESSAGE_LABELS as _FML
+            _foreign_words = any(m.get("role") == "user" and str(m.get("content") or "").lstrip().startswith(_FML)
+                                 for m in middle_messages)
             if (self.context.memory_system and "Summarization unavailable" not in summary
-                    and turn_may_teach(self.context)):   # a member's or a probe's conversation is not archived into the owner's memory (R4; §4KW)
+                    and turn_may_teach(self.context)   # a member's or a probe's conversation is not archived into the owner's memory (R4; §4KW)
+                    and not _foreign_words):   # …nor a summary of OTHER people's words in the owner's thread (§4KY)
                 episode_text = f"EPISODIC ARCHIVE (Past Conversation Summary):\n{summary}"
                 # Hold a reference to this fire-and-forget archive write:
                 # asyncio keeps only a weak ref to bare tasks, so an
@@ -12807,7 +12838,8 @@ class GhostAgent:
 
             try:
                 if item["type"] == "smart_memory":
-                    await self.run_smart_memory_task(item["data"]["text"], item["data"]["model"], self.context.args.smart_memory)
+                    await self.run_smart_memory_task(item["data"]["text"], item["data"]["model"], self.context.args.smart_memory,
+                                                     as_of=item.get("ts"))
                 elif item["type"] == "post_mortem":
                     await self._execute_post_mortem(item["data"]["user"], item["data"]["tools"], item["data"]["ai"], item["data"]["model"])
                 processed += 1
@@ -12920,7 +12952,46 @@ class GhostAgent:
             return False
         return False
 
-    async def run_smart_memory_task(self, interaction_context: str, model_name: str, selectivity: float):
+    async def _apply_owner_corrections(self, corrections) -> None:
+        """The owner said a fact about them is no longer true (§4KY/§4KZ):
+        remove it from the graph (same KIND of fact, or every owner edge for a
+        removal verb — "we sold the BMW"), from the profile (a field whose
+        value IS it, or the list item), and re-sync the mirrors."""
+        gm = getattr(self.context, "graph_memory", None)
+        pm = getattr(self.context, "profile_memory", None)
+        from ..memory.profile import _fold as _f
+        for value, predicate in corrections:
+            if gm is not None and hasattr(gm, "owner_edges_naming"):
+                for _e in await asyncio.to_thread(gm.owner_edges_naming, value, predicate):
+                    if await asyncio.to_thread(gm.delete_edge, *_e):
+                        pretty_log("Graph Correction", f"the owner said otherwise — removed {' '.join(_e)}",
+                                   icon=Icons.MEM_WIPE)
+            if pm is None or not hasattr(pm, "load"):
+                continue
+            try:
+                data = pm.load() or {}
+            except Exception:  # noqa: BLE001
+                continue
+            v = _f(value).strip()
+            for cat, sub in list(data.items()):
+                if not isinstance(sub, dict):
+                    continue
+                for k, cur in list(sub.items()):
+                    items = cur if isinstance(cur, list) else [cur]
+                    hit = [it for it in items if _f(it).strip() == v or _f(it).strip().startswith(v + " ")]
+                    if not hit:
+                        continue
+                    if isinstance(cur, list) and len(hit) < len(items):
+                        for it in hit:
+                            await asyncio.to_thread(pm.remove_item, cat, k, str(it))
+                    else:
+                        await asyncio.to_thread(pm.delete, cat, k, exact=True)
+                    pretty_log("Profile Correction", f"the owner said otherwise — {cat}.{k}", icon=Icons.MEM_WIPE)
+                    from ..tools.memory import sync_owner_mirrors
+                    await sync_owner_mirrors(cat, k, pm, gm, getattr(self.context, "memory_system", None))
+
+    async def run_smart_memory_task(self, interaction_context: str, model_name: str, selectivity: float,
+                                    as_of: float = None):
         from ..memory.journal import RetryableConsolidationError as _RetryableConsolidation
         if not self.context.memory_system: return
 
@@ -12931,7 +13002,14 @@ class GhostAgent:
         user_text = " ".join(user_lines).lower() if user_lines else interaction_context.lower()
 
         # Fast exit if no identity/preference keywords are present
-        if not re.search(r'\b(i|me|my|mine|prefer|always|never|remember|project|build|work|name|live|use|hate|love|want|need)\b', user_text):
+        # (§4KY: "im not a doctor" — the owner's own correction — matched none
+        # of these and never reached the extractor; Greek likewise. "not"
+        # alone is not needed: a correction is first-person to count.)
+        if not re.search(r"\b(i|i'?m|im|i'?ve|ive|i'?d|me|my|mine|we|we'?re|our|ours|us|prefer|always|never|"
+                         r"remember|project|build|work|name|live|use|hate|love|want|need|sold|moved)\b"
+                         r"|(?<!\w)(μου|μας|είμαι|ειμαι|έχω|εχω|εγώ|εγω|μένω|μενω|δουλεύω|δουλευω|δεν)(?!\w)"
+                         r"|\w+(?:αμε|άμε|ουμε|ούμε)(?!\w)",   # Greek "we" verbs (§4KZ: "πουλήσαμε το BMW")
+                         user_text):
             return
 
 
@@ -12946,7 +13024,11 @@ class GhostAgent:
             if is_requesting_summary and len(interaction_context) > 1500:
                 return
 
-            final_prompt = SMART_MEMORY_PROMPT + f"\n\n### EPISODE LOG:\n{interaction_context}"
+            # the CURRENT TIME the prompt's temporal rule refers to (§4KY:
+            # it was never given)
+            from ..utils.helpers import get_utc_timestamp as _now_ts
+            final_prompt = (SMART_MEMORY_PROMPT + f"\n\n### CURRENT TIME\n{_now_ts()}"
+                            + f"\n\n### EPISODE LOG:\n{interaction_context}")
             try:
                 # max_tokens 1024 truncated real consolidations mid-JSON
                 # (observed: output died at `"profile_update":` and the
@@ -12996,6 +13078,11 @@ class GhostAgent:
                 # error of hours is nothing against the months of drift
                 # this removes.
                 from ..memory.temporal import anchor as _anchor_temporal
+                # WHO said it is checked on the RAW profile value (§4KZ: anchoring
+                # first turned "is now 10" into "born ~2016-04", words the owner
+                # never typed, and every age update was refused; a fact needs
+                # only one shared word, which anchoring keeps)
+                _raw_pv = str((profile_up or {}).get("value") or "") if isinstance(profile_up, dict) else ""
                 if fact:
                     fact = _anchor_temporal(fact)
                 if profile_up is not None and profile_up.get("value"):
@@ -13004,6 +13091,53 @@ class GhostAgent:
                 # --- UNCONDITIONAL KNOWLEDGE GRAPH INGESTION ---
                 from ..utils.helpers import is_removal_or_negation_text, is_removal_triplet
                 graph_triplets = result_json.get("graph_triplets", [])
+                if not isinstance(graph_triplets, list):
+                    graph_triplets = []
+                # §4KY WHO SAID IT: a fact about the owner is kept only when
+                # the OWNER stated it (first person, not a question, not
+                # role-play, not quoted, not another member's line); one the
+                # owner NEGATED is a correction that removes the old fact.
+                from ..memory.attribution import (owner_statements, owner_said, is_owner_end,
+                                                  strip_negation, is_agent_state_predicate, PREDICATE_CUES)
+                from ..memory.profile import _fold as _fold_attr
+                _gm = getattr(self.context, 'graph_memory', None)
+                _canon = (_gm.canonical_predicate if _gm is not None and hasattr(_gm, "canonical_predicate")
+                          else (lambda x: str(x).upper()))
+                _stmts = owner_statements(interaction_context)
+                _corrections, _attributed, _unattributed = [], [], 0
+                for _t in graph_triplets:
+                    if not isinstance(_t, dict):
+                        continue
+                    _s, _p, _o = (str(_t.get("subject") or ""), str(_t.get("predicate") or _t.get("relation") or ""),
+                                  str(_t.get("object") or ""))
+                    if not (is_owner_end(_s) or is_owner_end(_o)):
+                        _attributed.append(_t)
+                        continue
+                    _other = _o if is_owner_end(_s) else _s
+                    if is_agent_state_predicate(_p):
+                        _unattributed += 1          # the agent's / a project's state, not the owner's life
+                        continue
+                    _v = strip_negation(_other)
+                    _cp = _canon(_p)
+                    _said = owner_said(_v, _stmts, cue=PREDICATE_CUES.get(_cp))
+                    if is_removal_triplet(_t) and owner_said(_v, _stmts) is not None:
+                        # "we sold the BMW": every owner edge naming it goes
+                        _corrections.append((_v, None))
+                        continue
+                    if _said == "negated" or (_v != _fold_attr(_other).strip() and _said is not None):
+                        # "I'm not going to Athens": only THAT kind of fact
+                        _corrections.append((_v, _cp))
+                        continue
+                    if _said != "stated":
+                        _unattributed += 1
+                        continue
+                    _attributed.append(_t)
+                if _unattributed:
+                    pretty_log("Graph Attribution Skip",
+                               f"Dropped {_unattributed} owner triplet(s) the owner did not state", icon=Icons.SKIP)
+                graph_triplets = _attributed
+                if _corrections:
+                    await self._apply_owner_corrections(list(dict.fromkeys(_corrections)))
                 # Drop removal / past-ownership triplets (e.g. user
                 # PREVIOUSLY_OWNED iguana). Ingesting these re-creates the
                 # tombstone the user just asked to forget; a removal must
@@ -13015,7 +13149,8 @@ class GhostAgent:
                         pretty_log("Graph Tombstone Skip", f"Dropped {dropped} removal/past-ownership triplet(s)", icon=Icons.STOP)
                     graph_triplets = kept_triplets
                 if getattr(self.context, 'graph_memory', None) and graph_triplets:
-                    added = await asyncio.to_thread(self.context.graph_memory.add_triplets, graph_triplets)
+                    added = await asyncio.to_thread(self.context.graph_memory.add_triplets, graph_triplets,
+                                                    **({"as_of": float(as_of)} if as_of else {}))
                     if added and added > 0:
                         # Show the actual edges, not just a count — the triples
                         # ARE the knowledge learned this turn.
@@ -13033,6 +13168,21 @@ class GhostAgent:
                                    icon=Icons.MEM_SAVE)
 
                 if fact is None: fact = ""
+                fact = str(fact)
+                # §4KY: a fact or profile value about the owner needs the owner's
+                # own statement (the doctor case: a QUESTION became "the user
+                # identifies as a doctor")
+                # (§4KZ: gated whenever the fact is PERSONAL — "Wife's name is
+                # Maria" carried no "user" and skipped the gate)
+                _personal_rx = (r"\b(?:user|owner|my|me|wife|husband|son|sons|daughter|child|children|family|home|"
+                                r"address|lives?|living|works?|job|born|birthday|age|name|married|car|health)\b")
+                if fact and re.search(_personal_rx, fact.lower()) \
+                        and owner_said(fact, _stmts, minimum=1e-9) != "stated":   # WHO said it; a fact paraphrases
+                    pretty_log("Auto Memory Skip", f"not stated by the owner: {fact[:80]}", icon=Icons.SKIP)
+                    fact = ""
+                if profile_up is not None and owner_said(_raw_pv, _stmts) != "stated":
+                    pretty_log("Profile Skip", "profile value not stated by the owner — not written", icon=Icons.SKIP)
+                    profile_up = None
                 # A removal / non-ownership fact ("user previously had an
                 # iguana that was removed") must NOT be stored: consolidating
                 # it manufactures a self-perpetuating tombstone that survives
@@ -13085,6 +13235,20 @@ class GhostAgent:
                         "(missing category or key): %.120s",
                         str(profile_up.get("value", fact)))
                     profile_up = None
+                # §4KZ: an OWNER-STATED profile value is applied on its own —
+                # independent of the fact's score (a value the agent already
+                # saved with a tool scores < 0.5, and "remember that I moved"
+                # never reached the profile) — and the mirrors follow it.
+                if profile_up and self.context.profile_memory and str(profile_up.get("value") or "").strip():
+                    _cat_p = profile_up.get("category")
+                    _key_p = profile_up.get("key")
+                    _pmsg = await asyncio.to_thread(self.context.profile_memory.update, _cat_p, _key_p,
+                                                    profile_up.get("value"))
+                    if not (isinstance(_pmsg, str) and _pmsg.lower().startswith("error")):
+                        from ..tools.memory import sync_owner_mirrors
+                        await sync_owner_mirrors(_cat_p, _key_p, self.context.profile_memory,
+                                                 getattr(self.context, "graph_memory", None),
+                                                 self.context.memory_system)
                 fact_lc = fact.lower()
                 is_personal = any(w in fact_lc for w in ["user", "me", "my ", " i ", "identity", "preference", "like"])
                 is_technical = any(w in fact_lc for w in ["file", "path", "code", "error", "script", "project", "repo", "build", "library", "version"])
@@ -13172,197 +13336,22 @@ class GhostAgent:
                     # one IS a semantic judgement about what deserves to be a
                     # profile fact, not a safety filter, so an absolute bar is
                     # correct here rather than a threshold-relative one.
-                    memory_type = "identity" if (score >= 0.9 and profile_up) else "auto"
-
-                    # --- CONTRADICTION ENGINE (LLM-Driven Belief Revision) ---
-                    try:
-                        # SAME-TYPE scope (§4R Lens-B CRIT, 2026-08-08). This
-                        # was a `$nin` DENYLIST — document/episode/skill/
-                        # acquired_skill — which is NOT the complement of the
-                        # prunable set, so everything else stayed a legal
-                        # deletion victim. Measured on the live store, the
-                        # denylist left 33 rows deletable of which only **2**
-                        # were the `auto` facts this engine exists to supersede:
-                        # 28 dream `synthesis` rows (each the ONLY surviving
-                        # copy of the source fragments it merged — dream.py
-                        # deletes those on consolidation), the single
-                        # user-saved `manual` row, the single `identity` row,
-                        # and a `document_summary`. One 0.9-scoring turn plus
-                        # one small-model opinion could erase any of them.
-                        #
-                        # This is the IDENTICAL defect already fixed in the
-                        # sibling delete path (`vector.smart_update`, see its
-                        # comment naming the denylist as the bug); that fix
-                        # never propagated here. Mirror it: an identity fact
-                        # may supersede an identity fact and an auto fact an
-                        # auto fact — distinct types simply coexist, which
-                        # removes the whole cross-type deletion class.
-                        candidates = await asyncio.to_thread(
-                            self.context.memory_system.search_advanced, fact,
-                            limit=3,
-                            where={"type": memory_type},
-                            record_retrievals=False,
-                        )
-                        ids_to_delete = []
-                        old_facts = []
-
-                        if candidates:
-                            # 0.50 + subject-key agreement, NOT the old bare
-                            # `< 0.6` (§4R Lens-B MAJOR). Two independent
-                            # calibrations in this repo say 0.6 was too loose to
-                            # DELETE on: `search_items`' own measurements put a
-                            # genuine match under 0.40 with 0.44–0.58 being the
-                            # off-topic NOISE band, and the sibling delete gate
-                            # (`vector.smart_update`) uses 0.50. At 0.6 a row too
-                            # weakly related to be worth SHOWING the model was
-                            # still eligible to be DESTROYED.
-                            #
-                            # The key guard is the sibling's too: distance alone
-                            # over-matches on shared templates ("favourite colour
-                            # is blue" vs "favourite food is blue cheese" embed
-                            # close but are distinct facts). When both texts
-                            # expose a subject/attribute key and those keys
-                            # DISAGREE, they are not the same fact. Texts with no
-                            # extractable key fall back to distance-only, so
-                            # genuine paraphrases still collapse.
-                            from ..memory.vector import _subject_key
-                            _new_key = _subject_key(fact)
-                            for c in candidates:
-                                if c.get('score', 1.0) >= 0.50:
-                                    continue
-                                _cand_key = _subject_key(c.get('text'))
-                                _keys_conflict = (
-                                    _new_key is not None and _cand_key is not None
-                                    and _new_key != _cand_key
-                                    and _new_key not in _cand_key
-                                    and _cand_key not in _new_key
-                                )
-                                if _keys_conflict:
-                                    continue
-                                old_facts.append({"id": c['id'], "text": c['text']})
-
-                        if old_facts:
-                            eval_prompt = f"NEW FACT:\n{fact}\n\nOLD FACTS:\n" + "\n".join([f"ID: {f['id']} | TEXT: {f['text']}" for f in old_facts]) + "\n\nAnalyze if the NEW FACT contradicts, updates, or supersedes any OLD FACTS. Return ONLY a JSON object with a list of 'ids' to delete. If they safely coexist (e.g. they refer to different topics/projects), return an empty list.\n\nExample: {\"ids\": [\"ID:123\"]}"
-                            eval_payload = {"model": model_name, "messages": [{"role": "system", "content": "You are a Belief Revision Engine. Output JSON."}, {"role": "user", "content": eval_prompt}], "temperature": 0.0, "max_tokens": 1024}
-                            eval_data = await self.context.llm_client.chat_completion(eval_payload, use_worker=True, is_background=True, off_main_only=True, timeout=90.0, task_label="self-eval")  # §4O A-MAJOR-2
-                            eval_res = extract_json_from_text(eval_data["choices"][0]["message"]["content"])
-
-                            raw_ids = eval_res.get("ids", [])
-                            ids_to_delete = [str(i).replace("ID: ", "").replace("ID:", "").strip() for i in raw_ids]
-                            # Only ids we actually OFFERED may be deleted — the
-                            # judge model can (and did) return malformed or
-                            # hallucinated ids, and an unscoped collection
-                            # delete would erase whatever they happened to hit.
-                            _offered = {f["id"] for f in old_facts}
-                            ids_to_delete = [i for i in ids_to_delete if i in _offered]
-
-                        # OBSERVABILITY (§4R Lens-A D3): the engine used to log
-                        # ONLY when it deleted something, so "never ran", "no
-                        # candidate under the bar", "judge declined" and "worker
-                        # call failed" were indistinguishable from outside —
-                        # which is why diagnosing 12 days of silence needed the
-                        # embeddings reconstructed offline. One line, every run.
-                        logger.info(
-                            "belief-revision: %d candidate(s), %d offered, "
-                            "%d to delete (type=%s)",
-                            len(candidates or []), len(old_facts),
-                            len(ids_to_delete), memory_type)
-
-                        if ids_to_delete:
-                            # RECORD BEFORE DELETE (§4R Lens-B/D MAJOR). The old
-                            # order deleted first and wrote the audit record
-                            # best-effort afterwards, swallowing failures at
-                            # DEBUG. Since `_save` is a silent no-op on a
-                            # degraded store, an irreversible deletion could
-                            # leave NO record of what was erased, anywhere. An
-                            # unrecordable revision is not one we are willing to
-                            # perform: if the ledger cannot take the entry, keep
-                            # the memories.
-                            contradiction_log = getattr(self.context, 'contradiction_log', None)
-                            # `contradiction_log is None` → proceed with the
-                            # delete. ⚠ Be honest about what that case IS: in
-                            # production main.py ALWAYS wires the ledger, so
-                            # None means its constructor RAISED (e.g. an
-                            # unwritable memory dir), which main.py logs as a
-                            # warning. It is therefore not "no audit was
-                            # promised" — it is a construction failure, and this
-                            # branch is more permissive about it than about a
-                            # runtime write failure. That inversion is
-                            # deliberate but narrow: blocking here would
-                            # silently disable belief revision for every test
-                            # and every deployment whose context lacks the
-                            # attribute, which is a much larger blast radius
-                            # than the rare unwritable-dir case.
-                            _recorded = contradiction_log is None
-                            if contradiction_log is not None:
-                                try:
-                                    _recorded = bool(await asyncio.to_thread(
-                                        contradiction_log.record,
-                                        fact, old_facts, ids_to_delete,
-                                        reason="LLM-driven belief revision"
-                                    ))
-                                except Exception as cl_err:
-                                    logger.warning(
-                                        "Contradiction log write FAILED — "
-                                        "skipping the delete to avoid an "
-                                        "unrecorded erasure: %s", cl_err)
-                            if not _recorded:
-                                pretty_log(
-                                    "Belief Revision",
-                                    f"SKIPPED erasing {len(ids_to_delete)} "
-                                    "memor(ies) — the revision could not be "
-                                    "recorded, so the deletion would be "
-                                    "unexplainable.",
-                                    level="WARNING", icon=Icons.WARN)
-                            else:
-                                try:
-                                    await asyncio.to_thread(self.context.memory_system.collection.delete, ids=ids_to_delete)
-                                except BaseException:
-                                    # Record-then-delete introduces its own
-                                    # inconsistency: the entry is already
-                                    # written, so if the delete fails the ledger
-                                    # permanently CLAIMS an erasure that never
-                                    # happened, and the next turn can surface
-                                    # "updated to X (superseded: Y)" while Y is
-                                    # still in the store. Nothing reconciles
-                                    # `deleted_ids` (it has no readers), so the
-                                    # least we owe is a loud, specific error —
-                                    # the generic handler below would report
-                                    # this as an ordinary engine error.
-                                    # BaseException, not Exception: a
-                                    # CancelledError landing here would
-                                    # otherwise slip past silently.
-                                    logger.error(
-                                        "Belief revision INCONSISTENT: ledger "
-                                        "entry for %r claims deleted_ids=%s but "
-                                        "the vector delete FAILED — those "
-                                        "memories are still present.",
-                                        fact[:60], ids_to_delete)
-                                    raise
-                                # Name the TYPE: a synthesis/identity/manual
-                                # erasure used to read identically to an
-                                # ordinary auto-fact one in the live stream.
-                                pretty_log(
-                                    "Belief Revision",
-                                    f"Erased {len(ids_to_delete)} outdated "
-                                    f"{memory_type} memor(ies).",
-                                    icon=Icons.CUT)
-
-                    except Exception as ce:
-                        logger.error(f"Contradiction Engine error: {ce}")
-
-                    # Save the new fact (bypassing the old simplistic smart_update math check, since we just logically validated it)
+                    # §4KZ: NO model-judged deletion. The belief-revision engine
+                    # let one LLM call delete stored facts; on the live store 5
+                    # of its 7 deletions since 08-08 were wrong (Fotini's birth
+                    # date, an exact date for an approximation, another subject's
+                    # fact). A changed OWNER fact is a PROFILE change: the
+                    # profile is written and its graph/vector mirrors are synced
+                    # to it (`sync_owner_mirrors`); the extractor's own sentence
+                    # is an `auto` fact ranked by when it was stated.
                     from ..utils.helpers import get_utc_timestamp
-                    await asyncio.to_thread(self.context.memory_system.add, fact, {"timestamp": get_utc_timestamp(), "type": memory_type})
-                    pretty_log("Auto Memory Store", f"[{score:.2f}] {fact}", icon=Icons.MEM_SAVE)
+                    _res = await asyncio.to_thread(self.context.memory_system.add, fact,
+                                                   {"timestamp": get_utc_timestamp(), "type": "auto"})
+                    if isinstance(_res, str) and _res.startswith("refused"):
+                        pretty_log("Auto Memory Skip", f"{_res}: {fact[:80]}", icon=Icons.SKIP)
+                    else:
+                        pretty_log("Auto Memory Store", f"[{score:.2f}] {fact}", icon=Icons.MEM_SAVE)
 
-                    if memory_type == "identity" and self.context.profile_memory:
-                        await asyncio.to_thread(
-                            self.context.profile_memory.update,
-                            profile_up.get("category", "notes"),
-                            profile_up.get("key", "info"),
-                            profile_up.get("value", fact)
-                        )
 
 
             except _RetryableConsolidation:
@@ -14059,6 +14048,8 @@ class GhostAgent:
         profile_context = (profile_context or "").replace("\r", "")
         if requester_is_member():
             profile_context = _MEMBER_PROFILE_PLACEHOLDER   # a member's greeting gets the boundary, not the profile
+        elif reply_is_public():
+            profile_context = _public_profile(profile_context)
 
         profile_block = ""
         if profile_context:
@@ -27725,6 +27716,8 @@ class GhostAgent:
                     # Live 2026-09-24: a stranger's Slack thread ran with
                     # the owner's full profile in its system prompt.
                     profile_context = _MEMBER_PROFILE_PLACEHOLDER
+                elif reply_is_public():
+                    profile_context = _public_profile(profile_context)
 
                 # Metacog: reset per-request arbitration counter so the
                 # MAX_ARBITRATIONS_PER_REQUEST cap is enforced per user
@@ -28127,7 +28120,9 @@ class GhostAgent:
                         self._note_trivial_reply(req_id)
                         return fast_result
 
-                should_fetch_memory = (not is_fact_check and not is_trivial_greeting)
+                should_fetch_memory = (not is_fact_check and not is_trivial_greeting
+                                       # §4KY: no private memory in a public reply
+                                       and not reply_is_public())
 
                 # --- COGNITIVE EVENT BUS HYDRATION ---
                 # The previous sequential vector + graph blocks have collapsed
@@ -28217,33 +28212,11 @@ class GhostAgent:
                         except Exception as e:
                             logger.error(f"MemoryBus hydration failed: {e}")
 
-                # Surface any past belief revision relevant to this turn's
-                # query (feature 1C). The contradiction engine logs every
-                # supersede via ContradictionLog.record (agent.py belief
-                # revision + project_advancer), but explain_belief_change had
-                # no live caller — so the agent could never actually say "I
-                # previously thought X, updated to Y." Inject the explanation
-                # alongside the hydrated memory, query-scoped to the user's
-                # message, so it can. Best-effort.
-                if last_user_content and should_fetch_memory and not requester_is_member():
-                    _clog = getattr(self.context, "contradiction_log", None)   # the OWNER's belief history (R8, CRIT)
-                    if _clog is not None:
-                        try:
-                            _belief = await asyncio.to_thread(
-                                _clog.explain_belief_change, last_user_content,
-                            )
-                            if _belief:
-                                fetched_context = (
-                                    f"{fetched_context}\n\n{_belief}".strip()
-                                    if fetched_context else _belief
-                                )
-                                pretty_log(
-                                    "Belief Revision",
-                                    "Surfaced a relevant past belief change",
-                                    icon=Icons.BRAIN_CTX,
-                                )
-                        except Exception as e:
-                            logger.debug("explain_belief_change surfacing failed: %s", e)
+                # (§4KZ) The contradiction ledger is NOT injected any more: on
+                # the live ledger it put wrong, long-gone facts into owner
+                # prompts ("Thodoris born ~2017-03", the role-play "user plays
+                # Black against Vasilis") and nothing ever cleaned it. The
+                # profile is the current truth and is always in the prompt.
 
                 fetched_playbook = ""  # Now dynamically populated inside the loop
 
@@ -33686,7 +33659,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         # command and return the exit code verbatim", quarantined) and a
         # journal-challenge candidate. Gated HERE, the one writer, so every
         # kind and every future append site inherits it.
-        if turn_origin(self.context) in (ORIGIN_PROBE, "internal"):     # §4KW second review
+        if turn_origin(self.context) in (ORIGIN_PROBE, "internal", "sim", "bench"):     # §4KW second review; §4KY: sim/bench too (not only by isolation)
             logger.debug("journal append('%s') skipped: probe/internal turns never teach", kind)
             return
         if requester_is_member():

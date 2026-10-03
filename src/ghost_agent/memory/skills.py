@@ -881,6 +881,60 @@ def _trim_playbook_by_utility(playbook: list, max_entries: int) -> list:
     return kept
 
 
+#: producers that run unattended — the harness-framing gate applies to them;
+#: a user's own lesson may well be about a validator or an input.txt
+_AUTONOMOUS_SOURCES = frozenset({"self_play", "bench", "dream", "dream_pattern", "episode", "distilled"})
+#: archive reasons that mark an OPERATOR retraction (a tombstone)
+_TOMBSTONE_REASONS = frozenset({"removed_by_trigger"})
+
+#: a vector twin this close is the same lesson in other words, whoever wrote it
+_SAME_LESSON_DISTANCE = 0.08
+
+#: the request TELLS the agent to keep a rule — an IMPERATIVE at a clause start
+#: ("remember that…", "from now on…", "always use…", "θυμήσου…"), not a word
+#: in a bug report or a question (r8 review: "the game never starts", "what do
+#: you remember about…", and Greek substrings — αποτέλεσμα ⊃ ποτέ — matched)
+_CLAUSE = r"(?:^|[.!;:\n]\s*|,\s*(?:and|but|so)\s+|\b(?:please|pls)\s+)"
+_DICTATED_RE = re.compile(
+    _CLAUSE + r"(?:remember|memori[sz]e|learn|note|keep\s+in\s+mind)\s*(?:this|that|:|-|—|to\b|for\s+next\s+time)"
+    r"|" + _CLAUSE + r"(?:make|take)\s+a\s+note\b"
+    r"|\b(?:from\s+now\s+on|going\s+forward|in\s+(?:the\s+)?future)\s*[,:]?\s+(?:always|never|do|don'?t|use|make|"
+    r"check|prefer|avoid|when|if|please|you|ask|reply|answer|write|run|keep)\b"
+    r"|" + _CLAUSE + r"(?:always|never)\s+(?!\w+ed\b)(?:use|do|run|check|ask|reply|answer|write|prefer|avoid|make|"
+    r"keep|put|call|start|add|include|say|give|send|test|verify|read|open|try|show|tell|save|commit|push)\b"
+    r"|(?<!\w)(?:θυμ[ήη]σου|να\s+θυμ[άα]σαι|μ[άα]θε|σημε[ίι]ωσε)(?!\w)"
+    r"|(?<!\w)(?:στο\s+εξ[ήη]ς|απ[όο]\s+τ[ώω]ρα\s+και\s+(?:στο\s+εξ[ήη]ς|π[έε]ρα))(?!\w)",
+    re.IGNORECASE)
+
+
+class LessonWrite(str):
+    """``learn_lesson``'s "written"/"reinforced", carrying the SCOPE it was
+    stored in — per call, so two concurrent writes cannot read each other's
+    (r8 review: a shared attribute was wrong 39 of 40 times under gather)."""
+    def __new__(cls, status: str, scope: str = ""):
+        obj = super().__new__(cls, status)
+        obj.scope = scope or "general"
+        return obj
+
+
+def user_dictates_lesson(request: str) -> bool:
+    return bool(_DICTATED_RE.search(str(request or "").strip()))
+
+
+#: a lesson about the self-play TEST HARNESS rather than the user's task
+_VALIDATOR_FRAMING_RE = re.compile(
+    # the CHALLENGE's validator, not a validator in the user's code
+    # ("pre-execution validator", "pydantic validators" — re-review)
+    r"\bthe\s+(?:hidden\s+|challenge(?:'s)?\s+|task(?:'s)?\s+)?validators?\b(?!\s+(?:function|class|module|decorator))"
+    r"|\bvalidators?\s+(?:expect|require|check|want|accept|reject)\w*\b"
+    r"|\bsatisf(?:y|ies|ying)\s+(?:the\s+)?validators?\b"
+    r"|\bhidden[\s-]+tests?\b|\binput\.txt\b|\btest[\s-]+harness(?:es)?\b|\bgraders?\b"
+    r"|\bsatisf(?:y|ies|ying)\s+(?:the\s+)?(?:tests?|checkers?|checks?)\b"
+    r"|\bself[\s-]?play\b|\bcoded\s+stand-ins?\b|\bembedded\s+AI\s+opponents?\b|\bfinal\s+turns?\b"
+    r"|\bsynthetic\s+training\b",
+    re.IGNORECASE)
+
+
 def _twin_meta(lesson: dict) -> dict:
     """The vector metadata a lesson's twin carries (heal and refresh write
     the same fields `learn_lesson` writes)."""
@@ -1292,6 +1346,54 @@ class SkillMemory:
         )
         return len(orphans)
 
+    def _tombstones(self) -> set:
+        """Normalised triggers the operator RETRACTED (archive rows with a
+        removal reason — not cap-trim evictions), cached by archive mtime."""
+        try:
+            base = Path(self.file_path).parent / "skills_pruned_archive.jsonl"
+            # the rotated archive too (re-review: rotation at 8 MB dropped them)
+            paths = [p for p in (base.with_suffix(".jsonl.1"), base) if p.exists()]
+            mtime = tuple(p.stat().st_mtime for p in paths)
+        except Exception:  # noqa: BLE001 — no archive (or a test double): nothing retracted
+            return set()
+        if not paths:
+            return set()
+        cached = getattr(self, "_tomb_cache", None)
+        if cached and cached[0] == mtime:
+            return cached[1]
+        out = set()
+        try:
+            for p in paths:
+                with open(p, encoding="utf-8") as fh:
+                    for line in fh:
+                        try:
+                            rec = json.loads(line)
+                        except ValueError:
+                            continue
+                        # only an operator's RETRACTION — not a cap-trim, a
+                        # low-utility prune, an automatic `retract:<trajectory>`
+                        # (a judgement about provenance, re-review) or a
+                        # duplicate-pair cleanup
+                        if str(rec.get("reason") or "") not in _TOMBSTONE_REASONS:
+                            continue
+                        les = rec.get("lesson") or {}
+                        t = _normalize_trigger(str(les.get("trigger") or les.get("task") or ""))
+                        if t:
+                            out.add(t)
+        except Exception:  # noqa: BLE001
+            return set()
+        self._tomb_cache = (mtime, out)
+        return out
+
+    def _live_trigger(self, trigger: str) -> bool:
+        """A row with this trigger is in the playbook now (its reinforcement
+        is not a re-learn of the retracted one)."""
+        k = _normalize_trigger(trigger)
+        try:
+            return any(_normalize_trigger(p.get("trigger") or p.get("task") or "") == k for p in self._load_playbook())
+        except Exception:  # noqa: BLE001
+            return False
+
     def _refresh_twin(self, memory_system, lesson) -> None:
         """Re-embed a lesson whose fix a merge replaced (data audit: 111 of
         299 twins carried an older fix than their row). Delete + heal, so the
@@ -1428,6 +1530,8 @@ class SkillMemory:
         evidence_min_new_fraction: float = 0.0,
         scope: str = "",
         source_request: str = "",
+        generality_context: str = "",
+        generality_max_share: float = 0.5,
     ):
         """Write a lesson to the playbook. Accepts both legacy positional
         args (task/mistake/solution) and the new structured kwargs.
@@ -1482,6 +1586,43 @@ class SkillMemory:
                 logger.debug(
                     "learn_lesson: dropped non-actionable %s lesson: %r",
                     source or "?", (effective_correct or effective_trigger)[:80])
+                return None
+            # (producers review) a rule about the TEST HARNESS — "satisfy the
+            # validator", "reference a token from input.txt" — teaches the
+            # agent to game a self-play check, never to serve a user
+            if (str(source or "") in _AUTONOMOUS_SOURCES
+                    and _VALIDATOR_FRAMING_RE.search(f"{effective_trigger}\n{effective_correct}")):
+                logger.info("learn_lesson: refused %s lesson framed on the test harness: %r",
+                            source or "?", (effective_correct or "")[:100])
+                return None
+            # a GENERAL rule must not restate the text it came from (a word
+            # problem's numbers and names, a challenge's files) — producers
+            # that have one pass it as `generality_context`
+            # (§4KX r8) a lesson the USER dictates is the user's rule: kept
+            # general, no generality check (re-review: 7 of 10 dictated
+            # lessons were silently scoped to the request that taught them)
+            _dictated = str(source or "") == "learn_skill" and user_dictates_lesson(generality_context)
+            if generality_context and scope != _SCOPE_REQUEST and not _dictated:
+                from .lesson_scope import is_general_text as _igt, is_general_trigger as _igtr
+                if not (_igtr(effective_trigger, generality_context, max_shared_share=generality_max_share)
+                        and _igt(effective_correct, generality_context, max_shared_share=generality_max_share)):
+                    if str(source or "") == "learn_skill":
+                        # the model's own lesson about THIS request: kept for
+                        # this request, not dropped (re-review: 7 of 10 past
+                        # learn_skill lessons were refused, one dictated)
+                        scope = _SCOPE_REQUEST
+                        source_request = str(source_request or generality_context)
+                    else:
+                        logger.info("learn_lesson: refused %s lesson that restates its source: %r",
+                                    source or "?", effective_trigger[:100])
+                        return None
+            # a lesson the operator RETRACTED is not re-learned by the next
+            # idle cycle (producers review: no tombstone — dream and self-play
+            # re-minted retracted rules)
+            if (scope != _SCOPE_REQUEST and _normalize_trigger(effective_trigger) in self._tombstones()
+                    and not self._live_trigger(effective_trigger)):
+                logger.info("learn_lesson: %s lesson matches a retracted one — not re-learned: %r",
+                            source or "?", effective_trigger[:100])
                 return None
 
             # Harness-dimension attribution (2026-07-19). Chokepoint
@@ -1573,6 +1714,13 @@ class SkillMemory:
                             playbook[idx]["source_request"] = str(source_request or task or effective_trigger)[:4000]
                             _rescoped = True
                         elif idx is not None and scope != _SCOPE_REQUEST \
+                                and _lesson_scope(playbook[idx]) == _SCOPE_REQUEST and _dictated:
+                            # the user now dictates it: the request's lesson
+                            # becomes a general rule (r8 review)
+                            playbook[idx].pop("scope", None)
+                            playbook[idx].pop("source_request", None)
+                            _rescoped = True
+                        elif idx is not None and scope != _SCOPE_REQUEST \
                                 and _lesson_scope(playbook[idx]) == _SCOPE_REQUEST:
                             logger.info("learn_lesson: a general lesson cannot reuse a request-scoped "
                                         "trigger %r — not written", effective_trigger[:60])
@@ -1602,6 +1750,13 @@ class SkillMemory:
                                 existing["solution"] = effective_correct
                                 existing["correct_pattern"] = effective_correct
                                 existing["code_example"] = _extract_code_block(effective_correct)
+                                # the fix and its mistake travel as a PAIR (producers
+                                # review: a distilled cluster's new pattern sat next
+                                # to the previous pattern's mistake)
+                                # (even "none": an old mistake next to a new fix
+                                # is the mismatch this pair rule exists to stop)
+                                existing["mistake"] = effective_anti or "none"
+                                existing["anti_pattern"] = effective_anti or "none"
                                 # §4L R3 MINOR-3: the row's CONTENT now
                                 # comes from the reinforcing trajectory —
                                 # retraction keyed by trajectory id must
@@ -1648,7 +1803,7 @@ class SkillMemory:
                                  f"Re-derived from known evidence — freq kept at {existing['frequency']}: {effective_trigger[:30]}..."),
                                 icon=Icons.MEM_REINFORCE,
                             )
-                            return "reinforced"
+                            return LessonWrite("reinforced", scope)
                 else:
                     # Vector-dedup path. Previously this just returned, so a
                     # near-exact re-learn (which ALWAYS hits the vector store
@@ -1728,12 +1883,16 @@ class SkillMemory:
                                 # the SAME trigger in the other scope: the JSON
                                 # path's rule (fourth review: written here as a
                                 # second row with one trigger)
-                                if _incoming_scope != _SCOPE_REQUEST:
+                                if _incoming_scope != _SCOPE_REQUEST and _dictated:
+                                    playbook[idx].pop("scope", None)          # promoted (r8 review)
+                                    playbook[idx].pop("source_request", None)
+                                elif _incoming_scope != _SCOPE_REQUEST:
                                     logger.info("learn_lesson: a general lesson cannot reuse a request-scoped "
                                                 "trigger %r — not written", effective_trigger[:60])
                                     return None
-                                playbook[idx]["scope"] = _SCOPE_REQUEST
-                                playbook[idx]["source_request"] = str(source_request or task or effective_trigger)[:4000]
+                                else:
+                                    playbook[idx]["scope"] = _SCOPE_REQUEST
+                                    playbook[idx]["source_request"] = str(source_request or task or effective_trigger)[:4000]
                                 cross_scope = False
                                 _rescoped = True
                         if idx is not None and not cross_scope and _other_request(
@@ -1757,8 +1916,19 @@ class SkillMemory:
                         # both producers KNOWN and different: a separate row. A legacy
                         # row with no recorded producer merges as evidence only
                         # (`_foreign` below keeps its fix and its verified flag).
+                        # …unless they are the SAME lesson in other words (producers
+                        # review: at distance 0.03 a reflection row and a dream row
+                        # became two near-identical rows): evidence only, then
                         if (idx is not None and _src_old and source and _src_old != str(source)
-                                and not _same_trigger):
+                                and not _same_trigger
+                                # an INCOMING learn_skill lesson is never absorbed
+                                # into another producer's row (a dictated rule
+                                # vanished into a dream row at 0.05); other
+                                # producers' twins of a learn_skill row still
+                                # merge into it as evidence (r8 review: else
+                                # every rewording became a row)
+                                and (float(duplicate.get("distance") or 1.0) >= _SAME_LESSON_DISTANCE
+                                     or str(source) == "learn_skill")):
                             logger.info(
                                 "learn_lesson: %s twin of a %s lesson %r — written separately, not merged",
                                 source, _src_old,
@@ -1783,6 +1953,13 @@ class SkillMemory:
                                 existing["solution"] = effective_correct
                                 existing["correct_pattern"] = effective_correct
                                 existing["code_example"] = _extract_code_block(effective_correct)
+                                # the fix and its mistake travel as a PAIR (producers
+                                # review: a distilled cluster's new pattern sat next
+                                # to the previous pattern's mistake)
+                                # (even "none": an old mistake next to a new fix
+                                # is the mismatch this pair rule exists to stop)
+                                existing["mistake"] = effective_anti or "none"
+                                existing["anti_pattern"] = effective_anti or "none"
                                 # §4L R3 MINOR-3: the row's CONTENT now
                                 # comes from the reinforcing trajectory —
                                 # retraction keyed by trajectory id must
@@ -1854,7 +2031,7 @@ class SkillMemory:
                                 icon=Icons.SKIP,
                             )
                     if not orphan_healed and not cross_scope:
-                        return "reinforced" if bumped else None
+                        return LessonWrite("reinforced", scope) if bumped else None
 
             new_lesson = build_lesson(
                 task=task,
@@ -1987,7 +2164,7 @@ class SkillMemory:
                 # every plain acquisition made the two indistinguishable.
                 icon=Icons.IDEA,
             )
-            return "written"
+            return LessonWrite("written", scope)
         except Exception as e:
             logger.error(f"Failed to save skill: {e}")
             return None

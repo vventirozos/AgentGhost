@@ -126,7 +126,7 @@ class TestConsolidateEpisodes:
         digest = payload["messages"][1]["content"]
         assert "execute(FAILED) → execute" in digest
         assert "OUTCOME: FAILURE" in digest
-        assert "TRIGGER: deploy service v0 failed on permissions" in digest
+        assert "REQUEST: deploy service v0 failed on permissions" in digest
         assert "LESSON: check publish path first" in digest
 
     async def test_batch_capped(self, epi, monkeypatch):

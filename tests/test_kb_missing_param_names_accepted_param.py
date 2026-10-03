@@ -131,6 +131,8 @@ def subject_sink(monkeypatch):
     monkeypatch.setattr(mem, "tool_remember", _remember)
     monkeypatch.setattr(mem, "tool_gain_knowledge", _gain)
     monkeypatch.setattr(mem, "tool_unified_forget", _forget)
+    # §4KX r8: the model-facing forget is the PREVIEW step
+    monkeypatch.setattr(mem, "forget_preview", _forget)
     return seen
 
 

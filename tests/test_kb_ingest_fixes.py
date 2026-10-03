@@ -292,7 +292,9 @@ async def test_unified_forget_profile_sweep_prefers_exact_key_match(tmp_path):
     sandbox.mkdir()
     profile = MagicMock()
     profile.load.return_value = {
-        "root": {"location": "Athens", "located_in": "EU"}
+        # specific keys: an attribute word ("location") only lists its fields
+        # since the profile-writes review
+        "root": {"telescope": "Dobsonian", "telescope_mount": "EQ6"}
     }
     mem = MagicMock()
     mem.get_library.return_value = []
@@ -303,11 +305,11 @@ async def test_unified_forget_profile_sweep_prefers_exact_key_match(tmp_path):
     mem._get_lock.return_value.__enter__ = MagicMock(return_value=None)
     mem._get_lock.return_value.__exit__ = MagicMock(return_value=False)
 
-    await tool_unified_forget("location", sandbox, mem, profile_memory=profile)
+    await tool_unified_forget("telescope", sandbox, mem, profile_memory=profile)
     delete_calls = [c.args for c in profile.delete.call_args_list]
-    # Exact match beats substring — only `location` should be deleted.
-    assert ("root", "location") in delete_calls
-    assert ("root", "located_in") not in delete_calls
+    # Exact match beats substring — only `telescope` is deleted.
+    assert ("root", "telescope") in delete_calls
+    assert ("root", "telescope_mount") not in delete_calls
 
 
 # =====================================================================
@@ -414,3 +416,22 @@ async def test_reset_all_clears_library_atomically(tmp_path):
     res = await tool_knowledge_base("reset_all", sandbox_dir=tmp_path, memory_system=mem)
     assert "Success" in res or "Wiped" in res
     assert lib.read_text() == "[]"
+
+
+#: the tests here that run reset_all (by name: the fixture must not read source)
+_WIPE_TESTS = {'test_reset_all_handles_partial_batch_failure', 'test_reset_all_clears_library_atomically'}
+
+
+@pytest.fixture(autouse=True)
+def _a_user_who_confirms_the_wipe(request, monkeypatch):
+    """reset_all is preview → confirm in a later turn (§4KX r8); these tests
+    run the confirmed wipe. ONLY the tests that call it — a module-wide
+    wrapper would mask the preview step elsewhere (re-review)."""
+    if request.node.originalname in _WIPE_TESTS:
+        import ghost_agent.tools.memory as _m
+        from tests._wipe_confirm import confirming
+        _wrapped = confirming(_m.tool_knowledge_base)
+        monkeypatch.setattr(_m, "tool_knowledge_base", _wrapped)       # function-local imports
+        if hasattr(request.module, "tool_knowledge_base"):
+            monkeypatch.setattr(request.module, "tool_knowledge_base", _wrapped)
+    yield

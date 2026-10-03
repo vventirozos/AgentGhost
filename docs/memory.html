@@ -119,7 +119,7 @@
     <dd>If telling it doesn't stick, the entry is probably in the profile (always present) rather than the searchable stores. The web UI exposes a memory-correction control for this, and there's an HTTP endpoint behind it — <code>POST /api/memory/correct</code>.</dd>
 
     <dt>You want a topic gone entirely</dt>
-    <dd>Ask it to forget the topic by name. This removes the stored passages rather than just suppressing them.</dd>
+    <dd>Ask it to forget the topic by name. It first shows you a numbered list of everything it found — files, facts, profile fields, graph facts, past conversations — and deletes only what you confirm in your reply ("yes", or "only 1 and 3"). The stored items are removed, not just suppressed. Wiping all memory works the same way: it says what would go and waits for your yes.</dd>
 
     <dt>It learned the wrong lesson</dt>
     <dd>Lessons are recorded automatically, so a bad one can get in. If the self-check later refuses the answer a lesson came from, Ghost removes that lesson on its own. You can also list them (<em>"show me your lessons"</em>) and ask it to drop a specific one.</dd>

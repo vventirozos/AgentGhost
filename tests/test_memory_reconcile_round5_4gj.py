@@ -362,8 +362,12 @@ async def test_a_refused_identity_write_reaches_the_user_as_a_partial():
     vm.smart_update("User car is a Fiat", "identity")
     vm.add("User car is a BMW", {"type": "auto",
                                  "timestamp": "2026-01-01T00:00:00Z"})
+    # §4KZ: the mirror reads the (canonical) field AFTER the write — a
+    # stateful profile: Fiat on file, BMW once written
+    _state = {"assets": {"car": "a Fiat"}}
     profile = MagicMock()
-    profile.update = MagicMock(return_value="JSON updated")
+    profile.update = MagicMock(side_effect=lambda c, k, v: (_state["assets"].__setitem__("car", v), "JSON updated")[1])
+    profile.load = MagicMock(side_effect=lambda: {"assets": dict(_state["assets"])})
 
     out = str(await tool_update_profile(
         category="identity", key="car", value="a BMW",

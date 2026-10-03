@@ -180,7 +180,9 @@ class TestPatchWithFallback:
         # First-try wins on familiar shapes really have nothing to teach.
         assert out == {}
 
-    def test_preserves_llm_partial_trigger(self):
+    def test_a_partial_lesson_is_not_patched(self):
+        """Producers review: a specific LLM trigger with a generic template fix
+        was a mismatched pair — half a lesson is left alone (no lesson)."""
         out = _patch_with_fallback(
             {"trigger": "LLM said this"},
             outcome="STRUGGLED_THEN_WON",
@@ -189,8 +191,7 @@ class TestPatchWithFallback:
             attempt=1,
             solution_novelty=None,
         )
-        assert out["trigger"] == "LLM said this"  # not overwritten
-        assert out["correct_pattern"]  # but the missing pattern is filled
+        assert out == {"trigger": "LLM said this"}
 
     def test_domains_default_from_cluster(self):
         out = _patch_with_fallback(

@@ -28,8 +28,6 @@
     "unsubscriptable-object|src/ghost_agent/core/objection.py|Value 'best' is unsubscriptable": 1,
     "unsubscriptable-object|src/ghost_agent/core/verifier.py|Value '_vote' is unsubscriptable": 1,
     "unsubscriptable-object|src/ghost_agent/distill/collector.py|Value 'cached' is unsubscriptable": 2,
-    "unsupported-membership-test|src/ghost_agent/core/agent.py|Value '_cand_key' doesn't support membership test": 1,
-    "unsupported-membership-test|src/ghost_agent/core/agent.py|Value '_new_key' doesn't support membership test": 1,
     "unsupported-membership-test|src/ghost_agent/memory/vector.py|Value 'neighbor_key' doesn't support membership test": 1,
     "unsupported-membership-test|src/ghost_agent/memory/vector.py|Value 'new_key' doesn't support membership test": 1,
     "unused-import|src/ghost_agent/api/projects_routes.py|Unused Depends imported from fastapi": 1,

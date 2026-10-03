@@ -66,7 +66,7 @@ Value := str                      # LEGACY — as_of unknown
 
   <h2>Forgetting values (not just keys)</h2>
   <p>The profile is injected into the system prompt every turn via <code>get_context_string()</code>, so it is the <em>authoritative</em> source the model answers from — vector and graph stores are secondary. This made one deletion bug user-visible: pets / interests / assets are stored as <strong>values</strong> (e.g. <code>assets.pets = ["Hanzo the dog", "Mortimer the iguana"]</code>), but <code>unified_forget</code>'s profile sweep only matched <strong>keys</strong>. <code>forget('mortimer')</code> therefore never reached the row — it kept being injected, so the model kept "remembering" the deleted pet even after reporting success. The merge semantics above compounded it: a "Mortimer is gone" interaction <em>appended</em> a soft-delete tombstone string (<code>"Mortimer the iguana (removed)"</code>) rather than deleting anything.</p>
-  <p><code>prune_value(category, key, target)</code> closes this: it removes every list item (or a matching scalar) whose text <em>mentions</em> the target, collapsing a surviving singleton list back to a scalar and dropping the key — and the category — when nothing remains. Matching is <strong>token/word-boundary aware</strong> so <code>forget('age')</code> does not strip a value of <code>'language'</code>, while <code>forget('mortimer')</code> still matches <code>'Mortimer the iguana (removed)'</code>. <code>unified_forget</code> now runs this value sweep after its key sweep (see <a href="../tools/memory_tools.html">memory tools</a>).</p>
+  <p><code>prune_value(category, key, target)</code> closes this: it removes every list item (or a matching scalar) whose text <em>mentions</em> the target, collapsing a surviving singleton list back to a scalar and dropping the key — and the category — when nothing remains. Matching is <strong>token/word-boundary aware</strong> so <code>forget('age')</code> does not strip a value of <code>'language'</code>, while <code>forget('mortimer')</code> still matches <code>'Mortimer the iguana (removed)'</code>. <code>unified_forget</code> now runs this value sweep after its key sweep (see <a href="../tools/memory_tools.html">memory tools</a>). <em>Since 2026-10-03 a scalar is removed only when it IS (or starts with) the entity; a field that merely mentions it is listed — <a href="../tools/memory_tools.html#rereview">current rules</a>.</em></p>
 
   <h2>Robustness — <code>profile_update</code> shape</h2>
   <p>The smart-memory consolidation prompt asks the LLM to return <code>profile_update</code> as an object (<code>{category, key, value}</code>). The model occasionally ignores this and emits a bare string instead. The agent now coerces any non-dict <code>profile_update</code> to <code>None</code> at parse time: such a fact is still stored as a normal <code>auto</code> vector memory but skips the <code>identity</code> / <code>profile_memory.update</code> path entirely. This prevents the previous crash — <code>'str' object has no attribute 'get'</code> — which fired (and was swallowed) when a high-score string slipped into the identity branch.</p>
@@ -128,6 +128,33 @@ Value := str                      # LEGACY — as_of unknown
   <p><strong>Fail-closed on transient read errors.</strong> ProfileMemory was the only small store without the <code>_degraded</code> discipline its siblings have: an EIO/EACCES read was treated as corruption — the INTACT profile was shunted to a <code>.corrupt-*</code> sidecar, identity reverted to <code>{"name": "User"}</code>, and the next <code>save()</code> overwrote the real file. Now: OSError (≠ FileNotFoundError) serves the default in-memory, leaves the on-disk file untouched, and BLOCKS writes until a read succeeds; parse corruption keeps the sidecar path. <code>save()</code> also fsyncs before the rename (torn-write window). The bus's profile leg and the smart-memory consolidation both now REQUIRE category+key on a profile_update — the old "info"/"notes" defaults minted permanent junk keys like <code>cli_tools.info</code> outside the notes ring (no rotation, no value cap, injected into every prompt). Tests: <code>::TestProfileFailClosed</code>.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+  <h2 id="writes-review">Empty values and replaced values <span class="tag">2026-10-03 memory-writes / producers review</span></h2>
+  <p><code>update()</code> refuses an empty value (None, blank, zero-width, "null", "none", <code>[]</code>…) — an extractor's null was
+  stored as "None". A replaced single-value field keeps the value before it under <code>previous</code> (one level) and says
+  "(was: …)", so a background writer can no longer swap <code>root.name</code> without a trace.</p>
+  <h2 id="r8">Corrections and forget helpers <span class="tag">2026-10-03 &sect;4KX r8</span></h2>
+  <p class="note"><strong>Correction</strong> to the section above: <code>update()</code> refuses <code>None</code>, blank,
+  zero-width, "null", "nil", "undefined", <code>[]</code>, <code>{}</code> — but "none" and "N/A" are real answers ("allergies:
+  none") and are stored.</p>
+  <ul>
+    <li><code>mentions(value, target)</code> — the one mention rule for the forget profile leg and <code>prune_value</code>:
+    whole word, accent- and case-folded, any script; a multi-word target as a folded phrase on word boundaries. The old
+    ASCII-only split never found a Greek name.</li>
+    <li><code>drop_previous(category, key)</code> and <code>remove_item(category, key, item)</code> — item-level deletes for the
+    forget executor (one exact list item, not every item mentioning a word).</li>
+  </ul>
+  <p><code>delete(category, key, exact=True)</code> skips the canonical field map — the forget executor deletes the field the user
+  was shown.</p>
+  <h2 id="4kz">The profile is the authority; the rest are mirrors <span class="tag">2026-10-03 &sect;4KZ</span></h2>
+  <p>After every profile write — <code>update_profile</code> (bus or direct), its delete, or the background extractor —
+  <code>tools.memory.sync_owner_mirrors</code> reads the field back and makes its mirrors EQUAL it:
+  <code>GraphMemory.sync_owner_field</code> (the <code>user HAS_&lt;KEY&gt;</code> edges, stale ones deleted and archived) and
+  <code>VectorMemory.sync_owner_field</code> (the identity rows <code>User &lt;key&gt; is …</code>, by EXACT key — the old
+  distance-based <code>smart_update</code> deleted the sibling key's row). New rows are written first; stale ones go only when
+  they landed, and a refused write reports PARTIAL. Measured before: three live HAS_WIFE edges after a correction, the old
+  HAS_LOCATION beside the new, a list item's row replaced by the next item's.</p>
+  <p>The extractor writes an owner-stated <code>profile_update</code> on its own, independent of the fact's score ("remember that
+  I moved" never reached the profile); <code>drop_previous</code> uses the canonical field map.</p>
 </main>
 </body>
 </html>

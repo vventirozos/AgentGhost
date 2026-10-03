@@ -122,7 +122,7 @@
   <p>When <code>pick_seed</code> finds every brittle candidate saturated (and the caller isn't rolling the 35% random-exploration dice), it returns <code>mode="exploration"</code> with the saturated list attached. The dream loop then branches:</p>
 
   <ol>
-    <li><strong>Journal mining probability boost</strong>: <code>_try_journal_challenge</code> is called with <code>probability=0.75</code> instead of the default 0.25. Journal-mined challenges come from real user post-mortems — the richest source of novel, struggle-inducing material.</li>
+    <li><strong>Journal mining probability boost</strong>: <code>_try_journal_challenge</code> is called with <code>probability=0.75</code> instead of the default 0.25. Journal-mined challenges come from real user post-mortems — the richest source of novel, struggle-inducing material. <em>Since 2026-10-03 they exercise the agent but never write a lesson (a lesson would restate the user's request and the lenient validator).</em></li>
     <li><strong>20/80 coin-flip</strong> (was 50/50, rebalanced toward novelty): if journal mining misses, the loop flips a coin. 20% → <code>pick_random_template(exclude_clusters=saturated)</code> so the expert concurrency / algo / regex-parse templates still get airtime. 80% → fall through to LLM-generated challenges, with a <strong>diversity-requirement prompt injection</strong> telling the generator to pick from <code>{concurrency, algo, regex_parse, sql, bash}</code> and explicitly forbidding another data-analysis / CSV groupby. The rebalance reflects that deterministic templates are now primarily regression-tests rather than training signal — novel LLM-gen shapes are where real learning happens.</li>
   </ol>
 

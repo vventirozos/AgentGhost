@@ -400,6 +400,13 @@ _REMOVAL_NEGATION_PHRASES = (
     "no longer has", "no longer have", "no longer owns", "no longer own",
     "got rid of", "is gone", "are gone", "is no more",
     "not own", "not have an", "not have a",
+    # §4KY: "The user is not a doctor" was stored as an identity fact
+    "is not a ", "is not an ", "isn't a ", "isn't an ", "am not a ", "am not an ", "is no ", "not a doctor",
+    "is not the ", "isn't the ",
+    # §4KZ: selling / giving away retracts ownership ("we sold the BMW" left
+    # OWNS, DRIVES and HAS_CAR live and added `user SOLD bmw`)
+    "sold the ", "sold my ", "sold our ", "sold his ", "sold her ", "gave away", "πούλησα", "πουλήσαμε",
+    "πουλησα", "πουλησαμε",
     # Parenthetical tombstone markers an earlier soft-delete left behind,
     # e.g. "Mortimer the iguana (removed)".
     "(removed)", "[removed]", "(deleted)", "[deleted]", "(former)",
@@ -414,6 +421,7 @@ _REMOVAL_NEGATION_PHRASES = (
 #: are checked as substrings still (no embedding risk measured for them).
 _REMOVAL_PREDICATE_TOKENS = frozenset({
     "PREVIOUSLY", "FORMER", "REMOVED", "NEVER", "DELETED", "NOT", "PAST",
+    "SOLD", "SELLS", "GAVE", "LOST",          # §4KZ: a sale retracts ownership
 })
 _REMOVAL_PREDICATE_PHRASES = ("NO_LONGER", "NOLONGER", "USED_TO")
 # Back-compat alias for external readers of the old tuple name.

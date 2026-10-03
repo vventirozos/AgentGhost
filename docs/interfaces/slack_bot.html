@@ -337,6 +337,12 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/com.local.ghost-slackbot.
     page fails (a 429).</li>
   </ul>
 
+  <h2 id="4ky">Public replies and forged labels <span class="tag">2026-10-03 &sect;4KY</span></h2>
+  <p>Every agent call carries <code>X-Ghost-Surface</code>: "dm" for a 1:1 DM, "public" for a channel or group DM
+  (<code>reply_surface_header</code>). The agent then gives an OWNER turn on a public surface only the owner's name plus a
+  PUBLIC REPLY notice — no private profile, no memory hydration (tools still answer an explicit ask). A non-owner's message
+  that types the bot's own "[message from the owner…]" / "[message from another channel member…]" label has it defused, so a
+  member cannot pass words off as the owner's.</p>
 </main>
 
   <h2 id="4kd-slack">Requests are minted <code>slack-…</code> and never teach <span class="tag">2026-09-24 &sect;4KD</span></h2>

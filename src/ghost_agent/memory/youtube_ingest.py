@@ -688,8 +688,9 @@ def ingest_youtube(url: str, *, sandbox_dir: Path, memory_system, tor_proxy: Opt
         return YoutubeIngestResult(True, (
             f"Skipped: this video is already in the knowledge base as '{have}'. Read it in order "
             f"with knowledge_base(action='transcript', filename='{have}') or ask about it with "
-            f"action='query'. To transcribe it afresh, forget it first: knowledge_base("
-            f"action='forget', target='{have}')."), video_id=vid, filename=have)
+            f"action='query'. To transcribe it afresh it must be forgotten first, which the USER confirms: "
+            f"knowledge_base(action='forget', target='{have}') shows them what would go; after their yes, "
+            f"transcribe again."), video_id=vid, filename=have)
 
     stats = FetchStats()
     pot_up = ensure_pot_server()
@@ -799,7 +800,8 @@ def ingest_youtube(url: str, *, sandbox_dir: Path, memory_system, tor_proxy: Opt
     gap_note = f" Gaps (not transcribed): {'; '.join(gaps)}." if gaps else ""
     if stopped:
         gap_note += (f" STOPPED EARLY: {stopped}. What was transcribed is kept; to redo the whole "
-                     f"video later: knowledge_base(action='forget', target='{filename}') then transcribe again.")
+                     f"video later: knowledge_base(action='forget', target='{filename}') (a preview the user "
+                     f"confirms), then transcribe again.")
     head = "SUCCESS (partial)" if stopped else "SUCCESS"
     msg = (
         f"{head}: Transcribed YouTube video \"{title}\" ({format_timestamp(duration)}, "

@@ -15,39 +15,23 @@ def mock_context():
     return ctx
 
 @pytest.mark.asyncio
-async def test_run_smart_memory_task_contradiction_engine(mock_context):
+async def test_run_smart_memory_task_never_lets_the_model_delete(mock_context):
+    """§4KZ: the LLM-judged belief-revision engine is gone — 5 of its 7 live
+    deletions since 08-08 were wrong. A stored fact near the new one is NOT
+    offered to a judge and NOT deleted; the profile change is applied and
+    its mirrors synced instead."""
     mock_context.profile_memory.get_context_string.return_value = "Profile context"
     agent = GhostAgent(mock_context)
-    
-    # Mock LLM response to extract fact
     mock_context.llm_client.chat_completion.side_effect = [
-        # First call: Fact extraction
         {"choices": [{"message": {"content": '{"score": 0.95, "fact": "User is building a React app.", "profile_update": {"category": "project", "key": "current", "value": "React app"}}'}}]},
-        # Second call: Contradiction Engine evaluation
-        {"choices": [{"message": {"content": '{"ids": ["ID:123"]}'}}]}
+        {"choices": [{"message": {"content": '{"ids": ["ID:123"]}'}}]},
     ]
-    
-    # Mock advanced search to return conflicting memories
     mock_context.memory_system.search_advanced.return_value = [
-        # 0.30, not the old 0.50: §4R tightened the delete gate from `< 0.6`
-        # to `< 0.50` (matching the sibling `vector.smart_update`), because
-        # 0.44–0.58 is this embedder's measured OFF-TOPIC noise band and a row
-        # too weakly related to be worth showing must not be deletable. 0.50
-        # sat exactly ON the new boundary; 0.30 is an unambiguous match, which
-        # is what this test means to exercise.
-        {"id": "123", "text": "User is building a Vue app.", "score": 0.30}
-    ]
-    
+        {"id": "123", "text": "User is building a Vue app.", "score": 0.30}]
     await agent.run_smart_memory_task("User: I am building a React app.\nAI: Got it.", "test-model", 0.5)
-    
-    # Assert collection.delete was called with the old ID
-    mock_context.memory_system.collection.delete.assert_called_with(ids=["123"])
-    
-    # Assert new fact was added
-    mock_context.memory_system.add.assert_called()
-    call_args = mock_context.memory_system.add.call_args[0]
-    assert call_args[0] == "User is building a React app."
-    assert mock_context.profile_memory.update.called
+    mock_context.memory_system.collection.delete.assert_not_called()
+    assert mock_context.llm_client.chat_completion.await_count == 1      # no judge call
+
 
 @pytest.mark.asyncio
 async def test_run_smart_memory_task_no_contradiction(mock_context):

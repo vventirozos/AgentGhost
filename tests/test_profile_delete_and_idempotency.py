@@ -70,12 +70,11 @@ class TestUpdateProfileDelete:
         prof = self._profile(
             {"preferences": {"python_indentation": "Tabs over spaces"}})
         mem = MagicMock()
-        mem.delete_fragment.return_value = (True, {})
         await tool_update_profile(
             category="preferences", key="python_indentation", value="",
             profile_memory=prof, memory_system=mem)
-        mem.delete_fragment.assert_called_once_with(
-            "User python_indentation is Tabs over spaces")
+        # §4KZ: the mirror is synced to the field — no value left, no row left
+        assert mem.sync_owner_field.call_args.args[0] == "python_indentation"
 
     async def test_delete_vector_scrub_is_best_effort(self):
         prof = self._profile(

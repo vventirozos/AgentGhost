@@ -996,7 +996,8 @@ An absolute date already in the statement ("born in March 2026") is already corr
 
 ### OUTPUT FORMAT
 Return ONLY a JSON object.
-1. For `score` and `fact`: If the episode contains NEW implicit context to remember semantically, score it >= 0.8 and provide a 1-sentence "fact". If the agent already explicitly saved the fact using a tool, score it < 0.5 to avoid duplicates.
+1. For `score` and `fact`: If the episode contains NEW implicit context to remember semantically, score it >= 0.8 and provide a 1-sentence "fact". If the agent already explicitly saved the fact using a tool, score it < 0.5 to avoid duplicates — but when the USER stated a CHANGED profile value (moved, new job, a corrected name, a sold car), STILL return it as `profile_update` {"category", "key", "value"}.
+   Only what the USER says about THEMSELVES is about the user: a question, a role-play, a quote, a pasted text or another person's message is not. Ages: write the birth date, never the age.
 2. For `graph_triplets`: ALWAYS extract explicit entity relationships into this array as objects with "subject", "predicate", and "object" keys, REGARDLESS of the semantic score. Predicates MUST be uppercase verbs (e.g., OWNS, LIKES, USES, WORKS_AT). Use broad, normalized entities.
 
 example:

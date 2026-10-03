@@ -718,8 +718,11 @@ async def test_the_owner_turn_still_carries_its_data(monkeypatch, tmp_path, plan
     await agent.handle_chat({"messages": [{"role": "user", "content": "check what you know about me and tell me"}]},
                             FakeBgTasks(), request_id="web-8", requester_role="owner")
     text = _all_prompt_text(ctx)
-    for m in ("MARK-PROFILE", "MARK-SCRATCH", "MARK-RECALL", "MARK-BELIEF"):
+    for m in ("MARK-PROFILE", "MARK-SCRATCH", "MARK-RECALL"):
         assert m in text, m
+    # §4KZ: the contradiction ledger is no longer injected — on the live
+    # ledger it carried wrong, long-gone owner facts into prompts
+    assert "MARK-BELIEF" not in text
     if planning:
         assert "MARK-PLAYBOOK" in text
 

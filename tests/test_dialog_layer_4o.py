@@ -186,7 +186,8 @@ def test_background_worker_consumers_use_off_main_only():
     mem = (REPO / "src" / "ghost_agent" / "tools" / "memory.py").read_text()
     assert mem.count("off_main_only=True") >= 2      # both smart-memory paths
     ag = (REPO / "src" / "ghost_agent" / "core" / "agent.py").read_text()
-    for label in ('"classifier"', '"memory extract"', '"self-eval"',
+    # ("self-eval" was the belief-revision judge, removed in §4KZ)
+    for label in ('"classifier"', '"memory extract"',
                   '"postmortem"'):
         i = ag.index(f'task_label={label}')
         assert "off_main_only=True" in ag[i - 200:i], label

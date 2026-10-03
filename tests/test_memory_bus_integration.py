@@ -223,10 +223,8 @@ async def test_tool_update_profile_routes_through_bus():
         "key": "favorite language",
         "value": "Python",
     }
-    assert fact_data["triplets"] == [
-        {"subject": "user", "predicate": "HAS_FAVORITE_LANGUAGE", "object": "python"}
-    ]
-    assert fact_data["text"] == "User favorite language is Python"
+    # §4KZ: the profile only — its graph/vector mirrors are synced after
+    assert "triplets" not in fact_data and "text" not in fact_data
 
 
 @pytest.mark.asyncio

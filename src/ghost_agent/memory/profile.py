@@ -1,4 +1,5 @@
 import json
+import re
 import logging
 import threading
 import os
@@ -134,6 +135,24 @@ def stamp_of(item: Any) -> Any:
     return None
 
 
+#: "none" / "N/A" are real answers ("allergies: none") — only the words a
+#: program writes for a missing value are empty (third review)
+_EMPTY_WORDS = {"", "null", "nil", "undefined", "[]", "{}", "''", '""'}
+
+
+def _is_empty_value(value) -> bool:
+    """None, a blank or zero-width string, an empty list/dict, or the
+    literal words a model writes for "nothing"."""
+    if value is None:
+        return True
+    if isinstance(value, (list, dict, tuple, set)):
+        return not value
+    if isinstance(value, (int, float, bool)):
+        return False
+    t = re.sub(r"[\s\u200b-\u200f\u2060\ufeff]+", "", str(value))
+    return t.lower() in _EMPTY_WORDS
+
+
 def _wrap(value: Any, as_of: str) -> Any:
     """A plain value + a date → the stamped item to persist.
 
@@ -152,6 +171,27 @@ def _wrap(value: Any, as_of: str) -> Any:
 _DEGRADED_MSG = ("Error: the profile store could not be read, so it is write-protected — nothing was "
                  "changed. Tell the user the profile is temporarily unavailable.")
 
+
+
+def _fold(text) -> str:
+    """Case- and accent-folded text (Greek "Φωτεινή" ~ "φωτεινη")."""
+    import unicodedata
+    t = unicodedata.normalize("NFD", str(text or "").casefold())
+    return "".join(ch for ch in t if not unicodedata.combining(ch))
+
+
+def mentions(value, target) -> bool:
+    """Does ``value`` name ``target`` — a whole word (any script, accents and
+    case folded), or for a multi-word target the folded phrase? `forget`'s
+    profile leg and `prune_value` share it (re-review: the old ASCII-only
+    split never found a Greek name)."""
+    t = " ".join(_fold(target).split())
+    if not t:
+        return False
+    v = " ".join(_fold(value).split())
+    if " " in t:
+        return re.search(r"(?<!\w)" + re.escape(t) + r"(?!\w)", v) is not None
+    return t in re.split(r"[^\w.\-]+|(?<!\w)[.\-]|[.\-](?!\w)", v) or t in re.split(r"\W+", v)
 
 class ProfileMemory:
     def __init__(self, path: Path):
@@ -382,6 +422,67 @@ class ProfileMemory:
             return cls._CANONICAL_FIELD_MAP[k]
         return cat, k
 
+    def drop_previous(self, category: str, key: str) -> str:
+        """Remove the `previous` value kept beside a replaced field."""
+        with self._lock:
+            data = self.load_raw()
+            if self._degraded:
+                return _DEGRADED_MSG
+            _c, _k = self.canonicalize(str(category).lower(), str(key).lower())   # §4KZ: same map as delete()
+            item = (data.get(_c) or {}).get(_k)
+            if item is None:
+                item = (data.get(str(category).lower()) or {}).get(str(key).lower())
+            if isinstance(item, dict) and "previous" in item:
+                del item["previous"]
+                self.save(data)
+                return f"Removed the previous value of {category}.{key}"
+        return f"No previous value of {category}.{key}"
+
+    def remove_item(self, category: str, key: str, item_text: str) -> str:
+        """Remove ONE exact item from a list field (the forget executor's
+        item-level delete; `prune_value` removes every item MENTIONING a word)."""
+        with self._lock:
+            data = self.load_raw()
+            if self._degraded:
+                return _DEGRADED_MSG
+            cat, k = str(category).lower(), str(key).lower()
+            cur = (data.get(cat) or {}).get(k)
+            items = cur if isinstance(cur, list) else [cur]
+            keep = [i for i in items if str(unwrap(i)) != str(item_text)]
+            if len(keep) == len(items):
+                return f"No item {item_text!r} in {cat}.{k}"
+            if keep:
+                data[cat][k] = keep if len(keep) > 1 else keep[0]
+            else:
+                del data[cat][k]
+                if not data[cat]:
+                    del data[cat]
+            self.save(data)
+            return f"Removed {item_text!r} from {cat}.{k}"
+
+    def drop_previous_mentioning(self, target: str) -> list:
+        """Remove the `previous` value of any field whose replaced value
+        names ``target`` (whole word) — `forget` must reach it too (third
+        review: `forget Leonidas` left `previous: Leonidas` on disk)."""
+        t = str(target or "").strip().lower()
+        if len(t) < 3:
+            return []
+        out = []
+        with self._lock:
+            data = self.load_raw()
+            if self._degraded:
+                return []
+            for cat, sub in data.items():
+                if not isinstance(sub, dict):
+                    continue
+                for k, item in sub.items():
+                    if isinstance(item, dict) and "previous" in item and mentions(unwrap(item["previous"]), t):
+                        del item["previous"]
+                        out.append(f"Removed the previous value of {cat}.{k}")
+            if out:
+                self.save(data)
+        return out
+
     def update(self, category: str, key: str, value: Any, as_of=None):
         """Write ``value`` under ``category.key``, stamped with when it was
         learned.
@@ -417,6 +518,11 @@ class ProfileMemory:
             # leg, and smart-memory consolidation. anchor() is idempotent,
             # so a caller that already anchored (to attach the right
             # said_at, or to keep sibling stores in step) is unaffected.
+            # an EMPTY value is never stored: an extractor's null became
+            # "None", "" an empty item (profile-writes review). Deleting is
+            # delete()'s job, asked for explicitly.
+            if _is_empty_value(value):
+                return f"Error: refusing to store an empty value for {cat}.{k} — nothing was changed."
             v = _anchor(str(value).strip())
 
             original_cat, original_key = cat, k
@@ -433,8 +539,23 @@ class ProfileMemory:
             # always REPLACE; for everything else the merge behavior
             # below applies. (Module-level table — see _SINGLETON_KEYS.)
             if target_key in _SINGLETON_KEYS:
+                _prev = data[cat].get(target_key)
                 data[cat][target_key] = _wrap(v, as_of)
+                # a REPLACED value is kept beside the new one, not lost: a
+                # background writer (smart-memory consolidation) could swap
+                # root.name with no trace (profile-writes review)
+                if _prev is not None and str(unwrap(_prev)).strip() not in ("", v):
+                    # ONE level: the value before this one, not a growing chain
+                    data[cat][target_key]["previous"] = (
+                        {kk: vv for kk, vv in _prev.items() if kk != "previous"} if isinstance(_prev, dict) else _prev)
                 self.save(data)
+                _was = (f" (was: {str(unwrap(_prev))[:200]!r})"
+                        if _prev is not None and str(unwrap(_prev)).strip() not in ("", v) else "")
+                if (cat, target_key) != (original_cat, original_key):
+                    return (f"Synchronized: {cat}.{target_key} = {v}{_was}  "
+                            f"[normalised from {original_cat}.{original_key}]")
+                if _was:
+                    return f"Synchronized: {cat}.{target_key} = {v}{_was}"
                 if (cat, target_key) != (original_cat, original_key):
                     return (f"Synchronized: {cat}.{target_key} = {v}  "
                             f"[normalised from {original_cat}.{original_key}]")
@@ -552,7 +673,11 @@ class ProfileMemory:
                 self.save(data)
             return n
 
-    def delete(self, category: str, key: str) -> str:
+    def delete(self, category: str, key: str, exact: bool = False) -> str:
+        """Remove ``category.key``. ``exact`` deletes the key AS STORED,
+        without the canonical map — the forget executor deletes the field the
+        user was shown (r8 review: a legacy `root.car` shown, `assets.car`
+        deleted)."""
         with self._lock:
             # RAW: load() unwraps, and the save() below would then strip
             # provenance from every OTHER key in the file.
@@ -566,7 +691,8 @@ class ProfileMemory:
             # §4M R2 MINOR-5: one canonical map (see _CANONICAL_FIELD_MAP)
             # — this was an inline verbatim copy; the next map entry would
             # have diverged write/delete/prune silently.
-            cat, k = self.canonicalize(cat, k)
+            if not exact:
+                cat, k = self.canonicalize(cat, k)
 
             if cat in data and k in data[cat]:
                 del data[cat][k]
@@ -597,7 +723,6 @@ class ProfileMemory:
         Deletes the key when nothing survives, and the category when it
         becomes empty. Returns a human-readable report line.
         """
-        import re
         with self._lock:
             # RAW, for the same reason as delete(); _mentions() unwraps.
             data = self.load_raw()
@@ -619,10 +744,7 @@ class ProfileMemory:
                 return "Profile: empty target, nothing pruned."
 
             def _mentions(val) -> bool:
-                v = str(unwrap(val)).lower()
-                if " " in target_lc:
-                    return target_lc in v
-                return target_lc in re.split(r"[^a-z0-9]+", v)
+                return mentions(unwrap(val), target_lc)
 
             existing = data[cat][k]
 

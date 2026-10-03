@@ -203,54 +203,12 @@ def test_record_returns_false_when_degraded(tmp_path):
         os.chmod(p, 0o644)
 
 
-# ── engine: scope, gate, ordering (structural — driving the full
-#    consolidation path needs the whole LLM stack) ──────────────────────────
-
-def _engine_src():
-    """Source of the contradiction-engine block with COMMENTS STRIPPED.
-
-    Necessary because the fix comments quote the old behaviour verbatim
-    ("was a `$nin` denylist", "not the bare `< 0.6`"), so a naive substring
-    assertion matches the explanation instead of the code — these tests
-    failed on correct source before the stripping was added.
-    """
-    import inspect
-    from ghost_agent.core.agent import GhostAgent
-    src = inspect.getsource(GhostAgent.run_smart_memory_task)
-    seg = src[src.index("CONTRADICTION ENGINE"):src.index("Save the new fact")]
-    return "\n".join(ln for ln in seg.splitlines()
-                     if not ln.lstrip().startswith("#"))
-
-
-def test_candidate_scope_is_same_type_not_a_denylist():
-    seg = _engine_src()
-    assert '"type": memory_type' in seg, (
-        "candidate scope must be same-type; a $nin denylist leaves synthesis / "
-        "identity / manual / document_summary rows deletable")
-    assert "$nin" not in seg, "the denylist scope is back"
-
-
-def test_delete_gate_matches_the_sibling_calibration():
-    seg = _engine_src()
-    assert "0.50" in seg, "delete gate must be 0.50 (the sibling smart_update value)"
-    assert "< 0.6" not in seg, "the loose 0.6 delete gate is back"
-    assert "_subject_key" in seg, "subject-key conflict guard missing"
-
-
-def test_record_precedes_delete():
-    """An irreversible delete must not outlive its audit record."""
-    seg = _engine_src()
-    assert seg.index("contradiction_log.record") < seg.index("collection.delete"), (
-        "delete still runs before the audit record is written")
-    assert "if not _recorded" in seg, "delete is not gated on a successful record"
-
-
-def test_judge_prompt_example_is_valid_json():
-    """The example was in a NON-f-string segment, so the judge was literally
-    shown `{{"ids": ...}}` — malformed, which silently no-op'd the engine."""
-    seg = _engine_src()
-    assert '{{\\"ids\\"' not in seg and '{{"ids"' not in seg, (
-        "judge prompt still shows doubled braces")
+# ── engine ────────────────────────────────────────────────────────────────
+# §4KZ: the LLM-judged belief-revision engine is GONE (5 of its 7 live
+# deletions since 08-08 were wrong). The scope/gate/order pins that stood
+# here pinned its source text; the behaviour that replaces them — no
+# model-judged deletion, profile + synced mirrors — is pinned in
+# tests/test_4kz_update_path.py.
 
 
 def test_top_tier_gates_key_off_effective_threshold():

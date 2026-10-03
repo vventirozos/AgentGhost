@@ -68,9 +68,10 @@ class TestDreamConsolidationMetrics:
         # Similar setup but with highly compressible data
         mock_dreamer.memory.collection.get.return_value = {
             "ids": ["id1", "id2", "id3"],
+            # two RELATED facts (§4KY: a merge of unrelated text is refused)
             "documents": [
-                "A" * 200,  # 200 chars
-                "B" * 200,  # 200 chars
+                'The user owns a red Ducati Streetfighter V4S motorcycle and rides it on weekends in the mountains near Athens.',
+                'The user rides his Ducati Streetfighter V4S motorcycle on mountain roads near Athens most weekends.',
                 "C" * 100,
             ],
             "metadatas": [{"type": "auto"}] * 3,
@@ -82,7 +83,7 @@ class TestDreamConsolidationMetrics:
                 "message": {
                     "content": json.dumps({
                         "consolidations": [{
-                            "synthesis": "Compressed summary",  # 18 chars vs 400 source
+                            "synthesis": 'The user rides his red Ducati Streetfighter V4S on mountain roads near Athens on weekends.',
                             "merged_ids": ["ID:id1", "ID:id2"]
                         }],
                         "heuristics": []
@@ -121,7 +122,7 @@ class TestDreamConsolidationMetrics:
         }
 
         result = await mock_dreamer.dream()
-        assert "low-compression" in result or "Synthesized 0" in result
+        assert "consolidations refused" in result   # (§4KY wording: the refusal is not only compression)
 
 
 class TestDreamHeuristicKeying:

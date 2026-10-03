@@ -108,7 +108,9 @@ def test_graph_connected_entities(tmp_path):
     g = GraphCls(tmp_path)
     g.add_triplets([
         {"subject": "user", "predicate": "HAS_PET", "object": "mortimer"},
-        {"subject": "mortimer", "predicate": "IS_A", "object": "iguana"},
+        # an ALIAS: the only edge the expansion follows (a class link is not —
+        # third memory-writes review)
+        {"subject": "mortimer", "predicate": "ALSO_KNOWN_AS", "object": "iguana"},
     ])
     related = g.get_connected_entities("mortimer")
     assert "iguana" in related
@@ -146,7 +148,9 @@ async def test_forget_expands_to_alias(tmp_path):
     g = GraphCls(tmp_path)
     g.add_triplets([
         {"subject": "user", "predicate": "HAS_PET", "object": "mortimer"},
-        {"subject": "mortimer", "predicate": "IS_A", "object": "iguana"},
+        # an ALIAS: the only edge the expansion follows (a class link is not —
+        # third memory-writes review)
+        {"subject": "mortimer", "predicate": "ALSO_KNOWN_AS", "object": "iguana"},
         {"subject": "user", "predicate": "PREVIOUSLY_OWNED", "object": "iguana"},
     ])
     pm = ProfileMemory(tmp_path)

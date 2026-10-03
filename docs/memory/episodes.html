@@ -145,6 +145,14 @@ context    = "tools: a → b(FAILED) → c ; recovered after failures in: b"</pr
   ("Describe the colour of the sea in five words or fewer." 327&times;). It now follows <code>turn_may_teach</code> (probe, member,
   internal). The 91 probe episodes and 6 member episodes recorded before the member wall were removed with their vector copies
   (<code>scripts/memory_repair_4kw.py</code>, operator-approved).</p>
+  <h2 id="writes-review">forget_mentions <span class="tag">2026-10-03 memory-writes / producers review</span></h2>
+  <p>Deletes the episodes whose trigger, context, outcome or lesson names a target as a whole word, after archiving each to
+  <code>episodes_forgotten.jsonl</code> (nothing is deleted when the archive cannot be written), and their vector twins.</p>
+  <h2 id="r8">Folded mentions, previews, item deletes <span class="tag">2026-10-03 &sect;4KX r8</span></h2>
+  <p>A mention is a whole word after case and accent folding; a non-ASCII target is scanned in Python, not with SQLite's
+  ASCII-only <code>LIKE</code> ("Ελένη" was never found). <code>mention_previews(target)</code> lists <code>(id, trigger)</code> for the
+  forget preview; <code>delete_episodes(ids)</code> deletes exactly the confirmed ones — archived with their actions to
+  <code>episodes_forgotten.jsonl</code> first, nothing deleted when the archive cannot be written — and their vector twins.</p>
 </main>
 </body>
 </html>

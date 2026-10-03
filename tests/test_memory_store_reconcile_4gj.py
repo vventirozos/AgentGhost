@@ -660,3 +660,22 @@ def test_the_rem_cycle_awaits_the_reconciler():
                if isinstance(n, ast.Await) and isinstance(n.value, ast.Call)
                and getattr(n.value.func, "attr", "") == "_reconcile_memory_stores"]
     assert awaited, "the call is not awaited — the coroutine never runs"
+
+
+#: the tests here that run reset_all (by name: the fixture must not read source)
+_WIPE_TESTS = {'test_reconcile_repairs_all_three_document_drifts', 'test_reset_all_clears_the_outline_sidecar_too', 'test_a_failed_wipe_leaves_both_catalogues_alone'}
+
+
+@pytest.fixture(autouse=True)
+def _a_user_who_confirms_the_wipe(request, monkeypatch):
+    """reset_all is preview → confirm in a later turn (§4KX r8); these tests
+    run the confirmed wipe. ONLY the tests that call it — a module-wide
+    wrapper would mask the preview step elsewhere (re-review)."""
+    if request.node.originalname in _WIPE_TESTS:
+        import ghost_agent.tools.memory as _m
+        from tests._wipe_confirm import confirming
+        _wrapped = confirming(_m.tool_knowledge_base)
+        monkeypatch.setattr(_m, "tool_knowledge_base", _wrapped)       # function-local imports
+        if hasattr(request.module, "tool_knowledge_base"):
+            monkeypatch.setattr(request.module, "tool_knowledge_base", _wrapped)
+    yield

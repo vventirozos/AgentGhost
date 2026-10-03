@@ -55,7 +55,7 @@ async def test_legacy_path_full_success_returns_success():
 async def test_legacy_path_vector_failure_returns_partial():
     pm = _profile_memory()
     ms = MagicMock()
-    ms.smart_update = MagicMock(side_effect=RuntimeError("embedding upstream down"))
+    ms.sync_owner_field = MagicMock(side_effect=RuntimeError("embedding upstream down"))
     gm = MagicMock()
     gm.add_triplets = MagicMock(return_value=None)
     out = await tool_update_profile(
@@ -78,7 +78,7 @@ async def test_legacy_path_graph_failure_returns_partial():
     ms = MagicMock()
     ms.smart_update = MagicMock(return_value=None)
     gm = MagicMock()
-    gm.add_triplets = MagicMock(side_effect=ConnectionError("graph DB unreachable"))
+    gm.sync_owner_field = MagicMock(side_effect=ConnectionError("graph DB unreachable"))
     out = await tool_update_profile(
         category="identity", key="city", value="Athens",
         profile_memory=pm, memory_system=ms, graph_memory=gm,
@@ -92,9 +92,9 @@ async def test_legacy_path_graph_failure_returns_partial():
 async def test_legacy_path_both_indexes_failing_lists_both():
     pm = _profile_memory()
     ms = MagicMock()
-    ms.smart_update = MagicMock(side_effect=RuntimeError("vector down"))
+    ms.sync_owner_field = MagicMock(side_effect=RuntimeError("vector down"))
     gm = MagicMock()
-    gm.add_triplets = MagicMock(side_effect=RuntimeError("graph down"))
+    gm.sync_owner_field = MagicMock(side_effect=RuntimeError("graph down"))
     out = await tool_update_profile(
         category="identity", key="city", value="Athens",
         profile_memory=pm, memory_system=ms, graph_memory=gm,
@@ -112,7 +112,7 @@ async def test_legacy_path_logs_warning_on_failure(caplog):
     import logging as _logging
     pm = _profile_memory()
     ms = MagicMock()
-    ms.smart_update = MagicMock(side_effect=RuntimeError("embedding upstream down"))
+    ms.sync_owner_field = MagicMock(side_effect=RuntimeError("embedding upstream down"))
     with caplog.at_level(_logging.WARNING, logger="GhostAgent"):
         await tool_update_profile(
             category="identity", key="city", value="Athens",
@@ -121,5 +121,5 @@ async def test_legacy_path_logs_warning_on_failure(caplog):
         )
     msgs = [r.message for r in caplog.records]
     assert any(
-        "smart_update" in m and "city" in m for m in msgs
-    ), f"Expected a WARNING about smart_update failure for key=city; got {msgs}"
+        "mirror" in m and "city" in m for m in msgs
+    ), f"Expected a WARNING about the vector mirror failure for key=city; got {msgs}"   # §4KZ: mirrors are synced

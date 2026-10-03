@@ -139,4 +139,5 @@ async def test_tool_update_profile_graph_injection(mock_graph_memory):
         
         assert "SUCCESS: Profile updated." in result
         mock_profile.update.assert_called_once_with("preferences", "favorite language", "Python")
-        mock_graph_memory.add_triplets.assert_called_once_with([{"subject": "user", "predicate": "HAS_FAVORITE_LANGUAGE", "object": "python"}])
+        # §4KZ: the graph mirror is synced to the profile field, not appended
+        assert mock_graph_memory.sync_owner_field.call_args.args[0] == "favorite language"
