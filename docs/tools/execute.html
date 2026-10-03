@@ -320,6 +320,69 @@ STDOUT/STDERR:
   <code>tests/test_req50855398_fixes.py</code>.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+  <h2 id="4kw-review4">No destructive re-run, no bulk removal over released work <span class="tag">2026-10-02 &sect;4KW</span></h2>
+  <ul>
+    <li><strong>A failed <code>rm</code>/<code>mv</code>/<code>cp</code> is never re-run from another folder.</strong> The
+    file-not-found retry re-ran the whole command elsewhere; <code>_rerun_unsafe</code> checked only the non-final segments, so
+    <code>rm notes.md</code> (missing in the project) deleted the root's <code>notes.md</code>, and <code>rm a.txt b.txt</code>
+    deleted <code>a.txt</code> in both places while the model saw only the <code>b.txt</code> error. A final segment headed by a
+    destructive command (<code>_DESTRUCTIVE_HEADS</code>) or carrying a redirect is now unsafe.</li>
+    <li><strong>Bulk removal is refused while a released project exists</strong> (<code>_bulk_destructive</code> in <code>_released_shell_block</code>; the first regex is gone &mdash; see
+    <a href="#4kw-r4">the fourth review</a>): <code>rm -rf projects</code>, <code>rm -rf *</code>, <code>find . -delete</code>,
+    <code>mv projects …</code> name no project id and passed. Targeted commands (<code>rm -rf build</code>, <code>rm -f *.pyc</code>)
+    are unaffected.</li>
+    <li>The deny-list reads long options: <code>rm --recursive --force /…</code>.</li>
+  </ul>
+  <h2 id="4kw-review5">Shell guards, second review <span class="tag">2026-10-02 &sect;4KW</span></h2>
+  <p>A redirect is a write only when it writes a file (<code>2&gt;&amp;1</code>, <code>&gt;/dev/null</code> are not); <code>find</code>
+  is destructive only with <code>-delete</code>/<code>-exec</code>. The bulk-removal guard ignores <code>git rm</code>,
+  <code>mv *.png …</code> and filtered <code>find … -delete</code>, catches <code>rm -rf ..</code> and <code>rm -r /workspace/projects</code>,
+  and inside a project's own workspace a bare <code>*</code>/<code>.</code>/<code>$PWD</code> is allowed.</p>
+  <h2 id="4kw-r3">Bulk removal: a token analysis, not a regex <span class="tag">2026-10-02 &sect;4KW</span></h2>
+  <p><code>_bulk_destructive</code> replaces the bulk regex (bypassed by <code>$(pwd)/*</code>, <code>find . -type f -delete</code>,
+  <code>xargs rm</code>, globs over project ids, <code>/workspace/./projects</code>, <code>cd projects; rm -rf &lt;id&gt;</code>,
+  case variants). Per command segment: a destructive verb, then every argument normalised (quotes, <code>$PWD</code>/<code>$(pwd)</code>/backticks,
+  <code>//</code>, <code>/./</code>, case) and checked against the projects folder, the workspace, <code>.</code>/<code>*</code>/<code>..</code>,
+  globs and released ids; <code>mv</code> destinations and name-filtered <code>find</code> are not targets. The re-run guard sees
+  wrapped verbs (<code>FOO=1 rm</code>, <code>nohup</code>, <code>bash -c</code>, <code>xargs</code>), <code>&amp;&gt;</code>, and not a
+  <code>&gt;</code> inside quotes.</p>
+  <h2 id="4kw-r4">Fourth review: the shell is parsed, and the OS holds the line <span class="tag">2026-10-02 &sect;4KW</span></h2>
+  <ul>
+    <li><code>_shell_segments</code> splits outside quotes and strips wrappers (<code>VAR=1</code>, <code>sudo -u x</code>,
+    <code>timeout 5</code>, <code>nice -n 5</code>, <code>exec</code>, <code>xargs -0 -r</code>, <code>do</code>/<code>then</code>), and
+    expands a nested shell's <code>-c</code> payload. Each simple command's OWN verb is read, so <code>grep -rn 'rm -rf' .</code> and
+    <code>--rm</code> are no removals.</li>
+    <li><code>_bulk_destructive</code> expands braces and <code>for</code> loop variables, collapses <code>x/..</code>, tracks the
+    directory through <code>cd</code>/<code>pushd</code> (a <code>cd /tmp</code> makes <code>*</code> safe; <code>cd</code>,
+    <code>cd -</code>, <code>cd ..</code> from a project make it unknown/bulk), and knows <code>git clean -f</code>,
+    <code>tar --remove-files</code>, <code>rsync --delete</code> (the destination only) and a glob matching the projects folder
+    (<code>proj*</code>). A find narrowed by a real name filter is targeted; <code>-name '*'</code> is not.</li>
+    <li><code>_released_written_ids</code>: a command is refused only when it WRITES into a released workspace (redirect targets,
+    copy destinations, mv/rm/sed -i/touch/tar -x/unzip/git-write targets, or a relative path while the working directory is the
+    released project). Reading or copying OUT of it is allowed.</li>
+    <li><code>_rerun_unsafe</code> reads verbs through the same wrappers (<code>xargs -0 rm</code>, <code>timeout 5 rm</code>) and
+    takes no <code>&gt;</code> inside quotes or <code>2&gt;&amp;1</code> for a write in any segment.</li>
+    <li>The hard guarantee for a RELEASED workspace is its user-immutable flag (<a href="../memory/projects.html">projects</a>, macOS):
+    a removal the parser misses fails there with "Operation not permitted". Development projects and the re-run heal have only the
+    parser.</li>
+  </ul>
+  <h2 id="4kw-r5">Fifth review: <code>tools/shell_analysis.py</code> <span class="tag">2026-10-03 &sect;4KW</span></h2>
+  <p>The analysis lives in <code>src/ghost_agent/tools/shell_analysis.py</code> (<code>_shell_segments</code>,
+  <code>_bulk_destructive</code>, <code>_written_paths</code>, <code>_released_written_ids</code>); <code>execute.py</code> imports it.</p>
+  <ul>
+    <li>Subshell parentheses split commands; <code>-lc</code>/<code>-ec</code>/<code>-c --</code>, <code>eval</code>, <code>echo … | sh</code>,
+    <code>$( … )</code>/backticks (an <code>echo</code>/<code>ls -d</code> substitution is replaced by its words), variables assigned in the
+    command, <code>busybox</code>/<code>doas</code>/<code>/usr/bin/env</code>, a shell reading a heredoc, and interpreter one-liners
+    (<code>os.system</code>, <code>subprocess</code>, <code>rmtree</code>, <code>rmSync</code>, <code>fs.rm</code>) are all analysed.
+    Nesting past three levels fails CLOSED.</li>
+    <li>Comments and heredoc bodies read as data are not commands; a quoted string over 4 KB is data (no quadratic parse).</li>
+    <li><code>find -maxdepth 1 … -exec rm</code> sweeps the start directory's contents; only a positive name filter BEFORE the action
+    narrows a find. <code>git clean --force</code>, <code>zip -m</code> count.</li>
+    <li>The directory is tracked with depth inside a project (<code>cd src &amp;&amp; rm -rf ../build</code> stays inside).</li>
+    <li>The bulk guard runs whether or not a project is released: the projects folder holds every workspace.</li>
+    <li>Written paths: <code>find -exec grep</code> and <code>tar -czf /tmp/x .</code> write nothing in the workspace; <code>&gt;</code> inside
+    <code>$(( ))</code>, a heredoc or quotes is no redirect; <code>&gt;|</code> is; <code>git -C</code>, npm/pip/make in the folder are writes.</li>
+  </ul>
 </main>
   <p><strong><code>find … 2&gt;/dev/null</code> exiting 1 is not a failed command (§4IE, 2026-09-17).</strong> <code>find</code> exits 1 whenever any directory under its root was unreadable; with stderr discarded that status carries nothing the model can act on and the paths it printed are valid. Probe <code>ifs18371…</code> re-ran eight <code>find / …</code> variants in a row (turns 31–38, up to 166 s each), each banner-flagged, each a strike. <code>_normalise_find_exit</code> (called inside <code>_normalise_exit</code>, before the self-reported status) forgives exit 1 ONLY when the last <code>;</code>/<code>&amp;&amp;</code>-separated command of the line is a <code>find</code> whose stderr is discarded, something was printed, and no <code>find:</code> error line is in the output; exit 2 (usage error) and a <code>find</code> that printed nothing keep their status. Pins: <code>tests/test_same_error_probe_labels.py</code>.</p>
 </body>

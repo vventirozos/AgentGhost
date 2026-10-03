@@ -1592,11 +1592,13 @@ class TestProducerParserParity:
     #  path heuristic is a guess about someone else's source, and a tripwire
     #  is what a guess deserves.
     # 2026-09-23 (§4KC): + the `edit` site (one path slot: the filename).
-    EXPECTED_SITES = 14
+    # +2 (§4KW fresh review): delete/rename of a symlink as itself — both
+    # emit the parsed `Deleted '…'.` / `Renamed/Moved '…' to '…'.` shapes
+    EXPECTED_SITES = 16
     # 2026-09-21 (§4JP): the write site's message gained `{rewrite_note}` —
     # a hint, not a path; the renderer's heuristic counts it as a slot. The
     # ledger's captures were re-checked (the parity assertions below pass).
-    EXPECTED_SLOT_COUNTS = [1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 5]
+    EXPECTED_SLOT_COUNTS = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 5]   # §4KW: + link delete (1), link rename (2)
 
     def _rendered_messages(self):
         """Every `SUCCESS:` message tools/file_system.py can emit, rendered.

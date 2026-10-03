@@ -364,6 +364,16 @@
   signal is its own state file, which
   <code>core/liveness.py::_negative_controls_probe</code> already reads.</p>
 
+  <h2 id="4kw-review4">Internal turns are their own population; a job wake reports <span class="tag">2026-10-02 &sect;4KW</span></h2>
+  <ul>
+    <li><code>turn_origin</code> returns <code>"internal"</code> for <code>job-</code>/<code>sched-</code>/<code>sub-</code> request ids:
+    the trajectory is <code>task_kind="internal"</code>, no calibration row is booked and the turn never teaches. They were recorded
+    as <code>user_request</code> while <code>is_internal_request</code> said internal.</li>
+    <li>A finished background job's wake turn records its conclusion like a scheduled task (<code>record_scheduled_result</code>):
+    "say briefly what the job produced &mdash; the user has not seen this output" was discarded.</li>
+    <li>A restored interval task keeps its cadence (anchored at <code>created_at</code>): each restart put the next run a full
+    interval after boot, so a daily task never fired on a box restarting more often.</li>
+  </ul>
 </main>
 </body>
 </html>

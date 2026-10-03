@@ -283,6 +283,133 @@
   that every <code>frequency</code> assignment in <code>learn_lesson</code> sits under the evidence test.</p>
   <!-- /4KS:evidence -->
 
+  <h2 id="4kw-review4">Credit, admission and merge <span class="tag">2026-10-02 &sect;4KW</span></h2>
+  <ul>
+    <li><strong>A lesson is credited for being relevant, not for being in the prompt.</strong> Both credit sites passed every surfaced
+    lesson as <code>top_triggers</code>, which <code>credit_recent_retrievals</code> counts as relevance: every lesson in the prompt
+    got helpful +1 and confidence +0.05 on every clean turn (154 of 290 lessons at confidence 1.0; helpful rate vs verified outcome
+    r = 0.28), and the hydration judge's later "used" verdict was then blocked as a double credit. Credit is now word overlap with
+    the request or the judge's verdict, and never on a turn that must not teach (probe, member, internal).</li>
+    <li><strong>No lesson may prescribe bulk or irreversible destruction</strong> (<code>lesson_quality.prescribes_destruction</code>
+    at the single write point): wildcard/root deletes, recursive removes of the workspace, <code>DROP TABLE</code>, force-push,
+    <code>git reset --hard</code>. Only the fix is screened; a negated warning ("never run rm -rf /") passes.</li>
+    <li><strong>A reflection plan the judge rejected is not a lesson</strong> (it was written with <code>verified=False</code>;
+    "delete path=/*" came in this way, from a refute of a correct cleanup).</li>
+    <li><strong>A vector twin from another producer does not rewrite a lesson.</strong> Dream rules about verifying a cleanup were
+    merged into the reflection "delete path=/*" lesson (frequency 1 &rarr; 17), a reflected deploy-check script replaced a dream
+    rule's fix (verified inherited). Word overlap cannot separate these from reworded twins; the producer can.</li>
+    <li>Known, not changed at the time: request-keyed reflection lessons are injected into unrelated turns (1,592 injections,
+    5 on the same request) &mdash; <em>fixed since</em> by the lesson scope (<a href="#4kw-scope">above</a>); retrieval ranking ignores the credit signals; late REFUTED verdicts do not reverse credit.</li>
+  </ul>
+  <h2 id="4kw-scope">A lesson for one request stays with that request <span class="tag">2026-10-02 &sect;4KW</span></h2>
+  <p><strong>The defect.</strong> Reflection, the post-mortem engine and the journal post-mortem keyed their lessons on the
+  failed request's own text, and the fix was a corrected plan for THAT request ("1. Directly answer 'Yes' to the user's
+  question regarding knowledge of Professor Spiros Denaxas…"). Retrieval embeds the whole lesson, so these plans matched almost
+  any request: on the recorded traffic, 40 request-keyed lessons were injected 927 times, 20 of them on their own request (or a
+  rewording). The Spiros Denaxas plan reached "what is my name?" 117 times.</p>
+  <p><strong>Two kinds of lesson</strong> (<code>memory/lesson_scope.py</code>):</p>
+  <ul>
+    <li><code>scope="request"</code> &mdash; one request's corrected plan, with its <code>source_request</code>. It enters a prompt
+    only when the new request IS that request (<code>same_request</code>; <em>superseded</em> &mdash; the current rule is in
+    <a href="#4kw-r4">the fourth review</a>): character similarity &ge; 0.85, or the shorter
+    request's content words all in the longer one and at least half its size. Calibrated on the 927 injections: it admits the 20
+    retries/rewordings ("show me your projects", "how old is leonidas ?") and refuses every template with a different payload
+    ("Use deep_research ONCE on: &lt;other topic&gt;"). Applied in every retrieval branch (vector, keyword, recency) &mdash; both
+    the volatile block and the bus skill tier.</li>
+    <li>a general lesson &mdash; its trigger names a SITUATION CLASS. Retrieved by relevance, as before.</li>
+  </ul>
+  <p><strong>How triggers are made now.</strong> The reflection prompt asks, besides the plan, for a GENERAL LESSON block
+  (SITUATION / MISTAKE / RULE in general terms, or NONE). The plan is written request-scoped; the rule is written as a general
+  lesson only when the plan judge CONFIRMED the plan and <code>is_general_trigger</code> / <code>is_general_text</code> pass (no
+  URL, path, @-mention, quote or number from the request; at most half its content words the request's). The post-mortem engine
+  (a SITUATION line) and the journal post-mortem (a <code>situation</code> field in place of <code>task</code>, now with
+  <code>source="journal_postmortem"</code>) write general lessons when the situation is general, and scope to the request
+  otherwise. A vector twin from the other scope is written fresh, never merged.</p>
+  <p><strong>Measured.</strong> The final prompt replayed on 8 real failures against the live model: 8/8 plans parse, 8/8
+  general lessons, all pass the generality check and the write gate. The two plan-parse misses of the first replay were the
+  thinking cap (empty content), as frequent with the old prompt. One replay generalised a WRONG refute into "clear the entire
+  directory" &mdash; why a rule requires a confirmed plan, and why the destruction screen now covers clear/purge/empty. On a
+  copy of the live store, the real retrieval over 400 recorded requests: request-keyed lessons on ANOTHER request 93 &rarr; 0,
+  on their own request 25 &rarr; 25.</p>
+  <p class="note">Migration: <code>scripts/lesson_scope_migrate_4kw.py</code> tagged the 40 live request-keyed lessons
+  (nothing rewritten or deleted). Pins: <code>tests/test_4kw_lesson_scope.py</code>,
+  <code>tests/test_lesson_scope_migrate_script.py</code>.</p>
+  <h2 id="4kw-scope-r2">Lesson scope, second review <span class="tag">2026-10-02 &sect;4KW</span></h2>
+  <ul>
+    <li><strong>"Same request" is the same content words</strong> (order, punctuation, accents, function words and per-word
+    typos of 5+ letter words aside; numbers exact, single digits included), at least two of them. The first rule (character
+    similarity &ge; 0.85, or containment) matched different tasks: "start/stop the chess service", "my name is vasilis" ~ "what is
+    my name", "Redo this" ~ every redo. Anaphoric requests ("redo this", "proceed") never admit a scoped lesson. A retry that adds
+    or drops a word is not admitted (fail-closed). On the 1,608 recorded requests, every typo-only match was read.</li>
+    <li>The scope test sees the <strong>user's request</strong>, never the bus's LLM sub-queries (<code>scope_request</code>).</li>
+    <li>A trigger cut to 200 chars in the vector metadata resolves by unique prefix; an unresolvable one is dropped while scoped
+    lessons exist (it skipped its scope check). The vector candidate pool grows by the number of scoped lessons.</li>
+    <li>A new scoped plan with the trigger of a stored row scopes that row; <code>source_request</code> keeps 4,000 chars (and a
+    legacy 400-char copy matches the same-length head).</li>
+    <li>A general lesson needs a general SITUATION, MISTAKE <em>and</em> RULE/fix, in all three producers. A twin from another
+    producer is written separately, never refused.</li>
+    <li>Data: 11 more request-keyed lessons scoped (prefix/truncated triggers, probe requests, six paraphrases read one by one);
+    general copies generated from confirmed reflection plans and from post-mortem/journal lessons (whose fix is already a rule),
+    each through every write gate (<code>scripts/lesson_generalize_legacy_4kw.py</code>).</li>
+    <li>Usage counters (lesson <code>retrievals</code>, episode <code>access_count</code>, vector <code>retrieval_count</code>) are
+    not bumped on probe, member or internal turns (<code>usage_credit_blocked</code>).</li>
+  </ul>
+  <h2 id="4kw-r3">Relevance gate, producers, scope — third review <span class="tag">2026-10-02 &sect;4KW</span></h2>
+  <ul>
+    <li><strong>Relevance gate.</strong> On 546 real (request, lesson) pairs labelled by the main model, the whole-lesson
+    vector distance barely separated relevant from irrelevant (7% of the delivered top-5 relevant). A candidate now enters only
+    when its TRIGGER shares a weighted term with the request or sits within cosine 0.30 of it on its own
+    (<code>TRIGGER_CLOSE_DISTANCE</code>, override with env <code>GHOST_LESSON_TRIGGER_DISTANCE</code>): delivered lessons &minus;66%, precision 0.07 &rarr; 0.18, 84% of the relevant kept.
+    Fails open without a real embedder.</li>
+    <li><strong>Same request</strong> is the same content words <em>in order</em>; negation, quantity, direction and question
+    words count; a request pointing at "this"/"it" never matches; dotted names stay whole; only a copy of exactly 400/4,000 chars
+    is taken as truncated. The turn's request is carried in <code>lesson_scope.current_request</code>, so planner/volatile
+    queries are judged against it too. A name from the request (even misspelled) makes a "general" text specific.</li>
+    <li><strong>Producers never overwrite each other.</strong> Same trigger from another producer: evidence only, the fix and
+    <code>verified</code> stay; a different-trigger twin from another known producer is a separate row; a producer-less legacy
+    row merges as evidence. A merge that replaces a fix re-embeds the twin. A 200-char metadata trigger resolves by prefix in the
+    twin retry (it deleted live twins as "orphans").</li>
+    <li>Data (<code>scripts/lesson_repair_4kw_r3.py</code>): 27 rows retracted (13 harmful/duplicate generated rules, 14 junk
+    incl. the sandbox <code>delete path=/*</code> lesson), 25 request-shaped lessons scoped, 3 used lessons restored.</li>
+  </ul>
+  <h2 id="4kw-r4">Fourth review: request matching, dedup, retrieval, data <span class="tag">2026-10-02 &sect;4KW</span></h2>
+  <ul>
+    <li><strong>Same request</strong> (<code>same_request</code>): a typo is one edit (two for words of 8+ letters) at similarity
+    &ge; 0.86 &mdash; never a word with a prefix added (<code>un</code>, <code>de</code>, <code>re</code>, <code>dis</code> &hellip;:
+    "install" vs "uninstall", "compress" vs "decompress"), never a plural ("service" vs "services"). "any"/"some" count. The
+    "this/that/it" rule applies only to requests of up to 3 content words (it made 13 of 70 scoped lessons unreachable: "an image
+    <em>that</em> looks like &hellip;"). A one-word request must match its whole wording; a request of anaphoric words only
+    ("redo", "proceed", "hello ghost") never matches. A home path is compared in its recorded, redacted form
+    (<code>/Users/&lt;user&gt;</code>).</li>
+    <li><strong>General text</strong>: a file or dotted name from the request (<code>report.txt</code>) makes it specific; so does a
+    capitalised first word that is no English word (<code>/usr/share/dict/words</code>, "Panerithraikos questions: &hellip;").</li>
+    <li><strong>Dedup</strong>: two request-scoped plans for different requests never merge (a reordered copy of the same words is
+    refused, a close vector twin becomes its own row); the same trigger in the other scope follows the JSON path's rule.</li>
+    <li><strong>Retrieval</strong>: an orphaned twin whose metadata says <code>scope=request</code> is never served; an item carries
+    its row's FULL trigger (credit, quarantine and attribution match it); trigger embeddings are cached across turns; a malformed
+    <code>GHOST_LESSON_TRIGGER_DISTANCE</code> keeps 0.30 instead of failing the import.</li>
+    <li><strong>Twins</strong>: a replaced fix re-embeds that lesson only (<code>_refresh_twin</code>, no full heal under the lock);
+    the heal re-checks each lesson under the lock (still in the playbook, twin still missing) before writing.</li>
+    <li><strong>Reflection</strong>: the sink is <code>reflection/sink.make_reflection_sink</code> and the plan judge's reply is parsed
+    by <code>parse_plan_verdict</code>, both driven by tests instead of source-text pins.</li>
+    <li><strong>Data</strong> (<code>scripts/lesson_repair_4kw_r4.py</code>): 25 harmful/junk general lessons retracted ("report only
+    the count", validator-gaming self-play rules, "print 'Let me…' first", one-off bench arithmetic, stale introspect lists,
+    duplicates); 23 request-scoped lessons keyed on a model restatement no trajectory traces retracted (they could never match);
+    2 re-keyed to the user's actual request; 14 rewritten without the request's entities; 3 general rules added from retired plans.</li>
+  </ul>
+  <h2 id="4kw-r5">Fifth review <span class="tag">2026-10-03 &sect;4KW</span></h2>
+  <ul>
+    <li><strong>Same request</strong>: two different dictionary words are never a typo (<code>/usr/share/dict/words</code>;
+    "present"/"president"); one prefix swapped for another is another word ("encoding"/"decoding"); a change of person or tense where
+    both requests state one is another request ("my name"/"your name", "did"/"will"); a request is compared in its recorded REDACTED
+    form only when the stored side carries a redaction mark; courtesy and filler words don't count in a one-word request.</li>
+    <li><strong>Dedup</strong>: a reordered request's plan becomes its own row on the JSON path too; a close twin with ANOTHER trigger
+    adds evidence only &mdash; it never replaces the row's fix; a row re-scoped by a merge gets a fresh twin.</li>
+    <li><strong>General text</strong>: each part of a hyphenated name counts; "e.g."/"i.e." are no file names.</li>
+    <li><strong>Data</strong> (<code>scripts/lesson_repair_4kw_r5.py</code>): 37 rows retracted (unmatchable scoped plans, harmful or
+    wrong rules and plans, duplicates, mismatched triggers), 5 rewritten, the twins of every scoped row restamped
+    <code>scope=request</code>; backups skip the older <code>*.bak</code> copies.</li>
+  </ul>
 </main>
 
   <h2 id="4kd-slack">A member never teaches <span class="tag">2026-09-24 &sect;4KD, de-Slacked in &sect;4KJ</span></h2>

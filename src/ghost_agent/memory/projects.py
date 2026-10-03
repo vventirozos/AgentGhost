@@ -207,6 +207,29 @@ def _contained_workspace(store, ws):
     return resolved
 
 
+#: files a released app WRITES at runtime (its database and sqlite's side
+#: files): kept writable by the release's immutable flag
+_RUNTIME_STATE_RE = re.compile(r"\.(?:db|sqlite3?|db3)(?:-journal|-wal|-shm)?$", re.IGNORECASE)
+
+
+def _is_runtime_state(name: str) -> bool:
+    return bool(_RUNTIME_STATE_RE.search(str(name)))
+
+
+def _inside_sandbox(store, ws: Path) -> bool:
+    """A workspace must lie under the store's sandbox root, when one is
+    known (a store without one keeps the old behaviour)."""
+    root = getattr(store, "sandbox_root", None)
+    if not root:
+        return True
+    try:
+        r = Path(root).resolve()
+        w = ws.resolve()
+        return w != r and r in w.parents
+    except OSError:
+        return False
+
+
 class ProjectStore:
     """SQLite-backed store for projects, tasks, artifacts, and events.
 
@@ -1678,10 +1701,38 @@ class ProjectStore:
         writability before rmtree."""
         import stat
         touched = 0
+        # §4KW fourth review: mode bits alone were undone from inside the
+        # sandbox (`chmod -R u+w . && rm -rf *` — container root holds
+        # FOWNER); the user-immutable flag cannot be cleared from the
+        # container (measured: rm, write, create, mv, rmtree, chmod all
+        # refused). macOS/BSD only; elsewhere the mode bits remain.
+        _imm = getattr(stat, "UF_IMMUTABLE", 0) if hasattr(os, "chflags") else 0
         try:
-            for p in [ws, *ws.rglob("*")]:
+            entries = [ws, *ws.rglob("*")]
+            # (fifth review) a released app's RUNTIME STATE stays writable:
+            # the Jiu Jitsu Calendar keeps its sqlite db next to app.py, and
+            # sqlite must also create its journal in that folder. The db and
+            # its folder keep their flags off; every other file — the code —
+            # stays immutable (measured: inserts work, removing, renaming or
+            # overwriting app.py and an immutable subfolder is refused).
+            _state = {p for p in entries if not p.is_symlink() and p.is_file() and _is_runtime_state(p.name)}
+            _exempt = _state | {p.parent for p in _state}
+            for p in entries:
                 try:
+                    if _imm and not p.is_symlink():
+                        _fl = p.lstat().st_flags
+                        if (not readonly or p in _exempt) and _fl & _imm:
+                            os.chflags(p, _fl & ~_imm, follow_symlinks=False)
                     mode = p.stat().st_mode
+                    if readonly and p in _exempt:
+                        # writable for real: the a-w bits alone already made
+                        # sqlite refuse ("attempt to write a readonly
+                        # database") — the calendar could not save since its
+                        # release (measured in the sandbox, fifth review)
+                        if not mode & stat.S_IWUSR:
+                            p.chmod(mode | stat.S_IWUSR)
+                            touched += 1
+                        continue
                     if readonly:
                         new_mode = mode & ~(stat.S_IWUSR | stat.S_IWGRP
                                             | stat.S_IWOTH)
@@ -1690,6 +1741,10 @@ class ProjectStore:
                     if new_mode != mode:
                         p.chmod(new_mode)
                         touched += 1
+                    if _imm and readonly and not p.is_symlink():
+                        _fl = p.lstat().st_flags
+                        if not _fl & _imm:
+                            os.chflags(p, _fl | _imm, follow_symlinks=False)
                 except Exception:
                     continue
         except Exception:
@@ -1705,8 +1760,11 @@ class ProjectStore:
         touched. Callers: release (True), unrelease (False), hard delete
         (False, before rmtree — which fails on read-only dirs)."""
         proj = self.get_project(project_id)
-        ws = Path(str((proj or {}).get("workspace_dir") or ""))
-        if not ws or not ws.is_dir():
+        # (fifth review) `Path("")` is the CURRENT directory: a project with
+        # no workspace path made the process's own folder immutable,
+        # recursively. Only an ABSOLUTE path inside the sandbox is touched.
+        ws = Path(str((proj or {}).get("workspace_dir") or "").strip())
+        if not ws.is_absolute() or not ws.is_dir() or not _inside_sandbox(self, ws):
             return 0
         return self._chmod_tree(ws, readonly)
 

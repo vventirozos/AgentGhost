@@ -288,6 +288,11 @@ def apply_human_label(agent: Any, request_id: str, signal: str,
                 # gate every other selfhood write site carries.
                 if (isinstance(_sm, _SelfModel)
                         and getattr(_sm, "enabled", False)
+                        # the LABELLED row's population (fresh review §4KW):
+                        # this runs in the feedback request's own context,
+                        # where the request id is "SYSTEM" — `_turn_origin`
+                        # always said "user", so a thumb on a probe counted
+                        and str(getattr(traj, "task_kind", "") or "user_request") == "user_request"
                         and _turn_origin(ctx) == "user"):
                     # A plain call, not spawned work: this whole function
                     # already runs on a to_thread worker, so the full-file

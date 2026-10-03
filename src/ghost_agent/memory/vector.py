@@ -1428,6 +1428,12 @@ class VectorMemory:
         step (the MemoryBus credits only the memories that actually entered
         the prompt, once per turn — not every candidate of every sub-query).
         """
+        try:                                   # §4KW: probe/member/internal turns
+            from .skills import usage_credit_blocked
+            if usage_credit_blocked():
+                return
+        except Exception:  # noqa: BLE001
+            pass
         uniq = [i for i in dict.fromkeys(ids or []) if i]
         if uniq:
             self._bump_retrieval_stats(uniq)

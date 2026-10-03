@@ -309,7 +309,14 @@ def risk_steer_message(reading: RiskReading) -> str:
         "3. If you cannot name such a check — or the last two steps produced no "
         "new information — STOP. Report what is known, what is blocked, and "
         "what you would need. An honest partial answer at this depth beats a "
-        "confident wrong one; a failed tool that you REPORT is not a failed turn."
+        "confident wrong one; a failed tool that you REPORT is not a failed turn. "
+        # §4KW (review): this checklist is for the MODEL. Answered in the
+        # reply, "**CONFIRMED SO FAR:** … **STILL NEEDED:**" reached members
+        # above the answer (slack-2ebdb623, slack-c2f88d60 — after the §4HG
+        # scrub, which matches by resemblance and missed both). Not "do 1–2 in
+        # your reasoning": step 2 is a tool call (second review). One
+        # sentence: the steer must stay under the 1,000-char L3 cap.
+        "Never copy this checklist into your reply."
     )
 
 

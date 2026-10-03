@@ -148,6 +148,11 @@ def _wrap(value: Any, as_of: str) -> Any:
     return {_VALUE_KEY: value, _AS_OF_KEY: as_of}
 
 
+#: What a write/delete returns while the store is read-degraded (save() refuses).
+_DEGRADED_MSG = ("Error: the profile store could not be read, so it is write-protected — nothing was "
+                 "changed. Tell the user the profile is temporarily unavailable.")
+
+
 class ProfileMemory:
     def __init__(self, path: Path):
         self.file_path = path / "user_profile.json"
@@ -391,6 +396,11 @@ class ProfileMemory:
         with self._lock:
             as_of = as_of or get_utc_timestamp()
             data = self.load_raw()
+            if self._degraded:
+                # fresh review (§4KW): save() refuses silently, and the tool
+                # then said "SUCCESS: Profile updated" over nothing. Read
+                # AFTER the load: the load is what discovers the failure.
+                return _DEGRADED_MSG
             cat = str(category).strip().lower()
             k = str(key).strip().lower()
             # TEMPORAL ANCHORING at the store boundary. A stated age is a
@@ -547,6 +557,8 @@ class ProfileMemory:
             # RAW: load() unwraps, and the save() below would then strip
             # provenance from every OTHER key in the file.
             data = self.load_raw()
+            if self._degraded:                      # §4KW: after the load
+                return _DEGRADED_MSG
             cat = str(category).strip().lower()
             k = str(key).strip().lower()
 
@@ -589,6 +601,8 @@ class ProfileMemory:
         with self._lock:
             # RAW, for the same reason as delete(); _mentions() unwraps.
             data = self.load_raw()
+            if self._degraded:                      # §4KW: refuse visibly, after the load
+                return _DEGRADED_MSG
             cat = str(category).strip().lower()
             k = str(key).strip().lower()
 
@@ -707,7 +721,12 @@ class ProfileMemory:
     @staticmethod
     def _staleness_marker(key: str, as_of) -> str:
         """`` (as of 2026-01-15)`` / `` (as of …, may be stale)`` / ``""``."""
-        if not as_of or str(key).strip().lower() in _DURABLE_KEYS:
+        _k = str(key).strip().lower()
+        # a person's birthdate or name never goes stale, whoever's it is
+        # ("son_thodoris_birthdate" — data audit §4KW)
+        # (not every "_name": an employer_name can go stale — third review)
+        if not as_of or _k in _DURABLE_KEYS or _k.endswith(("_birthdate", "_birthday")) \
+                or (_k.endswith("_name") and _k[:-5] in _DURABLE_KEYS):
             return ""
         try:
             import datetime

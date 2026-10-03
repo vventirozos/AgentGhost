@@ -1227,7 +1227,21 @@ async def _resume_after_job(context, entry) -> bool:
                 "messages": [{"role": "user", "content": prompt}],
                 "stream": False}
         # §4CB R1 A-F3 → R2 A-MAJ-4: the shared foreground bracket.
-        await _handle_chat_foreground(context, body, f"job-{jid}")
+        _started = time.time()
+        # the job id already carries its `job-` prefix (second review: the
+        # wake ran as "job-job-…")
+        _wake_id = jid if str(jid).startswith("job-") else f"job-{jid}"
+        _content, _, _ = await _handle_chat_foreground(context, body, _wake_id)
+        # Fresh review (§4KW): the wake's conclusion ("say briefly what the
+        # job produced — the user has not seen this output") was DISCARDED —
+        # internal turns are excluded from the digest and the notify
+        # backstop. Recorded like a scheduled task's result.
+        from .core.autonomous_activity import record_scheduled_result
+        record_scheduled_result(
+            getattr(context, "activity_log", None),
+            job_id=_wake_id, task_name=f"background job {jid}",
+            content=_content, ok=(state == "done" and code in (None, 0)),
+            duration_s=time.time() - _started)
         return True
     except asyncio.CancelledError:
         raise
@@ -1406,6 +1420,37 @@ def shutdown_line(agent) -> str:
     except Exception:  # noqa: BLE001
         parts.append("turn registry unreadable")
     return " · ".join(parts)
+
+
+def _start_boot_skill_reconcile(context) -> None:
+    """Boot-time skill-store reconcile, both directions, off the loop.
+
+    §4FS review: a pruned lesson's vector twin is rendered VERBATIM by the
+    retrieval path when its playbook row is gone, and the idle-phase
+    reconcile needs 15-60 min of idle plus a 2 h cooldown — so it runs at
+    boot too. §4KW: it lived in `main()`, which runs BEFORE `lifespan` creates
+    the vector store, so it never ran; and the inverse (re-embed a lesson
+    whose twin write failed — 44 general lessons, live) now runs with it.
+    Never raises."""
+    try:
+        _ms = getattr(context, "memory_system", None)
+        _sk = getattr(context, "skill_memory", None)
+        if _ms is None or _sk is None:
+            return
+        import threading as _thr
+
+        def _run():
+            for fn, msg in ((_sk.reconcile_vector_orphans, "removed {} orphan lesson twin(s)"),
+                            (_sk.heal_missing_twins, "re-embedded {} missing lesson twin(s)")):
+                try:
+                    n = fn(_ms)
+                    if n:
+                        pretty_log("Skill Store", "boot reconcile " + msg.format(n), icon=Icons.MEM_SAVE)
+                except Exception as e:  # noqa: BLE001
+                    logging.getLogger("GhostAgent").debug("boot skill reconcile step skipped: %s", e)
+        _thr.Thread(target=_run, name="skill-boot-reconcile", daemon=True).start()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 @asynccontextmanager
@@ -1724,6 +1769,7 @@ async def lifespan(app):
             if context.memory_system.collection:
                 count = context.memory_system.collection.count()
                 pretty_log("Memory Ready", f"{count} fragments indexed", icon=Icons.MEM_LIBRARY)
+                _start_boot_skill_reconcile(context)
             else:
                 pretty_log("Memory Offline", "Collection not loaded", level="WARNING", icon=Icons.WARN)
         except Exception as e:
@@ -2412,31 +2458,8 @@ async def lifespan(app):
                     (res or {}).get("choices", [{}])[0]
                     .get("message", {}).get("content", "") or ""
                 )
-                lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
-                # Verdict = the FIRST line's leading token, per the demanded
-                # format. The old anywhere-substring scan false-verified
-                # paraphrases like "cannot be considered CONFIRMED — it
-                # ignores the failure cause" (no "REFUTED" present). A
-                # non-conforming reply now falls back to a whole-content
-                # scan that requires CONFIRMED to appear WITHOUT a nearby
-                # negation, else fails closed.
-                first = (lines[0].upper() if lines else "")
-                if first.startswith("CONFIRMED"):
-                    verified = True
-                elif first.startswith("REFUTED"):
-                    verified = False
-                else:
-                    up = content.upper()
-                    c_pos = up.find("CONFIRMED")
-                    _neg_window = up[max(0, c_pos - 60):c_pos]
-                    verified = (
-                        c_pos != -1
-                        and up.find("REFUTED") == -1
-                        and not any(n in _neg_window for n in
-                                    ("NOT ", "CANNOT", "CAN'T", "NEVER", "ISN'T"))
-                    )
-                note = (lines[0] if lines else "no verdict")[:200]
-                return verified, note
+                from .reflection.sink import parse_plan_verdict
+                return parse_plan_verdict(content)
 
             context.reflector = Reflector(
                 critique_fn=_critique_fn,
@@ -2497,53 +2520,8 @@ async def lifespan(app):
             _vector_memory = getattr(context, "memory_system", None)
             _traj_collector = context.trajectory_collector
 
-            def _reflection_sink(reflected_trajectory):
-                # 1. Always append to the JSONL log.
-                try:
-                    _traj_collector.append(reflected_trajectory)
-                except Exception as e:
-                    logger.warning(f"reflection JSONL sink failed: {e}")
-
-                # 2. If SkillMemory is wired, also write the reflection as
-                # a lesson. The skill store already dedupes via vector
-                # distance, so repeat reflections on the same failure mode
-                # don't flood the playbook.
-                if _skill_memory is None:
-                    return
-                src_reason = reflected_trajectory.extra.get("source_failure_reason", "") or "failure"
-                plan_text = reflected_trajectory.planning_output or reflected_trajectory.final_response
-                # Tag the lesson with the ORIGINAL failed trajectory's
-                # id (`reflected_from`), not the reflection's own id.
-                # Rationale: this lesson is the corrective behaviour
-                # for that source failure. If the source trajectory is
-                # ever later un-promoted (false-positive correction
-                # detected, manual override, etc.), the retraction
-                # path scrubs both this lesson AND any opt-prot lesson
-                # from the same source — keeping provenance unified
-                # under one id per turn.
-                src_traj_id = reflected_trajectory.extra.get("reflected_from", "") or ""
-                # The plan judge's verdict must reach the LESSON, not just the
-                # trajectory outcome. `Reflector` documents that a verified
-                # plan "upgrades the outcome AND tags the lesson verified" —
-                # it only ever did the first, so every reflection lesson was
-                # written unverified: no +0.3 utility, unpinned by
-                # `_trim_playbook_by_utility`, and prunable. Live evidence: 96
-                # trajectories with plan_verified=True, 3 reflection lessons,
-                # all verified=False.
-                _plan_verified = bool(
-                    reflected_trajectory.extra.get("plan_verified") is True)
-                try:
-                    _skill_memory.learn_lesson(
-                        task=(reflected_trajectory.user_request or "")[:400],
-                        mistake=str(src_reason)[:400],
-                        solution=str(plan_text)[:1200],
-                        memory_system=_vector_memory,
-                        source_trajectory_id=str(src_traj_id),
-                        source="reflection",
-                        verified=_plan_verified,
-                    )
-                except Exception as e:
-                    logger.warning(f"reflection → SkillMemory write failed: {e}")
+            from .reflection.sink import make_reflection_sink
+            _reflection_sink = make_reflection_sink(_traj_collector, _skill_memory, _vector_memory)
 
             context.reflection_sink = _reflection_sink
             pretty_log(
@@ -3604,32 +3582,8 @@ def main():
         context.journal = MemoryJournal(context.memory_dir)
         context.skill_memory = SkillMemory(memory_dir)
         context.frontier_tracker = FrontierTracker(memory_dir)
-        # §4FS review: a pruned lesson's vector twin is rendered VERBATIM
-        # by the retrieval path when its playbook row is gone (skills.py,
-        # `text = … if lesson_entry else doc`), and the idle-phase reconcile
-        # that deletes orphans needs 15-60 min of idle plus a 2 h cooldown.
-        # Six lessons retired on 2026-09-09 kept teaching for hours. So:
-        # reconcile at boot too — best-effort, off the loop, the same call
-        # the idle cycle makes.
-        try:
-            _ms_boot = getattr(context, "memory_system", None)
-            if _ms_boot is not None:
-                import threading as _thr
-
-                def _boot_orphan_reconcile():
-                    try:
-                        _n = context.skill_memory.reconcile_vector_orphans(_ms_boot)
-                        if _n:
-                            pretty_log("Skill Store",
-                                       f"boot reconcile removed {_n} orphan lesson twin(s)",
-                                       icon=Icons.MEM_SAVE)
-                    except Exception as _e:  # noqa: BLE001
-                        logging.getLogger("GhostAgent").debug(
-                            "boot orphan reconcile skipped: %s", _e)
-                _thr.Thread(target=_boot_orphan_reconcile,
-                            name="skill-orphan-reconcile", daemon=True).start()
-        except Exception:  # noqa: BLE001
-            pass
+        # (the boot skill-store reconcile runs in `lifespan`, once the vector
+        # store exists — `_start_boot_skill_reconcile`, §4KW)
     
     app = create_app()
     app.router.lifespan_context = lifespan

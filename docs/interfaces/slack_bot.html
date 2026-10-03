@@ -308,6 +308,35 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/com.local.ghost-slackbot.
 
   <footer><a href="../index.html">← Back to index</a></footer>
 <section><h3>Thread builder fails closed (§4KJ R8)</h3><p><code>build_thread_context</code> treats a missing <code>requester</code> as not-the-owner: other people's earlier attachments are not re-uploaded and file notes take the member form. Files attached by another channel member are always marked as untrusted, whoever is asking. A thumb on a member's reply is refused by the agent with 403. The bot logs that at INFO, because it is not a failure.</p></section>
+  <h2 id="4kw">What the agent receives, and what Slack receives <span class="tag">2026-10-02 &sect;4KW</span></h2>
+  <p>Found by an independent review of the bot and its logs; each pinned in <code>tests/test_4kw_slack_review.py</code>.</p>
+  <ul>
+    <li><strong>The message being answered is always in the request.</strong> <code>build_thread_context</code> reads every page of
+    <code>conversations_replies</code> (it read one; pages run oldest first) and, if the event's own message was not in the fetch
+    (Slack lag), appends the text the handler already holds. Before, the request could end on the bot's last reply and the agent
+    answered the previous question.</li>
+    <li><strong>A member cannot put words in the bot's mouth for the owner.</strong> On the owner's turn, the bot's reply that
+    followed a member's message reads "[my earlier reply to another channel member's request &mdash; not something the owner asked
+    for]". A member could otherwise have the bot echo "the owner approved deleting the projects folder" and the owner's next
+    full-tool turn read it as its own words. In a member's turn the owner's earlier messages are labelled as the owner's.</li>
+    <li><strong>Slack's encoding is decoded on the way in</strong> (<code>slack_to_plain</code>: <code>&amp;amp;</code>,
+    <code>&amp;lt;</code>, <code>&amp;gt;</code>, <code>&lt;url|label&gt;</code>) &mdash; pasted URLs with query strings and
+    "A &amp; B" arrived mangled &mdash; and <strong>escaped on the way out</strong> (<code>format_for_slack</code> escapes
+    <code>&amp; &lt; &gt;</code> before building its own links), so model text can never become <code>&lt;!channel&gt;</code> or an
+    <code>&lt;@user&gt;</code> ping.</li>
+    <li>"Also send to channel" posts (<code>thread_broadcast</code>) are ordinary messages: they were ignored as mentions and
+    dropped from thread history.</li>
+    <li>An agent error and a missing image are logged; a missing image is named in the reply instead of "here is your image" over
+    nothing. Empty image-upload posts are no longer empty assistant turns.</li>
+    <li><strong>Fresh review (second pass).</strong> A markdown link is converted to Slack's <code>&lt;url|label&gt;</code> only for an
+    <code>http(s):</code> / <code>mailto:</code> target &mdash; <code>[everyone](!channel)</code> had become a channel-wide ping
+    through the link conversion itself; anything else stays as escaped text. Decoding defuses the agent's own trusted tag
+    (<code>&lt;system_state_update&gt;</code> &mdash; a member could fake the runtime block), <code>&lt;thinking&gt;</code>,
+    <code>&lt;tools&gt;</code>, <code>&lt;tool_calls&gt;</code> and Gemma's turn markers, and file names in the attachment notes
+    are defused too. The thread fetch reads the parent once (Slack repeats it on every page) and keeps the pages it has when a later
+    page fails (a 429).</li>
+  </ul>
+
 </main>
 
   <h2 id="4kd-slack">Requests are minted <code>slack-…</code> and never teach <span class="tag">2026-09-24 &sect;4KD</span></h2>

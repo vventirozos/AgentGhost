@@ -46,15 +46,16 @@ from typing import Any, Optional
 MAX_CHECKED_CHARS = 800
 #: Seconds the user may wait for the check; past it the check is skipped (the
 #: pre-§4KW behaviour). Measured: ~1.0 s median, 1.4 s p90 uncached, 0.7–1.1 s
-#: live. ⚠ ENFORCED FROM OUTSIDE, BY CANCELLATION — not as route()'s own
-#: timeout: route() counts its own ReadTimeout as a NODE FAULT, and the worker
-#: shares its URL (so its circuit breaker) with the critic. With the budget as
-#: route()'s timeout, three slow checks on a busy node opened the breaker and
-#: took the critic off the node for 60 s (review, reproduced). A cancelled
-#: call is never recorded against the node (`except Exception` does not catch
-#: CancelledError). route() keeps its ordinary routing timeout.
+#: live. ⚠ ENFORCED FROM OUTSIDE, BY CANCELLATION — never as route()'s own
+#: timeout: a short budget there is under llm._MIN_HTTP_FLOOR (every call
+#: declined) or a slow answer charged as a NODE FAULT on the breaker the
+#: worker shares with the critic (review, reproduced). Our cancellation is
+#: never charged; route()'s own deadline charges only a node that held our
+#: request alone and stayed silent (`_charge_route_deadline_miss`).
 CHECK_BUDGET_S = 3.0
-#: route()'s own timeout: long enough that only a genuinely stuck node trips it.
+#: route()'s own budget. Under the outer CHECK_BUDGET_S it never applies, so
+#: this check never charges a node (fresh review: by design — a hung node is
+#: caught by route()'s default callers and the critic).
 ROUTE_TIMEOUT_S = 12.0
 
 _SYSTEM = "You check one assistant reply. Answer with exactly one word: YES or NO."

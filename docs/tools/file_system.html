@@ -668,6 +668,39 @@ SyntaxError: Unexpected identifier 't'</pre>
   </ul>
   <p>Pins: <code>tests/test_4kb_round3_fixes.py</code> (24). Combined mutation batch across all three rounds: 44
   mutants, 44 killed, controls correct.</p>
+  <h2 id="4kw-review4">Released projects, symlinks and <code>.git</code> destinations <span class="tag">2026-10-02 &sect;4KW</span></h2>
+  <p>Found by an independent review of the sandbox tools, each reproduced on a temp tree.</p>
+  <ul>
+    <li><strong>A parent of a released workspace is locked too.</strong> <code>_released_write_block</code> named a project only by
+    its id in the path, so <code>delete path=projects</code> (or <code>rename projects</code>) removed every project, released ones
+    included. <code>_released_under</code> now refuses any target that contains a released workspace.</li>
+    <li><strong>A symlink is deleted or moved as itself</strong> (<code>_symlink_itself</code>). Delete and rename resolved the link and
+    acted on its target: another project's folder was removed and the link left dangling. The success messages keep the shapes the
+    verifier's file ledger parses (<code>Deleted '…'.</code>, <code>Renamed/Moved '…' to '…'.</code>).</li>
+    <li>The <code>.git</code> guard checks every destination, not just the source: <code>copy</code>/<code>move</code> INTO
+    <code>.git/hooks</code> was allowed.</li>
+    <li>What <code>delete path=/*</code> does today: nothing &mdash; there is no globbing, <code>/*</code> is a file literally named
+    <code>*</code> at the sandbox root. <code>/</code> is the sandbox root and is refused for destructive operations.</li>
+  </ul>
+  <h2 id="4kw-review5">The released lock, second review <span class="tag">2026-10-02 &sect;4KW</span></h2>
+  <p>The parent-folder lock applies only to the source of a delete/rename/move and only to the sandbox's own
+  <code>projects/</code> folder (a copy such as <code>backup/projects/&lt;id&gt;</code> is not a workspace); a symlink is judged as
+  the link. The healed destination parameters (<code>content</code>, <code>replace_with</code>) of copy/rename/move are checked
+  for <code>.git</code> and released workspaces too.</p>
+  <h2 id="4kw-r3">Every alias is locked <span class="tag">2026-10-02 &sect;4KW</span></h2>
+  <p>The released-project lock checks every parameter the healing step reads as a source or a destination: <code>path</code>,
+  <code>filename</code>, <code>file</code>, <code>destination</code>, <code>dest</code>, <code>new_name</code>, <code>target</code>,
+  <code>new_path</code>, and for copy/rename/move the healed <code>replace_with</code>/<code>content</code>/<code>data</code>/<code>text</code>.</p>
+  <h2 id="4kw-r4">Fourth review <span class="tag">2026-10-02 &sect;4KW</span></h2>
+  <ul>
+    <li><code>url=</code> is checked too: any non-download operation heals it into the target (<code>delete url=projects/&lt;released&gt;/app.py</code> deleted it).</li>
+    <li>The projects-folder check finds the OUTER projects folder from inside a project (<code>delete path=/workspace/projects</code>
+    from an active project removed every project).</li>
+    <li>A copy READS its source: copying out of a released project is allowed; a copy's destination never inherits the immutable flag.</li>
+  </ul>
+  <h2 id="4kw-r5">Fifth review <span class="tag">2026-10-03 &sect;4KW</span></h2>
+  <p>Removing or moving the projects folder (or an ancestor of it) is refused whether or not any project is released
+  (<code>_projects_folder_block</code>).</p>
 </main>
 </body>
 </html>

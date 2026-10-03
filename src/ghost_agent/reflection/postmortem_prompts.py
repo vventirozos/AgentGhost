@@ -57,6 +57,7 @@ CATEGORY: <BEHAVIOURAL|CONFIGURATION|CODE_DEFECT>
 TITLE: <short imperative title, <12 words>
 ROOT CAUSE: <1-3 sentences, naming the specific tool/flag/decision>
 LESSON: <BEHAVIOURAL only: what the agent should do differently>
+SITUATION: <BEHAVIOURAL only: the KIND of request where this lesson applies, in general terms — no names, places, numbers, paths or topics from this request>
 CONFIG CHANGE: <CONFIGURATION only: which flag/threshold, current vs proposed>
 CODE FIX: <CODE_DEFECT only: which file/function/tool and the change>
 
@@ -214,7 +215,7 @@ def _extract_section(text: str, label_pattern: str) -> str:
     # Stop at the next ALL-CAPS-ish section header on its own line.
     rest = stripped[start:]
     nxt = re.search(
-        r"\n\s*(?:CATEGORY|TITLE|ROOT CAUSE|LESSON|CONFIG CHANGE|CODE FIX)\b",
+        r"\n\s*(?:CATEGORY|TITLE|ROOT CAUSE|LESSON|SITUATION|CONFIG CHANGE|CODE FIX)\b",
         rest,
         flags=re.IGNORECASE,
     )
@@ -236,6 +237,7 @@ def parse_postmortem_output(text: str) -> dict:
         "title": "",
         "root_cause": "",
         "lesson": "",
+        "situation": "",
         "config_change": "",
         "code_fix": "",
     }
@@ -258,6 +260,8 @@ def parse_postmortem_output(text: str) -> dict:
     out["title"] = _first_line(_extract_section(text, r"\btitle\b"))[:160]
     out["root_cause"] = _extract_section(text, r"\broot\s+cause\b")[:1200]
     out["lesson"] = _extract_section(text, r"\blesson\b")[:1200]
+    # §4KW: anchored at a line start — "situation" is an ordinary word
+    out["situation"] = _first_line(_extract_section(text, r"(?im)^[ \t*\-]*situation(?=\s*:)"))[:300]
     out["config_change"] = _extract_section(text, r"\bconfig(?:uration)?\s+change\b")[:1000]
     out["code_fix"] = _extract_section(text, r"\bcode\s+fix\b")[:1000]
 

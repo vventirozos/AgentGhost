@@ -669,7 +669,11 @@ def fork_workspace(src, *, label: str = "",
                        len(errors), str(errors)[:200])
     except Exception as exc:  # noqa: BLE001
         logger.warning("fork_workspace: copytree failed (%s)", exc)
+        _clear_immutable_tree(dest)
         return ForkResult(path=dest, complete=False, reason=str(exc)[:200])
+    # copytree carries BSD flags (rsync does not): a fork holding a released
+    # workspace would be immutable and never removable (fifth review)
+    _clear_immutable_tree(dest)
     return ForkResult(path=dest, complete=not errors, skipped=len(errors),
                       reason=("copytree partial" if errors else ""),
                       bytes_copied=size)
@@ -801,9 +805,31 @@ def sweep_own_forks(max_remove: int = 64) -> list:
     return removed
 
 
+def _clear_immutable_tree(root: Path) -> None:
+    """Best-effort removal of the user-immutable flag (a released workspace
+    carries it) under ``root``. macOS/BSD only."""
+    import stat as _stat
+    imm = getattr(_stat, "UF_IMMUTABLE", 0)
+    if not (imm and hasattr(os, "chflags")):
+        return
+    try:
+        for dirpath, dirnames, filenames in os.walk(root):
+            for name in [dirpath] + [os.path.join(dirpath, n) for n in dirnames + filenames]:
+                try:
+                    fl = os.lstat(name).st_flags
+                    if fl & imm:
+                        os.chflags(name, fl & ~imm, follow_symlinks=False)
+                except OSError:
+                    pass
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _chmod_writable(root: Path) -> None:
     """Best-effort ``chmod -R u+rwX``. rsync ``-a`` faithfully preserves a
-    0500 directory, and then nothing can unlink what is inside it."""
+    0500 directory, and then nothing can unlink what is inside it. The
+    immutable flag goes first (a chmod of an immutable entry fails)."""
+    _clear_immutable_tree(root)
     try:
         for dirpath, dirnames, filenames in os.walk(root):
             for name in [dirpath] + [os.path.join(dirpath, d)

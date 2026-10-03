@@ -256,7 +256,7 @@ class TestTheUnattendedPathReadsTheStatus:
         not_about_tool_results = {
             "_parse_verdict", "_verdict_score_probe", "_error_key",
             "_syntax_fail_reason", "_replace_failure_kind",
-            "_log_verify_outcome", "_normalize_tool_error",
+            "_log_verify_outcome", "_normalize_tool_error", "parse_plan_verdict",
         }
 
         found = {}          # name -> (path, lineno, body)

@@ -139,6 +139,69 @@ _FORGET_PROTECTED_TYPES = [
     # note above and the expansion-sweep guard below.
     "document_summary",
 ]
+#: Fresh review (§4KW): the largest vector distance at which an ENTITY forget
+#: removes a fact that does not literally name it. Unrelated owner facts were
+#: measured at 0.53–0.65 from short targets; a near-paraphrase is well under.
+_FORGET_SEMANTIC_MAX = 0.3
+#: …and the largest distance at which a fact carrying ALL the target's
+#: distinctive words is a candidate (measured: "my address" ~ the address
+#: facts at 0.73, unrelated facts at 0.77+ with no shared word)
+_FORGET_SHARED_WORD_MAX = 0.8
+
+
+def _profile_line(result, ok_text: str) -> str:
+    """A forget report line for a profile write — a REFUSED write (read-degraded
+    store) is reported as such, never with a green tick (second review)."""
+    if isinstance(result, str) and result.lower().startswith("error"):
+        return f"⚠️ Profile: {result}"
+    return f"✅ Profile: {ok_text}"
+
+
+#: words that name no particular fact ("the user's …", "my project …")
+_FORGET_HUB_WORDS = frozenset("""user users agent assistant project projects file files forget forgot said say says
+remember thing things stuff info information about details data memory memories fact facts old new
+that this these those what when where who why how which it its them they there here""".split())
+#: attribute nouns: a target made only of these names a KIND of fact, so
+#: several facts that mention it are several candidates, not one entity
+#: (fourth review: `forget address` deleted the home AND the email address)
+_FORGET_ATTRIBUTE_WORDS = frozenset("""address addresses name names email emails phone number numbers birthday
+birthdays birthdate date dates age job jobs work city town country home location password username nickname
+account accounts preference preferences favorite favourite hobby hobbies car cars pet pets wife husband son sons
+daughter daughters child children kids family school company employer salary""".split())
+#: endings that make two words inflections of one stem
+#: (fifth review: "e", "t", "d", "er" made plan~plant/plane, star~start,
+#: bear~beard, bank~banker and Louis~Louise one word)
+_INFLECTIONS = frozenset({"", "s", "es", "ed", "ing", "ings", "ies", "ly"})
+#: …and the distance under which a fact covering HALF the target's words counts
+_FORGET_PARTIAL_WORD_MAX = 0.6
+
+
+def _word_matches(w: str, f: str) -> bool:
+    """Same word or an inflection of one stem (weight ~ weighs, address ~
+    addresses) — NOT any word it starts (fourth review: `homework` matched
+    "home town", `workout` "works at", `plan` "planet")."""
+    if w == f:
+        return True
+    k = 0
+    for a, b in zip(w, f):
+        if a != b:
+            break
+        k += 1
+    return k >= 4 and w[k:] in _INFLECTIONS and f[k:] in _INFLECTIONS
+
+
+def _target_word_coverage(fact: str, target: str):
+    """Share of the target's DISTINCTIVE content words found in ``fact``
+    (exact or inflected), or None when the target has none."""
+    try:
+        from ..memory.lesson_scope import content_words
+        tw = {w for w in content_words(target) if len(w) >= 3 and not w.isdigit() and w not in _FORGET_HUB_WORDS}
+        if not tw:
+            return None
+        fw = content_words(fact)
+        return sum(1 for w in tw if any(_word_matches(w, f) for f in fw)) / len(tw)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 #: How a bus leg SAYS it did not write. Two vocabularies, one meaning: the
@@ -1572,7 +1635,7 @@ async def tool_expand_evidence(ref=None, episodic_memory=None,
             f"(episode from EVIDENCE REFS) and '<session:the-id>'.")
 
 
-async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memory_system=None, profile_memory=None, graph_memory=None):
+async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memory_system=None, profile_memory=None, graph_memory=None, project_store=None):
     _blocked = _member_block()
     if _blocked is not None:
         return _blocked
@@ -1836,6 +1899,21 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
                     if not _is_within_root(resolved, sandbox_root):
                         report.append(f"⚠️ Disk: Refused unsafe path '{victim}' (outside sandbox)")
                         continue
+                    # §4KW: the RELEASED-project lock, per file the sweep
+                    # would delete (`forget projects/<released>/index.html`
+                    # removed it). Per file, not up front: a forget of a
+                    # MEMORY inside a released project must still run
+                    # (second review).
+                    try:
+                        from .file_system import _released_write_block
+                        _rb = _released_write_block(project_store, sandbox_root,
+                                                    str(resolved.relative_to(sandbox_root)),
+                                                    removes=True)
+                    except Exception:  # noqa: BLE001
+                        _rb = None
+                    if _rb:
+                        report.append(f"⚠️ Disk: Refused '{victim}' — inside a RELEASED project (immutable)")
+                        continue
                     if resolved.is_file():
                         resolved.unlink()
                         report.append(f"✅ Disk: Deleted '{resolved.relative_to(sandbox_root)}'")
@@ -1951,6 +2029,7 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
         # half that had not run. `sandbox/` is documented in file_system.py
         # as an observed live model shape.
         sweep_target_lc = clean_target.strip().lower()
+        _target_is_filename = bool(re.search(r"\.[a-z0-9]{1,8}$", sweep_target_lc)) or "/" in sweep_target_lc
 
         def _semantic_sweep():
             with memory_system._get_lock() if hasattr(memory_system, "_get_lock") else _NullCM():
@@ -1968,6 +2047,8 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
                     where={"type": {"$nin": _FORGET_PROTECTED_TYPES}})
                 deleted_local = 0
                 hits = []
+                word_cands = []
+                literal_hits = []
                 if cand.get('ids'):
                     for i, dist in enumerate(cand['distances'][0]):
                         doc_text = cand['documents'][0][i]
@@ -1976,7 +2057,14 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
                         m_type = meta.get('type', 'auto')
                         if m_type in _FORGET_PROTECTED_TYPES:
                             continue  # belt-and-braces vs the where scope
-                        semantic_threshold = 0.8 if m_type == 'auto' else 0.6
+                        # Fresh review (§4KW): 0.8/0.6 deleted UNRELATED owner
+                        # facts — `forget postgresql-19-A4.pdf` removed the
+                        # owner's birth date, both sons' birthdates and home
+                        # town (live, 09-09); unrelated facts sit at 0.53–0.65
+                        # from any short target. A FILE/DOCUMENT name removes
+                        # only facts that name it; an entity needs a near-
+                        # paraphrase (< _FORGET_SEMANTIC_MAX).
+                        semantic_threshold = 0.0 if _target_is_filename else _FORGET_SEMANTIC_MAX
                         # LITERAL-MENTION OVERRIDE: the distance threshold
                         # silently missed facts that name the target outright
                         # — e.g. forgetting 'iguana' left "user previously had
@@ -1986,11 +2074,66 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
                         # mentions it (word-boundary) is fair game regardless
                         # of distance.
                         literal = _value_mentions_target(doc_text, sweep_target_lc)
-                        if literal or dist < semantic_threshold:
+                        # §4KW second review: 0.3 alone deleted nothing for a
+                        # real entity forget ("my address" ~ "home address is
+                        # …" at 0.57, "my job at google" at 0.41) while
+                        # unrelated facts sat at 0.53–0.65 — no single distance
+                        # separates them. A fact that SHARES a content word
+                        # (stem) with the target is the target's, up to 0.7.
+                        if (not _target_is_filename and not literal
+                                and not dist < semantic_threshold):
+                            _cov = _target_word_coverage(doc_text, sweep_target_lc)
+                            if _cov is not None and ((_cov >= 1.0 and dist < _FORGET_SHARED_WORD_MAX)
+                                                     or (_cov >= 0.5 and dist < _FORGET_PARTIAL_WORD_MAX)):
+                                word_cands.append((mem_id, doc_text, _cov))
+                            continue
+                        if literal and not dist < semantic_threshold:
+                            literal_hits.append((mem_id, doc_text))
+                            continue
+                        if dist < semantic_threshold:
                             memory_system.collection.delete(ids=[mem_id])
                             deleted_local += 1
-                            tag = "literal" if literal else "derived"
-                            hits.append(f"✅ Sweep: Forgot {tag} fact: '{doc_text[:40]}...'")
+                            hits.append(f"✅ Sweep: Forgot derived fact: '{doc_text[:40]}...'")
+                # a fact matched only by its WORDS is removed only when it is
+                # the ONE such fact (third review: "user nickname" deleted all
+                # 8 owner facts; "my address" matches the home AND the email
+                # address) — otherwise the candidates are named, not deleted
+                # a LITERAL mention: every fact naming an entity is the
+                # entity's ("iguana") — but a target of hub words only names no
+                # fact ("forget user" deleted all four owner facts), and an
+                # attribute noun named by several facts is a choice ("address":
+                # home and email) — fourth review
+                from ..memory.lesson_scope import content_words
+                _distinct = {w for w in content_words(sweep_target_lc)
+                             if w not in _FORGET_HUB_WORDS and len(w) >= 2}
+                if literal_hits and (not _distinct or (
+                        len(literal_hits) > 1 and _distinct <= _FORGET_ATTRIBUTE_WORDS)):
+                    word_cands = [(i, t, 1.0) for i, t in literal_hits] + word_cands
+                    literal_hits = []
+                for mem_id, doc_text in literal_hits:
+                    memory_system.collection.delete(ids=[mem_id])
+                    deleted_local += 1
+                    hits.append(f"✅ Sweep: Forgot literal fact: '{doc_text[:40]}...'")
+                # the entity's own facts went: a fact matched only by SOME of
+                # its words is another fact ("wife is named Maria" after
+                # "wife's birthday is 3 March") — listed, never deleted (fifth
+                # review)
+                _auto_ok = not literal_hits
+                # one FULL match wins over partial ones (fourth review: "wife's
+                # birthday" was refused because "wife is named Maria" half-matched)
+                _full = [c for c in word_cands if c[2] >= 1.0]
+                if len(_full) == 1:
+                    word_cands = _full
+                if len(word_cands) == 1 and _distinct and _auto_ok:
+                    memory_system.collection.delete(ids=[word_cands[0][0]])
+                    deleted_local += 1
+                    hits.append(f"✅ Sweep: Forgot matching fact: '{word_cands[0][1][:40]}...'")
+                elif word_cands:
+                    hits.append("ℹ️ Sweep: " + ("several stored facts match '" if len(word_cands) > 1
+                                                  else "another stored fact matches '")
+                                + sweep_target_lc + "' — NOT deleted: "
+                                + "; ".join(repr(c[1][:60]) for c in word_cands[:5])
+                                + ". Forget the one you mean by its exact text.")
                 return deleted_local, hits
 
         deleted_count, hits = await asyncio.to_thread(_semantic_sweep)
@@ -2035,8 +2178,7 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
             chosen_profile_hits = exact_hits or substr_hits
             handled: set = set()
             for cat, k in chosen_profile_hits:
-                profile_memory.delete(cat, k)
-                report.append(f"✅ Profile: Removed {cat}.{k}")
+                report.append(_profile_line(profile_memory.delete(cat, k), f"Removed {cat}.{k}"))
                 handled.add((cat, k))
                 found_key = True
 
@@ -2066,12 +2208,12 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
                             # the argument raw made every value prune a
                             # no-op that still reported a green tick.
                             res = profile_memory.prune_value(cat, k, target_lc)
-                            report.append(f"✅ Profile: {res}")
+                            report.append(_profile_line(res, str(res)))
                             handled.add((cat, k))
                             found_key = True
                     elif _value_mentions_target(v, target_lc):
-                        profile_memory.delete(cat, k)
-                        report.append(f"✅ Profile: Removed {cat}.{k} (value match)")
+                        report.append(_profile_line(profile_memory.delete(cat, k),
+                                                    f"Removed {cat}.{k} (value match)"))
                         handled.add((cat, k))
                         found_key = True
 
@@ -2159,10 +2301,10 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
                         if isinstance(v, list):
                             if any(_value_mentions_target(it, extra_lc) for it in v):
                                 res = profile_memory.prune_value(cat, k, extra)
-                                report.append(f"✅ Profile: {res} (related '{extra}')")
+                                report.append(_profile_line(res, f"{res} (related '{extra}')"))
                         elif _value_mentions_target(v, extra_lc):
-                            profile_memory.delete(cat, k)
-                            report.append(f"✅ Profile: Removed {cat}.{k} (related '{extra}')")
+                            report.append(_profile_line(profile_memory.delete(cat, k),
+                                                        f"Removed {cat}.{k} (related '{extra}')"))
             except Exception:
                 pass
 
@@ -2208,12 +2350,23 @@ async def tool_update_profile(category: str = None, key: str = None, value: str 
         return _blocked
     category = category or kwargs.get("category", "root")
     key = key or kwargs.get("key")
-    value = value or kwargs.get("value")
+    value = value if value is not None else kwargs.get("value")
 
     if not key:
         return "Error: 'key' is a required argument for update_profile."
 
-    if not value:
+    # Fresh review (§4KW): ANY falsy value deleted — a key-only call (the model
+    # reaching for the tool to READ the profile, 3 live), None, 0. The
+    # owner's root.name was removed this way. Only an explicit "" deletes.
+    if value is None:
+        return ("Error: 'value' is required. update_profile only WRITES; the profile is already in your "
+                "context. To delete a stored fact, pass value=\"\" explicitly. Nothing was changed.")
+    if not isinstance(value, str):
+        value = str(value)
+    if value != "" and not value.strip():
+        return "Error: 'value' is blank. To delete a stored fact, pass value=\"\" explicitly. Nothing was changed."
+
+    if value == "":
         # DELETE path: an empty/omitted value removes the key — mirroring
         # `manage_projects config`, where an empty config_value deletes.
         # ProfileMemory.delete() existed but was unreachable from the tool;
@@ -2245,6 +2398,8 @@ async def tool_update_profile(category: str = None, key: str = None, value: str 
         pretty_log("Profile Update", f"delete {category}.{key}",
                    icon=Icons.USER_ID)
         msg = await asyncio.to_thread(prof.delete, category, key)
+        if old_val is not None and isinstance(msg, str) and not msg.lower().startswith("error"):
+            msg = f"{msg} (was: {str(old_val)[:200]!r})"
         # Best-effort: scrub the derived vector fact ("User <key> is
         # <value>") so semantic retrieval stops surfacing the deleted
         # field. The canonical store is the JSON profile — a miss here is
@@ -2326,6 +2481,8 @@ async def tool_update_profile(category: str = None, key: str = None, value: str 
     # --- LEGACY DIRECT PATH ---
     if not profile_memory: return "Error: Profile memory not loaded."
     msg = await asyncio.to_thread(profile_memory.update, category, key, value)
+    if isinstance(msg, str) and msg.lower().startswith("error"):
+        return ToolOutcome.failed(msg, reason_code="profile_write_refused")
 
     # The vector + graph indexes are best-effort secondary writes;
     # the canonical store is `profile_memory` (JSON). Track partial
@@ -2641,7 +2798,8 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
             "<the topic to erase>")
         if err:
             return err
-        return await tool_unified_forget(subject, sandbox_dir, memory_system, kwargs.get("profile_memory"), kwargs.get("graph_memory"))
+        return await tool_unified_forget(subject, sandbox_dir, memory_system, kwargs.get("profile_memory"), kwargs.get("graph_memory"),
+                                         project_store=kwargs.get("project_store"))
 
     elif action == "query":
         return await tool_query_document(

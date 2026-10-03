@@ -868,6 +868,12 @@ class EpisodicMemory:
 
         Never raises: usage accounting must not break recall.
         """
+        try:                                   # §4KW: probe/member/internal turns
+            from .skills import usage_credit_blocked
+            if usage_credit_blocked():
+                return
+        except Exception:  # noqa: BLE001
+            pass
         # Coerce PER ITEM, not as one comprehension: a single malformed id
         # (a row dict without "id", a None) would otherwise raise out of the
         # whole list and silently drop credit for every OTHER episode in the

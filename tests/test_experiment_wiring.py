@@ -48,6 +48,10 @@ def _agent_with_collector(tmp_path):
     ctx = make_context(memory_dir=tmp_path / "memory",
                        trajectory_collector=collector)
     ctx.skill_memory.last_playbook_triggers = ["lesson-A"]
+    # §4KW: the record reads the turn-guarded union; a real store stamps the
+    # turn key at lookup — an empty key is "no key recorded" (fail-open)
+    ctx.skill_memory._playbook_turn_key = ""
+    ctx.skill_memory._bus_delivered_turn_key = ""
     return make_agent(ctx), collector
 
 

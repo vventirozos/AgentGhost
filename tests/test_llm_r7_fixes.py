@@ -377,9 +377,13 @@ def test_route_bounds_its_own_contract_without_re_timing_its_callers(
                         fallback="fb", **kw))
     assert posts and posts[0] is not None
     if expect_clipped:
-        from ghost_agent.core.llm import _ROUTE_TIMEOUT_S
-        assert posts[0] <= _ROUTE_TIMEOUT_S + 0.01, (
-            f"route's own contract is not bounded: {posts[0]}")
+        # §4KW: route's own 12 s contract is a TOTAL enforced by cancellation
+        # from outside (pinned in tests/test_4kw_announced_work_and_outcome.py);
+        # the request itself gets the long client timeout, so a slow node is
+        # never charged a ReadTimeout for routing's impatience.
+        from ghost_agent.core.llm import _ROUTE_CLIENT_TIMEOUT_S
+        assert posts[0] == _ROUTE_CLIENT_TIMEOUT_S, (
+            f"route's request budget is not the client timeout: {posts[0]}")
     else:
         assert posts[0] >= override - 0.01, (
             f"a caller asking for {override}s of generation got "

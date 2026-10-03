@@ -108,6 +108,16 @@ def _main_fallback_timeout_s() -> float:
 _MAIN_FALLBACK_TIMEOUT_S = _main_fallback_timeout_s()
 
 _ROUTE_TIMEOUT_S = 12.0
+#: §4KW: the client timeout under a route() deadline enforced by cancellation —
+#: reached only by a node that is genuinely stuck, never by our impatience.
+_ROUTE_CLIENT_TIMEOUT_S = 60.0
+#: §4KW (second review): a routed request that held a node's permit ALONE
+#: this long without an answer when route()'s deadline passed is charged to
+#: the node — a routing call is ≤128 tokens, ~0.5 s uncontended.
+_ROUTE_HUNG_SILENCE_S = 6.0
+#: After cancelling a routed call at its deadline, how long route() waits for
+#: the cancellation to land (or a last-moment answer) before returning.
+_ROUTE_CANCEL_GRACE_S = 1.0
 
 
 class OffMainNodeUnavailable(Exception):
@@ -316,10 +326,41 @@ def _is_node_fault(exc) -> bool:
     flood — it relocates the wait to a place where the cause is KNOWN."""
     if isinstance(exc, NodeSaturated):
         return False
+    # §4KW (review): our own client closed at shutdown is not the node's
+    # illness (3 breaker OPEN lines in the log were shutdown artifacts).
+    if isinstance(exc, RuntimeError) and "client has been closed" in str(exc):
+        return False
     resp = getattr(exc, "response", None)
     code = getattr(resp, "status_code", None)
     if isinstance(code, int) and 400 <= code < 500:
         return False
+    return True
+
+
+def _charge_node_fault(client, node, exc, task_label) -> bool:
+    """Should this failure count toward ``node``'s circuit breaker?
+
+    `_is_node_fault` decides the class (not a 4xx, not our saturation); a
+    warm-up never counts. §4KW (review): neither does a KEEPALIVE ping that
+    failed while OUR OWN gated jobs held every slot of that node — pings
+    bypass the permit gate, so a one-token ping waited in llama-server's
+    queue behind our critic verdicts and timed out at 30 s. Two live breaker
+    trips (09-20 14:24, 09-30 14:33) were three such pings, 150 s apart, and
+    nothing else. With a free slot a ping is answered in well under a second,
+    so a ping that times out then is still charged."""
+    if task_label == "warmup" or not _is_node_fault(exc):
+        return False
+    if task_label == "keepalive":
+        try:
+            url = (node or {}).get("url") or ""
+            held = len((getattr(client, "_node_run_tasks", None) or {}).get(url) or {})
+            cap = client._known_slots(url)
+            # only with a KNOWN capacity (review): an unprobed node with one
+            # of our jobs may well have a free slot for the ping
+            if held and cap is not None and held >= cap:
+                return False
+        except Exception:  # noqa: BLE001 — attribution never raises
+            pass
     return True
 
 
@@ -842,6 +883,61 @@ class LLMClient:
         sized_payload.setdefault("max_tokens", max_tokens)
         sized_payload["stream"] = False
 
+        # §4KW (review): the deadline a routing caller states is ITS impatience,
+        # not evidence about the node. Passed as the client's own timeout, a
+        # healthy Nova answering at 12.1 s — busy with our own critic verdict
+        # — raised a ReadTimeout that `_is_node_fault` charged to the node
+        # (11 live, 6 within 1–2 s of our own critic dispatch; one opened the
+        # breaker the critic shares). The total is now enforced from OUTSIDE
+        # by cancellation (never counted against the node); the client gets
+        # `_ROUTE_CLIENT_TIMEOUT_S`, which only a genuinely stuck node reaches.
+        _deadline = (total_budget if total_budget is not None
+                     else (_ROUTE_TIMEOUT_S if timeout is None else None))
+        if _deadline is not None:
+            _call = asyncio.ensure_future(self.chat_completion(
+                sized_payload, use_worker=True, is_background=True,
+                timeout=max(float(timeout or 0.0), _ROUTE_CLIENT_TIMEOUT_S),
+                slot_wait=_ROUTE_TIMEOUT_S, total_budget=None,
+                off_main_only=True, require_healthy=True,
+                task_label=_task_display_label(task)))
+            # a call left running past us (outer cancel, or a swallowed cancel
+            # after the grace) must not log "exception was never retrieved"
+            _call.add_done_callback(lambda f: f.cancelled() or f.exception())
+            try:
+                try:
+                    done, _pending = await asyncio.wait({_call}, timeout=float(_deadline))
+                except asyncio.CancelledError:
+                    _call.cancel()
+                    raise
+                if _call not in done:
+                    # review (§4KW): a HUNG node must still trip its breaker —
+                    # with the deadline as a pure cancellation, a node that
+                    # accepted and never answered was never charged, and every
+                    # routed call paid the full deadline. Charged when our
+                    # request had been SENT (it held a permit) and no other job
+                    # of ours was on that node: then the silence is the node's,
+                    # not our own queueing.
+                    self._charge_route_deadline_miss(_call)
+                    _call.cancel()
+                    # Bounded (fresh review): py3.10's `wait_for(sem.acquire())`
+                    # can swallow a cancel that lands as the permit frees, and
+                    # the call then POSTs with the 60 s client timeout — an
+                    # unbounded `await _call` held the user that long. Wait a
+                    # grace at most; a caller's own cancel propagates from
+                    # `asyncio.wait` (it was swallowed by `except BaseException`).
+                    await asyncio.wait({_call}, timeout=_ROUTE_CANCEL_GRACE_S)
+                    if not (_call.done() and not _call.cancelled() and _call.exception() is None):
+                        logger.debug(f"route({task}): no answer within {_deadline:g}s — using fallback")
+                        return fallback
+                data = _call.result()
+            except OffMainNodeUnavailable:
+                logger.debug(f"route({task}): worker pool down — using fallback")
+                return fallback
+            except Exception as e:
+                logger.debug(f"route({task}) worker call failed: {e}")
+                return fallback
+            return self._route_content(data, fallback)
+
         try:
             data = await self.chat_completion(
                 sized_payload,
@@ -925,6 +1021,39 @@ class LLMClient:
             # `_note_usage` call, which a redundant call satisfies. A
             # structural proxy for a semantic property, and it forced the
             # defect in (LLM review 2026-08-18, two independent lenses).
+            content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+            return content if content else fallback
+        except Exception:
+            return fallback
+
+    def _charge_route_deadline_miss(self, call) -> None:
+        """§4KW: charge the node a routed call was waiting on when its deadline
+        passed — only if the request had been SENT and left unanswered for
+        `_ROUTE_HUNG_SILENCE_S` (time spent queueing for the permit is ours,
+        not the node's) with no other gated job of ours on that node. Never
+        raises."""
+        try:
+            key = id(call)
+            now = time.monotonic()
+            for url, held in list((getattr(self, "_node_run_tasks", None) or {}).items()):
+                rec = (held or {}).get(key)
+                if rec is None or len(held) != 1:
+                    continue
+                # alone for the WHOLE hold, not just now (fresh review: a
+                # critic verdict that slowed the node and ended at 7 s of
+                # 12 got the node charged): the hold's concurrency-seconds
+                # equal its length only if nobody of ours shared it.
+                self._settle_conc(held)
+                hold = now - float(rec[2])
+                if hold >= _ROUTE_HUNG_SILENCE_S and float(rec[0]) <= hold * 1.02 + 0.01:
+                    self.circuit_breaker.record_failure(url)
+        except Exception:  # noqa: BLE001 — attribution never raises
+            pass
+
+    @staticmethod
+    def _route_content(data, fallback):
+        """The text of a routed answer, or ``fallback`` (shared by both route() paths)."""
+        try:
             content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
             return content if content else fallback
         except Exception:
@@ -2282,7 +2411,7 @@ class LLMClient:
                             resp.raise_for_status()
                             return self._on_node_success(node, resp, _pool_leg, task_label, _conc)
                         except Exception as e:
-                            if _is_node_fault(e) and task_label != "warmup":
+                            if _charge_node_fault(self, node, e, task_label):
                                 self.circuit_breaker.record_failure(node["url"])
                             if not _quiet:
                                 pretty_log("Vision Node Failed", f"{node['model']}: {_node_error_detail(e)} — trying next", level="WARNING", icon=Icons.WARN)
@@ -2389,7 +2518,7 @@ class LLMClient:
                         resp.raise_for_status()
                         return self._on_node_success(node, resp, _pool_leg, task_label, _conc)
                     except Exception as e:
-                        if _is_node_fault(e) and task_label != "warmup":
+                        if _charge_node_fault(self, node, e, task_label):
                             self.circuit_breaker.record_failure(node["url"])
                         if _quiet:
                             logger.debug("keepalive worker %s failed: %s",
@@ -2514,7 +2643,7 @@ class LLMClient:
                         resp.raise_for_status()
                         return self._on_node_success(node, resp, _pool_leg, task_label, _conc)
                     except Exception as e:
-                        if _is_node_fault(e) and task_label != "warmup":
+                        if _charge_node_fault(self, node, e, task_label):
                             self.circuit_breaker.record_failure(node["url"])
                         if not _quiet:
                             pretty_log("Critic Node Failed", f"{node['model']}: {_node_error_detail(e)} — trying next", level="WARNING", icon=Icons.WARN)
@@ -2606,7 +2735,7 @@ class LLMClient:
                         resp.raise_for_status()
                         return self._on_node_success(node, resp, _pool_leg, task_label, _conc)
                     except Exception as e:
-                        if _is_node_fault(e) and task_label != "warmup":
+                        if _charge_node_fault(self, node, e, task_label):
                             self.circuit_breaker.record_failure(node["url"])
                         if not _quiet:
                             pretty_log("Coding Node Failed", f"{node['model']}: {_node_error_detail(e)} — trying next", level="WARNING", icon=Icons.WARN)
@@ -2699,7 +2828,7 @@ class LLMClient:
                         resp.raise_for_status()
                         return self._on_node_success(node, resp, _pool_leg, task_label, _conc)
                     except Exception as e:
-                        if _is_node_fault(e) and task_label != "warmup":
+                        if _charge_node_fault(self, node, e, task_label):
                             self.circuit_breaker.record_failure(node["url"])
                         if not _quiet:
                             pretty_log("Swarm Node Failed", f"{node['model']}: {_node_error_detail(e)} — trying next", level="WARNING", icon=Icons.WARN)

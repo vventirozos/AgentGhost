@@ -408,6 +408,35 @@ def playbook_writes_blocked() -> bool:
         return False
 
 
+def usage_credit_blocked() -> bool:
+    """§4KW (fresh audit): may THIS request bump usage counters (lesson
+    ``retrievals``, episode ``access_count``, vector ``retrieval_count``)?
+    Not for a probe, a member or an internal (job-/sched-/sub-) turn — a
+    probe's hydration was raising the counters that decide eviction and
+    utility on the stores just cleaned of probe data. Never raises."""
+    try:
+        if _derive_lesson_origin() in (LESSON_ORIGIN_PROBE, LESSON_ORIGIN_MEMBER):
+            return True
+        from ..utils.logging import request_id_context
+        from ..core.autonomous_activity import is_internal_request
+        return bool(is_internal_request(str(request_id_context.get() or "")))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+from .lesson_scope import (admits as _scope_admits, lesson_scope as _lesson_scope,  # noqa: E402
+                           SCOPE_REQUEST as _SCOPE_REQUEST, lesson_request_text as _lesson_request_text,
+                           same_request as _same_request)
+
+
+def _other_request(existing: dict, scope: str, incoming_request: str) -> bool:
+    """Both rows are request-scoped plans, for DIFFERENT requests (fourth
+    review: "copy A to B" and "copy B to A", "restart" and "stop" the same
+    service merged — one request's plan was served for the other)."""
+    return (scope == _SCOPE_REQUEST and _lesson_scope(existing) == _SCOPE_REQUEST
+            and not _same_request(_lesson_request_text(existing), incoming_request))
+
+
 def iter_teachable(trajectories):
     """The trajectories a lesson producer may read: `trajectory_may_teach`
     applied to an iterable (or a collector's `iter_trajectories()` result).
@@ -852,6 +881,28 @@ def _trim_playbook_by_utility(playbook: list, max_entries: int) -> list:
     return kept
 
 
+def _twin_meta(lesson: dict) -> dict:
+    """The vector metadata a lesson's twin carries (heal and refresh write
+    the same fields `learn_lesson` writes)."""
+    return {
+        "type": "skill",
+        # Preserve the lesson's own timestamp: eviction tie-breaks sort by
+        # it, and a healed twin should not look newer than the knowledge it
+        # mirrors. Converted to the store's UTC-"Z" convention (see _twin_ts).
+        "timestamp": _twin_ts(lesson.get("timestamp") or _now_iso()),
+        # §4M R2 MINOR-1: fall back to task — an empty-string trigger minted
+        # a keyless twin the existence check could never match.
+        "trigger": (lesson.get("trigger") or lesson.get("task") or "")[:200],
+        "domains": ",".join(lesson.get("domains") or [])[:200],
+        "verified": bool(lesson.get("verified")),
+        "source_trajectory_id": lesson.get("source_trajectory_id", "") or "",
+        "source_refs": ",".join(lesson.get("source_refs") or [])[:400],
+        "dimension": lesson.get("dimension", "") or "",
+        "scope": lesson.get("scope", "") or "general",
+        "source": lesson.get("source", "") or "",
+    }
+
+
 def _delete_lesson_twin(memory_system, lesson) -> None:
     """Best-effort delete of a lesson's embedded vector twin.
 
@@ -1241,6 +1292,21 @@ class SkillMemory:
         )
         return len(orphans)
 
+    def _refresh_twin(self, memory_system, lesson) -> None:
+        """Re-embed a lesson whose fix a merge replaced (data audit: 111 of
+        299 twins carried an older fix than their row). Delete + heal, so the
+        new twin is written exactly as the heal writes one. Never raises."""
+        if memory_system is None:
+            return
+        try:
+            # THIS lesson's twin only (fourth review: a full heal ran under
+            # the playbook lock on every merge and held up retrieval)
+            _delete_lesson_twin(memory_system, lesson)
+            les = _normalize_lesson(lesson)
+            memory_system.add(lesson_embedding_text(les), _twin_meta(les))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("twin refresh failed: %s", e)
+
     def heal_missing_twins(self, memory_system, limit: int = 2000) -> int:
         """Re-embed playbook lessons whose vector twin is MISSING — the
         inverse of :meth:`reconcile_vector_orphans`. A twin-less lesson is
@@ -1292,25 +1358,24 @@ class SkillMemory:
                 continue  # twin present
             try:
                 text = lesson_embedding_text(lesson)
-                meta = {
-                    "type": "skill",
-                    # Preserve the lesson's own timestamp: eviction
-                    # tie-breaks sort by it, and a healed twin should not
-                    # look newer than the knowledge it mirrors. Converted
-                    # to the store's UTC-"Z" convention (see _twin_ts).
-                    "timestamp": _twin_ts(lesson.get("timestamp") or _now_iso()),
-                    # §4M R2 MINOR-1: fall back to task — an empty-string
-                    # trigger minted a keyless twin the existence check
-                    # could never match (phantom heal every idle cycle).
-                    "trigger": (lesson.get("trigger")
-                                or lesson.get("task") or "")[:200],
-                    "domains": ",".join(lesson.get("domains") or [])[:200],
-                    "verified": bool(lesson.get("verified")),
-                    "source_trajectory_id": lesson.get("source_trajectory_id", "") or "",
-                    "source_refs": ",".join(lesson.get("source_refs") or [])[:400],
-                    "dimension": lesson.get("dimension", "") or "",
-                }
-                _r = memory_system.add(text, meta)
+                meta = _twin_meta(lesson)
+                # (fourth review) the snapshot above may be stale: a merge
+                # can have refreshed this twin, or a removal dropped the row,
+                # since it was read — re-check both under the lock, per lesson
+                with self._get_lock():
+                    _now = {_normalize_trigger((x.get("trigger") or x.get("task") or "")[:200])
+                            for x in self._load_playbook()}
+                    if keys[0] not in _now:
+                        continue
+                    try:
+                        _got = coll.get(where={"$and": [{"type": "skill"}, {"trigger": meta["trigger"]}]},
+                                        limit=1, include=["metadatas"])
+                        if any(str((m or {}).get("trigger") or "") == meta["trigger"]
+                               for m in (_got.get("metadatas") or [])):
+                            continue
+                    except Exception:                   # noqa: BLE001
+                        pass
+                    _r = memory_system.add(text, meta)
             except Exception as exc:
                 logger.debug("twin heal: re-embed failed: %s", exc)
                 continue
@@ -1326,9 +1391,11 @@ class SkillMemory:
                 continue
             healed += 1
             # Mark healed within this run too — duplicate-trigger rows
-            # must not each mint a twin.
-            for k in keys:
-                vec_keys.add(k)
+            # must not each mint a twin. Only the lesson's OWN key (its
+            # trigger, else its task): two rows with different triggers
+            # sharing one task left the second dark forever (§4KW r3 data
+            # repair: "Stateful log processing …" never got a twin).
+            vec_keys.add(keys[0])
         if healed:
             pretty_log(
                 "Skill Store Heal",
@@ -1359,6 +1426,8 @@ class SkillMemory:
         origin: str = "",
         evidence_refs=None,
         evidence_min_new_fraction: float = 0.0,
+        scope: str = "",
+        source_request: str = "",
     ):
         """Write a lesson to the playbook. Accepts both legacy positional
         args (task/mistake/solution) and the new structured kwargs.
@@ -1402,7 +1471,12 @@ class SkillMemory:
             # corrections and always pass; `verified` gets no bypass because it
             # would only exempt a verified OBSERVATION (a verified fix has a
             # mistake and passes; a verified actionable rule passes anyway).
-            from .lesson_quality import is_actionable_lesson
+            from .lesson_quality import is_actionable_lesson, prescribes_destruction
+            if prescribes_destruction(effective_correct):
+                logger.warning(
+                    "learn_lesson: refused %s lesson that prescribes bulk/irreversible destruction: %r",
+                    source or "?", (effective_correct or "")[:120])
+                return None
             if not is_actionable_lesson(
                     effective_anti, effective_correct, effective_trigger):
                 logger.debug(
@@ -1462,6 +1536,9 @@ class SkillMemory:
                 trigger=effective_trigger,
             )
             if duplicate:
+                # a row whose scope changes below gets a fresh twin (fifth
+                # review: 34 scoped rows' twins still said scope=general)
+                _rescoped = False
                 if duplicate.get("source") == "json":
                     with self._get_lock():
                         playbook = self._load_playbook()
@@ -1485,6 +1562,29 @@ class SkillMemory:
                                  p.get("trigger") or "") == key)),
                             None,
                         )
+                        if idx is not None and scope == _SCOPE_REQUEST \
+                                and _lesson_scope(playbook[idx]) != _SCOPE_REQUEST:
+                            # §4KW (fresh review): the SAME trigger as a new
+                            # request-scoped plan means the stored row is a
+                            # plan for that request too (one the migration
+                            # missed) — it becomes scoped before the merge,
+                            # instead of the plan merging in and staying general.
+                            playbook[idx]["scope"] = _SCOPE_REQUEST
+                            playbook[idx]["source_request"] = str(source_request or task or effective_trigger)[:4000]
+                            _rescoped = True
+                        elif idx is not None and scope != _SCOPE_REQUEST \
+                                and _lesson_scope(playbook[idx]) == _SCOPE_REQUEST:
+                            logger.info("learn_lesson: a general lesson cannot reuse a request-scoped "
+                                        "trigger %r — not written", effective_trigger[:60])
+                            return None
+                        elif idx is not None and _other_request(
+                                playbook[idx], scope, str(source_request or task or effective_trigger)):
+                            # the same words for another request (a reordered
+                            # copy): its own row, as the vector path does
+                            # (fifth review: the JSON path dropped the plan)
+                            logger.info("learn_lesson: a plan for another request shares the words of %r — "
+                                        "written as its own row", effective_trigger[:60])
+                            idx = None              # falls through to a fresh write
                         if idx is not None:
                             existing = _normalize_lesson(playbook[idx])
                             _counted = evidence_is_new(
@@ -1494,7 +1594,11 @@ class SkillMemory:
                                 remember_evidence(existing, _incoming_ev)
                             # Prefer the new solution if it's richer or
                             # if the caller marked it verified.
-                            if len(effective_correct) > len(existing.get("solution") or ""):
+                            # (third review) another producer's text never
+                            # replaces this row's fix, nor carries `verified`
+                            _foreign = str(existing.get("source") or "") != str(source or "")
+                            _replaced = not _foreign and len(effective_correct) > len(existing.get("solution") or "")
+                            if _replaced:
                                 existing["solution"] = effective_correct
                                 existing["correct_pattern"] = effective_correct
                                 existing["code_example"] = _extract_code_block(effective_correct)
@@ -1518,7 +1622,7 @@ class SkillMemory:
                             if domains:
                                 merged = sorted(set(existing.get("domains", [])) | set(_ensure_list(domains)))
                                 existing["domains"] = merged
-                            if verified and not existing.get("verified"):
+                            if verified and not existing.get("verified") and not _foreign:
                                 existing["verified"] = True
                                 existing["confidence"] = max(
                                     float(existing.get("confidence") or 0.5),
@@ -1535,6 +1639,8 @@ class SkillMemory:
                             existing["timestamp"] = _now_iso()
                             playbook[idx] = existing
                             self._save_playbook_unlocked(playbook)
+                            if _replaced or _rescoped:
+                                self._refresh_twin(memory_system, existing)
                             pretty_log(
                                 "SKILL REINFORCED",
                                 (f"Merged duplicate lesson: {effective_trigger[:30]}... (freq={existing['frequency']})"
@@ -1552,6 +1658,14 @@ class SkillMemory:
                     # just like the JSON-dedup branch does.
                     bumped = False
                     orphan_healed = False
+                    # §4KW: a twin from the OTHER scope is not a twin — a
+                    # reflection's general rule and its own request-scoped
+                    # plan embed close together; merging either into the
+                    # other would re-key the rule to one request (or spread
+                    # the plan to every request). Written fresh; nothing on
+                    # either row changes and no vector is dropped.
+                    cross_scope = False
+                    _incoming_scope = (_SCOPE_REQUEST if scope == _SCOPE_REQUEST else "general")
                     with self._get_lock():
                         playbook = self._load_playbook()
                         key = _normalize_trigger(effective_trigger or "")
@@ -1582,7 +1696,15 @@ class SkillMemory:
                                          or _dup_trigger_from_vector_text(
                                              str(duplicate.get("text") or "")))
                             _dup_key = _normalize_trigger(_dup_trig)
-                            if _dup_key:
+                            # a metadata trigger cut at 200 chars resolves by
+                            # unique prefix (data audit: an exact compare took
+                            # every long-trigger lesson for an orphan and
+                            # deleted its LIVE twin)
+                            if _dup_trig and len(_dup_trig) >= 190:
+                                _hit = _find_playbook_entry_by_trigger(playbook, _dup_trig)
+                                if _hit is not None:
+                                    idx = next((i for i, p in enumerate(playbook) if p is _hit), None)
+                            if _dup_key and idx is None:
                                 # §4M (Lens C): this retry compared
                                 # `task or trigger` only — the §4L R2 fix
                                 # landed on the primary lookups but missed
@@ -1599,14 +1721,65 @@ class SkillMemory:
                                          p.get("trigger") or "") == _dup_key),
                                     None,
                                 )
-                        if idx is not None:
+                        if idx is not None and _lesson_scope(playbook[idx]) != _incoming_scope:
+                            cross_scope = True
+                            if _normalize_trigger(playbook[idx].get("trigger") or playbook[idx].get("task") or "") \
+                                    == _normalize_trigger(effective_trigger or ""):
+                                # the SAME trigger in the other scope: the JSON
+                                # path's rule (fourth review: written here as a
+                                # second row with one trigger)
+                                if _incoming_scope != _SCOPE_REQUEST:
+                                    logger.info("learn_lesson: a general lesson cannot reuse a request-scoped "
+                                                "trigger %r — not written", effective_trigger[:60])
+                                    return None
+                                playbook[idx]["scope"] = _SCOPE_REQUEST
+                                playbook[idx]["source_request"] = str(source_request or task or effective_trigger)[:4000]
+                                cross_scope = False
+                                _rescoped = True
+                        if idx is not None and not cross_scope and _other_request(
+                                playbook[idx], scope, str(source_request or task or effective_trigger)):
+                            cross_scope = True                    # a plan for another request: its own row
+                        # Fresh review (§4KW): a vector twin is a different
+                        # TRIGGER whose whole text sits close; merging it
+                        # across PRODUCERS put dream "verify each file before
+                        # cleaning" rules on the reflection "delete path=/*"
+                        # lesson (frequency 1 → 17) and a reflected
+                        # deploy-check script into a dream rule (fix replaced,
+                        # verified inherited). Word overlap cannot tell those
+                        # from reworded twins (legit pairs score < 0.2); the
+                        # producer can. A twin from ANOTHER source is written
+                        # separately (second review: refusing it let a stale
+                        # lesson block another producer's correction forever).
+                        _src_old = (str(playbook[idx].get("source") or "") if idx is not None else "")
+                        _same_trigger = (idx is not None and _normalize_trigger(
+                            playbook[idx].get("trigger") or playbook[idx].get("task") or "")
+                            == _normalize_trigger(effective_trigger or ""))
+                        # both producers KNOWN and different: a separate row. A legacy
+                        # row with no recorded producer merges as evidence only
+                        # (`_foreign` below keeps its fix and its verified flag).
+                        if (idx is not None and _src_old and source and _src_old != str(source)
+                                and not _same_trigger):
+                            logger.info(
+                                "learn_lesson: %s twin of a %s lesson %r — written separately, not merged",
+                                source, _src_old,
+                                (playbook[idx].get("trigger") or playbook[idx].get("task") or "")[:60])
+                            cross_scope = True
+                        if idx is not None and not cross_scope:
                             existing = _normalize_lesson(playbook[idx])
                             _counted = evidence_is_new(
                                 existing, _incoming_ev, evidence_min_new_fraction)
                             if _counted:
                                 existing["frequency"] = int(existing.get("frequency") or 1) + 1
                                 remember_evidence(existing, _incoming_ev)
-                            if len(effective_correct) > len(existing.get("solution") or ""):
+                            # (third review) another producer's text never
+                            # replaces this row's fix, nor carries `verified`
+                            _foreign = str(existing.get("source") or "") != str(source or "")
+                            # a CLOSE twin with another trigger adds evidence only — its fix
+                            # never replaces this row's (fifth review: a dream merge put
+                            # "validate against external sources" on an output-processing row)
+                            _replaced = (not _foreign and _same_trigger
+                                         and len(effective_correct) > len(existing.get("solution") or ""))
+                            if _replaced:
                                 existing["solution"] = effective_correct
                                 existing["correct_pattern"] = effective_correct
                                 existing["code_example"] = _extract_code_block(effective_correct)
@@ -1627,7 +1800,7 @@ class SkillMemory:
                                         existing["source_refs"] = refs[:20]
                                     existing["source_trajectory_id"] = \
                                         source_trajectory_id
-                            if verified and not existing.get("verified"):
+                            if verified and not existing.get("verified") and not _foreign:
                                 existing["verified"] = True
                                 existing["confidence"] = max(
                                     float(existing.get("confidence") or 0.5),
@@ -1644,6 +1817,8 @@ class SkillMemory:
                             existing["timestamp"] = _now_iso()
                             playbook[idx] = existing
                             self._save_playbook_unlocked(playbook)
+                            if _replaced or _rescoped:
+                                self._refresh_twin(memory_system, existing)
                             bumped = True
                             pretty_log(
                                 "SKILL REINFORCED",
@@ -1652,7 +1827,7 @@ class SkillMemory:
                                  f"Vector-dedup: re-derived from known evidence — freq kept at {existing['frequency']}: {effective_trigger[:30]}..."),
                                 icon=Icons.MEM_REINFORCE,
                             )
-                        else:
+                        elif not cross_scope:
                             # TRUE orphan: the vector index holds a skill
                             # entry the JSON playbook doesn't (residue of a
                             # partial scrub). Left alone it silently vetoes
@@ -1678,7 +1853,7 @@ class SkillMemory:
                                 f"the orphan, writing fresh: {effective_trigger[:30]}...",
                                 icon=Icons.SKIP,
                             )
-                    if not orphan_healed:
+                    if not orphan_healed and not cross_scope:
                         return "reinforced" if bumped else None
 
             new_lesson = build_lesson(
@@ -1697,6 +1872,13 @@ class SkillMemory:
                 origin=origin,
             )
             remember_evidence(new_lesson, _incoming_ev)   # §4KS
+            if scope == _SCOPE_REQUEST:
+                # §4KW: one request's corrected plan — retrieved only when
+                # that request comes back (lesson_scope.same_request)
+                new_lesson["scope"] = _SCOPE_REQUEST
+                # up to 4,000 chars: a resent long request must still match
+                # (a 400-char copy never equalled the full request)
+                new_lesson["source_request"] = str(source_request or task or effective_trigger)[:4000]
 
             with self._get_lock():
                 before = [new_lesson] + self._load_playbook()
@@ -1743,6 +1925,7 @@ class SkillMemory:
                     "trigger": new_lesson.get("trigger", "")[:200],
                     "domains": ",".join(new_lesson.get("domains", []))[:200],
                     "verified": bool(new_lesson.get("verified")),
+                    "scope": new_lesson.get("scope", "") or "general",
                     # Persist provenance on the vector copy so
                     # `retract_lessons_from_trajectory` can scrub
                     # both stores at once via collection.delete with
@@ -2292,6 +2475,7 @@ class SkillMemory:
         *,
         distance_threshold: float = DEFAULT_RETRIEVAL_DISTANCE,
         limit: int = 5,
+        scope_request: str = "",
     ) -> List[Dict[str, str]]:
         """Top lessons relevant to `query` as PER-ITEM dicts.
 
@@ -2310,6 +2494,7 @@ class SkillMemory:
         items, _branch = self._playbook_items_and_branch(
             query, memory_system,
             distance_threshold=distance_threshold, limit=limit,
+            scope_request=scope_request,
         )
         return self._filter_quarantined(items)
 
@@ -2489,6 +2674,8 @@ class SkillMemory:
         """
         if playbook_writes_blocked():        # §4KD: Slack never teaches
             return 0
+        if usage_credit_blocked():           # §4KW: probe/internal turns
+            return 0
         keys = {t.strip().lower() for t in (triggers or []) if t and str(t).strip()}
         if not keys:
             return 0
@@ -2601,8 +2788,15 @@ class SkillMemory:
         *,
         distance_threshold: float = DEFAULT_RETRIEVAL_DISTANCE,
         limit: int = 5,
+        scope_request: str = "",
     ):
         """Shared retrieval core for get_playbook_items/get_playbook_context.
+
+        ``scope_request`` (§4KW): the USER's request when ``query`` is a
+        derived one (the memory bus's LLM sub-queries). A request-scoped
+        lesson is judged against the user's request, never against a
+        sub-query — a sub-query rephrased toward a lesson's request
+        admitted it on a turn whose request was different.
 
         Returns ``(items, branch)`` where branch ∈ {"vector", "vector_empty",
         "empty_playbook", "bm25", "bm25_empty", "recency"} so the string
@@ -2614,15 +2808,27 @@ class SkillMemory:
         def _trigger_of(lesson):
             return (lesson.get("trigger") or lesson.get("task") or "").strip().lower()
 
+        try:
+            from .lesson_scope import current_request as _cur_req
+            _turn_req = _cur_req.get()
+        except Exception:  # noqa: BLE001
+            _turn_req = ""
+        _scope_q = scope_request or _turn_req or query
+        # §4KW: request-scoped lessons are dropped AFTER the vector query, so
+        # they could fill the candidate pool and crowd admissible lessons
+        # out — the pool grows by how many scoped lessons exist.
+        _n_scoped = sum(1 for p in playbook_snapshot if _lesson_scope(p) == _SCOPE_REQUEST)
+
         vector_attempted = False
         _vec_idf = None          # built lazily; the vector branch may not run
+        _trig_cache: dict = {}
         try:
             if memory_system and query:
                 vector_attempted = True
                 try:
                     results = memory_system.collection.query(
                         query_texts=[query],
-                        n_results=max(limit * 2, 10),
+                        n_results=max(limit * 2, 10) + _n_scoped,
                         where={"type": "skill"},
                     )
                 except Exception as e:
@@ -2656,6 +2862,22 @@ class SkillMemory:
                                     and dist < _DOMAIN_RELAXED_DISTANCE):
                                 continue
                         trigger = (meta or {}).get("trigger", "") or _extract_trigger_from_doc(doc)
+                        # §4KW: a REQUEST-scoped lesson (one request's corrected
+                        # plan) enters only when this IS that request — the
+                        # whole-lesson embedding matched it to anything (927
+                        # injections, 20 on its own request).
+                        _entry = _find_playbook_entry_by_trigger(playbook_snapshot, trigger)
+                        if _entry is None and _n_scoped and len(trigger or "") >= 190:
+                            continue      # unresolvable long trigger: fail closed
+                        if _entry is None and str((meta or {}).get("scope") or "") == _SCOPE_REQUEST:
+                            continue      # an orphaned twin of a scoped plan (fourth review)
+                        if _entry is not None and not _scope_admits(_entry, _scope_q):
+                            continue
+                        if _entry is not None:
+                            # the ROW's full trigger: the metadata copy is cut at
+                            # 200 chars, and credit, quarantine and attribution
+                            # all match the full one (fourth review)
+                            trigger = _entry.get("trigger") or _entry.get("task") or trigger
                         # Same IDF corpus as the fallback, so a term is worth
                         # the same on both paths. Here bm25 only RE-RANKS
                         # candidates the vector store already admitted, so
@@ -2665,6 +2887,13 @@ class SkillMemory:
                             _vec_idf = _bm25_idf(
                                 [_trigger_of(p) for p in playbook_snapshot])
                         bm25 = _bm25_like_score(query, trigger or doc, _vec_idf)
+                        # §4KW relevance gate: the WHOLE-lesson distance barely
+                        # separates relevant from irrelevant (labelled set,
+                        # 546 real pairs: 7% of today's top-5 relevant). A
+                        # lesson enters when its TRIGGER shares a weighted
+                        # term with the query or sits close on its own.
+                        if bm25 <= 0 and not _trigger_is_close(memory_system, query, trigger, _trig_cache):
+                            continue
                         # Lower distance is better; higher bm25 is better.
                         combined = (1.0 - dist) + bm25 * 0.4
                         candidates.append((combined, dist, doc, meta or {}, trigger))
@@ -2705,6 +2934,8 @@ class SkillMemory:
             scored: List[Tuple[float, dict]] = []
             _idf = _bm25_idf([_trigger_of(p) for p in playbook_snapshot])
             for p in playbook_snapshot:
+                if not _scope_admits(p, _scope_q):       # §4KW: request-scoped
+                    continue
                 trig = _trigger_of(p)
                 score = _bm25_like_score(query, trig or "", _idf)
                 # ⚠ WAS `score > 0`, which admitted a lesson on ONE shared
@@ -2725,9 +2956,11 @@ class SkillMemory:
             return [], "bm25_empty"
 
         # No query supplied → recency fallback (system-prompt injection style).
+        # Never a request-scoped lesson: without a query there is no request
+        # it could belong to (§4KW).
         items = [
             {"text": render_lesson_for_prompt(p), "trigger": _trigger_of(p)}
-            for p in playbook_snapshot[:limit]
+            for p in [q for q in playbook_snapshot if _lesson_scope(q) != _SCOPE_REQUEST][:limit]
         ]
         return items, "recency"
 
@@ -3004,6 +3237,58 @@ class SkillMemory:
 # correlate embedded docs back to playbook entries.
 # ---------------------------------------------------------------------------
 
+#: §4KW: a candidate lesson with no keyword overlap is kept only when its
+#: TRIGGER alone is this close (cosine distance) to the query. Measured on 546
+#: real (request, lesson) pairs labelled by the main model: keyword>0 OR
+#: trigger < 0.30 keeps 84% of the relevant lessons and drops two thirds of
+#: the delivered ones (precision 0.07 → 0.18).
+def _env_distance(name: str, default: float) -> float:
+    """A malformed value ("0,3") keeps the default instead of failing the
+    import — and with it the agent's boot (fourth review)."""
+    try:
+        v = float(os.environ.get(name, "") or default)
+        return v if 0.0 < v < 2.0 else default
+    except ValueError:
+        logger.warning("%s=%r is not a number — using %s", name, os.environ.get(name), default)
+        return default
+
+
+TRIGGER_CLOSE_DISTANCE = _env_distance("GHOST_LESSON_TRIGGER_DISTANCE", 0.30)
+#: trigger embeddings, shared across turns and sub-queries (a trigger's vector
+#: never depends on the query; fourth review: one embed call per candidate
+#: per sub-query)
+_TRIGGER_VECS: "dict" = {}
+_TRIGGER_VECS_MAX = 4000
+
+
+def _trigger_is_close(memory_system, query: str, trigger: str, cache: dict) -> bool:
+    """Cosine distance between the query and the lesson TRIGGER (not the whole
+    lesson), with the store's own embedder. Fails OPEN (True) when no usable
+    embedder is wired, so a store without one keeps the old behaviour."""
+    try:
+        ef = getattr(memory_system, "embedding_fn", None)
+        if not callable(ef) or not trigger:
+            return True
+        import numpy as np
+        if "__q__" not in cache or cache.get("__qtext__") != query:
+            cache["__q__"] = np.asarray(ef([str(query)])[0], dtype=float)
+            cache["__qtext__"] = query
+        _k = (id(ef), trigger)
+        if trigger not in cache:
+            if _k not in _TRIGGER_VECS:
+                if len(_TRIGGER_VECS) >= _TRIGGER_VECS_MAX:
+                    _TRIGGER_VECS.clear()
+                _TRIGGER_VECS[_k] = np.asarray(ef([str(trigger)])[0], dtype=float)
+            cache[trigger] = _TRIGGER_VECS[_k]
+        a, b = cache["__q__"], cache[trigger]
+        if a.ndim != 1 or a.shape != b.shape or a.size < 8:
+            return True                       # not a real embedding: fail open
+        d = 1.0 - float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
+        return d < TRIGGER_CLOSE_DISTANCE
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def _find_playbook_entry_by_trigger(playbook: list, trigger: str):
     if not trigger:
         return None
@@ -3012,6 +3297,15 @@ def _find_playbook_entry_by_trigger(playbook: list, trigger: str):
         t = (entry.get("trigger") or entry.get("task") or "").strip().lower()
         if t == target:
             return entry
+    # The vector metadata stores the trigger cut at 200 chars (§4KW fresh
+    # review: an exact-only lookup missed every longer trigger, and a
+    # request-scoped lesson then skipped its scope check). A unique prefix
+    # match resolves it.
+    if len(target) >= 190:
+        hits = [e for e in (playbook or [])
+                if (e.get("trigger") or e.get("task") or "").strip().lower().startswith(target)]
+        if len(hits) == 1:
+            return hits[0]
     return None
 
 

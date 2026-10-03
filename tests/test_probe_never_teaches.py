@@ -164,13 +164,18 @@ def test_perfect_it_is_scheduled_for_a_user_turn():
 def test_orphan_twins_are_reconciled_at_boot_too():
     """A pruned lesson's vector twin is rendered VERBATIM by retrieval when
     its playbook row is gone, and the idle-phase reconcile needs 15-60 min of
-    idle plus a 2 h cooldown. The boot path runs the same reconcile (review,
-    2026-09-09). Pinned at the source: `main()` is not drivable here; the
-    reconcile itself is pinned by the skills-store tests."""
+    idle plus a 2 h cooldown, so boot runs it too (review, 2026-09-09).
+    §4KW: this pin used to find the call in `main()` by source text — where it
+    never ran, because `main()` runs before `lifespan` creates the vector
+    store. Now: `lifespan` starts it right after the store exists."""
+    import ast
     import inspect
     from ghost_agent import main as main_mod
-    src = inspect.getsource(main_mod.main)
-    i = src.index("reconcile_vector_orphans(_ms_boot)")
-    window = src[max(0, i - 1500):i]
-    assert "context.skill_memory = SkillMemory(memory_dir)" in window, "the boot reconcile must follow the persistent skill store"
-    assert "Thread(" in src[i:i + 1200], "the boot reconcile must run off the loop"
+    import textwrap
+    fn = ast.parse(textwrap.dedent(inspect.getsource(main_mod.lifespan))).body[0]
+    store = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Assign) and any(
+        isinstance(t, ast.Attribute) and t.attr == "memory_system" for t in n.targets)
+        and isinstance(n.value, ast.Call) and getattr(n.value.func, "id", "") == "VectorMemory"]
+    boot = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Call)
+            and getattr(n.func, "id", "") == "_start_boot_skill_reconcile"]
+    assert store and boot and min(store) < min(boot)

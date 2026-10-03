@@ -262,6 +262,39 @@ def _reset_log_collapse():
 _GHOST_HOME_COUNTER = itertools.count()
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _released_workspaces_stay_removable(tmp_path_factory):
+    """A release sets the user-immutable flag on its workspace (§4KW fourth
+    review); clear it under this session's temp tree at the end, or pytest
+    can never prune those folders. At the START too, over the earlier runs'
+    folders: a SIGKILLed session never reached its own teardown (fifth
+    review)."""
+    import stat as _stat
+    _imm = getattr(_stat, "UF_IMMUTABLE", 0)
+
+    def _clear(top):
+        if not (_imm and hasattr(os, "chflags")):
+            return
+        for root, dirs, files in os.walk(top):
+            for name in dirs + files:
+                p = os.path.join(root, name)
+                try:
+                    st = os.lstat(p)
+                    if st.st_flags & _imm:
+                        os.chflags(p, st.st_flags & ~_imm, follow_symlinks=False)
+                except OSError:
+                    pass
+    base = tmp_path_factory.getbasetemp()
+    # the per-user root (`pytest-of-<user>`), above a worker's `popen-gwN`
+    _user_root = next((a for a in base.parents if a.name.startswith("pytest-of-")), None)
+    _this_run = next((a for a in [base, *base.parents] if a.parent == _user_root), None)
+    for sib in (_user_root.iterdir() if _user_root is not None else []):
+        if sib != _this_run and sib.name.startswith("pytest-") and not sib.is_symlink() and sib.is_dir():
+            _clear(sib)
+    yield
+    _clear(base)
+
+
 @pytest.fixture(scope="session")
 def _ghost_home_base(tmp_path_factory):
     return tmp_path_factory.mktemp("isolated_ghost_homes")

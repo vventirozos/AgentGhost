@@ -26,12 +26,34 @@ from typing import List, Optional
 
 # Clause-level markers of an explicit prohibition / exclusion.
 _NEGATION_RE = re.compile(
-    r"\b(don'?t|do\s+not|never|must\s+not|should\s+not|shouldn'?t|"
+    r"\b(don['’]?t|do\s+not|never|must\s+not|should\s+not|shouldn['’]?t|"
     r"no\s+need\s+(?:for|to)|without|avoid|not\s+(?:a|an|some|the|going|gonna)|"
     r"instead\s+of|rather\s+than|none\s+of|stop\s+(?:using|doing)|"
-    r"skip\s+the)\b",
+    r"skip\s+the"
+    # §4KW (review): Greek prohibitions were invisible ("ΜΗΝ … χωρίς …" → []);
+    # Greek is a common request language here. Matched on ACCENT-STRIPPED
+    # text (`_fold_greek`: capitals carry no tonos — "ΜΗΝ ΤΟ ΤΡΕΞΕΙΣ"). Not
+    # negations: "όχι μόνο" (not only), "μη-" as a prefix ("μη-γραμμικό",
+    # non-linear). ποτέ (never) is NOT here: folded it is πότε (when) — see
+    # `_NEVER_EL_RE` (fresh review: 4 of 5 corpus hits were "when" questions).
+    r"|μην|μη(?![-\u2010])|χωρις|αντι\s+για|οχι(?!\s+μονο))\b",
     re.IGNORECASE,
 )
+#: Greek "never", told apart from πότε ("when") by its accent: matched on the
+#: original text, lower-cased (ποτέ) or in capitals (ΠΟΤΕ — capitals carry no
+#: accent, so ambiguous; taken as "never"). Not after "αν/εάν" (if ever).
+_NEVER_EL_RE = re.compile(r"(?<![αά]ν\s)(?<![αά]ν\s\s)(?:\bποτέ\b|\bΠΟΤΕ\b)", re.IGNORECASE)
+
+
+def _fold_greek(text: str) -> str:
+    """Lower-case and strip combining accents (tonos, dialytika), so one
+    unaccented pattern matches "Τρέξε", "ΤΡΕΞΕ" and "τρεξε". Latin text is
+    only lower-cased in effect (the patterns are case-insensitive anyway);
+    é → e is harmless to every English pattern here."""
+    import unicodedata
+    decomposed = unicodedata.normalize("NFD", str(text or ""))
+    return unicodedata.normalize(
+        "NFC", "".join(ch for ch in decomposed if not unicodedata.combining(ch))).lower()
 
 # Role assertions binding the AGENT itself into the deliverable ("YOU will
 # play against me"). These are constraints on architecture, not phrasing:
@@ -126,6 +148,26 @@ def _clauses(text: str) -> List[str]:
     return out
 
 
+#: §4KW (review): the self-play wrapper's own rule block ("Emit EXACTLY ONE
+#: tool call per turn. Never two.", "Keep any Python script under 60 lines")
+#: filled all six constraint slots of ~1,500 self-play turns, so a challenge's
+#: own "must NOT use regex" was dropped. The block is OURS, so it is cut by its
+#: structure: everything up to the blank line that ends the rules section.
+_SELFPLAY_HEAD = "### SYNTHETIC TRAINING EXERCISE"
+_SELFPLAY_RULES = "### RESPONSE SHAPE RULES (strict)"
+
+
+def _strip_selfplay_wrapper(text: str) -> str:
+    t = text or ""
+    if not t.lstrip().startswith(_SELFPLAY_HEAD):
+        return t
+    i = t.find(_SELFPLAY_RULES)
+    if i < 0:
+        return t
+    j = t.find("\n\n", i)
+    return t[j + 2:] if j >= 0 else t
+
+
 def extract_constraints(text: str, max_items: int = 6) -> List[str]:
     """Return the explicit-constraint clauses of a user message.
 
@@ -136,13 +178,14 @@ def extract_constraints(text: str, max_items: int = 6) -> List[str]:
     """
     found: List[str] = []
     seen = set()
-    for clause in _clauses(text):
+    for clause in _clauses(_strip_selfplay_wrapper(text)):
         if len(clause) < 8:
             continue
         if _is_furniture(clause):
             continue  # §4N MAJOR-2: injected playbook/context label line
         if not (
-            _NEGATION_RE.search(clause)
+            _NEGATION_RE.search(_fold_greek(clause))
+            or _NEVER_EL_RE.search(clause)
             or _PARTICIPANT_RE.search(clause)
             or _has_caps_emphasis(clause)
         ):
@@ -430,3 +473,53 @@ def participant_write_violation(constraints: List[str],
         " Rewrite the artifact with the embedded move picker removed, then "
         "write it again."
     )
+
+
+# §4KW (review): "don't run it" — the user asked for an edit and NOT to run it.
+# The unverified-write repair ("Actually RUN or preview it now") and its
+# INCOMPLETE caveat fired anyway on 9 live requests (d5162795, 961d939d, …),
+# each costing a repair turn and recording a correct edit as FAILED. Phrasing
+# in the store (21 of 3,308 requests): "no need to run anything" (16), "do not
+# run it" (3), "do not execute" / "do not use execute"; Greek added for the
+# same instruction ("μην το τρέξεις", "χωρίς να το τρέξεις").
+_NO_RUN_OBJ = (r"(?:it|this|that|them|anything|any\s+of\s+(?:it|this|them)"
+               r"|the\s+(?:code|script|program|file|tests?))\b")
+_NO_RUN_RE = re.compile(
+    # review (§4KW): the negation must govern the verb DIRECTLY and the verb
+    # must take the work as its object — with up to two words between, "don't
+    # forget to run the tests" and "don't hesitate to run it" read as
+    # prohibitions, and a refused repair shipped untested code.
+    r"\b(?:do\s+not|don['’]?t|never)\s+(?:run|execute|test)\s+" + _NO_RUN_OBJ +
+    r"|\bno\s+need\s+to\s+(?:run|execute|test)(?:\s+" + _NO_RUN_OBJ + r"|\s*[.,;!]|\s*$)"
+    r"|\b(?P<without>without)\s+(?:running|executing|testing)\s+" + _NO_RUN_OBJ +
+    # Greek, on accent-stripped text (`_fold_greek`); "χωρίς να" is the
+    # "without" form and gets the same earlier-negation skip (fresh review:
+    # "μην το ανεβάσεις χωρίς να το τρέξεις" = "don't deploy it without
+    # running it" read as "don't run it")
+    r"|\bμην\s+(?:το\s+|τα\s+)?(?:τρεξ|εκτελεσ|δοκιμασ)\w*"
+    r"|\bδεν\s+(?:χρειαζεται|θελω)\s+να\s+(?:το\s+|τα\s+)?(?:τρεξ|εκτελεσ|δοκιμασ)\w*"
+    r"|\b(?P<without_el>χωρις)\s+να\s+(?:το\s+|τα\s+)?(?:τρεξ|εκτελεσ|δοκιμασ)\w*",
+    re.IGNORECASE)
+#: "Do not deploy WITHOUT testing it" is the opposite of a no-run request: a
+#: "without running/testing" governed by an earlier negation is skipped.
+_NEGATED_BEFORE_RE = re.compile(r"\b(?:do\s+not|don['’]?t|never|μην|δεν)\b(?:\W+\w+){0,4}\W*$", re.IGNORECASE)
+#: A QUALIFIED prohibition is not "don't run it": "never run this in
+#: production", "don't run it as root / with sudo / yet", "don't test it
+#: manually" (fresh review) — the request still wants it run some other way.
+_QUALIFIED_AFTER_RE = re.compile(
+    r"\s+(?:in|on|as|with|yet|until|before|manually|locally|directly|again|twice|outside|inside)\b"
+    r"|\s+(?:σε|στο|στη|στην|ως|με|ακομα|ακομη)\b", re.IGNORECASE)
+
+
+def request_forbids_running(text: str) -> bool:
+    """True when the request tells the agent NOT to run / execute / test what
+    it writes ("No need to run anything", "Do not run it", "μην το τρέξεις")."""
+    folded = _fold_greek(text)
+    for m in _NO_RUN_RE.finditer(folded):
+        if ((m.group("without") or m.group("without_el"))
+                and _NEGATED_BEFORE_RE.search(folded[max(0, m.start() - 60):m.start()])):
+            continue
+        if _QUALIFIED_AFTER_RE.match(folded, m.end()):
+            continue
+        return True
+    return False

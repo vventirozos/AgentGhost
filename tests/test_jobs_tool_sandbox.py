@@ -562,7 +562,7 @@ async def test_a_landed_job_wakes_the_model_with_its_result(monkeypatch):
     assert await main_mod._resume_after_job(ctx, _landed()) is True
     assert len(ctx.turns) == 1
     req_id, prompt = ctx.turns[0]
-    assert req_id == "job-job-1a2b3c4d", (
+    assert req_id == "job-1a2b3c4d", (   # §4KW: the job id already carries `job-` (was doubled)
         "the wake must be an INTERNAL turn — the `job-` prefix is what keeps "
         "it out of the operator digest and the smart-memory corpus")
     assert "has finished" in prompt and "EXIT CODE: 0" in prompt

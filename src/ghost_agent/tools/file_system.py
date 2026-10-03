@@ -685,6 +685,20 @@ def walk_nofollow(base: Path):
         stack.clear()
 
 
+def _clear_immutable(path) -> None:
+    """Drop the user-immutable flag a release sets (macOS/BSD) from a COPY.
+    Never raises."""
+    try:
+        import stat as _st
+        _imm = getattr(_st, "UF_IMMUTABLE", 0)
+        if _imm and hasattr(os, "chflags"):
+            _fl = os.lstat(path).st_flags
+            if _fl & _imm:
+                os.chflags(path, _fl & ~_imm, follow_symlinks=False)
+    except Exception:                                       # noqa: BLE001
+        pass
+
+
 def copytree_nofollow(src: Path, dest: Path, root: Path, *, ignore=None,
                       dirs_exist_ok: bool = False) -> list:
     """Copy a tree the sandbox controls without ever following a symlink.
@@ -5671,6 +5685,9 @@ async def tool_copy_file(src_name: str, dest_name: str, sandbox_dir: Path):
             # future copy site that does not resolve first cannot follow.
             await asyncio.to_thread(shutil.copy2, str(src_path), str(dest_path),
                                     follow_symlinks=False)
+            # copy2 carries BSD flags on macOS: a copy OUT of a released
+            # workspace would be immutable too (§4KW fourth review)
+            _clear_immutable(dest_path)
         if _skipped:
             # A half-landed write is `ToolOutcome.partial`, never a bare
             # string that merely starts with "PARTIAL:" — the package-wide
@@ -5697,6 +5714,15 @@ async def tool_rename_file(old_name: str, new_name: str, sandbox_dir: Path):
     pretty_log("File Rename", f"{old_name} -> {new_name}", icon=Icons.TOOL_FILE_W)
     import shutil
     try:
+        _link = _symlink_itself(sandbox_dir, old_name)
+        if _link is not None:
+            new_path = _get_safe_path(sandbox_dir, new_name, allow_root=False)
+            if new_path.exists() or new_path.is_symlink():
+                return f"Error: destination '{new_name}' already exists."
+            new_path.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(str(_link), str(new_path))
+            # the shape `_FS_MOVED_RE` parses (the verifier's ground truth)
+            return f"SUCCESS: Renamed/Moved '{old_name}' to '{new_name}'. It was a link — its target was not touched."
         old_path = _get_safe_path(sandbox_dir, old_name, allow_root=False)
         new_path = _get_safe_path(sandbox_dir, new_name, allow_root=False)
         if not old_path.exists(): return f"Error: '{old_name}' not found."
@@ -5729,6 +5755,11 @@ async def tool_delete_file(filename: str, sandbox_dir: Path):
     pretty_log("File Delete", filename, icon=Icons.TOOL_FILE_W)
     import shutil
     try:
+        _link = _symlink_itself(sandbox_dir, filename)
+        if _link is not None:
+            await asyncio.to_thread(_link.unlink)
+            # the shape `_FS_RETIRE_RE` parses (the verifier's ground truth)
+            return f"SUCCESS: Deleted '{filename}'. It was a link — its target was not touched."
         path = _get_safe_path(sandbox_dir, filename, allow_root=False)
         if not path.exists(): return f"Error: '{filename}' not found."
         if path.is_dir():
@@ -5914,13 +5945,95 @@ _READ_ONLY_OPS = frozenset({
 })
 
 
-def _released_write_block(project_store, sandbox_dir, target) -> Optional[str]:
+def _released_under(project_store, sandbox_dir, target) -> Optional[str]:
+    """The id of a RELEASED project whose workspace lies INSIDE ``target``
+    (a directory), else None. Workspaces live at ``<sandbox>/projects/<id>``,
+    so only that folder (or an ancestor of it) can contain one — a copy such
+    as ``backup/projects/<id>`` is not a workspace (second review: it could
+    never be cleaned up). A symlink is judged as itself, never by what it
+    points to. Never raises."""
+    try:
+        sd = Path(str(sandbox_dir))
+        if _symlink_itself(sd, target) is not None:
+            return None
+        t = _get_safe_path(sd, str(target)).resolve()
+        # the OUTER sandbox's projects folder: from an active project the
+        # scoped dir is `<root>/projects/<id>`, and `/workspace/projects`
+        # names `<root>/projects` (fourth review: `sd / "projects"` did not
+        # exist there, so the delete removed every project)
+        _root = sd.parent.parent if sd.parent.name.lower() == "projects" else sd
+        root_proj = (_root / "projects").resolve()
+        # case-insensitively: APFS takes `PROJECTS` for `projects` (third review)
+        _low = lambda p: str(p).lower()
+        if not root_proj.is_dir() or not (_low(root_proj) == _low(t)
+                                          or _low(t) in {_low(x) for x in root_proj.parents}):
+            return None
+        for child in root_proj.iterdir():
+            if re.fullmatch(r"[0-9a-f]{12}", child.name.lower()) and str(
+                    (project_store.get_project(child.name.lower()) or {}).get("status", "")).upper() == "RELEASED":
+                return child.name.lower()
+    except Exception:                                       # noqa: BLE001
+        return None
+    return None
+
+
+def _projects_folder_block(sandbox_dir, target) -> Optional[str]:
+    """Refusal when removing or moving ``target`` would take the projects
+    folder — every project's workspace — with it: the folder itself or an
+    ancestor of it. Independent of any release (fifth review: with no
+    released project, `delete path=/workspace/projects` removed them all).
+    A symlink is judged as itself. Never raises."""
+    try:
+        sd = Path(str(sandbox_dir))
+        if _symlink_itself(sd, target) is not None:
+            return None
+        t = _get_safe_path(sd, str(target)).resolve()
+        _root = sd.parent.parent if sd.parent.name.lower() == "projects" else sd
+        root_proj = (_root / "projects").resolve()
+        _low = lambda p: str(p).lower()
+        if root_proj.is_dir() and (_low(root_proj) == _low(t) or _low(t) in {_low(x) for x in root_proj.parents}):
+            return ToolOutcome.rejected(
+                "SYSTEM BLOCK: this would remove or move the projects folder, which holds every project's "
+                "workspace — NOT applied. Remove one project's files explicitly, or use manage_projects to "
+                "archive or delete a project.", reason_code="projects_folder_blocked")
+    except Exception:                                       # noqa: BLE001
+        return None
+    return None
+
+
+def _symlink_itself(sandbox_dir, name) -> Optional[Path]:
+    """The path of ``name`` WITHOUT following its last component, when that
+    is a symlink inside the sandbox, else None. Fresh review: delete and
+    rename resolved the link and acted on its TARGET (another project's
+    folder deleted, the link left dangling); a link is removed or moved as
+    itself. Never raises."""
+    try:
+        raw = str(name or "").strip()
+        if not raw:
+            return None
+        rel = Path(raw.lstrip("/"))
+        parent = _get_safe_path(Path(str(sandbox_dir)), str(rel.parent) if str(rel.parent) not in ("", ".") else ".")
+        cand = parent / rel.name
+        return cand if cand.is_symlink() else None
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
+def _released_write_block(project_store, sandbox_dir, target, *, removes: bool = False,
+                          include_scope: bool = True) -> Optional[str]:
     """Refusal message when a write would land inside a RELEASED project's
     workspace, else None. The hard half of release immutability (2026-07-25):
     the briefing steers, but the agent's measured failure mode is regressing
     working artifacts, so the write path itself must refuse. Derives the
     project id from the scoped sandbox_dir OR the target path; one cheap
     status lookup. Never raises — an unresolvable store never blocks a write.
+
+    ``removes`` (§4KW): ``target`` is REMOVED or moved away (the source of a
+    delete/rename/move) — then a parent folder of a released workspace is
+    locked too, and a symlink is judged as the link itself.
+    ``include_scope=False``: judge the target only, not the scoped sandbox
+    (forget of a MEMORY must not be refused because the active project is
+    released — second review).
     """
     try:
         if project_store is None:
@@ -5934,11 +6047,16 @@ def _released_write_block(project_store, sandbox_dir, target) -> Optional[str]:
         cands = set()
         sd = Path(str(sandbox_dir))
         part_lists = []
-        try:
-            part_lists.append(sd.resolve().parts)
-        except Exception:                                   # noqa: BLE001
-            part_lists.append(sd.parts)
-        if target is not None and str(target).strip():
+        if include_scope:
+            try:
+                part_lists.append(sd.resolve().parts)
+            except Exception:                               # noqa: BLE001
+                part_lists.append(sd.parts)
+        _link = _symlink_itself(sd, target) if (removes and target is not None) else None
+        if _link is not None:
+            # the link's own location (its parent resolved, its name kept)
+            part_lists.append(_link.parent.resolve().parts + (_link.name,))
+        elif target is not None and str(target).strip():
             try:
                 part_lists.append(_get_safe_path(sd, str(target)).resolve().parts)
             except Exception:                               # noqa: BLE001
@@ -5950,12 +6068,18 @@ def _released_write_block(project_store, sandbox_dir, target) -> Optional[str]:
             for i in range(len(low) - 1):
                 if low[i] == "projects" and re.fullmatch(r"[0-9a-f]{12}", low[i + 1]):
                     cands.add(low[i + 1])
-        hay = f"{sandbox_dir}/{'' if target is None else target}"
+        hay = (f"{sandbox_dir}/{'' if target is None else target}" if include_scope
+               else ("" if target is None else str(target)))
         for m in _PROJECT_DIR_RE.finditer(str(hay).replace("\\", "/").lower()):
             cands.add(m.group(1))
         pid = next((c for c in sorted(cands)
                     if str((project_store.get_project(c) or {}).get("status", "")).upper() == "RELEASED"),
                    None)
+        if pid is None and removes and target is not None and str(target).strip():
+            # Fresh review: a PARENT of a released workspace — `delete
+            # path=projects`, `rename projects` — named no project id and
+            # removed every project, released ones included.
+            pid = _released_under(project_store, sd, str(target))
         if pid is not None:
             return (
                 ToolOutcome.rejected(f"SYSTEM BLOCK: project {pid} is RELEASED (human-attested, "
@@ -5980,12 +6104,30 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
         # set: `move`/`copy` carry the source in `path` and the real write in
         # `destination`, and the old `path or filename or destination` chain
         # therefore inspected the SOURCE and let the destination through.
-        for _target in (path, kwargs.get("filename"), destination,
-                        kwargs.get("destination"), kwargs.get("dest"),
-                        replace_with if operation in ("copy", "rename",
-                                                      "move") else None):
+        _op = str(operation or "").strip().lower()
+        _moving = _op in ("copy", "rename", "move")
+        _removes_src = _op in ("delete", "remove", "rm", "rename", "move")
+        # EVERY alias the healing step below reads (third review: `file=`,
+        # `new_name=`, `target=`, `new_path=`, `data=`, `text=` reached the
+        # write unchecked — `write file=projects/<released>/app.py` overwrote it)
+        _srcs = (path, kwargs.get("filename"), kwargs.get("path"), kwargs.get("file"))
+        # `url` becomes the target of any non-download operation below
+        # (fourth review: `delete url=projects/<released>/app.py` deleted it)
+        if _op != "download":
+            _srcs += (kwargs.get("url"),)
+        if _op == "copy":
+            _srcs = ()      # a copy READS its source (fourth review: copying out was refused)
+        _dsts = (destination, kwargs.get("destination"), kwargs.get("dest"), kwargs.get("new_name"),
+                 kwargs.get("target"), kwargs.get("new_path"))
+        _dsts += ((replace_with, content, kwargs.get("data"), kwargs.get("text")) if _moving else ())
+        for _target, _rm in ([(t, _removes_src) for t in _srcs] + [(t, False) for t in _dsts]):
+            if not isinstance(_target, str):
+                continue
+            _pb = _projects_folder_block(sandbox_dir, _target) if _rm else None
+            if _pb:
+                return _pb
             _rb = _released_write_block(
-                kwargs.get("project_store"), sandbox_dir, _target)
+                kwargs.get("project_store"), sandbox_dir, _target, removes=_rm)
             if _rb:
                 return _rb
     # Unified mapping for common parameter hallucinations
@@ -6165,43 +6307,52 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
     # `.git/config`, `.git/objects/info/alternates`, `a/b/.git/hooks/pre-commit`
     # and a `.git` file itself are all refused. `_get_safe_path` has already
     # resolved traversal, so `../.git/config` cannot slip past.
-    if operation not in _READ_ONLY_OPS and target_path:
-        try:
-            _probe = _get_safe_path(sandbox_dir, target_path)
-            # Lower-cased: the data volume is APFS (case-insensitive), so
-            # `.GIT/config` IS `.git/config` on disk (fresh-eye §4KC r2).
-            _parts = {str(p).lower() for p in _probe.parts} | {
-                p.lower() for p in
-                str(target_path).replace("\\", "/").split("/")}
-            if ".git" in _parts:
-                pretty_log(
-                    "Write Blocked",
-                    f"{target_path}: refused — a repository's internals are "
-                    f"not editable by hand",
-                    icon=Icons.SHIELD, level="WARNING")
+    # The SOURCE and every DESTINATION (fresh review: copy/move INTO `.git`
+    # passed — the same source-only bug the released lock had).
+    for _git_target in ([target_path] + [d for d in (destination, kwargs.get("destination"),
+                                                     kwargs.get("dest"), kwargs.get("new_name"),
+                                                     kwargs.get("target"), kwargs.get("new_path"),
+                                                     # healed destinations (second/third review)
+                                                     *((replace_with, content, final_content)
+                                                       if operation in ("copy", "rename", "move")
+                                                       else ())) if d and isinstance(d, str)]
+                        if (operation not in _READ_ONLY_OPS and target_path) else []):
+            try:
+                _probe = _get_safe_path(sandbox_dir, _git_target)
+                # Lower-cased: the data volume is APFS (case-insensitive), so
+                # `.GIT/config` IS `.git/config` on disk (fresh-eye §4KC r2).
+                _parts = {str(p).lower() for p in _probe.parts} | {
+                    p.lower() for p in
+                    str(_git_target).replace("\\", "/").split("/")}
+                if ".git" in _parts:
+                    pretty_log(
+                        "Write Blocked",
+                        f"{_git_target}: refused — a repository's internals are "
+                        f"not editable by hand",
+                        icon=Icons.SHIELD, level="WARNING")
+                    return ToolOutcome.rejected(
+                        f"SYSTEM BLOCK: '{_git_target}' is inside a `.git` "
+                        f"directory and cannot be created, modified or removed. "
+                        f"Repository internals are never edited by hand: a "
+                        f"hand-written git config can redirect the repository "
+                        f"out of this workspace or name a program for git to "
+                        f"execute. Use `execute` to run git commands. Nothing "
+                        f"was changed.",
+                        reason_code="dotgit_write_blocked")
+            except ValueError:
+                pass            # path escape: the operation's own guard reports it
+            except (OSError, RuntimeError) as _pe:
+                # ENAMETOOLONG, or a symlink LOOP (`resolve()` raises
+                # RuntimeError). A path this check cannot resolve is one it
+                # cannot CLEAR either — a `.git` symlink pointing out of the
+                # sandbox landed here and the deny was silently skipped (§4KC
+                # r3). Only ValueError was caught before r2, so a looped link
+                # tracebacked out of every mutating op.
                 return ToolOutcome.rejected(
-                    f"SYSTEM BLOCK: '{target_path}' is inside a `.git` "
-                    f"directory and cannot be created, modified or removed. "
-                    f"Repository internals are never edited by hand: a "
-                    f"hand-written git config can redirect the repository "
-                    f"out of this workspace or name a program for git to "
-                    f"execute. Use `execute` to run git commands. Nothing "
-                    f"was changed.",
-                    reason_code="dotgit_write_blocked")
-        except ValueError:
-            pass            # path escape: the operation's own guard reports it
-        except (OSError, RuntimeError) as _pe:
-            # ENAMETOOLONG, or a symlink LOOP (`resolve()` raises
-            # RuntimeError). A path this check cannot resolve is one it
-            # cannot CLEAR either — a `.git` symlink pointing out of the
-            # sandbox landed here and the deny was silently skipped (§4KC
-            # r3). Only ValueError was caught before r2, so a looped link
-            # tracebacked out of every mutating op.
-            return ToolOutcome.rejected(
-                f"SYSTEM BLOCK: '{target_path}' could not be resolved for "
-                f"the write-safety checks ({_pe}), so nothing was changed. "
-                f"Name the file by a plain relative path.",
-                reason_code="unresolvable_path")
+                    f"SYSTEM BLOCK: '{_git_target}' could not be resolved for "
+                    f"the write-safety checks ({_pe}), so nothing was changed. "
+                    f"Name the file by a plain relative path.",
+                    reason_code="unresolvable_path")
 
     if not target_path and operation not in _PATHLESS_OPS:
         return ToolOutcome.rejected(f"SYSTEM INSTRUCTION: The 'path' (target filename) is missing for the '{operation}' operation. You MUST specify WHICH file to {operation}.", reason_code="missing_path")

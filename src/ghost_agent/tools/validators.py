@@ -44,7 +44,8 @@ _SHELL_DENY: tuple = (
     # are intentionally NOT blocked. The two lookaheads require an `r` flag
     # and an `f` flag in the rm invocation before the target.
     re.compile(
-        r"\brm\b(?=[^|;&]*\s-\w*r)(?=[^|;&]*\s-\w*f)[^|;&]*\s+"
+        # long options too (fresh review: `rm --recursive --force /…` passed)
+        r"\brm\b(?=[^|;&]*\s(?:-\w*r|--recursive))(?=[^|;&]*\s(?:-\w*f|--force))[^|;&]*\s+"
         r"(?:/(?:\s|$|\*|\w[^\s'\"]*)|~(?:\s|$|/)|\$\{?HOME\}?"
         r"|['\"]\s*(?:/[^'\"]*|~[^'\"]*|\$\{?HOME\}?)['\"])",
         re.IGNORECASE,

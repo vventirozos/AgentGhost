@@ -2248,6 +2248,11 @@ def _redream_min_new_fragments() -> int:
         return 3
 
 
+#: §4KW: the memory optimizer's generation budget (background; by cancellation).
+_DREAM_DEADLINE_S = 600.0
+_DREAM_CLIENT_TIMEOUT_S = 900.0
+
+
 class Dreamer:
     """
     Active Memory Consolidation System.
@@ -2377,7 +2382,7 @@ class Dreamer:
                 include=["documents", "metadatas"]
             )
         except Exception as e:
-            msg = f"Dream error: {e}"
+            msg = f"Dream error: {str(e) or type(e).__name__}"  # a deadline miss has an empty str (review)
             self.last_dream_outcome = {"phase": "error", "side_output": False}
             pretty_log("Dream Mode", msg, level="ERROR", icon=Icons.FAIL)
             return msg
@@ -2543,7 +2548,16 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             # off_main_only: a worker-pool failure must DEGRADE (outer
             # except returns "Dream error") instead of falling back onto
             # the single main inference slot mid-user-turn.
-            data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=True, off_main_only=True, timeout=180.0, task_label="self-play")
+            # §4KW (review): a 4096-token generation on the worker at its
+            # measured 11–32 tok/s cannot finish in 180 s, and the client's
+            # ReadTimeout counted as a NODE FAULT against the node the critic
+            # shares (3 live, two of them today on an idle node). Background
+            # work: a longer deadline, enforced by cancellation (never charged
+            # to the node). The client timeout is set ABOVE the deadline so it
+            # never fires: this call never charges the node at all — a hung
+            # node is caught by route()'s and the critic's own checks.
+            from ..utils.aio import wait_for as _dream_wait_for
+            data = await _dream_wait_for(self.context.llm_client.chat_completion(payload, use_worker=True, is_background=True, off_main_only=True, timeout=_DREAM_CLIENT_TIMEOUT_S, task_label="self-play"), _DREAM_DEADLINE_S)
             content_text = data["choices"][0]["message"]["content"]
             
             result_json = extract_json_from_text(content_text)
@@ -2964,7 +2978,7 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             return msg
 
         except Exception as e:
-            msg = f"Dream error: {e}"
+            msg = f"Dream error: {str(e) or type(e).__name__}"  # a deadline miss has an empty str (review)
             self.last_dream_outcome = {"phase": "error", "side_output": False}
             pretty_log("Dream Mode", msg, level="ERROR", icon=Icons.FAIL)
             return msg

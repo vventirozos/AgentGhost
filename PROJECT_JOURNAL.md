@@ -49396,3 +49396,384 @@ anchors repaired. **Suite:** see deploy line below.
 **Deployed 11:04**, listener 16955 → 22692, one process. Live: a tool-free probe (check ran, ~1.1 s to the
 outcome, NO, shipped) and a `web_search` probe (check ran after the tool, NO; verified). No "Worker Node Failed",
 no breaker line.
+
+## §4KW review round — "do more independent reviews, expand the search to more systems" (2026-10-02) — R0 scope
+
+Four independent readers, each on a system the earlier §4KW rounds had not read: (1) timeouts, deadlines and the
+node circuit breaker (`core/llm.py` route/keepalive, dream, swarm); (2) every model-facing runtime steer, enumerated
+with its live fire count; (3) records vs reality (corpus rules, the outcome line, the record cap); (4) the Slack bot
+and the member wall. Then a second independent reader on each batch of fixes. Out of scope: anything the operator
+closed (search guard, §4KS removed designs), the data relabel of old test rows (asked, below).
+
+## §4KW review round — outcome (2026-10-02)
+
+**Shipped (first readers).** *Node blame:* `route()`'s deadline enforced by cancellation, the client given
+`_ROUTE_CLIENT_TIMEOUT_S` (60 s) — a healthy Nova answering at 12.1 s while busy with our own critic had been charged
+a node fault (11 live, one opened the breaker the critic shares); keepalive pings not charged while our own gated
+jobs fill every slot; swarm charges only node faults (a 4xx is our payload); a client closed at shutdown is not a
+node fault; the memory optimizer's 4,096-token call gets a 600 s deadline by cancellation (it could not finish in
+180 s). *Steers:* the answer-now retry names the dropped calls and says they produced nothing (slack-36bd38b6 shipped a
+"simulated" execute result); "don't run it" skips the untested-write repair and says "Not run, as you asked" (9 live
+requests had been repaired and recorded FAILED); the no-progress breaker's final for lookup loops answers from the
+results instead of "report success … devtools" (25 fires); the risk checklist is kept out of the reply and never
+stacked on another steer (⚠ the live `risk_steer` arm's treatment text changed on 2026-10-02); members are not steered
+to notify/learn_skill/update_profile or to tools they lack; the constraint block skips the self-play wrapper's own
+rules (~1,500 turns lost the challenge's constraint) and reads Greek. *Records:* the canned no-answer fallback is
+FAILED (corpus rule 1c) and on the line; a reply over the 16,000-char record cap keeps its tail (abort markers).
+*Slack:* `thread_broadcast` messages accepted; Slack's entity/link encoding decoded for the agent (`slack_to_plain`)
+with chat-template and protocol tags defused; every outgoing text escaped first (a member could make the bot post
+`<!channel>`); the thread is fetched across pages and the message being answered is always in the request; the
+bot's replies labelled by the reply index's requester, not adjacency; failures logged.
+
+**Second readers: MAJOR 4, every one inside this round's fixes.** Slack (3): the missing-image note was unescaped; the
+adjacency label mislabelled a reply when a member spoke in between; decoding handed `<|im_start|>` / `<tool_call>` to
+the model raw. Core (1): **the cancellation deadline stopped a HUNG node from ever tripping its breaker through
+`route()`** (reviewer's repro: five hung calls, breaker closed; pre-change tree opened it). Fixed by
+`_charge_route_deadline_miss`: charged only when our request had held the node's permit alone for
+`_ROUTE_HUNG_SILENCE_S` (6 s; a routing call is ~0.5 s) — queueing, a node busy with our critic, and the caller's
+outer cancellation stay uncharged. MINOR (6): keepalive excused with an unprobed capacity; `_NO_RUN_RE` let two words
+between the negation and the verb ("don't forget to run the tests", "do not deploy without testing it" read as
+no-run) — now the negation governs the verb directly with the work as object, and a "without running" under an
+earlier negation is skipped; Greek negations matched only accented lower-case and also caught "όχι μόνο", "αν ποτέ",
+"μη-" — now matched on accent-folded text with those excluded; the risk line "do 1–2 in your reasoning" contradicted
+step 2 (a tool call) → "Never copy this checklist into your reply."; `browser` was in the lookup set (its repeats are
+interaction steps); the risk/search-yield coupling (documented, kept). NIT (3): stale comment, empty dream timeout
+message, "`?`" named as a dropped call.
+
+**Pins:** `tests/test_4kw_review_round2.py`, `tests/test_4kw_review_round3.py`, `tests/test_4kw_slack_review.py`;
+legacy pins updated to the new contracts (route client timeout, the risk line, `browser`).
+**Battery** (scratch copy of src tests interface scripts docs; 9 files): 48 mutants incl. NOOP (passes) and KNOWN-BAD
+(the hung node never charged — killed); tree == pristine after every run. First pass 41/43 killed, 3 stale anchors;
+two survivors turned into pins — "don't run the &lt;anything&gt;" accepted ("don't run the risk of breaking prod" now
+pinned False) and Slack's `&amp;` decoded first (a typed "&lt;b&gt;" double-decoded); then 46/46 killed. A
+source-text pin I wrote (`inspect.getsource` on dream) tripped the pin-quality ratchet and was replaced by driving
+`Dreamer.dream()` to its error path.
+**Suite:** 26,650 passed, 1 failed (the ratchet, above; fixed and re-run with its file), 68 skipped, 693 s.
+**Deployed 15:15:** agent listener 22692 → 35898, one process, "system ready" +1; Slack bot 840 → 36014 (Bolt
+connected, reply index 210). Live: two probes — the routed announced-work check answered on Nova in 1.1–1.3 s, no
+node-failure or breaker line, outcome lines `ok`.
+**Open, said plainly:** (1) 17 test rows recorded as user traffic (probe4jr1–5, probe4js1, probe4jt, live4ks01–04,
+live4kt01, kf-live, kg-live, yt-4ke-live, fb-ctrl-01/02) — relabelling is a data change, left for the operator;
+(2) the 8-char request tag in the log is ambiguous across days; (3) `extra.verifier_verdict` can go stale after a
+later relabel; (4) a hard-killed turn leaves no record; (5) the ALL-CAPS constraint rule fires on acronyms;
+(6) the `risk_steer` arm's treatment text changed mid-experiment and is now suppressed on turns where another steer
+fired first — read its numbers from 2026-10-02 as a new arm.
+
+## §4KW — test rows relabelled (2026-10-02, operator: "do" — the 17 test rows recorded as user traffic)
+
+The operator's test requests probe4jr1–5, probe4js1, probe4jt, live4ks01–04, live4kt01, kf-live, kg-live, yt-4ke-live,
+fb-ctrl-01/02 were sent with an `X-Request-ID` but no `X-Ghost-Origin: probe` header (`is_probe_request_id` needs
+`probe-` with a dash), so they were recorded as user turns. Fix = what a header-marked probe writes, store by store
+(`scripts/probe_relabel_4kw.py`, dry run default, `.pre-4kw-*.bak` beside every file, refuses a file that grew while
+read): **19 trajectory rows → `task_kind="probe"`** (the 17 + two reflections of them; original kind kept in
+`extra.relabelled_4kw`); **24 calibration rows removed** (a probe never writes one, and the readers count every
+origin but `bench` as real — a relabel would not have excluded them); **254 `rrf/observations.jsonl` rows removed**
+(a probe never credits retrievals); **2 playbook lessons retracted** from JSON + vector store (both were the probes'
+own task text). Left by design: the foresight ledger and the verifier escalation/shadow logs (probes write them).
+Not separable, left: helpful-retrieval counters those turns added to other lessons, and the experiment enrolment
+records are read through the trajectories (now excluded). Pinned on a fixture store
+(`tests/test_probe_relabel_script.py`, 4 tests; 8/8 script mutants killed, NOOP clean). Applied with the agent
+stopped (`launchctl bootout` → script → `bootstrap`; listener 35898 → 39050, one process, `system ready` +1).
+Verified through the agent's readers: 0 of the 19 visible without `include_probes`; 0 calibration / rrf / playbook /
+vector rows left. **Cause not removed:** a test sender that sets its own `X-Request-ID` must also send
+`X-Ghost-Origin: probe` (or use a `probe-` id).
+
+## §4KW — fresh-eye verification of today's changes (2026-10-02, operator: "verify all your changes, use fresh eye reviewers")
+
+Four independent readers (none wrote the code): route/breaker, steers/gates/records, Slack bot, the data relabel.
+**MAJOR 4 — every one inside today's work:**
+1. *Breaker:* "alone on the node" was read only at the deadline, so a critic verdict that slowed Nova and finished before
+   the deadline still got Nova charged (reproduced through the real `_node_slot` path). Now: alone for the WHOLE hold,
+   from the concurrency-seconds accumulator (`_settle_conc`, then `accum <= hold·1.02`).
+2. *No-run:* the Greek "μην το ανεβάσεις χωρίς να το τρέξεις" ("don't deploy it without running it") read as "don't run
+   it" — the earlier-negation skip existed only for the English branch.
+3. *Slack:* `[everyone](!channel)` became `<!channel|everyone>` through the link conversion — the escape-first fix left the
+   link TARGET free. Links now convert only for http(s)/mailto targets.
+4. *Data:* three dream lessons restating test prompts were not retracted (no `source_trajectory_id`; dream summarises a
+   40-trajectory window) — "paste manage_services output verbatim as the entire reply" had been retrieved 97 times at
+   confidence 1.0. Retracted by exact trigger (archived first); lessons where test turns were only part of the window
+   are left (not separable).
+**MINOR fixed:** a swallowed cancel (py3.10 `wait_for` on the permit) held route up to the 60 s client timeout → bounded by
+`_ROUTE_CANCEL_GRACE_S` (1 s), an answer landing in the grace is used, the caller's cancel propagates (was swallowed by
+`except BaseException`); curly apostrophes; πότε ("when") folded into ποτέ ("never") — 4 of 5 corpus hits were questions
+(`_NEVER_EL_RE` on the accented text); "δεν χρειάζεται να το τρέξεις"; qualified prohibitions ("never run this in
+production", "as root", "yet", "manually") are not no-run; "Not run, as you asked" became "Not re-run after the last
+edit" when an earlier version was executed; the outcome line reads the CAPPED record; Slack: the agent's own
+`<system_state_update>` tag, `<thinking>`/`<tools>`/`<tool_calls>`, Gemma turn markers and attachment FILE NAMES defused;
+the thread parent read once (Slack repeats it per page); a failed later page keeps earlier pages. Data: 10 more test
+rows of the same kind (probe-a3b3b65c, probe-87956894, slack-kd4probe, sniffer-probe-1, fsnote-demo-2, imgtest01,
+smoketest-stream-1/2, watchtest1 + its watch callback; probe-fb-probe-01's calibration row) and 27 diary rows
+(`selfhood/autobiographical.jsonl`, written only for user turns). Integrity of the first apply was confirmed byte-exact.
+**Left, said plainly:** VERIFY and DISTILL_PATTERN still pass their own `timeout` as the client timeout (a ReadTimeout
+there is still charged — same class, not changed today); a member can still receive tool-agnostic "do it now" steers
+(trailing-promise guard, `_ANNOUNCED_WORK_DIRECTIVE`, risk step 2 — predates §4KW); `δεν` is not a constraint negation
+(too common in statements); fitted artefacts (`calibration_params.json`, `rrf/weights.json`) keep the removed rows until
+their next refit; the chroma backup is the sqlite file only (segments unchanged since July). **Flagged to the operator,
+not touched:** a reflection lesson for "lots of stuff in your sandbox, clean it up" recommends
+`file_system delete path=/*` (retrieved 3 times).
+**Pins:** production-path route tests (real `LLMClient` + `httpx.MockTransport`: hung node charged and cleaned up, critic
+overlap — late and brief-early — not blamed, queued behind ours, swallowed cancel bounded, caller cancel propagates,
+answer in grace used); Slack link/defuse/pagination; constraint and no-run tables; relabel fixture store (diary, named
+lessons). **Battery:** 25 mutants on a scratch tree — first pass 21 killed, 4 survivors: 2 missing pins (accumulator
+not settled — needed a brief EARLY overlap; ποτέ-only sentence — my "never" examples also carried μη/ΜΗΝ) and 2
+equivalent (a redundant `.done()` check removed; a πότε mutant that could not match, replaced by the real hazard) →
+24/24 killed, NOOP clean, tree == pristine. **Suite:** 26,708 passed, 0 failed (704 s).
+**Deployed 16:03:** agent bootout → cleanup (`--apply`) → bootstrap, listener 39050 → 71393, one process, `system ready`
++1; Slack bot 36014 → 71576. Verified through the readers: 30 test rows relabelled, 0 visible without `include_probes`; 0
+calibration/rrf/diary rows, 0 named lessons, 0 vector docs left. Live: two probes WITH the header — routed check on Nova
+~1.1 s, outcome `ok`, no node failure/breaker/traceback; both recorded `task_kind=probe`.
+
+## §4KW — five more systems reviewed (2026-10-02, operator: "do more independent reviews, expand the search to more systems")
+
+**R0.** Five independent readers on systems no §4KW round had read: (1) the API surface and request classification;
+(2) the lesson pipeline (producers, admission, credit, retraction); (3) scheduler, watches, background jobs and idle
+work; (4) the sandbox tool layer; (5) memory write and recall. Read-only; every finding reproduced or counted live.
+
+**MAJOR (15 across the five).**
+- *Memory — owner data destroyed:* `forget <document>`'s semantic sweep deleted every conversational fact within
+  0.8/0.6 of the target; unrelated facts sit at 0.53–0.65, so `forget postgresql-19-A4.pdf` (09-09) removed the owner's
+  birth date, both sons' birthdates and home town, and a YouTube forget (09-24) the owner's name. `update_profile` deleted
+  on ANY falsy value: a channel member's empty call removed `root.name` (slack-3851e437, 09-24); the `relationships`
+  category vanished by an unattributed path. Fixed: a file/document target removes only facts that name it, an entity
+  needs a near-paraphrase (0.3) or a literal mention; only an explicit `value=""` deletes and the result names the value;
+  a read-degraded profile refuses writes VISIBLY (save() refused silently and the tool said SUCCESS).
+- *Probe episodes:* `_record_episode_safe` skipped only members — 91 probe episodes recalled ~2,600 times ("Describe the
+  colour of the sea…" ×327) → gated on `turn_may_teach`; the context-summary archive too.
+- *Internal turns as user traffic:* job wakes and scheduled/watch turns (`job-`/`sched-`/`sub-`) were `user_request`,
+  booked calibration and could teach, while `is_internal_request` said internal → `turn_origin` = `"internal"`,
+  `task_kind="internal"`, no calibration, never teaches. A job wake's conclusion was discarded → recorded like a
+  scheduled result. Interval tasks restarted their clock on every boot (a daily task never fired across 8 restarts in
+  34 h) → anchored at `created_at`.
+- *Sandbox:* `delete path=projects` removed every project including RELEASED ones (the lock read only paths naming an
+  id) → `_released_under`; delete/rename followed a symlink and removed its TARGET → the link itself; `execute`'s
+  file-not-found retry re-ran a failed `rm`/`mv` from another folder (deleted the root's file; `rm a b` deleted a twice)
+  → a destructive final segment is never re-run. Also: bulk shell removal (`rm -rf projects|*`, `find . -delete`)
+  refused while a released project exists; long-option `rm --recursive --force /…` denied; `.git` destinations checked;
+  `forget` respects the released lock. `delete path=/*` itself does nothing today (no globbing; `/` is the sandbox root).
+- *Lessons:* no screen on what a lesson PRESCRIBES and reflection wrote plans its own judge rejected ("delete path=/*" from
+  a refute of a correct cleanup) → `prescribes_destruction` at the single write point + judged-and-rejected plans are not
+  lessons. Credit for PRESENCE: both credit sites passed every surfaced lesson as `top_triggers`, counted as relevance — every
+  lesson in the prompt got helpful +1 / confidence +0.05 per clean turn (154/290 at confidence 1.0; helpful vs verified
+  outcome r=0.28), and the judge's later verdict was blocked as a double credit → credit is word overlap or the judge, never
+  on a non-teaching turn. Cross-producer vector twins rewrote lessons (dream "verify before cleaning" rules → the delete
+  lesson, frequency 1→17; a deploy-check script → a dream rule, verified inherited) → a twin from another producer leaves
+  the lesson untouched (word overlap could not separate these from legit reworded twins, which score < 0.2).
+**MINOR fixed:** the `/api/feedback` probe gate read the feedback request's own context (always "user") → the labelled
+row's `task_kind`. **Left, said plainly:** request-keyed reflection lessons leak into unrelated turns (1,592 injections,
+5 on their request) — needs generalised triggers; retrieval ranking ignores the credit signals; late REFUTED verdicts do
+not reverse credit; the journal post-mortem writer records no provenance (65 lessons); `rem_fragments`/`postmortem`
+admissibility rows are not wired; episodes are injected twice per turn (two renderings); write-time dedup is exact-hash
+only; tool/web content carries no untrusted marker; no disk quota on the sandbox; DST drift in cron tasks created from
+the tool's hard-coded Athens example; the 8-char log tag collides within a day; `X-Request-ID` prefixes change behaviour
+without a header (key holders only).
+**Data (operator-chosen):** profile `root.name` + `relationships` restored from the 09-04 backups and the owner's 09-06
+write; 91 probe + 6 member episodes removed with their vector copies; 7 lessons retracted (6 dream restatements of test
+prompts, 1 minted from a sub-agent leaf) — `scripts/memory_repair_4kw.py`, backups `*.pre-4kw-repair-*`. Kept by the
+operator's choice: the "delete path=/*" lesson (now refused at write time for any new one) and the test-prompt lessons.
+**Pins:** `tests/test_4kw_review_round4.py` (69: released parent lock ×3 ops, symlink delete/rename, copy regression, `.git`
+destinations, forget lock, re-run table, bulk-shell table, long options, origin by request id, probe episode, scheduler
+cadence with real APScheduler, forget sweep on documents and entities, update_profile table, degraded store on a real EIO,
+bus report, credit by relevance, destruction screen table, write-point refusal, cross-producer twin), plus
+`tests/test_memory_repair_script.py`; legacy pins updated to the new contracts (the omitted-value delete REVERSED, the
+`top_triggers` credit count, the file-ledger site/slot counts +2). **Battery:** 31 mutants on a scratch tree — NOOP
+clean, KNOWN-BAD killed, 2 invalid anchors repaired → 30/30 killed, tree == pristine. **Suite:** 26,780 passed, 1 failed —
+`test_clockwork_ux::test_a_deploy_stages_probes_installs_and_restarts` (an untouched ClockworkPi deploy test reading a
+log a backgrounded fake process writes); its file alone and 3× under `-n 4` with this round's files: all pass. Not
+reproduced; cause not known (timing under full-suite load is the likely shape).
+**Deployed 17:4x:** bootout → `memory_repair_4kw.py --apply` → bootstrap. The first apply restored the profile and removed
+97 episodes (51 vector copies) and then failed on the lessons — a second `chromadb.PersistentClient` in one process
+raises "already exists … different settings"; fixed to one shared client, re-run with the agent stopped again (profile and
+episodes idempotent no-ops; 7 lessons retracted). Listener 71393 → 29766 → 30404, one process. Slack bot unchanged this
+round. Verified: profile carries root.name + 5 relationship keys; 403 episodes (500 − 97); 283 lessons. Live probe
+(header): "What is my name, and what are my sons called?" → "Your name is Vasilis, and your sons are called Thodoris and
+Leonidas."; outcome ok; no episode written.
+
+## §4KW — lessons keyed to one request stay with that request (2026-10-02, operator: "fix the lessons keyed to one specific request … needs a redesign of how lesson triggers are generated")
+
+**R0 / the defect, measured first.** Reflection, the post-mortem engine and the journal post-mortem keyed lessons on the
+failed request's text, and the fix was a corrected plan for THAT request ("1. Directly answer 'Yes' … Professor Spiros
+Denaxas"). Retrieval embeds the whole lesson, so a plan whose wording reads generic matched almost any request. Live store:
+40 lessons whose trigger IS a recorded user request (31 reflection, 8 journal post-mortem, 1 postmortem), injected 927 times
+on the recorded traffic. A more generic trigger alone would not fix it: the FIX text itself is case-specific.
+
+**Design (`memory/lesson_scope.py`).** `scope="request"` (+ `source_request`): one request's corrected plan, admitted only
+when the new request IS that request (`same_request`: character similarity ≥ 0.85, or the shorter request's content words
+all in the longer one and ≥ half its size). Calibrated on the 927 injections: similarity alone cannot separate a rewording
+("how old is leonidas ?" vs "do you know how old is leonidas now ?", 0.70) from a template with another payload ("Use
+deep_research ONCE on: <other topic>", 0.64–0.70); containment does. 20 admitted (all retries/rewordings, read one by one),
+907 refused. Applied in every retrieval branch (vector, keyword, recency) — both delivery surfaces. General lessons keep
+relevance retrieval.
+**Generation.** Reflection asks, besides the plan, for GENERAL LESSON: SITUATION / MISTAKE / RULE in general terms (or NONE).
+The plan is written request-scoped; the rule becomes a general lesson only when the plan judge CONFIRMED the plan and the
+situation/mistake pass `is_general_trigger` / `is_general_text` (no URL, path, @-mention, quote, or number taken from the
+request; at most half its content words the request's). The post-mortem engine (SITUATION line) and the journal post-mortem
+(`situation` field; provenance `source="journal_postmortem"`, never recorded before) write general when general, else
+request-scoped. A vector twin from the other scope is written fresh, never merged.
+**Measured on the live model** (one call at a time, agent idle): replay 1 (14 real failures) — plans parsed 12/14 (the 2
+misses were the thinking cap, reproduced with the OLD prompt too), one false reject on HTTP codes (numbers are now specific
+only when they come from the request), 5/10 rules mistake-less → MISTAKE line added. Replay 2 (final prompt, 8 failures):
+8/8 plans, 8/8 general lessons, all pass generality and the write gate. Both replays generalised the WRONGLY-refuted sandbox
+cleanup into "clear the entire directory" → rules only from confirmed plans, and the destruction screen covers
+clear/purge/empty. **End to end on a copy of the live store** (real `get_playbook_items` + vector store, 400 recorded
+requests): request-keyed lessons on ANOTHER request 93 → 0; on their own request 25 → 25.
+**Found on the way (live):** the trajectory recorder read `last_playbook_triggers` without the turn guard, so a turn with no
+playbook lookup recorded the PREVIOUS turn's lessons ("what about Veronica Moser ?" recorded a probe's project lessons; its
+own retrieval returns none) → it reads the same turn-guarded union as the outcome credit.
+**Migration:** `scripts/lesson_scope_migrate_4kw.py` tagged the 40 (nothing rewritten or deleted; backup
+`*.pre-4kw-scope-*`), applied 17:55 with the agent stopped. **Pins:** `tests/test_4kw_lesson_scope.py` (calibration table,
+generality table, every retrieval branch, storage, cross-scope twin, parsers, both post-mortems, the recorder),
+`tests/test_lesson_scope_migrate_script.py`; legacy pins updated (post-mortem threading expects the request scope;
+experiment-wiring helper stages a turn key). **Battery:** 31 mutants — first pass 25 killed, 6 missing pins (incl. a real gap:
+`~/` paths) + 1 redundant check removed → 30/30 killed, tree == pristine.
+**Left, said plainly:** the bus fans a turn into sub-queries; a scoped lesson is admitted when a SUB-QUERY is its request (the
+93 → 0 measure used raw requests); the 40 legacy plans are scoped, not generalised; a scoped lesson still occupies a vector
+candidate slot before the scope filter.
+**Suite:** 26,833 passed, 0 failed (771 s). **Deployed 18:31:** kickstart, listener 64144 → 15487, one process, `system
+ready` +1 (migration already applied at 17:55). Live: two probes answered normally. A probe turn runs NO memory
+hydration (no "Hydration tiers" line), so injection cannot be observed with a probe and was not; the evidence is the real
+retrieval on a copy of the migrated live store (93 → 0). The recorder fix shows on the next real user turn.
+
+## §4KW — fresh-eye verification of the lesson-scope redesign and the five-system fixes; open items closed (2026-10-02, operator: "verify all your changes using fresh eye reviewers and fix the still open items")
+
+Three independent readers: the lesson-scope redesign, the five-system fixes, today's data changes. **MAJOR 11, every one inside
+today's work.** Correction first: my previous entry said a probe turn runs NO memory hydration — WRONG (I read one probe's lines);
+probes hydrate and were bumping lesson/episode/vector usage counters (now blocked, below).
+*Lesson scope (5):* (1) the vector metadata cuts a trigger at 200 chars, so the exact-only playbook lookup missed every longer
+trigger and those scoped lessons skipped their scope check (9 of 40 live) → unique-prefix resolution, unresolvable = dropped while
+scoped lessons exist. (2) `same_request` matched different tasks ("start/stop the chess service", "my name is vasilis" ~ "what is
+my name", "Redo this" ~ every redo) → the SAME CONTENT WORDS (accent-folded, per-word typo ≥ 0.86 on 5+ letters, numbers exact
+incl. single digits), ≥ 2 of them; fail-closed for retries that add a word. Every typo-only match over the 1,608 recorded
+requests was read; "restart"~"start" and "servers"~"services" set the threshold. (3) the scope test saw the bus's LLM
+SUB-QUERIES → the user's request is threaded (`scope_request`). (4) the migration missed request-keyed lessons (truncated,
+prefix, probe-request, paraphrased) → 11 more scoped. (5) JSON dedup ignored scope → a same-trigger plan scopes the stored row.
+Also: candidate pool widened by the number of scoped lessons (open item 3); `source_request` 4,000 chars + truncated-copy
+matching; the rule/fix must be general too in all three producers.
+*Five systems (5):* forget refused whenever the ACTIVE project was released (judged the sandbox, not the target) → the lock is
+checked per FILE the sweep deletes; the forget threshold 0.3 deleted nothing for real entity forgets ("my address" at 0.57) →
+a fact sharing a content stem with the target, up to 0.7; the bulk-shell guard refused `mv *.png`, `git rm -r --cached .` and
+missed `rm -rf ..`, `rm -r /workspace/projects` → reworked, workdir-aware; `_rerun_unsafe` took `2>&1` as a write and any `find` as
+destructive (87 of 1,395 recorded commands lost the heal) → real writes and `find -delete/-exec` only; the healed destination
+params (`content`, `replace_with`) skipped the `.git` and released checks. MINOR fixed: `sub-` ids overrode sub-agents ("sim")
+and leaves (their own kind) → "internal" comes after the label and the sim check; the hydration judge and journal backstop
+excluded only probes → `turn_may_teach`; a plan-judge non-answer counted as a rejection, and the first-line verdict branches were
+unreachable ("VERDICT:" prefix); the parent lock over-blocked `backup/projects/<id>` and links; destruction-screen false
+positives ("Remove all debug prints", "Clear all filters", `DROP TABLE IF EXISTS`, `/tmp`); a stale lesson from one producer
+could block another's correction forever → written separately; forget reported a refused profile write as removed; credit on an
+empty request fell back to credit-everything; the `job-job-` wake id.
+*Data (1 MAJOR):* episodes #364/#365 (probes, 112 recalls) were missed → removed. Also: the memory-repair script's two chroma
+backups shared one name (the 16:04 `pre-4kw` copy is the real pre-repair state) → distinct names; 9 scoped lessons were general
+rules → general copies generated (below); birthdates were going to render as stale → `*_birthdate/_birthday/_name` durable.
+**Open items closed.** Sub-queries (above). Candidate pool (above). **General rules from the legacy plans:** for every scoped
+lesson whose reflection plan was CONFIRMED, or whose fix is already a rule (post-mortem/journal), the main model was asked for
+the GENERAL LESSON block; 45 candidates, all passed every gate, all read; 1 dropped by hand (a "check safety guidelines" rule from
+an image request — contrary to the operator's no-guard policy on uncensored testing); 44 written. Two defects found applying them:
+my script passed a collection-only stand-in, so every vector TWIN write failed after the JSON row was saved (0 of 44 twins) —
+and the boot reconcile that should heal that lived in `main()`, which runs BEFORE `lifespan` creates the vector store, so it
+NEVER ran (nor did the boot orphan reconcile, since 2026-09-09; its source-text pin could not see that). Moved to `lifespan`
+(`_start_boot_skill_reconcile`, both directions), pinned behaviourally. The 44 writes pushed the playbook to its 300 cap: 27
+lowest-utility lessons were cap-trimmed (archived in `skills_pruned_archive.jsonl`, mostly never retrieved, 5 of them scoped).
+**Battery:** 31 mutants on a scratch tree — first pass 22 killed, 7 survivors (6 missing pins + an EQUIVALENT KNOWN-BAD control,
+replaced) → 30/30 killed, NOOP clean, tree == pristine. Pin-quality ratchet re-baselined DOWN (3 source-text pins replaced).
+
+## §4KW — third fresh-eye verification; the three "not fixed" items closed (2026-10-02 night, operator: "verify all your changes using fresh eye reviewers and fix all the "not fixed" items")
+**Reviews (3 fresh readers + a data audit).** MAJOR in my own code: (1) `same_request` matched rewordings that flip the
+meaning (negation, quantity, direction, "this/it") → ordered content words, those words count, deictic never matches,
+dotted names whole, truncated copy only at exactly 400/4,000 chars; planner/volatile sub-queries now judged against the TURN's
+request (`lesson_scope.current_request`). (2) cross-producer merges overwrote another producer's fix and `verified` → evidence
+only; separate row for a different-trigger twin; merged fix re-embeds the twin (`_refresh_twin`). (3) the bulk-removal shell
+guard was a regex (bypassed by `$(pwd)/*`, `find -delete`, `xargs rm`, `/./`, `cd projects; rm -rf <id>`, case) → token
+analysis `_bulk_destructive`; the re-run guard sees wrapped verbs, `&>`, quoted `>`. (4) `forget` by words deleted every
+matching fact ("user nickname" → 8 owner facts) → only an unambiguous single match, else candidates named. (5) the
+file_system lock checked only `path`/`destination` → every alias. Data audit MAJOR: one generated lesson harmful
+(likeness from a description) and ≥20 request-shaped lessons still unscoped; m6: 111 of 299 vector twins carried an older fix.
+**Not-fixed items closed.** *Loosely related lessons:* 546 real (request, lesson) pairs labelled by the main model; whole-lesson
+distance barely separated them (7% of delivered top-5 relevant). Gate: trigger shares a weighted term with the request or is
+within cosine 0.30 on its own (`TRIGGER_CLOSE_DISTANCE`, env `GHOST_LESSON_TRIGGER_DISTANCE`): delivered −66%, precision
+0.07→0.18, recall 0.84. Still imperfect (a string-reversal request gets log-string lessons). *Request-shaped unscoped + the
+`delete path=/*` lesson:* `scripts/lesson_repair_4kw_r3.py` (rows named by EXACT trigger, all-or-nothing, whole memory dir
+backed up as `memory.pre-4kw-r3-<stamp>.bak`): 27 retracted (13 harmful/overbroad generated rules, 14 junk incl. the sandbox
+delete lesson), 25 scoped, 3 used lessons restored from the cap-trim archive, 107 stale twins re-embedded. Trial on a snapshot
+found one more bug: `heal_missing_twins` marked a healed row's TASK as present, so a second row with its own trigger and the
+same task never got a twin → only the row's own key is marked (pinned; pin fails on the old code). Applied live with the
+agent stopped: 276 lessons (70 request-scoped), 109 twins written. Live probes (labelled `probe`): VPS-pricing request gets
+no Hetzner lesson; "clean up the sandbox" gets no delete lesson.
+**Verification.** Battery 29/29 non-equivalent mutants killed, NOOP clean, tree pristine; full suite 26,974 passed, 1 failed
+(new env flag undocumented → documented; that file + the heal/repair suites re-run green, 248 passed). Heal fix and repair-script
+fixture added after the suite run (their suites re-run green). Docs: `memory/skills.html`, `tools/execute.html`,
+`tools/memory_tools.html` (#4kw-r3).
+
+## §4KW — fourth fresh-eye verification; every finding fixed (2026-10-02 late night, operator: "fix all of them, usual verification protocol")
+**Reviews (4 fresh readers: lesson code, tool guards, live data, verification quality) — 13 MAJOR, all in my own earlier fixes.**
+*Data loss / locks:* (1) `delete path=/workspace/projects` from an ACTIVE project removed every project — the parent check looked
+for `<project>/projects` → it finds the OUTER projects folder. (2) `url=` bypassed the released lock (healed into the target) →
+checked. (3) a released project as the working directory made the shell guard a no-op (ids read from the text) → the guard now
+reads what a command WRITES (`_released_written_ids`: redirect targets, copy destinations, mv/rm/sed -i/touch/tar -x/unzip/git
+writes, relative paths in a released cwd); reading/copying out is allowed. AND the hard backstop: release sets the macOS
+user-immutable flag — measured inside the sandbox container: rm, write, create, mv, shutil.rmtree, and even `chmod -R u+w`
+are refused (the old a-w bits were undone by `chmod -R u+w . && rm -rf *`, container root holds FOWNER). Applied to the 2 live
+released projects (`scripts/release_immutable_4kw.py`); copies drop the flag; the test session clears it under its temp tree.
+(4) the bulk guard and (5) the re-run guard were text regexes → `tools/shell_analysis.py`: quote-aware split, wrapper strip
+(sudo -u, timeout, nice, exec, xargs -0 -r, do/then), `bash -c` payloads expanded, braces, for-loop variables, `x/..`, cd/pushd
+directory tracking, git clean, tar --remove-files, `proj*`; false positives gone (`grep -rn 'rm -rf' .`, `--rm`, `cd /tmp && rm
+-rf *`, rsync source, `..data`). (6) `forget user` deleted all owner facts via the LITERAL path → a hub-word target names no
+fact, an attribute noun several facts mention is a choice; inflections not prefixes (`homework` ≠ "home town"); a single full
+match beats partial ones. (7) the lesson screen missed tool-call forms (`command='rm -rf *'`, `file_system(... path=
+"/workspace/projects")`, "Wipe /workspace clean") and refused targeted cleanups → quoted payloads, command starts anywhere,
+path prose, the execute analyser; narrowing qualifiers.
+*Lesson matching:* (8) "install"~"uninstall" (prefixes), plurals, "any" were typos/function words → refused; typo = 1 edit (2
+for 8+ letters) at ratio ≥ 0.86 (measured: "present"/"president", "listing"/"listening" pass the ratio alone). (9) plans for
+different requests merged (reordered copy, close vector twin) → `_other_request`. (10) 13 of 70 scoped lessons could never match
+their own request ("an image THAT looks like") → the deictic rule only for ≤ 3 content words; one-word requests by whole
+wording; home paths compared in the recorded redacted form. (11) the 25 lessons scoped last round were keyed on MODEL
+restatements → 2 traced to the real request and re-keyed, 23 retracted, 3 general rules extracted.
+*Verification:* (12) 20 of 51 reviewer mutants survived the tests → behaviour tests for each (gate threshold/overlap/query,
+refresh, heal, forget bounds, producer rule). (13) 14 tests were source-text checks dressed as AST → replaced by behaviour
+tests; the reflection sink and the plan-verdict parser moved to `reflection/sink.py`, the lesson credit to
+`_credit_turn_lessons`, the trajectory label to `trajectory_task_kind`; ordering checks use AST nodes.
+*Also:* a malformed `GHOST_LESSON_TRIGGER_DISTANCE` failed the import → default kept; long-trigger items carry the row's full
+trigger; an orphaned scoped twin is never served; trigger embeddings cached across turns; `_refresh_twin` re-embeds one
+lesson; the heal re-checks each lesson under the lock; scripts refuse to apply while the agent listens, back up the whole
+memory dir, check the rule's generality, save candidates incrementally.
+**Data r4** (`scripts/lesson_repair_4kw_r4.py`, agent stopped, whole memory dir backed up): 25 harmful/junk general lessons
+retracted ("report only the count", validator-gaming self-play rules, "print 'Let me…' first", "confirm update_profile and
+DONE", one-off bench arithmetic, stale introspect lists, duplicates), 23 untraceable scoped rows retracted, 2 re-keyed, 14
+rewritten without request entities (Hetzner, Leonidas, Fousekis …), 3 general rules added → 231 lessons, 47 scoped (all
+reachable), 230 twins, 0 missing/orphan/duplicate (1 stale = the pre-existing two-row duplicate trigger).
+**Verification.** Battery 56 mutants: first pass 48 killed, 7 survivors → tests added → 55/55 killed, NOOP clean, tree pristine
+(re-run on the relocated shell module). Full suite once: 27,149 passed, 3 failed (lint: unused names; execute.py over the
+120 KB brief budget → shell analysis moved to its own module; the LLM-verdict parser added to the classifier exemption) → those
+files re-run green (536). Deployed; live probes (labelled): a write into released 48e0373aaab3 refused, no file created; a
+workspace listing names the files. Docs: memory/skills, memory/projects, tools/execute, tools/file_system, tools/memory_tools.
+
+## §4KW — fifth fresh-eye verification; every finding fixed (2026-10-03 night, operator: "fix all of them, usual verification protocol")
+**Reviews (4 fresh readers) — 12 MAJOR, all in my previous round.** *The calendar:* the released Jiu Jitsu Calendar keeps
+`data.db` next to `app.py`. Measured in the sandbox after the fix: its database had been READ-ONLY since its release on 08-11 —
+the a-w mode bits alone make sqlite refuse ("attempt to write a readonly database"; the reviewer assumed container root
+bypassed them — it does not through virtiofs). Release now leaves runtime state writable (sqlite db + side files and the db's
+folder: flag off, u+w on); everything else stays immutable (measured: write+rollback works, `app.py` cannot be removed or
+renamed). A project without a workspace path (`Path("")` = the CWD) or outside the sandbox is never flagged. Isolation forks
+made by the copytree fallback drop the flag (copytree copies it, rsync does not); the test session also clears flags left by a
+killed run. *Shell guards* (`tools/shell_analysis.py`, rewritten): subshell parentheses, `-lc`/`-ec`/`-c --`, `eval`,
+`echo … | sh`, busybox/doas/`/usr/bin/env`, a shell-read heredoc, `$( … )`/backticks, variables assigned in the command,
+interpreter one-liners (os.system, subprocess, rmtree, rmSync, fs.rm) — nesting past 3 levels fails CLOSED; `find -maxdepth 1`
+sweeps, negated/late filters no longer narrow; `git clean --force`, `zip -m`; cd tracking with depth inside a project;
+comments, heredoc bodies and >4 KB quoted strings are data (a 2 MB token: 22 s → 0.0 s); ids match as path components;
+read-only work in a released workspace passes (find -exec grep, tar to /tmp, `>` in `$(( ))`/heredocs); `>|`, `git -C`,
+npm/pip/make are writes. The bulk guard and the file tool's projects-folder lock run WHETHER OR NOT a project is released.
+*Lessons/forget:* typos must be non-words (two dictionary words never match — present/president), prefix swaps
+(encoding/decoding), person/tense changes (my/your, did/will) and redaction only against a redacted record; a reordered request
+gets its own row on the JSON path; a close twin with another trigger never replaces a fix (the live dream merge); a re-scoped
+row gets a fresh twin; forget lists — never deletes — a look-alike after the literal match, inflections only -s/-es/-ed/-ing/
+-ies/-ly; the lesson screen exempts only a negation that governs the command and knows "Delete all projects", "Clean up the
+workspace". *Verification:* the reviewer's 36 surviving mutants' classes pinned (written paths, bulk details, re-run, typo
+classes); host-dependent test skips without the word list; the duplicate lifespan test removed; the trajectory-record check
+also catches attribute reads; script dry-run/refusal tests.
+**Data r5** (`scripts/lesson_repair_4kw_r5.py`, trial on a consistent copy first, backups now skip older *.bak — 180 MB not
+1 GB): 37 retracted (4 unmatchable scoped plans, harmful/wrong rules and plans, duplicates, mismatched triggers, one of the
+two-row duplicate trigger), 5 rewritten (2 scoped plans made general rules; the profile lesson no longer names update_profile
+for reading), 25 scoped twins restamped → 195 lessons, 34 scoped (all reachable, all twins stamped), 195 twins, 0
+missing/orphan/duplicate/stale. Release rule re-applied: calendar 4/6 entries immutable (db + folder writable), chess 9/9.
+**Verification.** Battery 49 mutants: 46 killed, 2 equivalent → the dead branches were deleted (the `-maxdepth` mapping, the
+empty-path check), NOOP clean, tree pristine. Full suite once: 27,280 passed, 0 failed (the release write-bit fix came after:
+its 3 files re-run, 179 passed). Deployed; probes (labelled): read-only `find -exec grep` in a released project runs; a
+subshell write into it is refused, no file created; the calendar's db accepts a write (rolled back, data unchanged).

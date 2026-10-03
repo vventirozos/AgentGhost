@@ -555,6 +555,34 @@
   two mixed in one request, a stream closed under another request's context, a stream with no chunks, and the record).</p>
   <!-- /4KV:unmetered -->
 
+  <h2 id="4kw-blame">Our impatience is not the node's illness <span class="tag">2026-10-02 &sect;4KW</span></h2>
+  <p>
+    The worker and the critic are the same Nova server, so they share one circuit breaker. Three paths charged our own behaviour
+    to it (independent review, with live timestamps):
+  </p>
+  <ul>
+    <li><strong><code>route()</code>'s 12&nbsp;s</strong> was the client's own timeout, so a healthy Nova answering at 12.1&nbsp;s
+    &mdash; busy with our own critic verdict &mdash; raised a ReadTimeout that counted as a node fault (11 live at exactly +12.0&nbsp;s,
+    6 within 1&ndash;2&nbsp;s of our own critic dispatch; one opened the breaker). The deadline is now enforced by cancellation
+    (the call runs as a task; <code>route()</code> waits on it and cancels it); the client gets <code>_ROUTE_CLIENT_TIMEOUT_S</code>
+    (60&nbsp;s). A caller that sets its own <code>timeout</code> without a total keeps its explicit request budget.
+    <em>Second review:</em> a pure cancellation also stopped a <em>hung</em> node from ever tripping its breaker (reproduced: five
+    hung calls, breaker still closed). A deadline miss is charged again &mdash; only when our request had held the node's permit
+    for <code>_ROUTE_HUNG_SILENCE_S</code> (6&nbsp;s; a routing call is ~0.5&nbsp;s) with no other job of ours on that node
+    (<code>_charge_route_deadline_miss</code>). Time spent queueing for the permit, a node busy with our critic, and a caller's own
+    outer cancellation (the announced-work check's 3&nbsp;s) are never charged. <em>Alone</em> means for the whole hold, read from
+    the concurrency-seconds accumulator (fresh review: a critic that slowed the node and finished before the deadline had got it
+    charged). After cancelling at the deadline, <code>route()</code> waits at most <code>_ROUTE_CANCEL_GRACE_S</code> (1&nbsp;s) &mdash;
+    py3.10 can swallow a cancel that lands as the permit frees, and the call then ran on its 60&nbsp;s client timeout &mdash; uses an
+    answer that lands in that grace, and lets the caller's own cancellation through. Not covered: VERIFY and DISTILL_PATTERN still
+    pass their own <code>timeout</code> as the client timeout, so a ReadTimeout there is still charged.</li>
+    <li><strong>Keepalive pings</strong> bypass the permit gate, so when our own gated jobs held every slot a one-token ping waited in
+    llama-server's queue and timed out (two live trips were three such pings and nothing else). <code>_charge_node_fault</code> does
+    not charge a keepalive then; with a free slot &mdash; or an unprobed capacity (second review) &mdash; it still does.</li>
+    <li>The memory optimizer's 4,096-token call could not finish in its 180&nbsp;s at the worker's rate: a 600&nbsp;s deadline by
+    cancellation. Swarm charges only node faults (not a 4xx), and a client closed at shutdown is not a node fault.</li>
+  </ul>
+
 </main>
 </body>
 </html>

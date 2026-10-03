@@ -1667,6 +1667,44 @@
   </p>
   <p class="note">Pins: <code>tests/test_4kw_announced_work_and_outcome.py</code>.</p>
   <!-- /4KW:announced-work -->
+
+  <!-- 4KW:review2 -->
+  <h2 id="4kw-review2">Instructions to the model, reviewed as a class <span class="tag">2026-10-02 &sect;4KW</span></h2>
+  <p>An independent review enumerated every runtime steer and counted its live fires; the defects with live cost:</p>
+  <ul>
+    <li><strong>The answer-now retry after a dropped tool call</strong> (<code>forced_final_answer_directive</code>) now names the calls
+    that were not run and says there is no output from them: slack-36bd38b6 shipped a "simulation" result of an <code>execute</code>
+    that was dropped.</li>
+    <li><strong>"Don't run it" is respected</strong> (<code>utils.constraints.request_forbids_running</code>): the untested-write repair
+    ("Actually RUN or preview it now") fired on 9 requests that said "No need to run anything", each costing a turn and recording a
+    correct edit as failed. It is skipped, and the reply says "Not run, as you asked". The negation must govern the verb directly,
+    with the work as its object ("don't run it / the script / the tests", "no need to run", "without running it"); "don't forget to
+    run the tests", "don't hesitate to run it" and "do not deploy without testing it" are not no-run requests (second review — the
+    first pattern let two words in between). Greek is matched with accents stripped, so capitals count. Fresh review: "μην το ανεβάσεις
+    χωρίς να το τρέξεις" ("don't deploy it without running it") gets the same earlier-negation skip as English; a qualified
+    prohibition ("never run this in production", "don't run it as root / yet", "don't test it manually") is not a no-run request;
+    curly apostrophes (<code>don’t</code>) and "δεν χρειάζεται να το τρέξεις" are. If an earlier version WAS executed, the note says
+    "Not re-run after the last edit".</li>
+    <li><strong>The no-progress breaker's final</strong> (<code>no_progress_final_steer</code>): search and other lookup loops get
+    "answer from what the results say, claim nothing as verified" instead of "report success … the failing URL from their devtools"
+    (25 fires on search loops). Not <code>browser</code>: its repeats are clicks and form steps, which keep the change/debug final.</li>
+    <li><strong>The risk governor's checklist</strong> ends "Never copy this checklist into your reply." ("**CONFIRMED SO FAR:** …"
+    reached members; the first wording, "do 1–2 in your reasoning", contradicted step 2, which is a tool call), and the steer is never stacked on another steer of the same batch (it said "run one check" right after "do not
+    search again"). ⚠ This changes the treatment text of the live <code>risk_steer</code> arm from 2026-10-02.</li>
+    <li><strong>Members are not ordered to use tools they lack</strong>: the checklist nudge (learn_skill/update_profile), the notify
+    guard (a member's notify would page the owner) and the filler guard skip or filter for members.</li>
+    <li><strong>The constraint block</strong> no longer fills with the self-play wrapper's own rules (~1,500 turns lost the challenge's
+    real constraint) and reads Greek prohibitions, accented or not, but not "όχι μόνο" (not only), "αν ποτέ" (if ever) or the
+    "μη-" prefix. ποτέ (never) is told from πότε (when) by its accent (<code>_NEVER_EL_RE</code>; 4 of 5 corpus hits had been "when"
+    questions).</li>
+    <li><strong>Records</strong>: the canned no-answer fallback is FAILED in the corpus (rule 1c) and on the line; a reply longer than
+    the 16,000-char record cap keeps its tail (where abort markers live).</li>
+  </ul>
+  <p class="note">Pins: <code>tests/test_4kw_review_round2.py</code>, <code>tests/test_4kw_review_round3.py</code> (second review).
+  Known coupling, kept: the risk steer is skipped when the newest message is another runtime steer, so on those turns the
+  <code>risk_steer</code> arm's treatment is suppressed by whichever steer fired first (the <code>search_yield</code> arm's among
+  them) — the arms are no longer independent on such turns.</p>
+  <!-- /4KW:review2 -->
 </main>
 
   <h2 id="4kd-clarify">Clarify-first after a costly tool turn <span class="tag">2026-09-24 &sect;4KD</span></h2>

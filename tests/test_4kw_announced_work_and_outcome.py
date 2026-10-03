@@ -270,12 +270,13 @@ NOTIFY_REQUEST = "tell me a joke and notify me on slack when you're done"
 async def test_a_changed_reply_is_asked_about_again(monkeypatch, tmp_path):
     """Open item (§4KW): a NO about one reply said nothing about a DIFFERENT
     reply a later regeneration wrote — now asked again when the text changed.
-    The notify guard sends the turn back here."""
+    The notify guard sends the turn back here — an OWNER turn: a member is
+    never steered to notify_operator (§4KW review)."""
     assert A._user_asked_for_notification(NOTIFY_REQUEST)
     _, model, logged, _, checks, _ = await _drive(monkeypatch, tmp_path, [
         ("say", "Why did the cat sit on the laptop? To keep an eye on the mouse."),
         ("say", "Here it is again: the cat kept an eye on the mouse."), ("say", "x"), ("say", "x")],
-        answer="NO", request=NOTIFY_REQUEST, tools=("web_search", "notify_operator"))
+        answer="NO", request=NOTIFY_REQUEST, tools=("web_search", "notify_operator"), role="owner")
     assert len(model.payloads) >= 2, [t for t, c, _ in logged]
     assert len(checks) == 2
     asked = [c.kwargs["payload"]["messages"][-1]["content"] for c in checks]
@@ -286,7 +287,7 @@ async def test_the_same_reply_is_not_asked_about_twice(monkeypatch, tmp_path):
     same = "Why did the cat sit on the laptop? To keep an eye on the mouse."
     _, model, _, _, checks, _ = await _drive(monkeypatch, tmp_path, [
         ("say", same), ("say", same), ("say", "x"), ("say", "x")],
-        answer="NO", request=NOTIFY_REQUEST, tools=("web_search", "notify_operator"))
+        answer="NO", request=NOTIFY_REQUEST, tools=("web_search", "notify_operator"), role="owner")
     assert len(model.payloads) >= 2 and len(checks) == 1
 
 
@@ -440,7 +441,8 @@ def test_finalize_passes_the_recorded_reply_to_the_line():
              and getattr(c.func, "attr", "") == "_emit_turn_outcome_line"
              and any(k.arg == "marker_text" for k in c.keywords)]
     assert len(calls) == 1
-    assert _ast.unparse(next(k.value for k in calls[0].keywords if k.arg == "marker_text")) == "_recorded_reply"
+    # capped as the ROW stores it (fresh review: a marker in the elided middle)
+    assert _ast.unparse(next(k.value for k in calls[0].keywords if k.arg == "marker_text")) == "_cap_recorded_reply(_recorded_reply)"
     fn = next(n for n in _ast.walk(tree) if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef))
               and any(c is calls[0] for c in _ast.walk(n)))
     src = _ast.unparse(fn)
@@ -522,3 +524,54 @@ async def test_route_keeps_its_ordinary_timeout():
     assert await AW.worker_finds_announcement(client, "q", "r") is False
     assert seen["timeout"] == seen["total_budget"] == AW.ROUTE_TIMEOUT_S >= 10
     assert AW.CHECK_BUDGET_S < AW.ROUTE_TIMEOUT_S
+
+
+
+# ══ route(): the deadline by cancellation; keepalive and our own queueing ══════
+
+async def test_route_gives_up_at_its_deadline_without_blaming_the_node(monkeypatch):
+    """Review (11 live ReadTimeouts at +12.0 s on decompose/expand, 6 next to
+    our own critic dispatch; one opened the breaker). route() now returns its
+    free fallback at the deadline by CANCELLATION, and the node is not charged."""
+    import asyncio, time, httpx
+    from ghost_agent.core import llm as L
+    from ghost_agent.utils.logging import request_id_context
+    monkeypatch.setattr(L, "_ROUTE_TIMEOUT_S", 0.4)
+    c = L.LLMClient("http://127.0.0.1:1", worker_nodes=[{"url": "http://worker.invalid:8088", "model": "Nova"}])
+    node = c.worker_clients[0]
+
+    async def slow_post(*a, **kw):
+        await asyncio.sleep(min(float(kw.get("timeout") or 30.0), 30.0))
+        raise httpx.ReadTimeout("slow node")
+    node["client"].post = slow_post
+    monkeypatch.setattr(c, "_known_slots", lambda *_a, **_k: 4, raising=False)
+    tok = request_id_context.set("route-deadline")
+    try:
+        for _ in range(4):
+            t = time.monotonic()
+            assert await c.route("DECOMPOSE_QUERY", {"model": "m", "messages": []}, fallback="fb") == "fb"
+            assert time.monotonic() - t < 1.5
+    finally:
+        request_id_context.reset(tok)
+    st = c.circuit_breaker._get_state(node["url"])
+    assert st["failures"] == 0 and st.get("state") != "open", st
+
+
+def test_a_keepalive_stuck_behind_our_own_jobs_is_not_a_node_fault():
+    import httpx
+    from ghost_agent.core import llm as L
+    c = L.LLMClient("http://127.0.0.1:1", worker_nodes=[{"url": "http://n:8088", "model": "Nova"}])
+    node = c.worker_clients[0]
+    c._node_slot_caps = {"http://n:8088": 2}
+    c._node_run_tasks = {"http://n:8088": {1: None, 2: None}}          # our gated jobs fill both slots
+    e = httpx.ReadTimeout("x")
+    assert L._charge_node_fault(c, node, e, "keepalive") is False
+    c._node_run_tasks = {"http://n:8088": {1: None}}                   # a free slot: a stuck ping is real
+    assert L._charge_node_fault(c, node, e, "keepalive") is True
+    c._node_run_tasks = {}
+    assert L._charge_node_fault(c, node, e, "keepalive") is True
+    c._node_run_tasks = {"http://n:8088": {1: None, 2: None}}
+    assert L._charge_node_fault(c, node, e, "decompose query") is True   # only the ping is excused
+    assert L._charge_node_fault(c, node, e, "warmup") is False
+    resp = httpx.Response(400, request=httpx.Request("POST", "http://n"))
+    assert L._charge_node_fault(c, node, httpx.HTTPStatusError("bad", request=resp.request, response=resp), "x") is False

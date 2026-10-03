@@ -429,8 +429,11 @@ def test_credit_sees_both_surfaces_after_delivery_dedup():
     src = (REPO / "src" / "ghost_agent" / "core" / "agent.py").read_text()
     assert 'top_triggers=list(\n' not in src.replace(
         'top_triggers=list(\r\n', 'top_triggers=list(\n') or True
-    # Both call sites use the union helper:
-    assert src.count("top_triggers=self._surfaced_lesson_triggers(") == 2
+    # §4KW (fresh review) SUPERSEDES this: passing the surfaced lessons as
+    # `top_triggers` credited every lesson IN THE PROMPT (membership counted
+    # as relevance) — helpful≈retrievals, 154/290 lessons at confidence 1.0.
+    # Neither credit site passes it now; credit is word overlap or the judge.
+    assert src.count("top_triggers=self._surfaced_lesson_triggers(") == 0
 
 
 def test_delivery_dedup_targets_bus_deliveries_not_bookings(tmp_path):
@@ -1430,7 +1433,7 @@ def test_update_profile_delete_scrubs_canonical_vector_fact():
     prof.delete.return_value = "Removed from Profile: assets.car"
     vec = MagicMock()
     out = asyncio.run(tool_update_profile(
-        category="misc", key="vehicle", value=None,
+        category="misc", key="vehicle", value="",       # §4KW: only "" deletes
         profile_memory=prof, memory_system=vec))
     assert "Removed" in out
     vec.delete_fragment.assert_called_once_with("User car is BMW")

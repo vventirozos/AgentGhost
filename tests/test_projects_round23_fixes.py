@@ -159,9 +159,7 @@ async def test_verify_release_healthy_and_drift(context, store):
     assert json.loads(res)["healthy"] is True
     # Remove the deliverable → degraded.
     ws = Path(store.get_project(pid)["workspace_dir"])
-    import os as _os
-    _os.chmod(ws, 0o755)               # dir writable — unlink needs it
-    _os.chmod(ws / "out.html", 0o644)
+    store._chmod_tree(ws, False)       # out-of-band drift: the lock lifted first
     (ws / "out.html").unlink()
     res2 = await tool_manage_projects(context, action="verify_release",
                                       project_id=pid)

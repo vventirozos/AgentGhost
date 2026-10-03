@@ -41,10 +41,14 @@ def _stub_client(captured):
 
 class TestRouteTimeoutOverride:
     async def test_default_is_route_ceiling(self):
+        """§4KW: the default 12 s is route()'s deadline, enforced by
+        cancellation; the client gets the long `_ROUTE_CLIENT_TIMEOUT_S`, so
+        a slow-but-healthy node is never charged a ReadTimeout for it."""
+        from ghost_agent.core.llm import _ROUTE_CLIENT_TIMEOUT_S
         captured = {}
         client = _stub_client(captured)
         await client.route("EXPAND_QUERY", {"messages": []})
-        assert captured["timeout"] == _ROUTE_TIMEOUT_S
+        assert captured["timeout"] == _ROUTE_CLIENT_TIMEOUT_S > _ROUTE_TIMEOUT_S
 
     async def test_explicit_timeout_wins(self):
         captured = {}

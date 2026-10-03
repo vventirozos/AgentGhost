@@ -904,13 +904,24 @@ class PostMortemEngine:
             # CAUSE and no LESSON → empty solution. Don't route a blank lesson
             # into the playbook (learn_lesson doesn't reject an empty solution).
             if _solution.strip():
+                # §4KW: keyed on the failed request, the lesson reached
+                # unrelated turns. With a general SITUATION it is a general
+                # lesson; otherwise it is scoped to this request.
+                from ..memory.lesson_scope import is_general_trigger
+                _req = (getattr(traj, "user_request", "") or "")
+                _sit = str(parsed.get("situation") or "")
+                from ..memory.lesson_scope import is_general_text
+                # the whole lesson is embedded: the fix must be general too
+                _general = bool(_sit) and is_general_trigger(_sit, _req) and is_general_text(_solution, _req)
                 rep.lesson = {
-                    "task": (getattr(traj, "user_request", "") or "")[:400],
-                    "mistake": (parsed.get("root_cause") or "")[:400],
+                    "task": (_sit if _general else _req[:400]),
+                    "mistake": ("" if _general else (parsed.get("root_cause") or "")[:400]),
                     "solution": _solution,
                     "source": "postmortem",
                     "source_trajectory_id": traj.id,
                 }
+                if not _general:
+                    rep.lesson.update(scope="request", source_request=_req[:4000])
         elif category == CATEGORY_CONFIGURATION:
             rep.config_change = (parsed.get("config_change") or "")[:1000]
         elif category == CATEGORY_CODE_DEFECT:

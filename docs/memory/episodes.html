@@ -140,6 +140,11 @@ context    = "tools: a → b(FAILED) → c ; recovered after failures in: b"</pr
   <code>tests/test_episode_context_backfill.py</code> (11).</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+  <h2 id="4kw-review4">Probe and internal turns write no episode <span class="tag">2026-10-02 &sect;4KW</span></h2>
+  <p><code>_record_episode_safe</code> skipped only member turns; probe turns wrote episodes that were recalled ~2,600 times
+  ("Describe the colour of the sea in five words or fewer." 327&times;). It now follows <code>turn_may_teach</code> (probe, member,
+  internal). The 91 probe episodes and 6 member episodes recorded before the member wall were removed with their vector copies
+  (<code>scripts/memory_repair_4kw.py</code>, operator-approved).</p>
 </main>
 </body>
 </html>

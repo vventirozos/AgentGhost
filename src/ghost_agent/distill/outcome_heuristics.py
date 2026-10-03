@@ -606,6 +606,21 @@ def classify_chat_outcome(
             reason=f"loop breaker closed the attempt ({_lbr})",
         )
 
+    # 1c. §4KW (review): the forced-final "no answer" fallback ("I ran out of
+    # this turn's budget before writing an answer…") is the system's own
+    # canned non-answer. Only the verifier's shape check rejected it, so a
+    # turn the verifier does not run on (a member, a sim, a leaf) recorded it
+    # UNKNOWN and printed "ok" (4 leaf rows on 09-23). Exact-head match on
+    # our own text — `reply_shape_check` owns the wording.
+    try:
+        from ..core.reply_shape_check import refute_no_answer_fallback
+        _nf = refute_no_answer_fallback(traj.final_response or "")
+    except Exception:  # noqa: BLE001 — a heuristic never raises
+        _nf = []
+    if _nf:
+        return FailureClassification(outcome=Outcome.FAILED.value,
+                                     reason=f"no-answer fallback shipped: {_nf[0]}")
+
     # 2. Repeated browser selector — agent stuck clicking same thing.
     # Per the module contract (signal 2), the repeats only count as
     # "stuck" when there was NO observable progress between them: a

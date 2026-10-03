@@ -29,7 +29,7 @@ job is to produce (a) a one-sentence diagnosis of what went wrong, and \
 You must NOT:
 - restate the original request
 - invent tools or facts that weren't available in the failed attempt
-- produce prose outside the two required sections
+- produce prose outside the required sections
 
 Required output format:
 
@@ -38,6 +38,15 @@ REVISED PLAN:
 1. <first concrete step, naming a tool if applicable>
 2. <second step>
 ...
+
+GENERAL LESSON:
+SITUATION: <the KIND of request or situation where the same mistake could happen again, in general \
+terms — no names, places, numbers, paths, quotes or topics from this request>
+MISTAKE: <the mistake to avoid in that kind of situation, in the same general terms>
+RULE: <what to do instead, one or two sentences>
+
+If nothing about this failure would help with a DIFFERENT request, write instead:
+GENERAL LESSON: NONE
 
 Original request:
 {user_request}
@@ -147,6 +156,12 @@ def parse_reflection_output(text: str) -> tuple[str, List[str]]:
         return "", []
     import re
 
+    # §4KW: the GENERAL LESSON block is not part of the plan (without a blank
+    # line before it, its lines were glued onto the last step).
+    _gl = _GENERAL_HEADER_RE.search(text)
+    if _gl:
+        text = text[:_gl.start()]
+
     diagnosis = ""
     steps: List[str] = []
 
@@ -216,3 +231,37 @@ def parse_reflection_output(text: str) -> tuple[str, List[str]]:
                 steps[-1] = (steps[-1] + " " + s).strip()
 
     return diagnosis, steps
+
+
+# ── §4KW: the transferable half of a reflection ─────────────────────────────
+_GENERAL_HEADER_RE = __import__("re").compile(r"(?im)^[ \t#*]*general\s+lesson\b")
+_SITUATION_RE = __import__("re").compile(r"(?im)^[ \t*\-]*situation\s*:\s*(.+)$")
+_RULE_RE = __import__("re").compile(r"(?im)^[ \t*\-]*rule\s*:\s*(.+)$")
+_MISTAKE_RE = __import__("re").compile(r"(?im)^[ \t*\-]*mistake\s*:\s*(.+)$")
+
+
+def parse_general_lesson(text: str):
+    """``{"situation", "mistake", "rule"}`` from the reply's GENERAL LESSON
+    block, or None when it is absent, says NONE, or lacks the SITUATION or
+    RULE line (MISTAKE is optional: ""). Only the text AFTER the header is
+    read, so a plan step mentioning "rule:" is never taken."""
+    import re
+    if not text:
+        return None
+    m = _GENERAL_HEADER_RE.search(re.sub(r"\*{2,}", "", text))
+    if not m:
+        return None
+    block = re.sub(r"\*{2,}", "", text)[m.end():]
+    if re.match(r"\s*:?\s*none\b", block, flags=re.IGNORECASE):
+        return None
+    sit, rule = _SITUATION_RE.search(block), _RULE_RE.search(block)
+    if not (sit and rule):
+        return None
+    situation, rule_text = sit.group(1).strip(), rule.group(1).strip()
+    if not situation or not rule_text or situation.lower().startswith("<") or rule_text.lower() == "none":
+        return None
+    mis = _MISTAKE_RE.search(block)
+    mistake = mis.group(1).strip() if mis else ""
+    if mistake.startswith("<") or mistake.lower() == "none":
+        mistake = ""
+    return {"situation": situation[:300], "mistake": mistake[:400], "rule": rule_text[:600]}

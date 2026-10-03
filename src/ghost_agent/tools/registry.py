@@ -1668,7 +1668,7 @@ def get_available_tools(context):
         "delegate": lambda **kwargs: tool_delegate(context=context, **kwargs),
         "jobs": lambda **kwargs: tool_jobs(context=context, **kwargs),
         "notify_operator": lambda **kwargs: tool_notify_operator(context=context, **kwargs),
-        "knowledge_base": lambda **kwargs: tool_knowledge_base(sandbox_dir=_proj_ws()[0], tor_proxy=context.tor_proxy, memory_system=context.memory_system, profile_memory=context.profile_memory, graph_memory=getattr(context, "graph_memory", None), llm_client=context.llm_client, model_name=getattr(context.args, "model", "default"), memory_bus=getattr(context, "memory_bus", None), episodic_memory=getattr(context, "episodic_memory", None), session_store=getattr(context, "session_store", None), **kwargs),
+        "knowledge_base": lambda **kwargs: tool_knowledge_base(sandbox_dir=_proj_ws()[0], tor_proxy=context.tor_proxy, memory_system=context.memory_system, profile_memory=context.profile_memory, graph_memory=getattr(context, "graph_memory", None), llm_client=context.llm_client, model_name=getattr(context.args, "model", "default"), memory_bus=getattr(context, "memory_bus", None), episodic_memory=getattr(context, "episodic_memory", None), session_store=getattr(context, "session_store", None), project_store=getattr(context, "project_store", None), **kwargs),
         "recall": lambda **kwargs: tool_recall(memory_system=context.memory_system, graph_memory=getattr(context, "graph_memory", None), **kwargs),
         "execute": _run_execute,
         "browser": _run_browser,

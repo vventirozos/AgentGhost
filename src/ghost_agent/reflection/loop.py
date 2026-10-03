@@ -413,6 +413,13 @@ class Reflector:
             return out
 
         diagnosis, plan = parse_reflection_output(response_text or "")
+        # §4KW: the transferable rule, if the model stated one (the plan is
+        # for THIS request only — see memory.lesson_scope)
+        try:
+            from .prompts import parse_general_lesson
+            _general = parse_general_lesson(response_text or "")
+        except Exception:  # noqa: BLE001
+            _general = None
         if not diagnosis and not plan:
             out.error = "unparseable reflection response"
             return out
@@ -451,6 +458,8 @@ class Reflector:
                 "source_outcome": traj.outcome,
             },
         )
+        if _general:
+            reflected.extra["general_lesson"] = dict(_general)
 
         # Plan verification (proposal #6). Reflection was previously the
         # ONE learning path with no correctness grounding — the revised

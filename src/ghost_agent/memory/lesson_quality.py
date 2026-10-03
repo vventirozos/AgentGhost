@@ -233,3 +233,135 @@ __all__ = [
     "_is_conversational_trigger",
     "_TRIVIAL_TOOL_ROUTING_RE",
 ]
+
+
+# ── §4KW (fresh review): a lesson may not PRESCRIBE bulk destruction ────────
+# A reflection lesson for "lots of stuff in your sandbox, clean it up" stored
+# `file_system(operation=delete, path=/*)` as the fix and was injected into
+# unrelated turns. Nothing at the write point read what a lesson tells the
+# agent to DO. Screened: the fix (correct pattern) only — an anti-pattern that
+# names `rm -rf /` as the thing NOT to do is a legitimate lesson.
+# Third review: the regex list missed `rm -rf ./projects`, `$PWD`, `find .
+# -type f -delete`, `rmtree('projects')`, `TRUNCATE`, an unqualified `DELETE
+# FROM`, `git clean -fdx`, "clear the workspace", and refused "remove all
+# duplicate rows" / "remove all files matching *.pyc". Commands go through the
+# same analyser the execute guard uses; prose needs a bulk OBJECT and no
+# qualifier that narrows it.
+_SQL_GIT_RE = re.compile(
+    r"\bdrop\s+(?:table|database|schema)\b(?!\s+if\s+exists)"
+    r"|\btruncate\s+(?:table\s+)?\w+"
+    r"|\bdelete\s+from\s+\w+(?![^.;\n]*\bwhere\b)"
+    r"|\bgit\s+push\s+(?:-f|--force)\b|\bgit\s+reset\s+--hard\b|\bgit\s+clean\s+-\w*f\w*d|\bgit\s+clean\s+-\w*d\w*f"
+    r"|\brsync\b[^\n]*--delete\b|\bmkfs\b",
+    re.IGNORECASE)
+#: a file_system-style delete naming a path: `delete path=/*`,
+#: `file_system(operation="delete", path="/workspace/projects")`
+_FS_DELETE_RE = re.compile(r"\b(?:delete|remove|rm)\b[^\n]{0,60}?\bpath\s*[=:]\s*['\"]?([^'\"\s,)]+)",
+                           re.IGNORECASE)
+_PROSE_VERB = r"\b(?:delete|remove|wipe|erase|clear|purge|empty|clean)"
+_PROSE_BULK_RE = re.compile(
+    _PROSE_VERB + r"\s+(?:out\s+|up\s+)?(?:"
+    # every/all of something, or the whole/entire something
+    r"(?:all|every(?:thing)?)(?:\s+of)?\s+(?:the\s+)?(?:\w+\s+)?(?:files?|folders?|director(?:y|ies)|dirs?|contents?"
+    r"|projects?|repos|repositories|workspaces|databases|tables|data)"
+    r"|the\s+(?:whole|entire)\s+\w+"
+    # a bulk object on its own: plural files/folders, the workspace …
+    r"|(?:the\s+)?(?:\w+\s+)?(?:files|folders|directories|dirs)"
+    r"|(?:the\s+)?(?:workspace|sandbox|projects(?:\s+folder)?|repo(?:sitory)?|database)"
+    r")\b"
+    r"|" + _PROSE_VERB + r"\s+everything\b",
+    re.IGNORECASE)
+#: a removal verb, then (within the clause) the workspace, the projects
+#: folder or the root as a PATH: "Wipe /workspace clean", "Remove every
+#: file in /workspace" (fourth review)
+_PROSE_PATH_RE = re.compile(
+    _PROSE_VERB + r"\b[^.\n]{0,40}?(?<![\w/.~-])(?:/workspace(?:/projects)?|/projects|/)/?\*?(?=[\s.,;:)'\"`]|$)",
+    re.IGNORECASE)
+#: a qualifier right after the object narrows it to a selection
+_NARROWING_RE = re.compile(r"^\W*(?:matching|named|that|which|older|newer|with|whose|except|containing|ending|"
+                           r"starting|created|generated|in\s+/tmp|under\s+/tmp|by\s+name|individually|one\s+(?:by|at\s+a)\s+\w+|explicitly|"
+                           r"(?:you|we|i|it)\s+(?:just\s+)?(?:created|made|wrote|generated|added|downloaded)|"
+                           # a relative folder ("in build/"), a selection someone made ("the user
+                           # listed"), or a UI noun that makes it a list, not files (fifth review)
+                           r"(?:in|under)\s+(?!/workspace\b|/\s|/$|the\s+(?:workspace|sandbox)\b)[\w.~-]*\w(?=/)|"
+                           r"(?:that\s+)?(?:the\s+)?(?:user|you|we|i|they)\s+(?:has\s+|have\s+)?\w+(?:ed|d)\b|"
+                           r"(?:list|array|field|count|panel|menu|view|tab|selection|state)\b|"
+                           r"from\s+the\s+(?:list|cart|dataframe|array))\b", re.IGNORECASE)
+#: where a shell command starts inside prose or a code span
+_CMD_START_RE = re.compile(
+    r"(?:^|(?<=[\s`'\"(=:;]))(?:sudo\s+)?(?:rm|rmdir|shred|find|rsync|xargs|tar|git\s+(?:-C\s+\S+\s+)?clean|"
+    r"(?:ba)?sh\s+-c|cd|pushd|for\s+\w+\s+in|python3?\s+-c)\b|(?:shutil\.)?rmtree\(", re.IGNORECASE | re.MULTILINE)
+#: a command handed to a tool as a quoted argument: `command='rm -rf *'`,
+#: `execute("rm -rf ./*")` — one shlex token to the generic scan
+_QUOTED_CMD_RE = re.compile(r"(?:\b(?:command|cmd|code)\s*[=:]\s*|\bexecute\(\s*)(['\"])(.+?)(?<!\\)\1",
+                            re.IGNORECASE | re.DOTALL)
+
+
+def _prose_bulk(text: str) -> bool:
+    for rx in (_PROSE_BULK_RE, _PROSE_PATH_RE):
+        for m in rx.finditer(text):
+            if _NEGATED_LEAD_RE.search(text[max(0, m.start() - 30):m.start()]):
+                continue
+            if rx is _PROSE_BULK_RE and _NARROWING_RE.match(text[m.end():m.end() + 40]):
+                continue
+            return True
+    return False
+
+
+def _command_spans(text: str):
+    """(start, command) for every shell command in the text: quoted tool
+    arguments, then each command start up to the end of its line, code span
+    or sentence."""
+    for m in _QUOTED_CMD_RE.finditer(text):
+        yield m.start(), m.group(2)
+    for m in _CMD_START_RE.finditer(text):
+        rest = text[m.start():]
+        end = re.search(r"\n|`|[.!?]\s+(?=[A-Z])|['\"]\s+(?:to|and|then|so|for)\b", rest)
+        yield m.start(), rest[:end.start()] if end else rest
+
+
+def _bulk_fs_path(value: str) -> bool:
+    from ..tools.shell_analysis import _bulk_target, _norm_shell_arg
+    # a project's whole workspace is bulk too (`delete path=projects/<id>`)
+    return (_norm_shell_arg(value) in (".", "*", "./*") or _bulk_target(value, [])
+            or bool(re.fullmatch(r"(?:/workspace/)?projects/[0-9a-f]{12}", _norm_shell_arg(value))))
+
+
+def prescribes_destruction(correct_pattern) -> bool:
+    """True when a lesson's FIX tells the agent to remove things in bulk or
+    irreversibly (the projects folder, the workspace, a wildcard, a whole
+    table, a force-push …). Such a lesson is never admitted. A command is
+    judged by the execute guard's own analyser as if run at the workspace
+    root, a name-filtered `find` excepted (advice for a chosen directory);
+    a command or prose under a negation ("never", "do not", "instead of")
+    is a warning, not a prescription."""
+    text = str(correct_pattern or "")
+    if not text.strip():
+        return False
+    try:
+        from ..tools.shell_analysis import _bulk_destructive
+        for start, span in _command_spans(text):
+            if _NEGATED_LEAD_RE.search(text[max(0, start - 30):start]):
+                continue
+            if _bulk_destructive(span.replace("/tmp/..", ".."), [], "/workspace"):
+                return True
+        for m in _FS_DELETE_RE.finditer(text):
+            if not _NEGATED_LEAD_RE.search(text[max(0, m.start() - 30):m.start()]) and _bulk_fs_path(m.group(1)):
+                return True
+    except Exception:  # noqa: BLE001
+        pass
+    for m in _SQL_GIT_RE.finditer(text):
+        if not _NEGATED_LEAD_RE.search(text[max(0, m.start() - 30):m.start()]):
+            return True
+    return _prose_bulk(text)
+
+
+#: a negation that GOVERNS what follows ("never run …", "do not use …",
+#: "avoid …", "instead of …") — not any negation nearby (fifth review: "Don't
+#: forget to run rm -rf *", "Do not hesitate to rm -rf projects", "Avoid
+#: leftovers: rm -rf /workspace/*" were exempted)
+_NEGATED_LEAD_RE = re.compile(
+    r"\b(?:never|don['’]?t|do\s+not|avoid|instead\s+of|rather\s+than|not)\s+"
+    r"(?:ever\s+)?(?:(?:use|run|call|execute|issue|type|try|using|running|calling|executing)\s+)?"
+    r"(?:a\s+|an\s+|the\s+)?(?:command\s+|commands\s+like\s+)?[`'\"(]*$",
+    re.IGNORECASE)

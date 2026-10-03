@@ -122,7 +122,7 @@ def _unpersist_all() -> None:
 
 def _add_job(scheduler, job_id: str, task_name: str, prompt: str,
              cron_expression: str, kind: str = "task",
-             check_command: str = None):
+             check_command: str = None, anchor_ts: float = None):
     """Register one job on the scheduler. Returns an error STRING on a
     rejected/malformed schedule, None on success. Shared by the create tool
     and the boot-time restore so both interpret expressions identically."""
@@ -164,10 +164,23 @@ def _add_job(scheduler, job_id: str, task_name: str, prompt: str,
             )
         if secs <= 0:
             return f"Error: interval must be a positive number of seconds, got {secs}."
+        # Fresh review (§4KW): restored with no start date, each restart put
+        # the next run a FULL interval after boot — a daily task on a box that
+        # restarts more often than daily never fired, while `list` showed a
+        # future "Next Run". Anchored at creation, the cadence survives a
+        # restart (next run = created_at + k·interval after now).
+        _anchor = {}
+        if anchor_ts:
+            try:
+                import datetime as _dt
+                _anchor = {"start_date": _dt.datetime.fromtimestamp(float(anchor_ts), tz=_dt.timezone.utc)}
+            except (TypeError, ValueError, OverflowError, OSError):
+                _anchor = {}
         scheduler.add_job(
             run_proactive_task_fn,
             'interval',
             seconds=secs,
+            **_anchor,
             args=[job_id, prompt],
             id=job_id,
             name=task_name,
@@ -220,6 +233,7 @@ def restore_persisted_tasks(scheduler) -> int:
                 str(rec.get("cron_expression") or ""),
                 kind=str(rec.get("kind") or "task"),
                 check_command=rec.get("check_command"),
+                anchor_ts=rec.get("created_at"),
             )
             if err:
                 raise ValueError(err)

@@ -146,7 +146,10 @@ async def _swarm_worker(instruction: str, input_data: str, output_key: str, llm_
             last_error = e
             # Record failure with circuit breaker
             cb = getattr(llm_client, 'circuit_breaker', None)
-            if cb and node.get("url"):
+            # §4KW (review): only a NODE fault counts — a 4xx is our payload,
+            # and three retries of one bad payload opened the breaker alone
+            from ..core.llm import _charge_node_fault
+            if cb and node.get("url") and _charge_node_fault(llm_client, node, e, "swarm"):
                 cb.record_failure(node["url"])
 
             if attempt < MAX_RETRIES:

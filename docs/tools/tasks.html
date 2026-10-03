@@ -60,6 +60,13 @@
   </ul>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+  <h2 id="4kw-review4">An interval task survives a restart <span class="tag">2026-10-02 &sect;4KW</span></h2>
+  <p><code>restore_persisted_tasks</code> re-registered an <code>interval:</code> task with no start date, so APScheduler put the
+  next run a FULL interval after boot: on a box that restarted 8 times in 34 hours a daily task never fired, while
+  <code>list</code> showed a future "Next Run". The interval is now anchored at the task's <code>created_at</code>
+  (<code>_add_job(…, anchor_ts=)</code>): the next run is the next <code>created_at + k&middot;interval</code>. Fires that fall
+  inside downtime are still skipped (coalesced). Scheduled and watch turns are recorded as the <code>internal</code> population
+  &mdash; see <a href="../core/autonomous_activity.html#4kw-review4">autonomous activity</a>.</p>
 </main>
 </body>
 </html>

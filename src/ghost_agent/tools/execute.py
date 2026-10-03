@@ -26,11 +26,8 @@ from .file_system import _get_safe_path
 _EXIT1_MEANS_NO_MATCH = {"grep", "egrep", "fgrep", "zgrep", "rg", "pgrep"}
 
 # Released-workspace shell guard (see call site in tool_execute).
-_RELEASED_PROJ_RE = re.compile(r"projects/([0-9a-f]{12})(?:/|\b)")
-_SHELL_MUTATION_RE = re.compile(
-    r"(?:^|[;&|]\s*|\b)(?:rm|mv|cp|tee|touch|mkdir|rmdir|chmod|chown|"
-    r"truncate|dd|ln|unzip|tar|patch)\b|>>?|\bsed\s+-i\b|\bperl\s+-i\b",
-)
+# case-insensitively: the sandbox volume is APFS (third review)
+_RELEASED_PROJ_RE = re.compile(r"projects/+(?:\./)*([0-9a-fA-F]{12})(?:/|\b)")
 
 
 # Backgrounded-server guard (2026-07-30, §4G). A `… &`-detached process
@@ -108,18 +105,47 @@ def _daemonized_server_block(command: str):
     return None
 
 
-def _released_shell_block(project_store, command: str):
+from .shell_analysis import _shell_segments, _bulk_destructive, _released_written_ids  # noqa: E402
+
+
+def _released_shell_block(project_store, command: str, workdir: str = ""):
     """Refusal message when a shell command would mutate a RELEASED
     project's workspace, else None. Heuristic by necessity (shell), so it
     only fires on the conjunction: released-project path referenced AND a
     mutation token present. Never raises."""
     try:
-        if project_store is None or not command:
+        if not command:
             return None
-        ids = set(_RELEASED_PROJ_RE.findall(str(command)))
-        if not ids or not _SHELL_MUTATION_RE.search(str(command)):
+        ids = {i.lower() for i in _RELEASED_PROJ_RE.findall(str(command))}
+        try:
+            _rel = [str(p.get("id") or "").lower()
+                    for p in ((project_store.list_projects("RELEASED") if project_store is not None else None) or [])]
+        except Exception:                                   # noqa: BLE001
+            _rel = []
+        # Fresh review: `rm -rf projects`, `rm -rf *`, `find . -delete` name
+        # no project id and removed released workspaces with the rest. Fifth
+        # review: refused ALWAYS — the projects folder holds every project's
+        # workspace, released or not (with none released, `rm -rf projects`
+        # passed).
+        if _bulk_destructive(str(command), [r for r in _rel if r], workdir):
+            _held = (f" — and RELEASED (immutable) project(s) {', '.join(str(r) for r in _rel[:5])}" if _rel else "")
+            return ToolOutcome.rejected(
+                f"SYSTEM BLOCK: this command removes or moves files in bulk (the projects folder, a wildcard at "
+                f"the workspace root, or the whole workspace), which holds every project's workspace{_held} — "
+                f"NOT executed. Name the files or folders to remove explicitly.",
+                reason_code="released_write_blocked")
+        if project_store is None:
             return None
-        for pid in ids:
+        # the working directory IS a released workspace (fourth review:
+        # `manage_projects switch` there, then `rm -rf *`, `sed -i`, `> f`
+        # all passed — the ids were read from the command text only)
+        _wm = re.search(r"/projects/([0-9a-fA-F]{12})(?:/|$)", str(workdir or ""))
+        if _wm:
+            ids.add(_wm.group(1).lower())
+        if not ids:
+            return None
+        written = _released_written_ids(str(command), ids, workdir)
+        for pid in sorted(written):
             proj = project_store.get_project(pid)
             if proj and str(proj.get("status", "")).upper() == "RELEASED":
                 return (
@@ -687,31 +713,34 @@ _MUTATING_HEADS = frozenset({
 })
 
 
+#: A final segment headed by one of these is never re-run elsewhere.
+_DESTRUCTIVE_HEADS = frozenset({"rm", "rmdir", "unlink", "shred", "mv", "cp", "ln", "truncate", "dd",
+                                "rsync", "chmod", "chown", "tee"})
+
+
 def _rerun_unsafe(command: str) -> bool:
-    """True when re-running the WHOLE command could repeat a side effect —
-    i.e. it is a compound (&&/||/;/newline/pipe) whose non-final segment
-    starts with a mutating verb or contains an output redirect. A simple
-    command, or a compound whose leading segments are read-only
-    (cd/pwd/ls/cat/echo…), is safe to re-run."""
+    """True when re-running the WHOLE command could repeat a side effect: a
+    write redirect anywhere, a removing/moving verb anywhere (the final
+    segment too — a failed `rm notes.md` re-run from the root deleted the
+    root's copy), or a mutating verb in a non-final segment. Verbs are read
+    per simple command through wrappers (`FOO=1`, `sudo -u x`, `timeout 5`,
+    `nice`, `exec`, `xargs -0 -r`, `bash -c '…'` — fourth review: `xargs -0
+    rm` hid the verb). A read-only compound (cd/pwd/ls/cat/echo…) is safe."""
     if not isinstance(command, str):
         return False
-    import re as _re
-    # Split on shell sequencing operators (approximate — good enough to
-    # decide "is there a mutating prefix"). Pipes count too: a producer in
-    # a pipeline can mutate.
-    segments = _re.split(r"&&|\|\||;|\n|\|", command)
-    for seg in segments[:-1]:  # non-final segments only
-        s = seg.strip()
-        if not s:
-            continue
-        if ">" in s:  # output redirect writes a file
+    segs = _shell_segments(command)
+    for i, (head, args, raw, _x) in enumerate(segs):
+        # a redirect that WRITES a file (`2>&1`, `>/dev/null` are not;
+        # a `>` inside quotes is not a redirect)
+        _unq = re.sub(r"'[^']*'|\"[^\"]*\"", "''", raw)
+        if re.search(r"&>>?\s*(?!/dev/null)\S|(?<![0-9&])>>?(?!&)\s*(?!/dev/null)\S|(?<=[0-9])>>?\s*(?!&|/dev/null)\S", _unq):
             return True
-        head = s.split()[0].lower() if s.split() else ""
-        # Strip a leading env-var assignment / sudo.
-        if head in ("sudo", "env"):
-            parts = s.split()
-            head = parts[1].lower() if len(parts) > 1 else head
-        if head in _MUTATING_HEADS:
+        if head == "find":
+            if any(a in ("-delete", "-exec", "-execdir", "-ok", "-okdir") for a in args):
+                return True
+        elif head in _DESTRUCTIVE_HEADS:
+            return True
+        elif i < len(segs) - 1 and head in _MUTATING_HEADS:
             return True
     return False
 
@@ -1177,7 +1206,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
             # create_version steer. Read-only commands pass untouched.
             if _shell_ok:
                 _rb = _released_shell_block(
-                    kwargs.get("project_store"), command)
+                    kwargs.get("project_store"), command, workdir=str(container_workdir or ""))
                 if _rb:
                     return _format_error(_rb)
                 # Backgrounded-server guard (2026-07-30, §4G): a detached

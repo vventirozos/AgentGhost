@@ -36,7 +36,7 @@ from .triggers import (
 from ..utils.logging import (Icons, ORIGIN_PROBE, pretty_log, request_id_context, request_origin_context, atomic_print, verify_purpose,
                              requester_role_context, requester_is_member, parse_requester_role)
 from ..utils import logging as _glog
-from ..utils.constraints import extract_constraints, render_constraint_block
+from ..utils.constraints import extract_constraints, render_constraint_block, request_forbids_running
 # Live randomized arms + the risk governor that is measured by one of them.
 # Imported as modules (not names) so a test can monkeypatch either surface in
 # one place, and so the turn loop pays no per-iteration import lookup.
@@ -1033,6 +1033,104 @@ _FORCED_FINAL_ANSWER_DIRECTIVE = (
 )
 
 
+#: §4KW (review): tools whose repeated SAME result means "the sources have
+#: nothing more", not "a change you made is or is not in place".
+#: Not `browser` (second review): its repeats are clicks and form steps on one
+#: page — "answer from what you found" is the wrong exit for an interaction.
+_LOOKUP_TOOLS = frozenset({"web_search", "darkweb_search", "deep_research", "darkweb_research",
+                           "fact_check", "recall", "knowledge_base"})
+
+
+#: The longest reply a trajectory row stores.
+_RECORDED_REPLY_CAP = 16000
+
+
+def _cap_recorded_reply(text) -> str:
+    """The reply as a row stores it: at most `_RECORDED_REPLY_CAP` chars.
+    §4KW (review): a plain `[:16000]` cut off an `[ATTEMPT_ABORTED_*]` marker
+    APPENDED to a long partial (the aborted-turn record puts it last), so the
+    row said UNKNOWN while the line read the full text and said failed. The
+    middle is elided instead: the head (what the user saw first) and the tail
+    (where markers and notes live) both survive."""
+    t = str(text or "")
+    if len(t) <= _RECORDED_REPLY_CAP:
+        return t
+    note = "\n\n[… reply truncated for the record …]\n\n"
+    keep_tail = 2000
+    return t[:_RECORDED_REPLY_CAP - keep_tail - len(note)] + note + t[-keep_tail:]
+
+
+def _is_no_answer_fallback(text) -> bool:
+    """§4KW: the reply is the system's own canned no-answer fallback (the
+    corpus's rule 1c; `reply_shape_check` owns the wording)."""
+    try:
+        from .reply_shape_check import refute_no_answer_fallback
+        return bool(refute_no_answer_fallback(str(text or "")))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _last_is_runtime_steer(messages) -> bool:
+    """§4KW: is the newest message a runtime steer ("SYSTEM ALERT…",
+    "SYSTEM BLOCK…", … — the shared `_MEMBER_STEER_HEAD_RE` heads)?"""
+    try:
+        m = (messages or [])[-1]
+        return (isinstance(m, dict) and m.get("role") == "user"
+                and isinstance(m.get("content"), str)
+                and bool(_MEMBER_STEER_HEAD_RE.match(m["content"])))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def no_progress_final_steer(tool, target_desc, count, pending_request=None) -> str:
+    """The no-progress breaker's forced final. §4KW (review): the one text it
+    had was written for change/debug loops — "if you confirmed the change via
+    state/file inspection, report success … the failing URL from their
+    devtools" — and fired 25 times on SEARCH loops (slack-36bd38b6 then
+    claimed "I verified the logic by simulating…"). A lookup tool gets the
+    answer-from-what-you-found final; both carry whose message it is and
+    which request it serves."""
+    head = (f"SYSTEM ALERT: You have run '{tool}'{target_desc} {count} times "
+            "and gotten the SAME result with no change — re-observing "
+            "produces NO new information. The evidence you already have is "
+            "AUTHORITATIVE. ")
+    if str(tool or "").strip().lower() in _LOOKUP_TOOLS:
+        body = ("Write your FINAL answer now from what the results you already have "
+                "actually say: state what they support, name plainly each part of the "
+                "question they do not answer, and do not present anything as checked or "
+                "verified that no result showed. Do NOT call this tool again.")
+    else:
+        body = ("Write your FINAL answer now: if you confirmed "
+                "the change via state/file inspection, report success and how "
+                "you confirmed it. If you are still UNSURE why something fails, "
+                "do not guess — say plainly what you verified, what you could "
+                "not verify from here, and ask the user for the ONE piece of "
+                "evidence that would settle it (the exact error text, the "
+                "failing URL from their devtools, or the output of a command "
+                "you give them). Do NOT call this tool again.")
+    return (head + body + " " + _ALERT_PROVENANCE
+            + (_which_request_line(pending_request) if pending_request is not None else "")).rstrip()
+
+
+def forced_final_answer_directive(dropped_tools=None, pending_request=None) -> str:
+    """§4KW (review): the answer-now retry of a forced final, with whose
+    message it is, which request it serves and — when the no-answer was a
+    tool call on a tools-off turn — that THOSE calls did not run. Without
+    that line the model wrote the dropped call's result anyway: slack-36bd38b6
+    shipped "The Python simulation … produced DARTHVADERO" after `execute`
+    was dropped; slack-23a1fa85 reasoned "I navigated to it in the browser"
+    after `browser` was. ``dropped_tools``: names (an empty list = "the
+    tool call(s) you just wrote"); None = nothing was dropped."""
+    text = _FORCED_FINAL_ANSWER_DIRECTIVE
+    if dropped_tools is not None:
+        names = ", ".join(f"`{n}`" for n in dict.fromkeys(n for n in dropped_tools if n and n != "?")) or "the tool call(s) you just wrote"
+        text += (f" The call(s) in your last output — {names} — were NOT run: there is no "
+                 "output from them, so do not report, quote or imply any result of them; say "
+                 "plainly that this step was not done.")
+    return (text + " " + _ALERT_PROVENANCE
+            + (_which_request_line(pending_request) if pending_request is not None else "")).rstrip()
+
+
 # §4IW (req a3ec5024, 2026-09-19): the model announced work and ended the
 # turn — "Ας κάνω έρευνα για τον ραβίνο Μορντεχάι Φριζή…" was the WHOLE reply
 # of a zero-tool turn; its thinking said "let me search" four times and
@@ -1493,6 +1591,23 @@ def _find_substantive_tool_for_verifier(
     return None
 
 
+def trajectory_task_kind(context) -> str:
+    """The trajectory row's ``task_kind``: "probe" for a diagnostic probe,
+    "internal" for an internal turn (an explicit kind — bench, leaf — wins
+    over it), else the context's explicit kind, else "user_request". Every
+    reader that filters ``task_kind == "user_request"`` excludes the rest by
+    construction. isinstance gate, not truthiness: a MagicMock context
+    auto-vivifies the attribute."""
+    _origin = turn_origin(context)
+    _tk = getattr(context, "trajectory_task_kind", None)
+    _tk = _tk if isinstance(_tk, str) and _tk else None
+    if _origin == "probe":
+        return "probe"
+    if _origin == "internal" and not _tk:
+        return "internal"
+    return _tk or "user_request"
+
+
 def turn_origin(context) -> str:
     """"user" or "sim" — which POPULATION this turn belongs to.
 
@@ -1538,8 +1653,33 @@ def turn_origin(context) -> str:
     label = getattr(context, "turn_origin_label", None)
     if isinstance(label, str) and label:
         return label
-    return "sim" if getattr(getattr(context, "skill_memory", None),
-                            "is_read_only", False) is True else "user"
+    if getattr(getattr(context, "skill_memory", None), "is_read_only", False) is True:
+        return "sim"
+    # §4KW (fresh review): a background-job wake, a scheduled task or a watch
+    # callback (`job-`/`sched-`/`sub-` ids) is the agent talking to itself —
+    # it was recorded as `user_request`, booked calibration and could teach,
+    # while `is_internal_request` said internal. AFTER the explicit label and
+    # the sim derivation (second review: sub-agents are "sim", coding leaves
+    # keep their own kind).
+    try:
+        from ..utils.logging import request_id_context
+        from .autonomous_activity import is_internal_request
+        if is_internal_request(request_id_context.get()):
+            return "internal"
+    except Exception:  # noqa: BLE001
+        pass
+    return "user"
+
+
+def _query_has_tokens(text) -> bool:
+    """§4KW: does the request carry a significant token? A request of "?" or
+    an emoji is non-empty but token-less, and `credit_recent_retrievals`
+    then falls back to crediting every recent lesson (third review)."""
+    try:
+        from ..memory.skills import _trigger_token_set
+        return bool(_trigger_token_set(str(text or "")))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def turn_may_teach(context) -> bool:
@@ -1550,7 +1690,7 @@ def turn_may_teach(context) -> bool:
     backstop (`memory.skills.playbook_writes_blocked`). No client name
     appears here: the role header is the only multi-user signal."""
     try:
-        if turn_origin(context) == "probe":
+        if turn_origin(context) in ("probe", "internal"):
             return False
         from ..utils.logging import requester_is_member
         return not requester_is_member()
@@ -9079,7 +9219,7 @@ class GhostAgent:
 
             from ..utils.helpers import get_utc_timestamp
             if (self.context.memory_system and "Summarization unavailable" not in summary
-                    and not requester_is_member()):   # a member's conversation is not archived into the owner's memory (R4)
+                    and turn_may_teach(self.context)):   # a member's or a probe's conversation is not archived into the owner's memory (R4; §4KW)
                 episode_text = f"EPISODIC ARCHIVE (Past Conversation Summary):\n{summary}"
                 # Hold a reference to this fire-and-forget archive write:
                 # asyncio keeps only a weak ref to bare tasks, so an
@@ -13249,7 +13389,7 @@ class GhostAgent:
             final_ai_content = _clean_for_cpp(final_ai_content)
             history_summary = _clean_for_cpp(history_summary)
 
-            learn_prompt = f"### TASK POST-MORTEM\nReview this interaction. The agent either struggled and succeeded, OR failed completely. Identify the core technical error, hallucination, or bad strategy. Extract a concrete rule to fix or avoid this in the future.\n\nHISTORY:\n{history_summary}\n\nFINAL AI: {final_ai_content[:500]}\n\nReturn ONLY a JSON object with 'task', 'mistake', and 'solution' (what to do instead next time/the anti-pattern to avoid). If no unique technical lesson is found, return null."
+            learn_prompt = f"### TASK POST-MORTEM\nReview this interaction. The agent either struggled and succeeded, OR failed completely. Identify the core technical error, hallucination, or bad strategy. Extract a concrete rule to fix or avoid this in the future.\n\nHISTORY:\n{history_summary}\n\nFINAL AI: {final_ai_content[:500]}\n\nReturn ONLY a JSON object with 'situation' (the KIND of request or situation where this could happen again, in general terms — no names, places, numbers, paths or topics from this conversation), 'mistake', and 'solution' (what to do instead next time/the anti-pattern to avoid). If no unique technical lesson is found, return null."
 
             payload = {"model": model, "messages": [{"role": "system", "content": "You are a Meta-Cognitive Analyst. Output JSON."}, {"role": "user", "content": learn_prompt}], "temperature": 0.1, "max_tokens": 1024}
             try:
@@ -13268,14 +13408,32 @@ class GhostAgent:
             l_content = str(l_data["choices"][0]["message"].get("content") or "")
             if l_content and "null" not in l_content.lower():
                 l_json = extract_json_from_text(l_content)
-                if all(k in l_json for k in ["task", "mistake", "solution"]):
+                _sit = l_json.get("situation") or l_json.get("task") if isinstance(l_json, dict) else None
+                if _sit and all(k in l_json for k in ["mistake", "solution"]):
+                    # §4KW: a situation that restates THIS request makes the
+                    # lesson request-scoped (retrieved only when the request
+                    # comes back) — the model echoed the request as 'task'
+                    # and the lesson reached unrelated turns. Provenance is
+                    # recorded (65 such lessons carried none).
+                    from ..memory.lesson_scope import is_general_text, is_general_trigger
+                    _lu = str(last_user_content or "")
+                    # all three fields: the whole lesson is embedded (second review)
+                    _general = (is_general_trigger(str(_sit), _lu) and is_general_text(str(l_json["mistake"]), _lu)
+                                and is_general_text(str(l_json["solution"]), _lu))
+                    _wrote = None
                     if getattr(self.context, 'skill_memory', None):
-                        await asyncio.to_thread(
+                        _wrote = await asyncio.to_thread(
                             self.context.skill_memory.learn_lesson,
-                            l_json["task"], l_json["mistake"], l_json["solution"],
-                            memory_system=self.context.memory_system
+                            (str(_sit) if _general else str(last_user_content or "")[:400]),
+                            l_json["mistake"], l_json["solution"],
+                            memory_system=self.context.memory_system,
+                            source="journal_postmortem",
+                            **({} if _general else {"scope": "request",
+                                                    "source_request": str(last_user_content or "")[:4000]}),
                         )
-                    pretty_log("Auto-Learning", "New lesson captured automatically", icon=Icons.IDEA)
+                    if _wrote:
+                        pretty_log("Auto-Learning", "New lesson captured automatically"
+                                   + ("" if _general else " (scoped to this request)"), icon=Icons.IDEA)
         except _RetryableConsolidation:
             # MUST escape the broad handler below: the drain loop
             # (process_journal_queue) re-queues on this type, and the item was
@@ -17108,6 +17266,26 @@ class GhostAgent:
     # is injected into the prompt — below this the percentages are
     # small-n noise the planner shouldn't anchor on.
     _COMPETENCE_MIN_OBS = 20
+
+    async def _credit_turn_lessons(self, execution_failure_count, last_user_content) -> None:
+        """Credit the lessons surfaced in this turn — both turn paths (the
+        finalize path and the streamed path) call this. Only a clean turn
+        that may teach (not a probe, member or internal turn) and has a
+        real request credits; only lessons that share words with THAT
+        request get credit. NOT `top_triggers` (fresh review §4KW): that
+        list is every lesson IN THE PROMPT and `credit_recent_retrievals`
+        counts membership as relevance — every surfaced lesson got helpful
+        +1 on every clean turn (154 of 290 reached confidence 1.0). A
+        token-less request would fall back to the legacy credit-all path."""
+        sm = getattr(self.context, 'skill_memory', None)
+        if not (sm is not None and execution_failure_count == 0 and turn_may_teach(self.context)
+                and _query_has_tokens(last_user_content)):
+            return
+        try:
+            if hasattr(sm, 'credit_recent_retrievals'):
+                await asyncio.to_thread(sm.credit_recent_retrievals, 300, query=str(last_user_content or ""))
+        except Exception:  # noqa: BLE001
+            pass
 
     def _surfaced_lesson_triggers(self, sm, turn_id: str = "") -> list:
         """Every lesson trigger that entered THIS turn's prompt, across BOTH
@@ -22092,18 +22270,7 @@ class GhostAgent:
                             force_final_response = True
                             self.context._breaker_forced_final = True  # §4JI: a tool call on this forced final IS the no-answer
                             messages.append({"role": "user", "content": (
-                                f"SYSTEM ALERT: You have run '{_afname}'{_tgt_desc} {_acnt} times "
-                                "and gotten the SAME result with no change — re-observing "
-                                "produces NO new information. The evidence you already have is "
-                                "AUTHORITATIVE. Write your FINAL answer now: if you confirmed "
-                                "the change via state/file inspection, report success and how "
-                                "you confirmed it. If you are still UNSURE why something fails, "
-                                "do not guess — say plainly what you verified, what you could "
-                                "not verify from here, and ask the user for the ONE piece of "
-                                "evidence that would settle it (the exact error text, the "
-                                "failing URL from their devtools, or the output of a command "
-                                "you give them). Do NOT call this tool again."
-                            )})
+                                no_progress_final_steer(_afname, _tgt_desc, _acnt, last_user_content))})
 
                 # An UNRESOLVED-only turn never sets `turn_has_failure`, so
                 # the "STILL RUNNING — do NOT re-dispatch, do NOT report
@@ -23464,7 +23631,21 @@ class GhostAgent:
                         # reported C=0.96). Treat that as a failed outcome
                         # so confidence drops below threshold and the turn
                         # is recorded as unverified rather than success.
-                        if _is_unverified_mutation(last_tool):
+                        if _is_unverified_mutation(last_tool) and request_forbids_running(last_user_content):
+                            # §4KW (review): untested BY REQUEST — say so, and do
+                            # not record a correct edit as FAILED
+                            # (fresh review) the model may have run an EARLIER
+                            # version anyway — then say so, not "as you asked"
+                            _ran_code = any(
+                                isinstance(_t, dict) and not _t.get("_synthetic")
+                                and str(_t.get("name", "")).lower() == "execute"
+                                for _t in (tools_run_this_turn or []))
+                            note = ("\n\n---\n*Not re-run after the last edit (you asked not to run it) — the "
+                                    "final version is untested.*" if _ran_code else
+                                    "\n\n---\n*Not run, as you asked — the change is untested.*")
+                            if note[:30] not in final_ai_content:
+                                final_ai_content = f"{final_ai_content}{note}"
+                        elif _is_unverified_mutation(last_tool):
                             verifier_backfill = ("failed", UNVERIFIED_MUTATION_REASON)
                             note = (
                                 "\n\n---\n**⚠ Unverified:** the final action "
@@ -23590,22 +23771,7 @@ class GhostAgent:
         # when nothing was retrieved, so running it on every
         # clean-exit turn is safe.
         sm = getattr(self.context, 'skill_memory', None)
-        if sm is not None and execution_failure_count == 0:
-            try:
-                if hasattr(sm, 'credit_recent_retrievals'):
-                    # Discriminative form: only lessons relevant to THIS
-                    # turn's query (or actually hydrated this turn) get
-                    # credit — the legacy no-arg form credited every
-                    # lesson surfaced in the window, re-creating the
-                    # helpful≈retrievals noise the mode was built to fix.
-                    await asyncio.to_thread(
-                        sm.credit_recent_retrievals, 300,
-                        query=str(last_user_content or ""),
-                        top_triggers=self._surfaced_lesson_triggers(
-                            sm, turn_id=str(req_id or "")),
-                    )
-            except Exception:
-                pass
+        await self._credit_turn_lessons(execution_failure_count, last_user_content)
 
         # Outcome-gated lesson feedback (2026-07-24): attribute THIS turn's
         # verified outcome — including the FAILURE arm the credit block above
@@ -24295,7 +24461,7 @@ class GhostAgent:
             exec_terminal=_exec_terminal, unacked_total_failure=_unacked_turn,
             budget_exhausted=_budget_exhausted, shape_failed=_shape_failed,
             verifier_backfill=verifier_backfill, print_reply=True,
-            marker_text=_recorded_reply)
+            marker_text=_cap_recorded_reply(_recorded_reply))   # what the ROW stores (fresh review)
         # § context R1 B1: request-END disarm of the per-batch read budget —
         # the registry resolves `context._read_budget` AT CALL TIME, so a
         # leftover (possibly zero/spent) budget from this request would
@@ -24466,7 +24632,7 @@ class GhostAgent:
             # a header-marked probe passed this carve-out (its skill memory
             # is the live one) and landed a calibration row stamped
             # origin="user" — the population the instrument exists to score.
-            if _calib_origin == "probe":
+            if _calib_origin in ("probe", "internal"):
                 return
             if (getattr(getattr(self.context, "skill_memory", None),
                         "is_read_only", False) is True
@@ -25896,9 +26062,11 @@ class GhostAgent:
             # `<tool_call>` text in `content`, which this agent's own XML
             # parser then picks up). One predicate, both halves.
             _dropped_this_turn = False
+            _dropped_names = None
             if is_final_generation and tool_calls:
                 dropped = [tc.get("function", {}).get("name", "?") for tc in tool_calls]
                 _dropped_this_turn = True
+                _dropped_names = dropped
                 logger.warning(
                     "Dropping %d tool_call(s) — final-generation turn (names=%s)",
                     len(tool_calls), dropped,
@@ -26008,7 +26176,8 @@ class GhostAgent:
                         )
                         messages.append(msg)
                         messages.append({"role": "user",
-                                         "content": _FORCED_FINAL_ANSWER_DIRECTIVE})
+                                         "content": forced_final_answer_directive(
+                                             _dropped_names, str(last_user_content or ""))})
                         return "continue"
                     pretty_log(
                         "Turn Budget",
@@ -26115,6 +26284,9 @@ class GhostAgent:
                         and not is_final_generation
                         and not force_stop
                         and "notify_operator" not in raw_tools_called
+                        # §4KW (review): a member's notify_operator would page
+                        # the OWNER, not the member — never steer a member to it
+                        and not requester_is_member()
                         and _user_asked_for_notification(last_user_content)):
                     notify_steer_fired = True
                     pretty_log(
@@ -26216,6 +26388,11 @@ class GhostAgent:
                             ):
                                 mentioned_tools.append(t)
 
+                    # §4KW (review): never order a tool the requester lacks
+                    # ("Output the XML <tool_call> immediately" for `browser`
+                    # to a member, then the caveat told it to ignore browser)
+                    if requester_is_member():
+                        mentioned_tools = [t for t in mentioned_tools if t in _MEMBER_ALLOWED_TOOLS]
                     if mentioned_tools and not has_run_tools:
                         is_valid_final = "```" in clean_ui or bool(re.search(r'\b(SUCCESS|DONE|COMPLETE|ERROR)\b', clean_ui.upper()))
                         if not is_valid_final and len(clean_ui.split()) < 100:
@@ -26328,7 +26505,10 @@ class GhostAgent:
                 # refusal ends the loop exactly as compliance does.
                 if _meta_nudge_fired:
                     has_meta_intent = False
-                if not suppress_nudge and has_meta_intent and meta_tools_available and not meta_tools_called and turn < 4:
+                # §4KW (review): learn_skill / update_profile write the OWNER's
+                # memory and profile; a member has neither tool
+                if (not suppress_nudge and has_meta_intent and meta_tools_available
+                        and not meta_tools_called and turn < 4 and not requester_is_member()):
                     _meta_nudge_fired = True
                     pretty_log("Checklist Nudge", "Enforcing meta-task compliance", icon=Icons.SHIELD)
                     messages.append({"role": "user", "content": (
@@ -26688,6 +26868,15 @@ class GhostAgent:
                                 pending_request=last_user_content,
                             )
                             _do_repair = True
+                        elif _unverified and request_forbids_running(last_user_content):
+                            # §4KW (review): the user said not to run it — an
+                            # untested write is what was asked for.
+                            pretty_log(
+                                "Verifier Gate",
+                                "untested write, as the request asked (\"don't run it\") — no repair round",
+                                icon=Icons.VERIFIER_LAB,
+                            )
+                            _do_repair = False
                         elif _unverified and getattr(
                                 self.context, "_breaker_forced_final", False):
                             # §4ID (probe ifs17585…): the futility
@@ -27021,6 +27210,14 @@ class GhostAgent:
                     last_user_content = " ".join([i.get("text", "") for i in last_user_content_raw if isinstance(i, dict) and i.get("type") == "text"])
                 else:
                     last_user_content = str(last_user_content_raw)
+                # §4KW: the request a request-scoped lesson is judged against,
+                # on EVERY retrieval path of this turn (the planner's and the
+                # volatile block's queries are prose, not the request)
+                try:
+                    from ..memory.lesson_scope import current_request as _cur_req
+                    _cur_req.set(str(last_user_content or ""))
+                except Exception:  # noqa: BLE001
+                    pass
                 # §4KV: one user message arrived. Evidence, with the text
                 # test, that the block's carrier is the request
                 # (`_carrier_label`); not proof on its own — the first
@@ -28422,6 +28619,13 @@ class GhostAgent:
                                                 "_futility_steer_done", False)
                                 and not force_final_response
                                 and not force_stop
+                                # §4KW (review): never stacked on another
+                                # runtime steer from the same batch — after the
+                                # search-yield steer ("do NOT run another
+                                # web_search … answer NOW") it said "before
+                                # your next tool call … run only that check"
+                                # (slack-3f1c468d)
+                                and not _last_is_runtime_steer(messages)
                                 and _risk_mod.steer_enabled()):
                             _risk_reading = _risk_mod.turn_risk(
                                 step=turn + 1,
@@ -32529,7 +32733,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     _ff_payload["stream"] = False
                     _ff_payload["messages"] = list(payload.get("messages") or []) + [
                         {"role": "assistant", "content": _ff_raw_turn or "(no answer)"},
-                        {"role": "user", "content": _FORCED_FINAL_ANSWER_DIRECTIVE},
+                        {"role": "user", "content": forced_final_answer_directive(
+                            [] if _ff_tried_tool else None, str(last_user_content or ""))},
                     ]
                     if _ff_payload.get("tools"):
                         _ff_payload["tool_choice"] = "none"
@@ -33322,24 +33527,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 # signal was biased toward complex tasks and
                 # the pruner drifted accordingly.
                 sm = getattr(self.context, 'skill_memory', None)
-                if sm is not None and execution_failure_count == 0:
-                    try:
-                        if hasattr(sm, 'credit_recent_retrievals'):
-                            # Discriminative form — see the
-                            # finalize-path call for rationale.
-                            await asyncio.to_thread(
-                                sm.credit_recent_retrievals, 300,
-                                query=str(last_user_content or ""),
-                                # BOTH surfaces (§4L R2 NEW-1): the
-                                # delivery dedup removed co-surfaced lessons
-                                # from last_playbook_triggers, starving their
-                                # deterministic credit channel while the
-                                # denominator kept booking.
-                                top_triggers=self._surfaced_lesson_triggers(
-                                    sm, turn_id=str(req_id or "")),
-                            )
-                    except Exception:
-                        pass
+                await self._credit_turn_lessons(execution_failure_count, last_user_content)
 
                 # Outcome-gated lesson feedback (streamed path): the verifier runs
                 # LATE here (trajectory recorded with verifier=None), so only a
@@ -33498,8 +33686,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         # command and return the exit code verbatim", quarantined) and a
         # journal-challenge candidate. Gated HERE, the one writer, so every
         # kind and every future append site inherits it.
-        if turn_origin(self.context) == ORIGIN_PROBE:
-            logger.debug("journal append('%s') skipped: probe turns never teach", kind)
+        if turn_origin(self.context) in (ORIGIN_PROBE, "internal"):     # §4KW second review
+            logger.debug("journal append('%s') skipped: probe/internal turns never teach", kind)
             return
         if requester_is_member():
             # The one writer backstops its callers' `turn_may_teach` (§4KJ R10).
@@ -33537,7 +33725,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         # §4FB: diagnostics never teach — a probe turn must not credit or
         # observe the memories it surfaced (the judge feeds helpful_retrievals
         # and the RRF refit ledger).
-        if turn_origin(self.context) == "probe":
+        if not turn_may_teach(self.context):     # probe, member, internal (§4KW second review)
             return
         bus = getattr(self.context, "memory_bus", None)
         stash = getattr(bus, "last_hydration", None) if bus is not None else None
@@ -33604,8 +33792,11 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         grouped everything as ``general``, and every injected episode line
         rendered a bare ``[]`` tag.
         """
-        if requester_is_member():
-            return              # the episodic store is the OWNER's recall (R4)
+        if not turn_may_teach(self.context):
+            # the episodic store is the OWNER's recall (R4) — and diagnostics
+            # never teach (fresh review §4KW: 79+ probe episodes, retrieved
+            # ~2,000 times, e.g. "What is my project codename?" ×366)
+            return
         em = getattr(self.context, "episodic_memory", None)
         if em is None:
             return
@@ -34084,9 +34275,11 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             # turn's correction banner is prepended after the record, and a
             # banner that quoted a marker must not fail this turn (§4KW open
             # item; the corpus row reads the text without it).
+            _as_recorded = final_content if marker_text is None else marker_text
             shape_failed = (bool(shape_failed) or bool(loop_breaker_for(self.context, req_id))
-                            or reply_carries_abort_marker(
-                                final_content if marker_text is None else marker_text))
+                            or reply_carries_abort_marker(_as_recorded)
+                            # the corpus's rule 1c: the canned no-answer fallback
+                            or _is_no_answer_fallback(_as_recorded))
             _verifier_failed = bool(verifier_backfill and verifier_backfill[0] == "failed")
             _verifier_passed = bool(verifier_backfill and verifier_backfill[0] == "passed")
             # §4EE R3 — the THIRD mirror. The calibration sample was written
@@ -34286,10 +34479,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             # §4FB: a diagnostic probe is its own kind. `admitted_task_kinds`
             # never lists it, so every trajectory reader — reflection first —
             # excludes probe rows by construction.
-            task_kind=("probe" if turn_origin(self.context) == "probe" else
-                       (_tk if isinstance(
-                           (_tk := getattr(self.context, "trajectory_task_kind", None)),
-                           str) and _tk else "user_request")),
+            task_kind=trajectory_task_kind(self.context),
             cluster=None,
             tier=None,
             model=str(model or ""),
@@ -34320,7 +34510,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             # after the last user message.
             n_steps=self._this_turn_step_count(msgs, user_request),
             outcome=Outcome.UNKNOWN.value,  # user turns have no validator
-            final_response=final_response[:16000],
+            final_response=_cap_recorded_reply(final_response),
         )
         # Stamp the turn's wall-clock from the pretty-log request clock.
         # The writer used to leave duration_s at the schema default (0.0)
@@ -34381,20 +34571,18 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             # for any future wrapper drift.
             _sm_h = (getattr(self.context, "skill_memory", None)
                      if turn_origin(self.context) == "user" else None)
-            _trigs = list(getattr(_sm_h, "last_playbook_triggers", []) or [])
-            # BOTH surfaces (§4L Lens-D MINOR-2) — bus-tier lessons were
-            # invisible to the attribution stamp. Turn-key gated (R2
-            # NEW-3): a stale previous-turn list must not be inherited.
+            # §4KW: the SAME turn-guarded union the outcome credit reads
+            # (`_surfaced_lesson_triggers`). The playbook list was read
+            # unguarded, so a turn that ran no playbook lookup recorded the
+            # PREVIOUS turn's lessons (live 2026-10-02: "what about Veronica
+            # Moser ?" recorded the five project lessons of the turn before).
             try:
                 from ..utils.logging import request_id_context as _ric
-                _cur_key = str(_ric.get() or "")
+                _cur_key = str(_ric.get() or "") or str(req_id or "")
             except Exception:
-                _cur_key = ""
-            if (_cur_key and _cur_key == str(getattr(
-                    _sm_h, "_bus_delivered_turn_key", "") or "")):
-                for _bt in (getattr(_sm_h, "last_bus_triggers", []) or []):
-                    if _bt not in _trigs:
-                        _trigs.append(_bt)
+                _cur_key = str(req_id or "")
+            _trigs = (list(dict.fromkeys(self._surfaced_lesson_triggers(_sm_h, turn_id=_cur_key)))
+                      if (_sm_h is not None and _cur_key) else [])
             if _trigs:
                 _extra["hydrated_lessons"] = _trigs[:10]
         except Exception:

@@ -234,7 +234,11 @@
   <h2>Round-2/3 hardening + features (2026-07-25)</h2>
   <p><strong>Services follow the lifecycle:</strong> hard delete, archive, and a failed release rehearsal all
   stop the project's services (no more orphaned processes under an rmtree'd workspace, or a retired release's
-  services running forever). <strong>OS-level immutability:</strong> release chmods the workspace read-only
+  services running forever). <strong>OS-level immutability:</strong> release chmods the workspace read-only <em>and sets the user-immutable
+  flag</em> on everything but its runtime state &mdash; a sqlite db and the db's folder stay writable (fifth review:
+  the Jiu Jitsu Calendar keeps <code>data.db</code> next to <code>app.py</code>); a project without a workspace path, or one outside the
+  sandbox, is never flagged (§4KW fourth review: the sandbox's root, holding FOWNER, ran <code>chmod -R u+w . &amp;&amp; rm -rf *</code>; the flag
+  cannot be cleared from the container &mdash; measured: rm, write, create, mv, rmtree and chmod all refused)
   (fork restores +w on the copy — copytree copies mode bits; hard delete restores +w path-direct before rmtree);
   <code>execute</code> refuses shell commands that reference a RELEASED path AND carry a mutation token
   (rm/mv/redirect/<code>sed -i</code>…) — closing the shell bypass of the file-tool guard. <strong>Views:</strong>

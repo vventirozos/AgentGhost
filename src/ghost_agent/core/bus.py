@@ -263,11 +263,15 @@ class MemoryBus:
             logger.info("memory bus sub-queries (%d): %s", len(sub_queries) - 1,
                         " | ".join(str(q)[:80] for q in sub_queries[1:]))
 
-        # Fan-out retrieval for each sub-query in parallel
+        # Fan-out retrieval for each sub-query in parallel. Request-scoped
+        # lessons are judged against the USER's request, not the sub-query
+        # (§4KW): `raw_user_text` when the caller gave it, else the query.
+        _scope_request = str(raw_user_text or query or "")
         fetch_coros = []
         for sq in sub_queries:
             fetch_coros.append(
-                self._fetch_all_tiers(sq, exclude_session_id=exclude_session_id))
+                self._fetch_all_tiers(sq, exclude_session_id=exclude_session_id,
+                                      scope_request=_scope_request))
         tier_results_per_query = await asyncio.gather(*fetch_coros)
 
         # One ranked list PER (sub-query, tier). RRF's keyed accumulation
@@ -606,12 +610,13 @@ class MemoryBus:
             except Exception as e:
                 logger.debug(f"skill record_retrievals_bulk failed: {e}")
 
-    async def _fetch_all_tiers(self, query: str, exclude_session_id: str = ""):
+    async def _fetch_all_tiers(self, query: str, exclude_session_id: str = "",
+                               scope_request: str = ""):
         """Fetch from all memory tiers for a single query."""
         return await asyncio.gather(
             self._fetch_vector(query),
             self._fetch_graph(query),
-            self._fetch_skill(query),
+            self._fetch_skill(query, scope_request=scope_request),
             self._fetch_episodic(query),
             self._fetch_session(query, exclude_session_id=exclude_session_id),
         )
@@ -847,7 +852,7 @@ class MemoryBus:
             return []
         return [{"source": "graph", "text": e} for e in edges if e]
 
-    async def _fetch_skill(self, query: str) -> List[Dict[str, Any]]:
+    async def _fetch_skill(self, query: str, scope_request: str = "") -> List[Dict[str, Any]]:
         if not self.skill:
             return []
         # Prefer the per-item API: one RRF item per LESSON. The old
@@ -861,6 +866,7 @@ class MemoryBus:
             try:
                 items = await asyncio.to_thread(
                     get_items, query, self.vector,
+                    **({"scope_request": scope_request} if scope_request else {}),
                 )
                 return [
                     {"source": "skill", "text": it.get("text", ""), "trigger": it.get("trigger", "")}
@@ -1380,13 +1386,15 @@ class MemoryBus:
                 results["profile"] = "skip"
                 return
             try:
-                await asyncio.to_thread(
+                _msg = await asyncio.to_thread(
                     self.profile.update,
                     update.get("category"),
                     update.get("key"),
                     update.get("value", ""),
                 )
-                results["profile"] = "ok"
+                # a refusal is RETURNED, not raised (read-degraded store)
+                results["profile"] = (f"error: {_msg}" if isinstance(_msg, str)
+                                      and _msg.lower().startswith("error") else "ok")
             except Exception as e:
                 results["profile"] = f"error: {e}"
 

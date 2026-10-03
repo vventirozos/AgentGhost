@@ -545,6 +545,44 @@
   <p>
     <strong>Graph edges, per edge.</strong> <code>get_neighborhood</code> matches any query word over three characters, so the year token <code>2026</code> pulled in every edge ending in a 2026 date — July news headlines, the operator's family profile — and put fifteen of them at the <em>top</em> of a Revolut recall. Corpus: 111 of 336 graph edges shown (33%) share no non-numeric content word with their query. <code>_graph_edges_on_topic</code> now keeps an edge only if it shares a folded (Unicode, accent-stripped), non-stopword, non-numeric content word with the query; the section is omitted when nothing survives and still leads the result when something does. A query with no content words passes edges through — nothing to judge, nothing rejected. Covered by <code>tests/test_recall_episode_refs_and_graph_filter.py</code>.
   </p>
+  <h2 id="4kw-review4">forget and update_profile no longer destroy owner data <span class="tag">2026-10-02 &sect;4KW</span></h2>
+  <ul>
+    <li><strong><code>forget &lt;document&gt;</code> keeps unrelated facts.</strong> The semantic sweep deleted every conversational
+    fact within distance 0.8/0.6 of the target; unrelated facts sit at 0.53&ndash;0.65, so <code>forget postgresql-19-A4.pdf</code>
+    removed the owner's birth date, both sons' birthdates and home town (live, 09-09). A file or document name now removes only facts
+    that name it; an entity needs a near-paraphrase (<code>_FORGET_SEMANTIC_MAX</code> = 0.3) or a literal mention. Forget also
+    respects the released-project lock.</li>
+    <li><strong><code>update_profile</code> deletes only on an explicit <code>value=""</code>.</strong> Any falsy value deleted &mdash;
+    a key-only call (the model reaching for the tool to read the profile), <code>None</code>, <code>0</code>; the owner's
+    <code>root.name</code> was removed this way. A missing value is an error, a blank one is refused, and a delete names the value
+    it removed.</li>
+    <li>A read-degraded profile store refuses writes VISIBLY: <code>ProfileMemory.update/delete</code> return an error after the load
+    that discovers the failure, and both the bus and the direct path report it (the tool said "SUCCESS: Profile updated" over a
+    silent refusal).</li>
+  </ul>
+  <h2 id="4kw-review5">forget, second review <span class="tag">2026-10-02 &sect;4KW</span></h2>
+  <p><em>Superseded by <a href="#4kw-r4">the fourth review</a> (thresholds 0.8 / 0.6, inflections only).</em>
+  An entity forget removes a fact that shares a content word (5-letter stem) with the target up to distance 0.7, or any fact
+  under 0.3 ("forget my address" removed nothing at 0.3 alone). The released-project lock is checked per FILE the sweep would
+  delete, so forgetting a memory inside a released project still runs. A refused profile write (read-degraded store) is reported
+  with &#9888;, never as removed.</p>
+  <h2 id="4kw-r3">forget by words: only an unambiguous match <span class="tag">2026-10-02 &sect;4KW</span></h2>
+  <p>A fact matched by WORDS (every distinctive word of the target, exact or inflected, within 0.8; or half of them within 0.6;
+  hub words like "user", "project", "file" never count) is deleted only when it is the ONE such fact; otherwise the candidates are
+  named and nothing is deleted ("user nickname" had deleted all eight owner facts; "my address" matches the home and the email
+  address).</p>
+  <h2 id="4kw-r4">forget, fourth review <span class="tag">2026-10-02 &sect;4KW</span></h2>
+  <ul>
+    <li>A literal mention no longer deletes unconditionally: a target of hub words only ("user", "the user") names no fact, and an
+    attribute noun several facts mention ("address": home and email) is a choice &mdash; both list the candidates, nothing is deleted.
+    A real entity ("iguana") still goes from every fact that names it.</li>
+    <li>Words match as inflections of one stem (<code>weight</code>/<code>weighs</code>, <code>address</code>/<code>addresses</code>),
+    not as prefixes (<code>homework</code> no longer matches "home town", <code>plan</code> no longer "planet").</li>
+    <li>One full-coverage match wins over partial ones ("my wife's birthday" deletes the birthday, not "wife is named Maria").</li>
+  </ul>
+  <h2 id="4kw-r5">forget, fifth review <span class="tag">2026-10-03 &sect;4KW</span></h2>
+  <p>After the facts naming the target are deleted, a fact that matches only some of its words is listed, never deleted ("wife's
+  birthday" no longer takes "wife is named Maria"). Inflections are only -s/-es/-ed/-ing/-ies/-ly (Louis is not Louise, plan is not plant).</p>
 </main>
   <h2 id="member">Not for a channel member <span class="tag">2026-09-24 &sect;4KJ</span></h2>
   <p><code>recall</code>, <code>remember</code>, <code>knowledge_base</code>, <code>update_profile</code> and <code>unified_forget</code> read or write the OWNER's stores. A request that declared itself a member's is refused at dispatch (every tool outside <code>core/agent._MEMBER_ALLOWED_TOOLS</code>) and, as a belt, inside each tool (<code>_member_block</code>, reason <code>owner_data_blocked</code>, nothing touched). Pins: <code>tests/test_requester_role.py</code>.</p>

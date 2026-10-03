@@ -187,7 +187,7 @@
     "test_preflight_guard.py": 1,
     "test_probe_before_hypothesis.py": 5,
     "test_probe_findings_2026_07_31.py": 1,
-    "test_probe_never_teaches.py": 6,
+    "test_probe_never_teaches.py": 3,
     "test_project_deliverable_honesty.py": 2,
     "test_project_readside_plumbing.py": 2,
     "test_project_research_offmain.py": 4,
@@ -271,5 +271,5 @@
     "test_workspace_cleanup_deletion_guards.py": 1,
     "test_workspace_tidy.py": 3
   },
-  "total_textual": 1327
+  "total_textual": 1324
 }

@@ -119,7 +119,11 @@ async def test_the_retry_is_told_tools_are_off_and_keeps_the_prefix():
     assert UNPARSED_TOOL_CALL_NOTE not in p["messages"][-2]["content"]   # the model never sees its own caveat
     assert p.get("stream") is False
     assert p.get("tools") and p.get("tool_choice") == "none"
-    assert p["messages"][-1] == {"role": "user", "content": _FORCED_FINAL_ANSWER_DIRECTIVE}
+    # §4KW: the builder — the constant, whose message it is, which request,
+    # and (here the model tried a tool) that the call did not run
+    last = p["messages"][-1]
+    assert last["role"] == "user" and last["content"].startswith(_FORCED_FINAL_ANSWER_DIRECTIVE)
+    assert "were NOT run" in last["content"] and "THE REQUEST YOU ARE ANSWERING" in last["content"]
     assert p["messages"][-2]["role"] == "assistant" and "final verification batch" in p["messages"][-2]["content"]
 
 

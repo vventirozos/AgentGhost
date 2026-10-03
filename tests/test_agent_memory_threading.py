@@ -47,7 +47,9 @@ async def test_agent_post_mortem_thread_offload():
         args, kwargs = mock_to_thread.call_args
         
         assert args[0] == skill_memory.learn_lesson
-        assert args[1] == "Test Task"
+        # §4KW: "Test Task" is not a general situation (too short to name a
+        # class), so the lesson is scoped to the request it came from
+        assert args[1] == "User said hi" and kwargs["scope"] == "request"
         assert args[2] == "Failed something"
         assert args[3] == "Fixed it"
         assert kwargs["memory_system"] == context.memory_system

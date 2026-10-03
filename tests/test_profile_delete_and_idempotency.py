@@ -55,12 +55,16 @@ class TestUpdateProfileDelete:
         prof.delete.assert_called_once_with(
             "preferences", "python_indentation")
 
-    async def test_omitted_value_deletes_key(self):
+    async def test_omitted_value_does_not_delete(self):
+        """§4KW (fresh review) REVERSES the old contract: a key-only call (the
+        model reaching for the tool to READ, 3 live) deleted the field — the
+        owner's root.name was lost this way. Only an explicit "" deletes."""
         prof = self._profile({"preferences": {"python_indentation": "Tabs"}})
         res = await tool_update_profile(
             category="preferences", key="python_indentation",
             profile_memory=prof)
-        assert "Removed from Profile" in res
+        assert "is required" in res and "Nothing was changed" in res
+        prof.delete.assert_not_called()
 
     async def test_delete_scrubs_derived_vector_fact(self):
         prof = self._profile(
