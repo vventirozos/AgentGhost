@@ -2097,7 +2097,7 @@ class _PlanVector(_Passthrough):
 
 
 async def forget_preview(target, sandbox_dir=None, memory_system=None, profile_memory=None, graph_memory=None,
-                         project_store=None, episodic_memory=None):
+                         project_store=None, episodic_memory=None, skill_memory=None):
     """Run the forget sweep in PLAN mode and return the numbered list plus a
     confirmation token. Nothing is deleted."""
     import time as _t
@@ -2108,6 +2108,15 @@ async def forget_preview(target, sandbox_dir=None, memory_system=None, profile_m
                                           project_store=project_store, episodic_memory=episodic_memory)
     finally:
         _FORGET_PLAN.reset(tok)
+    # §4LC: the lessons that mention it (a request-scoped plan stores the
+    # owner's request verbatim) — listed, and removed when confirmed
+    if skill_memory is not None and hasattr(skill_memory, "lessons_mentioning"):
+        try:
+            for trig, scoped in await asyncio.to_thread(skill_memory.lessons_mentioning, target):
+                plan.add("lesson", {"trigger": trig},
+                         f"lesson {trig[:80]!r}" + (" (one request's plan)" if scoped else ""))
+        except Exception as e:  # noqa: BLE001
+            notes = f"{notes}\n⚠️ Lessons could not be searched: {e}"
     if not isinstance(notes, str):
         notes = str(notes)
     if notes.startswith(("SYSTEM ERROR", "Error", "Report:")) and not plan.items:
@@ -2140,7 +2149,7 @@ async def forget_preview(target, sandbox_dir=None, memory_system=None, profile_m
     return "\n".join(lines)
 
 
-def _reset_preview(memory_system, graph_memory) -> str:
+def _reset_preview(memory_system, graph_memory, episodic_memory=None, skill_memory=None) -> str:
     import time as _t
     try:
         rows = memory_system.collection.count()
@@ -2152,14 +2161,28 @@ def _reset_preview(memory_system, graph_memory) -> str:
             edges = graph_memory.count_edges()
     except Exception:  # noqa: BLE001
         pass
+    eps = "?"
+    try:
+        if episodic_memory is not None and hasattr(episodic_memory, "count"):
+            eps = episodic_memory.count()
+    except Exception:  # noqa: BLE001
+        pass
     try:
         from ..utils.logging import request_id_context
         rid = str(request_id_context.get() or "")
     except Exception:  # noqa: BLE001
         rid = ""
+    req_lessons = "?"
+    try:
+        if skill_memory is not None and hasattr(skill_memory, "request_scoped_count"):
+            req_lessons = skill_memory.request_scoped_count()
+    except Exception:  # noqa: BLE001
+        pass
     token = _store_plan({"kind": "reset_all", "rid": rid, "ts": _t.time(), "items": []})
     return (f"PREVIEW — nothing was deleted. reset_all would erase the WHOLE vector memory ({rows} rows: every "
-            f"fact, document and stored search copy) and the knowledge graph ({edges} facts). Ask the user to "
+            f"fact, document and stored search copy), the knowledge graph ({edges} facts), the past-conversation "
+            f"episodes ({eps}) and the one-request lessons that quote your requests ({req_lessons}) — not the "
+            f"profile or the general lessons. Ask the user to "
             f"confirm. Only after the USER says yes in their next message, call "
             f"knowledge_base(action='reset_all', confirm='{token}'). To remove something specific instead, use "
             f"action='forget' with a target.")
@@ -2174,6 +2197,14 @@ _NOT_THE_USER_PREFIXES = ("bench-", "replay-")
 
 def _not_the_user(rid: str) -> bool:
     if not rid or rid == "SYSTEM" or rid.startswith(_NOT_THE_USER_PREFIXES):
+        return True
+    # §4LD: a probe is not the user either (it could confirm a forget or a
+    # reset_all preview; `_owner_write_block` already refused probes)
+    try:
+        from ..utils.logging import is_probe_request_id, request_origin_context, ORIGIN_PROBE
+        if is_probe_request_id(rid) or str(request_origin_context.get() or "") == ORIGIN_PROBE:
+            return True
+    except Exception:  # noqa: BLE001
         return True
     try:
         from ..core.autonomous_activity import is_internal_request
@@ -2230,7 +2261,7 @@ def _pick(items: list, selection):
 
 
 async def forget_execute(token, selection="all", sandbox_dir=None, memory_system=None, profile_memory=None,
-                         graph_memory=None, project_store=None, episodic_memory=None):
+                         graph_memory=None, project_store=None, episodic_memory=None, skill_memory=None):
     """Delete exactly the confirmed items of a preview."""
     plan = _take_plan(token, "forget")
     if plan is None:
@@ -2251,14 +2282,20 @@ async def forget_execute(token, selection="all", sandbox_dir=None, memory_system
     for it in chosen:
         try:
             report.append(await asyncio.to_thread(_execute_item, it, memory_system, profile_memory, graph_memory,
-                                                  project_store, episodic_memory))
+                                                  project_store, episodic_memory, skill_memory))
         except Exception as e:  # noqa: BLE001
             report.append(f"⚠️ {it['label']}: {e}")
     return "\n".join(report)
 
 
-def _execute_item(it, memory_system, profile_memory, graph_memory, project_store, episodic_memory) -> str:
+def _execute_item(it, memory_system, profile_memory, graph_memory, project_store, episodic_memory,
+                  skill_memory=None) -> str:
     k, r = it["kind"], it["ref"]
+    if k == "lesson":
+        if skill_memory is None:
+            return f"⚠️ {it['label']}: the lesson store is not available"
+        ok = skill_memory.remove_by_trigger(r["trigger"], memory_system=memory_system)
+        return f"✅ Removed {it['label']} (archived)" if ok else f"ℹ️ {it['label']} was already gone"
     if k == "file":
         root, path = Path(r["root"]), Path(r["path"])
         if path.is_symlink() or not _is_within_root(path.resolve(), root.resolve()):
@@ -2294,8 +2331,11 @@ def _execute_item(it, memory_system, profile_memory, graph_memory, project_store
         n = graph_memory.delete_edge(r["s"], r["p"], r["o"])
         return f"✅ Removed {it['label']}" if n else f"ℹ️ {it['label']} was already gone"
     if k == "episode":
-        n = episodic_memory.delete_episodes([r["id"]], memory_system, reason="forget")
-        return f"✅ Forgot {it['label']} (archived)" if n else f"ℹ️ {it['label']} was already gone"
+        n = episodic_memory.delete_episodes([r["id"]], memory_system, reason=f"forget {it.get('target', '')}".strip())
+        if n and getattr(episodic_memory, "last_twin_failures", None):
+            # (§4LA) the row went but its search copy did not — say so
+            return f"⚠️ Forgot {it['label']}, but its search copy could not be removed yet (it is retried later)"
+        return f"✅ Forgot {it['label']} (archived for 30 days)" if n else f"ℹ️ {it['label']} was already gone"
     return f"⚠️ unknown item kind {k}"
 
 
@@ -3531,7 +3571,8 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
             return await forget_execute(kwargs.get("confirm"), kwargs.get("items") or "all", sandbox_dir,
                                         memory_system, kwargs.get("profile_memory"), kwargs.get("graph_memory"),
                                         project_store=kwargs.get("project_store"),
-                                        episodic_memory=kwargs.get("episodic_memory"))
+                                        episodic_memory=kwargs.get("episodic_memory"),
+                                        skill_memory=kwargs.get("skill_memory"))
         subject, err = _kb_target_or_error(
             kwargs, action_as_called, "target",
             "pass the topic, entity or filename to erase",
@@ -3540,7 +3581,8 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
             return err
         return await forget_preview(subject, sandbox_dir, memory_system, kwargs.get("profile_memory"),
                                     kwargs.get("graph_memory"), project_store=kwargs.get("project_store"),
-                                    episodic_memory=kwargs.get("episodic_memory"))
+                                    episodic_memory=kwargs.get("episodic_memory"),
+                                    skill_memory=kwargs.get("skill_memory"))
 
     elif action == "query":
         return await tool_query_document(
@@ -3621,7 +3663,8 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
         # token, then the token in a LATER turn after the user says yes.
         _tok = str(kwargs.get("confirm") or "").strip()
         if not _tok:
-            return await asyncio.to_thread(_reset_preview, memory_system, kwargs.get("graph_memory"))
+            return await asyncio.to_thread(_reset_preview, memory_system, kwargs.get("graph_memory"),
+                                           kwargs.get("episodic_memory"), kwargs.get("skill_memory"))
         _plan = _take_plan(_tok, "reset_all")
         if _plan is None:
             return ToolOutcome.rejected("NOT executed: unknown or expired reset_all token — run reset_all "
@@ -3751,17 +3794,34 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
                 await asyncio.to_thread(kwargs.get("graph_memory").wipe_all)
             except Exception as e:
                 __import__("logging").getLogger("GhostAgent").warning(f"reset_all graph wipe failed: {e}")
-        note = ""
+        # §4LA: the episodes too — their vector twins went above, and the boot
+        # reconcile re-indexed every episode, so "wiped" memory came back
+        _em = kwargs.get("episodic_memory")
+        if _em is not None and hasattr(_em, "wipe_all"):
+            try:
+                await asyncio.to_thread(_em.wipe_all)
+                orphaned.pop("episode", None)
+            except Exception as e:  # noqa: BLE001
+                __import__("logging").getLogger("GhostAgent").warning(f"reset_all episode wipe failed: {e}")
+        # §4LC: the one-request lessons quote the owner's requests verbatim —
+        # they go too (the boot reconcile re-indexed them after the vector wipe)
+        _sk = kwargs.get("skill_memory")
+        _req_gone = 0
+        if _sk is not None and hasattr(_sk, "remove_request_scoped"):
+            try:
+                _req_gone = await asyncio.to_thread(_sk.remove_request_scoped, memory_system)
+            except Exception as e:  # noqa: BLE001
+                __import__("logging").getLogger("GhostAgent").warning(f"reset_all lesson wipe failed: {e}")
+        note = (f" Removed {_req_gone} one-request lesson(s) (archived)." if _req_gone else "")
         if report_note_incomplete:
-            note = (" NOTE: the store returned fewer metadata rows than ids,"
+            note += (" NOTE: the store returned fewer metadata rows than ids,"
                     " so the list of orphaned records below is incomplete.")
         if orphaned:
             note += (
                 " NOTE: this removed the vector rows for "
                 + ", ".join(f"{n} {t}" for t, n in sorted(orphaned.items()))
-                + ". Their records in the episodic / skill stores are NOT"
-                " deleted by this action and now have no searchable twin —"
-                " they remain on disk and will not surface in recall."
+                + ". Their records in the skill store are NOT deleted by this"
+                " action; the boot reconcile re-indexes them."
             )
         if failed_batches:
             return ToolOutcome.partial(

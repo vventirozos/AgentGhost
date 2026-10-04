@@ -139,7 +139,7 @@ def main() -> None:
                     help="rewrite files (default: dry-run report)")
     args = ap.parse_args()
 
-    from ghost_agent.distill.redact import redact_text
+    from ghost_agent.distill.redact import redact_text, RedactionConfig
     from ghost_agent.selfhood.autobiographical import redact_pii
 
     gh = _ghost_home()
@@ -165,6 +165,12 @@ def main() -> None:
          redact_text),
         ("llm_recordings", sorted((gh / "system" / "llm_recordings").rglob("*.jsonl")),
          redact_text),
+        # §4LH: the full tool results beside the rows (main + bench roots);
+        # same rules as the rows except onion addresses, which are kept
+        ("trajectory_results",
+         sorted((gh / "system" / "trajectory_results").rglob("*.jsonl"))
+         + sorted((gh / "system" / "bench" / "trajectory_results").rglob("*.jsonl")),
+         lambda t: redact_text(t, RedactionConfig(disabled_rules=("tor_onion",)))),
         ("selfhood", [p for p in [
             gh / "system" / "selfhood" / "autobiographical.jsonl",
             gh / "system" / "selfhood" / "narrative.history.jsonl",

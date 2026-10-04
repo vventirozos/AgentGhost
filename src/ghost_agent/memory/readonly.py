@@ -30,8 +30,20 @@ Keep the semantics here in sync if you change them there.
 from __future__ import annotations
 
 import logging
+import re
 
 logger = logging.getLogger("GhostAgent")
+
+
+#: §4LH final review: the named lists are a deny-list, and every writer added
+#: after them leaked through (unquarantine_lesson, reconcile_vector_orphans,
+#: heal_missing_twins, _update_lesson_fields). A method named for a mutation —
+#: public or private — is a no-op through any façade, listed or not.
+_MUTATING_NAME = re.compile(
+    r"^_*(?:add|set|save|write|update|upsert|delete|remove|retract|prune|mark|credit|record|bump|"
+    r"quarantine|unquarantine|reconcile|heal|learn|forget|wipe|ingest|reset|archive|rotate|store|"
+    r"put|insert|merge|apply|purge|clear|drop|rename|restore|relabel|backfill|graduate|"
+    r"promote|demote|evict|compact|rebuild|reindex|migrate|repair|refresh)_")
 
 
 class _ReadOnlyProxy:
@@ -60,7 +72,7 @@ class _ReadOnlyProxy:
     def __getattr__(self, name):
         # Only fires for names not found by normal lookup (so the class-level
         # methods / _MUTATORS / _BLOCKED_ATTRS / is_read_only resolve first).
-        if name in self._MUTATORS:
+        if name in self._MUTATORS or _MUTATING_NAME.match(name):
             return self._noop
         if name in self._BLOCKED_ATTRS:
             return None
@@ -130,6 +142,8 @@ class ReadOnlySkillMemory(_ReadOnlyProxy):
         # counterfactual regression checks) could quarantine a REAL operator
         # lesson through the façade.
         "quarantine_lesson",
+        "quarantine_citing",      # §4LC
+        "remove_request_scoped",  # §4LC
     })
 
     def get_playbook_context(self, *a, **kw):

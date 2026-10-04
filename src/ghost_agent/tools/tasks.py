@@ -421,6 +421,57 @@ async def tool_list_tasks(scheduler):
         lines.append(f"- ID: {job.id} | Name: {job.name} | Next Run: {_nrt}")
     return "\n".join(lines)
 
+#: §4LD bounds: a task fires a full LLM turn holding the agent's one slot
+MAX_TASKS = 20
+MIN_TASK_INTERVAL_S = 60
+
+
+def _schedule_refusal(action, scheduler, task_name, cron_expression, interval_secs):
+    """Why this create/watch/stop_all must not run, or None (§4LD):
+      * an unattended run (a scheduled task, a job, a sub-agent) never
+        schedules or wipes tasks — a task could re-schedule itself forever
+        or erase the owner's;
+      * a probe never leaves a task behind (it fired forever as an internal
+        turn);
+      * at most MAX_TASKS, at most one per MIN_TASK_INTERVAL_S (300 tasks at
+        interval:1 fired 600 turns in 2.2 s);
+      * a name already scheduled is not silently REPLACED (the id is the
+        name's hash — "SUCCESS" overwrote the old prompt)."""
+    from ..utils.logging import (request_id_context, is_probe_request_id, request_origin_context,
+                                 ORIGIN_PROBE)
+    from ..core.autonomous_activity import is_internal_request
+    rid = str(request_id_context.get() or "")
+    if is_internal_request(rid):
+        return (f"Error: a scheduled or background run cannot {action.replace('_', ' ')} tasks — only the "
+                f"user can, in a conversation.")
+    if is_probe_request_id(rid) or str(request_origin_context.get() or "") == ORIGIN_PROBE:
+        return "Error: a probe request does not create or stop scheduled tasks."
+    if action in ("stop_all", "stop"):
+        return None
+    try:
+        # the agent's own jobs (the idle dream monitor) are not the owner's
+        # tasks and do not count toward the limit (§4LI review)
+        jobs = [j for j in scheduler.get_jobs() if getattr(j, "id", None) != "idle_dream_monitor"]
+    except Exception:  # noqa: BLE001
+        jobs = []
+    _prefix = "watch" if action == "watch" else "task"    # a watch's id is watch_<hash> (review)
+    job_id = f"{_prefix}_{hashlib.md5(str(task_name).encode()).hexdigest()[:10]}"
+    if job_id and any(getattr(j, "id", None) == job_id for j in jobs):
+        return (f"Error: a task named {task_name!r} already exists — stop it first (action='stop') "
+                f"or choose another name.")
+    if len(jobs) >= MAX_TASKS:
+        return f"Error: {len(jobs)} tasks are scheduled (the limit is {MAX_TASKS}); stop one first."
+    if action == "create" and str(cron_expression or "").startswith("interval:"):
+        try:
+            secs = int(str(cron_expression).split(":", 1)[1].strip())
+        except (IndexError, ValueError):
+            return None              # the scheduler's own parser reports it
+        if 0 < secs < MIN_TASK_INTERVAL_S:        # ≤ 0: the scheduler's own "positive" error
+            return (f"Error: a task runs a full agent turn — the interval must be at least "
+                    f"{MIN_TASK_INTERVAL_S} seconds (got {secs}).")
+    return None
+
+
 async def tool_manage_tasks(action: str = None, scheduler=None, memory_system=None, task_name: str = None, cron_expression: str = None, prompt: str = None, task_identifier: str = None, check_command: str = None, interval_secs=None, **kwargs):
     if not action:
         return "SYSTEM ERROR: The 'action' parameter is MANDATORY. You must specify it."
@@ -430,6 +481,12 @@ async def tool_manage_tasks(action: str = None, scheduler=None, memory_system=No
     action = str(action or "").strip().lower()
     if not scheduler:
         return "Error: Background task scheduling is disabled or not available in this context."
+    # "stop" too (§4LI review): a scheduled run refused stop_all could still
+    # stop the owner's tasks one by one
+    if action in ("create", "watch", "stop_all", "stop"):
+        _why = _schedule_refusal(action, scheduler, task_name, cron_expression, interval_secs)
+        if _why:
+            return _why
 
     if action == "create":
         if not (task_name and cron_expression and prompt):

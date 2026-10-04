@@ -521,11 +521,12 @@ async def test_bench_claims_a_dice_missed_tick_without_closing_the_window():
 async def test_bench_skips_a_tick_where_self_play_ran():
     # One heavy solve per tick: when the dice HIT and self-play runs,
     # bench stands down for that tick.
+    from ghost_agent.core.agent import GhostAgent
     agent = _make_bench_agent(idle_seconds=4000)
     agent.context.args.no_self_play = False
     agent.context.frontier_tracker = None
-    agent._last_selfplay_at = (datetime.datetime.now()
-                               - datetime.timedelta(hours=3))
+    agent._last_selfplay_at = (datetime.datetime.now()     # past its cooldown (§4LF: 4 h)
+                               - datetime.timedelta(seconds=GhostAgent._SELFPLAY_COOLDOWN + 600))
     agent._bio_roll = lambda p: True    # dice hit → self-play fires
     fake_dreamer = MagicMock()
     fake_dreamer.synthetic_self_play = AsyncMock(return_value="ok")

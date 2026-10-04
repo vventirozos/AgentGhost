@@ -233,6 +233,26 @@
   <p>
     torch runs Xapian Omega, whose zero-hit page reads <em>No documents match your query</em>. <code>_NO_HITS_RE</code> knew "no results", "no matches", "nothing found" — not that — so every torch miss fell through to the last branch and was reported at WARNING as "the engine's result format may have drifted". Fetched over Tor on 2026-09-15: every "empty" torch response in the log (1.7–1.9&nbsp;KB) is that page. The phrasing is now in the pattern; <code>tests/fixtures/torch_zero_hits_2026-09-15.html</code> is the real body (form token scrubbed) and <code>tests/test_darkweb_no_hits_phrasings.py</code> pins it, together with the requirement that a genuinely unparseable page still reaches the <code>parser</code> branch — that <em>is</em> the drift signal.
   </p>
+
+<h2 id="4lg">Titles are not pages; read the on-topic ones <span class="tag">2026-10-04 &sect;4LG</span></h2>
+<ul>
+  <li><code>darkweb_search</code>'s header says its results are titles and snippets only — no page was opened (a reply had
+  described "active MH370 threads" from directory titles).</li>
+  <li><code>darkweb_research</code> fetches 3× the candidates and opens on-topic results with a path first
+  (<code>rank_for_reading</code>, the web search's own topic check): ranked by engine agreement alone, 32 of 36 pages read
+  yielded nothing, 25 of them homepages.</li>
+</ul>
+<h2 id="4lh">Torch is a fallback <span class="tag">2026-10-04 &sect;4LH</span></h2>
+<p>Over 3 weeks torch was useful in 22% of searches (78 "no matches", 34 timeouts at the 38 s deadline). It now carries
+<code>"tier": "fallback"</code>, and an engine in <code>GHOST_ONION_ENGINES</code> may carry the same.
+<code>_darkweb_search_raw</code> asks the first-tier engines, and only when they found fewer than
+<code>_FALLBACK_MIN_HOSTS</code> (5) distinct onions does it ask the fallback tier, with its own short deadline
+<code>_FALLBACK_DEADLINE_S</code> (12 s; torch answers in 2–6 s when it answers). The skip and denominator arithmetic
+counts the engines actually asked. A search with zero results always reaches the fallback, so "asked N of M" stays
+whole. <code>GHOST_ONION_FALLBACK_TIER=0</code> puts every engine back in one wave.</p>
+<p>&sect;4LI: a fallback engine cut by the 12 s deadline is recorded as a failure by the circuit breaker (the cut
+cancelled <code>_query_engine</code> before its own timeout could record anything, so a dead torch was paid for on
+every thin search), using <code>utils.aio.wait_for</code>.</p>
 </main>
 </body>
 </html>

@@ -137,6 +137,31 @@
   <p><strong>Identity facts REPLACE, not stack:</strong> <code>publish_fact</code>'s vector leg was a plain <code>add()</code>, which left <code>smart_update</code> (and its whole subject/attribute conflict guard) with no production caller once the bus was always wired — every profile change minted a new row and stale values kept being served (live: duplicate <code>home_lab_worker_node</code> facts, 5 coexisting paraphrases of one activity fact). Identity-typed facts now route through <code>smart_update</code>. <strong>Fail-open reporting closed:</strong> the bus swallows subsystem exceptions into its report dict by design, but the memory tools discarded the report — a total write failure returned "SUCCESS". <code>remember</code>/<code>update_profile</code>/<code>learn_skill</code> now surface <code>PARTIAL:</code> with the failing subsystems (restores the legacy path's contract). <strong>Stash clobber:</strong> a survivor-less hydration only clears its OWN turn's <code>last_hydration</code> stash now (blind None destroyed an overlapping turn's stash before its judge consumed it). Profile leg requires category+key (junk-key guard). Tests: <code>::TestBusIdentitySmartUpdate</code>, <code>::TestBusPartialReporting</code>.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+  <h2 id="4lb">What hydration no longer repeats <span class="tag">2026-10-03 &sect;4LB</span></h2>
+  <p>The vector tier drops the profile's mirror rows (identity — 42% of vector slots repeated the profile, on-demand fields
+  included) and episode twins (the episodic tier carries them). The graph tier drops chains through the agent's own nodes
+  (ai/assistant/system — 49% of graph items). Episodes are credited only post-fusion (§4LA).</p>
+  <h3>r2 (the review of the fixes)</h3>
+  <ul>
+    <li>The dropped types (<code>_VECTOR_DROPPED_TYPES</code>: skill, identity, episode) are passed to
+    <code>search_items(exclude_types=)</code> and removed BEFORE the off-topic gate — an identity row at 0.20 opened the
+    gate for "where do I live", was then dropped, and a 0.56 off-topic memory went in.</li>
+    <li>Episode twins: the vector tier admitted them at distance &lt; 0.70; the episodic tier keeps relevance ≥ 0.70
+    (distance ≤ 0.30). Episodes in between were the noise §4LA measured (nonsense queries scored 0.53–0.68), so they are
+    deliberately no longer injected — not "carried by the episodic tier".</li>
+    <li>The owner-fact lookup runs only on a question ABOUT the owner (first person and a question form, English or
+    Greek); request verbs (know, want, show, view, requested…) never name a fact. "What do you know about the database
+    view" filled every graph slot with <code>User KNOWS …</code>.</li>
+    <li>The agent-node filter drops a chain only where the agent is the SUBJECT (its own log lines); "user HAS_INTEREST
+    ai", "ghost IS_A framework" and a database named "agent" stay.</li>
+    <li>The episodic call is chosen by the stub's SIGNATURE; a TypeError raised inside the real search is an error, not a
+    retry without <code>credit=False</code> (which credited every candidate twice).</li>
+  </ul>
+
+  <h2 id="4le">Query split only on the user's words <span class="tag">2026-10-04 &sect;4LE</span></h2>
+  <p><code>_decompose_query(query, llm_client, basis=raw_user_text)</code>: the 8-word gate reads the user's own words,
+  and no split runs when the query was already rewritten by the expansion (one worker call before the reply is enough);
+  the route call gives up after 4 s (the keyword split is the fallback).</p>
 </main>
 </body>
 </html>

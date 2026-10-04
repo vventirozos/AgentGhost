@@ -17,6 +17,7 @@ No external broker (Redis/RabbitMQ/etc.) — pure asyncio.
 from __future__ import annotations
 
 import asyncio
+import functools as _ft
 import hashlib
 import json
 import logging
@@ -41,6 +42,19 @@ _STOPWORDS = {
     "test", "http", "https", "user", "agent", "ghost", "please", "know",
     "want", "need",
 }
+
+
+def _episodic_params(fn):
+    """The parameter names of ``fn`` (bound: no ``self``), or None when
+    they cannot be read (a ``**kwargs`` signature takes everything)."""
+    import inspect
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return None
+    if any(p.kind is p.VAR_KEYWORD for p in sig.parameters.values()):
+        return None
+    return [n for n in sig.parameters]
 
 
 class MemoryBus:
@@ -261,8 +275,11 @@ class MemoryBus:
             else:
                 max_chars = context_budget
 
-        # RAG-Fusion: decompose into sub-queries for broader coverage
-        sub_queries = await self._decompose_query(query, llm_client)
+        # RAG-Fusion: decompose into sub-queries for broader coverage — judged
+        # on the USER's words (§4LE: the length gate read the expanded
+        # "Context: … | User intent: …" string, always long, so a short
+        # follow-up paid a second worker call after the expansion)
+        sub_queries = await self._decompose_query(query, llm_client, basis=raw_user_text)
         # §4FB (2026-09-06): the fan-out queries were invisible. When an
         # unrelated lesson surfaced for an image request (req 2422eb25) no
         # log or ledger said WHICH sub-query admitted it — every offline
@@ -580,6 +597,14 @@ class MemoryBus:
         """One deduped retrieval-credit pass for the items injected this turn."""
         if not survivors:
             return
+        ep_ids = list(dict.fromkeys(it.get("episode_id") for it in survivors
+                                    if it.get("source") == "episodic" and it.get("episode_id") is not None))
+        _cred = getattr(self.episodic, "_credit_surfaced_episodes", None) if self.episodic else None
+        if ep_ids and callable(_cred):
+            try:
+                _cred(ep_ids)
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"episode credit failed: {e}")
         vec_ids = [it.get("mem_id") for it in survivors
                    if it.get("source") == "vector" and it.get("mem_id")]
         bump = getattr(self.vector, "bump_retrievals", None) if self.vector else None
@@ -668,7 +693,7 @@ class MemoryBus:
             added += 1
 
     async def _decompose_query(self, query: str,
-                               llm_client: Any = None) -> List[str]:
+                               llm_client: Any = None, basis: str = "") -> List[str]:
         """Decompose a query into sub-queries for broader retrieval.
 
         Uses the LLM worker pool for decomposition if available,
@@ -677,8 +702,11 @@ class MemoryBus:
         # Always include the original query
         sub_queries = [query]
 
-        # Skip decomposition for short/simple queries
-        if len(query.split()) < 8:
+        # Skip decomposition for short/simple queries — and when the query was
+        # already REWRITTEN from the user's words (the expansion ran: one
+        # worker call is enough before the reply)
+        _basis = str(basis or "").strip()
+        if len((_basis or query).split()) < 8 or (_basis and _basis != query.strip()):
             return sub_queries
 
         # Try LLM-based decomposition via worker pool
@@ -702,6 +730,7 @@ class MemoryBus:
                         max_tokens=256,
                         temperature=0.1,
                         fallback=None,
+                        timeout=4.0,     # §4LE: before the first token (the keyword split is the fallback)
                     )
                     if result:
                         # route() returns either a content string or a full
@@ -752,6 +781,19 @@ class MemoryBus:
     # ------------------------------------------------------------- fetchers
 
     @staticmethod
+    def _accepts_kw(fn: Any, name: str) -> bool:
+        import inspect
+        try:
+            params = inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            return False
+        return name in params or any(p.kind is p.VAR_KEYWORD for p in params.values())
+
+    #: types the MEMORY tier never carries (each has its own tier) — passed
+    #: to the store so its off-topic gate is measured on what is kept
+    _VECTOR_DROPPED_TYPES = ("SKILL", "IDENTITY", "EPISODE")
+
+    @staticmethod
     def _accepts_relevance_floor(fn: Any) -> bool:
         """True when ``fn`` can take ``min_relevance_dist`` (explicitly or via
         ``**kwargs``). Unintrospectable callables (builtins, C extensions,
@@ -787,9 +829,10 @@ class MemoryBus:
                 # retried without the gate — silently injecting the weakly-
                 # related tail with no log at all (found 2026-07-22).
                 if self._accepts_relevance_floor(search_items):
-                    items = await asyncio.to_thread(
-                        search_items, query,
-                        min_relevance_dist=self._VECTOR_MATCH_FLOOR)
+                    _kw = {"min_relevance_dist": self._VECTOR_MATCH_FLOOR}
+                    if self._accepts_kw(search_items, "exclude_types"):
+                        _kw["exclude_types"] = self._VECTOR_DROPPED_TYPES
+                    items = await asyncio.to_thread(search_items, query, **_kw)
                 else:
                     logger.warning(
                         "MemoryBus vector off-topic gate DROPPED: "
@@ -808,7 +851,13 @@ class MemoryBus:
                     # (a lesson rendered as a memory). They have their own
                     # skill tier + playbook; drop them from the MEMORY
                     # tier. 60/100 self-play + 2/21 interactive dedup'd.
-                    and str(it.get("type") or "").upper() != "SKILL"
+
+                    # §4LB: the profile's MIRROR rows (identity) repeat the
+                    # profile already in the prompt — and the on-demand fields
+                    # (the address, a description) came back through them in 42%
+                    # of vector slots; an EPISODE twin repeats the episodic tier
+                    # (28 of 55 injected twice). Both have their own home.
+                    and str(it.get("type") or "").upper() not in self._VECTOR_DROPPED_TYPES
                 ]
             except Exception as e:
                 logger.warning(f"MemoryBus vector fetch failed: {type(e).__name__}: {e}")
@@ -821,7 +870,6 @@ class MemoryBus:
             # but the next legacy-shaped store would silently inflate
             # spaced-repetition stats. Kwarg is signature-guarded so
             # legacy stubs without the parameter keep working.
-            import functools as _ft
             import inspect as _insp
             _search = self.vector.search
             try:
@@ -863,7 +911,12 @@ class MemoryBus:
         # newest first, dated (§4KZ: hydration only seeded on node names and
         # returned Elden Ring task edges for "where do I live?")
         _own = getattr(self.graph, "owner_facts_matching", None)
-        if callable(_own):
+        # §4LB r2: only a turn ABOUT the owner — first person and a question
+        # ("where do I live?", "what are my hobbies"); "what do you know about
+        # the database view" / "I want to optimize postgres" filled every
+        # graph slot with `User KNOWS …` / `User WANTS …` and pushed the
+        # topical chains out
+        if callable(_own) and self._asks_about_owner(query):
             try:
                 owned = await asyncio.to_thread(_own, query, 8)
                 if isinstance(owned, list):
@@ -871,6 +924,15 @@ class MemoryBus:
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"MemoryBus owner-fact fetch failed: {e}")
         return [{"source": "graph", "text": e} for e in edges if e]
+
+    _FIRST_PERSON = re.compile(r"\b(?:i|i'm|im|my|me|mine|myself|μου|μας|εγώ|είμαι|έχω)\b", re.IGNORECASE)
+    _QUESTION = re.compile(r"\?|^\s*(?:what|where|who|whom|which|when|how|do|does|did|am|is|are|have|has|tell|remind|"
+                           r"τι|πού|ποιο|ποια|ποιος|πότε|πώς|θυμάσαι)\b", re.IGNORECASE)
+
+    @classmethod
+    def _asks_about_owner(cls, query: str) -> bool:
+        q = str(query or "")
+        return bool(cls._FIRST_PERSON.search(q) and cls._QUESTION.search(q))
 
     async def _fetch_skill(self, query: str, scope_request: str = "") -> List[Dict[str, Any]]:
         if not self.skill:
@@ -920,19 +982,16 @@ class MemoryBus:
             # recall them by MEANING; without the kwarg search_similar
             # always fell back to substring matching over the 100 most
             # recent episodes, leaving ~half the collection unreachable.
-            episodes = await asyncio.to_thread(
-                self.episodic.search_similar, query, 5,
-                self.vector if self.vector else None,
-            )
-        except TypeError:
-            # Test stubs with a 2-arg search_similar signature.
-            try:
-                episodes = await asyncio.to_thread(
-                    self.episodic.search_similar, query, 5
-                )
-            except Exception as e:
-                logger.warning(f"MemoryBus episodic fetch failed: {type(e).__name__}: {e}")
-                return []
+            # credit=False: an episode is credited when it ENTERS the prompt,
+            # in `_credit_surfaced` (§4LA)
+            # The signature decides the call, never a caught TypeError (§4LB
+            # r2: a TypeError raised INSIDE the real search re-ran it without
+            # credit=False — the in-search credit §4LA removed, twice)
+            _params = _episodic_params(self.episodic.search_similar)
+            _args = (query, 5) + ((self.vector if self.vector else None,)
+                                  if _params is None or len(_params) >= 3 or "vector_memory" in _params else ())
+            _kw = {"credit": False} if _params is None or "credit" in _params else {}
+            episodes = await asyncio.to_thread(_ft.partial(self.episodic.search_similar, *_args, **_kw))
         except Exception as e:
             logger.warning(f"MemoryBus episodic fetch failed: {type(e).__name__}: {e}")
             return []
@@ -948,7 +1007,7 @@ class MemoryBus:
                 except Exception:
                     continue
                 if isinstance(text, str) and text.strip():
-                    items.append({"source": "episodic", "text": text.strip()})
+                    items.append({"source": "episodic", "text": text.strip(), "episode_id": ep.get("id")})
             if items:
                 return items
             # Stub episodic stores (tests) expose a format_episode that

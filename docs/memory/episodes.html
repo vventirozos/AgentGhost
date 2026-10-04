@@ -153,6 +153,26 @@ context    = "tools: a → b(FAILED) → c ; recovered after failures in: b"</pr
   ASCII-only <code>LIKE</code> ("Ελένη" was never found). <code>mention_previews(target)</code> lists <code>(id, trigger)</code> for the
   forget preview; <code>delete_episodes(ids)</code> deletes exactly the confirmed ones — archived with their actions to
   <code>episodes_forgotten.jsonl</code> first, nothing deleted when the archive cannot be written — and their vector twins.</p>
+  <h2 id="4la">What is recorded, recalled, relabelled and forgotten <span class="tag">2026-10-03 &sect;4LA</span></h2>
+  <ul>
+    <li><strong>Recorded:</strong> an owner's private turn only — not a probe/internal/member/sim/bench turn (the teach gate now
+    fails CLOSED), not a PUBLIC channel thread, not a request that is another person's labelled message. Texts and tool results
+    are redacted like the journal. The episode stores its <code>req_id</code>.</li>
+    <li><strong>Labelled:</strong> the agent's own failure sentinels ("[TURN BUDGET EXHAUSTED]", "I hit a hard limit") are
+    failures; a LATE REFUTED verdict (by request id) and the owner's correction (by the request's text) relabel the episode
+    (<code>mark_outcome</code>) — 142 live episodes said SUCCESS after their turn was proven wrong.</li>
+    <li><strong>Recalled:</strong> the semantic floor is 0.70 (measured: nonsense scores 0.53–0.68, a real past turn ≥ 0.73);
+    an empty semantic answer does not fall back to substring matching (only a store with no twins at all does); results are
+    re-sorted after recency shaping; credit is given only to episodes that ENTER the prompt (the bus credits them post-fusion);
+    a recovery needs a successful call AFTER the failure; twins carry the episode's own date. Not read by the System-3 pivot
+    on a public reply.</li>
+    <li><strong>Evicted:</strong> least credit per age first (<code>access_count / (1 + days since last use / 30)</code>) — stale
+    probe credit no longer outlives the owner's turns.</li>
+    <li><strong>Forgotten:</strong> a mention is searched in the trigger, outcome, context, lesson AND every action's args and
+    result, across scripts ("fotini" ~ "Φωτεινή") and Greek inflections ("της Φωτεινής"). <code>delete_episodes</code> is the one
+    deletion path; a twin that could not be deleted is logged and reported. <code>episodes_forgotten.jsonl</code> records what was
+    forgotten and when, and keeps 30 days. <code>reset_all</code> erases the episodes too (<code>wipe_all</code>).</li>
+  </ul>
 </main>
 </body>
 </html>

@@ -604,7 +604,7 @@ def test_perfect_it_is_deferred_when_flag_off():
     block = src.split("Perfect It Protocol")[1].split("VERIFIER GATE")[0]
     assert "_pending_background_tasks" in block
     assert "add_done_callback" in block
-    assert "last_activity_time = datetime.datetime.now()" in block  # heartbeat
+    assert "self._heartbeat()" in block  # heartbeat (§4LD: one method, skips internal turns)
     assert "messages.append({\"role\": \"user\", \"content\": perfect_it_prompt})" not in src
     # Heartbeat before the verifier completion too.
     verifier_gate = src.split("VERIFIER GATE")[1].split("verify_code_output")[0]

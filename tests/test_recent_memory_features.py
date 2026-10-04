@@ -126,12 +126,13 @@ def test_vector_memory_episode_and_decay(mock_vector_memory):
         # Order should be: New episode (1s) -> Old manual (2nd) -> New manual (3rd)
         # The output string format is "[timestamp] (TYPE) **[Prefix]** Doc"
         
+        # §4LA: an episode is EVIDENCE of a past turn, ranked with the facts
+        # (p_score 1, like auto) — the user's manual memories come first
         lines = results.split("\n---\n")
         assert len(lines) == 3
-        assert "New episode query" in lines[0] # Lowest score, highest rank
-        assert "EPISODE" in lines[0].upper()
-        assert "Old manual query" in lines[1]
-        assert "New manual query" in lines[2]
+        assert "Old manual query" in lines[0]
+        assert "New manual query" in lines[1]
+        assert "New episode query" in lines[2] and "EPISODE" in lines[2].upper()
 
 @pytest.mark.asyncio
 async def test_agent_query_expansion_and_bypass(mock_agent):

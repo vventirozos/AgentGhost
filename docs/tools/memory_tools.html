@@ -681,6 +681,10 @@
   <p><code>update_profile</code> and <code>insert_fact</code> refuse probe and background turns
   (<code>_owner_write_block</code>, reason <code>owner_write_not_owner_turn</code>) — a probe wrote
   <code>user HAS_PROFESSION pilot</code>. See memory &rarr; attribution for the extractor's rule.</p>
+  <h2 id="4la">reset_all and episodes <span class="tag">2026-10-03 &sect;4LA</span></h2>
+  <p>reset_all now erases the past-conversation episodes as well (its preview names their count); before, their twins went and
+  the boot reconcile re-indexed every episode, so "wiped" memory came back. A forgotten episode whose search copy could not be
+  removed is reported, not ✅.</p>
 </main>
   <h2 id="member">Not for a channel member <span class="tag">2026-09-24 &sect;4KJ</span></h2>
   <p><code>recall</code>, <code>remember</code>, <code>knowledge_base</code>, <code>update_profile</code> and <code>unified_forget</code> read or write the OWNER's stores. A request that declared itself a member's is refused at dispatch (every tool outside <code>core/agent._MEMBER_ALLOWED_TOOLS</code>) and, as a belt, inside each tool (<code>_member_block</code>, reason <code>owner_data_blocked</code>, nothing touched). Pins: <code>tests/test_requester_role.py</code>.</p>

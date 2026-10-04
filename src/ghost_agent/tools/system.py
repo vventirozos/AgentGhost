@@ -236,16 +236,29 @@ def _find_location_in_profile(data: dict) -> str:
         _root.get("city") or
         _personal.get("location")
     )
-    if loc: return loc
+    if loc: return _locality(loc)
 
-    # Priority 2: Broad Search in ALL categories
-    search_keys = ["location", "city", "address", "residence", "home"]
+    # Priority 2: Broad Search in ALL categories, then an address — every
+    # value reduced to its LOCALITY (§4LB r2: "home"/"residence" holding a
+    # street went to the geocoder; an address-only profile lost its weather)
+    search_keys = ["location", "city", "residence", "home"]
     for cat, subdata in data.items():
         if isinstance(subdata, dict):
             for k, v in subdata.items():
-                if k.lower() in search_keys and isinstance(v, str):
-                    return v
+                if k.lower() in search_keys and isinstance(v, str) and _locality(v):
+                    return _locality(v)
+    for cat, subdata in data.items():
+        if isinstance(subdata, dict):
+            for k, v in subdata.items():
+                if "address" in k.lower() and isinstance(v, str) and _locality(v):
+                    return _locality(v)
     return None
+
+
+def _locality(value):
+    from ..memory.egress import locality
+    return locality(value)
+
 
 async def tool_check_location(profile_memory):
     if requester_is_member():

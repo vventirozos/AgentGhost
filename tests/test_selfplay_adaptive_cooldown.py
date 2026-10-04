@@ -85,8 +85,8 @@ async def test_cooldown_halves_on_compression_progress(tmp_path):
          patch("ghost_agent.core.agent.random.random", return_value=0.05):
         await agent._biological_tick()
 
-    # last delta = 0.5 → cooldown = base/2 = 1800
-    assert agent._current_selfplay_cooldown == 1800
+    # last delta = 0.5 → cooldown = base/2
+    assert agent._current_selfplay_cooldown == GhostAgent._SELFPLAY_COOLDOWN // 2
 
 
 @pytest.mark.asyncio
@@ -105,14 +105,14 @@ async def test_cooldown_doubles_on_failure(tmp_path):
          patch("ghost_agent.core.agent.random.random", return_value=0.05):
         await agent._biological_tick()
 
-    # Failure → 2 * base = 7200, capped at ceiling
-    assert agent._current_selfplay_cooldown == 7200
+    # Failure → 2 * base (§4LF: the ceiling scales with the base)
+    assert agent._current_selfplay_cooldown == 2 * GhostAgent._SELFPLAY_COOLDOWN
 
 
 @pytest.mark.asyncio
 async def test_cooldown_gate_respects_adaptive_value(tmp_path):
     """After a failure, the cooldown doubles — a subsequent tick at only
-    3700s since last self-play must NOT trigger another run."""
+    base+100 s since last self-play must NOT trigger another run."""
     agent = _make_agent_with_tracker(tmp_path)
     ft = agent.context.frontier_tracker
 
@@ -128,11 +128,12 @@ async def test_cooldown_gate_respects_adaptive_value(tmp_path):
         await agent._biological_tick()
 
     assert mock_dreamer.synthetic_self_play.await_count == 1
-    assert agent._current_selfplay_cooldown == 7200
+    assert agent._current_selfplay_cooldown == 2 * GhostAgent._SELFPLAY_COOLDOWN
 
-    # Simulate 3700s of additional idle (>60 min, but well under the new
-    # 7200s adaptive cooldown). Another tick should NOT fire self-play.
-    agent._last_selfplay_at = datetime.datetime.now() - datetime.timedelta(seconds=3700)
+    # Past the BASE cooldown but well under the doubled adaptive one.
+    # Another tick should NOT fire self-play.
+    agent._last_selfplay_at = datetime.datetime.now() - datetime.timedelta(
+        seconds=GhostAgent._SELFPLAY_COOLDOWN + 100)
     agent.context.last_activity_time = datetime.datetime.now() - datetime.timedelta(seconds=4000)
 
     with patch("ghost_agent.core.dream.Dreamer", return_value=mock_dreamer), \

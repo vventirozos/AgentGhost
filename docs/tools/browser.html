@@ -345,6 +345,34 @@ Any claim that content renders is UNSUPPORTED by this screenshot…</code></pre>
   </p>
   <h2 id="4jp">WebGL2 is available — and a page-side denial is flagged <span class="tag">2026-09-21 &sect;4JP</span></h2>
   <p>Req <code>fd89fd6d</code>: the page printed "WebGL2 required", the model concluded the headless browser lacked WebGL2 and threw away a GPU renderer. Measured through this runner (proxy, loopback http, persistent profile): <code>canvas.getContext("webgl2")</code> is live — ANGLE on SwiftShader/Vulkan, software-rendered. The tool description now states it; <code>webgl_denial_note</code> appends a capability note to a navigate whose page text claims WebGL is missing/unsupported, pointing at the exceptions block above it. Pins: <code>tests/test_fd89fd6d_rewrite_hint_and_webgl_note_2026_09_21.py</code>.</p>
+
+<h2 id="4lg">Sites that keep failing; the timeout retry <span class="tag">2026-10-04 &sect;4LG</span></h2>
+<ul>
+  <li>A clearnet host is remembered like a dead onion: two failures of the repeatable kind (HTTP/2 protocol error,
+  timeout, 403/bot challenge — a BLOCKED page counts) within 6 h and the next navigate is refused with the recorded cause;
+  a clean load clears it (<code>_mark_host_failed</code> / <code>_dead_host_notice</code>; <code>GHOST_DEAD_HOST_MEMO=0</code>
+  disables). Measured: 60 of 65 re-fetches of an already-failed host failed again.</li>
+  <li>The commit-milestone retry after a navigation timeout is opt-in (<code>GHOST_BROWSER_COMMIT_RETRY=1</code>): it
+  recovered 1 of 17 at ~30 s each; the timeout hint now says another attempt usually times out the same way.</li>
+  <li>A v2 onion address (16 characters; Tor removed v2 in October 2021) is refused before it is dialled, and the refusal
+  says it is not a current address and says nothing about Tor working (<code>host_memo._retired_onion_notice</code>).
+  The first <code>ERR_SOCKS_CONNECTION_FAILED</code> on an onion now says the service is offline or the address does not
+  exist, not that Tor is broken (<code>ONION_FIRST_FAILURE_HINT</code>). The dead-onion notice already said this, but
+  only from the second failure of the same host. Live probe D2: DuckDuckGo's v2 address and two one-off onions each
+  failed once, and the reply said "Tor's SOCKS proxy is failing for all .onion addresses" while calling the v2 address
+  "official v3".</li>
+  <li>&sect;4LI (final review): what strikes a clearnet host is narrowed.
+    <ul>
+      <li>A BLOCKED page strikes only when it speaks for the site (<code>host_level_block</code>: HTTP 403/429 or a
+      bot challenge), never for a 404 or 5xx of one page.</li>
+      <li>A runner failure strikes only when it is a NAVIGATION failure (<code>Page.goto</code> / <code>net::</code>)
+      of the HTTP/2-protocol or timeout kind. A selector timeout never strikes, and the URL inside the error text is
+      not read as the cause.</li>
+      <li>Loopback, private and <code>.local</code> hosts are never remembered.</li>
+      <li>The key is host plus port, and a timeout expires after 1 h instead of 6.</li>
+    </ul>
+  Measured before the fix: 29 of 142 strikes were 404s, and two mistyped Wikipedia paths banned en.wikipedia.org.</li>
+</ul>
 </main>
 </body>
 </html>

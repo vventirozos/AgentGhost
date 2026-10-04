@@ -37,6 +37,36 @@ def _doc_key(text) -> str:
     return str(text or "").strip()
 
 
+def _redact(text) -> str:
+    """What the journal already does to these texts (§4LA: episodes stored
+    tool results verbatim — keys, home paths, e-mails)."""
+    try:
+        from ..distill.redact import redact_text
+        return redact_text(str(text or ""))
+    except Exception:  # noqa: BLE001
+        return str(text or "")
+
+
+def _iso(epoch) -> str:
+    import datetime as _dt
+    try:
+        return _dt.datetime.fromtimestamp(float(epoch), _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    except Exception:  # noqa: BLE001
+        return get_utc_timestamp()
+
+
+#: Greek → Latin, so "fotini" finds "Φωτεινή" (§4LA)
+_GR2LAT = str.maketrans({"α": "a", "β": "v", "γ": "g", "δ": "d", "ε": "e", "ζ": "z", "η": "i", "θ": "th", "ι": "i",
+                         "κ": "k", "λ": "l", "μ": "m", "ν": "n", "ξ": "x", "ο": "o", "π": "p", "ρ": "r", "σ": "s",
+                         "ς": "s", "τ": "t", "υ": "y", "φ": "f", "χ": "ch", "ψ": "ps", "ω": "o"})
+
+
+def _latin(text: str) -> str:
+    t = _fold(text).translate(_GR2LAT)
+    # common digraph spellings collapse ("ei"/"oi"/"ou" ~ "i"/"u", "y" ~ "i")
+    return t.replace("ei", "i").replace("oi", "i").replace("ou", "u").replace("y", "i").replace("h", "")
+
+
 def _fold(text: str) -> str:
     """Case- and accent-folded text (Greek "Ελένη" ~ "ελενη")."""
     import unicodedata
@@ -89,7 +119,10 @@ class EpisodicMemory:
     # regardless of distance, so semantically unrelated episodes were injected
     # as if they were perfect matches. relevance = clamp(1.0 - distance, 0, 1);
     # hits below this floor are dropped. Tunable.
-    MIN_VECTOR_RELEVANCE = 0.2
+    #: §4LA: measured on the live store — nonsense queries ("asdf qwerty",
+    #: "recipe for pancakes") score 0.53–0.68 against episodes, a half-trigger
+    #: of a real past turn ≥ 0.73. At 0.2 every turn got 5 unrelated episodes.
+    MIN_VECTOR_RELEVANCE = 0.70
 
     # Recency shaping, applied identically to BOTH recall paths so their
     # `relevance_score` values are on one comparable [0, 1] scale (consumers
@@ -156,6 +189,10 @@ class EpisodicMemory:
                 if "access_count" not in _cols:
                     conn.execute("ALTER TABLE episodes ADD COLUMN "
                                  "access_count INTEGER NOT NULL DEFAULT 0")
+                if "req_id" not in _cols:
+                    # §4LA: which request the episode records, so a LATE verdict
+                    # or the owner's correction can relabel it
+                    conn.execute("ALTER TABLE episodes ADD COLUMN req_id TEXT NOT NULL DEFAULT ''")
                 if "last_accessed" not in _cols:
                     conn.execute("ALTER TABLE episodes ADD COLUMN "
                                  "last_accessed REAL NOT NULL DEFAULT 0")
@@ -222,7 +259,7 @@ class EpisodicMemory:
                        actions: List[Dict[str, Any]] = None,
                        outcome: str = "", success: bool = False,
                        lesson: str = "", cluster_id: str = "",
-                       vector_memory=None) -> int:
+                       vector_memory=None, req_id: str = "") -> int:
         """Store a new episode. Returns the episode ID.
 
         When *vector_memory* is provided, the episode's trigger (and lesson,
@@ -242,12 +279,15 @@ class EpisodicMemory:
                 # would rank below every pre-existing row and be evicted first —
                 # the exact inversion this feature exists to remove.
                 _now = time.time()
+                # §4LA: redacted like the journal (keys, home paths, emails
+                # were stored verbatim from tool results)
+                trigger, context, outcome = _redact(trigger), _redact(context), _redact(outcome)
                 cursor = conn.execute(
                     '''INSERT INTO episodes (trigger, context, outcome, outcome_success,
-                       lesson, cluster_id, timestamp, last_accessed)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                       lesson, cluster_id, timestamp, last_accessed, req_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                     (trigger[:500], context[:2000], outcome[:1000],
-                     1 if success else 0, lesson[:500], cluster_id, _now, _now)
+                     1 if success else 0, lesson[:500], cluster_id, _now, _now, str(req_id or "")[:64])
                 )
                 episode_id = cursor.lastrowid
 
@@ -260,8 +300,8 @@ class EpisodicMemory:
                                VALUES (?, ?, ?, ?, ?, ?)''',
                             (episode_id, i,
                              action.get("tool", "unknown")[:100],
-                             json.dumps(action.get("args", {}), default=str)[:500],
-                             str(action.get("result", ""))[:1000],
+                             _redact(json.dumps(action.get("args", {}), default=str))[:500],
+                             _redact(str(action.get("result", "")))[:1000],
                              1 if action.get("success", True) else 0)
                         )
 
@@ -291,9 +331,9 @@ class EpisodicMemory:
                     victims = [r[0] for r in conn.execute(
                         '''SELECT id FROM episodes
                            WHERE lesson = '' AND consolidated = 1
-                           ORDER BY access_count ASC, last_accessed ASC,
+                           ORDER BY access_count / (1.0 + (? - last_accessed) / 2592000.0) ASC,
                                     timestamp ASC LIMIT ?''',
-                        (count - self.MAX_EPISODES,)
+                        (_now, count - self.MAX_EPISODES,)
                     ).fetchall()]
                     if victims:
                         conn.execute(
@@ -310,9 +350,9 @@ class EpisodicMemory:
                     if still > self.MAX_EPISODES:
                         victims2 = [r[0] for r in conn.execute(
                             '''SELECT id FROM episodes
-                               ORDER BY access_count ASC, last_accessed ASC,
+                               ORDER BY access_count / (1.0 + (? - last_accessed) / 2592000.0) ASC,
                                         timestamp ASC LIMIT ?''',
-                            (still - self.MAX_EPISODES,)
+                            (_now, still - self.MAX_EPISODES,)
                         ).fetchall()]
                         if victims2:
                             conn.execute(
@@ -383,7 +423,7 @@ class EpisodicMemory:
         return episode_id
 
     def _ingest_episode_vector(self, episode_id: int, trigger: str,
-                               lesson: str, vector_memory) -> None:
+                               lesson: str, vector_memory, when: float = None) -> None:
         """Index one episode's trigger (+lesson) into the vector store with
         ``{"type":"episode","episode_id":...}`` metadata. Best-effort — a
         failure here must never sink the episode write.
@@ -419,7 +459,9 @@ class EpisodicMemory:
                 # (VectorMemory._render_item prints the raw value) next to
                 # `[2026-07-22T...Z]` neighbours — unreadable as a date for
                 # exactly the memory type where recency matters most.
-                "timestamp": get_utc_timestamp(),
+                # the EPISODE's time (§4LA: a re-ingest stamped "now", and
+                # 133 of 371 twins were shown up to 19 days late)
+                "timestamp": (_iso(when) if when else get_utc_timestamp()),
             })
         except Exception as exc:
             # Was `debug`, i.e. invisible: a failed embed leaves an episode
@@ -681,12 +723,13 @@ class EpisodicMemory:
             len(genuine), len(rows), dedup_covered,
         )
         for ep_id, trigger, lesson in genuine:
+            _ep = self.get_episode(ep_id) or {}
             self._ingest_episode_vector(
-                ep_id, trigger or "", lesson or "", vector_memory)
+                ep_id, trigger or "", lesson or "", vector_memory, when=_ep.get("timestamp"))
         return len(genuine)
 
     def search_similar(self, trigger: str, limit: int = 5,
-                       vector_memory=None) -> List[Dict]:
+                       vector_memory=None, credit: bool = True) -> List[Dict]:
         """Find episodes with similar triggers.
 
         Uses vector-based semantic search when *vector_memory* is provided,
@@ -706,9 +749,13 @@ class EpisodicMemory:
         # Try vector-based search first (much better recall)
         if vector_memory is not None:
             try:
-                results = self._vector_search(trigger, limit, vector_memory)
-                if results:
-                    return results
+                # (§4LA) an EMPTY semantic answer is an answer — nothing cleared
+                # the relevance floor. Falling back to substring then matched
+                # any shared word ("what") and every query got 5 episodes.
+                # None = the store has no episode twins at all (cold): fall back.
+                _res = self._vector_search(trigger, limit, vector_memory, credit=credit)
+                if _res is not None:
+                    return _res
             except Exception as exc:
                 logger.debug("Episodic vector search failed, falling back: %s", exc)
 
@@ -754,7 +801,8 @@ class EpisodicMemory:
         # connection, and issuing that write while the read cursor above is
         # still open risks "database is locked", which the helper would swallow
         # — credit silently lost, the failure mode that is hardest to notice.
-        self._credit_surfaced_episodes([e.get("id") for e in surfaced])
+        if credit:
+            self._credit_surfaced_episodes([e.get("id") for e in surfaced])
         return surfaced
 
     @classmethod
@@ -908,7 +956,7 @@ class EpisodicMemory:
             logger.debug("episode usage-credit skipped: %s", exc)
 
     def _vector_search(self, trigger: str, limit: int,
-                       vector_memory) -> List[Dict]:
+                       vector_memory, credit: bool = True) -> List[Dict]:
         """Semantic search using the vector memory's embedding model."""
         # Episodes are ingested into the vector store with
         # {"type":"episode","episode_id":...} metadata by record_episode (when
@@ -925,7 +973,7 @@ class EpisodicMemory:
         if scoped is None:
             search_fn = getattr(vector_memory, "search_advanced", None)
             if not callable(search_fn):
-                return []
+                return None
             try:
                 # §4M (Lens B MINOR, latent): probe purity — this fallback
                 # read must not bump retrieval stats (search_advanced
@@ -943,15 +991,17 @@ class EpisodicMemory:
                     kw["record_retrievals"] = False  # mock/builtin — safe
                 hits = search_fn(trigger, **kw)
             except Exception:
-                return []
+                return None
             scoped_query = False
         else:
             hits = scoped
             scoped_query = True
         if not hits:
-            return []
+            return None
         # Defensive even on the scoped path: keep episode hits only.
         hits = [h for h in hits if (h.get("metadata") or {}).get("type") == "episode"]
+        if not hits:
+            return None
         # Map vector hits back to episode records, keeping each hit's distance
         # (search_advanced exposes it as "score" — lower is closer). We retain
         # the BEST (smallest) distance per episode if it appears more than once.
@@ -1000,11 +1050,18 @@ class EpisodicMemory:
                 ep["relevance_score"] = self._shape_by_recency(
                     relevance, ep.get("timestamp"))
                 results.append(ep)
-                surfaced_ep_ids.append(ep_id)
-                if ep_vec_id.get(ep_id):
-                    surfaced_vec_ids.append(ep_vec_id[ep_id])
-            if len(results) >= limit:
-                break
+        # ORDER by the shaped score (§4LA: shaping without re-sorting left a
+        # 2-month-old episode above a 2-week-old better one), THEN cut
+        results.sort(key=lambda e: e.get("relevance_score", 0.0), reverse=True)
+        results = results[:limit]
+        for ep in results:
+            surfaced_ep_ids.append(ep["id"])
+            if ep_vec_id.get(ep["id"]):
+                surfaced_vec_ids.append(ep_vec_id[ep["id"]])
+        if not credit:
+            # the caller credits what actually reaches the prompt (§4LA: the
+            # bus credited every candidate of every sub-query)
+            return results
         # The scoped path bypasses search_advanced's blanket stats bump, so
         # credit reinforcement HERE — and only to the episode rows that were
         # actually surfaced, which is what the spaced-repetition fields are
@@ -1071,12 +1128,18 @@ class EpisodicMemory:
             if full:
                 actions = full.get("actions")
                 fetched = actions
+        # a FAILED call followed by a SUCCEEDING one — a recovery; a failure
+        # that nothing succeeded after is not one (§4LA: one-action probes that
+        # failed were handed out as "failed-then-recovered")
+        _seen_fail = False
         for a in actions or []:
             if a.get("tool_name") == self.TRUNCATION_MARKER_TOOL:
                 continue
             if not a.get("success", 1):
+                _seen_fail = True
+            elif _seen_fail:
                 return "failed_action", fetched
-        text = f"{ep.get('outcome', '')} {ep.get('context', '')}".lower()
+        text = f"{ep.get('outcome', '')}".lower()          # (§4LA: not the context field)
         if any(m in text for m in self.RECOVERY_OUTCOME_MARKERS):
             return "outcome_text", fetched
         return "success_only", fetched
@@ -1134,22 +1197,64 @@ class EpisodicMemory:
         if len(t) < 3:
             return []
         rx = re.compile(r"(?<![\w])" + re.escape(_fold(t)) + r"(?![\w])")
+        # (§4LA) …and in the other script or an inflected form: "fotini"
+        # finds "Φωτεινή", "Φωτεινή" finds "της Φωτεινής"
+        _lt = _latin(t)
+        lrx = re.compile(r"(?<![\w])" + re.escape(_lt) + (r"\w{0,2}" if len(_lt) >= 4 else "") + r"(?![\w])")
+
+        def _names(x) -> bool:
+            x = str(x or "")
+            return bool(rx.search(_fold(x)) or lrx.search(_latin(x)))
         # every row: an ASCII target must still find "René" (r8 review);
-        # 21 ms on the live 400-episode store
+        # 21 ms on the live 400-episode store. The ACTIONS too (§4LA: a recall
+        # result naming Fotini survived "forget Fotini")
         rows = conn.execute("SELECT id, trigger, context, outcome, lesson, timestamp FROM episodes").fetchall()
-        return [r for r in rows if any(rx.search(_fold(str(x or ""))) for x in r[1:5])]
+        acts: Dict[int, list] = {}
+        for eid, a, r in conn.execute("SELECT episode_id, tool_args, result FROM episode_actions"):
+            acts.setdefault(eid, []).extend((a, r))
+        return [r for r in rows if any(_names(x) for x in r[1:5]) or any(_names(x) for x in acts.get(r[0], ()))]
 
     def mention_previews(self, target: str) -> list:
         """``[(id, trigger), …]`` of the episodes naming ``target``."""
         with closing(sqlite3.connect(self.db_path)) as conn:
             return [(r[0], str(r[1] or "")) for r in self._mention_hits(conn, target)]
 
+    #: how long a forgotten episode stays in ``episodes_forgotten.jsonl``
+    #: (§4LA: append-only, verbatim, forever)
+    FORGOTTEN_RETENTION_DAYS = 30
+
+    def _archive_path(self) -> Path:
+        return Path(self.db_path).parent / "episodes_forgotten.jsonl"
+
+    def _purge_forgotten_archive(self) -> None:
+        """Drop archive lines older than the retention (best-effort)."""
+        p = self._archive_path()
+        if not p.exists():
+            return
+        cutoff = time.time() - self.FORGOTTEN_RETENTION_DAYS * 86400
+        try:
+            keep = []
+            for ln in p.read_text(encoding="utf-8").splitlines():
+                try:
+                    if float(json.loads(ln).get("forgot_at") or 0) >= cutoff:
+                        keep.append(ln)
+                except Exception:  # noqa: BLE001 — an unreadable line is dropped
+                    continue
+            tmp = p.with_suffix(".jsonl.tmp")
+            tmp.write_text("".join(k + "\n" for k in keep), encoding="utf-8")
+            os.replace(tmp, p)
+        except OSError:
+            pass
+
     def delete_episodes(self, ids, vector_memory=None, reason: str = "") -> int:
-        """Delete the given episodes (archived with their actions to
-        ``episodes_forgotten.jsonl`` first — nothing is deleted when the
-        archive cannot be written) and their vector twins."""
-        import json as _json
+        """Delete the given episodes (archived with their actions, what was
+        forgotten and when, to ``episodes_forgotten.jsonl`` first — nothing is
+        deleted when the archive cannot be written; the archive keeps
+        ``FORGOTTEN_RETENTION_DAYS``) and their vector twins. A twin that
+        could not be deleted is LOGGED and listed in ``last_twin_failures``
+        (§4LA: it was swallowed while the user was told it worked)."""
         ids = [int(i) for i in ids or []]
+        self.last_twin_failures = []
         if not ids:
             return 0
         with self._lock, closing(sqlite3.connect(self.db_path)) as conn:
@@ -1159,14 +1264,15 @@ class EpisodicMemory:
             if not rows:
                 return 0
             try:
-                with open(Path(self.db_path).parent / "episodes_forgotten.jsonl", "a", encoding="utf-8") as fh:
+                now = time.time()
+                with open(self._archive_path(), "a", encoding="utf-8") as fh:
                     for r in rows:
                         acts = [dict(zip(("action_order", "tool_name", "tool_args", "result"), a)) for a in conn.execute(
                             "SELECT action_order, tool_name, tool_args, result FROM episode_actions "
                             "WHERE episode_id = ? ORDER BY action_order", (r[0],)).fetchall()]
-                        fh.write(_json.dumps({"id": r[0], "trigger": r[1], "context": r[2], "outcome": r[3],
-                                              "lesson": r[4], "timestamp": r[5], "actions": acts, "forgot": reason},
-                                             ensure_ascii=False) + "\n")
+                        fh.write(json.dumps({"id": r[0], "trigger": r[1], "context": r[2], "outcome": r[3],
+                                             "lesson": r[4], "timestamp": r[5], "actions": acts, "forgot": reason,
+                                             "forgot_at": now}, ensure_ascii=False) + "\n")
             except OSError:
                 return 0
             found = [r[0] for r in rows]
@@ -1178,53 +1284,60 @@ class EpisodicMemory:
             for i in found:
                 try:
                     coll.delete(where={"$and": [{"type": "episode"}, {"episode_id": int(i)}]})
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as e:  # noqa: BLE001
+                    self.last_twin_failures.append(i)
+                    logger.warning("episode %s deleted but its vector twin was NOT (%s) — recall may still show "
+                                   "it until the next reconcile", i, e)
+        self._purge_forgotten_archive()
         return len(found)
 
     def count_mentions(self, target: str) -> int:
-        """How many episodes name ``target`` as a whole word."""
+        """How many episodes name ``target`` (trigger, outcome, context,
+        lesson or an action's args/result; any script; inflected)."""
         with closing(sqlite3.connect(self.db_path)) as conn:
             return len(self._mention_hits(conn, target))
 
     def forget_mentions(self, target: str, vector_memory=None) -> int:
-        """Delete the episodes whose text NAMES ``target`` (a whole-word
-        match in trigger, context, outcome or lesson) — `forget`'s episode
-        leg, used for a person of the owner's family. Each row AND its
-        actions are archived to ``episodes_forgotten.jsonl`` first; nothing
-        is deleted when the archive cannot be written. Their vector twins
-        go too. Returns the number deleted."""
-        import json as _json
+        """Delete the episodes that NAME ``target`` — `forget`'s episode leg for
+        a person of the owner's family (one deletion path: `delete_episodes`)."""
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            ids = [r[0] for r in self._mention_hits(conn, target)]
+        return self.delete_episodes(ids, vector_memory, reason=str(target).strip().lower())
+
+    def wipe_all(self) -> int:
+        """`reset_all`'s episode leg (§4LA): every episode and action row.
+        A wipe the owner confirmed — not archived."""
         with self._lock, closing(sqlite3.connect(self.db_path)) as conn:
-            hits = self._mention_hits(conn, target)
-            if not hits:
-                return 0
-            ids = [r[0] for r in hits]
-            actions = {}
-            for i in ids:
-                actions[i] = [dict(zip(("action_order", "tool_name", "tool_args", "result"), a)) for a in conn.execute(
-                    "SELECT action_order, tool_name, tool_args, result FROM episode_actions WHERE episode_id = ? "
-                    "ORDER BY action_order", (i,)).fetchall()]
-            try:
-                with open(Path(self.db_path).parent / "episodes_forgotten.jsonl", "a", encoding="utf-8") as fh:
-                    for r in hits:
-                        fh.write(_json.dumps({"id": r[0], "trigger": r[1], "context": r[2], "outcome": r[3],
-                                              "lesson": r[4], "timestamp": r[5], "actions": actions.get(r[0], []),
-                                              "forgot": str(target).strip().lower()},
-                                             ensure_ascii=False) + "\n")
-            except OSError:
-                return 0
-            conn.executemany("DELETE FROM episode_actions WHERE episode_id = ?", [(i,) for i in ids])
-            conn.executemany("DELETE FROM episodes WHERE id = ?", [(i,) for i in ids])
+            n = conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0]
+            conn.execute("DELETE FROM episode_actions")
+            conn.execute("DELETE FROM episodes")
             conn.commit()
-        coll = getattr(vector_memory, "collection", None)
-        if coll is not None:
+        return int(n or 0)
+
+    def mark_outcome(self, req_id: str, success: bool, note: str = "", trigger: str = "") -> int:
+        """Relabel the episode recorded for request ``req_id`` (§4LA: a late
+        REFUTED verdict or the owner's correction left 142 episodes saying
+        SUCCESS, and they were handed out as how-to and recovery evidence).
+        Returns the rows changed."""
+        rid = str(req_id or "").strip()
+        trg = _redact(str(trigger or ""))[:500]
+        if not rid and not trg:
+            return 0
+        with self._lock, closing(sqlite3.connect(self.db_path)) as conn:
+            if rid:
+                ids = [r[0] for r in conn.execute("SELECT id FROM episodes WHERE req_id = ?", (rid,))]
+            else:
+                # no request id (the correction path knows the TURN's text):
+                # the most recent episode recording exactly that request
+                ids = [r[0] for r in conn.execute(
+                    "SELECT id FROM episodes WHERE trigger = ? ORDER BY timestamp DESC LIMIT 1", (trg,))]
             for i in ids:
-                try:
-                    coll.delete(where={"$and": [{"type": "episode"}, {"episode_id": int(i)}]})
-                except Exception:  # noqa: BLE001
-                    pass
-        return len(ids)
+                conn.execute("UPDATE episodes SET outcome_success = ?, outcome = substr(? || outcome, 1, 1000) "
+                             "WHERE id = ? AND outcome NOT LIKE ?",
+                             (1 if success else 0, (f"[{note}] " if note else ""), i, f"[{note}]%"))
+            conn.commit()
+            self.last_relabelled_ids = list(ids)      # §4LC: the lessons citing them follow
+            return len(ids)
 
     def get_episode(self, episode_id: int) -> Optional[Dict]:
         """Retrieve a full episode with its actions."""

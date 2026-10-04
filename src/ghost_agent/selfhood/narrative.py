@@ -172,14 +172,33 @@ class NarrativeSummariser:
         # Fingerprint of the last successfully-persisted regeneration's
         # INPUT (the rendered prompt). Lets the idle phase skip when
         # nothing new happened — observed live: ~15 identical hourly
-        # regenerations overnight, each an LLM round-trip. In-memory on
-        # purpose: a fresh boot regenerates once, which is wanted after
-        # a deploy.
-        self._last_input_key = ""
+        # regenerations overnight, each an LLM round-trip. Persisted next
+        # to the narrative (§4LF: in memory, every one of 285 boots in four
+        # weeks regenerated it on the main model).
+        self._last_input_key = self._load_input_key()
 
     # -----------------------------------------------------------------
     # Read path
     # -----------------------------------------------------------------
+
+    # §4LF: the "input unchanged" key survives a restart — kept in memory
+    # only, every one of 285 boots in 4 weeks re-generated the narrative
+    # (213 of 354 rewrites were the first after a boot, on the main model)
+    def _key_path(self):
+        return self.path.with_name(self.path.name + ".inputkey")
+
+    def _load_input_key(self) -> str:
+        try:
+            return self._key_path().read_text(encoding="utf-8").strip()
+        except Exception:  # noqa: BLE001 — no key: regenerate once
+            return ""
+
+    def _remember_input_key(self, key: str) -> None:
+        self._last_input_key = key
+        try:
+            self._key_path().write_text(key, encoding="utf-8")
+        except Exception:  # noqa: BLE001 — only costs one extra regeneration
+            pass
 
     def latest(self) -> str:
         """Return the most recently written narrative, or empty string
@@ -424,8 +443,10 @@ class NarrativeSummariser:
         # or disk error must not poison the guard against a valid retry
         # (the guard would otherwise pass via an OLDER narrative file,
         # turning a transient failure into persistent staleness).
-        if self._persist(text, used_llm=used_llm, source_count=len(recent)):
-            self._last_input_key = input_key
+        # …and only when the model wrote it (§4LI review: the key survives
+        # restarts — a template fallback must not freeze until inputs move)
+        if self._persist(text, used_llm=used_llm, source_count=len(recent)) and used_llm:
+            self._remember_input_key(input_key)
         return text
 
     def _persist(self, text: str, *, used_llm: bool, source_count: int) -> bool:

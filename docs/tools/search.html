@@ -265,6 +265,25 @@
   <code>tool_deep_research</code> runs over the live batches, and real URLs from the store).</p>
   <!-- /4KS:search -->
 
+  <h2 id="4lh">The 6 s hedge and the word-set cache key <span class="tag">2026-10-04 &sect;4LH</span></h2>
+  <p><strong>Hedge.</strong> 97% of winning yandex answers land inside 6 s, while a wave nobody wins waits for its
+  engines' 12 s timeout (13% of first waves; then a 1 s sleep and wave 2). When no engine has won at
+  <code>_race_hedge_at()</code> (6 s, <code>GHOST_SEARCH_HEDGE_S</code>; <code>0</code> disables), yandex and brave
+  are launched again inside the same wave, on fresh circuits (SOCKS salt <code>yand</code>+<code>h</code>). Their
+  timeout is the engine timeout minus the time already spent, so a wave nobody wins still ends at ~12 s. The pool is
+  sized for the extra two threads per wave.</p>
+  <p><strong>Cache key.</strong> <code>_norm_cache_key</code> is the sorted set of the query's words: quotes and
+  parentheses are dropped and trailing punctuation is stripped per word. So "python asyncio tutorial" and "&quot;asyncio&quot;
+  Python tutorial?" share one entry; on the recorded queries, exact-repeat hits within a turn went from 40 to 51. A
+  query with an order word (<code>to, from, into, vs, versus, before, after, than</code>, Greek
+  <code>σε, από, προς</code>) keeps its order ("athens to london" ≠ "london to athens"). A leading dot is kept
+  (".net").</p>
+
+  <p><strong>&sect;4LI: the word-set key is reverted.</strong> Replayed on 1,555 recorded queries it added 11
+  within-turn hits (0.7%), not the 13% "near-identical" share it was sized on, and it merged subject/object order
+  ("israel attacks iran" / "iran attacks israel"). The key is the exact normalised query again; a leading dot is still
+  kept (".net").</p>
+
 </main>
   <p><strong>Distinctive-token relevance (§4IL, 2026-09-18).</strong> The wave's off-topic check read "not one content word of the query appears anywhere in the batch" — so an engine answering a different question won whenever one common word overlapped: "How to get help in Windows" for <code>eckit Grid reduced_gg spec format nxacc pl python</code> (shared word: <em>format</em>), Doha for <code>Χρυσοί Σκούφοι Βραβεία Γαστρονομίας</code>, NHL standings for a Revolut-breach query. Replayed over 798 recorded searches (2026-08/09): 53 batches (6.6%) were such answers. <code>distinctive_tokens(query)</code> keeps the query's subject-bearing words — the first non-year content word unless it is query framing (<code>_WEAK_LEADING</code>: best, top, number, list…), any token with a digit or underscore, any word the system dictionary (<code>/usr/share/dict/words</code>, stem-aware) does not know; years never. <code>result_on_topic</code> matches a result on any distinctive token, as a substring of the folded text (title, body, URL slug) or fuzzily (ratio ≥ 0.8, tokens of 6+ chars) so a one-letter typo still finds its page. The wave counts a batch as off-topic when no result carries one (bare rows without text are not evidence; a query with no distinctive token keeps the old batch rule), and <code>rank_on_topic</code> re-orders the winner on-topic first — nothing is dropped (11.3% of recorded batches re-rank). Pins: <code>tests/test_search_distinctive_relevance.py</code>.</p>
 </body>

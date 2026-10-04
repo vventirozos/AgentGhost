@@ -1425,7 +1425,24 @@ PYTHONPATH=src python scripts/verify_bench.py --tier private --two-stage both</p
   the non-streamed path. <code>tests/test_verifier_web_exec.py</code> now feeds the probe the browser's real result shapes.</p>
   <!-- /4KS:verifier -->
 
-</main>
+
+<h2 id="4lg">Research turns: refutes from memory, corrections that arrive <span class="tag">2026-10-04 &sect;4LG</span></h2>
+<p>Measured on 164 research turns: 14 REFUTED, 13 reached the user unchanged, 0 of 11 queued corrections were ever shown;
+and the judge refuted correct answers from its own memory ("the actual final boss is Messiah" against a correct
+"Promised Consort Radahn") — the reflection then wrote the wrong fact as a lesson.</p>
+<ul>
+  <li><strong>Memory-refute guard</strong> (<code>_refute_rests_on_memory</code>, applied to every verdict in
+  <code>verify_claim</code>): a REFUTED whose every issue asserts a counter-fact — a number, or a capitalised name that is
+  not a sentence's first word nor audit vocabulary, absent from the claim — none of which appears in the evidence, the
+  raw sources, the request or the session's earlier outputs, is downgraded to UNCERTAIN (no failed label, no lesson scrub,
+  no correction). An issue that only says the claim is UNSUPPORTED names nothing new and the refute stands.
+  <code>GHOST_VERIFY_MEMORY_REFUTE_GUARD=0</code> disables it.</li>
+  <li><strong>A late correction reaches the owner</strong>: besides the next-message banner, a late REFUTED that queues a
+  correction is also written as an owner notice naming the question it corrects
+  (<code>GhostAgent._notify_owner_correction</code>; quiet hours and the hourly cap apply; never for a member, a public
+  reply, a probe or an internal run).</li>
+  <li><code>darkweb_research</code> and <code>fact_check</code> count as external evidence in the digest.</li>
+</ul>
   <h2>Conflicting evidence and internal contradiction (§4IJ, 2026-09-17)</h2>
   <p><strong>The blind spot.</strong> The stage-2 "support" rule read: REAL only if the fact appears in NO tool output or directly contradicts one. A fact that IS in the output therefore passed even when the same output also said otherwise — the bench fault <code>omitted_contradiction</code> (§4IA: the evidence line carrying a claim number is copied with the number perturbed and appended as another row of the same output; the claim reports one value) was CONFIRMED 23/23 at mean confidence 0.96, and the stage-1 pass had often <em>named</em> the conflict ("Evidence shows two different temperatures: 34°C and 35°C") only for stage 2 to dismiss it as supported. The live twin (probe <code>ifs21382…</code>): a reply stating "~10 km nominal resolution" and "the nearest grid point is ~86 km away" — both numbers printed by its own script, whose longitudes were radians labelled as degrees — CONFIRMED at 0.90.</p>
   <p><strong>The rules.</strong> Every deciding stage (<code>_VERIFY_CLAIM_PROMPT</code>, <code>_VERIFY_ADJUDICATE_PROMPT</code>) now carries two rules: <em>CONFLICTING EVIDENCE is a REAL problem</em> — two or more different values for the SAME quantity in the evidence, the claim reporting one without disclosing the disagreement — with the FPR guard spelled out (different quantities are not a conflict: 1/5/15-minute load averages, prices of different items, readings at different times, one file's size beside another's); and <em>INTERNAL CONTRADICTION is a REAL problem</em> — two claim statements that cannot both be true refute the claim even when each number appears in a tool output, because the output shows the agent's computation, not that it was right. Stage 1 (<code>_VERIFY_ENUMERATE_PROMPT</code>) names both shapes as "support" suspects; the "starting point, not a boundary" paragraph lists them among the problems stage 2 must find on its own. Both rules are in <code>_REQUIRED_RULE_MARKERS["verifier.adjudicate"]</code>, so a tuned template that sheds either is rejected and the constant serves (the optimizer-sheds-pinned-rules guard, §4BD).</p>
@@ -1486,5 +1503,27 @@ PYTHONPATH=src python scripts/verify_bench.py --tier private --two-stage both</p
   keeps the guard, conservatively, and one <code>Wrote</code> at or above the threshold keeps it for the whole run.
   Pinned with boundary values (2047/2048), mixed runs, and a parity-style check that every emitted
   <code>Wrote</code> shape parses — a reword blinds the threshold loudly (the guard stays ON), never silently.</p>
+<h2 id="4lh">Onion addresses are not confirmed from memory <span class="tag">2026-10-04 &sect;4LH</span></h2>
+<p><code>Verifier._guard_onion_claims</code> runs after the memory-refute guard on every verdict, including the
+claim-binding primary arm. <code>link_grounding.onion_claim_issues</code> names three problems:</p>
+<ul>
+  <li>an onion address that cannot exist (wrong length, or a character outside base32);</li>
+  <li>a v3 address that no tool output, raw source, prior evidence or context holds;</li>
+  <li>in a Latin-script reply only (the context words are English), a 16-character v2 address that the text around
+  it does not call retired / v2 / old.</li>
+</ul>
+<p>The issues are appended. A CONFIRMED becomes UNCERTAIN (≤0.5); every other field is kept
+(<code>dataclasses.replace</code>). Live probe D2: the escalation CONFIRMED the retired v2 address as DuckDuckGo's
+"official v3". <code>GHOST_VERIFY_ONION_GUARD=0</code> disables. A channel member's web-research turn is now verified
+too, after the reply; see <a href="agent.html#4lh">agent §4LH</a>.</p>
+<h2 id="4li">The memory-refute guard is off by default <span class="tag">2026-10-04 &sect;4LI</span></h2>
+<p>Replayed over the 42 recorded refutes it could judge, the §4LG guard fired once, and wrongly: on a right "stork,
+not pelican" refute, because its counter-fact extraction kept "Mismatch" (a capitalised label) and dropped lowercase
+facts. It also misses the Radahn case that motivated it, because the judge repeats the topic name from the evidence.
+It is a word-matching stand-in for "the judge answered from memory", so it is not patched further:
+<code>GHOST_VERIFY_MEMORY_REFUTE_GUARD=1</code> turns it on. Also: <code>fact_check</code> no longer counts as a
+SOURCE for claim binding (<code>SOURCE_EXCLUDED_TOOLS</code>), because its output is the main model's own verdict on
+the claim.</p>
+</main>
 </body>
 </html>

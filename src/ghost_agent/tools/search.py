@@ -111,7 +111,8 @@ def _norm_cache_key(query: str) -> str:
     trailing '?' — so 'python asyncio', 'Python  asyncio' and 'python
     asyncio?' share one entry. Meaning-bearing tokens are untouched."""
     q = re.sub(r"\s+", " ", (query or "").strip().lower())
-    return q.strip(" \t\n?.!,;:\"'")
+    q = q.strip(" \t\n\"'").rstrip("?.!,;:")      # a leading "." is meaning (".net")
+    return q
 
 
 def _sanitize_query(query: str) -> str:
@@ -608,6 +609,22 @@ def _failure_category(msg: str) -> str:
 # the caller wait forever.
 _RACE_WAVE_GRACE = 4
 
+#: §4LH hedge: 97% of yandex wins land inside 6 s, while a wave nobody wins
+#: waits the full deadline (13% of first waves; median 12 s, then a 1 s
+#: sleep and wave 2). At 6 s with no winner, the two engines that win most
+#: often are launched again on FRESH circuits inside the same wave and the
+#: same deadline. ``GHOST_SEARCH_HEDGE_S=0`` disables.
+_RACE_HEDGE_AT_S = 6.0
+_RACE_HEDGE_ENGINES = ("yandex", "brave")
+
+
+def _race_hedge_at() -> float:
+    try:
+        v = float(os.environ.get("GHOST_SEARCH_HEDGE_S", _RACE_HEDGE_AT_S))
+    except ValueError:
+        return _RACE_HEDGE_AT_S
+    return v if v > 0 else 0.0
+
 
 def _race_wave_deadline() -> float:
     """§4HR: the wave deadline is sized off the engines actually RACED —
@@ -630,7 +647,7 @@ def _race_wave_deadline() -> float:
 # requests. (The deeper fix is a cancellable racer so losers don't linger
 # up to 18s each; until then, headroom is the mitigation.)
 from concurrent.futures import ThreadPoolExecutor as _TPE
-_RACE_POOL = _TPE(max_workers=len(_RACE_ENGINES) * 8,
+_RACE_POOL = _TPE(max_workers=(len(_RACE_ENGINES) + len(_RACE_HEDGE_ENGINES)) * 8,
                   thread_name_prefix="search-race")
 
 # Fresh per process AND per ~minute: an identical SOCKS-auth tag maps to
@@ -979,8 +996,9 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
     _patch_ddgs_snippet_join()
     region = region_for_query(query)
 
-    def _run_engine(engine: str, proxy: Optional[str]) -> List[Dict]:
-        _eng_timeout = _engine_timeout(engine)
+    def _run_engine(engine: str, proxy: Optional[str],
+                    timeout: Optional[float] = None) -> List[Dict]:
+        _eng_timeout = timeout or _engine_timeout(engine)
         kwargs: Dict[str, Any] = {"timeout": _eng_timeout}
         if proxy:
             kwargs["proxy"] = proxy
@@ -1010,14 +1028,19 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
     t0 = time.monotonic()
     loop = asyncio.get_running_loop()
     tasks: Dict[Any, str] = {}
-    for engine in _RACE_ENGINES:
-        proxy = _proxy_for_attempt(tor_proxy, query, wave, salt=engine[:4])
+
+    def _launch(engine: str, salt: str, label: str, timeout: Optional[float] = None):
+        proxy = _proxy_for_attempt(tor_proxy, query, wave, salt=salt)
         # Dedicated _RACE_POOL, NOT to_thread: uncancellable loser threads
         # must queue against other WAVES, not against the process-wide
         # default executor every other to_thread caller shares.
         task = asyncio.ensure_future(
-            loop.run_in_executor(_RACE_POOL, _run_engine, engine, proxy))
-        tasks[task] = engine
+            loop.run_in_executor(_RACE_POOL, _run_engine, engine, proxy, timeout))
+        tasks[task] = label
+        return task
+
+    for engine in _RACE_ENGINES:
+        _launch(engine, engine[:4], engine)
 
     # Several searches can race concurrently in one agent turn; the query
     # tag on every wave log line keeps their interleaved output readable.
@@ -1026,17 +1049,35 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
     pending = set(tasks)
     failures: List[Tuple[str, str]] = []
     timed_out = False
+    hedge_at = _race_hedge_at()
+    hedged = hedge_at <= 0
     try:
         while pending:
-            remaining = deadline - (time.monotonic() - t0)
+            elapsed = time.monotonic() - t0
+            remaining = deadline - elapsed
             if remaining <= 0:
                 timed_out = True
                 break
+            if not hedged and elapsed >= hedge_at:
+                hedged = True
+                for engine in _RACE_HEDGE_ENGINES:
+                    # its own timeout ends with the first engines' (review
+                    # §4LH: a full 12 s from 6 s ran a no-winner wave to 16 s)
+                    pending.add(_launch(engine, engine[:4] + "h", f"{engine}-h",
+                                        timeout=max(1.0, _engine_timeout(engine) - elapsed)))
+                pretty_log("DDGS Search",
+                           f"no winner after {elapsed:.0f}s — hedging "
+                           f"{'+'.join(_RACE_HEDGE_ENGINES)} on fresh circuits ‹{qtag}›",
+                           icon=Icons.TOOL_SEARCH)
+                continue
+            wait_for = remaining if hedged else min(remaining, hedge_at - elapsed)
             done, pending = await asyncio.wait(
-                pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+                pending, timeout=wait_for, return_when=asyncio.FIRST_COMPLETED)
             if not done:
-                timed_out = True
-                break
+                if hedged:
+                    timed_out = True
+                    break
+                continue
             for task in done:
                 engine = tasks[task]
                 try:

@@ -174,12 +174,31 @@ class TestPreambleRollback:
         # The rollback must NOT fire: the real tool ran, and both the
         # legitimate preamble and the answer are delivered. (Single-tool
         # turns are not smoothed — the ≥2 gate, kept after §4FS's one-day
-        # trial of ≥1 — so the preamble reaches the user untouched.)
+        # trial of ≥1 — and §4LH drops text beside RESEARCH calls only, so
+        # the preamble reaches the user untouched.)
         weather.assert_awaited()
         assert "Let me check the weather first" in final, (
             f"Legitimate preamble was dropped (false-positive rollback). final={final!r}"
         )
         assert "It is 72 degrees and sunny" in final
+
+    @pytest.mark.asyncio
+    async def test_real_tool_iteration_keeps_preamble_with_the_drop_off(self, agent, monkeypatch):
+        """The false-positive guard for the rollback, with the §4LH drop off:
+        a real tool ran, so the rollback must not remove the preamble."""
+        monkeypatch.setenv("GHOST_DROP_PRE_TOOL_TEXT", "0")
+        replies = [_reply_with_tool_call("Let me check the weather first.", "weather_lookup"),
+                   _plain_text_reply("It is 72 degrees and sunny.")]
+        it = iter(replies)
+        agent.context.llm_client.chat_completion = AsyncMock(side_effect=lambda *a, **k: next(it))
+        weather = AsyncMock(return_value="72F sunny")
+        agent.available_tools = {"weather_lookup": weather}
+        with patch("ghost_agent.core.agent.pretty_log"), \
+             patch("ghost_agent.core.agent.get_active_tool_definitions",
+                   return_value=[{"function": {"name": "weather_lookup"}}]):
+            final, _, _ = await agent.handle_chat(
+                {"messages": [{"role": "user", "content": "what's the weather?"}]}, FakeBgTasks())
+        assert "Let me check the weather first" in final and "It is 72 degrees and sunny" in final
 
     @pytest.mark.asyncio
     async def test_invalid_json_args_iteration_drops_preamble(self, agent):

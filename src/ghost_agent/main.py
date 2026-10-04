@@ -1145,12 +1145,27 @@ async def _handle_chat_foreground(context, body, request_id: str):
     counter."""
     from fastapi import BackgroundTasks
     from .api.routes import _mark_foreground
+    from .utils.logging import (requester_role_context, reply_surface_context, client_deadline_context,
+                                verify_purpose_context, trajectory_id_context)
+    # §4LD: an autonomous turn is the OWNER's, on no surface, with no client
+    # deadline — never the context of whichever turn last added a scheduler
+    # job (APScheduler's wake-up copies the caller's contextvars into every
+    # later fire: one task created in a Slack channel made every scheduled
+    # run a PUBLIC reply; a web client's timeout cut them short)
+    # + the workspace event project (§4LI review: a scheduled turn with no
+    # active project stamped its events with the creating turn's project)
+    from .workspace.model import _EVENT_PROJECT_OVERRIDE
+    _clean = [(v, v.set(x)) for v, x in ((requester_role_context, "owner"), (reply_surface_context, ""),
+                                         (client_deadline_context, 0.0), (verify_purpose_context, ""),
+                                         (trajectory_id_context, ""), (_EVENT_PROJECT_OVERRIDE, None))]
     _mark_foreground(context.agent, +1)
     try:
         return await context.agent.handle_chat(
-            body, BackgroundTasks(), request_id=request_id)
+            body, BackgroundTasks(), request_id=request_id)   # the role rides the contextvar set above
     finally:
         _mark_foreground(context.agent, -1)
+        for v, t in reversed(_clean):
+            v.reset(t)
 
 
 async def _resume_after_job(context, entry) -> bool:
@@ -1351,7 +1366,15 @@ _BOOT_MONO = None
 
 #: §4JS: how long the lifespan shutdown waits for the cancelled biological
 #: watchdog before abandoning it. The healthy case takes milliseconds.
-_BIO_SHUTDOWN_GRACE_S = 15.0
+_BIO_SHUTDOWN_GRACE_S = 5.0
+
+#: §4LD: the whole stop must fit launchd's kill — the plist sets no
+#: ExitTimeOut, so SIGKILL lands 20 s after SIGTERM. uvicorn waited for every
+#: open request with NO limit before the app's shutdown ran at all: 45 of 49
+#: stops were killed before the drains, the abort record of an interrupted
+#: turn, `sched.shutdown` and `sandbox_mgr.close` ever ran. Budget: open
+#: requests ≤ 6 s, the watchdog ≤ 5 s, the drains in what is left.
+_HTTP_SHUTDOWN_GRACE_S = 6
 
 
 def _task_where(task, limit: int = 3) -> str:
@@ -1783,11 +1806,11 @@ async def lifespan(app):
         except Exception as e:
             pretty_log("Contradiction Log Failed", str(e), level="WARNING", icon=Icons.WARN)
 
-        try:
-            context.adaptive_threshold = AdaptiveThreshold(context.memory_dir)
-            pretty_log("Adaptive Threshold", "Self-tuning recall threshold initialized", icon=Icons.THRESHOLD_TUNE)
-        except Exception as e:
-            pretty_log("Adaptive Threshold Failed", str(e), level="WARNING", icon=Icons.WARN)
+        # §4LF (operator, 2026-10-04): OFF unless GHOST_ADAPTIVE_THRESHOLD=1. The
+        # smart-memory gate takes max(--smart-memory, learned) and the learned
+        # bar sat at 0.81 under the launcher's 0.9 — it never changed a decision,
+        # while recording an observation on every memory write.
+        _maybe_adaptive_threshold(context)
 
         try:
             context.episodic_memory = EpisodicMemory(context.memory_dir)
@@ -3590,7 +3613,26 @@ def main():
     app.state.args = args
     app.state.context = context
     
-    uvicorn.run(app, host=args.host, port=args.port, log_config=None)
+    _serve(app, args)
+
+
+def _maybe_adaptive_threshold(context) -> None:
+    """§4LF: the self-tuning recall threshold only when GHOST_ADAPTIVE_THRESHOLD=1
+    (it never changed a decision under --smart-memory 0.9)."""
+    if os.getenv("GHOST_ADAPTIVE_THRESHOLD", "0").strip().lower() not in ("1", "true", "yes", "on"):
+        return
+    try:
+        context.adaptive_threshold = AdaptiveThreshold(context.memory_dir)
+        pretty_log("Adaptive Threshold", "Self-tuning recall threshold initialized", icon=Icons.THRESHOLD_TUNE)
+    except Exception as e:  # noqa: BLE001
+        pretty_log("Adaptive Threshold Failed", str(e), level="WARNING", icon=Icons.WARN)
+
+
+def _serve(app, args) -> None:
+    """The server, with the shutdown budget above (§4LD)."""
+    uvicorn.run(app, host=args.host, port=args.port, log_config=None,
+                timeout_graceful_shutdown=_HTTP_SHUTDOWN_GRACE_S)
+
 
 if __name__ == "__main__":
     main()

@@ -1571,7 +1571,9 @@ def _regrade_echo(audit: List["AuditFigure"], entities: List["AuditEntity"], rep
 #: Of the packer's external tools, the two that may hand the agent its OWN
 #: words back (`execute`: a `cat` of the draft it just wrote; `recall`: its
 #: earlier reply). Kept here so the binder and the objection tier share it.
-SOURCE_EXCLUDED_TOOLS = frozenset({"execute", "recall"})
+# §4LH: + fact_check — its output is the main model's own verdict on the
+# claim, not a source; counted as one it vouched for the claim's entities
+SOURCE_EXCLUDED_TOOLS = frozenset({"execute", "recall", "fact_check"})
 
 
 def _source_tool(name: str) -> bool:

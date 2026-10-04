@@ -363,7 +363,7 @@ def test_a_late_verdict_queues_a_caveat_that_heads_the_next_reply_as_a_note(agen
         agent._record_late_verdict(_v_facts(VerifyVerdict.UNCERTAIN, ["1850", "1925"], 0.5, ""), trajectory_id="t9", conv_fp="conv-A")
     assert len(agent._pending_corrections) == 1
     # surfaced on the next turn of THIS conversation, as a note
-    agent._consume_pending_corrections([{"role": "user", "content": "next"}], conv_fp="conv-A")
+    agent._consume_pending_corrections([{"role": "assistant", "content": "earlier answer"}, {"role": "user", "content": "next"}], conv_fp="conv-A")
     banner = agent._take_active_correction()
     assert banner.startswith("ℹ️ **On my previous answer:** Not found in the sources I consulted: 1850, 1925.")
     assert "Correction" not in banner and agent._pending_corrections == []
@@ -373,7 +373,7 @@ def test_a_late_verdict_queues_a_caveat_that_heads_the_next_reply_as_a_note(agen
     assert not any(c.get("kind") == "caveat" for c in agent._pending_corrections)
     agent._pending_corrections = [{"note": "the port was 8103", "conv": "conv-C", "traj": "t11", "ts": time.monotonic()},
                                   {"note": "Not found in the sources I consulted: 1850.", "conv": "conv-C", "traj": "t11", "ts": time.monotonic(), "kind": "caveat"}]
-    agent._consume_pending_corrections([{"role": "user", "content": "x"}], conv_fp="conv-C")
+    agent._consume_pending_corrections([{"role": "assistant", "content": "earlier answer"}, {"role": "user", "content": "x"}], conv_fp="conv-C")
     b2 = agent._take_active_correction()
     assert b2.index("⚠️ **Correction") < b2.index("ℹ️ **On my previous answer:**")
     monkeypatch.setenv("GHOST_VERIFY_SOURCE_CAVEAT", "0")

@@ -5,6 +5,7 @@ import datetime
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import time
@@ -321,6 +322,60 @@ def _public_profile(profile_context: str) -> str:
     return ((name + "\n") if name else "") + _PUBLIC_REPLY_NOTICE
 
 
+from ..memory.egress import OUTBOUND_TOOLS as _OUTBOUND_TOOLS  # noqa: E402 — §4LB r2: one table
+
+
+def _scrub_owner_private(arguments, context, tool_name: str = "web_search"):
+    """The call's arguments with the owner's street address replaced by the
+    city, or None when nothing had to change (`memory.egress`)."""
+    from ..memory.egress import scrub_tool_args
+    new, changed = scrub_tool_args(tool_name, arguments, context)
+    return new if changed else None
+
+
+#: a turn about the AGENT's own practice (§4LB r2: bare "train"/"practice"
+#: matched "constraint", "best practices", "train times")
+_SELF_PLAY_ASK = re.compile(
+    r"\bself[- ]?play\b"
+    r"|\byou(?:'ve|'re)?(?:\s+(?:been|already|recently|lately|still))*\s+(?:practi[cs](?:e|ed|ing)|train(?:ed|ing)?|learn(?:ed|t|ing)?)\b"
+    r"|\byour (?:practice|training|learning|self[- ]?play)\b", re.IGNORECASE)
+
+
+def _is_null_reply(text: str) -> bool:
+    """A reply that IS null means "no lesson" (§4LC: the post-mortem dropped
+    every reply CONTAINING the word — lessons about null handling)."""
+    return str(text or "").strip().strip("`").strip().lower() in ("", "null", "none", "{}", "json null")
+
+
+def _privacy_area(context) -> str:
+    """The replacement the egress scrub used (the address's suburb)."""
+    from ..memory.egress import egress_profile
+    try:
+        return egress_profile(context).egress_scrubber()[1]
+    except Exception:  # noqa: BLE001
+        return "the owner's area"
+
+
+def _owner_context_hidden(context=None) -> bool:
+    """The owner's PRIVATE context (scrapbook, past requests, open questions,
+    competence, lessons, the project briefing) stays out: a member's turn, an
+    owner turn whose reply is PUBLIC (§4LB — the public notice said "not
+    loaded" while all of it was), or an owner-memory-isolated delegate
+    (§4LB r2: its lessons still came from the owner's playbook)."""
+    return (requester_is_member() or reply_is_public()
+            or getattr(context, "owner_memory_isolated", False) is True)
+
+
+def _specialist_profile(context, fallback: str) -> str:
+    pm = getattr(context, "profile_memory", None)
+    if _owner_context_hidden(context):
+        return "(none)"
+    try:
+        return (pm.get_context_string(only={"preferences"}) or "(none)") if pm is not None else "(none)"
+    except Exception:  # noqa: BLE001
+        return "(none)"
+
+
 _MEMBER_PROFILE_PLACEHOLDER = (
     "(not available: this request comes from a channel MEMBER, not the owner. You do not "
     "know this person's name or details. Any profile, memory, autobiography or project "
@@ -431,6 +486,79 @@ def _imagine_gate_built_at() -> "datetime.datetime":
             else datetime.datetime.min
     except Exception:  # noqa: BLE001
         return datetime.datetime.min
+
+
+#: §4LD: a failing idle phase is said ONCE an hour at WARNING (26 handlers
+#: logged at DEBUG, and production logs no GhostAgent DEBUG line — every
+#: failure was invisible, and the phase still said "ran")
+_IDLE_FAIL_WARN_EVERY_S = 3600.0
+
+
+def _env_cooldown_s(name: str, default: int) -> int:
+    """A positive whole number of seconds from the environment, else
+    ``default`` (a malformed value never breaks the import)."""
+    try:
+        f = float(os.environ.get(name, "") or default)
+        if not math.isfinite(f):          # "inf" / "1e400" raised OverflowError at import (§4LI review)
+            return default
+        v = int(f)
+        return v if v > 0 else default
+    except ValueError:
+        return default
+
+
+def _idle_phase_failed(agent, ran: list, phase: str, err) -> None:
+    now = time.time()
+    seen = getattr(agent, "_idle_fail_warned", None)
+    if not isinstance(seen, dict):
+        seen = agent._idle_fail_warned = {}
+    if now - seen.get(phase, 0.0) >= _IDLE_FAIL_WARN_EVERY_S:
+        seen[phase] = now
+        logger.warning("idle phase %s failed: %s: %s", phase, type(err).__name__, err)
+    else:
+        logger.debug("idle phase %s failed again: %s", phase, err)
+    try:
+        if phase in ran:
+            ran[ran.index(phase)] = f"{phase}(failed)"
+        elif f"{phase}(failed)" not in ran:
+            ran.append(f"{phase}(failed)")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _idle_anchor_path(ctx):
+    md = getattr(ctx, "memory_dir", None)
+    if not isinstance(md, (str, Path)) or not str(md):
+        return None
+    return Path(str(md)).parent / "idle_cooldowns.json"
+
+
+def _sync_idle_anchors(agent, ctx) -> None:
+    """Load the persisted ``_last_*_at`` anchors once (a missing/min anchor
+    takes the stored time), then write them back whenever they changed.
+    Never raises: a lost anchor only means one extra run."""
+    path = _idle_anchor_path(ctx)
+    if path is None:
+        return
+    try:
+        if not getattr(agent, "_idle_anchors_loaded", False):
+            agent._idle_anchors_loaded = True
+            if path.is_file():
+                for k, v in (json.loads(path.read_text()) or {}).items():
+                    if (isinstance(k, str) and k.startswith("_last_") and k.endswith("_at")
+                            and getattr(agent, k, datetime.datetime.min) == datetime.datetime.min):
+                        setattr(agent, k, datetime.datetime.fromisoformat(str(v)))
+        cur = {k: v.isoformat() for k, v in vars(agent).items()
+               if k.startswith("_last_") and k.endswith("_at")
+               and isinstance(v, datetime.datetime) and v != datetime.datetime.min}
+        blob = json.dumps(cur, sort_keys=True)
+        if blob != getattr(agent, "_idle_anchors_saved", None):
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(blob)
+            os.replace(tmp, path)
+            agent._idle_anchors_saved = blob
+    except Exception as e:  # noqa: BLE001
+        logger.debug("idle anchors not synced: %s", e)
 
 
 def _negctrl_last_run_at() -> "datetime.datetime":
@@ -1486,6 +1614,12 @@ def _latch_forces_final(task_closed_this_req: bool,
     return bool(task_closed_this_req) and not bool(repair_reentry_active)
 
 
+#: §4LE: worker-node calls on the critical path before the first token
+PRE_REPLY_ROUTE_TIMEOUT_S = 4.0
+
+_SELF_REPORT_TOOLS = frozenset({"introspect", "self_state", "list_lessons"})
+
+
 def _should_await_repair_verdict(budget: float, lt, unverified: bool) -> bool:
     """Loop-exit gate: is the bounded in-loop verdict await worth blocking
     the reply for? Extracted pure so the §4BC exclusion is unit-testable.
@@ -1507,6 +1641,11 @@ def _should_await_repair_verdict(budget: float, lt, unverified: bool) -> bool:
     mutation-guard re-entry (`unverified`) and substantive-tool awaits are
     unchanged."""
     if not (budget > 0 and lt is not None and not unverified):
+        return False
+    # §4LE: a SELF-REPORT (the agent describing its own state) has no outside
+    # evidence to repair it from — "good morning ghost" waited 35 s of 60 on
+    # this verdict; it still lands through the deferred/late path
+    if str(lt.get("name", "")).lower().strip() in _SELF_REPORT_TOOLS:
         return False
     if not _tool_is_bookkeeping(lt):
         return True
@@ -1713,12 +1852,14 @@ def turn_may_teach(context) -> bool:
     backstop (`memory.skills.playbook_writes_blocked`). No client name
     appears here: the role header is the only multi-user signal."""
     try:
-        if turn_origin(context) in ("probe", "internal"):
+        # (§4LA) sim and bench too — they were kept out only because isolation
+        # nulled the store handle
+        if turn_origin(context) in ("probe", "internal", "sim", "bench"):
             return False
         from ..utils.logging import requester_is_member
         return not requester_is_member()
-    except Exception:  # noqa: BLE001
-        return True
+    except Exception:  # noqa: BLE001 — a predicate that cannot decide does not teach (§4LA: failed open)
+        return False
 
 
 def rubric_shadow_eligible(context, traj) -> bool:
@@ -1996,11 +2137,93 @@ _EVIDENCE_DEEP_WINDOW = 40
 # genuinely different pair below 0.30 — 0.5 sits in open water.
 _EVIDENCE_DUP_JACCARD = 0.5
 
+def _self_play_planner_forced(context) -> bool:
+    """Self-play runs the planner only while the use_planning experiment is
+    LIVE in the registry (operator 2026-10-04). Unreadable registry → off,
+    the production regime."""
+    try:
+        from . import experiments as _E
+        return "use_planning" in _E.load_registry(
+            _E.registry_path_for_context(context)).names_for_scope(_E.SCOPE_LIVE)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _trim_corrections(queue) -> list:
+    """§4LH final review: one queue, capped at ``_CORRECTION_MAX`` — member
+    research refutes (bound to an answer by ``|r<tag>``) evicted the OWNER's
+    pending correction. Each side keeps its own newest ``_CORRECTION_MAX``."""
+    q = list(queue or [])
+    bound = [c for c in q if isinstance(c, dict) and "|r" in str(c.get("conv", ""))]
+    rest = [c for c in q if not (isinstance(c, dict) and "|r" in str(c.get("conv", "")))]
+    keep = {id(c) for c in rest[-_CORRECTION_MAX:]} | {id(c) for c in bound[-_CORRECTION_MAX:]}
+    return [c for c in q if id(c) in keep]
+
+
+def _reply_tag(text) -> str:
+    """§4LH: a short tag of a reply's opening words, stable across the Slack
+    round trip (markdown→mrkdwn→plain changes markup and links, not words).
+    A member's queued correction carries the tag of the answer it corrects
+    and surfaces only in a thread whose history holds that answer: the
+    conversation fingerprint alone is the FIRST message, which two members'
+    threads can share ("hi")."""
+    try:
+        from .reply_smoothing import strip_system_notes
+        t = strip_system_notes(str(text or ""))
+    except Exception:  # noqa: BLE001
+        t = str(text or "")
+    # a correction banner in Slack's markup (`*…*`, not `**…**`) is not
+    # matched by strip_system_notes — remove either form (review §4LH)
+    t = re.sub(r"\A\s*(?:⚠️|ℹ️)[^\n]{0,2000}\n(?:[^\n]{0,2000}\n){0,6}?\s*-{3,}\s*\n", "", t)
+    t = re.sub(r"<https?://[^|>]*\|([^>]*)>", r"\1", t)
+    t = re.sub(r"https?://\S+", " ", t)
+    core = re.sub(r"[\W_]+", "", t.lower())[:120]
+    if not core:
+        return ""
+    import hashlib
+    return hashlib.sha1(core.encode("utf-8")).hexdigest()[:10]
+
+
+#: §4LH: batches whose text-alongside is narration, not an answer.
+_PRE_TOOL_LOOKUP_TOOLS = frozenset({
+    "web_search", "darkweb_search", "deep_research", "darkweb_research", "browser",
+    "fact_check", "news_headlines", "recall", "knowledge_base", "query_document",
+})
+
+
+def _all_lookup_calls(tool_calls) -> bool:
+    names = []
+    for tc in tool_calls or []:
+        fn = (tc.get("function") if isinstance(tc, dict) else None) or {}
+        names.append(str(fn.get("name") or (tc.get("name") if isinstance(tc, dict) else "") or ""))
+    return bool(names) and all(n in _PRE_TOOL_LOOKUP_TOOLS for n in names)
+
+
+#: §4LH: the tools a member's turn may run whose output is the open web —
+#: nothing of the owner's. A member turn that ran only these is verified.
+_MEMBER_RESEARCH_TOOLS = frozenset({"web_search", "darkweb_search"})
+
+
+def _member_research_turn(tools_run) -> bool:
+    """True when every real tool this turn ran is open-web research (and at
+    least one ran). ``GHOST_VERIFY_MEMBER_RESEARCH=0`` restores the old
+    "members are never verified"."""
+    if os.environ.get("GHOST_VERIFY_MEMBER_RESEARCH", "1") == "0":
+        return False
+    names = [str(t.get("name") or "") for t in (tools_run or [])
+             if isinstance(t, dict) and not t.get("_synthetic")]
+    return bool(names) and all(n in _MEMBER_RESEARCH_TOOLS for n in names)
+
+
 # Tools whose output comes from OUTSIDE the agent's own writes. Anything
 # else (file_system, report_pdf, workspace, manage_projects, …) may be the
 # deliverable echoing itself and ranks BELOW these for the claim pull —
 # still eligible, so a turn with no external tool behaves as before.
 _EXTERNAL_EVIDENCE_TOOLS = frozenset({
+    # §4LG: + darkweb_research and fact_check — their outputs ranked below
+    # the outside-world tools in the digest and could not be pulled in as
+    # support for the claim they were the source of
+    "darkweb_research", "fact_check",
     "browser", "web_search", "darkweb_search", "deep_research", "execute",
     "vision_analysis", "news_headlines", "query_document", "knowledge_base",
     "database", "postgres_admin", "recall", "system_utility",
@@ -7539,6 +7762,10 @@ _NOTIFY_NEGATION_RE = re.compile(
 )
 
 
+_NOTIFY_CLAUSE_SPLIT_RE = re.compile(r"[.!?;\n]+|,?\s+\b(?:but|however|though|although|except)\b\s*",
+                                     re.IGNORECASE)
+
+
 def _user_asked_for_notification(user_text) -> bool:
     """True when the user's request explicitly asks for an out-of-band
     notification ("notify me in slack when you're done") and doesn't
@@ -7548,9 +7775,51 @@ def _user_asked_for_notification(user_text) -> bool:
     t = str(user_text or "")[:4000]
     if not t:
         return False
-    if _NOTIFY_NEGATION_RE.search(t):
-        return False
-    return bool(_NOTIFY_INTENT_RE.search(t))
+    # PER CLAUSE (§4LD): "Stop pinging me so often, but notify me when the
+    # build is done" — a negation anywhere cancelled the real ask
+    for clause in _NOTIFY_CLAUSE_SPLIT_RE.split(t):
+        if _NOTIFY_INTENT_RE.search(clause) and not _NOTIFY_NEGATION_RE.search(clause):
+            return True
+    return False
+
+
+_JOB_ID_RE = re.compile(r"\bjob-[0-9a-f]{6,12}\b")
+
+
+def _launched_background_jobs(tools_run) -> list:
+    """The job ids this turn's tool results report as STARTED (a delegate,
+    a swarm, a command promoted to a background job). §4LD: a "notify me
+    when it's done" turn that only LAUNCHED the work sent "Done — I've
+    started the benchmark…" while it ran; the job's own completion is the
+    notice."""
+    ids = []
+    for t in tools_run or []:
+        if isinstance(t, dict) and str(t.get("name") or "") in (
+                "delegate", "delegate_to_swarm", "execute", "jobs", "file_system"):
+            for jid in _JOB_ID_RE.findall(str(t.get("content") or "")):
+                if jid not in ids:
+                    ids.append(jid)
+    return ids
+
+
+def _notify_when_jobs_finish(context, job_ids, req_id) -> int:
+    """Arm the job registry to notify the owner when each still-running
+    sub-agent/swarm job finishes (they sent no completion notice at all).
+    Sandbox jobs already wake a turn that reports their result. Returns the
+    number armed."""
+    try:
+        from .jobs import get_job_registry, STATUS_RUNNING
+        reg = get_job_registry(context)
+    except Exception:  # noqa: BLE001
+        return 0
+    armed = 0
+    for jid in job_ids:
+        job = reg.get(jid)
+        if job is None or job.status != STATUS_RUNNING:
+            continue
+        job.meta["notify_owner_req"] = str(req_id or "")
+        armed += 1
+    return armed
 
 
 def _notify_promise_backstop(context, *, last_user_content, tools_run,
@@ -7593,6 +7862,15 @@ def _notify_promise_backstop(context, *, last_user_content, tools_run,
         )
         log = get_activity_log(context)
         if log is None or _rate_limited():
+            return False
+        # §4LD: the turn LAUNCHED the work — "Done" would be false. The jobs
+        # notify on finishing (sub-agents/swarms armed here; sandbox jobs wake
+        # a turn that reports the real result)
+        _launched = _launched_background_jobs(tools_run)
+        # only when a finish notice was actually ARMED (§4LI review: a turn
+        # that merely listed a finished job, or ran a sandbox job — another
+        # registry — armed nothing and the promised notice was lost)
+        if _launched and not had_failures and _notify_when_jobs_finish(context, _launched, req_id) > 0:
             return False
         head = summarize_turn_content(final_content, limit=260)
         msg = (("Task stopped early after repeated failures — "
@@ -9403,6 +9681,8 @@ class GhostAgent:
         bus = getattr(self.context, 'memory_bus', None)
         if isinstance(bus, MemoryBus):
             return bus
+        if getattr(self.context, 'owner_memory_isolated', False) is True:
+            return MemoryBus()          # a delegate: an empty bus (§4LB)
         return MemoryBus(
             vector_memory=getattr(self.context, 'memory_system', None),
             graph_memory=getattr(self.context, 'graph_memory', None),
@@ -9579,8 +9859,11 @@ class GhostAgent:
     # delaying a due job meaningfully against a daily clock.
     _GEPA_AUTONOMY_COOLDOWN = 3600
     _AUTOADVANCE_COOLDOWN = 1800  # 30 min between autonomous project-advance ticks (phase 2.95)
-    _SELFPLAY_COOLDOWN = 3600     # 60 min between self-plays
-    _BENCH_COOLDOWN = 2700        # 45 min between bench-bank items (§4BF 1b)
+    # §4LF (operator, 2026-10-04): fresh self-play made progress in 1 of 197
+    # frontier runs and its lessons reached 1 owner turn in 28 days; bench
+    # sits at 98.5% — both run less often (env-tunable)
+    _SELFPLAY_COOLDOWN = _env_cooldown_s("GHOST_SELFPLAY_COOLDOWN_S", 14400)   # 4 h (was 60 min)
+    _BENCH_COOLDOWN = _env_cooldown_s("GHOST_BENCH_COOLDOWN_S", 21600)         # 6 h (was 45 min, §4BF 1b)
     #: §4CM D3. A batch is `batch x 2 x n_pairs` full solve loops, so
     #: it is the most expensive idle phase here — 4 h between batches,
     #: which still leaves several firings inside the 24 h liveness
@@ -9982,8 +10265,17 @@ class GhostAgent:
         # FrontierTracker's last compression delta.
         if not hasattr(self, '_current_selfplay_cooldown'):
             self._current_selfplay_cooldown = self._SELFPLAY_COOLDOWN
+        # §4LD: the cooldown anchors survive a restart (50 boots in a week:
+        # 37/73 postmortem and router runs and 32/93 skills-auto runs fell
+        # inside their cooldown — empty re-runs)
+        _sync_idle_anchors(self, ctx)
 
-        idle_secs = (datetime.datetime.now() - ctx.last_activity_time).total_seconds()
+        # §4LF: the phases' idle WINDOW reads the later of the user clock and
+        # the window's own roll (`_idle_window_at`) — the roll never touches
+        # the user clock, which bench, the drain, replay and evolve read
+        idle_secs = (datetime.datetime.now()
+                     - max(ctx.last_activity_time,
+                           getattr(self, "_idle_window_at", datetime.datetime.min))).total_seconds()
 
         # Per-idle-cycle instrumentation: each phase appends its name when it
         # actually does work; the tick emits ONE durable summary at the end
@@ -10065,7 +10357,7 @@ class GhostAgent:
                     # A ChromaDB error / locked store must only skip the dream
                     # eligibility check, not abort the whole tick (which would
                     # starve phases 2.5–3 for this idle session).
-                    logger.debug("dream eligibility get() failed: %s", _cgx)
+                    _idle_phase_failed(self, _idle_ran, "dream-eligibility", _cgx)
                     res = None
                 _dream_eligible = bool(res and len(res.get('ids', [])) >= 3)
                 # isinstance gate: only consult the trajectory fallback when
@@ -10083,7 +10375,7 @@ class GhostAgent:
                         from .dream import trajectory_seed_available as _tsa
                         _dream_eligible = await asyncio.to_thread(_tsa, ctx)
                     except Exception as _tfx:
-                        logger.debug("dream trajectory eligibility failed: %s", _tfx)
+                        _idle_phase_failed(self, _idle_ran, "dream-eligibility", _tfx)
                 if not _dream_eligible and isinstance(res, dict):
                     # Self-play fallback (2026-07-19): dream() also seeds
                     # from frontier-tracker outcome digests — same
@@ -10093,7 +10385,7 @@ class GhostAgent:
                         _sp_ids, _ = await asyncio.to_thread(_spf, ctx)
                         _dream_eligible = len(_sp_ids) >= 3
                     except Exception as _spx:
-                        logger.debug("dream self-play eligibility failed: %s", _spx)
+                        _idle_phase_failed(self, _idle_ran, "dream-eligibility", _spx)
                 if _dream_eligible:
                     if self._bio_roll(0.5):
                         _idle_ran.append("dream")
@@ -10440,8 +10732,12 @@ class GhostAgent:
                         # pipeline stalls the event loop for seconds otherwise
                         # (matching the to_thread pattern phases 2.7c/2.95 use).
                         from ..memory.skills import iter_teachable as _iter_teachable_sa
+                        # §4LC: real owner requests only — probe, reflection
+                        # and bench turns were mined and their verbatim text
+                        # ("DISPATCH-OK-77") rode owner prompts as examples
+                        from ..skills_auto.store import minable_requests as _minable
                         trajs = await asyncio.to_thread(
-                            lambda: list(_iter_teachable_sa(traj_collector.iter_trajectories()))
+                            lambda: list(_minable(_iter_teachable_sa(traj_collector.iter_trajectories())))
                         )
                         if trajs:
                             candidates, report = await asyncio.to_thread(
@@ -11124,7 +11420,7 @@ class GhostAgent:
                         pretty_log("Experiment Verdict", _v,
                                    level="WARNING", icon=Icons.BRAIN_SUM)
                 except Exception as _expv:  # noqa: BLE001
-                    logger.debug("experiment verdict check skipped: %s", _expv)
+                    _idle_phase_failed(self, _idle_ran, "experiment-verdicts", _expv)
                 try:
                     params = await asyncio.to_thread(tracker.fit)
                     if params is not None:
@@ -11619,7 +11915,7 @@ class GhostAgent:
                                     if label in out:
                                         return label
                             except Exception as _ce:
-                                logger.debug(f"autoadvance classify failed: {_ce}")
+                                _idle_phase_failed(self, _idle_ran, "autoadvance", _ce)
                             return _kw(description)
 
                         async def _aa_code_gen(description):
@@ -11770,7 +12066,7 @@ class GhostAgent:
                                 f"{len(stale)} open question(s) carried "
                                 f">3 days: {preview}")
                     except Exception as e:
-                        logger.debug(f"stale-question surfacing failed: {e}")
+                        _idle_phase_failed(self, _idle_ran, "stale-questions", e)
                     finally:
                         self._last_stale_questions_at = datetime.datetime.now()
 
@@ -11846,7 +12142,7 @@ class GhostAgent:
                                           * _mood_scale),
                         )
                     except Exception as e:
-                        logger.debug(f"derived-mood idle refresh failed: {e}")
+                        _idle_phase_failed(self, _idle_ran, "derived-mood", e)
 
         # Phase 2.9: Workspace Narrative Consolidation (15-60 min idle).
         # Mirrors phase 2.8 but for the world-model. Re-renders the
@@ -11885,6 +12181,21 @@ class GhostAgent:
                     logger.warning(f"Workspace narrative phase failed: {e}")
                 finally:
                     self._last_workspace_narrative_at = datetime.datetime.now()
+
+        # §4LF: the idle WINDOW rolls over without self-play. Its finally (below)
+        # was the only idle-time writer of the clock, so --no-self-play — or a
+        # longer self-play cooldown — left idle_secs past 3600 for a whole away
+        # stretch and silently stopped reflection, postmortem, skills, router,
+        # calibration, the narratives and autoadvance. When self-play cannot run
+        # this tick (switched off, or in its cooldown), roll the window here.
+        # The roll moves only the WINDOW anchor (read above), never the user
+        # clock: bench, the drain, replay and evolve read `last_activity_time`.
+        if idle_secs > self._bio_scaled(3600) and (
+                getattr(ctx.args, "no_self_play", False) is True
+                or (datetime.datetime.now() - self._last_selfplay_at).total_seconds()
+                < self._bio_cooldown(self._current_selfplay_cooldown)):
+            self._idle_window_at = datetime.datetime.now()
+            _idle_ran.append("idle-window")
 
         # Phase 3: Synthetic Self-Play (>60 min idle)
         # --no-self-play ablates JUST this loop (Track-B earn-keep self-play-off
@@ -12002,9 +12313,10 @@ class GhostAgent:
                     # stretch, idle_secs climbs past 3600 forever: every
                     # mid-phase (reflection, postmortem, skills, PRM, router,
                     # calibration, tidy, narratives, autoadvance) is gated out
-                    # by its `<= 3600` ceiling and only phase 1 survives. That
-                    # is precisely what --no-self-play does today, which is why
-                    # that flag ablates far more than its name suggests.
+                    # by its `<= 3600` ceiling and only phase 1 survives. (§4LF:
+                    # when self-play is off or cooling down, the "idle-window"
+                    # roll above does this instead, so --no-self-play now
+                    # ablates only self-play.)
                     ctx.last_activity_time = datetime.datetime.now()
                     self._last_selfplay_at = datetime.datetime.now()
                     # Adapt the next cooldown from the FrontierTracker:
@@ -12013,7 +12325,10 @@ class GhostAgent:
                     tracker = getattr(ctx, 'frontier_tracker', None)
                     if tracker is not None:
                         try:
-                            self._current_selfplay_cooldown = tracker.adaptive_cooldown(base=self._SELFPLAY_COOLDOWN)
+                            # the ceiling scales with the base: at the fixed
+                            # 7200 a 4 h base got SHORTER after a failed run
+                            self._current_selfplay_cooldown = tracker.adaptive_cooldown(
+                                base=self._SELFPLAY_COOLDOWN, ceiling=max(7200, 2 * self._SELFPLAY_COOLDOWN))
                         except Exception as e:
                             logger.warning(f"Adaptive cooldown lookup failed: {e}")
                             self._current_selfplay_cooldown = self._SELFPLAY_COOLDOWN
@@ -13395,7 +13710,7 @@ class GhostAgent:
                     raise _RetryableConsolidation(f"{type(_ue).__name__}: {_ue}") from _ue
                 raise
             l_content = str(l_data["choices"][0]["message"].get("content") or "")
-            if l_content and "null" not in l_content.lower():
+            if l_content and not _is_null_reply(l_content):
                 l_json = extract_json_from_text(l_content)
                 _sit = l_json.get("situation") or l_json.get("task") if isinstance(l_json, dict) else None
                 if _sit and all(k in l_json for k in ["mistake", "solution"]):
@@ -13599,6 +13914,21 @@ class GhostAgent:
             self._xml_schema_cache.clear()
 
     async def warm_up_main_prefix(self, *, quiet: bool = False) -> None:
+        """Warm the head of every live tool-schema variant (§4LE: the
+        `fs_batch` treatment head was never warmed), control LAST so it is the
+        newest prompt-cache entry."""
+        from ..tools.registry import FS_BATCH_WARM_ARM, fs_batch_experiment_live
+        if FS_BATCH_WARM_ARM.get() is None and fs_batch_experiment_live(self.context):
+            tok = FS_BATCH_WARM_ARM.set(True)
+            try:
+                # same mode as the control pass: at boot a cold treatment head is
+                # a WARMUP, not an "eviction by churn" (the quiet re-warm's verdict)
+                await self._warm_up_main_prefix_once(quiet=quiet)
+            finally:
+                FS_BATCH_WARM_ARM.reset(tok)
+        await self._warm_up_main_prefix_once(quiet=quiet)
+
+    async def _warm_up_main_prefix_once(self, *, quiet: bool = False) -> None:
         """Prefill the MAIN node's prompt cache with the byte-stable request
         head at boot, so the first user request doesn't pay it (2026-07-14).
 
@@ -13845,6 +14175,14 @@ class GhostAgent:
         # Emoji
         "👍", "❤️", "🙏", "😊", "🙂",
     })
+    #: §4LE: Greek greetings/acks (accent-folded — the check folds the
+    #: message the same way). The fast path fired 5× in a week: every Greek
+    #: "γεια" or "ευχαριστώ" paid the full path (~3.7 s, two LLM calls).
+    _STRICT_GREETING_TOKENS_EL = frozenset({
+        "γεια", "σου", "σας", "χαιρετω", "καλημερα", "καλησπερα", "καληνυχτα",
+        "ευχαριστω", "ευχαριστουμε", "πολυ", "ενταξει", "οκ", "τελεια", "ωραια",
+        "μπραβο", "τα", "λεμε", "φιλε",
+    })
     _STRICT_GREETING_PHRASES = (
         "good morning", "good afternoon", "good evening", "good night",
         "thank you", "thanks a lot", "thanks so much", "thank you so much",
@@ -13874,8 +14212,10 @@ class GhostAgent:
             return False
         # Strip punctuation for token check.
         import string as _string
-        normalised = lc.translate(str.maketrans("", "", _string.punctuation))
-        normalised = normalised.strip()
+        import unicodedata as _ud
+        normalised = lc.translate(str.maketrans("", "", _string.punctuation + "·;΄"))
+        # accents off ("ευχαριστώ" ~ "ευχαριστω") — the Greek allowlist is folded
+        normalised = "".join(c for c in _ud.normalize("NFD", normalised) if not _ud.combining(c)).strip()
         if not normalised:
             return False
         tokens = normalised.split()
@@ -13892,7 +14232,8 @@ class GhostAgent:
                     return True
                 return False
         # All tokens must be in the allowlist.
-        return all(tok in cls._STRICT_GREETING_TOKENS for tok in tokens)
+        return all(tok in cls._STRICT_GREETING_TOKENS or tok in cls._STRICT_GREETING_TOKENS_EL
+                   for tok in tokens)
 
     # A token already counts as a "concrete subject" when it is an
     # id-like blob — a long hex string (project/task ids like
@@ -13975,6 +14316,10 @@ class GhostAgent:
             max_tokens=64,
             temperature=0.0,
             fallback=legacy_fallback,
+            # §4LE: before the FIRST token of the reply — a 12 s stall while
+            # the worker node was down cost two owner turns 12 s each; the
+            # legacy expansion is a complete fallback (median call 1.0 s)
+            timeout=PRE_REPLY_ROUTE_TIMEOUT_S,
         )
         if not isinstance(result, str) or not result.strip():
             return legacy_fallback
@@ -14113,7 +14458,7 @@ class GhostAgent:
 
         # Tag the heartbeat both before and after the LLM call so the
         # biological watchdog never spuriously fires mid-bypass.
-        self.context.last_activity_time = datetime.datetime.now()
+        self._heartbeat()
 
         try:
             data = await self.context.llm_client.chat_completion(payload)
@@ -14150,7 +14495,7 @@ class GhostAgent:
             logger.warning("Trivial fast path returned empty content; falling through to full path")
             return None
 
-        self.context.last_activity_time = datetime.datetime.now()
+        self._heartbeat()
         pretty_log("Trivial Fast Path", f"Resolved in {len(content)} chars", icon=Icons.OK)
 
         return content, created_time, req_id
@@ -14912,7 +15257,7 @@ class GhostAgent:
         # names across the whole sandbox, the memory-claim check quotes the
         # owner's profile — and its issues reach the member verbatim (inline
         # note, correction banner). One gate for the whole subsystem.
-        if requester_is_member():
+        if requester_is_member() and not _member_research_turn(tools_run_this_turn):
             return None, last_tool
         # §4FN: the reply's SHAPE, before any evidence question. A raw tool
         # dump pasted as the answer is refuted mechanically for tool turns
@@ -15003,7 +15348,9 @@ class GhostAgent:
         # highest-priority check, so they must ride along here. Prepended,
         # not appended: the call sites truncate context to 1000 chars and a
         # tail-note would be the first thing cut.
-        constraint_note = self._active_constraint_note(
+        # §4LH: a member's research turn is judged on its own request only —
+        # the active project is the OWNER's
+        constraint_note = "" if requester_is_member() else self._active_constraint_note(
             request_text=last_user_content or "", project_id=project_id)
         request_view = constraint_note + (last_user_content or "")
         v_result = None
@@ -15047,7 +15394,10 @@ class GhostAgent:
         _early_visual_img = None
         _early_visual_done = False
         _vblock = ""
-        if len(_turn_generated_images(tools_run_this_turn)) == 1:
+        # never for a member (§4LH final review): every sandbox-reading arm
+        # below — this look, the visual arm, WEB-EXEC and FILE-ARTIFACT —
+        # resolves into the OWNER's sandbox
+        if not requester_is_member() and len(_turn_generated_images(tools_run_this_turn)) == 1:
             # ONE image: the look covers it. With several, vision would see only
             # the last, and the rule excusing descriptions must not reach the
             # others (review R20) — those turns keep the old order.
@@ -15285,7 +15635,10 @@ class GhostAgent:
         _gen_imgs = _turn_generated_images(tools_run_this_turn)
         _visual_seen = False
         try:
-            if _is_visual_intent(last_user_content) or _gen_imgs:
+            # never for a member (review §4LH, CRIT): image names in a web
+            # result resolved into the OWNER's sandbox, and the judged
+            # image's issues reached the member's thread as a correction
+            if not requester_is_member() and (_is_visual_intent(last_user_content) or _gen_imgs):
                 _sbx = self._scoped_sandbox_for(project_id)
                 _before_img, _after_img = _select_visual_evidence(
                     messages, last_user_content or "", _sbx,
@@ -15388,7 +15741,7 @@ class GhostAgent:
                     f"the inconclusive cap still arms",
                     icon=Icons.VERIFIER_LAB, level="WARNING",
                 )
-            if written or _retired_pages:
+            if (written or _retired_pages) and not requester_is_member():
                 check = await self._execute_web_artifact(
                     written, project_id=project_id)
                 if check is None:
@@ -15469,8 +15822,14 @@ class GhostAgent:
             # correction banner, whose text is the previous refute's issue
             # list — parsing filenames out of it produced a false
             # FILE-ARTIFACT refute for files this reply never claimed.
-            _claimed = _claimed_deliverable_files(_claim_src)
-            _mutated, _retired = _fs_path_ledger(tools_run_this_turn)
+            # never for a member (§4LH final review, CRIT): a file name in the
+            # member's reply was looked up in the OWNER's sandbox, and "claimed
+            # but empty" told the member that the owner's file exists
+            if requester_is_member():
+                _claimed, (_mutated, _retired) = [], ([], [])
+            else:
+                _claimed = _claimed_deliverable_files(_claim_src)
+                _mutated, _retired = _fs_path_ledger(tools_run_this_turn)
             # ⚠ THE LEDGER IS THE ONLY ABSENCE-GRADE EVIDENCE. The hard,
             # missing-refuting list is built from tool confirmations alone;
             # prose claims ride the `soft` (emptiness-only) arm alongside the
@@ -16602,6 +16961,11 @@ class GhostAgent:
             return None, last_tool
 
         gate = self._critic_gate_timeout()
+        if requester_is_member():
+            # §4LH: a member's web research is verified AFTER the reply — no
+            # added wait; a correction surfaces on the member's next message
+            # in that thread (its fingerprint carries the role).
+            gate = 0
 
         # ⚠ Capture the project binding NOW, while this is still the turn's
         # own execution. The spawned verdict task can run ~60s later, and
@@ -16653,9 +17017,10 @@ class GhostAgent:
             trajectory_id=trajectory_id,
             project_id=_vp_project_id,
         )
-        if requester_is_member():
-            # §4KS R2: a member's turn is never verified — the computation
-            # returns at once. Handed to the late handler it became a task
+        _member_research = requester_is_member() and _member_research_turn(tools_run_this_turn)
+        if requester_is_member() and not _member_research:
+            # §4KS R2: a member's turn (other than web research, §4LH) is not
+            # verified — the computation returns at once. Handed to the late handler it became a task
             # that "landed" EMPTY: the finalize line said "nothing will land
             # late" and a late WARNING followed it.
             return await _verdict_call
@@ -16682,10 +17047,15 @@ class GhostAgent:
         # task to the late handler and release the response now. Capture the
         # conversation fingerprint NOW (while its messages are in scope) so a
         # late correction can only surface back in the SAME conversation.
+        _late_conv = (conv_fp if conv_fp is not None
+                      else self._conversation_fingerprint(messages))
+        if (requester_is_member() or reply_is_public()) and _late_conv:
+            # §4LH: bound to the answer it corrects (see _reply_tag) — two
+            # channel threads, or two members' threads, can open with the
+            # same words and so share the conversation fingerprint
+            _late_conv = f"{_late_conv}|r{_reply_tag(final_ai_content)}"
         self._attach_late_verdict_handler(
-            task, trajectory_id,
-            conv_fp if conv_fp is not None
-            else self._conversation_fingerprint(messages),
+            task, trajectory_id, _late_conv,
             n_tools=len(tools_run_this_turn or []),
             # the value captured above, NOT a fresh global read after the
             # gate wait — follow-up tasks were filed on whichever project the
@@ -16721,6 +17091,11 @@ class GhostAgent:
             # whose first message matches the owner's ("hi") must not share
             # the owner's queued corrections or costly-turn record.
             _role = "member:" if requester_is_member() else ""
+            # …and so is the SURFACE (§4LC): a DM and a channel thread that
+            # both start "hi" shared one tag, so a correction queued for the
+            # DM opened the channel's reply
+            if reply_is_public():
+                _role += "public:"
             return hashlib.sha1(
                 (_role + str(first_user)[:2000]).encode("utf-8", "ignore")
             ).hexdigest()[:16]
@@ -16750,8 +17125,9 @@ class GhostAgent:
         """``(kind, text)`` — why a finished turn that HAD verifiable evidence
         carries no verdict. One decision, read by the finalize line.
 
-        * ``member``   — a channel member's turn is never verified (the
-          verifier reads the OWNER's world; see `_compute_verifier_verdict`);
+        * ``member``   — a channel member's turn that is not web research
+          is not verified (the verifier reads the OWNER's world; §4LH
+          verifies web-only research after the reply);
         * ``deferred`` — a verdict task for THIS turn is attached and still
           running: a LATE line will follow;
         * ``landed``   — that task already finished and printed its own line;
@@ -16766,11 +17142,12 @@ class GhostAgent:
         and nothing ever arrived. A member's turn is named first (no verdict
         task is spawned for one); after that the TASK decides, whatever the
         mode: the sync path also hands a slow verdict to the late handler."""
-        if requester_is_member():
-            return ("member",
-                    "no verdict — member turn: the verifier does not run for "
-                    "a channel member (by design); nothing will land late")
         key = str(trajectory_id or "")
+        if requester_is_member() and not (key and (self._late_verdict_running().get(key, 0) > 0
+                                                   or key in self._late_verdict_ended())):
+            return ("member",
+                    "no verdict — member turn: the verifier runs for a channel "
+                    "member's web research only; nothing will land late")
         if key and self._late_verdict_running().get(key, 0) > 0:
             return ("deferred",
                     "verdict deferred — verifying asynchronously after the "
@@ -17912,6 +18289,38 @@ class GhostAgent:
         except Exception:  # noqa: BLE001
             return False
 
+    def _notify_owner_correction(self, note: str) -> bool:
+        """A late correction as an owner notice (quiet hours and the hourly
+        cap apply). Never for a member's or a channel's turn, nor an
+        internal/probe one. Names the question it corrects."""
+        try:
+            from ..memory.lesson_scope import current_request
+            from .autonomous_activity import (SEVERITY_NOTIFY, get_activity_log,
+                                              is_internal_request)
+            from ..tools.notify_tool import PHASE as _PHASE, _note_sent, _rate_limited
+            rid = str(request_id_context.get() or "")
+            # the streamed drain restores the id and the role, not the origin
+            # (§4LH final review: a streamed probe's late correction paged
+            # the owner) — `turn_origin` reads the probe id, and sim/bench
+            if (requester_is_member() or reply_is_public() or is_internal_request(rid)
+                    or str(request_origin_context.get() or "") == ORIGIN_PROBE
+                    or turn_origin(self.context) != "user"):
+                return False
+            log = get_activity_log(self.context)
+            if log is None or _rate_limited():
+                return False
+            q = " ".join(str(current_request.get() or "").split())[:90]
+            msg = (f"Correction to my answer" + (f" to “{q}”" if q else "") + ": "
+                   + " ".join(str(note or "").split())[:300])
+            ok = log.record(_PHASE, msg[:500], severity=SEVERITY_NOTIFY,
+                            auto="late correction", req_id=rid)
+            if ok:
+                _note_sent()
+            return bool(ok)
+        except Exception as e:  # noqa: BLE001 — a lost notice never breaks the verdict
+            logger.debug("correction notice not sent: %s", e)
+            return False
+
     def _record_late_verdict(self, v_result, trajectory_id, conv_fp="",
                              last_tool=None, force_correction=False,
                              project_id=None, n_tools=None):
@@ -18081,6 +18490,11 @@ class GhostAgent:
                 "scrubbing this turn's lessons",
                 icon=Icons.WARN, level="WARNING",
             )
+            # the episode of this turn stops saying SUCCESS (§4LA)
+            try:
+                self._relabel_episode(str(request_id_context.get() or ""), "refuted after the reply")
+            except Exception:  # noqa: BLE001
+                pass
             _sm = getattr(self.context, "skill_memory", None)
             if _sm is not None and trajectory_id:
                 # spawn_bg: a GC'd retraction leaves a poisoned lesson
@@ -18152,12 +18566,16 @@ class GhostAgent:
                         "ts": time.monotonic(),
                     })
                     if len(self._pending_corrections) > _CORRECTION_MAX:
-                        self._pending_corrections = self._pending_corrections[-_CORRECTION_MAX:]
+                        self._pending_corrections = _trim_corrections(self._pending_corrections)
                     pretty_log(
                         "Verifier",
                         "queued a correction to surface on the next message of this conversation",
                         icon=Icons.IDEA,
                     )
+                    # §4LG: and TELL the owner — a research question is one-shot,
+                    # so the banner waited for a next message that never came
+                    # (0 of 11 queued corrections were ever shown)
+                    self._notify_owner_correction(_corr_note)
         else:
             pretty_log(
                 "Verifier",
@@ -18184,12 +18602,28 @@ class GhostAgent:
         if not corrections:
             self._correction_active_this_turn = False
             return messages
+        # §4LG: a "previous answer" needs a previous answer in THIS thread. A
+        # fresh chat that repeats an earlier first message shares its
+        # fingerprint, and the old correction opened a NEW answer that it
+        # contradicted ("title not retrieved" over a page that had loaded).
+        # Leave it queued for a real follow-up; the owner notice carries it.
+        if not any(isinstance(m, dict) and m.get("role") == "assistant" for m in (messages or [])):
+            # still prune what has expired (review: this return skipped the TTL)
+            _now = time.monotonic()
+            self._pending_corrections = [
+                c for c in corrections
+                if not (isinstance(c, dict) and (_now - c.get("ts", _now)) > _CORRECTION_TTL)]
+            self._correction_active_this_turn = False
+            return messages
 
         now = time.monotonic()
         current_fp = (
             conv_fp if conv_fp is not None
             else self._conversation_fingerprint(messages)
         )
+        _thread_tags = {_reply_tag(m.get("content")) for m in (messages or [])
+                        if isinstance(m, dict) and m.get("role") == "assistant"
+                        and isinstance(m.get("content"), str)} - {""}
         surface = []   # notes belonging to THIS conversation → prepend now
         kept = []      # other conversations' corrections → still fresh, hold
         for c in corrections:
@@ -18204,6 +18638,15 @@ class GhostAgent:
             if (now - c.get("ts", now)) > _CORRECTION_TTL:
                 continue  # expired → drop (its conversation never came back)
             conv = c.get("conv", "")
+            if "|r" in conv:
+                # §4LH: a member's correction names the answer it corrects;
+                # it surfaces only where that answer is in the history
+                _base, _, _tag = conv.partition("|r")
+                if current_fp and _base == current_fp and _tag and _tag in _thread_tags:
+                    surface.append((c.get("kind", "correction"), c.get("note", "")))
+                else:
+                    kept.append(c)
+                continue
             # A dict correction with an EMPTY conv can't be safely targeted;
             # per _conversation_fingerprint's own contract (empty → fail-safe
             # DROP rather than risk cross-posting) it must NOT wildcard-surface
@@ -18217,7 +18660,7 @@ class GhostAgent:
 
         # Hold non-matching (still-fresh) corrections for their own
         # conversation, bounded by the cap; drop everything else.
-        self._pending_corrections = kept[-_CORRECTION_MAX:]
+        self._pending_corrections = _trim_corrections(kept)
         self._correction_active_this_turn = bool(surface)
         if not surface:
             return messages
@@ -18259,7 +18702,7 @@ class GhostAgent:
         self._pending_corrections.append({"note": note, "conv": conv_fp, "traj": str(trajectory_id or ""),
                                           "ts": time.monotonic(), "kind": "caveat"})
         if len(self._pending_corrections) > _CORRECTION_MAX:
-            self._pending_corrections = self._pending_corrections[-_CORRECTION_MAX:]
+            self._pending_corrections = _trim_corrections(self._pending_corrections)
         pretty_log("Verifier", f"queued a source caveat for this conversation's next reply: {', '.join(facts)}",
                    icon=Icons.VERIFIER_LAB)
         return True
@@ -19395,6 +19838,16 @@ class GhostAgent:
                                 _segs.append(ui_content)
                     except Exception:  # noqa: BLE001 — never break the loop
                         pass
+                # §4LH: text written alongside a tool call predates that
+                # tool's result — recorded so finalize can leave it out of
+                # a non-streamed answer (the live stream shows it as progress)
+                # Research/lookup batches only (review §4LH): an answer written
+                # alongside a bookkeeping call (remember, a profile write) IS
+                # the answer, and the last iteration only says "saved".
+                if tool_calls and _all_lookup_calls(tool_calls):
+                    _pts = getattr(self.context, "_pre_tool_segments", None)
+                    if isinstance(_pts, list) and len(_pts) < 24:
+                        _pts.append(ui_content)
                 if final_ai_content and not final_ai_content.endswith("\n\n"):
                     final_ai_content += "\n\n"
                 final_ai_content += ui_content
@@ -19645,6 +20098,21 @@ class GhostAgent:
                     tools_run_this_turn.append({**err_msg, "_synthetic": True,
                                                 **({"_member_refused": True} if requester_is_member() else {})})
                     continue
+
+                # §4LB EGRESS: the owner's private on-demand values (the street
+                # address) never leave the machine in a query — the model wrote
+                # "restaurants Makedonias 83 Thrakomakedones" into Tor searches.
+                # Replaced by the address's suburb in the call's own arguments,
+                # and the RESULT says so (r4: the model, not told, re-guessed
+                # the town and searched another Makedonias Ave).
+                if _cname in _OUTBOUND_TOOLS:
+                    _scrubbed = _scrub_owner_private(tool["function"].get("arguments"), self.context, _cname)
+                    if _scrubbed is not None:
+                        tool["function"]["arguments"] = _scrubbed
+                        tool["_privacy_area"] = _privacy_area(self.context)
+                        pretty_log("Privacy", f"{_cname}: the owner's street address was replaced by "
+                                   f"{tool['_privacy_area']}",
+                                   icon=Icons.SHIELD if hasattr(Icons, "SHIELD") else Icons.WARN)
 
                 # A parse error is not a call: it takes its own recovery branch
                 # below, never the owner-data block (§4KL R7).
@@ -20335,6 +20803,9 @@ class GhostAgent:
                             except Exception:
                                 pass
                             _coro = self.available_tools[fname](**t_args)
+                            if tool.get("_privacy_area"):
+                                from ..memory.egress import with_privacy_note as _wpn
+                                _coro = _wpn(_coro, tool["_privacy_area"])
                             tool_tasks.append(_timed_tool_coro(_coro, tool_durations, len(tool_tasks)))
                             tool_durations.append(None)
                             if not _collapse_unsafe:
@@ -23074,6 +23545,47 @@ class GhostAgent:
             except Exception as _ck_exc:  # noqa: BLE001
                 logger.debug("checkpoint scrub skipped: %s", _ck_exc)
 
+        # §4LH: the text the model wrote alongside its tool calls, recorded
+        # in the loop, is not the answer. Same rails as above: never reduce
+        # the reply to narration, never empty it.
+        _pre_segs = list(getattr(self.context, "_pre_tool_segments", None) or [])
+        if (_pre_segs and final_ai_content
+                and os.environ.get("GHOST_DROP_PRE_TOOL_TEXT", "1") != "0"):
+            try:
+                from .reply_smoothing import drop_pre_tool_segments
+                _no_pre = drop_pre_tool_segments(final_ai_content, _pre_segs)
+                if (_no_pre != final_ai_content
+                        and not _is_narration_only_trim(_no_pre, final_ai_content)):
+                    pretty_log(
+                        "Reply Smoothing",
+                        f"dropped text written alongside tool calls: "
+                        f"{len(final_ai_content)} → {len(_no_pre)} chars",
+                        icon=Icons.BRAIN_SUM,
+                    )
+                    final_ai_content = _no_pre
+            except Exception as _pt_exc:  # noqa: BLE001
+                logger.debug("pre-tool text scrub skipped: %s", _pt_exc)
+
+        # §4LH: a research turn's links must come from what it read — an
+        # invented deep link or onion address is removed (link_grounding).
+        try:
+            from . import link_grounding as _lg
+            if (final_ai_content and _lg.enabled()
+                    and any(isinstance(t, dict) and t.get("name") in _lg.RESEARCH_TOOLS
+                            for t in (tools_run_this_turn or []))):
+                _hay = _lg.haystack_from(messages, (
+                    f"{t.get('content') or ''}\n{getattr(t.get('content'), 'call_args', '') or ''}"
+                    for t in tools_run_this_turn if isinstance(t, dict)))
+                _grounded, _removed = _lg.ground_links(final_ai_content, _hay)
+                if _removed:
+                    pretty_log("Link Grounding",
+                               f"removed {len(_removed)} link(s) seen in no result: "
+                               f"{', '.join(r[:60] for r in _removed[:3])}",
+                               level="WARNING", icon=Icons.WARN)
+                    final_ai_content = _grounded
+        except Exception as _lg_exc:  # noqa: BLE001 — never costs the reply
+            logger.debug("link grounding skipped: %s", _lg_exc)
+
         # Gate: ≥2 real tool runs — the 2026-07-17 decision, kept. §4FS
         # tried ≥1 for a day: a single-tool turn does carry the stale beat
         # ("I'll forget the PDF." then "Done"), but pass 1 also deletes
@@ -23196,7 +23708,7 @@ class GhostAgent:
             # turn loop's heartbeats; without this, a long inline
             # generation makes the biological watchdog think the
             # system is idle MID-REQUEST and wake the hippocampus.
-            self.context.last_activity_time = datetime.datetime.now()
+            self._heartbeat()
             # NOT `str(...)` first: that destroys the status, and
             # `is_promoted_result` is an `execute`-only TEXT marker blind to
             # the second UNRESOLVED producer — so `swarm`'s "still running,
@@ -23454,7 +23966,7 @@ class GhostAgent:
             # clock here the biological watchdog (idle > 120s) wakes
             # the hippocampus MID-REQUEST and its consolidation LLM
             # calls compete with this one on the same upstream.
-            self.context.last_activity_time = datetime.datetime.now()
+            self._heartbeat()
             verifier = getattr(self.context, "verifier", None)
             # Gate: any tool-using turn is worth verifying. The old
             # `was_complex_task` constraint (turn > 2) silently
@@ -24028,7 +24540,8 @@ class GhostAgent:
             if (_ps is not None and final_ai_content
                     and turn_origin(self.context) == "user"
                     and not _is_internal_req(fs.req_id)
-                    and not requester_is_member()):   # the owner's digest, never a member's reply (R7, CRIT)
+                    and not requester_is_member()     # the owner's digest, never a member's reply (R7, CRIT)
+                    and not reply_is_public()):       # …nor a channel's (§4LC: project names in public)
                 from pathlib import Path as _Path
                 from .project_digest import (
                     summarize_since, render_digest,
@@ -24160,7 +24673,8 @@ class GhostAgent:
             if (_alog is not None and final_ai_content
                     and turn_origin(self.context) == "user"
                     and not _is_internal_req2(fs.req_id)
-                    and not requester_is_member()):   # the owner's activity digest, never a member's reply (R7, CRIT)
+                    and not requester_is_member()     # the owner's activity digest, never a member's reply (R7, CRIT)
+                    and not reply_is_public()):       # …nor a channel's (§4LC); its watermark stays for the DM
                 from pathlib import Path as _Path
                 _act_wm_path = (_Path(str(self.context.memory_dir)).parent
                                 / "activity_digest.json")
@@ -25202,7 +25716,7 @@ class GhostAgent:
                 stop_printing = False
 
                 async for chunk in self.context.llm_client.stream_chat_completion(payload, use_coding=has_coding_intent):
-                    self.context.last_activity_time = datetime.datetime.now() # Heartbeat to prevent Hippocampus from waking up
+                    self._heartbeat() # Heartbeat to prevent Hippocampus from waking up
                     try:
                         chunk_str = chunk.decode("utf-8")
                         if chunk_str.startswith("data: ") and chunk_str.strip() != "data: [DONE]":
@@ -26278,6 +26792,9 @@ class GhostAgent:
                         # §4KW (review): a member's notify_operator would page
                         # the OWNER, not the member — never steer a member to it
                         and not requester_is_member()
+                        # §4LD: a turn that only STARTED background work is
+                        # not done — its job notifies on finishing
+                        and not _launched_background_jobs(tools_run_this_turn)
                         and _user_asked_for_notification(last_user_content)):
                     notify_steer_fired = True
                     pretty_log(
@@ -26663,7 +27180,9 @@ class GhostAgent:
                     # for one reply). The raw accumulation stays in
                     # `final_ai_content` for the repair-round slicing.
                     from .reply_smoothing import delivery_view as _delivery_view
-                    _judge_text = _delivery_view(final_ai_content, tools_run_this_turn)
+                    _judge_text = _delivery_view(
+                        final_ai_content, tools_run_this_turn,
+                        pre_tool_segments=getattr(self.context, "_pre_tool_segments", None))
                     try:
                         from .verifier import VerifyVerdict as _VV
                         if self._critic_async_enabled():
@@ -26705,9 +27224,9 @@ class GhostAgent:
                             # BLOCKING await (pure defer — verdict still
                             # lands via the late handler); see
                             # _should_await_repair_verdict.
-                            # (§4KS R3: never for a channel member — the
-                            # verifier does not run for one, so there is no
-                            # verdict to await and no task to spawn.)
+                            # (§4KS R3: never for a channel member — a
+                            # member's research is verified AFTER the reply,
+                            # §4LH, so there is nothing to await here.)
                             if _should_await_repair_verdict(
                                     _rbudget, _lt, _unverified) \
                                     and not requester_is_member():
@@ -26785,10 +27304,13 @@ class GhostAgent:
                                         "async verdict await skipped: %s: %s",
                                         type(_await_exc).__name__, _await_exc,
                                     )
-                        elif _find_substantive_tool_for_verifier(
+                        elif requester_is_member() or _find_substantive_tool_for_verifier(
                                 tools_run_this_turn,
                                 include_informational_bookkeeping=False,
                         ) is None:
+                            # (§4LH: a member never waits on an inline
+                            # verdict here — their web research is verified
+                            # after the reply, in async mode only)
                             # SYNC mode + no action tool (§4BC scope
                             # guard, round-2 MAJOR-3): pre-§4BC this
                             # inline await early-returned with no LLM
@@ -27067,6 +27589,15 @@ class GhostAgent:
             rs.tool_calls = tool_calls
             rs.ui_content = ui_content
 
+    def _heartbeat(self) -> None:
+        """The idle clock: a request from OUTSIDE is activity. §4LD: a
+        scheduled task or job resume (sched-/job-/sub-) every <15 min kept
+        the agent "busy" and silently starved every idle phase — those turns
+        mark foreground, which already holds the idle tick off mid-turn."""
+        from .autonomous_activity import is_internal_request
+        if not is_internal_request(request_id_context.get()):
+            self.context.last_activity_time = datetime.datetime.now()
+
     async def handle_chat(self, body: Dict[str, Any], background_tasks, request_id: Optional[str] = None,
                           requester_role: str = ""):
         req_id = request_id or str(uuid.uuid4())[:8]
@@ -27085,7 +27616,10 @@ class GhostAgent:
         # liveness count came to disagree in the first place).
         _turn_origin = turn_origin(self.context)
         _origin_token = request_origin_context.set(_turn_origin)
-        self.context.last_activity_time = datetime.datetime.now()
+        # §4LD: only a REQUEST from outside is activity — a scheduled task or
+        # a job resume (sched-/job-/sub-) every <15 min kept the agent
+        # "busy" and silently starved every idle phase
+        self._heartbeat()
 
         # Continuous self-play interrupt: if a `self_play_loop` task is
         # active, any new user message implicitly pauses it. The loop
@@ -27171,6 +27705,9 @@ class GhostAgent:
                 # `SkillMemory.retract_lessons_from_trajectory` to
                 # actually find the lessons it needs to scrub.
                 current_trajectory_id = uuid.uuid4().hex
+                # §4LC: in-turn lesson writes stamp it (learn_skill left "")
+                from ..utils.logging import trajectory_id_context as _tid_ctx
+                _tid_ctx.set(current_trajectory_id)
                 # ...and mark it IN FLIGHT until `_record_turn_trajectory`
                 # writes it: a late verdict that lands first is deferred to
                 # that write instead of finding no record (2026-09-13).
@@ -27379,6 +27916,7 @@ class GhostAgent:
                 # the list holds the answers finalize must not deliver.
                 self.context._risk_steer_fired = False
                 self.context._governor_checkpoint_segments = []
+                self.context._pre_tool_segments = []      # §4LH
                 # §4HC: the previous main request's head, for planner prefix
                 # alignment. Per request — a stale head from another
                 # conversation would share nothing and cost a full prefill.
@@ -27775,6 +28313,7 @@ class GhostAgent:
                     from ..selfhood import SelfModel as _SelfModel
                     self_model = getattr(self.context, 'self_model', None)
                     if (_SELFHOOD_PREFIX_ENABLED and not requester_is_member()
+                            and not reply_is_public()          # §4LC: before it is re-enabled
                             and isinstance(self_model, _SelfModel)
                             and getattr(self_model, 'enabled', False)):
                         # Pass the current request as `query` so the
@@ -27800,7 +28339,8 @@ class GhostAgent:
                     from ..workspace import WorkspaceModel as _WorkspaceModel
                     workspace_model = getattr(self.context, 'workspace_model', None)
                     if (isinstance(workspace_model, _WorkspaceModel) and getattr(workspace_model, 'enabled', False)
-                            and not requester_is_member()):          # the activity log is the OWNER's (R4)
+                            and not requester_is_member()             # the activity log is the OWNER's (R4)
+                            and not reply_is_public()):               # …and not for a channel (§4LB r2)
                         # Keep the model's active-project pointer in sync so
                         # both recorded events and the wake-up prefix are
                         # scoped to THIS project — a prior project's research
@@ -27838,7 +28378,7 @@ class GhostAgent:
                 # footer. Non-fatal: must never break a user turn.
                 try:
                     _utracker = getattr(self.context, 'uncertainty_tracker', None)
-                    if _utracker is not None and not requester_is_member():
+                    if _utracker is not None and not _owner_context_hidden(self.context):
                         _uctx = _utracker.persisted_context()
                         # isinstance(str) guard: under MagicMock test
                         # contexts `persisted_context()` returns a mock,
@@ -27862,7 +28402,7 @@ class GhostAgent:
                     _mc_comp = getattr(self.context, 'metacog', None)
                     _comp = getattr(_mc_comp, 'competence', None) if _mc_comp is not None else None
                     if (_comp is not None and hasattr(_comp, 'get_context_string')
-                            and not requester_is_member()):   # the owner's competence history (R8)
+                            and not _owner_context_hidden(self.context)):   # the owner's competence history (R8)
                         _roll = _comp.by_domain()
                         _total_n = sum(n for _, n in _roll.values()) if _roll else 0
                         if _total_n >= self._COMPETENCE_MIN_OBS:
@@ -27879,7 +28419,7 @@ class GhostAgent:
                 # gets reused instead of sitting unread on disk. Non-fatal.
                 try:
                     _askstore = getattr(self.context, 'auto_skill_store', None)
-                    if _askstore is not None and last_user_content and not requester_is_member():
+                    if _askstore is not None and last_user_content and not _owner_context_hidden(self.context):
                         # §4CT: `surfaced_for_prompt` returns the block AND
                         # the hashes it listed. `format_for_prompt` threw the
                         # hashes away, which is why this loop reported
@@ -28052,7 +28592,9 @@ class GhostAgent:
                         getattr(self.context, "args", None), "native_tools", False))
                     active_persona = (
                         SPECIALIST_SYSTEM_PROMPT
-                        .replace('{{PROFILE}}', profile_context)
+                        # the PREFERENCES only (§4LB: the whole profile rode the
+                        # coding persona a second time — address, family)
+                        .replace('{{PROFILE}}', _specialist_profile(self.context, profile_context))
                         .replace(
                             '{{TOOL_XML_GUIDANCE}}',
                             SPECIALIST_TOOL_XML_NATIVE if _specialist_native
@@ -28474,7 +29016,7 @@ class GhostAgent:
                     # `hard=true` (task.cancel()) is for. See core/turns.py.
                     if _turn_reg.is_cancelled(req_id):
                         raise TurnCancelled(req_id, _active_turn.reason)
-                    self.context.last_activity_time = datetime.datetime.now() # Heartbeat
+                    self._heartbeat() # Heartbeat
                     # Per-turn auto-repair bookkeeping: the verdict cache is
                     # only "fresh" for the post-loop gate if THIS turn reached
                     # the normal-success finalisation; reset each turn so an
@@ -28779,8 +29321,12 @@ class GhostAgent:
                         except Exception:
                             pass
 
-                    scratch_data = (self.context.scratchpad.list_all()
-                                    if getattr(self.context, 'scratchpad', None) and not requester_is_member()
+                    # (§4LB) the self-play report rides only a turn about the
+                    # agent's practice/learning — it was relevant to 0 of 40
+                    _sp_ask = bool(_SELF_PLAY_ASK.search(str(last_user_content or "")))
+                    scratch_data = (self.context.scratchpad.list_all(
+                                        exclude=() if _sp_ask else ("Self-Play Report",))
+                                    if getattr(self.context, 'scratchpad', None) and not _owner_context_hidden(self.context)
                                     else "None.")        # the scratchpad is the OWNER's (R4)
                     # Bound the scratchpad at the SOURCE (2026-07-20). The
                     # per-turn `dynamic_state` injection below embeds this raw
@@ -28896,7 +29442,11 @@ class GhostAgent:
                                         None) == "selfplay"
                                 and turn_origin(self.context) != "bench")
                             if _is_self_play:
-                                _plan_treat = True
+                                # §4LI, operator 2026-10-04 ("follow experiment
+                                # settings"): the 2026-08-08 force holds only
+                                # while use_planning is LIVE — concluded to
+                                # control, self-play runs as production does
+                                _plan_treat = _self_play_planner_forced(self.context)
                             _exp_plan.mark_trigger(
                                 self.context, str(req_id or ""),
                                 "use_planning_fired", _plan_treat)
@@ -28966,7 +29516,7 @@ class GhostAgent:
                         # same query — both hits are served from the
                         # per-query cache so we pay the cost once.
                         planner_playbook = ""
-                        if self.context.skill_memory and not requester_is_member():
+                        if self.context.skill_memory and not _owner_context_hidden(self.context):
                             try:
                                 planner_playbook = await request_state.get_skill_playbook(
                                     last_user_content or ""
@@ -29070,8 +29620,18 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             # transient (no prefix exists yet).
                             _plan_json_compact = (json.dumps(current_plan_json, separators=(",", ":"))
                                                   if current_plan_json else "No plan yet.")
+                            # (§4LB) the lessons only when the shared prefix does
+                            # not already carry the SAME playbook — the whole
+                            # text, inside a message's own content (r2: the JSON
+                            # dump escaped "\n" so it never matched, and a
+                            # 200-char head equated different playbooks)
+                            _pfx_texts = [m.get("content") for m in (_pp.get("messages") or [])
+                                          if isinstance(m, dict) and isinstance(m.get("content"), str)]
+                            _pb_tail = ("" if isinstance(planner_playbook, str) and planner_playbook.strip()
+                                        and any(planner_playbook.strip() in t for t in _pfx_texts)
+                                        else planner_playbook_block)
                             _aligned_transient = (
-                                f"{planner_playbook_block}"
+                                f"{_pb_tail}"
                                 f"### AVAILABLE NATIVE TOOLS\n[{available_tools_list}]{_member_tools_note}\n"
                                 "CRITICAL INSTRUCTION: If an action requires a tool, explicitly name the "
                                 "native JSON tool you intend to use. DO NOT plan to write Python scripts "
@@ -29659,7 +30219,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         _req_tool = locals().get("required_tool", "none")
                         if use_plan and not turn_is_conversational and _req_tool not in ["none", "all"]:
                             skill_query = f"Tool: {_req_tool} - Context: {thought_content}"
-                        playbook = ("" if requester_is_member()
+                        playbook = ("" if _owner_context_hidden(self.context)
                                     else await request_state.get_skill_playbook(skill_query or ""))
                         if playbook:
                             fetched_playbook = f"### SKILL PLAYBOOK:\n{playbook}\n\n"
@@ -29690,7 +30250,11 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         from .prompts import build_project_briefing
                         _proj_store = getattr(self.context, "project_store", None)
                         _proj_id = getattr(self.context, "current_project_id", None)
-                        if _proj_store is not None and _proj_id:
+                        # §4LB r2: the briefing (file map, journal) is the
+                        # owner's work — not for a member or a channel; an
+                        # isolated coding leaf keeps it (its own project)
+                        if (_proj_store is not None and _proj_id
+                                and not requester_is_member() and not reply_is_public()):
                             _briefing = build_project_briefing(
                                 _proj_store, _proj_id,
                                 suppress_next_task=_proj_task_closed_this_req,
@@ -29972,7 +30536,13 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                                 None), "is_read_only",
                                         False) is True
                                 or getattr(self.context, "profile_memory",
-                                           None) is None)
+                                           None) is None
+                                # §4LE: a member's / a channel's head differs
+                                # BY DESIGN (no profile, allowlisted tools) —
+                                # slack-90/82 raised false MISS warnings and
+                                # used up the one-shot check before any
+                                # owner request reached it
+                                or requester_is_member() or reply_is_public())
                         _warmed = getattr(self.context, "_warmed_sys_hash", None)
                         if _warmed is not None and not _iso:
                             self.context._warmed_sys_hash = None
@@ -31496,6 +32066,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         Arithmetic, not a judge: no model call, no prompt to be argued out
         of, and it cannot invent a contradiction it did not compute.
         """
+        # §4LC: its note quotes the stored birth date — never into a
+        # channel's reply (members are already gated by the verifier)
+        if reply_is_public() or requester_is_member():
+            return None
         try:
             store = getattr(self.context, "profile_memory", None)
             if store is None:
@@ -31847,6 +32421,11 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         # task scheduled below will write a CORRECT lesson tagged
         # with the reflection trajectory's id, so the playbook ends
         # up with the right entry rather than both.
+        # the corrected turn's episode stops saying SUCCESS (§4LA)
+        try:
+            self._relabel_episode("", "the owner corrected this answer", trigger=str(getattr(traj, "user_request", "") or ""))
+        except Exception:  # noqa: BLE001
+            pass
         skill_memory = getattr(ctx, "skill_memory", None)
         vector_memory = getattr(ctx, "memory_system", None)
         if skill_memory is not None and traj.id:
@@ -32210,7 +32789,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 if _turn_reg.is_cancelled(req_id):
                     _cancel_cut = True   # § finalize/stream R1 B-5
                     break
-                self.context.last_activity_time = datetime.datetime.now() # Heartbeat
+                self._heartbeat() # Heartbeat
 
                 # Decode FIRST so we can decide whether to
                 # yield the raw chunk or substitute a
@@ -33411,9 +33990,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             "think-strip — skipped",
                             icon=Icons.VERIFIER_LAB)
                     elif requester_is_member():
-                        # §4KS R2: never verified (see
-                        # `_compute_verifier_verdict`) — no task, and no
-                        # "verdict deferred" for a verdict that cannot come.
+                        # §4KS R2: members never stream, so this branch is a
+                        # guard — and the stream gate does not verify them
                         pretty_log(
                             "Verifier",
                             "stream gate: no verdict — member turn "
@@ -33770,6 +34348,12 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             # never teach (fresh review §4KW: 79+ probe episodes, retrieved
             # ~2,000 times, e.g. "What is my project codename?" ×366)
             return
+        from ..utils.logging import FOREIGN_MESSAGE_LABELS as _FML, reply_is_public as _pub
+        if _pub() or str(user_text or "").lstrip().startswith(_FML):
+            # §4LA: a PUBLIC thread (other people's facts in it and in the
+            # reply) and another person's message are not the owner's private
+            # record — they surfaced later in private turns
+            return
         em = getattr(self.context, "episodic_memory", None)
         if em is None:
             return
@@ -33890,6 +34474,12 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     pass
                 success = (bool(ai_text) and _fails < 3
                            and not _all_tools_failed and not _capped)
+            # the agent's OWN failure sentinels are failures whatever the
+            # verdict path said (§4LA: 11 "[TURN BUDGET EXHAUSTED] … NOT a
+            # finished result" / "I hit a hard limit" episodes said SUCCESS)
+            if re.search(r"\[TURN BUDGET EXHAUSTED\]|\bI hit a hard limit\b|NOT a finished result",
+                         str(ai_text or "")[:2000]):
+                success = False
 
             # cluster_id: the domain of the FIRST substantive tool
             # (shell/code/fetch/fs/sql/memory/vision/other) — aligns
@@ -33929,9 +34519,33 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 # episodic tier can recall it semantically, not just by
                 # substring (feature 1C — previously a dormant ingestion gap).
                 vector_memory=getattr(self.context, "memory_system", None),
+                # so a LATE verdict or the owner's correction can relabel it (§4LA)
+                req_id=str(req_id or ""),
             )
         except Exception:
             pass
+
+    def _relabel_episode(self, req_id: str, note: str, trigger: str = "") -> None:
+        """A turn proven wrong after it was recorded: its episode stops
+        saying SUCCESS (§4LA — 142 live episodes did, and were handed out as
+        how-to and recovery evidence)."""
+        em = getattr(self.context, "episodic_memory", None)
+        if em is None or not hasattr(em, "mark_outcome") or not (req_id or trigger):
+            return
+        try:
+            n = em.mark_outcome(str(req_id or ""), False, note, trigger=trigger)
+            if n:
+                pretty_log("Episode Relabelled", f"{str(req_id or trigger)[:30]}: {note}", icon=Icons.WARN)
+                # §4LC: the lessons built from those episodes stop being taught
+                _sm = getattr(self.context, "skill_memory", None)
+                _ids = getattr(em, "last_relabelled_ids", None)
+                if _sm is not None and hasattr(_sm, "quarantine_citing") and isinstance(_ids, list) and _ids:
+                    _q = _sm.quarantine_citing([f"ep:{i}" for i in _ids], f"its episode was {note}")
+                    if _q:
+                        pretty_log("Skill Quarantined", f"{_q} lesson(s) built from a relabelled episode",
+                                   icon=Icons.WARN)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("episode relabel failed: %s", e)
 
     async def _perfect_it_generate_and_learn(
         self,
@@ -34099,6 +34713,9 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     except Exception:
                         pass
                     obj.result = _content[:4000]
+                    if len(_content) > 4000:
+                        # one char past the cap, so the collector can tell it was cut
+                        obj.full_result = _content[:200_001]      # §4LH sidecar
                     try:
                         from ..distill.outcome_heuristics import (
                             _looks_like_tool_error, _normalize_tool_error,
@@ -34783,6 +35400,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         except Exception as e:
             logger.debug("outcome consolidation skipped: %s: %s", type(e).__name__, e)
         _appended_path = collector.append(traj)
+        if _appended_path is not None and hasattr(collector, "append_full_results"):
+            collector.append_full_results(traj, _appended_path)   # §4LH: what the row cut at 4,000
         # §4BF 1c join handle: the bench solve loop (dream.py) reads this
         # after each attempt and writes the bank oracle's verdict onto THIS
         # trajectory via the bench collector's corrections sidecar — the
@@ -35119,7 +35738,9 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             # referenced nowhere, so every crisis pivot ignored how past
             # crises were actually survived. Best-effort, bounded.
             recovery_hint = ""
-            _epi = getattr(self.context, "episodic_memory", None)
+            # (§4LA) not into a PUBLIC reply: past turns are the owner's private
+            # record, and this pivot is automatic, not an explicit ask
+            _epi = None if reply_is_public() else getattr(self.context, "episodic_memory", None)
             if _epi is not None and hasattr(_epi, "search_recoveries"):
                 try:
                     _recs = await asyncio.to_thread(

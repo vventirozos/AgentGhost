@@ -437,6 +437,26 @@ def _other_request(existing: dict, scope: str, incoming_request: str) -> bool:
             and not _same_request(_lesson_request_text(existing), incoming_request))
 
 
+def _current_req() -> str:
+    """The live request id, or "" in an idle phase (SYSTEM)."""
+    from ..utils.logging import request_id_context
+    r = str(request_id_context.get() or "")
+    return "" if r in ("", "SYSTEM") else r
+
+
+def trigger_text(text, limit: int = 160) -> str:
+    """A lesson trigger made from free text: whitespace collapsed, cut at a
+    WORD boundary within ``limit`` (§4LC: dream/episode triggers were cut at
+    80 characters mid-word — "…verify the port is no" — and the trigger is
+    both the dedup key and what retrieval scores, so two rules sharing 80
+    characters merged and the tail of each was invisible)."""
+    t = " ".join(str(text or "").split())
+    if len(t) <= limit:
+        return t
+    cut = t[:limit].rsplit(" ", 1)[0].rstrip(",;:—-")
+    return cut or t[:limit]
+
+
 def iter_teachable(trajectories):
     """The trajectories a lesson producer may read: `trajectory_may_teach`
     applied to an iterable (or a collector's `iter_trajectories()` result).
@@ -681,9 +701,29 @@ _BM25_MIN_SCORE = float(os.environ.get("GHOST_BM25_MIN_SCORE", "0.30") or 0.30)
 
 
 def _bm25_tokens(text: str) -> set:
-    """Content tokens: long enough to matter, and not function words."""
-    return {t for t in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]+", (text or "").lower())
+    """Content tokens: long enough to matter, and not function words. The
+    text is folded first (accents off, Greek transliterated — §4LC: a Greek
+    query had NO token, so it rode the embedder alone)."""
+    from .egress import fold
+    return {t for t in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]+", fold(text or "")[0])
             if len(t) >= _BM25_MIN_TOKEN_LEN and t not in _STOPWORDS}
+
+
+def _mostly_non_latin(text: str) -> bool:
+    """More letters outside the Latin script than in it — the embedder
+    (bge-small-en) cannot place such a query (§4LC: Greek queries sat
+    closer to ARBITRARY lessons, 0.26–0.33, than relevant English pairs)."""
+    letters = [c for c in str(text or "") if c.isalpha()]
+    if not letters:
+        return False
+    return sum(1 for c in letters if not ("a" <= c.lower() <= "z")) > len(letters) / 2
+
+
+def _shared_content_words(query: str, trigger: str) -> int:
+    """How many content words the query and a trigger share (§4LC: ONE shared
+    word admitted a lesson — "what is my address" pulled "address factual
+    queries", "write a haiku" pulled "verify the content written")."""
+    return len(_bm25_tokens(query) & _bm25_tokens(trigger))
 
 
 def _bm25_idf(triggers) -> dict:
@@ -1352,7 +1392,18 @@ class SkillMemory:
         try:
             base = Path(self.file_path).parent / "skills_pruned_archive.jsonl"
             # the rotated archive too (re-review: rotation at 8 MB dropped them)
-            paths = [p for p in (base.with_suffix(".jsonl.1"), base) if p.exists()]
+            # EVERY rotated archive (§4LH final review: rotation numbers them
+            # .1, .2, … and this read only .1 — from the second rotation on,
+            # "never re-learn" markers were dropped again)
+            # (numbered in sequence by the rotation — probed by number, no
+            # directory walk: §4GI symlink class)
+            rotated = []
+            for _n in range(1, 1000):
+                _p = base.with_suffix(f".jsonl.{_n}")
+                if not _p.exists():
+                    break
+                rotated.append(_p)
+            paths = rotated + ([base] if base.exists() else [])
             mtime = tuple(p.stat().st_mtime for p in paths)
         except Exception:  # noqa: BLE001 — no archive (or a test double): nothing retracted
             return set()
@@ -1559,6 +1610,12 @@ class SkillMemory:
         """
         if playbook_writes_blocked():        # §4KD: Slack never teaches
             return None
+        if not source_trajectory_id:
+            # §4LC: a write during a turn carries the turn's id (learn_skill,
+            # the bus and the post-mortem passed none, so a refuted turn's
+            # retraction removed 0 of their lessons)
+            from ..utils.logging import trajectory_id_context as _tidc
+            source_trajectory_id = _tidc.get() or ""
         try:
             origin = origin or _derive_lesson_origin()
             effective_trigger = trigger or task or ""
@@ -1745,7 +1802,26 @@ class SkillMemory:
                             # (third review) another producer's text never
                             # replaces this row's fix, nor carries `verified`
                             _foreign = str(existing.get("source") or "") != str(source or "")
-                            _replaced = not _foreign and len(effective_correct) > len(existing.get("solution") or "")
+                            # §4LC: the OWNER's dictated lesson replaces the
+                            # stored text whoever wrote it ("from now on use
+                            # vision_analysis instead of tesseract" was folded
+                            # into dream's tesseract rule and reported saved)
+                            _owner_says = bool(_dictated) and (
+                                effective_correct.strip() != str(existing.get("solution") or "").strip())
+                            _replaced = _owner_says or (
+                                not _foreign and len(effective_correct) > len(existing.get("solution") or ""))
+                            if _replaced and source_trajectory_id:
+                                # §4LC: what a retraction of THIS turn restores
+                                # (it deleted the row and its earlier good text)
+                                existing["previous_version"] = {
+                                    k: existing.get(k) for k in (
+                                        "solution", "correct_pattern", "code_example", "mistake",
+                                        "anti_pattern", "source", "source_trajectory_id", "verified",
+                                        "confidence", "frequency")}
+                                existing["previous_version"]["replaced_by"] = source_trajectory_id
+                                if _counted:      # the version BEFORE this turn's +1 (review)
+                                    existing["previous_version"]["frequency"] = max(
+                                        1, int(existing.get("frequency") or 1) - 1)
                             if _replaced:
                                 existing["solution"] = effective_correct
                                 existing["correct_pattern"] = effective_correct
@@ -1777,7 +1853,17 @@ class SkillMemory:
                             if domains:
                                 merged = sorted(set(existing.get("domains", [])) | set(_ensure_list(domains)))
                                 existing["domains"] = merged
-                            if verified and not existing.get("verified") and not _foreign:
+                            _set_verified = bool(verified and not existing.get("verified")
+                                                 and (not _foreign or _owner_says))
+                            # §4LC: a reinforcement is UNDONE when its turn is
+                            # retracted (a refuted turn's +1 / verified made the
+                            # lesson permanent: protected from the cap)
+                            if source_trajectory_id and (_counted or _set_verified) and not _replaced:
+                                _rb = [r for r in (existing.get("reinforced_by") or []) if isinstance(r, dict)]
+                                _rb.append({"tid": source_trajectory_id, "counted": bool(_counted),
+                                            "verified": _set_verified})
+                                existing["reinforced_by"] = _rb[-20:]
+                            if _set_verified:
                                 existing["verified"] = True
                                 existing["confidence"] = max(
                                     float(existing.get("confidence") or 0.5),
@@ -1947,8 +2033,26 @@ class SkillMemory:
                             # a CLOSE twin with another trigger adds evidence only — its fix
                             # never replaces this row's (fifth review: a dream merge put
                             # "validate against external sources" on an output-processing row)
-                            _replaced = (not _foreign and _same_trigger
+                            # §4LC: the OWNER's dictated lesson replaces the
+                            # stored text whoever wrote it ("from now on use
+                            # vision_analysis instead of tesseract" was folded
+                            # into dream's tesseract rule and reported saved)
+                            _owner_says = bool(_dictated) and (
+                                effective_correct.strip() != str(existing.get("solution") or "").strip())
+                            _replaced = _owner_says or (not _foreign and _same_trigger
                                          and len(effective_correct) > len(existing.get("solution") or ""))
+                            if _replaced and source_trajectory_id:
+                                # §4LC: what a retraction of THIS turn restores
+                                # (it deleted the row and its earlier good text)
+                                existing["previous_version"] = {
+                                    k: existing.get(k) for k in (
+                                        "solution", "correct_pattern", "code_example", "mistake",
+                                        "anti_pattern", "source", "source_trajectory_id", "verified",
+                                        "confidence", "frequency")}
+                                existing["previous_version"]["replaced_by"] = source_trajectory_id
+                                if _counted:      # the version BEFORE this turn's +1 (review)
+                                    existing["previous_version"]["frequency"] = max(
+                                        1, int(existing.get("frequency") or 1) - 1)
                             if _replaced:
                                 existing["solution"] = effective_correct
                                 existing["correct_pattern"] = effective_correct
@@ -1977,7 +2081,17 @@ class SkillMemory:
                                         existing["source_refs"] = refs[:20]
                                     existing["source_trajectory_id"] = \
                                         source_trajectory_id
-                            if verified and not existing.get("verified") and not _foreign:
+                            _set_verified = bool(verified and not existing.get("verified")
+                                                 and (not _foreign or _owner_says))
+                            # §4LC: a reinforcement is UNDONE when its turn is
+                            # retracted (a refuted turn's +1 / verified made the
+                            # lesson permanent: protected from the cap)
+                            if source_trajectory_id and (_counted or _set_verified) and not _replaced:
+                                _rb = [r for r in (existing.get("reinforced_by") or []) if isinstance(r, dict)]
+                                _rb.append({"tid": source_trajectory_id, "counted": bool(_counted),
+                                            "verified": _set_verified})
+                                existing["reinforced_by"] = _rb[-20:]
+                            if _set_verified:
                                 existing["verified"] = True
                                 existing["confidence"] = max(
                                     float(existing.get("confidence") or 0.5),
@@ -2227,6 +2341,7 @@ class SkillMemory:
         # that raised before the inner assignment must not turn the
         # best-effort scrub into a NameError.
         removed_triggers = []
+        restored = []
         try:
             with self._get_lock():
                 playbook = self._load_playbook()
@@ -2237,6 +2352,36 @@ class SkillMemory:
                         entry.get("source_trajectory_id")
                         if isinstance(entry, dict) else None
                     )
+                    if isinstance(entry, dict) and isinstance(src, str) and src == trajectory_id \
+                            and isinstance(entry.get("previous_version"), dict) \
+                            and entry["previous_version"].get("replaced_by") == trajectory_id:
+                        # §4LC: this turn REPLACED the text — restore the
+                        # version before it instead of deleting the row
+                        prev = entry.pop("previous_version")
+                        prev.pop("replaced_by", None)
+                        entry.update({k: v for k, v in prev.items() if v is not None})
+                        restored.append(entry)
+                        kept.append(entry)
+                        continue
+                    if isinstance(entry, dict) and not (isinstance(src, str) and src == trajectory_id):
+                        _pv = entry.get("previous_version")
+                        if isinstance(_pv, dict) and _pv.get("source_trajectory_id") == trajectory_id:
+                            # §4LH final review: the saved version is THIS turn's
+                            # (refuted) text — a later retraction of the turn
+                            # that replaced it must delete the row, not bring
+                            # the refuted text back
+                            entry.pop("previous_version", None)
+                            restored.append(entry)
+                        _rb = [r for r in (entry.get("reinforced_by") or []) if isinstance(r, dict)]
+                        mine = [r for r in _rb if r.get("tid") == trajectory_id]
+                        if mine:
+                            # §4LC: undo this turn's reinforcement
+                            if any(r.get("counted") for r in mine):
+                                entry["frequency"] = max(1, int(entry.get("frequency") or 1) - 1)
+                            if any(r.get("verified") for r in mine):
+                                entry["verified"] = False
+                            entry["reinforced_by"] = [r for r in _rb if r.get("tid") != trajectory_id]
+                            restored.append(entry)
                     if isinstance(src, str) and src == trajectory_id:
                         removed += 1
                         dropped.append(entry)
@@ -2245,6 +2390,8 @@ class SkillMemory:
                                 entry.get("trigger") or entry.get("task") or "")
                         continue
                     kept.append(entry)
+                if restored and not removed:
+                    self._save_playbook_unlocked(kept)
                 if removed:
                     # ARCHIVE BEFORE DELETE, failing closed — same invariant
                     # as the prune. A retraction is a judgement about
@@ -2304,6 +2451,16 @@ class SkillMemory:
                     "retract_lessons_from_trajectory vector pass failed: %s", e
                 )
 
+        # a restored row's twin was deleted with the turn's id: rewrite it
+        if memory_system is not None and not json_failed:
+            for entry in restored:
+                try:
+                    self._refresh_twin(memory_system, entry)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("retraction: twin refresh failed: %s", e)
+        if restored:
+            pretty_log("Skill Retracted", f"restored/undid {len(restored)} lesson(s) touched by trajectory "
+                       f"{trajectory_id[:8]}", icon=Icons.MEM_WIPE)
         if removed:
             try:
                 pretty_log(
@@ -2342,6 +2499,7 @@ class SkillMemory:
         def _mut(lesson):
             lesson["retrievals"] = int(lesson.get("retrievals") or 0) + 1
             lesson["last_retrieved_at"] = _now_iso()
+            lesson["last_retrieved_req"] = _current_req()
             _hit_info["hash"] = str(lesson.get("source_challenge_hash") or "")
             _hit_info["source"] = str(lesson.get("source") or "")
 
@@ -2462,6 +2620,11 @@ class SkillMemory:
                     continue
                 if last_dt < cutoff:
                     continue
+                # §4LC: only a lesson retrieved for THIS request — the 300 s
+                # window credited the previous turn's lessons to this one
+                _req = _current_req()
+                if _req and str(lesson.get("last_retrieved_req") or "") != _req:
+                    continue
                 # Discriminative gate: skip recently-retrieved lessons that
                 # are not actually relevant to the succeeding query.
                 if not _is_relevant(lesson):
@@ -2499,7 +2662,13 @@ class SkillMemory:
             arch = self.file_path.parent / "skills_pruned_archive.jsonl"
             try:
                 if arch.is_file() and arch.stat().st_size > 8_000_000:
-                    arch.replace(arch.with_suffix(".jsonl.1"))
+                    # §4LC: a NEW numbered file each time — `.1` was replaced
+                    # on the second rotation, deleting operator retractions
+                    # (the "never re-learn this" markers) for good
+                    _n = 1
+                    while arch.with_suffix(f".jsonl.{_n}").exists():
+                        _n += 1
+                    arch.replace(arch.with_suffix(f".jsonl.{_n}"))
             except OSError:
                 pass
             with arch.open("a", encoding="utf-8") as fh:
@@ -2805,6 +2974,20 @@ class SkillMemory:
             )
         return updated
 
+    def quarantine_citing(self, refs, reason: str = "") -> int:
+        """Quarantine every lesson whose ``source_refs`` cite one of ``refs``
+        (e.g. ``ep:12``) — §4LC: a lesson built from an episode later proven
+        wrong stayed live after §4LA relabelled the episode."""
+        want = {str(r) for r in (refs or []) if r}
+        if not want:
+            return 0
+        n = 0
+        for raw in self._load_playbook():
+            if isinstance(raw, dict) and not raw.get("quarantined") and \
+                    want & {str(r) for r in (raw.get("source_refs") or [])}:
+                n += self.quarantine_lesson(raw.get("trigger") or raw.get("task") or "", reason)
+        return n
+
     def quarantine_lesson(self, trigger: str, reason: str = "") -> int:
         """Mark every lesson matching ``trigger`` (case-insensitive) as
         quarantined — excluded from prompt injection, kept on disk with
@@ -2894,6 +3077,7 @@ class SkillMemory:
                         lesson = _normalize_lesson(raw)
                         lesson["retrievals"] = int(lesson.get("retrievals") or 0) + 1
                         lesson["last_retrieved_at"] = _now_iso()
+                        lesson["last_retrieved_req"] = _current_req()
                         playbook[idx] = lesson
                         changed = True
                         updated += 1
@@ -3069,7 +3253,14 @@ class SkillMemory:
                         # 546 real pairs: 7% of today's top-5 relevant). A
                         # lesson enters when its TRIGGER shares a weighted
                         # term with the query or sits close on its own.
-                        if bm25 <= 0 and not _trigger_is_close(memory_system, query, trigger, _trig_cache):
+                        # §4LC: the keyword branch needs TWO shared content
+                        # words; one shared word (or none) needs the trigger to
+                        # sit close on its own — and the English embedder
+                        # cannot judge a mostly non-Latin query, so that one
+                        # needs the two words
+                        if _shared_content_words(query, trigger or doc) < 2 and (
+                                _mostly_non_latin(query)
+                                or not _trigger_is_close(memory_system, query, trigger, _trig_cache)):
                             continue
                         # Lower distance is better; higher bm25 is better.
                         combined = (1.0 - dist) + bm25 * 0.4
@@ -3119,7 +3310,9 @@ class SkillMemory:
                 # stopword and made this branch return 5 lessons for any
                 # query containing an English word. The floor is calibrated,
                 # not guessed — see _BM25_MIN_SCORE.
-                if score >= _BM25_MIN_SCORE:
+                # §4LC: and TWO shared content words — a one-word query
+                # scores 1.0 on any trigger holding that word
+                if score >= _BM25_MIN_SCORE and _shared_content_words(query, trig or "") >= 2:
                     scored.append((score, p))
             if scored:
                 scored.sort(key=lambda t: -t[0])
@@ -3186,7 +3379,7 @@ class SkillMemory:
         if branch in ("vector_empty", "bm25_empty"):
             return ""
         if branch == "empty_playbook":
-            return "No lessons learned yet."
+            return ""          # §4LC: the placeholder was injected as a SKILL PLAYBOOK block
 
         items = self._filter_quarantined(items)
         # ⚠ DELIVERY dedup against the bus skill tier (§4L Lens-D
@@ -3372,6 +3565,58 @@ class SkillMemory:
                 lesson["confidence"] = min(1.0, float(lesson.get("confidence") or 0.5) + 0.2)
 
         return self._update_lesson_fields(_match, _mut)
+
+    def request_scoped_count(self) -> int:
+        return sum(1 for r in self._load_playbook()
+                   if isinstance(r, dict) and _lesson_scope(r) == _SCOPE_REQUEST)
+
+    def remove_request_scoped(self, memory_system=None) -> int:
+        """Remove (archived) every request-scoped lesson — one request's plan,
+        holding the owner's request verbatim. `reset_all` (§4LC, operator:
+        "proceed") erases them with the rest of the owner's memory; general
+        lessons stay. Fails closed when the archive cannot be written."""
+        if playbook_writes_blocked():
+            return 0
+        with self._get_lock():
+            playbook = self._load_playbook()
+            gone = [r for r in playbook if isinstance(r, dict) and _lesson_scope(r) == _SCOPE_REQUEST]
+            if not gone:
+                return 0
+            if not self._archive_lessons(gone, "reset_all"):
+                logger.error("reset_all: request lessons NOT removed — archive unwritable")
+                return 0
+            self._save_playbook_unlocked([r for r in playbook if r not in gone])
+        if memory_system is not None:
+            for r in gone:
+                try:
+                    _delete_lesson_twin(memory_system, r)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("reset_all: lesson twin delete failed: %s", e)
+        return len(gone)
+
+    def lessons_mentioning(self, target: str) -> list:
+        """``[(trigger, request_scoped)]`` of every lesson whose trigger, fix
+        or stored request MENTIONS ``target`` (the profile's folded word
+        rule). §4LC: `forget` never reached lessons — a request-scoped plan
+        keeps the owner's request verbatim ("professor Spiros Denaxas")."""
+        from .profile import mentions
+        t = str(target or "").strip().lower()
+        if len(t) < 3:
+            return []
+        out = []
+        for raw in self._load_playbook():
+            if not isinstance(raw, dict):
+                continue
+            # + the code example and the saved previous version (§4LH final
+            # review: a forgotten name surviving there came back on a restore)
+            _pv = raw.get("previous_version") if isinstance(raw.get("previous_version"), dict) else {}
+            hay = " ".join(str(raw.get(k) or "") for k in (
+                "trigger", "task", "solution", "correct_pattern", "code_example", "mistake", "anti_pattern",
+                "source_request")) + " " + " ".join(str(v or "") for v in _pv.values())
+            if mentions(hay, t):
+                out.append((raw.get("trigger") or raw.get("task") or "",
+                            _lesson_scope(raw) == _SCOPE_REQUEST))
+        return out
 
     def remove_by_trigger(self, trigger: str, memory_system=None) -> bool:
         """Delete the first lesson with a matching trigger. Returns True

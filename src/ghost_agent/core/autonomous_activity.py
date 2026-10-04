@@ -771,6 +771,88 @@ def summarize_turn_content(content, *, limit: int = 300) -> str:
     return text
 
 
+def in_quiet_hours(now=None, spec: Optional[str] = None) -> bool:
+    """Is ``now`` (local time) inside the owner's quiet hours?
+    ``GHOST_QUIET_HOURS`` = "START-END" in whole local hours (default
+    "23-07"; a window may wrap midnight); empty / "off" disables it.
+    §4LF (operator, 2026-10-04): self-play regressions paged at 03:41 and
+    04:55 — notices are HELD overnight and delivered at the first poll after."""
+    import datetime as _dt
+    import os as _os
+    raw = (spec if spec is not None else _os.getenv("GHOST_QUIET_HOURS", "23-07")).strip().lower()
+    if raw in ("", "off", "none", "0", "false"):
+        return False
+    try:
+        a, b = (int(x) % 24 for x in raw.split("-", 1))
+    except (ValueError, TypeError):
+        global _QUIET_WARNED
+        if not _QUIET_WARNED:
+            _QUIET_WARNED = True
+            logger.warning("GHOST_QUIET_HOURS=%r is not START-END in whole hours (e.g. 23-07) — "
+                           "quiet hours are OFF", raw)
+        return False
+    h = (now or _dt.datetime.now()).hour
+    if a == b:
+        return False
+    return (a <= h < b) if a < b else (h >= a or h < b)
+
+
+_QUIET_WARNED = False
+
+#: notice phases the OWNER asked for (the notify tool, the "notify me when
+#: done" backstop, finished jobs, late corrections — all "agent_message" —
+#: and scheduled-task results)
+OWNER_ASKED_PHASES = frozenset({"agent_message", "scheduled_task"})
+#: the owner counts as present this long after their last message
+OWNER_PRESENT_S = 1800
+
+
+def owner_awaits(records, last_activity=None, now=None) -> bool:
+    """§4LI: quiet hours do not hold a batch that holds a notice the owner
+    asked for, nor anything while the owner was active in the last
+    ``OWNER_PRESENT_S`` seconds."""
+    import datetime as _dt
+    try:
+        if last_activity is not None and last_activity > _dt.datetime.min:
+            if ((now or _dt.datetime.now()) - last_activity).total_seconds() < OWNER_PRESENT_S:
+                return True
+    except Exception:  # noqa: BLE001
+        pass
+    for r in records or ():
+        phase = getattr(r, "phase", None) if not isinstance(r, dict) else r.get("phase")
+        meta = (getattr(r, "meta", None) if not isinstance(r, dict) else r.get("meta")) or {}
+        if phase in OWNER_ASKED_PHASES or str(meta.get("auto") or "") == "project notify promise":
+            return True
+    return False
+
+
+#: §4LD: a scheduled task PAGES the owner at most this often; the rest of its
+#: results are recorded (activity log) without paging
+SCHEDULED_NOTIFY_PER_HOUR = 4
+_SCHED_LAST_OK: Dict[str, bool] = {}
+_SCHED_PAGES: Dict[str, List[float]] = {}
+
+
+def _scheduled_severity(job_id: str, ok: bool, now: Optional[float] = None) -> str:
+    """notify or info for one scheduled result (§4LD: every fire paged, with
+    no rate limit and no dedupe — a task failing every cycle paged "FAILED"
+    every cycle). A FAILURE pages only on the transition into failure; a
+    result pages at most SCHEDULED_NOTIFY_PER_HOUR times per task per hour;
+    a recovery always pages."""
+    now = time.time() if now is None else now
+    prev = _SCHED_LAST_OK.get(job_id)
+    _SCHED_LAST_OK[job_id] = ok
+    if not ok and prev is False:
+        return SEVERITY_INFO                       # still failing: already told
+    recent = [t for t in _SCHED_PAGES.get(job_id, []) if now - t < 3600]
+    if ok and prev is not False and len(recent) >= SCHEDULED_NOTIFY_PER_HOUR:
+        _SCHED_PAGES[job_id] = recent
+        return SEVERITY_INFO
+    recent.append(now)
+    _SCHED_PAGES[job_id] = recent
+    return SEVERITY_NOTIFY
+
+
 def record_scheduled_result(log: Optional[ActivityLog], *, job_id: str,
                             task_name: str = "", content=None,
                             ok: bool = True,
@@ -792,7 +874,7 @@ def record_scheduled_result(log: Optional[ActivityLog], *, job_id: str,
         if duration_s is not None:
             meta["duration_s"] = f"{float(duration_s):.1f}"
         log.record("scheduled_task", summary,
-                   severity=SEVERITY_NOTIFY, **meta)
+                   severity=_scheduled_severity(job_id, bool(ok)), **meta)
     except Exception as e:  # noqa: BLE001
         logger.debug("record_scheduled_result failed: %s", e)
 

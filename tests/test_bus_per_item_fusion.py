@@ -253,7 +253,7 @@ def test_get_playbook_context_contracts_preserved(skill_store, tmp_path):
     # empty playbook → legacy sentinel string
     (tmp_path / "empty").mkdir()
     empty = SkillMemory(tmp_path / "empty")
-    assert empty.get_playbook_context() == "No lessons learned yet."
+    assert empty.get_playbook_context() == ""          # §4LC: no placeholder block
 
 
 # ------------------------------------------------- VectorMemory deferral

@@ -80,6 +80,8 @@ class JobRegistry:
         self._order: List[str] = []
         self._lock = threading.Lock()
         self.max_retained = max_retained
+        #: called with a finished job armed by the owner's "notify me" (§4LD)
+        self.notifier = None
 
     def register(self, kind: str, label: str, *,
                  task: Optional[asyncio.Task] = None, **meta) -> Job:
@@ -146,6 +148,13 @@ class JobRegistry:
             job.error = str(error or "")[:1000]
             job.task = None  # drop the task ref once it's landed
             self._evict_locked()
+            notify = self.notifier if job.meta.get("notify_owner_req") is not None else None
+        if notify is not None:
+            # §4LD: the owner asked to be told when this finished
+            try:
+                notify(job)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("job %s finished, but its notification failed: %s", job_id, e)
 
     def _evict_locked(self) -> None:
         """FIFO-evict the oldest COMPLETED jobs past the retention bound.
@@ -219,7 +228,32 @@ def get_job_registry(context) -> JobRegistry:
             context.job_registry = reg
         except Exception:  # noqa: BLE001 — a mock may refuse attributes
             pass
+    if reg.notifier is None:
+        reg.notifier = lambda job, _c=context: notify_owner_job_finished(_c, job)
     return reg
+
+
+def notify_owner_job_finished(context, job) -> bool:
+    """The completion notice the owner asked for ("notify me when it's
+    done") — written when the job really finishes, with its real outcome
+    (§4LD: the turn that launched it used to send "Done —" at launch)."""
+    from ..tools.notify_tool import PHASE as _PHASE, _note_sent, _rate_limited
+    from .autonomous_activity import SEVERITY_NOTIFY, get_activity_log
+    log = get_activity_log(context)
+    if log is None or _rate_limited():
+        return False
+    if job.status == STATUS_DONE:
+        head = " ".join(str(job.result or "").split())[:300] or "(no result text)"
+        msg = f"Done — {job.label[:80]}: {head}"
+    else:
+        msg = f"Finished with {job.status} — {job.label[:80]}: {str(job.error or '')[:200]}"
+    meta = {"auto": "job finished", "job_id": job.id}
+    if job.meta.get("notify_owner_req"):
+        meta["req_id"] = str(job.meta["notify_owner_req"])
+    ok = log.record(_PHASE, msg[:500], severity=SEVERITY_NOTIFY, **meta)
+    if ok:
+        _note_sent()
+    return bool(ok)
 
 
 __all__ = [

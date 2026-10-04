@@ -314,9 +314,12 @@ async def test_refuted_repair_discards_stale_interim_narration(agent):
     assert "7 tasks" not in result
 
 
-async def test_unverified_repair_keeps_prior_narration(agent):
+async def test_unverified_repair_keeps_prior_narration(agent, monkeypatch):
     """UNVERIFIED (untested write) is not a wrongness verdict — earlier
-    narration stays; only the finalising turn's text is replaced."""
+    narration stays; only the finalising turn's text is replaced. (§4LH
+    drops text written alongside tool calls from the delivered reply; this
+    test is about what the REPAIR keeps, so that step is off here.)"""
+    monkeypatch.setenv("GHOST_DROP_PRE_TOOL_TEXT", "0")
     agent.context.verifier = None
     agent.available_tools["file_system"] = AsyncMock(
         return_value="SUCCESS: wrote 120 bytes to 'app.py'.")

@@ -59,6 +59,15 @@
   <h2>Audit fixes (2026-07-26)</h2>
   <p><code>ReadOnlySkillMemory</code> closed two leaks (found independently by two auditors): <code>quarantine_lesson</code> — a real playbook writer added 2026-07-17, AFTER the façade hardening — was missing from <code>_MUTATORS</code>, so a delegated sub-agent could quarantine a REAL operator lesson; and <code>get_playbook_context</code> passed through with its default retrieval-stat bump AND stamped the operator's <code>last_playbook_triggers</code> attribution record. A façade override now forces <code>record_retrievals=False, stamp_triggers=False</code> (mirror of <code>ReadOnlyVectorMemory.search</code>). The drift-guard test's <code>_WRITE_HINTS</code> gained the "quarantine" prefix — the guard can only catch writers it can name. Tests: <code>::TestReadOnlySkillFacade</code>.</p>
 
+  <h2 id="4li">Every writer is blocked, listed or not <span class="tag">2026-10-04 &sect;4LI</span></h2>
+  <p>The named <code>_MUTATORS</code> lists are a deny-list, and every writer added after them leaked through
+  (<code>unquarantine_lesson</code>, <code>reconcile_vector_orphans</code>, <code>heal_missing_twins</code>,
+  <code>_update_lesson_fields</code>). A method whose name starts with a mutating verb (add, set, save, write, update,
+  upsert, delete, remove, retract, prune, mark, credit, record, bump, (un)quarantine, reconcile, heal, learn, forget,
+  wipe, ingest, reset, archive, rotate, store, put, insert, merge, apply, purge, clear, drop, rename, restore,
+  relabel, backfill, graduate, promote, demote, evict, compact, rebuild, reindex, migrate, repair, refresh) is a no-op
+  through every façade, public or private (<code>_MUTATING_NAME</code>). Every such name on the real stores is a
+  writer; no reader matches.</p>
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

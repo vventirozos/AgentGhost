@@ -352,6 +352,22 @@ def build_leaf_context(context, *, leaf_id: str, project_id: Optional[str] = Non
     iso.scheduler = None
     iso.profile_memory = None
     iso.memory_bus = None
+    # §4LB: NO owner memory at all — `_get_memory_bus` built a fresh bus from
+    # the read-only stores when this was None, and the scratchpad / past
+    # requests were shared, so the owner's recall (health, family) reached a
+    # delegate that writes web queries
+    iso.owner_memory_isolated = True
+    # §4LB r2: no owner memory, but its outbound queries are still scrubbed
+    # of the owner's street address (its prompt carries no profile; the
+    # scrubber needs one) — and `recall` refuses (it read the owner's store)
+    from ..memory.egress import egress_profile as _egress_profile
+    iso.egress_profile = _egress_profile(context)
+    try:
+        from ..memory.scratchpad import Scratchpad
+        iso.scratchpad = Scratchpad()
+    except Exception:  # noqa: BLE001
+        iso.scratchpad = None
+    iso.auto_skill_store = None
     try:
         iso.memory_system = ReadOnlyVectorMemory(context.memory_system)
         iso.skill_memory = ReadOnlySkillMemory(context.skill_memory)

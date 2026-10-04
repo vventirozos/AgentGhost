@@ -177,13 +177,15 @@ def test_legacy_log_without_resolution_records_still_parses(tmp_path: Path):
     existed contain only flag events (plus whatever junk survived a
     crash) and must read exactly as before."""
     log = tmp_path / "u.jsonl"
+    import time as _t
+    _now = _t.time()          # (§4LB: flags older than 14 days no longer recur)
     old_lines = [
-        json.dumps({"ts": 1.0, "kind": "unknown", "text": "the db backend",
+        json.dumps({"ts": _now - 3, "kind": "unknown", "text": "the db backend",
                     "impact": 4, "resolution": "ask user"}),
-        json.dumps({"ts": 2.0, "kind": "assumption", "text": "py3.11",
+        json.dumps({"ts": _now - 2, "kind": "assumption", "text": "py3.11",
                     "confidence": 0.5, "basis": ""}),
         "not json at all",
-        json.dumps({"ts": 3.0, "kind": "unknown", "text": "the db backend",
+        json.dumps({"ts": _now - 1, "kind": "unknown", "text": "the db backend",
                     "impact": 4, "resolution": "ask user"}),
     ]
     log.write_text("\n".join(old_lines) + "\n")

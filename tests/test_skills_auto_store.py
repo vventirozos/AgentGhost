@@ -40,7 +40,9 @@ def test_graduate_is_idempotent_on_signature(tmp_path: Path):
     store.graduate(_candidate(sig="same"))
     store.graduate(_candidate(sig="same"))
     assert store.count() == 1
-    assert store.all_skills()[0]["verifications"] == 2
+    # §4LF: the same evidence is not a second verification (re-runs on an
+    # unchanged corpus counted 950 on one skill)
+    assert store.all_skills()[0]["verifications"] == 1
 
 
 def test_store_survives_reload(tmp_path: Path):

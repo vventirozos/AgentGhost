@@ -467,7 +467,6 @@
     <li>Generality: the inner-capital (product) skip applies only to a dream WINDOW; inflection stems only to a sentence-initial
     word ("Harding", "McDonald", "EvolMonkey" from a request stay names). Framing also catches "satisfy validators".</li>
   </ul>
-</main>
 
   <h2 id="4kd-slack">A member never teaches <span class="tag">2026-09-24 &sect;4KD, de-Slacked in &sect;4KJ</span></h2>
   <p><strong>Superseded the same evening:</strong> the rule below was first keyed on the <code>slack-</code> request-id
@@ -548,5 +547,49 @@
   <code>slack-</code> trajectories (recorded before the role field) as member and retracted the three playbook lessons
   (and their vector copies) whose task was a member's request. <strong>Known limit:</strong> a member's own
   attachments land in the shared sandbox and cannot be read back on a member turn (only their generated images can).</p>
+
+<h2 id="4lc">Lessons: written, shown, taken back <span class="tag">2026-10-03 &sect;4LC</span></h2>
+<p>Three fresh reviewers measured the playbook (184 lessons) and 40 real owner turns. Fixed:</p>
+<ul>
+  <li><strong>Provenance.</strong> Every lesson written during a turn carries the turn's trajectory id
+  (<code>utils.logging.trajectory_id_context</code>, set where the id is minted): <code>learn_skill</code>, the bus and the
+  post-mortem wrote <code>""</code>, so a refuted or corrected turn's retraction removed 0 of their lessons.</li>
+  <li><strong>Retraction undoes what the turn did.</strong> A turn that REPLACED a lesson's text leaves
+  <code>previous_version</code>; retracting it restores that version instead of deleting the row and its earlier good
+  fix. A turn that only REINFORCED a lesson (+1 frequency, <code>verified</code>) is recorded in
+  <code>reinforced_by</code>, and retracting it takes the +1 and the <code>verified</code> back (a verified lesson is
+  protected from the cap, so a refuted turn made it permanent). Restored rows get their vector twin rewritten.</li>
+  <li><strong>The owner's dictated lesson wins.</strong> A <code>learn_skill</code> lesson the owner dictates ("from now on
+  …") replaces another producer's text under the same trigger, on both merge paths (it was folded into dream's opposite
+  rule and reported saved).</li>
+  <li><strong>Episodes:</strong> when §4LA relabels an episode as failed, the lessons citing it
+  (<code>source_refs</code> <code>ep:N</code>) are quarantined (<code>quarantine_citing</code>).</li>
+  <li><strong>Triggers</strong> from dream and episode strategies are cut at a word within 160 characters
+  (<code>trigger_text</code>), not at 80 mid-word — the trigger is the dedup key and what retrieval scores.</li>
+  <li><strong>Admission.</strong> A lesson enters a prompt with TWO shared content words (folded, Greek transliterated),
+  or one/none and a trigger that sits close on its own; a mostly non-Latin query never relies on the English embedder
+  (Greek queries sat closer to arbitrary lessons than relevant English pairs). One shared word ("what is my address"
+  → "address factual queries") no longer admits. The empty playbook injects nothing (the placeholder was a block).</li>
+  <li><strong>Credit</strong> goes only to lessons retrieved for THIS request (<code>last_retrieved_req</code>); the 300 s
+  window credited the previous turn's lessons.</li>
+  <li><strong>Forget</strong> lists and removes (archived) the lessons that mention the target
+  (<code>lessons_mentioning</code>; a request-scoped plan keeps the request verbatim). <code>reset_all</code> also
+  removes (archived) every ONE-REQUEST lesson — they quote the owner's requests — and its preview counts them; general
+  lessons stay (operator 2026-10-04). <code>remove_request_scoped</code> is blocked on the read-only façade.</li>
+  <li><strong>Archive</strong> rotation numbers each file (<code>.jsonl.1</code>, <code>.2</code>, …) — the second rotation
+  used to overwrite <code>.1</code> and with it the operator's "never re-learn" retractions.</li>
+  <li>The post-mortem drops a reply that IS null, not one that contains the word (lessons about null handling).</li>
+</ul>
+<h2 id="4li">After the final review <span class="tag">2026-10-04 &sect;4LI</span></h2>
+<ul>
+  <li>Tombstones are read from EVERY rotated archive (<code>.jsonl.1</code>, <code>.2</code>, …, probed by number).
+  The reader used to open only <code>.1</code>, so from the second rotation on, "never re-learn" markers were lost
+  again.</li>
+  <li>Retracting a turn also drops any saved <code>previous_version</code> that the turn's text became. With
+  t-a → t-b → t-c, retracting t-b and then t-c deletes the row; it no longer brings back t-b's refuted text. The saved
+  frequency is the value from before that turn's +1.</li>
+  <li><code>forget</code> also finds a name in a lesson's code example and saved previous version.</li>
+</ul>
+</main>
 </body>
 </html>

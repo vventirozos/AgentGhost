@@ -596,7 +596,7 @@ def test_hydration_judges_scoped_lessons_against_the_users_request():
     bus = MemoryBus()
     got = []
 
-    async def _dec(q, llm):
+    async def _dec(q, llm, **_kw):
         return [q, "a derived sub-query"]
 
     async def _fetch(sq, **kw):
@@ -649,10 +649,14 @@ def test_the_trigger_gate_threshold_is_030(tmp_path):
     assert got == ["zebra quokka lantern"]
 
 
-def test_a_shared_term_admits_a_distant_trigger(tmp_path):
-    """Kills "distance only": keyword overlap alone admits."""
+def test_shared_terms_admit_a_distant_trigger(tmp_path):
+    """Kills "distance only": keyword overlap alone admits — TWO shared
+    content words since §4LC (one shared word admitted "address factual
+    queries" for "what is my address")."""
     rows = [{"trigger": "gamma ray spectroscopy notes"}]
-    assert _gate(tmp_path, rows, {"gamma ray spectroscopy notes": 0.9}) == [rows[0]["trigger"]]
+    assert _gate(tmp_path, rows, {"gamma ray spectroscopy notes": 0.9},
+                 query="gamma ray burst") == [rows[0]["trigger"]]
+    assert _gate(tmp_path, rows, {"gamma ray spectroscopy notes": 0.9}) == []     # "gamma" alone
 
 
 def test_the_gate_measures_against_the_query_not_the_turn_request(tmp_path):

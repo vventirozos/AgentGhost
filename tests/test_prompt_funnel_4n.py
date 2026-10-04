@@ -97,7 +97,8 @@ def test_fetch_vector_drops_skill_twins():
     bus = MemoryBus(vector_memory=_Vec())
     items = asyncio.run(bus._fetch_vector("q"))
     texts = [i["text"] for i in items]
-    assert "a plain memory" in texts and "an episode" in texts
+    # §4LB: an episode twin goes too (the episodic tier carries it)
+    assert texts == ["a plain memory"]
     assert all("SITUATION" not in t for t in texts)   # twin gone
 
 
@@ -203,23 +204,18 @@ def test_use_planning_control_log_distinguishes_measured_from_unenrolled():
 
 
 def test_self_play_is_forced_to_treatment_for_use_planning():
-    """Operator decision 2026-08-08: self-play mines/verifies lessons, so
-    it must run planner-ON (treatment regime), even though it stays
-    unenrolled for MEASUREMENT. The override sets _plan_treat=True on
-    self-play and precedes mark_trigger (which no-ops on unenrolled)."""
+    """Operator decision 2026-08-08: self-play mines/verifies lessons, so it
+    ran planner-ON. AMENDED 2026-10-04 (§4LI, operator: "follow experiment
+    settings"): only while use_planning is live — the behaviour is pinned in
+    tests/test_4li_final_review.py (a self-play turn's recorded trigger
+    follows the registry). Still keyed ONLY on the selfplay thinking budget
+    (§4N R2 MAJOR-4), not the read-only skill store."""
     src = (REPO / "src" / "ghost_agent" / "core" / "agent.py").read_text()
     i = src.index('_is_self_play = (')
     j = src.index('mark_trigger', i)
     seg = src[i:j]
-    # §4N R2 MAJOR-4: keyed ONLY on the selfplay thinking budget — NOT the
-    # read-only skill store (which also marks delegated sub-agents).
     assert 'thinking_budget_override' in seg and '"selfplay"' in seg
     assert '"is_read_only"' not in seg
-    assert 'if _is_self_play:' in seg
-    assert '_plan_treat = True' in seg
-    # and the forcing happens BEFORE mark_trigger, so the arm value the
-    # (no-op) stamp sees is consistent
-    assert i < j
 
 
 # ── Lens C/B latent cluster (correctness; gated off live at 240k) ─────
@@ -426,7 +422,7 @@ def test_r2_warmup_miss_skips_isolate_contexts():
     check must skip them (it was lying on the operator stream)."""
     src = (REPO / "src" / "ghost_agent" / "core" / "agent.py").read_text()
     i = src.index("if _warmed is not None and not _iso:")
-    seg = src[i - 500:i + 60]
+    seg = src[i - 1000:i + 60]          # §4LE added the member/public clause
     assert "_iso = (" in seg and "is_read_only" in seg
     assert "profile_memory" in seg
     # NIT-3: the warmed hash is stashed AFTER the prefill request succeeds

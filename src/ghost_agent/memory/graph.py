@@ -506,7 +506,11 @@ class GraphMemory:
         words = [w for w in re.findall(r"\w+", _fold(query)) if len(w) >= 3]
         if not words:
             return []
-        stop = {"has", "have", "the", "and", "what", "who", "which", "user", "you", "about"}
+        # common verbs of a REQUEST are not the name of a fact (§4LB r2:
+        # "do you know" matched every `User KNOWS …`, "show me" REQUESTED)
+        stop = {"has", "have", "the", "and", "what", "who", "which", "user", "you", "about",
+                "know", "knows", "show", "tell", "view", "see", "find", "give", "look", "want",
+                "need", "request", "requested", "ask", "asked", "make", "get", "help", "use", "can"}
         asked = set(words) - stop
         implied = set()
         for w in words:
@@ -1266,6 +1270,11 @@ class GraphMemory:
             line += f" [Score {score}]"
         return line
 
+    #: the agent's OWN log lines ("ai RESPONDED_TO user"). Only as a SUBJECT:
+    #: "user HAS_INTEREST ai" is the owner's fact, and "ghost IS_A framework" /
+    #: a database named "agent" are real entities (§4LB r2)
+    _AGENT_NODES = frozenset({"ai", "assistant", "system", "the assistant", "the ai"})
+
     def get_neighborhood(self, words: List[str], global_limit: int = 25) -> List[str]:
         """Spreading-activation GraphRAG over the in-memory NetworkX graph.
 
@@ -1282,6 +1291,12 @@ class GraphMemory:
                 self._spreading_activation(seed, path_scores)
             if not path_scores:
                 return []
+            # §4LB: a chain through the AGENT's own nodes (ai / assistant /
+            # system) is a log of what the agent did, not knowledge — 49% of
+            # injected graph items ("(Ai)-[RESPONDED_TO]->(User)-[HAS_SON]->…"
+            # for a question about MoE models)
+            path_scores = {c: v for c, v in path_scores.items()
+                           if not any(str(t[0]).lower() in self._AGENT_NODES for t in c)}
             sorted_paths = sorted(
                 path_scores.items(),
                 key=lambda item: (item[1], len(item[0])),

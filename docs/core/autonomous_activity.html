@@ -374,6 +374,79 @@
     <li>A restored interval task keeps its cadence (anchored at <code>created_at</code>): each restart put the next run a full
     interval after boot, so a daily task never fired on a box restarting more often.</li>
   </ul>
+
+<h2 id="4ld">Unprompted messages and stopping <span class="tag">2026-10-04 &sect;4LD</span></h2>
+<ul>
+  <li><strong>"Notify me when it's done"</strong> on a turn that only LAUNCHED background work (a delegate, a swarm, a
+  promoted command — a <code>job-…</code> id in its tool results) no longer sends "Done —" at launch: sub-agent and swarm
+  jobs are armed (<code>job.meta["notify_owner_req"]</code>) and <code>jobs.notify_owner_job_finished</code> writes the
+  notice with the real outcome when the job finishes; sandbox jobs already wake a turn that reports theirs. The in-loop
+  steer stands down the same way.</li>
+  <li>A negation cancels a notification ask only in its own clause ("stop pinging me so often, but notify me when the
+  build is done" is an ask).</li>
+  <li>Scheduled-task pages: see <a href="../tools/tasks.html#4ld">tasks §4LD</a>. The Slack bot warns at start when
+  <code>GHOST_NOTIFY_SLACK_CHANNEL</code> names a channel (results carry the owner's context).</li>
+  <li><strong>Sub-agents</strong> running at once are capped across calls (<code>MAX_RUNNING_DELEGATES</code> = 8).</li>
+  <li><strong>Stopping:</strong> uvicorn now waits at most <code>_HTTP_SHUTDOWN_GRACE_S</code> (6 s) for open requests and
+  the watchdog <code>_BIO_SHUTDOWN_GRACE_S</code> (5 s), so the app's shutdown — drains, the abort record of an interrupted
+  turn, <code>sched.shutdown</code> — runs inside launchd's 20 s kill (45 of 49 stops died before it).</li>
+  <li><strong>Idle cooldowns</strong> persist in <code>system/idle_cooldowns.json</code>
+  (<code>_sync_idle_anchors</code>); a failing idle phase logs a WARNING at most once an hour and is listed as
+  <code>name(failed)</code>, not "ran" (<code>_idle_phase_failed</code>).</li>
+</ul>
+
+<h2 id="4lf">Background learning: what re-ran on unchanged input <span class="tag">2026-10-04 &sect;4LF</span></h2>
+<p>Measured over 28 days (285 boots): ~60% of the main model's generation was background; fresh self-play made progress
+in 1 of 197 frontier runs and its lessons were used in 1 owner turn; the selfhood and workspace narratives were rewritten
+~590× on the main model and read ~4×; dream re-ran mostly on self-play input; nine live experiments randomise owner turns
+and none can reach a verdict at current traffic. Fixed here (what runs and how often is the operator's call):</p>
+<ul>
+  <li><strong>Input keys survive a restart:</strong> both narratives keep their "input unchanged" key beside the
+  narrative (<code>*.inputkey</code>) — 213 of 354 rewrites were the first after a boot; postmortem keeps its failed
+  analyses with an attempt count (<code>postmortem_failed_analyses.json</code>, at most
+  <code>_FAILED_ANALYSIS_MAX_TRIES</code> = 3 across restarts — ~230 main-model calls re-tried the same two turns).</li>
+  <li><strong>The idle window rolls without self-play:</strong> self-play's finally was the only idle-time writer of the
+  clock, so <code>--no-self-play</code> or a longer self-play cooldown silently stopped every 15–60 min phase for a whole
+  away stretch. When self-play is off or cooling down the tick rolls the phases' WINDOW anchor
+  (<code>_idle_window_at</code>; "idle-window" in the tick summary) — never the user clock, which bench, the bench drain,
+  dream replay and evolve read for their own floors. <code>--no-self-play</code> now ablates only self-play.</li>
+  <li><strong>Graduated skills:</strong> only NEW evidence (higher support or changed confidence) is a verification — the
+  same corpus re-graduated every skill every run (950 "verifications" on one) and refreshed
+  <code>last_verified_at</code>, which disabled the 14-day staleness rule.</li>
+  <li><strong>Experiments:</strong> <code>imagine_preflight</code> and <code>search_yield_steer</code> are in
+  <code>TRIGGER_KEYS</code>; their triggered block was never reported.</li>
+</ul>
+
+<h3 id="4lf-decisions">The operator's decisions (2026-10-04, "proceed with your recommendations")</h3>
+<ul>
+  <li><strong>All nine live experiments concluded to CONTROL</strong> (<code>system/experiments.json</code>: each entry kept
+  with <code>enabled: false</code> and a dated <code>concluded</code> note; backup
+  <code>experiments.json.pre-4lf-*</code>). None could reach a verdict at current traffic (~3,850 resolved turns per arm for
+  a 5pp effect). Owner turns no longer run the planner (control arm) — <code>--use-planning</code> stays as the master
+  switch; self-play still forces the planner on. With <code>fs_batch</code> off, the warmup primes one head again.</li>
+  <li><strong>Self-play</strong> every 4 h (<code>_SELFPLAY_COOLDOWN</code>, <code>GHOST_SELFPLAY_COOLDOWN_S</code>); the
+  adaptive cooldown's ceiling now scales with the base (a fixed 2 h ceiling SHORTENED a 4 h base after a failure).
+  <strong>Bench</strong> every 6 h (<code>GHOST_BENCH_COOLDOWN_S</code>).</li>
+  <li>Launcher (<code>bin/start-ghost-agent.sh</code>, backup <code>.pre-4lf-*</code>):
+  <code>--self-narrative-cooldown 86400</code>, <code>--workspace-narrative-cooldown 21600</code>,
+  <code>--calib-refit-cooldown 21600</code>, <code>GHOST_DREAM_MIN_NEW=10</code>, <code>GHOST_NEGCTRL=0</code>.</li>
+  <li>The adaptive recall threshold is built only with <code>GHOST_ADAPTIVE_THRESHOLD=1</code> (it never changed a
+  decision under <code>--smart-memory 0.9</code>).</li>
+  <li><strong>Quiet hours:</strong> <code>/api/notifications/pending</code> serves nothing between
+  <code>GHOST_QUIET_HOURS</code> (default <code>23-07</code> local; empty/"off" disables) and leaves the watermark, so the
+  first poll after the window delivers what was held (<code>autonomous_activity.in_quiet_hours</code>).</li>
+  <li>&sect;4LI: quiet hours do not hold a batch that contains a notice the owner ASKED for (phase
+  <code>agent_message</code>: the notify tool, the "notify me when done" backstop, finished jobs, late corrections;
+  <code>scheduled_task</code> results; a project notify promise), and hold nothing while the owner was active in the
+  last 30 minutes (<code>owner_awaits</code>). The agent's own overnight noise still waits until morning. A malformed
+  <code>GHOST_QUIET_HOURS</code> is logged once. Tests run with quiet hours off (<code>tests/conftest.py</code>):
+  five notification tests failed when the suite ran at night.</li>
+  <li>&sect;4LI: the "notify me when done" backstop defers only when a finish notice was actually ARMED. A turn that
+  merely listed a finished job, or ran a sandbox job (another registry), used to send nothing at all.</li>
+  <li>&sect;4LI: scheduled and probe runs cannot <code>stop</code> the owner's tasks one at a time either. A watch is
+  checked under its real id (<code>watch_&lt;hash&gt;</code>), and the agent's own job (the idle dream monitor) does
+  not count toward <code>MAX_TASKS</code>.</li>
+</ul>
 </main>
 </body>
 </html>

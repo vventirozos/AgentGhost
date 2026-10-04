@@ -130,6 +130,14 @@ def _logging_handlers_are_per_test():
 
 
 @pytest.fixture(autouse=True)
+def _no_quiet_hours_by_clock(monkeypatch):
+    """§4LI: quiet hours read the WALL CLOCK (default 23-07); five
+    notification tests failed when the suite ran at night. Off for every
+    test — a test of the window sets GHOST_QUIET_HOURS itself."""
+    monkeypatch.setenv("GHOST_QUIET_HOURS", "off")
+
+
+@pytest.fixture(autouse=True)
 def _deterministic_log_width(monkeypatch):
     """`pretty_log` wraps at `shutil.get_terminal_size((120, 24)).columns`,
     so any test asserting on a log LINE is asserting on a layout decided

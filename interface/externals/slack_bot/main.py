@@ -1675,6 +1675,12 @@ async def main():
     if notify_dest.lower() in ("off", "none", "0", "false"):
         logger.info("Notification poller OFF (GHOST_NOTIFY_SLACK_CHANNEL=off)")
     else:
+        if notify_dest[:1] in ("C", "G"):
+            # §4LD: scheduled-task results and job notices are written with
+            # the owner's full context — a channel exposes them to everyone in it
+            logger.warning("Notifications go to CHANNEL %s — every member of it reads the owner's "
+                           "scheduled-task results and job notices; unset GHOST_NOTIFY_SLACK_CHANNEL "
+                           "to send them to the owner's DM", notify_dest)
         _poller_task = asyncio.create_task(notification_poller(notify_dest))
 
     handler = AsyncSocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])

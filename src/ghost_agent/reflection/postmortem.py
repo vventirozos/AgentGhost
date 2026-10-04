@@ -43,6 +43,8 @@ import asyncio
 import datetime
 import hashlib
 import inspect
+import json
+import os
 import logging
 import re
 import time
@@ -81,6 +83,9 @@ _VALID_CATEGORIES = frozenset(
 # Big enough that a tick's worth of permafails can't cycle back within a
 # session; small enough that memory stays trivial.
 _FAILED_ANALYSIS_CAP = 128
+#: §4LF: analyses of one failure signature, across restarts, before it is
+#: skipped for good
+_FAILED_ANALYSIS_MAX_TRIES = 3
 
 
 def primary_target_from_args(args) -> str:
@@ -746,9 +751,16 @@ class PostMortemEngine:
         # a permanently-unanalysable trajectory is re-selected every tick
         # — severity-ordered selection has no other exit — wasting one
         # LLM call per tick and starving lower-severity failures.
-        # Per-process and bounded; insertion-ordered dict for FIFO
-        # eviction, so a restart (or cap overflow) allows a retry.
+        # Bounded, insertion-ordered (FIFO eviction). §4LF: PERSISTED with an
+        # attempt count beside the defect queue — in memory, every restart
+        # re-tried the same two failed turns (~230 main-model calls, mostly
+        # 120 s timeouts, over ~129 boots). A restart still allows a retry,
+        # up to _FAILED_ANALYSIS_MAX_TRIES in all.
         self._failed_analysis_sigs: Dict[str, None] = {}
+        self._failed_tries: Dict[str, int] = self._load_failed_tries()
+        for _sig, _n in self._failed_tries.items():
+            if _n >= _FAILED_ANALYSIS_MAX_TRIES:
+                self._failed_analysis_sigs[_sig] = None
 
     async def run(
         self,
@@ -854,6 +866,38 @@ class PostMortemEngine:
         self._failed_analysis_sigs[sig_hash] = None
         while len(self._failed_analysis_sigs) > _FAILED_ANALYSIS_CAP:
             self._failed_analysis_sigs.pop(next(iter(self._failed_analysis_sigs)))
+        # re-noted → moved to the END, so eviction drops the oldest-touched
+        # signature, not a retired one that becomes eligible again (§4LI review)
+        _n = int(self._failed_tries.pop(sig_hash, 0)) + 1
+        self._failed_tries[sig_hash] = _n
+        while len(self._failed_tries) > _FAILED_ANALYSIS_CAP:
+            self._failed_tries.pop(next(iter(self._failed_tries)))
+        self._save_failed_tries()
+
+    def _failed_tries_path(self):
+        try:
+            return self.queue._path().with_name("postmortem_failed_analyses.json")
+        except Exception:  # noqa: BLE001 — a stub queue: nothing persisted
+            return None
+
+    def _load_failed_tries(self) -> Dict[str, int]:
+        p = self._failed_tries_path()
+        try:
+            data = json.loads(p.read_text(encoding="utf-8")) if p is not None and p.is_file() else {}
+            return {str(k): int(v) for k, v in data.items()} if isinstance(data, dict) else {}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _save_failed_tries(self) -> None:
+        p = self._failed_tries_path()
+        if p is None:
+            return
+        try:
+            tmp = p.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(self._failed_tries), encoding="utf-8")
+            os.replace(tmp, p)
+        except Exception:  # noqa: BLE001 — at worst one retry after a restart
+            pass
 
     async def _call(self, fn, prompt: str, timeout: float) -> str:
         call = fn(prompt)

@@ -127,7 +127,8 @@ async def test_hydrate_context_fans_out_in_parallel(bus, mocks):
     out = await bus.hydrate_context("tell me about my dog")
     # search_items now carries the proactive-injection relevance gate (2026-07-15).
     mocks["vector"].search_items.assert_called_once_with(
-        "tell me about my dog", min_relevance_dist=MemoryBus._VECTOR_MATCH_FLOOR)
+        "tell me about my dog", min_relevance_dist=MemoryBus._VECTOR_MATCH_FLOOR,
+        exclude_types=MemoryBus._VECTOR_DROPPED_TYPES)   # §4LB r2: dropped BEFORE the off-topic gate
     mocks["graph"].get_neighborhood.assert_called_once()
     mocks["skill"].get_playbook_items.assert_called_once()
     # Combined Markdown contains markers from each section.
@@ -171,9 +172,10 @@ async def test_hydrate_context_actually_concurrent(bus, mocks):
     assert timings["peak"] >= 3, (
         f"hydrate_context awaited its fetches sequentially — peak overlap "
         f"was {timings['peak']}, expected 3 concurrent")
-    # (+1 since §4KZ: the graph fetch also reads the owner's facts by kind)
-    assert timings["started"] == 5
-    assert timings["finished"] == 5
+    # (§4KZ added the owner-fact read; §4LB r2 runs it only on a question
+    # ABOUT the owner — "anything" is not one)
+    assert timings["started"] == 4
+    assert timings["finished"] == 4
     # Backstop only, deliberately loose: catches a pathological regression
     # (e.g. an accidental per-fetch retry loop) without re-introducing a
     # timing race on a loaded machine.

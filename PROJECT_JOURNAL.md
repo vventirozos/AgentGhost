@@ -49969,3 +49969,524 @@ from here to home ?" (told the model to doubt the owner's home) retracted; vecto
 rebuilt (the store had none since ≥09-24). Owner edges 316 → 267. Left for later (operator): RUNS evolmonkey, birth dates
 to the profile, helmets, IBKR account. Probe (labelled, read-only): home answered from the address without doubting it;
 sons' birth dates correct.
+
+## §4LA — episodic memory: what is recorded, recalled, relabelled and forgotten (2026-10-03, operator: "proceed, usual verification protocol")
+**Review** (3 fresh-eye reviewers, read-only on copies): writers 3 MAJOR/5 MINOR, readers 4/4, retention 4/4. Measured: 142
+episodes SUCCESS after their turn was refuted/failed (surfaced ~3,900×); a member's thread line and public channel turns
+recordable as the owner's; tool results stored verbatim (keys, paths); nonsense queries scored 0.53–0.68 against episodes
+vs the 0.2 floor → 5 unrelated episodes in every owner turn, plus a substring fallback on any shared word; an old episode
+outranked a correction (tier −12); credit at fetch (8 of 14 credited never shown) kept probe episodes un-evictable;
+recoveries without a recovery; twins dated at re-index (133 up to 19 days late); forget blind to action results, Greek
+inflection and other script; reset_all left every episode and the boot re-indexed them; twin-delete failures swallowed.
+**Fixes:** episodes carry `req_id`; `mark_outcome` relabels on a LATE REFUTED (request id) and on the owner's correction
+(request text); failure sentinels are failures; the teach gate fails CLOSED and names sim/bench; public and foreign-labelled
+turns are not recorded; redacted like the journal; floor 0.70 (measured), no fallback on an empty semantic answer (only a
+cold store), re-sorted after recency, credit only post-fusion for episodes that enter the prompt (`episode_id` on bus items),
+recovery needs a later success, twins carry the episode's date, System-3 not on a public reply; episodes rank as evidence
+(p 1); eviction by credit per age; forget searches actions + transliteration + Greek inflection; one deletion path with
+reported twin failures; the forgotten archive records what/when and keeps 30 days; reset_all wipes episodes and says so.
+**Verification:** battery 25 mutants: 23/24 → 24/24 non-control (the archive purge was only tested directly → now through a
+deletion), controls OK, tree pristine. New tests test_4la_episodes.py (26); 6 old-contract tests updated. Full suite once:
+27,674 passed, 0 failed. Deployed (req_id column migrated); probe (labelled, read-only): job answered from the profile, no
+episode hydrated. **Data:** NOT changed — the episode cleanup list awaits the operator.
+**§4LA data (operator: "yes to all, proceed"):** `scripts/memory_repair_4la.py` (ids listed verbatim; a moved store applies
+nothing; test_memory_repair_4la_script.py), trialled on a copy with the agent stopped, then live (backup
+memory.pre-4la-20261003T200324.bak): 122 episodes relabelled failed (their trajectory failed / was refuted late, or the
+reply was a failure sentinel; 14 more were in the deletion set), 41 deleted with their twins and archived 30 days (24
+legacy probe/test, 8 chess-engine prompts, 9 sensitive search topics; the Chess Coach v2 instructions #211/#212 and the
+journal line-count #264 kept as possibly the owner's), backups pruned to the newest two folders + every single-file backup
+(42 removed; system data 4.4 GB → 968 MB). The trial caught a defect in the script itself: copytree copies the source
+mtime, so the fresh backup sorted OLDEST and was pruned — fixed (order by the name's timestamp, never prune this run's
+backup; pinned). Probe (labelled, read-only): sons + birth dates correct.
+
+## §4LB — what goes into every prompt: private context, egress, duplication (2026-10-03, operator: "proceed")
+**Review** (3 fresh-eye reviewers, read-only on log/record copies): the model wrote the owner's street address into Tor
+searches ("restaurants Makedonias 83 Thrakomakedones walking distance"); the address and a physical description rode 40/40
+owner turns; sub-agents and coding leaves rebuilt a memory bus from the read-only stores and shared the owner's scratchpad
+and past requests; a PUBLIC channel reply said "private memory is NOT loaded" while scratchpad, past requests, open
+questions, competence and both playbooks were; coding turns carried the whole profile; profile mirrors (identity rows) and
+episode twins re-entered through the vector tier; 49% of graph items were chains through the agent's own ai/assistant nodes;
+the self-play report rode every turn (relevant to 0/40); recurring uncertainties never expired and were uncapped; the
+planner got the playbook twice; {{PROFILE}} at char 226 made any profile change re-prefill ~20k chars.
+**Fixes:** on-demand profile fields (default `root.address` + `*_description`; owner-extensible via
+`profile_prompt_policy.json`), named in the prompt so they can be recalled; egress scrub at dispatch for `_OUTBOUND_TOOLS`
+(on-demand values → the owner's city, case-insensitive, logged `Privacy`); weather never geocodes the address;
+`_owner_context_hidden()` = member OR public gates every private source; delegates `owner_memory_isolated` (empty bus,
+fresh scratchpad, no past-request store); coding persona gets preferences only; vector tier drops IDENTITY/EPISODE rows;
+graph drops agent-node chains; self-play report only on a practice/self-play/training/learn turn; uncertainties expire after
+14 days, capped 200 chars; planner tail dedupes the playbook; profile slot moved to the end of the system prompt.
+**Verification:** battery 22 mutants: first run 18/21 non-control killed — KNOWN-BAD (dispatch hook removed) SURVIVED: only
+the helper was tested, never the dispatch; plus case-sensitive scrub and the live self-play exclusion → 3 tests added
+(dispatched web_search carries the city; casing; the turn's scratchpad read excludes the report). The new test found a real
+defect: `practi[cs]e` missed "practicing" → fixed. Rerun 21/21, NOOP survives, tree pristine. test_4lb_prompt_context.py
+(19); 2 old-contract tests updated. Full suite once: 27,694 passed, 0 failed. Deployed (bootout/bootstrap; one listener).
+Probe (labelled, read-only, "pizza within walking distance of my home address"): 5 web_search queries used the suburb/Athens,
+"Makedonias 83" in 0 log lines. **Deferred (perf):** pinned-mode cache reuse; ~25k-token tool schemas (84% cached).
+**Data:** NOT changed — profile split (vehicles/hobbies/company on demand?) and cleanup (sons per-son, hobbies/vehicles as
+lists, 102 ai/assistant/system graph edges) await the operator.
+**§4LC data (operator: "1. none 3 yes 4 a i run evolmonkey, 4b yes 4 c no"; 2 not answered = not done):** no more
+on-demand profile fields. `scripts/memory_repair_4lc.py` (rows listed verbatim; the agent-edge count must equal the 102 the
+operator saw; kept facts verified live first; test_memory_repair_4lc_script.py), trialled on a copy with the agent stopped,
+then live (backup memory.pre-4lc-20261003T210044.bak): 107 graph edges archived — the 102 whose subject is ai/assistant/
+system, `user WORKS_AT evolmonkey` (he RUNS it), `user OWNS pista gp rr` + `shoei x-spirit iii` (not his helmets),
+`user HAS_ACCOUNT_WITH interactive brokers` + `HAS_FUNDS 100 euros` (not real) and the synthesis row stating that account;
+the two episodes recording that he ASKED about helmets kept (history, not a fact). Profile: root.role "Runs EvolMonkey",
+root.birthdate 1980-01-29, relationships.wife_birthdate 1982-01-10, mirrors synced. Probe (labelled, read-only): runs
+EvolMonkey, both birth dates right, no helmets, no brokerage account.
+**§4LC part 2 (operator: "do that too, proceed"):** `scripts/memory_repair_4lc_lists.py` (values listed verbatim and must
+equal the live ones; a rerun is a no-op; test_memory_repair_4lc_lists_script.py incl. the store keeping two anchored "born …"
+items apart), trialled on a copy with the agent stopped, then live (backup memory.pre-4lc-lists-20261003T210318.bak):
+relationships.sons → 2 items, interests.hobbies → 4, assets.vehicles → 3, each keeping the field's original as_of; vector
+identity rows synced per item (9 added, 3 sentence rows removed); no graph edges added (HAS_SON ×2 / OWNS ×3 / HAS_HOBBY
+already hold them). The prompt now derives each son's age separately. Probe (labelled, read-only): both sons with ages,
+4 hobbies, 3 vehicles.
+
+## §4LB r2 — fresh-eye review of the §4LB fixes (2026-10-03, operator: "should you verify all your coding changes?" → "proceed")
+**Review** (3 fresh reviewers, read-only): egress 3 MAJOR/4 MINOR, isolation 1 MAJOR/5 MINOR, hydration 2 MAJOR/3 MINOR.
+MAJOR: `darkweb_research` (and system_utility's geocoder argument) missing from the outbound set; delegates' `recall` read
+the owner's store ("User address is Makedonias 83 …") and, with `profile_memory=None`, their searches were never
+scrubbed; the exact-Latin-substring scrub let the postcode alone, Greek, \u-escaped JSON, "street 83", double spaces and
+URL-encoded links through and rewrote "Makedonias 830" to "Athens0"; the owner-fact graph lookup (§4KZ) matched request
+verbs ("do you know", "I want", "show me") and filled every graph slot; episodes between 0.30–0.70 (deliberate, §4LA
+noise — docs corrected). MINOR: `home_address`-style keys rendered and unscrubbed; description sentences as egress terms;
+weather lost an address-only profile and still geocoded a street under `home`; the planner dedupe never fired (JSON-escaped
+compare); the self-play regex matched "constraint"/"best practices"/"train times"; workspace prefix + project briefing
+reached public replies (briefing: members too); the off-topic gate measured rows the bus then dropped; the agent-node filter
+dropped "user HAS_INTEREST ai" / "ghost IS_A framework"; a TypeError inside the episode search re-ran it with in-search credit.
+**Fixes:** `memory/egress.py` — ONE detector (folded text: case, accents, Greek→Latin, URL-decoded, JSON parsed; street +
+number either order, street words, stem for Greek inflection, bounded number, postcode with/without space; replaced in the
+text as written) and ONE table `OUTBOUND_TOOLS` (all args / listed keys + URLs / URLs only), applied at dispatch AND at the
+tool callables (macros and delegates call those); delegates carry `egress_profile`, `recall` refuses in an isolated
+delegate, and `_owner_context_hidden(context)` covers isolation (their lessons); address-like keys always on demand;
+descriptions prompt-only; weather geocodes a locality; workspace prefix + briefing gated on member/public (an isolated
+coding leaf keeps its briefing); whole-text planner dedupe; `_SELF_PLAY_ASK` about the agent; owner facts only for a
+first-person question + request verbs never name a fact; `exclude_types` before the vector gate; subject-only agent
+filter; the episodic call chosen by signature.
+**Verification:** battery bat16, 32 mutants: first run 29/31 non-control killed — the planner dedupe test drove a ONE-turn
+request, but the aligned planner exists only from turn 2 (rewritten on the two-turn driver); one mutant was malformed
+(syntax error, regenerated). Rerun 31/31, NOOP survives, tree pristine. test_4lb_prompt_context.py 19 → 62 tests;
+test_memory_bus updated (exclude_types; owner-fact read only on owner questions). Full suite: first run 4 failed (3 mine: the
+vector fetch's `to_thread` call shape changed → restored; 1 selfhood late-verdict timing flake, 3/3 in isolation), rerun
+27,748 passed, 0 failed. Deployed; probe (labelled, read-only, Greek "φαρμακεία κοντά στη Μακεδονίας 83, 136 76"): two
+web_search calls and a Google Maps URL scrubbed (3 `privacy` log lines), 0 tool calls with the street or postcode.
+**Observed:** with the street replaced by "Athens" the model guessed the wrong suburb (Cholargos) — replacing with the
+address's suburb instead of the city would keep local results right; put to the operator.
+**§4LB r3 (operator: "yes, proceed" — the suburb, not the city):** the street + number and postcode are replaced by the
+address's SUBURB (`egress.locality`: the address without street, number and postcode → "Thrakomakedones"), else the
+city, else "nearby"; `tools/system._locality` now delegates to it (one implementation). Battery bat17: 3/4 → 4/4 (the
+"whole locality" mutant survived a contains-check; pinned the exact suburb), NOOP survives, tree pristine. Full suite
+27,751 passed, 0 failed. Deployed; probe (labelled, read-only, the same Greek pharmacy request): the first web_search
+went out as "φαρμακεία Thrakomakedones …", 0 tool calls carried the street or postcode. **Observed:** the model then
+added a town of its own and searched "Ασπρόπυργος Μακεδονίας" (a different Makedonias Ave) — it does not know its query
+was rewritten. Candidate next step (operator): tell the model in the tool result that the address was replaced by its
+suburb.
+**§4LB r4 (operator: "proceed" — tell the model):** a rewritten outbound call's result ends with `egress.privacy_note`
+("[privacy: the owner's street address in this call was replaced by its area, 'Thrakomakedones' … search there — never
+put the street, number or postcode in a query.]"), from the dispatch hook (`tool["_privacy_area"]`, wrapped around the
+tool coroutine) and from the tool-boundary wrapper (macros, delegates). APPENDED, never in front: a result's head is parsed
+("Error:" classifies a failure). Tool results reach the model inside a `<tool_response>` user block, not a role=tool
+message (the first test looked for the wrong role). Battery bat18 4/4 (incl. note-in-front and note-on-clean-calls), NOOP
+survives, tree pristine. Full suite 27,751 passed, 1 failed: test_hydrate_context_actually_concurrent's 1.0 s wall-clock
+backstop at 1.5 s under load (5/5 in isolation; the bus is untouched by r4). Deployed; probe (labelled, read-only, same
+Greek pharmacy request): answered with Thrakomakedones pharmacies (correct area), 2 rewrites logged, 0 tool calls with the
+street or postcode.
+
+## §4LC — lessons and past requests: written, shown, taken back (+ public-reply leaks) (2026-10-03, operator: "proceed")
+**Review** (3 fresh reviewers, read-only on copies; 184 lessons, 18 past requests, 40 real owner turns replayed): content
+6 MAJOR/6 MINOR, injection 6 MAJOR, lifecycle 3 MAJOR + public replies 2 MAJOR/4 MINOR. Measured: PAST REQUESTS rode 40/40
+owner turns, ~11% relevant ("the"/"you"/"what" matched; a Greek query got the top 3 by confidence), with probe text
+("DISPATCH-OK-77", "fr_probe.html") as examples and "validated, not speculative" overclaimed; probe traffic had taught
+lessons and inflated counters; the §4KW backfill wrote 30 unverified general rules; a lesson named the owner's son;
+4 recommended a removed git tool; dream/episode triggers cut at 80 chars mid-word; ONE shared word admitted a lesson; Greek
+queries rode the English embedder (closer to arbitrary lessons than relevant pairs); credit 78% vs the judge's 10%, and the
+300 s window credited the previous turn's lessons; learn_skill/bus/post-mortem lessons carried no trajectory id, so a
+refuted turn's retraction removed 0; the owner's dictated lesson was folded into dream's opposite rule; a refuted turn's
+reinforcement (+1, verified → cap-protected) was permanent; `forget` never reached lessons; the second archive rotation
+overwrote `.1` (operator retractions); public channel replies got the "while you were away" digests (and consumed the DM's
+watermarks), an age check that quotes the stored birth date, and a conversation tag shared with the DM.
+**Fixes:** past requests — content words (folded, Greek transliterated, stop-words out, tool names excluded), ≥2 shared, no
+fallback, stale after 14 days, mined from real requests only (`minable_requests`), honest wording. Lessons —
+`trajectory_id_context` stamps every in-turn write; retraction restores a replaced row's `previous_version` and undoes a
+`reinforced_by` +1/verified; the owner's dictated lesson replaces another producer's text (both merge paths); lessons citing
+a relabelled episode are quarantined (`quarantine_citing`, read-only façade blocks it); `trigger_text` cuts at a word within
+160; admission needs two shared content words or a close trigger, and a mostly non-Latin query never relies on the
+embedder; credit only for lessons retrieved for THIS request; forget lists/removes lessons that mention the target;
+numbered archive rotation; the post-mortem drops a reply that IS null (`_is_null_reply`); no placeholder block. Public —
+digests, the age check and the selfhood prefix gated on `reply_is_public()`; the conversation tag includes the surface.
+By design an owner's own coding request in a channel keeps its sandbox listing and project rules.
+**Verification:** battery bat19, 32 mutants: 24/31 → 31/31 non-control (7 survivors were test gaps: one-word and stop-word
+queries, the turn setting the id, a cut that landed on a space, the dream site, the vector path's fail-open embedder, the
+inline null check → helper), NOOP survives, tree pristine. test_4lc_lessons.py (32), script tests; 5 old-contract tests
+updated. Full suite: first 4 failed (read-only façade missed `quarantine_citing` — a REAL gap; a §4KW one-word pin; two
+evolve controls whose pin run hit them) → 27,788 passed, 0 failed. ⚠ While writing the cleanup script I overwrote the
+applied §4LC owner-fact script `scripts/memory_repair_4lc.py`; restored verbatim from this session (its tests pass), the new
+one is `memory_repair_4lc_lessons.py`.
+**Data (operator: "go with your recommendation"):** trialled on a copy with the agent stopped, then live (backup
+memory.pre-4lc-lessons-20261003T235059.bak): 45 lessons removed and archived (27 backfill rules — kept: renaming a
+variable, answer a direct question first, switch tool after a repeated error; the son's lesson and a Slack member's; 3
+dead-git-tool; 4 probe-taught; 2 wrong one-off rules; 7 self-play "None observed"), counters reset on 27 request lessons,
+auto_skills.json moved aside to be re-mined from real requests. 184 → 139 lessons, 139 twins. Deployed; probes (labelled,
+read-only): a generic and a Greek question got no lessons or past requests; "I renamed a parameter…" used the kept lesson.
+**§4LC part 3 (2026-10-04, operator: "proceed" — the open reset_all question):** `reset_all` also removes (archived) every
+ONE-REQUEST lesson (`SkillMemory.remove_request_scoped`; they quote the owner's requests verbatim) and its preview counts
+them; general lessons stay; blocked on the read-only façade. Battery bat20: 3/5 → 5/5 (the archive and the façade were
+untested on this path), NOOP survives, tree pristine. Full suite 27,791 passed, 0 failed. Deployed; probe (labelled,
+read-only): sons' names and birth dates correct. ⚠ **The deploy interrupted the owner's live request** ("LLM harnesses in
+Haskell", turn 4): the restart one-liner printed `foreground_requests: 1` and booted out anyway. The restart recipe now
+GATES on foreground_requests == 0 (memory: operator-restarts-the-agent).
+
+## §4LD — what the agent does on its own: scheduler, jobs, idle phases, unprompted messages, stopping (2026-10-04, operator: "yes, proceed")
+**Review** (3 fresh reviewers, read-only; 7 days of logs and ledgers measured): triggers 2 MAJOR/4 MINOR, messages 2 MAJOR/4
+MINOR, runtime 3 MAJOR/5 MINOR. Measured: no unprompted message ever reached a member or a channel (14 since 08-18, all the
+owner's DM; 0 in the last 7 days); background work never delayed an owner turn (0 overlaps of 119); ~60% of main-slot
+generation is background (bench 95 runs at 99% pass, self-play 4.3 h); 50 boots, 3 "shutdown complete".
+MAJOR: APScheduler's wake-up copied the contextvars of the turn that last added a job into EVERY later fire (one task created
+in a Slack channel → every scheduled run a PUBLIC reply; a web deadline cut them short); no task bounds (interval:1, no cap —
+300 tasks fired 600 turns in 2.2 s; a run could schedule more or stop_all); "notify me when it's done" sent "Done — I've
+started the benchmark…" at LAUNCH (sub-agent jobs sent nothing else); scheduled results paged every fire (a failing task
+every cycle, no rate/dedupe); uvicorn waited for open requests with no limit; idle cooldowns reset every boot (37/73
+postmortem and router runs, 32/93 skills-auto runs were empty re-runs).
+**Fixes:** `main._handle_chat_foreground` runs every autonomous turn as the owner, on no surface, no client deadline;
+`tasks._schedule_refusal`: no scheduling/stop_all from sched-/job-/sub- runs or probes (id or X-Ghost-Origin), ≤20 tasks,
+interval ≥60 s, no silent replace; probes cannot confirm a forget/reset_all (`_not_the_user`); `_heartbeat` — internal
+turns are not activity (a <15-min task starved every idle phase); ≤8 running sub-agents across calls; a turn that only
+LAUNCHED jobs arms them (`notify_owner_req`) and `jobs.notify_owner_job_finished` sends the real outcome when they finish —
+no "Done" at launch, the steer stands down too; scheduled pages: a failure pages on the transition only, results ≤4/hour per
+task, recovery pages; notification negation is per clause; the Slack bot warns when notifications target a channel;
+uvicorn `timeout_graceful_shutdown`=6 s + watchdog grace 5 s (`_serve`); idle anchors persisted
+(`system/idle_cooldowns.json`); a failing idle phase logs WARNING once an hour and shows as `name(failed)`.
+**Verification:** battery bat21, 27 mutants: 25/26 → 26/26 (the scheduled-result writer was untested), NOOP survives, tree
+pristine. test_4ld_autonomy.py (25); 5 old pins updated (two source pins, a message order, two evolve controls that ran
+them). Full suite 27,816 passed, 0 failed. Deployed with the GATED restart (waited for foreground_requests == 0).
+**Found at deploy:** the shutdowns were cut by `launchctl bootout` itself — it removes the service and kills the process
+~5 s after SIGTERM (measured: gone at 5.3 s, no "shutdown complete"). `sudo launchctl kill SIGTERM system/com.local.ghost-agent`
+lets the agent drain ("shutdown complete" at +5.3 s, measured) and KeepAlive restarts it — the deploy recipe now.
+Probe (labelled): "remind me every 5 minutes" from a probe was refused ("a probe request does not create … scheduled tasks"),
+scheduled_tasks.json still empty.
+**Put to the operator:** launchd ExitTimeOut (longer grace for in-flight requests), quiet hours, bench frequency.
+
+## §4LE — per-turn speed: what holds a reply, what breaks the prompt cache, what a simple turn pays (2026-10-04, operator: "proceed")
+**Review** (3 fresh reviewers measuring on copies: 7 days of agent log, the llama-server log joined to it, 30 days of
+trajectories, the model tokenizer). Owner turns: median 17.6 s (the 36 s figure included Slack members: 41.9 s). Time:
+main-model generation 45%, tools 40% (image turns ~3 min, the p90). Cache: 83% of prompt tokens reused; the chat template
+renders the TOOL SCHEMAS BEFORE the system prompt and the hybrid model resumes only from checkpoints ≥8,192 tokens apart, so
+a changed byte loses everything back to the previous checkpoint. Tool block ~23.7k tokens (manage_projects 3.6k, browser 2.0k;
+15 built-ins never called by the owner, ~3.9k).
+MAJOR: the live `fs_batch` A/B changes the file_system schema (2nd tool) in its treatment arm and the warmup (run as
+"SYSTEM", no arm) only warmed control — 4 of 15 treatment owner turns re-prefilled ~31.6k tokens (~35 s), +5.7 s per owner
+turn-1 on average, and a latency skew in the experiment; the end-of-loop verifier wait held self-report turns ("good morning
+ghost": 35 s of 60); two worker calls before the first token on short follow-ups (expand 1.0 s, then decompose 1.8 s
+because its 8-word gate read the EXPANDED string), each with a 12 s timeout (two owner turns lost 12 s while Nova was down);
+composed-skill descriptions carried live "used N× / P% success" counters (rewrite behind the tool block on every use).
+MINOR: the fast path knew English greetings only (5 hits in a week); the one-shot warmup-MISS check was used up by members'
+turns with false warnings; two dead constants.
+**Fixes:** `warm_up_main_prefix` warms both fs_batch heads (`FS_BATCH_WARM_ARM`, control last, same mode); self-report tools
+(`_SELF_REPORT_TOOLS`) never hold the reply for a verdict (deferred path still runs); `PRE_REPLY_ROUTE_TIMEOUT_S` = 4 s on the
+expansion, 4 s on the decomposition, which is judged on the user's own words and skipped after an expansion; no counters in
+macro descriptions; Greek greetings/thanks on the fast path (accent-folded); the MISS check skips member/public turns; dead
+constants removed.
+**Verification:** battery bat22, 14 mutants: 11/13 → 13/13 (hydration passing the user's words; the member MISS skip), NOOP
+survives, tree pristine. test_4le_speed.py (22); 4 test shapes updated (a one-head rewarm fixture, a decompose stub, a source
+window, two evolve controls that ran them). Full suite 27,838 passed, 0 failed. Deployed twice with the gated graceful
+restart (`launchctl kill SIGTERM`: "shutdown complete" +5.4 s both times; the second fixed the treatment pass's boot log
+reading as an "eviction"). Probes (labelled, idle agent): "γεια σου" 0.9 s via the fast path; "what is the capital of
+Portugal?" 4.4 s with no worker call before the reply.
+**Put to the operator:** a second llama slot (`-np 2`) or moving background work off the main slot (~35 s on ~15% of owner
+turns), `--checkpoint-min-step 2048`, the `use_planning` treatment (~7 s per planner step), trimming ~5–6k tokens of tool
+docs, a Slack member answer-length cap.
+
+## §4LF — does background learning earn its cost (2026-10-04, operator: "yes, start the learning-value review")
+**Review** (3 fresh reviewers measuring 28 days on copies, 285 boots in the window). Practice: fresh self-play made progress
+in 1/197 frontier runs, 74 lesson saves (10 still in the playbook), used in 1 owner turn per the usefulness judge (09-14);
+bench at 98.5% for 7 weeks, its lessons used in 2 owner turns (the son's math), `tts_bon` (the only bench experiment) never
+fired; counterfactual replay quarantined 20 lessons (keep). Consolidation: the selfhood + workspace narratives ~590 main-model
+rewrites, read ~4×; dream 353 LLM runs, 47% with no new owner turn, ~87% of heuristics near-duplicates; postmortem 197/327
+empty, 117 all-error (the same two turns re-tried after each restart), 7 config defects pending since 09-18..22; GEPA cannot
+measure (needs llm_recordings, GHOST_LLM_RECORD=0); evolve/replay already off. Learned models: every idle model loop is
+cheap (no LLM, ≤2 s); router deployed once (09-20) and is a real input (planner trigger on 75% of turns); calibration
+refits ~22×/day to the same answer; the adaptive threshold has no effect (--smart-memory 0.9 wins); nine live experiments
+randomise owner turns and none can reach a verdict at current traffic (a 5pp effect needs ~3,850 resolved turns per arm —
+~2 years); `use_planning` treatment costs ~58 s per triggered turn; member Slack turns are enrolled too.
+**Fixes (waste only — what runs and how often is the operator's call):** both narratives keep their "input unchanged" key
+beside the narrative across restarts (213 of 354 rewrites were the first after a boot); postmortem keeps its failed
+analyses with an attempt count (≤3 across restarts); the idle-phase WINDOW rolls without self-play via its own anchor
+(`_idle_window_at`) — self-play's finally was the only writer of the clock that re-opens the 15–60 min window, so
+`--no-self-play` or a longer self-play cooldown silently stopped reflection/postmortem/skills/router/calibration/narratives/
+autoadvance; graduated skills: only new evidence is a verification (re-runs refreshed last_verified_at and disabled the
+§4LC 14-day staleness rule); `imagine_preflight` and `search_yield_steer` added to TRIGGER_KEYS.
+**Verification:** battery bat23: 13/13, then the window fix was REDESIGNED after the full suite (17 failures: the first
+version rolled the USER clock that bench, the drain, dream replay and evolve read) — regenerated mutants incl. "roll moves
+the user clock": 14/14, NOOP survives, tree pristine. test_4lf_learning_value.py (9); one old pin updated (graduate
+verifications). Full suite 27,845 passed, 0 failed. Deployed (gated, graceful). Probe (labelled): 17×23 = 391 in 5.8 s.
+**Put to the operator:** the per-loop frequency/off list and the experiment conclusions (see the reply of 2026-10-04).
+**§4LF decisions (operator: "proceed with your recommendations", items 1–9):** (1) all nine live experiments concluded to
+CONTROL — `system/experiments.json` entries kept with `enabled: false` + a dated `concluded` note (backup
+experiments.json.pre-4lf-*); owner turns run no planner ("use_planning: unenrolled — planner off" in the log; self-play
+still forced on). (2) self-play every 4 h (`GHOST_SELFPLAY_COOLDOWN_S`, default 14400) — and the adaptive cooldown's ceiling
+now scales with the base (the fixed 7200 ceiling would have SHORTENED a 4 h base after a failed run); (3) bench every 6 h
+(`GHOST_BENCH_COOLDOWN_S`, 21600). Launcher (backup start-ghost-agent.sh.pre-4lf-*): (4) `--self-narrative-cooldown 86400`,
+`--workspace-narrative-cooldown 21600`; (5) `GHOST_DREAM_MIN_NEW=10`; (6) `--calib-refit-cooldown 21600`; (7)
+`GHOST_NEGCTRL=0`, and the adaptive threshold is built only with `GHOST_ADAPTIVE_THRESHOLD=1` (`main._maybe_adaptive_threshold`;
+not ripped out — 6 modules + 9 test files for zero behaviour change). (8) the 7 pending September defects: none of the 8
+settings they name exists in the code (the analysing model invented them); the behaviour (repeating a failing call on the
+same target) is covered by the no-progress loop breaker and the pre-flight repeat guard → recommended closing, NOT closed
+(awaiting the operator). (9) quiet hours: `/api/notifications/pending` serves nothing during `GHOST_QUIET_HOURS` (default
+23-07 local) and keeps the watermark, so the first poll after delivers the held notices (`autonomous_activity.in_quiet_hours`).
+Items 10–13 held (re-measure the slot after 1–3). Battery bat24 7/7, NOOP survives, tree pristine; tests +10 in
+test_4lf_learning_value.py; full suite 27,851 passed, 4 failed (four tests hard-coding the old 1 h self-play base / a 3 h
+"past the cooldown" — rewritten to derive from the configured base, 61/61 pass; test-only, source unchanged since the
+suite). Deployed (gated, graceful): flags and env verified in the resolved-config line and the process environment.
+Probe (labelled): a web-research turn ran with the planner off, 54 s.
+
+## §4LG — are research answers (web and dark web) right and sourced (2026-10-04, operator: "proceed , add dark web search as well in the review")
+**Review** (fresh reviewers on copies of 3 weeks of trajectories, the log and the verifier records). 16% of the facts in
+research replies had no source in the turn (owner 10%, members 18%), 14% of replies cited anything, 1 invented URL in 42.
+13 of 14 research answers the verifier REFUTED shipped unchanged; 0 of 11 queued corrections were ever shown (the owner
+did not come back to those threads). The judge refuted from its own memory (Radahn's boss fight: "the evidence says X,
+but actually Y"). 60 of 65 re-fetches of a clearnet host that had already failed failed again; the browser's
+commit-milestone retry recovered 1 of 17 timeouts at ~30 s each; darkweb_research read 32 of 36 irrelevant homepages
+(search order, homepage before the matching path).
+**Fixes:**
+- **System-prompt rule 4b:** state as fact only what this turn fetched, name the source inline, a search result is a
+  title/snippet and not the page, never use pages that failed, never invent a URL, label background knowledge, say when
+  nothing was found. It also says an organisation's OFFICIAL .onion comes only from its own clearnet site, and a page
+  whose content does not match the organisation is not it.
+- **Verifier:** `_guard_memory_refute` turns a REFUTED into UNCERTAIN (≤0.5) when every issue asserts counter-facts
+  found nowhere in the evidence, raw sources, prior evidence or context (`GHOST_VERIFY_MEMORY_REFUTE_GUARD`).
+- **Owner notice:** `_notify_owner_correction` sends the owner a notice "Correction to my answer to “…”" when a late
+  verdict queues a correction. Owner only, rate limited.
+- **Evidence tools:** `_EXTERNAL_EVIDENCE_TOOLS` gains darkweb_research and fact_check.
+- **darkweb_search:**
+  - the header says results are titles and snippets only;
+  - `rank_for_reading` reads on-topic results first, then a path before a homepage, from max_sources×3 candidates.
+- **Browser, clearnet:**
+  - dead-host memo (`tools/host_memo.py`; 2 repeatable strikes in 6 h, a BLOCKED page counts, a clean load clears it,
+    `GHOST_DEAD_HOST_MEMO=0`);
+  - the commit retry is opt-in (`GHOST_BROWSER_COMMIT_RETRY=1`);
+  - the timeout hint says another attempt usually times out the same way.
+**Verification:** batteries bat25 (21) and bat26 (6) converged, NOOP survived, tree pristine. test_4lg_research.py; old
+pins updated (verifier tests opt out of the guard; the commit-retry test opts in; browser size guard 1650→1700, dated).
+**MISTAKE:** the first deploy went out with 2 suite failures in the file (the lint gate's unused-import findings
+and a selfhood late-verdict timing flake). They were fixed and re-verified, and the agent was redeployed. The deploy gate is "0 failed" read
+from the suite file.
+**Probes (labelled), web, 10:**
+- 9 correct (incl. Python 3.13.16, PG 18.6 + 19 beta 4, a false premise caught, an honest "nothing new");
+- Radahn came back UNCERTAIN, not REFUTED;
+- W7 partial: answered from memory without searching;
+- 8 of 10 cited a source.
+**Probes (labelled), dark web, 4:**
+- **D3 Ahmia:** right (read from clearnet ahmia.fi).
+- **D4 Tor Project:** right.
+- **D1 BBC:** right address and title, but the reply OPENED with "⚠️ Correction to my previous answer: … the browser
+  failed, no title was retrieved". That correction was queued by the earlier run of the same probe: an identical first
+  message gives the same conversation fingerprint.
+  - Fix: a correction surfaces only in a thread that already contains an assistant answer; otherwise it stays queued
+    and the owner notice carries it.
+- **D2 DuckDuckGo, run 1:** a lookalike onion titled "Hello! Looking for the Hidden Wiki?" was reported as official.
+  - Fix: the official-onion clause in 4b.
+- **D2, run 2 (new build):** the retired 16-character v2 address `3g2upl4pq6kufc4m.onion` was reported as "official v3".
+  - Three onions failed once each, so the reply said "Tor's SOCKS proxy is failing for all .onion addresses" and tried
+    `manage_services restart tor` (refused: no such service).
+  - The verifier escalation CONFIRMED that answer.
+  - Fixes: `host_memo._retired_onion_notice` refuses a v2 address before dialling. `ONION_FIRST_FAILURE_HINT`: the
+    first ERR_SOCKS_CONNECTION_FAILED on an onion says the service is offline or the address is wrong, NOT Tor; the
+    dead-onion notice said so only from the second failure of the same host.
+  - Battery bat27: 8/8 after one survivor (a clearnet host with a 16-char label was not pinned → pinned). NOOP
+    survives, tree pristine.
+  - Full suite 27,887 passed, 0 failed. Deployed (gated, graceful, one process).
+- **D2, run 3 (reworded first message):** RIGHT. `duckduckgogg42…zczad.onion`, title "DuckDuckGo - Protection.
+  Privacy. Peace of mind." read from the loaded page; the clone was rejected and the v2 address named as retired.
+  184 s.
+**Open:**
+- the verifier cannot judge onion addresses: it CONFIRMED a wrong one;
+- the reply can open with progress narration ("Let me find the official one…").
+**Deferred (for the operator):** search hedge race at 6 s; strip invented URLs at finalize; verify members' research
+turns; near-duplicate search cache; demote the torch engine; store full tool results.
+
+## §4LH — the §4LG open and deferred items (2026-10-04, operator: "fix the open items , follow your recommendations")
+**Fixes (8):**
+1. **Verifier onion check** (`Verifier._guard_onion_claims`, `core/link_grounding.onion_claim_issues`, also on the
+   claim-binding primary arm). It flags:
+   - an onion address of an impossible length or with a non-base32 character;
+   - a v3 address no evidence holds;
+   - in a Latin-script reply only, a v2 address presented as current.
+   A CONFIRMED becomes UNCERTAIN ≤0.5, with the other fields kept. `GHOST_VERIFY_ONION_GUARD`.
+2. **Link grounding at finalize** on research turns (`link_grounding.ground_links`). It removes:
+   - a clearnet URL with a path, or a v3 onion, found nowhere in the conversation's tool results, tool arguments,
+     user/system text or EARLIER answers;
+   - a garbled onion.
+   Never touched: bare domains, clearnet URLs in code, v2 addresses. A markdown link or image keeps its label, a bare
+   URL keeps its domain, and one italic line counts the removals (stripped by `strip_system_notes`).
+   `GHOST_LINK_GROUNDING`.
+3. **Pre-tool narration.** Text written beside a batch of research/lookup calls is recorded
+   (`context._pre_tool_segments`). Finalize and the in-loop judged view drop it as whole paragraphs ≤400 chars;
+   text beside bookkeeping calls is kept. `GHOST_DROP_PRE_TOOL_TEXT`.
+4. **Search hedge.** At 6 s with no winner, yandex+brave are raced again on fresh circuits inside the wave, with
+   their timeout cut so a no-winner wave still ends at ~12 s. `GHOST_SEARCH_HEDGE_S`.
+5. **Members' web research is verified** (`_member_research_turn`: only web_search/darkweb_search ran). It runs
+   after the reply with:
+   - no owner project constraints in the judge's view;
+   - the visual arm off for members;
+   - a correction bound by `_reply_tag` to the answer it corrects;
+   - in async mode only.
+   `GHOST_VERIFY_MEMBER_RESEARCH`.
+6. **Cache key.** The search cache key is the sorted word set, except queries with an order word
+   (to/from/vs/before/after/than, σε/από/προς); a leading "." is kept.
+7. **Torch is a fallback tier.** It is asked only when the others found <5 onions, with a 12 s deadline.
+   `GHOST_ONION_FALLBACK_TIER`.
+8. **Full tool results sidecar.** Results over the row's 4,000 chars go to `system/trajectory_results/<row
+   day>/session-*.jsonl` (≤200k each, same redaction except onions, memory freed after writing).
+   `scripts/scrub_secrets.py` covers it. `GHOST_TRAJ_FULL_RESULTS`.
+**Fresh review (2 readers):**
+- **CRIT:** the verifier's visual arm, never member-gated, resolved image names from a member's web results into
+  the OWNER's sandbox, and its issues would reach the member's thread → gated.
+- **MAJOR:**
+  - the pre-tool drop deleted an answer written beside a `remember` call, and cut the first occurrence even inside
+    the answer → lookup batches only, whole paragraphs;
+  - grounding removed legitimate links (earlier answers, percent-encoding, `#fragment`, `…`/`。`) → fixed;
+  - the v2 check was English-only → abstains on non-Latin replies;
+  - the hedge ran a no-winner wave to 16 s → hedge timeout trimmed;
+  - torch as fallback ran a second 38 s deadline after the first wave → 12 s cap.
+- **MINOR:**
+  - two members' threads sharing a first message shared a correction tag → `_reply_tag`;
+  - order-carrying queries shared a cache key → order words;
+  - the sidecar was not in scrub_secrets, landed in the wrong day folder, and held its memory → all fixed;
+  - garbled onions of a wrong length were invisible → caught;
+  - URLs in code and image markup were damaged → fixed.
+**Verification:**
+- test_4lh_open_items.py (60), plus 3 old pins updated: `test_verifier_auto_repair`'s narration test opts out of
+  the drop, and the preamble test is unchanged because its tool is not a lookup.
+- Battery bat28: 40/40 after 7 survivors were pinned (incl. a sync-mode member path where the gate is the only
+  thing that keeps the reply from waiting). NOOP survives, tree pristine, tree == src.
+- Full suite 1: 1 failure. MY note regex (`\n*` leading) was quadratic on 100k newlines (3.2 s) — the same defect
+  the neighbouring regex's comment documents → anchored on the literal, plus a linearity test and a battery mutant.
+- Full suite 2: 27,948 passed, 0 failed. Deployed (gated, graceful, one process).
+**Probes (labelled):**
+- **L1** Python 3.13.16 + release-page link from the results ✔.
+- **L2** Tor Project onion + title ✔ (read via onion.torproject.org).
+- **L3** DuckDuckGo onion + title ✔; the log shows "dropped text written alongside tool calls: 1021 → 515", and the
+  reply opens with the answer.
+- **M1** member research: reply in 19 s, then LATE CONFIRMED (verified after the reply, no wait).
+- No link was removed and no hedge fired (yandex won in 1–3 s).
+**Docs:** agent §4lh, verifier §4lh, search §4lh, darkweb_search §4lh, configuration (the §4LH knobs plus the §4LG
+ones that were never listed there).
+
+## §4LI — final fresh-eye review of §4LB–§4LH (2026-10-04, operator: "verify all your changes using fresh eye reviewers")
+**Review:** 5 readers who did not write the code, each read-only on copies. The scopes:
+1. §4LH final code (member data wall);
+2. search, browser, torch, sidecar;
+3. §4LG verifier and corrections;
+4. §4LD–§4LF;
+5. §4LB–§4LC.
+
+Found 2 CRIT-class, 15 MAJOR and ~25 MINOR; most were reproduced with scripts (`tmp/rev_final_1..5/`).
+**Fixed (CRIT):** on a member's research turn, the verifier's FILE-ARTIFACT arm looked up a file name from the
+member's reply in the OWNER's sandbox, so "claimed but empty: salary_review.md" told the member that the owner's file
+exists. Now every sandbox-reading arm is off for members: early visual, visual, WEB-EXEC, FILE-ARTIFACT. (The second
+CRIT, the visual arm, was found and fixed in §4LH.)
+**Fixed (MAJOR):**
+- *Address egress* (§4LB):
+  - natural Greek ("αριθμός 83"), "Macedonias", "Nr./#", street and number apart (in one argument or several),
+    full-width, zero-width and Cyrillic letters, and "8 3" went out → the fold does NFKC, drops Cf, maps
+    confusables and c→k; "dh?" is tolerated; number words are allowed; a call-level rule scrubs a street stem plus
+    its number anywhere in one call;
+  - `execute` URLs went out (the sandbox has Tor egress) → `url_literals` policy;
+  - an address under `home`/`residence`/`lives_at`/`homeAddress`/`addr`/`domicile`/`location`, or any value that
+    reads as a street address, was in every prompt and unscrubbed → widened key regex plus value-based detection
+    (live profile copy: no field newly hidden);
+  - the postcode stays scrubbed alone (the §4LB pin) and is never touched inside an identifier (arXiv, issues/,
+    v1.13676), including "136-76" and "GR-13676".
+- *Lessons* (§4LC):
+  - tombstones read only `.jsonl.1` → every rotation, probed by number (the symlink lint forbids a glob);
+  - t-a→t-b→t-c, retract t-b then t-c restored t-b's refuted text → the retraction drops a `previous_version`
+    written by the retracted turn;
+  - the snapshot took the post-bump frequency → fixed.
+- *Verifier* (§4LG): the memory-refute guard, replayed over the recorded refutes, fired once and wrongly ("stork,
+  not pelican") and missed its own Radahn case → OFF by default (a lexical proxy; not patched further).
+- *Owner notices* (§4LG): a streamed probe's late correction notified the owner (the drain restores the id, not the
+  origin) → gated on `turn_origin`.
+- *Search/browser* (§4LG/§4LH): the dead-host memo banned whole sites on a 404 (29 of 142 strikes), a selector
+  timeout, a slow localhost dev server, or a "403" inside a URL → strikes only on site-level blocks (403/429/bot
+  challenge) and NAVIGATION failures; private/loopback hosts excluded; host:port key; timeouts kept 1 h.
+- *Narration* (§4LH): the drop deleted "The capital is Canberra." written beside a confirming search → dropped only
+  when ≥200 chars remain.
+- *Corrections* (§4LH): member refutes evicted the owner's queued correction → separate caps per side.
+- *Quiet hours* (§4LF):
+  - five tests failed when the suite ran at night → off in `tests/conftest.py`;
+  - owner-asked notices (notify tool, "notify me when done", finished jobs, late corrections, scheduled results)
+    and anything while the owner was active in the last 30 min are no longer held.
+- *Notify fallback* (§4LD): a "notify me" was lost when the turn only mentioned a job id → the fallback defers
+  only when a finish notice was ARMED.
+- *Tasks* (§4LD): a scheduled run could stop the owner's tasks one by one → `stop` refused too.
+**Fixed (MINOR):**
+- the read-only façade blocks any mutating-verb name, so every unlisted writer is blocked;
+- forget searches `previous_version`;
+- the word-set cache key is REVERTED (0.7% gain, merged "israel attacks iran" / "iran attacks israel");
+- a cut torch is recorded by the breaker (`utils.aio.wait_for`);
+- the sidecar `truncated` flag works;
+- the reading-order test asserts the fetch;
+- `fact_check` is not a claim-binding source;
+- link grounding: paren URLs, label==url, `&amp;`, onion substrings, >62-char labels, grammar, the note line found
+  anywhere;
+- `_reply_tag` survives Slack's banner markup; channel threads are bound like members; TTL pruning on fresh chats;
+- watch ids, internal jobs excluded from MAX_TASKS, cooldown overflow, the scheduled turn's workspace project
+  override reset;
+- the narratives persist their input key only for model-written text; postmortem FIFO touch;
+- `_no_verdict_reason` for member turns; stale comments; `scrub_secrets.py` covers the sidecar.
+**MISTAKE:** I changed self-play's planner force, but it is an OPERATOR decision (2026-08-08, re-noted in §4LF).
+The full suite caught the pinned test → reverted. Put to the operator below.
+**Not fixed, stated:**
+- link grounding cannot run on STREAMED replies (documented; the onion check covers those late);
+- deliberate obfuscation (base64, double-encoding, spelled numbers) is out of scope;
+- shutdown budget > launchd's 20 s (held: ExitTimeOut);
+- the swarm cap across calls;
+- `fs_batch` ignores `GHOST_EXPERIMENTS` (moot while disabled);
+- the push-path quiet hours (not configured live);
+- the turn's trajectory id inherited by tasks spawned in a turn (latent, no writer; needs py3.11 task context).
+**Verification:**
+- `tests/test_4li_final_review.py` (69), plus updated pins in 4LB/4LG/4LH/4LF tests;
+- battery bat29: 61 mutants → 17 survived run 1 (tests written after the tree was built). Two were equivalent
+  branches (a duplicate block check, an unreachable `OverflowError`) → REMOVED, not kept unfalsifiable; one
+  redundant probe-id check removed; the rest pinned → every remaining non-NOOP mutant killed, NOOP survives,
+  KNOWN-BAD killed, tree pristine, tree == src;
+- full suite 1: 1 failed (the operator-decision pin) → reverted;
+- full suite 2: 28,026 passed, 0 failed.
+
+Deployed (gated, graceful, one process). Docs: profile, skills, readonly, autonomous_activity, browser, search,
+darkweb_search, verifier, agent (#4li), configuration (guard default, GHOST_QUIET_HOURS). Two pages
+(skills, verifier) had sections outside `<main>`; agent.html's §4KD too → `</main>` moved to the end.
+**Probes (labelled) + one more fix:**
+- **N1 (owner, Node.js LTS):** the answer was right, but link grounding removed `…/releases/tag/v24.21.0` and
+  "Release notes: github.com" shipped. The agent had read `github.com/nodejs/node/releases` and BUILT the tag link
+  from it: very likely real, but in no text read. Fix (`link_grounding._seen_prefix` / `_extends_a_seen_page`):
+  - a link that extends a page read is kept when at least one added segment, and every segment with a digit,
+    appears in what was read;
+  - a removed bare URL falls back to the nearest page read, not the bare domain.
+  Battery bat30: 6/6 after one survivor was pinned (a "tag" word present in the text read). Full suite 28,033
+  passed, 0 failed. Redeployed (gated, one process).
+- **N1b (reworded):** right (v24.21.0, nodejs.org release-notes link, both pages actually opened). Nothing removed.
+- **M2 (member, JWST):** right, 18 s. The 6 s hedge fired live ("no winner after 6s — hedging yandex+brave") and
+  won at 10.6 s; then verified after the reply (LATE CONFIRMED).
+**For the operator:**
+- (a) self-play still forces the planner on while `use_planning` is concluded to control — keep (2026-08-08
+  decision) or follow the registry?
+- (b) launchd ExitTimeOut for the >20 s worst-case shutdown (held since §4LD).
+
+## §4LJ — the two operator decisions after §4LI (2026-10-04, operator: "1. follow experiment settings 2. yes")
+1. **Self-play follows the experiment settings.** The 2026-08-08 rule "self-play always runs the planner" now holds
+   only while `use_planning` is enabled in the registry (`agent._self_play_planner_forced`; an unreadable registry
+   means off). With it concluded to control (§4LF), self-play runs without the planner, like production turns.
+   - The §4N source pin is amended to keep only the selfplay-budget keying.
+   - The behaviour is pinned at the call site in test_4li_final_review.py (the recorded `use_planning_fired` of a
+     self-play turn follows the registry) plus the error case.
+   - Battery bat31 3/3 after one survivor (registry error → forced) was pinned.
+2. **launchd ExitTimeOut = 60 s.** The worst-case shutdown estimated by the §4LI review is ~36 s; the default
+   killed sooner.
+   - `/Library/LaunchDaemons/com.local.ghost-agent.plist` gained `ExitTimeOut 60`. Backup:
+     `~/Data/AI/bin/com.local.ghost-agent.plist.pre-4li`.
+   - The key is read only when the job is loaded, so it was reloaded ONCE:
+     1. gate on foreground 0;
+     2. graceful `launchctl kill SIGTERM` (old pid gone in 7 s, "shutdown complete" logged);
+     3. `bootout` of the freshly booting replacement (nothing to drain), then `bootstrap`.
+   - Verified: `launchctl print` shows `exit timeout = 60`, one agent, health OK, "system ready" stable.
+**Verification:** full suite 28,036 passed, 0 failed, before the deploy.

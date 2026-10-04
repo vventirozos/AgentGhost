@@ -121,14 +121,14 @@ class TestPendingCorrectionScoping:
         # A correction whose recorded conv fingerprint is "" must NOT wildcard
         # into whatever conversation happens to be next (fail-safe drop).
         agent = self._agent([{"note": "stale", "conv": "", "ts": time.monotonic()}])
-        msgs = [{"role": "user", "content": "an unrelated question"}]
+        msgs = [{"role": "user", "content": "an unrelated question"}, {"role": "assistant", "content": "earlier answer"}, {"role": "user", "content": "next"}]
         agent._consume_pending_corrections(msgs, conv_fp="fpA")
         assert agent._correction_active_this_turn is False
         assert agent._take_active_correction() == ""
 
     def test_matching_conv_surfaces(self):
         agent = self._agent([{"note": "that was wrong", "conv": "fpA", "ts": time.monotonic()}])
-        msgs = [{"role": "user", "content": "hello"}]
+        msgs = [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "earlier answer"}, {"role": "user", "content": "next"}]
         agent._consume_pending_corrections(msgs, conv_fp="fpA")
         assert agent._correction_active_this_turn is True
         assert "that was wrong" in agent._take_active_correction()
@@ -138,7 +138,7 @@ class TestPendingCorrectionScoping:
         # what matches — NOT a fingerprint recomputed from these messages. This
         # is the fix for corrections lost when pruning changed the opener.
         corr = [{"note": "correction", "conv": "fpA", "ts": time.monotonic()}]
-        msgs = [{"role": "user", "content": "totally different opener"}]
+        msgs = [{"role": "user", "content": "totally different opener"}, {"role": "assistant", "content": "earlier answer"}, {"role": "user", "content": "next"}]
         # message's own fingerprint is definitely not "fpA"
         assert agent_mod.GhostAgent._conversation_fingerprint(
             GhostAgent.__new__(GhostAgent), msgs) != "fpA"
@@ -153,7 +153,7 @@ class TestPendingCorrectionScoping:
 
     def test_nonmatching_conv_held_in_queue(self):
         agent = self._agent([{"note": "other conv", "conv": "fpB", "ts": time.monotonic()}])
-        msgs = [{"role": "user", "content": "hi"}]
+        msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "earlier answer"}, {"role": "user", "content": "next"}]
         agent._consume_pending_corrections(msgs, conv_fp="fpA")
         assert agent._correction_active_this_turn is False
         # still queued for its own conversation
@@ -202,4 +202,4 @@ class TestSourcePins:
         assert "getattr(_lc, 'foreground_requests', 0) > 0" in self.src
 
     def test_dream_eligibility_get_is_guarded(self):
-        assert "dream eligibility get() failed" in self.src
+        assert '_idle_phase_failed(self, _idle_ran, "dream-eligibility", _cgx)' in self.src   # §4LD: WARNING, rate-limited

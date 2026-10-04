@@ -88,7 +88,6 @@
     "unused-import|src/ghost_agent/memory/competence.py|Unused Iterable imported from typing": 1,
     "unused-import|src/ghost_agent/memory/competence.py|Unused List imported from typing": 1,
     "unused-import|src/ghost_agent/memory/competence.py|Unused field imported from dataclasses": 1,
-    "unused-import|src/ghost_agent/memory/episodes.py|Unused import os": 1,
     "unused-import|src/ghost_agent/memory/scratchpad.py|Unused import os": 1,
     "unused-import|src/ghost_agent/optim/run_gepa.py|Unused import dspy": 1,
     "unused-import|src/ghost_agent/optim/signatures.py|Unused Optional imported from typing": 1,

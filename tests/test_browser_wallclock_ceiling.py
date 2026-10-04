@@ -325,6 +325,7 @@ async def test_the_commit_milestone_retry_also_shares_the_deadline(tmp_path, mon
     Fails in the pre-fix world, where the retry restarted from
     `subprocess_timeout`.
     """
+    monkeypatch.setenv("GHOST_BROWSER_COMMIT_RETRY", "1")      # §4LG: the retry is opt-in now
     monkeypatch.delenv("GHOST_BROWSER_WALLCLOCK_S", raising=False)
     stub = _stub()
     calls = {"n": 0}

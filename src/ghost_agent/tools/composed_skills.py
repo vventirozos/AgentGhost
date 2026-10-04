@@ -1127,8 +1127,11 @@ class ComposedSkillRegistry:
                         f"To RUN it, CALL THIS TOOL DIRECTLY by name with its "
                         f"inputs — do NOT define/re-create it and do NOT plan a "
                         f"manage_composed_skills call to run it. "
-                        f"({len(skill.steps)} steps; "
-                        f"used {skill.usage_count}x with {skill.success_rate:.0%} success)"
+                        # §4LE: no live counters here — "used 3x with 33%
+                        # success" changed on every use and re-prefilled the
+                        # whole conversation behind the tool block; the
+                        # counts stay in manage_composed_skills(action='list')
+                        f"({len(skill.steps)} steps)"
                     ),
                     "parameters": schema,
                 }

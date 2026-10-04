@@ -31,10 +31,41 @@ STORE_FILENAME = "auto_skills.json"
 MAX_SKILLS = 60
 
 
+#: words that say nothing about the TASK (§4LC: "the"/"you"/"what" matched
+#: every English sentence, so past requests rode 40/40 owner turns)
+_STOP = frozenset("""
+the and for you your what how why who when where which with this that these those from into about
+can could would should will please tell show give make get let want need like just also then than
+are was were has have had does did not but all any some our out its it's i'm im me my mine yes no
+hi hello hey thanks thank ok okay now new use using one two kai gia apo sto sti stin ston tou tis
+ton tin ta na ti pos pou poio poia poios einai exo eimai mou mas sou sas den tha me se
+""".split())
+
+#: a past request older than this since it was last re-verified is not
+#: surfaced (§4LC: an entry left only on overflow; one unverified since
+#: 09-24 still rode every turn)
+STALE_AFTER_DAYS = 14
+
+
 def _tokens(text: str) -> set:
-    """Word tokens longer than two characters — short filler words
-    ("a", "of", "to") would otherwise create spurious keyword overlap."""
-    return {t for t in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(t) > 2}
+    """Content-word tokens of ``text``: case- and accent-folded, Greek
+    transliterated (one script for both sides — §4LC: a Greek query had no
+    `[a-z0-9]` token and got the top 3 regardless), stop-words dropped."""
+    from ..memory.egress import fold
+    folded = fold(text or "")[0]
+    return {t for t in re.findall(r"[a-z0-9]+", folded) if len(t) > 2 and t not in _STOP}
+
+
+def minable_requests(trajectories):
+    """The trajectories past requests may be mined from: real requests only
+    (`core.admissibility`, consumer "auto_skill_extraction"). §4LC: probe,
+    reflection and bench turns were mined, and their verbatim text
+    ("DISPATCH-OK-77") rode owner prompts as examples."""
+    from ..core.admissibility import admitted_task_kinds
+    kinds = set(admitted_task_kinds("auto_skill_extraction"))
+    for t in trajectories or []:
+        if str(getattr(t, "task_kind", "") or "user_request") in kinds:
+            yield t
 
 
 class GraduatedSkillStore:
@@ -107,6 +138,14 @@ class GraduatedSkillStore:
             data = self._load()
             existing = data.get(sig)
             if existing:
+                # §4LF: only NEW EVIDENCE is a verification. Every idle run
+                # re-graduated every skill on the unchanged corpus (950
+                # "verifications" on one), which also refreshed
+                # `last_verified_at` and so disabled the 14-day staleness rule
+                _new_support = int(getattr(candidate, "support", 0)) > int(existing.get("support", 0))
+                _new_conf = round(conf, 4) != round(float(existing.get("confidence", 0.0) or 0.0), 4)
+                if not (_new_support or _new_conf):
+                    return existing
                 existing["support"] = max(
                     int(existing.get("support", 0)),
                     int(getattr(candidate, "support", 0)),
@@ -260,30 +299,44 @@ class GraduatedSkillStore:
         with self._lock:
             return len(self._load())
 
+    #: content words a query must share with a skill's examples/cluster
+    MIN_OVERLAP = 2
+
     def relevant(self, query: str, *, limit: int = 3) -> List[dict]:
-        """Graduated skills relevant to ``query`` — keyword overlap on
-        trigger examples + cluster + tool names. Falls back to the
-        highest-confidence skills when the query matches nothing."""
-        skills = self.all_skills()
+        """Graduated skills relevant to ``query``: at least
+        ``MIN_OVERLAP`` content words shared with the trigger examples or
+        cluster (tool names do not count — "file" matched every
+        file_system skill), re-verified within ``STALE_AFTER_DAYS``.
+        NOTHING when the query has no content word: the old fallback
+        surfaced the top 3 on every Greek turn."""
+        skills = [s for s in self.all_skills() if not self._stale(s)]
         if not skills:
             return []
         q = _tokens(query)
         if not q:
-            return skills[:limit]
+            return []
         scored = []
         for s in skills:
             hay = _tokens(
                 " ".join(s.get("trigger_examples", []))
                 + " " + str(s.get("cluster") or "")
-                + " " + " ".join(s.get("tool_sequence", []))
             )
             overlap = len(q & hay)
-            if overlap > 0:
+            if overlap >= self.MIN_OVERLAP:
                 scored.append((overlap, s.get("confidence", 0.0), s))
         if not scored:
             return []
         scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
         return [s for _, _, s in scored[:limit]]
+
+    @staticmethod
+    def _stale(entry: dict) -> bool:
+        ts = str(entry.get("last_verified_at") or entry.get("graduated_at") or "")
+        try:
+            when = datetime.fromisoformat(ts.rstrip("Z"))
+        except ValueError:
+            return True
+        return (datetime.utcnow() - when).total_seconds() > STALE_AFTER_DAYS * 86400
 
     def surfaced_for_prompt(self, *, query: Optional[str] = None,
                             limit: int = 3):
@@ -301,7 +354,8 @@ class GraduatedSkillStore:
         formatter and the hashes cannot drift from the block that listed
         them.
         """
-        skills = self.relevant(query, limit=limit) if query else self.all_skills()[:limit]
+        skills = (self.relevant(query, limit=limit) if query
+                  else [e for e in self.all_skills() if not self._stale(e)][:limit])
         if not skills:
             return "", []
         hashes = [str(s.get("signature_hash") or "") for s in skills
@@ -327,7 +381,7 @@ class GraduatedSkillStore:
                 line += f' (e.g. for: "{trig}")'
             lines.append(line)
         lines.append(
-            "Reuse a proven sequence when the current task matches — it is "
-            "validated, not speculative."
+            "These sequences recurred in your past successful runs; reuse one only "
+            "when the current task is genuinely the same kind of task."
         )
         return "\n".join(lines)

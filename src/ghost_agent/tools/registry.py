@@ -33,6 +33,7 @@ from .workspace import tool_workspace
 from .workspace_track import tool_workspace_track
 from .uncertainty_tool import tool_flag_uncertainty
 
+import contextvars
 import json
 import logging
 import os
@@ -124,9 +125,8 @@ _SKILL_ROUTING_MIN_SKILLS = 25
 # experiment the control arm renders baselines and the treatment arm renders
 # the artifact, so the tool block has TWO shapes (measured h=2cc89490 vs
 # h=97c93458) and `warm_up_main_prefix` warms the treatment one — control
-# requests miss the warmed prefix and pay a re-prefill. That is the same
-# cost the already-live `fs_batch` arm carries, and it is the price of a
-# causal answer; it is stated here rather than left to contradict the
+# requests miss the warmed prefix and pay a re-prefill — the price of a
+# causal answer (`fs_batch` no longer pays it: §4LE warms both its heads); it is stated here rather than left to contradict the
 # paragraph above. With no experiment registered (today's state) nothing
 # changes.
 # --------------------------------------------------------------------------
@@ -1051,8 +1051,6 @@ TOOL_DEFINITIONS.append({
     },
 })
 
-_NON_CODING_DROP_TOOLS = frozenset({"postgres_admin"})
-_NON_VISION_DROP_TOOLS = frozenset({"vision_analysis"})
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1105,6 +1103,22 @@ _FS_BATCH_DESC_SUFFIX = (
 )
 
 
+#: §4LE: the prefix warmup primes BOTH arms' heads. It runs as "SYSTEM", which
+#: has no arm, so it only ever warmed control — and the treatment schema sits
+#: before the first checkpoint: 4 of 15 treatment owner turns re-prefilled
+#: ~31.6k tokens (~35 s) cold, a latency penalty that also skewed the A/B.
+FS_BATCH_WARM_ARM = contextvars.ContextVar("fs_batch_warm_arm", default=None)
+
+
+def fs_batch_experiment_live(context) -> bool:
+    try:
+        from ..core.experiments import load_registry, registry_path_for_context
+        spec = load_registry(registry_path_for_context(context)).specs.get("fs_batch")
+        return bool(spec and spec.enabled and float(spec.traffic or 0) > 0)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _fs_batch_active(context) -> bool:
     """Is THIS request in the `fs_batch` treatment arm?
 
@@ -1114,6 +1128,9 @@ def _fs_batch_active(context) -> bool:
     as treatment. Never raises — a broken experiment framework must degrade
     to the incumbent tool, not to a failed turn.
     """
+    forced = FS_BATCH_WARM_ARM.get()
+    if forced is not None:
+        return bool(forced)
     try:
         from ..core.experiments import TREATMENT, arm_for
         from ..utils.logging import request_id_context
@@ -1547,6 +1564,29 @@ def get_active_tool_definitions(context, query: str = None, *,
 # Pinned deleted in tests/test_4fx_tool_head_diet_retired.py.
 
 
+from ..memory.egress import OUTBOUND_TOOLS, egress_profile, scrub_tool_args, with_privacy_note  # noqa: E402
+
+_ISOLATED_RECALL_REFUSAL = ("recall is not available here: a delegated task has no access to the owner's "
+                            "memory (§4LB). Work from the task text and your own tool results.")
+
+
+def _egress_scrubbed(name, fn, context):
+    """``fn`` with the owner's street address replaced in its outbound
+    arguments (`memory.egress`). Synchronous, returning whatever ``fn``
+    returns (a coroutine for the async tools), so every caller keeps the
+    calling contract it had."""
+
+    def _run(**kwargs):
+        new, changed = scrub_tool_args(name, kwargs, context)
+        if not changed:
+            return fn(**new)
+        area = egress_profile(context).egress_scrubber()[1]
+        pretty_log("Privacy", f"{name}: the owner's street address was replaced by {area}", icon=Icons.WARN)
+        return with_privacy_note(fn(**new), area)
+    _run.__wrapped__ = fn
+    return _run
+
+
 def get_available_tools(context):
     from .memory import (
         tool_dream_mode,
@@ -1668,8 +1708,9 @@ def get_available_tools(context):
         "delegate": lambda **kwargs: tool_delegate(context=context, **kwargs),
         "jobs": lambda **kwargs: tool_jobs(context=context, **kwargs),
         "notify_operator": lambda **kwargs: tool_notify_operator(context=context, **kwargs),
-        "knowledge_base": lambda **kwargs: tool_knowledge_base(sandbox_dir=_proj_ws()[0], tor_proxy=context.tor_proxy, memory_system=context.memory_system, profile_memory=context.profile_memory, graph_memory=getattr(context, "graph_memory", None), llm_client=context.llm_client, model_name=getattr(context.args, "model", "default"), memory_bus=getattr(context, "memory_bus", None), episodic_memory=getattr(context, "episodic_memory", None), session_store=getattr(context, "session_store", None), project_store=getattr(context, "project_store", None), **kwargs),
-        "recall": lambda **kwargs: tool_recall(memory_system=context.memory_system, graph_memory=getattr(context, "graph_memory", None), **kwargs),
+        "knowledge_base": lambda **kwargs: tool_knowledge_base(sandbox_dir=_proj_ws()[0], tor_proxy=context.tor_proxy, memory_system=context.memory_system, profile_memory=context.profile_memory, graph_memory=getattr(context, "graph_memory", None), llm_client=context.llm_client, model_name=getattr(context.args, "model", "default"), memory_bus=getattr(context, "memory_bus", None), episodic_memory=getattr(context, "episodic_memory", None), session_store=getattr(context, "session_store", None), project_store=getattr(context, "project_store", None), skill_memory=getattr(context, "skill_memory", None), **kwargs),
+        "recall": lambda **kwargs: (_ISOLATED_RECALL_REFUSAL if getattr(context, "owner_memory_isolated", False) is True
+                                    else tool_recall(memory_system=context.memory_system, graph_memory=getattr(context, "graph_memory", None), **kwargs)),
         "execute": _run_execute,
         "browser": _run_browser,
         "learn_skill": lambda **kwargs: tool_learn_skill(skill_memory=context.skill_memory, memory_system=context.memory_system, memory_bus=getattr(context, "memory_bus", None), **kwargs),
@@ -1713,6 +1754,13 @@ def get_available_tools(context):
     
     from .vision import tool_vision_analysis
     tools["vision_analysis"] = lambda **kwargs: tool_vision_analysis(llm_client=context.llm_client, sandbox_dir=_proj_ws()[0], tor_proxy=context.tor_proxy, **kwargs)
+
+    # §4LB r2: the owner's street address is scrubbed at the TOOL boundary
+    # too — composed-skill macros and delegates call these callables
+    # directly, never through the dispatch hook
+    for _name in OUTBOUND_TOOLS:
+        if _name in tools:
+            tools[_name] = _egress_scrubbed(_name, tools[_name], context)
 
     from .report_pdf import tool_generate_pdf
     tools["report_pdf"] = lambda **kwargs: tool_generate_pdf(sandbox_dir=_proj_ws()[0], **kwargs)

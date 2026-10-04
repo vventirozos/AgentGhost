@@ -140,6 +140,62 @@ class TrajectoryCollector:
             logger.warning("trajectory append failed: %s", e)
             return None
 
+    # -----------------------------------------------------------------
+    # Full tool results (§4LH sidecar)
+    # -----------------------------------------------------------------
+
+    #: A trajectory row keeps 4,000 chars per tool result; every browser
+    #: result in the §4LG grounding audit hit that cap, so a reply's facts
+    #: could not be checked against the page it read. The longer ones are
+    #: written here, beside (NOT under) the trajectory root — readers glob
+    #: ``*.jsonl`` recursively there. Same redaction as the row, except
+    #: onion addresses: they are public service names, and redacting them
+    #: made every dark-web claim impossible to check afterwards.
+    FULL_RESULT_MAX = 200_000
+
+    def results_path(self, ts: datetime.datetime, day: Optional[str] = None) -> Path:
+        return (self.root.parent / "trajectory_results" / (day or ts.strftime("%Y-%m-%d"))
+                / f"session-{self.session_id}.jsonl")
+
+    def append_full_results(self, traj: Trajectory, row_path: Optional[Path] = None) -> int:
+        """Write the full text of every tool result the row truncated, in
+        the row's own day folder when ``row_path`` is given. The in-memory
+        copies are released afterwards (the trajectory object can outlive
+        the turn in a correction cache). Returns the number of rows written.
+        Never raises; ``GHOST_TRAJ_FULL_RESULTS=0`` disables."""
+        if not self.enabled or os.getenv("GHOST_TRAJ_FULL_RESULTS", "1") == "0":
+            return 0
+        try:
+            from .redact import redact_text
+            cfg = RedactionConfig(
+                disabled_rules=tuple(self.redaction.disabled_rules) + ("tor_onion",),
+                extra_rules=list(self.redaction.extra_rules))
+            rows = []
+            for i, tc in enumerate(traj.tool_calls):
+                full = getattr(tc, "full_result", "") or ""
+                if len(full) <= len(tc.result or ""):
+                    continue
+                rows.append(json.dumps({
+                    "trajectory_id": traj.id, "index": i, "name": tc.name,
+                    "chars": len(full), "truncated": len(full) > self.FULL_RESULT_MAX,
+                    "result": redact_text(full[: self.FULL_RESULT_MAX], cfg),
+                }, ensure_ascii=False))
+            for tc in traj.tool_calls:
+                if getattr(tc, "full_result", ""):
+                    tc.full_result = ""
+            if not rows:
+                return 0
+            path = self.results_path(datetime.datetime.utcnow(),
+                                     day=Path(row_path).parent.name if row_path else None)
+            with self._lock:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as f:
+                    f.write("\n".join(rows) + "\n")
+            return len(rows)
+        except Exception as e:  # noqa: BLE001 — secondary to the turn
+            logger.warning("full tool results append failed: %s", e)
+            return 0
+
     def append_many(self, trajs: Iterable[Trajectory]) -> int:
         """Batch append; returns the number successfully written."""
         n = 0

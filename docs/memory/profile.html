@@ -155,6 +155,55 @@ Value := str                      # LEGACY — as_of unknown
   HAS_LOCATION beside the new, a list item's row replaced by the next item's.</p>
   <p>The extractor writes an owner-stated <code>profile_update</code> on its own, independent of the fact's score ("remember that
   I moved" never reached the profile); <code>drop_previous</code> uses the canonical field map.</p>
+  <h2 id="4lb">What every prompt carries <span class="tag">2026-10-03 &sect;4LB</span></h2>
+  <p>Measured over 40 owner turns: the profile was relevant to 4 and used by none, yet carried the street address and a
+  physical description every time — and the model wrote "Makedonias 83" into Tor web searches. Now:</p>
+  <ul>
+    <li><strong>On request only:</strong> <code>root.address</code>, every <code>*_description</code>, and any
+    address-like key (<code>address</code>, <code>street</code>, <code>postcode</code>, <code>zip</code> in the key name —
+    the model chooses keys, and <code>root.home_address</code> was rendered) are left out of the prompt and NAMED at the end
+    ("on request only — recall them when the task needs them, never put them in a web search"). The owner extends the list
+    in <code>profile_prompt_policy.json</code> (<code>{"on_demand": [...]}</code>). The model reaches them through
+    <code>recall</code> (the identity mirror rows).</li>
+    <li><strong>Egress (r2, <code>memory/egress.py</code>):</strong> one detector for every outbound path — the dispatch
+    hook AND the tool callables themselves (a composed-skill macro or a delegate calls them directly). It folds the text
+    (lower case, accents off, Greek transliterated, URL-decoded; a JSON string is parsed, so \u-escaped Greek is seen) and
+    matches the street + house number in either order, with "street/st/odos" between and the street by its stem
+    (Μακεδονίας / Makedonias), the number bounded (83 ≠ 830; 83A is 83), and the postcode with or without the Greek space.
+    The match is replaced, in the text as written, by the address's SUBURB (<code>egress.locality</code>: the address
+    without street, number and postcode — "Thrakomakedones"), else the owner's city, else "nearby". Operator 2026-10-03:
+    with "Athens" the live probe searched the wrong suburb. The model is TOLD: a rewritten call's result ends with
+    <code>egress.privacy_note</code> ("[privacy: … replaced by its area, 'Thrakomakedones' … search there]") — appended,
+    never in front, because a result's head is parsed (an "Error:" prefix classifies a failed call). Not told, the model
+    re-guessed the town and searched another Makedonias Ave (r4).
+    <code>OUTBOUND_TOOLS</code> says which arguments of which tool leave: every argument of web_search, deep_research,
+    darkweb_search, darkweb_research, fact_check and browser; <code>location</code>/<code>city</code>/<code>query</code>
+    of system_utility (the geocoder); only URLs for file_system, knowledge_base and vision_analysis (their local paths and
+    the owner's own text never leave). Not covered by design: <code>execute</code>. Descriptions are prompt-only — as
+    egress terms their first clause rewrote unrelated queries ("brown hair dye").</li>
+    <li><strong>Weather</strong> geocodes a LOCALITY: the location/city field, else a home/residence/address value with
+    its street, number and postcode removed ("Kifisias 10, Marousi" → Marousi).</li>
+    <li>The coding persona carries the PREFERENCES only (it carried the whole profile a second time); the profile closes the
+    system prompt, so a change re-prefills only the tail.</li>
+  </ul>
+  <h2 id="4li">The address detector, after the final review <span class="tag">2026-10-04 &sect;4LI</span></h2>
+  <ul>
+    <li>Folding runs NFKC, drops invisible format characters, and maps Cyrillic look-alikes and "c" to their Latin /
+    "k" forms, so "Ｍakedonias ８３", a zero-width space or "Macedonias" match. "Makedhonias" is tolerated, and so is
+    a spaced number ("8 3").</li>
+    <li>Between street and number, "no. / nr / # / number / αριθμός" are allowed. A call that carries the street stem
+    AND its number anywhere ("house 83 on Makedonias", the street and the number in separate arguments) has both
+    replaced (<code>egress.address_parts</code>).</li>
+    <li>The postcode, including "136-76" and "GR-13676", is scrubbed on its own, but never inside an identifier:
+    arXiv <code>2401.13676</code>, <code>issues/13676</code> and <code>v1.13676.tar.gz</code> are left as written.</li>
+    <li><code>execute</code> is outbound for the URLs inside its code: a <code>curl 'https://…?q=Makedonias+83'</code>
+    is scrubbed, while the rest of the code (a letter it writes) is the owner's and is left alone.</li>
+    <li>An address under any key the model picks (<code>home</code>, <code>residence</code>, <code>lives_at</code>,
+    <code>homeAddress</code>, <code>addr</code>, <code>domicile</code>), or any value that reads as a street address
+    (a street word or postcode plus a word and a house number; a <code>location</code> with a house number), is kept
+    out of the prompt and scrubbed.</li>
+    <li>Not covered, accepted: deliberate obfuscation (base64, double URL-encoding, spelled-out numbers).</li>
+  </ul>
 </main>
 </body>
 </html>

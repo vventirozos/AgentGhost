@@ -258,8 +258,10 @@ async def test_reset_all_says_what_it_orphans():
                             ("3", "episode"), ("4", "fact")])
     out = await tool_knowledge_base(action="reset_all", memory_system=mem)
 
+    # (§4LA: with no episodic store passed, the episode twin is reported as
+    # orphaned too; the note names what re-indexes them)
     assert "2 document" in out and "1 episode" in out
-    assert "no searchable twin" in out
+    assert "re-indexes them" in out
     # Split on the LAST NOTE: `reset_all` can emit two (an incomplete-
     # metadata warning is prepended to the orphan note), in which case
     # index 1 is the wrong half.

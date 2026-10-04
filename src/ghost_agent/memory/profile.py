@@ -776,7 +776,100 @@ class ProfileMemory:
                 return f"Removed {cat}.{k}"
             return f"No matching value under {cat}.{k}"
 
-    def get_context_string(self) -> str:
+    #: §4LB: fields that are NOT rendered into every prompt — reachable on
+    #: request (recall / the profile tools) — by default the street address
+    #: (the model wrote "Makedonias 83" into Tor web searches) and any
+    #: ``*_description`` (a physical description from a photo). The owner can
+    #: extend the list in ``profile_prompt_policy.json`` next to the profile
+    #: (``{"on_demand": ["assets.vehicles", …]}``).
+    DEFAULT_ON_DEMAND = ("root.address",)
+    ON_DEMAND_SUFFIXES = ("_description",)
+
+    def on_demand_fields(self) -> set:
+        out = set(self.DEFAULT_ON_DEMAND)
+        try:
+            pol = json.loads((Path(self.file_path).parent / "profile_prompt_policy.json").read_text())
+            out |= {str(x).strip().lower() for x in pol.get("on_demand", [])}
+        except Exception:  # noqa: BLE001 — no policy file: the defaults
+            pass
+        return out
+
+    #: an address-like KEY is on demand whatever it is called (§4LB r2: the
+    #: model chooses keys, and `root.home_address` was rendered and sent)
+    # §4LH review: the model chooses the keys — "home", "residence",
+    # "lives_at", "homeAddress", "addr", "domicile" held a street too and went
+    # into every prompt and out in web_search unscrubbed
+    _ADDRESS_KEY = re.compile(r"address|street|postcode|post_code|zipcode|^zip$|(?:^|_)zip(?:$|_)|residence|"
+                              r"domicile|lives_?at|^home$|^house$|home_?addr|^addr$|(?:^|_)addr(?:$|_)")
+
+    @staticmethod
+    def _looks_like_street_address(value) -> bool:
+        """A VALUE that is a street address whatever its key: a street word
+        or a 5-digit postcode, together with a word + house number."""
+        from .egress import looks_like_street_address
+        return looks_like_street_address(value)
+
+    @staticmethod
+    def _has_house_number(value) -> bool:
+        """A location value with a word + house number is a street, not a town."""
+        from .egress import fold
+        return bool(re.search(r"[^\W\d_]{3,}\.?\s+\d{1,4}[a-z]?\b", fold(str(value or ""))[0]))
+
+    def is_on_demand(self, category: str, key: str, fields: set = None, value=None) -> bool:
+        f = fields if fields is not None else self.on_demand_fields()
+        k = str(key).lower()
+        return (f"{str(category).lower()}.{k}" in f or k.endswith(self.ON_DEMAND_SUFFIXES)
+                or bool(self._ADDRESS_KEY.search(k))
+                or (value is not None and (self._looks_like_street_address(value)
+                                           or ("location" in k and self._has_house_number(value)))))
+
+    def address_values(self) -> list:
+        """The owner's address-like values (address-like keys, plus any
+        on-demand field the policy names that is not a description)."""
+        f = self.on_demand_fields()
+        out = []
+        for cat, sub in (self.load() or {}).items():
+            if not isinstance(sub, dict):
+                continue
+            for k, v in sub.items():
+                kl = str(k).lower()
+                vs = [str(x) for x in (v if isinstance(v, list) else [v]) if x]
+                if self._ADDRESS_KEY.search(kl) or (f"{str(cat).lower()}.{kl}" in f
+                                                    and not kl.endswith(self.ON_DEMAND_SUFFIXES)):
+                    out.extend(vs)
+                else:
+                    out.extend(x for x in vs if self._looks_like_street_address(x)
+                               or ("location" in kl and self._has_house_number(x)))
+        return out
+
+    def egress_scrubber(self):
+        """(patterns, replacement) for `memory.egress.scrub_text` — the street
+        + number and postcode of every address value, replaced by the
+        address's SUBURB (operator 2026-10-03: "Athens" sent a local search
+        to the wrong suburb), else the owner's city, else "nearby".
+        Descriptions are prompt-only: their sentences are not identifiers,
+        and as terms they rewrote unrelated queries ("brown hair dye")."""
+        from .egress import address_patterns, locality
+        vals = self.address_values()
+        area = ""
+        for v in vals:
+            loc = locality(v)
+            if loc and loc.strip() != str(v).strip():
+                area = loc.split(",")[0].strip()
+                break
+        if not area:
+            root = (self.load() or {}).get("root") or {}
+            area = str(root.get("location") or "").split(",")[0].strip() or "nearby"
+        return address_patterns(vals), area
+
+    def get_context_string(self, full: bool = False, only=None) -> str:
+        """``full``: every field (the profile tools). Otherwise the on-demand
+        fields are left out and NAMED, so the model knows to ask for them.
+        ``only``: a set of category names to render (the coding persona gets
+        just the preferences — §4LB: it carried the whole profile twice)."""
+        return self._context_string(full=full, only=only)
+
+    def _context_string(self, full: bool = False, only=None) -> str:
         """Render the profile for the ``{{PROFILE}}`` system-prompt slot.
 
         Temporal anchors are DERIVED here, not stored: a value held as
@@ -797,12 +890,20 @@ class ProfileMemory:
         # RAW: the stamps are what the staleness marker is rendered from.
         data = self.load_raw()
         lines = []
+        hidden = []
+        _od = set() if full else self.on_demand_fields()
         for key, val in data.items():
             if not val: continue
+            if only is not None and key not in only:
+                continue
             label = key.replace("_", " ").capitalize()
             if isinstance(val, dict):
+                _shown = {k: v for k, v in val.items() if full or not self.is_on_demand(key, k, _od, value=v)}
+                hidden += [f"{key}.{k}" for k in val if k not in _shown]
+                if not _shown:
+                    continue
                 lines.append(f"## {label}:")
-                for sub_k, sub_v in val.items():
+                for sub_k, sub_v in _shown.items():
                     # Sub-values may now be lists (multi-value merge); flatten
                     # them inline so the LLM sees "language: python, rust"
                     # rather than a Python repr like "['python', 'rust']".
@@ -817,6 +918,9 @@ class ProfileMemory:
                              + ", ".join(self._render_item(key, i) for i in val))
             else:
                 lines.append(f"{label}: {self._render_item(key, val)}")
+        if hidden:
+            lines.append("(on request only — recall them when the task needs them, never put them in a web search: "
+                         + ", ".join(hidden) + ")")
         return "\n".join(lines)
 
     @classmethod

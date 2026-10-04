@@ -30,6 +30,9 @@ pytestmark = pytest.mark.asyncio
 def _env(monkeypatch):
     for k in ("GHOST_MAIN_PREFIX_REWARM_S", "GHOST_MAIN_PREFIX_REWARM_SLOW_S"):
         monkeypatch.delenv(k, raising=False)
+    # one head here; warming BOTH fs_batch heads is §4LE's own test
+    import ghost_agent.tools.registry as _reg
+    monkeypatch.setattr(_reg, "fs_batch_experiment_live", lambda ctx: False)
 
 
 def _resp(prompt=28000, cached=None):

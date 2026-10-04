@@ -306,6 +306,11 @@ class UncertaintyTracker:
 
         return "\n".join(lines)
 
+    #: §4LB: an unknown not flagged again within this window is no longer
+    #: "recurring" — the block never expired ("which school does Thodoris
+    #: attend" rode a CSV coding turn)
+    RECURRING_MAX_AGE_DAYS = 14.0
+
     def recurring_unknowns(
         self, *, min_count: int = 2, lookback: int = 400,
     ) -> List[Tuple[str, int]]:
@@ -342,6 +347,12 @@ class UncertaintyTracker:
                 continue
             key = text.lower()
             if kind == "unknown":
+                try:
+                    _ts = rec.get("ts")
+                    if _ts is not None and time.time() - float(_ts) > self.RECURRING_MAX_AGE_DAYS * 86400:
+                        continue
+                except (TypeError, ValueError):
+                    pass                    # an unreadable stamp: counted, as before
                 counts[key] = counts.get(key, 0) + 1
                 display[key] = text
             elif kind == "unknown_resolved":
@@ -361,7 +372,7 @@ class UncertaintyTracker:
         ]
         for text, count in recurring[:limit]:
             parts.append(
-                f"  - {text} (flagged {count}× — resolve this if it is in scope)"
+                f"  - {text[:200]} (flagged {count}× — resolve this if it is in scope)"
             )
         return "\n".join(parts)
 

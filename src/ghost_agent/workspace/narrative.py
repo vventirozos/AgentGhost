@@ -137,9 +137,28 @@ class WorkspaceNarrative:
         # Fingerprint of the last successfully-persisted regeneration's
         # INPUT (the deterministic template). Same idempotency discipline
         # as the selfhood narrative: identical workspace state → skip the
-        # LLM round-trip and the redundant persist. In-memory on purpose
-        # (fresh boot regenerates once).
-        self._last_input_key = ""
+        # LLM round-trip and the redundant persist. Persisted next to the
+        # narrative (§4LF: in memory, every boot regenerated once — 285 boots).
+        self._last_input_key = self._load_input_key()
+
+    # §4LF: the "input unchanged" key survives a restart — kept in memory
+    # only, every one of 285 boots in 4 weeks re-generated the narrative
+    # (213 of 354 rewrites were the first after a boot, on the main model)
+    def _key_path(self):
+        return self.path.with_name(self.path.name + ".inputkey")
+
+    def _load_input_key(self) -> str:
+        try:
+            return self._key_path().read_text(encoding="utf-8").strip()
+        except Exception:  # noqa: BLE001 — no key: regenerate once
+            return ""
+
+    def _remember_input_key(self, key: str) -> None:
+        self._last_input_key = key
+        try:
+            self._key_path().write_text(key, encoding="utf-8")
+        except Exception:  # noqa: BLE001 — only costs one extra regeneration
+            pass
 
     def latest(self) -> str:
         if not self.path.exists():
@@ -195,7 +214,7 @@ class WorkspaceNarrative:
 
         if self.critique_fn is None:
             self._persist(template)
-            self._last_input_key = input_key
+            self._remember_input_key(input_key)
             return template
 
         prompt = (
@@ -218,10 +237,13 @@ class WorkspaceNarrative:
         except Exception as e:  # noqa: BLE001
             logger.warning("workspace narrative LLM critique failed: %s", e)
             text = ""
+        _llm_wrote = bool((text or "").strip())
         text = (text or "").strip() or template
         # Commit the idempotency key only on a successful persist — a
         # transient disk error otherwise becomes persistent staleness
-        # (the unchanged-input guard keeps serving the stale file).
-        if self._persist(text):
-            self._last_input_key = input_key
+        # (the unchanged-input guard keeps serving the stale file). And only
+        # when the MODEL wrote it (§4LI review): the key now survives restarts,
+        # so a boot-time timeout froze the raw template until the inputs moved.
+        if self._persist(text) and _llm_wrote:
+            self._remember_input_key(input_key)
         return text

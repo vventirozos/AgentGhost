@@ -79,7 +79,7 @@ def test_guard_wiring_in_turn_loop():
     assert "notify_steer_fired = False" in src
     assert '"notify_operator" not in raw_tools_called' in src
     assert "_user_asked_for_notification(last_user_content)" in src
-    guard = src[src.index("Catch a PROMISED NOTIFICATION"):][:1600]
+    guard = src[src.index("Catch a PROMISED NOTIFICATION"):][:2000]   # §4LD added the launched-job clause
     assert "not force_final_response" in guard
     assert "not is_final_generation" in guard
     assert "not force_stop" in guard

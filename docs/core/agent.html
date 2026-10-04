@@ -1705,7 +1705,185 @@
   <code>risk_steer</code> arm's treatment is suppressed by whichever steer fired first (the <code>search_yield</code> arm's among
   them) — the arms are no longer independent on such turns.</p>
   <!-- /4KW:review2 -->
-</main>
+  <h2 id="4lb">Private context: who gets it <span class="tag">2026-10-03 &sect;4LB</span></h2>
+  <ul>
+    <li><code>_owner_context_hidden()</code> (member OR public reply) gates the scrapbook, past requests, open questions,
+    competence and both playbook reads — a public channel reply said "private memory is NOT loaded" while all of it was.</li>
+    <li>Sub-agents and coding leaves are <code>owner_memory_isolated</code>: an empty bus (not one rebuilt from the read-only
+    stores), a fresh scratchpad, no past-request store — they hold web tools.</li>
+    <li>Egress: every call to an outbound tool (<code>memory.egress.OUTBOUND_TOOLS</code>) has the owner's street
+    address replaced by the address's suburb (else the city) in its arguments <em>at dispatch</em> and again at the tool
+    callable (r2),
+    logged as <code>Privacy</code>. The mutation battery found
+    the dispatch hook untested (only the helper was); a dispatched-call test now pins it.</li>
+    <li>The self-play report rides only a turn about the agent's practice (r2: <code>_SELF_PLAY_ASK</code>, below); recurring uncertainties expire after 14 days and
+    are capped at 200 characters; the planner's aligned tail drops the playbook the shared prefix already holds.</li>
+    <li>Deferred (performance, not correctness): pinned-mode cache reuse across requests; the ~25k-token tool schemas
+    (84% cached).</li>
+  </ul>
+  <h3>r2 (three fresh reviewers of the fixes)</h3>
+  <ul>
+    <li><code>_owner_context_hidden(context)</code> also holds for an <code>owner_memory_isolated</code> delegate — its
+    lessons came from the owner's playbook. In a delegate, <code>recall</code> refuses (it read the owner's store: "User
+    address is …"); the delegate carries <code>egress_profile</code> (the owner's profile, never rendered) so its own
+    searches are still scrubbed.</li>
+    <li>The workspace wake-up prefix and the project briefing (file map, journal) are left out of a member's turn and a
+    PUBLIC reply; an isolated coding leaf keeps its project briefing.</li>
+    <li>The planner dedupe compares the whole playbook against each message's own content (the JSON dump escaped
+    newlines, so it never matched).</li>
+    <li>The self-play report needs a question about the AGENT's practice (<code>_SELF_PLAY_ASK</code>): "best practices",
+    "constraint" and "train times" matched the bare words.</li>
+    <li>Egress: see <a href="../memory/profile.html#4lb">profile §4LB</a> — <code>memory/egress.py</code> is the one
+    detector and table (<code>OUTBOUND_TOOLS</code>).</li>
+  </ul>
+
+  <h2 id="4lc-public">Public replies: what else stayed out <span class="tag">2026-10-03 &sect;4LC</span></h2>
+  <ul>
+    <li>The "while you were away" project and activity digests are not added to a PUBLIC reply, and their watermarks
+    stay for the owner's DM (they opened a channel reply with project names and waiting tasks).</li>
+    <li>The memory-claim age check returns nothing on a public reply — its note quotes the stored birth date.</li>
+    <li>The conversation tag includes the reply surface: a DM and a channel thread that both start "hi" no longer share
+    queued corrections.</li>
+    <li>The selfhood wake-up prefix is gated on public too (off today; safe if re-enabled).</li>
+    <li>By design, an owner's own coding request in a channel keeps its sandbox listing and project rules — the work
+    needs them; what a public reply loses is AMBIENT private context (memory, digests, lessons).</li>
+  </ul>
+
+  <h2 id="4le">Per-turn speed <span class="tag">2026-10-04 &sect;4LE</span></h2>
+  <p>Measured (7 days, owner turns median 17.6 s; members' 41.9 s): main-model generation 45% of the time, tools 40%.
+  The chat template renders the tool schemas BEFORE the system prompt, and the hybrid model resumes only from checkpoints
+  ~8k tokens apart — a changed byte anywhere loses everything back to the previous checkpoint. Fixed:</p>
+  <ul>
+    <li><strong>Both <code>fs_batch</code> heads are warmed</strong> (<code>warm_up_main_prefix</code> →
+    <code>_warm_up_main_prefix_once</code> under <code>tools.registry.FS_BATCH_WARM_ARM</code>, control last). The warmup ran
+    as "SYSTEM" (no arm) and only warmed control; the treatment schema sits before the first checkpoint, so 4 of 15
+    treatment owner turns re-prefilled ~31.6k tokens (~35 s) — a penalty that also skewed the A/B.</li>
+    <li><strong>A self-report does not hold the reply</strong> for its verdict (<code>_SELF_REPORT_TOOLS</code>: introspect,
+    self_state, list_lessons) — "good morning ghost" waited 35 s of 60; the verdict still lands through the deferred path.</li>
+    <li><strong>Worker calls before the first token</strong> give up after <code>PRE_REPLY_ROUTE_TIMEOUT_S</code> (4 s, was
+    12 s; both have non-LLM fallbacks), and the memory query is split only on the user's OWN long words (the gate read the
+    expanded "Context: … | User intent: …" string, always long — a second worker call after every expansion).</li>
+    <li><strong>Greek greetings and thanks</strong> take the fast path (accent-folded allowlist).</li>
+    <li>The one-shot "prefix warmup MISS" check skips member and public turns (their head differs by design and used it
+    up with false warnings).</li>
+  </ul>
+
+  <h2 id="4lg">Research answers <span class="tag">2026-10-04 &sect;4LG</span></h2>
+  <p>System-prompt rule 4b: state as fact only what the pages and results fetched in this turn say, name the source inline
+  for every number/date/version/name/quote, never describe a thread you did not open or a page that failed to load, never
+  invent a URL, label background knowledge as such, and say so when the sources found nothing. Measured before: 16% of
+  research-reply facts had no source in the turn, 14% of replies cited anything, 1 invented URL in 42 replies.</p>
+  <p>Rule 4b also says an organisation's <em>official</em> .onion address comes only from that organisation's own clearnet
+  site: onion search results are full of clones, and a page whose content does not match the organisation is not it. (Live
+  probe D2: a page titled "Hello! Looking for the Hidden Wiki?" found through onion search was reported as DuckDuckGo's
+  official onion.)</p>
+  <p id="4lg-fresh-chat">A deferred correction ("&#9888;&#65039; Correction to my previous answer") surfaces only in a thread that already
+  contains an assistant answer. A new chat whose first message repeats an earlier chat's first message has the same
+  conversation fingerprint, and before this the old correction opened the new reply and contradicted it. (Live probe D1:
+  "the browser failed, no title was retrieved" sat above a page title that had just been read.) The correction stays
+  queued for a real follow-up until its TTL runs out, and for the owner the notice from <code>_notify_owner_correction</code>
+  still delivers it.</p>
+
+  <h2 id="4lh">Research replies: narration, links, members, full results <span class="tag">2026-10-04 &sect;4LH</span></h2>
+  <ul>
+    <li><strong>Text written alongside a research call is not the answer.</strong> The loop records the text the model
+    writes in the same iteration as a batch of lookup calls (<code>_PRE_TOOL_LOOKUP_TOOLS</code>: web/dark-web search
+    and research, browser, fact_check, news, recall, knowledge_base, query_document) into
+    <code>context._pre_tool_segments</code>. Finalize removes each recorded segment of up to 400 chars when it stands
+    as a whole paragraph, and the in-loop judged text (<code>delivery_view(..., pre_tool_segments=)</code>) does the
+    same, so the in-loop verdict is still reused. Kept:
+      <ul>
+        <li>text beside a bookkeeping call (<code>remember</code>, a profile write), because that text is often the
+        answer;</li>
+        <li>longer segments;</li>
+        <li>a reply that would end up empty or narration-only.</li>
+      </ul>
+    The live web stream still shows the narration as progress. Live probe D2 opened "The known DuckDuckGo onion
+    address didn't respond. Let me find the official one…". <code>GHOST_DROP_PRE_TOOL_TEXT=0</code> disables.</li>
+    <li><strong>Links must come from what the turn read</strong> (<code>core/link_grounding.py</code>). On a turn
+    that ran a research tool, finalize removes:
+      <ul>
+        <li>a clearnet URL with a path that appears nowhere in the conversation's tool results, tool-call
+        arguments, user/system text or the agent's EARLIER answers;</li>
+        <li>a v3 onion address that appears in none of them;</li>
+        <li>an onion address that cannot exist (wrong length, or a character base32 never uses).</li>
+      </ul>
+    A markdown link or image keeps its label, a bare URL keeps its domain, and an onion address becomes a marker.
+    One italic line counts the removals; <code>strip_system_notes</code> treats that line as ours, not the model's.
+    Never touched:
+      <ul>
+        <li>bare domains;</li>
+        <li>clearnet URLs inside code;</li>
+        <li>v2 addresses (the verifier names them).</li>
+      </ul>
+    Matching ignores scheme, <code>www.</code>, case, percent-encoding, fragments and trailing punctuation, including
+    <code>…</code> and <code>。</code>. The §4LG audit found 1 invented URL in 42 research replies.
+    <code>GHOST_LINK_GROUNDING=0</code> disables. Streamed replies do not pass through finalize; for those, the
+    verifier's onion check applies.</li>
+    <li><strong>A channel member's web research is verified</strong> (<code>_member_research_turn</code>), when
+    every real tool the member's turn ran was <code>web_search</code> / <code>darkweb_search</code>. Before, 0 of 25
+    were verified (R8). It runs after the reply (gate 0, no added wait), with:
+      <ul>
+        <li>no owner project constraints in the judge's request view;</li>
+        <li>the visual arm switched off for every member turn, because image names in a web result resolved into the
+        owner's sandbox;</li>
+        <li>no owner notice.</li>
+      </ul>
+    A member's queued correction carries <code>_reply_tag</code>, a hash of the corrected answer's opening words that
+    survives the Slack markup round trip. It surfaces only in a thread whose history holds that answer: two members'
+    threads that open with the same words share a fingerprint. Only in async-critic mode; the sync in-loop path skips
+    members. <code>GHOST_VERIFY_MEMBER_RESEARCH=0</code> restores "members are never verified".</li>
+    <li><strong>Full tool results beside the trajectory.</strong> A trajectory row keeps 4,000 chars per tool result,
+    and every browser result in the §4LG audit hit that cap. <code>_reconstruct_tool_calls</code> keeps the full text
+    (up to 200k) in memory on <code>ToolCall.full_result</code>, which is never serialized into the row.
+    <code>TrajectoryCollector.append_full_results</code> writes it to
+    <code>system/trajectory_results/&lt;row's day&gt;/session-&lt;sid&gt;.jsonl</code>, outside the trajectory root
+    so readers that glob <code>*.jsonl</code> there never see it. It is keyed by <code>trajectory_id</code> and tool
+    index, uses the same redaction except onion addresses (kept, so dark-web claims can be checked), and frees the
+    in-memory copy. <code>scripts/scrub_secrets.py</code> covers it. <code>GHOST_TRAJ_FULL_RESULTS=0</code>
+    disables.</li>
+  </ul>
+  <h2 id="4li">After the final review <span class="tag">2026-10-04 &sect;4LI</span></h2>
+  <ul>
+    <li><strong>Member data wall.</strong> On a member's turn every sandbox-reading arm of the verifier is off: the
+    early visual look, the visual arm, WEB-EXEC and FILE-ARTIFACT. Before, a file name in a member's reply was looked
+    up in the OWNER's sandbox, and "claimed but empty" told the member that the owner's file exists.</li>
+    <li><strong>Corrections.</strong> Members' corrections and the owner's are capped separately
+    (<code>_trim_corrections</code>), so three member refutes can no longer evict the owner's pending one.
+    <code>_reply_tag</code> strips a correction banner in Slack's <code>*…*</code> markup too. Channel threads, like
+    members, bind a correction to the answer it corrects. A thread with no answer yet still prunes expired
+    corrections.</li>
+    <li><strong>Owner notices.</strong> A late correction never notifies the owner for a probe id or a non-user turn
+    (<code>turn_origin</code>): the streamed drain restores the id and the role, not the origin.</li>
+    <li><strong>Pre-tool narration.</strong> It is dropped only when what remains is at least 200 chars
+    (<code>PRE_TOOL_MIN_REST</code>). "The capital is Canberra." beside a search, followed by "The search confirms
+    it.", was being delivered as the second sentence alone.</li>
+    <li><strong>Link grounding.</strong>
+      <ul>
+        <li>URLs with balanced parentheses are handled, and a link whose label is its own URL is counted once.</li>
+        <li><code>&amp;amp;</code> in results is unescaped, and an onion seen only inside a longer token does not
+        count.</li>
+        <li>Labels longer than 62 characters are caught, and the note says "1 link that appears".</li>
+        <li>The note line is recognised wherever it sits. Grounding does not run on streamed replies.</li>
+        <li>A link that EXTENDS a page the turn read is kept when the segments that name the thing were in what was
+        read: at least one added segment, and every one with a digit (a version, an id). Live probe N1 read
+        <code>github.com/nodejs/node/releases</code> and linked <code>…/releases/tag/v24.21.0</code>; it was removed
+        and "Release notes: github.com" shipped. A removed bare URL now falls back to the nearest page that WAS read,
+        and to the domain only when there is none.</li>
+      </ul></li>
+    <li><strong>Self-play follows the experiment settings</strong> (operator, 2026-10-04): the 2026-08-08 rule "self-play
+    always runs the planner" now holds only while the <code>use_planning</code> experiment is enabled in the registry
+    (<code>_self_play_planner_forced</code>; an unreadable registry means off). With it concluded to control (§4LF),
+    self-play runs without the planner, as production turns do.</li>
+    <li><strong>Smaller fixes.</strong>
+      <ul>
+        <li>A cooldown env var of <code>inf</code> / <code>1e400</code> no longer breaks the import.</li>
+        <li>Scheduled runs start without the creating turn's workspace event project.</li>
+        <li>The narratives remember their input key only when the model wrote the text.</li>
+        <li>Postmortem re-noted signatures move to the end of the eviction order.</li>
+      </ul></li>
+    <li><strong>Sidecar.</strong> The <code>truncated</code> flag is now true when a result was cut.</li>
+  </ul>
 
   <h2 id="4kd-clarify">Clarify-first after a costly tool turn <span class="tag">2026-09-24 &sect;4KD</span></h2>
   <p>A deterministic pre-dispatch guard (next to the participant engine guard, same mechanism: a REJECTED tool row,
@@ -1718,5 +1896,6 @@
   per-conversation record written at finalize — a client that resends text only still trips it; a restart loses only
   the record. The question exemption keeps "ok"/"yes" as consent to OUR question. Why a guard and not a prompt line:
   the system prompt's "if you lack information, ASK" already lost to a tool result's suggested next action.</p>
+</main>
 </body>
 </html>

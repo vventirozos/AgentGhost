@@ -107,5 +107,17 @@
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
+
+<h2 id="4lc">Past requests (PROVEN APPROACHES) <span class="tag">2026-10-03 &sect;4LC</span></h2>
+<p>Measured on 40 real owner turns: the block rode 40/40, about 11% relevant. Now:</p>
+<ul>
+  <li><code>relevant()</code> needs two shared CONTENT words between the request and a skill's examples/cluster
+  (case/accent-folded, Greek transliterated, stop-words dropped; tool names do not count). A request with no content
+  word gets nothing — the old fallback surfaced the top 3 on every Greek turn.</li>
+  <li>A skill not re-verified within <code>STALE_AFTER_DAYS</code> (14) — or with no date — is not surfaced.</li>
+  <li>Mining reads real requests only (<code>minable_requests</code>, admissibility consumer
+  <code>auto_skill_extraction</code>): probe and reflection turns were mined and their verbatim text became examples.</li>
+  <li>The block no longer claims the sequences are "validated, not speculative" (nothing replays them).</li>
+</ul>
 </body>
 </html>

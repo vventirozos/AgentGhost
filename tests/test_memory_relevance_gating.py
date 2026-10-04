@@ -202,4 +202,10 @@ def test_episodic_no_hits_returns_empty():
     ep = _make_episodic()
     out = ep._vector_search("x", limit=5,
                             vector_memory=_FakeVectorForEpisodes([]))
-    assert out == []
+    # §4LA: "no episode twins at all" (a cold store) is None, so the public
+    # path falls back; an empty store still answers []
+    assert out is None
+    import tempfile
+    from pathlib import Path
+    real = EpisodicMemory(Path(tempfile.mkdtemp()))
+    assert real.search_similar("x", limit=5, vector_memory=_FakeVectorForEpisodes([])) == []

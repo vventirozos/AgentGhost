@@ -28,6 +28,13 @@ import json
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _no_memory_refute_guard(monkeypatch):
+    # These pin the two-stage MECHANICS with placeholder evidence ("e");
+    # the §4LG evidence-anchoring guard has its own tests (test_4lg_research)
+    monkeypatch.setenv("GHOST_VERIFY_MEMORY_REFUTE_GUARD", "0")
+
 from ghost_agent.core.verifier import (
     Verifier,
     VerifyVerdict,

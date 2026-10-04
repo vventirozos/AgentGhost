@@ -949,7 +949,12 @@ TRIGGER_KEYS: Dict[str, str] = {"risk_steer": "risk_steer_fired",
                                 "use_planning": "use_planning_fired",
                                 "tts_bon": "tts_bon_fired",
                                 "verify_depth": "verify_depth_fired",
-                                "evidence_gate": "evidence_gate_fired"}
+                                "evidence_gate": "evidence_gate_fired",
+                                # §4LF: both stamp their trigger, but were never
+                                # LISTED — the report only ever showed their
+                                # diluted all-turns block
+                                "imagine_preflight": "imagine_preflight_fired",
+                                "search_yield_steer": "search_yield_steer_fired"}
 
 
 def trigger_fired(traj, experiment: str) -> bool:

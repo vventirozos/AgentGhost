@@ -41,6 +41,9 @@ class ToolCall:
     result: str = ""
     error: str = ""
     duration_s: float = 0.0
+    #: §4LH: the untruncated result, in memory only — never serialized into
+    #: the row; ``TrajectoryCollector.append_full_results`` writes it beside.
+    full_result: str = field(default="", repr=False, compare=False)
 
 
 @dataclass
@@ -96,6 +99,8 @@ class Trajectory:
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
+        for tc in d.get("tool_calls") or []:
+            tc.pop("full_result", None)      # §4LH: never part of the row
         return d
 
     def to_jsonl(self) -> str:

@@ -33,6 +33,9 @@ from ..utils.logging import pretty_log, Icons, spawn_bg
 logger = logging.getLogger("GhostAgent")
 
 MAX_PARALLEL_DELEGATES = 4
+#: §4LD: sub-agents RUNNING at once across every call — the per-call cap let a
+#: turn (or a scheduled run) call delegate again and again
+MAX_RUNNING_DELEGATES = 8
 
 
 SANDBOX_KIND = "sandbox"
@@ -365,6 +368,13 @@ async def tool_delegate(task=None, tasks=None, tools=None, wait: bool = False,
         timeout_s = DEFAULT_TIMEOUT_S
 
     reg = get_job_registry(context)
+    try:
+        _running = len(reg.list(status="running", kind="subagent"))
+    except Exception:  # noqa: BLE001
+        _running = 0
+    if _running + len(task_list) > MAX_RUNNING_DELEGATES:
+        return (f"Error: {_running} sub-agents are already running (at most {MAX_RUNNING_DELEGATES} at "
+                f"once) — collect their results with jobs(action='collect') before delegating more.")
     jobs = []
     for t in task_list:
         job = reg.register("subagent", t, tools=len(allowed))

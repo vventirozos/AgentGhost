@@ -159,7 +159,7 @@ def test_empty_playbook_no_query():
     with tempfile.TemporaryDirectory() as td:
         sm = SkillMemory(Path(td))
         ctx = sm.get_playbook_context(query=None, memory_system=None)
-        assert ctx == "No lessons learned yet."
+        assert ctx == ""          # §4LC: the placeholder was injected as a block
 
 
 def test_empty_playbook_with_query():
@@ -170,7 +170,7 @@ def test_empty_playbook_with_query():
             memory_system=None,
         )
         # Empty playbook + query → same "no lessons" sentinel
-        assert ctx == "No lessons learned yet."
+        assert ctx == ""          # §4LC: the placeholder was injected as a block
 
 
 def test_query_with_only_stopwords_returns_empty():

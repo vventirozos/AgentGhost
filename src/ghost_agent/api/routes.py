@@ -2813,6 +2813,21 @@ async def notifications_pending(request: Request, consumer: str = "default",
         return JSONResponse({"enabled": True, "records": [],
                              "watermark": log.current_offset(),
                              "baseline": True})
+    # §4LF: quiet hours HOLD notices — nothing served, the watermark stays,
+    # so the first poll after the window delivers them (GHOST_QUIET_HOURS)
+    from ..core.autonomous_activity import in_quiet_hours, owner_awaits
+    if in_quiet_hours():
+        # §4LI: a notice the OWNER asked for ("notify me when done", a
+        # scheduled reminder, a correction to their answer) is not held, and
+        # nothing is held while they are at the console — the window exists
+        # for the agent's own overnight noise (self-play pages at 03:41)
+        try:
+            _peek, _ = await _store_call(log.read_since, offset, limit=200, severity=SEVERITY_NOTIFY)
+        except StoreCallTimeout as e:
+            return _store_timeout_response(e)
+        if not owner_awaits(_peek, getattr(agent.context, "last_activity_time", None)):
+            return JSONResponse({"enabled": True, "records": [], "watermark": offset,
+                                 "quiet_hours": True})
     try:
         limit = max(1, min(int(limit), 200))
     except (TypeError, ValueError):

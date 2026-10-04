@@ -1515,7 +1515,7 @@ class VectorMemory:
             logger.debug(f"Helpful stats bump failed (non-critical): {e}")
 
     def search_items(self, query: str, inject_identity: bool = True,
-                     min_relevance_dist: Optional[float] = None) -> list:
+                     min_relevance_dist: Optional[float] = None, exclude_types=()) -> list:
         """Per-item variant of `search()` for the MemoryBus.
 
         Returns ``[{"id": <chroma id>, "text": <formatted line>, "score":
@@ -1537,6 +1537,12 @@ class VectorMemory:
         Only the bus hydration path passes this; the recall TOOL leaves it
         None (an explicit "what do you know about X" stays best-effort)."""
         selection = self._search_selection(query, inject_identity)
+        # §4LB r2: rows the caller drops are dropped BEFORE the off-topic
+        # gate — an identity row at 0.20 opened the gate for "where do I
+        # live", was dropped by the bus, and a 0.56 off-topic memory went in
+        _ex = {str(t).upper() for t in (exclude_types or ())}
+        if _ex:
+            selection = [it for it in selection if str(it.get("type") or "").upper() not in _ex]
         if min_relevance_dist is not None and selection:
             # Gate on QUERY-batch distances only. Identity-batch items carry
             # distance to the canned profile probe ("User's profile. User's
@@ -1771,7 +1777,10 @@ class VectorMemory:
                             # reached is ranked by its own type.
                             if is_name_memory: priority_score = -20
                             elif is_identity_type: priority_score = -15
-                            elif is_episode: priority_score = -12
+                            # an episode is EVIDENCE of a past turn, not a fact —
+                            # it ranks with the facts, by distance and age (§4LA:
+                            # an old "I'm a doctor" turn outranked the correction)
+                            elif is_episode: priority_score = 1
                             elif is_summary or is_synthesis: priority_score = -10
                             elif m_type == 'document': priority_score = -5 # Elevate document priority above general manual/auto
                             elif m_type == 'manual': priority_score = 0

@@ -39,6 +39,7 @@ client changes):
 
 from __future__ import annotations
 
+import os
 import re
 from typing import List
 
@@ -564,6 +565,55 @@ def drop_checkpoint_segments(text: str, segments, *, keep_if_empty: bool = True)
     return out
 
 
+#: §4LH: a pre-tool segment longer than this may carry real content (a
+#: partial answer before one more lookup) and is left alone.
+PRE_TOOL_SEGMENT_MAX = 400
+
+
+def drop_pre_tool_segments(text: str, segments) -> str:
+    """Remove the short text the model wrote ALONGSIDE a tool call.
+
+    That text was written before the tool's result existed, so it is
+    working narration by construction ("The known address didn't respond.
+    Let me find the official one…"), not the answer — live probe D2's
+    non-streamed reply opened with two such paragraphs. Exact-substring
+    removal of what the loop recorded (nothing matched by resemblance);
+    segments over ``PRE_TOOL_SEGMENT_MAX`` chars are kept; if removal
+    would leave nothing, the original is returned.
+    """
+    if not text or not segments:
+        return text
+    out = text
+    for seg in segments:
+        seg = (seg or "").strip()
+        if not seg or len(seg) > PRE_TOOL_SEGMENT_MAX:
+            continue
+        # whole paragraphs only (review §4LH: "Done." inside an answer was
+        # cut while the recorded "Done." paragraph stayed)
+        at = 0
+        while True:
+            i = out.find(seg, at)
+            if i < 0:
+                break
+            j = i + len(seg)
+            if (out[:i].strip() == "" or out[:i].endswith("\n\n")) and \
+                    (out[j:].strip() == "" or out[j:].startswith("\n\n")):
+                out = out[:i] + out[j:]
+                break
+            at = j
+    out = re.sub(r"\n{3,}", "\n\n", out).strip()
+    # §4LH final review: the answer itself can sit beside a confirming
+    # lookup ("The capital is Canberra." + search, then "The search confirms
+    # it.") — drop only when what is left stands as an answer on its own
+    if len(out) < PRE_TOOL_MIN_REST:
+        return text
+    return out
+
+
+#: what must remain after the drop for it to happen at all
+PRE_TOOL_MIN_REST = 200
+
+
 def strip_system_notes(text: str) -> str:
     """Return *text* without finalize-appended system notes (trailing
     Unverified / Plan check / risk-summary blocks, leading correction
@@ -576,6 +626,11 @@ def strip_system_notes(text: str) -> str:
         if not m:
             break
         out = out[:m.start()]
+    # §4LH: the link-grounding line is ours, not the model's — checked after
+    # the trailing notes come off (a caveat appended after it hid it)
+    from .link_grounding import REMOVED_NOTE_RE
+    if REMOVED_NOTE_RE.search(out):
+        out = re.sub(r"\n{3,}", "\n\n", REMOVED_NOTE_RE.sub("", out)).rstrip()
     # the unparsed-call note is ours too (review §4IY: the judge and the binder read it as the
     # model's words — "artifact: machine noise")
     if UNPARSED_TOOL_CALL_NOTE in out:
@@ -1298,7 +1353,7 @@ def smooth_gated(text: str, n_real_tools: int) -> str:
     return text
 
 
-def delivery_view(text: str, tools_run) -> str:
+def delivery_view(text: str, tools_run, pre_tool_segments=None) -> str:
     """The reply as it will be DELIVERED: `smooth_reply` behind the two
     guards finalisation applies — the ≥2-real-tool gate (2026-07-17: a
     single-tool turn's "First… Then… Finally…" are instructions, not beats)
@@ -1309,6 +1364,13 @@ def delivery_view(text: str, tools_run) -> str:
     away for a fingerprint mismatch (live 2026-09-24: 26.7 s of in-loop
     verification recomputed after a 502→219-char trim). Never raises."""
     try:
+        # §4LH: the text written alongside tool calls is dropped first (the
+        # finalize step does the same before calling this) — so the in-loop
+        # judge sees the delivered text and its verdict is reused.
+        if pre_tool_segments and os.environ.get("GHOST_DROP_PRE_TOOL_TEXT", "1") != "0":
+            _cand = drop_pre_tool_segments(text, pre_tool_segments)
+            if _cand != text and not is_narration_only_trim(_cand, text):
+                text = _cand
         return smooth_gated(text, count_real_tools(tools_run or []))
     except Exception:  # noqa: BLE001
         return text

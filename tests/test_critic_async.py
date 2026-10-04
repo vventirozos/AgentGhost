@@ -69,9 +69,9 @@ def _final(text):
     return {"choices": [{"message": {"content": text, "tool_calls": []}}]}
 
 
-async def _run(agent, user, llm_side_effects):
+async def _run(agent, user, llm_side_effects, history=()):
     agent.context.llm_client.chat_completion = AsyncMock(side_effect=list(llm_side_effects))
-    body = {"messages": [{"role": "user", "content": user}], "model": "Qwen-Test"}
+    body = {"messages": [*history, {"role": "user", "content": user}], "model": "Qwen-Test"}
     with patch("ghost_agent.core.agent.pretty_log"):
         result, _, _ = await agent.handle_chat(body, background_tasks=MagicMock())
     return result
@@ -255,6 +255,7 @@ def test_consume_stages_banner_without_touching_messages(agent):
     agent._pending_corrections = ["the script printed 7, not 42"]
     msgs = [
         {"role": "system", "content": "SYS"},
+        {"role": "assistant", "content": "earlier answer"},
         {"role": "user", "content": "next question"},
     ]
     with patch("ghost_agent.core.agent.pretty_log"):
@@ -262,6 +263,7 @@ def test_consume_stages_banner_without_touching_messages(agent):
     # Messages are NOT mutated (no fragile model-instruction injection)...
     assert out == [
         {"role": "system", "content": "SYS"},
+        {"role": "assistant", "content": "earlier answer"},
         {"role": "user", "content": "next question"},
     ]
     # ...the banner is staged for deterministic prepend, and the queue cleared.
@@ -292,12 +294,12 @@ def test_consume_sets_turn_flag_to_skip_trivial_path(agent):
     no pending → flag off."""
     agent._pending_corrections = ["prev answer was truncated"]
     with patch("ghost_agent.core.agent.pretty_log"):
-        agent._consume_pending_corrections([{"role": "user", "content": "q"}])
+        agent._consume_pending_corrections([{"role": "assistant", "content": "earlier answer"}, {"role": "user", "content": "q"}])
     assert agent._correction_active_this_turn is True
 
     agent._pending_corrections = []
     with patch("ghost_agent.core.agent.pretty_log"):
-        agent._consume_pending_corrections([{"role": "user", "content": "q"}])
+        agent._consume_pending_corrections([{"role": "assistant", "content": "earlier answer"}, {"role": "user", "content": "q"}])
     assert agent._correction_active_this_turn is False
 
 
@@ -369,10 +371,12 @@ async def test_staged_correction_is_prepended_to_next_reply(agent, monkeypatch):
     prepended to THIS turn's reply (not left to the model to weave in)."""
     monkeypatch.setenv("GHOST_CRITIC_ASYNC", "1")
     agent._pending_corrections = ["previous reply was truncated mid-code"]
+    agent.context.llm_client.route = AsyncMock(return_value="")      # follow-up query expansion
 
     result = await _run(agent, "what else can you tell me", [
         _final("Here is more information."),
-    ])
+    ], history=[{"role": "user", "content": "show me the code"},
+                {"role": "assistant", "content": "def f(): ..."}])
 
     assert result.startswith("⚠️ **Correction to my previous answer:**")
     assert "previous reply was truncated mid-code" in result
@@ -380,6 +384,20 @@ async def test_staged_correction_is_prepended_to_next_reply(agent, monkeypatch):
     # One-shot: the queue and stage are both cleared.
     assert agent._pending_corrections == []
     assert agent._take_active_correction() == ""
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_chat_repeating_an_old_question_gets_no_stale_correction(agent, monkeypatch):
+    """§4LG: fails where a new chat whose first message matched an earlier
+    one (same fingerprint) opened with that chat's correction — the live D1
+    reply began "the browser failed, no title was retrieved" above a page
+    title it had just read. Nothing in a fresh chat is a "previous answer";
+    the correction stays queued for a real follow-up."""
+    monkeypatch.setenv("GHOST_CRITIC_ASYNC", "1")
+    agent._pending_corrections = [{"note": "no title was retrieved", "conv": agent._conversation_fingerprint(
+        [{"role": "user", "content": "find the onion"}]), "traj": "t1", "ts": __import__("time").monotonic()}]
+    result = await _run(agent, "find the onion", [_final("Title: BBC - Home.")])
+    assert "Correction" not in result and len(agent._pending_corrections) == 1
 
 
 @pytest.mark.asyncio
@@ -419,7 +437,9 @@ def _queue(agent, note, conv, ts=None):
 
 
 def _msgs(first_user):
-    return [{"role": "system", "content": "SYS"}, {"role": "user", "content": first_user}]
+    # a follow-up: the first user message (the fingerprint) and an answer to correct
+    return [{"role": "system", "content": "SYS"}, {"role": "user", "content": first_user},
+            {"role": "assistant", "content": "earlier answer"}, {"role": "user", "content": "follow-up"}]
 
 
 def test_record_late_verdict_tags_conversation(agent, monkeypatch):

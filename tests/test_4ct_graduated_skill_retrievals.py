@@ -43,6 +43,12 @@ def _store(tmp_path, entries=None):
                "confidence": 0.8, "trigger_examples": ["look it up"],
                "verifications": 2},
     }
+    # (§4LC: an entry not re-verified within STALE_AFTER_DAYS — or with no
+    # date at all — is not surfaced; these fixtures are fresh)
+    import datetime as _dt
+    _now = _dt.datetime.utcnow().isoformat() + "Z"
+    for e in entries.values():
+        e.setdefault("last_verified_at", _now)
     (tmp_path / "auto_skills.json").write_text(json.dumps(entries))
     return GraduatedSkillStore(tmp_path)
 
@@ -87,10 +93,10 @@ class TestSurfacedForPrompt:
         assert _store(tmp_path, {}).surfaced_for_prompt(query="x") == ("", [])
 
     def test_a_row_without_a_hash_is_not_offered_as_one(self, tmp_path):
-        s = _store(tmp_path, {"h1": {"name": "n", "trigger_examples": ["q"],
+        s = _store(tmp_path, {"h1": {"name": "n", "trigger_examples": ["rotate nginx logs"],
                                      "tool_sequence": ["execute"],
                                      "signature_hash": ""}})
-        block, hashes = s.surfaced_for_prompt(query="q")
+        block, hashes = s.surfaced_for_prompt(query="rotate the nginx logs")
         assert block and hashes == [], "an unbookable row must not be booked"
 
 

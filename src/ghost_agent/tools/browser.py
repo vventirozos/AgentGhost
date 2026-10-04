@@ -472,6 +472,13 @@ def _mark_onion_dead(url: str, cause: str) -> None:
         _cap(_DEAD_ONIONS, lambda h: _DEAD_ONIONS[h])
 
 
+# §4LG: the clearnet host memory lives in `host_memo` (browser.py is held
+# under its size guard).
+from .host_memo import (  # noqa: E402
+    _clearnet_host, _mark_host_failed, _mark_host_ok, _dead_host_notice,
+    _retired_onion_notice, ONION_FIRST_FAILURE_HINT)
+
+
 def _dead_onion_notice(url: str):
     """A directive message when `url`'s host is a known-dead onion."""
     host = _onion_host(url)
@@ -1084,10 +1091,11 @@ async def tool_browser(
     # disagreed with the runner in both directions (R4).
     _nav_url = _runner_first_url(operation, url, sanitised_actions,
                                  sandbox_dir)
-    _dead = _dead_onion_notice(_nav_url)
+    _dead = (_retired_onion_notice(_nav_url) or _dead_onion_notice(_nav_url)
+             or _dead_host_notice(_nav_url))
     if _dead:
         pretty_log("Browser Skipped",
-                   f"{_onion_host(_nav_url)} is a known-dead hidden service — "
+                   f"{_onion_host(_nav_url) or _clearnet_host(_nav_url)} skipped (dead, retired or failing) — "
                    f"told the model to try another result",
                    icon=Icons.TOOL_BROWSER, level="WARNING")
         return _err(_dead, hint=None)
@@ -1229,7 +1237,10 @@ async def tool_browser(
     # committed, HTML streaming) is a much weaker milestone that usually
     # lands on the same circuit. One retry, only for proxied navigates that
     # timed out, and only when the caller didn't already pin `commit`.
+    # §4LG: OPT-IN — measured, the retry recovered 1 of 17 timeouts and cost
+    # ~30 s each (the same circuit, the same slow exit)
     if (not ok and operation == "navigate" and tor_proxy
+            and os.environ.get("GHOST_BROWSER_COMMIT_RETRY", "0") == "1"
             and payload.get("wait_until") != "commit"
             and "timeout" in str(parsed).lower()):
         pretty_log("Browser Retry",
@@ -1337,6 +1348,7 @@ async def tool_browser(
         # and `_mark_onion_dead("")` is a no-op; the interact scan is
         # what records the real host.
         _mark_onion_dead(_nav_url, str(parsed))
+        _mark_host_failed(_nav_url, str(parsed))
         # A FAILING re-fetch is the loop most worth interrupting, and the
         # success-only counter could not see it: the 2026-09-15 Revolut
         # turn hit one Telegram post five times (one of them a selector
@@ -1373,6 +1385,9 @@ async def tool_browser(
             # through anyway was dead code that no mutant could falsify.
             return _err(f"Runner failed (exit {exit_code}): {parsed}", ran=True,
                         hint=_onion_note)
+        if _onion_host(_nav_url) and any(m in str(parsed) for m in _ONION_UNREACHABLE_MARKERS):
+            return _err(f"Runner failed (exit {exit_code}): {parsed}", ran=True,
+                        hint=ONION_FIRST_FAILURE_HINT)
         # §4HB: name the next action for errors an IDENTICAL retry cannot
         # fix, ahead of the generic advice. Live (req 6a7882f5) both of
         # these were re-issued unchanged on the very next turn and failed
@@ -1384,8 +1399,9 @@ async def tool_browser(
             hint=(
                 ((_fail_nav_note + " ") if _fail_nav_note else "") +
                 ((_specific_route + " ") if _specific_route else "") +
-                "If this is a navigation timeout, try wait_until='domcontentloaded' "
-                "or raise timeout_ms. If a CLICK timed out or its selector was "
+                "If this is a navigation timeout, the page did not load over Tor — "
+                "another attempt usually times out the same way; use a different "
+                "source. If a CLICK timed out or its selector was "
                 "not found: each atomic op reloads the page in a fresh context, "
                 "so elements created by a previous click (opened windows, menus, "
                 "dialogs) are GONE — run the whole flow in one context with "
@@ -1434,6 +1450,9 @@ async def tool_browser(
     if _blocked:
         header = (f"--- BROWSER RESULT ---\nSTATUS: BLOCKED ({_blocked})\nOP: {operation}"
                   f"\nHINT: {BLOCKED_PAGE_HINT}")
+        _mark_host_failed(_nav_url, f"blocked: {_blocked}")      # the memo decides (host_level_block)
+    elif ok and operation in ("navigate", "extract_text"):
+        _mark_host_ok(_nav_url)
     if _nav_suggestion:
         header += f"\nNOTE: {_nav_suggestion}"
 

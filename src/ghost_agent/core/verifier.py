@@ -912,6 +912,63 @@ def _quote_supported_by_evidence(quote: str, evidence: str) -> bool:
         return False
 
 
+#: words of the AUDIT itself, not facts — never a counter-fact
+_META_WORDS = frozenset("""
+claim claims reply response answer evidence source sources tool tools output outputs user request
+the this that these those however actually actual instead not none nothing also but and while
+agent judge assistant model statement fact facts value values number date name version text
+""".split())
+_COUNTERFACT_TOKEN_RE = re.compile(r"\d[\d.,:/-]*\d|\d|[^\W\d_][\w'’-]{3,}")
+
+
+def _issue_counterfacts(issue: str, claim: str) -> list:
+    """The facts an issue ASSERTS that the claim did not say: numbers, and
+    capitalised names that are not the first word of a sentence and not
+    audit vocabulary. "The final boss is Messiah, not Promised Consort
+    Radahn" → ["Messiah"] against a claim naming Radahn."""
+    claim_n = _normalize_for_containment(claim)
+    out = []
+    for sent in re.split(r"(?<=[.!?;:])\s+", str(issue or "")):
+        for i, m in enumerate(_COUNTERFACT_TOKEN_RE.finditer(sent)):
+            tok = m.group(0).strip(".,:/-'’")
+            if not tok:
+                continue
+            is_num = tok[0].isdigit()
+            if not is_num and (i == 0 or not tok[0].isupper() or tok.lower() in _META_WORDS):
+                continue
+            if _normalize_for_containment(tok) in claim_n:
+                continue
+            out.append(tok)
+    return out
+
+
+def _refute_rests_on_memory(issues, claim: str, haystack: str) -> bool:
+    """True when EVERY issue asserts a counter-fact and none of any issue's
+    counter-facts appears in the evidence, the request or the session's
+    earlier tool outputs — the judge "corrected" the claim from its own
+    memory (§4LG: "the actual final boss is Messiah" refuted a correct
+    "Promised Consort Radahn", and the reflection wrote it as a lesson). An
+    issue that only says the claim is UNSUPPORTED names nothing new and keeps
+    the refute standing."""
+    items = [str(i or "").strip() for i in (issues or []) if str(i or "").strip()]
+    if not items:
+        return False
+    hay = _normalize_for_containment(haystack)
+    for it in items:
+        cf = _issue_counterfacts(it, claim)
+        if not cf or any(_normalize_for_containment(t) in hay for t in cf):
+            return False
+    return True
+
+
+def _memory_refute_guard_enabled() -> bool:
+    # OFF by default (§4LH final review): replayed over the recorded refutes
+    # it fired once — wrongly, on a right "stork, not pelican" refute — and it
+    # misses the Radahn case that motivated it (the judge repeats the topic
+    # name from the evidence). A lexical proxy for "the judge used memory".
+    return os.getenv("GHOST_VERIFY_MEMORY_REFUTE_GUARD", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _refute_is_unanchored(issues, claim: str = "", evidence: str = "",
                           context: str = "") -> bool:
     """True when NO stated issue carries any evidentiary anchor — the
@@ -3264,13 +3321,17 @@ class Verifier:
         context_t = context[:1000]
         if _claim_binding_primary_enabled():
             # §4IM bench arm: the claim-binding verdict alone, no escalation.
-            return await self._verify_claim_binding(claim_t, evidence_t, context_t, trace=trace, raw_sources=raw_sources)
+            return self._guard_onion_claims(
+                await self._verify_claim_binding(claim_t, evidence_t, context_t, trace=trace, raw_sources=raw_sources),
+                claim, "\n".join(str(x or "") for x in (evidence, raw_sources, prior_evidence, context)))
         cb_task = (self._start_claim_binding(claim_t, evidence_t, context_t, trace=trace, raw_sources=raw_sources)
                    if _claim_binding_refute_first_enabled() else None)
         try:
-            return await self._verify_claim_incumbent(
+            res = await self._verify_claim_incumbent(
                 claim_t, evidence_t, context_t, cb_task, high_stakes=high_stakes, deep=deep, trace=trace,
                 prior_evidence=prior_evidence, raw_sources=raw_sources)
+            _hay = "\n".join(str(x or "") for x in (evidence, raw_sources, prior_evidence, context))
+            return self._guard_onion_claims(self._guard_memory_refute(res, claim_t, _hay), claim, _hay)
         except BaseException:
             # a caller cancellation or an incumbent exception must not leak
             # the binder task (a critic slot, an unwritten row — review §4IN M6)
@@ -3699,6 +3760,54 @@ class Verifier:
             task.add_done_callback(lambda t: (keep.discard(t), t.exception() if not t.cancelled() else None))
         except RuntimeError:
             logger.debug("claim-binding shadow: no running loop")
+
+    def _guard_memory_refute(self, result: Optional[VerifyResult], claim: str,
+                             haystack: str) -> Optional[VerifyResult]:
+        """A REFUTED whose every issue asserts a counter-fact found nowhere in
+        what the agent saw is downgraded to UNCERTAIN — no failed label, no
+        lesson scrub, no correction to the user (see
+        `_refute_rests_on_memory`). Kill switch GHOST_VERIFY_MEMORY_REFUTE_GUARD=0."""
+        if (result is None or result.verdict != VerifyVerdict.REFUTED
+                or not _memory_refute_guard_enabled()
+                or not _refute_rests_on_memory(result.issues, claim, haystack)):
+            return result
+        logger.warning("verifier: REFUTED rests on counter-facts absent from the evidence (%s) — "
+                       "downgraded to UNCERTAIN",
+                       "; ".join(", ".join(_issue_counterfacts(i, claim)) for i in result.issues)[:200])
+        return VerifyResult(
+            verdict=VerifyVerdict.UNCERTAIN,
+            confidence=min(float(result.confidence or 0.5), 0.5),
+            reasoning=("memory-refute guard: every issue asserts a counter-fact that appears nowhere in "
+                       "the evidence, the request or the session — the judge's own memory, not a "
+                       "contradiction. Was: " + (result.reasoning or ""))[:1000],
+            issues=list(result.issues or []),
+            suspects=getattr(result, "suspects", None),
+        )
+
+    def _guard_onion_claims(self, result: Optional[VerifyResult], claim: str,
+                            haystack: str) -> Optional[VerifyResult]:
+        """§4LH: the judge cannot check an onion address from memory — it
+        CONFIRMED a retired v2 address as DuckDuckGo's "official v3" (live
+        probe D2). A v2 address presented as current, or an onion address
+        no tool output contains, is an issue; a CONFIRMED carrying one
+        becomes UNCERTAIN (≤0.5). Kill switch GHOST_VERIFY_ONION_GUARD=0."""
+        if result is None or os.getenv("GHOST_VERIFY_ONION_GUARD", "1") == "0":
+            return result
+        from .link_grounding import onion_claim_issues
+        new = [i for i in onion_claim_issues(claim, haystack) if i not in (result.issues or [])]
+        if not new:
+            return result
+        logger.warning("verifier: onion guard — %s", "; ".join(new)[:200])
+        import dataclasses
+        demote = result.verdict == VerifyVerdict.CONFIRMED
+        return dataclasses.replace(
+            result,
+            verdict=VerifyVerdict.UNCERTAIN if demote else result.verdict,
+            confidence=min(float(result.confidence or 0.5), 0.5) if demote else result.confidence,
+            reasoning=((("onion guard: " + " ".join(new) + " Was: ") if demote else "")
+                       + (result.reasoning or ""))[:1000],
+            issues=list(result.issues or []) + new,
+        )
 
     def _guard_truncated_absence(self, result: Optional[VerifyResult],
                                  claim: str, evidence: str,

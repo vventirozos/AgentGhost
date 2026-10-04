@@ -2911,7 +2911,8 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                         # `source="dream"` tag lets B3 count dream's real
                         # contribution by provenance. Retrieval is trigger/BM25-
                         # keyed, so a content-derived trigger is also findable.
-                        _h_task = " ".join(str(h).split())[:80] or "Dream Heuristic"
+                        from ..memory.skills import trigger_text as _trig_text
+                        _h_task = _trig_text(h) or "Dream Heuristic"
                         _hw = await asyncio.to_thread(
                             self.context.skill_memory.learn_lesson,
                             _h_task, "none", h,
@@ -3579,7 +3580,8 @@ Return ONLY valid JSON:
             if not s or not _is_actionable_heuristic(s):
                 continue
             if hasattr(self.context, "skill_memory") and self.context.skill_memory:
-                _task = " ".join(str(s).split())[:80] or "Episode Strategy"
+                from ..memory.skills import trigger_text as _trig_text
+                _task = _trig_text(s) or "Episode Strategy"
                 _w = await asyncio.to_thread(
                     self.context.skill_memory.learn_lesson,
                     _task, "none", s,

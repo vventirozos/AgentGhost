@@ -26,6 +26,10 @@ request_id_context = contextvars.ContextVar("request_id", default="SYSTEM")
 # text itself still comes from the explicit `origin=` argument, so the
 # liveness `origin=` stamp readers see nothing new.
 request_origin_context = contextvars.ContextVar("request_origin", default="")
+#: the trajectory id of the turn in flight (§4LC): every lesson written
+#: during the turn — `learn_skill`, the bus, the post-mortem — is stamped
+#: with it, so a refuted or corrected turn's retraction finds them all
+trajectory_id_context = contextvars.ContextVar("trajectory_id", default="")
 #: §4JP: how many seconds the CLIENT will wait for this request before it
 #: closes the connection (the web interface's GHOST_CHAT_TIMEOUT, sent as
 #: `X-Ghost-Client-Timeout`); 0.0 = unknown / no deadline. The turn loop

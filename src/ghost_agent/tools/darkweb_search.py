@@ -148,10 +148,14 @@ _DEFAULT_ONION_ENGINES: List[Dict[str, str]] = [
         # HITSPERPAGE lifts one page from 7 unique onions to 28 (the parser
         # de-dupes by host, so this is 100 hits collapsing to 28 hosts).
         # Measured 4/4 reachable at 1.6-6.6s — the fastest engine in the set.
+        # §4LH: over 3 weeks of live use it was useful in 22% of searches (78
+        # "no matches", 34 timeouts at the 38 s deadline), so it is a FALLBACK:
+        # asked only when the other engines come back thin.
         "name": "torch",
         "url": "http://xmh57jrknzkhv6y3ls3ubitzfqnkrwxhopf5aygthi7d6rplyvk3noyd.onion"
                "/cgi-bin/omega/omega?P={q}&HITSPERPAGE=100",
         "index": "torch",
+        "tier": "fallback",
     },
     {
         # Torgle — added 2026-07-29 as a third INDEPENDENT index, so
@@ -513,6 +517,8 @@ def _load_engines() -> List[Dict[str, str]]:
             token_from = e.get("form_token_from")
             if token_from:
                 entry["form_token_from"] = str(token_from)
+            if str(e.get("tier") or "") == "fallback":
+                entry["tier"] = "fallback"
             engines.append(entry)
         return engines or [dict(e) for e in _DEFAULT_ONION_ENGINES]
     except Exception:
@@ -1216,6 +1222,12 @@ _NO_RESULTS_ERROR = (
 )
 
 
+#: Distinct onions the first wave must find for the fallback tier to stay idle.
+_FALLBACK_MIN_HOSTS = 5
+#: …and the fallback tier's own deadline, after the first wave.
+_FALLBACK_DEADLINE_S = 12.0
+
+
 async def _darkweb_search_raw(
     query: str, tor_proxy: str, max_results: int = 12
 ) -> Tuple[List[Dict[str, Any]], List[str], bool, int]:
@@ -1230,12 +1242,41 @@ async def _darkweb_search_raw(
     indexes that surfaced it, PLUS the names of engines the circuit
     breaker skipped and whether that was ALL of them — returned rather
     than stashed in a module global, because searches overlap."""
-    engines = _load_engines()
-    exclude = _engine_onion_hosts(engines)
-    per_engine = await asyncio.gather(
-        *[_query_engine(e, query, tor_proxy, exclude) for e in engines],
+    all_engines = _load_engines()
+    exclude = _engine_onion_hosts(all_engines)
+    # §4LH: fallback-tier engines (torch) are asked only when the first wave
+    # found fewer than _FALLBACK_MIN_HOSTS distinct onions. `engines` is the
+    # list this call actually SEARCHED, so the skip/denominator arithmetic
+    # below stays over what was asked.
+    if os.getenv("GHOST_ONION_FALLBACK_TIER", "1") == "0":
+        first, later = list(all_engines), []
+    else:
+        first = [e for e in all_engines if e.get("tier") != "fallback"]
+        later = [e for e in all_engines if e.get("tier") == "fallback"]
+    engines = list(first)
+    per_engine = list(await asyncio.gather(
+        *[_query_engine(e, query, tor_proxy, exclude) for e in first],
         return_exceptions=True,
-    )
+    )) if first else []
+    _hosts = {_onion_host(r["url"]) for res in per_engine if isinstance(res, list) for r in res}
+    if later and len(_hosts) < _FALLBACK_MIN_HOSTS:
+        engines += later
+        # A SHORT deadline: torch answers in 2-6 s when it answers at all
+        # (review §4LH: a full second 38 s deadline after the first wave
+        # took a thin search from ~50 s to ~88 s worst case).
+        async def _fallback(e):
+            # the outer deadline cancels _query_engine before its own timeout
+            # records anything — record the miss here, or a dead torch is
+            # paid for on every thin search (§4LH final review)
+            from ..utils.aio import wait_for as _wait_for
+            try:
+                return await _wait_for(_query_engine(e, query, tor_proxy, exclude), _FALLBACK_DEADLINE_S)
+            except asyncio.TimeoutError:
+                _breaker_record(e["name"], False)
+                logging.getLogger(__name__).info("fallback engine %s cut at %.0fs", e["name"],
+                                                 _FALLBACK_DEADLINE_S)
+                raise
+        per_engine += list(await asyncio.gather(*[_fallback(e) for e in later], return_exceptions=True))
 
     # J3: the denominator is the list THIS call searched, not a second
     # `_load_engines()` read — that re-reads GHOST_ONION_ENGINES (so a
@@ -1440,6 +1481,11 @@ async def tool_darkweb_search(
         header = (f"[Dark-web search — {len(queries)} phrasings "
                   f"({'; '.join(queries)}), engines reached: "
                   f"{', '.join(reached)}]")
+    # §4LG: say what this IS — the reply described "active MH370 threads on
+    # TForum" from directory titles, no onion page ever opened
+    header += ("\n[These are search-engine TITLES and snippets only — no page was opened. "
+               "Do not describe a page's content, posts or discussion from them; open a page "
+               "with darkweb_research or browser first, and say so if it fails to load.]")
     cacheable = header + "\n\n" + _format_results(ranked)
     # R2 M6: cache WITHOUT the NARROWED banner. It describes a transient
     # breaker state, and baking it into a 5-minute cache entry kept
@@ -1451,6 +1497,27 @@ async def tool_darkweb_search(
         return header + _narrowed_header(_skipped) + "\n\n" + \
             _format_results(ranked)
     return cacheable
+
+
+def rank_for_reading(ranked: List[Dict[str, Any]], query: str) -> List[Dict[str, Any]]:
+    """The onions worth OPENING first: on-topic (a distinctive query token in
+    the title/snippet/url — the web search's own check) before off-topic, a
+    page with a path before a bare homepage, engine agreement after that.
+    §4LG: ranked by engine agreement alone, 32 of 36 pages read yielded "No
+    relevant information" — 25 of them site homepages."""
+    from urllib.parse import urlparse
+    try:
+        from .search import distinctive_tokens, result_on_topic
+        dist = distinctive_tokens(query)
+    except Exception:  # noqa: BLE001 — no topic check: keep the engines' order
+        return list(ranked)
+
+    def key(item):
+        i, r = item
+        on = result_on_topic({"title": r.get("title"), "body": r.get("snippet"), "url": r.get("url")}, dist)
+        path = urlparse(str(r.get("url") or "")).path.strip("/")
+        return (not on, not path, i)
+    return [r for _, r in sorted(enumerate(ranked), key=key)]
 
 
 async def tool_darkweb_research(
@@ -1505,7 +1572,7 @@ async def tool_darkweb_research(
         return ToolOutcome.ok(cached, world_changed=False)
 
     ranked, _skipped, _all_skipped, _total = await _darkweb_search_raw(
-        query, tor_proxy, max_results=max_sources)
+        query, tor_proxy, max_results=max_sources * 3)
     if not ranked:
         # J1: this caller kept blaming the query after the sibling was
         # fixed — and it is the follow-up `darkweb_search`'s own tool
@@ -1513,7 +1580,7 @@ async def tool_darkweb_research(
         # after a thin result set.
         return _no_results_error(_skipped, _total, _all_skipped)
 
-    urls = [r["url"] for r in ranked][:max_sources]
+    urls = [r["url"] for r in rank_for_reading(ranked, query)][:max_sources]
 
     # ⚠ WHAT `max_context` ACTUALLY BOUNDS. It is the MAIN model's window, and
     # the assembled report is what gets read back into it — so this is a
