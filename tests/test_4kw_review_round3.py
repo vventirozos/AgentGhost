@@ -235,13 +235,11 @@ def test_the_outcome_line_reads_the_capped_record():
                          == "_cap_recorded_reply(_recorded_reply)" for c in calls)
 
 
-def test_the_no_run_caveat_does_not_hide_an_earlier_run():
-    import ast, inspect
-    tree = ast.parse(inspect.getsource(A))
-    n = next(n for n in ast.walk(tree) if isinstance(n, ast.If)
-             and "_is_unverified_mutation(last_tool) and request_forbids_running(last_user_content)" in ast.unparse(n.test))
-    body = "\n".join(ast.unparse(s) for s in n.body)
-    assert "Not re-run after the last edit" in body and "tools_run_this_turn" in body and "'execute'" in body
+def test_the_no_run_caveat_does_not_hide_an_earlier_run(monkeypatch):
+    monkeypatch.setattr(A, "_is_unverified_mutation", lambda t: True)
+    note, failed = A._unverified_mutation_note(
+        {"name": "file_system"}, "edit app.py but don't run it", [{"name": "execute", "content": "ok"}])
+    assert "Not re-run after the last edit" in note and failed is False
 
 
 # ── fresh review (second pass): the hung-node charge on the PRODUCTION path ──

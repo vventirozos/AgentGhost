@@ -3812,6 +3812,13 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
                 _req_gone = await asyncio.to_thread(_sk.remove_request_scoped, memory_system)
             except Exception as e:  # noqa: BLE001
                 __import__("logging").getLogger("GhostAgent").warning(f"reset_all lesson wipe failed: {e}")
+        # §4LK: the queued corrections quote the owner's conversations
+        _ag = kwargs.get("owner_agent")
+        if _ag is not None and hasattr(_ag, "clear_pending_corrections"):
+            try:
+                _ag.clear_pending_corrections()
+            except Exception as e:  # noqa: BLE001
+                __import__("logging").getLogger("GhostAgent").warning(f"reset_all correction-queue wipe failed: {e}")
         note = (f" Removed {_req_gone} one-request lesson(s) (archived)." if _req_gone else "")
         if report_note_incomplete:
             note += (" NOTE: the store returned fewer metadata rows than ids,"

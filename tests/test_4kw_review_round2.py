@@ -82,11 +82,15 @@ def test_the_repair_is_skipped_before_it_is_ordered():
     assert rest.index("_breaker_forced_final") < rest.index("Actually RUN")
 
 
-def test_the_caveat_says_not_run_as_asked_and_records_no_failure():
-    n = _if_chain("_is_unverified_mutation(last_tool) and request_forbids_running(last_user_content)")
-    body = "\n".join(ast.unparse(s) for s in n.body)
-    assert "Not run, as you asked" in body and "verifier_backfill" not in body
-    assert "verifier_backfill = ('failed', UNVERIFIED_MUTATION_REASON)" in ast.unparse(n.orelse[0])
+def test_the_caveat_says_not_run_as_asked_and_records_no_failure(monkeypatch):
+    """Behaviour of the one helper both delivery paths use (§4LK): a write the
+    user asked not to run is SAID, not failed; otherwise it is flagged and
+    failed."""
+    monkeypatch.setattr(A, "_is_unverified_mutation", lambda t: True)
+    note, failed = A._unverified_mutation_note({"name": "file_system"}, "edit app.py but don't run it", [])
+    assert "Not run, as you asked" in note and failed is False
+    note, failed = A._unverified_mutation_note({"name": "file_system"}, "fix app.py", [])
+    assert "⚠ Unverified" in note and failed is True
 
 
 # ── (S4) the no-progress breaker's final ─────────────────────────────────────

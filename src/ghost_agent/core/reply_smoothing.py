@@ -1202,10 +1202,21 @@ _NEGATED_OPENER_RE = re.compile(
     r"^\s*(?:\w+[,\s]+)*(?:i will|i'?ll|i am going to|i'?m going to|i should|let me|let'?s)\s+(?:not|never)\b", re.IGNORECASE)
 
 
-def _is_work_beat(sentence: str) -> bool:
+#: §4LK review: under a tool attempt, "you" in an announcement is excused —
+#: but a question, or a contrast that turns to the user ("Let me confirm, but
+#: yes, you can delete it", "Θα το ελέγξω, αλλά μπορείς…"), carries an answer
+_TOOL_ATTEMPT_ANSWER_RE = re.compile(
+    r"\?|;|—|–|\b(?:but|though|although|however|yet)\b|αλλά|όμως|ωστόσο", re.IGNORECASE)
+
+
+def _is_work_beat(sentence: str, tool_attempt: bool = False) -> bool:
+    # §4LK: on a turn that went on to call a tool, a "Let me check …" sentence
+    # is an announcement even when it says "you" ("…before you came back",
+    # req b46518f0) — the call is the structural proof it was not the answer
     return (bool(_NARRATION_BEAT_SENT_RE.match(sentence))
             and bool(_NARRATION_WORK_RE.search(sentence))
-            and not _NARRATION_ADDRESSED_RE.search(sentence)
+            and ((tool_attempt and not _TOOL_ATTEMPT_ANSWER_RE.search(sentence))
+                 or not _NARRATION_ADDRESSED_RE.search(sentence))
             and not _GREEK_QUESTION_RE.search(sentence)
             and not _LEAD_IN_RE.search(sentence)
             and not _NEGATED_OPENER_RE.match(sentence))
@@ -1259,7 +1270,7 @@ def _mask_beat_years(block: str) -> str:
     return " ".join(out)
 
 
-def narration_only(text: str, *, request: str = "") -> bool:
+def narration_only(text: str, *, request: str = "", tool_attempt: bool = False) -> bool:
     """True when EVERY paragraph of ``text`` is a working-narration beat and
     none carries content — the reply announces work and reports nothing.
     ``request`` (the user's message) lets figures it already contains be
@@ -1272,7 +1283,7 @@ def narration_only(text: str, *, request: str = "") -> bool:
                 _mask_beat_years(_mask_request_echoes(b, request))):
             return False
         sents = [s for s in _SENT_SPLIT_RE.split(b) if s.strip()]
-        beats = [_is_work_beat(s) for s in sents]
+        beats = [_is_work_beat(s, tool_attempt) for s in sents]
         if not any(beats):
             return False
         # a sentence BEFORE the first beat is an answer ("Yes. I'll check it tomorrow.",

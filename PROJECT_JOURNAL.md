@@ -50490,3 +50490,63 @@ darkweb_search, verifier, agent (#4li), configuration (guard default, GHOST_QUIE
      3. `bootout` of the freshly booting replacement (nothing to drain), then `bootstrap`.
    - Verified: `launchctl print` shows `exit timeout = 60`, one agent, health OK, "system ready" stable.
 **Verification:** full suite 28,036 passed, 0 failed, before the deploy.
+
+## §4LK — the streamed reply path (2026-10-04, operator: "yes, proceed")
+**Review** (3 fresh readers, read-only on copies; window 2026-09-13 → 10-04 for owner traffic):
+- **Measurement:**
+  - 42 streamed vs 198 non-streamed owner turns. Owner turns streamed only 09-14 → 09-30.
+  - Streamed research turns: 21% of reply facts were not in the turn's results (non-streamed: 10%).
+  - **0 of 8** corrections and caveats for streamed answers were ever shown; 11 of 27 queued corrections expired
+    at the 15-min TTL (median gap to the next message: 21 min).
+  - **6 of 60** streamed turns ended with NO answer (the "could not be parsed" note or narration). Most were before
+    the §4HF retry; one owner case after it (b46518f0).
+  - Link grounding found nothing invented on the streamed path, so the live link filter is DEFERRED; the 2 URLs it
+    would have removed were real.
+- **Parity table:** finalize steps the stream skipped: link grounding, the pre-tool drop, the unverified-write note
+  and failed label, the correction banner leaking into the record.
+- **Correction funnel:** the owner fingerprint had no answer binding, so chat A's correction could open chat B
+  ("hello ghost" twice). Caveats reached no one. The queue was lost on restart.
+**Fixes:**
+1. **No answer on the stream:** a tools-off final whose text only ANNOUNCED work and then called a tool gets the
+   answer-now retry on both paths, even when the announcement says "you" (`narration_only(…, tool_attempt=True)`,
+   `_announced_then_called`). Reproduced on current code first: b46518f0's "Let me check what I was actually
+   carrying before you came back." + a self_state call shipped with no retry, because "you" read as addressed to
+   the user.
+2. **Corrections:** every correction (owner too) is bound to the answer it corrects:
+   - the key is `fp|r<tag>|k<normalised opening>`, matched by CONTAINMENT in the thread's assistant messages,
+     robust to a clarify head, digests, the not-run note, Slack-dropped images and `:warning:` banners;
+   - bound corrections live 24 h; the queue persists (`memory/pending_corrections.json`, main agent only);
+   - members and the owner are capped separately (a `member` flag);
+   - `reset_all` clears the queue; log lines carry the fingerprint prefix.
+3. **The streamed record** drops the previous turn's correction banner (it was recorded as this answer, feeding
+   lessons and calibration) and the text written beside lookups.
+4. **An untested final write** is flagged on the stream too: the same note as finalize (one helper,
+   `_unverified_mutation_note`) as the last chunk before [DONE], and the trajectory is labelled failed.
+**Fresh review of the fixes (1 reader):**
+- **MAJOR:**
+  - a delegate (same memory_dir) loaded and re-saved the owner's queue → a shown correction returned after a
+    restart → main agent only;
+  - binding everything broke the §4LH per-side cap → a member flag;
+  - the "you" exemption also caught real short answers ("Let me confirm, but yes, you can delete it") → a question
+    or contrast keeps it an answer.
+- **MINOR:** exact-hash tags missed answers with added heads, notes, images or shortcodes → containment;
+  `reset_all` did not clear the queue → fixed.
+**Verification:**
+- `tests/test_4lk_stream_path.py` (29);
+- 2 old §4KW source pins rewritten as behaviour tests of the shared helper;
+- battery bat32: 20/20 after 4 survivors were pinned (the image and shortcode cases queued from the shipped text;
+  reset_all through the tool and through the registry). NOOP survives, tree pristine;
+- full suite 28,063 passed, 0 failed. Deployed (gated, graceful, one process).
+**Decisions for the operator** (UI and notification volume; not done):
+- (a) send source caveats as notices too;
+- (b) write a late correction into the SAVED chat so reopening it shows the correction;
+- (c) per-device consumers for the web bell.
+**Probes (labelled, `stream: true`, read as SSE like the web UI):**
+- **S1 (Python 3.12 latest patch):** 3.12.15, 30 Sep 2026, cited python.org/downloads (a page the turn read);
+  CONFIRMED (escalation overturned a cheap refute that compared against 3.14.8).
+- **S2 (BBC top headline):** a 2-sentence summary from the bbc.com/news page read; UNCERTAIN via the truncation
+  guard (56% of the evidence cut).
+- **NOT exercised live:** both turns ended on a normal final answer, so they took the NON-streamed finalize and
+  were served as one SSE chunk (time to first token == total). The streamed drain runs only on a FORCED final
+  (breaker, planner `required_tool: none`, closed task), which a prompt cannot force. The §4LK stream-side fixes
+  are pinned by tests driving the real stream generator (`_stream_final_generation`), not by a live probe.

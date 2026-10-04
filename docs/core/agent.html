@@ -1896,6 +1896,43 @@
   per-conversation record written at finalize — a client that resends text only still trips it; a restart loses only
   the record. The question exemption keeps "ok"/"yes" as consent to OUR question. Why a guard and not a prompt line:
   the system prompt's "if you lack information, ASK" already lost to a tool result's suggested next action.</p>
+  <h2 id="4lk">The streamed reply path <span class="tag">2026-10-04 &sect;4LK</span></h2>
+  <p>Measured over 3 weeks (owner turns): the streamed path's worst harms were research turns ending with no answer
+  (6 of 60 streamed turns ended on the "could not be parsed" note) and late corrections that never arrived (0 of 8
+  for streamed answers; 11 of 27 queued corrections expired at 15 min, with a median gap of 21 min to the next
+  message). Link grounding found nothing invented on the streamed path, so the live link filter is deferred.</p>
+  <ul>
+    <li><strong>A tools-off final that only announced work and then called a tool gets the answer-now
+    retry</strong> on both paths, even when the announcement says "you"
+    (<code>narration_only(..., tool_attempt=True)</code>, <code>_announced_then_called</code>). Request b46518f0
+    shipped "Let me check what I was actually carrying before you came back." plus the parse note. A real answer
+    plus a stray call is still not retried, and neither is a sentence with a question or a contrast that turns to the
+    user ("Let me confirm, but yes, you can delete it"; "Θα το ελέγξω, αλλά μπορείς…").</li>
+    <li><strong>Every correction is bound to the answer it corrects</strong>, the owner's too: the key is the
+    conversation fingerprint plus <code>|r</code> plus the <code>_reply_tag</code> of the answer, and on the stream
+    the tag is taken from the text the client stored. Before, chat A's correction could open chat B when both
+    started "hello ghost". A bound correction waits 24 h for the next message in that chat
+    (<code>_CORRECTION_TTL_BOUND</code>); an unbound one still expires at 15 min. The queue is saved to
+    <code>memory/pending_corrections.json</code> and survives restarts (2 of 27 streamed corrections were lost to
+    one). Queue, surface and expiry log lines carry the fingerprint prefix.
+      <ul>
+        <li>The match is by CONTAINMENT of the answer's normalised opening (<code>_reply_norm</code>), so text added
+        around a shipped reply cannot hide it: a clarify question before it, a digest, the "not run" note, an image
+        Slack drops, or a <code>:warning:</code> banner.</li>
+        <li>Only the main agent loads or saves the queue. A delegate shares <code>memory_dir</code>, and in review it
+        brought a shown correction back after a restart.</li>
+        <li>Members' and the owner's corrections are capped separately, by a <code>member</code> flag on each
+        entry.</li>
+        <li><code>reset_all</code> clears the queue.</li>
+      </ul></li>
+    <li><strong>The streamed record</strong> (trajectory, post-mortem lessons, episode, calibration) no longer
+    carries the previous turn's correction banner as this answer. It also drops text written beside lookup calls,
+    as the non-stream path does (<code>StreamState.pre_tool_segments</code>). The live stream is unchanged.</li>
+    <li><strong>An untested final write</strong> is flagged on the stream too: the same note as finalize
+    (<code>_unverified_mutation_note</code>, one helper for both paths) goes out as the last chunk before
+    <code>[DONE]</code>, and the trajectory is labelled failed. A write the user asked not to run is said, not
+    failed.</li>
+  </ul>
 </main>
 </body>
 </html>

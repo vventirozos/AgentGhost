@@ -62,10 +62,10 @@ def test_member_corrections_never_evict_the_owners():
     """Fails where three member refutes pushed the owner's pending correction
     out of the shared 3-slot queue."""
     from ghost_agent.core.agent import _trim_corrections
-    owner = {"note": "OWNER", "conv": "ownerfp", "ts": 1}
-    members = [{"note": f"m{i}", "conv": f"m{i}|rabc", "ts": 1} for i in range(5)]
+    owner = {"note": "OWNER", "conv": "ownerfp|rabc", "ts": 1}            # §4LK: the owner's are bound too
+    members = [{"note": f"m{i}", "conv": f"m{i}|rabc", "ts": 1, "member": True} for i in range(5)]
     out = _trim_corrections([owner] + members)
-    assert owner in out and sum(1 for c in out if "|r" in c["conv"]) == 3
+    assert owner in out and sum(1 for c in out if c.get("member")) == 3
 
 
 def test_a_members_tag_survives_a_correction_banner_in_slack_markup():

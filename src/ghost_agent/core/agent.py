@@ -1352,6 +1352,13 @@ def _worker_check_applies(messages, pending_request) -> bool:
         return False
 
 
+def _announced_then_called(text: str, request: str = "") -> bool:
+    """§4LK: this turn's text only ANNOUNCED work, and a tool call followed —
+    an announcement may say "you" ("…before you came back", req b46518f0)."""
+    from .reply_smoothing import narration_only
+    return bool((text or "").strip()) and narration_only(text, request=request, tool_attempt=True)
+
+
 def _forced_final_has_no_answer(this_turn_text: str, accumulated: str,
                                 request: str = "") -> bool:
     """`reply_smoothing.forced_final_has_no_answer` over the model's text
@@ -2154,34 +2161,48 @@ def _trim_corrections(queue) -> list:
     research refutes (bound to an answer by ``|r<tag>``) evicted the OWNER's
     pending correction. Each side keeps its own newest ``_CORRECTION_MAX``."""
     q = list(queue or [])
-    bound = [c for c in q if isinstance(c, dict) and "|r" in str(c.get("conv", ""))]
-    rest = [c for c in q if not (isinstance(c, dict) and "|r" in str(c.get("conv", "")))]
+    # by WHO the correction is for (§4LK review: every correction is bound
+    # now, so splitting on the binding put the owner's with the members')
+    bound = [c for c in q if isinstance(c, dict) and c.get("member")]
+    rest = [c for c in q if not (isinstance(c, dict) and c.get("member"))]
     keep = {id(c) for c in rest[-_CORRECTION_MAX:]} | {id(c) for c in bound[-_CORRECTION_MAX:]}
     return [c for c in q if id(c) in keep]
 
 
-def _reply_tag(text) -> str:
-    """§4LH: a short tag of a reply's opening words, stable across the Slack
-    round trip (markdown→mrkdwn→plain changes markup and links, not words).
-    A member's queued correction carries the tag of the answer it corrects
-    and surfaces only in a thread whose history holds that answer: the
-    conversation fingerprint alone is the FIRST message, which two members'
-    threads can share ("hi")."""
+def _reply_norm(text) -> str:
+    """A reply's words, normalised to survive the Slack round trip and the
+    notes added around a shipped reply: system notes and either banner markup
+    stripped, image markdown and Slack :shortcodes: removed, links reduced to
+    their labels, URLs dropped, then letters and digits only, lower case."""
     try:
         from .reply_smoothing import strip_system_notes
         t = strip_system_notes(str(text or ""))
     except Exception:  # noqa: BLE001
         t = str(text or "")
-    # a correction banner in Slack's markup (`*…*`, not `**…**`) is not
-    # matched by strip_system_notes — remove either form (review §4LH)
-    t = re.sub(r"\A\s*(?:⚠️|ℹ️)[^\n]{0,2000}\n(?:[^\n]{0,2000}\n){0,6}?\s*-{3,}\s*\n", "", t)
+    t = re.sub(r"\A\s*(?:⚠️|ℹ️|:warning:|:information_source:)[^\n]{0,2000}\n(?:[^\n]{0,2000}\n){0,6}?\s*-{3,}\s*\n", "", t)
+    t = re.sub(r"!\[[^\]\n]{0,300}\]\([^)\s]{0,500}\)", " ", t)          # images (Slack drops them)
+    t = re.sub(r":[a-z0-9_+-]{1,40}:", " ", t)                             # Slack emoji shortcodes
     t = re.sub(r"<https?://[^|>]*\|([^>]*)>", r"\1", t)
+    t = re.sub(r"\[([^\]\n]{0,300})\]\(https?://[^)\s]+\)", r"\1", t)
     t = re.sub(r"https?://\S+", " ", t)
-    core = re.sub(r"[\W_]+", "", t.lower())[:120]
+    return re.sub(r"[\W_]+", "", t.lower())
+
+
+#: how much of a reply's opening identifies it
+_REPLY_KEY_CHARS = 120
+
+
+def _reply_tag(text) -> str:
+    """§4LH/§4LK: a short tag of a reply's opening words. A queued correction
+    carries the tag AND the opening itself (``|k``) of the answer it corrects;
+    it surfaces only in a thread whose history CONTAINS that answer — a header
+    put before it or a note after it (the clarify question, a digest, the
+    "not run" note) no longer breaks the match (§4LK review)."""
+    core = _reply_norm(text)[:_REPLY_KEY_CHARS]
     if not core:
         return ""
     import hashlib
-    return hashlib.sha1(core.encode("utf-8")).hexdigest()[:10]
+    return hashlib.sha1(core.encode("utf-8")).hexdigest()[:10] + "|k" + core
 
 
 #: §4LH: batches whose text-alongside is narration, not an answer.
@@ -3322,6 +3343,31 @@ def _backfilled_failure_reason(verifier: Optional[str], verifier_reason: str,
             return verifier_reason
         return "verifier refuted"
     return structural_reason(structural_cause_for_trajectory(traj))
+
+
+def _unverified_mutation_note(last_tool, request, tools_run):
+    """(note, failed) for a turn whose final substantive action was a file
+    write never run or rendered — ("", False) otherwise. ONE wording for
+    both delivery paths (§4LK: the streamed path had none — a streamed final
+    after an untested write was neither flagged nor labelled failed).
+    Untested BY REQUEST ("don't run it") is said, not failed (§4KW)."""
+    if not _is_unverified_mutation(last_tool):
+        return "", False
+    if request_forbids_running(request):
+        # (fresh review) the model may have run an EARLIER version anyway —
+        # then say so, not "as you asked"
+        _ran_code = any(
+            isinstance(_t, dict) and not _t.get("_synthetic")
+            and str(_t.get("name", "")).lower() == "execute"
+            for _t in (tools_run or []))
+        return (("\n\n---\n*Not re-run after the last edit (you asked not to run it) — the "
+                 "final version is untested.*") if _ran_code else
+                "\n\n---\n*Not run, as you asked — the change is untested.*"), False
+    return ("\n\n---\n**⚠ Unverified:** the final action "
+            "was a file write that was never executed or "
+            "rendered, so I cannot confirm it works. Treat "
+            "this as INCOMPLETE — run/preview it before "
+            "relying on it."), True
 
 
 def _is_unverified_mutation(tool: Optional[dict]) -> bool:
@@ -7730,6 +7776,15 @@ class GhostContext:
 #     dropped after this many seconds instead of lingering forever.
 _CORRECTION_MAX = 3
 _CORRECTION_TTL = 900.0  # seconds
+#: §4LK: a correction BOUND to the answer it corrects (`|r<tag>`) cannot open
+#: the wrong reply, so it can wait for the owner's next message in that chat —
+#: the median gap was 21 min and 11 of 27 expired at 15 min
+_CORRECTION_TTL_BOUND = 86400.0
+_PENDING_CORRECTIONS_FILE = "pending_corrections.json"
+
+
+def _correction_ttl(c) -> float:
+    return _CORRECTION_TTL_BOUND if "|r" in str((c or {}).get("conv", "")) else _CORRECTION_TTL
 
 # Promised-notification finish-line guard (2026-07-13, req 11fe11d8): the
 # user asked "notify me in slack when you're done", the model PLANNED the
@@ -8738,6 +8793,9 @@ class StreamState:
     # (tests) stay valid; the build site always passes it explicitly.
     pressure_lockdown: Any = False
     requester_role: Any = ""
+    # §4LK: this turn's text written alongside lookup calls (taken under the
+    # semaphore) — the saved record drops it as the non-stream path does
+    pre_tool_segments: Any = ()
 
 
 
@@ -8845,7 +8903,7 @@ class GhostAgent:
         # Corrections queued by a previous turn's async verdict (GHOST_CRITIC_ASYNC),
         # surfaced at the top of the next turn. See _record_late_verdict /
         # _consume_pending_corrections.
-        self._pending_corrections = []
+        self._pending_corrections = self._load_pending_corrections()
         self._correction_active_this_turn = False
         self._active_correction = ""
         self.available_tools = get_available_tools(context)
@@ -17049,10 +17107,11 @@ class GhostAgent:
         # late correction can only surface back in the SAME conversation.
         _late_conv = (conv_fp if conv_fp is not None
                       else self._conversation_fingerprint(messages))
-        if (requester_is_member() or reply_is_public()) and _late_conv:
-            # §4LH: bound to the answer it corrects (see _reply_tag) — two
-            # channel threads, or two members' threads, can open with the
-            # same words and so share the conversation fingerprint
+        if _late_conv:
+            # §4LH/§4LK: bound to the answer it corrects (see _reply_tag) — two
+            # chats can open with the same words ("hello ghost") and so share
+            # the conversation fingerprint; the owner's too (§4LK review: chat
+            # A's correction opened chat B)
             _late_conv = f"{_late_conv}|r{_reply_tag(final_ai_content)}"
         self._attach_late_verdict_handler(
             task, trajectory_id, _late_conv,
@@ -18195,6 +18254,7 @@ class GhostAgent:
             dropped = len(lst) - len(kept)
             if dropped:
                 self._pending_corrections = kept
+                self._save_pending_corrections()
                 pretty_log(
                     "Human Feedback",
                     f"revoked {dropped} queued correction banner(s) for "
@@ -18564,12 +18624,15 @@ class GhostAgent:
                         # thumbed up).
                         "traj": str(trajectory_id or ""),
                         "ts": time.monotonic(),
+                        "member": requester_is_member(),
                     })
                     if len(self._pending_corrections) > _CORRECTION_MAX:
                         self._pending_corrections = _trim_corrections(self._pending_corrections)
+                    self._save_pending_corrections()
                     pretty_log(
                         "Verifier",
-                        "queued a correction to surface on the next message of this conversation",
+                        f"queued a correction to surface on the next message of this conversation "
+                        f"(conv {str(conv_fp or '')[:6]})",
                         icon=Icons.IDEA,
                     )
                     # §4LG: and TELL the owner — a research question is one-shot,
@@ -18612,7 +18675,8 @@ class GhostAgent:
             _now = time.monotonic()
             self._pending_corrections = [
                 c for c in corrections
-                if not (isinstance(c, dict) and (_now - c.get("ts", _now)) > _CORRECTION_TTL)]
+                if not (isinstance(c, dict) and (_now - c.get("ts", _now)) > _correction_ttl(c))]
+            self._save_pending_corrections()
             self._correction_active_this_turn = False
             return messages
 
@@ -18621,7 +18685,10 @@ class GhostAgent:
             conv_fp if conv_fp is not None
             else self._conversation_fingerprint(messages)
         )
-        _thread_tags = {_reply_tag(m.get("content")) for m in (messages or [])
+        _thread_texts = [_reply_norm(m.get("content")) for m in (messages or [])
+                         if isinstance(m, dict) and m.get("role") == "assistant"
+                         and isinstance(m.get("content"), str)]
+        _thread_tags = {_reply_tag(m.get("content")).split("|k", 1)[0] for m in (messages or [])
                         if isinstance(m, dict) and m.get("role") == "assistant"
                         and isinstance(m.get("content"), str)} - {""}
         surface = []   # notes belonging to THIS conversation → prepend now
@@ -18635,14 +18702,19 @@ class GhostAgent:
                 continue
             if not isinstance(c, dict):
                 continue
-            if (now - c.get("ts", now)) > _CORRECTION_TTL:
+            if (now - c.get("ts", now)) > _correction_ttl(c):
+                logger.info("correction expired unshown (conv %s, %s)", str(c.get("conv", ""))[:6],
+                            c.get("kind", "correction"))
                 continue  # expired → drop (its conversation never came back)
             conv = c.get("conv", "")
             if "|r" in conv:
-                # §4LH: a member's correction names the answer it corrects;
-                # it surfaces only where that answer is in the history
-                _base, _, _tag = conv.partition("|r")
-                if current_fp and _base == current_fp and _tag and _tag in _thread_tags:
+                # §4LH/§4LK: the correction names the answer it corrects; it
+                # surfaces only where that answer is in the history
+                _base, _, _rest = conv.partition("|r")
+                _tag, _, _core = _rest.partition("|k")
+                if current_fp and _base == current_fp and (
+                        (_tag and _tag in _thread_tags)
+                        or (_core and any(_core in t for t in _thread_texts))):
                     surface.append((c.get("kind", "correction"), c.get("note", "")))
                 else:
                     kept.append(c)
@@ -18661,6 +18733,7 @@ class GhostAgent:
         # Hold non-matching (still-fresh) corrections for their own
         # conversation, bounded by the cap; drop everything else.
         self._pending_corrections = _trim_corrections(kept)
+        self._save_pending_corrections()
         self._correction_active_this_turn = bool(surface)
         if not surface:
             return messages
@@ -18677,7 +18750,7 @@ class GhostAgent:
         self._active_correction = banner + "---\n\n"
         pretty_log(
             "Verifier",
-            f"surfacing {len(surface)} deferred correction(s) from a prior turn "
+            f"surfacing {len(surface)} deferred correction(s) (conv {str(current_fp or '')[:6]}) from a prior turn "
             "of this conversation",
             icon=Icons.IDEA,
         )
@@ -18700,12 +18773,69 @@ class GhostAgent:
         if any(c.get("note") == note and c.get("conv") == conv_fp for c in self._pending_corrections if isinstance(c, dict)):
             return False
         self._pending_corrections.append({"note": note, "conv": conv_fp, "traj": str(trajectory_id or ""),
-                                          "ts": time.monotonic(), "kind": "caveat"})
+                                          "ts": time.monotonic(), "kind": "caveat",
+                                          "member": requester_is_member()})
         if len(self._pending_corrections) > _CORRECTION_MAX:
             self._pending_corrections = _trim_corrections(self._pending_corrections)
-        pretty_log("Verifier", f"queued a source caveat for this conversation's next reply: {', '.join(facts)}",
+        self._save_pending_corrections()
+        pretty_log("Verifier", f"queued a source caveat for this conversation's next reply "
+                               f"(conv {str(conv_fp or '')[:6]}): {', '.join(facts)}",
                    icon=Icons.VERIFIER_LAB)
         return True
+
+    def _pending_corrections_path(self):
+        ctx = getattr(self, "context", None)
+        # only the MAIN agent owns the queue (§4LK review: a delegate shares
+        # memory_dir — it loaded the owner's corrections and saved a stale copy
+        # back, so a shown correction returned after a restart)
+        if (getattr(ctx, "owner_memory_isolated", False) is True
+                or getattr(getattr(ctx, "skill_memory", None), "is_read_only", False) is True):
+            return None
+        md = getattr(ctx, "memory_dir", None)
+        if not isinstance(md, (str, Path)) or not str(md):
+            return None
+        return Path(md) / _PENDING_CORRECTIONS_FILE
+
+    def clear_pending_corrections(self) -> None:
+        """reset_all: the queue quotes the owner's conversations."""
+        self._pending_corrections = []
+        self._save_pending_corrections()
+
+    def _save_pending_corrections(self) -> None:
+        """§4LK: the queue survives a restart (2 of 27 streamed corrections were
+        lost to one, at ~9 restarts a day). Monotonic stamps are stored as wall
+        time. Never raises."""
+        try:
+            path = self._pending_corrections_path()
+            if path is None:
+                return
+            now_m, now_w = time.monotonic(), time.time()
+            rows = [dict(c, wall=now_w - (now_m - float(c.get("ts", now_m))))
+                    for c in (self._pending_corrections or []) if isinstance(c, dict)]
+            tmp = path.with_suffix(f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(rows, ensure_ascii=False))
+            os.replace(tmp, path)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("pending corrections not saved: %s", e)
+
+    def _load_pending_corrections(self) -> list:
+        try:
+            path = self._pending_corrections_path()
+            if path is None or not path.exists():
+                return []
+            now_m, now_w = time.monotonic(), time.time()
+            out = []
+            for c in json.loads(path.read_text()) or []:
+                if not isinstance(c, dict) or "wall" not in c:
+                    continue
+                c = dict(c)
+                c["ts"] = now_m - (now_w - float(c.pop("wall")))
+                if (now_m - c["ts"]) <= _correction_ttl(c):
+                    out.append(c)
+            return _trim_corrections(out)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("pending corrections not loaded: %s", e)
+            return []
 
     def _take_active_correction(self) -> str:
         """Return the staged correction banner and clear it (one-shot, so it
@@ -24134,31 +24264,17 @@ class GhostAgent:
                         # reported C=0.96). Treat that as a failed outcome
                         # so confidence drops below threshold and the turn
                         # is recorded as unverified rather than success.
-                        if _is_unverified_mutation(last_tool) and request_forbids_running(last_user_content):
+                        _um_note, _um_failed = _unverified_mutation_note(
+                            last_tool, last_user_content, tools_run_this_turn)
+                        if _um_note and not _um_failed:
                             # §4KW (review): untested BY REQUEST — say so, and do
                             # not record a correct edit as FAILED
-                            # (fresh review) the model may have run an EARLIER
-                            # version anyway — then say so, not "as you asked"
-                            _ran_code = any(
-                                isinstance(_t, dict) and not _t.get("_synthetic")
-                                and str(_t.get("name", "")).lower() == "execute"
-                                for _t in (tools_run_this_turn or []))
-                            note = ("\n\n---\n*Not re-run after the last edit (you asked not to run it) — the "
-                                    "final version is untested.*" if _ran_code else
-                                    "\n\n---\n*Not run, as you asked — the change is untested.*")
-                            if note[:30] not in final_ai_content:
-                                final_ai_content = f"{final_ai_content}{note}"
-                        elif _is_unverified_mutation(last_tool):
+                            if _um_note[:30] not in final_ai_content:
+                                final_ai_content = f"{final_ai_content}{_um_note}"
+                        elif _um_failed:
                             verifier_backfill = ("failed", UNVERIFIED_MUTATION_REASON)
-                            note = (
-                                "\n\n---\n**⚠ Unverified:** the final action "
-                                "was a file write that was never executed or "
-                                "rendered, so I cannot confirm it works. Treat "
-                                "this as INCOMPLETE — run/preview it before "
-                                "relying on it."
-                            )
-                            if note[:40] not in final_ai_content:
-                                final_ai_content = f"{final_ai_content}{note}"
+                            if _um_note[:40] not in final_ai_content:
+                                final_ai_content = f"{final_ai_content}{_um_note}"
                             pretty_log(
                                 "Verifier",
                                 "finalised on an UNVERIFIED file write (never "
@@ -26665,7 +26781,11 @@ class GhostAgent:
                         # to work instead of reporting, whatever prose came
                         # with it (probe ifs19450…: "Let me fix that." + execute).
                         or (_dropped_this_turn
-                            and getattr(self.context, "_breaker_forced_final", False))):
+                            and getattr(self.context, "_breaker_forced_final", False))
+                        # §4LK: a dropped call after announcement-only prose
+                        # ("Let me check … before you came back.")
+                        or (_dropped_this_turn and _announced_then_called(
+                            clean_ui, str(last_user_content or "")))):
                     # No retry on the last budget turn — a `continue`
                     # there exits to the exhaustion path, which ships
                     # the narration this branch exists to replace.
@@ -30933,6 +31053,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             # Under the semaphore: this is THIS turn's flag.
                             pressure_lockdown=bool(getattr(
                                 self.context, "_ctx_pressure_lockdown", False)),
+                            pre_tool_segments=tuple(getattr(
+                                self.context, "_pre_tool_segments", None) or ()),
                         )
                         # WRITE-BACK (not a captured read): the streaming path
                         # defers the turn-unregister to _stream_then_unregister's
@@ -32604,6 +32726,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         # write, the late verdict, the playbook backstop) would otherwise
         # read "SYSTEM" / no role (R2 review, 2026-09-24).
         requester_role = ss.requester_role
+        pre_tool_segments = ss.pre_tool_segments
         _stream_req_id = ss.req_id
         _stream_role = str(requester_role or "")
         if _stream_role == "member":
@@ -32650,6 +32773,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
 
         async def stream_wrapper():
             full_content = ""
+            _um_failed_stream = False     # §4LK: set before [DONE]; read by the record
             # §4O B-MAJOR-1: the internal drain sets stream_errored on an
             # upstream abort frame and recovers; this USER-FACING final
             # stream previously only LOGGED the abort, then persisted the
@@ -33271,7 +33395,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     _stream_scrub_active
                     and (not _scrub_fallback_emitted or _scrub_fallback_deferred)  # §4HW
                     and not loop_detected and not stream_aborted
-                    and ((_ff_tried_tool and (not _ff_turn or _ff_narr(_ff_turn) or _ff_breaker))
+                    and ((_ff_tried_tool and (not _ff_turn or _ff_narr(_ff_turn, tool_attempt=True)   # §4LK
+                                              or _ff_breaker))
                          or _ff_no_answer(_ff_turn, stream_prefix or "")))
                 if _ff_fire:
                     pretty_log(
@@ -33356,6 +33481,26 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 yield f"data: {json.dumps(_note_chunk)}\n\n".encode('utf-8')       # §4IS: no retry answer — the note stands alone
                 _note_chunk = None
 
+            # §4LK: the unverified-write note, as finalize appends it — last,
+            # before [DONE]; the record carries it and the failed label
+            try:
+                _um_tool = (_find_substantive_tool_for_verifier(
+                    stream_tools_snapshot, include_informational_bookkeeping=False)
+                    or _find_substantive_tool_for_verifier(stream_tools_snapshot))
+                _um_note_s, _um_failed_stream = _unverified_mutation_note(
+                    _um_tool, last_user_content, stream_tools_snapshot)
+                if _um_note_s and _um_note_s[:30] not in (full_content or ""):
+                    yield f"data: {json.dumps({'id': f'chatcmpl-{req_id}', 'object': 'chat.completion.chunk', 'created': created_time, 'model': stream_model, 'choices': [{'index': 0, 'delta': {'content': _um_note_s}, 'finish_reason': None}]})}\n\n".encode('utf-8')
+                    full_content = (full_content or "") + _um_note_s
+                    _stream_effective_content = (locals().get("_stream_effective_content") or "") + _um_note_s \
+                        if locals().get("_stream_effective_content") else full_content
+                    if _um_failed_stream:
+                        pretty_log("Verifier", "streamed final on an UNVERIFIED file write (never "
+                                   "run/rendered) — flagged INCOMPLETE (outcome=failed)",
+                                   icon=Icons.WARN, level="WARNING")
+            except Exception as _um_exc:  # noqa: BLE001 — never costs the stream
+                logger.debug("stream unverified-write note skipped: %s", _um_exc)
+
             # ⚠ THE [DONE] SENTINEL IS NOW RELEASED AT THE VERY END OF THIS
             # GENERATOR (see the release site at the bottom of stream_wrapper).
             # It used to be yielded HERE, and everything after it — metacog,
@@ -33413,9 +33558,23 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         treat_reply as _tr_treat)
                     _treated_base = locals().get(
                         "_stream_effective_content", full_content) or full_content
+                    # §4LK: the previous turn's correction banner opens the
+                    # stream but is not THIS answer — the record (trajectory,
+                    # post-mortem lessons, episode, calibration) took it as
+                    # the answer, and its wording read as an acknowledgement
+                    from .reply_smoothing import (_CORRECTION_BANNER_RE as _tr_banner,
+                                                  drop_pre_tool_segments as _tr_drop_pre)
+                    _treated_base = _tr_banner.sub("", _treated_base, count=1)
                     _treated_content = _tr_treat(
                         _treated_base,
                         n_real_tools=_tr_count(stream_tools_snapshot))
+                    # …and the text written beside lookup calls, as the
+                    # non-stream path drops it (same rails)
+                    if (pre_tool_segments
+                            and os.environ.get("GHOST_DROP_PRE_TOOL_TEXT", "1") != "0"):
+                        _tr_np = _tr_drop_pre(_treated_content, list(pre_tool_segments))
+                        if not _is_narration_only_trim(_tr_np, _treated_content):
+                            _treated_content = _tr_np
                     if (isinstance(_treated_content, str)
                             and isinstance(_treated_base, str)
                             and _treated_content != _treated_base):
@@ -33756,7 +33915,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             model=model,
                             trajectory_id=current_trajectory_id,
                             user_request=last_user_content,
-                            verifier=None,
+                            # §4LK: an untested final write is a failed turn
+                            # here too (finalize's verifier_backfill)
+                            verifier=("failed" if _um_failed_stream else None),
+                            verifier_reason=(UNVERIFIED_MUTATION_REASON if _um_failed_stream else ""),
                             execution_failed=(
                                 execution_failure_count > 0
                                 and bool(last_was_failure)),
@@ -34041,7 +34203,9 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             ))
                         self._attach_late_verdict_handler(
                             _sv_task, current_trajectory_id,
-                            stream_conv_fp,
+                            # §4LK: bound to the answer it corrects (_reply_tag)
+                            (f"{stream_conv_fp}|r{_reply_tag(_sv_source)}"   # what the client stored
+                             if stream_conv_fp else stream_conv_fp),
                             force_correction=True,
                             project_id=_drain_pid,
                             # The STREAMED spawn site — the one an AST
