@@ -344,11 +344,16 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
             "prompt into it):\n\n"
             f"![generated image](/api/download/{download_rel})\n\n"
             "Then, on the next line, write ONE or TWO short sentences in your own "
-            + ("words telling the user WHAT YOU CHANGED (and anything you could not "
-               "change). Do NOT describe the whole picture again."
+            + ("words telling the user what you ASKED the model to change (and anything "
+               "you could not ask for). Do NOT describe the whole picture again."
                if ref_b64 else
-               "words telling the user what you generated and the mood/style you went "
-               "for. Do NOT paste the raw prompt verbatim.")
+               "words telling the user what you ASKED the image model for and the "
+               "mood/style you aimed at. Do NOT paste the raw prompt verbatim.")
+            # §4LM: 6 of 16 generated-image turns described pixels nobody had
+            # seen ("melting clocks…" over a golden egg on a lake). The model
+            # knows its REQUEST, not the result.
+            + " You have NOT seen this image: do not claim any specific detail is in it. "
+              "To state what it actually shows, call vision_analysis on it first."
         )
     except Exception as e:
         return f"ERROR generating image: {str(e)}"

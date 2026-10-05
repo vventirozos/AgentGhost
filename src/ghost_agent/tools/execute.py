@@ -284,7 +284,10 @@ def _normalise_find_exit(command: str, exit_code, output: str = "") -> int:
         return code
     if not _FIND_QUIET_RE.match(_last_simple_command(command)):
         return code
-    if not str(output or "").strip():
+    _o = str(output or "").strip()
+    # the sandbox's own "no output" placeholder is not output (§4LO: two live
+    # quiet finds were turned from exit 1 into exit 0 by it)
+    if not _o or re.fullmatch(r"\[SYSTEM ERROR\]: Process failed \(Exit \d+\) with no output\.", _o):
         return code
     if re.search(r"^find: ", str(output or ""), re.M):
         return code
@@ -322,7 +325,63 @@ def _bash_c(command: str) -> str:
     moved off 1/6, the failure taught the model nothing, and it re-ran the
     same broken probe. A pipeline's failure is the pipeline's failure.
     """
-    return "bash -c " + shlex.quote("set -o pipefail; " + (command or ""))
+    cmd = "set -o pipefail; " + (command or "")
+    if _grep_tail_after_pipe(command):
+        cmd += _PIPESTATUS_TRAILER
+    return "bash -c " + shlex.quote(cmd)
+
+
+#: §4LO: `python3 x.py 2>&1 | grep X` that CRASHED and `… | grep X` that just
+#: found nothing both exit 1 with no output under pipefail — and the second
+#: is rewritten to "no matches, exit 0", so the crash read as success. For
+#: that one shape the shell reports every stage's status on a marker line.
+_PIPESTATUS_MARK = "__GHOST_PIPESTATUS="
+_PIPESTATUS_TRAILER = (
+    '\n__g_ps=("${PIPESTATUS[@]}"); printf "\\n%s%s\\n" "' + _PIPESTATUS_MARK + '" "${__g_ps[*]}"; '
+    '__g_r=0; for __g_s in "${__g_ps[@]}"; do [ "$__g_s" -ne 0 ] && __g_r=$__g_s; done; exit $__g_r')
+_PIPESTATUS_LINE_RE = re.compile(r"\n?" + re.escape(_PIPESTATUS_MARK) + r"([0-9 ]*)\n?\s*\Z")
+
+
+def _grep_tail_after_pipe(command: str) -> bool:
+    last = re.split(r";|&&|\|\|", str(command or ""))[-1]
+    stages = [s.strip() for s in last.split("|")]
+    if len(stages) < 2:
+        return False
+    toks = stages[-1].split()
+    while toks and re.fullmatch(r"[A-Za-z_]\w*=.*", toks[0]):
+        toks = toks[1:]
+    return bool(toks) and Path(toks[0]).name in _EXIT1_MEANS_NO_MATCH
+
+
+def _an_upstream_stage_failed(command: str, codes) -> bool:
+    """Did a stage BEFORE the trailing grep really fail? 141 is a stage the
+    downstream closed early, and a quiet `find … 2>/dev/null` exits 1 for any
+    unreadable directory (review: `find / … 2>/dev/null | grep x` with no
+    match read "1 1" and became a failure)."""
+    if not codes or len(codes) < 2:
+        return False
+    last = re.split(r";|&&|\|\|", str(command or ""))[-1]
+    stages = [s.strip().lstrip("&").strip() for s in last.split("|")]
+    for i, c in enumerate(codes[:-1]):
+        if c in (0, 141):
+            continue
+        if c == 1 and i < len(stages) and _FIND_QUIET_RE.match(stages[i]):
+            continue
+        return True
+    return False
+
+
+def _take_pipestatus(output):
+    """(output without the marker line, [stage statuses] or None)."""
+    text = output or ""
+    m = _PIPESTATUS_LINE_RE.search(text)
+    if not m:
+        return output, None
+    try:
+        codes = [int(x) for x in m.group(1).split()]
+    except ValueError:
+        codes = None
+    return text[:m.start()], codes
 
 
 def _normalise_pipe_exit(command: str, exit_code, output: str = "") -> int:
@@ -343,11 +402,40 @@ def _normalise_pipe_exit(command: str, exit_code, output: str = "") -> int:
         return exit_code
     if code == 0 or "|" not in str(command or "").replace("||", ""):
         return code
+    # §4LO: only a pipeline whose READER can close early can break a pipe —
+    # `| tail` reads to the end, and a pipe elsewhere in the command does not
+    # excuse its last pipeline (`pip install … | tail` failing, a DataLoader's
+    # own BrokenPipeError, `cat a | sort > b; python3 client.py`).
+    if not _has_early_closing_reader(command):
+        return code
     if code in _PIPE_CLOSED_EARLY_CODES:
         return 0
     if _BROKEN_PIPE_RE.search(str(output or "")):
         return 0
     return code
+
+
+_EARLY_READER_RE = re.compile(
+    r"^(?:head\b|grep\b.*\s-(?:[a-zA-Z]*[qm][a-zA-Z0-9]*|-max-count\b|-quiet\b)|"
+    r"sed\b.*\d*q\b|awk\b.*\bexit\b|less\b|more\b|read\b)")
+
+
+def _has_early_closing_reader(command: str) -> bool:
+    """The LAST pipeline of `command` has a downstream stage that may stop
+    reading before its input ends (head, grep -q/-m, sed …q, awk … exit)."""
+    segs = [x for x in re.split(r";|&&|\|\|", str(command or "")) if x.strip()]
+    # a trailing `echo "exit=$?"` reports the pipeline BEFORE it (§4HZ)
+    while len(segs) > 1 and re.match(r"\s*(?:echo|printf)\b.*\$\?", segs[-1]):
+        segs.pop()
+    last = segs[-1] if segs else ""
+    stages = [s.strip().lstrip("&").strip() for s in last.split("|")]   # `|&` too
+    for st in stages[1:]:
+        toks = st.split(None, 1)
+        if toks:
+            st = Path(toks[0]).name + ((" " + toks[1]) if len(toks) > 1 else "")   # /usr/bin/head
+        if _EARLY_READER_RE.match(st):
+            return True
+    return False
 
 
 async def _run_in_sandbox(sandbox_manager, cmd_str, *, timeout=_EXEC_TIMEOUT_S,
@@ -672,6 +760,31 @@ _AGENT_PORT_FILE_NOTE = (
     "the `browser` tool or ask the user to run the check on THEIR machine.\n"
     "------------------------"
 )
+
+
+_MISSING_NAME_RES = (
+    re.compile(r"can't open file ['\"]([^'\"]+)['\"]"),
+    re.compile(r"No such file or directory:? ['\"]([^'\"]+)['\"]"),
+    re.compile(r"(?m)^(?:[\w./-]+: )?([^\s:]+): No such file or directory"),
+    re.compile(r"ENOENT[^'\"]*['\"]([^'\"]+)['\"]"),
+    re.compile(r"Cannot find module ['\"]([^'\"]+)['\"]"),
+)
+
+
+def _missing_target_named_by(command: str, out: str) -> bool:
+    """§4LO: the root re-run is for a WRONG-CWD miss — the file the COMMAND
+    names was not where it looked. When the error names a file the command
+    does not mention (a data file the program looked for at runtime: node's
+    ENOENT, a script printing its own error), re-running elsewhere repeats
+    the program's side effects and the root's exit 0 replaced the real
+    failure (reproduced). Unknown (no name extractable) keeps the old rule."""
+    names = [m.group(1) for rx in _MISSING_NAME_RES for m in rx.finditer(out or "")]
+    if not names:
+        return True
+    cmd = str(command or "")
+    if re.match(r"\s*(?:npm|yarn|pnpm)\b", cmd) and any(Path(n).name == "package.json" for n in names):
+        return True                  # `npm start` names its package.json implicitly
+    return any(Path(n).name and Path(n).name in cmd for n in names)
 
 
 def _looks_like_file_not_found(out) -> bool:
@@ -1265,6 +1378,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
             label=command[:120],
             project_id=_project_id_from_workdir(container_workdir),
             spill_large_output=True, **_workdir_kw)
+        output, _pipe_codes = _take_pipestatus(output)
         exit_code = _normalise_exit(command, exit_code, output)
         # Root fallback for project-scoped commands. When a project is active
         # the command runs from /workspace/projects/<id>, but the model may
@@ -1287,7 +1401,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
         # workdir kwarg, i.e. disabled precisely when this happens. Re-derive
         # the project dir from the workspace-model mirror and retry once
         # from there, with a note naming the actual mechanism.
-        if exit_code != 0 and exit_code not in _TIMEOUT_KILL_CODES and not _workdir_kw and _looks_like_file_not_found(output) and not _rerun_unsafe(command):
+        if exit_code != 0 and exit_code not in _TIMEOUT_KILL_CODES and not _workdir_kw and _looks_like_file_not_found(output) and _missing_target_named_by(command, output) and not _rerun_unsafe(command):
             _flap_pid = ""
             try:
                 _flap_pid = str(getattr(
@@ -1321,7 +1435,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                         f"files either drop stateful, or use the absolute "
                         f"project path.]")
 
-        if exit_code != 0 and exit_code not in _TIMEOUT_KILL_CODES and _workdir_kw and _looks_like_file_not_found(output) and not _rerun_unsafe(command):
+        if exit_code != 0 and exit_code not in _TIMEOUT_KILL_CODES and _workdir_kw and _looks_like_file_not_found(output) and _missing_target_named_by(command, output) and not _rerun_unsafe(command):
             # Absolute-path variant first: when the command names files under
             # `/workspace/...` a workdir change can't help (absolute paths are
             # cwd-independent) — but the model almost always means the ACTIVE
@@ -1352,9 +1466,10 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                     sandbox_manager.execute,
                     _bash_c(_remapped), timeout=_EXEC_TIMEOUT_S,
                     spill_large_output=True, **_workdir_kw)
+                _re_out, _re_pipe = _take_pipestatus(_re_out)
                 _re_code = _normalise_exit(_remapped, _re_code, _re_out)
                 if _re_code == 0 or not _looks_like_file_not_found(_re_out):
-                    output, exit_code = _re_out, _re_code
+                    output, exit_code, _pipe_codes = _re_out, _re_code, _re_pipe
                     # Teach on EVERY adopted remap, not just clean exits.
                     # The note used to ride only exit_code == 0 — so when a
                     # remapped run failed for its own reasons (req A3: the
@@ -1423,7 +1538,8 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
         _no_output = (not _out_stripped
                       or _out_stripped == f"[SYSTEM ERROR]: Process failed (Exit {exit_code}) with no output.")
         _grep_no_match = False
-        if exit_code == 1 and _no_output:
+        # …and only when every stage BEFORE the grep succeeded (§4LO)
+        if exit_code == 1 and _no_output and not _an_upstream_stage_failed(command, _pipe_codes):
             _tail_seg = re.split(r"&&|\|\||;|\|", command)[-1].strip()
             try:
                 _tail_toks = shlex.split(_tail_seg)
@@ -1740,7 +1856,34 @@ msg_id = kc.execute(code)
 has_error = False
 start_time = time.time()
 
+def _interrupt_kernel():
+    # SIGINT to THIS kernel (the one started on /workspace/.kernel.json) — a
+    # timed-out cell otherwise ran on and queued every later stateful call
+    # behind it (§4LO). KeyboardInterrupt in the cell; state survives.
+    import os, signal
+    for _pid in os.listdir('/proc'):
+        if not _pid.isdigit():
+            continue
+        try:
+            with open('/proc/' + _pid + '/cmdline', 'rb') as _f:
+                _cl = _f.read()
+        except OSError:
+            continue
+        if b'ipykernel' in _cl and b'/workspace/.kernel.json' in _cl:
+            try:
+                os.kill(int(_pid), signal.SIGINT)
+            except OSError:
+                pass
+
 while True:
+    # the 5-minute wall clock is checked on EVERY pass — a cell that keeps
+    # printing never reached the queue.Empty branch and was never stopped
+    if time.time() - start_time > 295:
+        _interrupt_kernel()
+        sys.stdout.write("\\n[SYSTEM ERROR: Kernel Timeout. Execution exceeded 5 minutes — the cell was interrupted; kernel state is kept]\\n")
+        sys.stdout.flush()
+        has_error = True
+        break
     try:
         # Short timeout so we can check if the kernel died (e.g. os._exit) or if we hit the 5 min limit
         msg = kc.get_iopub_msg(timeout=1)
@@ -1768,11 +1911,6 @@ while True:
     except queue.Empty:
         if not kc.is_alive():
             sys.stdout.write("\\n[SYSTEM ERROR: Kernel Terminated Abruptly (Did the script call os._exit()?)]\\n")
-            sys.stdout.flush()
-            has_error = True
-            break
-        if time.time() - start_time > 295:
-            sys.stdout.write("\\n[SYSTEM ERROR: Kernel Timeout. Execution exceeded 5 minutes]\\n")
             sys.stdout.flush()
             has_error = True
             break
@@ -2012,7 +2150,7 @@ if has_error:
         if exit_code != 0:
              return _append_note(
                  _format_error(output, hint=diagnostic_info,
-                               exit_code=exit_code),
+                               exit_code=exit_code, elapsed_s=_dt),
                  _probe_note + _proxyless_browser_note)
 
         return (f"--- EXECUTION RESULT ---\nEXIT CODE: {exit_code}\n"

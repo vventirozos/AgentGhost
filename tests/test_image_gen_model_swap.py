@@ -1021,14 +1021,16 @@ class TestResultWording:
     def test_edit_asks_for_what_changed(self, tmp_path):
         (tmp_path / "a.png").write_bytes(_PNG_1x1)
         out = self._run(tmp_path, reference_images=["a.png"])
-        assert "WHAT YOU CHANGED" in out
-        assert "mood/style you went" not in out
+        assert "ASKED the model to change" in out
+        assert "mood/style you aimed" not in out
         assert "reference image(s)" not in out          # no clumsy plural for the one-ref cap
         assert "edited from the reference image" in out
 
     def test_plain_generation_keeps_the_original_closing(self, tmp_path):
         out = self._run(tmp_path)
-        assert "mood/style you went" in out and "WHAT YOU CHANGED" not in out
+        assert "mood/style you aimed" in out and "ASKED the model to change" not in out
+        # §4LM: the closing never invites describing pixels nobody has seen
+        assert "You have NOT seen this image" in out
 
 
 def test_seed_parameter_does_not_promise_a_refinement():

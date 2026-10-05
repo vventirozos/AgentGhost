@@ -48,8 +48,9 @@ async def test_the_live_http2_error_gets_the_no_retry_route(tmp_path):
     text = str(out)
     assert "STATUS: ERROR" in text
     assert "do not retry this URL" in text
-    # …and it comes BEFORE the generic advice, where the model reads first.
-    assert text.index("do not retry this URL") < text.index("If this is a navigation timeout")
+    # §4LN: the hint carries only what fits the error — no generic paragraph
+    # naming every other failure mode after the route
+    assert "If this is a navigation timeout" not in text and "supercharged" not in text
 
 
 @pytest.mark.asyncio
@@ -72,7 +73,9 @@ async def test_an_unlisted_error_gets_only_the_generic_hint(tmp_path):
     text = str(out)
     assert "do not retry this URL" not in text
     assert "networkidle" not in text
-    assert "If this is a navigation timeout" in text
+    # §4LN: a missing selector gets the selector advice, not Tor / install advice
+    assert "pick a selector from what is there" in text
+    assert "over Tor" not in text and "supercharged" not in text
 
 
 def test_socks_errors_are_deliberately_not_in_the_table():

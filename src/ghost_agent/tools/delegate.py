@@ -253,6 +253,16 @@ def _land_sandbox_row(reg, sup, sbx_jobs, job, sid, entry) -> None:
     except Exception:  # noqa: BLE001
         tail = "(output unavailable)"
     code = entry.get("exit_code")
+    if isinstance(code, int) and code != 0:
+        # §4LO: the same exit-code reading as a foreground run — a detached
+        # `find / … 2>/dev/null` that printed results, or a `| head` that
+        # closed the pipe early, is not "exited 1, failed"
+        try:
+            from .execute import _normalise_exit, _take_pipestatus
+            tail, _ = _take_pipestatus(tail)
+            code = _normalise_exit(str(entry.get("command") or ""), code, tail)
+        except Exception:  # noqa: BLE001
+            pass
     log_hint = ""
     if entry.get("log"):
         log_hint = (f"\n[full output: {entry['log']} — file_system "

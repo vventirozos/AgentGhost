@@ -50550,3 +50550,370 @@ darkweb_search, verifier, agent (#4li), configuration (guard default, GHOST_QUIE
   were served as one SSE chunk (time to first token == total). The streamed drain runs only on a FORCED final
   (breaker, planner `required_tool: none`, closed task), which a prompt cannot force. The §4LK stream-side fixes
   are pinned by tests driving the real stream generator (`_stream_final_generation`), not by a live probe.
+
+## §4LL — file handling: the file_system tool, its labels, what file failures teach (2026-10-04, operator: "proceed.")
+**Review** (3 fresh readers, read-only on copies):
+- **Failures:** 26 of 83 user file turns were "failed" (31%), and NONE of them because of file_system:
+  - 17 were test prompts sent WITHOUT the probe header, mostly my own earlier sessions;
+  - 10 were correct edits labelled "unverified write" (8 said "don't run");
+  - 8 failed on other tools (browser/vision loops, aborts).
+
+  Real traffic: 15%. All 26 predate 09-25.
+- **git:** the 4 `git` calls were the §4KB checks before the tool's removal; it is not advertised anywhere.
+- **Lessons:** nothing checks that a lesson names real tools. Lessons taught the removed `git` tool,
+  `web_extractor` (not a tool) and the wrong parameter name `old_text`. Untagged test turns graduated into skills.
+- **Code review:** 1 CRIT (same-file calls in one message raced: 1 of 3 edits landed) and 5 MAJOR (the sniffer read
+  "error"/"exception" in file CONTENT as failure; the unverified gate fired on filenames; `~/Desktop` writes landed
+  in the sandbox reported as Desktop; search ran a regex advertised as exact text and skipped hidden/ignored files;
+  an empty replacement offered to wipe the file).
+**Fixes:**
+- **File calls run in order:** all file_system calls of a message run one at a time in the order written, and a
+  read after a write re-runs (the batch read-dedup is cleared on any mutation).
+- **Failure sniffer:** for file_system (content tool) the anchored failure prefix decides, plus "Security Error".
+  The tool name is passed by every caller that has it.
+- **Unverified gate:** markers outside the quoted path; dotfiles and lockfiles inert.
+- **Host paths:** mutations to the user's machine or container system paths are refused with the reason (case-folded
+  on macOS); reading `/Users/…` says to ask the user for the file.
+- **Search:**
+  - `--hidden`; `--no-ignore-vcs` only for a named path;
+  - a regex parse error → plain-text retry with a note;
+  - rg exit 2 keeps the matches, and fails only with none.
+- **Replace/edit:**
+  - an empty replacement deletes (a non-empty alias wins);
+  - the replace message points to `edit`;
+  - an old_string carrying a ranged read's line numbers is named;
+  - a CRLF region keeps CRLF on insert;
+  - the rollback advice names `edit`.
+- **Smaller:**
+  - download errors say why and not to retry;
+  - `http_…` files are read;
+  - operations are case-insensitive, and the unknown-op list = the schema enum (`ADVERTISED_OPS`, pinned);
+  - a directory read names list_files;
+  - empty marker files can be written;
+  - "already inside this project" only when one is active.
+- **Unknown tool:** the message names `execute` for shell-like names, else the tool list.
+- **Lessons:** a lesson prescribing a nonexistent tool call or file_system operation is refused at write time
+  (`lesson_quality.unknown_tool_calls`; runtime tools, negated mentions, method calls and op aliases allowed).
+**Fresh review of the fixes:**
+- **CRIT:** path-string grouping missed aliases (`app.py` = `/workspace/app.py`) → sequential.
+- **MAJOR:**
+  - read-after-write dedup returned the stale read → cleared on mutation;
+  - "Security Error" became success → added;
+  - the lesson check refused real runtime tools and negated mentions → widened;
+  - rg exit 2 threw matches away and `--no-ignore-vcs` flooded results → fixed.
+- **MINOR:** alias priority, CRLF by region, case-folding (`normcase` is identity on macOS), and others → fixed.
+- One equivalent change (the URL-heal regex) was reverted: a later step restores the filename, and the mutant
+  survived.
+**Verification:**
+- `tests/test_4ll_file_handling.py` (43);
+- old pins updated: the §4FH metadata-tuple rule (no single-index assignment), "ALREADY inside" now project-only
+  (with a project case added), the reconstruct source pin;
+- battery bat33: all killed after the pins were tightened. NOOP survives, tree pristine;
+- full suite 1: 4 failed (2 old pins + 2 evolve stages re-running one of them) → fixed;
+- full suite 2: 28,106 passed, 0 failed. Deployed (gated, graceful, one process).
+**For the operator (deletions need confirmation, not done):**
+- retire 9 file-related lessons (#127, #113, #16, #48, #110, #109, #138, #120, #82; reasons in the reviewer's list);
+- delete the 4 episodes and 1 Chroma doc holding the §4KB git check turns;
+- relabel the test turns sent without the probe header (they still count as user failures).
+**Probes (labelled):**
+- **F1:** "create probe_4ll/notes.txt with alpha, beta, gamma, change beta to BETA, show it" → write, edit, read,
+  each running in turn; final content right; CONFIRMED.
+- **F2:** "save hello from ghost to ~/Desktop/hello_ghost.txt on my Mac". The model did not try the host path: it
+  wrote the file in the sandbox and gave a download link (true). The host-path refusal was therefore not exercised
+  live (pinned by tests).
+  - A stray `download` call without a URL failed. The verifier read that failure banner as "the file is not ready"
+    and REFUTED a true reply (in-loop and late), so the turn was labelled failed: a verifier false refute, not a
+    file defect.
+  - The reply's suggested `curl` to the local API lacked the key header, so it would not work.
+- Probe files were removed from the sandbox afterwards.
+**Data actions (2026-10-04, operator: "proceed"), `scripts/memory_repair_4ll.py`:**
+- **What it does.**
+  - Retires the 9 lessons by trigger prefix; each prefix must match exactly one lesson.
+  - Deletes episodes 502/508/510/511, archived to `episodes_forgotten.jsonl`. Their vector twins
+    25977/25989/25996/26000 go with them (the listed "Chroma doc 25977" was 502's twin; the other three had twins
+    too).
+  - Relabels the 24 test turns to `task_kind="probe"`, keeping the old kind in `extra.relabelled_from`.
+  - Every check runs before any write; a re-run is refused.
+- **Trial on a copy.** 9/9 lessons, 4/4 episodes, 13 vector rows (4 episode + 9 lesson twins), 24 rows. A diff
+  against live showed no other field changed.
+- **Live.**
+  - Gated `foreground_requests==0`, SIGTERM, old pid 72659 exited, bootout, then apply.
+  - Backups: `system/memory.pre-4ll-20261004T211257.bak` and `system/trajectories.pre-4ll-20261004T211257/`.
+  - Bootstrap brought up pid 76163, one process, "system ready" count steady.
+  - Verified on live: 24/24 rows probe, 0 episodes, 0 twins, 131 lessons.
+- **Not touched** (not on the confirmed list):
+  - the 3 selfhood autobiographical entries about the git turns;
+  - a separate request-scoped lesson (09-23, a photorealism prompt naming the same person as #16).
+**Follow-up (2026-10-04, operator: "also fix the 3 selfhood entries … and the separate lesson from 09-23"),
+`scripts/memory_repair_4ll_b.py`:**
+- **Diary.** Removed the `selfhood/autobiographical.jsonl` rows of the §4KB test turns that used `git` or wrote
+  `.git/config`. That is SIX rows (941fcc3c, 977d51d5, e20c93e9, b4808853, 5d6136ed, 410a93d4), not the three the
+  review counted. None had a vector twin, and the narrative does not mention them. The two non-git test rows of
+  that series (1d578f23 dup_probe, f72fe9f5 r5) were left.
+- **Lesson.** Retired the request-scoped 09-23 image lesson naming the same person as #16 (archived; its vector
+  twin was removed).
+- **Trial on a copy.** The diff showed only the 6 rows changed. Lessons 131 → 130, vector rows −1. A re-run is
+  refused.
+- **Live.** Same gated stop (pid 76163 exited), then apply. Backups: `selfhood/autobiographical.jsonl.pre-4ll-20261004T211945.bak`
+  and `memory.pre-4ll-b-20261004T211945.bak`. Bootstrap brought up pid 78173, one process. The new last row is
+  the restart's "Session resumed".
+- **Still present.** The 09-22 diary row (04e1deb4) about the same image request; the operator named only the
+  lesson.
+**Follow-up 2 (2026-10-04, operator: "remove them"), `scripts/memory_repair_4ll_c.py`:** dropped the remaining 3
+diary rows: 1d578f23 (dup_probe test), f72fe9f5 (r5 test), and 04e1deb4 (09-22 row of the retired image request).
+- **Trial on a copy:** the diff showed only the 3 rows changed, and a re-run is refused.
+- **Live:** gated stop (pid 78173), apply, bootstrap. The new pid 80153 is one process, and 0 of the ids remain.
+- **Backup:** `selfhood/autobiographical.jsonl.pre-4ll-c-20261004T212621.bak`.
+
+## §4LM — image understanding: `vision_analysis`, attached images, what a caption is trusted for (2026-10-04, operator: "proceed") — R0 scope, written first
+**Why this system.** Of 534 real turns in 30 days, `vision_analysis` ran in 37, and 10% of those failed (the
+highest failure rate among unreviewed tools). It was last touched for the empty-caption cap (§4KJ).
+**Scope:**
+- the attachment path: a pasted image is saved to the sandbox and the model is told to call the tool;
+- `tools/vision.py` (describe_picture, verify_ui, normalisation, the no-think switch, errors);
+- the vision node client;
+- how a caption is labelled: the failure sniffer, the verifier and claim binding, the "inspected" gate for
+  generated images;
+- the member wall;
+- what vision turns teach.
+**Data.**
+- 95 trajectory rows with vision calls (89 real, 6 probe).
+- None of the 92 target images still exist in the sandbox, so accuracy can't be checked after the fact. It is
+  measured instead by labelled live probes on images with known content.
+**Method:** three fresh-eye readers, read-only on copies (code, traffic, downstream labels), then the usual
+protocol.
+
+## §4LM — outcome (2026-10-04)
+**Measured first (labelled live probes, images with known content).** 7 of 8 were right: invoice, counts, chart,
+26 px code in a 3000×2000 image, two images in order, a blank image (nothing invented), and a member's own note.
+- **V5** (black text on a transparent PNG) read as "a completely solid black rectangle". The verifier, whose call
+  had the same defect, CONFIRMED it at 100%.
+- **Traffic (89 real turns).** The tool returned a caption on 88% of calls. The weak link was what came after:
+  - 6 of 16 generated-image turns described pixels nobody had looked at;
+  - one reply (08-21) embedded and described an image link that was never generated;
+  - 14 rows were unlabelled operator tests.
+**Fixed** (3 reviewers, 28 findings; then a fresh reader on the diff found 4 MAJOR in the fixes, all fixed):
+- **alpha:** composited onto a contrasting background (tool + verifier); opaque RGBA ships unchanged;
+- **captions are content:** declared OK and `vision_analysis` treated as a content tool, so "Traceback" /
+  "EXIT CODE: 2" / "SYSTEM ERROR" in a caption is no longer a failure, banner or strike; the banner rule is a
+  helper (`_result_failure_shaped`);
+- **Tor DNS:** vision URL + every redirect hop + `file_system` download check SSRF without a host DNS lookup over
+  Tor (the download's comment had claimed parity it never had);
+- **visual evidence:**
+  - the request's own pasted image is the before, never the after (`vision_<sha12>.<ext>` named by bytes, atomic
+    write);
+  - an older request's paste is ignored;
+  - another project's file is never resolved;
+  - the verifier's vision call is all-or-nothing;
+- **batch:** vision runs after every other tool in its batch;
+- **generated images:** tool text and blind-regeneration block say "describe what you ASKED for — you have not
+  seen it"; an owner link to a file that does not exist is replaced (lenient: decoded, punctuation-stripped,
+  glob-escaped name search);
+- **messages that tell the truth:**
+  - action aliases are mapped and unknown actions refused;
+  - undecodable formats get "Do NOT retry, convert";
+  - the thinking-cap message says "not seen";
+  - URL-404 gets URL advice;
+  - a remote PDF's note says download first;
+  - no `file_system` fallback chain;
+- **member wall:** `/name` and `/api/download/name` accepted;
+- **bounded:** `GHOST_VISION_TIMEOUT` 300 s, plus the verifier's bounded kwargs;
+- **salvage parser:** each field read from its own tag or quote;
+- **schema:** neutral questions and exact transcription.
+**Not fixed:**
+- vision stays mutating (the advised retry must not be collapsed);
+- the verifier's own independent look;
+- the member allowlist is per-install (operator question);
+- the member wall still refuses `/api/download/projects/<id>/x` (a false refusal, not a leak);
+- vision now waits for slow batch-mates (correctness first);
+- the streamed (forced-final) path has neither link check — pre-existing, member scrub included;
+- live `file_system` reads quoting `EXIT CODE: 1` still get a strike (the loop's rule, pre-existing §4LL scope).
+**Verification:**
+- `tests/test_4lm_vision.py` (52); old pins updated (sink count, banner extractor namespace, thinking-cap
+  params, image_gen wording, batch producer pin, env timeout);
+- battery bat34: all valid mutants killed, NOOP survives, KNOWN-BAD killed, tree pristine;
+- suite: 28,163 passed, 0 failed;
+- deployed pid 52251 (gated, graceful, one process).
+**Live after deploy:** V5 "HELLO 42" (transcode logged), V1 correct, V9 error screenshot answered with no
+banner and the row labelled passed, all VERIFIED.
+
+## §4LN — the browser tool: navigate, extract, interact, screenshot (2026-10-04, operator: "proceed with the next systems until you are done. double check all your changes") — R0 scope, written first
+**Why.** 231 trajectory rows used `browser` (209 real: 39 passed, 21 failed, 149 unknown). Calls by operation:
+navigate 625, extract_text 231, interact 127, screenshot 75, click 23. The browser was reviewed only as part of
+research (§4LG).
+**Scope:**
+- `tools/browser.py`, `browser_runner.py`, `browser_routes.py`: ops, the `.last_url` sidecar, interact actions,
+  `evaluate`, screenshots, file:// for the agent's own apps, timeouts, Tor routing and DNS, bot challenges
+  (`STATUS: BLOCKED`), host memo;
+- how results are labelled (sniffer, evidence gate, verifier);
+- member wall;
+- what browser turns teach.
+**Method:**
+- three fresh-eye readers, read-only on copies (code, traffic, downstream);
+- labelled live probes on local `file://` pages with known content (no third-party sites needed for
+  correctness);
+- then the usual protocol;
+- the operator asked for every change to be double-checked: a fresh reader on the diff before deploy.
+
+## §4LN — outcome (2026-10-05)
+**Measured first.** 5 labelled live probes on known pages, all answered right, but with costs:
+- B2: a guessed selector cost 3 × 30 s under a `STATUS: OK` header that listed 3 errors.
+- B5: a missing `h1` got Chromium-install advice; example.com itself has changed and the agent was right.
+**Traffic.** Of 209 real turns, the browser decided only 2 of 21 failures. The real problems:
+- stale or wrong labels; the "selector used N×" label was wrong in 8 of 8;
+- answers with facts no result showed (32% of 25 sampled);
+- wrong-page reads from the shared `.last_url`;
+- block pages read via `interact`;
+- 52 operator test rows labelled real (24 Revolut re-runs).
+**Fixed** (3 reviewers, ~35 findings; then a fresh reader on the diff found 4 MAJOR + 12 MINOR in my fixes, all
+fixed or stated):
+- **declared success:** a browser success is declared `ToolOutcome.ok`; text checks read the browser's own
+  `STATUS:` header (`browser_result_status`); PARTIAL counts as evidence;
+- **interact:**
+  - the header is `PARTIAL`/`ERROR (every action failed)`/`BLOCKED`, decided by the LAST goto, which also takes
+    the strike;
+  - an extract shows its full text;
+  - a missing selector waits once (the full timeout), then fails at once on the same guess and lists the
+    clickable elements;
+- **url-less reads:**
+  - sidecar per request, with a shared fallback;
+  - a navigate records the URL ASKED for before loading;
+  - a url-less result names the page;
+  - browser calls in one batch run in order;
+- **runner output:** UTF-8 output trimmed under the exec line cap (never invalid JSON); parsed on `\n` only;
+- **retry classes:** selector, memo and own-service failures are DIAGNOSTIC, not "will retry"; classification
+  ignores page text;
+- **screenshots:**
+  - size-aware blocked check;
+  - "not seen" note;
+  - never overwrites a non-screenshot file;
+  - a failed shot is never the "after" image;
+- **budgets:**
+  - ≤60 actions;
+  - step waits clamped (atomic `settle_ms`/`post_click_ms` too);
+  - the lock is held across cancels until the runner returns;
+- **hints by cause:** own app / 404 / refused; the runner hint names only what matched;
+- **labels:**
+  - the selector label resets on an edit between tests;
+  - a refusal is not progress;
+  - the extract steer asks for the full text and counts a url-less extract after that navigate;
+- **link grounding:** a URL whose browser call failed does not vouch (the agent's own app does);
+- **ledger:** no blocked fetches;
+- **text:** schema/prompt text corrected; `close` truthful; runner written atomically;
+- **module split:** helpers moved to `tools/browser_support.py` (size gate).
+**Found live after deploy (B2):** the verifier REFUTED a correct "3" because an earlier read of the same page
+said "Count: 0". `find_conflicting_line` now skips a twin from an EARLIER browser result of the SAME page; a
+reply reporting the stale reading still conflicts. Re-probe: CONFIRMED, no repair round.
+**Not changed:**
+- the persistent cookie profile links browsing across Tor circuits (operator decision: third-party-cookie block
+  or per-request profile trades away logins);
+- WebSocket/service-worker traffic outside the request guard (Playwright limit);
+- a JPEG screenshot cannot be re-taken after a restart (only PNGs are recognised as earlier screenshots);
+- the streamed path is unchanged;
+- one interact clicking a selector ≥4× is still the webOS "stuck" shape (existing pin, kept).
+**For the operator (data, needs confirmation):** relabel the operator test rows the traffic reviewer listed (14
+definite #30–#43 in the vision set; 52 harness-shaped browser rows incl. 24 Revolut re-runs) — list in
+`tmp/rev4ln/review_traffic.md`.
+**Verification:**
+- `tests/test_4ln_browser.py` (56);
+- old pins updated (wall-clock enumeration → `_exec_holding_lock`, the starved-floor case via a 60 s ceiling,
+  blocked-page OK string, deterministic routes, research hint, size gate);
+- battery bat35: all valid mutants killed, NOOP survives, tree pristine;
+- suite: 28,220 passed, 0 failed;
+- deployed pid 40245 (gated, graceful, one process).
+**Live after deploy:** B1/B3 correct, B6 (long Greek page over Tor) correct and CONFIRMED, B2 CONFIRMED in 2 calls.
+
+## §4LO — code execution: `execute`, the sandbox exec path, detached jobs (2026-10-05, operator: "proceed with the next systems until you are done. double check all your changes") — R0 scope, written first
+**Why.** 383 trajectory rows ran `execute`:
+- real: 183 (66 passed, 33 failed, 84 unknown);
+- coding leaves: 65;
+- probes: 135.
+The sandbox's privileges and CLI set were reviewed in §4KF/§4KG; the execute path itself never was.
+**Scope:**
+- `tools/execute.py` (languages, stateful kernel, file writes, timeouts, output capping, exit-code envelope,
+  detached jobs/UNRESOLVED);
+- `sandbox/docker.py` exec;
+- `sandbox/jobs.py`;
+- how results are labelled (shell_failed, strikes, verifier, unverified-mutation note);
+- member wall; what execute turns teach.
+**Method:**
+- three fresh-eye readers, read-only on copies;
+- labelled live probes with known outputs;
+- the usual protocol, with a fresh reader on the diff before deploy.
+
+## §4LO — outcome (2026-10-05)
+**CRIT found and verified live:** sandbox code could `setuid()` to `debian-tor`, the uid the egress firewall
+exempts for Tor's own traffic, and connect around Tor. As root the host name did not even resolve; as
+debian-tor it connected.
+**Round-1 fix:**
+- SETUID/SETGID dropped from the container;
+- Tor started AS debian-tor via the exec user (the torrc has no `User`);
+- apt told not to drop to `_apt`.
+**Round 2** (a fresh reader showed root could still get code run as that uid through the Tor it starts):
+- KILL dropped too;
+- hardened launch (`env -i`, `/usr/bin/tor`, `--defaults-torrc /dev/null`, `--__ReloadTorrcOnSIGHUP 0`);
+- `_tor_integrity_ok` before any (re)start: no ld.so.preload, and a host-side binary+library digest;
+  fail-closed (the test found a fail-OPEN NameError in the first version);
+- the drift check compares kept caps and logs CRITICAL.
+**Not closed structurally:** two readers agree the in-container exemption cannot be made watertight (the digest is
+trust-on-first-use). The real fix is Tor outside the sandbox (sidecar or separate netns). Operator decision: not
+yet (operator chose "do 1" = recreate now).
+**Operator: "do 1".** Gated deploy pid 2685; the old sandbox removed (only Tor was running in it) and rebuilt by
+the agent. Verified on the live container:
+- CapAdd = CHOWN, DAC_OVERRIDE, FOWNER, FSETID + no-new-privileges;
+- Tor as debian-tor with the hardened command line;
+- Tor-only egress ENFORCED;
+- setuid refused (EPERM), and root signalling Tor refused;
+- live probe E7: IsTor true.
+**Execute fixes:**
+- pipe forgiveness only with an early-closing reader;
+- per-stage PIPESTATUS for `… | grep` (a crash is not "no matches"; a quiet find / SIGPIPE'd stage is not a
+  crash);
+- the script path passes elapsed time (an OOM kill is not "600 s");
+- the root re-run only for a file the command names (npm's package.json counts);
+- the quiet-find placeholder is not output;
+- detached jobs get the same exit reading (marker stripped);
+- execute calls in a batch run in order;
+- job logs read at both ends only;
+- heredoc bodies skipped by the quote check;
+- System-3 hypothesis tests via `bash -c`, refused when they write;
+- the stateful kernel checks its 5-min limit every message and SIGINTs its own kernel;
+- the sniffer treats exit 0 as the verdict;
+- the privacy note keeps the declared status;
+- claim binding: a later execute run supersedes an earlier one (bounded by evidence-block labels).
+**Open:**
+- grep-chain upstream `grep` exit 1 is read as a failure (2 corpus cmds);
+- a quoted `;` in awk/sed readers;
+- the marker in SUCCESSFUL job tails;
+- the drift message cut at 240 chars;
+- the A/B-run supersession without an edit between;
+- the hypothesis guard is best-effort, not read-only;
+- `duration_s` not recorded;
+- timeouts still "retryable";
+- the `imagine_preflight` class-precedent deferral (operator experiment).
+**Verification:**
+- `tests/test_4lo_execute.py` (46);
+- old pins updated (caps, torrc, tor pattern/truncation, apt line prefix);
+- battery bat36: all valid mutants killed, NOOP survives, tree pristine (the battery tree now carries `sandbox/`);
+- suite: 28,264 passed, 0 failed.
+**Live:** E1/E3 correct; E7 IsTor; E8 the crash before grep reported as exit 1; B1 correct.
+
+## §4LP — projects and workspace (2026-10-05, operator: "proceed with projects and workspace") — R0 scope, written first
+**Why.**
+- 625 trajectory rows touch projects (manage_projects 621 calls, workspace 78, manage_tasks 20);
+- real: 501 user_request rows, of which 32 failed and 396 unknown;
+- the store (`system/memory/projects.db`) holds 5 projects with tasks, events and artifacts.
+Never reviewed as a system: pieces were touched in §4G/§4FV and the released-project guards.
+**Scope:**
+- `tools/projects.py` (4,400 lines: create/switch/status/tasks/versions/release/delete);
+- `core/project_*` (advancer, research, safety, digest, concepts);
+- project-scoped sandbox paths;
+- `tools/workspace.py` + `workspace/` (the continuity model, activity, narrative, recognition);
+- `tools/workspace_track.py`;
+- how project state reaches prompts;
+- member wall; what project turns teach.
+**Method:**
+- three fresh-eye readers, read-only on copies;
+- labelled live probes on a throwaway project (created, used and deleted inside the probes);
+- the usual protocol;
+- a fresh reader on the diff before deploy.

@@ -91,6 +91,14 @@ delay += 0.25 · delay · random()   # jitter</code></pre>
   </ul>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+  <h2 id="4ln">Same call, same result <span class="tag">2026-10-04 &sect;4LN</span></h2>
+  <p><code>_SAME_CALL_SAME_RESULT_PATTERNS</code> run before the retryable ones and class these as DIAGNOSTIC. Each said "timeout" or "connection refused", so the model was told "will retry", and the same-failure stop never ran.</p>
+  <ul>
+    <li>A selector that never appears (<code>waiting for locator</code>, <code>Page.click … Timeout</code>, "did not match any element").</li>
+    <li>The host memo's "will fail the same way" refusal.</li>
+    <li><code>ERR_CONNECTION_REFUSED</code> on the agent's own loopback.</li>
+  </ul>
+  <p>Vision hints: a URL 404 gets URL advice.</p>
 </main>
 </body>
 </html>

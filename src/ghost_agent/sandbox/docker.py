@@ -56,7 +56,20 @@ CONTAINER_WORKDIR = "/workspace"
 #: absent: NET_RAW, NET_BIND_SERVICE, MKNOD, SYS_CHROOT, SETPCAP, SETFCAP,
 #: AUDIT_WRITE, and of course NET_ADMIN (the egress rules go in through a
 #: privileged exec so the model cannot undo them).
-SANDBOX_KEPT_CAPS = ("CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "SETGID", "SETUID", "KILL")
+#: §4LO: SETUID/SETGID REMOVED. With them, any code the agent ran could
+#: `setuid(debian-tor)` — the uid the egress firewall exempts for Tor's own
+#: traffic — and connect around Tor (verified live, 2026-10-05). Tor now
+#: starts AS debian-tor via the exec user, and apt is told not to drop to
+#: `_apt` (APT_NO_DROP_CMD), so nothing needs to change uid inside.
+#: KILL removed too (§4LO round 2): root signalling its OWN children needs
+#: none, and with it root could signal or kill the debian-tor Tor process.
+SANDBOX_KEPT_CAPS = ("CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID")
+
+#: apt drops to `_apt` for downloads by default, which needs SETUID.
+#: (embedded in single-quoted `sh -c '…'` provisioning lines, so no ')
+_APT_NO_DROP_SH = ("mkdir -p /etc/apt/apt.conf.d && "
+                   "echo APT::Sandbox::User root\\; > /etc/apt/apt.conf.d/99ghost-no-privdrop")
+APT_NO_DROP_CMD = "sh -c " + shlex.quote(_APT_NO_DROP_SH)
 
 #: The everyday CLI set added in provisioning marker v10 (§4KG): apt package
 #: names, and the binaries that PROVE they landed (the marker is written only
@@ -1083,7 +1096,7 @@ class DockerSandbox:
         # live container while the package was there. The symlink puts it on
         # PATH for the model and for the verify chain alike (measured 2026-09-24).
         prev_marker_path = "/root/.supercharged.v9"
-        upgrade_delta_cmd = "timeout 1800 sh -c 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends netcat-openbsd socat jq unzip zip tree nano bc gawk rsync pkg-config telnet whois p7zip-full poppler-utils ffmpeg imagemagick stockfish && ln -sf /usr/games/stockfish /usr/local/bin/stockfish'"
+        upgrade_delta_cmd = "timeout 1800 sh -c 'export DEBIAN_FRONTEND=noninteractive; mkdir -p /etc/apt/apt.conf.d && echo APT::Sandbox::User root\\; > /etc/apt/apt.conf.d/99ghost-no-privdrop && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends netcat-openbsd socat jq unzip zip tree nano bc gawk rsync pkg-config telnet whois p7zip-full poppler-utils ffmpeg imagemagick stockfish && ln -sf /usr/games/stockfish /usr/local/bin/stockfish'"
         upgrade_delta_verify = "sh -c 'command -v nc && command -v socat && command -v jq && command -v unzip && command -v zip && command -v tree && command -v nano && command -v bc && command -v gawk && command -v rsync && command -v pkg-config && command -v telnet && command -v whois && command -v 7z && command -v pdftotext && command -v ffmpeg && command -v convert && command -v stockfish'"
 
         # The marker/chromium probes are two docker execs; running them
@@ -1195,7 +1208,7 @@ class DockerSandbox:
             # unbounded mirror/CDN stall would wedge every concurrent tool
             # call in the agent. The caps are generous — they exist to
             # bound a stall, not to race a slow link.
-            apt_cmd = "timeout 1800 sh -c 'export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y sudo coreutils nodejs npm g++ curl wget git procps postgresql-client libpq-dev tor ripgrep sqlite3 iproute2 file xxd lsof dnsutils iptables netcat-openbsd socat jq unzip zip tree nano bc gawk rsync pkg-config telnet whois p7zip-full poppler-utils ffmpeg imagemagick stockfish --no-install-recommends && ln -sf /usr/games/stockfish /usr/local/bin/stockfish'"
+            apt_cmd = "timeout 1800 sh -c 'export DEBIAN_FRONTEND=noninteractive; mkdir -p /etc/apt/apt.conf.d && echo APT::Sandbox::User root\\; > /etc/apt/apt.conf.d/99ghost-no-privdrop && apt-get update && apt-get install -y sudo coreutils nodejs npm g++ curl wget git procps postgresql-client libpq-dev tor ripgrep sqlite3 iproute2 file xxd lsof dnsutils iptables netcat-openbsd socat jq unzip zip tree nano bc gawk rsync pkg-config telnet whois p7zip-full poppler-utils ffmpeg imagemagick stockfish --no-install-recommends && ln -sf /usr/games/stockfish /usr/local/bin/stockfish'"
             code, out = self._provision_exec(apt_cmd, environment=env_vars)
             if code != 0:
                 err_msg = out.decode("utf-8", errors="replace") if out else "Unknown error"
@@ -1552,12 +1565,40 @@ class DockerSandbox:
     def _intended_privileges(self) -> dict:
         drop_on = os.environ.get("GHOST_SANDBOX_DROP_CAPS", "1").strip().lower() not in ("0", "false", "no", "off")
         return {
+            "cap_add": list(SANDBOX_KEPT_CAPS) if drop_on else [],
             "cap_drop": ["ALL"] if drop_on else [],
             "security_opt": ["no-new-privileges"] if drop_on else [],
             "network_mode": (getattr(self, "network_override", None)
                              or os.environ.get("GHOST_SANDBOX_NETWORK", "").strip().lower()
                              or "bridge"),
         }
+
+    def _tor_integrity_ok(self) -> bool:
+        """Before Tor is (re)started as the exempt uid: no ld.so.preload, and
+        the binary + libraries hash as they did at this agent's first start
+        in this container (digest kept HOST-side, where sandbox code cannot
+        rewrite it). Anything else keeps egress blocked — §4LO."""
+        from . import tor_egress as _te
+        try:
+            _code, out = self._exec_run(_te.integrity_cmd(), user="root")
+            text = (out or b"").decode("utf-8", "replace") if _code == 0 else ""
+        except Exception as exc:  # noqa: BLE001 — a check that could not run is a FAILED check
+            logger.warning("tor integrity check could not run: %s", exc)
+            text = ""
+        if "PRELOAD" in text.splitlines() or not text.strip() or "/usr/bin/tor" not in text:
+            self._block_egress_hard("Tor not started: /etc/ld.so.preload is present or the "
+                                    "integrity check failed — sandbox code may be tampering with Tor")
+            return False
+        cid = str(getattr(self.container, "id", "") or "")
+        known = getattr(self, "_tor_digest", None)
+        if known is None or known[0] != cid:
+            self._tor_digest = (cid, text)
+            return True
+        if known[1] != text:
+            self._block_egress_hard("Tor not restarted: its binary or libraries changed since the "
+                                    "first start — sandbox code may be tampering with Tor")
+            return False
+        return True
 
     def _settle_privileges_once(self) -> None:
         """Once per container generation (§4KF): (1) strip the
@@ -1574,6 +1615,10 @@ class DockerSandbox:
         if self._privilege_checked or not getattr(self, "container", None):
             return
         self._privilege_checked = True
+        try:
+            self._exec_run(APT_NO_DROP_CMD, user="root")     # §4LO: apt needs no SETUID
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("apt no-privdrop config skipped: %s", exc)
         try:
             code, out = self._exec_run(
                 "sh -c " + shlex.quote(
@@ -1596,12 +1641,20 @@ class DockerSandbox:
                 # remedy path).
                 return
             actual = {
+                "cap_add": [str(c).upper().replace("CAP_", "") for c in (hc.get("CapAdd") or [])],
                 "cap_drop": [str(c).upper() for c in (hc.get("CapDrop") or [])],
                 "security_opt": [str(o) for o in (hc.get("SecurityOpt") or [])],
                 "network_mode": str(hc.get("NetworkMode") or ""),
             }
             want = self._intended_privileges()
             drift = []
+            # §4LO: the KEPT set is the part that matters — a container that
+            # still has SETUID/SETGID/KILL can reach the exempt Tor uid
+            _extra = sorted(set(actual["cap_add"]) - set(want.get("cap_add") or []))
+            if _extra and want.get("cap_add"):
+                drift.append(f"cap_add keeps {', '.join(_extra)} (intended {', '.join(want.get('cap_add') or [])})")
+            else:
+                _extra = []
             if set(actual["cap_drop"]) != set(want["cap_drop"]):
                 drift.append(f"cap_drop {actual['cap_drop'] or 'none'} (intended {want['cap_drop'] or 'none'})")
             if set(actual["security_opt"]) != set(want["security_opt"]):
@@ -1614,8 +1667,10 @@ class DockerSandbox:
                     "Sandbox Privileges",
                     f"container {self.container_name} predates the current privilege defaults: "
                     f"{self._privilege_drift}. Flags apply at creation — remove the container "
-                    f"(docker rm -f {self.container_name}) and the next turn recreates it hardened.",
-                    level="WARNING", icon=Icons.WARN)
+                    f"(docker rm -f {self.container_name}) and the next turn recreates it hardened."
+                    + (" Until then sandbox code can reach the uid Tor's own traffic is exempted "
+                       "by — Tor-only egress is NOT guaranteed." if _extra else ""),
+                    level="CRITICAL" if _extra else "WARNING", icon=Icons.WARN)
         except Exception as exc:  # noqa: BLE001 — attrs may be stubbed
             logger.debug("privilege drift check skipped: %s", exc)
 
@@ -1658,7 +1713,10 @@ class DockerSandbox:
                     "(provisioning incomplete; the v9 image carries both)")
                 return
             self._exec_run(_te.write_torrc_cmd(), user="root")
-            self._exec_run(_te.start_tor_cmd(), user="root")
+            self._exec_run(_te.prepare_tor_cmd(), user="root")
+            if self._exec_run(_te.tor_running_as_expected_cmd())[0] != 0 and not self._tor_integrity_ok():
+                return                                      # tampered: stay fail-closed
+            self._exec_run(_te.start_tor_cmd(), user=_te.TOR_USER)       # §4LO: born as debian-tor
             # Rules first — the fail-closed moment. Privileged exec: the
             # container has no NET_ADMIN of its own.
             code, out = self._exec_run(_te.apply_rules_cmd(), privileged=True)

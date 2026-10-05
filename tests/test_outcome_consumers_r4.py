@@ -41,6 +41,8 @@ def _loop_expr(name):
             "str_res": str_res if str_res is not None else str(outcome),
             "_OutcomeStatus": OutcomeStatus,
             "fname": fname,
+            # §4LM: the banner rule is a module helper the loop calls
+            "_result_failure_shaped": __import__("ghost_agent.core.agent", fromlist=["x"])._result_failure_shaped,
             "_op_shell_failed": (outcome.shell_failed if fname == "execute"
                                  else outcome.exit_code_failed),
         }

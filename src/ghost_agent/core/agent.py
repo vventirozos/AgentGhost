@@ -991,7 +991,13 @@ def _action_failed(content, tool_name: str = "") -> bool:
             return False
     except Exception:  # noqa: BLE001
         pass
-    # the same shell/banner split the loop uses
+    # the same shell/banner split the loop uses. vision_analysis DECLARES
+    # every result (§4LM), so live a caption quoting "EXIT CODE: 2" is never a
+    # strike; a row rehydrated as plain text must not become one either.
+    # (file_system is NOT here: the live loop still applies the banner rule
+    # to its undeclared reads, and this must answer as the loop did.)
+    if str(tool_name or "").strip().lower() == "vision_analysis":
+        return bool(_o.is_failure)
     return bool(_o.is_failure
                 or (_o.shell_failed if tool_name == "execute"
                     else _o.exit_code_failed))
@@ -1587,6 +1593,7 @@ def _browser_loaded_but_never_extracted(tools_run, target: str) -> bool:
     if not tgt:
         return False
     navigated = extracted = False
+    _last_nav = ""
     for r in tools_run or []:
         if not isinstance(r, dict) or r.get("_synthetic"):
             continue
@@ -1595,12 +1602,23 @@ def _browser_loaded_but_never_extracted(tools_run, target: str) -> bool:
         args = getattr(r.get("content"), "call_args", None) or {}
         # the breaker's target is `primary_target_from_args`: lower-cased and
         # cut at 200 chars — compare the same form
-        if str(args.get("url") or "").strip().lower()[:200] != tgt:
-            continue
+        _url = str(args.get("url") or "").strip().lower()[:200]
         op = str(args.get("operation") or "").strip().lower()
-        if op == "extract_text":
+        _acts = [a for a in (args.get("actions") or []) if isinstance(a, dict)]
+        # §4LN: a url-less extract (the form the schema teaches: it re-opens
+        # the page just navigated) and an interact extract are reads too
+        _reads = op == "extract_text" or (op == "interact" and any(
+            str(a.get("action") or "").lower() == "extract_text" for a in _acts))
+        # a url-less read re-opens the page navigated last (review: any
+        # url-less extract used to clear the steer for every target)
+        if _reads and (_url == tgt or (_url == "" and _last_nav == tgt)):
             extracted = True
-        elif op in ("navigate", ""):
+            continue
+        if op == "navigate" and _url:
+            _last_nav = _url
+        if _url != tgt:
+            continue
+        if op in ("navigate", ""):
             # a screenshot loop is the breaker's classic case, not this one
             navigated = True
     return navigated and not extracted
@@ -2052,7 +2070,7 @@ def _turn_had_tool_failure(tools_run: Optional[list]) -> bool:
         if _st is not None and _st not in (OutcomeStatus.OK,
                                            OutcomeStatus.UNRESOLVED):
             return True
-        if looks_like_tool_error(str(content)):
+        if looks_like_tool_error(str(content), tool.get("name") or ""):
             return True
     return False
 
@@ -3345,6 +3363,23 @@ def _backfilled_failure_reason(verifier: Optional[str], verifier_reason: str,
     return structural_reason(structural_cause_for_trajectory(traj))
 
 
+#: shell-like tool names a model reaches for — the work runs through `execute`
+_SHELL_LIKE_TOOLS = frozenset({"git", "bash", "sh", "shell", "terminal", "zsh", "cmd", "run_command",
+                               "python", "pip", "npm", "curl", "docker"})
+
+
+def _unknown_tool_message(name, available) -> str:
+    """§4LL: "Unknown tool 'git'" named no way forward. Say what to use: a
+    shell-like name runs through `execute`; anything else gets the list."""
+    n = str(name or "").strip()
+    if n.lower() in _SHELL_LIKE_TOOLS:
+        return (f"Error: there is no '{n}' tool. Run it as a shell command through execute, "
+                f"e.g. execute(command=\"{n.lower()} …\").")
+    names = sorted(str(k) for k in (available or {}) if not str(k).startswith("_"))
+    return (f"Error: Unknown tool '{n}'. Available tools: {', '.join(names[:40])}"
+            + (" …" if len(names) > 40 else "") + ".")
+
+
 def _unverified_mutation_note(last_tool, request, tools_run):
     """(note, failed) for a turn whose final substantive action was a file
     write never run or rendered — ("", False) otherwise. ONE wording for
@@ -3399,7 +3434,9 @@ def _is_unverified_mutation(tool: Optional[dict]) -> bool:
     _head = _raw.split("\n", 1)[0].strip()
     if any(rx.match(_head) for rx in _TARGETED_EDIT_RES):
         return False                    # a targeted edit is not the gate's shape
-    content = _head.lower()
+    # the markers are looked for OUTSIDE the quoted path (§4LL review:
+    # "Copied 'edited_photo.jpg'", "Downloaded '…/Replaced_logo.png'")
+    content = re.sub(r"'[^']*'", "''", _head).lower()
     if not any(marker in content for marker in _FILE_MUTATION_MARKERS):
         return False
     # the leading run of SUCCESS lines, like `_written_paths_from_confirmation`
@@ -3451,11 +3488,21 @@ _INERT_ARTIFACT_SUFFIXES = frozenset({
 })
 
 
+#: config dotfiles and lockfiles have no extension to splitext but are inert
+#: (§4LL review: a 2 KB .gitignore or .env write was flagged "never run")
+_INERT_ARTIFACT_NAMES = frozenset({
+    ".gitignore", ".gitattributes", ".dockerignore", ".editorconfig", ".env", ".env.example",
+    ".prettierrc", ".npmrc", ".nvmrc", ".python-version", "license", "readme", "changelog",
+})
+
+
 def _is_inert_artifact(path: str) -> bool:
     """True when ``path`` names a file that cannot be executed or rendered."""
     import os as _os
-    return _os.path.splitext(str(path).strip().strip("'\"").lower())[1] in \
-        _INERT_ARTIFACT_SUFFIXES
+    p = str(path).strip().strip("'\"").lower()
+    base = _os.path.basename(p)
+    return (_os.path.splitext(p)[1] in _INERT_ARTIFACT_SUFFIXES
+            or base in _INERT_ARTIFACT_NAMES or base.endswith(".lock"))
 
 
 def _written_paths_from_confirmation(content: str) -> list:
@@ -4407,13 +4454,82 @@ def _resolve_image_path(token: str, sandbox_dir: Any) -> Optional[str]:
         matches: List[Path] = []
         for root in roots:
             matches.extend(root.rglob(base))
-        matches = [m for m in matches if m.is_file()]
+        # §4LM: never ANOTHER project's file — the root walk descends into
+        # every projects/<id>/, and the verifier judged an unrelated
+        # project's same-named chart.png as this turn's render.
+        _is_project = Path(sandbox_dir).parent.name == "projects"
+        _scope = Path(sandbox_dir).resolve()
+        _projects = (Path(sandbox_dir).parent if _is_project
+                     else Path(sandbox_dir) / "projects").resolve()
+
+        def _in_scope(m: Path) -> bool:
+            # the active project's own files, or shared root files — never a
+            # project's when another (or none) is active
+            r = m.resolve()
+            return (_is_project and r.is_relative_to(_scope)) or not r.is_relative_to(_projects)
+        matches = [m for m in matches if m.is_file() and _in_scope(m)]
         if matches:
             matches.sort(key=lambda m: m.stat().st_mtime, reverse=True)
             return str(matches[0])
     except Exception:
         pass
     return None
+
+
+#: The name the attachment translator gives a pasted image (content hash).
+#: Only that translator writes it, so the NAME is provenance: the file is the
+#: user's own image, never a render the agent produced (§4LM).
+_ATTACHMENT_NAME_RE = re.compile(r"^vision_[0-9a-f]{12}\.[a-z]{3,4}$")
+
+
+def _attachment_filename(img_data: bytes, header: str = "") -> str:
+    """`vision_<sha12>.<ext>` for a pasted image: the extension follows the
+    bytes (or the data-URL header), so a PNG is not saved — and later typed —
+    as `.jpg` (§4LM)."""
+    from ..tools.vision import _sniff_image_mime
+    mime = _sniff_image_mime(img_data[:16]) or ""
+    if not mime:
+        m = re.match(r"data:([\w.+/-]+)", header or "")
+        mime = (m.group(1).lower() if m else "")
+    ext = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/bmp": "bmp",
+           "image/tiff": "tiff", "image/webp": "webp", "image/svg+xml": "svg",
+           "image/heic": "heic", "image/avif": "avif"}.get(mime, "jpg")
+    return f"vision_{hashlib.sha256(img_data).hexdigest()[:12]}.{ext}"
+
+
+def _user_attachment_names(messages: list, request_text: str = "") -> List[str]:
+    """Attachment filenames of the images in THIS request's user message —
+    the user message whose text parts are `request_text` (how handle_chat
+    builds `last_user_content`). An image pasted requests ago is not this
+    request's evidence (review: a photo from two turns back was judged as
+    "the user's original screenshot" of a later, unrelated turn), so no
+    match means no attachments."""
+    import base64 as _b64
+
+    def _norm(t: str) -> str:
+        return " ".join(str(t or "").split())
+    want = _norm(request_text)
+    for msg in reversed(messages or []):
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        c = msg.get("content")
+        parts = c if isinstance(c, list) else [{"type": "text", "text": c}]
+        text = " ".join(i.get("text", "") for i in parts if isinstance(i, dict) and i.get("type") == "text")
+        if _norm(text) != want:
+            continue                       # a synthetic mid-turn row, or an older request
+        names = []
+        for item in parts:
+            if not (isinstance(item, dict) and item.get("type") == "image_url"):
+                continue
+            url = str((item.get("image_url") or {}).get("url") or "")
+            if url.startswith("data:") and "," in url:
+                header, enc = url.split(",", 1)
+                try:
+                    names.append(_attachment_filename(_b64.b64decode(enc), header))
+                except Exception:  # noqa: BLE001
+                    continue
+        return names
+    return []
 
 
 def _select_visual_evidence(messages: list, last_user_content: str,
@@ -4442,6 +4558,14 @@ def _select_visual_evidence(messages: list, last_user_content: str,
         before_img = _resolve_image_path(tok, sandbox_dir)
         if before_img:
             break
+    # A PASTED image's name never appears in the text-only user content, so
+    # it is read from the raw message — and, being the user's, it is the
+    # before image, never "the render after the agent's change" (§4LM).
+    if not before_img:
+        for _nm in _user_attachment_names(messages, last_user_content):
+            before_img = _resolve_image_path(_nm, sandbox_dir)
+            if before_img:
+                break
 
     # Provenance beats name-matching (probe req 68033190): a screenshot the
     # AGENT wrote this turn is after-evidence even when its filename appears
@@ -4461,10 +4585,18 @@ def _select_visual_evidence(messages: list, last_user_content: str,
             rendered.append(resolved)
 
     candidates: List[str] = []
+    # §4LN: a screenshot call that FAILED rendered nothing — its out_path
+    # names yesterday's file, which then won "newest" as the post-fix image
+    from .link_grounding import _failed_browser_result
+    _failed_ids = {str(m.get("tool_call_id")) for m in messages
+                   if isinstance(m, dict) and m.get("role") == "tool" and m.get("tool_call_id")
+                   and _failed_browser_result(m.get("content"))}
     for msg in messages:
         if not isinstance(msg, dict):
             continue
         if msg.get("role") not in ("assistant", "tool"):
+            continue
+        if msg.get("role") == "tool" and _failed_browser_result(msg.get("content")):
             continue
         blob_parts: List[str] = []
         c = msg.get("content")
@@ -4473,6 +4605,8 @@ def _select_visual_evidence(messages: list, last_user_content: str,
         tcs = msg.get("tool_calls")
         if isinstance(tcs, list):
             for tc in tcs:
+                if isinstance(tc, dict) and str(tc.get("id")) in _failed_ids:
+                    continue
                 try:
                     blob_parts.append(json.dumps(tc))
                 except Exception:
@@ -4500,7 +4634,8 @@ def _select_visual_evidence(messages: list, last_user_content: str,
                 _note_rendered(raw)
         for tok in _extract_image_tokens(blob):
             resolved = _resolve_image_path(tok, sandbox_dir)
-            if resolved and resolved != before_img and resolved not in candidates:
+            if (resolved and resolved != before_img and resolved not in candidates
+                    and not _ATTACHMENT_NAME_RE.match(Path(resolved).name)):
                 candidates.append(resolved)
 
     if before_img and before_img in rendered:
@@ -8238,6 +8373,112 @@ def _scrub_member_download_links(text, allowed) -> str:
         return text
 
 
+def _result_failure_shaped(str_res: str, res_is_error: bool, outcome) -> bool:
+    """Does this tool result get a FAILURE BANNER (and a fallback hint)? The
+    loop's verdict, an `Error` head, or "SYSTEM ERROR" anywhere — except in a
+    DECLARED success: a caption of a poster reading "SYSTEM ERROR" got the
+    banner, and the banner hid the look from the inspected-image gate (§4LM)."""
+    from ..tools.outcome import OutcomeStatus
+    return bool(
+        res_is_error
+        or str_res.lstrip().startswith("Error")
+        or ("SYSTEM ERROR" in str_res
+            and not (getattr(outcome, "declared", False)
+                     and getattr(outcome, "status", None) is OutcomeStatus.OK)))
+
+
+def _hypothesis_shell_cmd(cmd: str):
+    """The sandbox command for a System-3 hypothesis's SHELL test, or None
+    when it must not run (§4LO). It ran as a bare argv — no shell, so pipes,
+    `&&` and redirects became literal arguments (a right hypothesis was
+    eliminated on the garbled run) — and skipped every guard the execute
+    tool applies. A hypothesis TEST is read-only: invalid shell, a
+    deny-listed form, or anything that writes / removes / moves is refused."""
+    from ..tools.validators import validate_shell
+    from ..tools.execute import _bash_c, _rerun_unsafe
+    from ..tools.shell_analysis import _shell_segments
+    ok, _why = validate_shell(cmd)
+    if not ok or _rerun_unsafe(cmd):
+        return None
+    for head, args, _raw, _x in _shell_segments(cmd):
+        if head in ("kill", "pkill", "killall", "sed") and (head != "sed" or any(a.startswith("-i") for a in args)):
+            return None
+        if head == "git" and args and args[0] in ("checkout", "reset", "clean", "restore", "stash", "rm", "mv", "commit", "push"):
+            return None
+    return _bash_c(cmd)
+
+
+def _salvage_vision_args(block: str) -> dict:
+    """`target` / `action` / `prompt` of a malformed vision_analysis call,
+    each read from its OWN tag or JSON key; {} when no target is found."""
+    out: dict = {}
+    for key in ("target", "action", "prompt"):
+        m = (re.search(rf"<{key}>(.*?)</{key}>", block or "", re.DOTALL | re.IGNORECASE)
+             # each quote style closes only on ITS OWN quote: "Is the user's
+             # avatar visible?" kept its apostrophe (review)
+             or re.search(rf"[\"']{key}[\"']\s*:\s*\"((?:[^\"\\]|\\.)*)\"", block or "", re.DOTALL)
+             or re.search(rf"[\"']{key}[\"']\s*:\s*'((?:[^'\\]|\\.)*)'", block or "", re.DOTALL))
+        if m and m.group(1).strip():
+            out[key] = m.group(1).strip()
+    return out if out.get("target") else {}
+
+
+def _drop_missing_download_links(text, sandbox_root) -> tuple:
+    """(text, dropped names): every `/api/download/<rel>` link (markdown
+    image, markdown link or bare path) whose file does not exist — not at
+    `<rel>` under the sandbox, and (lenient) no file of that NAME anywhere in
+    it — is replaced with a plain notice. A live reply (08-21, req 654f4b01)
+    embedded `![generated image](/api/download/gen_d7f2a1b3.png)` and
+    described it, in a turn that generated nothing (§4LM). Lenient by
+    design: a real file is never unlinked. Never raises."""
+    if not isinstance(text, str) or "/api/download/" not in text or sandbox_root is None:
+        return text, []
+    try:
+        root = Path(sandbox_root)
+    except TypeError:
+        return text, []
+    dropped: List[str] = []
+
+    import glob as _glob
+    from urllib.parse import unquote as _unquote
+
+    def _readings(rel: str) -> List[str]:
+        """Every name the link could mean: as written, URL-decoded, and with
+        prose punctuation the regex swallowed (`plot.png.`, `x.png|`, `a.png\``)."""
+        rel = rel.split("?", 1)[0].split("#", 1)[0]
+        out = []
+        for r in (rel, rel.split("|", 1)[0].rstrip(".,;:!?`*'\"")):
+            for v in (r, _unquote(r)):
+                if v and v not in out:
+                    out.append(v)
+        return out
+
+    def _exists(rel: str) -> bool:
+        try:
+            for r in _readings(rel):
+                if ".." not in r and (root / r).is_file():
+                    return True
+                base = os.path.basename(r)
+                if base and any(m.is_file() for m in root.rglob(_glob.escape(base))):
+                    return True
+            return False
+        except Exception:  # noqa: BLE001 — unknown is "exists"
+            return True
+
+    def _sub(m):
+        name = m.group(2)
+        if _exists(name):
+            return m.group(0)
+        dropped.append(name)
+        # a bare path's match can swallow the `)` that closes the sentence
+        tail = ")" if (m.group(1) is None and m.group(0).endswith(")")) else ""
+        return f"[no such file: {os.path.basename(name)} — it was not created]{tail}"
+    try:
+        return _DOWNLOAD_LINK_RE.sub(_sub, text), dropped
+    except Exception:  # noqa: BLE001
+        return text, []
+
+
 def _iter_teachable_train(trajectories):
     """Member turns never train the owner's router / PRM / online PRM update
     (§4KJ R7: the member controls the text)."""
@@ -8350,8 +8591,9 @@ def _blind_regeneration_block(fname, tools_run_this_turn, messages, user_text,
     return (
         f"SYSTEM BLOCK — no second image blind: you generated {first} this request and "
         "have not looked at it. Either present it NOW "
-        f"with the markdown line ![generated image](/api/download/{first}) and a one-line "
-        f"description, or inspect it first — vision_analysis(action='describe_picture', "
+        f"with the markdown line ![generated image](/api/download/{first}) and one line on "
+        "what you ASKED for (not what it shows — you have not seen it), or inspect it first "
+        f"— vision_analysis(action='describe_picture', "
         f"target='{first}') — and only then decide whether a second take is needed. "
         "Each generation occupies the image node for minutes."
     )
@@ -19475,7 +19717,12 @@ class GhostAgent:
                                     arg_key = "target" if tool_name_fallback == "vision_analysis" else ("prompt" if tool_name_fallback == "image_generation" else "query")
                                     args_dict = {arg_key: extracted_val.strip()}
                                     if tool_name_fallback == "vision_analysis":
-                                        args_dict["action"] = "describe_picture"
+                                        # §4LM: each field from ITS OWN tag — the first of
+                                        # target|prompt|query made the QUESTION the target
+                                        # ("File 'Is the ball…' not found") and forced
+                                        # describe_picture over a requested verify_ui.
+                                        args_dict = _salvage_vision_args(block_content) or args_dict
+                                        args_dict.setdefault("action", "describe_picture")
 
                                     tool_calls.append({
                                         "id": f"call_{uuid.uuid4().hex[:8]}",
@@ -20889,6 +21136,11 @@ class GhostAgent:
                         # collapse-unsafe. Dropping a real call is far worse
                         # than a redundant read, so unknown/dynamic → unsafe.
                         _collapse_unsafe = is_mutating or fname not in _COLLAPSE_READSAFE
+                        if is_mutating:
+                            # §4LL review: a read AFTER this write in the same
+                            # batch must run again, not copy the earlier read's
+                            # (stale / "does not exist") result
+                            batch_seen_reads.clear()
                         # §4EC F9: ONE gate. Registration below admits only
                         # collapse-safe calls and `a_hash` carries the healed
                         # tool name, so a hit here is necessarily a read-safe
@@ -21006,7 +21258,9 @@ class GhostAgent:
                         # see, which it had no way to observe here.
                         _strike_synthetic(fname, describe_invocation_error(fname, e))
                 else:
-                    err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": _TO.failed(f"Error: Unknown tool '{fname}'", world_changed=False, reason_code="unknown_tool")}
+                    err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": _TO.failed(
+                        _unknown_tool_message(fname, self.available_tools), world_changed=False,
+                        reason_code="unknown_tool")}
                     messages.append(err_msg)
                     tools_run_this_turn.append({**err_msg, "_synthetic": True})
                     execution_failure_count += 1
@@ -21074,9 +21328,22 @@ class GhostAgent:
                         mutation_coros.append((i, task))
 
                 if mutation_coros:
-                    mut_results = await asyncio.gather(*(c[1] for c in mutation_coros), return_exceptions=True)
-                    for (i, _), res in zip(mutation_coros, mut_results):
-                        results[i] = res
+                    # §4LL: file_system calls run one after another, in the
+                    # order the model wrote them. One gather over all of them
+                    # raced: three edits to one file landed one, the others
+                    # came back "changed on disk" / "not found", and a read
+                    # after a write said the file did not exist. Grouping by
+                    # path string was not enough (review: "app.py",
+                    # "/workspace/app.py", "/app.py" are one file; a move's
+                    # destination; batch reads with no path). File calls are
+                    # cheap; correctness first.
+                    for i, c in mutation_coros:
+                        try:
+                            results[i] = await c
+                        except asyncio.CancelledError:
+                            raise
+                        except BaseException as e:  # noqa: BLE001 — gather(return_exceptions) parity
+                            results[i] = e
 
                 # Phase 2: Executions
                 exec_coros = []
@@ -21085,6 +21352,33 @@ class GhostAgent:
                         continue  # batch-dedup placeholder, filled below
                     if meta[0] != "file_system":
                         exec_coros.append((i, task))
+
+                # §4LN: browser calls of one batch run in the order the model
+                # wrote them. They share one profile (a lock serialises them
+                # in COMPLETION order) and a url-less op reads the page the
+                # previous navigate left — `navigate(A), navigate(B),
+                # extract_text()` read whichever navigate won the race.
+                # §4LO: `execute` too — two stateful calls in one batch raced on
+                # the shared kernel runner (one deleted it under the other),
+                # and a script and its test share files. One chain PER TOOL.
+                async def _in_order(prev_done, coro, my_done):
+                    try:
+                        if prev_done is not None:
+                            await prev_done.wait()
+                        return await coro
+                    finally:
+                        my_done.set()
+                for _ordered_tool in ("browser", "execute"):
+                    _br_idx = [k for k, (i, _) in enumerate(exec_coros)
+                               if tool_call_metadata[i][0] == _ordered_tool]
+                    if len(_br_idx) < 2:
+                        continue
+                    _prev_ev = None
+                    for k in _br_idx:
+                        _ev = asyncio.Event()
+                        i, t = exec_coros[k]
+                        exec_coros[k] = (i, _in_order(_prev_ev, t, _ev))
+                        _prev_ev = _ev
 
                 if exec_coros:
                     # Producer→consumer ordering inside the batch (2026-07-31,
@@ -21096,17 +21390,19 @@ class GhostAgent:
                     # holds both a file-producing tool and vision_analysis,
                     # the model authored a sequence — await the producers
                     # (and everything else) first, then the vision reads.
-                    _FILE_PRODUCERS = {"browser", "image_generation"}
-                    _prod = {i for i, _ in exec_coros
-                             if tool_call_metadata[i][0] in _FILE_PRODUCERS}
+                    # §4LM: EVERY other tool counts as a producer — `execute`
+                    # writing plot.png, report_pdf, a delegate, a skill. A
+                    # named set left `execute + vision(chart.png)` racing, and
+                    # vision captioned the PREVIOUS chart as the new one.
                     _cons = {i for i, _ in exec_coros
                              if tool_call_metadata[i][0] == "vision_analysis"}
+                    _prod = {i for i, _ in exec_coros} - _cons
                     if _prod and _cons:
                         pretty_log(
                             "Batch Order",
-                            "vision_analysis shares this batch with a "
-                            "file-producing tool — running producers first "
-                            "so vision reads the artifact, not its absence.",
+                            "vision_analysis shares this batch with other "
+                            "tools — running them first so vision reads "
+                            "what they wrote, not its absence or old copy.",
                             icon=Icons.TOOL_DEEP,
                         )
                         _first = [(i, t) for i, t in exec_coros if i not in _cons]
@@ -21375,7 +21671,7 @@ class GhostAgent:
                             _fs_resolve(
                                 _foresight_preds[i],
                                 ok=not (_res_is_error
-                                        or _fs_looks_err(str_res)),
+                                        or _fs_looks_err(str_res, tool_call_metadata[i][0])),
                                 result_head=str_res[:200],
                                 req_id=str(getattr(ts, "req_id", "")
                                            or request_id_context.get() or ""),
@@ -21820,10 +22116,11 @@ class GhostAgent:
                     # already guards with `not _outcome.declared` 140 lines
                     # below. This banner is the last thing the model reads
                     # before deciding to retry or pivot.
-                    _failure_shaped = (
-                        _res_is_error
-                        or str_res.lstrip().startswith("Error")
-                        or "SYSTEM ERROR" in str_res)
+                    # §4LM: the unanchored "SYSTEM ERROR" arm never overrules
+                    # a DECLARED success — a caption of a poster reading
+                    # "SYSTEM ERROR" got a FAILURE BANNER, and the banner then
+                    # hid the look from the inspected-image gate.
+                    _failure_shaped = _result_failure_shaped(str_res, _res_is_error, _outcome)
                     if _failure_shaped:
                         from ..tools.tool_failure import result_is_failure as _rif
                         first_err_line = next(
@@ -21908,7 +22205,7 @@ class GhostAgent:
                                 .strip().lower() not in ("0", "false", "no")):
                             from ..distill.outcome_heuristics import (
                                 looks_like_tool_error as _fsn_looks_err)
-                            if _res_is_error or _fsn_looks_err(str_res):
+                            if _res_is_error or _fsn_looks_err(str_res, tool_call_metadata[i][0]):
                                 from . import experiments as _fsn_exp
                                 from .foresight import (
                                     FORESIGHT_NOTE_MARKER as _fsn_marker)
@@ -22682,10 +22979,11 @@ class GhostAgent:
                         messages.append({"role": "user", "content": (
                             f"SYSTEM ALERT: you have loaded '{_atarget}' {_acnt} times "
                             "with `browser` navigate and got the SAME capped preview — "
-                            "re-loading it produces NO new information. You have NOT "
-                            "read the page yet. Call browser(operation='extract_text', "
-                            f"url='{_atarget}', max_chars=8000) ONCE now and use its "
-                            "text; then answer. Do NOT navigate this URL again."
+                            "re-loading it produces NO new information. You have read "
+                            "only its first 8 KB. Call browser(operation='extract_text', "
+                            f"url='{_atarget}', max_chars=65536) ONCE now for the full "
+                            "text (or add selector=<the section you need>), use it, then "
+                            "answer. Do NOT navigate this URL again."
                         )})
                     elif _acnt >= _hard_n and _nav_case:
                         force_final_response = True
@@ -23749,6 +24047,13 @@ class GhostAgent:
             self._note_member_files(_gen_now)
             final_ai_content = _scrub_member_download_links(
                 final_ai_content, self._member_files() | _gen_now)
+        else:
+            final_ai_content, _dl_missing = _drop_missing_download_links(
+                final_ai_content, getattr(self.context, "sandbox_dir", None))
+            if _dl_missing:
+                pretty_log("Missing File Link",
+                           f"removed {len(_dl_missing)} link(s) to files that do not exist: "
+                           + ", ".join(_dl_missing[:3]), level="WARNING", icon=Icons.WARN)
 
         # Start-with constraint enforcement on the ASSEMBLED reply
         # (req 56221fad): the model opened its FINAL turn with the mandated
@@ -30548,7 +30853,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                                         # model call and thread history re-sends images, so a
                                                         # random name wrote (and, for a member, registered) a new
                                                         # copy each time — evicting the member's own older files.
-                                                        filename = f"vision_{hashlib.sha256(img_data).hexdigest()[:12]}.jpg"
+                                                        filename = _attachment_filename(img_data, header)
                                                         # Save into the active project's dir so the scoped
                                                         # vision_analysis finds it by bare name and it shows
                                                         # in the scoped listing (vision also has a root
@@ -30556,8 +30861,12 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                                         from ..tools.file_system import project_scoped_sandbox
                                                         tmp_path = project_scoped_sandbox(self.context)[0] / filename
                                                         if not tmp_path.exists():
-                                                            with open(tmp_path, "wb") as f:
-                                                                f.write(img_data)
+                                                            # atomic (§4LM): a write cut short left a
+                                                            # truncated file the exists() gate never
+                                                            # rewrote — every later turn shipped it
+                                                            _part = tmp_path.with_name(tmp_path.name + f".part-{os.getpid()}-{id(img_data)}")
+                                                            _part.write_bytes(img_data)
+                                                            os.replace(_part, tmp_path)
                                                         if requester_is_member():
                                                             # the member's own pasted image is a member file (R10)
                                                             self._note_member_files({filename})
@@ -32073,7 +32382,14 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                      # file name is exact — `%` cannot reach a local path)
         if self._MEMBER_URL_RE.fullmatch(v):
             return True
-        return "/" not in v and "\\" not in v and v in ok
+        # §4LM: the schema and the image tool teach `/gen_x.png` and
+        # `/api/download/gen_x.png`; ONE such leading prefix is stripped, and
+        # what remains must still be exactly a member file's name.
+        for _pre in ("/api/download/", "/"):
+            if v.startswith(_pre):
+                v = v[len(_pre):]
+                break
+        return bool(v) and v in ok          # `ok` holds bare basenames only
 
     def _member_tool_refusal(self, cname, raw_args, tools_run_this_turn):
         """Why a MEMBER may not make this call, or None. Tools outside
@@ -34942,7 +35258,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             if _action_failed(_raw, _n):
                                 obj.error = _normalize_tool_error(obj.result)
                         elif (_st is not None and _st != "ok") \
-                                or (_looks_like_tool_error(obj.result)
+                                or (_looks_like_tool_error(obj.result, getattr(obj, "name", ""))
                                     and not (_decl and _st == "ok")):
                             obj.error = _normalize_tool_error(obj.result)
                     except Exception:
@@ -35809,7 +36125,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                       or _s.startswith(("print(", "import ", "from "))):
                                     _cmd = "python3 -c " + _shlex.quote(_s)
                                 else:
-                                    _cmd = _s
+                                    _cmd = _hypothesis_shell_cmd(_s)
+                                    if _cmd is None:
+                                        return ("[exit 126]\nrefused: a hypothesis test must be a "
+                                                "read-only command (no writes, no rm/mv/…, valid shell)")
                                 _out, _code = await asyncio.to_thread(
                                     _sm.execute, _cmd, 30)
                                 return f"[exit {_code}]\n{_out}"

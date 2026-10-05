@@ -383,6 +383,48 @@ STDOUT/STDERR:
     <li>Written paths: <code>find -exec grep</code> and <code>tar -czf /tmp/x .</code> write nothing in the workspace; <code>&gt;</code> inside
     <code>$(( ))</code>, a heredoc or quotes is no redirect; <code>&gt;|</code> is; <code>git -C</code>, npm/pip/make in the folder are writes.</li>
   </ul>
+  <h2 id="4lo">Execute review <span class="tag">2026-10-05 &sect;4LO</span></h2>
+  <p>Six live probes with known outputs were all right: a computed number, a script printing "Error:" with exit 0, a script that raises, a plot, 200,000 output lines, and Greek text. Of 111 real turns, the tool caused few failures; the defects were in reading exit statuses and labels.</p>
+  <ul>
+    <li><strong>Pipe forgiveness only where a reader can close early.</strong> A broken pipe excuses a non-zero status only when the LAST pipeline has <code>head</code>, <code>grep -q/-m</code>, <code>sed …q</code> or <code>awk … exit</code> downstream (a trailing <code>echo "$?"</code> reports the pipeline before it). <code>pip install … | tail</code>, a DataLoader's own BrokenPipeError and <code>cat a | sort &gt; b; python3 client.py</code> keep their failure.</li>
+    <li><strong>A crash in front of <code>| grep</code></strong> is not "no matches". For a pipeline ending in a grep-family tool, the shell prints every stage's status on a marker line (<code>__GHOST_PIPESTATUS=</code>, stripped from the output). The no-match rewrite requires every earlier stage to have exited 0.</li>
+    <li><strong>Kills and timeouts.</strong>
+      <ul>
+        <li>The script path passes the elapsed time, so a fast out-of-memory kill is not "timed out after 600 s".</li>
+        <li>The stateful kernel checks its 5-minute limit on every message and SIGINTs its own kernel on timeout, so the cell stops and the next call is not queued behind it.</li>
+      </ul>
+    </li>
+    <li><strong>Re-running from the root</strong> happens only for a file the command itself names, never for a data file the program looked for at runtime. A JS stack trace, like a Python traceback, proves the program ran.</li>
+    <li><strong>Quiet <code>find</code>:</strong> the sandbox's "no output" placeholder is not output, so the exit 1 stands.</li>
+    <li><strong>Detached jobs</strong> get the same exit-code reading as a foreground run.</li>
+    <li><strong>Ordering.</strong> <code>execute</code> calls of one batch run in the order written (two stateful calls raced on the kernel runner).</li>
+    <li><strong>Job logs.</strong> A job log over the cap is read at its two ends, not whole (a 1&nbsp;GB log used about 2&nbsp;GB of host memory).</li>
+    <li><strong>Heredoc bodies</strong> are data: an apostrophe in a file written with <code>cat &gt; f &lt;&lt;'EOF'</code> no longer fails the shell check.</li>
+    <li><strong>System-3 hypothesis tests</strong> run through <code>bash -c</code> with pipefail and must be read-only (shell check, no writes or removing/moving verbs).</li>
+    <li><strong>Labels.</strong>
+      <ul>
+        <li>Off the live loop, an execute-shaped result's <code>EXIT CODE: 0</code> is the verdict, as in the loop.</li>
+        <li>The privacy note keeps a declared outcome's status.</li>
+        <li>The verifier treats a later run as superseding an earlier one, so a fixed-and-re-run "Accuracy: 0.91" is not refuted by the earlier 0.87.</li>
+      </ul>
+    </li>
+  </ul>
+  <p><strong>Round 2, after a fresh reader on the diff:</strong></p>
+  <ul>
+    <li>A quiet <code>find … 2&gt;/dev/null</code> or a SIGPIPE'd stage before the grep is not a crash.</li>
+    <li>The JS-stack guard is gone: name matching covers runtime misses, a wrong-directory <code>node server.js</code> re-runs again, and <code>npm</code>'s implicit <code>package.json</code> counts as named.</li>
+    <li>A run's "same block" stops at the next evidence label, so a later file read is not part of the run above it.</li>
+    <li><code>|&amp; head</code> and <code>/usr/bin/head</code> count as early readers.</li>
+    <li>Hypothesis tests also refuse <code>sed -i</code>, <code>kill</code> and mutating <code>git</code>.</li>
+    <li>The status marker is stripped from detached-job tails.</li>
+  </ul>
+  <p>Not changed:</p>
+  <ul>
+    <li>Per-call <code>duration_s</code> is still not recorded in trajectories.</li>
+    <li>Timeouts stay "retryable" (an existing pin; a decision to revisit).</li>
+    <li>The <code>imagine_preflight</code> experiment's class-precedent deferral of a read-only probe was left to the operator (one turn).</li>
+  </ul>
+  <p>Pins: <code>tests/test_4lo_execute.py</code>.</p>
 </main>
   <p><strong><code>find … 2&gt;/dev/null</code> exiting 1 is not a failed command (§4IE, 2026-09-17).</strong> <code>find</code> exits 1 whenever any directory under its root was unreadable; with stderr discarded that status carries nothing the model can act on and the paths it printed are valid. Probe <code>ifs18371…</code> re-ran eight <code>find / …</code> variants in a row (turns 31–38, up to 166 s each), each banner-flagged, each a strike. <code>_normalise_find_exit</code> (called inside <code>_normalise_exit</code>, before the self-reported status) forgives exit 1 ONLY when the last <code>;</code>/<code>&amp;&amp;</code>-separated command of the line is a <code>find</code> whose stderr is discarded, something was printed, and no <code>find:</code> error line is in the output; exit 2 (usage error) and a <code>find</code> that printed nothing keep their status. Pins: <code>tests/test_same_error_probe_labels.py</code>.</p>
 </body>

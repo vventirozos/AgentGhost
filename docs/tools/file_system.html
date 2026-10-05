@@ -701,6 +701,65 @@ SyntaxError: Unexpected identifier 't'</pre>
   <h2 id="4kw-r5">Fifth review <span class="tag">2026-10-03 &sect;4KW</span></h2>
   <p>Removing or moving the projects folder (or an ancestor of it) is refused whether or not any project is released
   (<code>_projects_folder_block</code>).</p>
+<h2 id="4ll">File handling after the §4LL review <span class="tag">2026-10-04 &sect;4LL</span></h2>
+<p>Measured (3 weeks, user turns): 26 of 83 file turns were labelled failed, but none of them because of this tool.
+17 were test prompts sent without the probe header, 10 were correct edits labelled "unverified write", and 8 failed on
+other tools. On real traffic the rate was 15%. The code review found the defects below; all are fixed.</p>
+<ul>
+  <li><strong>Calls on one file in one message run in order.</strong> The turn loop used to run every file_system call of
+  a message at once, so three edits to one file landed one and the others came back "changed on disk" / "not found",
+  and a read after a write said the file did not exist. Calls are now grouped by path: the same path runs in the order
+  the model wrote them, different paths still run together.</li>
+  <li><strong>A read whose content mentions errors is not a failed call.</strong> The shared failure sniffer looked for
+  "error:" / "exception" in the first 120 characters, and for this tool those are file CONTENTS (a log, exceptions.py,
+  an rg hit on <code>except Exception</code>). For file_system the loop's own failure-prefix test decides
+  (<code>outcome_heuristics._CONTENT_TOOLS</code>).</li>
+  <li><strong>The unverified-write gate</strong> looks for "wrote / edited / replaced" outside the quoted path
+  ("Copied 'edited_photo.jpg'" is not a write), and config dotfiles and lockfiles (<code>.gitignore</code>,
+  <code>.env</code>, <code>*.lock</code>…) count as inert, like prose.</li>
+  <li><strong>Paths on the user's machine.</strong> A write, move or delete whose path names the user's computer or the
+  container's system folders (<code>~</code>, <code>/Users/</code>, <code>/home/</code>, <code>/tmp/</code>,
+  <code>/etc/</code>…) is refused with the reason (<code>_host_path_block</code>). Before, the leading-slash heal wrote
+  <code>~/Desktop/notes.txt</code> into <code>&lt;sandbox&gt;/Users/…</code> and reported it written to the Desktop.
+  The sandbox's own absolute path and <code>/workspace</code> still work. Reading a <code>/Users/…</code> path now says
+  to ask the user for the file (the container has no <code>/Users</code>, so <code>cat</code> fails too).</li>
+  <li><strong>Search.</strong>
+    <ul>
+      <li>Hidden and git-ignored files are searched (never inside <code>.git</code>).</li>
+      <li>A pattern that is not a valid regex (<code>print(</code>) is searched as plain text, with a note.</li>
+      <li>A real rg error (exit 2) is an error, not "no matches".</li>
+    </ul></li>
+  <li><strong>Replace and edit.</strong>
+    <ul>
+      <li>An empty replacement deletes the text. The alias chain read <code>new_string=""</code> as missing and
+      offered to overwrite the whole file.</li>
+      <li>The missing-<code>replace_with</code> message points to <code>edit</code>.</li>
+      <li>An <code>old_string</code> copied with the ranged read's line numbers is named as such.</li>
+      <li>A multi-line insert into a CRLF file stays CRLF.</li>
+      <li>The syntax-rollback advice names <code>edit</code>, not a SEARCH/REPLACE block <code>edit</code>
+      refuses.</li>
+    </ul></li>
+  <li><strong>Smaller fixes.</strong>
+    <ul>
+      <li>A failed download says why (429/403/404) and not to retry the same URL, curl included.</li>
+      <li>Files named <code>http_…</code> are read.</li>
+      <li>Operations are case-insensitive, and an unknown operation lists the schema's operations
+      (<code>ADVERTISED_OPS</code>, pinned equal to the enum).</li>
+      <li>Reading a directory points to <code>list_files</code>.</li>
+      <li>Empty marker files (<code>__init__.py</code>, <code>.gitkeep</code>…) can be written.</li>
+      <li>The "you are already inside this project" wording appears only when a project is active.</li>
+    </ul></li>
+  <li><strong>Elsewhere.</strong>
+    <ul>
+      <li>An unknown tool now says what to use: a shell-like name (<code>git</code>, <code>bash</code>…) runs through
+      <code>execute</code>, anything else gets the tool list.</li>
+      <li>A lesson that prescribes a tool call that does not exist (a removed tool, a file_system operation it lacks)
+      is refused when written (<code>lesson_quality.unknown_tool_calls</code>). The reflection on the §4KB checks had
+      taught "call <code>git(operation=write…)</code>" after the git tool was removed.</li>
+    </ul></li>
+</ul>
+  <h2 id="4lm">Download: no cleartext DNS over Tor <span class="tag">2026-10-04 &sect;4LM</span></h2>
+  <p><code>tool_download_file</code> resolves its egress proxy first. The SSRF guard, on the URL and on every redirect hop, then runs with <code>resolve=False</code> when the fetch goes over Tor. The default host-side <code>getaddrinfo</code> had sent the target's name to the local resolver in cleartext, while the comment above it claimed parity with the browser. Literal internal IPs are still refused. Pins: <code>tests/test_4lm_vision.py</code>.</p>
 </main>
 </body>
 </html>

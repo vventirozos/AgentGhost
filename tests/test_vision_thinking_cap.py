@@ -28,7 +28,8 @@ def _llm(content="a cat", finish_reason=None):
     return llm
 
 
-@pytest.mark.parametrize("action", ["describe_picture", "graph_analysis", "extract_text_picture", "weird_action"])
+# §4LM: an unknown action is refused before any call (test_4lm_vision.py)
+@pytest.mark.parametrize("action", ["describe_picture", "graph_analysis", "extract_text_picture"])
 async def test_every_action_suppresses_thinking(tmp_path, action, monkeypatch):
     monkeypatch.setattr(vision_mod, "_VISION_NO_THINK", True)      # the flag is read at import; pin the world
     (tmp_path / "img.png").write_bytes(PNG_BYTES)

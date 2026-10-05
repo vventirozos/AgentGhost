@@ -78,7 +78,8 @@ def _proxy_bypass_for_ports(ports):
 
 # ── SSRF guard (runner side) ──────────────────────────────────────────
 # The host-side guard (_browser_blocked_url) only vets the INITIAL url, but
-# the sandbox runs under HOST networking, so a page navigated to an untrusted
+# the sandbox's network can reach local services (it runs on its own bridge
+# netns today — HOST networking in earlier versions), so a page navigated to an untrusted
 # public host that 302-redirects to an internal address — http://127.0.0.1:9051
 # (Tor control), 169.254.169.254 (cloud metadata), a LAN host — would reach
 # host-local services. Chromium does NOT re-vet redirects and bypasses the
@@ -222,9 +223,51 @@ async def _install_ssrf_guard(ctx, sandbox_root=None, anonymous=False):
 _LAST_URL_FILENAME = ".last_url"
 
 
+#: §4LN: the host keeps at most 256 K characters of exec output and the
+#: result is ONE line — past that, the middle is cut and the JSON no longer
+#: parses ("malformed OK payload", every retry the same). ASCII escaping
+#: made it worse: a Greek page cost 6 characters per letter.
+_EMIT_MAX_CHARS = 200_000
+
+
+def _trim_payload(payload, limit=_EMIT_MAX_CHARS):
+    """Shrink the largest text fields until the line fits; mark them."""
+    def _fields(p):
+        out = [(p, k) for k in ("text", "value") if isinstance(p.get(k), str)]
+        for a in p.get("actions") or []:
+            if isinstance(a, dict):
+                out += [(a, k) for k in ("text", "value") if isinstance(a.get(k), str)]
+        return out
+    for _ in range(40):
+        line = json.dumps(payload, ensure_ascii=False)
+        if len(line) <= limit:
+            return line
+        fields = _fields(payload)
+        if not fields:
+            break
+        holder, key = max(fields, key=lambda hk: len(hk[0][hk[1]]))
+        cur = holder[key]
+        if not cur:
+            break
+        holder[key] = cur[: max(0, len(cur) - (len(line) - limit) - 200)]
+        holder["truncated"] = True
+        payload["payload_trimmed"] = True
+    for holder, key in _fields(payload):          # still too long: drop the texts, keep the shape
+        holder[key] = ""
+        holder["truncated"] = True
+    payload["payload_trimmed"] = True
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def _emit_ok(payload):
-    sys.stdout.write("[BROWSER_OK] " + json.dumps(payload) + "\n")
-    sys.stdout.flush()
+    line = "[BROWSER_OK] " + _trim_payload(payload) + "\n"
+    try:
+        sys.stdout.flush()
+        sys.stdout.buffer.write(line.encode("utf-8"))      # whatever the container locale
+        sys.stdout.buffer.flush()
+    except AttributeError:                                  # a text-only stdout (tests)
+        sys.stdout.write(line)
+        sys.stdout.flush()
 
 
 def _emit_err(msg):
@@ -236,18 +279,32 @@ def _last_url_path(profile_dir):
     return os.path.join(profile_dir, _LAST_URL_FILENAME)
 
 
+def _set_last_url_file(name):
+    """§4LN: the sidecar is per REQUEST (`.last_url.<req>`), so a url-less op
+    re-opens this request's page — not whatever another conversation, a
+    batch-mate or the verifier navigated last. The files are ~50 bytes;
+    `close` wipes them with the profile (no tree walk here — §4GI)."""
+    global _LAST_URL_FILENAME
+    n = os.path.basename(str(name or "")).strip()
+    if n.startswith(".last_url") and n.replace(".", "").replace("_", "").replace("-", "").isalnum():
+        _LAST_URL_FILENAME = n
+
+
 def _read_last_url(profile_dir):
-    """Return the URL of the most recent successful navigation, or
-    None if no prior navigation is recorded. Best-effort — any I/O
-    error is treated as "no record" so a corrupt sidecar never blocks
-    an op."""
-    try:
-        p = _last_url_path(profile_dir)
-        if os.path.isfile(p):
-            with open(p, "r", encoding="utf-8") as f:
-                return f.read().strip() or None
-    except Exception:
-        pass
+    """Return the URL of the most recent navigation — THIS request's
+    sidecar first, then the shared one (a url-less op in a follow-up turn
+    of the same conversation; the result names the page it re-opened).
+    Best-effort — any I/O error is treated as "no record"."""
+    for name in dict.fromkeys((_LAST_URL_FILENAME, ".last_url")):
+        try:
+            p = os.path.join(profile_dir, name)
+            if os.path.isfile(p):
+                with open(p, "r", encoding="utf-8") as f:
+                    v = f.read().strip()
+                if v:
+                    return v
+        except Exception:
+            pass
     return None
 
 
@@ -260,8 +317,9 @@ def _write_last_url(profile_dir, url):
         return
     try:
         os.makedirs(profile_dir, exist_ok=True)
-        with open(_last_url_path(profile_dir), "w", encoding="utf-8") as f:
-            f.write(url)
+        for name in dict.fromkeys((_LAST_URL_FILENAME, ".last_url")):
+            with open(os.path.join(profile_dir, name), "w", encoding="utf-8") as f:
+                f.write(url)
     except Exception:
         pass
 
@@ -601,6 +659,12 @@ async def op_navigate(op):
     # 64 KB extract_text budget; pass nav_text_chars=0 to opt out.
     nav_text_chars = int(op.get("nav_text_chars", 8 * 1024))
 
+    # §4LN: record the page ASKED for before loading it — a navigate that
+    # times out or is refused must not leave the PREVIOUS page in the
+    # sidecar for the next url-less extract to read as this one (live:
+    # "now the Bytebase article" returned postgresql.org).
+    _write_last_url(op["profile_dir"], url)
+
     async def run(page):
         resp = await page.goto(url, wait_until=wait_until)
         status = resp.status if resp else None
@@ -675,6 +739,57 @@ async def op_extract_text(op):
         }
 
     return await _with_context(op["profile_dir"], op.get("proxy"), op["timeout_ms"], run)
+
+
+_CANDIDATES_JS = """() => {
+  const out = [];
+  const els = document.querySelectorAll('button, a[href], input, select, textarea, [onclick], [role=button]');
+  for (const e of els) {
+    if (out.length >= 12) break;
+    let sel = e.tagName.toLowerCase();
+    if (e.id) sel = '#' + e.id;
+    else if (e.name) sel += '[name="' + e.name + '"]';
+    else if (e.classList.length) sel += '.' + [...e.classList].slice(0, 2).join('.');
+    const t = (e.innerText || e.value || e.getAttribute('aria-label') || '').trim().slice(0, 40);
+    out.push(sel + (t ? ' "' + t + '"' : ''));
+  }
+  return out;
+}"""
+
+
+_MISSING_SELECTORS: set = set()       # per runner process = per browser call
+
+
+async def _require_selector(page, sel, timeout_ms):
+    """§4LN: fail FAST when a selector is not on the page, naming what IS —
+    interact's click/fill waited Playwright's full 30 s per action (live
+    probe: three clicks on a guessed '#add-btn' burned 90 s; the page's
+    button was '#add'). state='attached', so a present-but-animating
+    element still goes on to the action's own actionability wait."""
+    # The FULL action timeout (an element can appear late over Tor — review:
+    # the 8 s probe failed clicks Playwright's 30 s wait would have made);
+    # a selector this sequence already found missing fails at once, so a
+    # guessed selector costs one wait, not one per action (live: 3 × 30 s).
+    probe_ms = 0 if sel in _MISSING_SELECTORS else max(500, int(timeout_ms))
+    try:
+        await page.wait_for_selector(sel, state="attached", timeout=probe_ms or 1)
+        return
+    except Exception as e:
+        # only a TIMEOUT means "not on the page"; anything else (an invalid
+        # selector, a page shape without the API) is left to the action
+        # itself, which reports its own error
+        if "Timeout" not in type(e).__name__:
+            return
+    try:
+        cands = await page.evaluate(_CANDIDATES_JS)
+    except Exception:
+        cands = []
+    _MISSING_SELECTORS.add(sel)
+    listed = "; ".join(cands) if cands else "none found"
+    raise ValueError(
+        f"selector {sel!r} did not match any element within {probe_ms}ms. "
+        f"Clickable elements on this page: {listed}. Use one of those "
+        f"selectors (or read the page with extract_text first) — do not guess.")
 
 
 async def op_click(op):
@@ -835,7 +950,8 @@ async def op_close(op):
     profile_dir = op["profile_dir"]
     if os.path.isdir(profile_dir):
         shutil.rmtree(profile_dir, ignore_errors=True)
-    return {"closed": True, "profile_dir": profile_dir}
+    # §4LN: report what happened — rmtree(ignore_errors) can leave files
+    return {"closed": not os.path.exists(profile_dir), "profile_dir": profile_dir}
 
 
 async def op_interact(op):
@@ -916,6 +1032,7 @@ async def op_interact(op):
         # error rather than running dozens of actions against an
         # error page.
         if initial_url is not None:
+            _write_last_url(op["profile_dir"], initial_url)       # §4LN: the page asked for
             try:
                 await page.goto(initial_url, wait_until=initial_wait_until)
                 _write_last_url(op["profile_dir"], page.url)
@@ -949,8 +1066,9 @@ async def op_interact(op):
                     if not url:
                         raise ValueError("goto requires 'url'")
                     wu = step.get("wait_until", "load")
+                    _write_last_url(op["profile_dir"], url)        # §4LN: the page asked for
                     try:
-                        await page.goto(url, wait_until=wu)
+                        _resp = await page.goto(url, wait_until=wu)
                     except Exception as nav_exc:
                         # A failed navigation is terminal for the whole
                         # sequence — see the docstring above. Record
@@ -966,9 +1084,13 @@ async def op_interact(op):
                         })
                         break
                     _write_last_url(op["profile_dir"], page.url)
+                    # §4LN: the document status, so the host can tell a 403 /
+                    # challenge page from the page itself (interact had no
+                    # blocked check — the route the blocked hint recommends)
                     results.append({
                         "index": idx, "action": "goto", "ok": True,
                         "url": page.url, "title": await page.title(),
+                        "status": getattr(_resp, "status", None),
                     })
                 elif name == "click":
                     sel = step.get("selector")
@@ -1018,6 +1140,7 @@ async def op_interact(op):
                     # a CSS transition that Playwright deems "not
                     # stable" but whose target is still the right
                     # element — explicit LLM-driven escape hatch.
+                    await _require_selector(page, sel, op["timeout_ms"])
                     if step.get("force"):
                         await page.click(sel, force=True)
                     else:
@@ -1057,6 +1180,7 @@ async def op_interact(op):
                                 f"timed out before dblclick({sel!r}): "
                                 f"{type(wait_exc).__name__}: {wait_exc}"
                             )
+                    await _require_selector(page, sel, op["timeout_ms"])
                     if step.get("force"):
                         await page.dblclick(sel, force=True)
                     else:
@@ -1112,6 +1236,7 @@ async def op_interact(op):
                                 f"timed out before fill({sel!r}): "
                                 f"{type(wait_exc).__name__}: {wait_exc}"
                             )
+                    await _require_selector(page, sel, op["timeout_ms"])
                     await page.fill(sel, text)
                     results.append({
                         "index": idx, "action": "fill", "ok": True,
@@ -1275,6 +1400,7 @@ async def main():
             int(x) for x in (op.get("allowed_local_ports") or []))
     except (TypeError, ValueError):
         pass
+    _set_last_url_file(op.get("last_url_file"))
     try:
         result = await OPS[op_name](op)
         _emit_ok(result)

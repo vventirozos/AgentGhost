@@ -111,7 +111,9 @@ def test_every_sandbox_exec_in_tool_browser_uses_the_bounded_timeout():
     fn = next(n for n in ast.walk(tree)
               if isinstance(n, ast.AsyncFunctionDef) and n.name == "tool_browser")
     execs = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
-             and ast.unparse(n.func) == "asyncio.to_thread"
+             # §4LN: every exec goes through `_exec_holding_lock` (the
+             # profile lock is held across a cancel), not a bare to_thread
+             and ast.unparse(n.func) == "_exec_holding_lock"
              and n.args and ast.unparse(n.args[0]) == "sandbox_manager.execute"]
     assert len(execs) >= 3, "the exec sites moved — re-point this enumeration"
     # §4GI round 3: it is no longer enough for each exec to be individually
@@ -155,7 +157,9 @@ def test_the_enumeration_fires_on_a_raw_timeout():
     fn = next(n for n in ast.walk(tree)
               if isinstance(n, ast.AsyncFunctionDef) and n.name == "tool_browser")
     execs = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
-             and ast.unparse(n.func) == "asyncio.to_thread"
+             # §4LN: every exec goes through `_exec_holding_lock` (the
+             # profile lock is held across a cancel), not a bare to_thread
+             and ast.unparse(n.func) == "_exec_holding_lock"
              and n.args and ast.unparse(n.args[0]) == "sandbox_manager.execute"]
     deadline_names = {
         t.id
@@ -221,10 +225,12 @@ async def test_one_action_still_gets_the_whole_per_op_budget(tmp_path, monkeypat
 async def test_an_action_is_never_starved_below_the_floor(tmp_path, monkeypatch):
     """A pathological action count divides the budget, but not to zero —
     below `_MIN_ACTION_MS` an action cannot even open a page."""
-    monkeypatch.delenv("GHOST_BROWSER_WALLCLOCK_S", raising=False)
+    # §4LN: more than 60 actions is refused (the overrun lost every result),
+    # so the floor is reached through a small ceiling instead
+    monkeypatch.setenv("GHOST_BROWSER_WALLCLOCK_S", "60")
     stub = _stub({"status": 200, "url": "file:///workspace/x.html",
                   "title": "X", "results": []})
-    await B.tool_browser(operation="interact", actions=_interact_actions(500),
+    await B.tool_browser(operation="interact", actions=_interact_actions(60),
                          timeout_ms=30000, sandbox_dir=tmp_path,
                          sandbox_manager=stub)
     assert _runner_timeout_ms(stub) == B._MIN_ACTION_MS

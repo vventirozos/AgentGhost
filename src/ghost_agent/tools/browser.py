@@ -45,14 +45,15 @@ from ..utils.logging import Icons, pretty_log
 from .file_system import _get_safe_path, _to_container_path
 from .outcome import ToolOutcome
 from .browser_routes import (  # §4HB / §4HH
-    _deterministic_error_route, blocked_page_reason, BLOCKED_PAGE_HINT)
+    _deterministic_error_route, blocked_page_reason, blocked_page_hint)
+from .browser_routes import _is_own_host as _is_own_host_url
 
 logger = logging.getLogger("GhostAgent")
 
 # Persistent per-sandbox browser profile — lives inside the sandbox
 # workspace so it survives across turns / tool calls but doesn't leak
 # onto the host filesystem outside GHOST_SANDBOX_DIR.
-_BROWSER_PROFILE_DIR = ".browser_profile"
+from .browser_support import _BROWSER_PROFILE_DIR  # noqa: E402 — one definition
 _BROWSER_RUNNER_FILENAME = ".browser_runner.py"
 
 # Serializes Chromium launches against the shared persistent profile dir.
@@ -68,10 +69,13 @@ _BROWSER_RUNNER_FILENAME = ".browser_runner.py"
 # perf regression. Module-global so it spans all tool_browser calls in the
 # (single-event-loop) agent process.
 _BROWSER_PROFILE_LOCK = asyncio.Lock()
+_MAX_INTERACT_ACTIONS = 60
+from .browser_support import (  # noqa: E402 — §4LN helpers, re-exported
+    _exec_holding_lock, _BROWSER_WRITTEN, _overwrite_refusal,
+    _UNSEEN_SCREENSHOT_NOTE, _runner_failure_hint, _last_url_filename, _runner_first_url)
+_STEP_WAIT_KEYS = ("ms", "timeout_ms", "wait_for_hidden_ms", "settle_ms", "post_click_ms")
 
-# Keep outputs reasonable — a single page's HTML can be 5+ MB and would
-# blow the LLM context window, so we cap before returning. These caps
-# match `helper_fetch_url_content`'s 5 MB ceiling.
+
 _MAX_TEXT_CHARS = 64 * 1024  # ~16k tokens — more than enough for LLM reasoning
 
 
@@ -248,6 +252,7 @@ def _build_op_payload(
         "profile_dir": f"/workspace/{_BROWSER_PROFILE_DIR}",
         "timeout_ms": int(timeout_ms),
         "proxy": proxy,
+        "last_url_file": _last_url_filename(),
     }
     if url is not None:
         payload["url"] = url
@@ -350,66 +355,6 @@ _ONION_UNREACHABLE_MARKERS = ("ERR_SOCKS_CONNECTION_FAILED",)
 _DEAD_ONION_STRIKES = 2
 #: {onion_host: [strike_count, first_strike_monotonic]}
 _ONION_STRIKES: Dict[str, list] = {}
-
-
-def _runner_first_url(operation, url, actions, sandbox_dir):
-    """The URL the runner will ACTUALLY dial first — the only URL the
-    memo may refuse or blame.
-
-    Mirrors `_runner_script`'s own rule, which R4 measured the host side
-    disagreeing with in BOTH directions:
-
-      * the runner tests `actions[0]["action"] == "goto"` — nothing else.
-        The host also accepted `"navigate"` (not a valid interact action
-        at all: the runner's dispatch is goto-only) and additionally
-        required a url. Consequences measured: `actions[0]=navigate` made
-        the host skip the check while the runner dialled the top-level
-        url (banned host re-dialled, nothing learned); and
-        `actions[0]={"action":"goto"}` with no url made the host blame
-        the top-level url the runner never touched — a ban on an
-        uncontacted host, the inversion R3 called the worst outcome.
-      * when the first action is NOT a goto, the runner performs an
-        IMPLICIT initial navigation to `url` — or, when there is no url,
-        to the `.last_url` sidecar. The memo was blind to that entire
-        path (R4): `navigate(A)` then `click`/`extract_text` with no url
-        is the flow this tool's own docstring teaches, and on it the memo
-        never armed and a banned host was re-dialled at full Tor cost.
-    """
-    # R5: ops that dial NOTHING. `close` only rmtree's the profile, and
-    # `navigate` without a url is a parameter error the runner raises on —
-    # neither consults the sidecar. Falling through to it meant `close`
-    # was REFUSED whenever the sidecar happened to name a banned host,
-    # i.e. the memo's own state blocked the one operation that clears the
-    # profile, for the full TTL; and a plain missing-parameter mistake was
-    # answered with "pick a DIFFERENT result from your search".
-    if operation in ("close", "navigate"):
-        return url or ""
-    if operation == "interact" and actions:
-        first = actions[0] if isinstance(actions[0], dict) else {}
-        if first.get("action") == "goto":
-            return first.get("url") or ""
-    if url:
-        return url
-    # Sidecar fallback, read host-side from the file the runner writes.
-    #
-    # ⚠ UN-SCOPE FIRST (R5). The runner's profile is hardcoded to
-    # `/workspace/.browser_profile`, and `/workspace` is the bind mount of
-    # the sandbox ROOT — but `registry.py` hands this function the
-    # PROJECT-scoped dir (`<root>/projects/<id>`) whenever a project is
-    # active. Reading `<root>/projects/<id>/.browser_profile/.last_url`
-    # finds nothing, so in a project session — the majority of real work —
-    # the memo neither refused a banned host nor learned from the failure,
-    # and the dead onion was re-dialled over Tor exactly as before the fix.
-    # `_to_container_path` un-scopes for the same reason.
-    try:
-        root = Path(str(sandbox_dir or "."))
-        if root.parent.name == "projects":
-            root = root.parent.parent
-        with open(root / _BROWSER_PROFILE_DIR / ".last_url",
-                  "r", encoding="utf-8") as fh:
-            return fh.read().strip()
-    except Exception:  # noqa: BLE001
-        return ""
 
 
 def _onion_host(url: str) -> str:
@@ -542,6 +487,13 @@ def _pre_interaction_line(parsed: dict) -> str:
     pre = parsed.get("pre_interaction") if isinstance(parsed, dict) else None
     if not (pre and pre.get("pre_interaction")):
         return ""
+    # §4LN: a "menu screen" verdict is about the agent's OWN app; on a
+    # third-party site (Hetzner's video Play buttons, 9 live results) it told
+    # the model an ordinary page "has NOT started".
+    from .browser_routes import _is_own_host
+    _pu = parsed.get("url") or parsed.get("final_url") or ""
+    if _pu and not _is_own_host(_pu):               # a known THIRD-PARTY page only
+        return ""
     ctrls = ", ".join(repr(c) for c in (pre.get("controls") or [])[:3])
     return (
         f"\nPRE_INTERACTION: a start/play/loading control is visible "
@@ -654,7 +606,10 @@ def _parse_runner_output(stdout: str) -> tuple[bool, object]:
     """
     ok_line = None
     err_line = None
-    for line in stdout.splitlines():
+    # "\n" ONLY (§4LN): the payload is unescaped UTF-8, and splitlines()
+    # also breaks on U+2028 / U+0085 / \x1c… that page text can contain.
+    for line in stdout.split("\n"):
+        line = line.rstrip("\r")
         if line.startswith("[BROWSER_OK] "):
             ok_line = line[len("[BROWSER_OK] "):]
         elif line.startswith("[BROWSER_ERR] "):
@@ -988,7 +943,11 @@ async def tool_browser(
         return _reject(str(ve))
     try:
         await asyncio.to_thread(runner_host_path.parent.mkdir, parents=True, exist_ok=True)
-        await asyncio.to_thread(runner_host_path.write_text, _runner_script())
+        # atomic (§4LN): a batch-mate's runner may be executing this file
+        # through the bind mount while this call refreshes it
+        _tmp_runner = runner_host_path.with_name(f"{runner_host_path.name}.{os.getpid()}.{id(runner_host_path)}.tmp")
+        await asyncio.to_thread(_tmp_runner.write_text, _runner_script())
+        await asyncio.to_thread(os.replace, _tmp_runner, runner_host_path)
     except Exception as e:
         return _err(f"Could not write browser runner: {e}")
 
@@ -1002,7 +961,11 @@ async def tool_browser(
             host_out = _get_safe_path(sandbox_dir, target)
         except ValueError as ve:
             return _reject(str(ve))
+        _ow = _overwrite_refusal(host_out)
+        if _ow:
+            return _reject(_ow)
         await asyncio.to_thread(host_out.parent.mkdir, parents=True, exist_ok=True)
+        _BROWSER_WRITTEN.add(str(host_out))
         # Translate host → container path. _to_container_path un-scopes a
         # project-scoped sandbox_dir to the root mount, so a scoped file at
         # <root>/projects/<id>/x.png maps to /workspace/projects/<id>/x.png
@@ -1027,6 +990,13 @@ async def tool_browser(
                 "[{\"action\":\"click\",\"selector\":\"...\"}, "
                 "{\"action\":\"extract_text\",\"selector\":\"...\"}]."
             )
+        if len(actions) > _MAX_INTERACT_ACTIONS:
+            # §4LN: the per-action budget is divided by the count, and a
+            # long list ran past the exec window — exit 124, every
+            # completed action's result lost.
+            return _reject(
+                f"interact takes at most {_MAX_INTERACT_ACTIONS} actions per call "
+                f"(got {len(actions)}). Split the flow into several interact calls.")
         sanitised_actions = []
         # True when the runner will have ALREADY navigated (implicitly)
         # before the first explicit goto — see `_runner_first_url`. Its
@@ -1050,9 +1020,13 @@ async def tool_browser(
                     host_sub = _get_safe_path(sandbox_dir, sub_target)
                 except ValueError as ve:
                     return _reject(f"actions[{idx}]: {ve}")
+                _ow = _overwrite_refusal(host_sub)
+                if _ow:
+                    return _reject(f"actions[{idx}]: {_ow}")
                 await asyncio.to_thread(
                     host_sub.parent.mkdir, parents=True, exist_ok=True
                 )
+                _BROWSER_WRITTEN.add(str(host_sub))
                 new_step["out_path"] = _to_container_path(sandbox_dir, host_sub)
                 _interact_shot_hosts[new_step["out_path"]] = host_sub
             # Heal a goto/navigate sub-action's file:// URL the same way the
@@ -1131,6 +1105,14 @@ async def tool_browser(
         if operation == "interact"
         else min(int(timeout_ms), _runner_total_ms)
     )
+    # §4LN: a step's OWN wait (sleep ms, wait_for_selector timeout_ms,
+    # settle/post-click/wait_for_hidden) never exceeds that step's share of
+    # the budget — `{"action":"sleep","ms":900000}` outlived the exec window
+    # and the whole sequence's results were lost with it.
+    for _st in sanitised_actions or []:
+        for _k in _STEP_WAIT_KEYS:
+            if _k in _st:
+                _st[_k] = max(0, min(_safe_int(_st.get(_k), 0), int(_runner_timeout_ms)))
 
     payload = _build_op_payload(
         op=operation,
@@ -1145,8 +1127,10 @@ async def tool_browser(
         actions=sanitised_actions,
         stop_on_error=stop_on_error,
         click_center=kwargs.get("click_center"),
-        settle_ms=kwargs.get("settle_ms"),
-        post_click_ms=kwargs.get("post_click_ms"),
+        settle_ms=(None if kwargs.get("settle_ms") is None
+                   else min(_safe_int(kwargs.get("settle_ms"), 0), int(_runner_timeout_ms))),
+        post_click_ms=(None if kwargs.get("post_click_ms") is None
+                       else min(_safe_int(kwargs.get("post_click_ms"), 0), int(_runner_timeout_ms))),
         nav_text_chars=kwargs.get("nav_text_chars"),
         allowed_local_ports=_svc_ports,
     )
@@ -1182,9 +1166,9 @@ async def tool_browser(
                            "could start (queued behind another browser call)",
                            icon=Icons.WARN, level="WARNING")
                 return _err("the call's wall-clock budget was spent before the "
-                            "browser could start — retry as a fresh call, or "
-                            "raise GHOST_BROWSER_WALLCLOCK_S", ran=False)
-            output, exit_code = await asyncio.to_thread(
+                            "browser could start (it was queued behind another "
+                            "browser call) — retry as a fresh call", ran=False)
+            output, exit_code = await _exec_holding_lock(
                 sandbox_manager.execute, cmd,
                 timeout=_first_t,
                 **_wd_kw
@@ -1220,7 +1204,7 @@ async def tool_browser(
         else:
             try:
                 async with _BROWSER_PROFILE_LOCK:
-                    output, exit_code = await asyncio.to_thread(
+                    output, exit_code = await _exec_holding_lock(
                         sandbox_manager.execute, cmd,
                         timeout=_retry_t, **_wd_kw
                     )
@@ -1261,7 +1245,7 @@ async def tool_browser(
         else:
             try:
                 async with _BROWSER_PROFILE_LOCK:
-                    output, exit_code = await asyncio.to_thread(
+                    output, exit_code = await _exec_holding_lock(
                         sandbox_manager.execute, retry_cmd,
                         timeout=_retry_t, **_wd_kw
                     )
@@ -1399,20 +1383,7 @@ async def tool_browser(
             hint=(
                 ((_fail_nav_note + " ") if _fail_nav_note else "") +
                 ((_specific_route + " ") if _specific_route else "") +
-                "If this is a navigation timeout, the page did not load over Tor — "
-                "another attempt usually times out the same way; use a different "
-                "source. If a CLICK timed out or its selector was "
-                "not found: each atomic op reloads the page in a fresh context, "
-                "so elements created by a previous click (opened windows, menus, "
-                "dialogs) are GONE — run the whole flow in one context with "
-                "operation='interact' and an actions list "
-                "([{\"action\":\"click\",...}, ...]). If the error mentions "
-                "'headless_shell not found' or 'Executable doesn't exist', the "
-                "sandbox was provisioned before the Chromium pre-install was "
-                "added — delete `/root/.supercharged` inside the container and "
-                "retry. If the error says the op needs a URL, call "
-                "`operation=\"navigate\"` once first, or pass `url=...` on "
-                "this call."
+                _runner_failure_hint(str(parsed))
             ),
         )
 
@@ -1423,7 +1394,13 @@ async def tool_browser(
     # a `parsed['url']` (or `final_url`). Non-fatal — must never break
     # a successful browser turn.
     _nav_suggestion = ""
-    if workspace_model is not None and getattr(workspace_model, "enabled", False):
+    _blocked = (blocked_page_reason(parsed)
+                if operation in ("navigate", "extract_text", "screenshot", "click") else "")
+    # §4LN: a refused/challenge page was booked "pulled" before this check
+    # ran, and the dedup then dropped the later REAL pull (persisted); a
+    # url-less re-read of the sidecar page is not a new visit either.
+    if (workspace_model is not None and getattr(workspace_model, "enabled", False)
+            and not _blocked and not parsed.get("used_last_url")):
         try:
             _hit_url = parsed.get("url") or parsed.get("final_url")
             if _hit_url:
@@ -1446,15 +1423,20 @@ async def tool_browser(
     # was labelled OK (12.8% of corpus fetches) and the model cited the
     # sources it never read. The header says BLOCKED, the hint says what to
     # do; the page's own text stays below so the model can see what it got.
-    _blocked = blocked_page_reason(parsed) if operation in ("navigate", "extract_text", "screenshot") else ""
     if _blocked:
         header = (f"--- BROWSER RESULT ---\nSTATUS: BLOCKED ({_blocked})\nOP: {operation}"
-                  f"\nHINT: {BLOCKED_PAGE_HINT}")
+                  f"\nHINT: {blocked_page_hint(_blocked, parsed.get('url') or _nav_url)}")
         _mark_host_failed(_nav_url, f"blocked: {_blocked}")      # the memo decides (host_level_block)
     elif ok and operation in ("navigate", "extract_text"):
         _mark_host_ok(_nav_url)
     if _nav_suggestion:
         header += f"\nNOTE: {_nav_suggestion}"
+    if parsed.get("used_last_url"):
+        # §4LN: say which page a url-less call re-opened — it read a page the
+        # model did not name, and live it was the wrong one, unflagged.
+        header += (f"\nNOTE: no url was given — this re-opened the last page asked for "
+                   f"(now at {parsed.get('url') or parsed.get('final_url')}). Pass url= to read a "
+                   "different page.")
 
     def _declared(text: str):
         """A blocked fetch is a DECLARED failure: the loop's strike ledger,
@@ -1463,7 +1445,10 @@ async def tool_browser(
         if _blocked:
             return ToolOutcome.failed(text, world_changed=False,
                                       reason_code="browser_blocked")
-        return text
+        # §4LN: a success is DECLARED — the page's own text ("TypeError: …",
+        # "Exception handling", a CI log's "EXIT CODE: 1") is content, and
+        # every text sniffer re-read it as this call failing.
+        return ToolOutcome.ok(text)
     js_diag = _format_js_diagnostics(parsed)
 
     def _text_block(p: dict) -> str:
@@ -1502,7 +1487,7 @@ async def tool_browser(
         # js_diag + the post-click text preview were computed by the runner
         # but dropped here (same formatter gap as navigate) — a click that
         # crashed page JS looked identical to one that worked.
-        return (
+        return _declared(
             f"{header}\nURL: {parsed.get('url')}\n"
             f"TITLE: {parsed.get('title')}{js_diag}"
             f"{_text_block(parsed)}"
@@ -1547,9 +1532,10 @@ async def tool_browser(
             f"SAVED: {host_rel}\n"
             f"DOWNLOAD: /api/download/{host_rel}{js_diag}{render_line}{dom_line}"
             f"{_pre_interaction_line(parsed)}"
+            f"{_UNSEEN_SCREENSHOT_NOTE}"
         )
     if operation == "close":
-        return f"{header}\nPROFILE_DIR: {parsed.get('profile_dir')}\nCLEARED: {parsed.get('closed')}"
+        return ToolOutcome.ok(f"{header}\nPROFILE_DIR: {parsed.get('profile_dir')}\nCLEARED: {parsed.get('closed')}")
     if operation == "interact":
         action_results = parsed.get("actions") or []
         ok_count = sum(1 for r in action_results if r.get("ok"))
@@ -1561,6 +1547,30 @@ async def tool_browser(
         _interact_status = (
             "failed" if (err_count and not ok_count)
             else "partial" if err_count else "ok")
+        # §4LN: and the header the MODEL reads says so too. `STATUS: OK` over
+        # "0 OK, 3 errors" (live probe B2) also unlocked the verifier's
+        # interaction-evidence cap, which matches that header text.
+        # §4LN: a goto that landed on a refusal / challenge makes the whole
+        # sequence a BLOCKED read (its extracts are of the challenge page)
+        # the LAST successful goto decides — the steps after it read that
+        # page; an earlier blocked goto followed by a real one is a real read
+        # (review). Its OWN url takes the strike and picks the hint.
+        _last_goto = next((r for r in reversed(action_results)
+                           if r.get("action") == "goto" and r.get("ok")), None)
+        _ib = (blocked_page_reason({"status": _last_goto.get("status"), "title": _last_goto.get("title"),
+                                    "url": _last_goto.get("url")}) if _last_goto else "")
+        if _ib:
+            _ib_url = _last_goto.get("url") or ""
+            header = header.replace(
+                "STATUS: OK", f"STATUS: BLOCKED ({_ib})\nHINT: {blocked_page_hint(_ib, _ib_url)}", 1)
+            _interact_status = "blocked"
+            if not _is_own_host_url(_ib_url):
+                _mark_host_failed(_ib_url, f"blocked: {_ib}")
+        elif _interact_status != "ok":
+            header = header.replace(
+                "STATUS: OK",
+                "STATUS: ERROR (every action failed)" if _interact_status == "failed"
+                else f"STATUS: PARTIAL ({err_count} of {len(action_results)} actions failed)", 1)
         lines = [
             header,
             f"FINAL_URL: {parsed.get('final_url')}",
@@ -1600,7 +1610,10 @@ async def tool_browser(
                     # log line, but a TEXT block follows for full fidelity.
                     summary = f"len={r.get('length')}{trunc} sel={r.get('selector')!r}"
                     lines.append(f"  [{idx}] {status} {act}: {summary}")
-                    lines.append(f"      TEXT: {text[:500]}" + (" ..." if len(text) > 500 else ""))
+                    # §4LN: the whole text (already capped runner-side at the
+                    # action's max_chars) — a 500-char teaser hid what the
+                    # model asked to read, and it re-read in a loop.
+                    lines.append(f"      TEXT: {text}")
                 elif act == "click":
                     lines.append(f"  [{idx}] {status} click {r.get('selector')!r}")
                 elif act == "goto":
@@ -1657,7 +1670,10 @@ async def tool_browser(
                 )
         _txt = "\n".join(lines)
         if _interact_status == "ok":
-            return _txt
+            return ToolOutcome.ok(_txt, world_changed=True)
+        if _interact_status == "blocked":
+            # its fill/click steps may have run before the refusal page
+            return ToolOutcome.failed(_txt, world_changed=True, reason_code="browser_blocked")
         # The runner already navigated, clicked and filled, so this DID
         # change the world even when every action errored.
         return (ToolOutcome.failed if _interact_status == "failed"

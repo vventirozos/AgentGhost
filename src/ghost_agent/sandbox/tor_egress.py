@@ -61,8 +61,12 @@ V6_CHAIN = "GHOST_TOR6"
 BOOTSTRAP_TIMEOUT_S = 75.0
 BOOTSTRAP_POLL_S = 2.0
 
+# §4LO: NO `User` line. Tor is STARTED as {TOR_USER} (a docker exec with that
+# user) instead of starting as root and dropping to it — which needed
+# SETUID/SETGID in the container, and with those ANY sandbox code could
+# setuid({TOR_USER}) and inherit the firewall's exemption for Tor's own
+# traffic: a direct, un-Torified connection (verified live, 2026-10-05).
 TORRC = f"""# Written by ghost_agent (sandbox/tor_egress.py). Do not edit by hand.
-User {TOR_USER}
 DataDirectory /var/lib/tor
 SocksPort 127.0.0.1:{SOCKS_PORT}
 TransPort 127.0.0.1:{TRANS_PORT}
@@ -116,13 +120,23 @@ def write_torrc_cmd() -> str:
 #: running", and the running-check reported "root". Live on 2026-09-09:
 #: the rules went in, Tor never started, the sandbox sat fail-closed. Tor's
 #: own command line begins with `tor -f`; the wrapper's begins with `sh`.
-TOR_PROC_PATTERN = f"^tor -f {TORRC_PATH}"
+# both launch forms: the hardened one, and the `tor -f …` a container started
+# before §4LO is still running (it must be recognised, not double-started)
+TOR_PROC_PATTERN = f"^(/usr/bin/)?tor (--defaults-torrc /dev/null )?-f {TORRC_PATH}"
+
+
+def prepare_tor_cmd() -> str:
+    """As ROOT (CHOWN is kept): the dirs and log Tor writes, owned by
+    {TOR_USER}, so Tor can run as that user from its first instruction."""
+    return ("sh -c " + shlex.quote(
+        f"mkdir -p /var/lib/tor /var/log/tor && chmod 700 /var/lib/tor && "
+        f"chown -R {TOR_USER}:{TOR_USER} /var/lib/tor /var/log/tor"))
 
 
 def start_tor_cmd() -> str:
     """Start Tor with the ghost torrc unless one is already running on it.
-    Started as root; `User debian-tor` in the torrc drops privileges, which
-    is what the uid exemption in the rules relies on.
+    Run it AS {TOR_USER} (`exec_run(..., user=TOR_USER)`, §4LO): the uid
+    exemption in the rules then covers Tor and nothing else can reach it.
 
     A FRESH start truncates the notice log first: the container's
     filesystem outlives a restart while its processes do not, so the log
@@ -131,7 +145,27 @@ def start_tor_cmd() -> str:
     container: two 100% lines from two starts)."""
     return ("sh -c " + shlex.quote(
         f"pgrep -f '{TOR_PROC_PATTERN}' >/dev/null 2>&1 || "
-        f"{{ : > {TOR_LOG}; chown {TOR_USER}:{TOR_USER} {TOR_LOG}; tor -f {TORRC_PATH} --RunAsDaemon 1; }}"))
+        f"{{ : > {TOR_LOG}; {TOR_LAUNCH}; }}"))
+
+
+#: §4LO hardening — the uid the firewall exempts must not be reachable from
+#: what the sandbox's root can write. Absolute binary, a clean environment,
+#: no defaults torrc and no SIGHUP reload (a root-writable torrc re-read as
+#: debian-tor ran root's choice of code as that uid). Root has no KILL either
+#: (it cannot signal or kill this process). What remains is a RESTART after
+#: tampering, which `integrity_cmd` + a host-side digest guard.
+TOR_BIN = "/usr/bin/tor"
+TOR_LAUNCH = (f"env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin {TOR_BIN} --defaults-torrc /dev/null "
+              f"-f {TORRC_PATH} --__ReloadTorrcOnSIGHUP 0 --RunAsDaemon 1")
+
+
+def integrity_cmd() -> str:
+    """Prints `PRELOAD` when /etc/ld.so.preload exists, then sha256 lines of
+    the Tor binary and every library it loads — compared host-side with the
+    digest from the first start before Tor is (re)started."""
+    return ("sh -c " + shlex.quote(
+        "[ -e /etc/ld.so.preload ] && echo PRELOAD; "
+        f"sha256sum {TOR_BIN} $(ldd {TOR_BIN} | grep -o '/[^ ]*' | sort -u) 2>/dev/null"))
 
 
 def tor_running_as_expected_cmd() -> str:

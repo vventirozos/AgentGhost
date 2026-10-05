@@ -4,6 +4,7 @@ import io
 import os
 import stat as stat_mod
 import re
+import sys
 import urllib.parse
 import json
 import shlex
@@ -171,7 +172,7 @@ def _close_quietly(fd) -> None:
         pass
 
 
-def read_bytes_nofollow(path: Path, *, max_bytes: int = 0) -> bytes:
+def read_bytes_nofollow(path: Path, *, max_bytes: int = 0, from_start: bool = False) -> bytes:
     """Read `path`, REFUSING to follow a symlink at the final component.
 
     The read counterpart of `write_text_nofollow`, and needed for the same
@@ -182,7 +183,8 @@ def read_bytes_nofollow(path: Path, *, max_bytes: int = 0) -> bytes:
     by `manage_services(action='logs', name='leak')` returned the master key
     straight into the model's context. Demonstrated 2026-08-30 (§4DX r4).
 
-    `max_bytes > 0` reads at most that many bytes from the END of the file.
+    `max_bytes > 0` reads at most that many bytes from the END of the file
+    (from the START with `from_start=True`).
     """
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
@@ -196,16 +198,21 @@ def read_bytes_nofollow(path: Path, *, max_bytes: int = 0) -> bytes:
         if not _stat.S_ISREG(os.fstat(fd).st_mode):
             raise ValueError(
                 f"Security Error: refusing to read '{path}' — not a regular file.")
-        if max_bytes > 0:
+        if max_bytes > 0 and not from_start:
             size = os.fstat(fd).st_size
             if size > max_bytes:
                 os.lseek(fd, size - max_bytes, os.SEEK_SET)
         chunks = []
+        got = 0
         while True:
-            b = os.read(fd, 1 << 20)
+            want = (1 << 20) if not (from_start and max_bytes > 0) else min(1 << 20, max_bytes - got)
+            if want <= 0:
+                break
+            b = os.read(fd, want)
             if not b:
                 break
             chunks.append(b)
+            got += len(b)
         return b"".join(chunks)
     finally:
         try:
@@ -1442,6 +1449,61 @@ def _sandbox_where(sandbox_dir) -> str:
 _INSIDE_ABS_PREFIXES = ("/workspace", "/sandbox")
 
 
+#: paths that name the USER's machine (macOS host), not the container —
+#: neither file_system nor execute can reach them (§4LL review)
+_HOST_MACHINE_PREFIXES = ("/users/", "/volumes/", "/private/", "/library/", "/applications/")
+#: …and absolute paths that a MUTATION must never take as "the sandbox root
+#: plus this path" (the leading-slash heal silently wrote ~/Desktop/notes.txt
+#: to <sandbox>/Users/…/Desktop/notes.txt and reported it written to the Desktop)
+_HOST_MUTATION_PREFIXES = _HOST_MACHINE_PREFIXES + ("/home/", "/tmp/", "/var/", "/etc/", "/opt/",
+                                                    "/usr/", "/root/", "/system/")
+
+
+def _host_path_block(sandbox_dir, target):
+    """A refusal for a mutation whose path names a place outside the sandbox
+    (the user's machine or the container's system dirs), else None. A path
+    that resolves inside the sandbox or its outer root is fine."""
+    raw = str(target or "").strip()
+    if not raw:
+        return None
+    norm = raw.replace("\\", "/")
+    if not (norm == "~" or norm.startswith("~/") or norm.lower().startswith(_HOST_MUTATION_PREFIXES)):
+        return None
+    try:
+        # APFS is case-insensitive (review); normcase folds only on Windows
+        _nc = (lambda p: str(p).lower()) if sys.platform == "darwin" else (lambda p: os.path.normcase(str(p)))
+        r = _nc(Path(norm).expanduser().resolve())
+        sb = Path(sandbox_dir).resolve()
+        outer = sb.parent.parent if sb.parent.name == "projects" else sb
+        for base in {_nc(sb), _nc(outer)}:
+            if r == base or r.startswith(base.rstrip(os.sep) + os.sep):
+                return None
+    except Exception:  # noqa: BLE001
+        pass
+    return ToolOutcome.rejected(
+        f"Error: '{raw}' is outside your sandbox — on the user's own machine or in the container's system "
+        f"folders — so you cannot write, move or delete it. Use a path inside your sandbox instead (e.g. "
+        f"'{Path(norm).name or 'file.txt'}'), and tell the user the file is in your sandbox, where they can "
+        f"download it.", reason_code="host_path_refused")
+
+
+def _download_error(code, url) -> str:
+    """§4LL: "Error 429 - Failed to download" gave no next step; live the
+    model fetched the same host with curl, saved a 166-byte error page as the
+    "photo", and told the user it used the real photo."""
+    try:
+        c = int(code)
+    except (TypeError, ValueError):
+        c = 0
+    why = ("the site is rate-limiting this exit (429)" if c == 429 else
+           "the site refused the download (403)" if c == 403 else
+           "the file is not at that address (404)" if c == 404 else
+           f"the server answered {c}")
+    return (f"Error {c} - Failed to download from {url}: {why}. Nothing was saved. Do not retry the "
+            f"same URL (with execute/curl either — it fails the same way); use a different source, "
+            f"and if none works, tell the user the file could not be downloaded.")
+
+
 def outside_workspace_message(filename) -> str:
     """The message for an absolute path that lies outside the sandbox
     workspace, or "" when the path is relative / inside. One home: every
@@ -1453,6 +1515,13 @@ def outside_workspace_message(filename) -> str:
     for pfx in _INSIDE_ABS_PREFIXES:
         if norm == pfx or norm.startswith(pfx + "/"):
             return ""
+    if norm.lower().startswith(_HOST_MACHINE_PREFIXES):
+        # the container has no /Users: `cat` there fails too (§4LL review)
+        return (
+            f"Error: '{raw}' is a path on the user's own computer, not in your sandbox. Neither "
+            f"file_system nor execute can reach it. Ask the user to upload the file (or paste its "
+            f"text) and then read it from your sandbox."
+        )
     return (
         f"Error: '{raw}' is OUTSIDE the sandbox workspace. file_system reads "
         f"only files under /workspace (and the project workspaces inside it); "
@@ -1521,11 +1590,13 @@ def _missing_file_message(filename, sandbox_dir) -> str:
         _match = next((e for e in existing
                        if e == _base or e.endswith("/" + _base)), None)
         if _match:
+            _in_project = Path(sandbox_dir).parent.name == "projects"
             prefix_hint = (
-                f" NOTE: '{_base}' DOES exist at '{_match}' — you are "
-                f"ALREADY inside this project's workspace, so '{_pref}/' "
-                f"is not a directory here (a project TITLE is not a "
-                f"path). Use the relative path '{_match}'."
+                f" NOTE: '{_base}' DOES exist at '{_match}' — " + (
+                    f"you are ALREADY inside this project's workspace, so '{_pref}/' "
+                    f"is not a directory here (a project TITLE is not a path). "
+                    if _in_project else f"'{_pref}/' is not where it is. ")
+                + f"Use the relative path '{_match}'."
             )
     return (
         f"Error: '{filename}' does not exist in {where}."
@@ -1907,7 +1978,7 @@ async def tool_read_file(filename: str, sandbox_dir: Path, max_context: int = 81
     # advice misrouted every "use the browser tool to open URL" request to
     # `knowledge_base(ingest_document, url=...)` because the error didn't
     # mention `browser` at all.
-    if str(filename).startswith("http"):
+    if re.match(r"(?i)https?://", str(filename).strip()):        # §4LL: not http_log.txt
         return (
             f"Error: file_system cannot read URLs. "
             f"To VIEW a webpage right now, use the `browser` tool "
@@ -2119,6 +2190,11 @@ def _nonregular_refusal(path: Path, filename: str) -> Optional[str]:
         return None                     # missing: the caller's own problem
     if stat_mod.S_ISREG(st.st_mode):
         return None
+    if stat_mod.S_ISDIR(st.st_mode):
+        # §4LL: name the next step for the common case
+        return (f"Error: '{filename}' is a directory, not a file — name a file inside it "
+                f"(file_system(operation='list_files', path='{filename}') shows them). "
+                f"'{filename}' is unchanged.")
     return (f"Error: '{filename}' is not a regular file (it is a FIFO, "
             f"device, socket or directory), so it cannot be read or written "
             f"as text. '{filename}' is unchanged.")
@@ -2884,6 +2960,15 @@ async def _edit_text_impl(filename: str, old_string: Any, new_string: Any,
         _old_c = old.replace("\n", "\r\n")
         if file_content.count(_old_c) > 0:
             old, new, _crlf = _old_c, new.replace("\r\n", "\n").replace("\n", "\r\n"), True
+    # §4LL: a one-line old_string in a CRLF file, with a multi-line
+    # new_string, inserted bare LF lines into the CRLF file
+    if not _crlf and "\r\n" in file_content and "\r" not in new and "\n" in new:
+        # the line ending of the REGION being edited, not a vote over the file
+        # (review: a mixed file's LF region got CRLF lines)
+        _at = file_content.find(old)
+        _eol = file_content.find("\n", _at) if _at >= 0 else -1
+        if _eol > 0 and file_content[_eol - 1] == "\r":
+            new = new.replace("\n", "\r\n")
 
     _n_lines = len(file_content.splitlines())
     _old_n_lines = len(old.splitlines())
@@ -2903,6 +2988,12 @@ async def _edit_text_impl(filename: str, old_string: Any, new_string: Any,
     if n == 0:
         _why, _near_line = await asyncio.to_thread(
             _edit_miss_diagnosis, file_content, old)
+        _ol = [ln for ln in old.splitlines() if ln.strip()]
+        if _ol and all(re.match(r"^\s*\d+\t", ln) for ln in _ol):
+            # §4LL: copied from a ranged read, line numbers and all
+            _why = ("old_string starts every line with a number and a tab ('12\\t…') — if you "
+                    "copied it from a ranged read, those line numbers are the read's display and "
+                    "are NOT in the file; remove them. " + (_why or ""))
         _near = (_snippet_at(file_content, _near_line) if _near_line
                  else await asyncio.to_thread(_nearest_snippet, file_content, old))
         return ToolOutcome.rejected(
@@ -3183,7 +3274,7 @@ async def _replace_text_impl(filename: str, old_text: str, new_text: str,
             f"file_system(operation='write', path='{filename}', "
             f"content='{_HELD_CONTENT_TOKEN}') — do NOT resend the text."
             if _held_key else "")
-        return ToolOutcome.rejected("SYSTEM INSTRUCTION: You used operation='replace' but forgot to specify 'replace_with'. If you want to rewrite the entire file, use operation='write'. Otherwise, provide 'replace_with'." + _held_note, reason_code="missing_replace_with")
+        return ToolOutcome.rejected("SYSTEM INSTRUCTION: You used operation='replace' but forgot to specify 'replace_with'. To change part of the file use operation='edit' with old_string (the exact text now) and new_string; to rewrite the entire file use operation='write'." + _held_note, reason_code="missing_replace_with")
         
     ext = str(filename).split('.')[-1].lower()
     if ext in ["py", "html", "css", "js", "ts", "json", "sh", "yaml", "yml", "csv", "xml"]:
@@ -4792,9 +4883,10 @@ async def _write_replace_guarded(path: Path, prev_content: str, new_content: str
             f"NOT applied — '{filename}' is unchanged on disk: {regression}."
             + (f"\nThe REJECTED result around that line would have read:\n"
                f"{_snippet}\n" if _snippet else " ")
-            + f"Your replacement block's indentation or structure is off. "
-            f"Re-read the file, then emit a TIGHT single-line SEARCH/REPLACE "
-            f"for the surgical edit. Do NOT rewrite the whole file.", reason_code="syntax_regression_rolled_back")
+            + f"Your replacement's indentation or structure is off. "
+            f"Re-read those lines, then make the change with operation='edit' "
+            f"(old_string = the exact current lines, new_string = the corrected "
+            f"lines, same indentation). Do NOT rewrite the whole file.", reason_code="syntax_regression_rolled_back")
         )
     # errors="surrogateescape": new_content is the replace result, which splices
     # the LLM's (clean) replacement into the untouched file body — that body may
@@ -4894,7 +4986,10 @@ async def tool_write_file(filename: str, content: Any, sandbox_dir: Path):
         # content is the word "none"/"None" or is only whitespace — match the
         # bare token exactly, not any content that lowercases to "none".
         _c_str = "" if content is None else str(content)
-        if content is None or _c_str.strip() == "" or _c_str.strip() == "None":
+        # §4LL: an EMPTY marker file is a real request (`__init__.py`, `.gitkeep`)
+        _marker = Path(str(filename)).name.lower() in _EMPTY_OK_NAMES
+        if content is None or (_c_str.strip() == "" and not (_marker and content == "")) \
+                or _c_str.strip() == "None":
             return f"Error: The 'content' you provided for '{filename}' is empty or 'None'. You MUST provide the actual text to write. If you intended to use data from a previous tool, ensure that tool succeeded and produced output."
 
         # Auto-serialize if the LLM sends a JSON object/list instead of a string
@@ -5183,16 +5278,22 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
     from ..utils.helpers import url_ssrf_reason as _url_ssrf_reason
     from ..utils.helpers import aclose_curl_response as _aclose_curl
     from ..utils.egress_guard import resolve_egress_proxy as _resolve_egress_proxy
-    _ssrf = _url_ssrf_reason(url)
-    if _ssrf:
-        return f"Error: {_ssrf}"
-
     # 1. Clean Proxy URL. Fail-closed (§4P): under --mandatory-tor a falsy proxy
     # is replaced with the loopback Tor default so a public download never
-    # connects cleartext (the SSRF guard above already refused internal hosts,
-    # so `url` here is public); the socket guard can't backstop this curl_cffi
+    # connects cleartext; the socket guard can't backstop this curl_cffi
     # call. Outside mandatory-tor the proxy is unchanged (direct WEB mode).
     proxy_url = _resolve_egress_proxy(tor_proxy, url)
+    # §4LM: the guard runs AFTER the proxy is known, with resolve=False over
+    # Tor — the default host-side getaddrinfo sent the target's name to the
+    # local resolver in cleartext before the socks5h fetch (the leak the
+    # web fetch already avoids). Literal internal IPs are still refused.
+    _ssrf_resolve = not bool(proxy_url)
+
+    def _ssrf_check(u):
+        return _url_ssrf_reason(u, resolve=_ssrf_resolve)
+    _ssrf = _ssrf_check(url)
+    if _ssrf:
+        return f"Error: {_ssrf}"
     mode = "TOR" if proxy_url and "127.0.0.1" in proxy_url else "WEB"
 
     # Full URL — the [:35] pre-truncation also starved the durable mirror (it
@@ -5224,7 +5325,7 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
                     for _hop in range(_MAX_DOWNLOAD_REDIRECTS + 1):
                         resp = await client.get(cur_url, stream=True, allow_redirects=False)
                         _next, _rerr = _download_redirect_target(
-                            resp.status_code, resp.headers, cur_url, _url_ssrf_reason)
+                            resp.status_code, resp.headers, cur_url, _ssrf_check)
                         # AsyncSession streaming responses need the ASYNC
                         # close (quit_now + aclose): the sync close() reaps
                         # stream_task, which async responses never set, so it
@@ -5261,7 +5362,7 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
                             await asyncio.to_thread(request_new_tor_identity)
                             await asyncio.sleep(5)
                             continue
-                        return f"Error {resp.status_code} - Failed to download from {url}"
+                        return _download_error(resp.status_code, url)
 
                     clength = resp.headers.get("Content-Length")
                     if clength and int(clength) > 50000000:
@@ -5305,7 +5406,7 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
                     for _hop in range(_MAX_DOWNLOAD_REDIRECTS + 1):
                         async with client.stream("GET", cur_url) as resp:
                             _next, _rerr = _download_redirect_target(
-                                resp.status_code, resp.headers, cur_url, _url_ssrf_reason)
+                                resp.status_code, resp.headers, cur_url, _ssrf_check)
                             if _rerr:
                                 return _rerr
                             if _next is not None:
@@ -5322,7 +5423,7 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
                                     # loop — rotating here too doubled the
                                     # identity churn + 10s of sleep per retry.
                                     break  # break the hop loop → outer attempt retry
-                                return f"Error {resp.status_code} - Failed to download from {url}"
+                                return _download_error(resp.status_code, url)
 
                             clength = resp.headers.get("Content-Length")
                             if clength and int(clength) > 50000000:
@@ -5456,8 +5557,36 @@ async def tool_file_search(pattern: str, sandbox_dir: Path, filename: str = None
         pretty_log("File Search", f"'{pattern}' in {filename or 'workspace'}", icon=Icons.TOOL_FILE_S)
 
         # -e: a pattern starting with '-' must not parse as an rg flag.
-        cmd = f"rg --line-number --no-heading --color=never --max-columns=300 -e {escaped_pattern} {escaped_path}"
+        # §4LL: hidden and git-ignored files are searched too (a string in a
+        # gitignored dist/ or in .env was "No matches … the search did not
+        # fail"), never inside .git itself
+        # hidden files always (.env); git-ignored files only when the call
+        # names a path — a whole-workspace search through node_modules/.venv
+        # flooded the head+tail cap and dropped the project's own hits (review)
+        _rg = ("rg --line-number --no-heading --color=never --max-columns=300 "
+               "--hidden --glob '!.git' " + ("--no-ignore-vcs " if filename else ""))
+        cmd = f"{_rg}-e {escaped_pattern} {escaped_path}"
         output, exit_code = await asyncio.to_thread(sandbox_manager.execute, cmd, timeout=20)
+        _as_text_note = ""
+        if exit_code == 2 and "regex parse error" in str(output or ""):
+            # the schema says "exact text": `print(` is a broken regex, not a
+            # failed search — search it as plain text (§4LL review)
+            output, exit_code = await asyncio.to_thread(
+                sandbox_manager.execute, f"{_rg}-F -e {escaped_pattern} {escaped_path}", timeout=20)
+            _as_text_note = (f" [searched as plain text: '{pattern}' is not a valid regular "
+                             f"expression]")
+        if exit_code == 2:
+            # rg exits 2 when ANY file errored, even with matches printed —
+            # keep the matches (review); fail only when nothing was found
+            _hits = [ln for ln in str(output or "").splitlines() if re.match(r"^[^:\n]+:\d+:", ln)]
+            if not _hits:
+                return ToolOutcome.failed(
+                    f"Error: the search failed (rg exit 2): {str(output or '').strip()[:400]}",
+                    reason_code="search_error")
+            output = "\n".join(_hits) + "\n[note: some files could not be read and were skipped]"
+            exit_code = 0
+        if _as_text_note and exit_code == 0 and isinstance(output, str) and output.strip():
+            output = output.rstrip() + "\n" + _as_text_note.strip()
 
         # rg exits 1 to mean "no matches" — a successful query with an empty
         # result, not a failure. The docker layer substitutes "[SYSTEM
@@ -5479,7 +5608,7 @@ async def tool_file_search(pattern: str, sandbox_dir: Path, filename: str = None
                 "workspace was searched.]" if _healed_dup_filename else "")
             return (f"Report: No matches found for '{pattern}'. (rg exited 1, "
                     f"which for a search means the pattern was NOT FOUND — "
-                    f"the search itself did not fail.){_dup_note}")
+                    f"the search itself did not fail.){_dup_note}{_as_text_note}")
 
         # Cap search output but keep BOTH head and tail. Without the tail
         # we'd silently hide the last matches in the file, which is the
@@ -5779,7 +5908,7 @@ async def tool_read_document_chunked(filename: str, sandbox_dir: Path, page: int
     # GUARD 1: Stop model from trying to read URLs as files. Same logic
     # as `tool_read_file` — surface `browser` first, `knowledge_base`
     # only when the user wants to ingest a document.
-    if str(filename).startswith("http"):
+    if re.match(r"(?i)https?://", str(filename).strip()):        # §4LL: not http_log.txt
         return (
             f"Error: file_system cannot read URLs. "
             f"To VIEW a webpage right now, use the `browser` tool "
@@ -6094,7 +6223,25 @@ def _released_write_block(project_store, sandbox_dir, target, *, removes: bool =
     return None
 
 
+#: files whose whole point is to exist empty (§4LL review: a write with
+#: content="" was refused as a lost payload)
+_EMPTY_OK_NAMES = frozenset({"__init__.py", ".gitkeep", ".keep", ".nojekyll", "py.typed"})
+
+
+#: the operations the tool schema advertises (tools/registry.py enum) — the
+#: unknown-operation message lists THESE (§4LL: it listed a nonexistent
+#: "batch" and left out edit/search/copy…). Pinned equal to the enum in tests.
+ADVERTISED_OPS = ("read", "read_chunked", "outline", "symbols", "inspect", "search", "find", "list_files",
+                  "write", "edit", "replace", "download", "copy", "rename", "move", "delete")
+#: …and every name the dispatch below accepts (the list aliases)
+ACCEPTED_OPS = ADVERTISED_OPS + ("list", "ls", "dir", "tree", "list_dir", "list_directory")
+
+
 async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path: str = None, content: str = None, replace_with: str = None, destination: str = None, pattern: str = None, max_context: int = 8192, read_budget: "ReadBudget | None" = None, **kwargs):
+    # §4LL: "Read" / " write " are the same operations (the read-only set
+    # already lowercased; the dispatch did not)
+    if isinstance(operation, str):
+        operation = operation.strip().lower()
     if not operation:
         return ToolOutcome.rejected("SYSTEM INSTRUCTION: The 'operation' parameter is MANDATORY. You must specify it (e.g., operation='read').", reason_code="missing_operation")
     # Release immutability: block mutations into a RELEASED project's
@@ -6123,6 +6270,9 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
         for _target, _rm in ([(t, _removes_src) for t in _srcs] + [(t, False) for t in _dsts]):
             if not isinstance(_target, str):
                 continue
+            _hb = _host_path_block(sandbox_dir, _target)           # §4LL: every write target
+            if _hb:
+                return _hb
             _pb = _projects_folder_block(sandbox_dir, _target) if _rm else None
             if _pb:
                 return _pb
@@ -6203,7 +6353,8 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
         final_content = _held
 
     # If the LLM put the content in 'path' but didn't provide 'content' (common for write)
-    if operation == "write" and target_path and not final_content:
+    if (operation == "write" and target_path and not final_content
+            and not (content == "" and Path(str(target_path)).name.lower() in _EMPTY_OK_NAMES)):
         # Check if the LLM accidentally sent the content as the only other parameter
         return ToolOutcome.rejected("SYSTEM INSTRUCTION: The 'content' parameter is MANDATORY for write operations. You must provide the full text to write.", reason_code="missing_content")
 
@@ -6446,7 +6597,8 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
         return await tool_inspect_file(target_path, sandbox_dir,
                                        lines=kwargs.get("lines", 10))
     elif operation == "write":
-        return await tool_write_file(target_path, final_content, sandbox_dir)
+        return await tool_write_file(target_path, "" if (final_content is None and content == "")
+                                     else final_content, sandbox_dir)
     elif operation == "edit":
         # §4KC: NO aliases, by design. The alias fan-out on `replace` is
         # where its interface failures lived (`content` holding a whole
@@ -6474,12 +6626,18 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
         # `content`). Old text: content/data/text → old_text/old_string/
         # search/old. New text: replace_with → new_text/new_string/new/
         # replacement.
+        def _first_set(*vals):
+            # §4LL: "" is a value (an empty replacement DELETES the text); the
+            # `or` chain read new_string="" as missing and offered to
+            # overwrite the whole file with the fragment. A non-empty alias
+            # still wins over an empty one (review: replace_with="" beside
+            # new_string="Y = 42" deleted the text)
+            vs = [v for v in vals if v is not None]
+            return next((v for v in vs if v != ""), vs[0] if vs else None)
         _old = (final_content or kwargs.get("old_text") or kwargs.get("old_string")
                 or kwargs.get("search") or kwargs.get("old"))
-        _new = (replace_with if replace_with is not None else kwargs.get("replace_with"))
-        if _new is None:
-            _new = (kwargs.get("new_text") or kwargs.get("new_string")
-                    or kwargs.get("new") or kwargs.get("replacement"))
+        _new = _first_set(replace_with, kwargs.get("replace_with"), kwargs.get("new_text"),
+                          kwargs.get("new_string"), kwargs.get("new"), kwargs.get("replacement"))
         return await tool_replace_text(target_path, _old, _new, sandbox_dir,
                                        post_edit=_fs_batch,
                                        project_store=kwargs.get("project_store"))
@@ -6508,6 +6666,6 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
         return await tool_delete_file(target_path, sandbox_dir)
     
     return ToolOutcome.rejected(
-        f"Unknown operation: {operation}. Valid operations are: read, write, "
-        f"replace, list_files, delete, find, batch.",
+        f"Unknown operation: {operation}. Valid operations are: {', '.join(ADVERTISED_OPS)} "
+        f"(to change part of a file use 'edit').",
         reason_code="unknown_operation")

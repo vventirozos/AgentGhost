@@ -191,7 +191,7 @@ def _tool_call_failed(tc) -> bool:
     legacy trajectories written before the flag was populated."""
     if getattr(tc, "error", ""):
         return True
-    return _looks_like_tool_error(getattr(tc, "result", "") or "")
+    return _looks_like_tool_error(getattr(tc, "result", "") or "", getattr(tc, "name", "") or "")
 
 
 def tool_call_failed(tc) -> bool:
@@ -205,7 +205,7 @@ def tool_call_failed(tc) -> bool:
     return _tool_call_failed(tc)
 
 
-def looks_like_tool_error(result: str) -> bool:
+def looks_like_tool_error(result: str, tool_name: str = "") -> bool:
     """Public alias for ``_looks_like_tool_error``.
 
     Same rationale as ``tool_call_failed``: the turn loop's
@@ -214,7 +214,7 @@ def looks_like_tool_error(result: str) -> bool:
     needs THE failure sniffer, not a second one that can drift from the
     label the corpus writes.
     """
-    return _looks_like_tool_error(result)
+    return _looks_like_tool_error(result, tool_name)
 
 
 def is_unresolved_tool_result(result) -> bool:
@@ -255,7 +255,32 @@ def is_unresolved_tool_result(result) -> bool:
     return is_promoted_result(_t)
 
 
-def _looks_like_tool_error(result: str) -> bool:
+#: §4LL: tools whose SUCCESS is arbitrary file/document text — a read of
+#: exceptions.py, a log whose first line is "ERROR:", an rg hit on
+#: "except Exception". Their failures are prefix-shaped, so for them the
+#: loop's own prefix test decides, not a substring scan of the content.
+#: §4LM: a vision caption is the same — the OCR of an error dialog starts
+#: "VISION ANALYSIS RESULT:\nTraceback (most recent call last)".
+#: file_system operations that change a file (an edit between two browser
+#: tests is progress — §4LN).
+_FS_MUTATING_OPS = frozenset({"write", "replace", "edit", "append", "patch", "delete",
+                              "move", "rename", "copy", "mkdir", "download", "batch"})
+
+_CONTENT_TOOLS = frozenset({"file_system", "vision_analysis"})
+
+
+_BROWSER_STATUS_RE = re.compile(
+    r"\A(?:\[FAILURE BANNER\][^\n]*\n)?(?:--- BROWSER RESULT ---\n)+STATUS: ([A-Z]+)")
+
+
+def browser_result_status(result) -> "str | None":
+    """'ok' / 'partial' / 'error' / 'blocked' … from a browser result's own
+    header, or None when the text is not a browser result (§4LN)."""
+    m = _BROWSER_STATUS_RE.match(str(result or "").lstrip())
+    return m.group(1).lower() if m else None
+
+
+def _looks_like_tool_error(result: str, tool_name: str = "") -> bool:
     """Cheap text detector for "this tool call failed" — the FALLBACK when the
     structured ``ToolCall.error`` flag isn't set (legacy trajectories).
     Conservative: favours false negatives over false positives.
@@ -276,6 +301,21 @@ def _looks_like_tool_error(result: str) -> bool:
         return True
     if not isinstance(result, str):
         return False
+    _bs = browser_result_status(result)
+    if _bs is not None:
+        # §4LN: the browser states its own verdict in its header; the page
+        # text under it ("TypeError: …", "Exception handling", "EXIT CODE: 1"
+        # in a CI log) is content, never this call failing.
+        # PARTIAL: some actions worked and read the page — the call is
+        # evidence, not a failure (the evidence gate agrees); the live loop
+        # still books it from the declared status
+        return _bs not in ("ok", "partial")
+    if str(tool_name or "").strip().lower() in _CONTENT_TOOLS:
+        from ..tools.tool_failure import result_is_failure
+        _h = result.strip()
+        # + the traversal refusals, returned as plain "Security Error: …" strings (review)
+        return (result_is_failure(result) or _h.startswith("Security Error")
+                or "replace rejected" in _h[:120].lower())
     # A NON-ZERO exit-code banner is a hard failure signal even without an
     # "error:" prefix (127 = command not found, 130 = SIGINT, 1..9, …). The
     # banner can trail stdout, so search the whole result, not just the head.
@@ -284,6 +324,12 @@ def _looks_like_tool_error(result: str) -> bool:
     _code = _exec_exit_code(result)
     if _code is not None and _code != 0:
         return True
+    if _code == 0:
+        # §4LO: an execute-shaped result's EXIT CODE is the verdict, as in the
+        # live loop — exit 0 output that merely prints "ERROR:" / a logged
+        # traceback / pip's resolver line is a success (75 of 1,435 corpus
+        # calls were booked failed off-loop while the loop booked them ok)
+        return False
     head = result.strip()[:120].lower()
     return any(
         marker in head
@@ -505,7 +551,7 @@ def tool_failure_flags(tools: Optional[Iterable[Any]]) -> List[bool]:
         if is_unresolved_tool_result(content):
             continue
         if isinstance(t, dict):
-            flags.append(_looks_like_tool_error(content))
+            flags.append(_looks_like_tool_error(content, t.get("name") or ""))
         else:
             flags.append(_tool_call_failed(t))
     return flags
@@ -634,11 +680,24 @@ def classify_chat_outcome(
         last_url = ""
         for tc in traj.tool_calls:
             if (tc.name or "").lower() != "browser":
+                # §4LN: an edit between two tests IS progress — the app the
+                # selector clicks changed. 6 of 8 stored "selector used N×"
+                # labels were edit → re-test loops on the agent's own apps.
+                _a = tc.arguments if isinstance(tc.arguments, dict) else {}
+                _nm = (tc.name or "").lower()
+                _op = str(_a.get("operation") or "").lower()
+                if not _tool_call_failed(tc) and (
+                        _nm == "execute"
+                        or (_nm == "file_system" and _op in _FS_MUTATING_OPS)):
+                    seen.clear()
                 continue
             args = tc.arguments if isinstance(tc.arguments, dict) else {}
             op = str(args.get("operation") or args.get("op") or "").lower()
             result = getattr(tc, "result", "") or ""
-            if op in ("navigate", "goto") and not _looks_like_tool_error(result):
+            # §4LN: the call's verdict (declared status, error flag), not a
+            # name-less text sniff — a dead-host / SSRF refusal has no marker
+            # in its head and read as progress
+            if op in ("navigate", "goto") and not _tool_call_failed(tc):
                 seen.clear()  # observable progress — restart the window
                 last_url = str(args.get("url") or "")
                 continue
@@ -649,7 +708,7 @@ def classify_chat_outcome(
             # same-page re-read (same url, same selector, N times) still
             # accumulates.
             url = str(args.get("url") or "")
-            if url and url != last_url and not _looks_like_tool_error(result):
+            if url and url != last_url and not _tool_call_failed(tc):
                 seen.clear()
                 last_url = url
             actions = [s for s in (args.get("actions") or []) if isinstance(s, dict)]

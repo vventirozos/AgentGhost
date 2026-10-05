@@ -81,6 +81,18 @@ _SHELL_DENY: tuple = (
 )
 
 
+_HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][\w.-]*)\1[^\n]*\n(.*?)^\t*\2[ \t]*$",
+                         re.S | re.M)
+
+
+def _strip_heredoc_bodies(cmd: str) -> str:
+    """The command with every heredoc BODY removed (kept: the `<<EOF` line and
+    its terminator). A body is data, not shell — one apostrophe in a file
+    written with `cat > f <<'EOF'` failed the quote check (§4LO: four valid
+    commands, `bash -n` clean, were refused)."""
+    return _HEREDOC_RE.sub(lambda m: m.group(0)[:m.start(3) - m.start(0)] + m.group(2), cmd)
+
+
 def validate_shell(cmd: str) -> Tuple[bool, str]:
     """Validate a shell command's shape and reject obviously-destructive
     forms. Returns ``(ok, reason)``.
@@ -95,7 +107,7 @@ def validate_shell(cmd: str) -> Tuple[bool, str]:
     # Shape check: must shlex-parse. Unclosed quotes are the most common
     # LLM emission bug ("echo 'hello world").
     try:
-        tokens = shlex.split(s, posix=True)
+        tokens = shlex.split(_strip_heredoc_bodies(s), posix=True)
     except ValueError as e:
         return False, f"shell syntax: {e}"
     if not tokens:

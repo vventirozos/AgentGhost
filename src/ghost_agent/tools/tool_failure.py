@@ -44,6 +44,21 @@ _RETRYABLE_PATTERNS = [
     re.compile(r"temporarily unavailable", re.IGNORECASE),
 ]
 
+# §4LN: failures that say "timeout" or "connection refused" but that an
+# identical call reproduces exactly — booked RETRYABLE, the model was told
+# "will retry" (nothing does) and the same-failure stop never ran. A
+# selector that never appears (21 live rows: 3 × 30 s on `#add-btn` in one
+# probe), the host memo's own "will fail the same way" refusal, and a
+# stopped service on the agent's own loopback.
+_SAME_CALL_SAME_RESULT_PATTERNS = [
+    re.compile(r"waiting for (?:locator|selector)\b", re.IGNORECASE),
+    re.compile(r"\bPage\.(?:click|dblclick|fill|wait_for_selector|hover|check)\b[^\n]{0,60}Timeout", re.IGNORECASE),
+    re.compile(r"selector '[^'\n]{0,200}' did not match any element", re.IGNORECASE),
+    re.compile(r"will fail the same way", re.IGNORECASE),
+    re.compile(r"(?:127\.0\.0\.1|localhost|\[::1\])[^\n]{0,120}ERR_CONNECTION_REFUSED"
+               r"|ERR_CONNECTION_REFUSED[^\n]{0,160}(?:127\.0\.0\.1|localhost|\[::1\])", re.IGNORECASE),
+]
+
 _FATAL_PATTERNS = [
     re.compile(r"permission.?denied", re.IGNORECASE),
     re.compile(r"access.?denied", re.IGNORECASE),
@@ -135,6 +150,11 @@ def classify_tool_failure(error_text: str) -> Tuple[FailureClass, str]:
         return FailureClass.UNKNOWN, "empty error"
     # Classify the ERROR, never the advice appended to it.
     error_text = strip_advisory_sections(error_text)
+    # …nor the PAGE TEXT a browser result carries (§4LN): an interact's
+    # extract of an article about "timeouts" is not a timeout.
+    if "--- BROWSER RESULT ---" in error_text:
+        error_text = re.sub(r"(?m)^\s+(?:TEXT|VALUE): .*$", "", error_text)
+        error_text = re.split(r"\n--- (?:PAGE )?TEXT", error_text, maxsplit=1)[0]
     if not error_text.strip():
         # A result that was NOTHING but advice. Same class as any other
         # unclassifiable text, but a distinct label: "the tool returned
@@ -142,6 +162,11 @@ def classify_tool_failure(error_text: str) -> Tuple[FailureClass, str]:
         # bug, and it should be legible in the strike line rather than
         # hiding under the generic "unclassified".
         return FailureClass.UNKNOWN, "advice-only failure"
+
+    for pat in _SAME_CALL_SAME_RESULT_PATTERNS:
+        m = pat.search(error_text)
+        if m:
+            return FailureClass.DIAGNOSTIC, m.group(0)
 
     for pat in _RETRYABLE_PATTERNS:
         m = pat.search(error_text)
@@ -541,7 +566,10 @@ _FALLBACK_HINTS = {
         ("0 of", "No swarm node could route the task. Process synchronously."),
     ],
     "vision_analysis": [
-        ("not found", "The image path doesn't exist in the sandbox. Use file_system(operation='list_files') to verify the filename first."),
+        # §4LM: a remote 404 ("Client error '404 Not Found' for url …") is not
+        # a sandbox path problem — the old bare "not found" needle said it was.
+        ("client error '404", "The image URL returned 404 — nothing is at that address. Do not retry it; find the image's real URL, or screenshot the page with browser and analyse that file."),
+        ("error: file '", "The image path doesn't exist in the sandbox. Use file_system(operation='list_files') to verify the filename first."),
     ],
     # `system` is the synthetic tool name used when the XML/JSON tool-call
     # parser rejects the model's output. The most common root cause is a

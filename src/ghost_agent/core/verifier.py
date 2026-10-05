@@ -4738,8 +4738,16 @@ class Verifier:
             except Exception as exc:
                 logger.debug("visual verify: could not read %s: %s", pth, exc)
                 continue
-            mime, _ = mimetypes.guess_type(str(pth))
-            mime = mime or "image/png"
+            # §4LM: the same input hardening as the tool — type from the
+            # BYTES (a pasted PNG was named .jpg), webp/tiff transcoded, and
+            # alpha flattened (the node drops it: a transparent image read
+            # "solid black" here too, and the verifier CONFIRMED that).
+            from ..tools.vision import _sniff_image_mime, _normalize_for_node, _undecodable
+            mime = _sniff_image_mime(data_bytes[:16]) or mimetypes.guess_type(str(pth))[0] or "image/png"
+            mime, data_bytes = await asyncio.to_thread(_normalize_for_node, mime, data_bytes)
+            if _undecodable(mime, pth):
+                logger.debug("visual verify: skipping undecodable image %s (%s)", pth, mime)
+                continue
             b64 = base64.b64encode(data_bytes).decode("utf-8")
             content_array.append({
                 "type": "image_url",
@@ -4748,6 +4756,14 @@ class Verifier:
             loaded += 1
 
         if loaded == 0:  # nothing renderable to judge
+            return {}
+        if loaded != sum(1 for x in image_paths if x):
+            # All or nothing (§4LM review): the prompt numbers the images
+            # ("[1] the user's ORIGINAL screenshot … [2] the CURRENT state"),
+            # so a dropped before-image made the after-image the "original"
+            # and a verdict still came back. Skipped is never a penalty.
+            logger.debug("visual verify: %d of %d images unusable — skipped",
+                         sum(1 for x in image_paths if x) - loaded, len(image_paths))
             return {}
 
         payload = {
@@ -4766,7 +4782,10 @@ class Verifier:
         if _VISUAL_NO_THINK:
             payload["chat_template_kwargs"] = {"enable_thinking": False}
         try:
-            result = await self.llm_client.chat_completion(payload, use_vision=True)
+            # bounded, like every other last-resort verdict call: the vision
+            # node IS the single main slot (§4LM)
+            result = await self.llm_client.chat_completion(
+                payload, use_vision=True, **_bounded_fallback_kwargs(self.llm_client))
             text = (
                 (result or {})
                 .get("choices", [{}])[0]

@@ -1632,7 +1632,12 @@ class SkillMemory:
             # corrections and always pass; `verified` gets no bypass because it
             # would only exempt a verified OBSERVATION (a verified fix has a
             # mistake and passes; a verified actionable rule passes anyway).
-            from .lesson_quality import is_actionable_lesson, prescribes_destruction
+            from .lesson_quality import is_actionable_lesson, prescribes_destruction, unknown_tool_calls
+            _bad_calls = unknown_tool_calls(f"{effective_trigger}\n{effective_correct}")
+            if _bad_calls:
+                logger.warning("learn_lesson: refused %s lesson prescribing calls that do not exist (%s): %r",
+                               source or "?", ", ".join(_bad_calls[:3]), (effective_correct or "")[:120])
+                return None
             if prescribes_destruction(effective_correct):
                 logger.warning(
                     "learn_lesson: refused %s lesson that prescribes bulk/irreversible destruction: %r",

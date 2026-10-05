@@ -84,16 +84,24 @@ def blocked_page_reason(parsed: dict) -> str:
         status = None
     title = str(parsed.get("title") or "")
     url = str(parsed.get("url") or "")
+    # §4LN: the page's text size under whichever name the op ships it — a
+    # screenshot carries `dom_text_chars`, never `length`, and an absent
+    # length read as 0 made every screenshot of a page titled "Cloudflare…"
+    # a challenge (and two of them banned the host for 6 h). Unknown size:
+    # the title alone decides nothing.
+    _raw_len = next((parsed.get(k) for k in ("length", "dom_text_chars", "nav_text_chars")
+                     if parsed.get(k) is not None), None)
     try:
-        length = int(parsed.get("length") or 0)
+        length = int(_raw_len) if _raw_len is not None else None
     except (TypeError, ValueError):
-        length = 0
+        length = None
     if status in _BLOCKED_STATUSES:
         kind = "bot challenge" if (_CHALLENGE_TITLE_RE.match(title) or _CHALLENGE_URL_RE.search(url)) else "access refused"
         return f"HTTP {status} — {kind}"
     if status is not None and status >= 400:
         return f"HTTP {status}"
-    if (_CHALLENGE_TITLE_RE.match(title) or _CHALLENGE_URL_RE.search(url)) and length < _CHALLENGE_MAX_CHARS:
+    if _CHALLENGE_URL_RE.search(url) or (
+            _CHALLENGE_TITLE_RE.match(title) and length is not None and length < _CHALLENGE_MAX_CHARS):
         return f"bot challenge / interstitial ({title.strip()[:40] or 'challenge url'})"
     return ""
 
@@ -105,3 +113,41 @@ BLOCKED_PAGE_HINT = (
     "quotes it and attribute the claim to that source."
 )
 
+
+
+def _is_own_host(url: str) -> bool:
+    """file://, loopback, a private/LAN address or a .local name — the
+    agent's own app or service, never a third-party site."""
+    from urllib.parse import urlparse
+    import ipaddress
+    try:
+        u = urlparse(str(url or ""))
+    except ValueError:
+        return False
+    if u.scheme == "file":
+        return True
+    host = (u.hostname or "").lower()
+    if host in ("localhost",) or host.endswith(".local") or host.endswith(".localhost"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_loopback or ip.is_private or ip.is_link_local
+    except ValueError:
+        return False
+
+
+def blocked_page_hint(reason: str, url: str) -> str:
+    """The next step for a page that must not be read, by CAUSE (§4LN): the
+    agent's own server failing is not "a site refused you"; a 404 is a URL
+    that does not exist (25 of 99 live BLOCKED results were 404s on URLs the
+    model had guessed), not a challenge a secondary source works around."""
+    r = str(reason or "")
+    if _is_own_host(url):
+        return ("This is YOUR OWN app/service, and it answered with an error — not a "
+                "site blocking you. Read its log or the response, fix the route or the "
+                "server, then load it again.")
+    if r.startswith("HTTP 404") or r.startswith("HTTP 410"):
+        return ("There is no page at this URL. If you built or guessed the URL, it is "
+                "wrong — find the real one (web_search, or a link on a page you did "
+                "load) instead of trying variants. Do not cite this URL.")
+    return BLOCKED_PAGE_HINT

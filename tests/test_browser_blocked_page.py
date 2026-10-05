@@ -139,7 +139,9 @@ async def test_a_read_page_is_still_an_ok_string(tmp_path):
     res = await tool_browser(operation="extract_text", url=_OK["url"],
                              sandbox_dir=tmp_path, sandbox_manager=_stub(_OK))
     assert str(res).startswith("--- BROWSER RESULT ---\nSTATUS: OK")
-    assert not isinstance(res, ToolOutcome)
+    # §4LN: a read page is a DECLARED success, so no text sniffer re-reads
+    # its content as a failure
+    assert isinstance(res, ToolOutcome) and res.declared and not res.is_failure
     assert "HTTP_STATUS: 200" in str(res)
 
 

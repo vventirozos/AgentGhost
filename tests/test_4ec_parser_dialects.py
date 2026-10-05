@@ -378,7 +378,7 @@ def test_xml_path_scrubs_tool_xml_from_the_ui_text():
 # (there is no other dict-key write in the method). Counted by SHAPE, not by
 # variable name, so a sink under a new name (the first version of this guard
 # missed the five `args_dict` sinks of the extreme fallback) still counts.
-EXPECTED_EXTRACTION_SINKS = 19   # 16 args_val/args_fallback + 3 args_dict (subscript writes only); §4EC removed the Format-0a CDATA sink (masking) and the repair-None arm (F4)
+EXPECTED_EXTRACTION_SINKS = 18   # 16 args_val/args_fallback + 2 args_dict (subscript writes only); §4EC removed the Format-0a CDATA sink (masking) and the repair-None arm (F4); §4LM moved the vision `action` write into `_salvage_vision_args` (row: extreme_vision_target_tag)
 
 
 def test_every_extraction_sink_has_a_dialect_row():

@@ -104,6 +104,51 @@
 
   <h2 id="4gl">A screenshot is evidence your text tools cannot read <span class="tag">2026-09-14 &sect;4GL</span></h2>
   <p>Vision already accepted a remote URL, fetched it over Tor behind the SSRF guard, and OCR'd it with <code>extract_text_picture</code>. Nothing said so from the research seat: the tool description was written around "generated images in your sandbox" and "UI/apps YOU built", and the system prompt mentioned vision only for checking your own screenshots. So an investigation navigated to a Telegram post carrying the one screenshot that mattered, ran <code>extract_text</code>, received the page markup, and reported the detail as unpublished. Both now state the research use and the trap behind it: <strong>extract_text returns nothing from inside an image</strong>, so "not in the page text" is not "not publicly available". If an investigation turns on something someone posted as a picture &mdash; a sender address, a header, a figure &mdash; OCR the picture, and say which images you read or that you did not try.</p>
+  <h2 id="4lm">Image understanding review <span class="tag">2026-10-04 &sect;4LM</span></h2>
+  <p>Eight labelled live probes with known content (invoice, shape counts, chart, a 26&nbsp;px code in a 3000&times;2000 image, two images in one message, a blank image, a member's own note) were all read correctly except one: <strong>black text on a transparent PNG came back as "a completely solid black rectangle"</strong>, and the verifier, whose own vision call had the same defect, CONFIRMED it. Over 89 real turns the tool itself returned a caption on 88% of calls. What broke was what the agent said afterwards, and how the result was labelled.</p>
+  <ul>
+    <li><strong>Transparency is composited, not dropped.</strong> The node decodes at 3 channels, so transparent pixels became their stored colour (usually black). <code>_normalize_for_node</code> now flattens any image that carries alpha (PNG, GIF, WebP, palette) onto a background that contrasts with its visible pixels: white behind dark content, dark grey behind light content. Opaque PNG and JPEG still ship byte-identical. The verifier's visual call gets the same normalisation, and types each image from its bytes.</li>
+    <li><strong>A caption is content.</strong> Successes are returned as a declared <code>ToolOutcome.ok</code>, and <code>vision_analysis</code> joins <code>file_system</code> as a content tool for the shared sniffer. A caption that quotes "Traceback", "EXIT CODE: 2" or "SYSTEM ERROR" off a screenshot is no longer booked as a failed call. Before, it added a FAILURE BANNER, triggered a strike, made claim binding withhold its confirm, and hid the look from the inspected-image gate.</li>
+    <li><strong>Tor-only, including DNS.</strong> A URL target, and every redirect hop, is checked by the SSRF guard <em>without</em> a host-side DNS lookup when the fetch goes over Tor. The default lookup sent the target's name to the local resolver in cleartext. <code>file_system</code> download had the same leak and the same fix.</li>
+    <li><strong>The user's pasted image is never the "after" render.</strong> Pasted images are saved as <code>vision_&lt;sha12&gt;.&lt;ext&gt;</code>. The extension now follows the bytes (a PNG is no longer saved as <code>.jpg</code>), and the write is atomic. That name marks the file as the user's: the visual verifier takes it as the <em>before</em> image and never as the post-fix state. The last-resort filename search no longer reaches another project's files.</li>
+    <li><strong>Vision runs after every other tool in its batch</strong>, not only after <code>browser</code> and <code>image_generation</code>. With <code>execute</code> writing <code>plot.png</code> in the same batch, vision used to caption the previous plot.</li>
+    <li><strong>Generated images.</strong> In 6 of 16 generated-image turns the reply described pixels nobody had looked at. Both the image tool's closing instruction and the blind-regeneration block now say to describe what was <em>asked for</em> and to call vision before claiming any detail. A <code>/api/download/…</code> link to a file that does not exist (one live reply invented one, in a turn that generated nothing) is replaced with a notice for the owner too. The check is lenient: a file with that name anywhere in the sandbox keeps its link.</li>
+    <li><strong>Refusals that tell the truth.</strong>
+      <ul>
+        <li>Short action names the model uses are mapped to the action they mean (<code>ocr</code> → <code>extract_text_picture</code>, <code>verify</code> → <code>verify_ui</code>, <code>describe</code> → <code>describe_picture</code>, …). A truly unknown <code>action</code> is refused with the list. All of these used to return a generic caption.</li>
+        <li>A format the node cannot decode (SVG, HEIC, AVIF) gets "Do NOT retry; convert it to PNG". It used to read "the vision node is offline".</li>
+        <li>A token-cap failure says the image was not seen. It used to say "present it as-is", which was wrong for a user's photo.</li>
+        <li>A URL 404 gets URL advice, not sandbox advice.</li>
+        <li>A remote PDF's page note says to download it first.</li>
+        <li>The fallback chain no longer suggests reading an image as text with <code>file_system</code>.</li>
+      </ul>
+    </li>
+    <li><strong>Member wall.</strong> <code>/gen_x.png</code> and <code>/api/download/gen_x.png</code>, the forms the schema teaches, are accepted. One prefix is stripped, and the rest must still be exactly a member file's name.</li>
+    <li><strong>Bounded.</strong> The vision call carries <code>GHOST_VISION_TIMEOUT</code> (default 300&nbsp;s) instead of the client's 1200&nbsp;s. The vision node is the single main slot.</li>
+    <li><strong>Salvage parser.</strong> A malformed call's <code>target</code>, <code>action</code> and <code>prompt</code> are each read from their own tag. Before, the question could become the target.</li>
+    <li><strong>Schema.</strong> Ask neutrally (a leading "does this resemble X?" got "Yes" live), and ask for an exact transcription (one image was read as "authorised" 5 times and "unauthorised" 3 times).</li>
+  </ul>
+  <p><strong>A second fresh reader, on the diff itself, found 4 MAJOR problems in these fixes. All are fixed:</strong></p>
+  <ul>
+    <li><strong>Real links were being removed.</strong> Trailing punctuation, <code>%20</code> and glob characters made real files look missing. A link is now kept if any reading of its name exists: as written, URL-decoded, or with prose punctuation removed. The name is glob-escaped, and a <code>)</code> that closes the sentence is kept.</li>
+    <li><strong>An old paste was used as evidence.</strong> A pasted image counts as this request's "before" only if it is in this request's own message, matched by its text. One pasted two requests earlier is ignored. A loop-injected user row in between does not hide it.</li>
+    <li><strong>The verifier's vision call is all-or-nothing.</strong> If one of its images cannot be used, it makes no call. A dropped before-image had relabelled the after-image as "the user's ORIGINAL screenshot".</li>
+    <li><strong>Stored rows match the live loop.</strong> The prefix-only failure rule for stored rows applies to <code>vision_analysis</code> only, because the live loop still applies the banner rule to <code>file_system</code>.</li>
+  </ul>
+  <p>Also fixed:</p>
+  <ul>
+    <li>A fully opaque RGBA image ships unchanged, and an image is downscaled before it is flattened.</li>
+    <li>With no project active, files under <code>projects/</code> are never resolved.</li>
+    <li>A salvaged prompt keeps its apostrophes.</li>
+    <li>The timeout is 300&nbsp;s.</li>
+  </ul>
+  <p>Not changed:</p>
+  <ul>
+    <li>Vision stays in the mutating set, because the advised single retry must not be collapsed.</li>
+    <li>The verifier still makes its own independent look at a generated image.</li>
+    <li>The member file allowlist is one store per install (a question for the operator).</li>
+  </ul>
+  <p>Pins: <code>tests/test_4lm_vision.py</code>.</p>
 </main>
 </body>
 </html>

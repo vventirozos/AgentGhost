@@ -123,6 +123,12 @@ def _content_failure_head(lines: list, declared: bool = False) -> str:
         return ""
     head = lines[0]
     if head.startswith("--- BROWSER RESULT ---"):
+        if len(lines) > 1 and re.match(r"STATUS:\s*(?:ERROR \(every action failed\)|PARTIAL\b)", lines[1]):
+            # §4LN: an interact's header names no error — its first failed
+            # action does (else every such failure keyed as "OP: interact")
+            for s in lines:
+                if _BROWSER_ACTION_ERR_RE.match(s):
+                    return s[:240]
         if len(lines) > 1 and _BROWSER_FAILURE_STATUS_RE.match(lines[1]):
             # `STATUS: ERROR` is followed by the message itself
             # (`_browser_error`); `STATUS: BLOCKED (HTTP 403 …)` names it.

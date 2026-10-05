@@ -34,7 +34,8 @@ from ghost_agent.sandbox.docker import DockerSandbox
 # --- the configuration, as data ------------------------------------------
 
 def test_tor_runs_as_the_unprivileged_user_with_trans_and_dns_ports():
-    assert f"User {T.TOR_USER}" in T.TORRC
+    # §4LO: no `User` line — Tor is STARTED as the user (no SETUID in the box)
+    assert "\nUser " not in T.TORRC
     assert f"TransPort 127.0.0.1:{T.TRANS_PORT}" in T.TORRC
     assert f"DNSPort 127.0.0.1:{T.DNS_PORT}" in T.TORRC
     assert "AutomapHostsOnResolve 1" in T.TORRC and f"VirtualAddrNetworkIPv4 {T.VIRTUAL_NET}" in T.TORRC
@@ -326,17 +327,19 @@ def test_the_process_patterns_cannot_match_their_own_wrapper():
     running-check said "root" — the sandbox sat fail-closed. The pattern
     must anchor on Tor's own command line."""
     import re, shlex
-    assert T.TOR_PROC_PATTERN.startswith("^tor -f ")
+    assert T.TOR_PROC_PATTERN.startswith("^(/usr/bin/)?tor ")      # §4LO: hardened + legacy forms
     for cmd in (T.start_tor_cmd(), T.tor_running_as_expected_cmd()):
         # what the wrapper's /proc/<pid>/cmdline holds: "sh -c <inner script>"
         argv = shlex.split(cmd)
         assert argv[:2] == ["sh", "-c"]
         wrapper_cmdline = " ".join(argv)
         pats = re.findall(r"pgrep -f '([^']+)'", argv[2])
-        assert pats and all(p.startswith("^tor -f") for p in pats), argv[2]
+        assert pats and all(p.startswith("^(/usr/bin/)?tor") for p in pats), argv[2]
         # the wrapper's own command line does not match the pattern it carries
         assert not re.search(pats[0], wrapper_cmdline), "the wrapper matches itself"
         assert re.search(pats[0], f"tor -f {T.TORRC_PATH} --RunAsDaemon 1"), "a real Tor does not match"
+        assert re.search(pats[0], f"/usr/bin/tor --defaults-torrc /dev/null -f {T.TORRC_PATH} "
+                                  "--__ReloadTorrcOnSIGHUP 0 --RunAsDaemon 1"), "the hardened Tor does not match"
 
 
 def test_a_fresh_tor_start_truncates_the_previous_bootstrap_log():
@@ -351,5 +354,33 @@ def test_a_fresh_tor_start_truncates_the_previous_bootstrap_log():
     guard, _, start = inner.partition("||")
     assert "pgrep" in guard and T.TOR_LOG not in guard
     assert f": > {T.TOR_LOG}" in start
-    assert start.index(f": > {T.TOR_LOG}") < start.index("tor -f"), "truncate BEFORE the start"
-    assert f"chown {T.TOR_USER}:{T.TOR_USER} {T.TOR_LOG}" in start, "root-owned log; Tor drops to debian-tor"
+    assert start.index(f": > {T.TOR_LOG}") < start.index(T.TOR_BIN), "truncate BEFORE the start"
+    # §4LO: Tor runs AS its user, so the log dir is chowned in the root-run
+    # prepare step and the start (as that user) can truncate it itself
+    assert f"chown -R {T.TOR_USER}:{T.TOR_USER}" in T.prepare_tor_cmd() and "/var/log/tor" in T.prepare_tor_cmd()
+
+
+
+# ── §4LO: sandbox code cannot become the exempt uid ──
+
+def test_tor_is_started_as_its_own_user_and_prepared_as_root(tmp_path):
+    sb = _stub(tmp_path)
+    seen, _ = _drive(sb)
+    start = [(c, k) for c, k in seen if "--RunAsDaemon 1" in c]
+    prep = [(c, k) for c, k in seen if "chown -R" in c and "/var/lib/tor" in c]
+    assert start and start[0][1].get("user") == T.TOR_USER, start
+    assert prep and prep[0][1].get("user") == "root"
+    cmds = _cmds(seen)
+    assert cmds.index(prep[0][0]) < cmds.index(start[0][0])
+
+
+def test_tor_is_not_started_when_the_integrity_check_finds_a_preload(tmp_path):
+    """§4LO: a (re)start runs a binary as the exempt uid — never over an
+    /etc/ld.so.preload the sandbox's root may have planted."""
+    sb = _stub(tmp_path)
+    seen, _ = _drive(sb, overrides={"ps -o user=": (1, b""),
+                                    "sha256sum": (0, b"PRELOAD\nabc  /usr/bin/tor\n")})
+    assert not any("--RunAsDaemon 1" in c for c, _k in seen)
+    seen2, _ = _drive(_stub(tmp_path), overrides={"ps -o user=": (1, b""),
+                                                  "sha256sum": (0, b"abc  /usr/bin/tor\n")})
+    assert any("--RunAsDaemon 1" in c for c, _k in seen2)

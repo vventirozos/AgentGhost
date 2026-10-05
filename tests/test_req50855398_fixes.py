@@ -292,8 +292,15 @@ def test_system3_calls_are_nothink_and_bounded():
 def test_missing_file_hint_for_title_prefix(tmp_path):
     (tmp_path / "train.py").write_text("x = 1\n")
     msg = _missing_file_message("Mini AI v2/train.py", tmp_path)
-    assert "ALREADY inside" in msg
+    # §4LL: "you are ALREADY inside this project's workspace" only when a
+    # project IS active — at the sandbox root it misled
+    assert "ALREADY inside" not in msg
     assert "relative path 'train.py'" in msg
+    proj = tmp_path / "projects" / "p1"
+    proj.mkdir(parents=True)
+    (proj / "train.py").write_text("x = 1\n")
+    msg = _missing_file_message("Mini AI v2/train.py", proj)
+    assert "ALREADY inside" in msg and "relative path 'train.py'" in msg
 
 
 def test_missing_file_hint_names_subdirectory_match(tmp_path):

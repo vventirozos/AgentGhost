@@ -373,6 +373,96 @@ Any claim that content renders is UNSUPPORTED by this screenshot…</code></pre>
     </ul>
   Measured before the fix: 29 of 142 strikes were 404s, and two mistyped Wikipedia paths banned en.wikipedia.org.</li>
 </ul>
+  <h2 id="4ln">Browser review <span class="tag">2026-10-04 &sect;4LN</span></h2>
+  <p>Five labelled live probes on pages with known content were all answered right, but two showed costs.</p>
+  <ul>
+    <li>A guessed selector burned 3&times;30&nbsp;s inside <code>interact</code>, under a <code>STATUS: OK</code> header.</li>
+    <li>A missing <code>h1</code> was answered with Chromium-install advice.</li>
+  </ul>
+  <p>Over 209 real turns, the browser itself decided only 2 of 21 failures. The defects were in what the result said, which page a url-less op read, and how results were labelled.</p>
+  <ul>
+    <li><strong>Successes are declared.</strong> Every successful read is a <code>ToolOutcome.ok</code>. The text-only checks (the corpus sniffer, the evidence gate, claim binding) read the browser's own <code>STATUS: OK|PARTIAL|ERROR|BLOCKED</code> header (<code>browser_result_status</code>). A page about <code>TypeError</code>s, a CI log with <code>EXIT CODE: 1</code> or a docs page on exception handling is content, not a failed call. A navigate that returned no text is not evidence.</li>
+    <li><strong><code>interact</code> says what happened.</strong>
+      <ul>
+        <li>The header reads <code>STATUS: PARTIAL (n of m actions failed)</code> or <code>STATUS: ERROR (every action failed)</code>, never OK. That also stops it unlocking the verifier's interaction-evidence check.</li>
+        <li>An extract step shows its whole text (up to its <code>max_chars</code>), not 500 characters.</li>
+        <li>A goto that landed on a 403 or a challenge page makes the whole sequence <code>BLOCKED</code>.</li>
+      </ul>
+    </li>
+    <li><strong>The url-less page is this request's.</strong>
+      <ul>
+        <li>The <code>.last_url</code> sidecar is per request (<code>.last_url.&lt;req&gt;</code>), so another conversation, a batch-mate or the verifier cannot redirect a url-less extract.</li>
+        <li>A navigate records the URL it was <em>asked</em> for before loading, so a failed load never leaves the previous page in place.</li>
+        <li>A url-less result names the page it re-opened.</li>
+        <li>Browser calls of one batch run in the order written.</li>
+      </ul>
+    </li>
+    <li><strong>Big and non-ASCII pages arrive intact.</strong> The runner emits UTF-8, not <code>\uXXXX</code> (a Greek page used 6 characters per letter), and trims its largest text fields to stay under the exec line cap, marking them truncated. The host parses on <code>\n</code> only, because page text may contain U+2028.</li>
+    <li><strong>Failures say what will work.</strong>
+      <ul>
+        <li>A selector that is not on the page fails in at most 8&nbsp;s and lists the clickable elements that are.</li>
+        <li>Selector timeouts, the host memo's refusal and a refused local service are no longer "retryable (will retry)".</li>
+        <li>The runner-failure hint names only the cause that matched.</li>
+        <li>A 404 says the URL does not exist (25 of 99 live BLOCKED results were guessed URLs).</li>
+        <li>The agent's own server failing says "fix your app", not "the site refused".</li>
+      </ul>
+    </li>
+    <li><strong>Screenshots.</strong>
+      <ul>
+        <li>The blocked check uses the page's DOM text size; an unknown size never makes a title alone a challenge. Before, two screenshots of cloudflare.com banned the host for 6&nbsp;h.</li>
+        <li>The result says the image has not been seen.</li>
+        <li>A screenshot never overwrites a file that is not an earlier screenshot (a user's photo, a generated image).</li>
+        <li>A failed screenshot's path is never the verifier's "after" image.</li>
+      </ul>
+    </li>
+    <li><strong>Budgets.</strong>
+      <ul>
+        <li>At most 60 actions per <code>interact</code>.</li>
+        <li>Each step's own wait is clamped to its share of the 600&nbsp;s ceiling.</li>
+        <li>A hard-cancelled call keeps the profile lock until its runner returns, so no second Chromium starts on the same profile.</li>
+      </ul>
+    </li>
+    <li><strong>Labels and steers.</strong>
+      <ul>
+        <li>The corpus "selector used N&times;" label resets on a successful edit between tests, and counts a selector once per successful <code>interact</code>.</li>
+        <li>The extract steer asks for the full text and counts url-less extracts.</li>
+        <li>Link grounding ignores URLs whose browser call failed.</li>
+        <li>The research ledger skips blocked fetches and sidecar re-reads.</li>
+      </ul>
+    </li>
+    <li><strong>Text.</strong>
+      <ul>
+        <li>Schema: the budget, the <code>wait_until</code> defaults and the <code>out_path</code> base.</li>
+        <li>Prompts: "visible text", not "markup"; the raw-Playwright recipe now has <code>EXCLUDE 127.0.0.1</code>.</li>
+        <li>The "menu screen" note is shown only for the agent's own apps.</li>
+        <li><code>close</code> reports whether the profile is really gone.</li>
+      </ul>
+    </li>
+  </ul>
+  <p><strong>A second fresh reader, on the diff itself, found 4 MAJOR problems in these fixes. All are fixed:</strong></p>
+  <ul>
+    <li><strong><code>PARTIAL</code> counts as evidence.</strong> An interact with one failed step and a good read is not a failed call for the text checks; the live loop still books it from its declared status.</li>
+    <li><strong>A navigate with no page text is still evidence.</strong> Canvas games and the agent's own apps have no text.</li>
+    <li><strong>A blocked interact is judged by its last goto.</strong> That goto's own host takes the strike, and an earlier blocked goto followed by a real one is a real read.</li>
+    <li><strong>The selector check waits the full action timeout.</strong> An element can appear late over Tor. A selector the same sequence already found missing fails at once, so a guessed selector costs one wait, not one per action.</li>
+  </ul>
+  <p>Also fixed:</p>
+  <ul>
+    <li>A url-less op in a follow-up turn falls back to the shared sidecar, and the result names the page.</li>
+    <li>The extract steer counts a url-less extract only after a navigate of that page.</li>
+    <li>A failed interact's strike line names its first failed action.</li>
+    <li>Failure classification ignores page text.</li>
+    <li>The payload trim never emits invalid JSON.</li>
+    <li>Atomic <code>settle_ms</code> and <code>post_click_ms</code> are clamped.</li>
+    <li>The agent's own app URL survives link grounding after its own 4xx/5xx.</li>
+    <li>The lock is held across repeated cancels.</li>
+  </ul>
+  <p>Not changed:</p>
+  <ul>
+    <li>The persistent cookie profile links browsing across Tor circuits; blocking third-party cookies or per-request profiles trades away logins, so it is an operator decision.</li>
+    <li>WebSocket and service-worker traffic is outside the request guard (Playwright limit; reach is the container's own netns).</li>
+  </ul>
+  <p>Pins: <code>tests/test_4ln_browser.py</code>.</p>
 </main>
 </body>
 </html>

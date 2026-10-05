@@ -137,7 +137,17 @@ def _empty_reason(name: str, args: Dict[str, Any], content: str,
             return f"{name}: nothing found"
         if _RECALL_WEAK_RE.search(text):
             return f"{name}: best match LOW (unrelated)"
-    if _ERROR_HEAD_RE.search(text[:200]):
+    _bs = None
+    if name == "browser":
+        # §4LN: the browser's own header decides, BEFORE the generic error
+        # head — a page whose text opens "Error handling in …" is content.
+        from ..distill.outcome_heuristics import browser_result_status
+        _bs = browser_result_status(text)
+        if _bs is not None and _bs not in ("ok", "partial"):
+            return f"browser: {_bs}"
+        if _bs is None and _ERROR_HEAD_RE.search(text[:200]):
+            return f"{name}: error"
+    if _ERROR_HEAD_RE.search(text[:200]) and not (name == "browser" and _bs is not None):
         return f"{name}: error"
     if name == "browser":
         m = _BROWSER_HTTP_RE.search(text)

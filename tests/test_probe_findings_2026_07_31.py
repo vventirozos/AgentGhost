@@ -65,4 +65,5 @@ def test_batch_order_producers_before_vision():
     it existed → spurious FATAL strike. The dispatch batch must hold the
     producer set and sequence vision behind it."""
     src = _source()
-    assert '_FILE_PRODUCERS = {"browser", "image_generation"}' in src
+    # §4LM: every other tool in the batch is a producer (execute too)
+    assert '_prod = {i for i, _ in exec_coros} - _cons' in src

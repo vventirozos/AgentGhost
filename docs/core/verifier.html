@@ -1524,6 +1524,15 @@ It is a word-matching stand-in for "the judge answered from memory", so it is no
 <code>GHOST_VERIFY_MEMORY_REFUTE_GUARD=1</code> turns it on. Also: <code>fact_check</code> no longer counts as a
 SOURCE for claim binding (<code>SOURCE_EXCLUDED_TOOLS</code>), because its output is the main model's own verdict on
 the claim.</p>
+  <h2 id="4lm">Visual call input hardening <span class="tag">2026-10-04 &sect;4LM</span></h2>
+  <p><code>_call_llm_vision</code> now prepares each image the way the tool does:</p>
+  <ul>
+    <li>It types the image from its bytes; a pasted PNG had been named <code>.jpg</code>.</li>
+    <li>It runs <code>_normalize_for_node</code>: webp and tiff are transcoded, and alpha is flattened. A transparent PNG used to read "solid black" here, and the verifier CONFIRMED that wrong reading.</li>
+    <li>It skips formats the node cannot decode.</li>
+    <li>It carries the bounded fallback timeout (<code>_bounded_fallback_kwargs</code>).</li>
+  </ul>
+  <p>See <a href="../tools/vision.html#4lm">vision &sect;4LM</a>.</p>
 </main>
 </body>
 </html>

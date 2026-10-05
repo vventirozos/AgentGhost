@@ -976,8 +976,69 @@ def find_conflicting_line(evidence: str, span: str, claim_quote: str, *,
         if len(diff) == 1 and home_slots[diff[0]] in claim_slots:
             if reply_slots is not None and (slots[diff[0]] in reply_slots or _stated_at_precision(slots[diff[0]], reply_slots)):
                 continue
+            if _earlier_reading_of_the_same_page(lines, ln, home):
+                continue
             return ln.strip()
     return None
+
+
+_PAGE_URL_RE = re.compile(r"^\s*(?:\[[\w .\-]+\]\s*)?(?:FINAL_)?URL:\s*(\S+)")
+
+
+def _browser_page_of(lines: List[str], idx: int) -> Optional[str]:
+    """The page a line of a browser result belongs to: the URL / FINAL_URL
+    of the nearest `--- BROWSER RESULT ---` block above it, or None (also
+    when another tool's evidence block lies in between)."""
+    start = None
+    for i in range(idx, -1, -1):
+        if "--- BROWSER RESULT ---" in lines[i]:
+            start = i
+            break
+        if _BLOCK_LABEL_RE.match(lines[i]) or _RUN_HEAD_RE.search(lines[i]):
+            return None
+    if start is None:
+        return None
+    for ln in lines[start:idx + 1]:
+        m = _PAGE_URL_RE.match(ln)
+        if m:
+            return m.group(1).rstrip("/")
+    return None
+
+
+_RUN_HEAD_RE = re.compile(r"--- (?:COMMAND|EXECUTION) RESULT ---")
+
+
+def _run_block_of(lines: List[str], idx: int) -> Optional[int]:
+    """Index of the `execute` result block a line belongs to, or None. Stops
+    at the first evidence-block label that is not an execute result — a later
+    file read or web search is not part of the run above it (review)."""
+    for i in range(idx, -1, -1):
+        if _RUN_HEAD_RE.search(lines[i]):
+            return i
+        if "--- BROWSER RESULT ---" in lines[i] or _BLOCK_LABEL_RE.match(lines[i]):
+            return None
+    return None
+
+
+def _earlier_reading_of_the_same_page(lines: List[str], other: str, home: str) -> bool:
+    """`other` is an EARLIER reading of what the claim's line reads later:
+    the same browser page re-read after it changed (live §4LN probe B2:
+    "Count: 0" before three clicks, "Count: 3" after), or an earlier
+    `execute` run of a program the agent then fixed and re-ran (§4LO:
+    "Accuracy: 0.87", edit, "Accuracy: 0.91") — the later reading
+    supersedes it; not two sources disagreeing."""
+    try:
+        oi = next(i for i, ln in enumerate(lines) if ln is other)
+        hi = next(i for i, ln in enumerate(lines) if ln is home)
+    except StopIteration:
+        return False
+    if oi >= hi:
+        return False
+    po, ph = _browser_page_of(lines, oi), _browser_page_of(lines, hi)
+    if po and po == ph:
+        return True
+    ro, rh = _run_block_of(lines, oi), _run_block_of(lines, hi)
+    return ro is not None and rh is not None and ro < rh
 
 
 _META_LINE_RE = re.compile(r"^\s*(?:LENGTH|EXIT CODE|HTTP_STATUS|STATUS|TRUNCATED|ELAPSED)\s*:", re.I)
@@ -2684,7 +2745,7 @@ def _block_failed_or_empty(name: str, body: str) -> bool:
     the body carries one, prose rules otherwise) or an empty retrieval (the
     turn's evidence gate, for the tools it knows). Never a third vocabulary."""
     from ..distill.outcome_heuristics import _looks_like_tool_error
-    if _looks_like_tool_error(body):
+    if _looks_like_tool_error(body, name):
         return True
     if not body.strip() or body.strip().lower() in ("(empty output)", "(no output)", "no results", "no results found."):
         return True

@@ -32,9 +32,10 @@ FALLBACK_CHAINS = {
     "postgres_admin": [
         ("execute", "If the database connection failed, try executing SQL via a Python script with execute."),
     ],
-    "vision_analysis": [
-        ("file_system", "If vision analysis failed, try reading the file as text with file_system."),
-    ],
+    # vision_analysis: NO chain (§4LM). "Read it as text with file_system"
+    # sent the model to a binary-file refusal that points back at vision, and
+    # contradicted the failure's own advice ("Do NOT retry"); each vision
+    # failure message carries its own next step.
     "delegate_to_swarm": [
         ("execute", "If swarm delegation failed, try executing the task directly with execute."),
     ],

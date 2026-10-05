@@ -512,7 +512,7 @@ def test_recorder_populates_error_flag_on_chat_path():
     import inspect
     src = inspect.getsource(GhostAgent._reconstruct_tool_calls)
     assert "obj.error = _normalize_tool_error" in src
-    assert "_looks_like_tool_error(obj.result)" in src
+    assert "_looks_like_tool_error(obj.result" in src
 
 
 # ── #12 sniffer blind-spot fix (2026-08-05) ─────────────────────────────────

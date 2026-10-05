@@ -94,6 +94,25 @@ def _onion_kind(host: str) -> str:
     return {56: "v3", 16: "v2"}.get(len(lab), "invalid")
 
 
+def _failed_browser_result(content) -> bool:
+    """A browser result whose own header says it did not read the page."""
+    from ..distill.outcome_heuristics import browser_result_status
+    from ..tools.browser_routes import _is_own_host
+    text = content if isinstance(content, str) else str(content or "")
+    # the producer's DECLARED status first (a live row); the header for a
+    # rehydrated one
+    _declared = getattr(content, "status", None)
+    _dv = str(getattr(_declared, "value", _declared or "")).lower()
+    if _dv in ("ok", "partial", "unresolved"):
+        return False
+    st = browser_result_status(text)
+    if st is None or st in ("ok", "partial"):
+        return False
+    # the agent's OWN app answering 4xx/5xx still exists (review)
+    m = re.search(r"(?m)^(?:FINAL_)?URL:\s*(\S+)", text)
+    return not (m and _is_own_host(m.group(1)))
+
+
 def haystack_from(messages: Iterable, tool_texts: Iterable[str] = ()) -> str:
     """Everything the conversation SAW: every non-assistant message's text,
     every tool call's arguments, and the assistant's answers to EARLIER
@@ -102,15 +121,23 @@ def haystack_from(messages: Iterable, tool_texts: Iterable[str] = ()) -> str:
     out, so an invented link cannot vouch for itself."""
     msgs = [m for m in (messages or []) if isinstance(m, dict)]
     last_user = max((i for i, m in enumerate(msgs) if m.get("role") == "user"), default=-1)
-    parts: List[str] = [str(t or "") for t in tool_texts]
+    # §4LN: a browser call that FAILED (404, refused, blocked, runner error)
+    # did not see its URL — its arguments and its result text are not
+    # evidence that the page exists. They vouched for an invented URL that
+    # had just answered 404.
+    failed_ids = {str(m.get("tool_call_id")) for m in msgs
+                  if m.get("role") == "tool" and m.get("tool_call_id") and _failed_browser_result(m.get("content"))}
+    parts: List[str] = [str(t or "") for t in tool_texts if not _failed_browser_result(t)]
     for i, m in enumerate(msgs):
         if m.get("role") == "assistant":
             for tc in m.get("tool_calls") or []:
-                if isinstance(tc, dict):
+                if isinstance(tc, dict) and str(tc.get("id")) not in failed_ids:
                     fn = tc.get("function") or {}
                     parts.append(str(fn.get("arguments") or ""))
             if i > last_user:
                 continue
+        if m.get("role") == "tool" and _failed_browser_result(m.get("content")):
+            continue
         c = m.get("content")
         if isinstance(c, list):
             c = " ".join(str(it.get("text", "")) for it in c if isinstance(it, dict))

@@ -344,4 +344,16 @@ def with_privacy_note(result, area: str):
         async def _noted():
             return with_privacy_note(await result, area)
         return _noted()
-    return f"{result}\n\n{privacy_note(area)}" if isinstance(result, str) else result
+    if not isinstance(result, str):
+        return result
+    text = f"{result}\n\n{privacy_note(area)}"
+    # §4LO: keep a DECLARED outcome's status — an f-string made a refusal or
+    # a declared browser failure a plain string, which coerced to SUCCESS
+    _st = getattr(result, "status", None)
+    if _st is not None:
+        from ..tools.outcome import ToolOutcome
+        return ToolOutcome(text, status=_st, world_changed=getattr(result, "world_changed", None),
+                           reason_code=getattr(result, "reason_code", None),
+                           declared=getattr(result, "declared", True),
+                           call_args=getattr(result, "call_args", None))
+    return text

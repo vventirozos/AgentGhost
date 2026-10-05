@@ -19,6 +19,9 @@ from .file_system import _get_safe_path, _download_redirect_target, _MAX_DOWNLOA
 # either. GHOST_VISUAL_NO_THINK=0 restores thinking for every path.
 _VISION_NO_THINK = os.getenv("GHOST_VISUAL_NO_THINK", "1").strip().lower() not in ("0", "false", "no")
 
+from ..utils.helpers import env_positive
+_VISION_TIMEOUT_S = env_positive("GHOST_VISION_TIMEOUT", 300.0)
+
 
 def _hit_token_cap(resp_data) -> bool:
     """True iff the first choice stopped on the generation cap. Read
@@ -76,37 +79,85 @@ _SNIFFABLE_MIMES = frozenset(
 _NODE_SAFE_MIMES = frozenset({"image/png", "image/jpeg", "image/gif", "image/bmp"})
 
 
+def _has_alpha(img) -> bool:
+    """Does this decoded image carry transparency (alpha band, or a tRNS /
+    GIF transparency index)?"""
+    return (img.mode in ("RGBA", "LA", "PA")
+            or (img.mode in ("P", "L", "RGB", "1") and "transparency" in img.info))
+
+
+def _alpha_may_matter(mime_type, file_bytes) -> bool:
+    """Header-only check (PIL opens lazily) for the node-safe formats that can
+    carry transparency. Anything unreadable is "no" — it ships as before."""
+    if mime_type not in ("image/png", "image/gif"):
+        return False
+    try:
+        import io
+        from PIL import Image
+        with Image.open(io.BytesIO(file_bytes)) as img:
+            return _has_alpha(img)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _flatten_alpha(img):
+    """Composite a transparent image onto an opaque background that CONTRASTS
+    with its visible pixels. llama.cpp decodes with stb_image at 3 channels,
+    which drops alpha WITHOUT compositing: transparent pixels become their
+    stored RGB — usually black — so black text on a transparent PNG arrived
+    as "a completely solid black rectangle" (§4LM live probe V5). Light
+    content (white text/logo) gets a dark background, everything else white."""
+    from PIL import Image, ImageStat
+    rgba = img.convert("RGBA")
+    alpha = rgba.getchannel("A")
+    try:
+        lum = ImageStat.Stat(rgba.convert("L"), mask=alpha).mean[0]
+    except Exception:  # noqa: BLE001 — a fully transparent image has no opaque pixels
+        lum = 0.0
+    bg = Image.new("RGB", rgba.size, (32, 32, 32) if lum > 160 else (255, 255, 255))
+    bg.paste(rgba, mask=alpha)
+    return bg
+
+
 def _normalize_for_node(mime_type, file_bytes):
     """Return (mime, bytes) the vision node can decode natively.
 
-    Node-safe formats pass through untouched. Everything else (webp, tiff,
-    ...) is re-encoded to PNG — first frame only for animations. If Pillow
-    is missing or cannot decode the bytes (e.g. SVG), the original data
-    ships unchanged with a warning, so the request behaves exactly as it
-    did before this guard existed instead of dying here.
+    Node-safe formats pass through untouched — unless they carry
+    transparency, which the node would drop (see `_flatten_alpha`).
+    Everything else (webp, tiff, ...) is re-encoded to PNG — first frame
+    only for animations. If Pillow is missing or cannot decode the bytes
+    (e.g. SVG), the original data ships unchanged with a warning, so the
+    request behaves exactly as it did before this guard existed instead of
+    dying here.
     """
-    if mime_type in _NODE_SAFE_MIMES:
+    if mime_type in _NODE_SAFE_MIMES and not _alpha_may_matter(mime_type, file_bytes):
         return mime_type, file_bytes
     try:
         import io
         from PIL import Image
         with Image.open(io.BytesIO(file_bytes)) as img:
-            # PNG cannot hold CMYK/YCbCr/etc.; flatten exotic modes, keeping
-            # alpha where the source may carry it (palette modes included).
-            if img.mode in ("P", "PA"):
-                img = img.convert("RGBA")
-            elif img.mode not in ("RGB", "RGBA", "L", "LA", "1"):
-                img = img.convert("RGB")
+            if (mime_type in _NODE_SAFE_MIMES and img.mode in ("RGBA", "LA")
+                    and img.getchannel("A").getextrema()[0] == 255):
+                # an alpha band that is fully opaque (most RGBA screenshots):
+                # nothing to composite — ship the original, untouched (review)
+                return mime_type, file_bytes
             # Bound the OUTPUT, not just the input: a 10 MB webp can decode
             # to a 100+ MB PNG. Same pixel budget as PDF rasterisation —
-            # far above what vision models sample at.
+            # far above what vision models sample at. Resized BEFORE the
+            # flatten, so the RGBA copies are made at the bounded size.
             w, h = img.size
             if w * h > _MAX_PDF_PAGE_PIXELS:
                 scale = (_MAX_PDF_PAGE_PIXELS / (w * h)) ** 0.5
                 img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+            if _has_alpha(img):
+                img = _flatten_alpha(img)
+            elif img.mode not in ("RGB", "L", "1"):
+                # PNG cannot hold CMYK/YCbCr/etc.; palette and exotic modes
+                # are flattened to RGB.
+                img = img.convert("RGB")
             buf = io.BytesIO()
             img.save(buf, format="PNG")
-        pretty_log("Vision Transcode", f"{mime_type} → image/png (node-safe)", icon=Icons.TOOL_DEEP)
+        pretty_log("Vision Transcode", f"{mime_type} → image/png (node-safe, opaque)", icon=Icons.TOOL_DEEP)
         return "image/png", buf.getvalue()
     except Exception as e:
         pretty_log("Vision Transcode",
@@ -115,11 +166,23 @@ def _normalize_for_node(mime_type, file_bytes):
         return mime_type, file_bytes
 
 
-async def _normalize_for_node_async(mime_type, file_bytes):
-    """Thread-dispatching wrapper: node-safe formats skip the hop entirely;
-    only an actual transcode (PIL decode+encode is CPU-bound) leaves the
-    event loop."""
+def _undecodable(mime_type, target) -> str:
+    """The deterministic refusal for bytes the node cannot decode (SVG, HEIC,
+    AVIF … after a failed transcode), or "". Shipping them anyway made the
+    node answer 4xx and the tool say "the vision node is offline" — a false
+    cause that invited a retry (§4LM)."""
     if mime_type in _NODE_SAFE_MIMES:
+        return ""
+    return (f"Error: '{target}' is {mime_type or 'an unknown image type'}, which the vision "
+            "model cannot decode and which could not be converted. Do NOT retry; convert it "
+            "to PNG first (e.g. execute: `convert in.svg out.png`, or cairosvg) and analyse that.")
+
+
+async def _normalize_for_node_async(mime_type, file_bytes):
+    """Thread-dispatching wrapper: node-safe, opaque images skip the hop (the
+    transparency check reads only the header); only an actual transcode
+    (PIL decode+encode is CPU-bound) leaves the event loop."""
+    if mime_type in _NODE_SAFE_MIMES and not _alpha_may_matter(mime_type, file_bytes):
         return mime_type, file_bytes
     return await asyncio.to_thread(_normalize_for_node, mime_type, file_bytes)
 
@@ -131,6 +194,21 @@ async def _normalize_for_node_async(mime_type, file_bytes):
 _MAX_PDF_PAGE_PIXELS = 4_000_000
 
 
+_ACTIONS = frozenset({"describe_picture", "verify_ui", "graph_analysis",
+                      "extract_text_picture", "extract_text_pdf"})
+# The short names the model reaches for, mapped to the action they mean (the
+# old fall-through answered them all with a generic caption — `ocr` got no
+# transcription, `verify` no verdict).
+_ACTION_ALIASES = {
+    "describe": "describe_picture", "describe_image": "describe_picture", "caption": "describe_picture",
+    "analyze": "describe_picture", "analyse": "describe_picture",
+    "ocr": "extract_text_picture", "extract_text": "extract_text_picture", "read_text": "extract_text_picture",
+    "verify": "verify_ui", "check_ui": "verify_ui",
+    "graph": "graph_analysis", "chart": "graph_analysis", "chart_analysis": "graph_analysis",
+    "pdf": "extract_text_pdf", "extract_pdf": "extract_text_pdf",
+}
+
+
 async def tool_vision_analysis(action: str = None, target: str = None, llm_client=None, sandbox_dir: Path = None, tor_proxy: str = None, prompt: str = None, **kwargs):
     if not action or not target:
         return "SYSTEM ERROR: The 'action' and 'target' parameters are MANDATORY."
@@ -138,6 +216,13 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
     # "Verify_UI" / "verify-ui" must not silently fall into the generic
     # else-branch and return a caption where a verdict was asked for.
     action = str(action).strip().lower().replace("-", "_")
+    action = _ACTION_ALIASES.get(action, action)
+    # §4LM: an unknown action used to fall through to "Analyze the image."
+    # and return a normal caption — `ocr` / `verify` got a description where
+    # text or a verdict was asked for, and it still counted as a look.
+    if action not in _ACTIONS:
+        return ("SYSTEM ERROR: unknown vision_analysis action "
+                f"'{action}'. Use one of: {', '.join(sorted(_ACTIONS))}.")
     # 72, not 30: the old cap cut real filenames mid-word in the operator
     # stream ("pinball_render_chec") — the target IS the signal here.
     pretty_log("Vision AI", f"{action} -> {str(target)[:72]}", icon=Icons.TOOL_DEEP)
@@ -179,13 +264,21 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
     try:
         if is_url:
             # SSRF guard (shared): block internal/metadata hosts before fetch.
-            from ..utils.helpers import url_ssrf_reason as _url_ssrf_reason
+            from ..utils.helpers import url_ssrf_reason
+            from ..utils.egress_guard import resolve_egress_proxy
+            # Fail-closed like the download (§4P), and the guard WITHOUT a
+            # host-side DNS lookup over Tor (§4LM): resolving first sent the
+            # target's name to the local resolver in cleartext.
+            proxy_url = resolve_egress_proxy(tor_proxy, target)
+            if proxy_url and proxy_url.startswith("socks5://"):
+                proxy_url = proxy_url.replace("socks5://", "socks5h://")
+            _ssrf_resolve = not bool(proxy_url)
+
+            def _url_ssrf_reason(u):
+                return url_ssrf_reason(u, resolve=_ssrf_resolve)
             _ssrf = _url_ssrf_reason(target)
             if _ssrf:
                 return f"Error: {_ssrf}"
-            proxy_url = tor_proxy
-            if proxy_url and proxy_url.startswith("socks5://"):
-                proxy_url = proxy_url.replace("socks5://", "socks5h://")
 
             # Same 50 MB ceiling as the local-file branch — STREAM with a byte
             # cap so a multi-GB URL can't OOM the host before the cap is seen
@@ -248,6 +341,9 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
                             f"downloaded bytes carry no image signature — refusing to send "
                             f"non-image data to the vision model.")
                 content_type, _norm_bytes = await _normalize_for_node_async(content_type, file_bytes)
+                _bad = _undecodable(content_type, target)
+                if _bad:
+                    return _bad
                 b64_images.append((content_type, base64.b64encode(_norm_bytes).decode("utf-8")))
         else:
             path = _get_safe_path(sandbox_dir, target)
@@ -261,6 +357,7 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
                 if root_path.exists():
                     path = root_path
             if not path.exists():
+                pretty_log("Vision Error", f"not found: {str(target)[:72]}", level="WARNING", icon=Icons.WARN)
                 return f"Error: File '{target}' not found. Use the `file_system` tool with operation='list_files' to check the sandbox directory."
 
             # Hard cap PDFs / images at 50 MB. Without this an attacker
@@ -296,6 +393,9 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
                             f"use file_system(operation='read') instead."
                         )
                 mime_type, _norm_bytes = await _normalize_for_node_async(mime_type, file_bytes)
+                _bad = _undecodable(mime_type, target)
+                if _bad:
+                    return _bad
                 b64_images.append((mime_type, base64.b64encode(_norm_bytes).decode("utf-8")))
 
         # PDF rasterisation is gated on the file ACTUALLY being a PDF.
@@ -400,7 +500,10 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
             # that emptied five of six live captions on 2026-09-24).
             payload["chat_template_kwargs"] = {"enable_thinking": False}
 
-        resp_data = await llm_client.chat_completion(payload, use_vision=True)
+        # Bounded (§4LM): the vision node is the single main llama slot, and
+        # the client default is 1200 s. A no-think caption takes seconds; a
+        # 4096-token cap hit ~45 s.
+        resp_data = await llm_client.chat_completion(payload, use_vision=True, timeout=_VISION_TIMEOUT_S)
         # `.get("content", "")` returns None when the key exists with a null
         # value (some OpenAI-compatible servers do that) → the concat below
         # would TypeError and a SUCCESS gets reported as an error. Coerce.
@@ -416,12 +519,16 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
         # answer that did NOT hit the cap is contention worth one retry.
         if not analysis.strip():
             from .outcome import ToolOutcome
+            pretty_log("Vision Error", f"EMPTY answer for {str(target)[:72]}"
+                       + (" (token cap)" if _hit_token_cap(resp_data) else ""),
+                       level="WARNING", icon=Icons.WARN)
             if _hit_token_cap(resp_data):
                 return ToolOutcome.failed(
                     "Vision API Error: the vision model spent its whole token "
                     "budget reasoning and returned NO answer (finish_reason="
                     "length). Do NOT retry this call — the same call gives "
-                    "the same result. Present the image to the user as-is.",
+                    "the same result. You have NOT seen this image: tell the "
+                    "user it could not be read, and do not describe its content.",
                     world_changed=False, reason_code="vision_thinking_cap")
             return ToolOutcome.failed(
                 "Vision API Error: the vision node returned an EMPTY result "
@@ -434,14 +541,23 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
         page_note = ("\nNOTE: this answer was cut at the model's token cap — it may be incomplete."
                      if _hit_token_cap(resp_data) else "")
         if pdf_total_pages > pdf_pages_analyzed:
+            _rest = (f"download it first (file_system operation='download', url='{target}'), then "
+                     f"use file_system(operation='read_chunked', path=<the saved file>, "
+                     f"page={pdf_pages_analyzed + 1})" if is_url else
+                     f"use file_system(operation='read_chunked', path='{target}', "
+                     f"page={pdf_pages_analyzed + 1})")
             page_note += (
                 f"\nNOTE: this PDF has {pdf_total_pages} pages; only the first "
-                f"{pdf_pages_analyzed} were analyzed. For the rest, use "
-                f"file_system(operation='read_chunked', path='{target}', "
-                f"page={pdf_pages_analyzed + 1}) or knowledge_base ingestion."
+                f"{pdf_pages_analyzed} were analyzed. For the rest, {_rest} "
+                f"or knowledge_base ingestion."
             )
+        # §4LM: a caption is CONTENT — it may quote "Traceback", "EXIT CODE: 2"
+        # or "SYSTEM ERROR" off a screenshot. Declared OK so no text sniffer
+        # re-reads a description of an error as this call failing.
+        from .outcome import ToolOutcome
         if action == "verify_ui":
-            return "UI VERIFICATION RESULT (judged from pixels only):\n" + analysis + page_note
+            return ToolOutcome.ok("UI VERIFICATION RESULT (judged from pixels only):\n" + analysis + page_note,
+                                  world_changed=False)
         # Moment-of-use steer (same pattern as browser's PRE_INTERACTION /
         # RENDER_CHECK lines): the prompt-level guidance loses to habit and
         # to auto-learned lessons that embed the old caption workflow — a
@@ -458,7 +574,7 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
                 "details} instead of a caption that may omit the detail "
                 "you need."
             )
-        return "VISION ANALYSIS RESULT:\n" + analysis + page_note + tip
+        return ToolOutcome.ok("VISION ANALYSIS RESULT:\n" + analysis + page_note + tip, world_changed=False)
 
     except Exception as e:
         pretty_log("Vision Error", str(e), level="ERROR", icon=Icons.FAIL)

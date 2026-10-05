@@ -64,7 +64,10 @@ def test_by_default_every_capability_is_dropped_but_the_seven_root_needs(tmp_pat
     kw, _ = _create_kwargs(tmp_path, monkeypatch)
     assert kw["cap_drop"] == ["ALL"]
     assert kw["cap_add"] == list(SANDBOX_KEPT_CAPS)
-    assert set(SANDBOX_KEPT_CAPS) == {"CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "SETGID", "SETUID", "KILL"}
+    # §4LO: SETUID/SETGID dropped — with them sandbox code could setuid() to the
+    # uid the egress firewall exempts (debian-tor) and bypass Tor
+    assert set(SANDBOX_KEPT_CAPS) == {"CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID"}
+    assert not {"SETUID", "SETGID", "KILL"} & set(SANDBOX_KEPT_CAPS)   # KILL: root could signal Tor
     for gone in ("NET_RAW", "NET_ADMIN", "SYS_ADMIN", "MKNOD", "SYS_CHROOT", "SETPCAP", "SETFCAP", "AUDIT_WRITE",
                  "NET_BIND_SERVICE", "SYS_PTRACE", "DAC_READ_SEARCH"):
         assert gone not in kw["cap_add"], gone

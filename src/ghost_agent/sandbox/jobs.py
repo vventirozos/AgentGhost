@@ -828,8 +828,10 @@ class SandboxJobSupervisor:
             # and was read with a plain `open()`. `path.stat()` above also
             # follows the link, which is how it got here.
             half = _LOG_READ_CAP // 2
-            _all = _read_bytes_nofollow(path)
-            head, tail = _all[:half], _all[-half:]
+            # §4LO: read the two ends, never the whole file — a 1 GB job log
+            # read whole cost ~2 GB of host memory to keep 32 MB of it
+            head = _read_bytes_nofollow(path, max_bytes=half, from_start=True)
+            tail = _read_bytes_nofollow(path, max_bytes=half)
             return (head
                     + f"\n\n[... {size - _LOG_READ_CAP} bytes of job output "
                       f"omitted — read {self.log_rel_path(jid)} ...]\n\n"

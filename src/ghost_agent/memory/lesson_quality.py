@@ -403,3 +403,41 @@ _NEGATED_LEAD_RE = re.compile(
     r"(?:ever\s+)?(?:(?:use|run|call|execute|issue|type|try|using|running|calling|executing)\s+)?"
     r"(?:a\s+|an\s+|the\s+)?(?:command\s+|commands\s+like\s+)?[`'\"(]*$",
     re.IGNORECASE)
+
+
+#: `tool(operation=…)` / `tool(action=…)` written inside a lesson — not a
+#: method call (`page.evaluate(action=…)`), so no "." right before the name
+_TOOL_CALL_IN_TEXT_RE = re.compile(
+    r"(?<![.\w])([a-z][a-z0-9_]{2,})\s*\(\s*(?:operation|action)\s*=\s*['\"]?([A-Za-z_]+)")
+#: tools registered at runtime, outside TOOL_DEFINITIONS (review §4LL)
+_RUNTIME_TOOLS = frozenset({"vision_analysis", "image_generation", "report_pdf"})
+_NEGATED_CALL_RE = re.compile(r"\b(?:do not|don't|never|avoid|instead of|not)\b[^.\n]{0,40}$", re.IGNORECASE)
+
+
+def unknown_tool_calls(text) -> list:
+    """§4LL: the tool calls a lesson PRESCRIBES that do not exist — a tool
+    name the agent does not have, or a file_system operation it does not
+    accept. The reflection on the §4KB checks saved "call `git(operation=
+    write, …)`" after the git tool was removed; nothing compared a lesson's
+    calls with the registry. A call named in a negation ("do NOT call
+    git(…)") is a warning, not a prescription. Empty when the registry cannot
+    be read (never blocks on a broken import)."""
+    s = str(text or "")
+    if "(" not in s:
+        return []
+    try:
+        from ..tools.registry import TOOL_DEFINITIONS
+        from ..tools.file_system import ACCEPTED_OPS
+    except Exception:  # noqa: BLE001
+        return []
+    known = {str(((d or {}).get("function") or {}).get("name") or "") for d in TOOL_DEFINITIONS} | _RUNTIME_TOOLS
+    bad = []
+    for m in _TOOL_CALL_IN_TEXT_RE.finditer(s):
+        if _NEGATED_CALL_RE.search(s[max(0, m.start() - 60):m.start()]):
+            continue
+        tool, op = m.group(1), m.group(2).lower()
+        if tool not in known:
+            bad.append(f"{tool}(…)")
+        elif tool == "file_system" and op not in ACCEPTED_OPS:
+            bad.append(f"file_system(operation='{op}')")
+    return bad

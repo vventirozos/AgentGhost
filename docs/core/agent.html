@@ -1933,6 +1933,18 @@
     <code>[DONE]</code>, and the trajectory is labelled failed. A write the user asked not to run is said, not
     failed.</li>
   </ul>
+  <h2 id="4lm">Image understanding <span class="tag">2026-10-04 &sect;4LM</span></h2>
+  <ul>
+    <li><code>_attachment_filename</code> names a pasted image <code>vision_&lt;sha12&gt;.&lt;ext&gt;</code> by its bytes, and the write is atomic. <code>_ATTACHMENT_NAME_RE</code> treats that name as provenance: <code>_select_visual_evidence</code> takes it as the user's <em>before</em> image (read from the raw message by <code>_user_attachment_names</code>) and never as the "after" render.</li>
+    <li><code>_resolve_image_path</code> no longer resolves another project's file.</li>
+    <li>In a batch, <code>vision_analysis</code> runs after every other tool.</li>
+    <li>The "SYSTEM ERROR" banner arm skips a declared success.</li>
+    <li><code>_action_failed</code> uses the prefix rule for content tools.</li>
+    <li><code>_drop_missing_download_links</code> replaces an owner's link to a file that does not exist.</li>
+    <li>The member wall accepts <code>/name</code> and <code>/api/download/name</code>.</li>
+    <li><code>_salvage_vision_args</code> reads each field from its own tag.</li>
+  </ul>
+  <p>Details: <a href="../tools/vision.html#4lm">vision &sect;4LM</a>.</p>
 </main>
 </body>
 </html>
