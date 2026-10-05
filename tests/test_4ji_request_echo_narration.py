@@ -283,7 +283,8 @@ def _arms_flag(stmts):
 NOT_A_BREAKER = ("_proj_task_closed_this_req", "_latch_forces_final",
                  "_NO_TOOL_DISCLAIM_PATTERNS", "_plan_focus_none",
                  "_lang_mismatch",            # §4JR: the reply-language regeneration (text-only turn)
-                 "_plan_signals_done")        # §4JS: the planner's DONE plan (was force_stop)
+                 "_plan_signals_done",        # §4JS: the planner's DONE plan (was force_stop)
+                 "_DEAD_END_REFUSALS")        # §4LW: a refusal that cannot change this request (normal wrap-up)
 
 
 def test_every_breaker_force_final_arms_the_flag():
@@ -302,7 +303,7 @@ def test_every_breaker_force_final_arms_the_flag():
             else:
                 bare.append(test_src)
     assert bare == [], f"force-final site(s) that neither arm the flag nor are a named non-breaker: {bare}"
-    assert len(exempt) == 6                                   # +2 on 2026-09-22: §4JR language regeneration, §4JS planner DONE
+    assert len(exempt) == 7                                   # +2 on 2026-09-22: §4JR/§4JS; +1 2026-10-05 §4LW dead-end refusal
     assert len(armed) == 13                                   # +2 on 2026-09-29: cross-turn loop report, member refusals (§4KL)
     # the six §4JI sites, by their enclosing condition
     for marker in ("execution_failure_count >= 6 or total_fail >= 8",     # Failure Cap

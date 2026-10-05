@@ -1815,9 +1815,12 @@ async def tool_manage_composed_skills(context=None, action: str = None,
         return await runner(**run_params)
 
     if action in ("approve", "delete", "define") and _not_an_owner_write():
-        return (f"Error: a probe or background request does not change the macro store "
-                f"({action}) — nothing changed. STOP: do not retry this in this turn; tell "
-                f"the user it needs their own request.")
+        from .outcome import ToolOutcome as _TO
+        return _TO.rejected(
+            f"Error: a probe or background request does not change the macro store "
+            f"({action}) — nothing changed. STOP: do not retry this in this turn; tell "
+            f"the user it needs their own request.",
+            world_changed=False, reason_code="not_owner_write")
 
     if action == "approve":
         if not name:

@@ -1532,7 +1532,9 @@ def _lifecycle_confirmation(store, act, rid, token):
         # one turn, taking each refusal as a cue to try again (§4LQ)
         _key = (_rid_now, kind, rid)
         if _key in _PREVIEWED_THIS_REQUEST:
-            return _err(f"already previewed in this turn — {_stop}")
+            from .outcome import ToolOutcome as _TO
+            return _TO.rejected(f"Error: already previewed in this turn — {_stop}",
+                                world_changed=False, reason_code="confirm_dead_end")
         if len(_PREVIEWED_THIS_REQUEST) > 256:
             _PREVIEWED_THIS_REQUEST.clear()
         tok = _store_plan({"kind": kind, "rid": _rid_now,
@@ -1554,7 +1556,9 @@ def _lifecycle_confirmation(store, act, rid, token):
                     "to get a new preview for the user")
     why = _confirm_allowed(plan)
     if why:
-        return _err(f"NOT done: {why}. {_stop}")
+        from .outcome import ToolOutcome as _TO
+        return _TO.rejected(f"Error: NOT done: {why}. {_stop}", world_changed=False,
+                            reason_code="confirm_dead_end")
     _drop_plan(token)
     return None
 

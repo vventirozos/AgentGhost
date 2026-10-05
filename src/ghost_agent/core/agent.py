@@ -3363,6 +3363,12 @@ def _backfilled_failure_reason(verifier: Optional[str], verifier_reason: str,
     return structural_reason(structural_cause_for_trajectory(traj))
 
 
+#: Tool refusals that cannot change within the request (§4LV): retrying is
+#: pointless, so the turn loop ends the tool phase on the first one.
+_DEAD_END_REFUSALS = frozenset({"not_owner_write", "confirm_dead_end",
+                                "forget_not_confirmed", "reset_not_confirmed"})
+
+
 #: shell-like tool names a model reaches for — the work runs through `execute`
 _SHELL_LIKE_TOOLS = frozenset({"git", "bash", "sh", "shell", "terminal", "zsh", "cmd", "run_command",
                                "python", "pip", "npm", "curl", "docker"})
@@ -21881,6 +21887,15 @@ class GhostAgent:
                     # re-assert True — harmless; no-result iterations keep
                     # the per-batch reset at the region top.
                     last_was_failure = bool(_res_is_error or _pf_exec_failed)
+
+                    # §4LV/§4LQ: a refusal that CANNOT change within this
+                    # request — a probe/background write, a confirm in the
+                    # preview's own turn — ends the tool phase. The model
+                    # retried a refused probe delete 3-8× despite STOP text.
+                    if getattr(_outcome, "reason_code", None) in _DEAD_END_REFUSALS:
+                        force_final_response = True
+                        logger.info("dead-end refusal (%s) — wrapping up the turn",
+                                    getattr(_outcome, "reason_code", None))
 
                     # One-task-per-turn gate: a manage_projects call that
                     # actually closed a task to DONE ends the interactive

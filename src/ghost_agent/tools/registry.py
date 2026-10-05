@@ -40,6 +40,39 @@ import os
 from ..utils.logging import pretty_log, Icons
 
 
+def _skill_args_error(schema, args):
+    """Why ``args`` do not fit an acquired skill's stored JSON schema, or
+    None. Checks the declared REQUIRED keys, unknown keys when the schema
+    forbids them, and each given value's JSON type — the mistakes a model
+    makes. A missing or malformed schema checks nothing."""
+    if not isinstance(schema, dict):
+        try:
+            import json as _json
+            schema = _json.loads(schema) if isinstance(schema, str) else None
+        except ValueError:
+            schema = None
+    if not isinstance(schema, dict):
+        return None
+    args = args if isinstance(args, dict) else {}
+    props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    missing = [k for k in (schema.get("required") or []) if k not in args]
+    if missing:
+        return "missing required argument(s): " + ", ".join(map(str, missing))
+    if schema.get("additionalProperties") is False:
+        extra = [k for k in args if k not in props]
+        if extra:
+            return "unknown argument(s): " + ", ".join(map(str, extra))
+    _types = {"string": (str,), "integer": (int,), "number": (int, float), "boolean": (bool,),
+              "array": (list,), "object": (dict,)}
+    for k, v in args.items():
+        want = (props.get(k) or {}).get("type") if isinstance(props.get(k), dict) else None
+        if isinstance(want, str) and want in _types and v is not None:
+            ok = isinstance(v, _types[want]) and not (want in ("integer", "number") and isinstance(v, bool))
+            if not ok:
+                return f"argument '{k}' must be a {want}, got {type(v).__name__}"
+    return None
+
+
 def _acquired_skill_result_class(result) -> str:
     """Classify an acquired-skill execution result: "ok" / "fail" / "infra".
 
@@ -1788,6 +1821,20 @@ def get_available_tools(context):
                     def make_skill_runner(name=skill_name, _mgr=manager):
                         async def _run(**kwargs):
                             import json
+                            # The MODEL's bad arguments are refused here,
+                            # against the skill's own stored schema, before
+                            # anything runs — so they never count against
+                            # the skill (§4LS m2: three of them retired a
+                            # working skill; reading the skill's output for
+                            # argument phrases was tried and reverted).
+                            _arg_err = _skill_args_error(
+                                (_mgr.get_all_skills().get(name) or {}).get("parameters_schema"), kwargs)
+                            if _arg_err:
+                                from .outcome import ToolOutcome as _TOa
+                                return _TOa.rejected(
+                                    f"Error: {name}: {_arg_err} — fix the arguments and call it again "
+                                    f"(nothing was run).", world_changed=False,
+                                    reason_code="acquired_skill_bad_args")
                             args_str = json.dumps(kwargs)
 
                             logger.info(f"Executing Acquired Skill: {name}")

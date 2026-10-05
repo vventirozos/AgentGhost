@@ -1362,6 +1362,24 @@ def _match_word(dist: float) -> str:
     return "weak"
 
 
+def _match_library_name(filename, library):
+    """``(match, ambiguity_error)`` for a document name the model typed.
+    An exact (case-insensitive) name wins; otherwise the documents whose
+    name minus extension equals it — ONE is used, SEVERAL are an error that
+    lists them (§4LT: "q3" silently picked q3.md when the answer was in
+    q3.txt). Shared by query, outline and transcript."""
+    want = str(filename or "").lower()
+    exact = [f for f in library if f.lower() == want]
+    if exact:
+        return exact[0], None
+    stem = want.rsplit(".", 1)[0]
+    by_stem = [f for f in library if f.lower().rsplit(".", 1)[0] == stem]
+    if len(by_stem) > 1:
+        return None, (f"Error: '{filename}' matches several documents: {by_stem}. "
+                      f"Pass one exact name.")
+    return (by_stem[0] if by_stem else None), None
+
+
 async def tool_query_document(filename: str = None, question: str = None,
                               memory_system=None, k: int = 8):
     """Ask a question against ONE ingested document (2026-07-13).
@@ -1388,13 +1406,9 @@ async def tool_query_document(filename: str = None, question: str = None,
     library = library or []
     if filename not in library:
         # Forgiving match: the model often passes a stem or a near-miss.
-        stem = str(filename).lower().rsplit(".", 1)[0]
-        match = next(
-            (f for f in library
-             if f.lower() == str(filename).lower()
-             or f.lower().rsplit(".", 1)[0] == stem),
-            None,
-        )
+        match, _amb = _match_library_name(filename, library)
+        if _amb:
+            return _amb
         if not match:
             return (f"Error: '{filename}' is not in the knowledge base. "
                     f"Available documents: {library or '(none)'}. "
@@ -1495,10 +1509,12 @@ async def tool_document_transcript(filename: str = None, offset=0, max_chars=TRA
         from ..memory.youtube_ingest import existing_document_for, youtube_video_id
         vid = youtube_video_id(filename)
         match = existing_document_for(vid, library) if vid else None
+        stem = ""
         if not match:
             stem = str(filename).lower().rsplit(".", 1)[0]
-            match = next((f for f in library if f.lower() == str(filename).lower()
-                          or f.lower().rsplit(".", 1)[0] == stem), None)
+            match, _amb = _match_library_name(filename, library)
+            if _amb:
+                return _amb
         if not match and stem:
             # A bare prefix is accepted only when it names ONE document.
             starts = [f for f in library if f.lower().startswith(stem)]
@@ -1702,10 +1718,9 @@ async def tool_document_outline(filename: str = None, memory_system=None,
     library = await asyncio.to_thread(memory_system.get_library)
     library = library or []
     if filename not in library:
-        stem = str(filename).lower().rsplit(".", 1)[0]
-        match = next((f for f in library
-                      if f.lower() == str(filename).lower()
-                      or f.lower().rsplit(".", 1)[0] == stem), None)
+        match, _amb = _match_library_name(filename, library)
+        if _amb:
+            return _amb
         if not match:
             return (f"Error: '{filename}' is not in the knowledge base. "
                     f"Available documents: {library or '(none)'}. "

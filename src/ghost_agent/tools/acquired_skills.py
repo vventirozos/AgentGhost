@@ -819,7 +819,8 @@ async def tool_create_skill(sandbox_dir: Path = None, memory_dir: Path = None, m
     if _not_an_owner_write(probe_only=True):
         # probes only: the dream cycle acquires skills in the background
         # through this function, and must keep doing so
-        return "Error: a probe request does not create skills — nothing changed. STOP: do not retry this in this turn."
+        from .outcome import ToolOutcome as _TO
+        return _TO.rejected("Error: a probe request does not create skills — nothing changed. STOP: do not retry this in this turn.", world_changed=False, reason_code="not_owner_write")
     # Tolerate stray kwargs the LLM sometimes invents (observed: `filename`
     # when the model confuses this tool with `execute`). Without this
     # catch-all the registry's `**kwargs` pass-through would raise a
@@ -1093,7 +1094,8 @@ async def tool_manage_skills(sandbox_dir: Path = None, memory_dir: Path = None, 
 
 
     elif action == "delete" and _not_an_owner_write():
-        return "Error: a probe or background request does not delete skills — nothing changed. STOP: do not retry this in this turn."
+        from .outcome import ToolOutcome as _TO
+        return _TO.rejected("Error: a probe or background request does not delete skills — nothing changed. STOP: do not retry this in this turn.", world_changed=False, reason_code="not_owner_write")
     elif action == "delete":
         if not skill_name:
             return "Error: skill_name is required for 'delete' action."
