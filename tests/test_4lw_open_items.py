@@ -85,6 +85,7 @@ async def test_the_turn_loop_stops_calling_tools_after_a_dead_end():
     ts = H._ts([("manage_skills", {"action": "delete", "skill_name": "x"})], StrikeLedger(), set())
     await agent._dispatch_and_process_tool_batch(ts)
     assert ts.force_final_response is True
+    assert any("Do NOT say you will retry" in str(m.get("content")) for m in ts.messages)
 
 
 async def test_an_ordinary_refusal_does_not_end_the_turn():

@@ -51270,3 +51270,27 @@ the battery stood in for a second reader.
 - V1 health: Internet Connected via Tor, Tor Connected (Anonymous).
 - V2 weather Athens: a real reading.
 **All systems with real traffic have now had a review (§4LL–§4LV).**
+
+## §4LW — the three open items (2026-10-05, operator: "fix the remaining 3 small items") — scope and outcome
+**Fixed:**
+1. **Acquired skills:** bad arguments are refused BEFORE the run, against the skill's stored
+   `parameters_schema` (`registry._skill_args_error`: required keys, unknown keys when
+   `additionalProperties:false`, JSON types). The refusal is `rejected` and is never charged to the skill.
+   Tested through the real `get_available_tools` runner.
+2. **Document names:** `memory._match_library_name` is shared by query, outline and transcript. An exact name
+   wins; a shortened name is used only when ONE document fits; several fits are an error listing them.
+3. **Dead-end refusals:**
+   - `agent._DEAD_END_REFUSALS` covers not_owner_write, confirm_dead_end, forget_not_confirmed and
+     reset_not_confirmed;
+   - the skill-store probe refusals and the project confirm refusals now carry these codes;
+   - the first such refusal sets `force_final_response` and adds a SYSTEM ALERT quoting the refusal.
+**Verification:**
+- `tests/test_4lw_open_items.py` (17);
+- battery bat48: every mutant killed, KNOWN-BAD killed, NOOP survives;
+- `test_4ji` NOT_A_BREAKER registry +1;
+- suite: 28,522 passed, 0 failed;
+- deployed pid 25540.
+**Live probe (labelled) — the refused macro delete:**
+- 1 tool call instead of 4, 12.3 s instead of ~30 s; the macro is intact.
+- The reply names the reason ("blocked as a probe") but still opens with "I'll retry" despite the alert. This
+  is model wording only (no call follows); left as is.

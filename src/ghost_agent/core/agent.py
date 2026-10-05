@@ -21896,6 +21896,13 @@ class GhostAgent:
                         force_final_response = True
                         logger.info("dead-end refusal (%s) — wrapping up the turn",
                                     getattr(_outcome, "reason_code", None))
+                        # …and say WHY, or the reply promises a retry that
+                        # never comes ("Let me retry…", live K1c probe)
+                        messages.append({"role": "user", "content": (
+                            "SYSTEM ALERT: that call was refused and cannot succeed in this "
+                            "request — tools are now closed. Do NOT say you will retry. Tell "
+                            "the user plainly what was refused and why: "
+                            + str(_outcome)[:300])})
 
                     # One-task-per-turn gate: a manage_projects call that
                     # actually closed a task to DONE ends the interactive
