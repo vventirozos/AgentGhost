@@ -88,6 +88,23 @@ async def tool_notify_operator(message: str = None, context=None, **kwargs):
     if len(message) > _MAX_MESSAGE_CHARS:
         message = message[:_MAX_MESSAGE_CHARS - 1].rstrip() + "…"
 
+    # A probe never pages the owner or spends the hourly quota (§4LZ A-F3:
+    # 12 probe calls used the whole quota and the owner's next real
+    # notification was refused). It is told what WOULD have been sent.
+    try:
+        from ..utils.logging import is_probe_request_id, request_id_context, request_origin_context, ORIGIN_PROBE
+        if (is_probe_request_id(str(request_id_context.get() or ""))
+                or str(request_origin_context.get() or "") == ORIGIN_PROBE):
+            from .outcome import ToolOutcome
+            # the head says NOT SENT and tells the model what to say: the
+            # first wording drew "the message was sent" in the reply (§4LZ probe)
+            return ToolOutcome.ok(f"PROBE — NOT SENT. This is a test (probe) request, so nothing "
+                                  f"was delivered and nothing was recorded. Tell the user the "
+                                  f"notification was NOT sent because this was a test request. "
+                                  f"(It would have said: {message})")
+    except Exception:  # noqa: BLE001
+        pass
+
     log = get_activity_log(context)
     if log is None:
         return ("Error: the activity ledger is not attached — operator "

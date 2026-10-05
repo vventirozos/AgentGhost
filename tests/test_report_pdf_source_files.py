@@ -67,10 +67,11 @@ async def test_source_files_only_satisfies_required(tmp_path):
     assert out.startswith("SUCCESS")  # source_files alone is enough; no 'sections' needed
 
 
-async def test_missing_source_files_noted_in_success(tmp_path):
+async def test_missing_source_files_make_the_report_partial(tmp_path):
+    # §4LZ B4: an incomplete report is declared partial, and the head says so
     (tmp_path / "x.md").write_text("# X\n## X1\nbody")
     out = await tool_generate_pdf(
         title="R", source_files=["x.md", "gone.md"], sandbox_dir=tmp_path,
     )
-    assert out.startswith("SUCCESS")
+    assert out.startswith("PARTIAL") and "INCOMPLETE" in out
     assert "gone.md" in out and "skipped" in out.lower()

@@ -1876,11 +1876,13 @@ def get_available_tools(context):
                                     manager.log_telemetry(name, success=False)
                                 except Exception:
                                     pass
-                                return msg
+                                from .outcome import ToolOutcome as _TOf
+                                return _TOf.failed(msg, reason_code='acquired_skill_unreadable')   # §4LZ B8
                             except Exception as e:
                                 msg = f"Could not read acquired skill {name}: {type(e).__name__}: {e}"
                                 logger.error(msg)
-                                return msg
+                                from .outcome import ToolOutcome as _TOf
+                                return _TOf.failed(msg, reason_code='acquired_skill_unreadable')   # §4LZ B8
 
                             try:
                                 result = await tool_execute(
@@ -1915,7 +1917,9 @@ def get_available_tools(context):
                                 manager.log_telemetry(name, success=False)
                                 logger.error(f"Acquired Skill '{name}' execution failed: {e}")
                                 pretty_log("Skill Error", f"Custom tool '{name}' failed: {str(e)}", level="ERROR", icon=Icons.FAIL)
-                                return str(e)
+                                from .outcome import ToolOutcome as _TOf
+                                return _TOf.failed(f"Acquired skill '{name}' failed: {e}",
+                                                   reason_code="acquired_skill_exception")   # §4LZ B8
                         return _run
 
                     tools[skill_name] = make_skill_runner(skill_name)

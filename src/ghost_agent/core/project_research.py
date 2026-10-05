@@ -239,6 +239,15 @@ def reconcile_research_dir(store, project_id: str) -> int:
 
 def _upsert_index(store, project_id: str, entry: Dict[str, Any]) -> None:
     """Insert/replace an index entry by slug, newest last, capped."""
+    if callable(getattr(store, "_atomic_metadata_update", None)):
+        def _up(meta):                       # atomic (§4LZ C2)
+            idx = [e for e in (meta.get(INDEX_META_KEY) or [])
+                   if isinstance(e, dict) and e.get("slug") != entry["slug"]]
+            idx.append(entry)
+            meta[INDEX_META_KEY] = idx[-_MAX_INDEX_ENTRIES:]
+            return meta
+        store._atomic_metadata_update(project_id, _up)
+        return
     proj = store.get_project(project_id) or {}
     meta = dict(proj.get("metadata") or {})
     idx = [e for e in (meta.get(INDEX_META_KEY) or [])

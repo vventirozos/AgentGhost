@@ -182,7 +182,7 @@ class TestVerificationFormatMatchesProduction:
 
         captured_body = {}
 
-        async def _capture(body, background_tasks=None):
+        async def _capture(body, background_tasks=None, **kw):
             captured_body["content"] = body["messages"][0]["content"]
             return ("ok", None, None)
 

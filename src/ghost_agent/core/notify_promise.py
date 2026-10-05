@@ -52,6 +52,11 @@ def capture_promise(store, project_id, user_text, req_id: str = "") -> bool:
             return False
         if str(proj.get("status") or "").upper() in _TERMINAL:
             return False
+        # a probe's ask is never parked: it would page the owner later,
+        # from the idle loop (§4LZ review)
+        from ..utils.logging import is_probe_request_id, request_kind
+        if is_probe_request_id(str(req_id or "")) or request_kind() == "probe":
+            return False
         entry = {
             "ask": " ".join(str(user_text or "").split())[:200],
             "ts": time.time(),

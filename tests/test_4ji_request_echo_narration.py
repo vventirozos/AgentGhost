@@ -304,7 +304,7 @@ def test_every_breaker_force_final_arms_the_flag():
                 bare.append(test_src)
     assert bare == [], f"force-final site(s) that neither arm the flag nor are a named non-breaker: {bare}"
     assert len(exempt) == 7                                   # +2 on 2026-09-22: §4JR/§4JS; +1 2026-10-05 §4LW dead-end refusal
-    assert len(armed) == 13                                   # +2 on 2026-09-29: cross-turn loop report, member refusals (§4KL)
+    assert len(armed) == 14                                   # +2 on 2026-09-29: cross-turn loop report, member refusals (§4KL); +1 2026-10-05 §4LZ duplicate-setter budget
     # the six §4JI sites, by their enclosing condition
     for marker in ("execution_failure_count >= 6 or total_fail >= 8",     # Failure Cap
                    "_acnt >= _hard_n and _nav_case",                    # never-extracted navigate

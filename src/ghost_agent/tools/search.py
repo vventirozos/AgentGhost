@@ -1308,8 +1308,12 @@ async def tool_search_ddgs(query: str, tor_proxy: str):
         # Every web ticket failed; the encyclopedia alone is still an answer.
         pretty_log("Wiki Supplement", f"el.wikipedia answered where every web engine failed: {_wiki[0]['title'][:60]}",
                    icon=Icons.TOOL_SEARCH)
-        clean_output = format_search_results(_wiki)
-        _cache_put(_cache_key, clean_output)
+        # …but SAY it is encyclopedia-only, and do NOT cache it (§4LZ B6): it
+        # read like normal results and a repeat query after the engines
+        # recovered got the same lone page for 300 s
+        clean_output = ("NOTE: every web search engine failed — the ONLY source below is "
+                        "the encyclopedia (el.wikipedia). Treat coverage as limited; say so "
+                        "to the user, or search again later.\n\n" + format_search_results(_wiki))
         return clean_output
 
     # --- QUERY REFORMULATION ---

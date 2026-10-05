@@ -85,6 +85,16 @@ def record_runtime(
     proj = store.get_project(project_id)
     if not proj:
         return
+    if callable(getattr(store, "_atomic_metadata_update", None)):
+        # counters in ONE atomic read-modify-write (§4LZ C2: two 10 s + 5 s
+        # ticks left runtime 5.0 — the budget caps undercounted)
+        def _add(meta):
+            meta["runtime_used_seconds"] = float(meta.get("runtime_used_seconds", 0) or 0) + float(seconds)
+            if tool_calls:
+                meta["tool_call_used"] = int(meta.get("tool_call_used", 0) or 0) + int(tool_calls)
+            return meta
+        store._atomic_metadata_update(project_id, _add)
+        return
     meta = dict(proj.get("metadata") or {})
     meta["runtime_used_seconds"] = float(
         meta.get("runtime_used_seconds", 0) or 0

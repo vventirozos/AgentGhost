@@ -2348,6 +2348,11 @@ async def tool_manage_projects(
                 # visible signal (via pretty_log) that something is
                 # wrong at the model level.
                 existing_meta = dict(existing.get("metadata") or {})
+                # DEEP copy: helpers below mutate nested values in place
+                # (`constraint_origins`), which a shallow copy hides from
+                # the changed-keys diff (§4LZ review)
+                import copy as _copy
+                _meta_before = _copy.deepcopy(existing_meta)
                 # Count the BURST, not the lifetime: a duplicate long after
                 # the last one is a fresh mistake, not turn 4 of a loop.
                 try:
@@ -2388,7 +2393,12 @@ async def tool_manage_projects(
                             c for c in _retired
                             if c.lower() not in _fresh_keys]
                 try:
-                    store.update_project(existing["id"], metadata=existing_meta)
+                    # only the keys THIS call changed — metadata merges, so
+                    # a whole-dict write put stale values back (§4LZ C2)
+                    _changed = {k: v for k, v in existing_meta.items()
+                                if k not in _meta_before or _meta_before[k] != v}
+                    if _changed:
+                        store.update_project(existing["id"], metadata=_changed)
                 except Exception:
                     pass
                 _set_current(context, existing["id"])
@@ -2587,8 +2597,7 @@ async def tool_manage_projects(
                 )
             if _probe_turn_now():
                 try:                                   # §4LP: a probe may clean up ITS OWN projects
-                    store.update_project(pid, metadata={**(store.get_project(pid).get("metadata") or {}),
-                                                        "probe_created": True})
+                    store.update_project(pid, metadata={"probe_created": True})   # merges (§4LZ C2)
                 except Exception:  # noqa: BLE001
                     pass
             return _ok({"created": pid,
@@ -3933,6 +3942,17 @@ async def tool_manage_projects(
             # same bumped port. An existing non-archived fork is returned
             # idempotently instead.
             for _child in store.list_children(project_id):
+                if ((_child.get("metadata") or {}).get("probe_created")
+                        and not _probe_turn_now()):
+                    # never hand the owner a probe's fork (§4LZ A-F4) — and
+                    # archive it, or the owner's fork mints a second "X vN"
+                    # on the same bumped port (review)
+                    if str(_child.get("status", "")).upper() != "ARCHIVED":
+                        try:
+                            store.update_project(_child["id"], status="ARCHIVED")
+                        except Exception:  # noqa: BLE001
+                            pass
+                    continue
                 if str(_child.get("status", "")).upper() == "ARCHIVED":
                     continue
                 _set_current(context, _child["id"])
@@ -3971,6 +3991,10 @@ async def tool_manage_projects(
                 "constraint_origins": dict(pmeta.get("constraint_origins") or {}),
                 "research_index": pmeta.get("research_index") or [],
             }
+            if _probe_turn_now():
+                # a probe's fork is marked like a probe's create (§4LZ A-F4),
+                # so it can clean it up and the owner never inherits it
+                new_meta["probe_created"] = True
             new_pid = store.create_project(
                 f"{base_title} v{new_version}",
                 kind=str(parent.get("kind") or "GENERAL"),
@@ -4375,8 +4399,7 @@ async def tool_manage_projects(
             _by_owner = _owner_turn_now()
             if _by_owner:
                 try:
-                    store.update_project(project_id, metadata={
-                        **((store.get_project(project_id) or {}).get("metadata") or {}), "autopilot": True})
+                    store.update_project(project_id, metadata={"autopilot": True})   # merges (§4LZ C2)
                 except Exception:  # noqa: BLE001
                     pass
             from ..workspace import pinned_event_project as _pin_evt

@@ -10,7 +10,6 @@ procedures the agent can execute as a single macro.
 import asyncio
 import json
 import logging
-import os
 import re
 import threading
 import time
@@ -812,7 +811,10 @@ class ComposedSkillRegistry:
     def __init__(self, storage_dir: Optional[Path] = None):
         self.storage_dir = storage_dir
         self.skills: Dict[str, ComposedSkill] = {}
-        self._save_lock = threading.Lock()
+        # RLock: a mutation holds it across its own save() (§4LZ: a
+        # mutation outside it could change the dict mid-snapshot, and that
+        # save failed)
+        self._save_lock = threading.RLock()
         if storage_dir:
             self._load()
 
@@ -827,6 +829,12 @@ class ComposedSkillRegistry:
         try:
             with open(path, "r") as f:
                 data = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            # set the damaged file aside, or the next save replaces every
+            # macro with the one being written (§4LZ C1)
+            from ..utils.json_store import preserve_corrupt
+            preserve_corrupt(path, exc, "composed_skills.json")
+            return
         except Exception as exc:
             logger.warning("Failed to load composed skills: %s", exc)
             return
@@ -924,12 +932,11 @@ class ComposedSkillRegistry:
             # through record_usage → execute(), discarding a macro run's real
             # results, contradicting this method's swallow-and-warn design.
             self.storage_dir.mkdir(parents=True, exist_ok=True)
-            data = {name: skill.to_dict() for name, skill in self.skills.items()}
+            from ..utils.json_store import write_json_atomic
             with self._save_lock:
-                tmp = path.with_suffix(".json.tmp")
-                with open(tmp, "w") as f:
-                    json.dump(data, f, indent=2, default=str)
-                os.replace(tmp, path)
+                # snapshot INSIDE the lock (§4LZ C4), fsync before rename (C1)
+                data = {name: skill.to_dict() for name, skill in self.skills.items()}
+                write_json_atomic(path, data, default=str)
         except Exception as exc:
             logger.warning("Failed to save composed skills: %s", exc)
 
@@ -938,6 +945,10 @@ class ComposedSkillRegistry:
         # Merge-don't-demote on re-register (belt-and-braces below the
         # compile_from_pattern no-op guard): an unconditional overwrite
         # reverted an approved macro to "proposed" and zeroed its stats.
+        with self._save_lock:
+            return self._register_locked(skill)
+
+    def _register_locked(self, skill: ComposedSkill) -> bool:
         existing = self.skills.get(skill.name)
         if existing is not None:
             if existing.status == "active" and skill.status != "active":
@@ -975,13 +986,14 @@ class ComposedSkillRegistry:
 
     def record_usage(self, skill_name: str, success: bool):
         """Record that a composed skill was used."""
-        if skill_name in self.skills:
-            skill = self.skills[skill_name]
-            skill.usage_count += 1
-            if success:
-                skill.success_count += 1
-            skill.last_used = time.time()
-            self.save()
+        with self._save_lock:
+            if skill_name in self.skills:
+                skill = self.skills[skill_name]
+                skill.usage_count += 1
+                if success:
+                    skill.success_count += 1
+                skill.last_used = time.time()
+                self.save()
 
     def compile_from_pattern(self, pattern_name: str,
                              tool_sequence: List[Dict[str, Any]],
@@ -1592,18 +1604,13 @@ def _format_execution_result(skill_name: str, result: Dict[str, Any]):
 
 
 def _not_an_owner_write() -> bool:
-    """A probe, scheduled or sub-agent request: it may read the skill stores
-    but never change them (a `job-` wake turn resumes the OWNER's own work and
-    is allowed) (§4LS M4 — a probe deleted the code-owned
-    `youtube_transcribe` macro, approved a stale one, and deleted an
-    acquired skill)."""
+    """A request that may read the macro store but never change it (§4LS
+    M4) — by the ONE shared classification (§4LZ A-F5): probes, scheduled
+    tasks, sub-agents, self-play (a `sim-` turn deleted a real macro), test
+    replays and members. A `job-` wake resumes the owner's own work."""
     try:
-        from ..utils.logging import (request_id_context, is_probe_request_id,
-                                     request_origin_context, ORIGIN_PROBE)
-        rid = str(request_id_context.get() or "")
-        return bool(is_probe_request_id(rid)
-                    or str(request_origin_context.get() or "") == ORIGIN_PROBE
-                    or rid.startswith(("sched-", "sub-")))
+        from ..utils.logging import request_kind
+        return request_kind() in ("probe", "background", "test", "member")
     except Exception:  # noqa: BLE001
         return False
 
@@ -1622,19 +1629,24 @@ def build_step_executor(tools_ref: Dict[str, Callable], composed_names) -> Calla
     composed = set(composed_names or ())
 
     async def _exec_step(tool_name: str, tool_args: Dict[str, Any]):
+        # every refusal here is DECLARED rejected (§4LZ B5: "[blocked]"
+        # matched no failure rule — "1/1 steps succeeded, overall OK")
+        from .outcome import ToolOutcome as _TOs
         if tool_name in MACRO_FORBIDDEN_STEP_TOOLS:
             # a macro running the macro manager ran itself 197 levels deep
             # (§4LS M2) — meta tools are never steps
-            return (f"[blocked] '{tool_name}' manages skills or self-play; it "
-                    f"cannot be a composed-skill step.")
+            return _TOs.rejected(f"[blocked] '{tool_name}' manages skills or self-play; it "
+                                 f"cannot be a composed-skill step.", world_changed=False,
+                                 reason_code="macro_step_blocked")
         if tool_name in composed:
-            return (
+            return _TOs.rejected(
                 f"[blocked] '{tool_name}' is itself a composed skill; "
-                f"composed skills cannot be nested as steps."
-            )
+                f"composed skills cannot be nested as steps.", world_changed=False,
+                reason_code="macro_step_blocked")
         fn = tools_ref.get(tool_name)
         if fn is None:
-            return f"[error] step tool '{tool_name}' is not available."
+            return _TOs.rejected(f"[error] step tool '{tool_name}' is not available.",
+                                 world_changed=False, reason_code="macro_step_unavailable")
         return await fn(**(tool_args or {}))
 
     return _exec_step
@@ -1897,8 +1909,9 @@ async def tool_manage_composed_skills(context=None, action: str = None,
             return "Error: 'name' is required for delete."
         if name not in reg.skills:
             return f"Error: composed skill '{name}' not found."
-        del reg.skills[name]
-        reg.save()
+        with reg._save_lock:
+            reg.skills.pop(name, None)
+            reg.save()
         pretty_log("Macro Forgotten", f"Deleted composed skill: {name}", icon=Icons.MEM_WIPE)
         return f"Success: composed skill '{name}' deleted."
 

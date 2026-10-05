@@ -3193,17 +3193,18 @@ def _scratch_reserved(key) -> bool:
 
 
 def _scratch_request_kind() -> str:
-    """'probe', 'background' or 'owner' for the current request."""
+    """'probe', 'background' or 'owner' for the current request — from the
+    ONE shared classification (§4LZ A-F5). Self-play (`sim-`), test
+    replays and job wakes write into the background scope."""
     try:
-        from ..utils.logging import (request_id_context, is_probe_request_id,
-                                     request_origin_context, ORIGIN_PROBE)
-        rid = str(request_id_context.get() or "")
-        if is_probe_request_id(rid) or str(request_origin_context.get() or "") == ORIGIN_PROBE:
-            return "probe"
-        if rid.startswith(("sched-", "sub-", "job-")):
-            return "background"
+        from ..utils.logging import request_kind
+        kind = request_kind()
     except Exception:  # noqa: BLE001
-        pass
+        return "owner"
+    if kind == "probe":
+        return "probe"
+    if kind in ("background", "job", "test"):
+        return "background"
     return "owner"
 
 

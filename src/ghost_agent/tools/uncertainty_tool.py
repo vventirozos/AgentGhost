@@ -19,6 +19,14 @@ import logging
 
 from ..utils.logging import Icons, pretty_log
 
+
+def _TO_failed(text):
+    """A tool-level exception, DECLARED failed (§4LZ B8: these plain
+    strings were booked OK by the turn loop and the corpus)."""
+    from .outcome import ToolOutcome
+    return ToolOutcome.failed(text, reason_code="tool_exception")
+
+
 logger = logging.getLogger("GhostAgent")
 
 _VALID_ACTIONS = frozenset({"unknown", "assumption", "list"})
@@ -63,7 +71,9 @@ async def tool_flag_uncertainty(
             f"{sorted(_VALID_ACTIONS)}."
         )
     if uncertainty_tracker is None:
-        return "Uncertainty tracking is unavailable — nothing was recorded."
+        from .outcome import ToolOutcome as _TOr
+        return _TOr.rejected("Uncertainty tracking is unavailable — nothing was recorded.",
+                             world_changed=False, reason_code="tool_unavailable")   # §4LZ B8
 
     try:
         if action == "list":
@@ -104,6 +114,6 @@ async def tool_flag_uncertainty(
             return f"Flagged assumption (confidence {a.confidence:.0%}): {a.claim}"
     except Exception as e:  # noqa: BLE001 — metacognition is secondary
         logger.warning("flag_uncertainty tool failed: %s: %s", type(e).__name__, e)
-        return f"Uncertainty operation failed: {type(e).__name__}: {e}"
+        return _TO_failed(f"Uncertainty operation failed: {type(e).__name__}: {e}")   # declared (§4LZ B8)
 
     return "SYSTEM ERROR: unreachable flag_uncertainty branch."

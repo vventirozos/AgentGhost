@@ -129,6 +129,14 @@ PROMOTED_RESULT_MARKER = "[SANDBOX JOB PROMOTED]"
 PROMOTED_RESULT_BANNER = f"--- COMMAND RESULT --- {PROMOTED_RESULT_MARKER}"
 
 
+def _current_request_id() -> str:
+    try:
+        from ..utils.logging import request_id_context
+        return str(request_id_context.get() or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def is_promoted_result(text) -> bool:
     """True when an execute result describes a command that was DETACHED and
     is still running — neither a success nor a failure, and never evidence
@@ -1563,6 +1571,9 @@ class SandboxJobSupervisor:
                 # script an `execute(content=…)` run is still executing.
                 # Persisted (not held in memory) so a restart still cleans up.
                 "cleanup_paths": [str(x) for x in (cleanup_paths or [])],
+                # WHO started it (§4LZ A-F2): the wake-up turn must keep the
+                # starter's class — a probe's job woke as an owner turn
+                "started_by": _current_request_id(),
             }
             reg[jid] = entry
             self._save(reg)

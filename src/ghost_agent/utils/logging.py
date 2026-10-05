@@ -126,6 +126,38 @@ def requester_is_member() -> bool:
         return False
 
 
+def request_kind(rid=None) -> str:
+    """THE classification of the current request (§4LZ A-F5: seven checks
+    written separately disagreed — `job-` was background for projects and
+    the owner for macros; self-play's random id read as the owner).
+
+    'probe'      a probe- id or X-Ghost-Origin: probe
+    'member'     a Slack member's turn
+    'background' sched- (scheduled task), sub- (sub-agent), sim- (self-play)
+    'job'        job- (the wake-up of a job the OWNER started)
+    'test'       bench- / replay-
+    'system'     no request (internal code)
+    'owner'      everything else — a real owner turn
+    """
+    r = str(request_id_context.get() if rid is None else rid or "")
+    if is_probe_request_id(r) or str(request_origin_context.get() or "") == ORIGIN_PROBE:
+        return "probe"
+    try:
+        if requester_is_member():
+            return "member"
+    except Exception:  # noqa: BLE001
+        pass
+    if r.startswith(("sched-", "sub-", "sim-")):
+        return "background"
+    if r.startswith("job-"):
+        return "job"
+    if r.startswith(("bench-", "replay-")):
+        return "test"
+    if not r or r == "SYSTEM":
+        return "system"
+    return "owner"
+
+
 def is_probe_request_id(req_id) -> bool:
     """True iff ``req_id`` carries the diagnostic-probe prefix."""
     return str(req_id or "").startswith(PROBE_REQUEST_PREFIX)

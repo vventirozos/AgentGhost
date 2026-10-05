@@ -572,7 +572,7 @@ async def tool_generate_pdf(
         "content is missing. Split it into multiple reports or shorten the input."
         if _pdf_truncated else ""
     )
-    return (
+    _text = (
         f"SUCCESS: PDF report generated ({pages} page(s), {size_kb:.1f} KB). "
         "DO NOT CALL THIS TOOL AGAIN with the same title. Respond DIRECTLY "
         "to the user by including this exact markdown so the file is "
@@ -580,3 +580,14 @@ async def tool_generate_pdf(
         f"[📄 {title} (PDF)](/api/download/{download_rel})"
         f"{_miss_note}{_trunc_note}"
     )
+    if file_missing or _pdf_truncated:
+        # an INCOMPLETE report is not a success (§4LZ B4): declared partial,
+        # and the head says so — the user must be told what is missing
+        from .outcome import ToolOutcome
+        return ToolOutcome.partial(
+            "PARTIAL: the PDF was generated but is INCOMPLETE — "
+            + ("source files were skipped; " if file_missing else "")
+            + ("the 200-page cap truncated it; " if _pdf_truncated else "")
+            + "tell the user exactly what is missing.\n\n" + _text,
+            reason_code="report_incomplete")
+    return _text

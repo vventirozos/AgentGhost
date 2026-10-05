@@ -1969,6 +1969,13 @@ SELF_PLAY_FORBIDDEN_TOOLS = frozenset({
     "manage_skills", "self_state", "manage_projects", "manage_services",
     "delegate", "self_play_loop", "stop_self_play",
     "dream_mode", "web_search", "deep_research",
+    # §4LZ A-F1: production state and outward actions the replay list
+    # already denied — a self-play turn deleted a REAL macro and could
+    # notify the owner. (browser / vision stay: challenges render local
+    # files.)
+    "manage_composed_skills", "notify_operator", "jobs", "rotate_secrets",
+    "fact_check", "darkweb_search", "darkweb_research", "news_headlines",
+    "youtube_transcribe", "knowledge_base", "deploy",
 })
 
 
@@ -4340,8 +4347,10 @@ Return ONLY a JSON object with:
             ],
         }
         try:
+            import uuid as _uuid_v
             _verify_final, _, _ = await temp_agent.handle_chat(
-                body, background_tasks=None)
+                body, background_tasks=None,
+                request_id=f"sim-{_uuid_v.uuid4().hex[:10]}")      # never the owner (§4LZ)
             # Run validator fresh.
             sandbox_manager = isolated_context.sandbox_manager
             # Make sure mocks are restored right before validation —
@@ -6407,6 +6416,14 @@ Return ONLY a JSON object with:
                     # self-play should be deterministic relative to the
                     # sandbox state we just set up.
                     "dream_mode", "web_search", "deep_research",
+                    # §4LZ A-F1: a self-play turn deleted a REAL macro
+                    # (`manage_composed_skills`) and could page the owner
+                    # (`notify_operator`); the rest are production state or
+                    # outward egress the replay denylist already refused.
+                    "manage_composed_skills", "notify_operator", "jobs",
+                    "rotate_secrets", "fact_check", "darkweb_search",
+                    "darkweb_research", "news_headlines",
+                    "youtube_transcribe", "knowledge_base", "deploy",
                 ])
                 # ⚠ The list above is the RATIONALE — every comment in it is
                 # a defect somebody shipped — but the SET now lives in
@@ -6619,7 +6636,10 @@ Return ONLY a JSON object with:
                     # req_id-joined store (R1 review: uuid4()[:8] from the
                     # shared space made "bench never re-labels a real row"
                     # chance, not construction).
-                    _bench_req_id = None
+                    # a self-play turn is NEVER the owner (§4LZ A-F1): a
+                    # plain random id read as owner to every prefix check
+                    import uuid as _uuid_sim
+                    _bench_req_id = f"sim-{_uuid_sim.uuid4().hex[:10]}"
                     # Per-ATTEMPT infra marker (R2 review): the deferred
                     # fail-side oracle verdict must key on whether THIS
                     # attempt's validation hit infra — the run-scoped

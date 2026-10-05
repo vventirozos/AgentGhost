@@ -14,6 +14,14 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+
+def _TO_failed(text):
+    """A tool-level exception, DECLARED failed (§4LZ B8: these plain
+    strings were booked OK by the turn loop and the corpus)."""
+    from .outcome import ToolOutcome
+    return ToolOutcome.failed(text, reason_code="tool_exception")
+
+
 logger = logging.getLogger("GhostAgent")
 
 _VALID_ACTIONS = frozenset({"pending", "list", "show", "stats"})
@@ -141,4 +149,4 @@ async def tool_postmortem(
         return f"{header}\n{body}{hint}"
     except Exception as e:
         logger.warning("postmortem tool failed: %s", e)
-        return f"Could not read the defect queue: {e}"
+        return _TO_failed(f"Could not read the defect queue: {e}")   # declared (§4LZ B8)

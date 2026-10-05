@@ -28,6 +28,14 @@ from typing import Dict, List, Optional, Tuple
 
 from ..utils.logging import Icons, pretty_log
 
+
+def _TO_failed(text):
+    """A tool-level exception, DECLARED failed (§4LZ B8: these plain
+    strings were booked OK by the turn loop and the corpus)."""
+    from .outcome import ToolOutcome
+    return ToolOutcome.failed(text, reason_code="tool_exception")
+
+
 logger = logging.getLogger("GhostAgent")
 
 
@@ -305,7 +313,7 @@ def _render_recent(self_model, limit: int, *, hours=None) -> str:
         recent = _recent_collapsed(self_model, limit, hours=hours)
     except Exception as e:  # noqa: BLE001
         logger.warning("introspect recent failed: %s", e)
-        return f"Could not read the autobiographical log: {type(e).__name__}: {e}"
+        return _TO_failed(f"Could not read the autobiographical log: {type(e).__name__}: {e}")   # declared (§4LZ B8)
     if not recent:
         if hours is not None:
             return f"I have no experiences on file from the last {hours:g}h."
@@ -863,7 +871,7 @@ async def tool_introspect(
         except Exception as e:  # noqa: BLE001 — never break the turn
             logger.warning("introspect activity failed: %s: %s",
                            type(e).__name__, e)
-            return f"Activity report failed: {type(e).__name__}: {e}"
+            return _TO_failed(f"Activity report failed: {type(e).__name__}: {e}")   # declared (§4LZ B8)
 
     # 'overview' composes six surfaces; the selfhood one degrades on its
     # own, so the action branches before the self_model gate like the
@@ -874,7 +882,7 @@ async def tool_introspect(
         except Exception as e:  # noqa: BLE001 — never break the turn
             logger.warning("introspect overview failed: %s: %s",
                            type(e).__name__, e)
-            return f"Overview failed: {type(e).__name__}: {e}"
+            return _TO_failed(f"Overview failed: {type(e).__name__}: {e}")   # declared (§4LZ B8)
 
     # 'learning' reads the learning-loop stores (lessons, competence,
     # episodes, calibration), not the SelfModel — it branches before the
@@ -900,7 +908,7 @@ async def tool_introspect(
                                        section=section, what="learning")
                     + _learning_trailer(_age))
         except Exception as e:
-            return f"Learning health unavailable: {type(e).__name__}: {e}"
+            return _TO_failed(f"Learning health unavailable: {type(e).__name__}: {e}")   # declared (§4LZ B8)
 
     # 'experiments' reads the trajectory corpus (arms are stamped on each
     # turn's record), not the SelfModel — so it branches before the selfhood
@@ -1016,7 +1024,7 @@ async def tool_introspect(
                                       brief_text=_live_brief,
                                       list_sections=False)
         except Exception as e:
-            return f"Experiment report unavailable: {type(e).__name__}: {e}"
+            return _TO_failed(f"Experiment report unavailable: {type(e).__name__}: {e}")   # declared (§4LZ B8)
 
     if self_model is None or not getattr(self_model, "enabled", False):
         return (
@@ -1061,4 +1069,4 @@ async def tool_introspect(
         return _render_summary(self_model)
     except Exception as e:  # noqa: BLE001 — never break the turn
         logger.warning("introspect tool failed: %s: %s", type(e).__name__, e)
-        return f"Introspection failed: {type(e).__name__}: {e}"
+        return _TO_failed(f"Introspection failed: {type(e).__name__}: {e}")   # declared (§4LZ B8)

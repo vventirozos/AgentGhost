@@ -20,6 +20,14 @@ from typing import Optional
 
 from ..utils.logging import Icons, pretty_log
 
+
+def _TO_failed(text):
+    """A tool-level exception, DECLARED failed (§4LZ B8: these plain
+    strings were booked OK by the turn loop and the corpus)."""
+    from .outcome import ToolOutcome
+    return ToolOutcome.failed(text, reason_code="tool_exception")
+
+
 logger = logging.getLogger("GhostAgent")
 
 
@@ -63,10 +71,11 @@ async def tool_workspace_track(
         )
 
     if workspace_model is None or not getattr(workspace_model, "enabled", False):
-        return (
+        from .outcome import ToolOutcome as _TOr
+        return _TOr.rejected(                                   # declared (§4LZ B8)
             "Workspace continuity is unavailable — the workspace module "
-            "is disabled. Nothing was recorded."
-        )
+            "is disabled. Nothing was recorded.",
+            world_changed=False, reason_code="tool_unavailable")
 
     try:
         if raw_action == "track":
@@ -115,6 +124,6 @@ async def tool_workspace_track(
         logger.warning(
             "workspace_track tool failed: %s: %s", type(e).__name__, e,
         )
-        return f"Workspace track operation failed: {type(e).__name__}: {e}"
+        return _TO_failed(f"Workspace track operation failed: {type(e).__name__}: {e}")   # declared (§4LZ B8)
 
     return "SYSTEM ERROR: unreachable workspace_track branch."

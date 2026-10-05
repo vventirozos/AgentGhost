@@ -398,6 +398,16 @@ def _increment_budget(store, project_id: str) -> None:
     # never hold this lock here (the leaf-claim span releases it before any
     # increment), and the span is fully synchronous, so this cannot deadlock.
     with _get_project_lock(project_id):
+        # ONE atomic read-modify-write (§4LZ C2): a whole-dict write-back
+        # put stale values back over keys merged in between
+        def _bump(meta):
+            meta["steps_used"] = int(meta.get("steps_used", 0) or 0) + 1
+            meta.setdefault("steps_cap", DEFAULT_STEPS_CAP)
+            meta["last_autoadvance_ts"] = time.time()
+            return meta
+        if callable(getattr(store, "_atomic_metadata_update", None)):
+            store._atomic_metadata_update(project_id, _bump)
+            return
         budget = _get_budget(store, project_id)
         new_meta = dict(budget["meta"])
         new_meta["steps_used"] = budget["used"] + 1
@@ -423,10 +433,8 @@ def _stamp_autoadvanced(store, project_id: str) -> None:
     project must rotate it to the back of the queue. Never raises."""
     try:
         with _get_project_lock(project_id):
-            budget = _get_budget(store, project_id)
-            new_meta = dict(budget["meta"])
-            new_meta["last_autoadvance_ts"] = time.time()
-            store.update_project(project_id, metadata=new_meta)
+            # just the one key — metadata merges (§4LZ C2)
+            store.update_project(project_id, metadata={"last_autoadvance_ts": time.time()})
     except Exception:
         logger.debug("last_autoadvance_ts stamp skipped", exc_info=True)
 
@@ -1625,6 +1633,16 @@ def _looks_like_failure(output: str) -> bool:
         return _code != 0
     if "[SYSTEM ERROR]" in s or "Critical Tool Error" in s:
         return True
+    # …and the SHARED classifier (§4LZ B7): this private copy missed
+    # "CRITICAL ERROR", "SYSTEM ERROR", "Security Error", "SYSTEM
+    # INSTRUCTION" and "REJECTED" heads, so the unattended advancer could
+    # close a task DONE on a refusal
+    try:
+        from ..tools.tool_failure import result_is_failure, result_is_rejection
+        if result_is_failure(s) or result_is_rejection(s) or s.startswith("Security Error"):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
     first = s.splitlines()[0].strip().lower()
     # Some tool failures surface as a stringified exception tuple, e.g.
     # "('error sending request for url ...', '...')". The leading "('" hid the

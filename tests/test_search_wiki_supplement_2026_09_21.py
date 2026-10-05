@@ -139,7 +139,9 @@ async def test_article_alone_answers_when_every_web_ticket_fails(monkeypatch):
          patch("src.ghost_agent.tools.search._DDGS_FAST_ENGINE_TIMEOUT", 0.2), \
          patch("src.ghost_agent.tools.search._reformulate_query", lambda q: []):
         out = await tool_search_ddgs("Δημήτρης Κουφοντίνας", None)
-    assert out.startswith("### 1. Δημήτρης Κουφοντίνας — Βικιπαίδεια") and "ZERO results" not in out
+    # §4LZ B6: the encyclopedia-only answer SAYS so, first
+    assert out.startswith("NOTE: every web search engine failed") and "ZERO results" not in out
+    assert "\n\n### 1. Δημήτρης Κουφοντίνας — Βικιπαίδεια" in out
 
 
 @pytest.mark.asyncio

@@ -1193,6 +1193,49 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
   <p>Three pins inherited from earlier rounds encoded the defect as the contract and were rewritten, including one that asserted the absolute-symlink recreation was correct. Two new pins written this round could not distinguish their own two worlds and were rewritten after their mutants survived.</p>
   <p>The battery, <code>scripts/mutate_4gk.py</code>, re-introduces each defect one at a time: 27 entries, three controls surviving, 24 killed, no survivors. Seven first-run survivors became pins &mdash; that number, not the final score, measures how much was unpinned when the fixes were written. A missing file in the copy tree made four mutants read as killed until a per-test-set control exposed it; one control is not enough.</p>
   <p><strong>The stopping rule is still not met, and this round does not claim it.</strong> Round 4 found defects inside round 3, so a fifth round is owed. What is true is narrower: every defect found is fixed, pinned and mutated.</p>
+
+  <h2 id="4lz">Second whole-system pass <span class="tag">2026-10-05 &sect;4LZ</span></h2>
+  <p>A second pass over the whole system after the per-subsystem reviews (§4LQ–§4LY), through three cross-cutting lenses: who may do what, whether results tell the truth, and whether stored state survives.</p>
+  <h3>Who may do what</h3>
+  <ul>
+    <li><strong>One request classification.</strong> <code>utils/logging.request_kind()</code> returns <code>probe</code>, <code>member</code>, <code>background</code> (<code>sched-</code>, <code>sub-</code>, <code>sim-</code>), <code>job</code>, <code>test</code> (<code>bench-</code>, <code>replay-</code>), <code>system</code> or <code>owner</code>. The macro store, the skill stores and the scratchpad all read it instead of each keeping its own prefix list.</li>
+    <li><strong>Self-play is background.</strong> Self-play turns now run as <code>sim-…</code> requests rather than owner turns; one of them had deleted a real macro. <code>SELF_PLAY_FORBIDDEN_TOOLS</code> also denies the macro manager, <code>notify_operator</code>, jobs, secrets, knowledge_base, deploy, and the outward search and transcription tools.</li>
+    <li><strong>Jobs wake as their starter.</strong> A promoted job records <code>started_by</code>. A job started by a scheduled task, sub-agent or self-play wakes as <code>sub-job-…</code>, so owner-only gates still apply. A probe's job is never woken; its output stays available through <code>jobs(action='collect')</code>.</li>
+    <li><strong>A probe never pages the owner.</strong> In a probe, <code>notify_operator</code> is a dry run ("PROBE — not sent … Would have sent: …"). Nothing is recorded and no quota is used; twelve probe calls had used up the hourly quota.</li>
+    <li><strong>Probe forks are marked.</strong> A probe's <code>create_version</code> stamps <code>probe_created</code>, and the owner's <code>create_version</code> never returns a probe's fork as "already exists".</li>
+  </ul>
+  <h3>Results that tell the truth</h3>
+  <ul>
+    <li>A knowledge_base <code>forget</code> <em>preview</em> is no longer treated as "already applied". Duplicate-setter blocks now share the two-block budget, and the second block ends the tool phase; 30 blocks had run in a row.</li>
+    <li>A notification counts as delivered only when its declared status is OK and it is not a probe dry run or a synthetic row (<code>agent._notify_delivered</code>).</li>
+    <li>Off-loop labelling (<code>outcome_heuristics</code>) treats search and memory results as content. A snippet that mentions an exception is not a failure, but a raw traceback or <code>Error:</code> head still is. A declared OK is believed unless an exec exit code says otherwise.</li>
+    <li>An incomplete PDF report (sources skipped, or truncated at the page cap) is declared <code>partial</code>, and its first line says so.</li>
+    <li>A refused macro step is declared <code>rejected</code>, so the run no longer reports "1/1 steps succeeded".</li>
+    <li>When every search engine fails, the encyclopedia-only result says so and is not cached.</li>
+    <li>The unattended project advancer reads failure heads with the shared classifier.</li>
+    <li>Exception paths in introspect, self_state, workspace, workspace_track, uncertainty, postmortem and the acquired-skill runner now return declared <code>failed</code>, and the "unavailable" paths return <code>rejected</code>.</li>
+  </ul>
+  <h3>State that survives</h3>
+  <ul>
+    <li><strong>A damaged store is set aside, not overwritten.</strong> The macro store, the skill registry and the task store go through <code>utils/json_store.preserve_corrupt</code>, which keeps the file as <code>&lt;name&gt;.corrupt-&lt;ts&gt;</code>. Saves use <code>write_json_atomic</code> (fsync, then rename).</li>
+    <li><strong>No lost updates on project metadata.</strong> The runtime counters, the advancer step budget and the research index use <code>ProjectStore._atomic_metadata_update</code>. Stamps write single keys, so a stale snapshot no longer overwrites keys merged in the meantime.</li>
+    <li><strong>The API delete stops services first</strong>, as the tool path already did. A hard delete also purges their state directories.</li>
+  </ul>
+  <h3>What the fresh reader found in the fixes</h3>
+  <ul>
+    <li><strong>The probe dry run moved the page to the backstop.</strong> When a probe's notify_operator was correctly treated as "not delivered", the finish-line backstop sent a real "Done —" notification in its place. The backstop and <code>capture_promise</code> now stand down for a probe, so a probe can no longer park a promise that the idle loop would deliver later.</li>
+    <li><strong>The wider content-tool set dropped real failure heads</strong> such as "Ingest Error:", "Disk Error:", "Search failed:" and "[error]". The anchored <code>_FAILURE_HEAD_RE</code> restores them, while snippets that merely mention an error remain content.</li>
+    <li><strong>A shallow "before" copy lost <code>constraint_origins</code>.</strong> A helper mutates it in place, so the changed-keys diff never saw the change. The copy is now deep.</li>
+    <li>The owner's fork archives a probe's leftover fork rather than minting a second "X vN" on the same port. <code>preserve_corrupt</code> re-checks the file before moving it and gives each backup a unique name. <code>write_json_atomic</code> uses a unique temp file. Jobs started by <code>bench-</code> or <code>replay-</code> turns wake as background. The scratchpad hide list now uses <code>request_kind</code>.</li>
+  </ul>
+  <h3>Closing items</h3>
+  <ul>
+    <li><strong>The probe dry run is worded so the model does not claim delivery.</strong> It now reads "PROBE — NOT SENT … Tell the user the notification was NOT sent because this was a test request". The first wording drew "the message was sent" in a live probe reply.</li>
+    <li><strong>Every macro-store mutation takes the store's lock.</strong> <code>register</code>, <code>record_usage</code> and <code>delete</code> now hold a reentrant <code>_save_lock</code>. A registration made while a save was snapshotting the dict had made that save fail. The only cross-process writer is <code>scripts/sync_youtube_transcribe_macro.py</code>, which documents "stop the agent first".</li>
+    <li><strong>One rule for background notes.</strong> <code>agent._scratch_hidden_namespaces</code> uses the same <code>request_kind</code> as the scratchpad tool, so a request that writes into the <code>bg</code> scope sees it, and an owner or probe prompt does not.</li>
+    <li><strong>Kept by design: a PDF with missing source files is <code>partial</code>.</strong> A report that lacks content it was asked to include is not done. The result names the missing files so the next call can fix them, and a project leaf should not close DONE on it.</li>
+  </ul>
+  <p>Pins: <code>tests/test_4lz_gating.py</code>, <code>tests/test_4lz_truth.py</code>, <code>tests/test_4lz_state.py</code>, <code>tests/test_4lz_review.py</code>.</p>
 </main>
 </body>
 </html>

@@ -2,7 +2,6 @@ import json
 import logging
 import re
 import threading
-import os
 from pathlib import Path
 
 from ..utils.logging import pretty_log, Icons
@@ -262,15 +261,19 @@ class AcquiredSkillManager:
 
     def _save_registry(self, registry: dict):
         with self._lock:
-            temp_path = self.registry_path.with_suffix('.tmp')
-            temp_path.write_text(json.dumps(registry, indent=2))
-            os.replace(temp_path, self.registry_path)
+            from ..utils.json_store import write_json_atomic
+            write_json_atomic(self.registry_path, registry)          # fsync (§4LZ C1)
 
     def _load_registry(self) -> dict:
         with self._lock:
             try:
                 content = self.registry_path.read_text()
                 return json.loads(content) if content else {}
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                # set it aside, or the next save keeps only the new skill (§4LZ C1)
+                from ..utils.json_store import preserve_corrupt
+                preserve_corrupt(self.registry_path, e, "skills_registry.json")
+                return {}
             except Exception:
                 return {}
 
@@ -799,20 +802,19 @@ def _summarise_tdd_failure(execution_result: str) -> str:
 
 
 def _not_an_owner_write(probe_only: bool = False) -> bool:
-    """A probe, scheduled or sub-agent request: it may read the skill stores
-    but never change them (a `job-` wake turn resumes the OWNER's own work and
-    is allowed) (§4LS M4 — a probe deleted the code-owned
-    `youtube_transcribe` macro, approved a stale one, and deleted an
-    acquired skill)."""
+    """A request that may read the skill stores but never change them
+    (§4LS M4) — by the ONE shared classification (§4LZ A-F5). A `job-` wake
+    resumes the owner's own work and internal code ('system') is allowed;
+    ``probe_only``: only probes are refused (the dream cycle creates skills
+    in the background through `create_skill`)."""
     try:
-        from ..utils.logging import (request_id_context, is_probe_request_id,
-                                     request_origin_context, ORIGIN_PROBE)
-        rid = str(request_id_context.get() or "")
-        return bool(is_probe_request_id(rid)
-                    or str(request_origin_context.get() or "") == ORIGIN_PROBE
-                    or (not probe_only and rid.startswith(("sched-", "sub-"))))
+        from ..utils.logging import request_kind
+        kind = request_kind()
     except Exception:  # noqa: BLE001
         return False
+    if probe_only:
+        return kind == "probe"
+    return kind in ("probe", "background", "test", "member")
 
 
 async def tool_create_skill(sandbox_dir: Path = None, memory_dir: Path = None, memory_system=None, sandbox_manager=None, name: str = None, description: str = None, parameters_schema: str = None, python_code: str = None, test_payload: str = None, **_extra):

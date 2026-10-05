@@ -3369,6 +3369,38 @@ _DEAD_END_REFUSALS = frozenset({"not_owner_write", "confirm_dead_end",
                                 "forget_not_confirmed", "reset_not_confirmed"})
 
 
+def _scratch_hidden_namespaces(req_id) -> tuple:
+    """Scratchpad namespaces this request's prompt must NOT show. Background
+    work's notes (the `bg` scope) stay out of an owner turn's prompt (§4LX);
+    a request that WRITES into `bg` — by the same classification the
+    scratchpad tool writes with, `request_kind` — sees them (§4LZ: bench and
+    replay turns wrote there and then could not see their own notes)."""
+    from ..utils.logging import request_kind
+    return () if request_kind(str(req_id or "")) in ("background", "job", "test") else ("bg",)
+
+
+def _notify_delivered(t) -> bool:
+    """Did this tool row really SEND an operator notification? (§4LZ B2:
+    three sites read "content doesn't start with Error" — a pre-flight
+    block, a disabled tool or a probe dry-run counted as delivered, and the
+    stored promise was spent without a ping.) The declared status decides;
+    synthetic rows (guards, blocks) never count."""
+    if not isinstance(t, dict) or t.get("_synthetic"):
+        return False
+    if str(t.get("name", "")).lower().strip() != "notify_operator":
+        return False
+    content = t.get("content")
+    try:
+        from ..tools.outcome import ToolOutcome as _TOn, OutcomeStatus as _OSn
+        out = content if isinstance(content, _TOn) else _TOn.coerce(str(content or ""))
+        if out.status is not _OSn.OK:
+            return False
+    except Exception:  # noqa: BLE001
+        pass
+    text = str(content or "").lstrip()
+    return not text.startswith(("Error", "PROBE", "SYSTEM"))
+
+
 def _dead_end_reply(refusal: str) -> str:
     """The direct answer for a request whose write was refused outright:
     the refusal's reason, without the tool-facing parts ("Error:", "STOP:
@@ -8056,18 +8088,20 @@ def _notify_promise_backstop(context, *, last_user_content, tools_run,
     if requester_is_member():
         return False        # a member never writes into the owner's notification feed (R7)
     try:
+        # a probe never pages the owner — not by the tool, not by this
+        # backstop (§4LZ review: the dry run made the backstop send instead)
+        from ..utils.logging import is_probe_request_id, request_kind
+        if is_probe_request_id(str(req_id or "")) or request_kind() == "probe":
+            return False
+    except Exception:  # noqa: BLE001
+        pass
+    try:
         if not _user_asked_for_notification(last_user_content):
             return False
-        for t in tools_run or []:
-            if (str((t or {}).get("name", "")).lower().strip()
-                    == "notify_operator"):
-                # A notify_operator call that ERRORED (rate limit aside,
-                # e.g. "failed to write the notification record") did NOT
-                # keep the promise — only a non-error call suppresses the
-                # backstop.
-                if not str((t or {}).get("content", "")).lstrip().startswith(
-                        "Error"):
-                    return False
+        # only a notify that really WENT OUT suppresses the backstop (§4LZ
+        # B2: a pre-flight-blocked or disabled call read as delivered)
+        if any(_notify_delivered(t) for t in tools_run or []):
+            return False
         from ..tools.notify_tool import (
             PHASE as _NOTIFY_PHASE, _note_sent, _rate_limited,
         )
@@ -20859,11 +20893,15 @@ class GhostAgent:
                 # a legitimate retry. `execute` and `file_system.write`
                 # are intentionally NOT in this set: rerunning a script
                 # after an external fix is legitimate.
+                # A forget PREVIEW applies nothing (§4LZ B1): booking it as an
+                # applied setter refused every re-preview as "already
+                # applied" — 30 times in one live request, nothing deleted.
+                _kb_act = str(t_args.get("action") or "").strip().lower()
                 is_idempotent_setter = (
                     _cname in ("update_profile", "learn_skill")
                     or (_cname == "knowledge_base"
-                        and str(t_args.get("action") or "").strip().lower()
-                        in ("insert_fact", "forget"))
+                        and (_kb_act == "insert_fact"
+                             or (_kb_act == "forget" and t_args.get("confirm"))))
                 )
                 if is_idempotent_setter and (
                         a_hash in executed_idempotent
@@ -20873,6 +20911,16 @@ class GhostAgent:
                         f"Blocked duplicate {fname} call (args already applied)",
                         icon=Icons.STOP,
                     )
+                    # the same two-block budget as the pre-flight guard (§4LZ
+                    # B1: these blocks had no limit — 30 in a row)
+                    preflight_blocks_this_request += 1
+                    _idem_final = ""
+                    if preflight_blocks_this_request >= 2:
+                        force_final_response = True
+                        self.context._breaker_forced_final = True  # §4JI: a tool call on this forced final IS the no-answer
+                        _idem_final = (" FINAL: you have now been blocked "
+                                       f"{preflight_blocks_this_request} times. STOP calling tools and "
+                                       "write your reply to the user.")
                     err_msg = {
                         "role": "tool",
                         "tool_call_id": tool["id"],
@@ -20881,7 +20929,7 @@ class GhostAgent:
                             f"SYSTEM IDEMPOTENCY: '{fname}' was already executed earlier in this "
                             f"request with these exact arguments. The intended state is already "
                             f"applied. DO NOT call it again — proceed to the next step or finalize "
-                            f"your response to the user.",
+                            f"your response to the user." + _idem_final,
                             reason_code="idempotency_guard"),
                     }
                     messages.append(err_msg)
@@ -25190,11 +25238,7 @@ class GhostAgent:
                     summarize_turn_content as _np_head)
                 from .notify_promise import fire_promise_if_settled
                 _model_notified = _backstop_fired or any(
-                    (str((t or {}).get("name", "")).lower().strip()
-                     == "notify_operator")
-                    and not str((t or {}).get("content", "")).lstrip()
-                    .startswith("Error")
-                    for t in tools_run_this_turn or [])
+                    _notify_delivered(t) for t in tools_run_this_turn or [])
                 fire_promise_if_settled(
                     _np_store, _np_get_alog(self.context), _np_pid,
                     model_notified=_model_notified,
@@ -29892,8 +29936,7 @@ class GhostAgent:
                     scratch_data = (self.context.scratchpad.list_all(
                                         exclude=() if _sp_ask else ("Self-Play Report",),
                                         # background jobs' notes stay theirs (§4LX)
-                                        hide_namespaces=() if str(req_id or "").startswith(("sched-", "sub-", "job-"))
-                                        else ("bg",))
+                                        hide_namespaces=_scratch_hidden_namespaces(req_id))
                                     if getattr(self.context, 'scratchpad', None) and not _owner_context_hidden(self.context)
                                     else "None.")        # the scratchpad is the OWNER's (R4)
                     # Bound the scratchpad at the SOURCE (2026-07-20). The
@@ -34450,11 +34493,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             summarize_turn_content as _np_head)
                         from .notify_promise import fire_promise_if_settled
                         _model_notified = _sbf or any(
-                            (str((t or {}).get("name", "")).lower().strip()
-                             == "notify_operator")
-                            and not str((t or {}).get("content", ""))
-                            .lstrip().startswith("Error")
-                            for t in stream_tools_snapshot or [])
+                            _notify_delivered(t) for t in stream_tools_snapshot or [])
                         fire_promise_if_settled(
                             _np_store, _np_get_alog(self.context), _np_pid,
                             model_notified=_model_notified,

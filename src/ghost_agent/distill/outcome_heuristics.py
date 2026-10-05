@@ -266,7 +266,23 @@ def is_unresolved_tool_result(result) -> bool:
 _FS_MUTATING_OPS = frozenset({"write", "replace", "edit", "append", "patch", "delete",
                               "move", "rename", "copy", "mkdir", "download", "batch"})
 
-_CONTENT_TOOLS = frozenset({"file_system", "vision_analysis"})
+#: tools whose result is CONTENT that can mention "exception" / "error:" —
+#: judged by the shared failure classifier, never the head-substring scan
+#: (§4LZ B3: a search snippet "Exceptional performance" was booked failed)
+_CONTENT_TOOLS = frozenset({"file_system", "vision_analysis", "web_search", "deep_research",
+                            "recall", "knowledge_base", "darkweb_search", "darkweb_research",
+                            "fact_check", "news_headlines"})
+
+
+#: the failure heads the search / memory tools WRITE themselves ("Ingest
+#: Error: …", "Disk Error: …", "Search failed: …", "[error] …", a raw
+#: traceback) — anchored at the start, so content that merely mentions an
+#: exception is not one (§4LZ review: widening _CONTENT_TOOLS dropped them)
+_FAILURE_HEAD_RE = re.compile(
+    r"(?:Traceback \(most recent call last\)"
+    r"|\[error\]"
+    r"|(?:[A-Za-z]+ ){0,3}(?:Error|Exception|failed)\s*:)",
+    re.IGNORECASE)
 
 
 _BROWSER_STATUS_RE = re.compile(
@@ -301,6 +317,16 @@ def _looks_like_tool_error(result: str, tool_name: str = "") -> bool:
         return True
     if not isinstance(result, str):
         return False
+    # A tool that DECLARED success is believed (§4LZ B3): the head scan
+    # below read a web_search snippet "Exceptional performance" as a failure,
+    # and the verdict reached the corpus, foresight and claim binding. Only
+    # an execute-shaped exit-code banner still outranks it.
+    if (_st is not None and str(getattr(_st, "value", _st)) == "ok"
+            and getattr(result, "declared", False)):
+        from ..tools.tool_failure import exec_exit_code as _eec
+        _c = _eec(result)
+        if _c is None or _c == 0:
+            return False
     _bs = browser_result_status(result)
     if _bs is not None:
         # §4LN: the browser states its own verdict in its header; the page
@@ -314,7 +340,11 @@ def _looks_like_tool_error(result: str, tool_name: str = "") -> bool:
         from ..tools.tool_failure import result_is_failure
         _h = result.strip()
         # + the traversal refusals, returned as plain "Security Error: …" strings (review)
-        return (result_is_failure(result) or _h.startswith("Security Error")
+        # a raw traceback / "Error:" HEAD is the tool crashing, not a snippet
+        # (search content starts with its own heading) — §4LZ review
+        _crash = (str(tool_name).strip().lower() not in ("file_system", "vision_analysis")
+                  and _FAILURE_HEAD_RE.match(_h) is not None)
+        return (result_is_failure(result) or _crash or _h.startswith("Security Error")
                 or "replace rejected" in _h[:120].lower())
     # A NON-ZERO exit-code banner is a hard failure signal even without an
     # "error:" prefix (127 = command not found, 130 = SIGINT, 1..9, …). The

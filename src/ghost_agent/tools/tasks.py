@@ -2,7 +2,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import os
 import time
 from pathlib import Path
 
@@ -49,7 +48,13 @@ def _load_task_store() -> dict:
         p = Path(task_store_path)
         if not p.is_file():
             return {}
-        data = json.loads(p.read_text(encoding="utf-8"))
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as je:
+            # set it aside, or the next save keeps only the new task (§4LZ C1)
+            from ..utils.json_store import preserve_corrupt
+            preserve_corrupt(p, je, "scheduled-task store")
+            return {}
         tasks = data.get("tasks")
         return tasks if isinstance(tasks, dict) else {}
     except Exception as e:  # noqa: BLE001
@@ -66,9 +71,8 @@ def _save_task_store(tasks: dict) -> None:
     try:
         p = Path(task_store_path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps({"tasks": tasks}, indent=2), encoding="utf-8")
-        os.replace(tmp, p)
+        from ..utils.json_store import write_json_atomic
+        write_json_atomic(p, {"tasks": tasks})               # fsync (§4LZ C1)
     except Exception as e:  # noqa: BLE001
         logger.warning("scheduled-task store write failed: %s", e)
 

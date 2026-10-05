@@ -318,8 +318,11 @@ class TestInternalPrefixContract:
         from ghost_agent.core.autonomous_activity import (
             INTERNAL_REQUEST_PREFIXES, is_internal_request)
 
-        assert set(INTERNAL_REQUEST_PREFIXES) == {"sched-", "job-", "sub-"}
+        # `sim-` (§4LZ): self-play turns, which ran under a random owner-
+        # looking id before; they never enrol (is_simulation)
+        assert set(INTERNAL_REQUEST_PREFIXES) == {"sched-", "job-", "sub-", "sim-"}
         assert is_internal_request("sched-nightly")
+        assert is_internal_request("sim-0a1b2c3d4e")
         assert is_internal_request("job-1a2b3c4d")
         assert is_internal_request("sub-9f")
         assert not is_internal_request("bench-deadbeef")

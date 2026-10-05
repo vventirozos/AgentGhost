@@ -22,6 +22,14 @@ from typing import List, Optional
 
 from ..utils.logging import Icons, pretty_log
 
+
+def _TO_failed(text):
+    """A tool-level exception, DECLARED failed (§4LZ B8: these plain
+    strings were booked OK by the turn loop and the corpus)."""
+    from .outcome import ToolOutcome
+    return ToolOutcome.failed(text, reason_code="tool_exception")
+
+
 logger = logging.getLogger("GhostAgent")
 
 
@@ -282,4 +290,4 @@ async def tool_workspace(
         return _render_summary(workspace_model)
     except Exception as e:  # noqa: BLE001
         logger.warning("workspace tool failed: %s: %s", type(e).__name__, e)
-        return f"Workspace introspection failed: {type(e).__name__}: {e}"
+        return _TO_failed(f"Workspace introspection failed: {type(e).__name__}: {e}")   # declared (§4LZ B8)

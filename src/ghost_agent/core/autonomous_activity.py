@@ -229,7 +229,7 @@ def phase_expectation(phase: str) -> str:
 # delegated sub-agents). The finalize digest must skip these — an internal
 # turn consuming the watermark would silently eat the operator's next
 # "while you were away" report.
-INTERNAL_REQUEST_PREFIXES = ("sched-", "job-", "sub-")
+INTERNAL_REQUEST_PREFIXES = ("sched-", "job-", "sub-", "sim-")   # sim-: self-play (§4LZ)
 
 
 def is_internal_request(req_id) -> bool:

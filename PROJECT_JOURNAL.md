@@ -51325,3 +51325,94 @@ the postmortem engine).
 - deployed pid 56114.
 **Live probe (labelled):** a probe scratchpad write was refused in 1 call and nothing stored. The reply still
 says "Let me retry" — the known §4LW wording quirk.
+
+## §4LY — the last open item: "Let me retry" after a refused probe write (2026-10-05, operator: "close the last open item") — scope and outcome
+**Why.** After §4LW the turn stopped on a dead-end refusal, but the model's forced final reply still said
+"Let me retry…", even under an explicit SYSTEM ALERT.
+**Fix:**
+- A `not_owner_write` refusal is answered DIRECTLY: `agent._dead_end_reply` produces "Not done: <the refusal's
+  reason>", without the tool-facing "Error:" / "STOP…" parts.
+- Implemented with `force_stop` + `_batch_short_circuit` (the first reason in a batch wins); no model-written
+  reply. A direct reply also reaches a streamed client, where rewriting text afterwards could not.
+- Confirm dead-ends keep the model-written reply and the alert, because it must present the preview and ask.
+**Verification:**
+- tests in `test_4lw_open_items.py` (20 total);
+- battery bat50: every mutant killed (one survivor → a two-refusal batch test);
+- suite: 28,538 passed, 0 failed;
+- deployed pid 86444.
+**Live probes (labelled):**
+- X1 (scratchpad) → "Not done: a probe request does not write the owner's scratchpad — nothing changed."
+  (6.3 s).
+- K1c (macro delete) → "Not done: a probe or background request does not change the macro store (delete) —
+  nothing changed." (6.1 s).
+**No open items remain from the §4LL–§4LY series.**
+
+## §4LZ — second whole-system pass (2026-10-05, operator: "approve the macros, and do a second whole-system pass") — R0 scope
+**Done first:** the three demoted macros were approved through an owner turn; each passed the §4LS approve
+checks (every step takes runtime inputs) and is active.
+**Why.** Every system had one review (§4LL–§4LY). A second fresh pass across systems once found a CRIT in
+already-reviewed code (§4LI). This pass reads ACROSS tools, not per tool.
+**Three lenses, three fresh readers in parallel (read-only copies):**
+- **A — who may do what:** owner / member / probe / sched- / sub- / job- / SYSTEM requests. The gates on every
+  write, egress, owner-data read, confirm flow, background loop and idle job: consistent? Any path around them?
+- **B — truthfulness:** declared statuses, error heads, caching of failures, labels; how the turn loop, the
+  verifier, the trajectory corpus and lessons consume them; silent wrong answers.
+- **C — state integrity:** every persistent store (projects, scratchpad, skills, macros, chroma/KB, services
+  registry, profile/graph, episodes, lessons); in-memory caches vs disk across restarts; atomicity; rollbacks;
+  concurrent requests; the deploy/restart path.
+**Then:** fixes with behaviour tests; battery; a fresh reader on the fix diff; suite once; gated deploy;
+labelled probes.
+
+### §4LZ — outcome (2026-10-05)
+**Lens fixes (3 readers on read-only copies):**
+- **A — who may do what.** One classifier, `utils/logging.request_kind()`, now drives the macro store, the skill stores and the scratchpad. Self-play turns run as `sim-` (background); a non-bench self-play turn used a random owner-looking id and had deleted a real macro. The self-play denylist was extended with the tools the replay list already denied. Jobs now record `started_by`: a probe's job is never woken, and a `sched-`/`sub-`/`sim-`/`bench-`/`replay-` starter wakes as `sub-job-`. notify_operator in a probe is a dry run (12 probe calls had used the hourly quota). A probe's `create_version` fork is stamped `probe_created`.
+- **B — truthfulness.**
+  - A knowledge_base forget PREVIEW is no longer "already applied", and duplicate-setter blocks are budgeted (the 2nd forces final; there had been 30 in a row).
+  - `_notify_delivered` decides by declared status.
+  - Off-loop labels: search and memory results are content.
+  - An incomplete PDF is declared partial.
+  - A refused macro step is declared rejected.
+  - The wiki-only search fallback is flagged and not cached.
+  - The advancer reads failure heads with the shared classifier.
+  - Exception paths in 7 small tools return declared `failed`.
+- **C — state.** Corrupt JSON stores (macros, skill registry, tasks) are set aside via `utils/json_store`, and saves are atomic with fsync. Project metadata counters and stamps are atomic or single-key; there had been lost updates. The API delete stops the project's services first.
+
+**Fresh reader on the fix diff: 3 MAJOR, all inside this round's fixes.**
+1. The probe dry run made the finish-line backstop send a REAL page. The backstop and `capture_promise` now stand down for probes.
+2. Widening `_CONTENT_TOOLS` dropped the tools' own heads ("Ingest Error:", "Search failed:", "[error]"). These are restored by the anchored `_FAILURE_HEAD_RE`.
+3. A shallow "before" copy hid an in-place `constraint_origins` change, so an auto constraint became user-mandated. The copy is now deep.
+
+MINOR fixes:
+- The owner's fork archives a probe fork; it had been a duplicate "X vN" on the same port.
+- `preserve_corrupt` re-checks before moving and uses unique backup names; `write_json_atomic` uses a unique temp file.
+- Jobs started by bench/replay turns wake as background.
+- The scratchpad hide list uses `request_kind`.
+- Two stale tests were fixed.
+
+Accepted, not changed:
+- A missing-source PDF is "partial" and may feed strikes.
+- Macro-store writes across processes are still last-writer-wins.
+- The scratchpad-hide change has no pin (it is inside the turn loop).
+
+**Verification:**
+- Pins: `tests/test_4lz_{state,gating,truth,review}.py`.
+- Battery bat51: 35 mutants all killed, NOOP survives, tree pristine. 7 survivors on the first run became pins; 1 mutant was invalid (a syntax error) and was rewritten.
+- Full suite: 28,612 passed, 0 failed. The first run had 4 failures, all from this round: unused imports, a breaker-site count, the `sim-` internal prefix and the wiki-note head.
+- Deploy: gated on foreground_requests==0, then `launchctl kill SIGTERM`; old pid 86444 exited in ~8 s, new 81239 is listening, 1 process.
+- Probes (`X-Ghost-Origin: probe`):
+  - P1 "use notify_operator to send…" → dry run; the activity log was unchanged (7653 → 7653).
+  - P2 "17×23, notify me on Slack when done" → 391, and no backstop page.
+  - Observation: P1's reply still says "was sent… PROBE status is expected". This wording is probe-only and was not changed.
+
+**Docs:** `docs/audit_fixes.html#4lz`.
+
+### §4LZ — closing items (2026-10-05, operator: "do all small things that remain, let's close everything today")
+- **Probe notify wording.** The dry run now reads "PROBE — NOT SENT … Tell the user the notification was NOT sent because this was a test request". Live probe reply after deploy: "a **test probe** — nothing was actually delivered to you"; the activity log was unchanged (7654 → 7654).
+- **Macro-store mutations take the lock.** `register`, `record_usage` and `delete` hold a reentrant `_save_lock`. A register that landed during a save's snapshot made that save fail; a later save heals the file, but until then — or after a crash — it is a lost write. The pin forces that interleaving deterministically: a GIL-timing stress test did NOT kill the unlocked mutant. The only cross-process writer is the manual sync script, which documents "stop the agent first".
+- **Background-notes visibility.** `agent._scratch_hidden_namespaces` uses the same `request_kind` as the scratchpad tool, and is pinned.
+- **PDF with missing sources stays `partial`.** Decided by design: a report missing requested content is not done, and the result names the missing files.
+- **Verification:**
+  - bat52: 4/4 mutants killed; NOOP survives; tree pristine.
+  - Suite: 28,624 passed, 0 failed.
+  - Gated deploy: old pid 81239 exited in ~8 s, new pid 9975 is listening, 1 process.
+- **Live self-play on the new code (21:51):** the cycle's generated setup script crashed in its own `generate_date()`, a defect in the generated challenge; it fell back to a template (§4KS) as designed. The solver turn ran as `sim-e534` (background) and the cycle ended SUCCESS in 1 attempt, score +1.534. No denylist-drift error since the deploy. **§4LZ CLOSED — no open items.**

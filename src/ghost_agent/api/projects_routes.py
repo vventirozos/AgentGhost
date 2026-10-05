@@ -152,6 +152,18 @@ async def update_project(pid: str, body: ProjectUpdate, request: Request):
 async def delete_project(pid: str, request: Request, hard: bool = False):
     store = _store(request)
     pid = _canon_id(pid)
+    if not store.get_project(pid):
+        raise HTTPException(404, "project not found")
+    # Stop the project's services FIRST, as the tool path does (§4LZ C3:
+    # the API deleted/archived the project and left its services running,
+    # registry rows pointing at a project that no longer existed). A hard
+    # delete also purges their state dirs.
+    try:
+        from ..tools.projects import _stop_project_services
+        await asyncio.to_thread(_stop_project_services, _context(request), pid, hard)
+    except Exception:  # noqa: BLE001 — the delete itself must still run
+        import logging as _lg
+        _lg.getLogger("GhostAgent").warning("service stop before project delete failed", exc_info=True)
     # Off-loop: a hard delete rmtree's the project workspace (sync
     # filesystem work that must not block the process-wide event loop).
     ok = await asyncio.to_thread(store.delete_project, pid, hard=hard)

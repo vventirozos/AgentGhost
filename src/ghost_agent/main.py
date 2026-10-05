@@ -1207,6 +1207,14 @@ async def _resume_after_job(context, entry) -> bool:
             return False
 
         _RESUMED_JOBS.add(jid)
+        # a PROBE's job is never woken (§4LZ A-F2): its wake turn ran with
+        # owner rights; the result stays readable via jobs(action='collect')
+        try:
+            from .utils.logging import is_probe_request_id
+            if is_probe_request_id(str((entry or {}).get("started_by") or "")):
+                return False
+        except Exception:  # noqa: BLE001
+            pass
         _resume_times.append(now)
         code = entry.get("exit_code")
         state = str(entry.get("state") or "")
@@ -1246,6 +1254,13 @@ async def _resume_after_job(context, entry) -> bool:
         # the job id already carries its `job-` prefix (second review: the
         # wake ran as "job-job-…")
         _wake_id = jid if str(jid).startswith("job-") else f"job-{jid}"
+        # …but it keeps the STARTER's class (§4LZ A-F2): a job a scheduled
+        # task, sub-agent, self-play or a test replay started wakes as
+        # BACKGROUND, so the owner-only gates hold. (A probe's job never
+        # gets here — it returned above.)
+        _starter = str((entry or {}).get("started_by") or "")
+        if _starter.startswith(("sched-", "sub-", "sim-", "bench-", "replay-")):
+            _wake_id = f"sub-{_wake_id}"
         _content, _, _ = await _handle_chat_foreground(context, body, _wake_id)
         # Fresh review (§4KW): the wake's conclusion ("say briefly what the
         # job produced — the user has not seen this output") was DISCARDED —
