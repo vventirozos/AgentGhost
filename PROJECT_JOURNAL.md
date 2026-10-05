@@ -51294,3 +51294,34 @@ the battery stood in for a second reader.
 - 1 tool call instead of 4, 12.3 s instead of ~30 s; the macro is intact.
 - The reply names the reason ("blocked as a probe") but still opens with "I'll retry" despite the alert. This
   is model wording only (no call follows); left as is.
+
+## §4LX — low-traffic tools: scratchpad, fact_check, youtube_transcribe, self_play, postmortem (2026-10-05, operator: "review scratchpad, fact_check, youtube_transcribe, self_play, postmortem") — R0 scope
+**Why.** These are the last unreviewed tools: 2–6 calls each since August. `delegate` is excluded (it needs a
+second server, which doesn't exist); `extract_html_content` is a user tool (operator: not important).
+youtube_transcribe's pipeline was reviewed in §4KE; this covers the tool surface.
+**Method:**
+- ONE fresh reader (code + traffic, read-only copies, network/LLM stubbed);
+- fixes with behaviour tests; battery; suite once; gated deploy; labelled probes for anything changed.
+
+## §4LX — outcome (2026-10-05)
+**Review.** One fresh reader (3 MAJOR + 2 MINOR, all reproduced; no defect in fact_check, youtube_transcribe or
+the postmortem engine).
+**Fixed:**
+- **scratchpad:**
+  - `clear` = the ACTIVE scope only, system keys protected (it wiped every project's notes, the project
+    binding, swarm results and checkpoints; live on "/xlear");
+  - a new `delete` action;
+  - system keys cannot be set or deleted; `set` requires a value;
+  - probes cannot write (not_owner_write → dead-end);
+  - sched-/sub-/job- requests write to the `bg` scope, which is hidden from owner prompts
+    (`list_all(hide_namespaces)`).
+- **self_play_loop:** `max_cycles` counts attempts; 3 failures in a row stop it.
+- **postmortem show:** stripped id, exact first, an ambiguous prefix lists the matches.
+**Data:** none to clean (the live scratchpad holds only the Self-Play Report; the probe leftovers had expired).
+**Verification:**
+- `tests/test_4lx_lowtraffic.py` (13) plus the enum pin;
+- battery bat49: every mutant killed;
+- suite: 28,535 passed, 0 failed;
+- deployed pid 56114.
+**Live probe (labelled):** a probe scratchpad write was refused in 1 call and nothing stored. The reply still
+says "Let me retry" — the known §4LW wording quirk.

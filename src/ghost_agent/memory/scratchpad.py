@@ -315,7 +315,7 @@ class Scratchpad:
             n += 1
         return n
 
-    def list_all(self, namespace: Any = _UNSET, exclude=()) -> str:
+    def list_all(self, namespace: Any = _UNSET, exclude=(), hide_namespaces=()) -> str:
         """Render the scratchpad. With no argument this is every entry
         (unchanged); pass ``namespace`` to render one scope only
         (``namespace=None`` → the global/free-chat scope). ``exclude``: keys
@@ -328,6 +328,9 @@ class Scratchpad:
                 items = [(k, v) for k, v in self._data.items()
                          if self._scopes.get(k) == ns]
             items = [(k, v) for k, v in items if k not in set(exclude or ())]
+            if hide_namespaces:
+                _hide = set(hide_namespaces)
+                items = [(k, v) for k, v in items if self._scopes.get(k) not in _hide]
             if not items:
                 return "Scratchpad is empty."
             return "\n".join([f"{k}: {v}" for k, v in items])

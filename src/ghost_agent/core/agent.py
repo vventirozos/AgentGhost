@@ -3369,6 +3369,16 @@ _DEAD_END_REFUSALS = frozenset({"not_owner_write", "confirm_dead_end",
                                 "forget_not_confirmed", "reset_not_confirmed"})
 
 
+def _dead_end_reply(refusal: str) -> str:
+    """The direct answer for a request whose write was refused outright:
+    the refusal's reason, without the tool-facing parts ("Error:", "STOP:
+    do not retry…")."""
+    t = re.sub(r"^\s*(?:Error:\s*)+", "", str(refusal or "")).strip()
+    t = re.split(r"\s*STOP\b", t, maxsplit=1)[0].strip()
+    t = t.rstrip(" .—-") + "."
+    return f"Not done: {t}"
+
+
 #: shell-like tool names a model reaches for — the work runs through `execute`
 _SHELL_LIKE_TOOLS = frozenset({"git", "bash", "sh", "shell", "terminal", "zsh", "cmd", "run_command",
                                "python", "pip", "npm", "curl", "docker"})
@@ -21892,10 +21902,21 @@ class GhostAgent:
                     # request — a probe/background write, a confirm in the
                     # preview's own turn — ends the tool phase. The model
                     # retried a refused probe delete 3-8× despite STOP text.
-                    if getattr(_outcome, "reason_code", None) in _DEAD_END_REFUSALS:
+                    _dead_code = getattr(_outcome, "reason_code", None)
+                    if _dead_code == "not_owner_write" and not _batch_short_circuit:
+                        # §4LX: a probe/background write the store refuses
+                        # for the whole request. The answer is the refusal
+                        # itself — no model-written reply, which kept saying
+                        # "Let me retry…" even with an explicit alert. A
+                        # direct reply (force_stop) also reaches a STREAMED
+                        # client, where a later rewrite could not.
+                        final_ai_content = _dead_end_reply(str(_outcome))
+                        force_stop = True
+                        _batch_short_circuit = True
+                        logger.info("dead-end refusal (%s) — answered directly", _dead_code)
+                    elif _dead_code in _DEAD_END_REFUSALS and _dead_code != "not_owner_write":
                         force_final_response = True
-                        logger.info("dead-end refusal (%s) — wrapping up the turn",
-                                    getattr(_outcome, "reason_code", None))
+                        logger.info("dead-end refusal (%s) — wrapping up the turn", _dead_code)
                         # …and say WHY, or the reply promises a retry that
                         # never comes ("Let me retry…", live K1c probe)
                         messages.append({"role": "user", "content": (
@@ -29869,7 +29890,10 @@ class GhostAgent:
                     # agent's practice/learning — it was relevant to 0 of 40
                     _sp_ask = bool(_SELF_PLAY_ASK.search(str(last_user_content or "")))
                     scratch_data = (self.context.scratchpad.list_all(
-                                        exclude=() if _sp_ask else ("Self-Play Report",))
+                                        exclude=() if _sp_ask else ("Self-Play Report",),
+                                        # background jobs' notes stay theirs (§4LX)
+                                        hide_namespaces=() if str(req_id or "").startswith(("sched-", "sub-", "job-"))
+                                        else ("bg",))
                                     if getattr(self.context, 'scratchpad', None) and not _owner_context_hidden(self.context)
                                     else "None.")        # the scratchpad is the OWNER's (R4)
                     # Bound the scratchpad at the SOURCE (2026-07-20). The

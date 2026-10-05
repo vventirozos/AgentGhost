@@ -84,8 +84,33 @@ async def test_the_turn_loop_stops_calling_tools_after_a_dead_end():
     agent.available_tools = {"manage_skills": refuse}
     ts = H._ts([("manage_skills", {"action": "delete", "skill_name": "x"})], StrikeLedger(), set())
     await agent._dispatch_and_process_tool_batch(ts)
-    assert ts.force_final_response is True
+    # §4LX: answered directly — no model-written reply to say "Let me retry"
+    assert ts.force_stop is True
+    assert ts.final_ai_content.startswith("Not done:") and "STOP" not in ts.final_ai_content
+    assert "retry" not in ts.final_ai_content.lower()
+
+
+async def test_a_confirm_dead_end_lets_the_model_ask_the_user():
+    from ghost_agent.core.strikes import StrikeLedger
+    import tests.test_4jj_search_yield_steer as H
+    agent = H._agent()
+
+    async def refuse(**kw):
+        return ToolOutcome.rejected("Error: NOT done: the user has not answered yet. STOP calling it.",
+                                    world_changed=False, reason_code="confirm_dead_end")
+    agent.available_tools = {"manage_projects": refuse}
+    ts = H._ts([("manage_projects", {"action": "delete", "project_id": "x", "confirm_token": "t"})],
+               StrikeLedger(), set())
+    await agent._dispatch_and_process_tool_batch(ts)
+    assert ts.force_final_response is True and not ts.force_stop
     assert any("Do NOT say you will retry" in str(m.get("content")) for m in ts.messages)
+
+
+def test_the_direct_reply_drops_the_tool_facing_parts():
+    from ghost_agent.core.agent import _dead_end_reply
+    out = _dead_end_reply("Error: a probe request does not write the owner's scratchpad — nothing "
+                          "changed. STOP: do not retry this in this turn.")
+    assert out == "Not done: a probe request does not write the owner's scratchpad — nothing changed."
 
 
 async def test_an_ordinary_refusal_does_not_end_the_turn():
@@ -125,3 +150,22 @@ async def test_the_real_skill_runner_refuses_bad_arguments_without_running_or_ch
     assert mgr.get_all_skills()["headlines"]["failure_count"] == 0
     await runner(q="news", count=3)
     assert len(ran) == 1
+
+
+async def test_two_refusals_in_one_batch_keep_the_first_reason():
+    from ghost_agent.core.strikes import StrikeLedger
+    import tests.test_4jj_search_yield_steer as H
+    agent = H._agent()
+
+    async def first(**kw):
+        return ToolOutcome.rejected("Error: FIRST reason — nothing changed.", world_changed=False,
+                                    reason_code="not_owner_write")
+
+    async def second(**kw):
+        return ToolOutcome.rejected("Error: SECOND reason — nothing changed.", world_changed=False,
+                                    reason_code="not_owner_write")
+    agent.available_tools = {"scratchpad": first, "manage_skills": second}
+    ts = H._ts([("scratchpad", {"action": "set", "key": "k", "value": "v"}),
+                ("manage_skills", {"action": "delete", "skill_name": "x"})], StrikeLedger(), set())
+    await agent._dispatch_and_process_tool_batch(ts)
+    assert "FIRST" in ts.final_ai_content and "SECOND" not in ts.final_ai_content

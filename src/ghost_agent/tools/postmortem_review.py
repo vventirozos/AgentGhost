@@ -114,10 +114,17 @@ async def tool_postmortem(
         if act == "show":
             if not defect_id:
                 return "action='show' needs a defect_id (use action='pending' to find one)."
-            for r in defect_queue.all():
-                if r.id.startswith(defect_id) or r.id == defect_id:
-                    return _fmt_full(r)
-            return f"No defect found with id starting '{defect_id}'."
+            # stripped, exact first, and a prefix only when it names ONE
+            # defect (§4LX: a short prefix silently showed the first match)
+            _want = str(defect_id).strip()
+            _all = list(defect_queue.all())
+            _hit = [r for r in _all if r.id == _want] or [r for r in _all if r.id.startswith(_want)]
+            if len(_hit) == 1:
+                return _fmt_full(_hit[0])
+            if len(_hit) > 1:
+                return (f"'{_want}' matches {len(_hit)} defects: "
+                        + ", ".join(r.id for r in _hit[:10]) + ". Pass a longer id.")
+            return f"No defect found with id starting '{_want}'."
 
         reports = defect_queue.pending() if act == "pending" else defect_queue.all()
         if not reports:

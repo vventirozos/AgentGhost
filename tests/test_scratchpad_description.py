@@ -68,7 +68,7 @@ def test_action_enum_unchanged():
     """The bug was in description salience, not action shape. Pin the
     action enum so the rename doesn't accidentally drop any."""
     props = _scratchpad_def()["parameters"]["properties"]
-    assert set(props["action"]["enum"]) == {"set", "get", "list", "clear"}
+    assert set(props["action"]["enum"]) == {"set", "get", "list", "delete", "clear"}   # §4LX: +delete
 
 
 def test_value_param_description_does_not_say_just_content():

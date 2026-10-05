@@ -758,12 +758,12 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "scratchpad",
-            "description": "Key/value store for short-term notes — survives across turns within the conversation. THIS is the FIRST CHOICE when the user says 'set a key', 'save a variable', 'remember X as Y for this conversation', or 'use the scratchpad'. Do NOT use file_system.write to persist tagged values — that creates orphan sandbox files that aren't recallable as named entries. action='set' stores; 'get' retrieves; 'list' shows all; 'clear' wipes everything.",
+            "description": "Key/value store for short-term notes — survives across turns within the conversation. THIS is the FIRST CHOICE when the user says 'set a key', 'save a variable', 'remember X as Y for this conversation', or 'use the scratchpad'. Do NOT use file_system.write to persist tagged values — that creates orphan sandbox files that aren't recallable as named entries. action='set' stores; 'get' retrieves; 'list' shows all; 'delete' removes ONE key; 'clear' empties the current scope only (other projects' notes and system keys are kept).",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["set", "get", "list", "clear"]},
-                    "key": {"type": "string", "description": "The name of the variable/note (required for set/get)."},
+                    "action": {"type": "string", "enum": ["set", "get", "list", "delete", "clear"]},
+                    "key": {"type": "string", "description": "The name of the variable/note (required for set/get/delete)."},
                     "value": {"type": "string", "description": "The text/data to associate with the key (required for action='set'). Can be any string — a value, a JSON blob, an ID, etc."}
                 },
                 "required": ["action"]

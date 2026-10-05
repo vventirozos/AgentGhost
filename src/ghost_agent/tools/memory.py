@@ -3180,6 +3180,33 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
 
     return "\n".join(report) if report else f"No matching memory found for '{target}'."
 
+#: Scratchpad keys the SYSTEM owns — the current-project binding, swarm
+#: results, turn checkpoints, project scopes. The model's tool may not set,
+#: delete or clear them (§4LX: one `clear` parked the owner's project).
+_SCRATCH_RESERVED_PREFIXES = ("__", "_swarm_task_id::", "_checkpoint_t", "proj::")
+#: the scope background requests write into — never shown in an owner prompt
+SCRATCH_BACKGROUND_NS = "bg"
+
+
+def _scratch_reserved(key) -> bool:
+    return str(key or "").startswith(_SCRATCH_RESERVED_PREFIXES)
+
+
+def _scratch_request_kind() -> str:
+    """'probe', 'background' or 'owner' for the current request."""
+    try:
+        from ..utils.logging import (request_id_context, is_probe_request_id,
+                                     request_origin_context, ORIGIN_PROBE)
+        rid = str(request_id_context.get() or "")
+        if is_probe_request_id(rid) or str(request_origin_context.get() or "") == ORIGIN_PROBE:
+            return "probe"
+        if rid.startswith(("sched-", "sub-", "job-")):
+            return "background"
+    except Exception:  # noqa: BLE001
+        pass
+    return "owner"
+
+
 async def tool_scratchpad(action: str = None, scratchpad: Scratchpad = None, key: str = None, value: str = None, **kwargs):
     if not action:
         return "SYSTEM ERROR: The 'action' parameter is MANDATORY. You must specify it."
@@ -3190,11 +3217,34 @@ async def tool_scratchpad(action: str = None, scratchpad: Scratchpad = None, key
     if not scratchpad:
         return "Error: Scratchpad memory is not initialized."
     action = str(action).strip().lower()
+    if action in ("remove", "del", "unset"):
+        action = "delete"
+    kind = _scratch_request_kind()
+    if action in ("set", "delete", "clear"):
+        if kind == "probe":
+            # §4LX: a probe's `pong_pending=PONG2` sat in the owner's prompt for 24 h
+            return ToolOutcome.rejected(
+                "Error: a probe request does not write the owner's scratchpad — nothing changed.",
+                world_changed=False, reason_code="not_owner_write")
+        if key is not None and _scratch_reserved(key):
+            return ToolOutcome.rejected(
+                f"Error: '{key}' is a system key (project binding, job result or checkpoint) — "
+                f"the scratchpad tool cannot change it.", world_changed=False,
+                reason_code="scratch_reserved_key")
+    _bg_ns = SCRATCH_BACKGROUND_NS if kind == "background" else None
     if action == "set":
         # A key is required — set(None, ...) stores under key None and the
         # SQLite error is swallowed, reporting a no-op as success.
         if not key:
             return "SYSTEM ERROR: 'key' is required for scratchpad set."
+        if value is None:
+            # (§4LX) a None value was stored, then `get` said "not found"
+            # while `list` and the prompt showed `todo: None`
+            return "SYSTEM ERROR: 'value' is required for scratchpad set."
+        if _bg_ns:
+            # a background job's notes stay out of the owner's prompt (§4LX:
+            # 14 chess-subscription notes rode every owner turn)
+            return scratchpad.set(key, value, namespace=_bg_ns)
         return scratchpad.set(key, value)
     elif action == "get":
         if not key:
@@ -3207,9 +3257,23 @@ async def tool_scratchpad(action: str = None, scratchpad: Scratchpad = None, key
         return f"{key} = {val}"
     elif action == "list":
         return scratchpad.list_all()
+    elif action == "delete":
+        if not key:
+            return "SYSTEM ERROR: 'key' is required for scratchpad delete."
+        if _bg_ns and scratchpad.namespace_of(key) != _bg_ns:
+            return "Error: a background request can only delete its own notes."
+        return (f"Deleted '{key}'." if scratchpad.delete(key) else f"Error: '{key}' not found.")
     elif action == "clear":
-        return scratchpad.clear()
-    return "Error: Unknown action"
+        # ONLY the active scope, never the system's keys (§4LX: the tool's
+        # clear wiped every project's notes, the project binding, swarm
+        # results and other requests' checkpoints — live, on "/xlear")
+        ns = _bg_ns or getattr(scratchpad, "active_namespace", None)
+        protect = {k for k in scratchpad.keys() if _scratch_reserved(k)}
+        gone = scratchpad.clear_namespace(ns, protect=protect)
+        return (f"Cleared {len(gone)} note(s) from "
+                + (f"scope '{ns}'" if ns else "the general scope")
+                + ". Other projects' notes and system keys were kept.")
+    return "Error: Unknown action (set, get, list, delete, clear)"
 
 async def sync_owner_mirrors(category, key, profile_memory, graph_memory=None, memory_system=None) -> list:
     """§4KZ: the PROFILE is the authority for an owner field; its graph edges
@@ -4225,6 +4289,8 @@ async def _run_self_play_loop(context, *, model_name: str, max_cycles: int, stop
     dreamer = Dreamer(context)
     dreamer.cycle_budget_s = SELF_PLAY_CYCLE_TIMEOUT_S   # §4KS: each cycle is bounded below
     cycles_done = 0
+    attempts = 0            # every TRY counts toward max_cycles (§4LX)
+    fails_in_a_row = 0
     lessons_before = _count_playbook(context)
     # PRM retrain cadence inside the loop. 20 is enough fresh
     # trajectories that the model picks up new signal but not so often
@@ -4237,8 +4303,15 @@ async def _run_self_play_loop(context, *, model_name: str, max_cycles: int, stop
     )
     try:
         while not stop_event.is_set():
-            if max_cycles and cycles_done >= max_cycles:
+            # ATTEMPTS, not successes (§4LX): failing cycles (600 s each, or
+            # a bad `model=`) were never counted, so max_cycles=2 ran 82
+            # attempts in a second and kept going
+            if max_cycles and attempts >= max_cycles:
                 pretty_log("Self-Play Loop", f"Reached max_cycles={max_cycles}. Stopping.", icon=Icons.OK)
+                break
+            if fails_in_a_row >= 3:
+                pretty_log("Self-Play Loop", "3 cycles failed in a row — stopping.",
+                           level="WARNING", icon=Icons.STOP)
                 break
             # Don't interrupt a live user turn.
             llm_client = getattr(context, "llm_client", None)
@@ -4249,13 +4322,16 @@ async def _run_self_play_loop(context, *, model_name: str, max_cycles: int, stop
                 except asyncio.TimeoutError:
                     continue
 
+            attempts += 1
             try:
                 await asyncio.wait_for(
                     dreamer.synthetic_self_play(model_name=model_name, is_background=True),
                     timeout=SELF_PLAY_CYCLE_TIMEOUT_S,
                 )
                 cycles_done += 1
+                fails_in_a_row = 0
             except asyncio.TimeoutError:
+                fails_in_a_row += 1
                 pretty_log(
                     "Self-Play Loop",
                     f"Cycle {cycles_done+1} exceeded {SELF_PLAY_CYCLE_TIMEOUT_S:.0f}s. Skipping.",
@@ -4265,6 +4341,7 @@ async def _run_self_play_loop(context, *, model_name: str, max_cycles: int, stop
                 raise
             except Exception as e:
                 # One cycle failing should not kill the loop — log and keep going.
+                fails_in_a_row += 1
                 pretty_log("Self-Play Loop", f"Cycle {cycles_done+1} raised: {e}", level="WARNING", icon=Icons.WARN)
 
             # Drain the short-term journal before cooling off. This keeps
