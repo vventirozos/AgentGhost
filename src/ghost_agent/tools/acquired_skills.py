@@ -450,6 +450,13 @@ class AcquiredSkillManager:
                     # skill vanished from defs AND runners, yet could never
                     # retire (retirement keyed on the now-zero counter) —
                     # a permanent zombie no path could revive.
+                    # ⚠ In practice unreachable (§4LS m2): a degraded skill
+                    # has no runner, so it cannot run to succeed; it is
+                    # retired by the next owner-turn sweep. OPEN: a call with
+                    # bad arguments is still charged to the skill — reading
+                    # the skill's output for argument phrases both missed
+                    # live wordings and excused real HTTP 400s; the fix is
+                    # validating args against the stored schema first.
                     if skill.get("status") == "degraded":
                         skill["status"] = "active"
                         pretty_log("Skill Recovered",
@@ -791,7 +798,28 @@ def _summarise_tdd_failure(execution_result: str) -> str:
         return "unknown cause"
 
 
+def _not_an_owner_write(probe_only: bool = False) -> bool:
+    """A probe, scheduled or sub-agent request: it may read the skill stores
+    but never change them (a `job-` wake turn resumes the OWNER's own work and
+    is allowed) (§4LS M4 — a probe deleted the code-owned
+    `youtube_transcribe` macro, approved a stale one, and deleted an
+    acquired skill)."""
+    try:
+        from ..utils.logging import (request_id_context, is_probe_request_id,
+                                     request_origin_context, ORIGIN_PROBE)
+        rid = str(request_id_context.get() or "")
+        return bool(is_probe_request_id(rid)
+                    or str(request_origin_context.get() or "") == ORIGIN_PROBE
+                    or (not probe_only and rid.startswith(("sched-", "sub-"))))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 async def tool_create_skill(sandbox_dir: Path = None, memory_dir: Path = None, memory_system=None, sandbox_manager=None, name: str = None, description: str = None, parameters_schema: str = None, python_code: str = None, test_payload: str = None, **_extra):
+    if _not_an_owner_write(probe_only=True):
+        # probes only: the dream cycle acquires skills in the background
+        # through this function, and must keep doing so
+        return "Error: a probe request does not create skills — nothing changed. STOP: do not retry this in this turn."
     # Tolerate stray kwargs the LLM sometimes invents (observed: `filename`
     # when the model confuses this tool with `execute`). Without this
     # catch-all the registry's `**kwargs` pass-through would raise a
@@ -989,6 +1017,10 @@ async def tool_create_skill(sandbox_dir: Path = None, memory_dir: Path = None, m
         f"sandbox) so those paths will not resolve."
     )
 
+class _SkipSweep(Exception):
+    """No retirement sweep on this call."""
+
+
 async def tool_manage_skills(sandbox_dir: Path = None, memory_dir: Path = None, memory_system=None, action: str = None, skill_name: str = None, **kwargs):
     if not action:
         return "SYSTEM ERROR: The 'action' parameter is MANDATORY. You must specify it."
@@ -1001,15 +1033,24 @@ async def tool_manage_skills(sandbox_dir: Path = None, memory_dir: Path = None, 
     # retire_degraded_skills — degraded skills lingered in the list forever.
     # Sweep them here whenever the agent manages skills. Best-effort.
     try:
+        # never from a probe/background turn (§4LS m1: a probe's `list`
+        # moved live skills to retired/); an owner's call — `list` included,
+        # the tool's only other action is delete — still sweeps, or degraded
+        # skills linger forever (fix review N2)
+        if _not_an_owner_write():
+            raise _SkipSweep()
         _retired = mgr.retire_degraded_skills()
         if _retired:
             logger.info("Retired %d degraded skill(s): %s", len(_retired), _retired)
+    except _SkipSweep:
+        pass
     except Exception as _re:
         logger.debug("retire_degraded_skills skipped: %s", _re)
     # Also sweep embeddings orphaned by the pre-2026-07-26 broken vector
     # deletes (flat multi-key where) — their registry entries are gone, so
     # no other path can ever clean them. Self-guarding, never raises.
-    mgr.purge_orphaned_skill_embeddings()
+    if not _not_an_owner_write():
+        mgr.purge_orphaned_skill_embeddings()
     # ...and the inverse: re-embed any ACTIVE skill that has no embedding.
     # Without this the index can only ever lose entries (see the method's
     # docstring for how a skill goes permanently invisible).
@@ -1051,6 +1092,8 @@ async def tool_manage_skills(sandbox_dir: Path = None, memory_dir: Path = None, 
         return body + footer
 
 
+    elif action == "delete" and _not_an_owner_write():
+        return "Error: a probe or background request does not delete skills — nothing changed. STOP: do not retry this in this turn."
     elif action == "delete":
         if not skill_name:
             return "Error: skill_name is required for 'delete' action."

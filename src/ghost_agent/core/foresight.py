@@ -267,6 +267,13 @@ def call_target(tool: str, op: str, args: Any) -> str:
     NOT fixed by widening `_PRIMARY_ARG_KEYS` — that list is shared
     semantics for the no-progress breaker and postmortem signatures."""
     args = args if isinstance(args, dict) else {}
+    if tool == "manage_services":
+        # a service's identity is its name (+ port), not a path: every start
+        # filed under '' — one untagged test's failures blocked the owner's
+        # unrelated starts 8 days later (§4LR M3; cf. triggers.py)
+        _nm = str(args.get("name") or args.get("service") or args.get("service_name") or "").strip().lower()
+        _pt = args.get("port")
+        return f"svc:{_nm}" + (f":{_pt}" if _pt not in (None, "") else "") if _nm else ""
     t = str(args.get("path") or "")
     if not t and tool == "execute":
         t = str(args.get("command") or args.get("cmd") or "")
@@ -364,6 +371,10 @@ def target_class(tool: str, op: str, target: str) -> str:
         return ""
     if t.startswith("<redacted"):
         return "redacted"
+    if tool == "manage_services" and t.startswith("svc:"):
+        # the class is the SERVICE: one shared `other` bucket let three
+        # `probesvc` failures predict a `sponza` start (§4LR fix review N2)
+        return ":".join(t.split(":")[:2])[:40]
     m = _SCHEME_RE.match(t)
     if m:
         return f"scheme:{m.group(1)}"

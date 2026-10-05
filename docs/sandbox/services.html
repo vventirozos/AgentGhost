@@ -85,13 +85,14 @@
     is dead but the port is still held (a mis-tracked orphan), <code>stop</code>
     reclaims it by killing the port's listener, found via <code>ss</code>
     (iproute2, baked into the image).</li>
-    <li><code>stop-all</code> — <strong>the one-shot cleanup</strong>
-    (2026-07-12): stops EVERY service, reclaims their ports, and clears the
-    registry. For when services have accumulated or orphaned.</li>
+    <li><code>stop-all</code> — stops the current project's services (or,
+    without a project, the project-less ones); <code>all_projects=true</code>
+    stops every service. Project rows are kept so <code>restart</code> works
+    (<a href="#4lr">&sect;4LR</a>; it used to clear the whole registry).</li>
     <li><code>status</code> — liveness (<code>kill -0</code>) + port
     listening state + uptime for every registered service; a recreated
     container shows them DEAD (pids don't survive re-provisioning), and the
-    listing points at <code>stop-all</code> when any dead entry is present.</li>
+    listing points at <code>restart</code> (bring one back) or <code>stop</code> (drop one).</li>
     <li><code>logs</code> — host-side tail (default 60 lines, 8 KB cap).</li>
   </ul>
   <p class="note"><strong>Reliable pid tracking (2026-07-12).</strong> The
@@ -463,6 +464,20 @@ bin/unserve-remote.sh 8100    # tear down (or `… all` to reset every mapping)<
   what the start report and status print for an unpublished port, the tool).</p>
   <!-- /4KS:loopback -->
 
+  <h2 id="4lr">Services review <span class="tag">2026-10-05 &sect;4LR</span></h2>
+  <p>A fresh reader drove the real supervisor in a throwaway container and read 175 real turns: of 47 failed calls, about 30 were app or model errors the tool reported correctly; the tool's own faults are fixed here.</p>
+  <ul>
+    <li><strong>Running services are not "stale".</strong> The project briefing compared the container id with the <code>&lt;id&gt;:&lt;StartedAt&gt;</code> stamp and marked every live service STALE on every turn, telling the model to restart working (released) apps. It now compares in the stamp's own form, from cached attributes; a legacy id-only stamp reads stale.</li>
+    <li><strong>A server that names no port gets the lease</strong> (<code>add_default_port</code>): <code>python3 -m http.server</code> defaulted to the RESERVED 8000; <code>uvicorn</code> and <code>flask run</code> get <code>--port</code> too. Only the program that runs is edited, read as shell tokens (the command, or what follows one leading <code>cd dir &amp;&amp;</code>); a command that passes <code>$PORT</code>, a compound or piped command, and a name inside quoted code are left exactly as written. Logs are unbuffered (<code>PYTHONUNBUFFERED=1</code>), so a failure shows a log tail.</li>
+    <li><strong>"Nothing listening" says where it is listening</strong> (<code>_ports_held_by</code>, the service's process group in <code>ss -ltnp</code>): "listening on port 5000 instead". A service holding a reserved port is stopped, and when the kill does not land the report says so.</li>
+    <li><strong>An explicit reserved port is a preference</strong>, re-leased with a note, as the same port in the command always was.</li>
+    <li><strong>The pre-flight guard keys services by name</strong> (<code>foresight.call_target</code> → <code>svc:&lt;name&gt;[:port]</code>, and the coarse class is <code>svc:&lt;name&gt;</code> — the shared <code>other</code> class let one service's failures predict another's): every start had shared one target, so an untagged test's failures blocked the owner's unrelated starts eight days later.</li>
+    <li><strong><code>stop-all</code> is scoped.</strong> From a project: that project's services. Without one: the project-less ones; every service only with <code>all_projects=true</code>. Project rows are kept, so <code>restart</code> still works (it had erased released apps' rows). The vague aliases <code>cleanup</code> and <code>reap</code> are gone, and a bulk stop is never a composed-macro step.</li>
+    <li><strong>"Did NOT stop" is a declared failure</strong> (<code>service_kill_survived</code>), from <code>stop</code> and <code>stop-all</code>.</li>
+    <li><strong>The release rehearsal believes the supervisor:</strong> a restart that declared FAILED fails it, and reachability is checked inside the sandbox (<code>_port_listening</code>) plus the bind address (a loopback-only app in bridge mode fails: the host cannot reach it); the host probe was answered by OrbStack on every published port.</li>
+    <li><strong>Exposure warnings.</strong> In host-network mode <code>http.server</code> gets <code>--bind 127.0.0.1</code>, and any wildcard listener is reported as LAN-reachable. A file server rooted at the sandbox root is reported as publishing everything there, the service registry and its tokens included.</li>
+  </ul>
+  <p>Pins: <code>tests/test_4lr_services.py</code>.</p>
 </main>
 </body>
 </html>

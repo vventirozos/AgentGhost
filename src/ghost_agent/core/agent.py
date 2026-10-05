@@ -3372,12 +3372,20 @@ def _unknown_tool_message(name, available) -> str:
     """§4LL: "Unknown tool 'git'" named no way forward. Say what to use: a
     shell-like name runs through `execute`; anything else gets the list."""
     n = str(name or "").strip()
-    if n.lower() in _SHELL_LIKE_TOOLS:
+    names = sorted(str(k) for k in (available or {}) if not str(k).startswith("_"))
+    # §4LV: a member's turn lists only what a member may call, and is never
+    # told to use `execute` (members cannot) — and the list is WHOLE: cut at
+    # 40, `web_search` and `workspace` fell off the end
+    try:
+        from ..utils.logging import requester_is_member
+        if requester_is_member():
+            names = [k for k in names if k in _MEMBER_ALLOWED_TOOLS]
+    except Exception:  # noqa: BLE001
+        pass
+    if n.lower() in _SHELL_LIKE_TOOLS and "execute" in names:
         return (f"Error: there is no '{n}' tool. Run it as a shell command through execute, "
                 f"e.g. execute(command=\"{n.lower()} …\").")
-    names = sorted(str(k) for k in (available or {}) if not str(k).startswith("_"))
-    return (f"Error: Unknown tool '{n}'. Available tools: {', '.join(names[:40])}"
-            + (" …" if len(names) > 40 else "") + ".")
+    return f"Error: Unknown tool '{n}'. Available tools: {', '.join(names)}."
 
 
 def _unverified_mutation_note(last_tool, request, tools_run):
@@ -8392,20 +8400,104 @@ def _hypothesis_shell_cmd(cmd: str):
     when it must not run (§4LO). It ran as a bare argv — no shell, so pipes,
     `&&` and redirects became literal arguments (a right hypothesis was
     eliminated on the garbled run) — and skipped every guard the execute
-    tool applies. A hypothesis TEST is read-only: invalid shell, a
-    deny-listed form, or anything that writes / removes / moves is refused."""
+    tool applies. A hypothesis test should only LOOK, so invalid shell, a
+    deny-listed form, a write redirect and every mutating verb the shell
+    shows (in ANY segment: `touch`, `pip install`, `git commit`, `sed -i`,
+    `curl -o`, kill) are refused. BEST-EFFORT, not a sandbox: an interpreter
+    (`python3 -c "open('x','w')"`) can still write — the guard sees only
+    the shell's own verbs (§4LP follow-up)."""
     from ..tools.validators import validate_shell
-    from ..tools.execute import _bash_c, _rerun_unsafe
+    from ..tools.execute import _bash_c, _rerun_unsafe, _MUTATING_HEADS
     from ..tools.shell_analysis import _shell_segments
     ok, _why = validate_shell(cmd)
     if not ok or _rerun_unsafe(cmd):
         return None
     for head, args, _raw, _x in _shell_segments(cmd):
-        if head in ("kill", "pkill", "killall", "sed") and (head != "sed" or any(a.startswith("-i") for a in args)):
+        if head in ("kill", "pkill", "killall") or head in _HYPOTHESIS_DENY_HEADS:
             return None
-        if head == "git" and args and args[0] in ("checkout", "reset", "clean", "restore", "stash", "rm", "mv", "commit", "push"):
+        if head in _HYPOTHESIS_READ_ONLY_SUBCOMMANDS:
+            # an ALLOWLIST at the subcommand position (§4LQ round 4: a
+            # deny-list of verbs let `cargo b`, `pnpm i`, `systemctl reboot`,
+            # `docker compose down -v` through and refused `docker logs
+            # build`). The bare tool and anything not listed refuse.
+            sub = next((a for a in args if not a.startswith("-")), "")
+            if args and args[0] in ("--version", "-V", "version"):
+                continue
+            if head == "service":           # service <name> status
+                if len(args) == 2 and args[1] == "status":
+                    continue
+                return None
+            if sub not in _HYPOTHESIS_READ_ONLY_SUBCOMMANDS[head]:
+                return None
+            if head == "go" and sub == "env" and any(a in ("-w", "-u") for a in args):
+                return None                 # `go env -w` writes the config
+            continue
+        if head == "sed":
+            if any(a.startswith(("-i", "--in-place")) for a in args):
+                return None
+        elif head == "perl":
+            if any(re.fullmatch(r"-[a-zA-Z]*i\S*", a) for a in args):
+                return None
+        elif re.fullmatch(r"python[0-9.]*", head or ""):
+            _mods = [args[i + 1] for i, a in enumerate(args[:-1]) if a == "-m"]
+            _mods += [a[2:] for a in args if a.startswith("-m") and len(a) > 2]     # -mpip
+            if any(m in ("pip", "pip3", "ensurepip", "venv") for m in _mods):
+                return None
+        elif head == "git":
+            rest = list(args)
+            # only path/paging globals: `git -c core.fsmonitor=<cmd> status`
+            # RUNS <cmd> (review N4), so any other global option refuses
+            while rest and rest[0].startswith("-"):      # git -C repo / --no-pager
+                opt = rest.pop(0)
+                if opt == "-C" and rest:
+                    rest.pop(0)
+                elif not (opt in ("--no-pager", "-P")
+                          or opt.startswith(("--git-dir=", "--work-tree="))):
+                    return None
+            if not rest or rest[0] not in _GIT_READ_ONLY:
+                return None
+        elif head == "tar":
+            # listing only: `tar tf a.tar`, `tar -tzf …`, `tar --list …`
+            mode = args[0] if args else ""
+            listing = mode == "--list" or (re.fullmatch(r"-?[a-zA-Z]+", mode or "-")
+                                           and "t" in mode and not re.search(r"[xcru]", mode))
+            if not listing:
+                return None
+        elif head == "curl":
+            if any(a in ("-o", "-O", "--output", "--remote-name") or a.startswith(("-o", "--output="))
+                   for a in args):
+                return None
+        elif head in _MUTATING_HEADS:
             return None
     return _bash_c(cmd)
+
+
+#: package / service tools: the read-only subcommands a hypothesis test may use
+_HYPOTHESIS_READ_ONLY_SUBCOMMANDS = {
+    "docker": {"ps", "images", "logs", "inspect", "info", "version", "top", "port", "history"},
+    "podman": {"ps", "images", "logs", "inspect", "info", "version", "top", "port", "history"},
+    "kubectl": {"get", "describe", "logs", "version", "explain", "top", "api-resources"},
+    "systemctl": {"status", "is-active", "is-enabled", "is-failed", "list-units",
+                  "list-unit-files", "show", "cat"},
+    "launchctl": {"list", "print", "blame"},
+    "service": set(),
+    "go": {"version", "env", "list", "vet", "doc", "test"},
+    "cargo": {"tree", "metadata", "search", "test", "check"},
+    "uv": {"tree"},
+    "conda": {"list", "info", "search"},
+    "mamba": {"list", "info", "search"},
+    "poetry": {"show", "check"},
+    "gem": {"list", "info", "environment", "search"},
+    "brew": {"list", "info", "config", "search", "outdated", "deps"},
+    "yarn": {"list", "info", "why", "outdated"},
+    "pnpm": {"list", "ls", "why", "outdated"},
+    "pipx": {"list"},
+}
+_HYPOTHESIS_DENY_HEADS = frozenset({"crontab", "reboot", "shutdown",
+                                    "mount", "umount", "useradd", "userdel", "passwd"})
+
+_GIT_READ_ONLY = frozenset({"status", "log", "diff", "show", "rev-parse", "ls-files",
+                            "blame", "grep", "describe", "shortlog", "cat-file"})
 
 
 def _salvage_vision_args(block: str) -> dict:
@@ -12145,7 +12237,9 @@ class GhostAgent:
                 _idle_ran.append("autoadvance")
                 self._last_autoadvance_at = datetime.datetime.now()
                 try:
-                    actives = await asyncio.to_thread(store.list_projects, "ACTIVE")
+                    # §4LP: only projects the owner put on autopilot
+                    from .project_advancer import idle_candidates
+                    actives = await asyncio.to_thread(idle_candidates, store)
                     if actives:
                         # Round-robin fairness: pick the project advanced
                         # LEAST recently (never-advanced projects, ts=0, go
@@ -18295,7 +18389,7 @@ class GhostAgent:
             pretty_log(
                 "Verifier",
                 f"filed {filed} follow-up task(s) from the late refute on "
-                f"project {project_id} — next turn / autoadvance picks "
+                f"project {project_id} — the owner's next turn picks "
                 "them up",
                 icon=Icons.IDEA,
             )
@@ -22257,6 +22351,8 @@ class GhostAgent:
                     # `json.dumps` and the LLM payload, which see exactly the
                     # same characters as before. No extra dict key: an
                     # unknown field on a message is sent to the API.
+                    # the call's wall time, for the trajectory row (§4LP follow-up)
+                    _call_dur = tool_durations[i] if i < len(tool_durations) else None
                     tool_msg = {"role": "tool", "tool_call_id": tool_id,
                                 "name": fname,
                                 "content": ToolOutcome(
@@ -22285,7 +22381,8 @@ class GhostAgent:
                                     # read a key no row had and booked every
                                     # write as substantive evidence
                                     # (2026-09-13).
-                                    call_args=_recorded_args)}
+                                    call_args=_recorded_args,
+                                    duration_s=_call_dur)}
                     messages.append(tool_msg)
                     tools_run_this_turn.append(tool_msg)
 
@@ -35193,6 +35290,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     except Exception:
                         pass
                     obj.result = _content[:4000]
+                    try:
+                        obj.duration_s = float(getattr(m.get("content"), "duration_s", None) or 0.0)
+                    except (TypeError, ValueError):
+                        pass
                     if len(_content) > 4000:
                         # one char past the cap, so the collector can tell it was cut
                         obj.full_result = _content[:200_001]      # §4LH sidecar

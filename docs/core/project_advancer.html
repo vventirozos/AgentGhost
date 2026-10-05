@@ -216,6 +216,15 @@
     no work happened.</b> A transient exception is a reason to <em>stop</em>, not to accept a lower
     standard of proof — the leaf stays open and the next tick retries it under the full gate set.
   </p>
+  <h2 id="4lp">Only what was asked <span class="tag">2026-10-05 &sect;4LP</span></h2>
+  <p><code>advance_once(…, owner_requested=False)</code>, the idle loop, never claims a task the verifier filed on its own (<code>_is_unrequested_task</code>, through <code>ProjectPlan.next_ready_leaf(skip=…)</code>). The manage_projects <code>autoadvance</code> action and the API route pass <code>owner_requested=True</code>.</p>
+  <p><strong>Unattended closes need evidence</strong> (operator: "go with your recommendations"). <code>_unattended_close</code> decides how a leaf closes when nobody asked for the run:</p>
+  <ul>
+    <li>A task whose text mentions a check <em>anywhere</em> — verify/verification, test/testing/re-test, check, validate/validation, confirm, ensure, "make sure", QA, sanity, smoke-test, e2e (whole words: "Checkout", "Testimonials", "Latest", "Check-in" are not) — goes to <code>NEEDS_USER</code>, not DONE. Writing a file does not verify anything ("Verify full pipeline" had closed on "wrote index.html"). Four review rounds narrowed and widened a leading-verb rule and each round found real checks closed unattended or builds held; the rule now errs toward holding, because the owner's own run takes a held task back (below) and a wrong hold costs one look. The description is read up to 400 characters.</li>
+    <li>A research task whose <code>web_search</code> result did not persist as research also goes to <code>NEEDS_USER</code>.</li>
+  </ul>
+  <p>Both the tool path and the coding path (<code>_finalize_coding</code>) use the rule. A held task is logged as <code>autoadvance_needs_user</code> with its reason, so the digest lists it under "need your input" and not as a failure. An owner-run advance closes DONE as before, and may take back what an unattended run held (result ending "not closed unattended"): for the claim, held tasks count as PENDING <em>in memory only</em>, so they join the normal ready-leaf pick — dependencies, leaf-only, no paused parent — in task order. Only the task actually claimed leaves NEEDS_USER (claiming it rolls the project from NEEDS_USER back to ACTIVE); the rest stay held, so the idle loop never rebuilds them, and a gate that stops the step changes nothing. A batch that stops with tasks waiting on the owner reports <code>needs_user</code>, never <code>project_done</code>, and the tool's reply lists them (<code>needs_user_tasks</code>).</p>
+  <p><code>idle_candidates(store)</code> is the idle loop's project list: ACTIVE projects with <code>metadata.autopilot</code> only.</p>
 </main>
 </body>
 </html>

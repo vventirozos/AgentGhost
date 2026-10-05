@@ -247,8 +247,14 @@ class WorkspaceStateThread:
             # boot's time (the field is stamped at boot, before any
             # consumer reads it). Only capture on the first touch so a
             # mid-session re-touch can't clobber the genuine prior value.
-            if self._state.last_session_at and not self._state.prior_session_at:
-                self._state.prior_session_at = self._state.last_session_at
+            # §4LP: "first touch" is per PROCESS (this boot), not per saved
+            # state — `prior_session_at` is persisted, so the old test was
+            # true once ever and the line said "last touched 2026-07-07" for
+            # three months
+            if not getattr(self, "_touched_this_process", False):
+                if self._state.last_session_at:
+                    self._state.prior_session_at = self._state.last_session_at
+                self._touched_this_process = True
             self._state.last_session_at = _utcnow_iso()
             self._flush()
 

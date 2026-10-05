@@ -1068,7 +1068,9 @@ async def _fetch_onion_text(url: str, tor_proxy: str) -> str:
     try:
         status, html = await _fetch_raw_html(url, tor_proxy, _ONION_PAGE_TIMEOUT)
     except Exception as e:  # noqa: BLE001
-        return f"Error reading {url}: {e}"
+        # "Error:" — the head every failure check reads (§4LV: "Error
+        # reading" was summarised as page text, booked OK and cached)
+        return f"Error: reading {url} failed: {e}"
     if not status:
         return f"Error: no response from {url}"
     if status != 200 or not html:
@@ -1931,10 +1933,9 @@ async def tool_darkweb_research(
     # Workspace research dedup — record every onion we pulled. Non-fatal.
     if workspace_model is not None and getattr(workspace_model, "enabled", False):
         try:
-            for u in urls:
-                workspace_model.record_research_artifact(
-                    url=u, source="darkweb_research", note=(query or "")[:120],
-                )
+            from .search import record_loaded_sources       # §4LP: loaded sources only
+            record_loaded_sources(workspace_model, urls, page_contents, _source_block_failed,
+                                  source="darkweb_research", note=(query or "")[:120])
         except Exception:  # noqa: BLE001
             pass
 

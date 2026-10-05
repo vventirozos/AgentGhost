@@ -77,6 +77,21 @@ def pinned_event_project(project_id: Optional[str]) -> Iterator[None]:
         _EVENT_PROJECT_OVERRIDE.reset(token)
 
 
+
+
+def _probe_turn() -> bool:
+    """§4LP: a diagnostic probe is not the owner's work — every other learning
+    store skips probe turns, the workspace record did not, and a project's
+    continuity text became probe noise (`raise ValueError('boom')`, probe
+    pulls)."""
+    try:
+        from ..utils.logging import (request_id_context, is_probe_request_id,
+                                     request_origin_context, ORIGIN_PROBE)
+        return (is_probe_request_id(str(request_id_context.get() or ""))
+                or str(request_origin_context.get() or "") == ORIGIN_PROBE)
+    except Exception:  # noqa: BLE001
+        return False
+
 class WorkspaceModel:
     """Top-level workspace facade. Cheap to construct."""
 
@@ -252,6 +267,8 @@ class WorkspaceModel:
         flood the log."""
         if not self.enabled or self.activity is None or self.state is None:
             return None
+        if _probe_turn():
+            return None
         if not (url or "").strip():
             return None
         try:
@@ -339,6 +356,8 @@ class WorkspaceModel:
         None otherwise. Fires once (at the threshold) to avoid spamming every
         subsequent re-fetch.
         """
+        if _probe_turn():
+            return None
         if not self.enabled:
             return None
         # Count the PAGE, not the spelling: `t.me/s/x/1` and `t.me/x/1`
@@ -392,6 +411,8 @@ class WorkspaceModel:
         """Capture a significant command outcome (long, failed, or
         mutating). Caller decides what's significant — we just write."""
         if not self.enabled or self.activity is None:
+            return None
+        if _probe_turn():
             return None
         try:
             c = CommandOutcome(

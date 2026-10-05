@@ -796,10 +796,50 @@ def _audio_success_message(filename: str, stats, passages, gaps) -> str:
     )
 
 
+#: The heads an ingest uses to say it FAILED. None matched the shared failure
+#: pattern, so every failed ingest was booked ok (§4LT M3).
+_INGEST_FAILURE_HEADS = ("Ingest Error:", "Embedding Error:", "Disk Error:", "Web Error:")
+
+
+def _declare_ingest(res):
+    """Declare an ingest's outcome. The SHARED classifier first (it already
+    knows fetch failures, the containment refusal, Tor errors), then the four
+    ingest failure heads it misses → failed, and a partial/truncated ingest →
+    partial (fix review N1: overriding the classifier mislabelled those). A
+    result that already declared itself is kept."""
+    from .outcome import ToolOutcome, OutcomeStatus
+    if isinstance(res, ToolOutcome):
+        return res
+    t = str(res or "")
+    head = t.lstrip()
+    if head.startswith(_INGEST_FAILURE_HEADS):
+        return ToolOutcome.failed(t, reason_code="kb_ingest_failed")
+    out = ToolOutcome.coerce(t)
+    if getattr(out, "status", None) is OutcomeStatus.OK and head.startswith("SUCCESS (PARTIAL)"):
+        return ToolOutcome.partial(t, reason_code="kb_ingest_truncated")
+    return out
+
+
+def _norm_doc_name(name):
+    """`./notes.txt`, `.//notes.txt` and `notes.txt` are ONE document (§4LT):
+    used at ingest AND at every lookup (query/outline/transcript/forget), so
+    the two can never disagree (fix review N4). URLs and absolute paths are
+    left alone."""
+    if not isinstance(name, str):
+        return name
+    s = name.strip()
+    if "://" in s or not s.startswith("./"):
+        return s or name
+    while s.startswith("./"):
+        s = s[2:].lstrip("/")
+    return s or name
+
+
 async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, memory_system=None,
                               tor_proxy: str = None, language: str = None):
     if not filename:
         return "SYSTEM ERROR: The 'filename' parameter is MANDATORY. You must specify it."
+    filename = _norm_doc_name(filename)
     import time
     import fitz  # PyMuPDF
     import re
@@ -876,7 +916,10 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
 
     current_library = memory_system.get_library()
     if filename in current_library:
-        return f"Skipped: '{filename}' is already in KB."
+        return (f"Skipped: '{filename}' is already in KB. If the file has CHANGED since, "
+                f"forget the STORED copy first (knowledge_base action='forget' target='{filename}'; "
+                f"when the user confirms, pass only the number of the ingested-document item — "
+                f"NOT 'all', which would also delete the file itself) and ingest it again.")
 
     is_web = filename.lower().startswith("http://") or filename.lower().startswith("https://")
 
@@ -1002,7 +1045,10 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
                     # (hours of CPU; content-hashed ids mean no duplication,
                     # just pure wasted work).
                     if filename in current_library:
-                        return f"Skipped: '{filename}' is already in KB."
+                        return (f"Skipped: '{filename}' is already in KB. If the file has CHANGED since, "
+                f"forget the STORED copy first (knowledge_base action='forget' target='{filename}'; "
+                f"when the user confirms, pass only the number of the ingested-document item — "
+                f"NOT 'all', which would also delete the file itself) and ingest it again.")
                 else:
                     # ⚠ SAY WHAT THIS ACTION DOES NOT DO. "Check list_files"
                     # was the wrong advice for the common case: the model
@@ -1227,7 +1273,9 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
     # Use semantic chunking for structured content (markdown, code), falling
     # back to recursive splitting for plain text. Chunk size 600 prevents
     # silent truncation by all-MiniLM-L6-v2's 256 token limit.
-    chunks = semantic_split_text(full_text, chunk_size=600, chunk_overlap=100)
+    # off the event loop: a splitter fault must never freeze every request
+    # (§4LT CRIT — it looped forever on one ordinary web page)
+    chunks = await asyncio.to_thread(semantic_split_text, full_text, 600, 100)
     if not chunks: return "Error: No chunks created."
 
     pretty_log("KB Embed", f"{len(chunks)} fragments", icon=Icons.MEM_EMBED)
@@ -1267,6 +1315,11 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
     except Exception:
         pass  # Non-critical; chunks are already ingested
 
+    if full_text.rstrip().endswith(("[... INGEST TRUNCATED at 5 MB of extracted text ...]",
+                                    "[... TRUNCATED at 5 MB ceiling ...]")):
+        # say so — the PDF path always did (§4LT minor)
+        return (f"SUCCESS (PARTIAL): Ingested the first 5 MB of '{filename}' — the rest "
+                f"was NOT stored; answers cannot come from beyond that point.")
     return f"SUCCESS: Ingested '{filename}'."
 
 #: RAW VECTOR DISTANCE bands, measured on the live PostgreSQL manual
@@ -1950,6 +2003,11 @@ def _store_plan(plan: dict) -> str:
     import secrets
     import time as _t
     token = secrets.token_hex(4)
+    try:
+        from ..utils.logging import conversation_key_context
+        plan.setdefault("conv", str(conversation_key_context.get() or ""))
+    except Exception:  # noqa: BLE001
+        plan.setdefault("conv", "")
     with _PLANS_LOCK:
         now = _t.time()
         for k in [k for k, v in _FORGET_PLANS.items() if now - v["ts"] > _PLAN_TTL_S]:
@@ -1970,6 +2028,38 @@ def _take_plan(token, kind: str):
             _FORGET_PLANS.pop(str(token).strip(), None)
             return None
         return plan
+
+
+def _resolve_plan(token, kind: str, match=None):
+    """``(token, plan)`` for a confirm call, or ``(token, None)``.
+
+    The given token when it is live. Otherwise — a missing, unknown or
+    placeholder token like "yes" — the NEWEST live preview of ``kind`` made
+    in THIS conversation (and passing ``match``, e.g. the same project).
+    Why (§4LU): the token lives in the preview's TOOL RESULT, and the chat
+    API / web history carries only reply text, so on the user's "yes" turn
+    the model no longer has it — the live forget of the PostgreSQL manual
+    failed this way. `_confirm_allowed` still requires a LATER turn by the
+    user, so this changes how the plan is found, never who may confirm."""
+    import time as _t
+    plan = _take_plan(token, kind)
+    if plan is not None:
+        return str(token).strip(), plan
+    try:
+        from ..utils.logging import conversation_key_context
+        conv = str(conversation_key_context.get() or "")
+    except Exception:  # noqa: BLE001
+        conv = ""
+    if not conv:
+        return token, None
+    now = _t.time()
+    with _PLANS_LOCK:
+        cands = [(t, p) for t, p in _FORGET_PLANS.items()
+                 if p.get("kind") == kind and p.get("conv") == conv
+                 and now - p["ts"] <= _PLAN_TTL_S and (match is None or match(p))]
+    if not cands:
+        return token, None
+    return max(cands, key=lambda tp: tp[1]["ts"])
 
 
 def _drop_plan(token) -> None:
@@ -2145,7 +2235,9 @@ async def forget_preview(target, sandbox_dir=None, memory_system=None, profile_m
         lines += ["Notes from the search:"] + warn
     lines.append(f"Show this list to the user. Only after the USER confirms in their next message, call "
                  f"knowledge_base(action='forget', confirm='{token}', items='all') — or items='1,3' for a "
-                 f"selection (numbers from either group). The token expires in an hour.")
+                 f"selection (numbers from either group). The token expires in an hour. If you no longer "
+                 f"see the token in that later turn, pass confirm='yes' — this conversation's preview is "
+                 f"found for you.")
     return "\n".join(lines)
 
 
@@ -2184,7 +2276,8 @@ def _reset_preview(memory_system, graph_memory, episodic_memory=None, skill_memo
             f"episodes ({eps}) and the one-request lessons that quote your requests ({req_lessons}) — not the "
             f"profile or the general lessons. Ask the user to "
             f"confirm. Only after the USER says yes in their next message, call "
-            f"knowledge_base(action='reset_all', confirm='{token}'). To remove something specific instead, use "
+            f"knowledge_base(action='reset_all', confirm='{token}') (or confirm='yes' if you no longer see "
+            f"the token). To remove something specific instead, use "
             f"action='forget' with a target.")
 
 
@@ -2263,7 +2356,7 @@ def _pick(items: list, selection):
 async def forget_execute(token, selection="all", sandbox_dir=None, memory_system=None, profile_memory=None,
                          graph_memory=None, project_store=None, episodic_memory=None, skill_memory=None):
     """Delete exactly the confirmed items of a preview."""
-    plan = _take_plan(token, "forget")
+    token, plan = _resolve_plan(token, "forget")
     if plan is None:
         return ToolOutcome.rejected("Error: unknown or expired confirmation token — run the forget preview again.",
                                     reason_code="forget_token_unknown")
@@ -3559,9 +3652,9 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
             "<your-recording.mp4>" if _is_media_verb else "<your-file.pdf>")
         if err:
             return err
-        return await tool_gain_knowledge(
+        return _declare_ingest(await tool_gain_knowledge(
             filename, sandbox_dir, memory_system,
-            tor_proxy=kwargs.get("tor_proxy"), language=kwargs.get("language"))
+            tor_proxy=kwargs.get("tor_proxy"), language=kwargs.get("language")))
 
     elif action == "forget":
         # Two steps (§4KX r8): without `confirm` this is a PREVIEW that
@@ -3579,6 +3672,7 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
             "<the topic to erase>")
         if err:
             return err
+        subject = _norm_doc_name(subject)
         return await forget_preview(subject, sandbox_dir, memory_system, kwargs.get("profile_memory"),
                                     kwargs.get("graph_memory"), project_store=kwargs.get("project_store"),
                                     episodic_memory=kwargs.get("episodic_memory"),
@@ -3586,7 +3680,7 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
 
     elif action == "query":
         return await tool_query_document(
-            filename=kwargs.get("filename") or kwargs.get("source") or target,
+            filename=_norm_doc_name(kwargs.get("filename") or kwargs.get("source") or target),
             question=(kwargs.get("question") or kwargs.get("query")
                       or kwargs.get("q")),
             memory_system=memory_system,
@@ -3594,7 +3688,7 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
 
     elif action == "transcript":
         return await tool_document_transcript(
-            filename=kwargs.get("filename") or kwargs.get("source") or target,
+            filename=_norm_doc_name(kwargs.get("filename") or kwargs.get("source") or target),
             offset=kwargs.get("offset", 0),
             max_chars=kwargs.get("max_chars", TRANSCRIPT_PAGE_CHARS),
             memory_system=memory_system,
@@ -3602,7 +3696,7 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
 
     elif action == "outline":
         return await tool_document_outline(
-            filename=kwargs.get("filename") or kwargs.get("source") or target,
+            filename=_norm_doc_name(kwargs.get("filename") or kwargs.get("source") or target),
             memory_system=memory_system,
             depth=kwargs.get("depth", 2),
         )
@@ -3665,7 +3759,7 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
         if not _tok:
             return await asyncio.to_thread(_reset_preview, memory_system, kwargs.get("graph_memory"),
                                            kwargs.get("episodic_memory"), kwargs.get("skill_memory"))
-        _plan = _take_plan(_tok, "reset_all")
+        _tok, _plan = _resolve_plan(_tok, "reset_all")
         if _plan is None:
             return ToolOutcome.rejected("NOT executed: unknown or expired reset_all token — run reset_all "
                                         "without confirm to get a new preview.", reason_code="reset_token_unknown")

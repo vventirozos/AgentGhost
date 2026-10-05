@@ -6213,7 +6213,7 @@ def _released_write_block(project_store, sandbox_dir, target, *, removes: bool =
             return (
                 ToolOutcome.rejected(f"SYSTEM BLOCK: project {pid} is RELEASED (human-attested, "
                 f"immutable) — this write was NOT applied. To change it, "
-                f"fork a development copy first: manage_projects "
+                f"(only if the user asked for a change) fork a development copy first: manage_projects "
                 f"action=create_version project_id={pid} "
                 f"description=\"<the requested change>\", then edit the new "
                 f"version's workspace. The released version keeps running "

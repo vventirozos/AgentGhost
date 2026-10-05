@@ -380,6 +380,67 @@ def extract_command_port(command) -> Optional[int]:
     return None
 
 
+def add_default_port(command, port, *, loopback: bool = False):
+    """``(command, note)``: give a server that names NO port the leased one
+    (§4LR M2). ``python3 -m http.server`` defaults to 8000 — a RESERVED port
+    (the agent's own API in host mode) that the guard never saw, and the
+    report said "nothing listening on 8100". Same for ``uvicorn`` (8000) and
+    ``flask run`` (5000). ``loopback`` (host netns): also bind http.server to
+    127.0.0.1 — it ignores $HOST and would listen on every host interface
+    (§4LR M6).
+
+    Only the program that RUNS is edited, read as shell tokens: the command
+    itself, or what follows one leading ``cd <dir> &&``. Anything else —
+    compound commands, ``$PORT`` already passed, the name inside quoted code
+    (``python3 -c "import http.server"``), ``pip install uvicorn && …`` — is
+    left exactly as written (fix review N1)."""
+    cmd = str(command or "")
+    if port is None or extract_command_port(cmd) is not None \
+            or re.search(r"\$\{?(?:PORT|GHOST_SERVICE_PORT)\b", cmd):
+        return cmd, None
+    prefix, body = "", cmd
+    m = re.match(r"^(\s*cd\s+[^\s;&|]+\s*&&\s*)(.+)$", cmd, re.DOTALL)
+    if m:
+        prefix, body = m.group(1), m.group(2)
+    if re.search(r"[;&|\n`]|\$\(", body):
+        return cmd, None
+    try:
+        toks = shlex.split(body)
+    except ValueError:
+        return cmd, None
+    i = 0
+    while i < len(toks) and re.fullmatch(r"[A-Za-z_]\w*=.*", toks[i]):
+        i += 1                                   # FOO=1 env assignments
+    if i >= len(toks):
+        return cmd, None
+    head = Path(toks[i]).name
+    rest = toks[i + 1:]
+    p = int(port)
+    mod, pre, after = None, [], []
+    if re.fullmatch(r"python[0-9.]*", head) and len(rest) >= 2 and rest[0] == "-m":
+        mod, after = rest[1], rest[2:]
+        pre = toks[:i + 3]
+    elif head in ("uvicorn", "flask"):
+        mod, after = head, rest
+        pre = toks[:i + 1]
+    if mod == "http.server":
+        add = [str(p)]
+        if loopback and not any(a in ("--bind", "-b") or a.startswith("--bind=") for a in after):
+            add += ["--bind", "127.0.0.1"]
+        new = pre + add + after
+        note = f"the command named no port — added {' '.join(add)} to http.server"
+    elif mod == "uvicorn":
+        new = pre + ["--port", str(p)] + after
+        note = f"the command named no port — added --port {p} to uvicorn"
+    elif mod == "flask" and "run" in after:
+        k = after.index("run") + 1
+        new = pre + after[:k] + ["--port", str(p)] + after[k:]
+        note = f"the command named no port — added --port {p} to flask run"
+    else:
+        return cmd, None
+    return prefix + shlex.join(new), note
+
+
 def substitute_command_port(command, old_port, new_port) -> str:
     """Rewrite a hardcoded port literal when the lease lands elsewhere —
     ``http.server 8102`` must become ``http.server 8103`` or the app binds
@@ -768,6 +829,33 @@ class ServiceSupervisor:
             addrs.append(addr.strip("[]") or "*")
         return addrs or None
 
+    def _ports_held_by(self, pid) -> list:
+        """TCP ports the service's process GROUP listens on (``ss -ltnp``),
+        sorted; [] when unknown. The supervisor knew the app bound 8000 and
+        reported only "nothing on 8100" (§4LR M2)."""
+        try:
+            out, code = self._exec(
+                "sh -c \"ss -H -ltnp 2>/dev/null; echo ---; ps -o pid= -g %d 2>/dev/null\"" % int(pid),
+                timeout=10)
+        except Exception:  # noqa: BLE001
+            return []
+        if code != 0 or "---" not in (out or ""):
+            return []
+        listing, _, pids = out.partition("---")
+        group = {int(x) for x in pids.split() if x.isdigit()} | {int(pid)}
+        ports = set()
+        for line in listing.splitlines():
+            cols = line.split()
+            if len(cols) < 4:
+                continue
+            owners = {int(m) for m in re.findall(r"pid=(\d+)", line)}
+            if not owners & group:
+                continue
+            port_s = cols[3].rpartition(":")[2]
+            if port_s.isdigit():
+                ports.add(int(port_s))
+        return sorted(ports)
+
     def _host_unreachable_bind(self, port) -> bool:
         """The app on a PUBLISHED port listens on loopback only, in bridge
         mode — the host cannot reach it. False whenever that cannot be
@@ -1011,6 +1099,16 @@ class ServiceSupervisor:
             str(port).strip().lower() in ("0", "none", "no", "off")
         if _portless:
             port = None
+        # An explicit RESERVED port is a preference like any other (§4LR
+        # minor): the same port written in the command was re-leased, the
+        # argument was refused — 3 live refusals, one the first step of an
+        # aborted turn.
+        _reserved_req = None
+        try:
+            if port is not None and int(port) in BLOCKED_PORTS:
+                _reserved_req, port = int(port), None
+        except (TypeError, ValueError):
+            pass
         for err in (self._validate_name(name),
                     self._validate_command(command),
                     self._validate_port(port)):
@@ -1018,6 +1116,7 @@ class ServiceSupervisor:
                 return err
         name = str(name)
         project_id = str(project_id).strip() if project_id else None
+        _root_file_server = False
         with self._lock:
             reg = self._load()
             # Scope-limited resolution: the bound project's spelling of this
@@ -1057,6 +1156,9 @@ class ServiceSupervisor:
             # service starts on the granted port, $PORT tells the app, and
             # a hardcoded literal is rewritten below.
             _alloc_notes: list = []
+            if _reserved_req is not None:
+                _alloc_notes.append(f"port {_reserved_req} is RESERVED (agent API / "
+                                    f"LLM / Tor) — a free port is assigned instead")
             _blocked_cmd_port = None
             if not _portless:
                 _requested = port
@@ -1100,6 +1202,13 @@ class ServiceSupervisor:
                     _alloc_notes.append(
                         f"rewrote the hardcoded {_rewrite_from} in the "
                         f"command to {port}")
+                try:
+                    _loopback = bool(self._binds_host_netns())
+                except Exception:  # noqa: BLE001
+                    _loopback = False
+                command, _dp_note = add_default_port(command, port, loopback=_loopback)
+                if _dp_note:
+                    _alloc_notes.append(_dp_note)
 
             # The command ships as a SCRIPT via the bind mount (no quoting
             # hazards), then launches detached: setsid gives it a fresh
@@ -1137,6 +1246,10 @@ class ServiceSupervisor:
             if not wd.startswith("/"):
                 # Relative paths are relative to /workspace by contract.
                 wd = f"{CONTAINER_WORKDIR}/{wd}"
+            _root_file_server = (
+                wd.rstrip("/") == CONTAINER_WORKDIR.rstrip("/")
+                and re.search(r"\bhttp\.server\b|\bphp\s+-S\b", str(command))
+                and not re.search(r"--directory\b|(?<![\w-])-d\s", str(command)))
             _, _wd_code = self._exec(f"test -d {shlex.quote(wd)}", timeout=10)
             if _wd_code != 0:
                 _healed = None
@@ -1207,7 +1320,8 @@ class ServiceSupervisor:
                 except Exception:  # noqa: BLE001 — stub/older manager → bridge
                     _host_netns = False
                 _bind_host = "127.0.0.1" if _host_netns else "0.0.0.0"
-                _env_prefix = (f"export PORT={int(port)}\n"
+                _env_prefix = ("export PYTHONUNBUFFERED=1\n"   # a log tail, not an empty buffer (§4LR)
+                               f"export PORT={int(port)}\n"
                                f"export GHOST_SERVICE_PORT={int(port)}\n"
                                f"export HOST={_bind_host}\n"
                                f"export GHOST_SERVICE_HOST={_bind_host}\n")
@@ -1478,11 +1592,25 @@ class ServiceSupervisor:
 
         if port is not None and listening is False:
             tail = self._log_tail(stem)
+            held = self._ports_held_by(pid)
+            where = ""
+            if held:
+                where = (f" It IS listening on port {', '.join(map(str, held))} "
+                         f"instead — the app ignores the lease; make it bind $PORT "
+                         f"({port}) or name {port} in the command.")
+                if set(held) & BLOCKED_PORTS:
+                    # a RESERVED port (the agent's own API in host mode,
+                    # Tor's): never left held by a service
+                    _rp = ', '.join(str(x) for x in held if x in BLOCKED_PORTS)
+                    if not self._kill_pgroup(pid):            # True = the tree is GONE
+                        where += (f" Port {_rp} is RESERVED and the service could NOT be "
+                                  f"stopped — action='stop' name='{name}' now.")
+                    else:
+                        where += f" Port {_rp} is RESERVED, so the service was STOPPED."
             return ToolOutcome.failed(
                 f"Service '{name}' started (pid {pid}) but nothing is "
-                f"listening on port {port} after ~6s — it likely FAILED to "
-                f"bind (missing dependency, a crash on import, or the app "
-                f"binds a different port). Check the log below BEFORE trying "
+                f"listening on port {port} after ~6s.{where or ' It likely FAILED to bind (missing dependency, a crash on import, or the app binds a different port).'} "
+                f"Check the log below BEFORE trying "
                 f"to reach it:\n--- {name} log tail ---\n{tail}\n"
                 f"Fix the cause (e.g. pip install the missing module, or point "
                 f"the app at port {port}), then action='restart' name='{name}'.",
@@ -1499,6 +1627,16 @@ class ServiceSupervisor:
                 f"execute tools reach it there (listening ✓). The port is "
                 f"exported to the app as $PORT.")
             _pub = self._published_ports()
+            if self._binds_host_netns():
+                # host netns: a wildcard bind is EVERY host interface — the
+                # LAN (§4LR M6: HOST=127.0.0.1 is only an env var)
+                _addrs = self._listen_addrs(port) or []
+                if any(a in ("0.0.0.0", "*", "::") for a in _addrs):
+                    lines.append(
+                        f"⚠ WARNING: '{name}' listens on ALL interfaces "
+                        f"({', '.join(_addrs)}) and the sandbox shares the host "
+                        f"network — it is reachable from the LAN. Bind 127.0.0.1 "
+                        f"($HOST) and restart it.")
             if self._host_unreachable_bind(port):
                 # §4KS: published, but bound to the container's loopback —
                 # the remote-access hint here would be a false "reachable".
@@ -1513,6 +1651,14 @@ class ServiceSupervisor:
                 # neither.
                 lines.append(unpublished_port_warning(
                     port, published_ports=_pub, command=_cmd_str, workdir=wd))
+        if _root_file_server:
+            # it publishes the WHOLE sandbox — other projects and
+            # `.services/registry.json` with every service token (§4LR)
+            lines.append(
+                "⚠ WARNING: this file server is rooted at the sandbox root, so it "
+                "publishes EVERYTHING there — other projects and the service "
+                "registry (with service tokens). Restart it with workdir=<folder> "
+                "or --directory <folder> unless the user wants that.")
         lines.append(
             f"Logs: action='logs' name='{name}' · stop: action='stop'. "
             f"It survives across turns until stopped (or the sandbox "
@@ -1780,23 +1926,46 @@ class ServiceSupervisor:
                 reg[key] = entry
             self._save(reg)
         if _survived:
-            return (f"Service '{_disp}' did NOT stop — its process survived "
-                    f"TERM+KILL and still holds its port. The registry entry "
-                    f"is kept; retry the stop, or check the log at "
-                    f"{CONTAINER_SERVICES_DIR}/{_file_stem(key)}.log")
+            # a FAILURE, declared (§4LR minor: booked ok, it also reset the
+            # pre-flight guard's world-changed state)
+            return ToolOutcome.failed(
+                f"Service '{_disp}' did NOT stop — its process survived "
+                f"TERM+KILL and still holds its port. The registry entry "
+                f"is kept; retry the stop, or check the log at "
+                f"{CONTAINER_SERVICES_DIR}/{_file_stem(key)}.log",
+                world_changed=False, reason_code="service_kill_survived")
         state = "stopped" if was_alive else "was already dead; removed"
         return (f"Service '{_disp}' {state}. Log kept at "
                 f"{CONTAINER_SERVICES_DIR}/{_file_stem(key)}.log")
 
-    def stop_all(self) -> str:
-        """Stop EVERY registered service and reclaim their ports — the
-        one-command cleanup for accumulated / orphaned services."""
+    def stop_all(self, project_id=None, all_projects: bool = False):
+        """Stop the services in scope and reclaim their ports.
+
+        §4LR M4: this killed EVERY project's services from any project's turn
+        and erased every row — a RELEASED app's stored command, port and
+        token — so its later `restart` failed "no service named …". Now:
+        with a bound project, only THAT project's services; without one,
+        every service only when ``all_projects`` (the owner said "stop all
+        services") — otherwise the project-less ones. A project's row is
+        KEPT (dead rows are how `restart` recovers); only project-less rows
+        are cleared."""
         with self._lock:
             reg = self._load()
             if not reg:
                 return "No services registered — nothing to stop."
+
+            def _in_scope(entry) -> bool:
+                owner = entry.get("project_id")
+                if project_id and not all_projects:
+                    return owner == project_id
+                return all_projects or not owner
+            scope = {nm: e for nm, e in reg.items() if _in_scope(e)}
+            if not scope:
+                return ("No services in scope — nothing stopped. "
+                        + (f"Project {project_id} has none; " if project_id else "")
+                        + "pass all_projects=true only when the user asked to stop EVERY service.")
             killed, cleared, survivors = [], [], []
-            for nm, entry in list(reg.items()):
+            for nm, entry in list(scope.items()):
                 _others = [e for n2, e in reg.items() if n2 != nm]
                 self._last_kill_survived = False
                 _acted = self._kill_service(entry, others=_others)
@@ -1804,21 +1973,23 @@ class ServiceSupervisor:
                     survivors.append(nm)          # keeps its row below
                 else:
                     (killed if _acted else cleared).append(nm)
-            # Survivors keep their rows: the process is still running and
-            # still holds its port (§4GK round 5).
-            _keep = {nm: reg[nm] for nm in survivors if nm in reg}
-            reg.clear()
-            reg.update(_keep)
+            for nm in killed + cleared:
+                if not reg.get(nm, {}).get("project_id"):
+                    reg.pop(nm, None)             # project-less clutter only
             self._save(reg)
-        parts = [f"Stopped {len(killed) + len(cleared)} service(s)."]
+        parts = [f"Stopped {len(killed)} running service(s)"
+                 + (f" of project {project_id}" if project_id and not all_projects else "") + "."]
+        if killed:
+            parts.append(f"Killed (running/orphaned): {', '.join(killed)}.")
+        if cleared:
+            parts.append(f"Already dead: {', '.join(cleared)}.")
+        parts.append("Project services keep their entries — action='restart' brings one back.")
         if survivors:
             parts.append(
                 f"⚠ Did NOT stop (survived TERM+KILL, still holding their "
                 f"ports, rows kept): {', '.join(survivors)}.")
-        if killed:
-            parts.append(f"Killed (running/orphaned): {', '.join(killed)}.")
-        if cleared:
-            parts.append(f"Cleared (already dead): {', '.join(cleared)}.")
+            return ToolOutcome.failed(" ".join(parts), world_changed=bool(killed),
+                                      reason_code="service_kill_survived")
         return " ".join(parts)
 
     def restart(self, name: str, project_id=None, port=None) -> str:
@@ -1987,9 +2158,11 @@ class ServiceSupervisor:
                 part += f" · cmd: {_cmd_full[:80]}"
             lines.append(part)
         if _dead and name is None:
+            # not "stop-all clears them": that steered the model into erasing
+            # released apps' rows (§4LR M4); a dead row holds no port
             lines.append(f"({_dead} dead — action='restart' brings one back "
                          f"(a taken port is reassigned automatically); "
-                         f"action='stop-all' clears them and reclaims ports.)")
+                         f"action='stop' name=<service> removes one you no longer want.)")
         out = "Services:\n" + "\n".join(lines)
         if name is None:
             _map = self._port_map_text(reg)

@@ -958,7 +958,7 @@ class ProjectPlan:
 
     # ------------------------------------------------------------------ query
 
-    def next_ready_leaf(self) -> Optional[TaskNode]:
+    def next_ready_leaf(self, skip=None) -> Optional[TaskNode]:
         """Return the next leaf that is READY or PENDING and not
         blocked by an upstream PAUSED/NEEDS_USER/BLOCKED ancestor.
 
@@ -1044,6 +1044,8 @@ class ProjectPlan:
             if ancestor_blocked(node):
                 continue
             if not deps_satisfied(node):
+                continue
+            if skip is not None and skip(node):
                 continue
             return node
         return None

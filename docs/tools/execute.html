@@ -418,9 +418,17 @@ STDOUT/STDERR:
     <li>Hypothesis tests also refuse <code>sed -i</code>, <code>kill</code> and mutating <code>git</code>.</li>
     <li>The status marker is stripped from detached-job tails.</li>
   </ul>
+  <p><strong>Follow-up, the open items</strong> (operator: "go with your recommendations"):</p>
+  <ul>
+    <li><strong>Quote-aware splitting.</strong> <code>_shell_pipelines</code> splits a command into pipelines and stages without cutting inside quotes, so <code>… | awk '{print $1; exit}'</code> is seen as an early reader and <code>grep 'a|b'</code> stays one stage. A whole-command <code>bash -c '…'</code> (a detached job's recorded form) is read as the script it runs. A <code>#</code> comment runs to the end of its line and its apostrophes are not quotes; any other unpaired quote (a heredoc body) falls back to the quote-blind split.</li>
+    <li><strong>An upstream grep</strong> that found nothing (exit 1) is not a crash: <code>grep -r TODO src | grep fixme</code> is a search with no result. Exit 2 still is.</li>
+    <li><strong>The status marker</strong> is stripped from every detached-job tail, not only failed ones.</li>
+    <li><strong>Supersession needs a re-run.</strong> A later run supersedes an earlier one only when another tool call sits between them — the fix, an edit or an <code>execute</code> <code>sed -i</code>. Two runs back to back are an A/B — "model A 0.87, model B 0.91" — two sources.</li>
+    <li><strong>Hypothesis tests</strong> refuse every mutating verb the shell shows, in any segment (<code>touch</code>, <code>mkdir</code>, <code>pip install</code>, <code>git commit</code>, <code>curl -o</code> …). Also <code>python3 -m pip</code>/<code>-mpip</code>, <code>perl -i</code>, <code>crontab</code>, <code>mount</code> and the like. Package and service tools (<code>docker</code>, <code>podman</code>, <code>kubectl</code>, <code>go</code>, <code>cargo</code>, <code>uv</code>, <code>conda</code>, <code>poetry</code>, <code>gem</code>, <code>brew</code>, <code>yarn</code>, <code>pnpm</code>, <code>systemctl</code>, <code>launchctl</code>, <code>service</code>) run only an <em>allowlisted</em> read-only subcommand at the subcommand position (<code>docker ps/logs/inspect</code>, <code>kubectl get/describe/logs</code>, <code>go version/env/list/vet/test</code>, <code>cargo tree/test/check</code>, <code>conda list</code>, <code>systemctl status/show</code>, <code>service &lt;name&gt; status</code>, any <code>--version</code>); the bare tool and everything else refuse (a deny-list of verbs had let <code>cargo b</code>, <code>pnpm i</code>, <code>systemctl reboot</code> through). <code>go env -w</code> refuses. Read-only git (<code>status</code>, <code>log</code>, <code>diff</code> …) after only <code>-C repo</code>, <code>--git-dir=</code>, <code>--work-tree=</code> or <code>--no-pager</code>; any other global option is refused, because <code>git -c core.fsmonitor=&lt;cmd&gt; status</code> runs the command, <code>tar t</code> listings and plain <code>curl</code> still run. The guard is best-effort: an interpreter (<code>python3 -c</code>) can still write.</li>
+    <li><strong>Per-call duration.</strong> The dispatch loop puts each call's wall time on its <code>ToolOutcome</code> (<code>duration_s</code>), and the trajectory row records it. 0 of 1,435 execute rows had one.</li>
+  </ul>
   <p>Not changed:</p>
   <ul>
-    <li>Per-call <code>duration_s</code> is still not recorded in trajectories.</li>
     <li>Timeouts stay "retryable" (an existing pin; a decision to revisit).</li>
     <li>The <code>imagine_preflight</code> experiment's class-precedent deferral of a read-only probe was left to the operator (one turn).</li>
   </ul>

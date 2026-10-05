@@ -83,6 +83,14 @@
   </ul>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+  <h2 id="4lv">Small-tools review <span class="tag">2026-10-05 &sect;4LV</span></h2>
+  <ul>
+    <li><strong>darkweb_research:</strong> a fetch that throws now reads <code>Error: reading … failed</code> — "Error reading …" matched no failure check, so it was summarised as page text, booked OK and cached for 300 s.</li>
+    <li><strong>postgres_admin:</strong> the one retry on a connection error never re-sends a statement that may have run — a statement timeout (it ran twice, 2× the timeout) or a non-read-only statement sent before the connection dropped (<code>_read_only_sql</code>). The configured ROLE is checked too, not only host/port/database. Without <code>confirm</code>, <code>validate_sql</code> also refuses <code>ALTER … DROP COLUMN/CONSTRAINT</code>, <code>ALTER … TYPE … USING</code>, and a function/procedure whose (quoted) body drops, truncates or deletes.</li>
+    <li><strong>system_utility:</strong> every HTTPS call verifies TLS (8 calls had <code>verify=False</code> — any Tor exit could fake the weather or "Tor: Connected"); the wttr.in fallback is one bounded, control-free line; the full WMO table names drizzle, showers and snow (moderate rain is "Rain"); the place is shown with region and country. The health check gives the internet probe and the Tor check 10 s, never forces a new Tor identity on a timeout (it did, process-wide, 3×), and a failed probe over Tor says it is not proof the host is offline.</li>
+    <li><strong>Unknown tool:</strong> the reply lists every tool (it cut at 40 — <code>web_search</code> fell off) and, for a member, only member tools; a member is never told to use <code>execute</code>.</li>
+  </ul>
+  <p>Pins: <code>tests/test_4lv_small_tools.py</code>.</p>
 </main>
 </body>
 </html>

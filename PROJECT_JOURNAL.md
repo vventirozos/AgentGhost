@@ -50917,3 +50917,356 @@ Never reviewed as a system: pieces were touched in §4G/§4FV and the released-p
 - labelled live probes on a throwaway project (created, used and deleted inside the probes);
 - the usual protocol;
 - a fresh reader on the diff before deploy.
+
+## §4LP — outcome (2026-10-05)
+**Measured first.** 4 labelled live probes on a throwaway project (create → do + close task → read back →
+delete) were all right, owner projects untouched; re-run after deploy: same, and the probe now leaves nothing in
+the workspace record.
+**Reviews.** 3 readers (code 1 CRIT + 12 MAJOR; traffic 1 CRIT + 8 MAJOR; workspace 11), then a fresh reader on
+the diff (1 MAJOR + 7 MINOR).
+**Fixed:**
+- **CRIT, research notes written through a symlink.** `_research_dir` refuses a linked/escaping workspace or dir
+  BEFORE creating anything; writes go via `write_text_nofollow_in_dir` (the findings file still atomic, temp +
+  rename); reads go via `read_bytes_nofollow`.
+- **CRIT, unasked edits to shipped apps.** The idle advancer never claims a "Verifier follow-up:" task
+  (`owner_requested=False` default; the tool's `autoadvance` and the API pass True).
+- **Release:** chmod never follows a link out of the workspace.
+- **Released guard:** resolves a title passed as `project_id` and the task's own project.
+- **Fork steers:** every one now says fork ONLY on a user request (`FORK_ONLY_IF_ASKED`); a probe had forked
+  Chess Coach v3 → v4, which the advancer then built.
+- **Refusals:** a `task_update` where nothing landed is a declared rejection.
+- **`status`:** answers about the named project and errors on an unknown one.
+- **`exit`:** never clears another conversation's binding.
+- **Workspace:**
+  - probe turns write nothing;
+  - research records only loaded sources (`record_loaded_sources`);
+  - a failed/blocked interact is not "pulled";
+  - "last touched" moves every boot (was frozen at 2026-07-07).
+**Open (operator decisions):**
+- `unrelease`/`release`/hard `delete` guarded only by the tool description;
+- research/coding tasks closed DONE on weak evidence (search summary, "wrote index.html");
+- the "While you were away" digest counts the owner's own work;
+- idle autoadvance runs on every ACTIVE project;
+- the existing Chess Coach v4 (FAILED, unasked fork) and 9 falsely-DONE tasks in the store — data repair needs a
+  confirmed list;
+- the deep_research call-site wiring of `record_loaded_sources` is verified by reading only.
+**Verification:**
+- `tests/test_4lp_projects.py` (21);
+- battery bat37: all valid mutants killed except the deep_research wiring, NOOP survives, KNOWN-BAD killed, tree
+  pristine;
+- suite: 28,285 passed, 0 failed;
+- deployed pid 67644 (gated, graceful, one process).
+
+## §4LQ — the §4LP operator decisions and the §4LO open items (2026-10-05, operator: "tor won't get it's own container . i don't wanna spend the ram. for the rest, go with your recommendations") — R0 scope
+**Decided by the operator:** no Tor sidecar container (RAM); in-container hardening stays. "The rest" = my
+recommendations:
+1. `release`/`unrelease`/hard `delete` from the model: preview → the user confirms in a later turn (the §4KX
+   forget design);
+2. no DONE on weak evidence when nobody asked for the run;
+3. the "While you were away" digest counts only work nobody asked for;
+4. idle autoadvance opt-in (autopilot), set by the owner's own advance;
+5. data repair (Chess Coach v4, the false-DONE tasks): a list the operator confirms first, nothing deleted before;
+6. the seven minor §4LO items (grep chains, quoted `;`, the marker in successful job tails, the drift message
+   cut, A/B supersession, the hypothesis guard, per-call duration).
+**Method:** the usual protocol; behaviour tests that drive the real paths; battery; a fresh reader on the diff;
+suite once; gated deploy; labelled probes.
+
+## §4LQ — outcome (2026-10-05)
+**Shipped (operator: "go with your recommendations"):**
+1. **release / unrelease / hard delete from the model = preview → the user confirms in a LATER turn**
+   (`tool_manage_projects_for_model`; the §4KX design).
+   - The target is resolved once (`_lifecycle_target`: id in any case, title, or current). An unknown name is
+     refused, and so is a vanished current project.
+   - The confirmed action runs on exactly the previewed project.
+   - No preview for an action that would refuse anyway.
+   - One preview per request; a refused confirm says STOP. The live probe had looped eight times in 135 s.
+   - `probe_created` / `autopilot` are system-only metadata keys. `autopilot` via metadata is refused with a
+     pointer, so "turn it off" is never a silent no-op.
+2. **No DONE on weak evidence while unattended** (`_unattended_close`, tool path + `_finalize_coding`):
+   - a task that mentions a check anywhere, or a web_search research task whose research did not persist,
+     goes NEEDS_USER and is logged as `autoadvance_needs_user`.
+   - The owner's own run takes held tasks back through the normal ready-leaf pick. Held tasks count as PENDING
+     in memory only; only the claimed one leaves NEEDS_USER.
+   - A batch that stops on held tasks reports `needs_user` and lists them.
+3. **Digest:** an owner-run step is logged `owner_requested` and is not "on my own".
+4. **Idle autoadvance is opt-in** (`idle_candidates`: ACTIVE + `metadata.autopilot`).
+   - Set by the owner's own `autoadvance`; `action=autopilot enabled=true|false` sets it; `status` shows it.
+   - Owner = `_owner_turn_now`: not a probe, sched-, job-, sub-, SYSTEM.
+   - At deploy NO project had autopilot, so idle advancing stopped until the owner opts in.
+5. **Data repair (operator confirmed the list):**
+   - Chess Coach v4 hard-deleted.
+   - 8 tasks annotated "UNVERIFIED — closed unattended / built by the idle advancer without being asked";
+     statuses unchanged.
+   - Backup: `Data/system/memory.pre-4lq-repair-*.bak/`.
+   - The WebOS retry-button code is NOT reverted.
+6. **§4LO minor items:**
+   - quote- and comment-aware `_shell_pipelines` (unwraps `bash -c`; unpaired quote → old split);
+   - upstream grep exit 1 = no match;
+   - the marker is stripped from every job tail;
+   - drift log `no_truncate`;
+   - A/B supersession needs another tool call between the runs;
+   - hypothesis guard: deny heads, an ALLOWLIST of read-only subcommands for package/service tools, git
+     globals only `-C`/`--git-dir=`/`--work-tree=`/`--no-pager`, `go env -w` refused;
+   - per-call `duration_s` on ToolOutcome → trajectory (copy/pickle/with_text/egress/context compression).
+
+**Reviews:** four fresh readers on successive diffs.
+- R1: 1 CRIT (unknown title → unrelease of the CURRENT project) + 5 MAJOR + 7 MINOR.
+- R2: 1 MAJOR (autopilot title → current project) + 8 MINOR.
+- R3: 1 MAJOR (take-back ran an unready task) + 1 MAJOR residual.
+- R4: 2 MAJOR, both in my R3 fixes:
+  - a hypothesis deny-list let `cargo b` / `systemctl reboot` through;
+  - the narrowed check regex closed "Ensure all tests pass" unattended.
+- Both R4 findings were INVERTED rather than patched again: an allowlist, and a whole-word "mentions a check"
+  rule that errs toward holding. A wrong hold costs the owner one look, now that the owner's own run takes
+  holds back.
+
+**Verification:**
+- `tests/test_4lp_projects.py` + `tests/test_4lo_execute.py`: 168 pass.
+- Batteries bat38–bat42: every valid mutant killed except 2 equivalents (the in-memory revert, the 400-char
+  cap); KNOWN-BAD killed; NOOP survives; tree pristine.
+- Suite: 28,388 passed, 1 failed (lint gate: pylint no-member on `duration_s` → `getattr`). After the fix:
+  lint gate + 1,604 outcome tests + 3,541 project tests green.
+- Deployed pid 86817, then pid 91705 (gated, graceful, one process).
+
+**Live probes (labelled):**
+- Q1: create a probe project — ok.
+- Q2: unrelease Chess Coach v3 → preview only; v3 stays RELEASED. After the loop fix, Q2b = 22 s, one preview.
+- Q3: autopilot status — read correctly.
+- Q4: grep with no match → "no matches, exit 0". The model then re-ran with `echo $?`, got grep's raw 1, and
+  the turn was labelled failed until the late verdict corrected it. Pre-existing; noted.
+- Q5: delete the probe's own project — no confirmation needed; gone.
+
+**Open:**
+- A held PARENT closed by the tree's rollup keeps its "not closed unattended" summary (nit).
+- The check rule over-holds by design.
+- The Q4 relabel above.
+
+## §4LR — sandbox services: `manage_services`, the supervisor, port leases, released apps (2026-10-05, operator: "proceed") — R0 scope, written first
+**Why.** Since August, 69 real `manage_services` calls, 14 failed (20%): the highest failure rate among unreviewed
+tools in regular use. It hosts the owner's released apps (Chess Coach v3, Jiu Jitsu Calendar) and leases their
+ports. No dedicated review; the port allocator was last touched in §4G.
+**Scope:**
+- `tools/sandbox_services.py`, `sandbox/services.py` (2,355 lines: supervisor, leases, health, restart);
+- callers: projects (release rehearsal), execute, composed skills;
+- `sandbox/registry_guard.py`;
+- the live registry and service state (read-only copies).
+**Method (budget-aware, operator at 87% of the weekly limit):**
+- ONE fresh reader combining code and traffic, read-only on copies;
+- fixes with behaviour tests; battery; one fresh reader on the fix diff;
+- suite once; gated deploy; labelled probes that start and stop only a throwaway service.
+
+## §4LR — outcome (2026-10-05)
+**Review.** One fresh reader drove the real supervisor in a throwaway `--network none` container and read 175
+real turns. Of 47 failed calls, about 30 were app or model errors the tool reported correctly; 3 were tool faults.
+Code: 6 MAJOR + 4 MINOR. A fresh reader on the fix diff then found 2 MAJOR regressions + 3 MINOR, all fixed.
+**Fixed:**
+- **M1:** the project briefing marked EVERY running service STALE (bare container id vs the `<id>:<StartedAt>`
+  stamp), telling the model to restart working apps every turn. It now compares in the stamp's form from cached
+  attrs; a legacy id-only stamp reads stale.
+- **M2:**
+  - a port-less `http.server` bound the RESERVED 8000, and the report said "nothing on 8100" with an empty log.
+    `add_default_port` now gives the program that RUNS (shell tokens; one leading `cd x &&`) the lease;
+    `$PORT`, compound/piped commands and quoted code are untouched (fix review N1);
+  - logs are unbuffered (`PYTHONUNBUFFERED=1`);
+  - "not listening" names the port the service's session actually holds, and stops a reserved holder — saying
+    so honestly when the kill does not land.
+- **M3:** the pre-flight guard keyed every service start as one target AND one class (`other`). It is now
+  `svc:<name>[:port]`, class `svc:<name>`. An untagged test's failures had blocked the owner's starts 8 days
+  later.
+- **M4:** `stop-all` killed every project's services and erased released apps' rows. It is now scoped:
+  - from a project, that project's services;
+  - otherwise the project-less ones, or every service with `all_projects=true`;
+  - project rows are kept;
+  - the aliases `cleanup`/`reap` are gone;
+  - the status hint no longer steers to stop-all;
+  - a bulk stop is never a macro step.
+- **M5:** the release rehearsal now fails on a DECLARED failed restart, and checks reachability inside the
+  sandbox plus the bind address. The host probe had been answered by OrbStack.
+- **M6 / minors:**
+  - host-netns `http.server` gets `--bind 127.0.0.1`; a wildcard listener is warned as LAN-reachable;
+  - a file server rooted at the sandbox root is warned (it publishes the registry's tokens);
+  - "did NOT stop" is a declared failure;
+  - an explicit reserved port is re-leased with a note.
+**Data (operator: "do whatever" / "clean it up"):**
+- the apps stay down;
+- the Jiu Jitsu Calendar `app.py` is now `debug=False` (uchg + read-only restored; verify_release may report drift);
+- the registry `tmp-server` row (left by a probe), 52 orphan files and 5 state dirs were removed;
+- backup: `Data/system/services.pre-4lr-cleanup-20261005T140143.bak/`.
+**Verification:**
+- `tests/test_4lr_services.py` (38);
+- battery bat43: every valid mutant killed, KNOWN-BAD killed, NOOP survives, tree pristine;
+- suite: 28,425 passed, 2 failed — both the lint gate (`pre` possibly unassigned) → fixed; the gate plus the
+  services tests then green (221);
+- deployed pid 40441 (gated, graceful, one process).
+**Live probes (labelled):**
+- S1: a port-less `http.server --directory /tmp` got lease 8100. The model's first try had copied a stray "."
+  from the probe text.
+- S2: status shows RUNNING on 8100.
+- S3: stopped; the registry has no probe row.
+
+## §4LS — skills: composed macros, acquired skills, auto-skills (2026-10-05, operator: "proceed") — R0 scope, written first
+**Why.** Since August: `manage_composed_skills` 31 calls, 7 failed (23%); `manage_skills` 13; `learn_skill` 7.
+These decide what the agent saves and REPLAYS, so a bad skill repeats. The lessons playbook (`memory/skills.py`)
+was reviewed in §4LC; this review covers the parts never reviewed: `tools/composed_skills.py` (macros: mining,
+minting, execution), `tools/acquired_skills.py` (learn_skill / manage_skills), the auto-skills store, and how
+skills reach prompts and get used.
+**Method (lean, operator at ~90% of the weekly limit):**
+- ONE fresh reader (code + traffic + the live stores, read-only copies);
+- fixes with behaviour tests; battery; one fresh reader on the fix diff;
+- suite once; gated deploy; labelled probes;
+- data findings go to the operator as a list.
+
+## §4LS — outcome (2026-10-05)
+**Review.** One fresh reader (5 MAJOR + 3 MINOR, all reproduced on store copies), then a fresh reader on the fix
+diff (4 MINOR + nits, no CRIT/MAJOR; corrected).
+**Fixed:**
+- **M1:** a macro DECLARES its result (ok / partial / failed / unresolved; a hard failure outranks a sibling still
+  running). A failed `browser` step used to reach the strike ledger and corpus as a success. The header counts
+  succeeded steps; a promoted step reads STILL RUNNING.
+- **M2:** `MACRO_FORBIDDEN_STEP_TOOLS` (macro manager, skill tools, self-play, dream) are refused at define, at
+  approve and in the step executor. A self-calling macro had run 197 levels deep. Read-only meta tools such as
+  introspect stay allowed.
+- **M3:** replay containment drops every real macro name (never a shadowed built-in). A macro's steps run through
+  the full captured tool set.
+- **M4:** define / approve / delete and manage_skills delete refuse probe, `sched-` and `sub-` requests;
+  `create_skill` refuses probes only (the dream cycle acquires skills through it); a `job-` wake turn is allowed.
+- **M5:** approve re-runs the mint rules — every step needs a runtime input, no forbidden step.
+- **m1:** the retirement sweep and the embedding purge run on owner calls only.
+- **m3:** re-graduation refreshes `trigger_examples`.
+**Reverted / open:**
+- **m2** (bad arguments charged to a skill): reading the skill's output missed live wordings and excused real
+  HTTP 400s. The fix is schema validation before the run.
+- **Probe-refusal retries:** the model still retried a refused probe delete 3× despite STOP wording (harmless;
+  nothing changes).
+**Data (operator: "yes proceed"):**
+- **Macros:** 24 unapprovable proposals removed; 3 script-approved macros demoted to proposed. 17 remain, 1
+  active (`youtube_transcribe`).
+- **Acquired skills:** 6 unused ones deleted. `news_headlines` now exits non-zero on fetch/parse failure (usage
+  kept).
+- **Auto-skills:** probe examples scrubbed from 5 entries.
+- **Backup:** `Data/system/skills.pre-4ls-repair-20261005T151423.bak/`.
+**Verification:**
+- `tests/test_4ls_skills.py` (21) plus updated old pins;
+- battery bat44: every valid mutant killed, KNOWN-BAD killed, NOOP survives, tree pristine;
+- suite: 28,447 passed, 1 failed (a ClockworkPi deploy test that passes alone — timing flake);
+- deployed pid 85458, then pid 87652 (STOP wording).
+**Live probes (labelled):**
+- K1/K1b: a probe's delete of `youtube_transcribe` was refused; the macro is intact.
+- K2: the listing shows the cleaned stores.
+
+## §4LT — knowledge base (document Q&A) (2026-10-05, operator: "proceed") — R0 scope, written first
+**Why.** Since August, 88 `knowledge_base` calls, 9 failed (10%). Never reviewed as a system. forget/reset_all
+(§4KX) and the YouTube/audio ingest (§4KE) were reviewed separately and are out of scope except where they
+interact.
+**Scope:**
+- `tools/memory.py` `tool_knowledge_base`: ingest_document (text/PDF/HTML/URL), query, outline, transcript,
+  expand, insert_fact, list_docs;
+- `memory/pdf_ingest.py`, `memory/vector.py` (document chunks and retrieval);
+- `library_index.json` and `document_outlines.json`;
+- how answers cite documents.
+**Method (lean):**
+- ONE fresh reader (code + traffic + store copies, read-only);
+- fixes with behaviour tests; battery; one fresh reader on the fix diff;
+- suite once; gated deploy; labelled probes (ingest + query a throwaway text file, then forget it);
+- data findings go to the operator as a list.
+
+## §4LT — outcome (2026-10-05)
+**Review.** One fresh reader (1 CRIT + 5 MAJOR + 3 MINOR, reproduced with the local embedder on store copies),
+then a fresh reader on the fix diff (3 MAJOR + 2 MINOR introduced, all fixed).
+**Fixed:**
+- **CRIT:** `recursive_split_text` looped forever on "Sentence. " + 600 chars with no ". " (any page with a nav
+  menu), on the event loop. Each piece now carries its separator level and only moves to finer ones (always
+  terminates; output byte-identical to the old splitter wherever that one finished, so no chunk-id churn), and
+  the ingest splits in a thread.
+- **M1:** duplicate chunks are deduped before the upsert.
+- **M2:** a failed PDF ingest is rolled back, under a per-name in-flight claim so a concurrent ingest's rollback
+  cannot delete a good copy.
+- **M3:** `_declare_ingest` (the shared classifier, plus the four ingest failure heads → failed, truncation →
+  partial).
+- **M4:** TOC stable-sorted by page (4% of the manual's breadcrumbs were mis-nested).
+- **M5:** ambient recall excludes `document_summary` rows (a stored prompt injection).
+- **Minors:**
+  - `_norm_doc_name` at ingest and every lookup;
+  - the skip hint says confirm only the document item (never 'all', which deletes the file);
+  - truncation is read from the end marker (text and URL).
+**Data (operator: "delete everything in knowledge base if it's wrong"):** the PostgreSQL manual (wrong
+breadcrumbs) was removed via forget preview → owner confirm; the YouTube clip is kept.
+**Found while doing it (OPEN, not fixed):**
+- Preview → confirm across turns only works if the next turn can SEE the token.
+- API and web history carry the reply text, not tool results, and the model does not repeat the token. Its
+  confirm used an unknown token; it then re-previewed and confirmed in one turn (refused).
+- Affects knowledge_base forget/reset_all and manage_projects release/unrelease/delete (§4LQ).
+- Fix: remember the latest preview per conversation server-side and accept the user's yes, or make the preview
+  reply show the token.
+**Verification:**
+- `tests/test_4lt_kb.py` (25);
+- battery bat45: every valid mutant killed, KNOWN-BAD killed, NOOP survives, tree pristine;
+- suite before round 2: 28,464 passed, 0 failed;
+- after round 2: the KB set (2,924) + lint gate green;
+- deployed pid 27268.
+
+## §4LU — confirming a preview with "yes" (2026-10-05, operator: "proceed") — scope and outcome
+**Why.** Found in §4LT: preview → confirm flows (forget, reset_all, manage_projects release/unrelease/delete)
+keep the token in the preview's TOOL RESULT, while API/web history carries only reply text. On the user's "yes"
+turn the model no longer had the token, and the live forget of the PostgreSQL manual failed until the token was
+read from the trajectory.
+**Fix:**
+- each plan is stamped with its conversation (`conversation_key_context`, set by `reconcile_conversation`; the
+  hash of the first user message);
+- `memory._resolve_plan`: a missing, unknown or 'yes' token resolves to the newest live preview of that kind in
+  THIS conversation, for the same target (projects: the same project id);
+- used by forget_execute, reset_all and the project lifecycle gate;
+- the preview instructions tell the model it may pass 'yes';
+- unchanged: `_confirm_allowed` (the user, a later turn); member turns carry no conversation and get no
+  fallback; another conversation's preview is never used.
+**Verification:**
+- `tests/test_4lu_confirm.py` (8);
+- battery bat46: every valid mutant killed, KNOWN-BAD killed, NOOP survives, tree pristine;
+- suite: 28,481 passed, 0 failed;
+- deployed (gated, one process).
+**Not live-tested:** a live "yes" needs an owner turn that deletes something; probes cannot confirm by design.
+
+## §4LV — small tools: report_pdf, news_headlines, system_utility, darkweb_search/research, git, postgres_admin (2026-10-05, operator: "proceed with the small tools") — R0 scope
+**Why.** The last unreviewed tools with real traffic since August:
+- system_utility 103 calls (0 errors);
+- darkweb_search 78 (1);
+- report_pdf 17 (1);
+- news_headlines 14;
+- darkweb_research 10;
+- git 4 (4 errors);
+- postgres_admin 4 (2).
+Low volume, so a single lean pass.
+**Method:**
+- ONE fresh reader (code + traffic, read-only copies);
+- fixes with behaviour tests; battery; one fresh reader on the fix diff only if a fix is non-trivial;
+- suite once; gated deploy; labelled probes for anything changed.
+**Constraints:** search anything is allowed (no topic guards); Tor-only egress; no keyed APIs.
+
+## §4LV — outcome (2026-10-05)
+**Review.** One fresh reader (5 MAJOR + 3 MINOR, all reproduced with the network stubbed). Fixes were small, so
+the battery stood in for a second reader.
+**Fixed:**
+- **darkweb_research:** a thrown fetch now reads `Error: …`. It had been summarised as page text, booked OK and
+  cached (live: SOCKS error as "facts", 10-04).
+- **postgres_admin:**
+  - no re-send of a statement that may have run (a timeout ran twice; a write sent before a drop);
+  - the role is checked;
+  - `validate_sql` requires confirm for ALTER DROP COLUMN/CONSTRAINT, TYPE…USING, and a routine body that
+    drops, truncates or deletes.
+- **system_utility:**
+  - TLS verified on all 8 HTTPS calls (was `verify=False`; a Tor exit could fake the weather and
+    "Tor: Connected");
+  - the wttr.in line is bounded;
+  - the full WMO table, plus region and country;
+  - health: 10 s probes, no Tor identity change on a timeout (was 3× process-wide), and a failed probe over Tor
+    is not reported as "offline".
+- **Unknown tool:** the full list, member-aware; a member is never told to use execute.
+**Verification:**
+- `tests/test_4lv_small_tools.py` (22);
+- battery bat47: every real mutant killed, KNOWN-BAD killed, NOOP survives;
+- suite: 28,503 passed, 0 failed;
+- deployed pid 88967.
+**Live probes (labelled):**
+- V1 health: Internet Connected via Tor, Tor Connected (Anonymous).
+- V2 weather Athens: a real reading.
+**All systems with real traffic have now had a review (§4LL–§4LV).**

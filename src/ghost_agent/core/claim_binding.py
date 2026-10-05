@@ -1038,7 +1038,15 @@ def _earlier_reading_of_the_same_page(lines: List[str], other: str, home: str) -
     if po and po == ph:
         return True
     ro, rh = _run_block_of(lines, oi), _run_block_of(lines, hi)
-    return ro is not None and rh is not None and ro < rh
+    if ro is None or rh is None or ro >= rh:
+        return False
+    # a RE-run: some other tool call (the fix — an edit, or an `execute`
+    # `sed -i` / patch, review M3) sits between the two runs. Two runs back
+    # to back are an A/B — model A 0.87, model B 0.91 — two sources (§4LQ).
+    # Best-effort: the blocks carry no command, so a third run between two
+    # others also reads as "a fix in between".
+    return any(_BLOCK_LABEL_RE.match(ln) or _RUN_HEAD_RE.search(ln)
+               for ln in lines[ro + 1:rh])
 
 
 _META_LINE_RE = re.compile(r"^\s*(?:LENGTH|EXIT CODE|HTTP_STATUS|STATUS|TRUNCATED|ELAPSED)\s*:", re.I)

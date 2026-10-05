@@ -158,6 +158,13 @@ class GraduatedSkillStore:
                 existing["confidence"] = round(conf, 4)
                 existing["verifications"] = int(existing.get("verifications", 0)) + 1
                 existing["last_verified_at"] = now
+                # the examples come from the CURRENT evidence (§4LS m3): the
+                # first graduation's were kept forever, so probe text mined
+                # before §4LC stayed in owner prompts while real traffic
+                # kept the entry fresh
+                _ex = list(getattr(candidate, "trigger_examples", []) or [])
+                if _ex:
+                    existing["trigger_examples"] = _ex[:3]
                 entry = existing
             else:
                 entry = {

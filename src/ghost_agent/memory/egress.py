@@ -355,5 +355,6 @@ def with_privacy_note(result, area: str):
         return ToolOutcome(text, status=_st, world_changed=getattr(result, "world_changed", None),
                            reason_code=getattr(result, "reason_code", None),
                            declared=getattr(result, "declared", True),
-                           call_args=getattr(result, "call_args", None))
+                           call_args=getattr(result, "call_args", None),
+                           duration_s=getattr(result, "duration_s", None))
     return text

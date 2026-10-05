@@ -1670,7 +1670,8 @@ class DockerSandbox:
                     f"(docker rm -f {self.container_name}) and the next turn recreates it hardened."
                     + (" Until then sandbox code can reach the uid Tor's own traffic is exempted "
                        "by — Tor-only egress is NOT guaranteed." if _extra else ""),
-                    level="CRITICAL" if _extra else "WARNING", icon=Icons.WARN)
+                    level="CRITICAL" if _extra else "WARNING", icon=Icons.WARN,
+                    no_truncate=True)   # the fix and the Tor warning sat past the 240-char cut
         except Exception as exc:  # noqa: BLE001 — attrs may be stubbed
             logger.debug("privilege drift check skipped: %s", exc)
 

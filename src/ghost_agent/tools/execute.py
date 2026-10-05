@@ -148,6 +148,7 @@ def _released_shell_block(project_store, command: str, workdir: str = ""):
         for pid in sorted(written):
             proj = project_store.get_project(pid)
             if proj and str(proj.get("status", "")).upper() == "RELEASED":
+                from .projects import FORK_ONLY_IF_ASKED
                 return (
                     ToolOutcome.rejected(f"SYSTEM BLOCK: project {pid} is RELEASED (immutable) and "
                     f"this command contains a mutation (rm/mv/redirect/"
@@ -155,7 +156,7 @@ def _released_shell_block(project_store, command: str, workdir: str = ""):
                     f"a development copy first: manage_projects "
                     f"action=create_version project_id={pid}, then work in "
                     f"the new version's workspace. Read-only commands "
-                    f"(cat/grep/ls) on released files are fine."))
+                    f"(cat/grep/ls) on released files are fine. {FORK_ONLY_IF_ASKED}"))
     except Exception:
         return None
     return None
@@ -266,13 +267,77 @@ def _normalise_exit(command: str, exit_code, output: str = "") -> int:
 _FIND_QUIET_RE = re.compile(r"^\s*find\b.*2>\s*/dev/null", re.S)
 
 
+def _shell_pipelines(command: str) -> list:
+    """`command` as ``[[stage, …], …]`` — the `;`/`&&`/`||`-separated
+    pipelines, each split into its `|`/`|&` stages, QUOTE-AWARE (§4LP
+    follow-up): `… | awk '{print $1; exit}'` and `grep 'a|b'` were cut at the
+    quoted `;`/`|`, so the reader was not seen and the pattern became a stage.
+    Blank pipelines are dropped; at least one (possibly empty) is returned.
+    A whole-command `bash -c '…'` wrapper (a detached job's recorded
+    command) is read as the script it runs."""
+    s = str(command or "")
+    try:
+        _w = shlex.split(s)
+    except ValueError:
+        _w = []
+    if len(_w) == 3 and Path(_w[0]).name in ("bash", "sh") and _w[1] == "-c":
+        return _shell_pipelines(_w[2])
+    out, stages, cur, q, i = [], [], [], None, 0
+    while i < len(s):
+        c = s[i]
+        if q:
+            cur.append(c)
+            if c == "\\" and q == '"' and i + 1 < len(s):
+                cur.append(s[i + 1])
+                i += 2
+                continue
+            if c == q:
+                q = None
+            i += 1
+            continue
+        if c == "\\" and i + 1 < len(s):
+            cur.append(s[i:i + 2])
+            i += 2
+            continue
+        if c == "#" and (i == 0 or s[i - 1] in " \t\n;|&("):
+            # a comment runs to the end of its line; an apostrophe in it is
+            # not a quote (review N5: `# don't … # it's fine` paired up)
+            nl = s.find("\n", i)
+            i = len(s) if nl < 0 else nl
+            continue
+        if c in "'\"":
+            q = c
+        elif s.startswith(("&&", "||"), i) or c == ";":
+            stages.append("".join(cur))
+            out.append(stages)
+            stages, cur = [], []
+            i += 1 if c == ";" else 2
+            continue
+        elif c == "|":
+            stages.append("".join(cur))
+            cur = []
+            i += 2 if s.startswith("|&", i) else 1
+            continue
+        cur.append(c)
+        i += 1
+    if q:
+        # an unpaired quote — an apostrophe in a comment or a heredoc body
+        # ("# don't …") is not shell quoting; the quote-blind split is the
+        # better reading than one stage swallowing the rest (review m1)
+        out = [[st.strip().lstrip("&").strip() for st in pl.split("|")]
+               for pl in re.split(r";|&&|\|\|", s) if pl.strip()]
+        return out or [[""]]
+    stages.append("".join(cur))
+    out.append(stages)
+    out = [[st.strip() for st in pl] for pl in out if "".join(pl).strip()]
+    return out or [[""]]
+
+
 def _last_simple_command(command: str) -> str:
     """The last `;`/`&&`/`||`-separated command, minus a trailing pipe tail
     of pure filters (`| head`, `| sort`, `| grep -v …` keep find's status
     under pipefail only when THEY fail)."""
-    tail = re.split(r";|&&|\|\|", str(command or ""))[-1]
-    segs = [s.strip() for s in tail.split("|")]
-    return segs[0] if segs else ""
+    return _shell_pipelines(command)[-1][0]
 
 
 def _normalise_find_exit(command: str, exit_code, output: str = "") -> int:
@@ -343,8 +408,7 @@ _PIPESTATUS_LINE_RE = re.compile(r"\n?" + re.escape(_PIPESTATUS_MARK) + r"([0-9 
 
 
 def _grep_tail_after_pipe(command: str) -> bool:
-    last = re.split(r";|&&|\|\|", str(command or ""))[-1]
-    stages = [s.strip() for s in last.split("|")]
+    stages = _shell_pipelines(command)[-1]
     if len(stages) < 2:
         return False
     toks = stages[-1].split()
@@ -357,18 +421,27 @@ def _an_upstream_stage_failed(command: str, codes) -> bool:
     """Did a stage BEFORE the trailing grep really fail? 141 is a stage the
     downstream closed early, and a quiet `find … 2>/dev/null` exits 1 for any
     unreadable directory (review: `find / … 2>/dev/null | grep x` with no
-    match read "1 1" and became a failure)."""
+    match read "1 1" and became a failure). An upstream grep's 1 is "no
+    match" too — `grep a f | grep b` is a search that found nothing."""
     if not codes or len(codes) < 2:
         return False
-    last = re.split(r";|&&|\|\|", str(command or ""))[-1]
-    stages = [s.strip().lstrip("&").strip() for s in last.split("|")]
+    stages = _shell_pipelines(command)[-1]
     for i, c in enumerate(codes[:-1]):
         if c in (0, 141):
             continue
-        if c == 1 and i < len(stages) and _FIND_QUIET_RE.match(stages[i]):
+        if c == 1 and i < len(stages) and (_FIND_QUIET_RE.match(stages[i])
+                                           or _stage_head(stages[i]) in _EXIT1_MEANS_NO_MATCH):
             continue
         return True
     return False
+
+
+def _stage_head(stage: str) -> str:
+    """The program name of one pipeline stage (env assignments skipped)."""
+    toks = str(stage or "").split()
+    while toks and re.fullmatch(r"[A-Za-z_]\w*=.*", toks[0]):
+        toks = toks[1:]
+    return Path(toks[0]).name if toks else ""
 
 
 def _take_pipestatus(output):
@@ -423,12 +496,11 @@ _EARLY_READER_RE = re.compile(
 def _has_early_closing_reader(command: str) -> bool:
     """The LAST pipeline of `command` has a downstream stage that may stop
     reading before its input ends (head, grep -q/-m, sed …q, awk … exit)."""
-    segs = [x for x in re.split(r";|&&|\|\|", str(command or "")) if x.strip()]
+    segs = _shell_pipelines(command)
     # a trailing `echo "exit=$?"` reports the pipeline BEFORE it (§4HZ)
-    while len(segs) > 1 and re.match(r"\s*(?:echo|printf)\b.*\$\?", segs[-1]):
+    while len(segs) > 1 and re.match(r"\s*(?:echo|printf)\b.*\$\?", "|".join(segs[-1])):
         segs.pop()
-    last = segs[-1] if segs else ""
-    stages = [s.strip().lstrip("&").strip() for s in last.split("|")]   # `|&` too
+    stages = segs[-1]
     for st in stages[1:]:
         toks = st.split(None, 1)
         if toks:
@@ -1540,7 +1612,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
         _grep_no_match = False
         # …and only when every stage BEFORE the grep succeeded (§4LO)
         if exit_code == 1 and _no_output and not _an_upstream_stage_failed(command, _pipe_codes):
-            _tail_seg = re.split(r"&&|\|\||;|\|", command)[-1].strip()
+            _tail_seg = _shell_pipelines(command)[-1][-1]
             try:
                 _tail_toks = shlex.split(_tail_seg)
             except ValueError:

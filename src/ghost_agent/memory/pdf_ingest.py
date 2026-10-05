@@ -107,7 +107,11 @@ def normalise_toc(toc) -> List[Tuple[int, str, int]]:
         if page < 1 or not title:
             continue
         entries.append((max(1, level), title, page))
-    entries.sort(key=lambda e: (e[2], e[0]))
+    # Stable sort by PAGE only: PyMuPDF returns the TOC in document order, and
+    # the old (page, level) key put "5.9 Privileges" (level 2) before "5.8.8
+    # Renaming a Table" (level 3) when both start on one page — 4% of the
+    # live manual's breadcrumbs nested under the wrong section (§4LT M4).
+    entries.sort(key=lambda e: e[2])
     return entries
 
 
@@ -262,6 +266,13 @@ def iter_pdf_chunks(
             pass
 
 
+import threading as _threading
+
+#: PDF names being ingested right now (one ingest per name at a time)
+_IN_FLIGHT: set = set()
+_IN_FLIGHT_LOCK = _threading.Lock()
+
+
 def ingest_pdf_streaming(
     file_path: Path,
     filename: str,
@@ -277,6 +288,35 @@ def ingest_pdf_streaming(
     the ``IngestStats``; raises only on a fatal condition (unreadable PDF,
     page-cap breach), never on a single bad page.
     """
+    # Claim the name for THIS call before anything is written (fix review N2):
+    # two concurrent ingests of one PDF both passed the library check, and
+    # one's rollback deleted the other's rows. The loser is refused here,
+    # before the try, so its refusal never rolls anything back.
+    with _IN_FLIGHT_LOCK:
+        if filename in _IN_FLIGHT:
+            raise RuntimeError(f"'{filename}' is already being ingested — wait for it to finish")
+        _IN_FLIGHT.add(filename)
+    try:
+        return _ingest_pdf_batches(file_path, filename, memory_system,
+                                   progress=progress, **kwargs)
+    except BaseException:
+        # A failure part-way left a permanent half-document: the library
+        # entry is written on the FIRST batch, so a retry said "already in
+        # KB" and queries answered from half a manual (§4LT M2). Roll the
+        # partial rows and index entry back so the retry is a clean ingest.
+        try:
+            _del = getattr(memory_system, "delete_document_by_name", None)
+            if callable(_del):
+                _del(filename)
+        except Exception:  # noqa: BLE001 — the original failure is the one to report
+            pass
+        raise
+    finally:
+        with _IN_FLIGHT_LOCK:
+            _IN_FLIGHT.discard(filename)
+
+
+def _ingest_pdf_batches(file_path, filename, memory_system, *, progress=None, **kwargs) -> IngestStats:
     stats = IngestStats()
     batch: List[str] = []
     flushed = 0

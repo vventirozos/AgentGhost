@@ -1708,7 +1708,12 @@ class ProjectStore:
         # refused). macOS/BSD only; elsewhere the mode bits remain.
         _imm = getattr(stat, "UF_IMMUTABLE", 0) if hasattr(os, "chflags") else 0
         try:
-            entries = [ws, *ws.rglob("*")]
+            # §4LP: never through a link — `ln -s /Users/…/file x` inside the
+            # workspace made release chmod a HOST file read-only (and delete
+            # make it writable); rglob also descends symlinked directories
+            _root = ws.resolve()
+            entries = [e for e in [ws, *ws.rglob("*")]
+                       if not e.is_symlink() and e.resolve().is_relative_to(_root)]
             # (fifth review) a released app's RUNTIME STATE stays writable:
             # the Jiu Jitsu Calendar keeps its sqlite db next to app.py, and
             # sqlite must also create its journal in that folder. The db and

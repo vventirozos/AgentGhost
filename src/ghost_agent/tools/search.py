@@ -1495,6 +1495,20 @@ def source_block_failed(block: str) -> bool:
     return body.startswith("Error:")
 
 
+def record_loaded_sources(workspace_model, urls, page_contents, failed, *, source: str, note: str) -> int:
+    """Record in the workspace ONLY the sources whose page loaded (§4LP: a
+    failed or refused source booked "pulled" — 642 of 1,124 live entries —
+    answered "have I read this?" wrongly and deduped the later real pull).
+    ``page_contents`` is the gather result, one per url."""
+    n = 0
+    for u, c in zip(urls, page_contents):
+        if not isinstance(c, str) or failed(c):
+            continue
+        workspace_model.record_research_artifact(url=u, source=source, note=note)
+        n += 1
+    return n
+
+
 async def tool_deep_research(query: Optional[str] = None, anonymous: bool = False, tor_proxy: str = None, llm_client=None, model_name="default", max_context: int = 8192, workspace_model=None, **kwargs):
     if not query:
         return "SYSTEM ERROR: The 'query' parameter is MANDATORY. You must specify it."
@@ -1954,10 +1968,11 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
     # tool. Non-fatal — must never break a successful research turn.
     if workspace_model is not None and getattr(workspace_model, "enabled", False):
         try:
-            for u in urls:
-                workspace_model.record_research_artifact(
-                    url=u, source="deep_research", note=(query or "")[:120],
-                )
+            # §4LP: only the sources that LOADED — a failed or refused one
+            # booked "pulled" (642 of 1,124 live entries) answered "have I
+            # read this?" wrongly and deduped the later real pull
+            record_loaded_sources(workspace_model, urls, page_contents, source_block_failed,
+                                  source="deep_research", note=(query or "")[:120])
         except Exception:  # noqa: BLE001
             pass
     # §4GI (2026-09-13): the STATUS rides the outcome. A report whose every

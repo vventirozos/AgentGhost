@@ -72,6 +72,8 @@ _ACTIONS = {
     "search", "set_dependency", "clone",
     # workspace hygiene
     "cleanup",
+    # idle-advance opt-in, owner-controlled (§4LQ)
+    "autopilot",
     # inbox promotion (suggestion-accepted path)
     "promote_from_context",
     # self-advancing loop
@@ -288,8 +290,12 @@ def _ok(payload: Any) -> "ToolOutcome":
     # every task at non-DONE — nothing landed, and a declared ok silences the
     # sniffer that would otherwise have caught it.
     if isinstance(payload, dict):
-        _held = payload.get("gated_constraints") or payload.get(
-            "agent_instruction_constraints")
+        # §4LP: EVERY refusal kind, not just the constraint hold — the
+        # visual-artifact gate, the live re-check, the constraint audit and
+        # unknown task ids also came back `ok` with `updated: []`
+        _held = any(payload.get(k) for k in (
+            "gated_constraints", "agent_instruction_constraints", "gated_unverified",
+            "still_failing", "constraint_violations", "missing"))
         _nothing = (payload.get("updated") == []
                     or payload.get("count") == 0)
         if _held and _nothing:
@@ -875,6 +881,11 @@ def _reconcile_conversation(context, conv_key: str):
       owning conversation gets it back.
     """
     context.conversation_key = conv_key or ""
+    try:
+        from ..utils.logging import conversation_key_context
+        conversation_key_context.set(conv_key or "")
+    except Exception:  # noqa: BLE001
+        pass
     sp = getattr(context, "scratchpad", None)
     if sp is None:
         return
@@ -1415,6 +1426,185 @@ def _link_concepts_in_graph(context, project_id: str):
         logger.debug("graph concept link skipped", exc_info=True)
 
 
+#: §4LP: every "fork a new version" steer — a probe whose blocked command
+#: met this text forked the owner's released Chess Coach v3 into a v4 that the
+#: idle advancer then built (and failed). A fork is the owner's change request.
+FORK_ONLY_IF_ASKED = ("Fork ONLY when the user asked for a change to this app — never to get "
+                      "around this block, to retry a command, or for a test.")
+
+
+_CONFIRMED_ACTIONS = {
+    "release": "RELEASE it — the app becomes immutable; changes then need a new version",
+    "unrelease": "UN-RELEASE it — the released app becomes editable again",
+    "delete": "PERMANENTLY DELETE it — the record, its tasks and its workspace files",
+}
+
+
+def _probe_turn_now() -> bool:
+    try:
+        from ..utils.logging import (request_id_context, is_probe_request_id,
+                                     request_origin_context, ORIGIN_PROBE)
+        return (is_probe_request_id(str(request_id_context.get() or ""))
+                or str(request_origin_context.get() or "") == ORIGIN_PROBE)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _owner_turn_now() -> bool:
+    """Is this the OWNER's own turn? Not a probe, a scheduled task, a
+    sub-agent or any other background run (review M5: a `sched-`/`sub-`
+    autoadvance counted as the owner — it set autopilot, skipped the
+    unattended hold and hid from the digest). Web, CLI and Slack owner turns
+    carry a request id; a call outside any request reads "SYSTEM" and is
+    not the owner."""
+    try:
+        from ..utils.logging import request_id_context
+        rid = str(request_id_context.get() or "")
+    except Exception:  # noqa: BLE001
+        return False
+    from .memory import _not_the_user
+    return not _not_the_user(rid)
+
+
+def _autopilot_on(store, project_id) -> bool:
+    try:
+        return bool(((store.get_project(project_id) or {}).get("metadata") or {}).get("autopilot"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _lifecycle_target(context, store, project_id, title):
+    """``(rid, error)`` — the ONE project a release/unrelease/delete will act
+    on, resolved before the gate so the preview, the confirmation and the
+    action all name the same project (review C1/M1: a title that matched
+    nothing passed the gate, and `unrelease` — which ignores `title` — then
+    un-released the CURRENT project). ``(None, None)``: nothing given and
+    nothing current — the action reports that itself."""
+    from ..memory.projects import _canon_id as _canon_pid
+    pid = _canon_pid(project_id) if project_id else None
+    if pid or str(title or "").strip():
+        rid, rerr = _resolve_project_ref(store, pid, title or "")
+        if rerr:
+            return None, rerr
+        if not rid:
+            return None, (f"project not found: {project_id or title!r} — NOTHING was changed. "
+                          f"Use action=list to see the real ids.")
+        return rid, None
+    cur = getattr(context, "current_project_id", None)
+    if cur and not store.get_project(_canon_pid(cur)):
+        return None, (f"the current project {cur} no longer exists — NOTHING was changed. "
+                      f"Name the project (project_id or title).")       # review N9
+    return (_canon_pid(cur) if cur else None), None
+
+
+def _lifecycle_would_refuse(store, act, rid, kwargs) -> bool:
+    """The action will refuse on its own and change nothing — no preview to
+    confirm (review m4: a preview for an ACTIVE project's release ended in
+    the owner's "yes" hitting "not DONE")."""
+    st = str((store.get_project(rid) or {}).get("status") or "").upper()
+    if act == "unrelease":
+        return st != "RELEASED"
+    if act == "release":
+        return (st != "DONE"
+                or len(" ".join(str(kwargs.get("directions") or "").split())) < 30)
+    return False
+
+
+#: (request id, action, project) previews already shown in that request
+_PREVIEWED_THIS_REQUEST: set = set()
+
+
+def _lifecycle_confirmation(store, act, rid, token):
+    """None when the action may run now on ``rid``; otherwise the preview (no
+    token) or the refusal (bad token / not the user / same turn)."""
+    import time as _time
+    from .memory import _store_plan, _resolve_plan, _drop_plan, _confirm_allowed
+    from ..utils.logging import request_id_context
+    proj = store.get_project(rid) or {}
+    if _probe_turn_now() and (proj.get("metadata") or {}).get("probe_created"):
+        return None                       # a probe's own throwaway project
+    kind = f"project_{act}"
+    _rid_now = str(request_id_context.get() or "")
+    _stop = (f"STOP calling {act} in this turn. Reply to the user now: say what it would do and ask "
+             f"them to confirm in their next message.")
+    if not str(token or "").strip():
+        # one preview per request: the live probe re-previewed eight times in
+        # one turn, taking each refusal as a cue to try again (§4LQ)
+        _key = (_rid_now, kind, rid)
+        if _key in _PREVIEWED_THIS_REQUEST:
+            return _err(f"already previewed in this turn — {_stop}")
+        if len(_PREVIEWED_THIS_REQUEST) > 256:
+            _PREVIEWED_THIS_REQUEST.clear()
+        tok = _store_plan({"kind": kind, "rid": _rid_now,
+                           "ts": _time.time(), "project_id": rid})
+        _PREVIEWED_THIS_REQUEST.add(_key)
+        return _ok({
+            "confirmation_needed": True, "action": act, "project": rid,
+            "title": proj.get("title"), "confirm_token": tok,
+            "agent_instruction": (
+                f"NOT done yet. This would {_CONFIRMED_ACTIONS[act]} ('{proj.get('title')}'). Ask the "
+                f"user to confirm. ONLY after they say yes, in their next message, call "
+                f"manage_projects action={act} project_id={rid} confirm_token={tok} (or "
+                f"confirm_token=yes if you no longer see the token). Never confirm "
+                f"on their behalf, and do not call it again in this turn."),
+        })
+    token, plan = _resolve_plan(token, kind, match=lambda p: p.get("project_id") == rid)
+    if plan is None or plan.get("project_id") != rid:
+        return _err("unknown, expired or mismatched confirm_token — call the action again without it "
+                    "to get a new preview for the user")
+    why = _confirm_allowed(plan)
+    if why:
+        return _err(f"NOT done: {why}. {_stop}")
+    _drop_plan(token)
+    return None
+
+
+#: metadata keys only the system writes — the model's `metadata=` cannot set
+#: them (review M2: a probe set `probe_created` on an owner project, then
+#: deleted it with no confirmation)
+_SYSTEM_METADATA_KEYS = ("probe_created", "autopilot")
+
+
+async def tool_manage_projects_for_model(context, **kwargs):
+    """The MODEL-facing manage_projects (the registry's). §4LP (operator: "go
+    with your recommendations"): release, unrelease and hard delete are the
+    OWNER's decisions — a preview, then the user confirms in a later turn (the
+    forget/reset_all design, §4KX). The model had released an untested
+    project nobody asked to release, and the guard against unrelease was only
+    description text. The confirmed action runs on the project the preview
+    named. Direct callers (tests, API routes) keep the immediate behaviour,
+    as forget's do."""
+    act = str(kwargs.get("action") or "").strip().lower()
+    token = kwargs.pop("confirm_token", "") or ""
+    _md = kwargs.get("metadata")
+    if isinstance(_md, str):
+        try:
+            _md = json.loads(_md.strip() or "null")
+        except ValueError:
+            _md = kwargs.get("metadata")       # the action reports the bad JSON
+    if isinstance(_md, dict):
+        if "autopilot" in _md:
+            # never a silent no-op (review N2: `{"autopilot": false}` answered
+            # "updated" and the idle loop kept building)
+            return _err("autopilot is not metadata: use manage_projects action=autopilot "
+                        "enabled=true|false, on the owner's request — nothing changed")
+        kwargs["metadata"] = {k: v for k, v in _md.items() if k not in _SYSTEM_METADATA_KEYS}
+    if act in _CONFIRMED_ACTIONS:
+        store = getattr(context, "project_store", None)
+        if store is not None:
+            rid, rerr = _lifecycle_target(context, store, kwargs.get("project_id"), kwargs.get("title") or "")
+            if rerr:
+                return _err(rerr)
+            if rid and not _lifecycle_would_refuse(store, act, rid, kwargs):
+                _gate = _lifecycle_confirmation(store, act, rid, token)
+                if _gate is not None:
+                    return _gate
+            if rid:
+                kwargs["project_id"] = rid          # act on exactly the project confirmed
+                kwargs.pop("title", None)
+    return await tool_manage_projects(context, **kwargs)
+
+
 def _released_guard(store: ProjectStore, project_id) -> Optional[str]:
     """Error string when ``project_id`` is RELEASED (mutations must fork a
     version), else None. Applied to every mutating action — a RELEASED
@@ -1431,7 +1621,7 @@ def _released_guard(store: ProjectStore, project_id) -> Optional[str]:
                 f"manage_projects action=create_version project_id="
                 f"{project_id} description=\"<the requested change>\" — "
                 f"the released version keeps working untouched. To run/use "
-                f"it, follow the RELEASE DIRECTIONS in the briefing."
+                f"it, follow the RELEASE DIRECTIONS in the briefing. {FORK_ONLY_IF_ASKED}"
             )
     except Exception:
         return None
@@ -1483,21 +1673,34 @@ def project_services_summary(context, project_id: str) -> list:
     entries = _project_service_entries(context, project_id)
     if not entries:
         return []
-    _gen = None
+    # The live generation in the supervisor's own form, `<id>:<StartedAt>`
+    # (§4BW), from the CACHED attrs — no docker exec per turn. Comparing the
+    # bare id against that stamp marked every running service STALE on every
+    # turn, telling the model to restart working (released) apps (§4LR M1).
+    _cid, _started = "", ""
     try:
-        sm = getattr(context, "sandbox_manager", None)
-        _gen = str(getattr(getattr(sm, "container", None), "id", None) or "")
-    except Exception:
-        _gen = None
+        _c = getattr(getattr(context, "sandbox_manager", None), "container", None)
+        _cid = str(getattr(_c, "id", None) or "")
+        _started = str(((getattr(_c, "attrs", None) or {}).get("State") or {}).get("StartedAt") or "")
+    except Exception:  # noqa: BLE001 — stubs
+        _cid, _started = "", ""
     out = []
     for e in entries:
         stamped = str(e.get("container_id") or "")
+        if not (_cid and stamped):
+            stale = False
+        elif ":" not in stamped:
+            stale = True            # legacy id-only stamp: never survives a restart (services.py)
+        elif _started:
+            stale = stamped != f"{_cid}:{_started}"
+        else:
+            stale = stamped.split(":", 1)[0] != _cid
         out.append({
             "name": e.get("name") or e.get("key"),
             "port": e.get("port"),
             "command": str(e.get("command") or "")[:80],
             "started_at": e.get("started_at"),
-            "stale": bool(_gen and stamped and _gen != stamped),
+            "stale": stale,
         })
     return out
 
@@ -1585,9 +1788,14 @@ def _release_rehearsal(context, store: ProjectStore, project_id: str) -> Dict[st
             # exceptions — a failed restart must fail the rehearsal
             # (review 2026-07-30: a portless service's failed restart
             # passed as `alive=True`).
-            if isinstance(_r_out, str) and _r_out.startswith("Error:"):
+            # …and a DECLARED failure is one too: the bind failures are
+            # `ToolOutcome.failed` with a "Service 'x' started …" head, which
+            # the prefix check let through to a host probe (§4LR M5).
+            from .outcome import OutcomeStatus as _OS
+            if ((isinstance(_r_out, str) and _r_out.startswith("Error:"))
+                    or getattr(_r_out, "status", None) in (_OS.FAILED, _OS.REJECTED)):
                 ok = False
-                checks.append(f"{name}: restart failed — {_r_out[:120]}")
+                checks.append(f"{name}: restart failed — {str(_r_out)[:120]}")
                 continue
             # The lease may have MOVED the port on restart (preference
             # semantics), and the substituted command moved with it — read
@@ -1607,7 +1815,23 @@ def _release_rehearsal(context, store: ProjectStore, project_id: str) -> Dict[st
                         cmd_str = str(_fresh["command"])
             except Exception:
                 pass
-            alive = _probe_tcp(port) if port else True
+            # Reachability INSIDE the container: a host probe is answered by
+            # anything on that port — OrbStack holds every published port on
+            # the host (§4LR M5).
+            if not port:
+                alive = True
+            elif callable(getattr(sup, "_port_listening", None)):
+                try:
+                    alive = bool(sup._port_listening(port))
+                    # …and bound where the HOST can reach it: a loopback-only
+                    # app in bridge mode answers inside, not to the user (N4)
+                    if alive and callable(getattr(sup, "_host_unreachable_bind", None)) \
+                            and sup._host_unreachable_bind(port):
+                        alive = False
+                except Exception:  # noqa: BLE001
+                    alive = False
+            else:
+                alive = _probe_tcp(port)
             services.append({"name": name,
                              "command": cmd_str,
                              "port": port})
@@ -1878,6 +2102,8 @@ async def tool_manage_projects(
     query: str = "",
     # autonomous batch pacing
     count: Any = None,
+    # action=autopilot: on / off (None = report)
+    enabled: Any = None,
     # research
     topic: str = "",
     topics: Optional[List[str]] = None,
@@ -1994,7 +2220,7 @@ async def tool_manage_projects(
     # NB: "update" is NOT here — its `title` arg is a RENAME value, not a
     # lookup key, so auto-filling `current` for a rename is correct.
     _TITLE_RESOLVABLE = {"delete", "archive", "get", "switch", "resume",
-                         "release", "create_version"}
+                         "release", "create_version", "status", "autopilot"}
     if project_id is None and act not in {"create", "list", "promote_from_context"}:
         if not (title and act in _TITLE_RESOLVABLE):
             project_id = getattr(context, "current_project_id", None)
@@ -2019,9 +2245,28 @@ async def tool_manage_projects(
                 and not (file_path or payload or "").strip())
         )
         if not _is_read_form:
-            _rg = _released_guard(store, project_id)
-            if _rg:
-                return _err(_rg)
+            # §4LP: guard the project this call will REALLY touch — a TITLE
+            # passed as project_id found no project here and passed the
+            # guard (`update project_id="<title>" status=ACTIVE` un-released
+            # the app), and a task op on another project's task_id guarded
+            # the active project instead of the task's.
+            _guard_ids = {project_id}
+            if project_id and not store.get_project(project_id):
+                _gid, _ = _resolve_project_ref(store, project_id, "")
+                if _gid:
+                    _guard_ids.add(_gid)
+            _tid = task_id
+            if _tid:
+                try:
+                    _t = store.get_task(_tid)
+                    if _t and _t.get("project_id"):
+                        _guard_ids.add(_t.get("project_id"))
+                except Exception:  # noqa: BLE001
+                    pass
+            for _gid in _guard_ids:
+                _rg = _released_guard(store, _gid) if _gid else None
+                if _rg:
+                    return _err(_rg)
 
     try:
         # ---- project lifecycle ------------------------------------------
@@ -2079,7 +2324,7 @@ async def tool_manage_projects(
                         f"action=create_version project_id={existing['id']} "
                         f"description=\"<what you want to change>\". To start "
                         f"something genuinely unrelated, pick a different "
-                        f"title.")
+                        f"title. {FORK_ONLY_IF_ASKED}")
                 if existing["status"] in _TERMINAL_PROJECT_STATUSES:
                     continue
                 # Existence-based guard: an in-flight project with the same
@@ -2336,6 +2581,12 @@ async def tool_manage_projects(
                     "gate task completion): "
                     + " | ".join(req_constraints) + ". " + instruction
                 )
+            if _probe_turn_now():
+                try:                                   # §4LP: a probe may clean up ITS OWN projects
+                    store.update_project(pid, metadata={**(store.get_project(pid).get("metadata") or {}),
+                                                        "probe_created": True})
+                except Exception:  # noqa: BLE001
+                    pass
             return _ok({"created": pid,
                         "tasks_created": created_task_ids,
                         "workspace": f"projects/{pid}",
@@ -2437,7 +2688,13 @@ async def tool_manage_projects(
                         "briefing": _b})
 
         if act == "exit":
-            prev = getattr(context, "current_project_id", None)
+            prev = (getattr(context, "current_project_id", None)
+                    or _conversation_bound_project_pid(context) or None)
+            if not prev:
+                # §4LP: nothing active or bound in THIS conversation —
+                # `_set_current(None)` would delete the binding ANOTHER
+                # conversation owns (its next turn wrote to the sandbox root)
+                return _ok({"exited": None, "note": "no project was active in this conversation"})
             _set_current(context, None)
             return _ok({"exited": prev})
 
@@ -2658,10 +2915,55 @@ async def tool_manage_projects(
 
         if act == "status":
             cur = getattr(context, "current_project_id", None)
+            # §4LP: a NAMED project is reported (without switching) — 31 of
+            # 53 live `status project_id=…` calls answered "free_chat" about
+            # the conversation instead, and two turns aborted on it
+            if (project_id and project_id != cur) or (title and not project_id):
+                rid, rerr = _resolve_project_ref(store, project_id, title)
+                if rerr:
+                    return _err(rerr)
+                if not rid or not store.get_project(rid):
+                    return _err(f"no project matches {(title or project_id)!r} — "
+                                "manage_projects action=list shows the real ones")
+                return _ok({"current": cur, "mode": "project" if cur else "free_chat",
+                            "project": rid, "autopilot": _autopilot_on(store, rid),
+                            "briefing": _briefing(store, rid)})
             if not cur:
                 return _ok({"current": None, "mode": "free_chat"})
             return _ok({"current": cur, "mode": "project",
+                        "autopilot": _autopilot_on(store, cur),
                         "briefing": _briefing(store, cur)})
+
+        if act == "autopilot":
+            # §4LQ: the idle loop advances a project only with autopilot on.
+            # The owner's own `autoadvance` turns it on; this reports it or
+            # turns it on/off. Not from a probe or a background turn.
+            # a NAMED project, never the current one by default (review N1:
+            # the title was ignored and the current project went on autopilot)
+            if project_id or title:
+                project_id, _aerr = _resolve_project_ref(store, project_id, title)
+                if _aerr:
+                    return _err(_aerr)
+            if not project_id:
+                return _err("no such project (pass project_id or title, or switch first) — nothing changed")
+            if not store.get_project(project_id):
+                return _err(f"project not found: {project_id}")
+            if enabled is None or str(enabled).strip() == "":
+                return _ok({"project": project_id, "autopilot": _autopilot_on(store, project_id)})
+            _ev = str(enabled).strip().lower()
+            if _ev in ("1", "true", "yes", "on", "enable", "enabled"):
+                want = True
+            elif _ev in ("0", "false", "no", "off", "disable", "disabled"):
+                want = False
+            else:
+                return _err(f"enabled must be true or false, got {enabled!r} — nothing changed")
+            if not _owner_turn_now():
+                return _err("only the owner's own turn changes autopilot — "
+                            "a probe or background run cannot")
+            store.update_project(project_id, metadata={"autopilot": want})
+            return _ok({"project": project_id, "autopilot": want,
+                        "note": ("the idle loop may now advance this project between your turns"
+                                 if want else "the idle loop will no longer advance this project")})
 
         # ---- task lifecycle ---------------------------------------------
 
@@ -4063,11 +4365,22 @@ async def tool_manage_projects(
             # switched project, record_* would otherwise stamp the batch's
             # command/research outcomes with the CHAT turn's project. Scoped,
             # so the turn's own stamp is restored after the batch.
+            # the owner advanced this project → it may continue while idle
+            # (§4LP). A probe's, a scheduled task's or a sub-agent's advance
+            # is not the owner's opt-in, and runs under the unattended rules.
+            _by_owner = _owner_turn_now()
+            if _by_owner:
+                try:
+                    store.update_project(project_id, metadata={
+                        **((store.get_project(project_id) or {}).get("metadata") or {}), "autopilot": True})
+                except Exception:  # noqa: BLE001
+                    pass
             from ..workspace import pinned_event_project as _pin_evt
             with _pin_evt(project_id):
                 batch = await advance_many(
                     context, project_id,
                     max_tasks=max_tasks,
+                    owner_requested=_by_owner,      # the owner asked (§4LP/§4LQ)
                     tool_runner=tool_runner,
                     llm_classifier=default_llm_classifier(context),
                     code_generator=default_code_generator(context),
@@ -4085,6 +4398,16 @@ async def tool_manage_projects(
                 "stop_reason": batch.stop_reason,
                 "agent_instruction": _advance_batch_instruction(batch, max_tasks),
             }
+            if batch.stop_reason == "needs_user":
+                # name what waits, or the model cannot tell the owner (§4LQ F5)
+                try:
+                    _adv_payload["needs_user_tasks"] = [
+                        {"task_id": t["id"], "description": str(t.get("description") or "")[:160],
+                         "result": str(t.get("result_summary") or "")[:200]}
+                        for t in store.list_tasks(project_id)
+                        if str(t.get("status") or "").upper() == "NEEDS_USER"][:10]
+                except Exception:  # noqa: BLE001
+                    logger.debug("needs_user task list skipped", exc_info=True)
             # A failure-shaped stop names the LEDGER's failed tasks, not just
             # this batch's: on an already-FAILED project the batch advanced
             # nothing, so the model otherwise has no ids/reasons to act on
@@ -4270,7 +4593,12 @@ MANAGE_PROJECTS_TOOL_DEF = {
             "PERMANENTLY remove a project and ALL its data — tasks, "
             "artifacts, events, AND its workspace files on disk (NOT "
             "reversible). Use `delete` only when the user clearly means "
-            "to erase it; otherwise prefer `archive`. "
+            "to erase it; otherwise prefer `archive`. `release`, `unrelease` "
+            "and `delete` first return a preview: ask the user, and repeat "
+            "the call with its confirm_token only after they say yes. "
+            "`autopilot` (enabled=true|false, only on the user's request) "
+            "lets the idle loop advance the project between their turns, or "
+            "stops it; without `enabled` it reports the setting. "
             "`promote_from_context` only when the user has explicitly "
             "accepted a suggestion to convert the current chat into a "
             "project. `research` to web-research a topic (pass `topic`) or "
@@ -4377,6 +4705,10 @@ MANAGE_PROJECTS_TOOL_DEF = {
                 "event_type": {"type": "string"},
                 "context_summary": {"type": "string",
                                     "description": "Optional textual snapshot captured at promotion time."},
+                "confirm_token": {"type": "string",
+                                  "description": "action=release / unrelease / delete: these are the USER's decisions. The first call only PREVIEWS and returns a confirm_token; show the user what will happen and, ONLY after they say yes in their next message, repeat the call with this token."},
+                "enabled": {"type": "boolean",
+                            "description": "action=autopilot: true lets the idle loop advance this project between the owner's turns, false stops it; omit to report. Only on the owner's request."},
                 "count": {"type": "string",
                           "description": "action=autoadvance: how many tasks to advance autonomously in a bounded loop — a number (e.g. \"3\") or \"all\" to run to completion. Use this ONLY for an explicit MULTI-task request: 'do the next 3 tasks' → count=\"3\"; 'proceed with all remaining tasks' / 'finish the project' → count=\"all\". A single 'proceed'/'next' you do YOURSELF as one focused full turn — do NOT route that here (autoadvance runs a lighter single-step-per-task executor). The loop checkpoints each task and stops at the first of: done · a task that needs you · budget · a FAILED task."},
                 "ledger": {"type": "string",

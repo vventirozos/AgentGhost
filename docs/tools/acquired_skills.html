@@ -146,6 +146,13 @@ way you'd call any built-in tool.</code></pre>
   headlines, no scrub fallback.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+  <h2 id="4ls">Skills review <span class="tag">2026-10-05 &sect;4LS</span></h2>
+  <ul>
+    <li><code>create_skill</code> refuses probe requests; <code>manage_skills delete</code> refuses probe and background requests. The dream cycle still acquires skills in the background (probes only are refused at <code>create_skill</code>).</li>
+    <li>The degraded-skill retirement sweep (and the orphan-embedding purge) runs on the owner's calls only, never on a probe or background request: a probe's <code>list</code> moved a live skill to <code>retired/</code>.</li>
+    <li>Open: a call with bad ARGUMENTS still counts against the skill. Reading the skill's output for argument phrases was tried and reverted — it missed the live wordings and excused real HTTP 400s; the fix is validating arguments against the stored schema before running. The "degraded → recovered" branch is in practice unreachable (a degraded skill has no runner).</li>
+    <li>Auto-skills: a re-graduation replaces the trigger examples with the current evidence's, so probe text mined before &sect;4LC no longer surfaces in owner prompts.</li>
+  </ul>
 </main>
 </body>
 </html>

@@ -84,13 +84,16 @@ async def test_tool_gain_knowledge_calls_ingest_async(mock_vector_memory):
         with patch("ghost_agent.tools.memory.semantic_split_text", return_value=["chunk1", "chunk2"]):
             
             # Mock asyncio.to_thread
+            import ghost_agent.tools.memory as ghost_memory_tools
             with patch("asyncio.to_thread", new_callable=AsyncMock) as mock_to_thread:
                 # to_thread is called twice:
                 # 1. _extract_text -> returns str
                 # 2. ingest_document -> returns (True, "Success")
                 
                 async def side_effect(func, *args, **kwargs):
-                    if func.__name__ == "_extract_text":
+                    if func is ghost_memory_tools.semantic_split_text:
+                        return func(*args, **kwargs)        # the split runs in a thread (§4LT)
+                    if getattr(func, "__name__", "") == "_extract_text":
                         return "Mocked File Content"
                     elif func == mock_vector_memory.ingest_document:
                          return (True, "Success")

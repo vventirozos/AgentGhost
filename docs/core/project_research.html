@@ -160,6 +160,8 @@
     <li><strong>The project's goal and constraints are part of what it is about.</strong> "make the AI opponent smarter" overlaps "don't come up with some random AI" even when the title never says "AI".</li>
   </ul>
   <p>Still fail-open on any store error. Tests: <code>tests/test_4fd_constraint_scoping.py</code>.</p>
+  <h2 id="4lp">Research notes never write through a link <span class="tag">2026-10-05 &sect;4LP &middot; CRIT</span></h2>
+  <p><code>research/</code> lives in the project workspace under the sandbox bind mount. A symlink planted at the directory or at a note's name redirected these HOST-side writes (the topic note, <code>INDEX.md</code>, the findings file) to any host file. <code>_research_dir</code> refuses a linked or escaping directory. Every write goes through <code>write_text_nofollow_in_dir</code>, and the findings read through <code>read_bytes_nofollow</code>.</p>
 </main>
 </body>
 </html>

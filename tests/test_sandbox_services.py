@@ -159,10 +159,13 @@ class TestSupervisorValidation:
         assert "forbidden" in out and "8000" in out
 
     @pytest.mark.parametrize("port", sorted(BLOCKED_PORTS))
-    def test_blocked_ports_refused(self, tmp_path, port):
-        out = self._sup(tmp_path).start(
-            "web", "python3 -m http.server", port=port)
-        assert "reserved" in out
+    def test_a_reserved_port_is_never_granted(self, tmp_path, port):
+        # §4LR: an explicit reserved port is a PREFERENCE (re-leased with a
+        # note), as the same port written in the command always was
+        sup = self._sup(tmp_path)
+        sup.start("web", "python3 -m http.server", port=port)
+        script = "".join(f.read_text() for f in (tmp_path / ".services").glob("*.cmd.sh"))
+        assert script and f"PORT={port}\n" not in script and f"http.server {port}" not in script
 
     def test_port_out_of_range(self, tmp_path):
         assert "out of range" in self._sup(tmp_path).start(
@@ -543,8 +546,9 @@ class TestRemoteAccessHint:
         out = sup.status()
         assert "alive: RUNNING" in out
         assert "gone: DEAD" in out
-        # A dead entry present -> status points at the one-shot cleanup.
-        assert "stop-all" in out
+        # A dead entry present -> status points at restart / stop, never at
+        # stop-all (it erased released apps' rows, §4LR)
+        assert "action='restart'" in out and "stop-all" not in out
 
 
 class TestReliablePidAndCleanup:

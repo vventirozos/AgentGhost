@@ -232,7 +232,10 @@ class ContextManager:
         from ..tools.outcome import ToolOutcome
         return {**msg, "content": ToolOutcome(
             new_text, status=old.status, world_changed=old.world_changed,
-            reason_code="context_compressed", declared=old.declared)}
+            reason_code="context_compressed", declared=old.declared,
+            # the call's arguments and wall time survive the cut (§4LQ N6)
+            call_args=getattr(old, "call_args", None),
+            duration_s=getattr(old, "duration_s", None))}
 
     def _summarize_tool_output(self, msg: dict) -> dict:
         """Compress a tool output message to its essential information."""

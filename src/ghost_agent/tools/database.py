@@ -138,6 +138,20 @@ def _clip_row_cells(rows):
         return rows
 
 
+def _read_only_sql(sql) -> bool:
+    """A statement that is safe to send twice: a plain SELECT / SHOW /
+    EXPLAIN (without ANALYZE) / WITH … SELECT. Anything else may write."""
+    import re as _re
+    t = _re.sub(r"--[^\n]*|/\*.*?\*/", " ", str(sql or ""), flags=_re.S).strip().lower()
+    if not t:
+        return True                     # list/describe actions build their own SELECTs
+    if _re.match(r"explain\s+(\(.*analyze|analyze)", t):
+        return False
+    if not _re.match(r"(select|show|explain|with|table|values)\b", t):
+        return False
+    return not _re.search(r"\b(insert|update|delete|merge|create|drop|alter|truncate|grant|revoke|call|do|copy|vacuum|reindex|cluster|refresh|lock|nextval|setval|pg_terminate_backend|pg_cancel_backend)\b", t)
+
+
 async def tool_postgres_admin(action: str = None, connection_string: Optional[str] = None, query: Optional[str] = None, table_name: Optional[str] = None, default_uri: Optional[str] = None, timeout_ms: Optional[int] = None, confirm: bool = False, **kwargs):
     if not action:
         return "SYSTEM ERROR: The 'action' parameter is MANDATORY. You must specify it."
@@ -193,16 +207,19 @@ async def tool_postgres_admin(action: str = None, connection_string: Optional[st
             host = (_last("hostaddr") or _last("host") or (p.hostname or "")).lower()
             port = str(_last("port") or (p.port or 5432))
             dbname = _last("dbname") or (p.path or "").lstrip("/")
-            return (host, port, dbname)
+            # …and the USER (§4LV): `postgres@` in place of the configured
+            # role passed the host/port/db check
+            user = (_last("user") or p.username or "").lower()
+            return (host, port, dbname, user)
         try:
             _sup_key, _def_key = _dsn_target(_supplied_conn), _dsn_target(default_uri)
         except Exception:
             return "Error: could not parse the supplied connection_string."
         if _sup_key != _def_key:
             return (
-                f"Error: refused connection to {_sup_key[0]}:{_sup_key[1]}/{_sup_key[2]!r}; "
-                f"only the configured database "
-                f"{_def_key[0]}:{_def_key[1]}/{_def_key[2]!r} is allowed. Omit "
+                f"Error: refused connection to {_sup_key[3] or '?'}@{_sup_key[0]}:{_sup_key[1]}/{_sup_key[2]!r}; "
+                f"only the configured database and role "
+                f"{_def_key[3] or '?'}@{_def_key[0]}:{_def_key[1]}/{_def_key[2]!r} are allowed. Omit "
                 f"connection_string to use the default. (Note: host/hostaddr/"
                 f"port/dbname in the URI query string are resolved and checked "
                 f"too — they cannot be used to redirect the connection.)"
@@ -415,9 +432,11 @@ async def tool_postgres_admin(action: str = None, connection_string: Optional[st
             last_err = None
             for attempt in range(2):  # one retry on a stale/broken connection
                 conn = None
+                sent = False
                 try:
                     conn = _get_connection(connection_string)
                     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                        sent = True
                         return _run_action(cur, conn)
                 except Exception as e:
                     # Always discard the (possibly broken) connection.
@@ -433,7 +452,17 @@ async def tool_postgres_admin(action: str = None, connection_string: Optional[st
                     # connection. Query-level errors (bad SQL) are not —
                     # the statement itself is the problem.
                     is_conn_err = bool(_conn_err_types) and isinstance(e, _conn_err_types)
-                    if is_conn_err and attempt == 0:
+                    # …but NEVER re-run a statement that may have run (§4LV):
+                    # a statement timeout is an OperationalError too (it ran
+                    # twice — 2× the timeout), and a write sent before the
+                    # connection dropped may already be applied. A stale
+                    # connection fails before the statement reaches the
+                    # server, or on a read-only query, which is safe to repeat.
+                    _msg = str(e).lower()
+                    _ran_maybe = sent and (
+                        "timeout" in _msg or "cancel" in _msg
+                        or not _read_only_sql(query))
+                    if is_conn_err and attempt == 0 and not _ran_maybe:
                         logger.debug("DB connection-level error, retrying with a fresh connection: %s", e)
                         continue
                     pretty_log("Postgres Error", f"{type(e).__name__}: {str(e)[:160]}",

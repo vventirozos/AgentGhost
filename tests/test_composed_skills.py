@@ -570,8 +570,10 @@ class TestProposedStatusAndApproval:
         reg = _registry_from_context(ctx)
         reg.compile_from_pattern(
             "auto_seq",
-            [{"tool": "web_search", "params": {"query": "x"}},
-             {"tool": "deep_research", "params": {"query": "y"}}],
+            # $slots: a step with only fixed values is refused at approve
+            # (§4LS M5 — it would replay the mined call)
+            [{"tool": "web_search", "params": {"query": "$query"}},
+             {"tool": "deep_research", "params": {"query": "$topic"}}],
             "auto-discovered",
         )
         listing = await tool_manage_composed_skills(context=ctx, action="list")

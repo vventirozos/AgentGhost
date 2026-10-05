@@ -164,6 +164,15 @@
 <p>A macro's tool description no longer carries "used N× with P% success": it changed on every use and, sitting in the
 tool block that renders before the system prompt, re-prefilled the whole conversation behind it. The counts stay in
 <code>manage_composed_skills(action='list')</code>.</p>
+  <h2 id="4ls">Skills review <span class="tag">2026-10-05 &sect;4LS</span></h2>
+  <ul>
+    <li><strong>A macro declares how it went.</strong> The runner returns a <code>ToolOutcome</code>: every step ok → ok; a step still running in the background → unresolved (labelled STILL RUNNING, not FAILED); some ok → partial; none → failed — and a hard-failed step outranks a sibling still running. A plain string had been coerced to OK whenever the failing step was not a shell <code>execute</code>, so failed macros reached the strike ledger and the corpus as successes. The header counts SUCCEEDED steps.</li>
+    <li><strong>Some tools are never a step</strong> (<code>MACRO_FORBIDDEN_STEP_TOOLS</code>: the macro manager, the skill tools, self-play, dream). <code>define</code> and <code>approve</code> refuse them and the step executor refuses them again: a macro whose step ran the macro manager ran itself 197 levels deep. Read-only tools such as <code>introspect</code> stay allowed.</li>
+    <li><strong>Replay containment drops every macro</strong> (but never a built-in a stored macro's name shadows) (<code>isolation.restrict_tool_surface</code>): a macro's steps dispatch through the full tool set captured at registration, so a kept macro ran <code>web_search</code> and <code>notify_operator</code> from a contained replay.</li>
+    <li><strong>Only the owner's turn changes the store.</strong> <code>define</code>, <code>approve</code> and <code>delete</code> refuse probe, scheduled and sub-agent requests (a <code>job-</code> wake turn resumes the owner's own work and is allowed) (a probe had deleted the code-owned <code>youtube_transcribe</code>).</li>
+    <li><strong><code>approve</code> re-runs the mint rules</strong> on the stored templates: every step must take a runtime input and none may be a meta tool. Pre-&sect;4CS proposals carried fixed July values (a <code>task_update</code> on a stale project) and approve activated them as-is.</li>
+  </ul>
+  <p>Pins: <code>tests/test_4ls_skills.py</code>.</p>
 </main>
 </body>
 </html>

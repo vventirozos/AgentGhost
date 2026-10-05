@@ -116,7 +116,7 @@ class TestTheLoopDoesNotDeclareOnTheProducersBehalf:
                          {"_outcome": src_outcome, "safe_res": str(src_outcome),
                           # the recorded call arguments (2026-09-13) — not
                           # what this pin is about
-                          "_recorded_args": {}})
+                          "_recorded_args": {}, "_call_dur": None})
             assert built.status is src_outcome.status
             assert built.declared is want, (
                 f"the loop relayed a {'declared' if want else 'DERIVED'} "

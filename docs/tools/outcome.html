@@ -239,6 +239,8 @@
   <code>vision_analysis</code> 4, <code>manage_services</code> 3, <code>darkweb_research</code> 1 &mdash;
   and no subsystem outside the readers listed above consults a status yet. See
   <a href="tool_failure.html">tool_failure</a> for the retry/replan taxonomy that sits behind it.</p>
+  <h2 id="duration">Per-call duration <span class="tag">2026-10-05 &sect;4LP follow-up</span></h2>
+  <p><code>ToolOutcome.duration_s</code> is the call's wall time, set by the dispatch loop from its timing shim and kept through copy, pickle, <code>with_text</code>/<code>append_note</code>, the context manager's compression (<code>_keep_outcome</code>, which also keeps <code>call_args</code>) and the egress note. The trajectory row (<code>ToolCall.duration_s</code>) reads it. Before this, 0 of 1,435 execute rows carried a duration. Like <code>call_args</code>, it lives on the outcome, not as a message key, because the message is sent to the API.</p>
 </main>
 </body>
 </html>

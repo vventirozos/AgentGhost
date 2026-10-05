@@ -115,6 +115,8 @@ def summarize_since(store, last_event_id: int, *, per_project_limit: int = 50) -
             if etype not in _RELEVANT:
                 continue
             if etype in _ADVANCE_EVENTS:
+                if (ev.get("payload") or {}).get("owner_requested"):
+                    continue                     # the owner's own run, not "on my own" (§4LP)
                 touched.add(pid)
                 res.advanced += 1
             elif etype in _ROLLUP_EVENTS:
@@ -166,8 +168,9 @@ def render_digest(res: DigestResult, *, max_needs_user: int = 3) -> str:
     if not res.has_content:
         return ""
     lines = [
-        f"**While you were away** — I advanced {res.advanced} task(s) "
-        f"on {res.projects_touched} project(s) on my own."
+        (f"**While you were away** — I advanced {res.advanced} task(s) "
+         f"on {res.projects_touched} project(s) on my own.") if res.advanced
+        else "**While you were away** — project updates:"      # never "advanced 0" (§4LP)
     ]
     if res.finished:
         lines.append(f"{len(res.finished)} project(s) reached a final status:")

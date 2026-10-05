@@ -59,7 +59,7 @@ async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = 
         try:
             if curl_requests:
                 proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-                async with curl_requests.AsyncSession(impersonate="chrome110", proxies=proxies, timeout=20.0, verify=False) as client:
+                async with curl_requests.AsyncSession(impersonate="chrome110", proxies=proxies, timeout=20.0, verify=True) as client:
                     geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={urllib.parse.quote(location)}&count=1&language=en&format=json"
                     geo_resp = await client.get(geo_url)
                     if geo_resp.status_code in [401, 403, 503] and mode == "TOR":
@@ -69,7 +69,9 @@ async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = 
                         continue
                     if geo_resp.status_code == 200 and geo_resp.json().get("results"):
                         res = geo_resp.json()["results"][0]
-                        lat, lon, name = res["latitude"], res["longitude"], res["name"]
+                        lat, lon = res["latitude"], res["longitude"]
+                        # with region and country: an "Athens" match can be Georgia, US (§4LV)
+                        name = ", ".join(x for x in (res.get("name"), res.get("admin1"), res.get("country")) if x)
                         w_url = (
                             f"https://api.open-meteo.com/v1/forecast?"
                             f"latitude={lat}&longitude={lon}&"
@@ -84,8 +86,8 @@ async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = 
                             continue
                         if w_resp.status_code == 200:
                             curr = w_resp.json().get("current", {})
-                            wmo_map = {0: "Clear", 1: "Mainly Clear", 2: "Partly Cloudy", 3: "Overcast", 45: "Fog", 61: "Rain", 63: "Heavy Rain", 71: "Snow", 95: "Thunderstorm"}
-                            cond = wmo_map.get(curr.get("weather_code"), "Variable")
+                            cond = WMO_CONDITIONS.get(curr.get("weather_code"),
+                                                      f"code {curr.get('weather_code')}")
                             return (
                                 f"REPORT (Source: Open-Meteo): Weather in {name}\n"
                                 f"Condition: {cond}\n"
@@ -101,7 +103,7 @@ async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = 
                         last_error = None  # a definitive answer outranks an earlier transient refusal (review, 2026-09-09)
                     break
             else:
-                async with httpx.AsyncClient(proxy=proxy_url, timeout=20.0, verify=False) as client:
+                async with httpx.AsyncClient(proxy=proxy_url, timeout=20.0, verify=True) as client:
                     geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={urllib.parse.quote(location)}&count=1&language=en&format=json"
                     geo_resp = await client.get(geo_url)
                     if geo_resp.status_code in [401, 403, 503] and mode == "TOR":
@@ -111,7 +113,9 @@ async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = 
                         continue
                     if geo_resp.status_code == 200 and geo_resp.json().get("results"):
                         res = geo_resp.json()["results"][0]
-                        lat, lon, name = res["latitude"], res["longitude"], res["name"]
+                        lat, lon = res["latitude"], res["longitude"]
+                        # with region and country: an "Athens" match can be Georgia, US (§4LV)
+                        name = ", ".join(x for x in (res.get("name"), res.get("admin1"), res.get("country")) if x)
                         w_url = (
                             f"https://api.open-meteo.com/v1/forecast?"
                             f"latitude={lat}&longitude={lon}&"
@@ -126,8 +130,8 @@ async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = 
                             continue
                         if w_resp.status_code == 200:
                             curr = w_resp.json().get("current", {})
-                            wmo_map = {0: "Clear", 1: "Mainly Clear", 2: "Partly Cloudy", 3: "Overcast", 45: "Fog", 61: "Rain", 63: "Heavy Rain", 71: "Snow", 95: "Thunderstorm"}
-                            cond = wmo_map.get(curr.get("weather_code"), "Variable")
+                            cond = WMO_CONDITIONS.get(curr.get("weather_code"),
+                                                      f"code {curr.get('weather_code')}")
                             return (
                                 f"REPORT (Source: Open-Meteo): Weather in {name}\n"
                                 f"Condition: {cond}\n"
@@ -156,7 +160,7 @@ async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = 
             url = f"https://wttr.in/{urllib.parse.quote(location)}?format=3"
             if curl_requests:
                 proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-                async with curl_requests.AsyncSession(impersonate="chrome110", proxies=proxies, timeout=20.0, verify=False) as client:
+                async with curl_requests.AsyncSession(impersonate="chrome110", proxies=proxies, timeout=20.0, verify=True) as client:
                     resp = await client.get(url)
                     if resp.status_code in [401, 403, 503] and mode == "TOR":
                         last_error = f"HTTP {resp.status_code} from {_server_name(resp)}"  # §4FS: record the refusal
@@ -164,10 +168,10 @@ async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = 
                         await asyncio.sleep(5)
                         continue
                     if resp.status_code == 200 and "<html" not in resp.text.lower():
-                        return f"REPORT (Source: wttr.in): {resp.text.strip()}"
+                        return f"REPORT (Source: wttr.in, quoted data): {_wttr_line(resp.text)}"
                     break
             else:
-                async with httpx.AsyncClient(proxy=proxy_url, timeout=20.0, verify=False) as client:
+                async with httpx.AsyncClient(proxy=proxy_url, timeout=20.0, verify=True) as client:
                     resp = await client.get(url)
                     if resp.status_code in [401, 403, 503] and mode == "TOR":
                         last_error = f"HTTP {resp.status_code} from {_server_name(resp)}"  # §4FS: record the refusal
@@ -175,7 +179,7 @@ async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = 
                         await asyncio.sleep(5)
                         continue
                     if resp.status_code == 200 and "<html" not in resp.text.lower():
-                        return f"REPORT (Source: wttr.in): {resp.text.strip()}"
+                        return f"REPORT (Source: wttr.in, quoted data): {_wttr_line(resp.text)}"
                     break
         except Exception as e:
             last_error = e
@@ -360,41 +364,41 @@ async def tool_check_health(context=None):
              check_proxy = check_proxy.replace("socks5://", "socks5h://")
              if "127.0.0.1" in check_proxy: mode = "TOR"
 
-        for attempt in range(3):
+        # §4LV: a 3 s probe over Tor (the Tor check itself gets 5 s+) read a
+        # slow circuit as "Internet: Disconnected" beside "Tor: Connected",
+        # and every failed attempt forced a NEW Tor identity for the whole
+        # process (3×, plus 15 s of sleeps). One circuit change, only for an
+        # exit that is BLOCKED (401/403/503); a timeout is just retried.
+        _renewed = False
+        _last_err = ""
+        for attempt in range(2):
             try:
                 if curl_requests:
                     proxies = {"http": check_proxy, "https": check_proxy} if check_proxy else None
-                    async with curl_requests.AsyncSession(impersonate="chrome110", proxies=proxies, timeout=3.0, verify=False) as client:
+                    async with curl_requests.AsyncSession(impersonate="chrome110", proxies=proxies, timeout=10.0, verify=True) as client:
                         resp = await client.get("https://1.1.1.1")
-                        if resp.status_code in [401, 403, 503] and mode == "TOR":
-                            await asyncio.to_thread(request_new_tor_identity)
-                            await asyncio.sleep(5)
-                            continue
-                        status_msg = f"Internet: Connected ({resp.status_code})"
-                        if check_proxy: status_msg += " [via Tor]"
-                        health_status.append(status_msg)
-                        break
                 else:
-                    async with httpx.AsyncClient(timeout=3.0, proxy=check_proxy, verify=False) as client:
+                    async with httpx.AsyncClient(timeout=10.0, proxy=check_proxy, verify=True) as client:
                         resp = await client.get("https://1.1.1.1")
-                        if resp.status_code in [401, 403, 503] and mode == "TOR":
-                            await asyncio.to_thread(request_new_tor_identity)
-                            await asyncio.sleep(5)
-                            continue
-                        status_msg = f"Internet: Connected ({resp.status_code})"
-                        if check_proxy: status_msg += " [via Tor]"
-                        health_status.append(status_msg)
-                        break
-            except Exception:
-                if mode == "TOR":
+                if resp.status_code in [401, 403, 503] and mode == "TOR" and not _renewed:
+                    _renewed = True
                     await asyncio.to_thread(request_new_tor_identity)
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(3)
                     continue
-                else:
+                status_msg = f"Internet: Connected ({resp.status_code})"
+                if check_proxy: status_msg += " [via Tor]"
+                health_status.append(status_msg)
+                break
+            except Exception as _e:  # noqa: BLE001
+                _last_err = type(_e).__name__
+                if mode != "TOR":
                     health_status.append("Internet: Disconnected or Blocked")
                     break
         else:
-            health_status.append("Internet: Disconnected or Blocked")
+            health_status.append(
+                ("Internet: NOT reached via Tor within 10 s (" + (_last_err or "blocked exit")
+                 + ") — the circuit may be slow; this is not proof the host is offline")
+                if mode == "TOR" else "Internet: Disconnected or Blocked")
     except Exception:
         health_status.append("Internet: Disconnected or Blocked")
         
@@ -405,7 +409,7 @@ async def tool_check_health(context=None):
             try:
                 if curl_requests:
                     proxies = {"http": check_proxy, "https": check_proxy} if check_proxy else None
-                    async with curl_requests.AsyncSession(impersonate="chrome110", proxies=proxies, timeout=5.0, verify=False) as client:
+                    async with curl_requests.AsyncSession(impersonate="chrome110", proxies=proxies, timeout=10.0, verify=True) as client:
                         resp = await client.get("https://check.torproject.org/api/ip")
                         if resp.status_code in [401, 403, 503] and mode == "TOR":
                             await asyncio.to_thread(request_new_tor_identity)
@@ -417,7 +421,7 @@ async def tool_check_health(context=None):
                             health_status.append("Tor: Connected but Not Anonymous (Check Config)")
                         break
                 else:
-                    async with httpx.AsyncClient(proxy=check_proxy, timeout=5.0, verify=False) as client:
+                    async with httpx.AsyncClient(proxy=check_proxy, timeout=10.0, verify=True) as client:
                         resp = await client.get("https://check.torproject.org/api/ip")
                         if resp.status_code in [401, 403, 503] and mode == "TOR":
                             await asyncio.to_thread(request_new_tor_identity)
@@ -430,8 +434,9 @@ async def tool_check_health(context=None):
                         break
             except Exception as e:
                 if mode == "TOR":
-                    await asyncio.to_thread(request_new_tor_identity)
-                    await asyncio.sleep(5)
+                    # a timeout is a slow circuit, not a blocked exit: retry
+                    # WITHOUT a process-wide identity change (§4LV)
+                    await asyncio.sleep(2)
                     continue
                 else:
                     health_status.append(f"Tor: Connection Failed ({str(e)})")
@@ -487,6 +492,32 @@ async def tool_check_health(context=None):
         )
         
     return "\n".join(health_status)
+
+#: The full WMO weather-interpretation table Open-Meteo uses (§4LV: 9 codes
+#: were mapped — drizzle, showers and most snow read "Variable", and moderate
+#: rain (63) read "Heavy Rain").
+WMO_CONDITIONS = {
+    0: "Clear", 1: "Mainly Clear", 2: "Partly Cloudy", 3: "Overcast",
+    45: "Fog", 48: "Freezing Fog",
+    51: "Light Drizzle", 53: "Drizzle", 55: "Heavy Drizzle",
+    56: "Light Freezing Drizzle", 57: "Freezing Drizzle",
+    61: "Light Rain", 63: "Rain", 65: "Heavy Rain",
+    66: "Light Freezing Rain", 67: "Freezing Rain",
+    71: "Light Snow", 73: "Snow", 75: "Heavy Snow", 77: "Snow Grains",
+    80: "Light Showers", 81: "Showers", 82: "Violent Showers",
+    85: "Light Snow Showers", 86: "Heavy Snow Showers",
+    95: "Thunderstorm", 96: "Thunderstorm with Light Hail", 99: "Thunderstorm with Heavy Hail",
+}
+
+
+def _wttr_line(text) -> str:
+    """wttr.in's `format=3` answer is ONE short line. Anything else (a
+    hostile exit, an error page) is cut to one bounded, control-free line,
+    so it can never be a page of instructions in the prompt (§4LV)."""
+    import re as _re
+    line = str(text or "").strip().splitlines()[0] if str(text or "").strip() else ""
+    return _re.sub(r"[\x00-\x1f\x7f]", " ", line)[:160]
+
 
 async def tool_system_utility(action: str = None, tor_proxy: str = None, profile_memory=None, location: str = None, context=None, **kwargs):
     if not action:

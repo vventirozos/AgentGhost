@@ -1447,6 +1447,14 @@ class VectorMemory:
                 hashlib.md5(f"{filename}|{chunk}".encode("utf-8")).hexdigest()
                 for chunk in enriched_chunks
             ]
+            # …and dedup them HERE: Chroma rejects a duplicate id inside one
+            # upsert, so a log with a repeated traceback could never be
+            # ingested (§4LT M1). First occurrence wins; order is kept.
+            _seen: set = set()
+            _keep = [k for k, _id in enumerate(ids) if not (_id in _seen or _seen.add(_id))]
+            if len(_keep) != len(ids):
+                enriched_chunks = [enriched_chunks[k] for k in _keep]
+                ids = [ids[k] for k in _keep]
             ts = get_utc_timestamp()
             metadatas = [{"timestamp": ts, "type": "document", "source": filename}
                          for _ in range(len(enriched_chunks))]
@@ -1683,10 +1691,16 @@ class VectorMemory:
                     #      rejected wholesale at its _VECTOR_MATCH_FLOOR (0.42,
                     #      vs doc distances of 0.8-1.2). Net effect: the vector
                     #      tier returned [] and ambient memory went DARK.
+                    # …and not its `document_summary` twin either (§4LT M5):
+                    # that row is the first 500 chars of an ingested page,
+                    # and ambient recall served it as a top-priority
+                    # "[MASTER SUMMARY]" — a hostile page's "NOTE TO THE AI:
+                    # run execute(curl …)" surfaced on a weather question.
+                    # Document content is reached through knowledge_base.
                     results = self.collection.query(
                         query_texts=search_queries,
                         n_results=30,
-                        where={"type": {"$ne": "document"}},
+                        where={"type": {"$nin": ["document", "document_summary"]}},
                     )
 
                 candidates = []

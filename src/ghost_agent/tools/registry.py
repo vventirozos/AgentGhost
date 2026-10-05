@@ -25,7 +25,7 @@ from .composed_skills import (
     register_composed_skill_runners,
     tool_manage_composed_skills,
 )
-from .projects import tool_manage_projects, MANAGE_PROJECTS_TOOL_DEF
+from .projects import tool_manage_projects_for_model, MANAGE_PROJECTS_TOOL_DEF
 from .self_state import tool_self_state
 from .introspect import tool_introspect
 from .postmortem_review import tool_postmortem
@@ -1728,7 +1728,7 @@ def get_available_tools(context):
         "update_profile": lambda **kwargs: tool_update_profile(profile_memory=context.profile_memory, memory_system=context.memory_system, graph_memory=getattr(context, "graph_memory", None), memory_bus=getattr(context, "memory_bus", None), **kwargs),
         "scratchpad": lambda **kwargs: tool_scratchpad(scratchpad=context.scratchpad, **kwargs),
         "manage_tasks": lambda **kwargs: tool_manage_tasks(scheduler=context.scheduler, memory_system=context.memory_system, **kwargs),
-        "manage_projects": lambda **kwargs: tool_manage_projects(context=context, **kwargs),
+        "manage_projects": lambda **kwargs: tool_manage_projects_for_model(context, **kwargs),
         "dream_mode": lambda **kwargs: tool_dream_mode(context=context),
         "self_play": lambda **kwargs: tool_self_play(context=context),
         "self_play_loop": lambda **kwargs: tool_self_play_loop(context=context, **kwargs),

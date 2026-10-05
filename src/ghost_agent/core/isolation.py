@@ -948,6 +948,19 @@ def restrict_tool_surface(agent, forbidden=None) -> frozenset:
         forbidden = getattr(ctx, "_replay_forbidden_tools", None)
     forbidden = set(forbidden or REPLAY_FORBIDDEN_TOOLS)
     try:
+        # Composed macros are forbidden as a class (§4LS M3): a macro's steps
+        # dispatch through the FULL tool dict captured at registration, so a
+        # macro name kept here ran `web_search` / `notify_operator` from a
+        # contained replay. Only names that ARE macros — a stored macro that
+        # shadows a built-in is never registered under it, and the built-in
+        # stays (fix review N4). Best-effort: an unreadable registry adds
+        # nothing (no macro runner was registered from it either).
+        from ..tools.composed_skills import _registry_from_context
+        from ..tools.registry import TOOL_DEFINITIONS as _TD
+        _builtin = {t["function"]["name"] for t in _TD}
+        _reg = _registry_from_context(ctx) if ctx is not None else None
+        if _reg is not None:
+            forbidden |= set(getattr(_reg, "skills", {}) or {}) - _builtin
         from ..tools.registry import TOOL_DEFINITIONS
         advertised = {t["function"]["name"] for t in TOOL_DEFINITIONS}
         advertised |= set(agent.available_tools or {})

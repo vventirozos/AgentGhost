@@ -410,6 +410,39 @@
   <p>Readers that treat constraints as <em>user-mandated</em> — the verifier's request view and the prompt-side merge, via <code>GhostAgent._project_constraints_for</code> — drop stamped <code>"auto"</code> rows. Legacy rows carry no stamp and stay (they predate any non-user writer of the field). Task-level constraints and the coding-leaf constraint gate are unaffected: a project's own builds honour its constraints whatever their origin.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+  <h2 id="4lp">Projects review <span class="tag">2026-10-05 &sect;4LP</span></h2>
+  <p>Four labelled live probes on a throwaway project were all right: create, do and close the task, read the file back, delete. Your other projects were untouched. Three fresh-eye readers found these, all fixed:</p>
+  <ul>
+    <li><strong>Released means released.</strong>
+      <ul>
+        <li>The guard now checks the project a call will really touch. Before, a title passed as <code>project_id</code> skipped it, so <code>update … status=ACTIVE</code> un-released the app; and a task operation on another project's task guarded the active project instead.</li>
+        <li>Release never changes a file's permissions through a symlink (<code>_chmod_tree</code> keeps to the workspace). Before, a planted link made a host file read-only.</li>
+      </ul>
+    </li>
+    <li><strong>No unasked forks.</strong> Every "fork a new version" steer now says to fork only when the user asked for a change (<code>FORK_ONLY_IF_ASKED</code>). A probe had forked the released Chess Coach v3, and the idle advancer then built the fork.</li>
+    <li><strong>The idle advancer builds only what was asked.</strong> A task the verifier filed on its own ("Verifier follow-up: …") is skipped unless the owner runs the advance (<code>owner_requested=True</code> from the tool and the API). It had edited two shipped apps to "resolve" such complaints.</li>
+    <li><strong>Refusals say so.</strong> A <code>task_update</code> where nothing landed (unknown ids, the visual gate, the live re-check, a constraint violation) is a declared rejection, not <code>ok</code> with <code>updated: []</code>.</li>
+    <li><strong><code>status</code> answers about the project named</strong> (by id or title) without switching. 58% of such calls had answered "free_chat".</li>
+    <li><strong><code>exit</code></strong> with nothing active no longer deletes the binding another conversation owns.</li>
+  </ul>
+  <p><strong>Operator decisions, shipped</strong> (operator: "go with your recommendations"):</p>
+  <ul>
+    <li><strong><code>release</code>, <code>unrelease</code> and hard <code>delete</code> are the owner's call.</strong> From the model (<code>tool_manage_projects_for_model</code>, the registry's handler) the first call only returns a preview with a <code>confirm_token</code>. The action runs when the call is repeated with that token in the user's <em>next</em> turn — the same design as memory's forget (&sect;4KX). The same turn, a probe and a background run cannot confirm. A probe may drop a project it created itself (<code>probe_created</code>). Direct callers (API routes, tests) keep the immediate behaviour.
+      <ul>
+        <li>The gate resolves the target exactly once (<code>_lifecycle_target</code>): an id (any case), a title, or the current project. A name that matches nothing is refused — it used to fall through to the current project, and <code>unrelease</code>, which ignores <code>title</code>, un-released that one. The confirmed action runs on the project the preview named.</li>
+        <li>No preview for an action that will refuse anyway (releasing a project that is not DONE or has no directions; un-releasing one that is not RELEASED): the action's own error comes back.</li>
+        <li><code>probe_created</code> and <code>autopilot</code> are system-only metadata keys: the model's <code>metadata=</code> (object or JSON string) cannot set them. <code>probe_created</code> is dropped; <code>autopilot</code> is refused with a pointer to <code>action=autopilot</code>, so "turn it off" is never a silent no-op.</li>
+        <li>A current project that no longer exists is refused, not previewed.</li>
+      </ul>
+    </li>
+    <li><strong>Idle autoadvance is opt-in.</strong> The idle loop advances only ACTIVE projects with <code>metadata.autopilot</code> (<code>project_advancer.idle_candidates</code>). The owner's own <code>autoadvance</code> turns it on; <code>action=autopilot enabled=true|false</code> turns it on or off for the project named by <code>project_id</code> or <code>title</code> (the current one only when neither is given), and without <code>enabled</code> reports it (so does <code>status</code>). Any other <code>enabled</code> value is refused. Only the owner's turn counts (<code>_owner_turn_now</code>): a probe, a scheduled task (<code>sched-</code>), a job or a sub-agent neither opts in nor counts as "asked" — their advances run under the unattended rules. At deploy no project had autopilot, so idle advancing stops until you opt a project in.</li>
+    <li><strong>No DONE on weak evidence while unattended.</strong> See <a href="../core/project_advancer.html#4lp">project_advancer</a>.</li>
+    <li><strong>The digest counts only work nobody asked for.</strong> An owner-run step is logged with <code>owner_requested</code> and skipped by "While you were away"; with nothing advanced the header reads "project updates", never "advanced 0".</li>
+  </ul>
+  <p>Data repair (Chess Coach v4 and the false-DONE tasks) waits for the operator to confirm a list.</p>
+  <p>Pins: <code>tests/test_4lp_projects.py</code>.</p>
+  <h2 id="4lu">Confirming a preview with "yes" <span class="tag">2026-10-05 &sect;4LU</span></h2>
+  <p>forget, reset_all and manage_projects release/unrelease/delete are two steps: a preview with a token, then the user's confirmation in a LATER turn. The token lives in the preview's tool result, and the chat API / web history carry only reply text — so on the "yes" turn the model no longer had it, and the confirmation failed (found deleting the PostgreSQL manual). Each preview is now stamped with its conversation (<code>conversation_key_context</code>, the hash of the first user message, set by <code>reconcile_conversation</code>), and a confirm whose token is missing, unknown or just <code>'yes'</code> resolves to the newest live preview of that kind in THIS conversation, for the same target (<code>memory._resolve_plan</code>). Who may confirm is unchanged: <code>_confirm_allowed</code> still requires the user, in a later turn; member turns carry no conversation and get no fallback; another conversation's preview is never used. The preview instructions tell the model it may pass <code>'yes'</code>. Pins: <code>tests/test_4lu_confirm.py</code>.</p>
 </main>
 </body>
 </html>

@@ -106,13 +106,14 @@ class ToolOutcome(str):
     """
 
     __slots__ = ("status", "world_changed", "reason_code", "declared",
-                 "call_args")
+                 "call_args", "duration_s")
 
     def __new__(cls, text: Any = "", status: "OutcomeStatus" = OutcomeStatus.OK,
                 world_changed: Optional[bool] = None,
                 reason_code: Optional[str] = None,
                 declared: bool = True,
-                call_args: Optional[dict] = None):
+                call_args: Optional[dict] = None,
+                duration_s: Optional[float] = None):
         self = super().__new__(cls, "" if text is None else str(text))
         self.status = status
         self.world_changed = world_changed
@@ -133,6 +134,9 @@ class ToolOutcome(str):
         # never read), and `meta` allocated a dict on EVERY construction
         # for a field nothing wrote.
         self.declared = declared
+        # The call's wall time, set by the dispatch loop (§4LP follow-up:
+        # 0 of 1,435 execute rows in the corpus carried one).
+        self.duration_s = duration_s
         return self
 
     # `text` stays available: it is what the dispatch loop reads, and the
@@ -149,7 +153,8 @@ class ToolOutcome(str):
     def __reduce__(self):
         return (_rebuild_outcome,
                 (str(self), self.status, self.world_changed,
-                 self.reason_code, self.declared, self.call_args))
+                 self.reason_code, self.declared, self.call_args,
+                 getattr(self, "duration_s", None)))
 
     # -- what the loop asks ------------------------------------------------
     @property
@@ -334,7 +339,10 @@ def with_text(res, new_text: str):
                            # iteration, and a row that lost its arguments
                            # read as a read to the evidence gate (R3 review
                            # of the 2026-09-13 fix)
-                           call_args=res.call_args)
+                           call_args=res.call_args,
+                           # and its wall time (review m2: the cutter's
+                           # rewrite recorded the slowest runs as 0.0)
+                           duration_s=getattr(res, "duration_s", None))
     return new_text
 
 
@@ -354,8 +362,8 @@ def append_note(res, note: str):
 
 
 def _rebuild_outcome(text, status, world_changed, reason_code, declared=True,
-                     call_args=None):
+                     call_args=None, duration_s=None):
     """Module-level so pickle/copy can find it."""
     return ToolOutcome(text, status=status, world_changed=world_changed,
                        reason_code=reason_code, declared=declared,
-                       call_args=call_args)
+                       call_args=call_args, duration_s=duration_s)

@@ -116,7 +116,7 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
             "To RUN/USE it: follow the directions below (start the listed "
             "services via manage_services if they are not running — the "
             "commands were verified at release). For ANY change request: "
-            "do NOT edit these files — fork a development copy with "
+            "do NOT edit these files — when the USER asks for a change, fork a development copy with "
             "`manage_projects action=create_version` and work there; this "
             "version keeps running untouched. ***",
         ]

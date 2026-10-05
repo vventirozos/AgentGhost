@@ -26,6 +26,12 @@ request_id_context = contextvars.ContextVar("request_id", default="SYSTEM")
 # text itself still comes from the explicit `origin=` argument, so the
 # liveness `origin=` stamp readers see nothing new.
 request_origin_context = contextvars.ContextVar("request_origin", default="")
+
+# The conversation this request belongs to (`projects.conversation_fingerprint`:
+# a hash of its first user message — the chat API carries no conversation id).
+# Lets a preview → confirm flow find the conversation's pending preview when
+# the user's "yes" arrives without the token (§4LU).
+conversation_key_context = contextvars.ContextVar("conversation_key", default="")
 #: the trajectory id of the turn in flight (§4LC): every lesson written
 #: during the turn — `learn_skill`, the bus, the post-mortem — is stamped
 #: with it, so a refuted or corrected turn's retraction finds them all

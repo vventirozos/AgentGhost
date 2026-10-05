@@ -40,8 +40,9 @@ async def tool_manage_services(action: str = None, name: str = None,
         action = "status"
     if action == "log":
         action = "logs"
-    if action in ("stop_all", "stopall", "cleanup", "kill-all", "killall",
-                  "stop-services", "reap"):
+    # `cleanup` / `reap` were aliases too: the model reached for stop-all on
+    # "proceed with all tasks" (§4LR M4) — only names that SAY stop-all
+    if action in ("stop_all", "stopall", "kill-all", "killall", "stop-services"):
         action = "stop-all"
     if action not in _VALID_ACTIONS:
         return (f"Error: unknown action {action!r}. "
@@ -112,7 +113,9 @@ async def tool_manage_services(action: str = None, name: str = None,
             return _declare(await asyncio.to_thread(
                 lambda: sup.restart(name, project_id, port=port)))
         if action == "stop-all":
-            return _declare(await asyncio.to_thread(sup.stop_all))
+            _all = str(kwargs.get("all_projects") or "").strip().lower() in ("1", "true", "yes")
+            return _declare(await asyncio.to_thread(
+                lambda: sup.stop_all(project_id=project_id, all_projects=_all)))
         if action == "adopt":
             return _declare(await asyncio.to_thread(
                 lambda: sup.adopt(name, port, project_id=project_id)))
@@ -160,10 +163,13 @@ MANAGE_SERVICES_TOOL_DEFINITION = {
                                     "adopt registers an EXISTING "
                                     "unregistered listener (name + port) so "
                                     "it becomes visible/stoppable. "
-                                    "stop-all stops EVERY service, reclaims "
-                                    "their ports, and clears the registry — "
-                                    "the one-shot cleanup for accumulated or "
-                                    "orphaned services."),
+                                    "stop-all stops the CURRENT project's "
+                                    "services (or, with no project, the "
+                                    "project-less ones); all_projects=true "
+                                    "stops EVERY service — only when the user "
+                                    "asked to stop all services. Project "
+                                    "services keep their entries so restart "
+                                    "works."),
                 },
                 "name": {
                     "type": "string",
@@ -218,6 +224,10 @@ MANAGE_SERVICES_TOOL_DEFINITION = {
                         "subdirectory — pass workdir instead of prefixing the "
                         "command with 'cd <dir> &&'."
                     ),
+                },
+                "all_projects": {
+                    "type": "boolean",
+                    "description": "stop-all only: true stops EVERY project's services. Only when the user asked to stop all services.",
                 },
                 "lines": {
                     "type": "integer",

@@ -253,13 +253,19 @@ def _land_sandbox_row(reg, sup, sbx_jobs, job, sid, entry) -> None:
     except Exception:  # noqa: BLE001
         tail = "(output unavailable)"
     code = entry.get("exit_code")
+    try:
+        # the stage-status marker line is ours, never the job's output —
+        # stripped from a successful tail too (§4LP follow-up)
+        from .execute import _take_pipestatus
+        tail, _ = _take_pipestatus(tail)
+    except Exception:  # noqa: BLE001
+        pass
     if isinstance(code, int) and code != 0:
         # §4LO: the same exit-code reading as a foreground run — a detached
         # `find / … 2>/dev/null` that printed results, or a `| head` that
         # closed the pipe early, is not "exited 1, failed"
         try:
-            from .execute import _normalise_exit, _take_pipestatus
-            tail, _ = _take_pipestatus(tail)
+            from .execute import _normalise_exit
             code = _normalise_exit(str(entry.get("command") or ""), code, tail)
         except Exception:  # noqa: BLE001
             pass

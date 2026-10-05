@@ -451,6 +451,16 @@ MACRO_IGNORE_TOOLS = frozenset({
 })
 
 
+#: Tools that can never be a macro STEP (§4LS): the macro manager (a macro
+#: running it ran itself 197 levels deep) and the tools that create or retire
+#: skills or drive self-play. Narrower than MACRO_IGNORE_TOOLS (the miner's
+#: list, which also holds read-only tools like `introspect`).
+MACRO_FORBIDDEN_STEP_TOOLS = frozenset({
+    "manage_composed_skills", "create_skill", "manage_skills", "self_play",
+    "self_play_loop", "stop_self_play", "dream_mode",
+})
+
+
 #: The stamps BOTH auto-mint producers write into a macro's
 #: `trigger_description`, and that `core/liveness._is_loop_minted_macro`
 #: reads back to decide whether a stored macro is the LOOP's output.
@@ -692,8 +702,9 @@ def mint_param_schema(tool_names, observations, *,
         #
         # `knowledge_base(action='reset_all')` deletes every id in the
         # vector store, truncates the library index and calls
-        # `graph_memory.wipe_all()`, with no confirmation gate of any
-        # kind; and a macro's steps are dispatched through
+        # `graph_memory.wipe_all()` (since §4KX only after a preview the
+        # user confirms in a later turn — the gate lives in the tool, so a
+        # macro step meets it too); and a macro's steps are dispatched through
         # `build_step_executor`, which calls the tool function directly
         # and never reaches the turn loop's mutation classification. So a
         # zero-input mutating step has no guard above it at all.
@@ -707,6 +718,13 @@ def mint_param_schema(tool_names, observations, *,
             return templates, slots, (
                 f"step {pos + 1} ({tool}) takes NO runtime input: the call "
                 f"would be fully determined at mint time, which is a replay")
+        if tool == "manage_services" and str(template.get("action") or "").strip().lower() in (
+                "stop-all", "stop_all", "stopall", "kill-all", "killall", "stop-services"):
+            # an unread `$name` slot passes the input rule (§4LR minor)
+            return templates, slots, (
+                f"step {pos + 1} (manage_services stop-all) ignores its inputs — "
+                f"a bulk stop is never a macro step")
+
     return templates, slots, None
 
 
@@ -1506,31 +1524,55 @@ def register_composed_skills(tool_definitions: list, context) -> int:
     return added
 
 
-def _format_execution_result(skill_name: str, result: Dict[str, Any]) -> str:
-    """Render an `execute()` result dict as a compact, LLM-readable string.
+def _format_execution_result(skill_name: str, result: Dict[str, Any]):
+    """Render an `execute()` result dict as a compact, LLM-readable
+    ``ToolOutcome`` that DECLARES how the macro went (§4LS M1).
 
-    This is what the agent's dispatch loop hands back as the tool result;
-    the model then synthesises the briefing/answer from the per-step
-    blocks. Each step's body is already bounded to ``MAX_STEP_RESULT_CHARS``
-    by `execute()` (via `_cap_step_result`), so a chatty step can't blow the
-    context budget — and any step that DID hit the cap carries an explicit
-    truncation marker, so a list-bearing step is never silently shortened.
-    """
+    A plain string was coerced to OK by the turn loop whenever the failing
+    step was not a shell `execute`: a macro with a failed `browser` step
+    reached the strike ledger, the outcome banner and the trajectory as a
+    success. Now: every step ok → ok; a step still running (promoted to a
+    background job) → unresolved; some ok → partial; none → failed. The
+    header counts SUCCEEDED steps, and a still-running step is labelled so,
+    not FAILED. Each step's body is already bounded to
+    ``MAX_STEP_RESULT_CHARS`` by `execute()` (via `_cap_step_result`)."""
+    from .outcome import ToolOutcome
     # Guard-style failures (unknown skill) carry an 'error' and no 'results'.
     if not result.get("success") and "error" in result and "results" not in result:
-        return f"[composed skill '{skill_name}' error] {result.get('error')}"
-
+        return ToolOutcome.failed(f"[composed skill '{skill_name}' error] {result.get('error')}",
+                                  world_changed=False, reason_code="composed_skill_error")
+    try:
+        from ..sandbox.jobs import is_promoted_result
+    except Exception:  # noqa: BLE001
+        def is_promoted_result(_t):
+            return False
+    results = result.get("results", []) or []
     mode = result.get("mode", "sequential")
-    header = (
-        f"COMPOSED SKILL '{skill_name}' — "
-        f"{result.get('steps_completed', 0)}/{result.get('total_steps', 0)} steps "
-        f"({mode}), overall {'OK' if result.get('success') else 'PARTIAL/FAIL'}."
-    )
+    ok_n = sum(1 for r in results if r.get("success"))
+    running = [r for r in results if not r.get("success") and is_promoted_result(r.get("result") or "")]
+    total = result.get("total_steps", 0)
+    hard_failed = [r for r in results if not r.get("success")
+                   and r not in running and not r.get("optional")]
+    if result.get("success") and not running:
+        verdict = "OK"
+    elif hard_failed:
+        # a hard failure outranks a sibling still running (fix review N6)
+        verdict = "PARTIAL" if ok_n or running else "FAILED"
+    elif running:
+        verdict = "STILL RUNNING"
+    elif ok_n:
+        verdict = "PARTIAL"
+    else:
+        verdict = "FAILED"
+    header = (f"COMPOSED SKILL '{skill_name}' — {ok_n}/{total} steps succeeded "
+              f"({mode}), overall {verdict}.")
     blocks = [header]
-    for i, r in enumerate(result.get("results", []), 1):
+    for i, r in enumerate(results, 1):
         head = f"[{i}] {r.get('tool')} — {r.get('step')}"
         if r.get("success"):
             blocks.append(f"{head}:\n{r.get('result', '')}")
+        elif r in running:
+            blocks.append(f"{head}: STILL RUNNING — {r.get('result')}")
         else:
             opt = " (optional)" if r.get("optional") else ""
             # Fall back to the RESULT body: a step whose tool returned an
@@ -1539,7 +1581,31 @@ def _format_execution_result(skill_name: str, result: Dict[str, Any]) -> str:
             # could not recover or re-route.
             detail = r.get("error") or r.get("result") or "unknown error"
             blocks.append(f"{head}: FAILED{opt} — {detail}")
-    return "\n\n".join(blocks)
+    text = "\n\n".join(blocks)
+    if verdict == "OK":
+        return ToolOutcome.ok(text)
+    if verdict == "STILL RUNNING":
+        return ToolOutcome.unresolved(text, reason_code="composed_skill_step_running")
+    if verdict == "PARTIAL":
+        return ToolOutcome.partial(text, reason_code="composed_skill_partial")
+    return ToolOutcome.failed(text, reason_code="composed_skill_failed")
+
+
+def _not_an_owner_write() -> bool:
+    """A probe, scheduled or sub-agent request: it may read the skill stores
+    but never change them (a `job-` wake turn resumes the OWNER's own work and
+    is allowed) (§4LS M4 — a probe deleted the code-owned
+    `youtube_transcribe` macro, approved a stale one, and deleted an
+    acquired skill)."""
+    try:
+        from ..utils.logging import (request_id_context, is_probe_request_id,
+                                     request_origin_context, ORIGIN_PROBE)
+        rid = str(request_id_context.get() or "")
+        return bool(is_probe_request_id(rid)
+                    or str(request_origin_context.get() or "") == ORIGIN_PROBE
+                    or rid.startswith(("sched-", "sub-")))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def build_step_executor(tools_ref: Dict[str, Callable], composed_names) -> Callable:
@@ -1556,6 +1622,11 @@ def build_step_executor(tools_ref: Dict[str, Callable], composed_names) -> Calla
     composed = set(composed_names or ())
 
     async def _exec_step(tool_name: str, tool_args: Dict[str, Any]):
+        if tool_name in MACRO_FORBIDDEN_STEP_TOOLS:
+            # a macro running the macro manager ran itself 197 levels deep
+            # (§4LS M2) — meta tools are never steps
+            return (f"[blocked] '{tool_name}' manages skills or self-play; it "
+                    f"cannot be a composed-skill step.")
         if tool_name in composed:
             return (
                 f"[blocked] '{tool_name}' is itself a composed skill; "
@@ -1743,6 +1814,11 @@ async def tool_manage_composed_skills(context=None, action: str = None,
         )
         return await runner(**run_params)
 
+    if action in ("approve", "delete", "define") and _not_an_owner_write():
+        return (f"Error: a probe or background request does not change the macro store "
+                f"({action}) — nothing changed. STOP: do not retry this in this turn; tell "
+                f"the user it needs their own request.")
+
     if action == "approve":
         if not name:
             return "Error: 'name' is required for approve."
@@ -1760,6 +1836,22 @@ async def tool_manage_composed_skills(context=None, action: str = None,
         except ValueError as ve:
             return (f"Error: cannot approve '{name}' — {ve} Delete it and "
                     f"re-define it under a valid name.")
+        # …and re-run the mint rules on the STORED templates (§4LS M5): a
+        # pre-§4CS proposal carried fixed July values — a `task_update` on a
+        # stale project — and approve activated it as-is. Every step must
+        # take a runtime input, and no step may be a meta tool.
+        for _i, _st in enumerate(sk.steps, 1):
+            if _st.tool_name in MACRO_FORBIDDEN_STEP_TOOLS:
+                return (f"Error: cannot approve '{name}' — step {_i} uses "
+                        f"'{_st.tool_name}', which cannot be a macro step. Nothing changed.")
+            if not macro_step_inputs(getattr(_st, "param_template", None)):
+                return (f"Error: cannot approve '{name}' — step {_i} ({_st.tool_name}) "
+                        f"takes no runtime input: "
+                        + ("its parameters are EMPTY, so it cannot run usefully"
+                           if not _st.param_template else
+                           "its parameters are fixed values from when it was mined, so "
+                           "running it would replay that old call")
+                        + ". Delete it, or define a new macro with $slots. Nothing changed.")
         sk.status = "active"
         reg.save()
         pretty_log("Macro Approved", f"Activated proposed macro: {name}", icon=Icons.OK)
@@ -1896,6 +1988,9 @@ async def tool_manage_composed_skills(context=None, action: str = None,
                 if tool == name:
                     return None, (f"Error: {label} {i + 1} references the macro itself "
                                   f"('{name}') — composed skills cannot recurse.")
+                if tool in MACRO_FORBIDDEN_STEP_TOOLS:
+                    return None, (f"Error: {label} {i + 1} uses '{tool}', which manages "
+                                  f"skills or self-play — it cannot be a macro step.")
                 if known_tools and tool not in known_tools:
                     unknown_tools.append(tool)
                 params = raw.get("params") or raw.get("param_template") or {}

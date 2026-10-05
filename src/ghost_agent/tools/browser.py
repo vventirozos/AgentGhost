@@ -54,6 +54,19 @@ logger = logging.getLogger("GhostAgent")
 # workspace so it survives across turns / tool calls but doesn't leak
 # onto the host filesystem outside GHOST_SANDBOX_DIR.
 from .browser_support import _BROWSER_PROFILE_DIR  # noqa: E402 — one definition
+
+
+def _interact_read_failed(parsed) -> bool:
+    """An interact whose page was NOT read: the sequence aborted, or its last
+    goto failed / landed on a refusal page (§4LP: those were booked "pulled")."""
+    if not isinstance(parsed, dict) or parsed.get("aborted"):
+        return True
+    gotos = [r for r in (parsed.get("actions") or []) if isinstance(r, dict) and r.get("action") == "goto"]
+    if not gotos:
+        return False
+    last = gotos[-1]
+    return (not last.get("ok")) or bool(blocked_page_reason(
+        {"status": last.get("status"), "title": last.get("title"), "url": last.get("url")}))
 _BROWSER_RUNNER_FILENAME = ".browser_runner.py"
 
 # Serializes Chromium launches against the shared persistent profile dir.
@@ -1400,7 +1413,8 @@ async def tool_browser(
     # ran, and the dedup then dropped the later REAL pull (persisted); a
     # url-less re-read of the sidecar page is not a new visit either.
     if (workspace_model is not None and getattr(workspace_model, "enabled", False)
-            and not _blocked and not parsed.get("used_last_url")):
+            and not _blocked and not parsed.get("used_last_url")
+            and not (operation == "interact" and _interact_read_failed(parsed))):
         try:
             _hit_url = parsed.get("url") or parsed.get("final_url")
             if _hit_url:

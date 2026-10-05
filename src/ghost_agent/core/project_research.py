@@ -109,6 +109,16 @@ def _research_dir(store, project_id: str) -> Optional[Path]:
         return None
     d = Path(ws) / RESEARCH_SUBDIR
     try:
+        # §4LP CRIT: the workspace is under the sandbox bind mount — a symlink
+        # planted at `research/` (or a file name in it) redirected these
+        # host-side writes to any host file. Refuse a linked or escaping dir;
+        # the writers below refuse a linked FILE (write_text_nofollow_in_dir).
+        from ..memory.projects import _inside_sandbox
+        # the WORKSPACE itself first, BEFORE anything is created (a linked
+        # projects/<pid> made mkdir create research/ at the link's target)
+        if Path(ws).is_symlink() or not _inside_sandbox(store, Path(ws)) or d.is_symlink():
+            logger.warning("research dir %s or its workspace is a link / outside the sandbox — refusing", d)
+            return None
         d.mkdir(parents=True, exist_ok=True)
     except Exception as e:  # pragma: no cover - exotic FS
         logger.warning("Could not create research dir %s: %s", d, e)
@@ -269,7 +279,8 @@ def _write_index_md(store, project_id: str, rdir: Path) -> None:
         prev = f" — {prev}" if prev else ""
         lines.append(f"- **{e.get('topic', '')}** → `{e.get('path', '')}`{prev}")
     try:
-        (Path(rdir) / "INDEX.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        from ..tools.file_system import write_text_nofollow_in_dir
+        write_text_nofollow_in_dir(Path(rdir), "INDEX.md", "\n".join(lines) + "\n")
     except Exception:  # pragma: no cover
         logger.debug("research INDEX.md write skipped", exc_info=True)
 
@@ -485,16 +496,22 @@ def record_main_loop_findings(store, project_id: str, query: str, output: str,
             return None
         ts = time.time() if ts is None else float(ts)
         path = rdir / MAIN_LOOP_FINDINGS_FILE
-        existing = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+        from ..tools.file_system import read_bytes_nofollow, write_text_nofollow_in_dir
+        try:
+            existing = read_bytes_nofollow(path).decode("utf-8", "replace") if path.exists() else ""
+        except ValueError:             # a symlink planted at the findings file
+            return None
         entries = [e for e in _split_findings(existing)
                    if _entry_query(e) != query.lower()]
         entries.insert(0, _render_finding(query, results, ts))
         entries = entries[:MAIN_LOOP_FINDINGS_MAX_SEARCHES]
         text = _FINDINGS_HEADER + "\n" + "\n".join(entries)
+        # atomic, and still never through a link: the temp file is written
+        # nofollow, and rename REPLACES a link at the name, never its target
+        _tmp = f".{MAIN_LOOP_FINDINGS_FILE}.tmp"
+        write_text_nofollow_in_dir(rdir, _tmp, text)
         import os as _os
-        tmp = path.with_suffix(".md.tmp")
-        tmp.write_text(text, encoding="utf-8")
-        _os.replace(tmp, path)
+        _os.replace(rdir / _tmp, path)
         rel = f"{RESEARCH_SUBDIR}/{MAIN_LOOP_FINDINGS_FILE}"
         _upsert_index(store, project_id, {
             "slug": MAIN_LOOP_FINDINGS_SLUG,
@@ -705,7 +722,8 @@ async def _persist(context, project_id: str, topic: str, search_output: str, *,
 
     path = rdir / f"{slug}.md"
     try:
-        path.write_text(doc, encoding="utf-8")
+        from ..tools.file_system import write_text_nofollow_in_dir
+        write_text_nofollow_in_dir(rdir, f"{slug}.md", doc)
     except Exception as e:
         return ResearchResult(False, topic, slug=slug, error=f"write failed: {e}")
 

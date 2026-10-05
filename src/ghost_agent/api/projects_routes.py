@@ -246,6 +246,7 @@ async def advance_project(pid: str, request: Request):
         with pinned_event_project(pid):
             result = await advance_once(
                 ctx, pid,
+                owner_requested=True,               # an owner action (§4LP)
                 tool_runner=_run,
                 llm_classifier=default_llm_classifier(ctx),
                 code_generator=default_code_generator(ctx),

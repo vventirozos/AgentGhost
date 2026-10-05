@@ -6,6 +6,7 @@ claim binder / sniffers with result text shaped like the live failures."""
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -346,3 +347,151 @@ def test_an_integrity_check_that_cannot_run_keeps_tor_down():
         raise RuntimeError("exec failed")
     sb._exec_run = boom
     assert sb._tor_integrity_ok() is False and sb.blocked
+
+
+# ── §4LP follow-up: the seven open §4LO items ──
+
+def test_a_quoted_semicolon_or_pipe_does_not_cut_the_pipeline():
+    from ghost_agent.tools.execute import _has_early_closing_reader, _grep_tail_after_pipe, _shell_pipelines
+    assert _has_early_closing_reader("python3 gen.py | awk '{print $1; exit}'")
+    assert not _grep_tail_after_pipe("grep 'a|b' notes.txt")
+    assert _shell_pipelines('echo "x; y" && ls | grep "p|q"') == [['echo "x; y"'], ["ls", 'grep "p|q"']]
+
+
+def test_an_upstream_grep_that_found_nothing_is_not_a_crash():
+    from ghost_agent.tools.execute import _an_upstream_stage_failed
+    assert not _an_upstream_stage_failed("grep -r TODO src | grep fixme", [1, 1])
+    assert _an_upstream_stage_failed("python3 x.py | grep fixme", [1, 1])
+    assert _an_upstream_stage_failed("grep -r TODO nosuchdir | grep fixme", [2, 1])
+
+
+def test_a_successful_job_tail_never_shows_the_status_marker():
+    from ghost_agent.tools.execute import _PIPESTATUS_MARK
+    from ghost_agent.tools import delegate as D
+    from ghost_agent.sandbox import jobs as sbx_jobs
+    landed = {}
+    reg = SimpleNamespace(finish=lambda jid, **kw: landed.update(kw))
+    sup = SimpleNamespace(log_tail=lambda sid, lines=40: f"found 3\n{_PIPESTATUS_MARK}0 0\n")
+    entry = {"state": sbx_jobs.STATE_DONE, "exit_code": 0, "command": "ls | grep x"}
+    D._land_sandbox_row(reg, sup, sbx_jobs, SimpleNamespace(id="job-1"), "sbx-1", entry)
+    assert "found 3" in landed["result"] and _PIPESTATUS_MARK not in landed["result"]
+
+
+def test_back_to_back_runs_are_two_sources_not_a_rerun():
+    from ghost_agent.core.claim_binding import find_conflicting_line
+    ab = ("[execute] --- COMMAND RESULT ---\nEXIT CODE: 0\nSTDOUT/STDERR:\nAccuracy: 0.87\n"
+          "[execute] --- COMMAND RESULT ---\nEXIT CODE: 0\nSTDOUT/STDERR:\nAccuracy: 0.91")
+    assert find_conflicting_line(ab, "Accuracy: 0.91", "model B scored 0.91") == "Accuracy: 0.87"
+
+
+def test_a_hypothesis_test_refuses_every_visible_mutating_verb():
+    from ghost_agent.core.agent import _hypothesis_shell_cmd
+    for bad in ("touch x", "pip install foo", "git commit -m x", "sed -i s/a/b/ f",
+                "curl -o f http://x", "cat f > out", "mkdir d"):
+        assert _hypothesis_shell_cmd(bad) is None, bad
+    for good in ("git status", "sed -n 1p f", "curl -s http://x", "ls | head"):
+        assert _hypothesis_shell_cmd(good), good
+
+
+def test_a_tool_result_carries_its_duration_through_a_copy():
+    import copy, pickle
+    from ghost_agent.tools.outcome import ToolOutcome
+    o = ToolOutcome("done", duration_s=2.5)
+    assert copy.copy(o).duration_s == 2.5 and pickle.loads(pickle.dumps(o)).duration_s == 2.5
+
+
+def test_the_trajectory_row_records_the_calls_duration():
+    from ghost_agent.core.agent import GhostAgent
+    from ghost_agent.tools.outcome import ToolOutcome
+    msgs = [{"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "execute", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "name": "execute", "content": ToolOutcome("ok", duration_s=3.25)}]
+    calls = GhostAgent._reconstruct_tool_calls(msgs)
+    calls = calls[0] if isinstance(calls, tuple) else calls
+    assert calls[0].duration_s == 3.25
+
+
+async def test_the_dispatch_loop_stamps_each_calls_duration():
+    from unittest.mock import AsyncMock, MagicMock
+    from ghost_agent.core.agent import GhostAgent
+    from ghost_agent.core.strikes import StrikeLedger
+    import tests.test_4jj_search_yield_steer as H
+    agent = H._agent()
+
+    async def slow(**kw):
+        await asyncio.sleep(0.05)
+        return "### 1. result\nsnippet\n[Source: https://example.org/1]\n"
+    agent.available_tools = {"web_search": slow}
+    ts = H._ts([("web_search", {"query": "q"})], StrikeLedger(), set())
+    await agent._dispatch_and_process_tool_batch(ts)
+    row = next(m for m in ts.messages if m.get("role") == "tool")
+    assert (row["content"].duration_s or 0) >= 0.04
+
+
+# ── §4LQ review round ──
+
+def test_a_fix_made_with_execute_still_supersedes_the_earlier_run():
+    from ghost_agent.core.claim_binding import find_conflicting_line
+    ev = ("[execute] --- COMMAND RESULT ---\nEXIT CODE: 0\nSTDOUT/STDERR:\nAccuracy: 0.87\n"
+          "[execute] --- COMMAND RESULT ---\nEXIT CODE: 0\nSTDOUT/STDERR:\n\n"
+          "[execute] --- COMMAND RESULT ---\nEXIT CODE: 0\nSTDOUT/STDERR:\nAccuracy: 0.91")
+    assert find_conflicting_line(ev, "Accuracy: 0.91", "accuracy is now 0.91") is None
+
+
+def test_an_apostrophe_in_a_comment_does_not_swallow_the_pipeline():
+    from ghost_agent.tools.execute import _has_early_closing_reader, _grep_tail_after_pipe
+    assert _grep_tail_after_pipe("# don't panic\npython3 x.py | grep foo")
+    assert _has_early_closing_reader("echo it's here; python3 gen.py | head -3")
+
+
+def test_a_rewritten_row_keeps_its_duration():
+    from ghost_agent.tools.outcome import ToolOutcome, with_text, append_note
+    o = ToolOutcome("long output", duration_s=7.0)
+    assert with_text(o, "cut").duration_s == 7.0 and append_note(o, " [note]").duration_s == 7.0
+
+
+@pytest.mark.parametrize("cmd,runs", [
+    ("python3 -m pip install x", False), ("perl -pi -e s/a/b/ f", False), ("docker rm x", False),
+    ("systemctl restart x", False), ("git --no-pager log", True), ("git -C repo status", True),
+    ("git -C repo commit -m x", False), ("tar tf a.tar", True), ("tar xf a.tar", False)])
+def test_the_hypothesis_guard_reads_wrappers_and_listing_forms(cmd, runs):
+    from ghost_agent.core.agent import _hypothesis_shell_cmd
+    assert (_hypothesis_shell_cmd(cmd) is not None) is runs
+
+
+# ── §4LQ review round 2 ──
+
+def test_apostrophes_in_comments_never_pair_up_into_a_quote():
+    from ghost_agent.tools.execute import _normalise_exit
+    cmd = "# don't do this\npython3 gen.py | head -5  # it's fine"
+    assert _normalise_exit(cmd, 1, "BrokenPipeError: [Errno 32] Broken pipe") == 0
+
+
+@pytest.mark.parametrize("cmd", ['git -c core.fsmonitor="rm -rf data" status',
+                                 "git -c diff.external=./x.sh diff", "python3 -mpip install x",
+                                 "uv pip install x", "podman rm x"])
+def test_a_hypothesis_test_refuses_command_running_options(cmd):
+    from ghost_agent.core.agent import _hypothesis_shell_cmd
+    assert _hypothesis_shell_cmd(cmd) is None
+
+
+def test_the_context_cut_keeps_duration_and_arguments():
+    from ghost_agent.core.context_manager import ContextManager
+    from ghost_agent.tools.outcome import ToolOutcome
+    msg = {"role": "tool", "content": ToolOutcome("x" * 10, duration_s=4.0, call_args={"command": "ls"})}
+    out = ContextManager._keep_outcome(msg, "cut")["content"]
+    assert out.duration_s == 4.0 and out.call_args == {"command": "ls"}
+
+
+@pytest.mark.parametrize("cmd,runs", [
+    ("go version", True), ("cargo tree", True), ("conda list", True), ("podman ps", True),
+    ("git --git-dir=.git log", True), ("systemctl status x", True),
+    ("go build .", False), ("systemctl restart x", False), ("docker run x", False),
+    ("crontab -r", False), ("mount /dev/x /mnt", False),
+    # round 4: an allowlist at the subcommand position
+    ("yarn", False), ("pnpm i", False), ("cargo b", False), ("docker compose down -v", False),
+    ("systemctl reboot", False), ("kubectl drain n", False), ("go env -w GOPATH=/x", False),
+    ("service nginx restart", False), ("docker run ps", False), ("docker logs build", True), ("kubectl get pods", True),
+    ("go env GOPATH", True), ("service nginx status", True), ("uv --version", True)])
+def test_read_only_tool_subcommands_run_and_changing_ones_do_not(cmd, runs):
+    from ghost_agent.core.agent import _hypothesis_shell_cmd
+    assert (_hypothesis_shell_cmd(cmd) is not None) is runs

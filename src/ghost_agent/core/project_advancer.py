@@ -483,8 +483,44 @@ def _work_log_step(store, project_id, nxt, *, outcome: str,
         logger.debug("autoadvance work_log skipped", exc_info=True)
 
 
+#: The task asks for a check — ANYWHERE in its text (§4LQ, after four review
+#: rounds): narrowing the word list flip-flopped — each round closed real
+#: check tasks unattended ("Ensure all tests pass", "Verify data
+#: integrity", "Final verification") or held build tasks. Since the owner's
+#: own run takes a held task back (no jam), holding a build task by mistake
+#: costs one look; closing a check unattended is the incident this exists
+#: for. So the rule errs toward holding. Whole words only: "checkout",
+#: "testimonials", "latest", "contest" are not checks.
+_VERIFY_TASK_RE = re.compile(
+    r"\b(?:verif(?:y|ies|ied|ying|ication)|(?:re-?)?test(?:s|ing|ed)?|check(?:s|ing|ed)?"
+    r"|validat(?:e|es|ed|ing|ion)|confirm(?:s|ed|ing|ation)?|ensure|make\s+sure"
+    r"|qa|sanity|smoke[- ]?test\w*|e2e)\b(?!-in\b)", re.I)
+#: the result tail of a held task — an owner-run advance re-opens these
+_HELD_MARK = "not closed unattended"
+
+
+def _unattended_close(owner_requested: bool, description: str,
+                      evidence_ok: bool = True):
+    """(status, note) for closing a leaf (§4LP, operator: "go with your
+    recommendations"). Unattended (the idle loop) a task that asks to
+    verify / test / check is not done because a file was written ("Verify
+    full pipeline" closed with "wrote index.html"), and a research task
+    whose research did not land is not done on a summary of off-topic
+    results. Those wait for the owner (NEEDS_USER). An owner-run advance
+    closes DONE as before."""
+    from .planning import TaskStatus
+    if owner_requested:
+        return TaskStatus.DONE, ""
+    if _VERIFY_TASK_RE.search(str(description or "")[:400]):
+        return TaskStatus.NEEDS_USER, f"needs a real check — {_HELD_MARK}"
+    if not evidence_ok:
+        return (TaskStatus.NEEDS_USER,
+                f"the research did not land — {_HELD_MARK}")
+    return TaskStatus.DONE, ""
+
+
 def _finalize_coding(context, store, plan, project_id, nxt, cres,
-                     tick_started_at) -> AdvanceResult:
+                     tick_started_at, owner_requested: bool = False) -> AdvanceResult:
     """Persist the outcome of a real coding build (CodingResult) for one leaf.
 
     On success: register the produced files as deliverable artifacts (so the
@@ -512,8 +548,10 @@ def _finalize_coding(context, store, plan, project_id, nxt, cres,
                 store.append_ledger(project_id, cres.ledger_note)
             except Exception:
                 logger.debug("ledger append skipped", exc_info=True)
-        plan.update_status(nxt.id, TaskStatus.DONE,
-                           result=cres.summary, actual_tool="code_executor")
+        _st, _why = _unattended_close(owner_requested, nxt.description)
+        plan.update_status(nxt.id, _st,
+                           result=(f"{cres.summary} — {_why}" if _why else cres.summary),
+                           actual_tool="code_executor")
         _metacog_set_task(context, None)
         _increment_budget(store, project_id)
         _tick_secs = max(0.0, time.time() - tick_started_at)
@@ -524,15 +562,25 @@ def _finalize_coding(context, store, plan, project_id, nxt, cres,
             store.update_task(nxt.id, actual_cost=_tick_secs)
         except Exception:
             logger.debug("actual_cost stamp skipped", exc_info=True)
-        store.log_event(project_id, nxt.id, "autoadvance_step",
-                        {"tool": "code_executor", "classification": "coding",
-                         "files": list(cres.files or [])[:8]})
-        _work_log_step(store, project_id, nxt, outcome="completed",
+        if _why:
+            store.log_event(project_id, nxt.id, "autoadvance_needs_user",
+                            {"description": nxt.description, "reason": _why,
+                             "files": list(cres.files or [])[:8]})
+            _record_needs_user_activity(context, project_id, nxt.description,
+                                        "autoadvance_needs_user")
+        else:
+            store.log_event(project_id, nxt.id, "autoadvance_step",
+                            {"tool": "code_executor", "classification": "coding",
+                             "files": list(cres.files or [])[:8],
+                             "owner_requested": bool(owner_requested)})
+        _work_log_step(store, project_id, nxt,
+                       outcome="needs_user" if _why else "completed",
                        files=list(cres.files or []),
                        tools={"code_executor": 1},
                        note=str(cres.summary or "")[:280])
         return AdvanceResult(True, nxt.id, "coding",
-                             f"built: {cres.summary}", None)
+                             (f"built: {cres.summary}; held for the owner: {_why}"
+                              if _why else f"built: {cres.summary}"), None)
 
     plan.update_status(nxt.id, TaskStatus.FAILED,
                        failure_reason=f"code_executor: {cres.summary}")
@@ -671,8 +719,15 @@ async def advance_once(
     llm_classifier: Optional[LLMClassifier] = None,
     code_generator: Optional[Callable[[str], Awaitable[str]]] = None,
     coding_executor: Optional[Callable[..., Awaitable[Any]]] = None,
+    owner_requested: bool = False,
 ) -> AdvanceResult:
     """Run a single autoadvance tick for ``project_id``.
+
+    ``owner_requested=False`` (the idle loop): a task the VERIFIER filed on its
+    own ("Verifier follow-up: …") is never built — the owner did not ask for
+    it. §4LP: the background advancer edited two shipped apps to "resolve"
+    such complaints (a made-up retry button; the real bug untouched) and
+    marked them DONE. They stay on the books for the owner's own turns.
 
     Args:
       context: the GhostContext-like object (needs ``project_store``).
@@ -700,7 +755,18 @@ async def advance_once(
     if not proj:
         return AdvanceResult(False, None, "idle",
                              f"project not found: {project_id}")
-    if proj["status"] != "ACTIVE":
+    # The owner's run may take back what an unattended run held for them
+    # (§4LQ review M4: it skipped them, and the hold had rolled the project
+    # to NEEDS_USER, so the owner's advance was refused). Nothing is reopened
+    # here: the held tasks join the normal ready-leaf pick in the claim below
+    # (dependencies, leaf-only, no paused parent — review round 3 F1), and
+    # only the one claimed leaves NEEDS_USER (round 2 N7, round 3 F3).
+    _owner_may_take_back = (
+        owner_requested and proj["status"] == "NEEDS_USER"
+        and any(str(_t.get("status") or "").upper() == "NEEDS_USER"
+                and str(_t.get("result_summary") or "").endswith(_HELD_MARK)
+                for _t in (store.list_tasks(project_id) or [])))
+    if proj["status"] != "ACTIVE" and not _owner_may_take_back:
         return AdvanceResult(True, None, "blocked",
                              f"project is {proj['status']}, not ACTIVE")
 
@@ -767,7 +833,18 @@ async def advance_once(
     # advance in parallel.
     with _get_project_lock(project_id):
         plan = ProjectPlan(store, project_id)
-        nxt = plan.next_ready_leaf()
+        # in memory only: a held task counts as PENDING for this one pick
+        _held = ([n for n in plan.tree.nodes.values()
+                  if n.status == TaskStatus.NEEDS_USER
+                  and str(n.result_summary or "").endswith(_HELD_MARK)]
+                 if owner_requested else [])
+        for _n in _held:
+            _n.status = TaskStatus.PENDING
+        nxt = plan.next_ready_leaf(
+            skip=None if owner_requested else _is_unrequested_task)
+        for _n in _held:
+            if _n is not nxt:
+                _n.status = TaskStatus.NEEDS_USER
         if nxt:
             plan.update_status(nxt.id, TaskStatus.IN_PROGRESS)
     if not nxt:
@@ -936,7 +1013,8 @@ async def advance_once(
                 f"closed by the weaker fallback path")
         if cres is not None:
             return _finalize_coding(context, store, plan, project_id, nxt,
-                                    cres, _tick_started_at)
+                                    cres, _tick_started_at,
+                                    owner_requested=owner_requested)
 
     # Pick a tool by classification. Research → web_search,
     # coding → execute (sandbox runs it). A missing tool runner means
@@ -1128,8 +1206,13 @@ async def advance_once(
         except Exception:
             logger.debug("auto-research persist skipped", exc_info=True)
 
-    plan.update_status(nxt.id, TaskStatus.DONE,
-                       result=result_summary, actual_tool=tool_name)
+    _st, _why = _unattended_close(
+        owner_requested, nxt.description,
+        evidence_ok=not (classification == "research"
+                         and tool_name == "web_search" and not research_path))
+    plan.update_status(nxt.id, _st,
+                       result=(f"{result_summary} — {_why}" if _why else result_summary),
+                       actual_tool=tool_name)
     # update_status(DONE) silently DEMOTES the leaf to FAILED when a
     # postcondition isn't satisfied (planning.py). Read the resulting
     # status so the event log / work_log / dream digest record what
@@ -1143,6 +1226,8 @@ async def advance_once(
     except Exception:
         pass
     _step_ok = _final_status == TaskStatus.DONE
+    # held for the owner by _unattended_close — not a postcondition failure
+    _held = bool(_why) and _final_status == TaskStatus.NEEDS_USER
     _metacog_set_task(context, None)  # node finished → don't replan a done task
     _increment_budget(store, project_id)
     _tool_tick_secs = max(0.0, time.time() - _tick_started_at)
@@ -1157,18 +1242,31 @@ async def advance_once(
                                      "classification": classification}
     if research_path:
         step_payload["research_path"] = research_path
-    if not _step_ok:
+    if _held:
+        step_payload["description"] = nxt.description
+        step_payload["reason"] = _why
+    elif not _step_ok:
         step_payload["postcondition_failed"] = True
+    # §4LP: the "While you were away … on my own" digest counts only steps
+    # nobody asked for — an owner-run advance is the owner's own work
+    step_payload["owner_requested"] = bool(owner_requested)
     store.log_event(project_id, nxt.id,
-                    "autoadvance_step" if _step_ok else "autoadvance_step_failed",
+                    "autoadvance_needs_user" if _held
+                    else "autoadvance_step" if _step_ok
+                    else "autoadvance_step_failed",
                     step_payload)
+    if _held:
+        _record_needs_user_activity(context, project_id, nxt.description,
+                                    "autoadvance_needs_user")
     _work_log_step(store, project_id, nxt,
-                   outcome="completed" if _step_ok else "had_failures",
+                   outcome=("needs_user" if _held
+                            else "completed" if _step_ok else "had_failures"),
                    files=([research_path] if research_path else []),
                    tools=({tool_name: 1} if tool_name else {}),
                    note=str(result_summary or "")[:280])
     summary = (
         (f"advanced via {tool_name}" if _step_ok
+         else f"task ran via {tool_name}; held for the owner: {_why}" if _held
          else f"task ran via {tool_name} but a postcondition FAILED")
         + (f"; saved research to {research_path}" if research_path else ""))
     return AdvanceResult(True, nxt.id, classification, summary, artifact_id)
@@ -1325,11 +1423,28 @@ def default_code_generator(context):
     return _gen
 
 
+def idle_candidates(store) -> list:
+    """The projects the IDLE loop may advance (§4LP, operator: "go with your
+    recommendations"): ACTIVE ones the OWNER put on autopilot — by running
+    `manage_projects action=autoadvance` in their own turn, or
+    `action=autopilot enabled=true`. A single web "advance" step does not
+    opt in. Every ACTIVE project used to be, and that is how a released
+    app's unasked fork got built."""
+    return [p for p in (store.list_projects("ACTIVE") or [])
+            if (p.get("metadata") or {}).get("autopilot")]
+
+
+def _is_unrequested_task(node) -> bool:
+    """A task nobody asked for: filed by the verifier on its own."""
+    return str(getattr(node, "description", "") or "").lstrip().lower().startswith("verifier follow-up:")
+
+
 async def advance_many(
     context,
     project_id: str,
     *,
     max_tasks: Optional[int],
+    owner_requested: bool = False,
     tool_runner: Optional[ToolRunner] = None,
     llm_classifier: Optional[LLMClassifier] = None,
     code_generator: Optional[Callable[[str], Awaitable[str]]] = None,
@@ -1381,6 +1496,7 @@ async def advance_many(
             llm_classifier=llm_classifier,
             code_generator=code_generator,
             coding_executor=coding_executor,
+            owner_requested=owner_requested,
         )
         cls = (res.classification or "").lower()
         if cls == "idle":
@@ -1392,9 +1508,14 @@ async def advance_many(
             stop_reason = _final_reason("project_done")
             if stop_reason == "project_done":
                 try:
-                    if any(str(t.get("status", "")).upper() == "FAILED"
-                           for t in store.list_tasks(project_id)):
+                    _sts = [str(t.get("status", "")).upper()
+                            for t in store.list_tasks(project_id)]
+                    if "FAILED" in _sts:
                         stop_reason = "project_failed"
+                    elif "NEEDS_USER" in _sts:
+                        # tasks wait on the owner — "done" would be relayed as
+                        # "all tasks are complete" (§4LQ review R1)
+                        stop_reason = "needs_user"
                 except Exception:
                     logger.debug("idle-stop ledger scan skipped",
                                  exc_info=True)

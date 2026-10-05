@@ -519,19 +519,27 @@ def recursive_split_text(text: str, chunk_size: int = 500, chunk_overlap: int = 
 
     separators = ["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""]
     final_chunks = []
-    stack = [text]
+    # (text, first separator index to try). An oversize piece goes back on
+    # the stack with the NEXT, finer separator — never re-detected from the
+    # top (§4LT CRIT: "Sentence. " + 600 chars without ". " split into the
+    # same two pieces forever, freezing the event loop on one URL ingest).
+    # The index only grows, so this always terminates.
+    stack = [(text, 0)]
 
     while stack:
-        current_text = stack.pop()
+        current_text, _sep_from = stack.pop()
 
         if len(current_text) <= chunk_size:
             final_chunks.append(current_text)
             continue
 
         found_sep = ""
-        for sep in separators:
+        _found_at = len(separators) - 1
+        for _k in range(_sep_from, len(separators)):
+            sep = separators[_k]
             if sep in current_text:
                 found_sep = sep
+                _found_at = _k
                 break
 
         if not found_sep:
@@ -584,13 +592,15 @@ def recursive_split_text(text: str, chunk_size: int = 500, chunk_overlap: int = 
         # document order) — appending fitting chunks to final_chunks here
         # while iterating reversed would emit them backwards.
         for chunk in reversed(temp_chunks):
-            if len(chunk) > chunk_size and (found_sep == "" or chunk == current_text):
+            if len(chunk) > chunk_size and found_sep == "":
                 # Can't be reduced by separators — hard character split.
                 pieces = [chunk[i:i+chunk_size]
                           for i in range(0, len(chunk), chunk_size - chunk_overlap)]
-                stack.extend(reversed(pieces))
+                stack.extend((pc, len(separators) - 1) for pc in reversed(pieces))
+            elif len(chunk) > chunk_size:
+                stack.append((chunk, _found_at + 1))   # finer separators only
             else:
-                stack.append(chunk)
+                stack.append((chunk, 0))
 
     return final_chunks
 

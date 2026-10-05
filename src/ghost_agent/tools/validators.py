@@ -150,6 +150,11 @@ _SQL_UNGUARDED_UPDATE = re.compile(
 _SQL_DROP = re.compile(r"\bdrop\s+(?:table|schema|database|view|index)\b",
                        re.IGNORECASE)
 _SQL_TRUNCATE = re.compile(r"\btruncate\b", re.IGNORECASE)
+_SQL_ALTER_DESTRUCTIVE = re.compile(
+    r"\balter\s+table\b[^;]*?\b(?:drop\s+(?:column|constraint)|drop\s+(?!default\b|not\b)\w+|type\b[^;]*?\busing\b)",
+    re.IGNORECASE | re.DOTALL)
+_SQL_CREATE_ROUTINE = re.compile(r"\bcreate\s+(?:or\s+replace\s+)?(?:function|procedure)\b", re.IGNORECASE)
+_SQL_BODY_DESTRUCTIVE = re.compile(r"\b(?:drop\s+\w+|truncate|delete\s+from)\b", re.IGNORECASE)
 
 # Postgres built-ins that reach outside the database: server-side file I/O,
 # large-object import/export, and `COPY … TO/FROM PROGRAM` (command
@@ -550,6 +555,13 @@ def validate_sql(stmt: str, confirm: bool = False) -> Tuple[bool, str]:
             return False, "DROP statement requires confirm=true"
         if _SQL_TRUNCATE.search(masked):
             return False, "TRUNCATE statement requires confirm=true"
+        # destroys data without saying DROP TABLE (§4LV): a dropped column,
+        # a lossy type rewrite, and a function whose QUOTED body — masked
+        # above — drops or deletes (`SELECT f()` then destroys the table)
+        if _SQL_ALTER_DESTRUCTIVE.search(masked):
+            return False, "ALTER that drops a column/constraint or rewrites a type requires confirm=true"
+        if _SQL_CREATE_ROUTINE.search(masked) and _SQL_BODY_DESTRUCTIVE.search(s):
+            return False, "a function/procedure whose body drops, truncates or deletes requires confirm=true"
 
     # ⚠ SANDBOX ESCAPE — NEVER GATED BY `confirm`.
     #
