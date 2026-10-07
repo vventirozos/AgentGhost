@@ -9,6 +9,7 @@ This lets the agent decide when to ask the user vs. when to proceed,
 and attach a risk summary to final responses for transparency.
 """
 
+from ..utils.json_store import open_append  # torn-tail-safe JSONL appends (§4MF)
 import json
 import logging
 import re
@@ -122,7 +123,7 @@ class UncertaintyTracker:
             return
         try:
             self.persist_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.persist_path.open("a", encoding="utf-8") as f:
+            with open_append(self.persist_path) as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
         except Exception as e:
             logger.debug("uncertainty persist failed: %s", e)

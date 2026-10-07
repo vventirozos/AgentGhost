@@ -41,6 +41,7 @@ File layout under ``$GHOST_HOME/system/bench/``:
 
 from __future__ import annotations
 
+from ..utils.json_store import open_append  # torn-tail-safe JSONL appends (§4MF)
 import base64
 import datetime
 import json
@@ -601,7 +602,7 @@ def record_result(item: Dict[str, Any], *, passed: bool, status: str,
             "attempts": int(attempts or 0),
             "source": _src if _src in RESULT_SOURCES else "idle",
         }
-        with path.open("a", encoding="utf-8") as f:
+        with open_append(path) as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
         return True
     except Exception as e:  # noqa: BLE001 — the ledger must not kill the phase

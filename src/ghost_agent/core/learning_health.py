@@ -3175,7 +3175,7 @@ def _experiment_health_lines(memory_dir) -> List[str]:
         except Exception:  # noqa: BLE001
             _deny = None
         all_stats, trig_stats, coverage = summarize_streaming(
-            collector.iter_trajectories(), deny_names=_deny)
+            collector.iter_trajectories(include_archive=True), deny_names=_deny)   # §4MF
         seen = int(coverage.get("user_turns", 0))
         stamped = int(coverage.get("stamped", 0))
         if not seen and not stamped:

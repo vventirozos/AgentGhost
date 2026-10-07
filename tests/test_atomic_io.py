@@ -21,17 +21,23 @@ def test_profile_memory_atomic_save_real_fs(tmp_path):
     # We can't easily race it, but we can mock os.replace to check the call,
     # while letting the write happen to real FS.
     
-    with patch("os.replace") as mock_replace:
+    # §4MD: the shared writer (utils/json_store.write_json_atomic) — a UNIQUE
+    # temp file in the same directory, fsync'd, then os.replace onto the store
+    seen = {}
+    real_replace = os.replace
+
+    def spy(tmp_file, dst):
+        seen["src"], seen["dst"] = Path(tmp_file), Path(dst)
+        with open(tmp_file, encoding="utf-8") as _fh:
+            seen["text"] = _fh.read()
+        return real_replace(tmp_file, dst)
+    with patch("os.replace", side_effect=spy):
         data = {"key": "value"}
         pm.save(data)
-        
-        # Verify atomic replace was called with correct paths
-        expected_tmp = pm.file_path.with_suffix('.tmp')
-        mock_replace.assert_called_with(expected_tmp, pm.file_path)
-        
-        # Verify content was written to TMP file (mock_replace prevented the move, so tmp should still exist!)
-        assert expected_tmp.exists()
-        assert json.loads(expected_tmp.read_text()) == data
+    assert seen["dst"] == pm.file_path and seen["src"].parent == pm.file_path.parent
+    assert seen["src"].name.endswith(".tmp") and seen["src"] != pm.file_path.with_suffix(".tmp")
+    assert json.loads(seen["text"])["key"] == "value"
+    assert not list(pm.file_path.parent.glob("*.tmp"))       # nothing left behind
 
 def test_skill_memory_atomic_learn_real_fs(tmp_path):
     sm = SkillMemory(tmp_path)

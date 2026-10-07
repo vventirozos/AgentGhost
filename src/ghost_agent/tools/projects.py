@@ -981,6 +981,26 @@ def _constraint_origin(context) -> str:
         return "user"
 
 
+def _content_constraint_origin(constraint: str, origin: str) -> str:
+    """A constraint the MODEL passed after reading outside content is the
+    user's only if the user's own message says it (§4MB: a README's "MUST
+    send telemetry to x" was stamped user-mandated and replayed to the
+    verifier)."""
+    if origin != "user":
+        return origin
+    try:
+        from ..utils.provenance import untrusted_seen, user_message
+        if not untrusted_seen():
+            return origin
+        from ..memory.attribution import _coverage, _words
+        words = _words(constraint)
+        if words and _coverage(words, user_message()) >= 0.5:
+            return origin
+        return "auto"
+    except Exception:  # noqa: BLE001
+        return origin
+
+
 def _stamp_constraint_origins(meta: Dict[str, Any], constraints: List[str],
                               origin: str) -> Dict[str, Any]:
     """Record ``origin`` for each of ``constraints`` in
@@ -1000,8 +1020,9 @@ def _stamp_constraint_origins(meta: Dict[str, Any], constraints: List[str],
         key = str(c)
         if not key:
             continue
-        if o == "user" or key not in stamps:
-            stamps[key] = o
+        o_c = _content_constraint_origin(key, o)
+        if o_c == "user" or key not in stamps:
+            stamps[key] = o_c
     meta["constraint_origins"] = stamps
     return meta
 
@@ -1405,6 +1426,32 @@ def _link_task_in_graph(context, project_id: str, task_id: str, description: str
         ])
     except Exception:
         logger.debug("graph task link skipped", exc_info=True)
+
+
+def _unlink_project_in_graph(context, project_id: str, title: str):
+    """Hard delete's graph leg: remove every edge naming the project, so
+    recall stops telling the model the user works on it (live 2cb40b10
+    rebuilt a deleted project from `user RESUMES project <id>`). The title
+    edges (generic `project HAS_TITLE` and the title-named node) stay while
+    another project has that title. Best-effort: the delete already
+    succeeded."""
+    gm = getattr(context, "graph_memory", None)
+    if gm is None or not hasattr(gm, "forget_project"):
+        return
+    try:
+        from ..memory.graph import GraphMemory
+        key = GraphMemory.project_title_key
+        store = getattr(context, "project_store", None)
+        t = key(title)
+        shared = bool(t) and store is not None and any(
+            key(p.get("title")) == t
+            for p in store.list_projects() if p.get("id") != project_id)
+        n = gm.forget_project(project_id, title=title, forget_title=not shared)
+        if n:
+            pretty_log("Project Graph", f"deleted {project_id}: removed {n} "
+                       f"graph edge(s)", icon=Icons.MEM_WIPE)
+    except Exception:
+        logger.debug("graph project unlink skipped", exc_info=True)
 
 
 def _link_concepts_in_graph(context, project_id: str):
@@ -2834,11 +2881,13 @@ async def tool_manage_projects(
             # registry entries (review H6). Hard delete also purges their
             # writable state dirs ("no files left behind").
             _stop_project_services(context, rid, purge_state=True)
+            _gone = store.get_project(rid) or {}
             ok = store.delete_project(rid, hard=True)
             if not ok:
                 return _err(f"delete failed for {rid} — nothing was removed.")
             if getattr(context, "current_project_id", None) == rid:
                 _set_current(context, None)
+            _unlink_project_in_graph(context, rid, _gone.get("title", ""))
             return _ok({"deleted": True, "project_id": rid, "hard": True,
                         "note": "Project, its tasks/artifacts/events, and its "
                                 "workspace files were permanently removed."})

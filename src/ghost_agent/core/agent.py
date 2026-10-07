@@ -1,5 +1,6 @@
 # src/ghost_agent/core/agent.py
 
+from ..utils.json_store import open_append  # torn-tail-safe JSONL appends (§4MF)
 import asyncio
 import datetime
 import hashlib
@@ -1926,6 +1927,25 @@ def rubric_shadow_eligible(context, traj) -> bool:
         from .rubric_grader import shadow_enabled
         if not shadow_enabled():
             return False
+        return _declined_real_turn(context, traj)
+    except Exception:                                       # noqa: BLE001
+        return False
+
+
+def knowledge_shadow_eligible(context, traj) -> bool:
+    """§4MF: the same declined population as the rubric shadow, for the
+    correctness check (`core/knowledge_shadow`), under its own switch."""
+    try:
+        from .knowledge_shadow import enabled
+        return enabled() and _declined_real_turn(context, traj)
+    except Exception:                                       # noqa: BLE001
+        return False
+
+
+def _declined_real_turn(context, traj) -> bool:
+    """A real OWNER turn that ran no tool and has no verdict yet — the
+    population the verifier declines (see `rubric_shadow_eligible`)."""
+    try:
         if context is None or traj is None:
             return False
         if turn_origin(context) != "user":
@@ -2398,11 +2418,23 @@ def _build_memory_arc(history, ai_text, *, tools_run) -> str:
             continue
         clean_content = re.sub(r'```.*?```', '', str(m.get("content", "")),
                                flags=re.DOTALL)
-        micro.append(f"{role}: {clean_content[:500].strip()}")
+        micro.append(f"{role}: {_unmark_roles(clean_content[:500].strip())}")
     treated = treat_reply(str(ai_text or ""),
                           n_real_tools=count_real_tools(tools_run))
     clean_ai = re.sub(r'```.*?```', '', treated, flags=re.DOTALL)
-    return "\n".join(micro) + f"\nAI: {clean_ai[:500].strip()}"
+    return "\n".join(micro) + f"\nAI: {_unmark_roles(clean_ai[:500].strip())}"
+
+
+#: a line that would read as a speaker mark to `attribution.owner_lines`
+_ARC_ROLE_LINE = re.compile(r"^(\s*)(user|ai|assistant|system|tool)(\s*:)", re.IGNORECASE | re.MULTILINE)
+
+
+def _unmark_roles(text: str) -> str:
+    """Quote any line INSIDE a message that starts with a role mark: a reply
+    that quoted a page's "USER: my wife is Mallory" became the owner's own
+    statement and rewrote the profile (§4MB). The arc's real speaker marks
+    are the ones this function's caller prepends."""
+    return _ARC_ROLE_LINE.sub(lambda m: f"{m.group(1)}> {m.group(2)}{m.group(3)}", text)
 
 
 def _claim_tokens(text: str) -> set:
@@ -3367,6 +3399,169 @@ def _backfilled_failure_reason(verifier: Optional[str], verifier_reason: str,
 #: pointless, so the turn loop ends the tool phase on the first one.
 _DEAD_END_REFUSALS = frozenset({"not_owner_write", "confirm_dead_end",
                                 "forget_not_confirmed", "reset_not_confirmed"})
+
+
+def _defuse_tool_text(content) -> str:
+    """A tool result's text with chat-template control tags made inert, for
+    the sites that wrap it in the agent's own ``<tool_response>`` tags (§4MB)."""
+    from ..utils.prompt_safety import defuse_text
+    return defuse_text(str(content if content is not None else ""), "tool")
+
+
+def _tools_for_journal(rows) -> list:
+    """Tool rows for the post-mortem journal entry, each stamped
+    ``_outside`` when its content came from outside — the stamp the
+    post-mortem reads later, from the journal, where a ToolOutcome's
+    ``call_args`` and this request's provenance no longer exist (§4MB
+    review). Copies: the turn's own rows are API messages."""
+    out = []
+    for t in rows or []:
+        if not isinstance(t, dict):
+            out.append(t)
+            continue
+        c = t.get("content")
+        try:
+            from ..utils.provenance import is_untrusted_source
+            outside = is_untrusted_source(t.get("name", ""), getattr(c, "call_args", None))
+        except Exception:  # noqa: BLE001
+            outside = True             # unknown: never quote it
+        out.append({**t, "_outside": bool(outside)})
+    return out
+
+
+class _OrderedIdSet(set):
+    """A set that remembers INSERTION order, so a cap drops the OLDEST ids.
+    `list(a_set)[-cap:]` dropped arbitrary ones, and old failures were
+    reflected again (§4MC MINOR 7)."""
+
+    def __init__(self, items=()):
+        super().__init__()
+        self._order: dict = {}
+        for x in items:
+            self.add(x)
+
+    def add(self, x) -> None:
+        super().add(x)
+        self._order.setdefault(x, None)
+
+    def discard(self, x) -> None:
+        super().discard(x)
+        self._order.pop(x, None)
+
+    def update(self, *its) -> None:
+        for it in its:
+            for x in it:
+                self.add(x)
+
+    def remove(self, x) -> None:
+        super().remove(x)
+        self._order.pop(x, None)
+
+    def clear(self) -> None:
+        super().clear()
+        self._order.clear()
+
+    def __iter__(self):
+        return iter(list(self._order))
+
+
+#: a request that bounds the reply's length or form (§4ME F5)
+_FORMAT_BOUND_RE = re.compile(
+    # explicit length/form asks only: "exactly", "just the", "only the" read
+    # as ordinary phrasing ("what exactly went wrong") and held the banner
+    # for good (§4ME review)
+    r"\b(?:one|1|single|two|2|three|3)[\s-]+(?:line|word|sentence|paragraph)s?\b|\bbriefly\b|"
+    r"\bno preamble\b|\b(?:reply|answer|respond)(?: with)? only\b|\bjust (?:say|answer|reply)\b|"
+    r"\bin \d+ words\b|μία? (?:γραμμή|λέξη|πρόταση)|σύντομα", re.IGNORECASE)
+
+
+#: world-fact predicates whose value is a moving target (§4ME F3)
+_TRANSIENT_WORLD_PREDICATE = re.compile(
+    # whole `_`-separated words: "RELEASED_IN 2008" is a stable fact (review)
+    r"(?:^|_)(?:VERSION|LATEST|CURRENT|NEWEST|PRICE|COSTS?|STOCK|RATE|SCORE|RANK|RANKING)(?:_|$)",
+    re.IGNORECASE)
+
+
+#: a status question — what has happened / where are we — not a request for
+#: more work (§4MF: "progress report" ran the full work loop for 37 minutes).
+#: STRICT, by review: whole phrases at word boundaries, a short message, and
+#: no work verb anywhere in it ("build a progress bar", "is it ready? then
+#: deploy it", "τι γίνεται με τον καιρό" all matched the first cut).
+_STATUS_QUESTION_RE = re.compile(
+    r"(?<!\w)(?:progress (?:report|update)|status (?:update|report)|what(?:'s| is) the status|"
+    r"where are we(?: at| with (?:it|this|that|the \w+))?|how(?:'s| is) it going|how far along|"
+    r"are you (?:done|finished)|is it (?:done|finished|ready)|what have you done so far|"
+    r"πώς πάει|πως παει|σε τι φάση είμαστε|σε τι φαση ειμαστε|τελείωσες|τελειωσες)(?!\w)",
+    re.IGNORECASE)
+#: any of these in the message makes it a WORK request, whatever else it asks
+_WORK_VERB_RE = re.compile(
+    r"(?<!\w)(?:then|if so|and (?:then )?(?:run|deploy|push|fix|build|add|write|make|start|continue)|"
+    r"build|deploy|push|fix|add|write|make|create|implement|generate|run|benchmark|check|"
+    r"stop|cancel|kill|continue|resume|φτιάξε|φτιαξε|γράψε|γραψε|τρέξε|τρεξε|πρόσθεσε|προσθεσε|"
+    r"συνέχισε|συνεχισε|σταμάτα|σταματα)(?!\w)", re.IGNORECASE)
+#: tools that START work — refused on a status question while work is live.
+#: Reading stays open (file_system, jobs status/log, manage_tasks list,
+#: manage_projects, workspace, introspect).
+_WORK_TOOLS = frozenset({"execute", "browser", "web_search", "deep_research", "darkweb_search",
+                         "darkweb_research", "image_generation", "deploy", "manage_services",
+                         "delegate", "delegate_to_swarm", "create_skill"})
+
+
+def thumb_ask_fits(final: str, ask: str) -> bool:
+    """May the "was it right? 👍/👎" line go under this reply? Not under an
+    aborted attempt (§4IF — the marker already says what happened), not under
+    a budget-exhausted state report (§4ME F2: it asked to grade working
+    notes), and not twice."""
+    f = str(final or "")
+    return bool(f) and str(ask)[:40] not in f and not reply_carries_abort_marker(f) \
+        and "[TURN BUDGET EXHAUSTED]" not in f
+
+
+def is_status_question(text: str) -> bool:
+    t = str(text or "").strip()
+    return (len(t) <= 80 and bool(_STATUS_QUESTION_RE.search(t))
+            and not _WORK_VERB_RE.search(t))
+
+
+def has_live_work(context) -> bool:
+    """A bound project or a running background job: something to report on."""
+    try:
+        if getattr(context, "current_project_id", None):
+            return True
+        from .jobs import get_job_registry, STATUS_RUNNING
+        reg = get_job_registry(context)
+        return bool(reg and reg.list(status=STATUS_RUNNING))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _tool_row_as_user_text(m) -> str:
+    """A tool row re-sent as user text in the agent's own ``<tool_response>``
+    wrapper. The row may come from the CLIENT's history (never through this
+    process's dispatcher), so its text is defused here too (§4MB)."""
+    return (f"<tool_response name=\"{m.get('name', 'unknown')}\">\n"
+            f"{_defuse_tool_text(m.get('content'))}\n</tool_response>")
+
+
+def _postmortem_tool_line(t_msg) -> str:
+    """One tool row for the post-mortem's HISTORY. Content from OUTSIDE (a
+    page, a document, a transcript) is never quoted: the post-mortem's
+    output becomes a lesson replayed into later turns, and a planted "rule"
+    in a page became one (§4MB). Its failures are the agent's own text and
+    stay — the lesson is about what went wrong."""
+    content = t_msg.get("content", "")
+    try:
+        from ..utils.provenance import is_untrusted_source
+        from ..tools.outcome import ToolOutcome as _TOp
+        out = content if isinstance(content, _TOp) else _TOp.coerce(str(content or ""))
+        args = getattr(content, "call_args", None)
+        outside = (t_msg.get("_outside") if "_outside" in t_msg
+                   else is_untrusted_source(t_msg.get("name", ""), args))
+        if outside and not out.is_failure:
+            return "(ok — content from outside, not quoted)"
+    except Exception:  # noqa: BLE001
+        pass
+    return str(content or "")[:200]
 
 
 def _scratch_hidden_namespaces(req_id) -> tuple:
@@ -5324,7 +5519,19 @@ DEFAULT_TOOL_TURN_MAX_TOKENS = 16384
 # many times, then accept whatever we have. Bounded so a model that emits
 # "length" on every continuation (mis-reported finish_reason, runaway) can't
 # loop forever — each continuation is a full upstream round-trip.
+#: the reflection pass reads failures of the last N days, not the whole
+#: corpus (§4MC MAJOR 2); older ones were absorbed by `already_reflected`
+REFLECTION_WINDOW_DAYS = 30.0
 MAX_TRUNCATION_CONTINUATIONS = 3
+#: one continuation call's budget (§4MD M2)
+TRUNCATION_CONTINUATION_TIMEOUT_S = 180.0
+#: the visible note on an answer the model server cut and the agent could not finish (§4MD M1)
+TRUNCATED_ANSWER_NOTE = ("⚠️ This answer was cut off — the model server stopped in the middle of "
+                         "the reply, so it is incomplete.")
+#: the marker an upstream failure leaves on a reply: the outcome rules book it
+#: FAILED; like every abort marker it is stripped from a channel MEMBER's
+#: copy (the owner's reply and the trajectory keep it)
+UPSTREAM_ABORT_MARKER = "[ATTEMPT_ABORTED_UPSTREAM]"
 
 # Strategic planner output cap. RAISED 4096 → 8192 on 2026-08-11 (operator),
 # sized from 167 recorded planner calls over four days rather than doubled by
@@ -5529,7 +5736,23 @@ def request_checkpoint_namespace(req_id) -> str:
 #: both room). Req fd89fd6d: the web interface's 1800 s timeout cut a
 #: 35-turn build mid-`sleep 60000` with 61 s left, and the reply that landed
 #: was the stitched working narration.
-DEADLINE_REPORT_FLOOR_S = 150.0
+#: §4ME F2: 150 s was checked only at a turn's START — a tool turn begun
+#: with 160 s left ran past the deadline and the stitched notes shipped
+#: (fd89fd6d again). 300 s covers one ordinary tool turn plus the report.
+DEADLINE_REPORT_FLOOR_S = 300.0
+
+
+def effective_report_floor(deadline_s) -> float:
+    """The report reserve for a client deadline: DEADLINE_REPORT_FLOOR_S, but
+    never more than a quarter of the whole deadline — a 300 s client timeout
+    would otherwise force a report on its FIRST turn (§4ME review)."""
+    try:
+        d = float(deadline_s or 0.0)
+    except (TypeError, ValueError):
+        d = 0.0
+    if d <= 0:
+        return DEADLINE_REPORT_FLOOR_S
+    return min(DEADLINE_REPORT_FLOOR_S, max(30.0, 0.25 * d))
 
 
 def deadline_needs_report(remaining_s, floor_s: float, force_final_response, force_stop) -> bool:
@@ -9982,10 +10205,18 @@ class GhostAgent:
                 if _bg is None:
                     _bg = set()
                     self.context._pending_background_tasks = _bg
+                # a summary of a request that READ outside content carries
+                # that content's lines: stored under its own type, which
+                # ambient recall never serves (§4MB); explicit recall still finds it
+                try:
+                    from ..utils.provenance import untrusted_seen as _us_ep
+                    _ep_type = "episode_outside" if _us_ep() else "episode"
+                except Exception:  # noqa: BLE001
+                    _ep_type = "episode"
                 _arch_task = asyncio.create_task(asyncio.to_thread(
                     self.context.memory_system.add,
                     episode_text,
-                    {"type": "episode", "timestamp": get_utc_timestamp()}
+                    {"type": _ep_type, "timestamp": get_utc_timestamp()}
                 ))
                 _bg.add(_arch_task)
                 _arch_task.add_done_callback(_bg.discard)
@@ -11033,7 +11264,8 @@ class GhostAgent:
                         # site simply never got the same treatment.
                         from ..memory.skills import iter_teachable as _iter_teachable_refl
                         _refl_trajs = await asyncio.to_thread(
-                            lambda: list(_iter_teachable_refl(traj_collector.iter_trajectories())))
+                            lambda: list(_iter_teachable_refl(traj_collector.iter_trajectories(
+                                since_days=REFLECTION_WINDOW_DAYS))))
                         report = await reflector.run(
                             failed_source=lambda: _refl_trajs,
                             sink=_sink,
@@ -13870,6 +14102,12 @@ class GhostAgent:
                     _s, _p, _o = (str(_t.get("subject") or ""), str(_t.get("predicate") or _t.get("relation") or ""),
                                   str(_t.get("object") or ""))
                     if not (is_owner_end(_s) or is_owner_end(_o)):
+                        # a world fact that goes stale by design ("Postgresql
+                        # HAS_VERSION 18.4" outlived 18.6 and answered a later
+                        # "latest version?" — §4ME F3) is not stored
+                        if _TRANSIENT_WORLD_PREDICATE.search(_canon(_p)):
+                            _unattributed += 1
+                            continue
                         _attributed.append(_t)
                         continue
                     _other = _o if is_owner_end(_s) else _s
@@ -14125,7 +14363,7 @@ class GhostAgent:
         try:
             history_summary = f"User: {last_user_content}\n"
             for t_msg in tools_run[-5:]:
-                history_summary += f"Tool {t_msg.get('name', 'unknown')}: {str(t_msg.get('content', ''))[:200]}\n"
+                history_summary += f"Tool {t_msg.get('name', 'unknown')}: {_postmortem_tool_line(t_msg)}\n"
 
             # Aggressively strip lone surrogates and raw control characters for C++ backends
             def _clean_for_cpp(text: str) -> str:
@@ -15567,7 +15805,7 @@ class GhostAgent:
             day = get_utc_timestamp()[:10]
             out = Path(root).parent / "verdicts"
             out.mkdir(parents=True, exist_ok=True)
-            with open(out / f"{day}.jsonl", "a", encoding="utf-8") as fh:
+            with open_append(out / f"{day}.jsonl") as fh:
                 fh.write(_json.dumps({
                     "trajectory_id": trajectory_id,
                     "verdict": verdict,
@@ -18080,7 +18318,8 @@ class GhostAgent:
     # small-n noise the planner shouldn't anchor on.
     _COMPETENCE_MIN_OBS = 20
 
-    async def _credit_turn_lessons(self, execution_failure_count, last_user_content) -> None:
+    async def _credit_turn_lessons(self, execution_failure_count, last_user_content,
+                                   final_text: str = "") -> None:
         """Credit the lessons surfaced in this turn — both turn paths (the
         finalize path and the streamed path) call this. Only a clean turn
         that may teach (not a probe, member or internal turn) and has a
@@ -18091,6 +18330,10 @@ class GhostAgent:
         +1 on every clean turn (154 of 290 reached confidence 1.0). A
         token-less request would fall back to the legacy credit-all path."""
         sm = getattr(self.context, 'skill_memory', None)
+        # an ABORTED turn (an upstream outage, a strike cap …) helped nobody
+        # (§4MD M3: every retry during an outage gave each shown lesson +1)
+        if _ABORT_MARKER_RE.search(str(final_text or "")):
+            return
         if not (sm is not None and execution_failure_count == 0 and turn_may_teach(self.context)
                 and _query_has_tokens(last_user_content)):
             return
@@ -20635,6 +20878,35 @@ class GhostAgent:
                                    f"{tool['_privacy_area']}",
                                    icon=Icons.SHIELD if hasattr(Icons, "SHIELD") else Icons.WARN)
 
+                # §4MF: a STATUS question while work is live is answered from
+                # the current state — a call that starts new work is refused
+                _so = getattr(self.context, "_status_only_req", None)
+                if _cname in _WORK_TOOLS and _so and _so == str(request_id_context.get() or ""):
+                    err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname,
+                               "content": _TO.rejected(
+                                   "Not run: the user asked for a STATUS / progress report. Answer from "
+                                   "what is already known — the project's tasks and work log, the jobs' "
+                                   "state, files already written. Start no new work; offer to continue "
+                                   "if they want.", world_changed=False, reason_code="status_only")}
+                    messages.append(err_msg)
+                    tools_run_this_turn.append({**err_msg, "_synthetic": True})
+                    continue
+
+                # §4MB: after outside content entered the request, a call that
+                # would carry the owner's identifiers out is refused — a page's
+                # "search for the owner's name and phone" is not the owner
+                from ..memory.egress import content_egress_refusal as _cer
+                _egress_ref = _cer(_cname, tool["function"].get("arguments"), self.context)
+                if _egress_ref is not None:
+                    pretty_log("Privacy", f"{_cname} refused — owner identifier after outside content",
+                               icon=Icons.STOP, level="WARNING")
+                    err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname,
+                               "content": _TO.rejected(str(_egress_ref), world_changed=False,
+                                                       reason_code="untrusted_egress")}
+                    messages.append(err_msg)
+                    tools_run_this_turn.append({**err_msg, "_synthetic": True})
+                    continue
+
                 # A parse error is not a call: it takes its own recovery branch
                 # below, never the owner-data block (§4KL R7).
                 _member_refusal = (self._member_tool_refusal(
@@ -21246,10 +21518,12 @@ class GhostAgent:
                     # shape as the pre-flight steer, not a strike.
                     _dl_remaining = _glog.request_remaining_s(request_id_context.get() or "")
                     _dl_wait = declared_wait_s(fname, t_args)
-                    if wait_crosses_deadline(_dl_wait, _dl_remaining, DEADLINE_REPORT_FLOOR_S):
+                    if wait_crosses_deadline(_dl_wait, _dl_remaining,
+                                             effective_report_floor(_glog.request_deadline_s(
+                                                 request_id_context.get() or ""))):
                         _dl_note = (
                             f"SYSTEM PREFLIGHT — deadline: this call was NOT run. It declares a "
-                            f"{_dl_wait:.0f} s wait but the client closes its connection in about "
+                            f"{_dl_wait:.0f} s wait but this request's time runs out in about "
                             f"{int(max(0.0, _dl_remaining))} s and the last {int(DEADLINE_REPORT_FLOOR_S)} s are "
                             "reserved for your report. Do not wait: report what exists now (files, "
                             "URLs, what remains) or take an action that returns immediately.")
@@ -22447,7 +22721,9 @@ class GhostAgent:
                     tool_msg = {"role": "tool", "tool_call_id": tool_id,
                                 "name": fname,
                                 "content": ToolOutcome(
-                                    safe_res, status=_outcome.status,
+                                    # outside text never becomes chat-template
+                                    # control, here or in any store it reaches (§4MB)
+                                    _defuse_tool_text(safe_res), status=_outcome.status,
                                     world_changed=_outcome.world_changed,
                                     reason_code=_outcome.reason_code,
                                     # ⚠ `declared` MUST be forwarded.
@@ -22476,6 +22752,15 @@ class GhostAgent:
                                     duration_s=_call_dur)}
                     messages.append(tool_msg)
                     tools_run_this_turn.append(tool_msg)
+                    # provenance: content from outside entered this request (§4MB)
+                    try:
+                        from ..utils.provenance import note_tool_result as _note_prov
+                        _note_prov(fname, _recorded_args, ok=not _outcome.is_failure,
+                                   extra_tools=((fname,) if getattr(
+                                       (self.available_tools or {}).get(fname), "_ghost_opaque", False)
+                                       else ()))
+                    except Exception:  # noqa: BLE001
+                        pass
 
                     # No-progress (ungrounded-verification) loop
                     # detection — ONLY on SUCCESSFUL, NON-MUTATING
@@ -24357,7 +24642,7 @@ class GhostAgent:
             # record or any later consumer of `messages`.
             for m in messages + [{"role": "user", "content": perfect_it_prompt}]:
                 if m.get("role") == "tool":
-                    p_req_messages.append({"role": "user", "content": f"<tool_response name=\"{m.get('name', 'unknown')}\">\n{m.get('content')}\n</tool_response>"})
+                    p_req_messages.append({"role": "user", "content": _tool_row_as_user_text(m)})
                 elif m.get("role") == "assistant":
                     p_req_messages.append({"role": "assistant", "content": m.get("content", "")})
                 else:
@@ -24856,7 +25141,7 @@ class GhostAgent:
                     # costly tool, for the next turn's clarify-first guard.
                     self._note_costly_turn(_stable_conv_fp, tools_run_this_turn)
                     if turn_may_teach(self.context):
-                        await self._journal_append_safe('post_mortem', {'user': last_user_content, 'tools': list(tools_run_this_turn), 'ai': final_ai_content, 'model': model})
+                        await self._journal_append_safe('post_mortem', {'user': last_user_content, 'tools': _tools_for_journal(list(tools_run_this_turn)), 'ai': final_ai_content, 'model': model})
                     else:
                         # §4KD: the queue consumer runs under the "SYSTEM"
                         # request id, so a Slack post-mortem cannot know it
@@ -24883,7 +25168,8 @@ class GhostAgent:
         # when nothing was retrieved, so running it on every
         # clean-exit turn is safe.
         sm = getattr(self.context, 'skill_memory', None)
-        await self._credit_turn_lessons(execution_failure_count, last_user_content)
+        await self._credit_turn_lessons(execution_failure_count, last_user_content,
+                                       final_text=final_ai_content)
 
         # Outcome-gated lesson feedback (2026-07-24): attribute THIS turn's
         # verified outcome — including the FAILURE arm the credit block above
@@ -25062,8 +25348,7 @@ class GhostAgent:
                         self._prepenalty_confidence(req_id,
                                                     tools_run_this_turn),
                         verifier_backfill)
-                    if (_ask and final_ai_content and _ask[:40] not in final_ai_content
-                            and not reply_carries_abort_marker(final_ai_content)):
+                    if _ask and thumb_ask_fits(final_ai_content, _ask):
                         # §4IF: no thumbs ask on an aborted attempt — the
                         # marker already says what happened.
                         final_ai_content = f"{final_ai_content}{_ask}"
@@ -25277,6 +25562,10 @@ class GhostAgent:
             _alog = _get_alog(self.context)
             if (_alog is not None and final_ai_content
                     and turn_origin(self.context) == "user"
+                    # a reply asked to be one line / brief is not where a
+                    # banner goes (§4ME F5: "hi, one line please" got one);
+                    # the watermark stays, so it shows on the next reply
+                    and not _FORMAT_BOUND_RE.search(str(last_user_content or ""))
                     and not _is_internal_req2(fs.req_id)
                     and not requester_is_member()     # the owner's activity digest, never a member's reply (R7, CRIT)
                     and not reply_is_public()):       # …nor a channel's (§4LC); its watermark stays for the DM
@@ -26152,6 +26441,7 @@ class GhostAgent:
         try:
             # Ensure msg is always defined in this scope
             msg = {"role": "assistant", "content": "", "tool_calls": []}
+            _raw_reply_empty = False       # §4MD M4: set from the RAW reply, before think-stripping
             thinking_loop_detected = False
             # Which of the two collapse shapes killed the stream. Both
             # take the `thinking_loop_detected` recovery path (discard
@@ -26655,6 +26945,7 @@ class GhostAgent:
                     and "<function" not in full_content.lower()
                 )
                 _continue_tries = 0
+                _cut_unrecovered = False     # §4MD M1: a cut answer left cut
                 while (
                     _truncated_text_turn
                     and _continue_tries < MAX_TRUNCATION_CONTINUATIONS
@@ -26689,7 +26980,10 @@ class GhostAgent:
                     cont_payload.pop("parallel_tool_calls", None)
                     stream_finish_reason = None
                     try:
-                        cont_result = await self.context.llm_client.chat_completion(cont_payload)
+                        # bounded (§4MD M2): this call holds the turn lock and
+                        # the main-node lock; the client default is 1200 s
+                        cont_result = await self.context.llm_client.chat_completion(
+                            cont_payload, timeout=TRUNCATION_CONTINUATION_TIMEOUT_S)
                         cont_choice = (cont_result or {}).get("choices", [{}])[0]
                         cont_text = (cont_choice.get("message", {}) or {}).get("content", "") or ""
                         stream_finish_reason = cont_choice.get("finish_reason")
@@ -26701,6 +26995,7 @@ class GhostAgent:
                             cont_text, flags=re.DOTALL | re.IGNORECASE,
                         )
                         if not cont_text.strip():
+                            _cut_unrecovered = True
                             break
                         # Bridge with a space only when the seam would
                         # otherwise weld two words together; mid-token
@@ -26711,8 +27006,18 @@ class GhostAgent:
                             full_content += cont_text
                     except Exception as exc:
                         logger.warning("Truncation continuation failed: %s", exc)
+                        _cut_unrecovered = True
                         break
                     _truncated_text_turn = stream_finish_reason == "length"
+                if _truncated_text_turn and _continue_tries >= MAX_TRUNCATION_CONTINUATIONS:
+                    _cut_unrecovered = True
+                if _cut_unrecovered:
+                    # The partial answer reached the user as COMPLETE ("The
+                    # capital of Peru is") and the turn booked ok (§4MD M1).
+                    # Say it, and mark the turn failed — the marker is the
+                    # outcome rules' strongest signal.
+                    full_content = (full_content.rstrip() + "\n\n" + TRUNCATED_ANSWER_NOTE
+                                    + " " + UPSTREAM_ABORT_MARKER)
 
                 merged_content = full_content
                 if reasoning_content:
@@ -26834,6 +27139,10 @@ class GhostAgent:
                 prev_turn_opening_words = _stream_opening_words
 
                 # CRITICAL FIX: Strip <think> blocks from permanent history to prevent cognitive looping
+                # EXACTLY empty: whitespace is the model emitting tokens (a
+                # stall), nothing at all is the server
+                _raw_reply_empty = (not str(merged_content or "")
+                                    and not msg.get("tool_calls"))
                 clean_msg_content = _strip_think_blocks(merged_content).strip()
                 msg["content"] = clean_msg_content
 
@@ -26961,7 +27270,10 @@ class GhostAgent:
                         self.context._breaker_forced_final = True  # §4JI: a tool call on this forced final IS the no-answer
                     return "continue"
             except (httpx.ConnectError, httpx.ConnectTimeout):
-                final_ai_content = "CRITICAL: The upstream LLM server is unreachable. It may have crashed due to memory pressure or is currently restarting. Please wait a moment and try again."
+                # the marker books the turn FAILED (§4MD M3: an outage was
+                # "turn outcome ok" and credited every lesson shown in it)
+                final_ai_content = ("CRITICAL: The upstream LLM server is unreachable. It may have crashed due to memory pressure or is currently restarting. Please wait a moment and try again. "
+                                    + UPSTREAM_ABORT_MARKER)
                 pretty_log("System Fault", "Upstream server unreachable", level="ERROR", icon=Icons.FAIL)
                 force_stop = True
                 return "break"
@@ -27025,7 +27337,7 @@ class GhostAgent:
                         # assistant tool_calls) is rejected by strict
                         # chat templates, turning a recoverable overflow
                         # into a hard failure.
-                        _rt_content = str(real_tool.get("content", ""))[:1000] + "\n... [EMERGENCY TRUNCATION] ..."
+                        _rt_content = _defuse_tool_text(str(real_tool.get("content", ""))[:1000]) + "\n... [EMERGENCY TRUNCATION] ..."
                         recovery_msgs.append({
                             "role": "user",
                             "content": (
@@ -27050,6 +27362,9 @@ class GhostAgent:
                         data = await self.context.llm_client.chat_completion(payload, use_coding=has_coding_intent)
                         if "choices" in data and len(data["choices"]) > 0:
                             msg = data["choices"][0]["message"]
+                            _raw_reply_empty = (not str(msg.get("content") or "")
+                                                and not msg.get("reasoning_content")
+                                                and not msg.get("tool_calls"))
                     except Exception as retry_e:
                         # Surface a calm, actionable message instead of a
                         # raw CRITICAL/traceback. The task state is intact;
@@ -27065,12 +27380,18 @@ class GhostAgent:
                         force_stop = True
                         return "break"
                 else:
-                    final_ai_content = f"CRITICAL: Upstream error {e.response.status_code}: {e.response.text}"
+                    # the raw upstream body (model paths, server internals)
+                    # stays in the log, not the reply (§4MD MINOR 8)
+                    logger.error("upstream HTTP %s: %s", e.response.status_code, e.response.text[:2000])
+                    final_ai_content = (f"CRITICAL: Upstream error {e.response.status_code} — the model server could "
+                                        f"not answer this time. Please try again in a moment. " + UPSTREAM_ABORT_MARKER)
                     pretty_log("System Fault", f"HTTP {e.response.status_code}", level="ERROR", icon=Icons.FAIL)
                     force_stop = True
                     return "break"
             except Exception as e:
-                final_ai_content = f"CRITICAL: An unexpected error occurred while communicating with the LLM: {str(e)}"
+                logger.error("LLM communication failed: %s: %s", type(e).__name__, e)
+                final_ai_content = (f"CRITICAL: An unexpected error occurred while communicating with the LLM "
+                                    f"({type(e).__name__}). Please try again in a moment. " + UPSTREAM_ABORT_MARKER)
                 pretty_log("System Fault", str(e), level="ERROR", icon=Icons.FAIL)
                 force_stop = True
                 return "break"
@@ -27567,6 +27888,31 @@ class GhostAgent:
                         return "continue"
 
                 # Conversational fallback removed for smarter models.
+                _ue = getattr(self, "_upstream_empty_by_req", None)
+                if not _raw_reply_empty and _ue:
+                    _ue.pop(req_id, None)        # only CONSECUTIVE empty replies count
+                if not clean_ui and _raw_reply_empty:
+                    # an EMPTY 200 is the SERVER (out of memory, restarting),
+                    # not the model: it ran the strike budget down and then
+                    # told the user to rephrase (§4MD M4). Transient, and the
+                    # second in a row ends the turn honestly.
+                    # per REQUEST (the turn state's transient count is
+                    # rebuilt every turn, so it never reached 2)
+                    if _ue is None:
+                        _ue = self._upstream_empty_by_req = {}
+                    _ue[req_id] = _ue.get(req_id, 0) + 1
+                    if len(_ue) > 256:
+                        _ue.pop(next(iter(_ue)))
+                    transient_failure_count += 1
+                    pretty_log("Upstream Empty", f"the model server returned an empty reply "
+                               f"({_ue[req_id]})", level="WARNING", icon=Icons.WARN)
+                    if _ue[req_id] >= 2:
+                        final_ai_content = ("CRITICAL: Upstream error — the model server returned empty replies "
+                                            "(it may be out of memory or restarting). Please try again in a moment. "
+                                            + UPSTREAM_ABORT_MARKER)
+                        force_stop = True
+                        return "break"
+                    return "continue"
                 if not clean_ui and not force_final_response and not is_final_generation:
                     pretty_log("Agent Parser", "Model stalled after thinking. Forcing retry.", level="WARNING", icon=Icons.WARN)
                     messages.append(msg)
@@ -28368,6 +28714,18 @@ class GhostAgent:
                 # `context.last_user_content`. Set BEFORE any tool
                 # dispatch path can run in this turn.
                 self.context.last_user_content = last_user_content
+                try:            # the user's own words, for content-provenance sinks (§4MB)
+                    from ..utils.provenance import note_user_message as _note_um
+                    _note_um(last_user_content, req_id)
+                except Exception:  # noqa: BLE001
+                    pass
+                # §4MF: a status question while work is live → a read-only answer
+                try:
+                    self.context._status_only_req = (
+                        req_id if (is_status_question(last_user_content) and has_live_work(self.context))
+                        else None)
+                except Exception:  # noqa: BLE001
+                    pass
                 # Extract the request's explicit constraints ONCE, up front.
                 # `_request_constraint_block` is re-rendered into the dynamic
                 # state every turn of this request, and the first successful
@@ -29699,18 +30057,19 @@ class GhostAgent:
                     # seconds are the report's — the same breaker shape as
                     # the reserved turn (tools off, the §4IG flag armed).
                     _remaining_s = _glog.request_remaining_s(str(req_id or ""))
-                    if deadline_needs_report(_remaining_s, DEADLINE_REPORT_FLOOR_S,
+                    if deadline_needs_report(_remaining_s,
+                                             effective_report_floor(_glog.request_deadline_s(str(req_id or ""))),
                                              force_final_response, force_stop):
                         force_final_response = True
                         _report_turn_forced = True
                         self.context._breaker_forced_final = True  # §4JP: a tool call on this final IS the no-answer
                         pretty_log("Client Deadline",
-                                   f"{_remaining_s:.0f}s remain before the client closes its connection — "
+                                   f"{_remaining_s:.0f}s remain in this request's time budget — "
                                    "reserved for the report, tools off",
                                    level="WARNING", icon=Icons.STOP)
                         messages.append({"role": "user", "content": blocker_report_alert(
                             "client deadline",
-                            f"the client will close its connection in about {int(max(0.0, _remaining_s))} seconds "
+                            f"this request's time runs out in about {int(max(0.0, _remaining_s))} seconds "
                             "and the task is not finished — say where the work stands and where the files are",
                             last_user_content)})
 
@@ -31007,7 +31366,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             # Translate tool results to a user message wrapped in <tool_response>
                             req_messages.append({
                                 "role": "user",
-                                "content": f"<tool_response name=\"{m.get('name', 'unknown')}\">\n{m.get('content')}\n</tool_response>"
+                                "content": _tool_row_as_user_text(m)
                             })
                         elif m.get("role") == "assistant":
                             req_messages.append({
@@ -32119,7 +32478,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         already = getattr(self.context, "_reflected_trajectory_ids", None)
         if already is not None:
             return already
-        already = set()
+        already = _OrderedIdSet()
         p = self._reflected_ids_path()
         if p is not None:
             try:
@@ -32127,10 +32486,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     import json as _json
                     data = _json.loads(p.read_text())
                     if isinstance(data, list):
-                        already = set(str(x) for x in data)
+                        already = _OrderedIdSet(str(x) for x in data)
             except Exception as e:
                 logger.debug("reflected-ids load failed: %s", e)
-                already = set()
+                already = _OrderedIdSet()
         self.context._reflected_trajectory_ids = already
         return already
 
@@ -32144,15 +32503,13 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         if p is None:
             return
         try:
-            ids = list(already)
+            ids = list(already)                 # insertion order: oldest first (§4MC MINOR 7)
             if len(ids) > cap:
                 ids = ids[-cap:]
-                self.context._reflected_trajectory_ids = set(ids)
-            import json as _json
+                self.context._reflected_trajectory_ids = _OrderedIdSet(ids)
+            from ..utils.json_store import write_json_atomic
             p.parent.mkdir(parents=True, exist_ok=True)
-            tmp = p.with_suffix(".json.tmp")
-            tmp.write_text(_json.dumps(ids))
-            tmp.replace(p)
+            write_json_atomic(p, ids, indent=None)
         except Exception as e:
             logger.debug("reflected-ids persist failed: %s", e)
 
@@ -33943,6 +34300,15 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             except Exception as _ff_exc:  # noqa: BLE001 — the retry must never cost the stream
                 logger.warning("streamed forced-final retry skipped: %s", _ff_exc)
                 _ff_retry_text = ""
+            if _ff_retry_text and not requester_is_member():
+                # the retry wrote `![…](/api/download/gen_1024x1024.png)` for an
+                # image that was never generated (§4ME F1) — the non-stream
+                # finalize drops such links; this answer is about to stream
+                _ff_retry_text, _ff_missing = _drop_missing_download_links(
+                    _ff_retry_text, getattr(self.context, "sandbox_dir", None))
+                if _ff_missing:
+                    pretty_log("Missing File Link", "the forced-final retry linked file(s) that do not exist: "
+                               + ", ".join(_ff_missing[:3]), level="WARNING", icon=Icons.WARN)
             if _ff_retry_text:
                 # §4IS: no separator when nothing visible went out before it —
                 # the retry's answer then OPENS the reply
@@ -33982,6 +34348,22 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             if _note_chunk is not None:
                 yield f"data: {json.dumps(_note_chunk)}\n\n".encode('utf-8')       # §4IS: no retry answer — the note stands alone
                 _note_chunk = None
+
+            # §4ME F1: a link the STREAM already delivered to a file that does
+            # not exist cannot be taken back — say so, after the answer
+            try:
+                if not requester_is_member():
+                    _, _st_missing = _drop_missing_download_links(
+                        full_content or "", getattr(self.context, "sandbox_dir", None))
+                    if _st_missing:
+                        _miss_note = ("\n\n⚠️ The link(s) above to " + ", ".join(f"`{n}`" for n in _st_missing[:3])
+                                      + " point to file(s) that do not exist — they were NOT created.")
+                        yield f"data: {json.dumps({'id': f'chatcmpl-{req_id}', 'object': 'chat.completion.chunk', 'created': created_time, 'model': stream_model, 'choices': [{'index': 0, 'delta': {'content': _miss_note}, 'finish_reason': None}]})}\n\n".encode('utf-8')
+                        full_content = (full_content or "") + _miss_note
+                        pretty_log("Missing File Link", "streamed reply linked file(s) that do not exist: "
+                                   + ", ".join(_st_missing[:3]), level="WARNING", icon=Icons.WARN)
+            except Exception as _ml_exc:  # noqa: BLE001
+                logger.debug("streamed missing-link check skipped: %s", _ml_exc)
 
             # §4LK: the unverified-write note, as finalize appends it — last,
             # before [DONE]; the record carries it and the failed label
@@ -34338,7 +34720,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 and self.context.args.smart_memory > 0.0
                                 and not forget_was_called
                                 and turn_may_teach(self.context)):     # R4: same gate as the non-streamed path
-                            await self._journal_append_safe('post_mortem', {'user': last_user_content, 'tools': stream_tools_snapshot, 'ai': _treated_content, 'model': stream_model})  # §4FV
+                            await self._journal_append_safe('post_mortem', {'user': last_user_content, 'tools': _tools_for_journal(stream_tools_snapshot), 'ai': _treated_content, 'model': stream_model})  # §4FV
                         if self.context.args.smart_memory > 0.0 and not forget_was_called:
                             # No verdict is available on the streamed path — the
                             # verifier runs as a LATE handler after the drain — so
@@ -34740,7 +35122,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 # signal was biased toward complex tasks and
                 # the pruner drifted accordingly.
                 sm = getattr(self.context, 'skill_memory', None)
-                await self._credit_turn_lessons(execution_failure_count, last_user_content)
+                await self._credit_turn_lessons(execution_failure_count, last_user_content,
+                                       final_text=_treated_content)
 
                 # Outcome-gated lesson feedback (streamed path): the verifier runs
                 # LATE here (trajectory recorded with verifier=None), so only a
@@ -35047,6 +35430,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 # loop uses, asked of a stored row.
                 _ok = not _action_failed(_raw, str(t.get("name") or ""))
                 _name = t.get("name", "unknown")
+                # an episode is replayed into later prompts and mined into
+                # lessons: a page's text is never stored as a result (§4MB)
+                if _ok and _postmortem_tool_line(t).startswith("(ok — content from outside"):
+                    content = "(ok — content from outside, not stored)"
                 actions.append({
                     "tool": _name,
                     "args": {},  # post_mortem entries keep result, not args
@@ -35591,6 +35978,17 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 level=("WARNING" if (_state == "failed"
                                      or _state.startswith("partial")
                                      or budget_exhausted) else "INFO"))
+            # Resident memory over uptime, one file line per turn (§4MC): no
+            # RSS history existed, so a slow in-process leak was invisible
+            # behind daily restarts.
+            try:
+                import psutil as _ps
+                _pr = _ps.Process()
+                logger.info("turn resources rss_mb=%d uptime_s=%d req=%s",
+                            _pr.memory_info().rss // (1024 * 1024),
+                            int(time.time() - _pr.create_time()), req_id)
+            except Exception:  # noqa: BLE001
+                pass
             # §LOG-3 (2026-08-20): the turn's single most important artifact
             # never reached the log — the operator watched minutes of
             # reasoning and never saw what was SAID. Console shows the head
@@ -36137,6 +36535,20 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     f"{type(e).__name__}: {str(e)[:200]}",
                     level="WARNING", icon=Icons.WARN,
                 )
+
+        # §4MF — the CORRECTNESS shadow on the same declined turns: is
+        # anything in the answer wrong? Shadow-only, off-main, never raises.
+        try:
+            if knowledge_shadow_eligible(self.context, traj):
+                asyncio.get_running_loop()
+                from . import knowledge_shadow as _ks_mod
+                _glog.spawn_bg(_ks_mod.check_and_record(
+                    str(traj.user_request or ""), str(traj.final_response or ""),
+                    getattr(self.context, "llm_client", None),
+                    trajectory_id=str(traj.id or ""), req_id=str(req_id or "")),
+                    name="knowledge-shadow")
+        except Exception as e:  # noqa: BLE001
+            logger.debug("knowledge shadow not scheduled: %s", e)
 
         # Stage-1 self-improvement: cache the just-recorded trajectory
         # keyed by its response fingerprint so the NEXT user message's

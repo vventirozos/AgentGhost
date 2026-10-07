@@ -1,3 +1,4 @@
+from ..utils.json_store import open_append  # torn-tail-safe JSONL appends (§4MF)
 import sqlite3
 import threading
 import difflib
@@ -348,7 +349,7 @@ class GraphMemory:
         try:
             path = Path(self.db_path).parent / self._ARCHIVE_FILENAME
             ts = _time.time()
-            with open(path, "a", encoding="utf-8") as fh:
+            with open_append(path) as fh:
                 for row in rows:
                     rec = {"archived_at": ts, "reason": reason,
                            "subject": row[0], "predicate": row[1],
@@ -630,6 +631,89 @@ class GraphMemory:
         if doomed:
             self._invalidate_node_cache()
         return len(doomed), [(r[1], r[2], r[3]) for r in kept]
+
+    #: generic subjects the extractor files per-project facts under
+    #: (`project HAS_ID 7b62e5e533d1`, `project HAS_TITLE <title>`)
+    _PROJECT_GENERIC_NODES = {"project", "projects", "the project"}
+
+    @staticmethod
+    def project_title_key(title) -> str:
+        """The one title comparison `forget_project` and its caller share:
+        folded (case + accents), hyphen/underscore as space, whitespace
+        collapsed. Review: the caller's `.lower()` check and this `_fold`
+        disagreed on "Café"/"Cafe", so a twin's title edge was deleted."""
+        return " ".join(re.sub(r"[-_]+", " ", _fold(title)).split())
+
+    def forget_project(self, project_id: str, title: str = "",
+                       forget_title: bool = True) -> int:
+        """A hard-deleted project's graph leg: delete every edge (current AND
+        expired, archived first) that names the project. Live 2cb40b10: after
+        the user deleted projects, `user RESUMES project 7b62e5e533d1` and
+        `project 7b62e5e533d1 TESTED 4-layer recursive cascade` kept telling
+        the model "the user runs this experiment as a project", and it built
+        one again.
+
+        Matches a node holding ``project_id`` as a whole token (the tool's
+        `project:<id>`, the extractor's `project <id>`, a bare id under
+        `project HAS_ID`) and the `task:<tid>` nodes the project owned. When
+        ``forget_title`` (the caller passes False while another project still
+        has that title) it also matches the generic `project HAS_TITLE <title>`
+        edge and the node NAMED by the title — the extractor's main shape
+        (`ai self awareness exploration TESTED self-awareness emergence`
+        survived the first version). The title node is matched only for a
+        title of two or more words: a one-word title ("Chess") is also a
+        topic the owner talks about. On that node an owner life fact (see
+        `_is_owner_life_fact`) is kept. Shared concept nodes
+        (`technique:bayesian`) lose only this project's edge. If the archive
+        write fails the rows are soft-expired (recoverable), as
+        `delete_by_target` does. Returns the number of rows removed."""
+        pid = str(project_id or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{8,}", pid):
+            return 0
+        id_re = re.compile(rf"(?<![0-9a-z]){re.escape(pid)}(?![0-9a-z])")
+        key = self.project_title_key
+        title_k = key(title) if forget_title else ""
+        node_k = title_k if len(title_k.split()) >= 2 else ""
+        cols = "rowid, subject, predicate, object, COALESCE(weight, 1), timestamp"
+        with self._lock:
+            with sqlite3.connect(self.db_path) as conn:
+                rows = conn.execute(f"SELECT {cols} FROM triplets").fetchall()
+                names = lambda r: id_re.search(_fold(r[1])) or id_re.search(_fold(r[3]))
+                own = [r for r in rows if names(r)]
+                tasks = {_fold(r[3]).strip() for r in own
+                         if str(r[2]).upper() == "HAS_TASK"
+                         and _fold(r[3]).strip().startswith("task:")}
+
+                def titled(r):
+                    if not title_k:
+                        return False
+                    if (str(r[2]).upper() == "HAS_TITLE"
+                            and _fold(r[1]).strip() in self._PROJECT_GENERIC_NODES
+                            and key(r[3]) == title_k):
+                        return True
+                    return bool(node_k) and node_k in (key(r[1]), key(r[3])) \
+                        and not self._is_owner_life_fact(r[1], r[2], r[3])
+
+                doomed = [r for r in rows if names(r)
+                          or _fold(r[1]).strip() in tasks or _fold(r[3]).strip() in tasks
+                          or titled(r)]
+                if not doomed:
+                    return 0
+                if self._archive_rows("forget_project", [r[1:] for r in doomed]):
+                    conn.executemany("DELETE FROM triplets WHERE rowid = ?", [(r[0],) for r in doomed])
+                else:
+                    import time as _time
+                    logger.warning("graph forget_project %s: archive failed — soft-expiring "
+                                   "%d row(s) instead of deleting", pid, len(doomed))
+                    now = _time.time()
+                    conn.executemany(
+                        "UPDATE triplets SET valid_until = COALESCE(valid_until, ?) WHERE rowid = ?",
+                        [(now, r[0]) for r in doomed])
+                conn.commit()
+            for r in doomed:
+                self._remove_edge(r[1], r[2], r[3])
+        self._invalidate_node_cache()
+        return len(doomed)
 
     def delete_by_target(self, target: str) -> int:
         if not target or len(target.strip()) < 3:

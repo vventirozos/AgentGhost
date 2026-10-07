@@ -1039,7 +1039,10 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
     # `EXIT CODE:\s*(\d+)` and must keep working.
     def _format_error(msg, hint=None, exit_code=1, elapsed_s=None):
         _code_note = ""
-        if _kill_is_oom(exit_code, elapsed_s):
+        # the sandbox layer already said the CONTAINER died (§4MD M10): the
+        # OOM advice ("reduce peak memory") would send the model to rewrite
+        # correct code
+        if _kill_is_oom(exit_code, elapsed_s) and not str(msg or "").lstrip().startswith("[SANDBOX INFRA ERROR]"):
             # §4HZ: a 137 this far under the budget is the OOM killer. Say
             # so — and say "memory", because the timeout advice (fewer
             # iterations, checkpoint) does nothing for a peak-memory kill.

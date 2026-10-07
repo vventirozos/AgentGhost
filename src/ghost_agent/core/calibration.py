@@ -41,6 +41,7 @@ Design non-negotiables (same as every other Stage-1 module):
 
 from __future__ import annotations
 
+from ..utils.json_store import open_append  # torn-tail-safe JSONL appends (§4MF)
 import datetime
 import json
 import logging
@@ -57,8 +58,8 @@ logger = logging.getLogger("GhostAgent")
 SCHEMA_VERSION = "ghost.calibration.v1"
 
 # ── Corpus EPOCH ──────────────────────────────────────────────────────
-# The history is append-only and `DEFAULT_MAX_HISTORY` exceeds it, so every
-# refit pools the entire corpus. That is only valid while the label scheme
+# The history is append-only and `DEFAULT_MAX_HISTORY` exceeds it (§4MC: kept
+# so — raised to 20000), so every refit pools the entire corpus. That is only valid while the label scheme
 # and the feature set hold still — and they have not.
 #
 # Measured 2026-08-02 on 1709 live samples, the pooled fit was structurally
@@ -1498,7 +1499,12 @@ class CalibrationTracker:
     # Defaults mirror the prm.trainer bail floors — below these a fit is
     # noise. Both classes (success AND failure) must also be present.
     DEFAULT_MIN_SAMPLES = 40
-    DEFAULT_MAX_HISTORY = 4000
+    # The epoch (above) is what bounds the fit population; this cap is only a
+    # safety net. At 4000 it had silently become a SLIDING window — the
+    # history passed 4,401 rows around 2026-09-30, and every refit since
+    # dropped the oldest post-epoch rows while the comment above said the
+    # whole corpus pools (§4MC MINOR 6). ~48 rows/day: 20000 ≈ a year.
+    DEFAULT_MAX_HISTORY = 20000
 
     def __init__(
         self,
@@ -1569,7 +1575,7 @@ class CalibrationTracker:
             )
             with self._lock:
                 self.dir.mkdir(parents=True, exist_ok=True)
-                with self.history_path.open("a", encoding="utf-8") as fh:
+                with open_append(self.history_path) as fh:
                     fh.write(json.dumps(asdict(sample)) + "\n")
             return True
         except Exception as exc:  # pragma: no cover — defensive

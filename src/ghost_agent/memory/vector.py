@@ -273,6 +273,12 @@ class MemoryWriteRefused(RuntimeError):
     """
 
 
+#: row types ambient recall never serves: document content (§4LT M5) and the
+#: summary of a request that read outside content (§4MB) — both can carry a
+#: planted "NOTE TO THE AI". Explicit recall / knowledge_base still reach them.
+AMBIENT_EXCLUDED_TYPES = ["document", "document_summary", "episode_outside"]
+
+
 class VectorMemory:
     # Bounded growth for the open-ended tiers. Entries the agent accretes
     # turn after turn — `auto` / `manual`, plus `synthesis` (dream
@@ -702,9 +708,8 @@ class VectorMemory:
                     # actually droppable.
                     data = [d for d in data if str(d) != filename]
 
-                tmp = self.library_file.with_suffix(self.library_file.suffix + ".tmp")
-                tmp.write_text(json.dumps(data))
-                os.replace(tmp, self.library_file)
+                from ..utils.json_store import write_json_atomic      # unique tmp + fsync (§4MD)
+                write_json_atomic(self.library_file, data, indent=None)
                 # Did it LAND? This method swallows every failure it meets
                 # (that is deliberate — a catalogue write must never sink an
                 # ingest), and the reconciler's drop arm appended the name to
@@ -1478,6 +1483,20 @@ class VectorMemory:
             logger.error(f"Ingest failed: {e}")
             return False, str(e)
 
+    def rollback_partial_document(self, filename: str) -> None:
+        """Remove a document an ingest wrote PART of (§4MD M13: the chunks
+        already stored stayed, the dream reconcile adopted the name into the
+        catalogue, and a retry said "already ingested" while queries answered
+        from 25 of 60 chunks). The PDF path always did this; every ingest
+        caller now does. Never raises — the original failure is the one to
+        report."""
+        try:
+            _del = getattr(self, "delete_document_by_name", None)
+            if callable(_del):
+                _del(filename)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("rollback of partial document %s failed: %s", filename, e)
+
     def bump_retrievals(self, ids: list):
         """Public, deduplicating wrapper around `_bump_retrieval_stats`.
 
@@ -1700,7 +1719,7 @@ class VectorMemory:
                     results = self.collection.query(
                         query_texts=search_queries,
                         n_results=30,
-                        where={"type": {"$nin": ["document", "document_summary"]}},
+                        where={"type": {"$nin": AMBIENT_EXCLUDED_TYPES}},
                     )
 
                 candidates = []
@@ -1920,7 +1939,8 @@ class VectorMemory:
         ``pg_stat_activity`` — are exactly what embeddings blur), then the
         top-k are returned newest-first-agnostic, in rank order.
 
-        Returns a list of ``{"text", "id", "score"}``; empty on any failure.
+        Returns a list of ``{"text", "id", "score"}``; RAISES when the store
+        fails (§4MD M14: an empty list read as "no passages found").
         """
         if not (filename or "").strip() or not (question or "").strip():
             return []
@@ -1947,8 +1967,11 @@ class VectorMemory:
                         where={"source": filename},
                     )
         except Exception as e:
+            # RAISE: an empty list read as "No passages found… try rephrasing"
+            # while the store was failing (§4MD M14); the tool's own except
+            # reports the failure
             logger.warning("search_document(%s) failed: %s", filename, e)
-            return []
+            raise
 
         docs = (res.get("documents") or [[]])[0]
         dists = (res.get("distances") or [[]])[0]

@@ -1,3 +1,4 @@
+from ..utils.json_store import open_append  # torn-tail-safe JSONL appends (§4MF)
 import json
 import logging
 import math
@@ -2676,7 +2677,7 @@ class SkillMemory:
                     arch.replace(arch.with_suffix(f".jsonl.{_n}"))
             except OSError:
                 pass
-            with arch.open("a", encoding="utf-8") as fh:
+            with open_append(arch) as fh:
                 for lesson in lessons:
                     fh.write(_json.dumps(
                         {"pruned_at": datetime.now().isoformat(),

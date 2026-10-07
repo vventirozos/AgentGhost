@@ -37,7 +37,7 @@ from tests.helpers import FakeBgTasks, make_context
 def test_report_is_forced_only_inside_the_floor_on_a_running_request():
     assert deadline_needs_report(120.0, DEADLINE_REPORT_FLOOR_S, False, False) is True
     assert deadline_needs_report(DEADLINE_REPORT_FLOOR_S, DEADLINE_REPORT_FLOOR_S, False, False) is True
-    assert deadline_needs_report(151.0, DEADLINE_REPORT_FLOOR_S, False, False) is False
+    assert deadline_needs_report(DEADLINE_REPORT_FLOOR_S + 1, DEADLINE_REPORT_FLOOR_S, False, False) is False
     assert deadline_needs_report(None, DEADLINE_REPORT_FLOOR_S, False, False) is False       # no deadline known
     assert deadline_needs_report(10.0, DEADLINE_REPORT_FLOOR_S, True, False) is False        # already forced
     assert deadline_needs_report(10.0, DEADLINE_REPORT_FLOOR_S, False, True) is False        # stopping anyway
@@ -61,13 +61,17 @@ def test_a_wait_that_ends_inside_the_floor_is_refused():
     assert wait_crosses_deadline(0.0, 10.0, DEADLINE_REPORT_FLOOR_S) is False      # nothing declared
 
 
-def test_remaining_time_is_deadline_minus_elapsed_and_none_without_a_deadline():
+def test_remaining_time_is_deadline_minus_elapsed_and_none_without_a_deadline(monkeypatch):
     rid = "dl-test-" + str(int(time.time() * 1000))
     tok = glog.request_id_context.set(rid)
     try:
         glog.pretty_log("request started", "x", special_marker="BEGIN", origin="user")
         glog.client_deadline_context.set(0.0)
+        monkeypatch.setenv("GHOST_MAX_REQUEST_S", "0")          # no server cap either
         assert glog.request_remaining_s(rid) is None
+        monkeypatch.setenv("GHOST_MAX_REQUEST_S", "1200")       # §4MF: the server cap applies
+        r0 = glog.request_remaining_s(rid)
+        assert r0 is not None and 1195.0 < r0 <= 1200.0
         glog.client_deadline_context.set(1800.0)
         r = glog.request_remaining_s(rid)
         assert r is not None and 1795.0 < r <= 1800.0
@@ -128,7 +132,7 @@ async def test_inside_the_floor_the_next_turn_is_the_report_with_tools_off(monke
     out, _, _ = await agent.handle_chat({"messages": [{"role": "user", "content": "investigate the revolut breach"}]}, FakeBgTasks())
     text = "\n".join(str(m.get("content")) for p in _payloads(ctx) for m in p)
     assert "SYSTEM ALERT (client deadline)" in text, "the deadline report alert never reached the model"
-    assert "close its connection in about 100 seconds" in text
+    assert "time runs out in about 100 seconds" in text
     assert search.await_count == 1                                            # the second search never ran
     assert "Reuters confirming the breach" in out
 
@@ -149,10 +153,10 @@ async def test_without_a_deadline_the_loop_is_untouched(monkeypatch):
 
 
 async def test_a_long_wait_is_refused_before_it_runs_and_is_not_a_strike(monkeypatch):
-    """Remaining 200 s, floor 150: a 60 s browser sleep would end inside
+    """Remaining 330 s, floor 300 (§4ME): a 60 s browser sleep would end inside
     the floor → refused with the deadline note, the browser never runs,
     the model answers on the next turn; no failure strike is recorded."""
-    monkeypatch.setattr(glog, "request_remaining_s", lambda rid: 200.0)
+    monkeypatch.setattr(glog, "request_remaining_s", lambda rid: 330.0)
     browser = AsyncMock(return_value="--- BROWSER RESULT ---\nSTATUS: OK")
     agent, ctx = _agent(monkeypatch, [
         _resp("Let me wait for the render.", [_tc("c0", "browser", {"operation": "interact",
@@ -165,7 +169,7 @@ async def test_a_long_wait_is_refused_before_it_runs_and_is_not_a_strike(monkeyp
     # the synthetic tool message rides inside the volatile state block the
     # loop wraps around the last messages — search every message's text
     text = "\n".join(str(m.get("content")) for p in _payloads(ctx) for m in p)
-    assert "SYSTEM PREFLIGHT — deadline" in text and "60 s wait" in text and "about 200 s" in text
+    assert "SYSTEM PREFLIGHT — deadline" in text and "60 s wait" in text and "about 330 s" in text
     assert "served at" in out
 
 

@@ -71,6 +71,41 @@ _APT_NO_DROP_SH = ("mkdir -p /etc/apt/apt.conf.d && "
                    "echo APT::Sandbox::User root\\; > /etc/apt/apt.conf.d/99ghost-no-privdrop")
 APT_NO_DROP_CMD = "sh -c " + shlex.quote(_APT_NO_DROP_SH)
 
+#: §4MF: an `rm` that refuses to remove a whole project, the projects or
+#: uploads folder, or the workspace itself — `rm -rf /workspace/projects/<id>`
+#: was the one-command delete around manage_projects' preview→confirm. It sits
+#: first on PATH (/usr/local/bin) and hands every other call to /bin/rm
+#: unchanged. A guard against a mistaken or content-steered command, not
+#: against code that sets out to delete (`/bin/rm`, shutil.rmtree).
+SAFE_RM_SH = r"""#!/bin/sh
+# Ghost sandbox: a whole project / projects / uploads / the workspace is
+# deleted through manage_projects (it previews and asks the user), never rm.
+# Case-insensitive (the macOS bind mount is), symlinks not followed (removing
+# a link is fine), and only paths under /workspace are examined.
+here=$(pwd | tr 'A-Z' 'a-z')
+endopts=0
+for a in "$@"; do
+  if [ "$endopts" = 0 ] && [ "$a" = "--" ]; then endopts=1; continue; fi
+  if [ "$endopts" = 0 ] && [ "${a#-}" != "$a" ]; then continue; fi
+  case "$a" in
+    /*) case "$(printf '%s' "$a" | tr 'A-Z' 'a-z')" in /workspace*) ;; *) continue ;; esac ;;
+    *)  case "$here" in /workspace*) ;; *) continue ;; esac ;;
+  esac
+  p=$(realpath -m -s -- "$a" 2>/dev/null || printf '%s' "$a")
+  lp=$(printf '%s' "$p" | tr 'A-Z' 'a-z')
+  case "$lp" in
+    /workspace|/workspace/|/workspace/projects|/workspace/uploads|/workspace/projects/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+      echo "rm: refusing to remove '$a' — a whole project, projects/, uploads/ or the workspace is deleted with manage_projects (it shows the user a preview and asks). Nothing was removed." >&2
+      exit 1 ;;
+  esac
+done
+exec /bin/rm "$@"
+"""
+import base64 as _b64
+SAFE_RM_INSTALL_CMD = "sh -c " + shlex.quote(
+    "echo " + _b64.b64encode(SAFE_RM_SH.encode()).decode()
+    + " | base64 -d > /usr/local/bin/rm && chmod 755 /usr/local/bin/rm && echo installed")
+
 #: The everyday CLI set added in provisioning marker v10 (§4KG): apt package
 #: names, and the binaries that PROVE they landed (the marker is written only
 #: after every one answers `command -v`). Three copies must agree — the v10
@@ -194,6 +229,62 @@ class SandboxDaemonTimeout(Exception):
     """A container exec exceeded its CLIENT-SIDE deadline — the docker daemon
     is likely wedged. Raised instead of blocking forever so the caller
     releases self._lock and the agent surfaces a clear error."""
+
+
+def _docker_ts(value: str) -> float:
+    """Epoch seconds of a Docker RFC3339 time ("2026-10-07T11:02:03.12345Z",
+    nanoseconds, "+03:00"). Python 3.10's fromisoformat takes only 3 or 6
+    fractional digits, and Docker trims trailing zeros (§4MD review). 0.0
+    when empty or unreadable."""
+    import re as _re
+    from datetime import datetime, timedelta, timezone
+    m = _re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})?$", value.strip())
+    if not m:
+        return 0.0
+    base = datetime.fromisoformat(m.group(1))
+    frac = float("0." + m.group(2)) if m.group(2) else 0.0
+    tz = m.group(3) or "Z"
+    if tz == "Z":
+        off = timedelta(0)
+    else:
+        sign = 1 if tz[0] == "+" else -1
+        off = sign * timedelta(hours=int(tz[1:3]), minutes=int(tz[4:6]))
+    return base.replace(tzinfo=timezone(off)).timestamp() + frac
+
+
+def _settle_readiness_after_exec(self, exit_code, output, t0: float):
+    """Readiness bookkeeping after an exec, and the output to return.
+    Exit 126/127/128 are the OCI-level codes a deleted/recreated mount
+    inode produces — re-probe. A 137 from a container that DIED or
+    restarted under the command is not the OOM killer on the process and
+    not the model's code (§4MD M10: it was told "reduce PEAK MEMORY", and
+    the dead container was stamped ready for the TTL). Anything else
+    confirms readiness."""
+    if exit_code in (126, 127, 128):
+        self.invalidate_ready()
+    elif exit_code == 137 and _container_died_since(self, t0):
+        self.invalidate_ready()
+        output = ("[SANDBOX INFRA ERROR] the sandbox container stopped or restarted while this "
+                  "command ran (exit 137 here is the container dying, not your code or its "
+                  "memory). It is restarted on the next command; re-run it.\n" + (output or ""))
+    else:
+        self.mark_ready()
+    return output
+
+def _container_died_since(self, t0: float) -> bool:
+    """Is the container stopped, gone, or (re)started after ``t0``?"""
+    c = getattr(self, "container", None)
+    if c is None:
+        return True
+    try:
+        c.reload()
+        state = (c.attrs or {}).get("State") or {}
+        if str(c.status) != "running":
+            return True
+        ts = _docker_ts(str(state.get("StartedAt") or ""))
+        return ts > t0 - 1.0
+    except Exception:  # noqa: BLE001 — cannot inspect it: treat as dead, a re-probe is cheap
+        return True
 
 
 class DockerSandbox:
@@ -660,7 +751,14 @@ class DockerSandbox:
         # Reproduced. All this line ever needed to do is decline the TTL
         # short-circuit so the real path below runs.
         if not self._cut_off and self._ready_is_fresh():
-            return
+            # …unless the container RESTARTED inside the TTL: a command there
+            # ran with no Tor rules and its mark_ready() extended the window
+            # (§4MD review of the C1 fix). One inspect per command.
+            _g = (self._container_generation()
+                  if getattr(self, "_egress_generation", None) is not None else None)
+            if _g is None or _g == self._egress_generation:
+                return
+            self.invalidate_ready()
 
         # Track whether this call did any actual work. Most invocations are
         # no-ops (the container is already up and provisioned) and must stay
@@ -1551,11 +1649,44 @@ class DockerSandbox:
         path that starts a container to do the same. Cheap and idempotent
         when the generation has already been enforced.
         """
+        # A container RESTARTED IN PLACE (docker restart, the daemon's restart
+        # policy, an OOM restart) keeps its id and passes the readiness probe,
+        # so no generation boundary above ever fired: the new run had no
+        # GHOST_TOR rules and no Tor, sandbox code reached the internet with
+        # the host's address, and the state still read "enforced" (§4MD C1).
+        # The generation is the container id AND its StartedAt.
+        gen = self._container_generation()
+        if gen is not None:
+            # unknown-but-attempted counts as changed: a re-apply is idempotent
+            if gen != self._egress_generation and (self._egress_generation is not None
+                                                   or self._tor_attempted):
+                pretty_log("Sandbox Egress",
+                           "the sandbox container restarted in place — re-applying Tor-only egress",
+                           level="WARNING", icon=Icons.WARN)
+                self._tor_attempted = False
+                self._privilege_checked = False
+                self._set_egress_state("")
+            self._egress_generation = gen
         self._settle_privileges_once()
         if not self.tor_proxy or self._tor_attempted:
             return
         self._tor_attempted = True
         self._enforce_tor_egress()
+
+    #: (container id, StartedAt) egress was last enforced for (§4MD C1)
+    _egress_generation = None
+
+    def _container_generation(self):
+        """(id, StartedAt) of the current container, or None if unreadable."""
+        c = getattr(self, "container", None)
+        if c is None:
+            return None
+        try:
+            c.reload()
+            started = ((c.attrs or {}).get("State") or {}).get("StartedAt")
+            return (str(c.id), str(started or ""))
+        except Exception:  # noqa: BLE001
+            return None
 
     #: Intended create-time privilege set (§4KF), used to REPORT drift on a
     #: container this process adopted rather than created.
@@ -1619,6 +1750,12 @@ class DockerSandbox:
             self._exec_run(APT_NO_DROP_CMD, user="root")     # §4LO: apt needs no SETUID
         except Exception as exc:  # noqa: BLE001
             logger.debug("apt no-privdrop config skipped: %s", exc)
+        try:
+            _rc, _rout = self._exec_run(SAFE_RM_INSTALL_CMD, user="root")  # §4MF: no rm -rf of a whole project
+            if _rc != 0 or b"installed" not in (_rout or b""):
+                logger.warning("sandbox rm guard NOT installed (exit %s): whole-project rm is unguarded", _rc)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("sandbox rm guard NOT installed: %s", exc)
         try:
             code, out = self._exec_run(
                 "sh -c " + shlex.quote(
@@ -1985,6 +2122,7 @@ class DockerSandbox:
         """Shared body of execute / execute_promotable → ``(output,
         exit_code, job_entry_or_None)``. ``job_entry`` is always None on the
         classic path."""
+        _exec_t0 = time.time()               # §4MD M10: did the container die DURING this exec?
         # Per-manager command ceiling (see `max_exec_timeout`). FIRST, so
         # every caller is clamped regardless of what it passed.
         _cap = getattr(self, "max_exec_timeout", None)
@@ -2168,11 +2306,7 @@ class DockerSandbox:
             # readiness. Exit 126/127/128 are the OCI-level codes that a
             # deleted/recreated mount inode produces, so those INVALIDATE
             # instead — forcing a full reprobe (and reprovision) next call.
-            if exit_code in (126, 127, 128):
-                self.invalidate_ready()
-            else:
-                self.mark_ready()
-
+            output = _settle_readiness_after_exec(self, exit_code, output, _exec_t0)
             return output, exit_code, job_entry
 
         except Exception as e:

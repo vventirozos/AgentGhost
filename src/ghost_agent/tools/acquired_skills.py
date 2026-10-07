@@ -823,6 +823,12 @@ async def tool_create_skill(sandbox_dir: Path = None, memory_dir: Path = None, m
         # through this function, and must keep doing so
         from .outcome import ToolOutcome as _TO
         return _TO.rejected("Error: a probe request does not create skills — nothing changed. STOP: do not retry this in this turn.", world_changed=False, reason_code="not_owner_write")
+    # a skill is code + a description rendered into EVERY later turn's tool
+    # list: never from a request whose content came from outside (§4MB)
+    from ..utils.provenance import refuse_if_untrusted
+    _ref = refuse_if_untrusted("the skill")
+    if _ref is not None:
+        return _ref
     # Tolerate stray kwargs the LLM sometimes invents (observed: `filename`
     # when the model confuses this tool with `execute`). Without this
     # catch-all the registry's `**kwargs` pass-through would raise a

@@ -1673,6 +1673,9 @@ def make_composed_skill_runner(skill_name: str, registry: "ComposedSkillRegistry
         result = await registry.execute(skill_name, executor, params=kwargs)
         return _format_execution_result(skill_name, result)
 
+    _run._ghost_opaque = True       # its output is unvetted content (§4MB provenance)
+    from ..utils.provenance import register_opaque
+    register_opaque(skill_name)
     return _run
 
 
@@ -1835,6 +1838,12 @@ async def tool_manage_composed_skills(context=None, action: str = None,
             world_changed=False, reason_code="not_owner_write")
 
     if action == "approve":
+        # a macro is a standing tool: never defined or activated from a
+        # request whose content came from outside (§4MB)
+        from ..utils.provenance import refuse_if_untrusted
+        _ref = refuse_if_untrusted("the macro")
+        if _ref is not None:
+            return _ref
         if not name:
             return "Error: 'name' is required for approve."
         if name not in reg.skills:
@@ -1916,6 +1925,12 @@ async def tool_manage_composed_skills(context=None, action: str = None,
         return f"Success: composed skill '{name}' deleted."
 
     if action == "define":
+        # a macro is a standing tool: never defined or activated from a
+        # request whose content came from outside (§4MB)
+        from ..utils.provenance import refuse_if_untrusted
+        _ref = refuse_if_untrusted("the macro")
+        if _ref is not None:
+            return _ref
         if not name or not description or not steps:
             return ("SYSTEM ERROR: 'name', 'description', and 'steps' are "
                     "MANDATORY for define.")

@@ -177,8 +177,10 @@ def test_reply_carries_abort_marker(text, marked):
 
 
 def test_thumbs_ask_is_skipped_on_aborted_replies():
-    """The append `final_ai_content = f"{final_ai_content}{_ask}"` is
-    guarded by `not reply_carries_abort_marker(final_ai_content)`."""
+    """The append `final_ai_content = f"{final_ai_content}{_ask}"` is guarded
+    by `thumb_ask_fits(final_ai_content, _ask)` (§4MF: one helper for the
+    abort-marker and budget-exhausted rules), and that helper refuses an
+    aborted reply."""
     hits = []
     for n in ast.walk(_TREE):
         if isinstance(n, ast.If):
@@ -188,9 +190,8 @@ def test_thumbs_ask_is_skipped_on_aborted_replies():
                         and getattr(st.targets[0], "id", "") == "final_ai_content"):
                     hits.append(n)
     assert len(hits) == 1
-    t = hits[0].test
-    guards = [u for u in ast.walk(t) if isinstance(u, ast.UnaryOp) and isinstance(u.op, ast.Not)
-              and isinstance(u.operand, ast.Call)
-              and getattr(u.operand.func, "id", "") == "reply_carries_abort_marker"]
-    assert len(guards) == 1
-    assert getattr(guards[0].operand.args[0], "id", "") == "final_ai_content"
+    calls = [u for u in ast.walk(hits[0].test) if isinstance(u, ast.Call)
+             and getattr(u.func, "id", "") == "thumb_ask_fits"]
+    assert len(calls) == 1 and getattr(calls[0].args[0], "id", "") == "final_ai_content"
+    from ghost_agent.core.agent import thumb_ask_fits
+    assert not thumb_ask_fits("notes [ATTEMPT_ABORTED_STRIKE_CAP] hit a limit", "\n\n*ask*")

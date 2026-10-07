@@ -16,11 +16,13 @@ continues; a failed trajectory write must never break a user request.
 
 from __future__ import annotations
 
+from ..utils.json_store import open_append  # torn-tail-safe JSONL appends (§4MF)
 import datetime
 import hashlib
 import json
 import logging
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Iterable, Iterator, List, Optional
@@ -189,7 +191,7 @@ class TrajectoryCollector:
                                      day=Path(row_path).parent.name if row_path else None)
             with self._lock:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                with path.open("a", encoding="utf-8") as f:
+                with open_append(path) as f:
                     f.write("\n".join(rows) + "\n")
             return len(rows)
         except Exception as e:  # noqa: BLE001 — secondary to the turn
@@ -370,7 +372,7 @@ class TrajectoryCollector:
                             latest.get("outcome"), _new_src,
                             record["outcome"])
                 path.parent.mkdir(parents=True, exist_ok=True)
-                with path.open("a", encoding="utf-8") as f:
+                with open_append(path) as f:
                     import json as _json
                     f.write(_json.dumps(record, ensure_ascii=False))
                     f.write("\n")
@@ -418,7 +420,7 @@ class TrajectoryCollector:
             path = self._withheld_path()
             path.parent.mkdir(parents=True, exist_ok=True)
             with self._lock:
-                with path.open("a", encoding="utf-8") as f:
+                with open_append(path) as f:
                     f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             return True
         except Exception as exc:  # noqa: BLE001 — a measurement must never break a turn
@@ -668,12 +670,47 @@ class TrajectoryCollector:
     # Read path
     # -----------------------------------------------------------------
 
+    def _line_sources(self, day_dirs, include_archive: bool):
+        """(session file name, text stream) for every session file: the
+        ARCHIVED days first (`archive/<day>.tar.gz`, oldest first), then the
+        live day partitions. A cumulative reader — experiment verdicts,
+        lifetime counts — passes ``include_archive`` so the 90-day archive
+        (§4MF) does not silently shrink its evidence (review)."""
+        import io
+        import tarfile
+        if include_archive:
+            arch = self.root / "archive"
+            if arch.is_dir():
+                for tgz in sorted(arch.glob("*.tar.gz")):
+                    try:
+                        with tarfile.open(tgz, "r:gz") as tf:
+                            for m in sorted(tf.getmembers(), key=lambda x: x.name):
+                                base = m.name.rsplit("/", 1)[-1]
+                                if not (m.isfile() and base.startswith("session-") and base.endswith(".jsonl")):
+                                    continue
+                                fh = tf.extractfile(m)
+                                if fh is None:
+                                    continue
+                                yield base, io.TextIOWrapper(fh, encoding="utf-8")
+                    except (OSError, tarfile.TarError) as e:
+                        logger.warning("trajectory archive %s unreadable: %s", tgz.name, e)
+        for d in day_dirs:
+            if not (d.exists() and re.fullmatch(r"\d{4}-\d{2}-\d{2}", d.name)):
+                continue
+            for file_path in sorted(d.glob("session-*.jsonl")):
+                try:
+                    yield file_path.name, file_path.open("r", encoding="utf-8")
+                except OSError:
+                    continue
+
     def iter_trajectories(
         self,
         *,
         day: Optional[str] = None,
         session_id: Optional[str] = None,
         include_probes: bool = False,
+        since_days: Optional[float] = None,
+        include_archive: bool = False,
     ) -> Iterator[Trajectory]:
         """Stream trajectories from disk, overlaying outcome
         corrections from the sidecar.
@@ -710,15 +747,29 @@ class TrajectoryCollector:
             if not self.root.exists():
                 return
             day_dirs = sorted([p for p in self.root.iterdir() if p.is_dir()])
+            if since_days is not None:
+                # only the recent day partitions (§4MC MAJOR 2): readers that
+                # want "recent" materialised the WHOLE corpus every pass, and
+                # it grows ~38 trajectories a day with no retention
+                # measured from the NEWEST partition, not today: a corpus
+                # idle for a month still yields its recent history
+                import datetime as _dt
+                # a FUTURE-dated partition (clock skew) must not define "newest" (review)
+                _tomorrow = (_dt.date.today() + _dt.timedelta(days=1)).isoformat()
+                _days = [p for p in day_dirs if re.fullmatch(r"\d{4}-\d{2}-\d{2}", p.name)
+                         and p.name <= _tomorrow]
+                if _days:
+                    _newest = _dt.date.fromisoformat(_days[-1].name)
+                    _cut = (_newest - _dt.timedelta(days=float(since_days))).isoformat()
+                    day_dirs = [p for p in day_dirs if p.name >= _cut]
 
-        for d in day_dirs:
-            if not d.exists():
-                continue
-            for file_path in sorted(d.glob("session-*.jsonl")):
-                if session_id and f"session-{session_id}.jsonl" != file_path.name:
+        for file_name, src in self._line_sources(day_dirs, include_archive and not day
+                                                 and since_days is None):
+            if True:  # (one source per session file — on disk or archived)
+                if session_id and f"session-{session_id}.jsonl" != file_name:
                     continue
                 try:
-                    with file_path.open("r", encoding="utf-8") as f:
+                    with src as f:
                         for line in f:
                             line = line.strip()
                             if not line:
@@ -829,7 +880,7 @@ class TrajectoryCollector:
                                         pass
                             yield traj
                 except OSError as e:
-                    logger.warning("cannot read trajectory file %s: %s", file_path, e)
+                    logger.warning("cannot read trajectory file %s: %s", file_name, e)
 
     def corpus_fingerprint(self) -> str:
         """Stat-level fingerprint of the on-disk corpus: name, size and
@@ -892,3 +943,50 @@ def _default_session_id() -> str:
     import uuid
     stamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%S")
     return f"{stamp}-{uuid.uuid4().hex[:8]}"
+
+
+
+#: day partitions older than this are archived (§4MF, operator: archive, not delete)
+TRAJECTORY_RETENTION_DAYS = 90
+
+
+def archive_old_partitions(root, days: float = TRAJECTORY_RETENTION_DAYS, now=None) -> list:
+    """Move day partitions older than ``days`` into ``<root>/archive/<day>.tar.gz``
+    and remove the directory once the archive is written and verified. The
+    readers walk only ``YYYY-MM-DD`` directories, so archived days drop out
+    of every pass; nothing is deleted without its compressed copy. Returns the
+    archived day names. Never raises."""
+    import shutil
+    import tarfile
+    out: list = []
+    try:
+        root = Path(root)
+        if not root.is_dir():
+            return out
+        today = (now or datetime.date.today())
+        cut = (today - datetime.timedelta(days=float(days))).isoformat()
+        arch = root / "archive"
+        for d in sorted(root.iterdir()):
+            if not (d.is_dir() and re.fullmatch(r"\d{4}-\d{2}-\d{2}", d.name) and d.name < cut):
+                continue
+            arch.mkdir(exist_ok=True)
+            dest = arch / f"{d.name}.tar.gz"
+            n = 1
+            while dest.exists():               # a re-archived (restored) day never overwrites
+                dest = arch / f"{d.name}.{n}.tar.gz"
+                n += 1
+            tmp = arch / f".{d.name}.tar.gz.part"
+            with tarfile.open(tmp, "w:gz") as tf:
+                tf.add(str(d), arcname=d.name)
+            with tarfile.open(tmp, "r:gz") as tf:          # verify before removing
+                names = set(tf.getnames())
+            want = {d.name} | {f"{d.name}/{f.relative_to(d).as_posix()}" for f in d.rglob("*")}
+            if not want <= names:
+                tmp.unlink(missing_ok=True)
+                continue
+            os.replace(tmp, dest)
+            shutil.rmtree(d)
+            out.append(d.name)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("trajectory archive pass failed: %s", e)
+    return out

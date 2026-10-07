@@ -112,7 +112,8 @@ class TestTheLoopDoesNotDeclareOnTheProducersBehalf:
                 (ToolOutcome.coerce("SUCCESS: done"), False),
                 (ToolOutcome.rejected("SYSTEM BLOCK: x"), True),
                 (ToolOutcome.ok("declared success"), True)):
-            built = eval(code, {"ToolOutcome": ToolOutcome},
+            from ghost_agent.core.agent import _defuse_tool_text      # §4MB
+            built = eval(code, {"ToolOutcome": ToolOutcome, "_defuse_tool_text": _defuse_tool_text},
                          {"_outcome": src_outcome, "safe_res": str(src_outcome),
                           # the recorded call arguments (2026-09-13) — not
                           # what this pin is about

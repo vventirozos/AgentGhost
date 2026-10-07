@@ -50,7 +50,7 @@ class TestAmbientExcludesDocumentCorpus:
         }
         vm._search_selection("where do I live?", inject_identity=False)
         where = vm.collection.query.call_args.kwargs["where"]
-        assert where == {"type": {"$nin": ["document", "document_summary"]}}   # §4LT M5
+        assert where == {"type": {"$nin": ["document", "document_summary", "episode_outside"]}}   # §4LT M5, §4MB
 
     def test_document_qa_path_is_unaffected(self):
         # Ambient hydration excludes docs; the scoped doc-QA path must not.

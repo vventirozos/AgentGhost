@@ -186,11 +186,16 @@ class TestNoSameTurnEcho:
                               meta={"req_id": "reqABC12"})
         older = ActivityRecord(ts=_t.time(), phase=PHASE, summary="earlier",
                                severity=SEVERITY_NOTIFY,
-                               meta={"req_id": "reqOLD99"})
-        out = render_activity_digest([mine, older],
+                               meta={"req_id": "sched-OLD99"})
+        # §4ME F5: a notify_operator call from an EARLIER owner turn was seen
+        # in that conversation and is not re-announced
+        seen = ActivityRecord(ts=_t.time(), phase=PHASE, summary="seen already",
+                              severity=SEVERITY_NOTIFY, meta={"req_id": "reqOLD77"})
+        out = render_activity_digest([mine, older, seen],
                                      current_req_id="reqABC12")
         assert "my own" not in out       # no same-turn echo
         assert "earlier" in out          # other turns still surface
+        assert "seen already" not in out
 
     def test_finalize_passes_current_req_id(self):
         src = (Path(__file__).resolve().parents[1] / "src" / "ghost_agent"

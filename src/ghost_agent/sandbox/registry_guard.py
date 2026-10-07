@@ -299,3 +299,51 @@ __all__ = [
     "probe_inconclusive", "pid_state_cmd", "pid_state", "kill_tree_script",
     "kill_tree", "validate_row",
 ]
+
+
+
+def registry_load_failed(registry_path, exc, owner) -> dict:
+    """What a registry ``_load`` does with a read that FAILED (§4MD M9):
+
+    * missing → empty (a fresh workspace);
+    * readable but not a registry (bad JSON, oversize) → set ASIDE under
+      ``.corrupt-<ts>``, then empty — the next save must not erase rows it
+      never saw, and the bytes stay for a human;
+    * not readable at all (EACCES, EIO) → empty for now, and
+      ``owner._registry_unreadable`` holds every save until a read succeeds.
+
+    It used to be ``except Exception: return {}`` — one torn write (the file
+    sits in a sandbox-writable directory) and the next save dropped every
+    running job's row: never reaped, never killed, never collectable."""
+    import logging
+    import os
+    import time
+    import errno
+    log = logging.getLogger("GhostAgent")
+    # the nofollow reader wraps EVERY OSError in a ValueError — the cause says
+    # which it was
+    cause = exc.__cause__ if isinstance(exc.__cause__, OSError) else exc
+    if isinstance(cause, FileNotFoundError):
+        owner._registry_unreadable = False
+        return {}
+    planted_link = isinstance(cause, OSError) and cause.errno == errno.ELOOP
+    if planted_link or (isinstance(exc, (ValueError, UnicodeDecodeError))
+                        and not isinstance(cause, OSError)):
+        try:
+            aside = f"{registry_path}.corrupt-{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}"
+            os.replace(str(registry_path), aside)        # renames a link itself, never its target
+            log.warning("registry %s was unreadable (%s); set aside as %s", registry_path, exc, aside)
+            owner._registry_unreadable = False
+        except OSError as e:
+            log.error("registry %s unreadable and could not be set aside: %s", registry_path, e)
+            owner._registry_unreadable = True
+        return {}
+    log.warning("registry %s could not be read (%s): saves are held", registry_path, exc)
+    owner._registry_unreadable = True
+    return {}
+
+
+def refuse_save_if_unreadable(owner) -> None:
+    """Raise instead of overwriting a registry the last load could not read."""
+    if getattr(owner, "_registry_unreadable", False):
+        raise RuntimeError("the registry could not be read — not saved, so its rows are not overwritten")

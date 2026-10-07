@@ -10,6 +10,7 @@ Two capabilities:
 2. verify_code_output — Check whether code output actually answers the user's question.
 """
 
+from ..utils.json_store import open_append  # torn-tail-safe JSONL appends (§4MF)
 import asyncio
 import base64
 import datetime
@@ -1188,7 +1189,7 @@ def record_claim_binding_shadow(row: Dict[str, Any]) -> bool:
                     os.replace(str(path), str(path) + ".1")
             except FileNotFoundError:
                 pass
-            with path.open("a", encoding="utf-8") as fh:
+            with open_append(path) as fh:
                 fh.write(line + "\n")
         return True
     except Exception as exc:  # noqa: BLE001 — a ledger never breaks a verdict
@@ -1527,7 +1528,7 @@ def record_escalation(*, kind: str, route: str, outcome: str,
                     os.replace(str(path), str(path) + ".1")
             except FileNotFoundError:
                 pass
-            with path.open("a", encoding="utf-8") as f:
+            with open_append(path) as f:
                 f.write(line)
                 f.write("\n")
                 f.flush()
@@ -1807,6 +1808,7 @@ Check, in order:
 2. **Evidence support.** Given that the CLAIM is on-topic, is it actually supported by the EVIDENCE? Flag silent errors (empty output, truncated results, wrong columns, "succeeded" claims when the tool actually failed).
    - Judge the CLAIM against ALL the tool outputs TOGETHER. One tool failing (403/timeout/empty) does NOT refute the parts of the CLAIM that are supported by OTHER tool outputs — refute on lack of support only when NO output supports the disputed part.
    - Specific facts in the CLAIM (names, dates, awards, rankings, prices) that appear in NO tool output are fabrications — REFUTED, no matter how plausible they sound.
+   - What the USER REQUEST itself supplies is GIVEN, not a fabrication: names, numbers, a plan, code or a config the user pasted or described (their "DB5/DB6", their migration steps) need no tool output.
    - But DERIVED facts are SUPPORTED — the evidence need not restate them word-for-word. Paraphrase; arithmetic, rounding and unit conversion (49152 bytes → "48 KB"); ordering and superlatives ("latest"/"largest" = the max of what the evidence lists); a classification the evidence itself marks ("19 is Beta" ⇒ the newest STABLE is 18.4); and counts over listed items are all supported. Only a fact with NO basis in any output is a fabrication.
    - CONFLICTING EVIDENCE is a REAL problem: when the EVIDENCE states two or more different values for the SAME quantity (the same reading, count, total, price or date — e.g. two rows of one output giving 34°C and 35°C for the same place and time) and the CLAIM reports one of them without saying the evidence disagrees, the CLAIM is REFUTED — a summary must disclose or reconcile conflicting rows, never silently pick one. Different quantities are NOT a conflict (1-, 5- and 15-minute load averages; prices of different items; readings at different times).
    - INTERNAL CONTRADICTION is a REAL problem: two statements of the CLAIM that cannot both be true (a stated ~10 km grid spacing beside a nearest point 86 km away; a "global" plot whose axis spans a few degrees) refute the CLAIM even when each number appears in a tool output.
@@ -1879,7 +1881,7 @@ SUSPECTS (from the forced identification pass, most-suspicious first):
 {suspects}
 
 For EACH suspect, decide against the EVIDENCE whether it is a REAL problem or a FALSE ALARM:
-- "support" suspects are REAL only if the fact appears in NO tool output (fabrication) or directly contradicts one. Judge against ALL tool outputs TOGETHER: one tool failing (403/timeout/empty) does NOT make a fact wrong when ANOTHER output supports it.
+- "support" suspects are REAL only if the fact appears in NO tool output (fabrication) or directly contradicts one. A fact the USER REQUEST itself supplies (names, numbers, a plan or code the user pasted) is GIVEN — never a fabrication. Judge against ALL tool outputs TOGETHER: one tool failing (403/timeout/empty) does NOT make a fact wrong when ANOTHER output supports it.
 - DERIVED facts are SUPPORTED — the evidence does NOT have to restate them word-for-word. Before calling a "support" suspect real, ask: can I reach it from the evidence by ordinary reasoning? If yes it is a FALSE ALARM. This covers: paraphrase; arithmetic, rounding and unit conversion (49152 bytes → "48 KB"; 3600s → "1 hour"); ordering and superlatives ("latest"/"newest"/"largest"/"highest" = the max of what the evidence lists); a classification the evidence itself marks ("19 is Beta" ⇒ the newest STABLE is 18.4); and counts or totals over listed items. Only a fact with NO basis in any output — an invented number, version, name or date — is a fabrication.
 - CONFLICTING EVIDENCE is a REAL problem: when the EVIDENCE states two or more different values for the SAME quantity — the same reading, count, total, price or date; e.g. one row of a tool output says 34°C and another row of that same output says 35°C for the same place and time — and the CLAIM reports one of them as the value without saying the evidence disagrees, that "support" suspect is REAL. A fact "appearing in a tool output" does not rescue it when the same output also contradicts it: a summary must disclose or reconcile conflicting rows, never silently pick one. Different quantities are NOT a conflict (the 1-, 5- and 15-minute load averages; prices of different items; readings at different times; a file's size beside another file's).
 - INTERNAL CONTRADICTION is a REAL problem: two statements of the CLAIM that cannot both be true (a stated ~10 km grid spacing beside a nearest point 86 km away; a "global" plot whose axis spans a few degrees; a total smaller than one of its parts) refute the CLAIM even when each number, taken alone, appears in a tool output — the tool output shows the agent's computation, not that the computation was right.

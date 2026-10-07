@@ -271,6 +271,10 @@ async def run_subagent(context, *, job_id: str, task: str,
     pretty_log("Delegate Start",
                f"{job_id}: {task[:80]!r} · tools={len(allowed_tools)}",
                icon=Icons.NODE_WORKER)
+    # the child answers to the parent's provenance (§4MB): what the parent
+    # read, and the parent's user message as "what the user said"
+    from ..utils.provenance import link_child
+    link_child(f"sub-{job_id}")
     content, _, _ = await asyncio.wait_for(
         agent.handle_chat(body, background_tasks=None,
                           request_id=f"sub-{job_id}"),

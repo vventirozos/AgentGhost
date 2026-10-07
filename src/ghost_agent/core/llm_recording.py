@@ -29,6 +29,7 @@ goal — see PROJECT_JOURNAL 2026-07-17).
 
 from __future__ import annotations
 
+from ..utils.json_store import open_append  # torn-tail-safe JSONL appends (§4MF)
 import datetime
 import hashlib
 import json
@@ -260,7 +261,7 @@ class LLMRecorder:
                 pass
             with self._lock:
                 root.mkdir(parents=True, exist_ok=True)
-                with path.open("a", encoding="utf-8") as f:
+                with open_append(path) as f:
                     f.write(line + "\n")
             return True
         except Exception as e:  # noqa: BLE001 — recording is best-effort

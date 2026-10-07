@@ -76,6 +76,7 @@ that one is about what the tools do, which is identical in both.
 
 from __future__ import annotations
 
+from ..utils.json_store import open_append  # torn-tail-safe JSONL appends (§4MF)
 import asyncio
 import datetime
 import hashlib
@@ -570,7 +571,7 @@ def write_specs(specs: List[ReplaySpec], home: str = None) -> int:
                     os.replace(str(path), str(path) + ".1")
             except FileNotFoundError:
                 pass
-            with path.open("a", encoding="utf-8") as f:
+            with open_append(path) as f:
                 f.write(blob)
                 f.flush()
         except Exception as exc:  # noqa: BLE001
@@ -1697,7 +1698,7 @@ def write_credits(records: List[Dict[str, Any]], home: str = None) -> int:
                     os.replace(str(path), str(path) + ".1")
             except FileNotFoundError:
                 pass
-            with path.open("a", encoding="utf-8") as f:
+            with open_append(path) as f:
                 f.write(blob)
                 f.flush()
         except Exception as exc:  # noqa: BLE001

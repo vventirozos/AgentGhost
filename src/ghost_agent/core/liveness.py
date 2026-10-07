@@ -187,37 +187,114 @@ def _mtime_probe(rel: str, *, stale_h: float) -> Callable[[Path], ProbeResult]:
 # shared. Keyed on size+mtime so an appended log invalidates the entry rather
 # than serving a stale count — a monitor caching its own staleness would be a
 # neat way to reinvent the defect this module exists to catch.
+# §4MC MAJOR 1: the log never rotated (82 MB) and this parse held EVERY line —
+# 4.6 s and 191 MB resident. Now only the last LOG_SCAN_DAYS (the longest
+# windowed probe is 7 days; 14 keeps a recent "last fired") of the current file and its newest rotated
+# generation are read: a binary search on the line timestamps finds the start.
 _LOG_CACHE: Dict[tuple, List[tuple]] = {}
+LOG_SCAN_DAYS = 14.0
+_TS_RX = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+
+
+def _line_ts(line: str) -> Optional[float]:
+    m = _TS_RX.match(line)
+    if not m:
+        return None
+    try:
+        return time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))
+    except ValueError:
+        return None
+
+
+def _offset_at(fh, size: int, cutoff: float) -> int:
+    """Byte offset of the first timestamped line at or after ``cutoff``
+    (binary search over the file; lines are appended in time order)."""
+    lo, hi = 0, size
+    while hi - lo > 4096:
+        mid = (lo + hi) // 2
+        fh.seek(mid)
+        fh.readline()                         # to the next line start
+        ts = None
+        for _ in range(50):                   # skip untimestamped lines
+            line = fh.readline()
+            if not line:
+                break
+            ts = _line_ts(line.decode("utf-8", "replace"))
+            if ts is not None:
+                break
+        if ts is None or ts >= cutoff:
+            hi = mid
+        else:
+            lo = mid
+    return lo
+
+
+def _read_recent(p: Path, cutoff: float, out: List[tuple]) -> bool:
+    try:
+        with p.open("rb") as fh:
+            size = p.stat().st_size
+            fh.seek(_offset_at(fh, size, cutoff))
+            for raw in fh:
+                line = raw.decode("utf-8", "replace")
+                ts = _line_ts(line)
+                if ts is not None and ts >= cutoff:
+                    out.append((ts, line))
+        return True
+    except OSError:
+        return False
 
 
 def _log_entries(p: Path) -> Optional[List[tuple]]:
-    """[(epoch_ts, line)] for timestamped mirror lines. One parse, shared."""
+    """[(epoch_ts, line)] for timestamped mirror lines of the last
+    LOG_SCAN_DAYS, oldest first, across the newest rotated generation and the
+    current file. One parse, shared."""
     try:
         st = p.stat()
     except OSError:
         return None
-    key = (str(p), st.st_size, st.st_mtime)
+    rotated = p.with_name(p.name + ".1")
+    try:
+        rst = rotated.stat()
+        rkey = (rst.st_size, rst.st_mtime)
+    except OSError:
+        rkey = None
+    key = (str(p), st.st_size, st.st_mtime, rkey)
     hit = _LOG_CACHE.get(key)
     if hit is not None:
         return hit
     _LOG_CACHE.clear()          # only ever hold the current log
-    ts_rx = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+    cutoff = time.time() - LOG_SCAN_DAYS * 86400.0
     out: List[tuple] = []
-    try:
-        with p.open(errors="replace") as fh:
-            for line in fh:
-                m = ts_rx.match(line)
-                if not m:
-                    continue
-                try:
-                    out.append((time.mktime(time.strptime(
-                        m.group(1), "%Y-%m-%d %H:%M:%S")), line))
-                except ValueError:
-                    continue
-    except OSError:
+    if rkey is not None:
+        _read_recent(rotated, cutoff, out)
+    if not _read_recent(p, cutoff, out):
         return None
     _LOG_CACHE[key] = out
     return out
+
+
+def _stream_count(p: Path, rx, ex, cutoff: float) -> ProbeResult:
+    """Count matching timestamped lines at/after ``cutoff`` across the log
+    and all its rotated generations, in O(1) memory."""
+    n, last = 0, None
+    gens = sorted(p.parent.glob(p.name + ".*"),
+                  key=lambda q: -int(q.suffix[1:]) if q.suffix[1:].isdigit() else 0)
+    try:
+        for f in [g for g in gens if g.suffix[1:].isdigit()] + [p]:
+            with f.open("rb") as fh:
+                for raw in fh:
+                    line = raw.decode("utf-8", "replace")
+                    if not rx.search(line) or (ex is not None and ex.search(line)):
+                        continue
+                    ts = _line_ts(line)
+                    if ts is None:
+                        continue
+                    last = max(last or 0.0, ts)
+                    if ts >= cutoff:
+                        n += 1
+    except OSError:
+        return ProbeResult(NO_SOURCE, note="log unreadable")
+    return ProbeResult(FIRED if n else ZERO, n, last)
 
 
 def _log_probe(pattern: str, *, window_h: float,
@@ -242,6 +319,10 @@ def _log_probe(pattern: str, *, window_h: float,
         p = home / rel
         if not p.exists():
             return ProbeResult(NO_SOURCE, note=f"{rel} absent")
+        if window_h > LOG_SCAN_DAYS * 24.0:
+            # an all-time count (GEPA loads): stream every generation, hold
+            # only the count and the newest match — never the lines (§4MC)
+            return _stream_count(p, rx, ex, time.time() - window_h * 3600.0)
         entries = _log_entries(p)
         if entries is None:
             return ProbeResult(NO_SOURCE, note=f"{rel} unreadable")
@@ -361,32 +442,25 @@ def _count_user_turns(home: Path, window_h: float) -> tuple:
     if not p.exists():
         return (None, 0, "no-log")
     cutoff = time.time() - window_h * 3600.0
-    ts_rx = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*request started")
     origin_rx = re.compile(r"\borigin=(\w+)")
     n = 0
     total = 0
     unstamped = 0
-    try:
-        with p.open(errors="replace") as fh:
-            for line in fh:
-                m = ts_rx.match(line)
-                if not m:
-                    continue
-                try:
-                    ts = time.mktime(time.strptime(m.group(1),
-                                                   "%Y-%m-%d %H:%M:%S"))
-                except ValueError:
-                    continue
-                if ts < cutoff:
-                    continue
-                total += 1
-                o = origin_rx.search(line)
-                if o is None:
-                    unstamped += 1
-                elif o.group(1) == "user" and " role=member" not in line:
-                    n += 1              # a member's turn feeds no owner store (§4KJ R10)
-    except OSError:
+    # the shared bounded reader: the current file AND its newest rotated
+    # generation (§4MC review: a single-file scan under-counted for a day
+    # after every rollover)
+    entries = _log_entries(p)
+    if entries is None:
         return (None, 0, "no-log")
+    for ts, line in entries:
+        if ts < cutoff or "request started" not in line:
+            continue
+        total += 1
+        o = origin_rx.search(line)
+        if o is None:
+            unstamped += 1
+        elif o.group(1) == "user" and " role=member" not in line:
+            n += 1              # a member's turn feeds no owner store (§4KJ R10)
     if unstamped:
         # Mixed or wholly pre-stamp window: the stamped subset is a LOWER
         # bound on user turns, never the count. Say so instead of quoting it.
@@ -438,7 +512,10 @@ def _trajectory_router_signal_probe(home: Path) -> ProbeResult:
     if not d.is_dir():
         return ProbeResult(NO_SOURCE, note="no trajectory corpus")
     try:
-        parts = sorted((p for p in d.iterdir() if p.is_dir()),
+        # DATE partitions only — `archive/` sorts after them and was read as
+        # a day, tarballs as text (§4MF review)
+        parts = sorted((p for p in d.iterdir()
+                        if p.is_dir() and re.fullmatch(r"\d{4}-\d{2}-\d{2}", p.name)),
                        key=lambda p: p.name)[-3:]
     except OSError as e:
         return ProbeResult(NO_SOURCE, note=f"unreadable: {e}")

@@ -39,6 +39,7 @@ Ghost's LLMClient.
 
 from __future__ import annotations
 
+from ..utils.json_store import open_append  # torn-tail-safe JSONL appends (§4MF)
 import asyncio
 import datetime
 import hashlib
@@ -416,7 +417,7 @@ class DefectQueue:
                 return False
             with self._lock:
                 self._path().parent.mkdir(parents=True, exist_ok=True)
-                with self._path().open("a", encoding="utf-8") as f:
+                with open_append(self._path()) as f:
                     f.write(report.to_jsonl())
                     f.write("\n")
                     f.flush()
@@ -440,7 +441,7 @@ class DefectQueue:
             }
             with self._lock:
                 self._status_path().parent.mkdir(parents=True, exist_ok=True)
-                with self._status_path().open("a", encoding="utf-8") as f:
+                with open_append(self._status_path()) as f:
                     f.write(json.dumps(rec, ensure_ascii=False))
                     f.write("\n")
                     f.flush()

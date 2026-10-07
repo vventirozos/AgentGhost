@@ -19,6 +19,7 @@ property here is "small, dense, immediately relevant on wake-up".
 
 from __future__ import annotations
 
+from ..utils.json_store import open_append  # torn-tail-safe JSONL appends (§4MF)
 import datetime
 import json
 import logging
@@ -258,7 +259,7 @@ class SelfStateThread:
                     "set_at": mood.set_at,
                     "source": mood.source,
                 }
-                with self.mood_history_path.open("a", encoding="utf-8") as f:
+                with open_append(self.mood_history_path) as f:
                     f.write(json.dumps(rec, ensure_ascii=False))
                     f.write("\n")
                 self._maybe_compact_mood_history_locked()

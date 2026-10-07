@@ -608,6 +608,12 @@ def ingest_audio_streaming(
             if len(batch) >= BATCH_CHUNKS:
                 _flush()
         _flush()
+    except BaseException:
+        # a failure part-way leaves no half-recording behind (§4MD M13)
+        _rb = getattr(memory_system, "rollback_partial_document", None)
+        if callable(_rb):
+            _rb(filename)
+        raise
     finally:
         _INGEST_LOCK.release()
 

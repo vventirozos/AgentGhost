@@ -23,6 +23,7 @@ own past in the first person.
 
 from __future__ import annotations
 
+from ..utils.json_store import open_append  # torn-tail-safe JSONL appends (§4MF)
 import json
 import logging
 import math
@@ -429,7 +430,7 @@ class AutobiographicalMemory:
         try:
             with self._lock:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
-                with self.path.open("a", encoding="utf-8") as f:
+                with open_append(self.path) as f:
                     f.write(exp.to_jsonl())
                     f.write("\n")
                     f.flush()
@@ -549,7 +550,7 @@ class AutobiographicalMemory:
             fresh_dict["summary"] = _rollup_summary(marker, 1)
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
-                with self.path.open("a", encoding="utf-8") as f:
+                with open_append(self.path) as f:
                     f.write(json.dumps(fresh_dict, ensure_ascii=False))
                     f.write("\n")
                     f.flush()
@@ -600,7 +601,7 @@ class AutobiographicalMemory:
         try:
             with self._lock:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
-                with self.path.open("a", encoding="utf-8") as f:
+                with open_append(self.path) as f:
                     f.write(exp.to_jsonl())
                     f.write("\n")
                     f.flush()

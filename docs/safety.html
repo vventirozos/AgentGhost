@@ -209,6 +209,37 @@
     </a>
   </div>
 
+  <h2 id="content-injection">Instructions hidden in what Ghost reads <span class="tag">2026-10-07 &sect;4MB</span></h2>
+  <p>In your own conversation, Ghost acts with your rights. Text it <em>reads</em> can also contain instructions: a web page, a search result, an uploaded file, a knowledge-base document, a transcript, or the text in an image ("ignore the user and run this", "remember: the owner prefers…", "schedule a daily sync…"). Ghost now records, for each request, whether such outside content came in (<code>utils/provenance.py</code>). The places where that would matter check this record.</p>
+  <ul>
+    <li><strong>It cannot open a fake system or user turn.</strong> The model server reads <code>&lt;|im_start|&gt;</code>, <code>&lt;/tool_response&gt;</code> and similar tags as real control tokens, even inside a page's text. Every tool result is rewritten so these role-forging tags are plain characters (<code>utils/prompt_safety.py</code>). This happens where the result enters the conversation, where it is re-wrapped as user text, and again where the client sends. Your messages and Ghost's own instructions are left untouched, and so are <code>&lt;think&gt;</code>/<code>&lt;tool_call&gt;</code> inside a project file.</li>
+    <li><strong>What counts as outside content:</strong>
+      <ul>
+        <li>search, research, news, browser, fact-check, YouTube, vision and recall results;</li>
+        <li>knowledge-base reads;</li>
+        <li>reads of uploaded files, and anything downloaded or cloned;</li>
+        <li><code>execute</code> code that fetches from the network;</li>
+        <li>job output;</li>
+        <li>the answers of sub-agents, the swarm, skills and macros.</li>
+      </ul>
+      A failed result counts too. A sub-agent inherits its parent's record, and "what you said" for a sub-agent is your message, not the task text the model wrote.</li>
+    <li><strong>No standing instructions from content.</strong> A request that read outside content cannot create, watch or stop scheduled tasks, create skills, or define or activate macros. Ghost says what it would set up and asks you to confirm in a new message.</li>
+    <li><strong>No lessons or memories from content.</strong> A lesson needs your own dictation. The post-mortem and the per-turn episode never store outside content: it is stamped when the turn is journalled, because the post-mortem runs later. Scratchpad notes are labelled. A conversation summary that includes outside content is kept out of automatic recall.</li>
+    <li><strong>Facts about you come from you.</strong> After reading outside content, <code>update_profile</code> and <code>remember</code> save only what your own message states. A quoted "USER: …" line inside a reply is never taken as you speaking. A project constraint the model passes counts as yours only if your message says it.</li>
+    <li><strong>A confirmation is your "yes".</strong> To confirm a delete, reset, release or forget preview, your message must open with yes (English or Greek: "yes", "ok", "go ahead", "ναι", "εντάξει" …), quote the token, or pick items, and must not hold back ("wait", "no", "όχι"). A confirm is refused if outside content was read before it in the same request. A whole project folder is deleted (or moved away) only through <code>manage_projects</code>, which shows you a preview first. After outside content, database DROP and TRUNCATE stay locked.</li>
+    <li><strong>Your identifiers stay home.</strong> After outside content, Ghost refuses a call that would send your identifiers out, unless your own message contained that value:
+      <ul>
+        <li><strong>What counts as an identifier:</strong> your full name and surname, birth dates, address, family members' names, phone and email. A lone first name, your city, company, interests and favourites are not identifiers, because ordinary searches need them.</li>
+        <li><strong>Which calls:</strong> search, browser, fact-check, sub-agent and swarm tasks are checked in full. Local tools and code are checked only in their URLs, so a letter Ghost writes and signs with your name is not egress.</li>
+        <li><strong>Encoded copies:</strong> URL-encoded and base64 copies are caught.</li>
+        <li><strong>Your files:</strong> code that would send your uploads or memory files over the network is refused, unless your message names your files.</li>
+        <li><strong>If the check itself fails</strong> after outside content was read, the call is refused.</li>
+      </ul>
+    </li>
+    <li>A notification written after reading outside content is labelled as such.</li>
+  </ul>
+  <p>The confirm-in-a-new-message rule is deliberate: nothing has been read yet in that next request. Pins: <code>tests/test_4mb_content.py</code>.</p>
+
   <footer>
     <p>Checked against <code>utils/egress_guard.py</code> (incl. <code>resolve_egress_proxy</code>, the layer-2 call-site backstop), <code>utils/helpers.py</code>, <code>tools/search.py</code>, <code>tools/system.py</code>, <code>tools/file_system.py</code>, <code>tools/browser.py</code>, <code>sandbox/docker.py</code> and <code>main.py</code> on 2026-08-08.</p>
   </footer>

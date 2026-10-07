@@ -546,8 +546,10 @@ class SandboxJobSupervisor:
             # `return {}` reports "No background jobs" while the directory is
             # hijacked. A guard that fires and tells nobody.
             raise
-        except Exception:  # noqa: BLE001 — absent/corrupt → empty
-            return {}
+        except Exception as _lexc:  # noqa: BLE001 — absent / damaged / unreadable (§4MD M9)
+            from .registry_guard import registry_load_failed
+            return registry_load_failed(self._registry_path, _lexc, self)
+        self._registry_unreadable = False
         if not isinstance(data, dict):
             return {}
         clean: Dict[str, dict] = {}
@@ -602,6 +604,8 @@ class SandboxJobSupervisor:
         # registry. The result parses as garbage, `_load` returns {}, and
         # EVERY running job silently loses its row — never reaped, never
         # killed, never collectable.
+        from .registry_guard import refuse_save_if_unreadable
+        refuse_save_if_unreadable(self)              # §4MD M9
         tmp = self._registry_path.with_suffix(
             f".{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
         try:

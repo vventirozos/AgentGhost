@@ -18,6 +18,7 @@ so the module works (just less richly) without an upstream LLM.
 
 from __future__ import annotations
 
+from ..utils.json_store import open_append  # torn-tail-safe JSONL appends (§4MF)
 import datetime
 import hashlib
 import json
@@ -466,7 +467,7 @@ class NarrativeSummariser:
                     "source_experience_count": int(source_count),
                     "text": text,
                 }
-                with self.history_path.open("a", encoding="utf-8") as f:
+                with open_append(self.history_path) as f:
                     f.write(json.dumps(record, ensure_ascii=False))
                     f.write("\n")
                     f.flush()

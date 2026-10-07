@@ -122,7 +122,8 @@ async def _swarm_worker(instruction: str, input_data: str, output_key: str, llm_
         payload["model"] = model_name
 
         try:
-            resp = await client.post("/v1/chat/completions", json=payload, timeout=300.0)
+            from ..utils.prompt_safety import defuse_payload     # §4MB
+            resp = await client.post("/v1/chat/completions", json=defuse_payload(payload), timeout=300.0)
             resp.raise_for_status()
             data = resp.json()
             # `.get("content", "")` returns None when the key is present but

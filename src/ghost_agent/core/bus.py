@@ -16,6 +16,7 @@ No external broker (Redis/RabbitMQ/etc.) — pure asyncio.
 
 from __future__ import annotations
 
+from ..utils.json_store import open_append  # torn-tail-safe JSONL appends (§4MF)
 import asyncio
 import functools as _ft
 import hashlib
@@ -563,8 +564,7 @@ class MemoryBus:
                 with LEDGER_LOCK:
                     self.usefulness_ledger_path.parent.mkdir(parents=True,
                                                              exist_ok=True)
-                    with open(self.usefulness_ledger_path, "a",
-                              encoding="utf-8") as f:
+                    with open_append(self.usefulness_ledger_path) as f:
                         f.write(lines)
 
             try:

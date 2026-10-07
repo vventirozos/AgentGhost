@@ -30,7 +30,7 @@ def test_post_mortem_producer_gated_in_streaming_path():
     src = SRC.read_text()
     # The streaming path uses `stream_tools_snapshot` and `full_content`.
     # Find the line that appends to journal in that vicinity.
-    streaming_marker = "'post_mortem', {'user': last_user_content, 'tools': stream_tools_snapshot"
+    streaming_marker = "'post_mortem', {'user': last_user_content, 'tools': _tools_for_journal(stream_tools_snapshot)"
     idx = src.find(streaming_marker)
     assert idx != -1, "Streaming post_mortem producer not found"
     # Walk back ~6 lines and confirm a smart_memory > 0.0 gate is present.
@@ -46,7 +46,7 @@ def test_post_mortem_producer_gated_in_nonstreaming_path():
     smart_memory > 0.0 before appending to the journal."""
     src = SRC.read_text()
     # The non-streaming path uses `list(tools_run_this_turn)` and `final_ai_content`.
-    nonstreaming_marker = "'post_mortem', {'user': last_user_content, 'tools': list(tools_run_this_turn)"
+    nonstreaming_marker = "'post_mortem', {'user': last_user_content, 'tools': _tools_for_journal(list(tools_run_this_turn))"
     idx = src.find(nonstreaming_marker)
     assert idx != -1, "Non-streaming post_mortem producer not found"
     preceding = src[max(0, idx - 600):idx]

@@ -86,7 +86,7 @@ async def test_stop_task(mock_scheduler):
 
     res = await tool_stop_task("job_1", mock_scheduler)
     assert "Stopped" in res
-    mock_scheduler.remove_job.assert_called_with("job_1")
+    mock_scheduler.remove_job.assert_any_call("job_1")
 
 @pytest.mark.asyncio
 async def test_stop_task_not_found(mock_scheduler):

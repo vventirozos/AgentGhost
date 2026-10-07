@@ -306,6 +306,11 @@ def write_text_nofollow(path: Path, text: str, *, encoding: str = "utf-8") -> No
             "regular file (FIFO, socket or device node).")
     with os.fdopen(fd, "w", encoding=encoding) as fh:
         fh.write(text)
+        fh.flush()
+        # durable before the caller's os.replace publishes it: a registry torn
+        # by a power loss read as EMPTY and the next save dropped every row
+        # (§4MD M9)
+        os.fsync(fh.fileno())
 
 
 def write_text_nofollow_in_dir(dir_path: Path, name: str, text: str, *,
@@ -1509,6 +1514,14 @@ def outside_workspace_message(filename) -> str:
     workspace, or "" when the path is relative / inside. One home: every
     missing-file branch reads it through `_missing_file_message`."""
     raw = str(filename or "").strip()
+    if re.match(r"^[a-z][a-z0-9+.-]*://", raw, re.IGNORECASE):
+        # a URL is not a file (§4ME F8: URLs passed to file_system read
+        # "not found" and the model kept guessing paths)
+        return (
+            f"Error: '{raw}' is a URL, not a file in your sandbox. To READ a web page use the "
+            f"`browser` tool (or web_search); to SAVE a file from the web use file_system "
+            f"operation='download' with url='{raw}'."
+        )
     if not raw.startswith("/"):
         return ""
     norm = raw.replace("\\", "/")
@@ -5853,6 +5866,12 @@ async def tool_rename_file(old_name: str, new_name: str, sandbox_dir: Path):
             # the shape `_FS_MOVED_RE` parses (the verifier's ground truth)
             return f"SUCCESS: Renamed/Moved '{old_name}' to '{new_name}'. It was a link — its target was not touched."
         old_path = _get_safe_path(sandbox_dir, old_name, allow_root=False)
+        # moving a whole project out of projects/ and deleting it there was
+        # the same rmtree around manage_projects' confirm (§4MB review)
+        if old_path.exists():
+            _ref = _protected_dir_refusal(sandbox_dir, old_path, old_name)
+            if _ref is not None:
+                return _ref
         new_path = _get_safe_path(sandbox_dir, new_name, allow_root=False)
         if not old_path.exists(): return f"Error: '{old_name}' not found."
         if new_path.exists():
@@ -5880,6 +5899,36 @@ async def tool_rename_file(old_name: str, new_name: str, sandbox_dir: Path):
     except ValueError as ve: return str(ve)
     except Exception as e: return f"Error: {e}"
 
+def _protected_dir_refusal(sandbox_dir: Path, path: Path, filename: str):
+    """A whole PROJECT directory is deleted through manage_projects, which
+    previews and asks the user — `file_system delete projects/<id>` was a
+    one-call rmtree around that confirm (§4MB). After outside content entered
+    the request, the uploads folder and the projects root are refused too."""
+    if not path.is_dir():
+        return None
+    try:
+        rel = path.resolve().relative_to(Path(sandbox_dir).resolve()).parts
+    except (ValueError, OSError):
+        return None
+    from .outcome import ToolOutcome
+    # a PROJECT is a directory the project store owns (its id is 12 hex
+    # characters); a user folder named "projects/<name>" inside a project's
+    # workspace is not one
+    if len(rel) == 2 and rel[0] == "projects" and re.fullmatch(r"[0-9a-f]{12}", rel[1]):
+        return ToolOutcome.rejected(
+            f"Error: '{filename}' is a whole project — delete it with manage_projects "
+            f"action='delete' (it shows the user a preview and asks). Nothing was deleted.",
+            world_changed=False, reason_code="protected_dir")
+    if rel in (("projects",), ("uploads",)):
+        from ..utils.provenance import untrusted_seen, content_refusal
+        _src = untrusted_seen()
+        if _src:
+            return ToolOutcome.rejected(
+                content_refusal(f"the deletion of '{filename}'", _src).replace("was not created", "was not done"),
+                world_changed=False, reason_code="untrusted_content")
+    return None
+
+
 async def tool_delete_file(filename: str, sandbox_dir: Path):
     pretty_log("File Delete", filename, icon=Icons.TOOL_FILE_W)
     import shutil
@@ -5891,6 +5940,9 @@ async def tool_delete_file(filename: str, sandbox_dir: Path):
             return f"SUCCESS: Deleted '{filename}'. It was a link — its target was not touched."
         path = _get_safe_path(sandbox_dir, filename, allow_root=False)
         if not path.exists(): return f"Error: '{filename}' not found."
+        _ref = _protected_dir_refusal(sandbox_dir, path, filename)
+        if _ref is not None:
+            return _ref
         if path.is_dir():
             await asyncio.to_thread(shutil.rmtree, path)
         else:

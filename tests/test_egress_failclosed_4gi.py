@@ -190,10 +190,13 @@ def test_every_egress_state_write_is_enforced_blocked_or_the_two_named_exception
     # R3 round 2: `_recreate_if_cut_off` resets the state to "" (a NEW
     # generation is about to be provisioned and enforced) — the one allowed
     # reset, in the one function that drops the container.
+    # §4MD C1: `_enforce_egress_once` resets it too, when the container was
+    # RESTARTED IN PLACE (a new generation) — and enforces in the same call.
+    _resets = ("_recreate_if_cut_off", "_enforce_egress_once")
     assert others and all(val in ("enforced", "blocked")
-                          or (val == "" and fn == "_recreate_if_cut_off")
+                          or (val == "" and fn in _resets)
                           for fn, val in others), others
-    assert [fn for fn, val in others if val == ""] == ["_recreate_if_cut_off"]
+    assert sorted(fn for fn, val in others if val == "") == sorted(_resets)
     # ⚠ EVERY BRANCH THAT LEARNS EGRESS IS NOT TOR MUST CUT THE CONTAINER
     # OFF — counted, because a count is what catches a new branch that only
     # LABELS the state. §4GK round 4 added the fourth: a verification that

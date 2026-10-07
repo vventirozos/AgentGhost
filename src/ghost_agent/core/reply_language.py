@@ -139,6 +139,31 @@ def prose_lines(reply: str) -> str:
     return "\n".join(keep)
 
 
+_ITEM_SUMMARY = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+.+?\s[—–:]\s+(.+)$")
+
+
+def list_item_summaries(reply: str) -> str:
+    """The model-written part of each list item: what follows its em dash,
+    en dash or colon ("- «Headline» — the model's summary")."""
+    out: List[str] = []
+    in_fence = False
+    for ln in (reply or "").splitlines():
+        if _FENCE_LINE.match(ln):
+            in_fence = not in_fence
+            continue
+        m = None if in_fence else _ITEM_SUMMARY.match(ln)
+        if m:
+            # a link or code is not language ("— https://www.kathimerini.gr/…"
+            # read Latin and flagged a Greek digest as English; review)
+            txt = _NON_LANGUAGE.sub(" ", m.group(1))
+            if txt.strip():
+                out.append(txt)
+    return "\n".join(out)
+
+
+_NON_LANGUAGE = re.compile(r"https?://\S+|www\.\S+|`[^`]*`|\[[^\]]*\]\([^)]*\)|\S+@\S+|\d+")
+
+
 def _greeklish(text: str) -> bool:
     toks = [t.lower() for t in _TOKEN.findall(text or "")]
     return sum(1 for t in toks if t in _GREEKLISH) >= GREEKLISH_MIN_HITS
@@ -183,7 +208,13 @@ def reply_language_mismatch(request: str, reply: str,
             return None  # code-authored abort / fallback text — not the model's choice
         prose = prose_lines(reply)
         if _letters(prose) < MIN_REPLY_LETTERS:
-            return None
+            # a reply that is ALL list items (a news digest) was never judged
+            # (§4ME F7: an English request got all-Greek bullets). The text
+            # AFTER an item's dash/colon is the model's own summary, not the
+            # quoted headline — judge that.
+            prose = list_item_summaries(reply)
+            if _letters(prose) < MIN_REPLY_LETTERS:
+                return None
         share = script_share(prose)
         if want == "latin" and share > EN_TO_EL_MIN_SHARE:
             return ("English", "Greek")

@@ -2125,6 +2125,9 @@ class LLMClient:
         """
         Sends a chat completion request to the upstream LLM with robust retry logic.
         """
+        # content the agent read never becomes chat-template control (§4MB)
+        from ..utils.prompt_safety import defuse_payload
+        payload = defuse_payload(payload)
         # How long a caller will queue for a node permit before giving up.
         # Generous relative to a request, because WAITING is the desired
         # behaviour — the alternative it replaces is not "go faster", it is
@@ -3502,6 +3505,9 @@ class LLMClient:
         import contextlib as _contextlib
         import copy as _copy
         payload = _copy.deepcopy(payload)
+        # content the agent read never becomes chat-template control (§4MB)
+        from ..utils.prompt_safety import defuse_payload
+        payload = defuse_payload(payload)
         payload["stream"] = True
         # Mirror the non-streaming path: ask llama.cpp to reuse any
         # matching prefix in its KV cache. See _do_chat_completion for

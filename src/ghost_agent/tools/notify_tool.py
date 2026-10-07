@@ -115,6 +115,16 @@ async def tool_notify_operator(message: str = None, context=None, **kwargs):
                 f"({_MAX_PER_HOUR}/hour) — the message was NOT sent. "
                 f"Batch your updates into fewer notifications.")
 
+    # a notification written after reading outside content says so: a page's
+    # "urgent: verify your account at <link>" must not read as the agent's own
+    # alert, on the phone or in the next turn's digest (§4MB)
+    try:
+        from ..utils.provenance import untrusted_seen
+        if untrusted_seen() and not message.startswith(OUTSIDE_CONTENT_PREFIX):
+            message = OUTSIDE_CONTENT_PREFIX + message
+    except Exception:  # noqa: BLE001
+        pass
+
     # Stamp the writing turn's request id so the finalize digest can skip
     # records THIS turn authored — without it, the "while you were away"
     # banner echoes the notification the same reply just sent (observed on
@@ -132,8 +142,17 @@ async def tool_notify_operator(message: str = None, context=None, **kwargs):
 
     _note_sent()  # commit the rate-limit slot only after a successful write
     channels = _delivery_channels(context)
+    # where it went, and where it did NOT (§4ME F1: "posted in #general" and
+    # "sent to @someone" were reported after a DM to the owner)
     return (f"Notification queued for the operator via: "
-            f"{', '.join(channels)}.\nMessage: {message}")
+            f"{', '.join(channels)}.\nMessage: {message}\n"
+            f"Delivered ONLY to the operator (their own DM). No channel and no other person "
+            f"received it — if a channel post or a message to someone else was asked for, "
+            f"tell the user that was NOT done.")
+
+
+#: the label on a notification sent after reading outside content (§4MB)
+OUTSIDE_CONTENT_PREFIX = "[written after reading outside content] "
 
 
 NOTIFY_OPERATOR_TOOL_DEFINITION = {
@@ -148,7 +167,9 @@ NOTIFY_OPERATOR_TOOL_DEFINITION = {
             "operator should hear about now. NOT for normal replies (they "
             "already see your answer here), and NOT a substitute for your "
             "final response — send the one-line headline, keep the detail "
-            "in your reply."
+            "in your reply. It reaches ONLY the operator's own DM: it cannot "
+            "post to a Slack channel or message anyone else — if asked to, "
+            "say plainly that it was NOT done."
         ),
         "parameters": {
             "type": "object",

@@ -75,6 +75,7 @@ imports stay silent, same idiom as the verifier escalation ledger).
 
 from __future__ import annotations
 
+from ..utils.json_store import open_append  # torn-tail-safe JSONL appends (§4MF)
 import datetime
 import hashlib
 import json
@@ -617,7 +618,7 @@ class Foresight:
                     os.replace(str(path), str(path) + ".1")
             except FileNotFoundError:
                 pass
-            with path.open("a", encoding="utf-8") as f:
+            with open_append(path) as f:
                 f.write(line)
                 f.write("\n")
                 f.flush()

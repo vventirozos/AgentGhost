@@ -10,6 +10,7 @@ context) and can be consolidated by the dream cycle into generalized
 strategies while keeping the best exemplar intact.
 """
 
+from ..utils.json_store import open_append  # torn-tail-safe JSONL appends (§4MF)
 import json
 import logging
 import os
@@ -1255,6 +1256,7 @@ class EpisodicMemory:
         (§4LA: it was swallowed while the user was told it worked)."""
         ids = [int(i) for i in ids or []]
         self.last_twin_failures = []
+        self.last_archive_failed = False
         if not ids:
             return 0
         with self._lock, closing(sqlite3.connect(self.db_path)) as conn:
@@ -1265,7 +1267,7 @@ class EpisodicMemory:
                 return 0
             try:
                 now = time.time()
-                with open(self._archive_path(), "a", encoding="utf-8") as fh:
+                with open_append(self._archive_path()) as fh:
                     for r in rows:
                         acts = [dict(zip(("action_order", "tool_name", "tool_args", "result"), a)) for a in conn.execute(
                             "SELECT action_order, tool_name, tool_args, result FROM episode_actions "
@@ -1273,7 +1275,11 @@ class EpisodicMemory:
                         fh.write(json.dumps({"id": r[0], "trigger": r[1], "context": r[2], "outcome": r[3],
                                              "lesson": r[4], "timestamp": r[5], "actions": acts, "forgot": reason,
                                              "forgot_at": now}, ensure_ascii=False) + "\n")
-            except OSError:
+            except OSError as e:
+                # NOTHING was deleted (the archive comes first) — and that is
+                # not "already gone" (§4MD M8: a privacy request was told so)
+                logger.warning("episode archive write failed (%s): nothing deleted", e)
+                self.last_archive_failed = True
                 return 0
             found = [r[0] for r in rows]
             conn.executemany("DELETE FROM episode_actions WHERE episode_id = ?", [(i,) for i in found])

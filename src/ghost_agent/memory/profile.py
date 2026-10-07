@@ -332,14 +332,10 @@ class ProfileMemory:
                            "overwrite the on-disk identity",
                            icon=Icons.USER_ID, level="WARNING")
                 return
-            temp_path = self.file_path.with_suffix('.tmp')
-            # fsync before rename: the rename alone can publish a torn/empty
-            # file on power loss (see journal.py's identical rationale).
-            with open(temp_path, "w", encoding="utf-8") as f:
-                f.write(json.dumps(data, indent=2))
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(temp_path, self.file_path)
+            # fsync before rename (a rename alone can publish a torn/empty
+            # file on power loss) and a UNIQUE temp name (§4MD MINOR 5)
+            from ..utils.json_store import write_json_atomic
+            write_json_atomic(self.file_path, data)
 
     @staticmethod
     def _bounded(values: list, cap: int, cat: str, key: str) -> list:

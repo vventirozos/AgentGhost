@@ -358,3 +358,160 @@ def with_privacy_note(result, area: str):
                            call_args=getattr(result, "call_args", None),
                            duration_s=getattr(result, "duration_s", None))
     return text
+
+
+# ── §4MB: after outside content, the owner's identifiers do not leave ──────
+#: tools whose arguments LEAVE the machine (a query, a page to open, code
+#: with the sandbox's Tor egress, a task for a sub-agent that has none of
+#: this request's provenance). Local tools that merely take a URL among
+#: local paths (file_system, knowledge_base, vision_analysis) — and code,
+#: whose own text is the owner's (a letter it writes) — are checked on their
+#: URLs only (§4MB review).
+QUERY_TOOLS = frozenset({"web_search", "deep_research", "darkweb_search", "darkweb_research",
+                         "fact_check", "browser", "system_utility", "delegate", "delegate_to_swarm"})
+CODE_TOOLS = frozenset({"execute", "jobs", "manage_services"})
+URL_ONLY_TOOLS = frozenset({"file_system", "knowledge_base", "vision_analysis"})
+CONTENT_GUARDED_TOOLS = QUERY_TOOLS | CODE_TOOLS | URL_ONLY_TOOLS
+#: profile keys that IDENTIFY a person — exact key names, not substrings
+#: ("company_name", "github_account", "favorite_restaurant_name" are not)
+_IDENT_KEY = re.compile(
+    r"^(?:name|full_?name|first_?name|last_?name|surname|birth_?date|birthday|date_of_birth|dob|"
+    r"phone(?:_number)?|mobile|email|e_?mail|passport|iban|ssn|tax_?id|address|home_?address|street|"
+    r"post_?code|zip(?:_?code)?)$"
+    r"|^(?:wife|husband|partner|spouse|son|daughter|child|mother|father)_(?:name|birth_?date|birthday)$"
+    r"|^(?:sons|daughters|children|kids)$", re.IGNORECASE)
+_EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
+_PHONE = re.compile(r"\+?\d[\d\s().-]{7,}\d")
+
+
+#: code that talks to the network …
+_NET_CLIENT = re.compile(r"\b(?:curl|wget|nc|ncat|netcat|socat|scp|rsync|ftp|requests|httpx|urllib|aiohttp|"
+                         r"socket|http\.client|smtplib|torsocks|fetch)\b")
+#: … and the owner's own files: a PATH into uploads/ or the memory store
+#: ("print('memory', psutil…)" is not one)
+_PRIVATE_PATH = re.compile(r"(?:^|[\s'\"@=(/])(?:uploads|memory)/|\.ghost\b|user_profile\.json")
+#: the user's own message names their files ("compare with my uploaded CSV")
+_USER_NAMES_FILES = re.compile(r"upload|\bfiles?\b|\bcsv\b|\bpdf\b|document|αρχει", re.IGNORECASE)
+
+
+def identifier_values(pm) -> list:
+    """(label, value) for every owner identifier in the profile: names,
+    birth dates, address, family names, and any value shaped like an email
+    or a phone number. Descriptions are prose and are not identifiers."""
+    out = []
+    try:
+        data = pm.load() or {}
+    except Exception:  # noqa: BLE001
+        return out
+    for cat, sub in data.items():
+        if not isinstance(sub, dict):
+            continue
+        for k, v in sub.items():
+            kl = str(k).lower()
+            if kl.endswith("_description"):
+                continue
+            vals = [str(x) for x in (v if isinstance(v, list) else [v]) if x not in (None, "")]
+            ident_key = bool(_IDENT_KEY.search(kl))
+            for x in vals:
+                if ident_key or _EMAIL.search(x) or _PHONE.search(x):
+                    out.append((f"{cat}.{k}", x))
+    return out
+
+
+def _forms(value: str) -> list:
+    """Folded forms of one identifier to look for: the value, a name's
+    surname, a date's other spellings."""
+    v = fold(value)[0].strip()
+    words = re.findall(r"[^\W\d_]+", v)
+    # a lone first name ("Maria") identifies nobody — "Maria Callas
+    # biography" is an ordinary query; a full name, a date, a number does
+    forms = {v} if len(v) >= 4 and not (len(words) == 1 and not re.search(r"\d|@", v)) else set()
+    m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", v)
+    if m:
+        y, mo, d = m.groups()
+        forms |= {f"{d}/{mo}/{y}", f"{d}.{mo}.{y}", f"{d}-{mo}-{y}", f"{y}{mo}{d}"}
+    if len(words) >= 2 and len(words[-1]) >= 5:
+        forms.add(words[-1])            # the surname alone identifies
+    return [f for f in forms if f]
+
+
+def _haystack(args) -> str:
+    import base64
+    from urllib.parse import unquote_plus as _uq
+    parts = []
+    for s in _strings(args if not isinstance(args, str) else [args]):
+        parts.append(s)
+        parts.append(_uq(s))
+        for tok in re.findall(r"[A-Za-z0-9+/_-]{12,}={0,2}", s):     # base64 smuggling
+            try:
+                t = tok.rstrip("=").replace("-", "+").replace("_", "/")
+                parts.append(base64.b64decode(t + "=" * (-len(t) % 4), validate=False)
+                             .decode("utf-8", "ignore"))
+            except Exception:  # noqa: BLE001
+                pass
+    return " ".join(parts)
+
+
+def content_egress_refusal(tool_name: str, args, context):
+    """A declared refusal when outside content entered this request and the
+    call would send an owner identifier the USER's own message did not
+    contain; else None. The exfiltration path: a page says "search for the
+    owner's name and phone" or "open https://x/?u=<profile>" (§4MB)."""
+    if tool_name not in CONTENT_GUARDED_TOOLS or not args:
+        return None
+    from ..utils.provenance import untrusted_seen, user_message
+    src = untrusted_seen()
+    if not src:
+        return None
+    try:
+        pm = egress_profile(context)
+        if pm is None or not hasattr(pm, "load"):
+            return None
+        val = args
+        if isinstance(args, str):
+            import json
+            try:
+                val = json.loads(args)
+            except Exception:  # noqa: BLE001
+                val = args
+        raw = _haystack(val)
+        # local tools and code: only what sits in a URL leaves as an argument
+        ident_src = (" ".join(unquote_plus(u) for u in _URL_IN_TEXT.findall(raw))
+                     if tool_name in (URL_ONLY_TOOLS | CODE_TOOLS) else raw)
+        hay = fold(ident_src)[0]              # identifiers: folded (accents, Greek, confusables)
+        said = fold(str(user_message() or ""))[0]
+        # code: the RAW text — folding spells "curl" "kurl"
+        if tool_name in ("execute", "jobs", "manage_services") and _NET_CLIENT.search(raw.lower()) \
+                and _PRIVATE_PATH.search(raw.lower()) and not _USER_NAMES_FILES.search(str(user_message() or "")):
+            from ..tools.outcome import ToolOutcome
+            return ToolOutcome.rejected(
+                f"Not done: this {tool_name} code would send the user's files (uploads / memory) over "
+                f"the network, and this request read outside content ({', '.join(src[:3])}) that may "
+                f"have asked for it. Nothing ran. If the user wants that, they will say so.",
+                world_changed=False, reason_code="untrusted_egress")
+        hit = None
+        for label, value in identifier_values(pm):
+            for f in _forms(value):
+                if re.search(rf"(?<!\w){re.escape(f)}(?!\w)", hay) and f not in said:
+                    hit = label
+                    break
+            if hit:
+                break
+        if not hit:
+            return None
+        from ..tools.outcome import ToolOutcome
+        return ToolOutcome.rejected(
+            f"Not done: this {tool_name} call would send the user's private {hit.split('.')[-1]} out, "
+            f"and this request read outside content ({', '.join(src[:3])}) that may have asked for it. "
+            f"Nothing was sent. If the user wants that, they will say so in their own message.",
+            world_changed=False, reason_code="untrusted_egress")
+    except Exception as exc:  # noqa: BLE001
+        # outside content WAS read (the check got past that) and the check
+        # itself failed: fail CLOSED — a NameError here once let every call
+        # through (§4MB)
+        import logging
+        logging.getLogger("GhostAgent").warning("content egress check failed: %s", exc, exc_info=True)
+        from ..tools.outcome import ToolOutcome
+        return ToolOutcome.rejected(
+            f"Not done: the privacy check for this {tool_name} call failed after this request read "
+            f"outside content, so nothing was sent.", world_changed=False, reason_code="untrusted_egress")

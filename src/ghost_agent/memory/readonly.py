@@ -165,7 +165,7 @@ class ReadOnlyGraphMemory(_ReadOnlyProxy):
     """Knowledge graph: queries pass through, triple writes are no-ops."""
 
     _MUTATORS = frozenset({
-        "add_triplets", "delete_by_target", "delete_edge", "forget_entity", "wipe_all", "prune_stale_edges",
+        "add_triplets", "delete_by_target", "delete_edge", "forget_entity", "forget_project", "wipe_all", "prune_stale_edges",
         "execute_graph_compression", "bump", "initialize_graph",
         # legacy guessed names kept harmless
         "add_triplet", "insert_fact", "delete_triplet",

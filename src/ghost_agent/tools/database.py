@@ -242,6 +242,15 @@ async def tool_postgres_admin(action: str = None, connection_string: Optional[st
     # affirmative tokens count.
     _confirmed = (confirm is True
                   or str(confirm).strip().lower() in ("true", "1", "yes", "y"))
+    if _confirmed:
+        # the model sets `confirm`; after outside content entered the request
+        # it may be a page's instruction — DROP/TRUNCATE stay locked (§4MB)
+        try:
+            from ..utils.provenance import untrusted_seen
+            if untrusted_seen():
+                _confirmed = False
+        except Exception:  # noqa: BLE001
+            pass
     _metacog = kwargs.get("_metacog_bundle")
     if query and action in ("query", "explain_analyze"):
         try:

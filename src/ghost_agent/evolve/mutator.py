@@ -45,6 +45,7 @@ the mutator would silently propose nothing forever.
 """
 from __future__ import annotations
 
+from ..utils.json_store import open_append  # torn-tail-safe JSONL appends (§4MF)
 import asyncio
 import datetime
 import inspect
@@ -1524,7 +1525,7 @@ def write_mutation(rec: Dict[str, Any], home: str = None) -> bool:
         return False
     try:
         base.mkdir(parents=True, exist_ok=True)
-        with (base / LEDGER_FILE).open("a", encoding="utf-8") as fh:
+        with open_append((base / LEDGER_FILE)) as fh:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
         return True
     except Exception:              # noqa: BLE001

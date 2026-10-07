@@ -31,6 +31,7 @@ at sim conclusion) and ``results.jsonl`` (one line per replay).
 
 from __future__ import annotations
 
+from ..utils.json_store import open_append  # torn-tail-safe JSONL appends (§4MF)
 import datetime
 import hashlib
 import json
@@ -203,7 +204,7 @@ def persist_challenge(*, challenge: str, setup_script: str,
         }
         with _LOCK:
             root.mkdir(parents=True, exist_ok=True)
-            with (root / "challenges.jsonl").open("a", encoding="utf-8") as f:
+            with open_append((root / "challenges.jsonl")) as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         return cid
     except Exception as e:  # noqa: BLE001
@@ -343,7 +344,7 @@ def record_result(*, challenge_id: str, original: str, replay: str,
             rec["attempts"] = int(attempts)
         with _LOCK:
             root.mkdir(parents=True, exist_ok=True)
-            with (root / "results.jsonl").open("a", encoding="utf-8") as f:
+            with open_append((root / "results.jsonl")) as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception as e:  # noqa: BLE001
         logger.debug("counterfactual result write skipped: %s", e)

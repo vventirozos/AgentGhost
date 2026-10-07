@@ -266,7 +266,11 @@ class Scratchpad:
                 self._scopes.pop(evicted_key, None)
                 self._persist_delete(evicted_key)
 
-            self._persist_entry(key, value, ns)
+            _saved = self._persist_entry(key, value, ns) if self.persist_path else True
+        if not _saved:
+            # §4MD MINOR 3: the note is held for this session only — say so
+            return (f"Stored: {key} = {self._echo(value)} — for THIS session only: it could not be "
+                    f"saved to disk and will be lost at the next restart.")
         return f"Stored: {key} = {self._echo(value)}"
 
     def get(self, key: str) -> Optional[Any]:

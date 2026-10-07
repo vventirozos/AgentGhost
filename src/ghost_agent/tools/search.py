@@ -1331,6 +1331,14 @@ async def tool_search_ddgs(query: str, tor_proxy: str):
             _cache_put(_cache_key, result)
             return result
 
+    if not await asyncio.to_thread(_proxy_reachable, tor_proxy):
+        # every engine failed because the PROXY is down, not because of the
+        # query — "use fewer keywords" sent the model on a futile rewrite
+        # loop (§4MD MINOR 1)
+        return ("ERROR: web search is unavailable — the Tor proxy is not reachable, so no "
+                "engine could be contacted. Rephrasing will not help. Tell the user web "
+                "search is down right now, and answer from your own knowledge only if you "
+                "say so.")
     return (
         "ERROR: web search returned ZERO results across all engines and "
         "circuits, even after reformulation. Likely the query was too "
@@ -1340,6 +1348,25 @@ async def tool_search_ddgs(query: str, tor_proxy: str):
         "proceed with your own knowledge and state that web search was "
         "unavailable, rather than looping on more searches."
     )
+
+def _proxy_reachable(proxy_url, timeout: float = 3.0) -> bool:
+    """Does the proxy's port accept a TCP connection? True when there is no
+    proxy or it cannot be parsed (then the query is the likelier cause)."""
+    if not proxy_url:
+        return True
+    try:
+        import socket
+        from urllib.parse import urlparse
+        u = urlparse(str(proxy_url))
+        if not u.hostname or not u.port:
+            return True
+        with socket.create_connection((u.hostname, u.port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+    except Exception:  # noqa: BLE001
+        return True
+
 
 def _record_project_findings(context, query: str, output: str) -> Optional[str]:
     """Main-loop research write-back (2026-09-03, §4EK): a live conversation

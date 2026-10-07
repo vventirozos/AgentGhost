@@ -616,10 +616,17 @@ def download_audio(url: str, video_id: str, tor_proxy: str, dest_dir: Path, *, r
 def _store_passages(memory_system, filename: str,
                     passages: List[Tuple[float, float, str]], progress=None) -> int:
     chunks = [passage_chunk(filename, s, e, t) for s, e, t in passages]
-    for i in range(0, len(chunks), BATCH_CHUNKS):
-        ok, msg = memory_system.ingest_document(filename, chunks[i:i + BATCH_CHUNKS], _batch=True)
-        if not ok:
-            raise RuntimeError(f"embedding failed at chunk {i}: {msg}")
+    try:
+        for i in range(0, len(chunks), BATCH_CHUNKS):
+            ok, msg = memory_system.ingest_document(filename, chunks[i:i + BATCH_CHUNKS], _batch=True)
+            if not ok:
+                raise RuntimeError(f"embedding failed at chunk {i}: {msg}")
+    except BaseException:
+        # no half-transcript behind (§4MD M13)
+        _rb = getattr(memory_system, "rollback_partial_document", None)
+        if callable(_rb):
+            _rb(filename)
+        raise
     return len(chunks)
 
 

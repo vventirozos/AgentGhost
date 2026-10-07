@@ -47,39 +47,62 @@ def _load_task_store() -> dict:
     try:
         p = Path(task_store_path)
         if not p.is_file():
+            _STORE_STATE["unreadable"] = False
             return {}
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError) as je:
-            # set it aside, or the next save keeps only the new task (§4LZ C1)
+            if not isinstance(data, dict):
+                raise ValueError(f"not a task store: a JSON {type(data).__name__}")
+        except (ValueError, UnicodeDecodeError) as je:
+            # set it aside, or the next save keeps only the new task (§4LZ C1);
+            # a valid-JSON non-dict (null, []) is damaged too (§4MD review: it
+            # read as "unreadable" forever)
             from ..utils.json_store import preserve_corrupt
-            preserve_corrupt(p, je, "scheduled-task store")
+            preserve_corrupt(p, je, "scheduled-task store", is_valid=lambda d: isinstance(d, dict))
+            _STORE_STATE["unreadable"] = False
             return {}
         tasks = data.get("tasks")
+        _STORE_STATE["unreadable"] = False
         return tasks if isinstance(tasks, dict) else {}
     except Exception as e:  # noqa: BLE001
-        logger.warning("scheduled-task store unreadable (%s) — treating as empty", e)
+        # NOT empty: the file is there and could not be READ (EACCES, EIO).
+        # Saving "the store plus one task" now would overwrite every other
+        # task — the next save is refused until a read succeeds (§4MD M6)
+        _STORE_STATE["unreadable"] = True
+        logger.warning("scheduled-task store unreadable (%s) — saves are held until it reads again", e)
         return {}
 
 
-def _save_task_store(tasks: dict) -> None:
+#: the last load could not READ the store (not a decode error, which sets the
+#: file aside): a save would overwrite tasks it never saw (§4MD M6)
+_STORE_STATE = {"unreadable": False}
+
+
+def _save_task_store(tasks: dict) -> bool:
     """Atomic write (tmp + os.replace) so a crash mid-save can't truncate
-    the store. Best-effort: a persistence failure is logged, never raised —
-    the live scheduler state stays authoritative for this session."""
+    the store. Never raises; returns False when the store was NOT written —
+    the caller must say so (§4MD M7: a failed write replied SUCCESS and the
+    task vanished at the next restart). The live scheduler state stays
+    authoritative for this session."""
     if not task_store_path:
-        return
+        return True
+    if _STORE_STATE["unreadable"]:
+        logger.warning("scheduled-task store not saved: it could not be read, and a save would drop its tasks")
+        return False
     try:
         p = Path(task_store_path)
         p.parent.mkdir(parents=True, exist_ok=True)
         from ..utils.json_store import write_json_atomic
         write_json_atomic(p, {"tasks": tasks})               # fsync (§4LZ C1)
+        return True
     except Exception as e:  # noqa: BLE001
         logger.warning("scheduled-task store write failed: %s", e)
+        return False
 
 
 def _persist_task(job_id: str, task_name: str, prompt: str,
                   cron_expression: str, kind: str = "task",
-                  check_command: str = None) -> None:
+                  check_command: str = None) -> bool:
     tasks = _load_task_store()
     rec = {
         "task_name": task_name,
@@ -94,7 +117,7 @@ def _persist_task(job_id: str, task_name: str, prompt: str,
         rec["check_command"] = check_command
         rec["last_fired"] = False
     tasks[job_id] = rec
-    _save_task_store(tasks)
+    return _save_task_store(tasks)
 
 
 def get_watch_record(job_id: str) -> dict:
@@ -112,16 +135,20 @@ def set_watch_state(job_id: str, last_fired: bool) -> None:
         _save_task_store(tasks)
 
 
-def _unpersist_task(job_id: str) -> None:
+def _unpersist_task(job_id: str) -> bool:
+    """False when the removal could NOT be saved — the task comes back at the
+    next restart, and the caller must say so (§4MD review)."""
     tasks = _load_task_store()
     if job_id in tasks:
         del tasks[job_id]
-        _save_task_store(tasks)
+        return _save_task_store(tasks)
+    return not _STORE_STATE["unreadable"]
 
 
-def _unpersist_all() -> None:
+def _unpersist_all() -> bool:
     if task_store_path:
-        _save_task_store({})
+        return _save_task_store({})
+    return True
 
 
 def _add_job(scheduler, job_id: str, task_name: str, prompt: str,
@@ -216,6 +243,50 @@ def _add_job(scheduler, job_id: str, task_name: str, prompt: str,
     return None
 
 
+def note_task_fired(job_id: str, ts: float) -> None:
+    """Record when a scheduled task last fired (§4MD MINOR 7)."""
+    tasks = _load_task_store()
+    rec = tasks.get(job_id)
+    if isinstance(rec, dict):
+        rec["last_fire_ts"] = float(ts)
+        _save_task_store(tasks)
+
+
+#: how far back a missed cron fire is still caught up at boot
+CATCHUP_WINDOW_S = 6 * 3600
+
+
+def _schedule_missed_fire(scheduler, job_id: str, rec: dict, now: float) -> bool:
+    """A cron task whose fire fell inside a restart was skipped until its next
+    slot — a daily task due during a one-minute deploy waited a day (§4MD
+    MINOR 7). Run it ONCE, a minute after boot, when the missed fire is
+    recent; older misses are left to the schedule."""
+    expr = str(rec.get("cron_expression") or "")
+    if CronTrigger is None or not expr or expr.startswith("interval:") or rec.get("kind") == "watch":
+        return False
+    last = rec.get("last_fire_ts") or rec.get("created_at")
+    if not last:
+        return False
+    import datetime as _dt
+    trig = CronTrigger.from_crontab(expr, timezone="UTC")
+    prev = _dt.datetime.fromtimestamp(float(last), tz=_dt.timezone.utc)
+    nxt = trig.get_next_fire_time(None, prev + _dt.timedelta(seconds=1))
+    if nxt is None:
+        return False
+    missed = nxt.timestamp()
+    if not (missed < now and now - missed <= CATCHUP_WINDOW_S):
+        return False
+    scheduler.add_job(
+        run_proactive_task_fn, 'date',
+        run_date=_dt.datetime.fromtimestamp(now + 60, tz=_dt.timezone.utc),
+        args=[f"{job_id}__catchup", str(rec.get("prompt") or "")],
+        id=f"{job_id}__catchup", name=f"{rec.get('task_name') or job_id} (missed run)",
+        replace_existing=True, misfire_grace_time=300)
+    logger.info("scheduled task %s missed its %s fire during downtime — running it once now",
+                job_id, nxt.isoformat())
+    return True
+
+
 def restore_persisted_tasks(scheduler) -> int:
     """Re-register every persisted task on a fresh scheduler at boot.
     Returns the number restored. A malformed record is skipped with a
@@ -242,6 +313,10 @@ def restore_persisted_tasks(scheduler) -> int:
             if err:
                 raise ValueError(err)
             restored += 1
+            try:
+                _schedule_missed_fire(scheduler, job_id, rec, time.time())
+            except Exception as _ce:  # noqa: BLE001 — a catch-up never blocks a restore
+                logger.debug("catch-up check for %s skipped: %s", job_id, _ce)
         except Exception as e:  # noqa: BLE001
             logger.warning("skipping persisted task %s (%s): %s",
                            job_id, rec.get("task_name"), e)
@@ -291,7 +366,7 @@ async def tool_schedule_task(task_name: str, prompt: str, cron_expression: str, 
         # ever holds tasks that were actually schedulable. Survives agent
         # restarts (the jobstore itself is in-memory); best-effort like the
         # memory note below.
-        _persist_task(job_id, task_name, prompt, cron_expression)
+        _saved = _persist_task(job_id, task_name, prompt, cron_expression)
 
         # The job is already scheduled at this point. A failure to write the
         # bookkeeping memory entry must NOT be reported as a scheduling
@@ -312,6 +387,12 @@ async def tool_schedule_task(task_name: str, prompt: str, cron_expression: str, 
                 pretty_log("Schedule Memory", f"note write failed (task still scheduled): {mem_err}",
                            level="WARNING", icon=Icons.WARN)
 
+        if not _saved:
+            from .outcome import ToolOutcome
+            return ToolOutcome.partial(
+                f"PARTIAL: Task '{task_name}' is scheduled for THIS session (ID: {job_id}) but could NOT "
+                f"be saved — it will be lost at the next restart. Tell the user.",
+                reason_code="task_not_persisted")
         return f"SUCCESS: Task '{task_name}' scheduled (ID: {job_id})."
     except Exception as e:
         pretty_log("Schedule Error", str(e), level="ERROR", icon=Icons.FAIL)
@@ -345,8 +426,8 @@ async def tool_watch_condition(task_name: str, check_command: str,
                        kind="watch", check_command=check_command)
         if err:
             return err
-        _persist_task(job_id, task_name, reaction_prompt, cron,
-                      kind="watch", check_command=check_command)
+        _saved = _persist_task(job_id, task_name, reaction_prompt, cron,
+                               kind="watch", check_command=check_command)
         if memory_system:
             try:
                 from ..utils.helpers import get_utc_timestamp as _uts
@@ -359,6 +440,12 @@ async def tool_watch_condition(task_name: str, check_command: str,
             except Exception as mem_err:
                 pretty_log("Watch Memory", f"note write failed (watch still active): {mem_err}",
                            level="WARNING", icon=Icons.WARN)
+        if not _saved:
+            from .outcome import ToolOutcome
+            return ToolOutcome.partial(
+                f"PARTIAL: Watch '{task_name}' is active for THIS session (ID: {job_id}) but could NOT be "
+                f"saved — it will be lost at the next restart. Tell the user.",
+                reason_code="task_not_persisted")
         return (f"SUCCESS: Watch '{task_name}' active (ID: {job_id}) — polling every {secs}s. "
                 f"It fires the reaction the moment `{str(check_command)[:60]}` first exits 0.")
     except Exception as e:
@@ -376,7 +463,12 @@ async def tool_stop_all_tasks(scheduler):
             return "No active tasks to stop."
         count = len(jobs)
         scheduler.remove_all_jobs()
-        _unpersist_all()
+        if not _unpersist_all():
+            from .outcome import ToolOutcome
+            return ToolOutcome.partial(
+                f"PARTIAL: Stopped {count} scheduled tasks for THIS session, but the task store could NOT "
+                f"be updated — they come back at the next restart. Tell the user.",
+                reason_code="task_not_persisted")
         return f"SUCCESS: Stopped and removed {count} scheduled tasks."
     except Exception as e:
         return f"Error stopping tasks: {e}"
@@ -395,7 +487,16 @@ async def tool_stop_task(task_identifier: str, scheduler):
         return f"Error: No active task found matching '{task_identifier}'."
     try:
         scheduler.remove_job(target_job.id)
-        _unpersist_task(target_job.id)
+        try:                     # its pending catch-up run goes with it (§4MD review)
+            scheduler.remove_job(f"{target_job.id}__catchup")
+        except Exception:  # noqa: BLE001 — none scheduled
+            pass
+        if not _unpersist_task(target_job.id):
+            from .outcome import ToolOutcome
+            return ToolOutcome.partial(
+                f"PARTIAL: Stopped '{target_job.name}' for THIS session, but the task store could NOT be "
+                f"updated — it comes back at the next restart. Tell the user.",
+                reason_code="task_not_persisted")
         return f"SUCCESS: Stopped background task '{target_job.name}' (ID: {target_job.id})."
     except Exception as e:
         return f"Error stopping task: {e}"
@@ -450,6 +551,14 @@ def _schedule_refusal(action, scheduler, task_name, cron_expression, interval_se
                 f"user can, in a conversation.")
     if is_probe_request_id(rid) or str(request_origin_context.get() or "") == ORIGIN_PROBE:
         return "Error: a probe request does not create or stop scheduled tasks."
+    # a task is a STANDING instruction replayed as the owner's own message
+    # (and a watch runs its command with no model at all): never from a
+    # request whose content came from outside (§4MB)
+    from ..utils.provenance import refuse_if_untrusted
+    _ref = refuse_if_untrusted("the scheduled task" if action in ("create", "watch")
+                               else "the change to scheduled tasks")
+    if _ref is not None:
+        return _ref
     if action in ("stop_all", "stop"):
         return None
     try:

@@ -1044,7 +1044,11 @@ def trajectory_dream_fragments(context, limit: int = 40):
         if collector is None:
             return [], []
         from ..memory.skills import iter_teachable
-        trajs = list(iter_teachable(collector.iter_trajectories()))
+        # the newest `limit` are kept — read only recent days (§4MC MAJOR 2)
+        try:
+            trajs = list(iter_teachable(collector.iter_trajectories(since_days=30.0)))
+        except TypeError:                     # a collector without the bound
+            trajs = list(iter_teachable(collector.iter_trajectories()))
     except Exception:
         return [], []
     ids, docs = [], []
@@ -3048,6 +3052,20 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                 metrics_note += f" ({distilled_lessons} failure-pattern lessons distilled)"
             if project_digests:
                 metrics_note += f" ({project_digests} project digests written)"
+
+            # Trajectory retention (§4MF): day partitions older than 90 days
+            # are archived to trajectories/archive/<day>.tar.gz — kept, not
+            # deleted — so readers stop walking the whole corpus forever.
+            try:
+                _tc = getattr(self.context, "trajectory_collector", None)
+                _troot = getattr(_tc, "root", None)
+                if _troot is not None:
+                    from ..distill.collector import archive_old_partitions
+                    _arch = await asyncio.to_thread(archive_old_partitions, _troot)
+                    if _arch:
+                        metrics_note += f" ({len(_arch)} old trajectory day(s) archived)"
+            except Exception as _tax:  # noqa: BLE001
+                logger.debug("trajectory archive skipped: %s", _tax)
 
             # Graph forgetting: drop weight-1 stale edges so the only uncapped
             # memory tier gets a decay story (IMPROVEMENTS.md #27c). Reinforced

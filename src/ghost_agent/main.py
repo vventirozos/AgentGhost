@@ -1127,6 +1127,27 @@ async def _reap_sandbox_jobs(context):
 # Jobs already woken, so a landing can never re-trigger. Bounded: reap only
 # reports a transition ONCE (it is the sole writer of terminal states), so
 # this is belt-and-braces against a reaper restart re-reading the registry.
+def _sandbox_has_live_work(sandbox_mgr):
+    """(keep_running, why): running background jobs or registered services
+    in the sandbox container (§4MD M11). Unknown → stop as before."""
+    if sandbox_mgr is None:
+        return False, ""
+    try:
+        from .sandbox.jobs import get_job_supervisor
+        from .sandbox.services import get_service_supervisor
+        jsup, ssup = get_job_supervisor(sandbox_mgr), get_service_supervisor(sandbox_mgr)
+        _j = jsup.list_entries() if jsup else []
+        _s = ssup.list_entries() if ssup else []
+        jobs = [e for e in (_j if isinstance(_j, list) else [])
+                if isinstance(e, dict) and str(e.get("state") or "") == "running"]
+        svcs = [e for e in (_s if isinstance(_s, list) else []) if isinstance(e, dict)]
+        if jobs or svcs:
+            return True, f"{len(jobs)} running job(s), {len(svcs)} service(s) live in it"
+    except Exception:  # noqa: BLE001
+        pass
+    return False, ""
+
+
 _RESUMED_JOBS: set = set()
 # A landed job is not allowed to start an unbounded chain of autonomous
 # turns. Each wake is one turn; a woken turn that promotes another job can
@@ -1764,7 +1785,12 @@ async def lifespan(app):
         # never completes and every later tick idles. Reset stale claims to
         # READY at boot, before the watchdog/advancer starts.
         try:
-            _reaped = context.project_store.reset_orphaned_in_progress()
+            # EVERY claim is the previous process's here — nothing in this one
+            # can have claimed yet (the advancer and request handling start
+            # later). The 900 s default kept a claim made in the last 15
+            # minutes before a deploy IN_PROGRESS until some LATER restart,
+            # and the project stalled (§4MD M12).
+            _reaped = context.project_store.reset_orphaned_in_progress(older_than_seconds=0.0)
             if _reaped:
                 pretty_log("Project Store",
                            f"reset {_reaped} orphaned IN_PROGRESS task(s) "
@@ -1772,6 +1798,21 @@ async def lifespan(app):
                            icon=Icons.RETRY)
         except Exception as _reap_exc:
             logger.debug("orphan reaper skipped: %s", _reap_exc)
+        # §4MF: temp files a killed atomic writer left behind — in the
+        # background (a full walk of the data home must not delay boot)
+        try:
+            from .utils.json_store import sweep_orphan_temps
+            _md = getattr(context, "memory_dir", None)
+            if _md is not None:
+                async def _sweep(root=Path(str(_md)).parent):
+                    _n = await asyncio.to_thread(sweep_orphan_temps, root)
+                    if _n:
+                        pretty_log("Store Hygiene", f"removed {_n} orphaned temp file(s) left by a killed write",
+                                   icon=Icons.RETRY)
+                from .utils.logging import spawn_bg as _spawn_bg
+                _spawn_bg(_sweep(), name="temp-sweep")
+        except Exception as _sw_exc:  # noqa: BLE001
+            logger.debug("temp sweep skipped: %s", _sw_exc)
         pretty_log("Project Store", "Long-term project store initialized",
                    icon=Icons.BRAIN_PLAN)
     except Exception as e:
@@ -1973,7 +2014,29 @@ async def lifespan(app):
                                 next_run_time=_dtt.now(_tzz.utc) + _tdl(seconds=60))
                     except Exception:  # noqa: BLE001 — retry nudge is best-effort
                         pass
+                    if str(job_id).endswith("__catchup") and _sched is not None:
+                        # a one-shot catch-up has no next run — re-arm it
+                        try:
+                            from datetime import datetime as _dtc, timedelta as _tdc, timezone as _tzc
+                            _sched.add_job(_run_proactive_task, 'date',
+                                           run_date=_dtc.now(_tzc.utc) + _tdc(seconds=60),
+                                           args=[job_id, prompt], id=job_id, name=task_name,
+                                           replace_existing=True, misfire_grace_time=300)
+                        except Exception:  # noqa: BLE001
+                            pass
                     return False
+                # the fire is RECORDED — only now, after the deferral, and only
+                # for cron and catch-up runs (an interval task rewrote the store
+                # every tick) — so a restart can tell a missed one (§4MD)
+                try:
+                    _base_id = str(job_id).split("__catchup")[0]
+                    from apscheduler.triggers.cron import CronTrigger as _CTf
+                    _jf = _sched.get_job(_base_id) if _sched else None
+                    if str(job_id).endswith("__catchup") or (
+                            _jf is not None and isinstance(getattr(_jf, "trigger", None), _CTf)):
+                        await asyncio.to_thread(_tools_tasks.note_task_fired, _base_id, started)
+                except Exception:  # noqa: BLE001
+                    pass
                 pretty_log(
                     "Scheduled Task Fire",
                     f"{job_id} | prompt={prompt[:80]!r}",
@@ -3533,7 +3596,16 @@ async def lifespan(app):
         # so the next run resumes the already-provisioned environment
         # without re-installing the deep-learning stack.
         sandbox_mgr = getattr(context, 'sandbox_manager', None)
-        if sandbox_mgr is not None and hasattr(sandbox_mgr, 'close'):
+        _keep, _why_keep = _sandbox_has_live_work(sandbox_mgr)
+        if _keep:
+            # Background jobs and in-sandbox services LIVE in the container:
+            # stopping it on every deploy killed them all, and the next boot
+            # booked them "vanished (container recreated, or killed from
+            # outside)" (§4MD M11). The container is adopted by name at the
+            # next start, so leaving it up leaks nothing.
+            pretty_log("Sandbox Shutdown", f"container left running — {_why_keep}",
+                       icon=Icons.SANDBOX_BOX)
+        elif sandbox_mgr is not None and hasattr(sandbox_mgr, 'close'):
             try:
                 await asyncio.to_thread(sandbox_mgr.close, False)
             except Exception as e:

@@ -57,6 +57,7 @@ Kill switch / flip:
 
 from __future__ import annotations
 
+from ..utils.json_store import open_append  # torn-tail-safe JSONL appends (§4MF)
 import json
 import logging
 import os
@@ -497,7 +498,7 @@ def record_shadow(verdict: RubricVerdict, *, trajectory_id: str = "",
         p = shadow_path(home)
         p.parent.mkdir(parents=True, exist_ok=True)
         row = verdict.to_row(trajectory_id=trajectory_id, req_id=req_id, ts=ts)
-        with p.open("a", encoding="utf-8") as fh:
+        with open_append(p) as fh:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
         return True
     except Exception as exc:                                # noqa: BLE001

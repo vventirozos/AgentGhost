@@ -534,6 +534,7 @@ class ServiceSupervisor:
             data = json.loads(_read_bytes_nofollow(
                 self._registry_path,
                 max_bytes=_REGISTRY_MAX_BYTES).decode("utf-8", "replace"))
+            self._registry_unreadable = False
             return self._validated_rows(data)
         except RuntimeError:
             # ⚠ NOT SWALLOWED. `host_dir` raises RuntimeError only when the
@@ -545,8 +546,9 @@ class ServiceSupervisor:
             # link, and nobody is told. Let it out so the tool layer can
             # render it.
             raise
-        except Exception:  # noqa: BLE001 — absent/corrupt → empty
-            return {}
+        except Exception as _lexc:  # noqa: BLE001 — absent / damaged / unreadable (§4MD M9)
+            from .registry_guard import registry_load_failed
+            return registry_load_failed(self._registry_path, _lexc, self)
 
     def _validated_rows(self, data) -> Dict[str, dict]:
         """§4GI: the registry is on the bind mount — every row is attacker
@@ -590,6 +592,8 @@ class ServiceSupervisor:
         # registry. It then parses as garbage, `_load()` returns {}, and every
         # running service silently loses its row — ports, tokens and project
         # coupling gone, `valid_service_token` 403s every sandbox app.
+        from .registry_guard import refuse_save_if_unreadable
+        refuse_save_if_unreadable(self)              # §4MD M9
         tmp = self._registry_path.with_suffix(
             f".{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
         try:

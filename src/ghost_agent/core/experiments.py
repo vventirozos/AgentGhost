@@ -2622,7 +2622,9 @@ def _summaries_from_trajectories(trajectory_root: Any, *,
     except Exception:  # noqa: BLE001 — the PPI line is additive, never fatal
         judge_map = None
     return summarize_streaming(
-        collector.iter_trajectories(day=day),
+        # all-time verdicts read the 90-day archive too (§4MF review: archiving
+        # silently dropped a rare arm's older samples)
+        collector.iter_trajectories(day=day, include_archive=day is None),
         admit_task_kinds=admit_task_kinds,
         admit_names=admit_names,
         deny_names=deny_names,
@@ -2768,7 +2770,7 @@ def announce_new_verdicts(context, *, alpha: float = 0.05) -> List[str]:
             bench_scoped = set(reg.names_in_scope(SCOPE_BENCH))
             collector = TrajectoryCollector(root=root, session_id="reader")
             all_stats, trig_stats, _cov = summarize_streaming(
-                collector.iter_trajectories(),
+                collector.iter_trajectories(include_archive=True),   # §4MF: verdicts keep archived evidence
                 deny_names=bench_scoped)
         # §4BF 1c: the BENCH population, read separately. Only names the
         # registry currently scopes to bench are analyzed — a retired or

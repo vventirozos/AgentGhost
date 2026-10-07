@@ -36,6 +36,7 @@ Read it with `scripts/edit_ladder_report.py`.
 
 from __future__ import annotations
 
+from .json_store import open_append  # torn-tail-safe JSONL appends (§4MF)
 import json
 import logging
 import os
@@ -117,7 +118,7 @@ def record_edit(*, path: str, op: str = "replace", applied: bool = False,
             "blocks_total": int(blocks_total or 0),
             "blocks_applied": int(blocks_applied or 0),
         }
-        with p.open("a", encoding="utf-8") as fh:
+        with open_append(p) as fh:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
         return True
     except Exception as exc:                                # noqa: BLE001

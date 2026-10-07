@@ -1164,3 +1164,23 @@ def pytest_configure(config):
 
 
 _MISSING = object()
+
+
+@pytest.fixture(autouse=True)
+def _legacy_confirm_tests_say_yes(monkeypatch):
+    """§4MB: a preview is confirmed only by the USER's own "yes", recorded by
+    `handle_chat` for every real request (`utils.provenance.note_user_message`).
+    Tests that drive a confirm WITHOUT `handle_chat` record nothing; for those
+    the user is taken to have said "yes". A test that records a message —
+    every §4MB pin does — gets exactly that message."""
+    from ghost_agent.utils import provenance as _prov
+    real = _prov.user_message
+
+    def _user_message(req_id=None):
+        rid = _prov._lineage(_prov._rid(req_id))[-1]
+        with _prov._LOCK:
+            recorded = rid in _prov._USER
+        return real(req_id) if recorded else "yes"
+    monkeypatch.setattr(_prov, "user_message", _user_message)
+    yield
+    _prov._reset_for_tests()

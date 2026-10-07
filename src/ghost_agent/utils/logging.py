@@ -307,8 +307,14 @@ _STDOUT_LOCK = threading.Lock()
 def atomic_print(line: str) -> None:
     """Print one complete log line atomically. Always appends a newline."""
     with _STDOUT_LOCK:
-        sys.stdout.write(line + "\n")
-        sys.stdout.flush()
+        try:
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            # stdout IS the log file under launchd: a full disk (ENOSPC) or a
+            # closed stream must not turn the line that REPORTS a failure into
+            # a crash of the code reporting it (§4MD M5)
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -489,11 +495,42 @@ def request_remaining_s(req_id: str) -> Optional[float]:
     except Exception:  # noqa: BLE001
         deadline = 0.0
     if deadline <= 0:
+        deadline = server_request_cap_s(req_id)
+    if deadline <= 0:
         return None
     elapsed = request_elapsed_s(req_id)
     if elapsed is None:
         return None
     return deadline - elapsed
+
+
+def request_deadline_s(req_id: str = "") -> float:
+    """The deadline in force: the client's, else the server cap (0 = none)."""
+    try:
+        d = float(client_deadline_context.get() or 0.0)
+    except Exception:  # noqa: BLE001
+        d = 0.0
+    return d if d > 0 else server_request_cap_s(req_id)
+
+
+def server_request_cap_s(req_id: str = "") -> float:
+    """§4MF: the SERVER's time budget for a conversation request when the
+    client sent no deadline (Slack, CLI, probes): 10–37-minute requests ended
+    as stitched working notes because nothing told the loop to report.
+    ``GHOST_MAX_REQUEST_S`` (default 1800; 0 = none). Background work
+    (scheduled, sub-agent, job, self-play, bench) keeps its own budgets."""
+    try:
+        cap = float(os.environ.get("GHOST_MAX_REQUEST_S", "1800"))
+    except ValueError:
+        cap = 1800.0
+    if cap <= 0:
+        return 0.0
+    try:
+        if request_kind(req_id or None) in ("background", "job", "test", "system"):
+            return 0.0
+    except Exception:  # noqa: BLE001
+        return 0.0
+    return cap
 
 
 def request_elapsed_s(req_id: str) -> Optional[float]:
@@ -772,7 +809,16 @@ def setup_logging(log_file: str, debug: bool = False, daemon: bool = False, verb
     log_dir = os.path.dirname(log_file)
     if log_dir:
         os.makedirs(log_dir, exist_ok=True)
-    fh = logging.FileHandler(log_file)
+    # ROTATED (§4MC MAJOR 1): a plain FileHandler grew 1-1.5 MB/day forever
+    # (82 MB at review). 50 MB × 5 generations ≈ 35 days per file at today's
+    # rate; GHOST_LOG_MAX_MB / GHOST_LOG_BACKUPS override.
+    from logging.handlers import RotatingFileHandler
+    try:
+        _max_mb = float(os.environ.get("GHOST_LOG_MAX_MB", "50"))
+        _backups = int(os.environ.get("GHOST_LOG_BACKUPS", "5"))
+    except ValueError:
+        _max_mb, _backups = 50.0, 5
+    fh = RotatingFileHandler(log_file, maxBytes=int(_max_mb * 1024 * 1024), backupCount=max(1, _backups))
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(formatter)
 

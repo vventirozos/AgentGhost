@@ -24,6 +24,7 @@ a broken activity log must never break a turn or an idle phase.
 
 from __future__ import annotations
 
+from ..utils.json_store import open_append  # torn-tail-safe JSONL appends (§4MF)
 import json
 import logging
 import os
@@ -506,7 +507,7 @@ class ActivityLog:
                                 _prefix = "\n"
                 except OSError:
                     pass
-                with open(self.path, "a", encoding="utf-8") as f:
+                with open_append(self.path) as f:
                     f.write(_prefix + line + "\n")
         except Exception as e:  # noqa: BLE001 — fail-safe contract
             logger.debug("activity record failed: %s", e)
@@ -589,9 +590,8 @@ def save_offset(path, offset: int) -> None:
     try:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"offset": int(offset)}))
-        os.replace(tmp, p)
+        from ..utils.json_store import write_json_atomic
+        write_json_atomic(p, {"offset": int(offset)}, indent=None)
     except Exception as e:  # noqa: BLE001
         logger.debug("activity watermark save failed: %s", e)
 
@@ -619,8 +619,17 @@ def save_consumer_offset(path, consumer: str, offset: int) -> None:
                 data = json.loads(p.read_text())
                 if not isinstance(data, dict):
                     data = {}
-            except Exception:  # noqa: BLE001
+            except FileNotFoundError:
                 data = {}
+            except ValueError as je:
+                # damaged: set it aside, or this save drops every OTHER
+                # consumer's position and they miss notifications (§4MD MINOR 5)
+                from ..utils.json_store import preserve_corrupt
+                preserve_corrupt(p, je, "notification consumer offsets")
+                data = {}
+            except OSError as e:
+                logger.warning("consumer offsets unreadable (%s) — not saved", e)
+                return
             # No-op acks skip the write (2026-08-01). Pollers (slack,
             # web-ui) used to re-ack an unchanged watermark every cycle,
             # rewriting this file every ~30s around the clock — pointless
@@ -632,9 +641,8 @@ def save_consumer_offset(path, consumer: str, offset: int) -> None:
                 return
             data[str(consumer)] = int(offset)
             p.parent.mkdir(parents=True, exist_ok=True)
-            tmp = p.with_suffix(".tmp")
-            tmp.write_text(json.dumps(data))
-            os.replace(tmp, p)
+            from ..utils.json_store import write_json_atomic
+            write_json_atomic(p, data, indent=None)
     except Exception as e:  # noqa: BLE001
         logger.debug("consumer watermark save failed: %s", e)
 
@@ -642,6 +650,27 @@ def save_consumer_offset(path, consumer: str, offset: int) -> None:
 # --------------------------------------------------------------------------
 # Digest rendering
 # --------------------------------------------------------------------------
+
+def _seen_in_conversation(r) -> bool:
+    """A notification the agent sent DURING an owner conversation: the owner
+    read that reply (and the DM) already — re-announcing it on a later,
+    unrelated reply as "while you were away" was noise (§4ME F5: three
+    "hello"s repeated under an unrelated answer)."""
+    try:
+        meta = r.meta or {}
+        rid = str(meta.get("req_id") or "")
+        if not rid or r.phase != "agent_message":
+            return False
+        # only a notify_operator call made IN that turn — a record the agent
+        # wrote LATER under the turn's id ("job finished" hours later, a late
+        # correction) is news the owner has not seen (§4MD review)
+        if meta.get("auto"):
+            return False
+        from ..utils.logging import request_kind
+        return request_kind(rid) == "owner"
+    except Exception:  # noqa: BLE001
+        return False
+
 
 def render_activity_digest(records: List[ActivityRecord], *,
                            max_items: int = 6,
@@ -662,7 +691,8 @@ def render_activity_digest(records: List[ActivityRecord], *,
              if r.summary and r.phase not in (exclude_phases or ())
              and (severities is None or r.severity in severities)
              and not (current_req_id
-                      and r.meta.get("req_id") == current_req_id)]
+                      and r.meta.get("req_id") == current_req_id)
+             and not _seen_in_conversation(r)]
     if not items:
         return ""
     items.sort(key=lambda r: 0 if r.severity == SEVERITY_NOTIFY else 1)

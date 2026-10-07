@@ -166,10 +166,16 @@ async def delete_project(pid: str, request: Request, hard: bool = False):
         _lg.getLogger("GhostAgent").warning("service stop before project delete failed", exc_info=True)
     # Off-loop: a hard delete rmtree's the project workspace (sync
     # filesystem work that must not block the process-wide event loop).
+    _title = (store.get_project(pid) or {}).get("title", "")
     ok = await asyncio.to_thread(store.delete_project, pid, hard=hard)
     if not ok:
         raise HTTPException(404, "project not found")
     ctx = _context(request)
+    if hard:
+        # The tool path's graph leg (2cb40b10): edges naming a deleted
+        # project kept steering the model to rebuild it.
+        from ..tools.projects import _unlink_project_in_graph
+        await asyncio.to_thread(_unlink_project_in_graph, ctx, pid, _title)
     if getattr(ctx, "current_project_id", None) == pid:
         # Route through the tool-side setter: a raw attribute write left
         # the conversation sentinel + workspace_model pointer naming the

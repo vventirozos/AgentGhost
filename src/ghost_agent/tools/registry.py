@@ -1597,7 +1597,7 @@ def get_active_tool_definitions(context, query: str = None, *,
 # Pinned deleted in tests/test_4fx_tool_head_diet_retired.py.
 
 
-from ..memory.egress import OUTBOUND_TOOLS, egress_profile, scrub_tool_args, with_privacy_note  # noqa: E402
+from ..memory.egress import egress_profile, scrub_tool_args, with_privacy_note  # noqa: E402
 
 _ISOLATED_RECALL_REFUSAL = ("recall is not available here: a delegated task has no access to the owner's "
                             "memory (§4LB). Work from the task text and your own tool results.")
@@ -1610,6 +1610,13 @@ def _egress_scrubbed(name, fn, context):
     calling contract it had."""
 
     def _run(**kwargs):
+        # §4MB: macros and delegates call this wrapper, never the dispatch hook
+        from ..memory.egress import content_egress_refusal
+        _ref = content_egress_refusal(name, kwargs, context)
+        if _ref is not None:
+            async def _refused():
+                return _ref
+            return _refused()
         new, changed = scrub_tool_args(name, kwargs, context)
         if not changed:
             return fn(**new)
@@ -1791,7 +1798,8 @@ def get_available_tools(context):
     # §4LB r2: the owner's street address is scrubbed at the TOOL boundary
     # too — composed-skill macros and delegates call these callables
     # directly, never through the dispatch hook
-    for _name in OUTBOUND_TOOLS:
+    from ..memory.egress import CONTENT_GUARDED_TOOLS
+    for _name in CONTENT_GUARDED_TOOLS:
         if _name in tools:
             tools[_name] = _egress_scrubbed(_name, tools[_name], context)
 
@@ -1920,6 +1928,9 @@ def get_available_tools(context):
                                 from .outcome import ToolOutcome as _TOf
                                 return _TOf.failed(f"Acquired skill '{name}' failed: {e}",
                                                    reason_code="acquired_skill_exception")   # §4LZ B8
+                        _run._ghost_opaque = True   # unvetted content (§4MB provenance)
+                        from ..utils.provenance import register_opaque
+                        register_opaque(name)
                         return _run
 
                     tools[skill_name] = make_skill_runner(skill_name)

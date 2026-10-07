@@ -1698,6 +1698,8 @@ def test_every_outage_reply_the_turn_loop_emits_is_a_known_banner():
                 getattr(t, "id", "") == "final_ai_content" for t in node.targets)):
             continue
         v = node.value
+        while isinstance(v, ast.BinOp):      # "…banner… " + UPSTREAM_ABORT_MARKER (§4MD)
+            v = v.left
         head = (v.value if isinstance(v, ast.Constant) and isinstance(v.value, str)
                 else v.values[0].value if isinstance(v, ast.JoinedStr) and v.values
                 and isinstance(v.values[0], ast.Constant) else "")

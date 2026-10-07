@@ -1236,6 +1236,111 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
     <li><strong>Kept by design: a PDF with missing source files is <code>partial</code>.</strong> A report that lacks content it was asked to include is not done. The result names the missing files so the next call can fix them, and a project leaf should not close DONE on it.</li>
   </ul>
   <p>Pins: <code>tests/test_4lz_gating.py</code>, <code>tests/test_4lz_truth.py</code>, <code>tests/test_4lz_state.py</code>, <code>tests/test_4lz_review.py</code>.</p>
+
+  <h2 id="4md">When something breaks, growth over weeks, answer quality <span class="tag">2026-10-07 &sect;4MC&ndash;&sect;4ME</span></h2>
+  <p>Three reviews ran in parallel. <strong>Growth</strong> measured every store on live data (read-only). <strong>Failure handling</strong> injected faults on copies and throwaway <code>--network none</code> containers. <strong>Answer quality</strong> graded 112 real owner turns from the last three weeks.</p>
+  <h3>When something breaks (&sect;4MD)</h3>
+  <ul>
+    <li><strong>Tor egress survives an in-place sandbox restart (was CRIT).</strong> <code>docker restart</code> keeps the container id. The new run had no Tor rules, yet egress still read "enforced". Enforcement is now keyed on the container's id <em>and</em> its <code>StartedAt</code>, and is re-applied when either changes.</li>
+    <li><strong>Model-server failures are honest.</strong>
+      <ul>
+        <li><strong>Cut answers:</strong> an answer cut mid-stream that could not be continued says it is incomplete, and is booked as failed.</li>
+        <li><strong>Bounded continuation:</strong> the continuation call is capped at 180 s.</li>
+        <li><strong>Outages:</strong> outage and HTTP-error replies carry the abort marker, so they are booked as failed, credit no lesson, and no longer leak the server's raw error text.</li>
+        <li><strong>Empty replies:</strong> two empty replies in one request stop the turn with "the model server returned empty replies" instead of "please rephrase".</li>
+      </ul>
+    </li>
+    <li><strong>Stores do not lose rows when a read fails.</strong>
+      <ul>
+        <li><strong>Unreadable files:</strong> the scheduled-task store and the sandbox job/service registries hold every save after a read that failed with EACCES or EIO.</li>
+        <li><strong>Damaged files:</strong> a damaged file is set aside as <code>.corrupt-*</code>; the notification consumer offsets get the same treatment.</li>
+        <li><strong>Atomic writes:</strong> profile, library and offset writes use the unique-temp, fsync-then-rename writer.</li>
+      </ul>
+    </li>
+    <li><strong>Saves that failed are reported.</strong>
+      <ul>
+        <li><strong>Tasks:</strong> a task that could not be saved is reported as PARTIAL ("lost at the next restart").</li>
+        <li><strong>Scratchpad:</strong> a note that could not be persisted says "for this session only".</li>
+        <li><strong>Forget:</strong> a forget whose archive write failed says "Could NOT forget". It used to say "already gone".</li>
+      </ul>
+    </li>
+    <li><strong>The knowledge base never keeps half a document.</strong> Plain, audio and YouTube ingests roll back on failure, as PDF already did. A failed query is an error, not "no passages found".</li>
+    <li><strong>A dead container is not "out of memory".</strong> An exit 137 from a container that stopped or restarted under the command is a <code>[SANDBOX INFRA ERROR]</code>: readiness is invalidated and no OOM advice is given.</li>
+    <li><strong>Deploys keep live work.</strong> A graceful shutdown leaves the sandbox container running while jobs or services live in it. The boot reset frees every IN_PROGRESS claim from the previous process. A cron fire missed within 6 h runs once after boot.</li>
+    <li><strong>Smaller fixes:</strong> the log writer never raises on a full disk; web search says "the Tor proxy is not reachable" rather than "use fewer keywords"; registry writes fsync.</li>
+  </ul>
+  <h3>Growth over weeks (&sect;4MC)</h3>
+  <ul>
+    <li><strong>Disk:</strong> about 4&ndash;5 MB/day, with no disk risk. The real costs were RAM and CPU.</li>
+    <li><strong>The agent log rotates</strong> at <code>GHOST_LOG_MAX_MB</code> (default 50) with <code>GHOST_LOG_BACKUPS</code> (default 5) generations. The liveness probes binary-search the last 8 days of the current file and <code>.1</code>: 0.19&nbsp;s instead of 4.6&nbsp;s, and no longer 191&nbsp;MB resident.</li>
+    <li><strong>Trajectories:</strong> <code>iter_trajectories(since_days=…)</code> lets the reflection pass and dream seeds read only recent days.</li>
+    <li><strong>Reflected ids:</strong> kept in insertion order, so the cap drops the oldest.</li>
+    <li><strong>Calibration:</strong> the history cap was raised to 20000, so the fit uses the whole post-epoch corpus again.</li>
+    <li><strong>Memory instrumentation:</strong> a per-turn <code>turn resources rss_mb=… uptime_s=…</code> line in the file log.</li>
+  </ul>
+  <h3>Answer quality (&sect;4ME)</h3>
+  <ul>
+    <li><strong><code>notify_operator</code> states its reach:</strong> "Delivered ONLY to the operator … if a channel post or a message to someone else was asked for, tell the user that was NOT done".</li>
+    <li><strong>No links to missing files:</strong> a streamed reply, including the forced-final retry, no longer links to <code>/api/download/</code> files that do not exist.</li>
+    <li><strong>Research rules:</strong> 4b now says "latest/current" means the newest <em>dated</em> statement from the official source. A new rule 4c says to re-check before conceding.</li>
+    <li><strong>Verifier:</strong> facts the user supplied are GIVEN, never fabrications.</li>
+    <li><strong>Graph:</strong> moving-target world facts (VERSION, LATEST, PRICE …) are not stored.</li>
+    <li><strong>Background banner:</strong> it no longer repeats notifications sent during an owner conversation, and is held, watermark kept, when the request bounds the reply's length.</li>
+    <li><strong>Reply language:</strong> an all-list reply is judged by its list items' own summaries.</li>
+    <li><strong>Smaller fixes:</strong> <code>file_system</code> tells the model a URL is not a file; the deadline report reserve rose to 300&nbsp;s.</li>
+  </ul>
+  <h3>What the fresh reader found in these fixes</h3>
+  <ul>
+    <li><strong>A thinking-only reply was booked as an outage.</strong> The empty-reply check read the message after its thinking had been stripped. It now reads the RAW reply, and only CONSECUTIVE empty replies count.</li>
+    <li><strong>The "already seen" digest filter also hid news the owner had not seen:</strong> "job finished" hours later, and late corrections. It now skips only <code>notify_operator</code> calls made in the turn itself (records without an <code>auto</code> tag).</li>
+    <li><strong>The list-item language check called a Greek digest of links English.</strong> URLs, code, links and digits are no longer measured.</li>
+    <li><strong>Smaller fixes:</strong>
+      <ul>
+        <li><strong>Task store:</strong> a non-dict task store is set aside instead of holding saves forever; stopping a task reports when the store could not be updated, and cancels its pending catch-up run.</li>
+        <li><strong>Cron catch-up:</strong> fires are recorded only after the deferral check, for cron and catch-up runs only, and a deferred catch-up is re-armed.</li>
+        <li><strong>Container restarts:</strong> a container restart is detected inside the readiness TTL too, and Docker's timestamps are parsed in every form.</li>
+        <li><strong>Log rotation:</strong> user turns are counted across a rotation.</li>
+        <li><strong>Narrower patterns:</strong> the length-bound pattern no longer matches "exactly", "just the" or "only the", and the stale-fact pattern matches whole words only.</li>
+        <li><strong>Report reserve:</strong> it is never more than a quarter of the client's deadline.</li>
+      </ul>
+    </li>
+  </ul>
+  <p>Pins: <code>tests/test_4md_failures.py</code>, <code>tests/test_4mc_4me.py</code>.</p>
+
+  <h2 id="4mf">Operator: "proceed with all items" <span class="tag">2026-10-07 &sect;4MF</span></h2>
+  <ul>
+    <li><strong>Data cleanup (approved list):</strong>
+      <ul>
+        <li>deleted: seven memory snapshots, the per-file <code>.pre-*</code> backups, an orphaned vector-index folder and the dangling Docker images (about 1.28&nbsp;GB plus 254&nbsp;MB of images);</li>
+        <li><code>chroma.sqlite3</code> vacuumed once, with the agent stopped and a backup taken first.</li>
+      </ul>
+    </li>
+    <li><strong>Trajectory retention:</strong> the dream cycle archives day partitions older than 90 days to <code>trajectories/archive/&lt;day&gt;.tar.gz</code>. The archive is verified before the folder is removed; nothing is deleted without its copy. Readers walk only dated folders, so archived days drop out of every pass.</li>
+    <li><strong>Sandbox <code>rm</code> guard:</strong> an <code>rm</code> first on the container's PATH refuses to remove a whole project, <code>projects/</code>, <code>uploads/</code> or <code>/workspace</code>. It is installed once per container generation and passes every other call to <code>/bin/rm</code>. It guards against a mistaken or content-steered command, not code set on deleting (<code>/bin/rm</code>, <code>shutil.rmtree</code>).</li>
+    <li><strong>Correctness check for no-tool answers (shadow):</strong> about 46% of real owner turns ran no tool, so the verifier had nothing to judge. <code>core/knowledge_shadow</code> asks the critic node, off the main model, whether anything in such an answer is <em>wrong</em>:
+      <ul>
+        <li>a false statement;</li>
+        <li>a function, column or command that does not exist;</li>
+        <li>an unsafe step order;</li>
+        <li>a contradiction with what the user supplied.</li>
+      </ul>
+      It writes only <code>system/verifier/knowledge_shadow.jsonl</code>; nothing acts on it until its precision is measured. <code>GHOST_KNOWLEDGE_SHADOW=0</code> turns it off.</li>
+    <li><strong>Long tasks:</strong>
+      <ul>
+        <li><strong>Server time cap:</strong> a conversation request with no client deadline gets one, <code>GHOST_MAX_REQUEST_S</code> (default 1800; 0 = none), so the report turn fires before the cap instead of shipping working notes. Background work keeps its own budgets.</li>
+        <li><strong>Status questions:</strong> a status question ("progress report", "where are we", "πώς πάει") while a project is bound or a job runs gets a read-only answer; tools that start work are refused for that request.</li>
+        <li><strong>No thumb ask on budget-exhausted reports:</strong> the "was it right? 👍/👎" line no longer goes under a budget-exhausted state report.</li>
+      </ul>
+    </li>
+    <li><strong>Store hygiene:</strong>
+      <ul>
+        <li><strong>Torn appends:</strong> every JSONL append goes through <code>utils/json_store.open_append</code>, which repairs a torn last line first. A killed append costs only that line, not the next record too.</li>
+        <li><strong>Temp sweep:</strong> at boot, <code>sweep_orphan_temps</code> removes atomic-writer temp files whose writer died more than an hour ago.</li>
+      </ul>
+    </li>
+    <li><strong>Follow-up:</strong> re-grade answer quality on new real turns around 2026-10-21, against the §4ME baseline (112 turns: 54 right / 24 partial / 24 wrong / 10 undetermined).</li>
+  </ul>
+  <p>Pins: <code>tests/test_4mf_items.py</code>.</p>
 </main>
 </body>
 </html>
