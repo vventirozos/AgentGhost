@@ -418,8 +418,8 @@ class TestGenerateEndpoint:
 # ================================================================ §4JV editing
 # Reference-image editing rides the same node. Measured 2026-09-22: one
 # reference at 768x512 = 28 s/step (measured 2026-09-22; an earlier 14.2 figure was per-forward) and 6.7 GB peak, so the cap is ONE
-# on this box. Transparency is deliberately NOT exposed: sd.cpp does not
-# decode the alpha matte for this model yet (measured: α noise ≈ opaque).
+# on this box. Transparency: the 2026-09-22 sd.cpp build returned α noise ≈
+# opaque; the a1ded76 build decodes it (§4MH), so it is now advertised.
 _PNG_1x1 = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
 
@@ -635,7 +635,7 @@ class TestToolEditing:
                                  reference_images=["a.png"], width=1000, height=1000))
         assert (cap["width"], cap["height"]) == (1000, 1000)
 
-    def test_schema_teaches_editing_but_not_transparency(self):
+    def test_schema_teaches_editing_and_transparency(self):
         import sys
         sys.path.insert(0, str(REPO / "src"))
         from unittest.mock import MagicMock
@@ -648,7 +648,11 @@ class TestToolEditing:
         props = tool["function"]["parameters"]["properties"]
         assert props["reference_images"]["type"] == "array" and props["reference_images"]["maxItems"] == 1
         assert "EDITING" in tool["function"]["description"]
-        assert "transparent" not in props                  # not delivered by the backend → not advertised
+        # §4MH: the a1ded76 node decodes the alpha channel → advertised (it was
+        # withheld while the old build returned noise around opaque)
+        assert props["transparent"]["type"] == "boolean"
+        assert "REALLY transparent background" in props["transparent"]["description"]
+        assert "set `transparent` to true" in tool["function"]["description"]
         assert "reference_images" in SYSTEM_PROMPT and "keep everything else the same" in SYSTEM_PROMPT
 
     def test_edit_result_caps_the_retry_loop(self, tmp_path):

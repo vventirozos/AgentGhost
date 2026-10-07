@@ -18,7 +18,8 @@ from ..utils.logging import Icons, pretty_log
 # Editing (§4JV): the node accepts base64 reference images and conditions
 # the DiT on their latents, so each reference costs roughly one more image
 # of tokens, and an edit also runs CFG (two forwards per step, without which
-# the instruction is ignored entirely) — measured ~11 min at 768x512/20 steps.
+# the instruction is ignored entirely) — measured ~11 min at 768x512/20 steps
+# (~8 min since the sd.cpp a1ded76 prefix KV cache, §4MH).
 # The cap mirrors the node's MAX_REFERENCES. Measured §4JW: a second
 # reference at 768×512 OOMs the DiT after 921 s of sampling — the cap is what
 # stops the model spending a quarter-hour of GPU on a guaranteed failure.
@@ -333,7 +334,7 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
               "picture with one subject's portrait as the reference (the model would see only that "
               "portrait, not this scene). If the photo found was of the wrong person or thing, a "
               "retry needs a MORE SPECIFIC name (the same name finds the same photo); each render "
-              "from photos takes about 11 minutes.\n\n")
+              "from photos takes about 8 minutes.\n\n")
     transparent =str(transparent).strip().lower() in ("1", "true", "yes") if not isinstance(transparent, bool) else transparent
 
     # No size given → send none and let the node apply its default (or, for an
@@ -422,7 +423,7 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
             + ("; built from the subjects' photos" if subject_note else
                "; edited from the reference image" if len(ref_b64) == 1 else
                f"; edited from {len(ref_b64)} reference images" if ref_b64 else "")
-            + ("; NOTE: transparency was requested but this backend does not decode an alpha matte — the background will be opaque" if transparent else "")
+            + ("; transparent background: the PNG has an alpha channel (the background is really transparent — it shows as a checkerboard or the page colour)" if transparent else "")
             + ".\n\n"
             # The node picks a random seed when none was given and reports it.
             # §4KD: this line is INFORMATION, not a next action. It used to end

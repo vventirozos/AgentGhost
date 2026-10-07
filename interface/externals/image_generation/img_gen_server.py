@@ -34,16 +34,18 @@ Three things the path does NOT survive without:
     draws one and the response reports it (see its docstring).
   * A fitted reference. sd-cli encodes a reference at ITS OWN resolution,
     so `fit_reference` matches it to the render geometry first.
-Cost: ~11 min at 768x512/20 steps, about 3.3x a plain image — the
+Cost: ~8 min at 768x512/20 steps on the a1ded76 build (~11 before its prefix KV
+cache), about 2.5x a plain image — the
 reference's latents lengthen the DiT sequence AND CFG doubles the forwards
 per step. MAX_REFERENCES is a memory cap on an 8 GB box, not a taste.
 With no size requested, an edit inherits the reference's shape.
 
-Transparency (§4JV): `transparent=true` wraps the prompt in the model
-card's RGBA template — kept for the day sd.cpp decodes the alpha matte for
-this model; measured 2026-09-22 it does NOT (the 4th channel is noise
-around opaque: background a~248, subject a~218), so the agent does not
-advertise it.
+Transparency (§4JV, §4MH): `transparent=true` wraps the prompt in the model
+card's RGBA template. On the 2026-09-22 build the alpha channel came out as
+noise around opaque (an fp16 overflow in the VAE, sd.cpp #2024); the
+a1ded76 build decodes it (measured 2026-10-07: a red apple on a fully
+transparent background, 57% of pixels alpha < 16), so the agent offers it.
+The PNG is returned untouched, alpha included.
 
 THE ALLOCATOR TRAP (cost 40 min of §4JT — do not "simplify" this away):
 Tegra's CUDA allocator (NvMap) fails with `error 12` while `free` shows GBs
@@ -97,7 +99,11 @@ from pydantic import BaseModel
 # Tunables — measured on an 8 GB Orin Nano (§4JT). Paths are relative to the
 # systemd WorkingDirectory (~/Data/AI/ImgGen) unless overridden by env.
 # ---------------------------------------------------------------------------
-SD_CLI = os.environ.get("IMGGEN_SD_CLI", "qwen21/build/bin/sd-cli")
+# §4MH (2026-10-07): sd.cpp a1ded76 — same model and images as the 2026-09-22
+# build (6dcb5bb, still at qwen21/build/bin/sd-cli for rollback), plus the
+# Qwen-Image-2.1 prefix KV cache (edits 658 → 462 s) and the VAE fp16 fix that
+# makes the alpha channel decode (RGBA now a clean cut-out).
+SD_CLI = os.environ.get("IMGGEN_SD_CLI", "qwen21/build-a1ded76/bin/sd-cli")
 DIT_PATH = os.environ.get("IMGGEN_DIT", "qwen21/models/qwen_image_2.1-Q4_K.gguf")
 TE_PATH = os.environ.get("IMGGEN_TE", "qwen21/models/Qwen3VL-8B-Instruct-Q4_K_M.gguf")
 VAE_PATH = os.environ.get("IMGGEN_VAE_PATH", "qwen21/models/qwen_image_2.1_vae_bf16.safetensors")
@@ -131,7 +137,7 @@ EDIT_GUIDANCE = 4.0
 MIN_GUIDANCE = 1.0            # below 1 is not "less guidance", it is unsupported
 MAX_GUIDANCE = 20.0
 MAX_VRAM_GIB = "4.5"          # sd-cli managed budget; at 768×512 the DiT stays monolithic
-GEN_TIMEOUT_S = 1500.0        # an edit (CFG × refs) runs ~11 min at 20 steps; 25 min is the hard stop
+GEN_TIMEOUT_S = 1500.0        # an edit (CFG × refs) runs ~8 min at 20 steps (§4MH); 25 min is the hard stop
 # How long a queued request waits for the single GPU before 503. Sized against
 # the CLIENT's own ceiling, not by feel: the agent's image pool uses httpx
 # timeout=1200 s, and the worst generation the node PERMITS is an edit at

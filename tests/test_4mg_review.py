@@ -318,3 +318,24 @@ async def test_a_retry_answer_that_shows_the_image_is_not_given_a_second_copy(tm
                                   lead="Let me check the image first.\n")
     assert "Here it is:" in client                   # the retry really ran
     assert client.count("/api/download/gen_ab12cd34.png") == 1, client
+
+
+# ── §4MH: the node runs the a1ded76 build; transparency is delivered ───────
+
+def test_the_node_defaults_to_the_new_build_and_keeps_the_old_for_rollback(monkeypatch):
+    import importlib.util
+    monkeypatch.delenv("IMGGEN_SD_CLI", raising=False)
+    monkeypatch.setenv("GHOST_API_KEY", "k")
+    path = Path(__file__).resolve().parents[1] / "interface/externals/image_generation/img_gen_server.py"
+    spec = importlib.util.spec_from_file_location("img_gen_server_4mh", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.SD_CLI == "qwen21/build-a1ded76/bin/sd-cli"
+    assert mod.build_sd_cli_args("x", 768, 512, 30, "o.png")[0] == mod.SD_CLI
+
+
+async def test_a_transparent_result_says_the_background_is_really_transparent(tmp_path):
+    llm = _llm()
+    out = await tool_generate_image(prompt="a red apple", transparent=True, llm_client=llm, sandbox_dir=tmp_path)
+    assert _sent(llm)["transparent"] is True
+    assert "the PNG has an alpha channel" in out and "opaque" not in out

@@ -51767,3 +51767,27 @@ Three independent read-only reviewers: (A) the tool and `subject_photos.py`; (B)
   - `test_finalize_stream_r4_fixes` — a REAL regression from the first stream fix (an extra full-text scrub); fixed by reusing `_final_view`.
 - Re-run of all stream / finalize / image / egress / member files: 1,376 passed.
 - Deploy: 86291 → 20854.
+
+## §4MH — image node: newer stable-diffusion.cpp, Turbo8, RGBA (2026-10-07, operator: "proceed with steps 1-3, don't use tor for any download"; then "if Turbo8 is just faster then don't use it… the current speed is fine"; "don't download q6_k or q8_k, keep the model i had")
+Experiments on ghost in `~/Data/AI/ImgGen/qwen21/exp-4mh/` (the live node untouched; each run waited for an idle node). Downloads were direct, not over Tor, per the operator. Harness: `exp4mh.sh` (drop_caches + 1-s sidecar + tegrastats). Same model throughout: Q4_K DiT, Q4_K_M TE, bf16 VAE. Seed 7, 768×512.
+- **New sd.cpp `a1ded76` (2026-10-06) vs the live build `6dcb5bb` (2026-09-22)** — built with `-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc` (nvcc is not on PATH over ssh), target sd-cli only:
+  - **Plain images:** 198/200 s → 186/188 s (sampling 180 → 165 s). The images are near-identical on the same seed (bakery scene + text poster).
+  - **Edit with a reference** (stitched two-portrait reference, 20 steps, cfg 4): 658 s → **462 s** (−30%). This is the prefix KV cache, #2035. Peak memory 6.7 GB, unchanged. One scene; likenesses OK.
+  - **RGBA** (the model card's prompt template, 30 steps): the old build gave white blotches (85% opaque). The new build gives a **clean cut-out** (57% fully transparent, crisp edges). This is the VAE fp16 overflow fix (#2054, bug #2024) — the cause of "alpha not decoded" in §4JV.
+- **Turbo8 (8-step LoRA)** — measured, then **REJECTED by the operator** (quality over speed):
+  - Runtime LoRA on Q4_K: 11.7 s/step (2× base), 130 s/image.
+  - Merged into Q4_K (`-M convert` + `<lora:…>` in `-p`, #2079; 550 s convert): 68 s/image at 768×512, 216 s at 1024².
+  - Quality: scenes fine at 768×512. **Text clearly broken** ("OPEN DAILV"). 1024² was NOT better: garbled sign, a duplicated bicycle.
+  - Files deleted.
+- **Not done (operator):** higher-precision DiT (Q6_K / Q8_0) — keep Q4_K.
+- **NEXT (needs the operator):** swap the node to the new binary (`SD_CLI` in `img_gen_server.py`, keep the old binary for rollback). Then advertise `transparent` in the agent tool (the node already wraps the RGBA template), and update the edit / subjects timing text (~8 min instead of ~11).
+### §4MH — switched (2026-10-07, operator: "proceed")
+- **Node:** `SD_CLI` now defaults to `qwen21/build-a1ded76/bin/sd-cli`; the old build stays at `qwen21/build/bin/sd-cli`. Backup: `~/Data/AI/ImgGen/server.pre-4mh.bak.py`. Deployed (md5 2f966e02); `ghost-image-node` restarted; the preflight (a real 1-step render) passed.
+- **Agent:**
+  - `transparent` is advertised (a boolean in the schema plus a line in the tool description). The SUCCESS note now says the PNG has an alpha channel; it used to say "background will be opaque".
+  - Edit / `subjects` timings changed from ~11 to ~8 min everywhere the model reads them.
+  - Docs: the server page and the tool page (`#4mh`).
+  - Pins: the schema test updated (transparency is now advertised), plus 2 new tests in `test_4mg_review.py`. Image and lint files pass (335).
+- **Agent restart:** 20854 → 53607.
+- **Live probe `probe-4mh-sticker`** ("a sticker of a cute cartoon owl, with a transparent background"): the agent set `transparent` itself; rendered in 220 s; the PNG is RGBA, with 30% of pixels at α<16 — a clean cut-out.
+- **Rollback:** `IMGGEN_SD_CLI=qwen21/build/bin/sd-cli` in the unit, or restore the backup server.
