@@ -8886,6 +8886,62 @@ def _turn_generated_images(tools_run_this_turn) -> List[str]:
     return out
 
 
+def _unshown_image_note(text, tools_run_this_turn, sandbox_root=None) -> str:
+    """The markdown line for the LAST image generated this request when the
+    reply DISPLAYS none of them, else "" (§4MG). Live 2026-10-07: the time
+    budget ran out after two ~10-minute renders; the forced report linked
+    no image, so the user saw prose about three pictures and none of them.
+
+    Displayed = an `/api/download/…<name>` link, not the bare name: "saved
+    as gen_a.png" shows nothing, and on the streamed path the raw text still
+    holds tool-call markup the user never saw (review) — callers pass the
+    VISIBLE text. A file that no longer exists is not linked."""
+    try:
+        gen = _turn_generated_images(tools_run_this_turn)
+        if not gen:
+            return ""
+        shown = {os.path.basename(m.group(2).split("?", 1)[0])
+                 for m in _DOWNLOAD_LINK_RE.finditer(str(text or ""))}
+        if any(os.path.basename(g) in shown for g in gen):
+            return ""
+        note = f"\n\n![generated image](/api/download/{gen[-1]})"
+        if sandbox_root is not None:
+            _, dropped = _drop_missing_download_links(note, sandbox_root)
+            if dropped:
+                return ""
+        return note
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+#: §4MG: the image tool's record of the photos a render was built from
+#: (`subjects`) — "REFERENCE PHOTO: <file> — [left to right: ]<A> (<a.jpg>), …. THIS WAS A NEW SCENE"
+_SUBJECT_REFERENCE_RE = re.compile(r"^REFERENCE PHOTO: (\S+) — (?:left to right: )?(.+?)\. THIS WAS A NEW SCENE",
+                                   re.MULTILINE)
+
+
+def _turn_subject_reference(tools_run_this_turn):
+    """(reference file, "A, B") for the LAST image generated this request
+    when it was built from `subjects` photos, else None — the visual check
+    then compares the picture with those photos (§4MG)."""
+    last = None
+    for t in (tools_run_this_turn or []):
+        try:
+            if not isinstance(t, dict) or t.get("_synthetic"):
+                continue
+            body = str(t.get("content") or "")
+            if not body.lstrip().startswith("SUCCESS: Image generated"):
+                continue
+            m = _SUBJECT_REFERENCE_RE.search(body)
+            last = None
+            if m:
+                names = re.sub(r"\s*\([^()]*\)", "", m.group(2)).strip()
+                last = (m.group(1).strip(), names)
+        except Exception:  # noqa: BLE001
+            continue
+    return last
+
+
 _VISION_OK_RESULT_RE = re.compile(r"^\s*(?:VISION ANALYSIS RESULT|UI VERIFICATION RESULT)")
 
 
@@ -8962,6 +9018,67 @@ def _blind_regeneration_block(fname, tools_run_this_turn, messages, user_text,
         f"target='{first}') — and only then decide whether a second take is needed. "
         "Each generation occupies the image node for minutes."
     )
+
+
+_MISSING_SUBJECT_HEAD = "ERROR: no usable photo found for "
+_MISSING_SUBJECT_TAIL = "\n[subjects: "
+
+
+def _missing_subject_block(fname, raw_args, tools_run_this_turn) -> Optional[str]:
+    """The SYSTEM BLOCK for an `image_generation` call that drops — or
+    replaces — a subject the tool found no photo for EARLIER IN THIS
+    REQUEST, else None (§4MG, operator 2026-10-07: "stop and ask"). Live
+    probe-4mg-missing: told "only if they agree to a generic stand-in", the
+    agent re-rendered without the subject in the same request.
+
+    Reads the tool's machine-readable `[subjects: {"missing", "found"}]`
+    tail, only on a row that IS that error (review: a page quoting the
+    error text armed the block, and parsing names out of the prose broke on
+    a name containing "), " or "; "). A retry passes only when every found
+    subject is kept and every missing one has a close respelling (review: a
+    count-only rule let `["Alexis Tsipras", "a man"]` through). The user's
+    answer is a new request, which this never blocks."""
+    if str(fname or "") != "image_generation":
+        return None
+    missing, found = [], []
+    for t in (tools_run_this_turn or []):
+        if not isinstance(t, dict) or t.get("_synthetic"):
+            continue
+        body = str(t.get("content") or "").lstrip()
+        if not body.startswith(_MISSING_SUBJECT_HEAD):
+            continue
+        k = body.rfind(_MISSING_SUBJECT_TAIL)
+        if k < 0:
+            continue
+        try:
+            rec = json.loads(body[k + len(_MISSING_SUBJECT_TAIL):].rstrip().rstrip("]"))
+        except Exception:  # noqa: BLE001
+            continue
+        missing += [str(n) for n in rec.get("missing") or [] if str(n) not in missing]
+        found += [str(n) for n in rec.get("found") or [] if str(n) not in found]
+    if not missing:
+        return None
+    try:
+        args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args or {})
+    except Exception:  # noqa: BLE001
+        args = {}
+    from difflib import SequenceMatcher
+    from ..tools.subject_photos import normalise_subjects, slug
+    subj = normalise_subjects(args.get("subjects") if isinstance(args, dict) else None)
+    new = {slug(s): s for s in subj}
+    kept = all(slug(f) in new for f in found)
+    rest = [slug(s) for s in subj if slug(s) not in {slug(f) for f in found}]
+
+    def _respelled(name):
+        return any(SequenceMatcher(None, slug(name), r).ratio() >= 0.75 for r in rest)
+    if kept and all(_respelled(m) for m in missing):
+        return None
+    who = ", ".join(missing)
+    return (f"SYSTEM BLOCK — ask the user first: no photo of {who} was found earlier in this "
+            "request, and the user has not agreed to a stand-in. Do NOT render a picture without "
+            f"{who} or with someone else in their place. Reply to the user NOW: say that no "
+            f"photo of {who} could be found, and ask them to upload one or to confirm that a "
+            "generic stand-in is fine.")
 
 
 def _clarify_first_block(fname, user_text, messages, costly_record: bool):
@@ -16333,11 +16450,19 @@ class GhostAgent:
                     if _gen_imgs and _early_visual_done:      # same resolver, same image
                         _vv = _early_visual            # already looked at these pixels, before the text judge
                     else:
+                        _likeness = None
+                        # only when the after-image IS the generated one — a
+                        # fallback pick must not be judged against the
+                        # subjects' photo (review)
+                        if _gen_imgs and _resolve_image_path(_gen_imgs[-1], _sbx):
+                            _before_img, _likeness = self._likeness_evidence(
+                                tools_run_this_turn, _sbx, _before_img)
                         _vv = await verifier.verify_visual(
                             symptom=last_user_content or "",
                             claim=_claim_src,
                             after_image=_after_img,
                             before_image=_before_img,
+                            likeness_subjects=_likeness,
                         )
                     if _vv is not None:
                         _visual_seen = (_vv.confidence >= 0.7 and _vv.verdict in
@@ -20980,6 +21105,19 @@ class GhostAgent:
                     tools_run_this_turn.append({**err_msg, "_synthetic": True})
                     continue
 
+                _ms_block = _missing_subject_block(
+                    _cname, tool["function"].get("arguments"), tools_run_this_turn)
+                if _ms_block:
+                    pretty_log("Missing Subject",
+                               f"{_cname} blocked — a subject had no photo; the user decides",
+                               icon=Icons.STOP, level="WARNING")
+                    err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname,
+                               "content": _TO.rejected(_ms_block, reason_code="subject_photo_missing")}
+                    messages.append(err_msg)
+                    # No strike: asking is the correct turn (as clarify-first).
+                    tools_run_this_turn.append({**err_msg, "_synthetic": True})
+                    continue
+
                 if fname == "system_parse_error":
                     consecutive_parse_errors += 1
                     pretty_log(
@@ -24527,6 +24665,12 @@ class GhostAgent:
                 pretty_log("Missing File Link",
                            f"removed {len(_dl_missing)} link(s) to files that do not exist: "
                            + ", ".join(_dl_missing[:3]), level="WARNING", icon=Icons.WARN)
+        _img_note = _unshown_image_note(final_ai_content, tools_run_this_turn,
+                                        getattr(self.context, "sandbox_dir", None))
+        if _img_note:
+            final_ai_content = (final_ai_content or "").rstrip() + _img_note
+            pretty_log("Unshown Image", "the reply showed no generated image — appended the last one",
+                       icon=Icons.IMAGE_GEN)
 
         # Start-with constraint enforcement on the ASSEMBLED reply
         # (req 56221fad): the model opened its FINAL turn with the mandated
@@ -32912,8 +33056,12 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
     # local path, and six synonym keys carried a reference the check never
     # read). Key allowlists close the class: an unknown key is refused.
     _MEMBER_VISION_KEYS = frozenset({"action", "target", "prompt", "question"})
+    # §4MG review: `subjects` is allowed — a member was SHOWN it in the schema and
+    # refused for using it, and the refusal steered to a name-only render (a
+    # stranger). It fetches only the encyclopedia's own image for a name, over
+    # Tor, like the search tools a member already has.
     _MEMBER_IMAGE_KEYS = frozenset({"prompt", "negative_prompt", "width", "height", "steps",
-                                    "seed", "transparent", "size", "reference_images"})
+                                    "seed", "transparent", "size", "reference_images", "subjects"})
     _MEMBER_URL_RE = re.compile(r"https?://[^\s/]+(?:/[^\s]*)?", re.IGNORECASE)
 
     def _member_file_value_ok(self, value, ok) -> bool:
@@ -32989,9 +33137,23 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             # never another file's pixels under this image's name (review R21):
             # the visual arm below falls back as it always has, and caps
             return None, None
+        before, likeness = self._likeness_evidence(tools_run, sbx, before)
         vv = await verifier.verify_visual(symptom=last_user_content or "", claim=claim_src,
-                                          after_image=after, before_image=before)
+                                          after_image=after, before_image=before,
+                                          likeness_subjects=likeness)
         return vv, after
+
+    @staticmethod
+    def _likeness_evidence(tools_run, sbx, before):
+        """(before image, subjects) for the visual check: a render built from
+        `subjects` photos is compared with THOSE photos (§4MG); otherwise the
+        usual before-image and no likeness mode."""
+        ref = _turn_subject_reference(tools_run)
+        if ref:
+            ref_path = _resolve_image_path(ref[0], sbx)
+            if ref_path:
+                return ref_path, ref[1]
+        return before, None
 
     @staticmethod
     def _cap_unseen_image_confirm(v_result):
@@ -34364,6 +34526,31 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                    + ", ".join(_st_missing[:3]), level="WARNING", icon=Icons.WARN)
             except Exception as _ml_exc:  # noqa: BLE001
                 logger.debug("streamed missing-link check skipped: %s", _ml_exc)
+
+            # §4MG: a request that generated an image shows it, even when the
+            # streamed reply (a forced report, a retry) linked none
+            try:
+                # the VISIBLE text: raw `full_content` still holds tool-call
+                # markup the stream scrubbed (a hidden `target: gen_x.png`
+                # counted as shown — review). Reuses the end-of-stream
+                # scrubbed view (`_final_view`) plus the retry answer appended
+                # after it — no second scrub of the whole text (the
+                # incremental-scrub pin counts every one).
+                _vis_base = locals().get("_final_view")
+                if not isinstance(_vis_base, str):
+                    _vis_base = full_content or ""
+                _img_note_s = _unshown_image_note(
+                    _vis_base + "\n\n" + str(locals().get("_ff_retry_text") or ""),
+                    stream_tools_snapshot, getattr(self.context, "sandbox_dir", None))
+                if _img_note_s:
+                    yield f"data: {json.dumps({'id': f'chatcmpl-{req_id}', 'object': 'chat.completion.chunk', 'created': created_time, 'model': stream_model, 'choices': [{'index': 0, 'delta': {'content': _img_note_s}, 'finish_reason': None}]})}\n\n".encode('utf-8')
+                    full_content = (full_content or "") + _img_note_s
+                    if locals().get("_stream_effective_content"):
+                        _stream_effective_content = _stream_effective_content + _img_note_s
+                    pretty_log("Unshown Image", "the streamed reply showed no generated image — appended the last one",
+                               icon=Icons.IMAGE_GEN)
+            except Exception as _ui_exc:  # noqa: BLE001
+                logger.debug("streamed unshown-image check skipped: %s", _ui_exc)
 
             # §4LK: the unverified-write note, as finalize appends it — last,
             # before [DONE]; the record carries it and the failed label

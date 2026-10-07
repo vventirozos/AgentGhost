@@ -1,4 +1,5 @@
 import asyncio
+import json
 import uuid
 import base64
 from pathlib import Path
@@ -98,7 +99,7 @@ def _resolve_reference(name, sandbox_dir) -> Path:
     raise ValueError(f"reference image {name!r} not found in the sandbox")
 
 
-async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=None, steps: int = 0, width: int = 0, height: int = 0, seed=None, negative_prompt: str = "", reference_images=None, transparent=False, **kwargs):
+async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=None, steps: int = 0, width: int = 0, height: int = 0, seed=None, negative_prompt: str = "", reference_images=None, transparent=False, subjects=None, tor_proxy=None, **kwargs):
     # --- PARAMETER HALLUCINATION HEALING ---
     prompt = prompt or kwargs.get("image") or kwargs.get("description") or kwargs.get("subject") or kwargs.get("text")
     # §4KD: a list prompt went to the node verbatim (422 ×3), an int crashed
@@ -112,7 +113,7 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
         # Extreme fallback: If they hallucinated `<parameter name="imagination_prompt">`, grab the longest string passed
         longest_str = ""
         _skip = {"steps", "mode", "size", "dimensions", "width", "height",
-                 "seed", "negative_prompt", "transparent", *_REF_KEYS}
+                 "seed", "negative_prompt", "transparent", "subjects", *_REF_KEYS}
         for k, v in kwargs.items():
             if k not in _skip and isinstance(v, str) and len(v) > len(longest_str):
                 longest_str = v
@@ -218,7 +219,122 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
                 return f"ERROR: cannot read reference image {name!r}: {e.__class__.__name__}."
             ref_bytes.append(data)
             ref_b64.append(base64.b64encode(data).decode("ascii"))
-    transparent = str(transparent).strip().lower() in ("1", "true", "yes") if not isinstance(transparent, bool) else transparent
+
+    # SUBJECTS (§4MG): specific real people / places / products are drawn
+    # from PHOTOS the tool fetches itself — a name alone renders a stranger
+    # (live 2026-10-07: the agent planned to download photos, then rendered
+    # from the names). See tools/subject_photos.py.
+    from .subject_photos import (MAX_SUBJECTS, DEFAULT_ASPECT, PHOTO_DIR, SearchUnavailable,
+                                 normalise_subjects, fetch_subject_photo, combine_side_by_side,
+                                 pad_photo)
+    subj = normalise_subjects(subjects)
+    subject_note = ""
+    _size_by_tool = False      # the tool, not the caller, chose 768x512 for a joined strip
+    if subj:
+        if ref_b64:
+            return ("ERROR: `subjects` and `reference_images` cannot be combined — the node takes ONE "
+                    "photo. `subjects` builds that photo from pictures of the named people/places/"
+                    "products; `reference_images` edits an existing picture. To fix WHO is in a "
+                    "picture, call again with only `subjects` (a new render from their photos); to "
+                    "change something else in an existing picture, use only `reference_images`. "
+                    "Nothing was rendered.")
+        if len(subj) > MAX_SUBJECTS:
+            return (f"ERROR: at most {MAX_SUBJECTS} subjects fit in one picture on this node "
+                    f"(got {len(subj)}: {', '.join(subj)}) — their faces would be too small to keep a "
+                    "likeness. Pick the ones that matter most. Nothing was rendered.")
+        if sandbox_dir is None:
+            return "ERROR: no sandbox to store the subjects' photos in. Nothing was rendered."
+        # review: photos were fetched over Tor (and written) before the
+        # offline check further down — work for a render that cannot happen
+        if not getattr(llm_client, 'image_gen_clients', None):
+            return "ERROR: Image generation node is offline or not configured."
+        results = await asyncio.gather(
+            *(fetch_subject_photo(s, Path(sandbox_dir), tor_proxy, is_image=_is_supported_image)
+              for s in subj),
+            return_exceptions=True)
+        unreachable = [s for s, r in zip(subj, results) if isinstance(r, SearchUnavailable)]
+        if unreachable:
+            return ("ERROR: the photo search could not reach the encyclopedia for "
+                    + ", ".join(unreachable) + " (network / Tor). This is NOT a missing photo. "
+                    "Nothing was rendered. Call image_generation again once with the same `subjects`; "
+                    "if it fails again, tell the user the photo search is unreachable right now.")
+        missing = [(s, r) for s, r in zip(subj, results) if isinstance(r, BaseException)]
+        if missing:
+            found = [s for s, r in zip(subj, results) if not isinstance(r, BaseException)]
+            return ("ERROR: no usable photo found for "
+                    + "; ".join(f"{s} — {e if isinstance(e, LookupError) else e.__class__.__name__}"
+                                for s, e in missing)
+                    + ". Nothing was rendered: without a photo the model would draw a stranger under "
+                      "that name. STOP and reply to the user now: say which subject has no photo and "
+                      "ask them to upload one or to confirm a generic stand-in. Do not render anything "
+                      "else for this request. Once they answer: an upload goes in `reference_images` "
+                      "on its own (it cannot be combined with `subjects`, so the other subjects' photos "
+                      "are not used); if they accept a stand-in, leave that subject out of `subjects`. "
+                      "If the name may be misspelled, you may retry once with the corrected spelling."
+                    # machine-readable: the loop's missing-subject block reads THIS, not the prose
+                    + "\n[subjects: " + json.dumps({"missing": [s for s, _ in missing], "found": found},
+                                                  ensure_ascii=False) + "]")
+        photos = [r[0] for r in results]
+        # The node STRETCHES a reference to the render size (fit_reference
+        # keeps no aspect) and, with no size, renders at the reference's
+        # shape: a strip of three portraits became a 2.3:1 panorama or
+        # squeezed faces (review). Pad to the render's shape and, for a
+        # joined strip with no size asked, ask for the node's default.
+        size_asked = bool(raw_w and raw_h)
+        aspect = (raw_w / raw_h) if size_asked else (DEFAULT_ASPECT if len(photos) > 1 else None)
+        if len(photos) > 1 and not size_asked:
+            raw_w, raw_h = 768, 512
+            _size_by_tool = True
+        try:
+            if len(photos) == 1 and aspect is None:
+                data = await asyncio.to_thread(photos[0].read_bytes)
+                ref_name = f"{PHOTO_DIR}/{photos[0].name}"
+            else:
+                data = await asyncio.to_thread(
+                    (lambda: combine_side_by_side(photos, aspect)) if len(photos) > 1
+                    else (lambda: pad_photo(photos[0], aspect)))
+                ref_name = f"{PHOTO_DIR}/ref_combined_{uuid.uuid4().hex[:8]}.jpg"
+                await asyncio.to_thread((Path(sandbox_dir) / ref_name).write_bytes, data)
+        except Exception as e:  # noqa: BLE001 — a corrupt photo must be a result, not a crash
+            return f"ERROR: could not prepare the subjects' photos ({e.__class__.__name__}). Nothing was rendered."
+        if len(data) > MAX_REFERENCE_BYTES:
+            return ("ERROR: the subjects' photo is larger than the node accepts "
+                    f"({len(data) // (1024*1024)} MB). Nothing was rendered.")
+        ref_bytes.append(data)
+        ref_b64.append(base64.b64encode(data).decode("ascii"))
+        if len(subj) == 1:
+            lead = (f"The reference photo shows {subj[0]}. Keep {subj[0]} looking exactly as in the "
+                    "photo (same face, identity and appearance) and place them in this new scene: ")
+        else:
+            # Live 2026-10-07 (probe-4mg-kiss): without the ONE-photograph
+            # sentence and the negative prompt the model copied the joined
+            # reference's layout — a two-panel collage of the kiss.
+            lead = (f"The reference image is {len(subj)} separate photos side by side; left to right: "
+                    + ", ".join(subj) + ". Keep each of them looking exactly as in their photo (same "
+                    "faces, identities and appearance). Create ONE single photograph of ONE continuous "
+                    "scene with all of them together in the same frame — not a collage, not split "
+                    "panels, not side-by-side pictures. The scene: ")
+            _no_panels = "collage, split screen, diptych, two panels, side-by-side photos, border, frame divider"
+            if isinstance(negative_prompt, (list, tuple)):
+                negative_prompt = ", ".join(str(x) for x in negative_prompt if x)
+            negative_prompt = (f"{negative_prompt}, {_no_panels}"
+                               if isinstance(negative_prompt, str) and negative_prompt.strip() else _no_panels)
+        if len(lead) + len(prompt) > MAX_PROMPT_CHARS:
+            prompt = prompt[:max(0, MAX_PROMPT_CHARS - len(lead))]
+            _prompt_note = (f"NOTE: the prompt was truncated to fit the node's {MAX_PROMPT_CHARS}-character "
+                            "limit together with the subjects' lead; the tail was dropped. ")
+        prompt = lead + prompt
+        subject_note = (
+            f"REFERENCE PHOTO: {ref_name} — "
+            + ("left to right: " if len(subj) > 1 else "")
+            + ", ".join(f"{s} ({p.name})" for s, p in zip(subj, photos))
+            + ". THIS WAS A NEW SCENE built from those photos (not an edit). If a likeness came out "
+              "wrong, tell the user plainly which subject does not look right — do NOT edit the "
+              "picture with one subject's portrait as the reference (the model would see only that "
+              "portrait, not this scene). If the photo found was of the wrong person or thing, a "
+              "retry needs a MORE SPECIFIC name (the same name finds the same photo); each render "
+              "from photos takes about 11 minutes.\n\n")
+    transparent =str(transparent).strip().lower() in ("1", "true", "yes") if not isinstance(transparent, bool) else transparent
 
     # No size given → send none and let the node apply its default (or, for an
     # edit, the reference's shape). One source of truth for geometry.
@@ -296,14 +412,15 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
             _rw, _rh = _png_size(image_bytes) or (final_w, final_h)
         _asked = (f" (you asked for {raw_w}x{raw_h}; the node renders the nearest size it "
                   f"supports — tell the user the actual size if they asked for a specific one)"
-                  if size_requested and (_rw, _rh) != (raw_w, raw_h) else "")
+                  if size_requested and not _size_by_tool and (_rw, _rh) != (raw_w, raw_h) else "")
         _steps_used = resp_data.get("steps")
         _size_note = (
             _prompt_note
             + (f"Rendered at {_rw}x{_rh}" if _rw and _rh else "Rendered")
             + (f" in {int(_steps_used)} steps" if isinstance(_steps_used, (int, float)) and _steps_used else "")
             + _asked
-            + ("; edited from the reference image" if len(ref_b64) == 1 else
+            + ("; built from the subjects' photos" if subject_note else
+               "; edited from the reference image" if len(ref_b64) == 1 else
                f"; edited from {len(ref_b64)} reference images" if ref_b64 else "")
             + ("; NOTE: transparency was requested but this backend does not decode an alpha matte — the background will be opaque" if transparent else "")
             + ".\n\n"
@@ -334,7 +451,18 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
             "it still did not apply, STOP and tell the user plainly which part "
             "changed and which did not. Do NOT keep retrying — each attempt "
             "occupies the image node for several minutes.\n\n"
-        ) if ref_b64 else ""
+        ) if ref_b64 and not subject_note else ""
+        # §4MG: an edit sees ONLY its reference. Live 2026-10-07 the agent
+        # "fixed" a two-person scene by passing one man's downloaded portrait
+        # with "keep everything else the same" — the scene was never sent, and
+        # the result was four podium portraits. Say what the model saw.
+        _ref_names = [n for n in (refs_in or []) if isinstance(n, str)]
+        if ref_b64 and not subject_note and _ref_names \
+                and not Path(_ref_names[0].strip()).name.startswith("gen_"):
+            _edit_note += (
+                f"The model saw ONLY {Path(_ref_names[0].strip()).name}: nothing from any earlier "
+                "generated picture carried over into this result.\n\n")
+        _edit_note = subject_note + _edit_note
         return (
             "SUCCESS: Image generated and saved to sandbox. "
             f"{_size_note}{_edit_note}"
@@ -346,7 +474,7 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
             "Then, on the next line, write ONE or TWO short sentences in your own "
             + ("words telling the user what you ASKED the model to change (and anything "
                "you could not ask for). Do NOT describe the whole picture again."
-               if ref_b64 else
+               if ref_b64 and not subject_note else
                "words telling the user what you ASKED the image model for and the "
                "mood/style you aimed at. Do NOT paste the raw prompt verbatim.")
             # §4LM: 6 of 16 generated-image turns described pixels nobody had

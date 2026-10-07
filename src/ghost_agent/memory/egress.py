@@ -218,6 +218,9 @@ OUTBOUND_TOOLS = {
     "system_utility": {"location", "city", "query", "place", "address", "area", "where"},
     "file_system": "urls", "knowledge_base": "urls", "vision_analysis": "urls",
     "execute": "url_literals",
+    # §4MG: `subjects` is a public encyclopedia search over Tor; the prompt
+    # goes only to the owner's own GPU node
+    "image_generation": {"subjects"},
 }
 
 _URL_IN_TEXT = re.compile(r"(?:https?://|www\.)[^\s'\"<>`]+", re.IGNORECASE)
@@ -371,7 +374,10 @@ QUERY_TOOLS = frozenset({"web_search", "deep_research", "darkweb_search", "darkw
                          "fact_check", "browser", "system_utility", "delegate", "delegate_to_swarm"})
 CODE_TOOLS = frozenset({"execute", "jobs", "manage_services"})
 URL_ONLY_TOOLS = frozenset({"file_system", "knowledge_base", "vision_analysis"})
-CONTENT_GUARDED_TOOLS = QUERY_TOOLS | CODE_TOOLS | URL_ONLY_TOOLS
+#: §4MG: tools where only the `subjects` argument leaves the machine (searched
+#: on Wikipedia over Tor); the rest of the call stays on the owner's nodes
+SUBJECT_TOOLS = frozenset({"image_generation"})
+CONTENT_GUARDED_TOOLS = QUERY_TOOLS | CODE_TOOLS | URL_ONLY_TOOLS | SUBJECT_TOOLS
 #: profile keys that IDENTIFY a person — exact key names, not substrings
 #: ("company_name", "github_account", "favorite_restaurant_name" are not)
 _IDENT_KEY = re.compile(
@@ -474,6 +480,10 @@ def content_egress_refusal(tool_name: str, args, context):
                 val = json.loads(args)
             except Exception:  # noqa: BLE001
                 val = args
+        if tool_name in SUBJECT_TOOLS:
+            val = val.get("subjects") if isinstance(val, dict) else None
+            if not val:
+                return None
         raw = _haystack(val)
         # local tools and code: only what sits in a URL leaves as an argument
         ident_src = (" ".join(unquote_plus(u) for u in _URL_IN_TEXT.findall(raw))

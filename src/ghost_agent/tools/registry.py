@@ -1334,7 +1334,7 @@ def get_active_tool_definitions(context, query: str = None, *,
             "type": "function",
             "function": {
                 "name": "image_generation",
-                "description": "Generate an image on the external GPU node (Qwen-Image-2.1 — a prompt-faithful model: it renders every object, count and spatial relation you describe, in any style: photorealistic, fantasy, surreal, cartoon/illustration; pick the style in the prompt). It can render LEGIBLE TEXT: put the exact words in double quotes (a sign that reads \"OPEN\"). Write the prompt as natural-language prose in any language (Greek works); do NOT use attention-weight syntax like (x:1.2) or [x] — its text encoder is an LLM and reads that as literal characters. Follow 3 modes: 1) EXACT: use prompt exactly as-is, 2) ENHANCED: append style/quality enhancements matching the intended look, 3) IMAGINATION: create a high-entropy prompt. Preserve the user's exact subject description in modes 1 and 2. Prompts up to ~8000 characters are fully used (longer is truncated). A generation takes about 3-4 MINUTES — call it ONCE and wait; never re-call because it seems slow. A SPECIFIC REAL PERSON OR OBJECT — YOU MUST PASS A PHOTO. The model draws a likeness from PIXELS, never from a name and never from a description. Naming someone who is not globally famous, or describing their face in words (including from a `vision_analysis` caption), yields a generic stranger — it does NOT matter how detailed the description is. So to put a real person anywhere (in space, in a costume, in another city): get a photo into the sandbox first (`file_system` operation=download, or the user uploads one), then pass that filename in `reference_images` with a prompt describing the SCENE you want them in. Same for a specific product, building or pet. EDITING: to change an EXISTING image (fix a detail, change the text on a sign, restyle, add/remove an object, change the background) pass its sandbox filename in `reference_images` and describe THE CHANGE in the prompt ('Change the sign so it reads \"OPEN\"; keep everything else the same') — the model preserves the rest, including people's identity; an edit re-renders at the reference's SHAPE (nearest supported size to its aspect, not its exact pixels) and takes about 11 MINUTES (it runs guidance, which doubles the work per step) — so make the instruction count on the first try. CRITICAL: If the user says the generated image is WRONG or needs fixing, DO NOT blind-guess what to change. You MUST use the `vision_analysis` tool first on the previously generated image to explicitly 'see' what went wrong — then EDIT it with `reference_images` rather than regenerating from scratch.",
+                "description": "Generate an image on the external GPU node (Qwen-Image-2.1 — a prompt-faithful model: it renders every object, count and spatial relation you describe, in any style: photorealistic, fantasy, surreal, cartoon/illustration; pick the style in the prompt). It can render LEGIBLE TEXT: put the exact words in double quotes (a sign that reads \"OPEN\"). Write the prompt as natural-language prose in any language (Greek works); do NOT use attention-weight syntax like (x:1.2) or [x] — its text encoder is an LLM and reads that as literal characters. Follow 3 modes: 1) EXACT: use prompt exactly as-is, 2) ENHANCED: append style/quality enhancements matching the intended look, 3) IMAGINATION: create a high-entropy prompt. Preserve the user's exact subject description in modes 1 and 2. Prompts up to ~8000 characters are fully used (longer is truncated). A generation takes about 3-4 MINUTES (about 11 with `subjects` or `reference_images`) — call it ONCE and wait; never re-call because it seems slow. SPECIFIC REAL PEOPLE, PLACES OR PRODUCTS — LIST THEM IN `subjects`. The model draws a likeness from PIXELS, never from a name and never from a description: a name in the prompt alone, or a face described in words (even from a `vision_analysis` caption), yields a generic stranger. Put each specific real person, landmark or product the picture must show in `subjects` (e.g. [\"Alexis Tsipras\", \"Antonis Samaras\"], up to 3): the tool itself finds a photo of each, downloads it, joins several side by side into the one reference this node takes, and renders the scene from those photos. Do NOT download photos yourself for this, and do NOT describe their faces, hair or glasses in the prompt — describe the SCENE. If a photo cannot be found the tool renders nothing and says which subject is missing: ask the user to upload one. A photo the USER uploaded (or their own pet/house, which no search can find) goes in `reference_images` instead. EDITING: to change an EXISTING image (fix a detail, change the text on a sign, restyle, add/remove an object, change the background) pass its sandbox filename in `reference_images` and describe THE CHANGE in the prompt ('Change the sign so it reads \"OPEN\"; keep everything else the same') — the model preserves the rest, including people's identity; an edit re-renders at the reference's SHAPE (nearest supported size to its aspect, not its exact pixels) and takes about 11 MINUTES (it runs guidance, which doubles the work per step) — so make the instruction count on the first try. CRITICAL: If the user says the generated image is WRONG or needs fixing, DO NOT blind-guess what to change. You MUST use the `vision_analysis` tool first on the previously generated image to explicitly 'see' what went wrong — then EDIT it with `reference_images` rather than regenerating from scratch. EXCEPTION: if the people/place/product are not the right ones (\"that's not X\"), an edit cannot fix it — the edit sees only its one reference. Render it again with those names in `subjects`.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1346,7 +1346,7 @@ def get_active_tool_definitions(context, query: str = None, *,
                             "type": "integer",
                             "minimum": 15,
                             "maximum": 50,
-                            "description": "Inference steps. OMIT to get the node's tuned default — 30 for a new image (~3.3 min), 20 for an edit (~11 min, since an edit runs guidance and each step costs twice). Only set it to trade time for detail: 15 = fast draft, 50 = maximum for a NEW image, but an EDIT is capped at 30 (anything higher is silently reduced, because ~28 s per edit step would outlive the request)."
+                            "description": "Inference steps. OMIT to get the node's tuned default — 30 for a new image (~3.3 min), 20 for an edit or a render from `subjects` photos (~11 min, since any reference runs guidance and each step costs twice). Only set it to trade time for detail: 15 = fast draft, 50 = maximum for a NEW image without a reference, but an EDIT or a `subjects` render is capped at 30 (anything higher is silently reduced, because ~28 s per edit step would outlive the request)."
                         },
                         "width": {
                             "type": "integer",
@@ -1369,13 +1369,19 @@ def get_active_tool_definitions(context, query: str = None, *,
                         },
                         "seed": {
                             "type": "integer",
-                            "description": "Optional. Omit for a fresh random image — the result records the seed it used (for a new image; an edit's result does not, since re-rolling cannot reproduce an edit). Only pass a seed back when the USER asks for a reproducible re-run of a specific image: the SAME prompt + that seed reproduces it exactly; a TWEAKED prompt + that seed is a different composition (measured), i.e. another take on the idea (~3 min), NOT the same picture changed. To keep THIS picture and change one thing, use `reference_images` (an edit, ~11 min). Never re-run the tool because a result mentioned a seed."
+                            "description": "Optional. Omit for a fresh random image — the result records the seed it used (for a new image without a reference; an edit's or a `subjects` render's result does not). Only pass a seed back when the USER asks for a reproducible re-run of a specific image: the SAME prompt + that seed reproduces it exactly; a TWEAKED prompt + that seed is a different composition (measured), i.e. another take on the idea (~3 min), NOT the same picture changed. To keep THIS picture and change one thing, use `reference_images` (an edit, ~11 min). Never re-run the tool because a result mentioned a seed."
                         },
                         "reference_images": {
                             "type": "array",
                             "items": {"type": "string"},
                             "maxItems": 1,
-                            "description": "The sandbox filename of a photo to build on (e.g. [\"gen_1a2b3c4d.png\"] or [\"mitsotakis.jpg\"] — a previous result, a user upload, or something you downloaded). Use it for BOTH: (a) IDENTITY — any specific real person/object must come from a photo, since a name or a description cannot reproduce a likeness; the prompt then describes the scene to place them in; (b) EDITING an existing image, where the prompt describes only the change. One reference on this node. Omit only when the subject is generic."
+                            "description": "The sandbox filename of ONE image to build on (e.g. [\"gen_1a2b3c4d.png\"] or [\"photo.jpg\"]): (a) EDITING an existing picture — the prompt describes only the change; the model sees ONLY this image, so nothing from any other picture carries over; or (b) a photo the USER uploaded of a person/pet/object to place in a new scene. For famous or findable real people, places and products use `subjects` instead (the tool fetches their photos). Cannot be combined with `subjects`. One reference on this node."
+                        },
+                        "subjects": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": 3,
+                            "description": "Names of the SPECIFIC real people, places or products the picture must show — e.g. [\"Alexis Tsipras\", \"Antonis Samaras\"], [\"Parthenon\"], [\"Toyota Corolla\"]. The tool finds and downloads a photo of each (encyclopedia lead image, over Tor), joins several side by side into the one reference, and renders the scene from them — so they look like themselves. Omit for generic or invented subjects (\"a cat\", \"a wizard\"). Rendering from photos runs the slower guided path (~11 min)."
                         },
                     },
                     "required": ["prompt"]
@@ -1795,6 +1801,12 @@ def get_available_tools(context):
     from .vision import tool_vision_analysis
     tools["vision_analysis"] = lambda **kwargs: tool_vision_analysis(llm_client=context.llm_client, sandbox_dir=_proj_ws()[0], tor_proxy=context.tor_proxy, **kwargs)
 
+    # §4MG: registered BEFORE the egress wrap below — `subjects` leave the
+    # machine, and macros/delegates call the wrapped callable directly
+    if getattr(context.llm_client, 'image_gen_clients', None):
+        from .image_gen import tool_generate_image
+        tools["image_generation"] = lambda **kwargs: tool_generate_image(llm_client=context.llm_client, sandbox_dir=_proj_ws()[0], tor_proxy=context.tor_proxy, **{k: v for k, v in kwargs.items() if k != "tor_proxy"})
+
     # §4LB r2: the owner's street address is scrubbed at the TOOL boundary
     # too — composed-skill macros and delegates call these callables
     # directly, never through the dispatch hook
@@ -1805,9 +1817,6 @@ def get_available_tools(context):
 
     from .report_pdf import tool_generate_pdf
     tools["report_pdf"] = lambda **kwargs: tool_generate_pdf(sandbox_dir=_proj_ws()[0], **kwargs)
-    if getattr(context.llm_client, 'image_gen_clients', None):
-        from .image_gen import tool_generate_image
-        tools["image_generation"] = lambda **kwargs: tool_generate_image(llm_client=context.llm_client, sandbox_dir=_proj_ws()[0], **kwargs)
         
     if context and getattr(context, 'sandbox_dir', None) and getattr(context, 'memory_system', None):
         try:

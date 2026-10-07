@@ -1163,18 +1163,27 @@ class TestIdentityNeedsAPhoto:
         # "specific real person", which survives replacing the steer with
         # "A specific real person is fine to name" — the mutation battery
         # caught that the pin could not tell the steer from its opposite.
+        # §4MG: the photo is now FETCHED by the tool — the imperative is to
+        # name the subject in `subjects`, not to download and pass it.
         desc = self._tool()["description"].lower()
-        assert "must pass a photo" in desc                  # the imperative
+        assert "list them in `subjects`" in desc            # the imperative
+        assert "the tool itself finds a photo of each" in desc
+        assert "do not download photos yourself" in desc
         assert "never from a name" in desc                  # why naming fails
-        assert "generic stranger" in desc                   # what you get instead
-        assert "vision_analysis" in desc                    # the wrong turn it took live
+        # the WHOLE consequence clause — review: "generic stranger" and
+        # "vision_analysis" alone survived reversing the sentence
+        assert ("a name in the prompt alone, or a face described in words (even from a "
+                "`vision_analysis` caption), yields a generic stranger") in desc
 
     def test_the_reference_parameter_is_not_edit_only(self):
         # It was labelled "EDIT MODE." — the label itself is what made the
         # model skip it for a new scene.
         d = self._tool()["parameters"]["properties"]["reference_images"]["description"]
         assert not d.startswith("EDIT MODE")
-        assert "identity" in d.lower() and "editing" in d.lower()
+        # §4MG: identity of findable subjects moved to `subjects`; this
+        # parameter keeps editing AND a photo the user uploaded
+        assert "editing" in d.lower() and "the user uploaded" in d.lower()
+        assert "use `subjects` instead" in d.lower()
 
     def test_the_system_prompt_says_it_too(self):
         import sys
@@ -1183,8 +1192,9 @@ class TestIdentityNeedsAPhoto:
         block = SYSTEM_PROMPT[SYSTEM_PROMPT.index("- IMAGE GENERATION:"):][:1200]
         assert "reference_images" in block
         assert "HAS TO COME FROM A PHOTO" in block          # the imperative, not the topic
-        assert "generic stranger" in block                  # the consequence of not doing it
-        assert "vision_analysis" in block                   # the exact wrong turn it took live
+        # the whole consequence clause (review: the topic words survived a reversal)
+        assert ("A name in the prompt alone, or a face described in words — even from a "
+                "`vision_analysis` caption — produces a generic stranger.") in block
 
     def test_the_tool_still_accepts_a_downloaded_photo_by_name(self, tmp_path):
         # End of the chain the agent was supposed to complete: a file that

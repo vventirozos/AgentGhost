@@ -51671,3 +51671,99 @@ Accepted, not changed:
 **Follow-up (5):** re-grade answer quality on NEW real owner turns around 2026-10-21 against the §4ME baseline.
 
 - **2026-10-07 (operator: "delete the DB backup"):** `chroma.sqlite3.pre-4mf-vacuum.bak` deleted after a final check of the live store (integrity ok, 502 embeddings).
+
+## §4MG — image_generation fetches the subjects' photos (2026-10-07, operator: "look at the last 2 image generation requests … why?", then "proceed with all your recommendations, go with subjects (people, places, products)")
+**Diagnosis (requests d31790d9, a171b275):**
+- Request 1: the thinking said "reference images of both … let me first find/download photos". The next action was a names-only render, which produced two strangers. The prompt also invented features ("Tsipras … glasses"; it is Samaras who wears them). The visual check CONFIRMED at 100%.
+- Request 2: the agent guessed Wikimedia URLs (400 ×2), took screenshots, then downloaded both portraits. It passed ONE of them (MAX_REFERENCES=1), so the second man was invented; vision named him "Erdoğan". It then edited Samaras's PORTRAIT with "change the man on the right … keep the kiss scene". The scene was never sent, and the result was four podium portraits with Turkish flags (the flags came from the vision caption copied into the prompt).
+- Time budget: the two ~10-min renders used it up. The report showed no image and blamed "multi-reference". The escalation overturned a correct cheap-judge refute.
+
+**Operator decision:** refusing a name-only call is NOT the fix; the agent should search and download photos first; it is named `subjects`, for people, places and products.
+
+**Shipped:**
+1. `tools/subject_photos.py` + the `subjects` parameter, with up to 3 subjects. Per subject:
+   - one Wikipedia `pageimages` call over Tor (Greek script tries `el` first);
+   - `title_matches` requires subject ⊆ title or title ⊆ subject, and disambiguation pages are skipped;
+   - the photo is downloaded by `tool_download_file` as `ref_<slug>`, an existing file is reused, and a non-image is deleted.
+   - With 2–3 subjects the photos are joined side by side (1024 px high, 16 px gap) into `ref_combined_<hex>.jpg`. The prompt gets a left-to-right lead.
+   - No photo for a subject → nothing is rendered and the subject is named. `subjects` combined with `reference_images` → error.
+   - The result records `REFERENCE PHOTO: … THIS WAS A NEW SCENE`.
+2. The schema description, the `reference_images` description and the system prompt route real subjects to `subjects`. "That's not X" → a new render with `subjects`, never an edit.
+3. An edit whose reference is not a `gen_*` result says "The model saw ONLY <file>".
+4. Visual verifier likeness mode: `verify_visual(likeness_subjects=…)` compares the image against the reference photo and never names anyone. It is wired into both the early pixel check and the visual arm via `_likeness_evidence`.
+5. `_unshown_image_note`: a reply (streamed or not) that shows none of the request's generated images gets the last one appended.
+6. Members cannot pass `subjects` (key allowlist unchanged — the photos land in the owner's sandbox).
+
+**Measured:**
+- Wikipedia lookup over Tor: about 1 s.
+- Stitched Tsipras+Samaras reference + kiss prompt on ghost: 736×512, 20 steps, 619 s. Both men are recognisably themselves, in the requested pose.
+
+**Verification:** `tests/test_4mg_image_subjects.py` (23 tests). The 2 §4JX pins in `test_image_gen_model_swap.py` were updated to the new claim. Mini-battery: 14 mutants, all killed; the disambiguation mutant survived the first fixture, which was then fixed. Full suite: 28,862 passed. 2 failed: the lint gate (`PIL.Image.LANCZOS` → `Image.Resampling.LANCZOS`, fixed and re-run green) and `test_memory_bus::test_publish_fact_concurrent_fanout` (passes alone — a concurrency flake, unrelated).
+
+**Open:**
+- The auto-learned lesson `skills_playbook[0]` (2026-10-07 19:01) learned the misdiagnosis ("use a face-swapping tool", "prompt for high fidelity"). It has not been removed; that is the operator's decision.
+- Not deployed until the operator says.
+
+### §4MG — deploy + verification (2026-10-07, operator: "restart it and delete the bad lesson, then verify all your changes")
+- **Bad lesson:** removed with `remove_by_trigger`, archived as a `removed_by_trigger` tombstone. The vector twin `d8c023ca…` was deleted with the agent stopped: graceful SIGTERM → bootout of the replacement → backup `chroma.sqlite3.pre-4mg.bak` → delete → integrity ok → bootstrap. Both are still gone after two restarts.
+- **Deploys:** 3101 → 71452 → 78375, one process each time, no respawn loop. Tor egress ENFORCED.
+- **Probe probe-4mg-missing** (a made-up violinist):
+  - the agent passed `subjects` unprompted, and the tool refused with no photo (as designed);
+  - **deviation:** the agent then re-rendered a generic violinist WITHOUT asking first. Its reply disclosed this and offered an upload. Left as found.
+- **Probe probe-4mg-kiss:** both photos were fetched in about 1 s over Tor and both likenesses are right — but the output was a **two-panel collage**. The likeness check CONFIRMED it at 95%.
+  - Replay on Eva: the likeness judge cannot tell a collage from a single scene, even with an explicit rule (2/2 each), so that rule was removed.
+  - Fix in the tool: a "ONE single photograph of ONE continuous scene" lead plus a no-panels negative prompt (CFG is on for reference renders).
+- **Re-run probe-4mg-kiss2** (673 s): one scene, both recognisable (n=1).
+- Pins: 24 tests in `test_4mg_image_subjects.py`; the image and lint files pass (241).
+- **Not verified live:** the likeness check catching a WRONG person — the failed images were cleared from the sandbox by the operator mid-session; this is covered only by the unit wiring test.
+
+### §4MG — the agent asks when a subject has no photo (2026-10-07, operator: "yes, … should the agent stop and ask you when a subject has no photo, rather than drawing a generic stand-in on its own")
+- `_missing_subject_block` runs at the dispatch site next to the blind-regeneration block. After the tool's "no usable photo found for X" error in THIS request, any further `image_generation` call with fewer `subjects` than the failed call is REJECTED (`subject_photo_missing`, no strike), with "ask the user first … Reply NOW". A corrected spelling that keeps every subject passes. The user's answer is a new request and is not blocked.
+- The tool's error text now says STOP and ask (it used to say "only if they agree … call again without that subject", which read as permission).
+- Pins: 4 more tests, including the end-to-end `handle_chat` check that the second render never reaches the tool. 3 mutants, all killed.
+- **Deploy** 78375 → 86291 (gated; one process; no respawn loop).
+- **Live probe probe-4mg-missing2** (made-up violinist): the agent passed `subjects`, the tool refused, and the agent ASKED ("Could you upload a photo of him? Or should I generate the scene with a generic violinist instead?"). Nothing was rendered. The stricter error text alone sufficed this time; the dispatch block is the backstop.
+- **Observed, pre-existing:** the tool's ERROR draws strike 1/6 and the turn is booked `structural failure`. The late verifier PASS corrected the stream line ("CORRECTED failed → verified … honestly reported"), but the corpus row stayed FAILED: "verdict for traj c5294e4d landed before its stash", and the late backfill returns when `cached is None`. This is a race in the late-verdict path, not in §4MG. Left open for the operator. **CORRECTED the same day — this was NOT a race.** `_stash_trajectory_for_correction_lookup` caches only `task_kind == "user_request"` rows (§4BF R1, by design). A probe row is never in the correction cache, so its late verdict finds nothing and skips; "landed before its stash" was the separate lesson-sign ring. Real user turns ARE upgraded: request A1 earlier today logged "late verdict backfilled into the corpus + diary", and `test_a_late_pass_lifts_the_no_photo_ask_turn_for_a_real_user` drives the real `_record_turn_trajectory` + `_backfill_trajectory_outcome` on a real collector with the tool's real error and the agent's real question: recorded `failed`/`structural failure` → late PASS → corpus `passed`. No code change. Lesson: a probe's corpus row is not evidence for how a USER turn is labelled.
+
+### §4MG — fresh-eye review (2026-10-07, operator: "review all your changes using fresh eye reviewers")
+Three independent read-only reviewers: (A) the tool and `subject_photos.py`; (B) the agent-side wiring; (C) the model-facing text, tests and docs. Totals: **5 MAJOR + ~20 MINOR, all verified and fixed.**
+
+**MAJOR:**
+- **(A) Privacy guards did not cover `subjects`.** `subjects` is a public search and was in neither egress table, so an address or an owner identifier could reach Wikipedia; the tool was also registered AFTER the registry's egress wrap.
+  - Fix: `OUTBOUND_TOOLS["image_generation"] = {"subjects"}` (address scrub on `subjects` only — the prompt goes to the owner's node); `SUBJECT_TOOLS` added to `CONTENT_GUARDED_TOOLS`, with the haystack limited to `subjects`; the tool is now registered before the wrap.
+- **(A) The photo cache was reused forever with no provenance.** That meant a user's own `ref_x.jpg`, a same-slug person, or a truncated download.
+  - Fix: photos live in `subject_photos/` with a `.json` record. A cached photo is reused only when the record names the same subject AND the file fully decodes (`im.load()`). Downloads go to a `.part-*` name and are promoted only when complete.
+- **(A) `title ⊆ name` matching was wrong.** "Alexis Tsipras and Antonis Samaras" matched "Alexis Tsipras" (one man's photo rendered as both), and "and" was never split.
+  - Fix: subject ⊆ title only; `normalise_subjects` splits and/&/και, parses a JSON list string, collapses whitespace and dedupes by slug.
+- **(A) The node stretches the reference to the render size** (`fit_reference` keeps no aspect), and with no size an edit takes the reference's shape. A strip of three portraits became a panorama or squeezed faces.
+  - Fix: pad to the requested aspect, or to 3:2 with an explicit 768×512 for a joined strip; a single photo with no size is unchanged. The "you asked for" note is not shown for the tool-chosen size.
+  - Live on ghost: a padded Tsipras+Samaras reference rendered one scene at 768×512 in 658 s, with no padding bands.
+- **(B) The streamed path judged the RAW text**, so tool-call markup naming the image counted as "shown"; (C) a bare "saved as gen_x.png" also counted as shown.
+  - Fix: "shown" now means an `/api/download/…` link. The streamed path reads `_final_view` (already scrubbed; no second scrub — the incremental-scrub pin counts subs) plus the retry answer. A missing file is not linked.
+  - Pinned through the real `_stream_final_generation`, including the case where the retry answer itself shows the image (no second copy).
+
+**MINOR:**
+- `SearchUnavailable` (network / non-200, retried once on a fresh Tor circuit) is now distinct from "no photo".
+- Photos are not fetched when the node is offline.
+- A truncation note is added when the lead pushes the prompt past 8000 characters.
+- A list `negative_prompt` is merged.
+- The missing-subject block:
+  - reads a machine-readable `[subjects: {"missing", "found"}]` tail, only on a row that IS the error;
+  - requires every found subject to be kept and a close respelling (SequenceMatcher ≥ 0.75) of each missing one — "a man" and other substitutes were let through by the count rule;
+  - handles names containing "), " or "; ".
+- The visual arm uses likeness mode only when the judged image IS the generated one.
+- **Members may pass `subjects`.** They were shown it and refused for using it, which steered to a stranger.
+- Timing, `steps` and `seed` wording now covers `subjects` renders (about 11 min, edit caps, no seed line).
+- The subject note says a wrong photo needs a MORE SPECIFIC name.
+- The two §4JX wording pins now assert the whole consequence clause (a reversal used to pass).
+- New pins for the STOP-and-ask text, the no-edit-a-portrait text and the panorama cap.
+- The docs lead quote, the `.png` case and the folder were corrected.
+
+**Verification:**
+- `tests/test_4mg_review.py` (27) + `test_4mg_image_subjects.py` (31).
+- Mutation battery: 29 + 2 mutants over every fix, all killed. 4 first survived (the truncation fixture, the "you asked" fixture, and 2 on the stream wiring); the fixtures were fixed and they were re-run.
+- Full suite: 28,898 passed, 2 failed:
+  - `test_clockwork_ux` — the known flake; passes alone;
+  - `test_finalize_stream_r4_fixes` — a REAL regression from the first stream fix (an extra full-text scrub); fixed by reusing `_final_view`.
+- Re-run of all stream / finalize / image / egress / member files: 1,376 passed.
+- Deploy: 86291 → 20854.

@@ -2214,6 +2214,35 @@ Respond ONLY with a JSON object:
   "issues": ["specific contradictions, if any"]
 }}"""
 
+# §4MG: a picture rendered from photos of named subjects is judged AGAINST
+# those photos. Live 2026-10-07 the visual check CONFIRMED two strangers at
+# 100% ("two men in suits kissing") and later named one of them "Erdoğan" —
+# recognising a face by name is not a check; comparing it to the photo is.
+_VERIFY_LIKENESS_PROMPT = """You check a GENERATED picture against REFERENCE photo(s) of the specific real subjects it had to show.
+
+IMAGES PROVIDED (in order):
+[1] the REFERENCE photo(s) the picture was built from — left to right: {subjects}
+[2] the GENERATED picture.
+
+USER REQUEST:
+{symptom}
+
+AGENT'S RESPONSE (its claim about the result):
+{claim}
+
+Compare each subject in [2] with its photo in [1] — for a person: face shape, hair, hairline, glasses, age, build; for a place or product: its distinctive shape and features. Do NOT identify anyone by name from memory; judge only resemblance to the reference.
+- Every subject in [2] is recognisably the same as in [1] and the requested scene is shown, OR the response honestly says which subject or part did not come out right → CONFIRMED.
+- The response presents the picture as showing the subjects, but at least one is clearly a different person/object, is missing, or the requested scene was not rendered → REFUTED.
+- You cannot tell (blurred, hidden faces, ambiguous) → UNCERTAIN.
+
+Respond ONLY with a JSON object:
+{{
+  "verdict": "CONFIRMED" | "REFUTED" | "UNCERTAIN",
+  "confidence": 0.0-1.0,
+  "reasoning": "one sentence: which subjects match their reference and which do not",
+  "issues": ["specific mismatches, if any"]
+}}"""
+
 # Claim packing (2026-08-01, req 56221fad post-mortem). The old blunt
 # ``claim[:2000]`` cut a 5.7k-char reply mid-sentence: the judge reported
 # "truncated at the end" as a defect of the ANSWER, and the confirmation
@@ -4802,7 +4831,8 @@ class Verifier:
     @_logged_verify("visual")
     async def verify_visual(self, *, symptom: str, claim: str,
                             after_image: str,
-                            before_image: Optional[str] = None
+                            before_image: Optional[str] = None,
+                            likeness_subjects: Optional[str] = None
                             ) -> Optional[VerifyResult]:
         """Check whether a reported VISUAL symptom is still present in the
         rendered artifact, by looking at the actual pixels.
@@ -4819,6 +4849,15 @@ class Verifier:
         """
         if not after_image:
             return None
+        if likeness_subjects and before_image:
+            # §4MG: before_image is the subjects' reference photo
+            prompt = _VERIFY_LIKENESS_PROMPT.format(
+                subjects=str(likeness_subjects)[:400],
+                symptom=(symptom or "")[:1000],
+                claim=(claim or "")[:1500],
+            )
+            data = await self._call_llm_vision(prompt, [before_image, after_image], temperature=0.1)
+            return self._build_verify_result(data)
         if before_image:
             images = [before_image, after_image]
             images_desc = (
