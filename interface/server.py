@@ -1309,7 +1309,7 @@ async def _active_chat_tasks_janitor():
         except asyncio.CancelledError:
             return
         except Exception as e:
-            logger.warning(f"active_chat_tasks janitor error: {e}")
+            logger.warning(f"active_chat_tasks janitor error: {type(e).__name__}: {e}")
 
 # ── Web push (2026-08-01) ──────────────────────────────────────────────
 # Reply-ready pushes for turns that finish while the phone is locked/away,
@@ -1352,7 +1352,7 @@ async def _push_if_unacked(task_id: str, user_text: str) -> None:
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        logger.warning(f"reply-ready push failed: {e}")
+        logger.warning(f"reply-ready push failed: {type(e).__name__}: {e}")
 
 def _last_user_text(payload) -> str:
     try:
@@ -1365,6 +1365,9 @@ def _last_user_text(payload) -> str:
         pass
     return ""
 
+_PUSH_MAX_FAILED_CYCLES = 10   # × 30 s: five minutes of retries
+
+
 async def _notify_push_poller():
     """Forward the agent's notify-severity ledger records as web pushes.
     Own consumer name ('web-push') per the watermark contract — never
@@ -1373,6 +1376,7 @@ async def _notify_push_poller():
     cycle — overflow records are acked unpushed and stay visible in the
     bell rather than storming the lock screen."""
     consumer = "web-push"
+    failed_cycles = 0   # §4ML: undelivered cycles in a row (bounded retry)
     last_acked = None  # skip re-acking an unchanged watermark: an idle
     # ledger otherwise gets notify_consumers.json rewritten every 30s
     # around the clock, killing that file's mtime staleness diagnostic
@@ -1393,12 +1397,33 @@ async def _notify_push_poller():
             if not data.get("enabled"):
                 continue
             records = [] if data.get("baseline") else (data.get("records") or [])
+            # §4ML: ack only what reached a subscription. A broadcast that
+            # reached 0 of N (a push service down, a broken VAPID key) used
+            # to be acked anyway — the records were gone from this consumer
+            # though no lock screen ever showed them. Unacked, they are
+            # retried next cycle (the Slack consumer's contract).
+            delivered = True
             for rec in records[:5]:
-                await webpush_notify.broadcast_async(
+                sent = await webpush_notify.broadcast_async(
                     f"Ghost — {str(rec.get('phase', 'event')).upper()[:40]}",
                     str(rec.get("summary", ""))[:300],
                     url=_PUSH_CLICK_URL, tag="ghost-notify")
+                if not sent:
+                    delivered = False
+                    break
             watermark = data.get("watermark", 0)
+            if not delivered:
+                failed_cycles += 1
+                if failed_cycles < _PUSH_MAX_FAILED_CYCLES:
+                    continue
+                # a subscription that can never be reached (one endpoint on
+                # a rotated VAPID key, never pruned while it is the only one)
+                # must not freeze this consumer forever: give up on THESE
+                # records, say so, and move on
+                logger.warning("notify push poller: %d record(s) undelivered after %d cycles — "
+                               "acknowledged without a push (they stay in the bell)",
+                               len(records[:5]), failed_cycles)
+            failed_cycles = 0
             if records or data.get("baseline") or watermark != last_acked:
                 resp = await client.post(
                     "http://localhost:8000/api/notifications/ack",
@@ -1409,7 +1434,8 @@ async def _notify_push_poller():
         except asyncio.CancelledError:
             return
         except Exception as e:
-            logger.warning(f"notify push poller error: {e}")
+            # type first: 81 of these lines were blank (a timeout's str() is "")
+            logger.warning(f"notify push poller error: {type(e).__name__}: {e}")
 
 
 async def _wait_for_new_data(task, timeout: float | None = None) -> bool:
@@ -2109,7 +2135,7 @@ async def stt_proxy(request: Request):
     except voice.VoiceError as e:
         # Carries its own status so a client-side problem (unusable upload,
         # over-length clip) isn't reported as a backend failure.
-        logger.error(f"STT failed: {e}")
+        logger.error(f"STT failed: {type(e).__name__}: {e}")
         return _err_json(e.status, str(e))
     except HTTPException:
         raise
@@ -2132,7 +2158,7 @@ async def tts_proxy(request: Request):
         audio = await voice.synthesize(body.get("text", ""))
         return Response(content=audio, media_type="audio/wav")
     except voice.VoiceError as e:
-        logger.error(f"TTS failed: {e}")
+        logger.error(f"TTS failed: {type(e).__name__}: {e}")
         return _err_json(e.status, str(e))
     except HTTPException:
         raise

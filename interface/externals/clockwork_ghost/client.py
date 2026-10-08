@@ -1872,6 +1872,7 @@ class MainWindow(QWidget):
         unlabelable = False
         writing = False
         recorded = False
+        saw_done = got_error = False   # read by the finally (§4ML)
         
         try:
             async with httpx.AsyncClient(timeout=3600.0) as client:
@@ -1969,10 +1970,19 @@ class MainWindow(QWidget):
             # operator asked for exactly this.
             pass
         except Exception as e:
-            self.web_face.note_error(f"{type(e).__name__}: {e}")
-            if agentapi.is_unreachable(e):
-                self._set_agent_ok(False)
-            self.update_chat_signal.emit("error", agentapi.describe_error(e, AGENT_BASE))
+            # only a stop the agent TOOK, or a FORCED one still on its way,
+            # breaks the stream on purpose — a cooperative stop pending (it
+            # may yet be refused) never hides a real drop (fresh-reader R2)
+            if self._stop_took or (self._stop_pending and self._stop_asked >= 2):
+                # §4ML: a hard stop kills the agent's task mid-stream, so the
+                # link breaks — the operator asked for that; it is not "eva
+                # dropped the connection" (the error flinch, then "stopped.")
+                print(f"[stop] stream ended by the stop: {type(e).__name__}", flush=True)
+            else:
+                self.web_face.note_error(f"{type(e).__name__}: {e}")
+                if agentapi.is_unreachable(e):
+                    self._set_agent_ok(False)
+                self.update_chat_signal.emit("error", agentapi.describe_error(e, AGENT_BASE))
         finally:
             if not recorded and self.current_response_text:
                 # A reply that was cut (stopped, or the link dropped) is still
@@ -1982,7 +1992,9 @@ class MainWindow(QWidget):
                 self.update_workspace_signal.emit()
             self.update_chat_signal.emit("stop_thinking", "")
             self.stop_btn.hide()
-            if self._stop_took or self._stop_pending:
+            # §4ML: a stop still on its way when the reply finished ON ITS OWN
+            # (a clean [DONE]) did not stop anything — the whole reply arrived
+            if self._stop_took or (self._stop_pending and not (saw_done and not got_error)):
                 # When the agent TOOK the stop (or this client forced it) —
                 # or the stream ended while the stop was still on its way,
                 # which is the same thing arriving in the other order. A stop
@@ -2164,7 +2176,7 @@ class MainWindow(QWidget):
             self.is_thinking = True
             # start() BEFORE the first render: it resets the elapsed clock and
             # re-arms corridor adoption, so the caption belongs to THIS turn.
-            self.ticker.start()
+            self.ticker.start(self._turn_rid)
             self._render_thinking()
             # 1 s — the clock has second granularity and each repaint re-fits
             # the bubble, which is not free on the CM4.

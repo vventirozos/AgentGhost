@@ -436,6 +436,14 @@ class AcquiredSkillManager:
         return self._load_registry()
 
     def log_telemetry(self, name: str, success: bool):
+        # §4MI: a self-play / probe / bench / member run must not move the
+        # owner's skill telemetry (three failures RETIRE a skill)
+        try:
+            from .composed_skills import _usage_is_bookable
+            if not _usage_is_bookable():
+                return
+        except Exception:  # noqa: BLE001
+            pass
         try:
             with self._lock:
                 registry = self._load_registry()

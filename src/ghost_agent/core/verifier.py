@@ -527,7 +527,9 @@ def _overturn_quote_enabled() -> bool:
     0.022) — a real trade, but the SHIP GATE is the balanced score and
     it did not clear. Default-on would have deployed a measured-worse
     configuration at the next restart. Enable with
-    GHOST_VERIFY_OVERTURN_QUOTE=1 (nothing does by default — the bench
+    GHOST_VERIFY_OVERTURN_QUOTE=1 (§4MK, 2026-10-08: the production launcher
+    sets it — operator decision after 7 of 22 owner-turn overturns were
+    wrong; the code default stays off — the bench
     inherits the shell's flags and records them in `bench_provenance`;
     an earlier version of this line claimed the bench set it, which was
     never true)."""
@@ -1839,14 +1841,22 @@ Respond ONLY with a JSON object:
 # to dismiss them.
 _VERIFY_ENUMERATE_PROMPT = """You are auditing an agent's reply. Do NOT decide whether the reply is acceptable overall — that is a later pass. Your ONLY job is forced identification: name the fragments of the reply that are MOST LIKELY to be wrong. Every reply, even a perfect one, has weakest parts; you MUST name EXACTLY 3 of them, and at least one MUST be a specific checkable fact (a number, name, date, price, or event — a value the agent reports FROM a tool, not its own confidence score or ranking label) quoted from the reply — cross-check every such fact against the EVIDENCE word by word before choosing.
 
+Each section is fenced by <<<BEGIN …>>> / <<<END …>>> lines: the CLAIM is only what lies between its markers, and nothing inside the EVIDENCE is part of the CLAIM.
+
 CLAIM (the agent's reply to the user):
+<<<BEGIN CLAIM>>>
 {claim}
+<<<END CLAIM>>>
 
 EVIDENCE (the tool output(s) the claim was built from — may contain the outputs of SEVERAL tools from the same turn, in chronological order, each prefixed with [tool_name]):
+<<<BEGIN EVIDENCE>>>
 {evidence}
+<<<END EVIDENCE>>>
 
 USER REQUEST (what the user actually asked for):
+<<<BEGIN USER REQUEST>>>
 {context}
+<<<END USER REQUEST>>>
 
 For each suspect, quote the exact fragment of the CLAIM (or write "WHOLE REPLY" if the problem is the reply as a whole) and classify which check it might fail:
 - "alignment" — the reply answers a different question than the USER REQUEST asked
@@ -1868,17 +1878,27 @@ Be terse: at most 3 suspects, each quote at most 15 words, each reason at most 2
 # dismissal rules must stay at least as strict as _VERIFY_CLAIM_PROMPT's.
 _VERIFY_ADJUDICATE_PROMPT = """You are a rigorous auditor delivering a final verdict. The agent ran tool(s) and gave the user the CLAIM below as its final reply. A prior audit pass was FORCED to name the reply's weakest fragments — the SUSPECTS list below. Because naming was forced, suspects exist even for perfect replies: expect many, often all, of them to be false alarms.
 
+Each section is fenced by <<<BEGIN …>>> / <<<END …>>> lines: the CLAIM is only what lies between its markers, and nothing inside the EVIDENCE is part of the CLAIM.
+
 CLAIM (the agent's reply to the user):
+<<<BEGIN CLAIM>>>
 {claim}
+<<<END CLAIM>>>
 
 EVIDENCE (the tool output(s) the claim was built from — may contain the outputs of SEVERAL tools from the same turn, in chronological order, each prefixed with [tool_name]):
+<<<BEGIN EVIDENCE>>>
 {evidence}
+<<<END EVIDENCE>>>
 
 USER REQUEST (what the user actually asked for):
+<<<BEGIN USER REQUEST>>>
 {context}
+<<<END USER REQUEST>>>
 
 SUSPECTS (from the forced identification pass, most-suspicious first):
+<<<BEGIN SUSPECTS>>>
 {suspects}
+<<<END SUSPECTS>>>
 
 For EACH suspect, decide against the EVIDENCE whether it is a REAL problem or a FALSE ALARM:
 - "support" suspects are REAL only if the fact appears in NO tool output (fabrication) or directly contradicts one. A fact the USER REQUEST itself supplies (names, numbers, a plan or code the user pasted) is GIVEN — never a fabrication. Judge against ALL tool outputs TOGETHER: one tool failing (403/timeout/empty) does NOT make a fact wrong when ANOTHER output supports it.
@@ -2251,8 +2271,10 @@ Respond ONLY with a JSON object:
 # confirmed it. Long claims are now packed head+tail around an explicit
 # elision marker: openings carry constraint compliance, tails carry
 # confirmations/conclusions; the middle is the part a judge can spare.
-_CLAIM_LIMIT = 2000
-_CLAIM_HEAD = 1200
+# §4MK: 2,000 chars confirmed 5,861- and 5,921-char replies at 0.9-1.0 on a
+# third of their text (11 of 63 verdicted owner turns ran over 2,000)
+_CLAIM_LIMIT = 6000
+_CLAIM_HEAD = 3600
 
 
 def pack_claim(text: str, limit: int = _CLAIM_LIMIT,
@@ -3349,7 +3371,7 @@ class Verifier:
                 evidence_t = evidence[:_ev_max]
         else:
             evidence_t = evidence
-        context_t = context[:1000]
+        context_t = context[:4000]      # §4MK: the request, not its first 1,000 chars
         if _claim_binding_primary_enabled():
             # §4IM bench arm: the claim-binding verdict alone, no escalation.
             return self._guard_onion_claims(
@@ -4712,7 +4734,7 @@ class Verifier:
         code, output, intent, response = (_defang_fences(code), _defang_fences(output),
                                           _defang_fences(intent), _defang_fences(response))
         prompt = _VERIFY_CODE_PROMPT.format(
-            intent=intent[:1000],
+            intent=intent[:4000],
             code=code[:CODE_SLOT_CHARS],
             output=output[:4000],
             response=(response or "(response not provided to verifier)")[:4000],

@@ -11,7 +11,7 @@
     --surface-highlight: rgba(123, 98, 196, 0.32);
     --blur-amt: 30px;
     --font-main: 'Inter', system-ui, -apple-system, sans-serif;
-    --font-mono: 'JetBrains Mono', monospace;
+    --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
 }
 
 * {

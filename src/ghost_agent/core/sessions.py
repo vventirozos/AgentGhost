@@ -454,6 +454,27 @@ def merge_history_detail(stored: List[dict],
     return lead + stored + extras, list(extras)
 
 
+def _densest_window(lowered: str, terms, width: int):
+    """(start, distinct terms inside) of the ``width``-char window holding
+    the most distinct query terms (§4MJ). Windows start at term hits."""
+    starts = sorted({m for t in terms for m in _find_all(lowered, t)})
+    best = (0, sum(1 for t in terms if t in lowered[:width]))
+    for p in starts:
+        a = max(0, p - 40)
+        n = sum(1 for t in terms if t in lowered[a:a + width])
+        if n > best[1]:
+            best = (a, n)
+    return best
+
+
+def _find_all(hay: str, needle: str, cap: int = 50):
+    out, i = [], hay.find(needle)
+    while i >= 0 and len(out) < cap:
+        out.append(i)
+        i = hay.find(needle, i + 1)
+    return out
+
+
 class SessionStore:
     """One JSON file per session. Thread-safe; never raises."""
 
@@ -606,7 +627,7 @@ class SessionStore:
                 self._search_cache.pop(next(iter(self._search_cache)))
         return msgs
 
-    def search_messages(self, query: str, limit: int = 5) -> List[dict]:
+    def search_messages(self, query: str, limit: int = 5, exclude_session_id: str = "") -> List[dict]:
         """Keyword search over stored conversations — the raw-conversation
         memory tier (2026-07-14). Sessions were previously replay-only:
         durable, but unreachable by any retrieval path.
@@ -625,6 +646,10 @@ class SessionStore:
             if not terms:
                 return []
             floor = 2 if len(terms) >= 2 else 1
+            # §4MJ: a long reply holds ANY two words — two 5.9 KB replies
+            # matched 23 of 80 unrelated requests. The terms must sit
+            # TOGETHER: the snippet is the window around the densest match,
+            # and the floor is counted inside that window.
 
             now = time.time()
             expires, summaries = self._list_memo
@@ -634,6 +659,8 @@ class SessionStore:
 
             hits: List[dict] = []
             for meta in summaries:
+                if exclude_session_id and meta["id"] == exclude_session_id:
+                    continue                     # §4MJ: the active session, before the limit
                 for m in self._cached_messages(meta["id"]):
                     if m.get("role") not in ("user", "assistant"):
                         continue
@@ -641,13 +668,16 @@ class SessionStore:
                     if not isinstance(content, str) or len(content) < 8:
                         continue
                     lowered = content.lower()
-                    score = sum(1 for t in terms if t in lowered)
+                    if sum(1 for t in terms if t in lowered) < floor:
+                        continue
+                    start, score = _densest_window(lowered, terms, self._SNIPPET_CHARS)
                     if score >= floor:
                         hits.append({
                             "session_id": meta["id"],
                             "title": meta["title"] or "untitled",
                             "role": m["role"],
-                            "text": content[:self._SNIPPET_CHARS],
+                            "text": (("…" if start else "")
+                                     + content[start:start + self._SNIPPET_CHARS]),
                             "score": score,
                         })
             hits.sort(key=lambda h: h["score"], reverse=True)

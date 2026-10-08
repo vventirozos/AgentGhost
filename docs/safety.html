@@ -244,5 +244,9 @@
     <p>Checked against <code>utils/egress_guard.py</code> (incl. <code>resolve_egress_proxy</code>, the layer-2 call-site backstop), <code>utils/helpers.py</code>, <code>tools/search.py</code>, <code>tools/system.py</code>, <code>tools/file_system.py</code>, <code>tools/browser.py</code>, <code>sandbox/docker.py</code> and <code>main.py</code> on 2026-08-08.</p>
   </footer>
 </main>
+
+<h2 id="4mi">§4MI (2026-10-08) — the owner's profile is redacted by value</h2>
+<p>Every stored system prompt carries the USER PROFILE block, and no shape rule knew the values in it. <code>distill/redact.py</code> now reads <code>$GHOST_HOME/system/memory/user_profile.json</code> (re-read when the file changes) and redacts the identity-class values — <code>root</code> (name, address, company, location, birth date), <code>relationships</code>, <code>assets</code>, <code>contact</code>, <code>family</code> — as <code>&lt;REDACTED_PROFILE&gt;</code>, <strong>only in a stored trajectory's <code>system_prompt</code></strong> (the field that carries the USER PROFILE block). It is deliberately NOT part of <code>redact_text</code>: that function also writes the memory journal and the episode store, where a placeholder was read back as an owner fact (§4MI re-review). Values match as whole words; a value under 8 characters matches only as written (the city "Nice", not the word "nice"); placeholders such as the stock name "User" are never a rule. Preferences, interests and the role are left (they are the learning signal). Conversation text (requests, replies, tool results) is not rewritten — a first name the owner types stays as typed. Two over-redactions fixed: the OpenAI key rule needs a left boundary (URL slugs like <code>…-musk-2024-annual-report</code> matched), and a 14-digit <code>web.archive.org/web/…</code> stamp is not a card number.</p>
+
 </body>
 </html>

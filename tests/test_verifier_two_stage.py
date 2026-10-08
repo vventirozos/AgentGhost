@@ -388,10 +388,10 @@ async def test_two_stage_truncates_slots_like_classic_path():
     from ghost_agent.core.agent import _EVIDENCE_BUDGET_MAX as _ev_max
     stub = _QueueStub([SUSPECTS_JSON, CONFIRM_JSON])
     v = Verifier(llm_client=stub)
-    await v.verify_claim("C" * 5000, "E" * (_ev_max + 1000), "X" * 3000)
+    await v.verify_claim("C" * 9000, "E" * (_ev_max + 1000), "X" * 6000)
     stage1 = stub.prompts[0]
     # Claim: bounded, head AND tail survive, elision is explicit.
-    assert "C" * 1200 in stage1 and "C" * 2001 not in stage1
+    assert "C" * 3600 in stage1 and "C" * 6001 not in stage1     # §4MK: 6,000-char pack, 3,600 head
     assert "NOT a truncated response" in stage1
     # Evidence: the cut is the PACKER's max (§4HO, 2026-09-16 — a literal
     # 4000 here re-truncated the scaled digest); context keeps its hard cut.
@@ -401,4 +401,4 @@ async def test_two_stage_truncates_slots_like_classic_path():
     from ghost_agent.core.agent import _EVIDENCE_TRUNCATION_MARK
     assert "E" * (_ev_max - 120) in stage1 and "E" * (_ev_max + 1) not in stage1
     assert _EVIDENCE_TRUNCATION_MARK in stage1
-    assert "X" * 1000 in stage1 and "X" * 1001 not in stage1
+    assert "X" * 4000 in stage1 and "X" * 4001 not in stage1     # §4MK: the request keeps 4,000 chars

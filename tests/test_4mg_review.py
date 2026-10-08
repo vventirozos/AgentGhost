@@ -194,8 +194,12 @@ async def test_names_with_separators_do_not_break_the_count(tmp_path, monkeypatc
     monkeypatch.setattr(FS, "tool_download_file", download)
     car = "Toyota Corolla (E210), red"
     row = await _missing(tmp_path, [car, "Bob Q; the third"])
+    # §4MI r2: the SAME name (by slug) is the same search and is blocked; a
+    # real respelling passes — the parse of "; " is what this pins
     assert A._missing_subject_block("image_generation",
-                                    {"prompt": "x", "subjects": [car, "Bob Q the third"]}, [row]) is None
+                                    {"prompt": "x", "subjects": [car, "Bob Q the 3rd"]}, [row]) is None
+    assert A._missing_subject_block("image_generation",
+                                    {"prompt": "x", "subjects": [car, "Bob Q the third"]}, [row])
 
 
 def test_a_quoted_error_in_other_content_does_not_arm_the_block():

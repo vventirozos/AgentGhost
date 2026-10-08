@@ -140,6 +140,11 @@ def _gate_fingerprint(embeddings_available: bool, *,
         # mechanism instead of a special case that had to be exempted from
         # the very budget it was bypassing.
         deployed_state,
+        # §4MI r2: the corpus POLICY — reflection copies and coding leaves
+        # left the training set; the model deployed on 09-20 was gated on a
+        # held-out set with 222 leaked twins, so the cleaned corpus is a
+        # different question (one look, through the ordinary mechanism)
+        "kinds-4mi",
     ))
 
 
@@ -207,7 +212,16 @@ def _evidence_unchanged(new_ids: frozenset, prev_ids: frozenset) -> bool:
     if new_ids <= prev_ids:
         return True
     from .model import ComplexityClassifier as _C
-    return (_jaccard(new_ids, prev_ids) >= _C._GATE_MAX_HELDOUT_OVERLAP
+    # §4MI: rows that LEFT the corpus (the §4MF 90-day archive, a day file
+    # moved aside) are not new evidence. Plain Jaccard read them as change:
+    # 97 ledger ids gone (90 archived) pulled the overlap to 0.854, and the
+    # next two archived days would have bought a look with 228 new rows,
+    # fitting on a smaller corpus than the one the look was gated on. The
+    # overlap is measured over what is READABLE NOW — with no removals it
+    # is exactly the Jaccard it replaces.
+    seen = new_ids & prev_ids
+    overlap = len(seen) / len(new_ids) if new_ids else 0.0
+    return (overlap >= _C._GATE_MAX_HELDOUT_OVERLAP
             and len(new_ids - prev_ids) < _C._GATE_LOOK_ABSOLUTE_SLACK)
 
 
@@ -519,7 +533,7 @@ class RouterTrainer:
             # look without ever writing a checkpoint.
             _anything_deployed = _ckpt_present and _servable
             report.bail_reason = (
-                f"the labelled corpus is {_overlap:.0%} the same as the last "
+                f"the labelled corpus is {(len(_ids & _prev_ids) / len(_ids) if _ids else 0):.0%} the same as the last "
                 f"look and nothing about the gate changed — not re-running "
                 f"the same test on the same evidence; "
                 + ("the deployed model stays" if _anything_deployed else

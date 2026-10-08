@@ -202,12 +202,40 @@ def filter_events_for_project(
     active = (active_project_id or "").strip().lower()
     if not active:
         return list(events)
+    # §4MI: a project-agnostic event (a research pull, a sandbox command
+    # with no project path, every legacy row) was kept for EVERY project
+    # forever — the prefix for a live project carried probe commands from
+    # four days earlier. With a project active, an agnostic event is kept
+    # only while it is recent.
+    import datetime as _dt
+    _cut = _dt.datetime.utcnow() - _dt.timedelta(seconds=AGNOSTIC_EVENT_MAX_AGE_S)
     kept: List["WorkspaceEvent"] = []
     for ev in events:
         owner = derive_event_project_id(ev)
-        if not owner or owner == active:
+        if owner == active:
+            kept.append(ev)
+        elif not owner and _event_is_recent(ev, _cut):
             kept.append(ev)
     return kept
+
+
+#: how long a project-agnostic event stays in a PROJECT's wake-up prefix
+AGNOSTIC_EVENT_MAX_AGE_S = 6 * 3600
+
+
+def _event_is_recent(ev, cutoff) -> bool:
+    """True when the event's UTC timestamp is after ``cutoff`` — an
+    unparseable stamp is NOT recent (fail closed: a row that cannot say
+    when it happened does not reach another project's prompt)."""
+    import datetime as _dt
+    try:
+        raw = str(getattr(ev, "timestamp", "") or "").rstrip("Z")
+        ts = _dt.datetime.fromisoformat(raw)
+        if ts.tzinfo is not None:
+            ts = ts.astimezone(_dt.timezone.utc).replace(tzinfo=None)
+        return ts >= cutoff
+    except Exception:  # noqa: BLE001
+        return False
 
 
 @dataclass

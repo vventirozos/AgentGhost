@@ -357,5 +357,14 @@
   <h2 id="4kp-hold">A reply flagged <code>reasoning_unparsed</code> <span class="tag">2026-09-29 &sect;4KP</span></h2>
   <p>When the agent's final stream carries no reasoning channel with thinking on, it sends an empty-delta frame with <code>{"ghost": {"reasoning_unparsed": true}}</code>: the reply's opening may be reasoning that ends in an orphan <code>&lt;/think&gt;</code>. A terminal cannot take printed text back, so both the REPL (<code>stream_reply</code>) and the one-shot path hold such a reply and print it only after the stream's own <code>[DONE]</code> with no error (an abort, an error frame or a stream that just ends prints nothing of it) through <code>strip_orphan_think_close</code> &mdash; a copy of the agent's <code>_strip_orphan_think_close</code>, pinned to it by the §4KO parity table. An unflagged reply streams exactly as before.</p>
 </main>
+
+<h2 id="4ml">§4ML (2026-10-08)</h2>
+<ul>
+  <li>A reply the agent marks unlabelable (a quick greeting) shows no rating hint, and <code>/good</code> / <code>/bad</code> on it say why instead of retrying for 6 s.</li>
+  <li><code>/notify</code> during quiet hours says how many notices the agent is holding (the agent's response now carries <code>held</code>), or "no new notifications (quiet hours)". It reports "acknowledged" only when the ack succeeded.</li>
+  <li><code>/cancel</code> stops whatever turn the agent is running, from any client, and now names the request it cancelled.</li>
+  <li><code>ghost --probe</code> marks every turn <code>X-Ghost-Origin: probe</code>: it runs normally and never teaches.</li>
+  <li><code>~/.ghost_history</code> is created owner-only (0600). A test had been writing "hello"/"world" into the real file.</li>
+</ul>
 </body>
 </html>

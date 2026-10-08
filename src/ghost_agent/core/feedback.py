@@ -304,6 +304,17 @@ def apply_human_label(agent: Any, request_id: str, signal: str,
             except Exception as _sfe:  # noqa: BLE001 — label already committed
                 logger.debug("selfhood human-label backfill skipped: %s: %s",
                              type(_sfe).__name__, _sfe)
+            # §4MI: a 👎 reaches the turn's EPISODE too (a late refute and
+            # the owner's correction already did; the thumb did not, so the
+            # episode kept saying SUCCESS and was handed out as how-to)
+            if not positive:
+                try:
+                    _rel = getattr(agent, "_relabel_episode", None)
+                    if callable(_rel):
+                        _rel(rid, "the owner marked this answer wrong",
+                             trigger=str(getattr(traj, "user_request", "") or ""))
+                except Exception as _ree:  # noqa: BLE001
+                    logger.debug("episode relabel on thumb skipped: %s", _ree)
             if unchanged:
                 logger.debug("human label repeat ignored: %s already %s",
                              traj.id[:8], outcome)

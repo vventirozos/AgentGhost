@@ -163,7 +163,7 @@ class TestRrfRefit:
                 "intent": "procedural",
                 "source": success_source if i % 2 == 0 else "graph",
                 "success": i % 2 == 0,
-                "ts": "2026-07-14T00:00:00Z",
+                "ts": "2026-10-01T00:00:00Z",   # §4MJ: inside the gated era
             }))
         ledger.write_text("\n".join(rows) + "\n")
         bus = MemoryBus(usefulness_ledger_path=ledger)

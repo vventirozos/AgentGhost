@@ -47,13 +47,13 @@
     <thead><tr><th>Member</th><th>Signature</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>__init__</code></td><td><code>(vector_memory, graph_memory, skill_memory, profile_memory, episodic_memory, session_store)</code></td><td>All tiers are optional — missing ones are skipped at fan-out time.</td></tr>
-      <tr><td><code>async hydrate_context</code></td><td><code>(query, max_chars=6000, rrf_k=60, context_budget=0, llm_client=None) -&gt; str</code></td><td>Fetch all tiers in parallel, fuse with RRF, return sectioned markdown for prompt injection.</td></tr>
+      <tr><td><code>async hydrate_context</code></td><td><code>(query, *, max_chars=6000, rrf_k=0 (→ _RRF_K=10), context_budget=0, llm_client=None, turn_id="", raw_user_text="", exclude_session_id="") -&gt; str</code></td><td>Fetch all tiers in parallel, fuse with RRF, return sectioned markdown for prompt injection.</td></tr>
       <tr><td><code>async publish_fact</code></td><td><code>(event_type, fact_data) -&gt; Dict[str, Any]</code></td><td>Fan-out write to vector, graph, profile, skill stores in parallel. Dedup-LRU gate prevents replays.</td></tr>
     </tbody>
   </table></div>
 
   <h2>RRF (Reciprocal Rank Fusion)</h2>
-  <p>For each ranker (vector, graph, skill, episodic) the bus computes:</p>
+  <p>For each ranker (vector, graph, skill, episodic, session) the bus computes:</p>
   <pre><code>score(doc) = Σ_ranker  weight_ranker / (k + rank_in_ranker + 1)</code></pre>
   <p><code>k = rrf_k</code>: <code>_reciprocal_rank_fusion</code> keeps <strong>60</strong> as its classmethod default, but the hydration path now passes <code>_RRF_K = 10</code> (2026-07-22, see the review section below). Per-source weights depend on a query intent classification; the table below is the hand-set <em>prior</em> that a learned matrix (<code>core.rrf_weights</code>) now scales multiplicatively within a bounded band:</p>
 
@@ -84,7 +84,7 @@
   <p><strong>Budget emission loop continues past an oversized item.</strong> When an item can't fit the remaining budget (and something is already emitted), <code>_format_markdown_with_survivors</code> now <code>continue</code>s to the next item instead of <code>break</code>ing. Items are ordered by fused score, NOT length, so the old break was simply wrong: a 900-char vector item at rank 3 discarded a 23-char SKILL LESSON and a 6-char graph edge that both fit trivially in the remaining ~277 chars — and because headers are emitted lazily on first sight, the entire SKILL PLAYBOOK and TOPOLOGICAL KNOWLEDGE GRAPH sections (headers included) vanished from the prompt silently.</p>
   <p><strong>Intent is classified on the raw user text.</strong> <code>hydrate_context</code> gained a <code>raw_user_text</code> kwarg (agent.py passes <code>last_user_content</code>); <code>_intent_source_text</code> classifies it when supplied. The old path classified the whole expanded query — <code>Context: &lt;~200 chars of the PREVIOUS assistant reply&gt; | User intent: &lt;query&gt;</code> — so on a short follow-up the assistant's own prose (dense in classifier keywords) drove the tier weighting instead of the user's actual question. The <code>_EXPANSION_MARKER</code> tail-split remains as the fallback for call sites that don't pass the kwarg yet.</p>
   <p><strong>Off-topic vector gate no longer self-disables on an unrelated <code>TypeError</code>.</strong> The blanket <code>except TypeError</code> that used to catch a stub's missing <code>min_relevance_dist</code> also swallowed any TypeError raised INSIDE a real <code>search_items</code> and retried without the gate — silently injecting the weakly-related tail with no log at all. <code>_accepts_relevance_floor</code> now decides by signature introspection whether the callable takes the parameter; a genuine arity mismatch on an introspectable callable drops the gate with a WARNING instead of masking a real error. (Distinct from the 2026-07-15 <code>_VECTOR_MATCH_FLOOR</code> distance gate above — this fixes how that gate is passed, not the gate itself.)</p>
-  <p><strong>Per-hydration instrumentation.</strong> <code>_log_hydration</code> emits one INFO line per hydration with per-tier candidate counts, per-tier survivor counts, survivor total, intent and budget — e.g. <code>Hydration tiers: v=4 g=0 s=2 e=3 sess=1 -&gt; 7 survivors (v4 g0 s2 e3 sess1) intent=contextual budget=4000</code>. A wired-but-empty tier reads as <code>x=0</code> and an unwired (<code>None</code>) store as <code>x=-</code>, distinguishing "dead for weeks" from "not configured" — the cheap guard that would have surfaced this whole finding class months earlier. INFO so it lands in the file log without touching the WARNING+ console/pretty stream.</p>
+  <p><strong>Per-hydration instrumentation.</strong> <code>_log_hydration</code> emits one INFO line per hydration with per-tier candidate counts, per-tier survivor counts, survivor total, intent and budget — e.g. <code>Hydration tiers: v=4 g=0 s=2 e=3 sess=1 -&gt; 7 survivors (v2 g0 s2 e2 sess1) — the <code>x=N</code> fields count FETCHED candidates, the bracket the INJECTED ones intent=contextual budget=4000</code>. A wired-but-empty tier reads as <code>x=0</code> and an unwired (<code>None</code>) store as <code>x=-</code>, distinguishing "dead for weeks" from "not configured" — the cheap guard that would have surfaced this whole finding class months earlier. INFO so it lands in the file log without touching the WARNING+ console/pretty stream.</p>
   <p>Tests: <code>tests/test_bus_rrf_fixes.py</code>.</p>
 
   <h2>Dedup LRU</h2>
@@ -163,5 +163,25 @@
   and no split runs when the query was already rewritten by the expansion (one worker call before the reply is enough);
   the route call gives up after 4 s (the keyword split is the fallback).</p>
 </main>
+
+<h2 id="4mj">§4MJ (2026-10-08) — what each tier may inject</h2>
+<p>Measured by replaying 80 real owner requests through the real bus on a copy of the live stores: 12.8% of injected tokens were relevant and 8.6% misleading. Changes:</p>
+<ul>
+  <li><strong>Episodes:</strong> a FAILED episode with no lesson is not hydrated (it rendered as the failed reply's own text — 2 of 87 relevant); recall still returns it. A mostly non-Latin query needs two shared content words with the episode's trigger, because the English embedder places any two Greek sentences ~0.1 apart. Stored tool-call/think markup is stripped from a rendered episode.</li>
+  <li><strong>Graph:</strong> hydration seeds no fuzzy matches (<code>get_neighborhood(..., fuzzy=False)</code>; 91 items, 0 relevant) and no generic hub words (<code>project</code>, <code>sandbox</code>, <code>task</code>, <code>file</code> …) — the <code>project</code> node holds every project's title, which put one project's chains into 16% of unrelated turns. The <code>recall</code> tool keeps the fuzzy tier.</li>
+  <li><strong>Sessions:</strong> a message matches only where the query terms sit together — the hit is the 240-character window holding the most distinct terms, and the ≥2-term floor is counted inside it (two 5.9 KB replies used to match 23 of 80 unrelated requests and inject their opening).</li>
+  <li><strong>Budget</strong> scales on the user's own words, not the expanded follow-up string.</li>
+  <li><strong>No per-tier timeout (tried and reverted):</strong> a timed-out tier abandons its worker thread, which stays blocked on the store lock; under a held lock eight turns filled the default executor and every threaded call in the process stalled. Unbounded, only the turn waiting on the lock waits.</li>
+  <li><strong>Ranking-weight refit</strong> reads only usefulness rows written after the probe/member gates (<code>RRF_OBSERVATIONS_CLEAN_SINCE</code>, 2026-09-24 18:31): the earlier rows were 17% probe/member.</li>
+  <li><strong>Public channel:</strong> an owner turn in a public channel is not written to the autobiography (episodes already refused it).</li>
+</ul>
+
+
+<h3 id="4mj-decisions">§4MJ — operator decisions (2026-10-08)</h3>
+<ul>
+  <li><strong>The vector "memory context" tier is retired from hydration.</strong> Every type it may admit is a twin of another tier (episodes, lessons, identity) or excluded for planted-content risk (documents); it injected 0 items on 80 replayed real turns and cost an embedding + a Chroma query per turn. The fetcher returns nothing without touching the store and the instrumentation line shows <code>v=-</code>. <code>recall</code> keeps vector search. <code>GHOST_BUS_VECTOR_TIER=1</code> restores the tier (the test suite runs with it on; the <code>vector_tier_off</code> marker pins the production default).</li>
+  <li><strong>A hard-deleted project's episodes are forgotten with it.</strong> <code>EpisodicMemory.forget_project(id, title, live_titles)</code> deletes (archived to <code>episodes_forgotten.jsonl</code>) the episodes whose OWN text — trigger, context, outcome, lesson, not tool results (a project list names every project) — names the project id, or its title when the title is distinctive: ≥2 words or ≥8 characters, and no live project's title contains it or is contained in it (a deleted "Chess Coach" vs the live "Chess Coach v3"). Called by <code>manage_projects(action='delete')</code> after the graph unlink. The existing episodes were repaired by <code>scripts/memory_repair_4mj_episodes.py</code> (54 episodes of 17 deleted projects, from the store's <code>deleted_projects</code> table).</li>
+</ul>
+
 </body>
 </html>

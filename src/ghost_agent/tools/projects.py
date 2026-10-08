@@ -1428,6 +1428,28 @@ def _link_task_in_graph(context, project_id: str, task_id: str, description: str
         logger.debug("graph task link skipped", exc_info=True)
 
 
+def _forget_project_episodes(context, project_id: str, title: str) -> int:
+    """§4MJ: hard delete's episode leg — the episodes naming the project (by
+    id, and by its title when no live project shares it) are archived and
+    deleted, like its graph edges. Best-effort: the delete already
+    succeeded."""
+    em = getattr(context, "episodic_memory", None)
+    if em is None or not hasattr(em, "forget_project"):
+        return 0
+    try:
+        store = getattr(context, "project_store", None)
+        live = [p.get("title") for p in (store.list_projects() if store is not None else [])
+                if p.get("id") != project_id]
+        n = em.forget_project(project_id, title=title, live_titles=live,
+                              vector_memory=getattr(context, "memory_system", None))
+        if n:
+            pretty_log("Project Episodes", f"deleted {project_id}: forgot {n} episode(s)", icon=Icons.MEM_WIPE)
+        return n
+    except Exception:  # noqa: BLE001
+        logger.debug("project episode forget skipped", exc_info=True)
+        return 0
+
+
 def _unlink_project_in_graph(context, project_id: str, title: str):
     """Hard delete's graph leg: remove every edge naming the project, so
     recall stops telling the model the user works on it (live 2cb40b10
@@ -2888,6 +2910,7 @@ async def tool_manage_projects(
             if getattr(context, "current_project_id", None) == rid:
                 _set_current(context, None)
             _unlink_project_in_graph(context, rid, _gone.get("title", ""))
+            _forget_project_episodes(context, rid, _gone.get("title", ""))
             return _ok({"deleted": True, "project_id": rid, "hard": True,
                         "note": "Project, its tasks/artifacts/events, and its "
                                 "workspace files were permanently removed."})

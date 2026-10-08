@@ -2825,9 +2825,14 @@ async def notifications_pending(request: Request, consumer: str = "default",
             _peek, _ = await _store_call(log.read_since, offset, limit=200, severity=SEVERITY_NOTIFY)
         except StoreCallTimeout as e:
             return _store_timeout_response(e)
-        if not owner_awaits(_peek, getattr(agent.context, "last_activity_time", None)):
+        # §4MI: the OWNER's clock, not the idle-window clock self-play writes
+        # r2 review: no fallback to the idle clock — after a restart it is
+        # the one self-play writes; "never seen the owner" = not present
+        if not owner_awaits(_peek, getattr(agent.context, "last_owner_activity_time", None)):
+            # §4ML: how many are held — a client must not say "holding
+            # notifications" when nothing is pending
             return JSONResponse({"enabled": True, "records": [], "watermark": offset,
-                                 "quiet_hours": True})
+                                 "quiet_hours": True, "held": len(_peek or [])})
     try:
         limit = max(1, min(int(limit), 200))
     except (TypeError, ValueError):

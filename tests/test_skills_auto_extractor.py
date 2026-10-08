@@ -211,7 +211,8 @@ def test_trigger_examples_deduped():
     trajs = [_mk(user_request="same ask") for _ in range(3)]
     trajs.append(_mk(user_request="different ask"))
     cands, _ = extract_candidates(trajs, min_support=2)
-    assert cands[0].trigger_examples == ["same ask", "different ask"]
+    # §4MI: newest first (the oldest three used to be kept forever)
+    assert sorted(cands[0].trigger_examples) == ["different ask", "same ask"]
 
 
 # ══════════════════════════════════════════════════════════════════════

@@ -183,12 +183,13 @@ class TestAdaptiveCooldown:
         ft.record_run("sql", "c2", 1, True, 100)  # huge delta
         assert ft.adaptive_cooldown(base=400, floor=600) == 600
 
-    def test_neutral_first_try_pass_slight_reduction(self, tmp_path):
+    def test_neutral_first_try_pass_is_not_progress(self, tmp_path):
         ft = FrontierTracker(tmp_path)
         ft.record_run("sql", "c", 1, True, 1000)  # new cluster, delta=0
         cooldown = ft.adaptive_cooldown(base=3600)
-        # new cluster with delta=0 and attempts_used=1 → 0.75 * base
-        assert cooldown == 2700
+        # §4MI: delta=0 means "duplicate or tie" (frontier.html) — it used
+        # to shorten the cooldown to 0.75 × base on 15 of 38 runs a week
+        assert cooldown == 3600
 
 
 class TestPersistence:

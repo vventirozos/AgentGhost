@@ -51,7 +51,7 @@
     noise (2 of 974 rows failed and were dropped on the 2026-08-13
     import).</li>
     <li><strong>Idle phase 3b</strong> (<code>_biological_tick</code>,
-    deep idle &gt;3600s, cooldown <code>_BENCH_COOLDOWN=2700s</code>, skips
+    deep idle &gt;3600s, cooldown <code>_BENCH_COOLDOWN</code> = <code>GHOST_BENCH_COOLDOWN_S</code> (default 21600 s since §4LF; it was 2700 s), skips
     ticks that already ran self-play, kill switch <code>--no-bench</code> —
     deliberately independent of <code>--no-self-play</code> per §4Q):
     <code>banks.pick_next_item()</code> (deterministic round-robin,

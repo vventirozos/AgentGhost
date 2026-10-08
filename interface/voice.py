@@ -91,6 +91,61 @@ STT_MAX_SECONDS = _env_num("GHOST_STT_MAX_SECONDS", 900.0)
 # Must clear the thinking-token budget — see trap 1 in the module docstring.
 STT_MAX_TOKENS = _env_num("GHOST_STT_MAX_TOKENS", 2048, int)
 STT_TIMEOUT_S = _env_num("GHOST_STT_TIMEOUT_S", 180.0)
+# §4ML: a clip this short is no speech the model can hear — at 0.2 s the
+# audio model answered "The quick brown fox jumps over the lazy dog." 12
+# times, and twice that reached the agent as the owner's words. Was 0.05 s.
+STT_MIN_SECONDS = _env_num("GHOST_STT_MIN_SECONDS", 0.35)
+# §4ML: voice work in flight at once, per kind (each STT = ffmpeg + temp dir
+# + a nova call up to STT_TIMEOUT_S). Unbounded, one held key on the uConsole
+# ran the server out of file descriptors (135 × "Too many open files"; chat
+# failed with it). STT and TTS have SEPARATE pools — a reply being spoken
+# must not be refused because someone is dictating — and each has a SHORT,
+# BOUNDED wait list: a TTS sentence queues behind the previous one (the
+# uConsole drops the rest of a reply's speech on a 429), while a burst past
+# the wait list is refused at once with 429.
+VOICE_MAX_CONCURRENT = max(1, _env_num("GHOST_VOICE_MAX_CONCURRENT", 2, int))
+VOICE_MAX_WAITING = max(0, _env_num("GHOST_VOICE_MAX_WAITING", 4, int))
+_VOICE_WAIT_S = {"stt": _env_num("GHOST_STT_SLOT_WAIT_S", 10.0),
+                 "tts": _env_num("GHOST_TTS_SLOT_WAIT_S", 30.0)}
+
+
+class _VoicePool:
+    def __init__(self, kind: str):
+        self.kind = kind
+        self.sem = asyncio.Semaphore(VOICE_MAX_CONCURRENT)
+        self.waiting = 0
+
+
+_VOICE_POOLS = {"stt": _VoicePool("stt"), "tts": _VoicePool("tts")}
+
+
+class _voice_slot:
+    """Take a slot of ``kind`` ('stt' | 'tts'): at once when free; else wait
+    up to that kind's wait time when the wait list has room; else 429."""
+    def __init__(self, kind: str):
+        self.pool = _VOICE_POOLS[kind]
+
+    def _busy(self) -> "VoiceError":
+        return VoiceError(f"Voice is busy ({VOICE_MAX_CONCURRENT} {self.pool.kind.upper()} "
+                          f"request(s) running, {self.pool.waiting} waiting); try again "
+                          f"in a moment.", 429)
+
+    async def __aenter__(self):
+        pool = self.pool
+        if pool.sem.locked() and pool.waiting >= VOICE_MAX_WAITING:
+            raise self._busy()
+        pool.waiting += 1
+        try:
+            await asyncio.wait_for(pool.sem.acquire(), timeout=_VOICE_WAIT_S[pool.kind])
+        except asyncio.TimeoutError:
+            raise self._busy() from None
+        finally:
+            pool.waiting -= 1
+        return self
+
+    async def __aexit__(self, *exc):
+        self.pool.sem.release()
+        return False
 
 # Female voice (operator preference, 2026-08-03; was "Samantha", itself a
 # 2026-08-02 replacement for "Daniel", en_GB male). Ava (Premium) is a
@@ -203,6 +258,17 @@ async def _run_binary(cmd: list[str], *, timeout: float, stdin: bytes | None = N
     )
     try:
         out, err = await asyncio.wait_for(proc.communicate(stdin), timeout=timeout)
+    except asyncio.CancelledError:
+        # §4ML: the request task was cancelled (server shutdown, a cancelled
+        # caller) — the child must not outlive it (pipes, a temp dir).
+        # uvicorn does NOT cancel a handler when the client merely hangs up;
+        # that case is bounded by the timeout below and by the slot pools.
+        proc.kill()
+        try:
+            await proc.wait()
+        except BaseException:  # noqa: BLE001 — best effort reap
+            pass
+        raise
     except asyncio.TimeoutError:
         proc.kill()
         # Reap so the killed child doesn't linger as a zombie — the same
@@ -278,9 +344,16 @@ async def transcribe(raw: bytes, *, client) -> str:
     nothing"); raises :class:`VoiceError` for every real failure, so a broken
     backend can never masquerade as silence.
     """
+    async with _voice_slot("stt"):
+        return await _transcribe(raw, client=client)
+
+
+async def _transcribe(raw: bytes, *, client) -> str:
     wav = await transcode_to_wav16k(raw)
     duration = wav_duration_seconds(wav)
-    if duration <= 0.05:
+    if duration < STT_MIN_SECONDS:
+        logger.info("STT: %.2fs clip is below the %.2fs floor — treated as silence",
+                    duration, STT_MIN_SECONDS)
         return ""
     if duration > STT_MAX_SECONDS:
         raise VoiceError(
@@ -330,6 +403,11 @@ async def synthesize(text: str) -> bytes:
     text = (text or "").strip()
     if not text:
         raise VoiceError("No text to speak.", 400)
+    async with _voice_slot("tts"):
+        return await _synthesize(text)
+
+
+async def _synthesize(text: str) -> bytes:
     if len(text) > TTS_MAX_CHARS:
         text = text[:TTS_MAX_CHARS].rsplit(" ", 1)[0] + "…"
     with tempfile.TemporaryDirectory(prefix="ghost-tts-") as td:

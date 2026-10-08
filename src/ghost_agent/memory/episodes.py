@@ -75,6 +75,15 @@ def _fold(text: str) -> str:
     return "".join(ch for ch in t if not unicodedata.combining(ch))
 
 
+_CALL_MARKUP_RE = re.compile(r"</?(?:tool_call|tool_response|function_call|think)>", re.I)
+
+
+def _strip_call_markup(text: str) -> str:
+    """§4MJ: tool-call / think tags out of a stored outcome before it is
+    rendered into a prompt."""
+    return re.sub(r"\s+", " ", _CALL_MARKUP_RE.sub(" ", str(text or ""))).strip()
+
+
 class EpisodicMemory:
     """SQLite-backed episodic memory with vector-searchable triggers.
 
@@ -1193,7 +1202,7 @@ class EpisodicMemory:
         )
         return [dict(row) for row in cursor]
 
-    def _mention_hits(self, conn, target: str) -> list:
+    def _mention_hits(self, conn, target: str, actions: bool = True) -> list:
         t = str(target or "").strip().lower()
         if len(t) < 3:
             return []
@@ -1211,8 +1220,9 @@ class EpisodicMemory:
         # result naming Fotini survived "forget Fotini")
         rows = conn.execute("SELECT id, trigger, context, outcome, lesson, timestamp FROM episodes").fetchall()
         acts: Dict[int, list] = {}
-        for eid, a, r in conn.execute("SELECT episode_id, tool_args, result FROM episode_actions"):
-            acts.setdefault(eid, []).extend((a, r))
+        if actions:
+            for eid, a, r in conn.execute("SELECT episode_id, tool_args, result FROM episode_actions"):
+                acts.setdefault(eid, []).extend((a, r))
         return [r for r in rows if any(_names(x) for x in r[1:5]) or any(_names(x) for x in acts.get(r[0], ()))]
 
     def mention_previews(self, target: str) -> list:
@@ -1309,6 +1319,41 @@ class EpisodicMemory:
         with closing(sqlite3.connect(self.db_path)) as conn:
             ids = [r[0] for r in self._mention_hits(conn, target)]
         return self.delete_episodes(ids, vector_memory, reason=str(target).strip().lower())
+
+    @staticmethod
+    def project_title_is_distinctive(title: str, live_titles=()) -> bool:
+        """§4MJ: may a deleted project's TITLE identify its episodes?
+        Only a title of ≥2 words or ≥8 characters ("Meta", "TinyAI" name
+        other things), and one that no live project's title contains or is
+        contained in (a deleted "Chess Coach" vs the live "Chess Coach v3",
+        a deleted "WebOS" vs the live "WebOS")."""
+        t = _fold(str(title or "").strip().lower())
+        if not t or (len(t.split()) < 2 and len(t) < 8):
+            return False
+        for lt in live_titles or ():
+            l = _fold(str(lt or "").strip().lower())
+            if l and (t in l or l in t):
+                return False
+        return True
+
+    def project_mention_ids(self, project_id: str, title: str = "", live_titles=()) -> list:
+        """Ids of the episodes that name a deleted project — by its id, and
+        by its title when the title is distinctive (see above)."""
+        # The episode's OWN text only (trigger, context, outcome, lesson) —
+        # not its tool results: a `manage_projects list` result names every
+        # project, and matched "If I meet this person…" to "Mini AI v3"
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            ids = {r[0] for r in self._mention_hits(conn, str(project_id or ""), actions=False)} if project_id else set()
+            if title and self.project_title_is_distinctive(title, live_titles):
+                ids |= {r[0] for r in self._mention_hits(conn, str(title), actions=False)}
+        return sorted(ids)
+
+    def forget_project(self, project_id: str, title: str = "", live_titles=(), vector_memory=None) -> int:
+        """§4MJ: a hard-deleted project's episodes are forgotten with it (16%
+        of episodes named a deleted project and were recalled for unrelated
+        turns). Archived through `delete_episodes` like every deletion."""
+        ids = self.project_mention_ids(project_id, title, live_titles)
+        return self.delete_episodes(ids, vector_memory, reason=f"project deleted: {project_id}")
 
     def wipe_all(self) -> int:
         """`reset_all`'s episode leg (§4LA): every episode and action row.
@@ -1451,6 +1496,10 @@ class EpisodicMemory:
         difference between "this is how the system behaves" and "this is how
         the system used to behave"."""
         age = EpisodicMemory._relative_age(ep.get("timestamp"))
+        # §4MJ: six stored outcomes carry raw `<tool_call>` markup — rendered
+        # into the prompt it reads as a call to make
+        ep = dict(ep)
+        ep["outcome"] = _strip_call_markup(str(ep.get("outcome") or "unknown"))
         entry = (
             f"- [{ep.get('cluster_id') or 'general'}] "
             f"{('[' + age + '] ') if age else ''}"

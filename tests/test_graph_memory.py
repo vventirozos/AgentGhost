@@ -69,10 +69,11 @@ def test_get_neighborhood_basic(temp_graph):
 
     # Disconnected (charlie/david) component must not appear.
     assert all("Charlie" not in e and "David" not in e for e in edges)
-    assert "- (Alice) -[KNOWS]-> (Bob)" in edges
-    assert "- (Bob) -[LIKES]-> (Coding)" in edges
-    # 2-hop through-chain produced by spreading activation
+    # 2-hop through-chain produced by spreading activation; §4MJ: its own
+    # 1-hop pieces are contained in it and are not returned again
     assert "- (Alice) -[KNOWS]-> (Bob) -[LIKES]-> (Coding)" in edges
+    assert "- (Alice) -[KNOWS]-> (Bob)" not in edges
+    assert "- (Bob) -[LIKES]-> (Coding)" not in edges
 
 def test_get_neighborhood_short_words_ignored(temp_graph):
     """Test that words under 3 characters are completely skipped in traversal."""

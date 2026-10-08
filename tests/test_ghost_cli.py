@@ -1180,6 +1180,11 @@ class TestInterrupts:
     clears the line; Ctrl-D exits."""
 
     def _cli(self, monkeypatch):
+        # §4ML: never the operator's real ~/.ghost_history — the Ctrl-C test
+        # drives chat() for real and wrote "hello"/"world" into it on every
+        # suite and battery run (2,015 of 2,997 entries)
+        import tempfile
+        monkeypatch.setattr(cli, "HISTORY_FILE", Path(tempfile.mkdtemp()) / "ghost_history")
         buf = io.StringIO()
         monkeypatch.setattr(cli, "console", cli.Console(
             file=buf, force_terminal=True, width=70,
@@ -1655,3 +1660,74 @@ class TestRenderedOutputIsNotPollutedByWarnings:
         r = subprocess.run([_sys.executable, "-c", code], capture_output=True,
                            text=True, env=env, timeout=120)
         assert ("probe" in r.stderr) is expect_warning, r.stderr[:300]
+
+
+class TestInterfaces4ML:
+    """§4ML (2026-10-08): the CLI's status claims must be true."""
+
+    def _cli(self, monkeypatch):
+        import tempfile
+        monkeypatch.setattr(cli, "HISTORY_FILE", Path(tempfile.mkdtemp()) / "h")
+        buf = io.StringIO()
+        monkeypatch.setattr(cli, "console", cli.Console(
+            file=buf, width=100, theme=cli.Theme(_THEME), highlight=False))
+        monkeypatch.setattr(cli, "render_reply_images", lambda *a, **k: None)
+        api = cli.GhostAPI("http://localhost:9", "k")
+        return cli.GhostCLI(api), api, buf
+
+    def test_an_unlabelable_reply_is_never_offered_for_rating(self, monkeypatch):
+        """Fails where a greeting reply showed the /good hint and a rating
+        then failed with 'is trajectory logging enabled?'."""
+        g, api, buf = self._cli(monkeypatch)
+        lines = [b'data: {"choices":[{"delta":{"content":"hi!"}}]}',
+                 b'data: {"choices":[],"ghost":{"labelable":false}}',
+                 b"data: [DONE]"]
+        monkeypatch.setattr(api, "chat_stream", lambda *a, **k: _FakeSSE(lines))
+        g.history.append({"role": "user", "content": "hello"})
+        g.chat_turn("hello")
+        out = buf.getvalue()
+        assert "/good" not in out
+        called = []
+        monkeypatch.setattr(api, "feedback", lambda *a, **k: called.append(a) or (200, {}))
+        g.cmd_rate("positive", "")
+        assert not called and "can't be rated" in buf.getvalue()
+
+    def test_quiet_hours_are_not_reported_as_no_notifications(self, monkeypatch):
+        g, api, buf = self._cli(monkeypatch)
+        monkeypatch.setattr(api, "notifications", lambda c: (200, {"enabled": True, "quiet_hours": True,
+                                                                  "records": [], "watermark": 5, "held": 2}))
+        g.cmd_notify()
+        assert "holding 2 notification(s)" in buf.getvalue() and "no new notifications" not in buf.getvalue()
+        monkeypatch.setattr(api, "notifications", lambda c: (200, {"enabled": True, "quiet_hours": True,
+                                                                  "records": [], "watermark": 5, "held": 0}))
+        g.cmd_notify()
+        assert "no new notifications (quiet hours)" in buf.getvalue()
+
+    def test_a_failed_ack_is_not_reported_as_acknowledged(self, monkeypatch):
+        g, api, buf = self._cli(monkeypatch)
+        monkeypatch.setattr(api, "notifications", lambda c: (200, {
+            "enabled": True, "records": [{"ts": time.time(), "phase": "done", "summary": "x"}], "watermark": 7}))
+        monkeypatch.setattr(api, "notifications_ack", lambda c, w: (503, {}))
+        g.cmd_notify()
+        assert "could not acknowledge" in buf.getvalue() and "acknowledged)" not in buf.getvalue()
+
+    def test_cancel_names_the_turn_it_cancelled(self, monkeypatch):
+        """/cancel stops whatever turn the agent runs — any client's."""
+        g, api, buf = self._cli(monkeypatch)
+        monkeypatch.setattr(api, "cancel_turn", lambda hard=False, request_id=None: (200, {
+            "cancelled": True, "request_id": "slack-ab12cd34", "mode": "cooperative"}))
+        g.cmd_cancel(False)
+        assert "slack-ab12cd34" in buf.getvalue()
+
+    def test_probe_flag_marks_every_request(self, monkeypatch):
+        """`ghost --probe` runs normally and never teaches: the header rides
+        the session, so every call of the run carries it."""
+        seen = {}
+
+        def fake_health(self_):
+            seen["origin"] = self_.api.http.headers.get("X-Ghost-Origin")
+        monkeypatch.setattr(cli.GhostCLI, "cmd_health", fake_health)
+        for argv, want in ((["ghost", "--probe", "--health"], "probe"), (["ghost", "--health"], None)):
+            monkeypatch.setattr(cli.sys, "argv", argv)
+            assert cli.main() == 0
+            assert seen["origin"] == want

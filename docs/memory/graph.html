@@ -159,5 +159,14 @@
     bus hydration graph tier.</li>
   </ul>
 </main>
+
+<h2 id="4mi">§4MI (2026-10-08)</h2>
+<ul>
+  <li><code>execute_graph_compression</code> now archives every row it rewrites (<code>reason=compress:&lt;old&gt;-&gt;&lt;new&gt;</code>) and logs the pair at INFO; it used to be the one destructive path with no record.</li>
+  <li><code>propose_merge_candidates</code> never pairs two names whose digit sequences differ (<code>qwen3.5…</code>/<code>qwen3.6…</code>, <code>1.10</code>/<code>1.1.0</code>); the same numbers written differently (<code>ubuntu 22.04</code>/<code>ubuntu-22-04</code>) still pair. In the safe tier each variant pairs with the first earlier variant it is not digit-distinct from.</li>
+  <li>Seeding: a query word reaches a LONGER node only as a whole token of it (Unicode word boundaries), or as the start of a token when the word is ≥4 characters and at least half that token ("germ" → <code>germany</code>). "back" no longer seeds <code>xtrabackup</code>. When every substring hit is refused, the word does NOT fall to the fuzzy tier (that turned "tool" into <code>pool</code>); a plain typo with no substring hit still does.</li>
+  <li><code>sync_owner_mirrors</code> keeps the mirror of an ON-DEMAND profile field (the address, a <code>*_description</code>) EMPTY, which also removes an edge written before this.</li>
+</ul>
+
 </body>
 </html>

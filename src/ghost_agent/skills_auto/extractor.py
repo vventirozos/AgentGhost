@@ -158,8 +158,10 @@ def extract_candidates(
             # would replay, so require the trajectory to contain at least
             # `min_tool_calls` calls that actually SUCCEEDED. Uses the
             # shared sniffer rather than a second copy of the rule.
+            from ..distill.outcome_heuristics import is_designed_stop as _ids
             n_ok = sum(1 for tc in (t.tool_calls or ())
-                       if tc is not None and not tool_call_failed(tc))
+                       if tc is not None and not tool_call_failed(tc)
+                       and not _ids(getattr(tc, "result", "")))   # §4MI: a clarify block is not a succeeded call
             if n_ok < min_tool_calls:
                 report.rejected_no_successful_tools += 1
                 continue
@@ -180,7 +182,16 @@ def extract_candidates(
         # Unique triggers, insertion-ordered — N samples of one batch
         # repeat the same prompt and would otherwise fill every slot.
         triggers: List[str] = []
-        for t in trajs:
+        # §4MI: newest first, STAMPED rows (extra.req_id, §4FB) before the
+        # legacy ones — the oldest three used to be kept forever, so a
+        # deploy-check probe mined before probes carried their own kind
+        # was shown to the owner as an example of his own requests
+        _ordered = sorted(
+            trajs,
+            key=lambda t: (bool((getattr(t, "extra", None) or {}).get("req_id")),
+                           str(getattr(t, "timestamp", "") or "")),
+            reverse=True)
+        for t in _ordered:
             tg = (t.user_request or "").strip()
             if tg and tg not in triggers:
                 triggers.append(tg)

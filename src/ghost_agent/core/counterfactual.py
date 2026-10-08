@@ -97,10 +97,40 @@ def learning_fingerprint() -> str:
     for name in _LEARNING_STATE_FILES:
         h.update(name.encode("utf-8"))
         try:
-            h.update((mem / name).read_bytes())
+            h.update(_learning_content_bytes((mem / name).read_bytes()))
         except OSError:
             h.update(b"<absent>")
     return h.hexdigest()
+
+
+#: §4MI: both stores are rewritten on EVERY prompt injection (retrieval
+#: counters, last_retrieved_at), so a byte hash re-armed the gate on every
+#: turn — "learning state changed" meant "something was retrieved". The
+#: digest is over the CONTENT that can change a replay's outcome.
+_VOLATILE_LEARNING_KEYS = frozenset({
+    "retrievals", "helpful_retrievals", "succeeded_retrievals", "failed_retrievals",
+    "last_retrieved_at", "last_credited_at", "last_used", "last_used_at",
+    "usage_count", "success_count", "verifications", "last_verified_at",
+})
+
+
+def _learning_content_bytes(raw: bytes) -> bytes:
+    import json as _json
+
+    def _strip(x):
+        if isinstance(x, dict):
+            # r2 review: `last_retrieved_req` (and any other last_* stamp)
+            # is rewritten on every injection too
+            return {k: _strip(v) for k, v in sorted(x.items())
+                    if k not in _VOLATILE_LEARNING_KEYS and not str(k).startswith("last_")}
+        if isinstance(x, list):
+            return [_strip(v) for v in x]
+        return x
+    try:
+        return _json.dumps(_strip(_json.loads(raw.decode("utf-8"))), sort_keys=True,
+                           ensure_ascii=False).encode("utf-8")
+    except Exception:  # noqa: BLE001
+        return raw
 
 
 def _gate_enabled() -> bool:

@@ -217,13 +217,24 @@ class TestDistill:
             "anti_pattern": "stray markers land in sql files",
             "correct_pattern": "Always fail closed on partial replacements.",
         })
-        ctx, sm, _, _ = _ctx(tmp_path, [_PATTERN_REPLY, rephrased])
+        ctx, sm, _, stub = _ctx(tmp_path, [_PATTERN_REPLY, rephrased])
         _seed(sm, _SQL_FAILURES)
         assert await distill_failure_clusters(ctx) == 1
-        # a 4th case changes the fingerprint → re-distill; the verbatim
-        # trigger reuse must merge (freq bump), not add a second row
+        # §4MI: ONE new case on three is not new evidence — the sliding
+        # window re-distilled a cluster 18× in a week and replaced the
+        # lesson's text each time. No LLM call, no rewrite.
         sm.learn_lesson("sql cte refactor edit failed",
                         "SEARCH/REPLACE block failed to parse the sql cte",
+                        "Fail closed and report the error.")
+        assert await distill_failure_clusters(ctx) == 0
+        assert len([c for c in stub.calls if c[0] == "DISTILL_PATTERN"]) == 1
+        # half the cluster new → re-distill; the verbatim trigger reuse
+        # must merge (freq bump), not add a second row
+        sm.learn_lesson("sql merge statement edit failed",
+                        "SEARCH/REPLACE block failed to parse the sql merge",
+                        "Fail closed and report the error.")
+        sm.learn_lesson("sql upsert edit failed",
+                        "SEARCH/REPLACE block failed to parse the sql upsert",
                         "Fail closed and report the error.")
         assert await distill_failure_clusters(ctx) == 1
         lessons = _distilled(sm)

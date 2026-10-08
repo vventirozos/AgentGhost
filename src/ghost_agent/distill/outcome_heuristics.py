@@ -181,6 +181,47 @@ def _normalize_tool_error(s: str) -> str:
     return s[:200]
 
 
+def _repeated_error_key(tc) -> str:
+    """§4MI: what "the SAME error" means for rule 3. The key used to be the
+    first 200 normalised characters of the result, which for a browser
+    result is ~115 characters of fixed banner, so two different pages'
+    `net::ERR_HTTP2_PROTOCOL_ERROR` lines plus one repeat keyed as one
+    error ×3 and a delivered report was FAILED for good (and the
+    post-mortem filed a "retry cooldown misconfigured" defect against flags
+    that do not exist). The key is the result's ERROR LINE (banner skipped,
+    the tool's own statement), from its exception name on, with memory
+    addresses / hex ids / clock times collapsed — and the URL KEPT: the
+    target is part of what was tried, so a different page is a different
+    attempt, not ignored feedback."""
+    result = getattr(tc, "result", "") or ""
+    try:
+        from ..core.strikes import error_line, exception_signature
+        line = error_line(str(result), tool=getattr(tc, "name", None) or None)
+        if line:
+            line = exception_signature(line)
+            line = _TOOL_ERROR_PREFIX_RE.sub("", line.strip())   # "Error:" / "failed:" are not the error
+            line = re.sub(r"0x[0-9a-fA-F]{4,}", "0xADDR", line)
+            line = re.sub(r"\b[0-9a-f]{16,}\b", "HEX", line)
+            line = re.sub(r"\b\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?\b", "TIME", line)
+            line = re.sub(r"\b(?:pid|PID)[ =:]+\d+\b", "pid=N", line)
+            line = re.sub(r"\s+", " ", line).strip().lower()[:300]
+            # r2 review: a generic head ("exit code: 1", "service 'x'
+            # exited immediately.") is not the error — three different
+            # failing commands keyed as one. The body (banner lines out,
+            # "Error:" prefix off, volatile collapsed) rides with it.
+            body = "\n".join(l for l in str(result).splitlines()
+                             if not l.lstrip().startswith(("[FAILURE BANNER]", "--- ")))
+            body = _normalize_tool_error(body)
+            for rx, rep in ((r"0x[0-9a-f]{4,}", "0xaddr"), (r"\b[0-9a-f]{16,}\b", "hex"),
+                            (r"\b\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?\b", "time"),
+                            (r"\b(?:pid)[ =:]+\d+\b", "pid=n")):
+                body = re.sub(rx, rep, body)
+            return line + " || " + body[:300]
+    except Exception:  # noqa: BLE001
+        pass
+    return _normalize_tool_error(getattr(tc, "error", "") or result)
+
+
 def _tool_call_failed(tc) -> bool:
     """True if a ToolCall failed, preferring its STRUCTURED ``error`` flag.
 
@@ -215,6 +256,33 @@ def looks_like_tool_error(result: str, tool_name: str = "") -> bool:
     label the corpus writes.
     """
     return _looks_like_tool_error(result, tool_name)
+
+
+#: §4MI: tool outcomes that are the DESIGNED stop of a turn — the tool (or
+#: the dispatch guard) told the agent to ask the USER and reply now. They
+#: carry status REJECTED, which the structural sniffer read as "this tool
+#: call failed": a clarify-first block on "emp1" booked the turn FAILED /
+#: "structural failure", debited two surfaced lessons as present-on-FAILURE,
+#: and made the turn a router/PRM negative and a post-mortem candidate. The
+#: same set lives in `tools.outcome.DESIGNED_STOP_REASONS` (pinned equal).
+DESIGNED_STOP_REASONS = frozenset({"clarify_first", "subject_photo_missing", "confirm_dead_end"})
+_DESIGNED_STOP_MARK_RE = re.compile(r"\[designed stop: ([a-z_]+)\]\s*$")
+
+
+def is_designed_stop(result) -> bool:
+    """A tool result that is a designed stop (ask the user), by its
+    outcome's ``reason_code`` or — for a CORPUS row, where the result is a
+    plain string — the mark the recorder appends. Like an unresolved call,
+    callers SKIP it rather than label it."""
+    _rc = getattr(result, "reason_code", None)
+    if _rc is not None and str(_rc) in DESIGNED_STOP_REASONS:
+        return True
+    if getattr(result, "status", None) is not None:
+        # r2 review: a LIVE outcome answers by its reason code only — a page
+        # or a file whose text ends with the mark is not a designed stop
+        return False
+    m = _DESIGNED_STOP_MARK_RE.search(str(result or "")[-80:])
+    return bool(m and m.group(1) in DESIGNED_STOP_REASONS)
 
 
 def is_unresolved_tool_result(result) -> bool:
@@ -580,6 +648,8 @@ def tool_failure_flags(tools: Optional[Iterable[Any]]) -> List[bool]:
         # one long command kept its PASS. Skipping leaves [T,T,T].
         if is_unresolved_tool_result(content):
             continue
+        if is_designed_stop(_raw) or is_designed_stop(content):   # §4MI
+            continue
         if isinstance(t, dict):
             flags.append(_looks_like_tool_error(content, t.get("name") or ""))
         else:
@@ -791,8 +861,9 @@ def classify_chat_outcome(
         # verifier-confirmed run FAILED.
         if _BLOCKED_HEAD_RE.search(str(getattr(tc, "result", "") or "")[:240]):
             continue
-        sig = getattr(tc, "error", "") or _normalize_tool_error(getattr(tc, "result", "") or "")
-        key = (tc.name or "", sig)
+        if is_designed_stop(getattr(tc, "result", "")):             # §4MI
+            continue
+        key = (tc.name or "", _repeated_error_key(tc))
         error_counts[key] = error_counts.get(key, 0) + 1
     for (tool_name, _err), count in error_counts.items():
         if count >= repeated_error_threshold:

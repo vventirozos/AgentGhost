@@ -928,8 +928,8 @@ def _web_automation_dom_extract(tier: Optional[str] = None) -> ChallengeTriple:
             "is injected into `#secret` by a JavaScript `DOMContentLoaded` "
             "handler. A solver that greps the raw HTML with `re` / "
             "`BeautifulSoup` will pick up the decoy; you MUST render "
-            "the page with a real browser (Playwright via the `browser` "
-            "tool, or raw Playwright in a stateful `execute` cell) to "
+            "the page with a real browser (raw Playwright in a stateful "
+            "`execute` cell — the `browser` tool is not available here) to "
             "obtain the true value.\n"
         )
 

@@ -633,18 +633,41 @@ def quantities_agree(claim_q: Quantity, span_q: Quantity, *, hedged: bool) -> bo
     ±HEDGE_REL_TOL instead. A range agrees with a value inside it, and with
     a range whose two endpoints agree. Decimal byte units agree under 1000ⁿ
     as well as 1024ⁿ."""
+    return bool(agreement_modes(claim_q, span_q, hedged=hedged))
+
+
+#: §4MK: the detail of a disagreement that is a MIX of unit conventions — the
+#: figure "agrees" on its own under the other convention, so the
+#: elsewhere-downgrade (which asks per figure) must not undo it
+_MIXED_CONVENTION_NOTE = "(the claim's other byte figures use the binary convention)"
+
+
+def agreement_modes(claim_q: Quantity, span_q: Quantity, *, hedged: bool) -> set:
+    """§4MK: the unit CONVENTIONS under which the two figures agree —
+    "native" (as written; binary for byte units), "decimal" (both sides
+    1000ⁿ: "30 GB" vs "30048MB" is 30.048 GB, refuted by one-sided aliasing),
+    "mixed" (one side aliased). One claim must hold under ONE convention —
+    "22 GB of 36 GB" against "21504 MB of 36864 MB" mixes decimal and binary
+    (see `_compare`)."""
+    modes = set()
     if _quantities_agree(claim_q, span_q, hedged=hedged):
-        return True
-    for a, b in ((_si_alias(claim_q), span_q), (claim_q, _si_alias(span_q))):
+        modes.add("native")
+    ca, sa = _si_alias(claim_q), _si_alias(span_q)
+    # both read decimally AND rounded in the claim's DECIMAL unit (1e9 for
+    # GB) — the binary factor made 36.864 GB "agree" with 36 GB
+    if (ca is not None and sa is not None
+            and _quantities_agree(ca, sa, hedged=hedged, factor=_DECIMAL_BYTE_UNITS[claim_q.unit])):
+        modes.add("decimal")
+    for a, b in ((ca, span_q), (claim_q, sa)):
         if a is not None and b is not None and _quantities_agree(a, b, hedged=hedged):
-            return True
-    return False
+            modes.add("mixed")
+    return modes
 
 
-def _quantities_agree(claim_q: Quantity, span_q: Quantity, *, hedged: bool) -> bool:
+def _quantities_agree(claim_q: Quantity, span_q: Quantity, *, hedged: bool, factor: Optional[float] = None) -> bool:
     if claim_q.family != span_q.family and claim_q.family and span_q.family:
         return False
-    f, d = _compare_factor(claim_q, span_q), claim_q.decimals
+    f, d = (factor if factor else _compare_factor(claim_q, span_q)), claim_q.decimals
     if claim_q.bound == "lower" and not span_q.is_range:
         return span_q.value >= claim_q.value
     if claim_q.bound == "upper" and not span_q.is_range:
@@ -729,6 +752,11 @@ def _compare(claim_quote: str, span: str) -> Tuple[str, str, Optional[Quantity],
     """`compare_claim_span` plus the claim figure that disagreed and the span
     figure it was measured against (None otherwise), for the guards in
     `bind`."""
+    # §4MK: a DATE is masked out of the figures, so "18.4 was released on
+    # May 14, 2026" agreed with "Released: March 3, 2019 … 18.4" on its
+    # version or a shared word — a claim's date must be in the span
+    if not _claim_dates_in_span(claim_quote, span):
+        return "unchecked", "the claim's date is not in the span", None, None
     cq = extract_quantities(claim_quote)
     if not cq:
         if lexical_anchor(claim_quote, span) and not _polarity_clash(claim_quote, span):
@@ -739,13 +767,18 @@ def _compare(claim_quote: str, span: str) -> Tuple[str, str, Optional[Quantity],
         return "unchecked", "span carries no quantity", None, None
     hedged = _hedged(claim_quote)
     supported = 0
+    _byte_modes = []          # §4MK: one unit convention per claim
     for q in cq:
         # comparable = the same unit family; a unit-bearing claim figure is
         # never compared with a bare number ("4TB" is not "289.90")
         comparable = [s for s in sq if s.family == q.family]
         if not comparable:
             continue                                   # unknown, not a contradiction
-        if any(quantities_agree(q, s, hedged=hedged) for s in comparable):
+        _ms = [(s, agreement_modes(q, s, hedged=hedged)) for s in comparable]
+        _agreeing = [(s, m) for s, m in _ms if m]
+        if _agreeing:
+            if q.family == "bytes":
+                _byte_modes.append((q, set().union(*[m for _s, m in _agreeing]), _agreeing))
             supported += 1
             continue
         near = [s for s in comparable if _near_miss(q, s)]
@@ -753,9 +786,78 @@ def _compare(claim_quote: str, span: str) -> Tuple[str, str, Optional[Quantity],
             continue                                   # a different figure of the same family (a bound, a core count)
         best = min(near, key=lambda s: abs(s.value - q.value))
         return "disagree", f"claim says {q.text!r}, evidence says {best.text!r}", q, best
+    if len(_byte_modes) >= 2:
+        _common = set.intersection(*[m for _q, m, _a in _byte_modes])
+        if not (_common & {"native", "decimal"}):
+            # the figures agree only under DIFFERENT conventions: the one
+            # that needs the odd convention is the misreading
+            _native = [x for x in _byte_modes if "native" in x[1]]
+            _odd = next((x for x in _byte_modes if "native" not in x[1]), _byte_modes[-1])
+            if _native:
+                q, _m, ag = _odd
+                return ("disagree", f"claim says {q.text!r}, evidence says {ag[0][0].text!r} "
+                        f"{_MIXED_CONVENTION_NOTE}", q, ag[0][0])
     if supported:
         return "agree", "", None, None
     return "unchecked", "no claim figure had a comparable evidence figure", None, None
+
+
+_MONTH_NUM = {m: i for i, m in enumerate(("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug",
+                                           "sep", "oct", "nov", "dec"), 1)}
+
+
+def _date_tokens(text: str) -> list:
+    """Each calendar date in ``text`` as (year | None, month | None, days)
+    — "May 14, 2026" and "2026-05-14" are both (2026, 5, {14}); "Jul 7–13"
+    is (None, 7, {7, 13}); an ambiguous "05/07/2026" leaves the month None
+    and keeps both numbers as days. Clock times and "N days ago" are skipped."""
+    out = []
+    for m in _DATE_TIME_RE.finditer(str(text or "")):
+        g = m.group(0).lower()
+        if re.fullmatch(r"\d{1,2}:\d{2}(?::\d{2})?", g) or g.endswith("ago") or re.fullmatch(r"(?:1[89]|20)\d0s", g):
+            continue
+        g = re.sub(r"[t ]\d{1,2}:\d{2}(?::\d{2})?$", "", g)
+        iso = re.match(r"(\d{4})-(\d{2})-(\d{2})", g)
+        if iso:
+            out.append((int(iso.group(1)), int(iso.group(2)), frozenset({int(iso.group(3))})))
+            continue
+        year, month, days = None, None, set()
+        mnames = [t for t in re.findall(r"[a-z]{3}", g) if t in _MONTH_NUM]
+        if mnames:
+            month = _MONTH_NUM[mnames[0]]
+        for t in re.findall(r"\d+", g):
+            v = int(t)
+            if v >= 1000:
+                year = v
+            elif 1 <= v <= 31:
+                days.add(v)
+        out.append((year, month, frozenset(days)))
+    return out
+
+
+def _dates_match(c, s) -> bool:
+    cy, cm, cd = c
+    sy, sm, sd = s
+    if cy and sy and cy != sy:
+        return False
+    if cm and sm and cm != sm:
+        return False
+    if cm and not sm and sd and cm not in sd:       # an ambiguous span date may carry the month as a number
+        return False
+    if cd and sd and not (cd & sd):
+        return False
+    return bool((cy and sy) or (cm and (sm or cm in sd)) or (cd and sd))
+
+
+def _claim_dates_in_span(claim_quote: str, span: str) -> bool:
+    """§4MK: every date the claim states has a span date that does not
+    contradict it and shares at least its year, month or a day. No date in
+    the claim → True."""
+    cd = _date_tokens(claim_quote)
+    if not cd:
+        return True
+    sd = _date_tokens(span)
+    return all(any(_dates_match(c, s) for s in sd) for c in cd)
 
 
 def _claim_states(claim_quote: str, span_fig: Optional[Quantity]) -> bool:
@@ -1236,7 +1338,8 @@ def bind(reply: str, evidence: str, rows: List[Dict[str, str]], *, raw: str = ""
         # hedge sits one word before the quote in the REPLY (review §4IY)
         outcome, detail, dq, ds = _compare(_with_reply_lead(b.quote, reply), b.evidence_quote)
         compared = outcome
-        elsewhere = figure_elsewhere(dq, evidence, hedged=_hedged(b.quote)) if dq is not None else None
+        elsewhere = (figure_elsewhere(dq, evidence, hedged=_hedged(b.quote))
+                     if dq is not None and _MIXED_CONVENTION_NOTE not in detail else None)
         _where = "the evidence"
         if elsewhere is None and dq is not None and outcome == "disagree" and raw:
             elsewhere = figure_elsewhere_in_turn(dq, b.quote, raw, hedged=_hedged(b.quote))
@@ -2029,7 +2132,9 @@ def audit_numbers(reply: str, evidence: str, context: str = "") -> List[AuditFig
         if _glued_occurrence(q.text, evidence):
             out.append(AuditFigure(q.text, q.value, q.family, sentence, "unsupported"))
             continue
-        if "." in q.text and re.search(r"(?<![\d.])" + re.escape(q.text) + r"\.\d", evidence):
+        # §4MK: a bare "18" is the head of "18.6" too (it refuted "PostgreSQL
+        # 18" against a "PostgreSQL 14" line with 18.6 in the evidence)
+        if ("." in q.text or not q.unit) and re.search(r"(?<![\d.])" + re.escape(q.text) + r"\.\d", evidence):
             out.append(AuditFigure(q.text, q.value, q.family, sentence, "unsupported"))     # "3.12" is the head of "3.12.4" (review §4IY)
             continue
         in_url = _url_occurrence(q.text, evidence) if not q.unit else None

@@ -18,16 +18,14 @@
     <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/icon-180.png">
     <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png">
     <title>Ghost Interface</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link
-        href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;700&display=swap"
-        rel="stylesheet">
+    <!-- §4ML: no Google Fonts — every page load reached Google from the
+         owner's address (the no-identity-egress rule); style.css falls back
+         to the system UI and monospace fonts. -->
     <script type="importmap">
         {
             "imports": {
-                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
-                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+                "three": "/static/vendor/three/three.module.js",
+                "three/addons/": "/static/vendor/three/jsm/"
             }
         }
     </script>
@@ -44,7 +42,7 @@
          touch. -->
     <script defer src="/static/vendor/marked.min.js"></script>
     <script defer src="/static/vendor/purify.min.js"></script>
-    <link rel="stylesheet" href="/static/style.css?v=6.4">
+    <link rel="stylesheet" href="/static/style.css?v=6.5">
 </head>
 
 <body>
@@ -335,7 +333,7 @@
 
     <div id="toast-stack" aria-live="polite"></div>
 
-    <script type="module" src="/static/app.js?v=13.6"></script>
+    <script type="module" src="/static/app.js?v=13.7"></script>
 </body>
 
 </html>

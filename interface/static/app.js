@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=13.6';
+import * as matrixGraphFace from './matrix_graph.js?v=13.7';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -33,6 +33,19 @@ const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
     (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
 
+// §4ML CRIT: "is this OUR api?" is decided on the PARSED url — origin and
+// path — never by substring. `url.includes(location.host + '/api/')` sent
+// the key to `https://attacker/c.png?x=<our host>/api/download/x` (a
+// markdown image in a reply fetches with no click). Returns the url when it
+// is same-origin and its PATH starts with `prefix`, else null.
+function _ownApiUrl(u, prefix = '/api/') {
+    try {
+        const p = new URL(String(u || ''), window.location.href);
+        if (p.origin !== window.location.origin) return null;
+        return p.pathname.startsWith(prefix) ? p : null;
+    } catch (e) { return null; }
+}
+
 // Wrap window.fetch so every request to our own /api/* automatically
 // includes the X-Ghost-Key header injected into the page by the server.
 (function installAuthFetch() {
@@ -42,7 +55,7 @@ const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
     window.fetch = function (input, init) {
         try {
             const url = typeof input === 'string' ? input : (input && input.url) || '';
-            const isApi = url.startsWith('/api/') || url.includes(window.location.host + '/api/');
+            const isApi = _ownApiUrl(url) !== null;
             if (isApi) {
                 init = init || {};
                 const headers = new Headers(init.headers || (typeof input !== 'string' ? input.headers : undefined) || {});
@@ -1194,11 +1207,50 @@ function dismissEmptyStateHero() {
 // of the markdown. If either library failed to load (CDN down, offline
 // deploy), fall back to plain text rather than silently leaking unsafe
 // HTML into the DOM.
+// §4ML: a reply may not draw a form (a fake "re-enter your key" box) or load
+// a remote image (it fetches from the owner's IP the moment it renders). An
+// image is kept only when it is ours (/api/download/…) or inline data; a
+// remote one becomes a plain link the owner can choose to open.
+// Every element/attribute that FETCHES on render is forbidden too — <img src>
+// is handled below, but srcset, a style background, <video poster>, <table
+// background>, SVG <image>/<use>, <picture>/<source>, <audio>/<video> each
+// fetched from a foreign host with no click (fresh-reader R2, Chromium).
+// marked emits `align`, never `style`, so no table loses its alignment.
+const _PURIFY_CONFIG = {
+    FORBID_TAGS: ['form', 'button', 'select', 'textarea', 'option',
+                  'picture', 'source', 'video', 'audio', 'track',
+                  'image', 'use', 'feimage', 'object', 'embed', 'iframe',
+                  'link', 'meta', 'base'],
+    FORBID_ATTR: ['action', 'formaction', 'srcset', 'poster', 'background',
+                  'style', 'ping', 'xlink:href'],
+};
+function _neutraliseRemoteImages(html) {
+    const t = document.createElement('template');
+    t.innerHTML = html;
+    // a GFM task list is the only input a reply may carry (a checkbox,
+    // disabled); `type=image` fetches, a text box is a phishing form
+    t.content.querySelectorAll('input').forEach((el) => {
+        if ((el.getAttribute('type') || '').toLowerCase() !== 'checkbox') el.remove();
+        else el.setAttribute('disabled', '');
+    });
+    t.content.querySelectorAll('img').forEach((img) => {
+        const src = img.getAttribute('src') || '';
+        if (/^data:image\//i.test(src) || _ownApiUrl(src, '/api/download/')) return;
+        const a = document.createElement('a');
+        a.setAttribute('href', src);
+        a.setAttribute('rel', 'noopener noreferrer');
+        a.setAttribute('target', '_blank');
+        a.textContent = `🖼 ${img.getAttribute('alt') || 'remote image'} (not loaded)`;
+        img.replaceWith(a);
+    });
+    return t.innerHTML;
+}
 function renderMarkdown(text) {
     const raw = String(text ?? "");
     if (window.marked && window.DOMPurify) {
         try {
-            return window.DOMPurify.sanitize(window.marked.parse(raw));
+            return _neutraliseRemoteImages(
+                window.DOMPurify.sanitize(window.marked.parse(raw), _PURIFY_CONFIG));
         } catch (e) {
             console.warn('markdown render failed, falling back to text', e);
         }
@@ -2498,12 +2550,36 @@ const turnStatusDescEl = document.getElementById('turn-status-desc');
 const turnStatusClockEl = document.getElementById('turn-status-clock');
 const turnStatusIconEl = document.getElementById('turn-status-icon');
 let tickerTimer = null, tickerStart = 0, tickerReqId = null;
+// §4ML: the corridor headers seen since send ({tag, rid8}) and this turn's
+// own request id once the proxy reports it. Adoption needs BOTH to agree:
+// "the first corridor after send" adopted a member's, a probe's or
+// self-play's turn whenever ours queued behind it (and showed its file
+// names). The header's third field is the request id's first 8 chars.
+let tickerSeen = [], tickerOwnRid = null;
+
+function _tickerHeaderIsOurs(rid8, own) {
+    own = String(own || '');
+    return !!own && (rid8 === own.slice(0, 8) || rid8 === ('probe-' + own).slice(0, 8));
+}
+
+function _tryAdoptTicker() {
+    if (tickerReqId !== null || !tickerOwnRid) return;
+    const hit = tickerSeen.find(h => _tickerHeaderIsOurs(h.rid8, tickerOwnRid));
+    if (hit) tickerReqId = hit.tag;
+}
+
+function noteTickerOwnRid(rid) {
+    tickerOwnRid = rid || null;
+    _tryAdoptTicker();
+}
 
 function startTurnTicker(afterEl) {
     stopTurnTicker();
     if (!turnStatusEl) return;
     tickerStart = Date.now();
     tickerReqId = null;
+    tickerSeen = [];
+    tickerOwnRid = null;
     turnStatusDescEl.textContent = 'starting…';
     turnStatusClockEl.textContent = '0:00';
     turnStatusIconEl.textContent = '⏳';
@@ -2525,6 +2601,8 @@ function stopTurnTicker() {
     clearInterval(tickerTimer);
     tickerTimer = null;
     tickerReqId = null;
+    tickerSeen = [];
+    tickerOwnRid = null;
     if (turnStatusEl) turnStatusEl.classList.add('hidden');
 }
 
@@ -2537,11 +2615,16 @@ function setTurnStatusDesc(text, icon) {
 function noteTickerLine(raw) {
     if (!tickerTimer) return;                       // no turn in flight
     const clean = cleanLogLine(raw);
-    // Corridor adoption: the first corridor that OPENS after our send.
+    // Corridor adoption: the corridor that OPENS after our send AND carries
+    // our request id (a corridor already open when we sent is never seen).
     if (tickerReqId === null) {
         if (/request started/.test(clean)) {
-            const m = clean.match(/^\S+\s+(\S+)\s/);
-            if (m) tickerReqId = m[1];
+            const m = clean.match(/^\S+\s+(\S+)\s+(\S+)\s/);
+            if (m) {
+                tickerSeen.push({ tag: m[1], rid8: m[2] });
+                if (tickerSeen.length > 32) tickerSeen.shift();
+                _tryAdoptTicker();
+            }
         }
         return;
     }
@@ -2876,6 +2959,7 @@ async function sendMessage(isResume = false) {
             if (response.headers.has('X-Request-ID')) {
                 const _rid = String(response.headers.get('X-Request-ID') || '').trim();
                 if (_rid) currentReqId = _rid.replace(/^chatcmpl-/, '');
+                noteTickerOwnRid(currentReqId);
             }
         }
 
@@ -2955,6 +3039,12 @@ async function sendMessage(isResume = false) {
                         _faceError(_msg, _type);
                         continue;
                     }
+                    // §4ML: after an error frame the agent echoes the error as a
+                    // content chunk (for clients that only read content). It is
+                    // not a reply: shown already as the system message above,
+                    // and pushed to history it became the "assistant's" turn in
+                    // the durable session and context for the next request.
+                    if (streamHadError) continue;
                     if (chunkContent) {
                         if (currentAccumulatedContent === "") {
                             if (currentThinkingInterval) {
@@ -4715,7 +4805,7 @@ function _evictAuthedBlobCache() {
 }
 
 async function _toAuthedBlobUrl(rawSrc) {
-    if (!rawSrc || !rawSrc.includes('/api/download/')) return rawSrc;
+    if (!rawSrc || !_ownApiUrl(rawSrc, '/api/download/')) return rawSrc;
     if (_authedBlobCache.has(rawSrc)) {
         // Touch: delete + re-set to mark as most recently used.
         const cached = _authedBlobCache.get(rawSrc);
@@ -4741,7 +4831,7 @@ async function _handleChatImage(img) {
     let swappedToBlob = false;
     try {
         const rawSrc = img.getAttribute('src') || '';
-        if (rawSrc.includes('/api/download/')) {
+        if (_ownApiUrl(rawSrc, '/api/download/')) {
             // The original <img src="/api/download/..."> load starts the
             // moment marked inserts it into the DOM; the browser can't
             // attach the X-Ghost-Key header to a plain <img>, so that
@@ -4867,7 +4957,13 @@ async function _handleChatPdfLink(link) {
             // revoked on replace and on window close.
             const res = await fetch(rawHref || link.href);
             if (!res.ok) throw new Error(`PDF fetch ${res.status}`);
-            const blob = await res.blob();
+            const fetched = await res.blob();
+            // §4ML CRIT: the native-viewer frame is NOT sandboxed and a blob
+            // URL inherits this page's origin — only real PDF bytes may load
+            // there, typed as a PDF whatever the server said.
+            const head = new Uint8Array(await fetched.slice(0, 5).arrayBuffer());
+            if (String.fromCharCode(...head) !== '%PDF-') throw new Error('not a PDF file');
+            const blob = new Blob([fetched], { type: 'application/pdf' });
             if (_pdfBlobUrl) {
                 try { URL.revokeObjectURL(_pdfBlobUrl); } catch (e) { /* ignore */ }
             }
@@ -4920,7 +5016,10 @@ function _processChatLogArtifacts() {
     document.querySelectorAll('#chat-log a[href*="/api/download/"]').forEach(link => {
         if (link.dataset.pdfHandled) return;
         const href = link.getAttribute('href') || '';
-        if (!/\.pdf(\?|$)/i.test(href)) return;
+        // §4ML CRIT: the PATH must end in .pdf (`x.html?.pdf` matched the
+        // old regex and loaded agent HTML into the same-origin frame)
+        const own = _ownApiUrl(href, '/api/download/');
+        if (!own || !/\.pdf$/i.test(own.pathname)) return;
         link.dataset.pdfHandled = '1';
         _handleChatPdfLink(link);
     });

@@ -456,6 +456,11 @@ class Reflector:
                 "reflected_from": traj.id,
                 "source_failure_reason": traj.failure_reason,
                 "source_outcome": traj.outcome,
+                # §4MI: the copy carries its source's role and kind, so the
+                # member rule and the probe rule reach it too (3 member and
+                # 10 probe turns re-entered the router/PRM corpus as copies)
+                "source_requester_role": str((traj.extra or {}).get("requester_role") or ""),
+                "source_task_kind": str(traj.task_kind or ""),
             },
         )
         if _general:

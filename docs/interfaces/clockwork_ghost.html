@@ -132,8 +132,8 @@
     <strong>The chat stream cannot supply this.</strong> <code>/api/chat</code> carries content
     tokens only — nothing about tools, memory or thinking — so the description comes from a SECOND
     channel, exactly as it does in the browser: the interface server tails the agent's pretty log and
-    rebroadcasts every line over <code>wss://eva:8080/ws?key=…</code>, and the client turns those
-    lines into captions. Same host, port and self-signed cert as the voice endpoints, so
+    rebroadcasts every line over <code>wss://eva.taila2b1d.ts.net:8080/ws?key=…</code>, and the client turns those
+    lines into captions. Same host, port and certificate (Let's Encrypt via <code>tailscale cert</code>, §4KR) as the voice endpoints, so
     <code>GHOST_VOICE_VERIFY_TLS</code> applies here too; <code>GHOST_LOG_WS</code> overrides the
     whole URL. The key rides in the <em>query string</em> because the endpoint is gated the way the
     web UI is and WebSockets take no custom headers.
@@ -374,9 +374,10 @@
       <code>GHOST_VOICE_BASE</code> / <code>GHOST_HOST</code> override the default
       <code>https://eva:8080</code>.</li>
     <li>They require <code>X-Ghost-Key</code>, like <code>/api/chat</code> already did. The interface
-      serves a self-signed cert, so TLS verification is off by default
-      (<code>GHOST_VOICE_VERIFY_TLS=1</code> to enable) — the hop is inside the tailnet, which is
-      already WireGuard-authenticated, and carries the same key the chat calls send in clear to :8000.</li>
+      serves a real certificate for its tailnet name (<code>tailscale cert</code>, renewed by §4KR), so
+      TLS verification is <strong>on</strong> by default (<code>GHOST_VOICE_VERIFY_TLS=0</code> turns it
+      off). The host is <code>GHOST_HOST</code>, default <code>eva.taila2b1d.ts.net</code> — the name
+      the certificate is for. (Before 2026-09 this page said self-signed, verification off.)</li>
   </ul>
   <p>
     <strong>Verified on-device 2026-08-02</strong> (host <code>clockworkpi</code>, aarch64): <code>eva</code>
@@ -646,5 +647,13 @@
       29 times.</li>
   </ul>
 </main>
+
+<h2 id="4ml">§4ML (2026-10-08)</h2>
+<ul>
+  <li><strong>The caption follows this device's own turn.</strong> <code>TurnTicker.start(own_rid)</code> adopts only the corridor whose header carries the id this client minted (or its <code>probe-</code> form). Before, it adopted the first corridor that opened after send. If the turn queued behind a member's, a probe's or self-play's turn, the caption and the face showed that turn, file names included. The web client had the same defect and got the same fix.</li>
+  <li><strong>Stops say what happened.</strong> A hard stop that breaks the stream is no longer reported as "eva dropped the connection". A stop still on its way when the reply finished by itself no longer prints "stopped.".</li>
+  <li><code>turnstatus.stream_log_lines</code> verifies TLS by default; the client passes <code>VOICE_VERIFY_TLS</code> explicitly.</li>
+  <li>Not yet on the device: it was offline on 2026-10-08 (last seen 6 days earlier). Deploy with <code>deploy.sh</code> when it is back. The probe now sends the header with the minted id and checks that a foreign corridor is ignored.</li>
+</ul>
 </body>
 </html>

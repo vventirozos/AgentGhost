@@ -609,6 +609,7 @@ def collect_learning_health(memory_dir, args: Any = None) -> Dict[str, Any]:
             # bench-flood detector (the capped `label_origins` below
             # saturates at 1:1 by construction).
             "label_origins_raw": raw_origins,
+            "bench_verdict": str(params.get("bench_verdict") or ""),
             **_label_health(samples),
             **_feature_health(samples),
         }
@@ -1953,10 +1954,16 @@ def render_learning_health(memory_dir, args: Any = None) -> str:
         # report down with a KeyError at exactly maximal flood).
         _raw_org = cal.get("label_origins_raw") or {}
         if _raw_org.get("bench"):
+            # §4MI: say what the fit DID with the bench rows — the
+            # direction gate (`bench_verdict`) can exclude them wholesale,
+            # and then "blends at ≤1:1" describes a population it removed
+            _bv = str(cal.get("bench_verdict") or "")
             lines.append(
                 f"  origin mix (current epoch, pre-cap): "
                 + ", ".join(f"{k}={v}" for k, v in sorted(_raw_org.items()))
-                + " — the fit blends at ≤1:1 (equal-mass cap)")
+                + (" — the direction gate EXCLUDED bench (bench_verdict=no): the fit is user rows only"
+                   if _bv == "no" else
+                   " — the fit blends at ≤1:1 (equal-mass cap)"))
             if not _raw_org.get("user"):
                 lines.append(
                     "    → BENCH-ONLY epoch: zero real rows — the fit "
@@ -2710,6 +2717,15 @@ def render_learning_health(memory_dir, args: Any = None) -> str:
                     f"unchanged corpus) is a healthy outcome-free run. Not "
                     f"dead; the heartbeat is a separate signal from the "
                     f"ledger.")
+                if int(row.get("n_context_window") or 0) == 0:
+                    # §4MI: a decline every 3 h for 17 days silenced the
+                    # alarm while the router checkpoint aged to 409 h —
+                    # the heartbeat vouched for a loop whose gate never
+                    # opened. Not an alarm (the gate may be right), but
+                    # said.
+                    lines.append(
+                        f"        └ ⚠ and no outcome in 7 d: a loop that only ever "
+                        f"declines is one whose input never changes — check its gate")
         if lv.get("alarms"):
             lines.append(
                 f"  ✗ {len(lv['alarms'])} PERIODIC loop(s) silent for {aw}h: "

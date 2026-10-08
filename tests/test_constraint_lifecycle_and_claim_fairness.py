@@ -353,7 +353,7 @@ class TestPackClaim:
         assert pack_claim("short") == "short"
 
     def test_long_claim_keeps_head_and_tail(self):
-        head = "OPENING-CONSTRAINT-PHRASE " + "a" * 2500
+        head = "OPENING-CONSTRAINT-PHRASE " + "a" * 7500        # §4MK: past the 6,000-char pack
         tail = " ✅ Ledger updated and confirmed at the very end."
         text = head + tail
         packed = pack_claim(text)

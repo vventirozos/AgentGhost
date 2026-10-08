@@ -242,5 +242,9 @@
   <h2 id="duration">Per-call duration <span class="tag">2026-10-05 &sect;4LP follow-up</span></h2>
   <p><code>ToolOutcome.duration_s</code> is the call's wall time, set by the dispatch loop from its timing shim and kept through copy, pickle, <code>with_text</code>/<code>append_note</code>, the context manager's compression (<code>_keep_outcome</code>, which also keeps <code>call_args</code>) and the egress note. The trajectory row (<code>ToolCall.duration_s</code>) reads it. Before this, 0 of 1,435 execute rows carried a duration. Like <code>call_args</code>, it lives on the outcome, not as a message key, because the message is sent to the API.</p>
 </main>
+
+<h2 id="4mi">§4MI (2026-10-08) — designed stops</h2>
+<p><code>DESIGNED_STOP_REASONS</code> = <code>clarify_first</code>, <code>subject_photo_missing</code>, <code>confirm_dead_end</code>: a REJECTED outcome that is the tool asking the USER (reply now, ask first). The recorder stores such a row with no <code>error</code> flag and a trailing <code>[designed stop: &lt;reason&gt;]</code> mark; <code>distill.outcome_heuristics.is_designed_stop</code> reads either the object's <code>reason_code</code> or the mark, and <code>tool_failure_flags</code> / the same-error rule SKIP it like an unresolved call. Before this, a clarify-first block booked the turn FAILED ("structural failure"), debited the surfaced lessons and made a post-mortem candidate. The same-error rule now keys on the result's error line (banner skipped, exception signature, volatile ids collapsed, URL kept) instead of the first 200 normalised characters.</p>
+
 </body>
 </html>

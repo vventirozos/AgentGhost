@@ -1125,8 +1125,10 @@ class FrontierTracker:
         passed = last.get("passed", False)
         if passed and delta > 0.05:
             return max(floor, base // 2)
-        if passed and last.get("attempts_used", 1) == 1 and delta == 0.0:
-            return max(floor, int(base * 0.75))
+        # §4MI: `delta == 0.0` has meant "duplicate or tie" since 2026-08-04
+        # (frontier.html: compression is a constant at the floor), not
+        # progress — it shortened the cooldown on 15 of 38 runs in a week.
+        # Only a real compression gain (delta > 0.05, above) shortens it.
         if not passed:
             return min(ceiling, base * 2)
         return base

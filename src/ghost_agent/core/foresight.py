@@ -881,6 +881,14 @@ def ledger_stats(path: Optional[Path] = None,
                 # must degrade to a skipped row, not blank the entire
                 # FORESIGHT section (fresh-eye review finding #3).
                 rec = json.loads(ln)
+                # §4MI: the owner's rows — 26% of the tail were probes,
+                # 38% of all time an untagged harness (`TRACEREQ`); their
+                # accuracy is not the agent's
+                _rid = str(rec.get("req_id") or "")
+                if _rid.startswith(("probe-", "sim-", "bench-", "replay-", "sub-", "sched-")) \
+                        or _rid == "TRACEREQ":
+                    out["skipped_non_owner"] = int(out.get("skipped_non_owner") or 0) + 1
+                    continue
                 total += 1
                 by_basis[str(rec.get("basis") or "?")] += 1
                 by_tool[str(rec.get("tool") or "?")] += 1

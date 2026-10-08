@@ -345,6 +345,10 @@ class DefectReport:
     severity: float = 0.0
     root_cause: str = ""
     evidence: str = ""           # the pure structural-signature summary
+    #: §4MI: the tool the signature is about — the evolve reader keys its
+    #: per-tool evidence on this and read 0 of 16 reports without it
+    tool: str = ""
+
     # category-specific payloads
     lesson: Optional[dict] = None        # behavioural: kwargs for learn_lesson
     config_change: str = ""              # configuration: proposed flag/threshold
@@ -941,6 +945,7 @@ class PostMortemEngine:
                       else round(sig.severity, 3)),
             root_cause=(parsed.get("root_cause") or "")[:1200],
             evidence=sig.summary(),
+            tool=str(sig.repeated_error_tool or sig.read_loop_tool or sig.dominant_tool or ""),
         )
 
         if category == CATEGORY_BEHAVIOURAL:

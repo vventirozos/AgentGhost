@@ -458,16 +458,25 @@ def trigger_text(text, limit: int = 160) -> str:
     return cut or t[:limit]
 
 
-def iter_teachable(trajectories):
+def iter_teachable(trajectories, consumer: str = ""):
     """The trajectories a lesson producer may read: `trajectory_may_teach`
     applied to an iterable (or a collector's `iter_trajectories()` result).
-    The ONE filter every idle-phase lesson producer goes through."""
+    The ONE filter every idle-phase lesson producer goes through.
+
+    §4MI: with ``consumer`` named, the task KINDS the admissibility matrix
+    grants that consumer are applied here too. Measured before this: the
+    router/PRM training set held 162 `reflection` copies and 66 coding
+    `leaf` rows beside 1,907 real requests — the same request text labelled
+    both "hard" (its source FAILED) and "easy" (the reflection re-run), and
+    222 of 641 held-out rows with an exact-text twin in train; REM seeds and
+    the post-mortem read "BUILD TASK (one leaf …)" rows as operator
+    messages."""
     for t in (trajectories or []):
-        if trajectory_may_teach(t):
+        if trajectory_may_teach(t, consumer=consumer):
             yield t
 
 
-def trajectory_may_teach(traj) -> bool:
+def trajectory_may_teach(traj, consumer: str = "") -> bool:
     """The member rule applied to a STORED trajectory: may a lesson be
     derived from it later, by an idle phase? The request-time gates
     (`turn_may_teach`, `playbook_writes_blocked`) read the request
@@ -479,12 +488,30 @@ def trajectory_may_teach(traj) -> bool:
     (recorded by `_record_turn_trajectory`); no client name is involved.
     Task KINDS (probe, bench, self-play…) stay with `core.admissibility`.
     One predicate, every trajectory-reading lesson producer (pinned by
-    enumeration in `tests/test_trajectory_may_teach.py`). Never raises."""
+    enumeration in `tests/test_trajectory_may_teach.py`). Never raises.
+
+    §4MI: ``consumer`` adds the task-kind rule from `core.admissibility`
+    (fails CLOSED — a kind filter that cannot decide admits nothing), and a
+    reflection COPY is judged by its source's role as well (the copy used
+    to carry no role, so a member's text re-entered through it)."""
     try:
         extra = getattr(traj, "extra", None) or {}
-        return str(extra.get("requester_role") or "").strip().lower() != "member"
-    except Exception:  # noqa: BLE001
+        _role = str(extra.get("requester_role") or extra.get("source_requester_role") or "").strip().lower()
+        if _role == "member":
+            return False
+        if str(extra.get("source_task_kind") or "") == "probe":     # r2: a probe's reflection copy
+            return False
+        if consumer:
+            try:
+                from ..core.admissibility import admitted_task_kinds
+                kinds = admitted_task_kinds(consumer)
+            except Exception:  # noqa: BLE001
+                return False
+            if str(getattr(traj, "task_kind", "") or "") not in kinds:
+                return False
         return True
+    except Exception:  # noqa: BLE001
+        return not consumer
 
 
 def _derive_lesson_origin() -> str:
@@ -679,6 +706,53 @@ these those under very were where whom why yours
 
 _BM25_MIN_TOKEN_LEN = 3
 
+
+def _folded_stopwords() -> frozenset:
+    """§4MI: `_bm25_tokens` folds the text FIRST (accents off, Greek
+    transliterated, c→k, ch→kh) and only then drops stop words — so the
+    plain-English list above missed every stop word the fold rewrites
+    ("because"→"bekause", "which"→"whikh", "back"→"bakk", "each", "once",
+    "such", "can"): seven of them counted as CONTENT words and could make
+    up the "two shared words" that admit a lesson. The list is folded once,
+    and both spellings are dropped."""
+    try:
+        from .egress import fold
+        return frozenset(_STOPWORDS | {fold(w)[0] for w in _STOPWORDS})
+    except Exception:  # noqa: BLE001
+        return _STOPWORDS
+
+
+_STOPWORDS_FOLDED = _folded_stopwords() | frozenset(
+    # r2 review: Greek function words, FOLDED (the tokenizer transliterates
+    # first) — "για τις" admitted a lesson on two shared "content" words
+    "gia tis toy tin ton sto sti stin ston stis stous poy pos poio poia poioi einai ena "
+    "mia moy soy mas sas kai apo oti alla tha den min ola oles oloi epi tora edo ekei poly "
+    "pio ayto ayta ayti aytos aytes kati kane kano pes mporeis thelo echo echeis esy ego "
+    "otan giati enan meta prin mesa pano kato".split())
+
+
+def _required_shared_for_count(n: int) -> int:
+    """The bar for a query of ``n`` content words (see below)."""
+    if n <= 12:
+        return 2
+    if n <= 40:
+        return 3
+    return 4
+
+
+def _required_shared_words(query: str) -> int:
+    """§4MI: how many shared content words admit a lesson on the keyword
+    branch — a function of the QUERY's length, because chance overlap is.
+
+    Measured on the live playbook (137 triggers) over 60 real owner
+    requests: a query of ≤12 content words collides (≥2 shared words) with
+    0–2 triggers, 13–21 words with 2–6, and a 119-word migration plan with
+    8 — five of which were admitted on exactly two generic verbs ("verify",
+    "write", "output", "format") and credited as helpful 27 s before the
+    turn was refuted. The close-trigger alternative is unchanged; this only
+    raises the bar the keyword branch must clear on its own."""
+    return _required_shared_for_count(len(_bm25_tokens(query)))
+
 # Floor for admitting a lesson on the BM25 FALLBACK path. CALIBRATED against
 # the live 50-lesson playbook (2026-08-11), not chosen:
 #
@@ -707,7 +781,7 @@ def _bm25_tokens(text: str) -> set:
     query had NO token, so it rode the embedder alone)."""
     from .egress import fold
     return {t for t in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]+", fold(text or "")[0])
-            if len(t) >= _BM25_MIN_TOKEN_LEN and t not in _STOPWORDS}
+            if len(t) >= _BM25_MIN_TOKEN_LEN and t not in _STOPWORDS_FOLDED}
 
 
 def _mostly_non_latin(text: str) -> bool:
@@ -718,6 +792,19 @@ def _mostly_non_latin(text: str) -> bool:
     if not letters:
         return False
     return sum(1 for c in letters if not ("a" <= c.lower() <= "z")) > len(letters) / 2
+
+
+_NO_MISTAKE_RE = re.compile(
+    r"^\s*(?:none|n/?a|no mistakes?|nothing)(?:\s+(?:observed|found|made|noted))?\s*(?:[.;,:—-]|$)", re.I)
+
+
+def _records_a_mistake(lesson: dict) -> bool:
+    """§4MI: does the row name an actual mistake? ("None observed; the
+    solution correctly used GROUP BY" is not one.) A row with NO mistake
+    field at all is unknown, not mistake-less — it is kept (the legacy
+    and the system-prompt injection rows carry none)."""
+    text = str(lesson.get("mistake") or lesson.get("anti_pattern") or "")
+    return not _NO_MISTAKE_RE.match(text)
 
 
 def _shared_content_words(query: str, trigger: str) -> int:
@@ -1817,6 +1904,16 @@ class SkillMemory:
                             _replaced = _owner_says or (
                                 not _foreign and len(effective_correct) > len(existing.get("solution") or ""))
                             if _replaced and source_trajectory_id:
+                                # §4MI: `previous_version` is one level deep —
+                                # a second replacement used to drop the
+                                # original text with no record anywhere. The
+                                # version being pushed out goes to the archive.
+                                if isinstance(existing.get("previous_version"), dict):
+                                    self._archive_lessons(
+                                        [dict(existing["previous_version"],
+                                              trigger=existing.get("trigger"),
+                                              task=existing.get("task"))],
+                                        "replaced-chain:" + str(source_trajectory_id))
                                 # §4LC: what a retraction of THIS turn restores
                                 # (it deleted the row and its earlier good text)
                                 existing["previous_version"] = {
@@ -1867,7 +1964,11 @@ class SkillMemory:
                             if source_trajectory_id and (_counted or _set_verified) and not _replaced:
                                 _rb = [r for r in (existing.get("reinforced_by") or []) if isinstance(r, dict)]
                                 _rb.append({"tid": source_trajectory_id, "counted": bool(_counted),
-                                            "verified": _set_verified})
+                                            "verified": _set_verified,
+                                            # §4MI: the +0.2 the verified bump adds is
+                                            # undone with the reinforcement
+                                            "conf_before": float(existing.get("confidence") or 0.5),
+                                            "source": str(source or "")})
                                 existing["reinforced_by"] = _rb[-20:]
                             if _set_verified:
                                 existing["verified"] = True
@@ -2048,6 +2149,16 @@ class SkillMemory:
                             _replaced = _owner_says or (not _foreign and _same_trigger
                                          and len(effective_correct) > len(existing.get("solution") or ""))
                             if _replaced and source_trajectory_id:
+                                # §4MI: `previous_version` is one level deep —
+                                # a second replacement used to drop the
+                                # original text with no record anywhere. The
+                                # version being pushed out goes to the archive.
+                                if isinstance(existing.get("previous_version"), dict):
+                                    self._archive_lessons(
+                                        [dict(existing["previous_version"],
+                                              trigger=existing.get("trigger"),
+                                              task=existing.get("task"))],
+                                        "replaced-chain:" + str(source_trajectory_id))
                                 # §4LC: what a retraction of THIS turn restores
                                 # (it deleted the row and its earlier good text)
                                 existing["previous_version"] = {
@@ -2095,7 +2206,11 @@ class SkillMemory:
                             if source_trajectory_id and (_counted or _set_verified) and not _replaced:
                                 _rb = [r for r in (existing.get("reinforced_by") or []) if isinstance(r, dict)]
                                 _rb.append({"tid": source_trajectory_id, "counted": bool(_counted),
-                                            "verified": _set_verified})
+                                            "verified": _set_verified,
+                                            # §4MI: the +0.2 the verified bump adds is
+                                            # undone with the reinforcement
+                                            "conf_before": float(existing.get("confidence") or 0.5),
+                                            "source": str(source or "")})
                                 existing["reinforced_by"] = _rb[-20:]
                             if _set_verified:
                                 existing["verified"] = True
@@ -2314,8 +2429,20 @@ class SkillMemory:
         self,
         trajectory_id: str,
         memory_system=None,
+        include_correctives: bool = False,
     ) -> int:
         """Remove every lesson whose ``source_trajectory_id`` matches.
+
+        §4MI: a REFLECTION lesson tagged with this id is the turn's
+        CORRECTIVE — written after the turn failed, to teach the right
+        behaviour — not a lesson learned from the refuted answer. Every
+        live caller retracts because the turn turned out BAD (a late
+        refute, an inline refute, the owner's correction), which is exactly
+        when the corrective is right, so correctives are KEPT unless
+        ``include_correctives`` is passed (a turn later found to have been
+        fine). Measured before this: 200 late refutes in two months removed
+        0 lessons, and the only rows carrying a refuted turn's id were 25
+        correctives that a second retraction of the same id would delete.
 
         Called by the user-correction promotion path: when a turn is
         promoted to FAILED via the user's next message, any lesson
@@ -2348,6 +2475,7 @@ class SkillMemory:
         # best-effort scrub into a NameError.
         removed_triggers = []
         restored = []
+        correctives_kept = []
         try:
             with self._get_lock():
                 playbook = self._load_playbook()
@@ -2358,6 +2486,14 @@ class SkillMemory:
                         entry.get("source_trajectory_id")
                         if isinstance(entry, dict) else None
                     )
+                    if (isinstance(entry, dict) and isinstance(src, str) and src == trajectory_id
+                            and not include_correctives
+                            and str(entry.get("source") or "") == "reflection"):
+                        # §4MI: the corrective for this turn, not a lesson
+                        # learned from it — see the docstring
+                        correctives_kept.append(entry.get("trigger") or entry.get("task") or "")
+                        kept.append(entry)
+                        continue
                     if isinstance(entry, dict) and isinstance(src, str) and src == trajectory_id \
                             and isinstance(entry.get("previous_version"), dict) \
                             and entry["previous_version"].get("replaced_by") == trajectory_id:
@@ -2379,13 +2515,23 @@ class SkillMemory:
                             entry.pop("previous_version", None)
                             restored.append(entry)
                         _rb = [r for r in (entry.get("reinforced_by") or []) if isinstance(r, dict)]
-                        mine = [r for r in _rb if r.get("tid") == trajectory_id]
+                        mine = [r for r in _rb if r.get("tid") == trajectory_id
+                                # r2: a corrective's reinforcement is kept like the corrective
+                                and (include_correctives or r.get("source") != "reflection")]
                         if mine:
                             # §4LC: undo this turn's reinforcement
                             if any(r.get("counted") for r in mine):
                                 entry["frequency"] = max(1, int(entry.get("frequency") or 1) - 1)
                             if any(r.get("verified") for r in mine):
                                 entry["verified"] = False
+                                # §4MI: the verified reinforcement also lifted
+                                # confidence (+0.2, utility ×0.5 weight); the
+                                # undo used to leave it at the lifted value
+                                _before = [r.get("conf_before") for r in mine
+                                           if r.get("verified") and isinstance(r.get("conf_before"), (int, float))]
+                                if _before:
+                                    entry["confidence"] = min(
+                                        float(entry.get("confidence") or 0.5), float(_before[0]))
                             entry["reinforced_by"] = [r for r in _rb if r.get("tid") != trajectory_id]
                             restored.append(entry)
                     if isinstance(src, str) and src == trajectory_id:
@@ -2433,7 +2579,12 @@ class SkillMemory:
             try:
                 coll = getattr(memory_system, "collection", None)
                 if coll is not None and hasattr(coll, "delete"):
-                    coll.delete(where={"source_trajectory_id": trajectory_id})
+                    # §4MI: the id-keyed delete would take a kept
+                    # corrective's twin with it (twin `source` metadata is
+                    # not reliable enough to exclude by) — when one was
+                    # kept, the exact trigger list below is the scrub
+                    if not correctives_kept:
+                        coll.delete(where={"source_trajectory_id": trajectory_id})
                     # §4HB: the vector twin does not always carry the id.
                     # Live: the playbook entry from trajectory 97b402e8 had
                     # `source_trajectory_id` set and its vector twin had "",
@@ -2443,6 +2594,8 @@ class SkillMemory:
                     # false lesson still surfacing on recall until then.
                     # The JSON pass knows exactly which TRIGGERS it removed;
                     # scrub the twins by trigger as well.
+                    # (a kept corrective's twin is safe here: triggers are
+                    # unique in the playbook, so a removed row never shares one)
                     _trig = [t for t in removed_triggers if isinstance(t, str) and t]
                     if _trig:
                         coll.delete(where={"trigger": {"$in": _trig}})
@@ -2467,6 +2620,14 @@ class SkillMemory:
         if restored:
             pretty_log("Skill Retracted", f"restored/undid {len(restored)} lesson(s) touched by trajectory "
                        f"{trajectory_id[:8]}", icon=Icons.MEM_WIPE)
+        if correctives_kept:
+            logger.info("skills: retraction of %s kept %d corrective lesson(s) written to fix it",
+                        trajectory_id[:8], len(correctives_kept))
+        if not removed and not restored and not json_failed:
+            # §4MI: the banner says "scrubbing this turn's lessons" — say
+            # what that came to
+            logger.info("skills: retraction of %s removed nothing (no lesson carries that id)",
+                        trajectory_id[:8])
         if removed:
             try:
                 pretty_log(
@@ -2594,6 +2755,11 @@ class SkillMemory:
         query_tokens = _trigger_token_set(query) if query else set()
         top_keys = {_normalize_trigger(t) for t in (top_triggers or []) if t}
         discriminate = bool(query_tokens) or bool(top_keys)
+        # §4MI: the same length-aware bar as admission — credit on a long
+        # request used to need two tokens shared with the trigger OR the
+        # whole correct_pattern, which every lesson met by chance (five
+        # unrelated lessons credited on one 119-word request)
+        _need = max(1, min_token_overlap, _required_shared_words(query) if query else 1)
 
         def _is_relevant(lesson) -> bool:
             if not discriminate:
@@ -2607,7 +2773,7 @@ class SkillMemory:
                 # trigger is terse but whose pattern clearly addresses the
                 # query still counts.
                 lesson_tokens |= _trigger_token_set(lesson.get("correct_pattern") or "")
-                if len(query_tokens & lesson_tokens) >= max(1, min_token_overlap):
+                if len(query_tokens & lesson_tokens) >= _need:
                     return True
             return False
 
@@ -3264,7 +3430,10 @@ class SkillMemory:
                         # sit close on its own — and the English embedder
                         # cannot judge a mostly non-Latin query, so that one
                         # needs the two words
-                        if _shared_content_words(query, trigger or doc) < 2 and (
+                        # §4MI: the bar rises with the query's length (a
+                        # 119-word request shares two generic verbs with
+                        # eight triggers by chance)
+                        if _shared_content_words(query, trigger or doc) < _required_shared_words(query) and (
                                 _mostly_non_latin(query)
                                 or not _trigger_is_close(memory_system, query, trigger, _trig_cache)):
                             continue
@@ -3318,7 +3487,7 @@ class SkillMemory:
                 # not guessed — see _BM25_MIN_SCORE.
                 # §4LC: and TWO shared content words — a one-word query
                 # scores 1.0 on any trigger holding that word
-                if score >= _BM25_MIN_SCORE and _shared_content_words(query, trig or "") >= 2:
+                if score >= _BM25_MIN_SCORE and _shared_content_words(query, trig or "") >= _required_shared_words(query):
                     scored.append((score, p))
             if scored:
                 scored.sort(key=lambda t: -t[0])
@@ -3334,6 +3503,11 @@ class SkillMemory:
         # No query supplied → recency fallback (system-prompt injection style).
         # Never a request-scoped lesson: without a query there is no request
         # it could belong to (§4KW).
+        # §4MI: the no-query fallback feeds the selfhood diary's RECENT
+        # MISTAKES block — a self-play row with "MISTAKE: None observed" and
+        # an episode row with "mistake: none" were narrated as the agent's
+        # own failures. Only rows that record a real mistake, from the
+        # agent's own turns (not a synthetic solver or a bench item).
         items = [
             {"text": render_lesson_for_prompt(p), "trigger": _trigger_of(p)}
             for p in [q for q in playbook_snapshot if _lesson_scope(q) != _SCOPE_REQUEST][:limit]
@@ -3474,7 +3648,15 @@ class SkillMemory:
             if not playbook:
                 return "No recent failures recorded."
 
-            recent_lessons = playbook[:limit]
+            # §4MI (r2): the selfhood diary's RECENT MISTAKES — "None
+            # observed; the solution correctly used GROUP BY" and an episode
+            # row with "mistake: none" were narrated as the agent's own
+            # failures, and a one-request plan rode along
+            recent_lessons = [p for p in playbook
+                              if isinstance(p, dict) and _records_a_mistake(p)
+                              and _lesson_scope(p) != _SCOPE_REQUEST][:limit]
+            if not recent_lessons:
+                return "No recent failures recorded."
             context = "## RECENT MISTAKES:\n"
             for p in recent_lessons:
                 task = p.get("task") or p.get("trigger") or ""

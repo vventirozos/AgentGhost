@@ -214,6 +214,13 @@ def gather_failure_corpus(context) -> List[dict]:
                 anti = lesson.get("anti_pattern") or lesson.get("mistake") or ""
                 if lesson.get("source") == "distilled":
                     continue
+                # §4MI: evidence only — a one-request plan (scope=request)
+                # would be generalised, a bench row would lose its
+                # provenance tag, a quarantined row is not taught
+                if (str(lesson.get("scope") or "") == "request"
+                        or str(lesson.get("source") or "") == "bench"
+                        or lesson.get("quarantined")):
+                    continue
                 if _is_mistake_less(anti):
                     continue
                 if not _within_window(lesson.get("timestamp") or ""):
@@ -517,6 +524,19 @@ async def distill_failure_clusters(context, *, min_cluster: int = _MIN_CLUSTER,
                 # same evidence → same lesson; nothing new to say
                 report["skipped_unchanged"] += 1
                 continue
+            # §4MI: the fingerprint is the exact handle set of a SLIDING
+            # window, so one case ageing out re-distilled the cluster and
+            # replaced the lesson's text (orchestration/python_general: 18
+            # re-distillations in a week, frequency 91, the credit of ~18
+            # different texts on one row). Re-distil only when at least
+            # half of the cluster is evidence the prior lesson never saw —
+            # the same bar dream heuristics use (DREAM_EVIDENCE_MIN_NEW_FRACTION).
+            _prior_handles = set(prior.get("handles") or [])
+            if _prior_handles and not prior.get("no_pattern"):
+                _new = [h for h in handles if h not in _prior_handles]
+                if len(_new) * 2 < len(handles):
+                    report["skipped_little_new"] = report.get("skipped_little_new", 0) + 1
+                    continue
             attempts += 1
             report["attempted"] = attempts
 
@@ -597,6 +617,7 @@ async def distill_failure_clusters(context, *, min_cluster: int = _MIN_CLUSTER,
                 # with a marker so identical evidence stops re-paying the
                 # synthesis call every cycle; changed evidence re-attempts.
                 state[state_key] = {"fingerprint": fingerprint,
+                                    "handles": handles,
                                     "ts": datetime.now().isoformat(),
                                     "cases": len(recs),
                                     "no_pattern": True}
@@ -634,6 +655,7 @@ async def distill_failure_clusters(context, *, min_cluster: int = _MIN_CLUSTER,
                              state_key)
                 continue
             state[state_key] = {"fingerprint": fingerprint,
+                                "handles": handles,
                                 "ts": datetime.now().isoformat(),
                                 "cases": len(recs)}
             written += 1

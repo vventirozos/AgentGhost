@@ -803,6 +803,40 @@ class ComposedSkill:
         }
 
 
+def _any_step_still_running(results) -> bool:
+    """§4MI: a step promoted to a background job has no outcome yet; the
+    booking used to call the whole macro FAILED while the result text said
+    STILL RUNNING."""
+    try:
+        from ..sandbox.jobs import is_promoted_result
+        return any(not r.get("success") and is_promoted_result(str(r.get("result") or ""))
+                   for r in (results or []) if isinstance(r, dict))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _usage_is_bookable() -> bool:
+    """§4MI: THE request populations whose macro / acquired-skill runs are
+    booked into the production skill stores. Never raises (an unknown
+    kind books, like before)."""
+    try:
+        from ..utils.logging import request_kind
+        # the populations that must NOT book — a probe, a member, a
+        # background turn (sched-/sub-/sim- self-play) and a bench/replay
+        # run; no request at all ("system": a script, a test) books
+        from ..utils.logging import request_id_context
+        _k = request_kind()
+        if _k in ("probe", "member", "test"):
+            return False
+        if _k == "background":
+            # r2 review: the owner's scheduled task (sched-) and sub-agent
+            # (sub-) are the owner's work; only self-play (sim-) is not
+            return not str(request_id_context.get() or "").startswith("sim-")
+        return True
+    except Exception:  # noqa: BLE001
+        return True
+
+
 class ComposedSkillRegistry:
     """Manages composed skills — discovery, storage, retrieval, and execution."""
 
@@ -985,7 +1019,15 @@ class ComposedSkillRegistry:
     # definitions the LLM sees), so it was removed 2026-07-14 as dead code.
 
     def record_usage(self, skill_name: str, success: bool):
-        """Record that a composed skill was used."""
+        """Record that a composed skill was used.
+
+        §4MI: only the OWNER's turns (and the owner's job wake-ups) book
+        usage. A self-play solver, a probe, a bench item or a member ran
+        the owner's approved macro and wrote its `usage_count` /
+        `success_count` into the production store (a labelled test run was
+        booked as a real failed use on 2026-09-24)."""
+        if not _usage_is_bookable():
+            return
         with self._save_lock:
             if skill_name in self.skills:
                 skill = self.skills[skill_name]
@@ -1363,7 +1405,8 @@ class ComposedSkillRegistry:
 
             step_idx += 1
 
-        self.record_usage(skill.name, success)
+        if not _any_step_still_running(results):     # §4MI: unresolved ≠ failed
+            self.record_usage(skill.name, success)
         out = {
             "success": success,
             "results": results,
@@ -1408,7 +1451,8 @@ class ComposedSkillRegistry:
         # A step is "tolerated" if it succeeded or was declared optional.
         success = all(r["success"] or r.get("optional") for r in results)
 
-        self.record_usage(skill.name, success)
+        if not _any_step_still_running(results):     # §4MI: unresolved ≠ failed
+            self.record_usage(skill.name, success)
         return {
             "success": success,
             "results": results,

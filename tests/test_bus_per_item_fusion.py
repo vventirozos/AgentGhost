@@ -61,10 +61,13 @@ async def test_fetch_episodic_emits_one_item_per_episode():
     ep.format_episode = lambda e: f"- Trigger: {e['trigger']}"
     bus = MemoryBus(episodic_memory=ep)
     items = await bus._fetch_episodic("query")
-    assert len(items) == 2
+    # §4MJ: a FAILED episode with no lesson is not hydrated (it renders as the
+    # failed reply's text); one with a lesson is
+    assert [it["text"] for it in items] == ["- Trigger: t1"]
     assert all(it["source"] == "episodic" for it in items)
-    assert items[0]["text"] == "- Trigger: t1"
-    assert items[1]["text"] == "- Trigger: t2"
+    ep.search_similar = MagicMock(return_value=[
+        {"trigger": "t2", "outcome": "o2", "outcome_success": False, "lesson": "check the port first"}])
+    assert [it["text"] for it in await bus._fetch_episodic("query")] == ["- Trigger: t2"]
 
 
 async def test_fetch_episodic_blob_fallback_for_legacy_stubs():

@@ -482,9 +482,18 @@ def _imagine_gate_built_at() -> "datetime.datetime":
     try:
         from .imagination import load_gate
         doc = load_gate() or {}
-        raw = str(doc.get("built") or "").rstrip("Z")
-        return datetime.datetime.fromisoformat(raw) if raw \
-            else datetime.datetime.min
+        _s = str(doc.get("built") or "")
+        raw = _s.rstrip("Z")
+        if not raw:
+            return datetime.datetime.min
+        built = datetime.datetime.fromisoformat(raw)
+        if _s.endswith("Z") and built.tzinfo is None:
+            # §4MI: the gate stamps UTC and the anchors are LOCAL naive —
+            # read as local, a 6 h cooldown was 3 h after every boot (8
+            # builds on a day with 18 boots against 4 allowed)
+            built = (built.replace(tzinfo=datetime.timezone.utc)
+                     .astimezone().replace(tzinfo=None))
+        return built
     except Exception:  # noqa: BLE001
         return datetime.datetime.min
 
@@ -546,9 +555,20 @@ def _sync_idle_anchors(agent, ctx) -> None:
             agent._idle_anchors_loaded = True
             if path.is_file():
                 for k, v in (json.loads(path.read_text()) or {}).items():
-                    if (isinstance(k, str) and k.startswith("_last_") and k.endswith("_at")
-                            and getattr(agent, k, datetime.datetime.min) == datetime.datetime.min):
-                        setattr(agent, k, datetime.datetime.fromisoformat(str(v)))
+                    if isinstance(k, str) and k.startswith("_last_") and k.endswith("_at"):
+                        _cur = getattr(agent, k, datetime.datetime.min)
+                        _stored = datetime.datetime.fromisoformat(str(v))
+                        # §4MI: a seed computed at boot (the imagine gate's
+                        # own stamp) must not discard a LATER persisted
+                        # anchor — the later of the two is the truth
+                        # r2 review: never adopt an anchor from the FUTURE
+                        # (clock skew, a DST fall-back, a hand edit) — it
+                        # would hold the phase for the size of the skew
+                        if _stored > datetime.datetime.now() + datetime.timedelta(minutes=5):
+                            continue
+                        if (not isinstance(_cur, datetime.datetime)
+                                or _cur == datetime.datetime.min or _stored > _cur):
+                            setattr(agent, k, _stored)
         cur = {k: v.isoformat() for k, v in vars(agent).items()
                if k.startswith("_last_") and k.endswith("_at")
                and isinstance(v, datetime.datetime) and v != datetime.datetime.min}
@@ -2075,6 +2095,8 @@ def _turn_had_tool_failure(tools_run: Optional[list]) -> bool:
         if not tool:
             continue
         content = tool.get("content", "") or ""
+        if _designed_stop_result(content):
+            continue      # §4MK: asking the user is not a failed call (it paid a main-model escalation)
         # Read the STATUS when the content carries one. `str(...)` threw it
         # away — the same defect `_reconstruct_tool_calls` was fixed for, in
         # this same file, over this same `tools_run_this_turn` list. The
@@ -2789,6 +2811,62 @@ def _raw_turn_sources(tools_run_this_turn) -> str:
 
 
 _STEER_HEAD_RE = re.compile(r"^\s*(?:SYSTEM ALERT|AUTO-DIAGNOSTIC|SYSTEM ERROR|SYSTEM OBSERVATION|SYSTEM:|\[SYSTEM)", re.IGNORECASE)
+
+
+#: §4MK: how much of the user's request the judges see. 1,000 cut "is my
+#: migration plan correct?" (2,956 chars) before DB6 and the plan was refuted
+#: for "DB5, DB6 … not present in the evidence".
+JUDGE_REQUEST_CHARS = 4000
+#: §4MK: the earlier-turn block the judges see (tool outputs + system banners)
+EARLIER_EVIDENCE_JUDGE_CHARS = 3000
+_EARLIER_EVIDENCE_HEAD = ("[EARLIER IN THIS CONVERSATION — tool outputs and system notices from previous "
+                          "turns (NOT the assistant's own words). A fact found here was not invented.]")
+
+
+def _earlier_turn_judge_evidence(prior: str) -> str:
+    """§4MK CRIT: the judges never saw earlier turns, so a fact the agent
+    learned from an earlier tool output or a SYSTEM notice ("While you were
+    away — Chess Coach v4 → FAILED") was refuted as invented, the owner got a
+    false correction, and reflection wrote a "hallucinated" lesson. Only
+    what is not the agent's voice: earlier TOOL outputs, and the leading
+    system banner blocks of earlier replies — never the replies themselves
+    (§4KK: the agent's own words made invented figures "supported")."""
+    try:
+        from .autonomous_activity import _BANNER_HEADS, _BANNER_SEP
+    except Exception:  # noqa: BLE001
+        _BANNER_HEADS, _BANNER_SEP = ("**While you were away**",), "\n\n---\n\n"
+    out, total = [], 0
+    for blk in re.split(r"(\[assistant\][\s\S]*?\[/assistant\])", str(prior or "")):
+        if not blk.strip():
+            continue
+        if blk.startswith("[assistant]"):
+            body = blk[len("[assistant]"):-len("[/assistant]")].lstrip()
+            banners = []
+            for _ in range(4):
+                if body.startswith(_BANNER_HEADS) and _BANNER_SEP in body:
+                    head, body = body.split(_BANNER_SEP, 1)
+                    banners.append(head)
+                    body = body.lstrip()
+                else:
+                    break
+            blk = "\n".join(banners)
+            if not blk:
+                continue
+        piece = blk.strip()
+        out.append(piece)
+        total += len(piece)
+        if total >= EARLIER_EVIDENCE_JUDGE_CHARS:
+            break
+    text = "\n".join(out)[:EARLIER_EVIDENCE_JUDGE_CHARS]
+    return f"{_EARLIER_EVIDENCE_HEAD}\n{text}" if text.strip() else ""
+
+
+def _with_earlier_turn_evidence(evidence, messages, tools_run_this_turn, last_user_content: str = "") -> str:
+    try:
+        extra = _earlier_turn_judge_evidence(_prior_turn_evidence(messages, tools_run_this_turn, last_user_content))
+    except Exception:  # noqa: BLE001
+        extra = ""
+    return f"{evidence}\n\n{extra}" if extra else evidence
 
 
 def _prior_turn_evidence(messages, tools_run_this_turn, last_user_content: str = "") -> str:
@@ -8844,11 +8922,59 @@ def _drop_missing_download_links(text, sandbox_root) -> tuple:
         return text, []
 
 
-def _iter_teachable_train(trajectories):
+#: §4MI r2: a self-play run that never concludes is the broken
+#: generation/setup the DEAD alarm exists for — "failed" keeps it armed
+SELF_PLAY_UNCONCLUDED_ATTEMPT = "failed"
+
+
+def idle_attempt_result_for_dream(outcome) -> str:
+    """§4MI r2: the heartbeat a dream tick that wrote nothing records — a
+    SKIP is "declined" (suppresses the DEAD alarm; the loop is healthy), an
+    ERROR is "failed" (keeps it armed: a worker that is down forever must
+    not look alive)."""
+    if isinstance(outcome, dict) and outcome.get("phase") == "error":
+        return "failed"
+    return "declined"
+
+
+def _designed_stop_result(outcome) -> bool:
+    """§4MI: is this tool outcome a designed stop (see
+    `distill.outcome_heuristics.is_designed_stop`)? Never raises."""
+    try:
+        from ..distill.outcome_heuristics import is_designed_stop
+        return bool(is_designed_stop(outcome))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _late_verdict_to_work_log(context, traj, reason: str) -> None:
+    """§4MI: append a work_log row naming the late refute on the project
+    the turn was bound to (`extra["project_id"]`, stamped at record
+    time). Append-only store, so the original "completed" row stays and
+    the briefing reads the newer verdict. Never raises."""
+    try:
+        _pid = str(((getattr(traj, "extra", None) or {}).get("project_id")) or "")
+        store = getattr(context, "project_store", None)
+        if not _pid or store is None or not hasattr(store, "add_work_log"):
+            return
+        store.add_work_log(
+            _pid,
+            request=str(getattr(traj, "user_request", "") or "")[:200],
+            outcome="verifier:failed (late)",
+            note=("the verifier refuted this reply after it was sent: "
+                  + str(reason or "")[:300]),
+        )
+        logger.info("late verdict → work_log of project %s", _pid[:12])
+    except Exception as e:  # noqa: BLE001
+        logger.debug("late verdict work_log skipped: %s: %s", type(e).__name__, e)
+
+
+def _iter_teachable_train(trajectories, consumer: str = "router"):
     """Member turns never train the owner's router / PRM / online PRM update
-    (§4KJ R7: the member controls the text)."""
+    (§4KJ R7: the member controls the text). §4MI: nor do reflection copies
+    or coding leaves — the consumer's admitted task kinds apply."""
     from ..memory.skills import iter_teachable
-    return iter_teachable(trajectories)
+    return iter_teachable(trajectories, consumer=consumer)
 
 
 class _SkipMemberCorrection(Exception):
@@ -9071,9 +9197,17 @@ def _missing_subject_block(fname, raw_args, tools_run_this_turn) -> Optional[str
 
     def _respelled(name):
         return any(SequenceMatcher(None, slug(name), r).ratio() >= 0.75 for r in rest)
+    who = ", ".join(missing)
+    if any(slug(m) in new for m in missing):
+        # r2 review: the SAME name again is not a respelling — the search
+        # returns the same nothing, and since the no-photo stop draws no
+        # strike, nothing else would end the loop
+        return (f"SYSTEM BLOCK — the photo search for {who} already returned nothing in this "
+                "request; the same name will return nothing again. Reply to the user NOW: ask "
+                "them to upload a photo or to confirm a generic stand-in. (Only a CORRECTED "
+                "spelling may be tried, once.)")
     if kept and all(_respelled(m) for m in missing):
         return None
-    who = ", ".join(missing)
     return (f"SYSTEM BLOCK — ask the user first: no photo of {who} was found earlier in this "
             "request, and the user has not agreed to a stand-in. Do NOT render a picture without "
             f"{who} or with someone else in their place. Reply to the user NOW: say that no "
@@ -11233,6 +11367,13 @@ class GhostAgent:
                             if _dream_skipped and not _side_output:
                                 self._dream_skip_streak = getattr(
                                     self, "_dream_skip_streak", 0) + 1
+                                # §4MI: the liveness view read 31 skip ticks
+                                # in 29 h as "✗ DEAD dream" — a decline is a
+                                # heartbeat, as it is for the router. An
+                                # ERROR is not a decline (r2 review): "failed"
+                                # does not silence the DEAD alarm.
+                                self._record_idle_attempt(
+                                    "dream", idle_attempt_result_for_dream(_outcome))
                             else:
                                 self._dream_skip_streak = 0
                             # Only ledger a cycle that actually did work —
@@ -11257,6 +11398,16 @@ class GhostAgent:
                                 self._record_autonomous_activity(
                                     "dream",
                                     dream_ledger_summary(_dream_msg))
+                            elif _side_output:
+                                # §4MI: a skip tick whose side passes WROTE
+                                # (26 distilled lessons in a week landed on
+                                # skip ticks and left no ledger row). Not the
+                                # "REM cycle ran" prefix: the digest counts
+                                # consolidation on it.
+                                self._record_autonomous_activity(
+                                    "dream",
+                                    "REM skipped; side passes wrote — "
+                                    + " ".join(str(_dream_msg).split())[:200])
                         except Exception as _dream_exc:
                             # §4Q Lens-A: dream was the ONLY non-terminal phase
                             # with no except. `Dreamer.dream` has unguarded
@@ -11483,7 +11634,7 @@ class GhostAgent:
                         )
                         from ..memory.skills import iter_teachable as _iter_teachable_pm
                         pm_report = await engine.run(
-                            source=lambda: _iter_teachable_pm(traj_collector.iter_trajectories()),
+                            source=lambda: _iter_teachable_pm(traj_collector.iter_trajectories(since_days=14.0), consumer="postmortem"),
                         )
                         pretty_log(
                             "Biological Hook",
@@ -11528,7 +11679,7 @@ class GhostAgent:
                         # ("DISPATCH-OK-77") rode owner prompts as examples
                         from ..skills_auto.store import minable_requests as _minable
                         trajs = await asyncio.to_thread(
-                            lambda: list(_minable(_iter_teachable_sa(traj_collector.iter_trajectories())))
+                            lambda: list(_minable(_iter_teachable_sa(traj_collector.iter_trajectories(), consumer="skills_auto")))
                         )
                         if trajs:
                             candidates, report = await asyncio.to_thread(
@@ -11549,6 +11700,7 @@ class GhostAgent:
                                 # confidence — so one-off coincidences don't
                                 # become "proven approaches".
                                 _graduated = 0
+                                _sa_crashed = 0
                                 _store = getattr(ctx, 'auto_skill_store', None)
                                 if _store is not None:
                                     def _verify_fn(c):
@@ -11584,7 +11736,7 @@ class GhostAgent:
                                                         _cand,
                                                         confidence=_vr.updated_confidence)
                                                 continue
-                                            _persisted = _store.graduate(
+                                            _persisted, _sa_changed = _store.graduate_changed(
                                                 _cand,
                                                 confidence=_vr.updated_confidence,
                                             )
@@ -11593,7 +11745,10 @@ class GhostAgent:
                                                 # (lowest confidence) — not really
                                                 # graduated; skip count + macro mint.
                                                 continue
-                                            _graduated += 1
+                                            if _sa_changed:
+                                                # §4MI: an unchanged re-graduation
+                                                # (no new evidence) is not one
+                                                _graduated += 1
                                             # Also mint the proven sequence
                                             # as a composed-skill MACRO so a
                                             # graduated skill becomes a
@@ -11703,6 +11858,7 @@ class GhostAgent:
                                                 logger.debug(
                                                     "composed-macro mint skipped: %s", _ce)
                                         except Exception as _ve:
+                                            _sa_crashed += 1
                                             logger.debug(
                                                 "skill graduation skipped for "
                                                 "%s: %s",
@@ -11722,6 +11878,15 @@ class GhostAgent:
                                         f"graduated {_graduated} proven skill(s) "
                                         f"from {report.n_trajectories_seen} "
                                         f"trajectories")
+                                else:
+                                    # §4MI: ran, nothing new — a heartbeat,
+                                    # not a row (the phase is EXPECT_PERIODIC);
+                                    # every candidate CRASHING is a failure (r2)
+                                    _sa_n = len(consolidated or [])
+                                    _sa_c = _sa_crashed
+                                    self._record_idle_attempt(
+                                        "skills_auto",
+                                        "failed" if (_sa_n and _sa_c >= _sa_n) else "declined")
                     except Exception as e:
                         logger.warning(f"Skills auto-extraction failed: {e}")
                     finally:
@@ -11975,7 +12140,7 @@ class GhostAgent:
                             trainer = PRMTrainer()
                             report = await asyncio.to_thread(
                                 trainer.run,
-                                trajectories=_iter_teachable_train(traj_collector.iter_trajectories()),
+                                trajectories=_iter_teachable_train(traj_collector.iter_trajectories(include_archive=True), consumer="prm"),
                                 save_path=save_path,
                                 bench_trajectories=iter_bench_trajectories(
                                     "prm", getattr(ctx, "args", None)),
@@ -12097,7 +12262,7 @@ class GhostAgent:
                             trainer = RouterTrainer(confidence_threshold=_thr)
                             report = await asyncio.to_thread(
                                 trainer.run,
-                                trajectories=_iter_teachable_train(traj_collector.iter_trajectories()),
+                                trajectories=_iter_teachable_train(traj_collector.iter_trajectories(include_archive=True), consumer="router"),
                                 save_path=save_path,
                                 bench_trajectories=iter_bench_trajectories(
                                     "router", getattr(ctx, "args", None)),
@@ -12633,13 +12798,15 @@ class GhostAgent:
             since_last_aa = (datetime.datetime.now() - self._last_autoadvance_at).total_seconds()
             store = getattr(ctx, 'project_store', None)
             if since_last_aa >= self._bio_cooldown(self._AUTOADVANCE_COOLDOWN) and store is not None:
-                _idle_ran.append("autoadvance")
                 self._last_autoadvance_at = datetime.datetime.now()
                 try:
                     # §4LP: only projects the owner put on autopilot
                     from .project_advancer import idle_candidates
                     actives = await asyncio.to_thread(idle_candidates, store)
                     if actives:
+                        # §4MI: "ran autoadvance" was logged 129 times in 3 d
+                        # with no autopilot project — reported only when it works
+                        _idle_ran.append("autoadvance")
                         # Round-robin fairness: pick the project advanced
                         # LEAST recently (never-advanced projects, ts=0, go
                         # first). `list_projects` orders by `updated_at DESC`,
@@ -12800,7 +12967,6 @@ class GhostAgent:
                 self_model = getattr(ctx, 'self_model', None)
                 if self_model is not None and getattr(self_model, 'enabled', False):
                     self._last_narrative_at = datetime.datetime.now()
-                    _idle_ran.append("selfhood-narrative")   # §4CB R1 A-F4
                     # Meta-cognitive narrative (proposal item #4): fold the
                     # learning phases' output into the diary. Recent
                     # mistakes from SkillMemory are the convergence point —
@@ -12823,6 +12989,7 @@ class GhostAgent:
                             meta_insights=meta_insights,
                         )
                         if text:
+                            _idle_ran.append("selfhood-narrative")   # §4CB R1 A-F4; §4MI: not on the unchanged-key skip
                             preview = text.replace("\n", " ")[:120]
                             pretty_log(
                                 "Selfhood",
@@ -12844,10 +13011,10 @@ class GhostAgent:
                 _sm = getattr(ctx, 'self_model', None)
                 if _sm is not None and getattr(_sm, 'enabled', False):
                     self._last_stale_questions_at = datetime.datetime.now()
-                    _idle_ran.append("stale-questions")   # §4CB R1 A-F4
                     try:
                         stale = _sm.stale_open_questions(max_age_days=3.0)
                         if stale:
+                            _idle_ran.append("stale-questions")   # §4CB R1 A-F4; §4MI: only when any
                             preview = "; ".join(getattr(q, "text", str(q))[:60] for q in stale[:3])
                             pretty_log(
                                 "Selfhood",
@@ -12961,9 +13128,9 @@ class GhostAgent:
                     ws = getattr(ctx, 'workspace_model', None)
                     if isinstance(ws, _WorkspaceModel) and getattr(ws, 'enabled', False):
                         self._last_workspace_narrative_at = datetime.datetime.now()
-                        _idle_ran.append("workspace-narrative")   # §4CB R1 A-F4
                         text = await ws.consolidate_narrative()
                         if text:
+                            _idle_ran.append("workspace-narrative")   # §4CB R1 A-F4; §4MI: not on the unchanged-key skip
                             preview = text.replace("\n", " ")[:120]
                             pretty_log(
                                 "Workspace",
@@ -13008,7 +13175,7 @@ class GhostAgent:
             elif not self._bio_roll(0.2):
                 # Eligible (idle >60m, cooldown elapsed) but lost the 20% roll.
                 logger.info(
-                    "idle self-play: eligible, skipped this tick (20%% dice miss)")
+                    "idle self-play: eligible, skipped this tick (%s dice miss)", "20%")
             else:
                 _idle_ran.append("self-play")
                 # C3: anchor `_last_selfplay_at` in a try/finally so a
@@ -13076,12 +13243,19 @@ class GhostAgent:
                         # Dreamer before each replay, and "" walked through
                         # the identity gate (synthetic_self_play now also
                         # pre-clears to None; this is the consumer-side belt).
-                        if getattr(dreamer, "last_self_play_status", None):
+                        _sp_status = getattr(dreamer, "last_self_play_status", None)
+                        if _sp_status:
+                            # §4MI: the row carries the session's OWN outcome
+                            # (it was one constant string for every run)
                             self._record_autonomous_activity(
                                 "self_play",
-                                "synthetic self-play session ran (new lessons land "
-                                "in the skills playbook)")
+                                "synthetic self-play session ran — "
+                                + " ".join(str(_sp_status).split())[:160])
                         else:
+                            # r2 review: a run that never concludes is the
+                            # broken generation/setup the DEAD alarm exists
+                            # for — "failed" keeps the alarm armed
+                            self._record_idle_attempt("self_play", SELF_PLAY_UNCONCLUDED_ATTEMPT)
                             logger.info(
                                 "self-play session did not conclude — "
                                 "no ledger row minted")
@@ -13422,14 +13596,6 @@ class GhostAgent:
                             ),
                             timeout=self._BENCH_ITEM_TIMEOUT,
                         )
-                        _bres = getattr(dreamer, "last_bench_result",
-                                        None) or {}
-                        self._record_autonomous_activity(
-                            "bench",
-                            f"bench {_safe_iid} → "
-                            f"{'PASS' if _bres.get('passed') else 'FAIL'}"
-                            f" ({_bres.get('status') or 'no result'})",
-                        )
                     except asyncio.TimeoutError:
                         # Distinguishable in the ledger from every other
                         # failure: a wedge is an INFRA fact about the box,
@@ -13481,6 +13647,17 @@ class GhostAgent:
                                            "conclude)")),
                                 attempts=int(_bres.get("attempts") or 0),
                                 source=_bench_source,
+                            )
+                            # §4MI: the activity row rides the finally too —
+                            # it lived in the try, so an INFRA_ABORT / timeout
+                            # reached the results ledger (671 rows) but never
+                            # the "while you were away" digest (662)
+                            self._record_autonomous_activity(
+                                "bench",
+                                f"bench {_safe_iid} → "
+                                + ("INFRA_ABORT" if _bench_timed_out
+                                   else ('PASS' if _bres.get('passed') else 'FAIL'))
+                                + f" ({_bres.get('status') or 'no result'})",
                             )
                         except Exception:  # noqa: BLE001
                             pass
@@ -16375,8 +16552,8 @@ class GhostAgent:
                 with verify_purpose("turn gate"):
                     v_result = await verifier.verify_claim(
                         claim=_claim_src,
-                        evidence=claim_evidence,
-                        context=request_view[:1000],
+                        evidence=_with_earlier_turn_evidence(claim_evidence, messages, tools_run_this_turn, last_user_content),
+                        context=request_view[:JUDGE_REQUEST_CHARS],
                         high_stakes=_high_stakes,
                         deep=_deep,
                         trace=_trace,
@@ -16388,8 +16565,8 @@ class GhostAgent:
             with verify_purpose("turn gate"):
                 v_result = await verifier.verify_claim(
                     claim=_claim_src,
-                    evidence=claim_evidence,
-                    context=request_view[:1000],
+                    evidence=_with_earlier_turn_evidence(claim_evidence, messages, tools_run_this_turn, last_user_content),
+                    context=request_view[:JUDGE_REQUEST_CHARS],
                     high_stakes=_high_stakes,
                     deep=_deep,
                     trace=_trace,
@@ -17580,8 +17757,11 @@ class GhostAgent:
 
         Only meaningful in async-critic mode, where the verdict runs on the
         OFF-HOST second model — so this wait costs the MAIN inference slot
-        nothing. Default 25s; ``GHOST_CRITIC_REPAIR_BUDGET`` overrides, 0
-        disables (pure defer, the pre-2026-07-07 async behaviour).
+        nothing. Code default 65s (below); ``GHOST_CRITIC_REPAIR_BUDGET``
+        overrides, 0 disables (pure defer, the pre-2026-07-07 async
+        behaviour). §4MK (2026-10-08): the production launcher sets 25 —
+        the operator's decision after 65s held 27/83 owner turns and caught
+        2 refutes, both false.
 
         ⚠ MEASURED AGAINST THE POPULATION IT EXISTS FOR (2026-08-22, 115
         verdicts over 16 days of live log). This window's whole purpose is to
@@ -18329,6 +18509,11 @@ class GhostAgent:
                         cached.failure_reason = ""   # incoherent otherwise
                     elif reason and not (cached.failure_reason or ""):
                         cached.failure_reason = reason
+                    # §4MI: the project's work_log follows the corpus too —
+                    # a late REFUTED on a project turn used to leave the
+                    # row that briefs the next resume saying "completed"
+                    if outcome == _Outcome.FAILED.value:
+                        _late_verdict_to_work_log(self.context, cached, reason)
                 # THE DIARY FOLLOWS THE CORPUS (queue #7, 2026-08-21).
                 # Until now the autobiographical log was verdict-backfilled
                 # ONLY from finalize's inline `verifier_backfill` leg — i.e.
@@ -21868,13 +22053,19 @@ class GhostAgent:
                 _foresight_preds = [None] * len(tool_tasks)
                 try:
                     from .foresight import predict_for_call as _fs_predict
+                    from ..utils.logging import request_kind as _fs_request_kind
                     _fs_simulation = getattr(
                         getattr(self.context, "skill_memory", None),
                         "is_read_only", False) is True
                     for _fs_i, (_fs_task, _fs_meta) in enumerate(
                             zip(tool_tasks, tool_call_metadata)):
-                        if requester_is_member():
-                            break      # the foresight ledger is the owner's precedent (R9)
+                        if requester_is_member() or _fs_request_kind() in ("probe", "member", "background", "test"):
+                            # the foresight ledger is the owner's precedent
+                            # (R9); §4MI: 86% of last week's rows were
+                            # probes, 38% of all time an untagged harness —
+                            # a probe, a test and a self-play turn teach the
+                            # transition index nothing about the owner
+                            break
                         if _fs_task is None:
                             continue   # batch-dedup placeholder — the
                                        # executed instance carries the grade
@@ -23428,6 +23619,16 @@ class GhostAgent:
 
                     # the same outcome the top of the iteration built —
                     # this was a seventh reading of the question
+                    elif _res_is_error and _designed_stop_result(_outcome):
+                        # §4MI: a DESIGNED stop — the tool told the agent to
+                        # ask the user (clarify first, a subject with no
+                        # photo, a preview awaiting confirmation). Not a
+                        # strike, not a turn failure: the strike made every
+                        # ask-the-user turn "structural failure" in the
+                        # corpus and debited its lessons.
+                        pretty_log("Designed Stop",
+                                   f"{fname} asked the user to decide (not a strike) -> "
+                                   f"{str_res[:100]}", icon=Icons.WARN, level="WARNING")
                     elif _res_is_error:
                         # UNRESOLVED is exempted at the other three readings
                         # (the verdict, the competence profile and the
@@ -28696,6 +28897,16 @@ class GhostAgent:
         from .autonomous_activity import is_internal_request
         if not is_internal_request(request_id_context.get()):
             self.context.last_activity_time = datetime.datetime.now()
+            # §4MI: the quiet-hours hold asks "was the OWNER here?" — the
+            # window clock above is also written by self-play's finally,
+            # so a 03:41 self-play run counted as the owner being present;
+            # a channel member's turn is not the owner either (fresh review)
+            try:
+                from ..utils.logging import request_kind as _rk
+                if _rk() == "owner":
+                    self.context.last_owner_activity_time = self.context.last_activity_time
+            except Exception:  # noqa: BLE001
+                pass
 
     async def handle_chat(self, body: Dict[str, Any], background_tasks, request_id: Optional[str] = None,
                           requester_role: str = ""):
@@ -29171,6 +29382,12 @@ class GhostAgent:
                         raise _SkipMemberCorrection()
                     _contradicts = await self._adjudicate_correction(
                         messages, last_user_content)
+                    if _contradicts is not None:
+                        # §4MI: the judge's verdict was never logged — its
+                        # yield (~0 promotions on the owner's real
+                        # push-backs) could not be measured
+                        logger.info("user-correction judge: contradicts=%s on %r",
+                                    _contradicts, str(last_user_content or "")[:80])
                     self._maybe_promote_prior_turn_via_user_correction(
                         messages, last_user_content,
                         contradicts=_contradicts,
@@ -32528,7 +32745,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # sample. The guard was therefore biased toward
                     # accepting the step, not merely weakened.
                     _tid = getattr(traj, "id", None)
-                    recent = [t for t in _iter_teachable_train(collector.iter_trajectories())
+                    recent = [t for t in _iter_teachable_train(collector.iter_trajectories(), consumer="prm_online_holdout")
                               if _tid is None or getattr(t, "id", None) != _tid
                               ][-50:]
                     holdout_X, holdout_y = samples_to_xy(recent)
@@ -34997,6 +35214,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             # the live flag here belongs to whichever
                             # request runs NOW, not this turn.
                             pressure_lockdown=pressure_lockdown,
+                            # §4MI: this turn's project, not the live one
+                            project_id=str(_drain_pid or ""),
                             # The request clock is closed by now (§4KS).
                             elapsed_s=time.monotonic() - _req_t0,
                             temperature=self._sampling_temperature(payload),
@@ -35511,12 +35730,19 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         if not turn_may_teach(self.context):     # probe, member, internal (§4KW second review)
             return
         bus = getattr(self.context, "memory_bus", None)
-        stash = getattr(bus, "last_hydration", None) if bus is not None else None
-        if not stash:
-            return
-        if (turn_id and stash.get("turn_id")
-                and stash["turn_id"] != str(turn_id)):
-            return  # another turn's stash — its own judge will consume it
+        # §4MJ (r2): THIS turn's own stash first — the bus keeps one per turn,
+        # and checking only the single slot returned here whenever an
+        # overlapping turn had hydrated since, so the per-turn stash was
+        # never read on the production path
+        _by_turn = getattr(bus, "_hydration_by_turn", None) if bus is not None else None
+        stash = (_by_turn.get(str(turn_id)) if (turn_id and isinstance(_by_turn, dict)) else None)
+        if stash is None:
+            stash = getattr(bus, "last_hydration", None) if bus is not None else None
+            if not stash:
+                return
+            if (turn_id and stash.get("turn_id")
+                    and stash["turn_id"] != str(turn_id)):
+                return  # another turn's stash — its own judge will consume it
         judge = getattr(bus, "judge_hydration_usefulness", None)
         if not callable(judge):
             return
@@ -35975,6 +36201,18 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         # SUCCESS, and the sniffer cannot tell that quote from
                         # a crash of its own.
                         _decl = bool(getattr(_raw, "declared", False))
+                        # §4MI: a DESIGNED stop (clarify first, a subject
+                        # with no photo, a preview awaiting confirmation) is
+                        # the tool asking the USER — not a failed call. The
+                        # row carries a mark so the corpus readers (which
+                        # see only the string) skip it like an unresolved
+                        # call; it draws no `error` flag.
+                        from ..distill.outcome_heuristics import is_designed_stop as _ids
+                        if _ids(_raw):
+                            obj.error = ""
+                            obj.result = (str(obj.result or "").rstrip()
+                                          + f"\n[designed stop: {getattr(_raw, 'reason_code', '')}]")
+                            continue
                         # OR, never override. The recorded status ADDS the
                         # refusals the sniffer cannot see (it has no rule for
                         # "SYSTEM INSTRUCTION"); the sniffer owns the
@@ -36241,6 +36479,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         verifier_reason: str = "",
         execution_failed: bool = False,
         pressure_lockdown: Optional[bool] = None,
+        project_id: Optional[str] = None,
         elapsed_s: Optional[float] = None,
         temperature: Optional[float] = None,
     ) -> Optional["Trajectory"]:
@@ -36395,6 +36634,20 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         # found a live trajectory with req_id nowhere in extra.
         if req_id:
             _extra["req_id"] = str(req_id)
+        # §4MI: the bound project (a hex id), so a LATE verdict can reach the
+        # project's work_log — the streamed path passes verifier_backfill=None,
+        # so every streamed turn's row said "completed" whatever the verifier
+        # concluded 30 s later, and the resume briefing read it back.
+        # Fresh review M-1: the STREAMED drain records after the semaphore
+        # is released, when `current_project_id` belongs to whichever
+        # request runs now — it passes its own drain-time pid (§4DG);
+        # the inline sites read the live one, which is theirs.
+        try:
+            _pid = project_id if project_id is not None else getattr(self.context, "current_project_id", None)
+            if isinstance(_pid, str) and _pid:
+                _extra["project_id"] = _pid
+        except Exception:  # noqa: BLE001
+            pass
         # Static per-context extras (§4BF: bench bank/item identifiers).
         try:
             _static = getattr(self.context, "trajectory_extra_static", None)
@@ -36778,7 +37031,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             if (isinstance(self_model, _SelfModel)
                     and getattr(self_model, 'enabled', False)
                     and turn_origin(self.context) == "user"
-                    and not requester_is_member()):     # a member's turn is not the owner's autobiography (R6)
+                    and not requester_is_member()       # a member's turn is not the owner's autobiography (R6)
+                    and not reply_is_public()):         # §4MJ: nor is a public-channel turn (episodes refuse it too, §4LA)
                 # Best-effort user handle: pull "root.name" from the
                 # profile memory. Anonymous installations or missing
                 # profile-memory leave it blank; the autobio writer

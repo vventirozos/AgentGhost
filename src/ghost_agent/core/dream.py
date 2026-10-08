@@ -1046,9 +1046,9 @@ def trajectory_dream_fragments(context, limit: int = 40):
         from ..memory.skills import iter_teachable
         # the newest `limit` are kept — read only recent days (§4MC MAJOR 2)
         try:
-            trajs = list(iter_teachable(collector.iter_trajectories(since_days=30.0)))
+            trajs = list(iter_teachable(collector.iter_trajectories(since_days=30.0), consumer="rem_fragments"))
         except TypeError:                     # a collector without the bound
-            trajs = list(iter_teachable(collector.iter_trajectories()))
+            trajs = list(iter_teachable(collector.iter_trajectories(), consumer="rem_fragments"))
     except Exception:
         return [], []
     ids, docs = [], []
@@ -1196,7 +1196,9 @@ def _load_dream_cache(context) -> dict:
     try:
         raw = _json.loads(path.read_text(encoding="utf-8")) if path is not None and path.exists() else {}
         return {str(k): frozenset(map(str, v)) for k, v in raw.items() if isinstance(v, list)}
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        logger.warning("dream fragment cache unreadable (%s: %s) — the last window will be re-dreamed",
+                       type(e).__name__, e)
         return {}
 
 
@@ -1209,8 +1211,9 @@ def _save_dream_cache(context, cache: dict) -> None:
         tmp = path.with_suffix(".tmp")
         tmp.write_text(_json.dumps({k: sorted(map(str, v)) for k, v in cache.items()}), encoding="utf-8")
         tmp.replace(path)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        logger.warning("dream fragment cache not persisted (%s: %s) — the window re-dreams after a restart",
+                       type(e).__name__, e)
 
 
 def _stamp_dream_cache(context, namespace: str, fragment_key) -> dict:
@@ -1967,7 +1970,33 @@ def _patch_with_fallback(
 #: (2026-08-22) so `core/isolation.REPLAY_FORBIDDEN_TOOLS` can be TESTED
 #: as a superset of it — while it was a literal, the superset claim in
 #: that module's docstring was false and unfalsifiable at the same time.
+#: §4MJ: the first usefulness-ledger row written after BOTH population gates
+RRF_OBSERVATIONS_CLEAN_SINCE = "2026-09-24T18:31"
+
+
+def _contain_self_play_agent(temp_agent) -> frozenset:
+    """§4MI: the three gates a restriction needs (the replay recipe), applied
+    to the self-play solver. Popping names from the dispatch dict alone left
+    the solver one dispatch MISS away from the full registry —
+    `_rebuild_available_tools` re-registers every ACTIVE macro with a runner
+    that captured the UNFILTERED dict, so `auto_web_search_browser_navigate`
+    could run `web_search` and `postgres_admin` from the host process. Macros
+    are dropped as a class and `context._subagent_allowed_tools` re-applies
+    the set on every rebuild. Fails closed (raises)."""
+    for t in list(getattr(temp_agent, "disabled_tools", None) or ()):
+        try:
+            temp_agent.available_tools.pop(t, None)
+        except Exception:  # noqa: BLE001
+            pass
+    from .isolation import restrict_tool_surface as _restrict
+    return _restrict(temp_agent, SELF_PLAY_FORBIDDEN_TOOLS)
+
+
 SELF_PLAY_FORBIDDEN_TOOLS = frozenset({
+    # §4MI: `browser` is HOST-PROCESS egress (a Playwright runner on the
+    # host carrying context.tor_proxy) — the container is network=none,
+    # the host tool was the way round it. Replay denies it already.
+    "browser",
     "self_play", "manage_tasks", "postgres_admin", "update_profile",
     "learn_skill", "delegate_to_swarm", "system_utility", "create_skill",
     "manage_skills", "self_state", "manage_projects", "manage_services",
@@ -1975,8 +2004,8 @@ SELF_PLAY_FORBIDDEN_TOOLS = frozenset({
     "dream_mode", "web_search", "deep_research",
     # §4LZ A-F1: production state and outward actions the replay list
     # already denied — a self-play turn deleted a REAL macro and could
-    # notify the owner. (browser / vision stay: challenges render local
-    # files.)
+    # notify the owner. (vision stays: challenges render local files; browser is denied
+    # since §4MI — host-process egress.)
     "manage_composed_skills", "notify_operator", "jobs", "rotate_secrets",
     "fact_check", "darkweb_search", "darkweb_research", "news_headlines",
     "youtube_transcribe", "knowledge_base", "deploy",
@@ -2555,6 +2584,22 @@ class Dreamer:
         seeded_from_trajectories = False
         _pool_thin_note = None
 
+        # Trajectory retention (§4MF): day partitions older than 90 days
+        # are archived to trajectories/archive/<day>.tar.gz — kept, not
+        # deleted — so readers stop walking the whole corpus forever.
+        # §4MI: runs on EVERY cycle that reaches this point, not only after
+        # a completed REM call (a worker outage used to stop retention).
+        try:
+            _tc = getattr(self.context, "trajectory_collector", None)
+            _troot = getattr(_tc, "root", None)
+            if _troot is not None:
+                from ..distill.collector import archive_old_partitions
+                _arch = await asyncio.to_thread(archive_old_partitions, _troot)
+                if _arch:
+                    pretty_log("Dream Mode", f"{len(_arch)} old trajectory day(s) archived", icon=Icons.OK)
+        except Exception as _tax:  # noqa: BLE001
+            logger.debug("trajectory archive skipped: %s", _tax)
+
         if len(documents) < 3:
             # Trajectory fallback (2026-07-09): the auto-memory pool is
             # organically unsatisfiable — see trajectory_dream_fragments.
@@ -2678,15 +2723,24 @@ class Dreamer:
         mem_block = "\n".join(mem_list[:150])
         pretty_log("Dream Mode", f"Analyzing {len(ids)} fragments for meta-patterns...", icon=Icons.BRAIN_SUM)
         
+        # §4MI: on the TRAJECTORY seed path the consolidations are discarded
+        # unread (nothing to merge, the ids never reach the store), yet the
+        # prompt asked for them FIRST — the reply's budget went on what was
+        # thrown away and the heuristics were what got cut (4,520-char
+        # replies, 2 unclosed braces, 0 heuristics, three cycles running).
+        _task_lines = (
+            "Your job is ONE thing:\n"
+            "EXTRACT HEURISTICS: Identify repeating mistakes-then-fixes or stable operational rules and phrase each as ONE imperative behavioral rule the agent can apply next time (e.g., \"Always use absolute paths in Docker\"). Return \"consolidations\": [] — do not merge anything on this pass.\n"
+            if seeded_from_trajectories else
+            "Your job is twofold:\n"
+            "1. MERGE overlapping facts into single, high-density facts.\n"
+            "2. EXTRACT HEURISTICS: Identify repeating mistakes-then-fixes or stable operational rules and phrase each as ONE imperative behavioral rule the agent can apply next time (e.g., \"Always use absolute paths in Docker\").\n")
         prompt = f"""### IDENTITY
 You are the Active Memory Consolidation (Dream) Subsystem.
 
 ### TASK
 Below is a list of raw, fragmented memories from the Ghost Agent's recent tasks.
-Your job is twofold:
-1. MERGE overlapping facts into single, high-density facts.
-2. EXTRACT HEURISTICS: Identify repeating mistakes-then-fixes or stable operational rules and phrase each as ONE imperative behavioral rule the agent can apply next time (e.g., "Always use absolute paths in Docker").
-
+{_task_lines}
 HEURISTIC RULES (strict):
 - Imperative voice only: start with a verb ("Always…", "Use…", "Verify…") or a condition followed by a verb ("When X, always Y").
 - NO observations, summaries, or profiles. Sentences shaped like "The agent…", "The user…", "The system…" are NOT heuristics — if it does not tell the agent to DO something differently, omit it.
@@ -3053,19 +3107,9 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             if project_digests:
                 metrics_note += f" ({project_digests} project digests written)"
 
-            # Trajectory retention (§4MF): day partitions older than 90 days
-            # are archived to trajectories/archive/<day>.tar.gz — kept, not
-            # deleted — so readers stop walking the whole corpus forever.
-            try:
-                _tc = getattr(self.context, "trajectory_collector", None)
-                _troot = getattr(_tc, "root", None)
-                if _troot is not None:
-                    from ..distill.collector import archive_old_partitions
-                    _arch = await asyncio.to_thread(archive_old_partitions, _troot)
-                    if _arch:
-                        metrics_note += f" ({len(_arch)} old trajectory day(s) archived)"
-            except Exception as _tax:  # noqa: BLE001
-                logger.debug("trajectory archive skipped: %s", _tax)
+            # (§4MI: the §4MF trajectory archive moved BEFORE the REM call —
+            # it ran only on a completed cycle, so a worker outage or the
+            # min-new gate silently stopped the 90-day retention.)
 
             # Graph forgetting: drop weight-1 stale edges so the only uncapped
             # memory tier gets a decay story (IMPROVEMENTS.md #27c). Reinforced
@@ -3126,13 +3170,42 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             # guard above).
             if parsed_ok:
                 _stamp_dream_cache(self.context, seed_namespace, current_fragment_key)
+                try:
+                    getattr(self.context, "_dream_unparseable", {}).pop(current_fragment_key, None)
+                except Exception:  # noqa: BLE001
+                    pass
             else:
-                pretty_log(
-                    "Dream Mode",
-                    "REM reply unparseable — fragment window left unstamped "
-                    "so the next cycle retries it.",
-                    level="WARNING", icon=Icons.WARN,
-                )
+                # §4MI: the retry re-sends the IDENTICAL input at T=0 — it
+                # produced the same cut reply three cycles running. Two
+                # failures on one window and the window is stamped (the
+                # next cycle needs new fragments), so the worker time is
+                # not spent a third time on a reply that cannot change.
+                _unp = getattr(self.context, "_dream_unparseable", None)
+                if not isinstance(_unp, dict):
+                    _unp = {}
+                    try:
+                        self.context._dream_unparseable = _unp
+                    except Exception:  # noqa: BLE001
+                        pass
+                for _k in [k for k in _unp if k != current_fragment_key]:
+                    _unp.pop(_k, None)            # r2: only the current window is tracked
+                _unp[current_fragment_key] = int(_unp.get(current_fragment_key, 0)) + 1
+                if _unp[current_fragment_key] >= 2:
+                    _stamp_dream_cache(self.context, seed_namespace, current_fragment_key)
+                    _unp.pop(current_fragment_key, None)
+                    pretty_log(
+                        "Dream Mode",
+                        "REM reply unparseable twice on the same fragment window — "
+                        "window stamped; the next cycle waits for new fragments.",
+                        level="WARNING", icon=Icons.WARN,
+                    )
+                else:
+                    pretty_log(
+                        "Dream Mode",
+                        "REM reply unparseable — fragment window left unstamped "
+                        "so the next cycle retries it (once).",
+                        level="WARNING", icon=Icons.WARN,
+                    )
 
             # Report what THIS PATH can actually produce (2026-08-09).
             #
@@ -3175,8 +3248,16 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                 msg = ("Dream Complete — produced nothing this cycle: no "
                        "consolidation met the compression bar and extracted "
                        f"{h_count} heuristics.{metrics_note}")
-            self.last_dream_outcome = {"phase": "ran", "side_output": True}
-            pretty_log("Dream Mode", msg, icon=Icons.OK)
+            # §4MI: an unparseable reply (a worker-side cut mid-JSON, three
+            # cycles in a row on 10-01) is not a cycle that ran — the ledger
+            # said "REM cycle ran … extracted 0 heuristics" three times
+            self.last_dream_outcome = {"phase": "ran" if parsed_ok else "error",
+                                       # r2 review: an unparseable reply wrote
+                                       # nothing; only the side passes count
+                                       "side_output": True if parsed_ok else bool(
+                                           episode_lessons or distilled_lessons or project_digests)}
+            pretty_log("Dream Mode", msg, icon=(Icons.OK if parsed_ok else Icons.WARN),
+                       level=("INFO" if parsed_ok else "WARNING"))
             return msg
 
         except Exception as e:
@@ -3278,6 +3359,12 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             for line in lines[-max_ledger_lines:]:
                 try:
                     d = json.loads(line)
+                    # §4MJ: rows written before the judge's population gates
+                    # (probe 2026-09-23, member 2026-09-24 18:31) carry no
+                    # origin and are 17% probe/member — the fit reads only
+                    # the gated era
+                    if str(d.get("ts") or "") < RRF_OBSERVATIONS_CLEAN_SINCE:
+                        continue
                     # Forward the `turn` id (2026-07-22) so fit_intent_weights
                     # can use the TURN-NORMALISED estimator — crediting each
                     # tier's share of a turn's judged-used set rather than a raw
@@ -3756,7 +3843,7 @@ Return ONLY valid JSON:
 
             # Bound the walk so a huge log can't dominate the REM cycle.
             from ..memory.skills import iter_teachable
-            trajs = list(deque(iter_teachable(collector.iter_trajectories()), maxlen=max_trajectories))
+            trajs = list(deque(iter_teachable(collector.iter_trajectories(), consumer="macro_mining"), maxlen=max_trajectories))
             if len(trajs) < 3:
                 return result
 
@@ -4057,6 +4144,12 @@ Return ONLY a JSON object with:
             logger.debug(f"Journal challenge mining failed: {e}")
             return None
         if mined is None:
+            # §4MI: this branch returned None on every path for 65 days
+            # (0 "Self-Play Journal" lines; the stash's 20 records all
+            # replayed, 0 synthesizable) with nothing logged — a dead
+            # source that the saturated-frontier branch leaned on at 75%
+            logger.info("self-play journal mining: nothing admissible this tick "
+                        "(live journal drained; stash records all replayed or non-transferable)")
             return None
         return (
             mined.challenge,
@@ -5751,6 +5844,14 @@ Return ONLY a JSON object with:
             isolated_context.args = copy.copy(self.context.args)
             isolated_context.args.perfect_it = False
             isolated_context.args.smart_memory = 0.0
+            # §4MI: the live Postgres URI and the push targets are inert in
+            # a self-play run only while the denylist holds (the replay
+            # recipe clears them; self-play kept them)
+            for _cap in ("default_db", "notify_webhook", "notify_ntfy"):
+                try:
+                    setattr(isolated_context.args, _cap, None)
+                except Exception:  # noqa: BLE001
+                    pass
             # Opt the self-play worker into native tool-calling. The agent
             # path at `agent.py:~2093` attaches the OpenAI-format tools
             # schema to the payload when `args.native_tools` is truthy,
@@ -5914,7 +6015,18 @@ Return ONLY a JSON object with:
             isolated_context.scratchpad = Scratchpad()
 
             try:
-                isolated_context.sandbox_manager = DockerSandbox(isolated_context.sandbox_dir, isolated_context.tor_proxy)
+                # §4MI: "a synthetic training run must never leak traffic to
+                # external services" — the container had Tor egress (4 pip
+                # installs in 65 days) and job promotion into the operator's
+                # queue. `GHOST_SELFPLAY_NETWORK=bridge` restores egress.
+                _sp_net = (os.environ.get("GHOST_SELFPLAY_NETWORK", "none").strip().lower() or "none")
+                # r2 review: with no network a Tor daemon can never bootstrap
+                # (75 s per run) — the replay recipe passes no proxy either
+                isolated_context.sandbox_manager = DockerSandbox(
+                    isolated_context.sandbox_dir,
+                    (None if _sp_net == "none" else isolated_context.tor_proxy),
+                    network=_sp_net)
+                isolated_context.sandbox_manager.supports_job_promotion = False
             except Exception as _sb_ctor_exc:  # noqa: BLE001
                 # §4BO: a failed constructor carries its half-built client
                 # (~11 unix sockets); self-play retries nightly, so an
@@ -6386,6 +6498,7 @@ Return ONLY a JSON object with:
                 # nodes).
                 temp_agent.disabled_tools.update(SELF_PLAY_FORBIDDEN_TOOLS)
                 _SELF_PLAY_DENYLIST_RATIONALE = ([
+                    "browser",            # §4MI: host-process egress
                     "self_play", "manage_tasks", "postgres_admin",
                     "update_profile", "learn_skill", "delegate_to_swarm",
                     "system_utility", "create_skill", "manage_skills",
@@ -6455,8 +6568,7 @@ Return ONLY a JSON object with:
                 assert set(_SELF_PLAY_DENYLIST_RATIONALE) == \
                     set(SELF_PLAY_FORBIDDEN_TOOLS), \
                     "the self-play denylist and its rationale have drifted"
-                for t in temp_agent.disabled_tools:
-                    temp_agent.available_tools.pop(t, None)
+                _contain_self_play_agent(temp_agent)
 
                 # Self-play budget caps — prevent a single attempt from
                 # burning 18+ minutes of wall-clock when the agent falls

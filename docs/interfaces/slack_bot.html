@@ -180,12 +180,13 @@
   <strong>a DM to the owner</strong> — push works out of the box on an
   owner-locked bot.</p>
 
-  <h2>Slash command router</h2>
+  <h2>Slash command router — NOT wired</h2>
+  <div class="note warn"><strong>Nothing imports this module</strong> (its only importer is <code>tests/test_slack_project_commands.py</code>, checked §4ML 2026-10-08). The bot has no <code>/project</code> command; the list below describes the router's code, not anything you can type in Slack. Wiring it needs an agent-API-backed store context.</div>
   <p><code>interface/slack_project_commands.py</code> is a stateless <code>shlex</code>-based router for <code>/project ...</code> commands:</p>
   <ul>
     <li><code>list [status]</code> · <code>new &lt;title&gt;</code> · <code>resume &lt;pid&gt;</code> · <code>switch &lt;pid&gt;</code> · <code>exit</code> · <code>status</code></li>
     <li><code>task add &lt;desc&gt;</code> · <code>task done &lt;tid&gt; [summary]</code> · <code>events [limit]</code></li>
-    <li><code>advance</code> — async-only; the placeholder response triggers <code>advance_async()</code> in the bot handler, which calls <code>core.project_advancer.advance_once()</code>.</li>
+    <li><code>advance</code> — async-only: the router returns a placeholder response, and a bot handler would have to call <code>advance_async()</code> → <code>core.project_advancer.advance_once()</code>. No bot handler does.</li>
   </ul>
 
   <h2>Launcher (<code>run.sh</code>, fixed 2026-07-11)</h2>
@@ -351,5 +352,12 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/com.local.ghost-slackbot.
   <a href="../memory/skills.html#4kd-slack">Slack never teaches</a>. Feedback reactions keep correlating on the same id,
   which is why the prefix is minted here rather than rewritten by the server. Deploy: <code>sudo launchctl kickstart -k
   system/com.local.ghost-slackbot</code>.</p>
+
+  <h2 id="4ml">§4ML (2026-10-08)</h2>
+  <ul>
+    <li><strong>Image posts take ratings.</strong> A 👍/👎 on the message an uploaded image was posted as is attributed like one on the text reply. <code>_register_uploaded_files</code> reads each file's <code>shares</code> back (Slack fills it a moment after the upload) and indexes that message's ts. Before this, the owner's rating on an image post was dropped (3 times).</li>
+    <li><strong>A restart is never silent.</strong> On SIGTERM (<code>launchctl kickstart -k</code>, a reboot) the bot posts "the Slack bot was restarted while this request was running … please send it again" in every in-flight request's thread before it stops (<code>notify_inflight_interrupted</code>). The notices are sent all at once, so slow posts still finish inside launchd's 20 s SIGTERM→SIGKILL window. A request leaves the in-flight list as soon as its text reply is posted, so a restart during an image upload does not claim the reply was lost. Tested on the real <code>main()</code> under SIGTERM: <code>tests/fixtures/slack_sigterm_sim.py</code>. Before this, a restart mid-request lost a 2,345-character answer with no word to the asker.</li>
+    <li>Every warning names the exception type (49 poller warnings had been blank).</li>
+  </ul>
 </body>
 </html>

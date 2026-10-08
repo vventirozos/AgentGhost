@@ -45,6 +45,17 @@ _GAP_RE = re.compile(r"\s{2,}")
 # Header:  ┌─ 99 9961f364  request started  15:16:26 ────────────
 # The SHORT id (`99`) is what body lines carry, so that is what is captured.
 _HEADER_ID_RE = re.compile(r"^\S+\s+(\S+)\s")
+# §4ML: the header's third field is the request id's first 8 characters
+# (`┌─ <tag> <req_id[:8]>  request started …`, utils/logging.py)
+_HEADER_RID_RE = re.compile(r"^\S+\s+(\S+)\s+(\S+)\s")
+
+
+def header_matches(header_rid8: str, own_rid: str) -> bool:
+    """Is a corridor header (its id's first 8 chars) OUR turn? The agent may
+    prefix a probe turn's id (`probe-`) and suffixes a collision (`#n`), so
+    the head of our own id, or of its probe form, is the match."""
+    own = str(own_rid or "")
+    return bool(own) and header_rid8 in (own[:8], ("probe-" + own)[:8])
 _DELTA_RE = re.compile(r"^\+[\d.\s]*m?s$")
 
 # ── icon → priority class (port of app.js ICON_CLASS) ───────────────────────
@@ -304,6 +315,7 @@ class TurnTicker:
         self.active = False
         self.connected = False
         self.req_id = None
+        self.own_rid = None
         self.icon = ICON_STARTING
         self.desc = DESC_OFFLINE
         # Called with (title, icon, detail) for EVERY step line of the adopted
@@ -312,10 +324,14 @@ class TurnTicker:
         self.on_step = None
 
     # ── lifecycle ────────────────────────────────────────────────────────
-    def start(self) -> None:
-        """A turn just went out; reset and begin counting."""
+    def start(self, own_rid=None) -> None:
+        """A turn just went out; reset and begin counting. ``own_rid`` is the
+        request id this client minted — only the corridor that carries it is
+        adopted (§4ML: "the first corridor after send" adopted a member's,
+        a probe's or self-play's turn whenever ours queued behind it)."""
         self.active = True
         self.req_id = None
+        self.own_rid = own_rid
         self._t0 = self._clock()
         self.icon = ICON_STARTING
         self.desc = DESC_STARTING if self.connected else DESC_OFFLINE
@@ -347,13 +363,19 @@ class TurnTicker:
             return False
         clean = clean_log_line(raw)
 
-        # Corridor adoption: the first corridor that OPENS after our send. A
+        # Corridor adoption: the corridor that carries OUR request id. Without
+        # one (an old caller) the first corridor that opens after our send — a
         # corridor already open when we sent can never be adopted.
         if self.req_id is None:
             if "request started" in clean:
-                m = _HEADER_ID_RE.match(clean)
-                if m:
-                    self.req_id = m.group(1)
+                if self.own_rid:
+                    m = _HEADER_RID_RE.match(clean)
+                    if m and header_matches(m.group(2), self.own_rid):
+                        self.req_id = m.group(1)
+                else:
+                    m = _HEADER_ID_RE.match(clean)
+                    if m:
+                        self.req_id = m.group(1)
             return False
 
         # Body lines: │  <id>  <icon>  <+delta>  <title>  <content…>
@@ -450,7 +472,7 @@ def log_ws_url(host: str, key: str, port: int = 8080, scheme: str = "wss") -> st
     return f"{scheme}://{host}:{port}/ws?key={quote(key, safe='')}"
 
 
-async def stream_log_lines(url, on_line, on_state=None, verify_tls=False,
+async def stream_log_lines(url, on_line, on_state=None, verify_tls=True,
                            backoff_max=30.0, connect_kwargs=None):
     """Forever-loop: read the interface's log broadcast, call ``on_line(text)``.
 

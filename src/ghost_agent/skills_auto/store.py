@@ -62,7 +62,7 @@ def minable_requests(trajectories):
     reflection and bench turns were mined, and their verbatim text
     ("DISPATCH-OK-77") rode owner prompts as examples."""
     from ..core.admissibility import admitted_task_kinds
-    kinds = set(admitted_task_kinds("auto_skill_extraction"))
+    kinds = set(admitted_task_kinds("skills_auto"))    # §4MI: the matrix's row (the old key was unregistered)
     for t in trajectories or []:
         if str(getattr(t, "task_kind", "") or "user_request") in kinds:
             yield t
@@ -130,6 +130,14 @@ class GraduatedSkillStore:
         Idempotent on ``signature_hash`` — re-graduating an existing
         skill bumps its support / confidence / verification count rather
         than duplicating it. Returns the stored entry."""
+        return self.graduate_changed(candidate, confidence=confidence)[0]
+
+    def graduate_changed(self, candidate, *, confidence: Optional[float] = None):
+        """§4MI: ``(entry, changed)`` — the idle phase counted every
+        unchanged re-graduation (the §4LF no-new-evidence return) as a
+        graduation and ledgered "graduated 17 proven skill(s)" 39 times
+        after the last real change. Only a NEW entry or new evidence is
+        ``changed``."""
         sig = getattr(candidate, "signature_hash", "") or getattr(candidate, "name", "")
         now = datetime.utcnow().isoformat() + "Z"
         conf = float(confidence if confidence is not None
@@ -137,6 +145,7 @@ class GraduatedSkillStore:
         with self._lock:
             data = self._load()
             existing = data.get(sig)
+            _sa_grew = False
             if existing:
                 # §4LF: only NEW EVIDENCE is a verification. Every idle run
                 # re-graduated every skill on the unchanged corpus (950
@@ -145,7 +154,8 @@ class GraduatedSkillStore:
                 _new_support = int(getattr(candidate, "support", 0)) > int(existing.get("support", 0))
                 _new_conf = round(conf, 4) != round(float(existing.get("confidence", 0.0) or 0.0), 4)
                 if not (_new_support or _new_conf):
-                    return existing
+                    return existing, False
+                _sa_grew = bool(_new_support)        # r2: a confidence-only change is a re-check, not a graduation
                 existing["support"] = max(
                     int(existing.get("support", 0)),
                     int(getattr(candidate, "support", 0)),
@@ -197,7 +207,9 @@ class GraduatedSkillStore:
             # and got evicted by the overflow trim, it was NOT persisted —
             # return None so the caller doesn't count/mint a macro for a skill
             # the store won't surface.
-            return entry if sig in data else None
+            if sig not in data:
+                return None, False
+            return entry, (True if not existing else _sa_grew)
 
     #: Turn keys whose bookings are already on disk. Bounded, and keyed on
     #: the TURN rather than kept in a single slot: the lesson system's

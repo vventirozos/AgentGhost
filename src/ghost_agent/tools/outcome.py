@@ -73,6 +73,12 @@ class OutcomeStatus(str, Enum):
     UNRESOLVED = "unresolved"
 
 
+#: §4MI: REJECTED outcomes that are a DESIGNED stop — the agent is told to
+#: ask the user and reply now. Not a failure of the call (see
+#: `distill.outcome_heuristics.is_designed_stop`, pinned equal to this).
+DESIGNED_STOP_REASONS = frozenset({"clarify_first", "subject_photo_missing", "confirm_dead_end"})
+
+
 #: Statuses that imply the call changed NOTHING unless it says otherwise.
 #:
 #: REJECTED never touched anything by definition. FAILED and UNRESOLVED

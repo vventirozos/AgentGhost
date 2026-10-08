@@ -62,7 +62,7 @@
     <li><strong>Idle phases</strong> — <code>GhostAgent._record_autonomous_activity</code>
     is called at each phase's completion point in <code>_biological_tick</code>:
     dream, reflection, post-mortem (when defects were queued), skills_auto
-    (when something graduated), PRM/router/calibration (on successful
+    (only when a skill is NEW or gained evidence — §4MI: an unchanged re-graduation is a heartbeat, not a row), PRM/router/calibration (on successful
     hot-swap), stale open questions, self-play.</li>
     <li><strong>Project advancer</strong> — <code>_record_needs_user_activity</code>
     pushes <code>severity=notify</code> records for

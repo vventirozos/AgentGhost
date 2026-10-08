@@ -262,7 +262,12 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
         missing = [(s, r) for s, r in zip(subj, results) if isinstance(r, BaseException)]
         if missing:
             found = [s for s, r in zip(subj, results) if not isinstance(r, BaseException)]
-            return ("ERROR: no usable photo found for "
+            # §4MI: a DESIGNED stop — the tool tells the agent to ask the
+            # user; the corpus must not book the turn as a structural
+            # failure (it did: "failed · tools: image_generation" on every
+            # ask-the-user turn, lifted for real users only by a late PASS)
+            from .outcome import ToolOutcome as _TO
+            return _TO.rejected("ERROR: no usable photo found for "
                     + "; ".join(f"{s} — {e if isinstance(e, LookupError) else e.__class__.__name__}"
                                 for s, e in missing)
                     + ". Nothing was rendered: without a photo the model would draw a stranger under "
@@ -274,7 +279,8 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
                       "If the name may be misspelled, you may retry once with the corrected spelling."
                     # machine-readable: the loop's missing-subject block reads THIS, not the prose
                     + "\n[subjects: " + json.dumps({"missing": [s for s, _ in missing], "found": found},
-                                                  ensure_ascii=False) + "]")
+                                                  ensure_ascii=False) + "]",
+                                world_changed=False, reason_code="subject_photo_missing")
         photos = [r[0] for r in results]
         # The node STRETCHES a reference to the render size (fit_reference
         # keeps no aspect) and, with no size, renders at the reference's

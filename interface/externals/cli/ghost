@@ -904,7 +904,7 @@ HELP = """[bold]conversation[/]
 [bold]agent[/]
   [you]/health[/]                runtime health of the agent
   [you]/turns[/]                 in-flight + queued turns
-  [you]/cancel[/] \\[hard]         cancel the running turn (hard = force-release)
+  [you]/cancel[/] \\[hard]         cancel the turn the agent is running — any client's (hard = force-release)
   [you]/notify[/]                show + ack pending autonomous-activity notifications
   [you]/memory fix[/] "old" "new"  correct one vector-memory fragment
   [you]/memory rm[/] "text"        delete one vector-memory fragment
@@ -1224,6 +1224,7 @@ class GhostCLI:
         waiting = True                 # spinner up, no token yet
         self._turn_interrupted = ""    # cleared per turn; set on every exit
                                        # branch that leaves the reply partial
+        self._turn_unlabelable = False  # §4ML: the agent said "no trajectory"
         printer = _StreamPrinter()
         held = None                    # §4KP: a list while the reply is held
         saw_done = False               # the stream's own terminal frame arrived
@@ -1286,6 +1287,8 @@ class GhostCLI:
                     # Control-char stripping lives in _StreamPrinter.feed —
                     # the single point where reply text becomes output and
                     # becomes self.text (→ history, → /save).
+                    if (obj.get("ghost") or {}).get("labelable") is False:
+                        self._turn_unlabelable = True
                     if (obj.get("ghost") or {}).get("reasoning_unparsed") is True and held is None:
                         held = []
                     chunk = ((obj.get("choices") or [{}])[0]
@@ -1357,13 +1360,15 @@ class GhostCLI:
             # trajectory's req_id, which /api/feedback resolves against).
             self.turns.append({"req_id": request_id, "prompt": line[:60],
                                "interrupted": self._turn_interrupted,
+                               "unlabelable": getattr(self, "_turn_unlabelable", False),
                                "label": None})
             del self.turns[:-RATE_HISTORY]
             try:
                 render_reply_images(self.api, reply)
             except KeyboardInterrupt:
                 self.notice("⛔ image rendering skipped", "mute")
-            if not self._rate_hinted and not self._turn_interrupted:
+            if (not self._rate_hinted and not self._turn_interrupted
+                    and not getattr(self, "_turn_unlabelable", False)):
                 self._rate_hinted = True     # once per session, not per reply
                 console.print(Text.assemble(
                     ("  👍 ", ""), ("/good", "mute"),
@@ -1460,6 +1465,13 @@ class GhostCLI:
         # PASSED teaches it that stopping early is fine. Both are label
         # noise in a corpus where labels are scarce enough to be load-
         # bearing — refuse, and say which case it was.
+        if ref.get("unlabelable"):
+            # §4ML: the agent marks quick replies (a greeting) unlabelable —
+            # no trajectory is recorded, so a rating retried for ~6 s and
+            # then blamed trajectory logging
+            return self.notice(
+                "✖ that reply can't be rated — the agent records no trajectory "
+                "for quick replies like greetings", "err")
         if ref["interrupted"]:
             why = ("you cancelled it" if ref["interrupted"] == "cancelled"
                    else "it errored mid-stream")
@@ -1646,8 +1658,12 @@ class GhostCLI:
     def cmd_cancel(self, hard: bool) -> None:
         status, data = self.api.cancel_turn(hard=hard)
         if status == 200 and isinstance(data, dict) and data.get("cancelled"):
-            mode = "hard-cancelled" if hard else "cancelled (cooperative)"
-            self.notice(f"⛔ turn {mode}", "mute")
+            # §4ML: this cancels WHATEVER turn the agent is running — from any
+            # client (the REPL never has a turn of its own in flight here) —
+            # so say which one it was
+            mode = "hard-cancelled" if data.get("mode") == "hard" else "cancelled (cooperative)"
+            rid = _safe(str(data.get("request_id") or "?"))
+            self.notice(f"⛔ turn {rid} {mode}", "mute")
         elif status == 404:
             self.notice("nothing to cancel — no turn running", "mute")
         else:
@@ -1659,6 +1675,14 @@ class GhostCLI:
             return self.fail(status, data)
         if not data.get("enabled"):
             return self.notice("autonomous-activity notifications are disabled")
+        if data.get("quiet_hours"):
+            # §4ML: quiet hours HOLD notices — "no new notifications" was false
+            held = data.get("held")
+            if held == 0:
+                return self.notice("no new notifications (quiet hours)", "mute")
+            what = f"{held} notification(s)" if isinstance(held, int) else "notifications"
+            return self.notice(f"quiet hours — the agent is holding {what}; "
+                               "they will show here afterwards", "mute")
         records = data.get("records", [])
         watermark = data.get("watermark", 0)
         if data.get("baseline"):
@@ -1675,8 +1699,12 @@ class GhostCLI:
                 (f"{_safe(r.get('phase') or '?'):<14}", sev_style),
                 (_trim(r.get("summary"), 90), "")))
         # Ack AFTER displaying — a crash mid-print re-serves them next time.
-        self.api.notifications_ack(NOTIFY_CONSUMER, watermark)
-        self.notice(f"({len(records)} notification(s) acknowledged)", "mute")
+        ack_status, _ = self.api.notifications_ack(NOTIFY_CONSUMER, watermark)
+        if ack_status == 200:
+            self.notice(f"({len(records)} notification(s) acknowledged)", "mute")
+        else:
+            self.notice(f"(could not acknowledge — HTTP {ack_status}; these will "
+                        f"show again next time)", "err")
 
     def cmd_memory(self, sub: str, args: list[str]) -> None:
         if sub == "fix" and len(args) == 2:
@@ -1956,6 +1984,12 @@ class GhostCLI:
 
     # -- main loop -------------------------------------------------------
     def chat(self) -> None:
+        # §4ML: every prompt the operator types lands here — owner-only
+        try:
+            HISTORY_FILE.touch(mode=0o600, exist_ok=True)
+            HISTORY_FILE.chmod(0o600)
+        except OSError:
+            pass
         self.prompt_session = PromptSession(
             key_bindings=bindings,
             style=PROMPT_STYLE,
@@ -2124,9 +2158,14 @@ def main() -> int:
                         help="server-side session id to resume / continue")
     parser.add_argument("--health", action="store_true",
                         help="print agent health and exit")
+    parser.add_argument("--probe", action="store_true",
+                        help="mark every turn as a diagnostic probe (X-Ghost-Origin: probe): "
+                             "it runs normally but never teaches the agent")
     args = parser.parse_args()
 
     api = GhostAPI(args.url, args.key)
+    if args.probe:
+        api.http.headers["X-Ghost-Origin"] = "probe"
 
     if args.health:
         cli = GhostCLI(api)

@@ -58,6 +58,40 @@ def _episodic_params(fn):
     return [n for n in sig.parameters]
 
 
+#: §4MJ: words that name a GENERIC node every project shares — the graph's
+#: `project` node holds every project's title, id and goal, and seeding it
+#: put WebOS chains into 16% of real owner turns ("resume the chess coach
+#: project" got six WebOS rows). A project is reached by its NAME.
+_GRAPH_HUB_WORDS = frozenset({"project", "projects", "sandbox", "workspace", "task", "tasks",
+                              "file", "files", "folder", "thing", "things"})
+
+
+def _episode_is_hydratable(ep, query: str) -> bool:
+    """§4MJ: may this episode enter the prompt for ``query``?
+
+    * A FAILED episode with no lesson renders as the failed reply's own text
+      ("FAILURE — I hit a hard limit…") — read as how-to it misleads: 2 of
+      87 injected failures were relevant (28% for successes). Recall still
+      returns them.
+    * A mostly non-Latin query cannot be judged by the English embedder —
+      any two Greek sentences sit at cosine distance ~0.1, so every Greek
+      request got the store's Greek episodes whatever their topic. Such a
+      query needs two shared content words with the trigger.
+    """
+    try:
+        if not isinstance(ep, dict):
+            return True
+        if ("outcome_success" in ep and not ep.get("outcome_success")
+                and not str(ep.get("lesson") or "").strip()):
+            return False
+        from ..memory.skills import _mostly_non_latin, _shared_content_words
+        if _mostly_non_latin(query) and _shared_content_words(query, str(ep.get("trigger") or "")) < 2:
+            return False
+        return True
+    except Exception:  # noqa: BLE001
+        return True
+
+
 class MemoryBus:
     # Soft cap on the recent-fact dedup ledger. RRF / hydration is unaffected
     # — this only stops `publish_fact` from fanning out the same write twice
@@ -86,6 +120,11 @@ class MemoryBus:
         # consumes it after the reply is known and appends (intent, source,
         # used) observations to the ledger that dream's RRF refit reads.
         self.last_hydration: Optional[Dict[str, Any]] = None
+        # §4MJ: one stash PER TURN — a single slot let an overlapping turn's
+        # hydration take the stash before the first turn's judge (staggered
+        # up to 90 s) read it; 96 of 318 real turns had another hydrating
+        # turn start inside that window
+        self._hydration_by_turn: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self.usefulness_ledger_path = (
             Path(usefulness_ledger_path) if usefulness_ledger_path else None)
         # Learned RRF intent→source weights (core.rrf_weights). None →
@@ -197,7 +236,23 @@ class MemoryBus:
         'procedural', or 'contextual'."""
         if not query:
             return "contextual"
-        words = set(query.lower().split())
+        # §4MJ: real tokens ("what?" was not "what"), and "how" is
+        # procedural only as "how to/do/can/should/would…": "how are you",
+        # "how are things" (greetings) and "how old/many/much…" (facts) came
+        # out procedural — 33 of 36 procedural turns were not how-to, and
+        # the weights then put failed-greeting episodes above the graph
+        # (r2: contractions stay one token — "what's up" is a greeting, not
+        # a "what" question)
+        toks = re.findall(r"[a-z]+(?:'[a-z]+)?", query.lower().replace("\u2019", "'"))
+        words = set(toks)
+        if "how" in words:
+            nxt = {toks[i + 1] for i, t in enumerate(toks[:-1]) if t == "how"}
+            words.discard("how")
+            if nxt & {"to", "do", "does", "did", "can", "could", "should", "would", "i", "we"}:
+                words.add("steps")
+            elif nxt & {"old", "many", "much", "long", "far", "big", "tall", "often"}:
+                words.add("what")
+        words.discard("should")             # "should I drive or walk?" is advice, not a procedure
         factual_hits = len(words & cls._FACTUAL_KEYWORDS)
         procedural_hits = len(words & cls._PROCEDURAL_KEYWORDS)
         if factual_hits > procedural_hits and factual_hits > 0:
@@ -268,7 +323,10 @@ class MemoryBus:
         # code, the docstring's 12000 unreachable, and the operator's
         # deliberate 4000 silently overridden (found 2026-07-22).
         if context_budget > 0:
-            query_words = len(query.split())
+            # §4MJ: the USER's words (the expanded "Context: … | User
+            # intent:" string made every short follow-up "complex", 2-3×
+            # budget — the §4LE class, fixed there for decomposition only)
+            query_words = len(str(raw_user_text or query).split())
             if query_words > 30:
                 max_chars = min(context_budget * 3, 12000)
             elif query_words > 15:
@@ -298,7 +356,8 @@ class MemoryBus:
         for sq in sub_queries:
             fetch_coros.append(
                 self._fetch_all_tiers(sq, exclude_session_id=exclude_session_id,
-                                      scope_request=_scope_request))
+                                      scope_request=_scope_request,
+                                      raw_user_text=str(raw_user_text or "")))
         tier_results_per_query = await asyncio.gather(*fetch_coros)
 
         # One ranked list PER (sub-query, tier). RRF's keyed accumulation
@@ -346,6 +405,10 @@ class MemoryBus:
                 "intent": intent, "survivors": survivors, "ts": time.time(),
                 "turn_id": str(turn_id or ""),
             }
+            if turn_id:
+                self._hydration_by_turn[str(turn_id)] = self.last_hydration
+                while len(self._hydration_by_turn) > 32:
+                    self._hydration_by_turn.popitem(last=False)
         else:
             # Survivor-less hydration: clear only OUR OWN (or an unstamped)
             # stash. Blindly writing None here destroyed an overlapping
@@ -389,6 +452,7 @@ class MemoryBus:
                 surv[src] = surv.get(src, 0) + 1
             got = " ".join(
                 f"{tag}=" + ("-" if stores.get(name) is None
+                             or (name == "vector" and not self._VECTOR_TIER_ENABLED)
                              else str(len(cands.get(name) or ())))
                 for name, tag in self._TIER_TAGS)
             kept = " ".join(f"{tag}{surv.get(name, 0)}"
@@ -424,11 +488,20 @@ class MemoryBus:
         its owner's judge. Returns the number of items judged used; never
         raises.
         """
-        state = self.last_hydration
-        if (state is not None and turn_id and state.get("turn_id")
-                and state["turn_id"] != str(turn_id)):
-            return 0  # another turn's stash — not ours to consume
-        self.last_hydration = None
+        # §4MJ: this turn's own stash first (it survives an overlapping
+        # turn's hydration); the single slot is the legacy fallback
+        state = self._hydration_by_turn.pop(str(turn_id), None) if turn_id else None
+        if state is not None:
+            if self.last_hydration is state:
+                self.last_hydration = None
+        else:
+            state = self.last_hydration
+            if (state is not None and turn_id and state.get("turn_id")
+                    and state["turn_id"] != str(turn_id)):
+                logger.info("hydration judge: no stash for turn %s (another turn's is current) — skipped",
+                            str(turn_id)[:8])
+                return 0  # another turn's stash — not ours to consume
+            self.last_hydration = None
         if (not state or not state.get("survivors") or not reply
                 or llm_client is None):
             return 0
@@ -645,15 +718,21 @@ class MemoryBus:
                 logger.debug(f"skill record_retrievals_bulk failed: {e}")
 
     async def _fetch_all_tiers(self, query: str, exclude_session_id: str = "",
-                               scope_request: str = ""):
+                               scope_request: str = "", raw_user_text: str = ""):
         """Fetch from all memory tiers for a single query."""
+        # §4MJ r2: NO per-tier timeout. One was tried and reverted: a timed-
+        # out tier abandons its to_thread work item, the thread stays blocked
+        # on the store lock, and under a held lock 8 turns filled the
+        # 14-worker default executor — every to_thread in the process then
+        # stalled. Unbounded, only the turn waiting on the lock waits.
         return await asyncio.gather(
             self._fetch_vector(query),
             self._fetch_graph(query),
             self._fetch_skill(query, scope_request=scope_request),
-            self._fetch_episodic(query),
+            self._fetch_episodic(query, raw_user_text=raw_user_text),
             self._fetch_session(query, exclude_session_id=exclude_session_id),
         )
+    _VECTOR_TIER_ENABLED = os.getenv("GHOST_BUS_VECTOR_TIER", "0").strip().lower() in ("1", "true", "yes", "on")
 
     @staticmethod
     def _dedup_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -813,6 +892,14 @@ class MemoryBus:
     async def _fetch_vector(self, query: str) -> List[Dict[str, Any]]:
         if not self.vector:
             return []
+        if not self._VECTOR_TIER_ENABLED:
+            # §4MJ (operator: "retire the empty vector tier"): every type the
+            # tier may admit is a twin of another tier (episodes, lessons,
+            # identity) or is excluded for planted-content risk (documents),
+            # so it injected 0 items on 80 replayed real turns while costing
+            # an embedding + a Chroma query every turn. `recall` keeps vector
+            # search; GHOST_BUS_VECTOR_TIER=1 restores the tier.
+            return []
         # Prefer the per-item API: it carries the real Chroma id per item
         # (so the bus can credit ONLY what survives fusion — see
         # _credit_surfaced) and skips the in-search retrieval-stat bump
@@ -895,13 +982,18 @@ class MemoryBus:
     async def _fetch_graph(self, query: str) -> List[Dict[str, Any]]:
         if not self.graph:
             return []
-        words = self._extract_query_terms(query)
+        words = [w for w in self._extract_query_terms(query) if w not in _GRAPH_HUB_WORDS]
         if not words:
             return []
         try:
-            edges = await asyncio.to_thread(
-                self.graph.get_neighborhood, words, 15
-            )
+            _gn = self.graph.get_neighborhood
+            try:
+                import inspect as _insp
+                _fz = "fuzzy" in _insp.signature(_gn).parameters
+            except (TypeError, ValueError):
+                _fz = True
+            edges = await (asyncio.to_thread(_gn, words, 15, fuzzy=False) if _fz
+                           else asyncio.to_thread(_gn, words, 15))
         except Exception as e:
             logger.warning(f"MemoryBus graph fetch failed: {type(e).__name__}: {e}")
             return []
@@ -973,7 +1065,7 @@ class MemoryBus:
             return []
         return [{"source": "skill", "text": playbook.strip()}]
 
-    async def _fetch_episodic(self, query: str) -> List[Dict[str, Any]]:
+    async def _fetch_episodic(self, query: str, raw_user_text: str = "") -> List[Dict[str, Any]]:
         if not self.episodic:
             return []
         try:
@@ -995,6 +1087,9 @@ class MemoryBus:
         except Exception as e:
             logger.warning(f"MemoryBus episodic fetch failed: {type(e).__name__}: {e}")
             return []
+        # §4MJ: judged on the USER's words — a short Greek follow-up arrives
+        # as "Context: <English reply> | User intent: <Greek>", mostly Latin
+        episodes = [ep for ep in (episodes or []) if _episode_is_hydratable(ep, raw_user_text or query)]
         if not episodes:
             return []
         # One RRF item per EPISODE (same rationale as _fetch_skill).
@@ -1044,7 +1139,15 @@ class MemoryBus:
         try:
             # Over-fetch slightly so filtering the active session out
             # doesn't shrink the tier below its 5-item budget.
-            hits = await asyncio.to_thread(search, query, 8)
+            # §4MJ: the active session is excluded INSIDE the search, before
+            # its limit — its own messages could fill all 8 slots
+            try:
+                import inspect as _insp
+                _ex = "exclude_session_id" in _insp.signature(search).parameters
+            except (TypeError, ValueError):
+                _ex = False
+            hits = await (asyncio.to_thread(search, query, 8, exclude_session_id=exclude_session_id)
+                          if _ex and exclude_session_id else asyncio.to_thread(search, query, 8))
         except Exception as e:
             logger.warning(f"MemoryBus session fetch failed: {type(e).__name__}: {e}")
             return []

@@ -98,7 +98,7 @@
   <p><code>_is_conversational_trigger</code> (in <code>memory/lesson_quality.py</code>) now also gates mistake-bearing lessons. Default-ACCEPT — only unambiguous chat tells reject: pronoun-initial fragments with no antecedent (<em>"it still does…"</em>, <em>"that didn't work…"</em>), short bare turn-level commands (<em>"proceed"</em>, <em>"try again"</em>, ≤&nbsp;60 chars), and direct-address phrases (<em>"notify me in slack"</em>, <em>"let me know"</em>). Deliberately NOT rejected: user-question triggers (<em>"How do I parse JSON?"</em>, <em>"Please parse JSON!"</em>) — the paraphrase-normalised dedup counts on them recurring — and "you"-phrasing, which is legitimate rule language addressed to the agent. Tests: <code>tests/test_lesson_quality_gate.py::TestConversationalTrigger</code>.</p>
 
   <h2>Retention &amp; eviction</h2>
-  <p><code>PLAYBOOK_MAX = 50</code>. Trim policy:</p>
+  <p><code>PLAYBOOK_MAX = 300</code> under ACE (<code>GHOST_PLAYBOOK_MAX</code>; the historical default was 50). Trim policy:</p>
   <ol>
     <li>Newest lesson is always kept (head pin).</li>
     <li>Verified lessons pinned next.</li>
@@ -591,5 +591,15 @@
   <li><code>forget</code> also finds a name in a lesson's code example and saved previous version.</li>
 </ul>
 </main>
+
+<h2 id="4mi">§4MI (2026-10-08) — admission, credit and retraction</h2>
+<ul>
+  <li><strong>Length-aware shared-word bar.</strong> The keyword branch (vector path, BM25 fallback and <code>credit_recent_retrievals</code>) needs <code>_required_shared_words(query)</code> shared content words: 2 for a query of ≤12 content words, 3 up to 40, 4 beyond. Measured on the live playbook, a 119-word migration plan collided with eight triggers on two generic verbs and credited five unrelated lessons as helpful 27 s before the turn was refuted. The close-trigger alternative is unchanged.</li>
+  <li><strong>Stop words are folded.</strong> <code>_bm25_tokens</code> folds before filtering, so the stop list is folded once at import ("because"→"bekause", "which", "back" …).</li>
+  <li><strong>Retraction keeps the corrective.</strong> A <code>source="reflection"</code> lesson tagged with the refuted turn's id is the lesson written to FIX that turn; <code>retract_lessons_from_trajectory</code> keeps it unless <code>include_correctives=True</code>, and when one is kept the vector pass scrubs only the removed triggers (never by id). A retraction that removes nothing logs so. Undoing a verified reinforcement also restores the confidence it lifted (<code>reinforced_by[].conf_before</code>); a second replacement archives the <code>previous_version</code> it pushes out (<code>replaced-chain:&lt;tid&gt;</code>).</li>
+  <li><strong>The no-query fallback</strong> (the selfhood diary's RECENT MISTAKES) returns only rows that record a real mistake and are not <code>self_play</code> / <code>bench</code> rows.</li>
+  <li><strong><code>iter_teachable(trajectories, consumer=)</code></strong> applies the admissibility matrix's task kinds for the named consumer (router/PRM: <code>user_request</code>+<code>bench</code>; post-mortem, skills-auto, REM seeds, macro mining: <code>user_request</code> only) and judges a reflection COPY by its source's role (<code>extra.source_requester_role</code>). Fails closed for a named consumer.</li>
+</ul>
+
 </body>
 </html>

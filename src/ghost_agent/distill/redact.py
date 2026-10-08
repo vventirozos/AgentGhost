@@ -240,7 +240,9 @@ _BUILTIN_RULES: List[_BuiltinRule] = [
     # before the generic openai `sk-` rule would swallow them.
     ("anthropic_key", re.compile(r"sk-ant-[A-Za-z0-9_\-]{16,}"), "<REDACTED_API_KEY>"),
     # OpenAI / generic `sk-` (hyphen) prefixed keys.
-    ("openai_key", re.compile(r"sk-[A-Za-z0-9_\-]{16,}"), "<REDACTED_API_KEY>"),
+    # §4MI: a left boundary — without it `…collaborative-ta|sks-…` and
+    # `…elon-mu|sk-…` URL slugs were 5 of 7 "keys" in a week's corpus
+    ("openai_key", re.compile(r"(?<![A-Za-z0-9/_.-])sk-[A-Za-z0-9_\-]{16,}"), "<REDACTED_API_KEY>"),
     # Stripe secret/restricted keys (underscore form — NOT caught by sk-).
     ("stripe_key", re.compile(r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b"), "<REDACTED_API_KEY>"),
     # Google API keys.
@@ -440,7 +442,9 @@ _BUILTIN_RULES: List[_BuiltinRule] = [
     # welded into a hyphen- or pipe-delimited token. Cards written WITH
     # dashes (`4111-1111-1111-1111`) are unaffected: the separators are
     # consumed inside the match, not at its edges.
-    ("credit_card", re.compile(r"(?<![0-9A-Za-z._|-])(?:\d[ -]?){13,19}(?![0-9A-Za-z_|-])(?!\.\d)"), _redact_cc_if_luhn),
+    # §4MI: not inside a web.archive.org snapshot path (`/web/2024…/`) —
+    # a 14-digit timestamp Luhn-validates one time in ten
+    ("credit_card", re.compile(r"(?<![0-9A-Za-z._|-])(?<!/web/)(?:\d[ -]?){13,19}(?![0-9A-Za-z_|-])(?!\.\d)"), _redact_cc_if_luhn),
     # A phone match must carry phone STRUCTURE — a leading `+`, a
     # parenthesised area code, or internal space/dash separators. The old
     # pattern's core (`\d{3}[ -]?\d{4}` with everything else optional)
@@ -529,6 +533,102 @@ def _master_key_rule():
         return None
 
 
+# ── the owner's profile, by VALUE (§4MI) ─────────────────────────────────
+# Every stored system prompt carries the USER PROFILE block — the owner's
+# name, city, company, street address, the family's names and birth dates,
+# the vehicles — and `agent.py` stores `system_prompt[:8000]` on every row.
+# Measured: 82 rows in one week carried the owner's name, 50 the company and
+# the address line. The docs promised "personal details are masked"; no rule
+# knew a single one of them. Like the master key, the values are already in
+# this process; reading them adds no exposure. Only the identity-class
+# categories are redacted (not preferences or interests — those are the
+# learning signal), and only values long enough not to be a common word.
+_PROFILE_CATEGORIES = ("root", "relationships", "assets", "contact", "family")
+_PROFILE_SKIP_KEYS = frozenset({"role", "as_of"})
+_PROFILE_MIN_LEN = 4
+#: placeholders and generic words a profile may hold — never a rule
+#: (the stock profile's name is "User"; "none"/"unknown" are states)
+_PROFILE_NEVER = frozenset({"user", "none", "null", "unknown", "n/a", "true", "false", "yes", "no",
+                            "owner", "home", "work", "other"})
+_PROFILE_CACHE: dict = {"mtime": None, "rule": None, "path": None}
+
+
+def _profile_values(doc) -> list:
+    out = []
+
+    def _walk(x, key=""):
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if k in _PROFILE_SKIP_KEYS:
+                    continue
+                _walk(v, k)
+        elif isinstance(x, list):
+            for v in x:
+                _walk(v, key)
+        elif isinstance(x, str):
+            v = x.strip()
+            if len(v) >= _PROFILE_MIN_LEN and v.lower() not in _PROFILE_NEVER:
+                out.append(v)
+    for cat in _PROFILE_CATEGORIES:
+        if isinstance(doc, dict) and isinstance(doc.get(cat), dict):
+            _walk(doc[cat])
+    return out
+
+
+def _profile_rule():
+    """A rule redacting the owner's identity-class profile values wherever
+    they appear, or None. Re-read when the profile file changes."""
+    try:
+        import os as _os
+        from pathlib import Path as _Path
+        home = (_os.environ.get("GHOST_HOME") or "").strip()
+        if not home:
+            return None
+        path = _Path(home) / "system" / "memory" / "user_profile.json"
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return None
+        if _PROFILE_CACHE["mtime"] == mtime and _PROFILE_CACHE["path"] == str(path):
+            return _PROFILE_CACHE["rule"]
+        import json as _json
+        doc = _json.loads(path.read_text(encoding="utf-8"))
+        vals = sorted({v for v in _profile_values(doc)}, key=len, reverse=True)
+        rule = None
+        if vals:
+            # whole WORDS only (fresh review C-1): a 4-letter value with no
+            # boundary shredded "markdown" on "Mark", "theory" on "Theo",
+            # "/Users/" on the stock name "User" — every path in the corpus.
+            # A SHORT value (a first name, a city) matches as written —
+            # "Nice" the city, not "nice" the word; a long one (an
+            # address, a description) matches in any case.
+            _short = [v for v in vals if len(v) < 8]
+            _long = [v for v in vals if len(v) >= 8]
+            _parts = []
+            if _long:
+                _parts.append("(?i:" + "|".join(re.escape(v) for v in _long) + ")")
+            if _short:
+                _parts.append("(?:" + "|".join(re.escape(v) for v in _short) + ")")
+            rule = ("owner_profile",
+                    re.compile(r"(?<![A-Za-z0-9_])(?:" + "|".join(_parts) + r")(?![A-Za-z0-9_])"),
+                    "<REDACTED_PROFILE>")
+        _PROFILE_CACHE.update({"mtime": mtime, "rule": rule, "path": str(path)})
+        return rule
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def redact_profile_values(text: str) -> str:
+    """The owner's identity-class profile values → `<REDACTED_PROFILE>`.
+    Applied ONLY to a stored trajectory's `system_prompt` (which carries the
+    USER PROFILE block, §4MI D-6) — never to memory writers or to
+    conversation text, where a placeholder is read back as a fact."""
+    if not text:
+        return text
+    _pr = _profile_rule()
+    return _pr[1].sub(_pr[2], text) if _pr is not None else text
+
+
 def redact_text(text: str, config: RedactionConfig | None = None) -> str:
     if not text:
         return text
@@ -540,6 +640,10 @@ def redact_text(text: str, config: RedactionConfig | None = None) -> str:
     _mk = None if "ghost_master_key" in disabled else _master_key_rule()
     if _mk is not None:
         out = _mk[1].sub(_mk[2], out)
+    # r2 review CRIT: the profile rule is NOT applied here. `redact_text`
+    # also feeds the memory journal (smart-memory consolidation input) and
+    # the episode store — a placeholder there became a "stated" owner fact
+    # and superseded the real graph edge. See `redact_profile_values`.
     for name, rx, repl in _BUILTIN_RULES:
         if name in disabled:
             continue
@@ -677,7 +781,8 @@ def redact_trajectory(traj: Trajectory, config: RedactionConfig | None = None) -
 
     return replace(
         traj,
-        system_prompt=_r(traj.system_prompt or ""),
+        # §4MI: the USER PROFILE block lives here, and only here
+        system_prompt=redact_profile_values(_r(traj.system_prompt or "")),
         user_request=_r(traj.user_request or ""),
         planning_output=_r(traj.planning_output) if traj.planning_output is not None else None,
         final_response=_r(traj.final_response or ""),

@@ -111,10 +111,11 @@ def test_execute_graph_compression_rebuilds_mirror(gm):
 
 def test_get_neighborhood_returns_2hop_chain(populated_gm):
     edges = populated_gm.get_neighborhood(["user"])
-    # Direct edge
-    assert "- (User) -[OWNS]-> (Dog)" in edges
-    # 2-hop chain in the example shape from the task description.
-    assert "- (User) -[OWNS]-> (Dog) -[NAMED]-> (Max)" in edges
+    # §4MJ: the longest chain carries its own prefixes — the direct edge and
+    # the 2-hop chain are NOT returned again as separate items
+    assert "- (User) -[OWNS]-> (Dog) -[NAMED]-> (Max) -[BREED]-> (Husky)" in edges
+    assert "- (User) -[OWNS]-> (Dog)" not in edges
+    assert "- (User) -[OWNS]-> (Dog) -[NAMED]-> (Max)" not in edges
     # Also surfaces the other branch
     assert any("Berlin" in e for e in edges)
 

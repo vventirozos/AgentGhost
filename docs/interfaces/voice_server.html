@@ -232,5 +232,12 @@
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
+
+<h2 id="4ml">§4ML (2026-10-08)</h2>
+<ul>
+  <li><strong>A clip under 0.35 s is silence</strong> (<code>GHOST_STT_MIN_SECONDS</code>; was 0.05 s). At 0.2 s the audio model answered "The quick brown fox jumps over the lazy dog." 12 times, and twice that reached the agent as the owner's words.</li>
+  <li><strong>Bounded voice work, per kind.</strong> STT and TTS each run at most 2 requests (<code>GHOST_VOICE_MAX_CONCURRENT</code>), in <em>separate</em> pools, so a reply being spoken is never refused because someone is dictating. Each kind has a short wait list: 4 waiters (<code>GHOST_VOICE_MAX_WAITING</code>), who wait 10 s for STT and 30 s for TTS (<code>GHOST_STT_SLOT_WAIT_S</code>, <code>GHOST_TTS_SLOT_WAIT_S</code>). The next TTS sentence therefore queues behind the last one instead of being refused (the uConsole drops a reply's remaining speech on a 429). Past the wait list, a request gets 429 at once. Before this, one held key on the uConsole ran the server out of file descriptors: 135 × "Too many open files", and chat failed with it.</li>
+  <li><strong>A cancelled request kills its child</strong> (ffmpeg, <code>say</code>): on server shutdown or a cancelled caller. uvicorn does not cancel a handler when the client merely hangs up; that case is bounded by the timeout and the pools.</li>
+</ul>
 </body>
 </html>

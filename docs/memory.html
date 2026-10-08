@@ -79,7 +79,7 @@
   </div>
 
   <h2>How they're searched together</h2>
-  <p>On every message, Ghost queries the stores <strong>in parallel</strong> and then has to merge five ranked lists into one. The problem: the stores don't share a scoring scale. A similarity score of 0.8 from the fact store means nothing in particular relative to a 0.8 from the episode store.</p>
+  <p>On every message that needs it (not a trivial greeting, a fact-check, a public-channel reply, a channel member's turn, or <code>--no-memory</code>), Ghost queries the stores <strong>in parallel</strong> and then has to merge five ranked lists into one. The problem: the stores don't share a scoring scale. A similarity score of 0.8 from the fact store means nothing in particular relative to a 0.8 from the episode store.</p>
   <p>So Ghost ignores the scores and uses the <em>positions</em> instead. Something that came 1st in one list and 3rd in another beats something that came 2nd in one list and nowhere in the others. Appearing in several lists is itself evidence of relevance.</p>
 
   <div class="diagram">
@@ -94,10 +94,10 @@
       </li>
       <li>
         <h4>The ranked lists are merged by position, not by score</h4>
-        <p>Items found by several sub-questions rise to the top. Duplicates collapse into one entry with a combined score.</p>
+        <p>Items found by several sub-questions rise to the top. Exact duplicates collapse into one entry with a combined score, and a graph chain contained in a longer chain is dropped (§4MJ).</p>
       </li>
       <li>
-        <h4>The top results are written above your message</h4>
+        <h4>The top results are added to the conversation (pinned above its first message)</h4>
         <p>Budgeted by length — a short question gets a small block, a long complex one gets up to three times as much.</p>
       </li>
     </ol>
@@ -153,7 +153,7 @@
   </div>
 
   <footer>
-    <p>Checked against <code>src/ghost_agent/memory/</code> and <code>core/bus.py</code> on 2026-08-04. Per-store detail is in <a href="reference.html">the deep reference</a>.</p>
+    <p>Checked against <code>src/ghost_agent/memory/</code> and <code>core/bus.py</code> on 2026-10-08 (§4MJ). Per-store detail is in <a href="reference.html">the deep reference</a>.</p>
   </footer>
 </main>
 </body>

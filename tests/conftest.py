@@ -1159,6 +1159,7 @@ class _StateIsolation:
 
 
 def pytest_configure(config):
+    config.addinivalue_line("markers", "vector_tier_off: run with the retired vector hydration tier OFF (production default, §4MJ)")
     if not config.pluginmanager.has_plugin("ghost-state-isolation"):
         config.pluginmanager.register(_StateIsolation(), "ghost-state-isolation")
 
@@ -1184,3 +1185,25 @@ def _legacy_confirm_tests_say_yes(monkeypatch):
     monkeypatch.setattr(_prov, "user_message", _user_message)
     yield
     _prov._reset_for_tests()
+
+
+# §4MJ (operator: "retire the empty vector tier"): production hydration runs
+# with the vector tier OFF (`MemoryBus._VECTOR_TIER_ENABLED`, env
+# GHOST_BUS_VECTOR_TIER). The tier's mechanics still exist behind the flag and
+# ~18 tests exercise them, so tests run with it ON unless they opt out with the
+# `vector_tier_off` marker; `tests/test_4mj_hydration.py` pins the production
+# default.
+import pytest as _pytest_4mj
+
+
+@_pytest_4mj.fixture(autouse=True)
+def _vector_tier_on_for_tests(request, monkeypatch):
+    if request.node.get_closest_marker("vector_tier_off"):
+        yield
+        return
+    try:
+        from ghost_agent.core.bus import MemoryBus
+        monkeypatch.setattr(MemoryBus, "_VECTOR_TIER_ENABLED", True)
+    except Exception:  # noqa: BLE001
+        pass
+    yield

@@ -18,11 +18,11 @@ _MEMBER_BLOCK = ("SYSTEM BLOCK: the profile and memory are not available for thi
                  "nothing was changed. Continue without saving or forgetting.")
 
 
-def _teachable(trajectories):
+def _teachable(trajectories, consumer: str = "router"):
     """Member turns never train the owner's router / PRM (§4KJ R7: the member
-    controls the text)."""
+    controls the text); §4MI: nor do reflection copies or coding leaves."""
     from ..memory.skills import iter_teachable
-    return iter_teachable(trajectories)
+    return iter_teachable(trajectories, consumer=consumer)
 
 
 def _member_block():
@@ -3359,6 +3359,16 @@ async def sync_owner_mirrors(category, key, profile_memory, graph_memory=None, m
     except Exception:  # noqa: BLE001
         return ["profile-read"]
     values = cur if isinstance(cur, list) else ([] if cur in (None, "") else [cur])
+    # §4MI: an ON-DEMAND field (the address, a physical description) is
+    # rendered only when the owner asks about it (§4LB); its graph mirror
+    # was seeded into prompts by any query word inside it ("brown"). The
+    # mirrors of such a field are kept EMPTY (which also removes an edge
+    # written before this).
+    try:
+        if profile_memory.is_on_demand(cat, k) is True:     # `is True`: a test double is truthy
+            values = []
+    except Exception:  # noqa: BLE001
+        pass
     lag = []
     for name, store in (("graph", graph_memory), ("vector", memory_system)):
         if store is None or not hasattr(store, "sync_owner_field"):
@@ -4560,7 +4570,7 @@ def _maybe_retrain_prm(context) -> None:
     trainer = PRMTrainer()
     from ..core.admissibility import iter_bench_trajectories
     report = trainer.run(
-        trajectories=_teachable(traj_collector.iter_trajectories()),
+        trajectories=_teachable(traj_collector.iter_trajectories(include_archive=True), consumer="prm"),
         save_path=save_path,
         bench_trajectories=iter_bench_trajectories(
             "prm", getattr(context, "args", None)),
@@ -4622,7 +4632,7 @@ def _maybe_retrain_router(context) -> None:
         confidence_threshold=getattr(dispatcher, "confidence_threshold", None))
     from ..core.admissibility import iter_bench_trajectories
     report = trainer.run(
-        trajectories=_teachable(traj_collector.iter_trajectories()),
+        trajectories=_teachable(traj_collector.iter_trajectories(include_archive=True), consumer="router"),
         save_path=save_path,
         bench_trajectories=iter_bench_trajectories(
             "router", getattr(context, "args", None)),

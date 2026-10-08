@@ -401,8 +401,16 @@ async def main(app):
     await asyncio.sleep(0.2)
     check("the rating chips are off while a new reply is arriving",
           not w.good_btn.isEnabled() and w._last_reply_rid is None)
+    # §4ML: a corridor that opens FIRST but is not ours (a member's, a
+    # probe's, self-play's) is never adopted — only the one carrying the id
+    # this client minted
+    w.note_log_line("┌─ 7F 1f00d7f3  request started  15:16:25 ─────────────")
+    w.note_log_line("│  7F  📖  +1.00s  file read           secret_member_notes.md")
+    check("another turn's corridor is not adopted",
+          "secret_member_notes" not in str(face.calls) and "secret_member_notes" not in w.ticker.desc,
+          str(face.calls[:4]))
     # the log socket's lines for THIS turn drive the face
-    w.note_log_line("┌─ 99 9961f364  request started  15:16:26 ─────────────")
+    w.note_log_line(f"┌─ 99 {w._turn_rid[:8]}  request started  15:16:26 ─────────────")
     w.note_log_line("│  99  📖  +8.06s  file read           notes.md")
     w.note_log_line("│  99  🧪  +9.10s  verifier            CONFIRMED: grounded")
     check("a step line gives the face its gait",

@@ -499,6 +499,65 @@ def register_reply(channel: str | None, ts: str | None, req_id: str,
     _save_reply_index()
 
 
+_BG_TASKS: set = set()
+
+
+def _spawn_bg(coro):
+    """A fire-and-forget task with a strong reference (an unreferenced
+    task can be garbage-collected mid-flight)."""
+    t = asyncio.create_task(coro)
+    _BG_TASKS.add(t)
+    t.add_done_callback(_BG_TASKS.discard)
+    return t
+
+
+_UPLOAD_SHARE_TRIES = 4
+_UPLOAD_SHARE_WAIT_S = 1.5
+
+
+def _file_ids(upload_resp) -> list:
+    try:
+        data = upload_resp.data if hasattr(upload_resp, "data") else dict(upload_resp)
+    except Exception:  # noqa: BLE001
+        return []
+    files = data.get("files") or ([data["file"]] if data.get("file") else [])
+    return [f.get("id") for f in files if isinstance(f, dict) and f.get("id")]
+
+
+def _share_ts(file_obj: dict, channel: str) -> str | None:
+    shares = (file_obj or {}).get("shares") or {}
+    for kind in ("public", "private"):
+        for share in (shares.get(kind) or {}).get(channel) or []:
+            if share.get("ts"):
+                return share["ts"]
+    return None
+
+
+async def _register_uploaded_files(upload_resp, channel, req_id, requester) -> int:
+    """Index the message each uploaded file was posted as, so a reaction on
+    it is attributed like one on the text reply (§4ML). Slack fills a file's
+    `shares` (where its message ts lives) a moment AFTER the upload returns,
+    so read it back a few times. Returns how many were registered."""
+    n = 0
+    for fid in _file_ids(upload_resp):
+        for attempt in range(_UPLOAD_SHARE_TRIES):
+            try:
+                info = await app.client.files_info(file=fid)
+                ts = _share_ts(info.get("file") or {}, channel)
+            except Exception as e:  # noqa: BLE001 — bookkeeping only
+                logger.info("upload share lookup failed for %s: %s: %s", fid, type(e).__name__, e)
+                ts = None
+            if ts:
+                register_reply(channel, ts, req_id, requester)
+                n += 1
+                break
+            await asyncio.sleep(_UPLOAD_SHARE_WAIT_S * (attempt + 1))
+        else:
+            logger.info("upload %s: no message ts after %d tries — its reactions will not be attributed",
+                        fid, _UPLOAD_SHARE_TRIES)
+    return n
+
+
 # Entries older than the agent's trajectory-scan window always 404 server-
 # side — expire them on lookup so the miss is honest instead of a doomed
 # round-trip (matches core/feedback._SCAN_DAYS = 8).
@@ -598,7 +657,7 @@ async def get_bot_user_id() -> str | None:
                 if val:
                     BOT_TEAM_IDS.add(val)
         except Exception as e:  # noqa: BLE001
-            logger.error(f"Failed to get bot user ID: {e}")
+            logger.error(f"Failed to get bot user ID: {type(e).__name__}: {e}")
     return BOT_USER_ID
 
 
@@ -827,7 +886,7 @@ async def build_thread_context(channel_id: str, thread_ts: str,
                 saw_current = saw_current or is_current
 
     except Exception as e:  # noqa: BLE001
-        logger.error(f"Failed to fetch thread context: {e}")
+        logger.error(f"Failed to fetch thread context: {type(e).__name__}: {e}")
 
     # §4KW (review): the message being answered must be IN the request. If
     # the reply fetch lagged behind the event (or the thread outgrew it), the
@@ -946,7 +1005,7 @@ async def upload_file_to_agent(file_info: dict, uploader: str | None = None) -> 
                 return filename
             logger.error(f"/api/upload returned {up.status_code} for {filename}")
     except Exception as e:  # noqa: BLE001
-        logger.error(f"Failed to ingest file {filename}: {e}")
+        logger.error(f"Failed to ingest file {filename}: {type(e).__name__}: {e}")
     return None
 
 
@@ -1016,7 +1075,7 @@ async def tail_logs(request_id: str, say, thread_ts: str | None = None):
                         current_status_msg = await say(
                             text=msg_text, thread_ts=thread_ts)
                 except Exception as e:  # noqa: BLE001
-                    logger.error(f"Failed to update status: {e}")
+                    logger.error(f"Failed to update status: {type(e).__name__}: {e}")
     except asyncio.CancelledError:
         pass
     finally:
@@ -1078,6 +1137,7 @@ async def _process_message(messages: list, say, thread_ts: str | None = None,
     # id is what feedback reactions correlate on, so it is minted HERE, once.
     request_id = "slack-" + str(uuid.uuid4())[:8]
     log_task = asyncio.create_task(tail_logs(request_id, say, thread_ts))
+    _INFLIGHT[request_id] = (say, thread_ts)
 
     try:
         for file_info in (event_files or []):
@@ -1178,7 +1238,7 @@ async def _process_message(messages: list, say, thread_ts: str | None = None,
                                      img_name, request_id, dl.status_code)
                         _missing_images.append(safe_name)
                 except Exception as e:  # noqa: BLE001
-                    logger.error(f"Failed to download image {img_name}: {e}")
+                    logger.error(f"Failed to download image {img_name}: {type(e).__name__}: {e}")
                     _missing_images.append(safe_name)
             if _missing_images:
                 # §4KW (review): the text said "here's your image" over nothing
@@ -1202,6 +1262,9 @@ async def _process_message(messages: list, say, thread_ts: str | None = None,
             # human outcome label. Error messages are deliberately NOT
             # registered — a thumbs-down on "Agent returned 500" would
             # label a turn the agent never completed.
+            # §4ML: the answer is posted — a restart from here on loses at
+            # most an image upload, not the reply
+            _INFLIGHT.pop(request_id, None)
             if posted is not None:
                 try:
                     register_reply(
@@ -1213,12 +1276,17 @@ async def _process_message(messages: list, say, thread_ts: str | None = None,
 
             for safe_name, blob in uploaded:
                 try:
-                    await app.client.files_upload_v2(
+                    up = await app.client.files_upload_v2(
                         channel=say.channel, thread_ts=thread_ts,
                         file=blob, filename=safe_name, title=safe_name,
                     )
+                    # §4ML: the image's own message takes 👍/👎 too — it
+                    # was never indexed, so a rating on it (the owner's,
+                    # 3 times) was dropped without a word
+                    _spawn_bg(_register_uploaded_files(
+                        up, say.channel, agent_req_id, requester))
                 except Exception as e:  # noqa: BLE001
-                    logger.error(f"Failed to upload {safe_name} to Slack: {e}")
+                    logger.error(f"Failed to upload {safe_name} to Slack: {type(e).__name__}: {e}")
 
     except Exception as e:  # noqa: BLE001
         # Generic text to the channel — open-channel mode means any member
@@ -1230,11 +1298,40 @@ async def _process_message(messages: list, say, thread_ts: str | None = None,
                        "The operator can check the bot log for details.",
                   thread_ts=thread_ts)
     finally:
+        _INFLIGHT.pop(request_id, None)
         log_task.cancel()
         try:
             await log_task
         except asyncio.CancelledError:
             pass
+
+
+# §4ML: requests in flight, so a restart can say so. `launchctl kickstart -k`
+# (or any SIGTERM) killed the bot mid-request: the agent finished the turn,
+# nobody posted the reply, and the asker got nothing — not even an error.
+_INFLIGHT: dict = {}
+_INTERRUPTED_TEXT = ("⚠️ The Slack bot was restarted while this request was running, so its "
+                     "reply was lost. Please send it again.")
+
+
+async def notify_inflight_interrupted() -> int:
+    """Tell every in-flight request's thread that its reply is lost.
+    Bounded: launchd SIGKILLs ~20 s after SIGTERM. Returns how many."""
+    async def _tell(rid, say, thread_ts) -> bool:
+        try:
+            await asyncio.wait_for(say(text=_INTERRUPTED_TEXT, thread_ts=thread_ts), timeout=5.0)
+            logger.warning("restart interrupted request %s — the asker was told", rid)
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("restart interrupted request %s — could not tell the asker: %s: %s",
+                           rid, type(e).__name__, e)
+            return False
+    # all at once: one after another, four slow posts outran launchd's
+    # 20 s SIGTERM→SIGKILL window (fresh-reader R2)
+    items = list(_INFLIGHT.items())
+    _INFLIGHT.clear()
+    done = await asyncio.gather(*(_tell(rid, say, ts) for rid, (say, ts) in items))
+    return sum(1 for ok in done if ok)
 
 
 # ---------------------------------------------------------------------------
@@ -1402,7 +1499,7 @@ async def handle_reaction(event, say=None):
                 "dropped; reactions are not replayed)",
                 signal, entry.get("req_id"), reactor, status)
     except Exception as e:  # noqa: BLE001 — reactions must never crash the bot
-        logger.warning(f"reaction handler failed: {e}")
+        logger.warning(f"reaction handler failed: {type(e).__name__}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1599,7 +1696,7 @@ async def notification_poller(channel: str):
             n = await poll_and_deliver_once(client, channel)
             beat = hb.note(n)
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"notification poller: {e}")
+            logger.warning(f"notification poller: {type(e).__name__}: {e}")
             beat = hb.note(0, error=True)
             if client is not None:
                 try:
@@ -1684,7 +1781,22 @@ async def main():
         _poller_task = asyncio.create_task(notification_poller(notify_dest))
 
     handler = AsyncSocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
-    await handler.start_async()
+    # §4ML: on SIGTERM, tell the in-flight askers, then stop
+    import signal as _signal
+    loop = asyncio.get_running_loop()
+    main_task = asyncio.current_task()
+
+    async def _on_term():
+        await notify_inflight_interrupted()
+        main_task.cancel()
+    try:
+        loop.add_signal_handler(_signal.SIGTERM, lambda: _spawn_bg(_on_term()))
+    except (NotImplementedError, RuntimeError):
+        pass
+    try:
+        await handler.start_async()
+    except asyncio.CancelledError:
+        logger.info("SIGTERM — stopped")
 
 
 if __name__ == "__main__":

@@ -1041,12 +1041,31 @@ class GraphMemory:
                 old, new = a, b
             out.append({"old_node": old, "new_node": new, "kind": kind})
 
+        def _digit_distinct(a: str, b: str) -> bool:
+            # §4MI: two names whose NUMBERS differ are versions, models or
+            # ids ("qwen3.6-35b" / "qwen3.5-35b", "1.10" / "1.1.0",
+            # "server1" / "server2") — never a spelling variant. `_norm`
+            # strips the dots, so these were "safe" merges or 0.90-ratio
+            # fuzzy candidates re-asked every dream since 08-25. Names
+            # whose numbers agree ("topic 0" / "topic-0") stay candidates.
+            _da, _db = re.findall(r"\d+", a), re.findall(r"\d+", b)
+            if not _da or not _db:
+                return False
+            # r2: the NUMBERS decide — "ubuntu 22.04" / "ubuntu-22-04" are
+            # one thing; "1.10" / "1.1.0" have different numbers anyway
+            return _da != _db
+
         by_norm: Dict[str, List[str]] = {}
         for n in nodes:
             by_norm.setdefault(_norm(n), []).append(n)
         for variants in by_norm.values():
-            for other in variants[1:]:
-                _add(variants[0], other, "safe")
+            # r2: pair each variant with the first one it is NOT
+            # digit-distinct from (comparing only against variants[0] left
+            # two equal names unpaired when the first was the odd one)
+            for i, other in enumerate(variants[1:], 1):
+                base = next((v for v in variants[:i] if not _digit_distinct(v, other)), None)
+                if base is not None:
+                    _add(base, other, "safe")
 
         ordered = sorted(nodes)
         for i, a in enumerate(ordered):
@@ -1055,6 +1074,8 @@ class GraphMemory:
             for b in ordered[i + 1:i + 1 + neighbor_window]:
                 if _norm(a) == _norm(b):
                     continue  # tier-1 pair (or already merged direction)
+                if _digit_distinct(a, b):
+                    continue  # §4MI: two versions are two things
                 if difflib.SequenceMatcher(None, a, b).ratio() >= fuzzy_cutoff:
                     _add(a, b, "fuzzy")
 
@@ -1085,6 +1106,19 @@ class GraphMemory:
                                    FROM triplets WHERE subject = ? OR object = ?''',
                                 (old_node, old_node))
                             src_rows = cursor.fetchall()
+                            # §4MI: a merge rewrites and DELETES rows with no
+                            # record — 40 merges in two months, none
+                            # reconstructible, and the docs promised the
+                            # archive. Fail closed like every other
+                            # destructive path here.
+                            if not self._archive_rows(
+                                    f"compress:{old_node}->{new_node}",
+                                    [(s_, p_, o_, w_) for s_, p_, o_, w_, _vf, _vu in src_rows]):
+                                logger.warning("graph compression skipped %r -> %r: archive unwritable",
+                                               old_node, new_node)
+                                continue
+                            logger.info("graph compression: %r -> %r (%d row(s))",
+                                        old_node, new_node, len(src_rows))
                             for subj, pred, obj, w, vfrom, vuntil in src_rows:
                                 n_subj = new_node if subj == old_node else subj
                                 n_obj = new_node if obj == old_node else obj
@@ -1234,9 +1268,26 @@ class GraphMemory:
                 return False
             if len(node) < self._SEED_FRAGMENT_MIN_RATIO * len(word):
                 return False
+        elif word in node:
+            # §4MI: the OTHER direction was unguarded — "back" seeded
+            # `xtrabackup`, "brown" seeded a description node. A word
+            # reaches a longer node only as a WHOLE token of it (r2: any
+            # length — "grid", "ring", "port" are real tokens — and Unicode
+            # word boundaries, so a Greek fragment is not a token either).
+            import re as _re
+            if _re.search(r"(?<!\w)" + _re.escape(word) + r"(?!\w)", node):
+                return True
+            # …or the START of a token, when the word is most of it
+            # ("germ" → `germany`, "german" → `germany`); never its middle
+            # or end ("back" ⊄ `xtrabackup`)
+            for _tok in _re.findall(r"\w+", node):
+                if (_tok.startswith(word) and len(word) >= 4
+                        and len(word) >= 0.5 * len(_tok)):
+                    return True
+            return False
         return True
 
-    def _map_words_to_seeds(self, words: Iterable[str]) -> List[str]:
+    def _map_words_to_seeds(self, words: Iterable[str], fuzzy: bool = True) -> List[str]:
         """Map free-form query words to exact node names in the graph.
 
         Strategy per word: exact match → substring containment → difflib
@@ -1255,11 +1306,21 @@ class GraphMemory:
             if wl in self.nx_graph:
                 matches = [wl]
             else:
-                substr = [n for n in all_nodes
-                          if (wl in n or n in wl) and self._seed_containment_ok(n, wl)]
-                if substr:
+                _raw_sub = [n for n in all_nodes if (wl in n or n in wl)]
+                substr = [n for n in _raw_sub if self._seed_containment_ok(n, wl)]
+                if _raw_sub and not substr:
+                    # r2 review: every substring hit was REFUSED — the word
+                    # is a fragment, not a name; falling to the fuzzy tier
+                    # turned "tool" into `pool` and "word" into `work`
+                    matches = []
+                elif substr:
                     # Prefer the closest length match for stable ordering
                     matches = sorted(substr, key=lambda n: (abs(len(n) - len(wl)), n))[:3]
+                elif not fuzzy:
+                    # §4MJ: hydration asks for no fuzzy seeds — 91 graph
+                    # items on 80 real turns came only from them and 0 were
+                    # relevant ("sitting"→`stealthing`, "going"→`coding`)
+                    matches = []
                 else:
                     # Same hub protection on the fuzzy tier: 'systemd' is a
                     # 0.92 difflib match for the 'system' hub.
@@ -1359,15 +1420,16 @@ class GraphMemory:
     #: a database named "agent" are real entities (§4LB r2)
     _AGENT_NODES = frozenset({"ai", "assistant", "system", "the assistant", "the ai"})
 
-    def get_neighborhood(self, words: List[str], global_limit: int = 25) -> List[str]:
+    def get_neighborhood(self, words: List[str], global_limit: int = 25, fuzzy: bool = True) -> List[str]:
         """Spreading-activation GraphRAG over the in-memory NetworkX graph.
 
         1. Map query words to exact graph nodes (fuzzy → exact matching).
-        2. Run 2-hop BFS from each seed, scoring chains by edge-weight sum.
+        2. Run a 3-hop BFS from each seed, scoring chains by edge-weight sum
+           (a chain contained in a higher-ranked chain is dropped, §4MJ).
         3. Return the highest-scoring directed paths formatted for the LLM.
         """
         with self._lock:
-            seeds = self._map_words_to_seeds(words)
+            seeds = self._map_words_to_seeds(words, fuzzy=fuzzy)
             if not seeds:
                 return []
             path_scores: Dict[Tuple, int] = {}
@@ -1385,5 +1447,17 @@ class GraphMemory:
                 path_scores.items(),
                 key=lambda item: (item[1], len(item[0])),
                 reverse=True
-            )[:global_limit]
-            return [self._format_path(chain, score) for chain, score in sorted_paths]
+            )
+            # §4MJ: a chain and its own sub-path were two items (a 3-hop
+            # chain always outranks its prefixes) — 102 duplicate pairs on
+            # 16% of real turns, each taking one of the tier's 6 slots
+            kept: List[Tuple[Tuple, int]] = []
+            for chain, score in sorted_paths:
+                n = len(chain)
+                if any(len(k) > n and any(k[i:i + n] == chain for i in range(len(k) - n + 1))
+                       for k, _ in kept):
+                    continue
+                kept.append((chain, score))
+                if len(kept) >= global_limit:
+                    break
+            return [self._format_path(chain, score) for chain, score in kept]
