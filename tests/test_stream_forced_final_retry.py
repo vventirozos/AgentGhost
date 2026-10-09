@@ -193,7 +193,7 @@ async def test_a_retry_that_raises_costs_nothing_but_the_answer():
     gen, _, _ = a._stream_final_generation(_state(reg, TOOLS, _PREFIX))
     chunks = [c async for c in gen]
     assert chunks[-1].strip() == b"data: [DONE]"
-    assert any(UNPARSED_TOOL_CALL_NOTE.encode() in c or b"could not be parsed" in c for c in chunks)
+    assert any(UNPARSED_TOOL_CALL_NOTE.encode() in c or b"NOT executed" in c for c in chunks)
 
 
 @pytest.mark.asyncio

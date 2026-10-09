@@ -130,29 +130,31 @@ async def test_treatment_steers_once_at_the_threshold_with_tools_kept(monkeypatc
     alert = _alerts(ts)[0]
     assert "extract_text" in alert and "could NOT confirm" in alert
     assert ts.force_final_response is False and ts.force_stop is False   # tools KEPT
-    assert trig == [("search_yield_steer_fired", True)]
+    assert trig == []          # §4MO operator decision: the owner is steered outright — no arm, no trigger
     # once per request: three more searches add no second steer
     ts, fired_at = await _run_searches(agent, 3, strikes, steered, start=SK.SEARCH_YIELD_STEER)
-    assert fired_at is None and trig == [("search_yield_steer_fired", True)]
+    assert fired_at is None and trig == []
 
 
 @pytest.mark.asyncio
-async def test_control_gets_no_message_but_the_trigger_is_stamped(monkeypatch):
+async def test_a_control_arm_no_longer_withholds_the_owners_steer(monkeypatch):
+    """§4MO operator decision (2026-10-08): the arm was concluded (§4LF) and
+    the owner is steered at 10 whatever any arm says."""
     agent = _agent()
     trig = _arm(monkeypatch, E.CONTROL)
     ts, fired_at = await _run_searches(agent, SK.SEARCH_YIELD_STEER + 2, StrikeLedger(), set())
-    assert fired_at is None
-    assert trig == [("search_yield_steer_fired", False)]
+    assert fired_at == SK.SEARCH_YIELD_STEER - 1
+    assert trig == []
 
 
 @pytest.mark.asyncio
-async def test_no_arm_means_no_steer_and_no_trigger(monkeypatch):
-    """GHOST_EXPERIMENTS=0 / an unlisted spec: `arm_for` returns "" and the
-    site does nothing at all."""
+async def test_no_arm_still_steers_the_owner_at_the_threshold(monkeypatch):
+    """§4MO: with no arm (the experiment concluded) the owner had NO bound —
+    one turn ran 22 searches. Now steered at 10, no trigger stamped."""
     agent = _agent()
     trig = _arm(monkeypatch, "")
     ts, fired_at = await _run_searches(agent, SK.SEARCH_YIELD_STEER + 1, StrikeLedger(), set())
-    assert fired_at is None and trig == []
+    assert fired_at == SK.SEARCH_YIELD_STEER - 1 and trig == []
 
 
 @pytest.mark.asyncio
@@ -186,9 +188,11 @@ async def test_the_run_counts_a_batch_in_call_order(monkeypatch):
 
 # ── the spec ──────────────────────────────────────────────────────────
 
-def test_the_arm_is_a_live_default_spec():
+def test_the_concluded_arm_is_a_disabled_default_spec():
+    """§4MO: concluded (§4LF) and replaced by an always-on owner steer — an
+    enabled default would show an arm with no consumer."""
     spec = next(s for s in E.DEFAULT_SPECS if s.name == "search_yield_steer")
-    assert spec.arms == (E.CONTROL, E.TREATMENT) and spec.scope == E.SCOPE_LIVE and spec.enabled
+    assert spec.arms == (E.CONTROL, E.TREATMENT) and spec.scope == E.SCOPE_LIVE and not spec.enabled
     assert spec.traffic == 1.0
 
 

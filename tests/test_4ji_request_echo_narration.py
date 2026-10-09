@@ -281,10 +281,12 @@ def _arms_flag(stmts):
 #: call there is the ordinary drop, not the §4IG no-answer. Named by the
 #: enclosing test's own symbol; a new unlisted force-final site must arm.
 NOT_A_BREAKER = ("_proj_task_closed_this_req", "_latch_forces_final",
-                 "_NO_TOOL_DISCLAIM_PATTERNS", "_plan_focus_none",
+                 "_plan_focus_none",
                  "_lang_mismatch",            # §4JR: the reply-language regeneration (text-only turn)
                  "_plan_signals_done",        # §4JS: the planner's DONE plan (was force_stop)
-                 "_DEAD_END_REFUSALS")        # §4LW: a refusal that cannot change this request (normal wrap-up)
+                 "_DEAD_END_REFUSALS",        # §4LW: a refusal that cannot change this request (normal wrap-up)
+                 "_ask_user_code",            # §4MO: a designed stop — the question to the user IS the answer
+                 "project_refusal_batches")   # §4MO: project creation refused twice — answer with what you have
 
 
 def test_every_breaker_force_final_arms_the_flag():
@@ -303,8 +305,8 @@ def test_every_breaker_force_final_arms_the_flag():
             else:
                 bare.append(test_src)
     assert bare == [], f"force-final site(s) that neither arm the flag nor are a named non-breaker: {bare}"
-    assert len(exempt) == 7                                   # +2 on 2026-09-22: §4JR/§4JS; +1 2026-10-05 §4LW dead-end refusal
-    assert len(armed) == 14                                   # +2 on 2026-09-29: cross-turn loop report, member refusals (§4KL); +1 2026-10-05 §4LZ duplicate-setter budget
+    assert len(exempt) == 8                                   # +2 on 2026-09-22: §4JR/§4JS; +1 2026-10-05 §4LW dead-end refusal; −1 §4MO: the no-tool disclaimer no longer forces a final; +2 §4MO designed stop, project refused twice
+    assert len(armed) == 15                                   # +2 on 2026-09-29: cross-turn loop report, member refusals (§4KL); +1 2026-10-05 §4LZ duplicate-setter budget; +1 §4MO owner blocked batches
     # the six §4JI sites, by their enclosing condition
     for marker in ("execution_failure_count >= 6 or total_fail >= 8",     # Failure Cap
                    "_acnt >= _hard_n and _nav_case",                    # never-extracted navigate
@@ -313,7 +315,8 @@ def test_every_breaker_force_final_arms_the_flag():
                    "_readwrite_loop",                                   # no-progress hard stop (its else)
                    "deadline_needs_report(",                            # §4JP client-deadline report
                    "not force_final_response and second_cap_reports(",   # §4KL cross-turn loop report
-                   "MEMBER_REFUSAL_REPORT_AT"):                          # §4KL member refusals
+                   "MEMBER_REFUSAL_REPORT_AT",                           # §4KL member refusals
+                   "strikes.blocked_batches >= MEMBER_REFUSAL_REPORT_AT"):  # §4MO owner blocked batches
         assert any(marker in a for a in armed), marker
     assert sum("execution_failure_count >= 6" == a for a in armed) == 1      # Think-Loop Halt
 

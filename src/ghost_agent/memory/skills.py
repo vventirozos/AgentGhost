@@ -501,6 +501,10 @@ def trajectory_may_teach(traj, consumer: str = "") -> bool:
             return False
         if str(extra.get("source_task_kind") or "") == "probe":     # r2: a probe's reflection copy
             return False
+        # §4MS: a turn cut from outside (disconnect, shutdown) was not the
+        # agent's attempt — no producer learns from it
+        if "[TURN_INTERRUPTED]" in str(getattr(traj, "final_response", "") or ""):
+            return False
         if consumer:
             try:
                 from ..core.admissibility import admitted_task_kinds
@@ -2654,6 +2658,8 @@ class SkillMemory:
         """
         if playbook_writes_blocked():        # §4KD: Slack never teaches
             return None
+        if usage_credit_blocked():          # §4MS: nor a probe or internal turn
+            return None
         if not trigger:
             return False
 
@@ -2683,6 +2689,8 @@ class SkillMemory:
         successful outcome. Increments helpful_retrievals and lightly
         bumps confidence."""
         if playbook_writes_blocked():        # §4KD: Slack never teaches
+            return None
+        if usage_credit_blocked():          # §4MS: nor a probe or internal turn
             return None
         if not trigger:
             return False
@@ -2745,6 +2753,8 @@ class SkillMemory:
         window does not double-count.
         """
         if playbook_writes_blocked():        # §4KD: Slack never teaches
+            return 0
+        if usage_credit_blocked():          # §4MS: nor a probe or internal turn
             return 0
         if window_seconds <= 0:
             return 0

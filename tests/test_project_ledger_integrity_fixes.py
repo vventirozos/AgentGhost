@@ -273,8 +273,15 @@ async def test_autoadvance_on_failed_project_reports_project_failed(
         context, stub_subtools):
     store = context.project_store
     pid, tid = await _mini_ai_with_failed_task(context, VALID_PY)
-    out = json.loads(await tool_manage_projects(
-        context, action="autoadvance", count="all"))
+    # the OWNER's batch (§4MQ: a background batch needs autopilot and would
+    # stop as `autopilot_off` before reading the ledger)
+    from ghost_agent.utils.logging import request_id_context
+    _tok = request_id_context.set("req-owner-ledger")
+    try:
+        out = json.loads(await tool_manage_projects(
+            context, action="autoadvance", count="all"))
+    finally:
+        request_id_context.reset(_tok)
     assert out["stop_reason"] == "project_failed"
     assert "FAILED state" in out["agent_instruction"]
     assert "Do NOT report the project as complete" in out["agent_instruction"]

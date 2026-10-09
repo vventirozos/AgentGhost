@@ -498,8 +498,46 @@ def _save_cursor(cursor: Dict[str, int], home: Optional[str] = None) -> None:
 RESULT_SOURCES = ("idle", "drain")
 
 
+#: §4MS (operator, 2026-10-09: "retire saturated banks"): an idle run of a
+#: bank that passes this often over its last `SATURATION_WINDOW` graded runs
+#: measures nothing new (gsm8k/mbpp: 94.5% in October, read by no owner turn)
+SATURATION_WINDOW = 30
+SATURATION_PASS_RATE = 0.90
+
+
+def saturated_banks(home: Optional[str] = None, *, window: int = SATURATION_WINDOW,
+                    threshold: float = SATURATION_PASS_RATE) -> List[str]:
+    """Banks whose last ``window`` GRADED runs (a pass or a fail — an
+    aborted or no-result run is not a grade) pass at ``threshold`` or more.
+    A bank with fewer graded runs is never saturated. The operator keeps a
+    bank running anyway with ``GHOST_BENCH_KEEP_BANKS=a,b``."""
+    import os as _os
+    keep = {b.strip() for b in _os.environ.get("GHOST_BENCH_KEEP_BANKS", "").split(",") if b.strip()}
+    by_bank: Dict[str, List[bool]] = {}
+    try:
+        with open(_results_path(home), encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                st = str(r.get("status") or "").upper()
+                if "NO_RESULT" in st or "INFRA" in st or "ABORT" in st:
+                    continue
+                by_bank.setdefault(str(r.get("bank") or ""), []).append(bool(r.get("passed")))
+    except OSError:
+        return []
+    out = []
+    for bank, runs in by_bank.items():
+        last = runs[-window:]
+        if bank and bank not in keep and len(last) >= window and sum(last) / len(last) >= threshold:
+            out.append(bank)
+    return sorted(out)
+
+
 def pick_next_item(home: Optional[str] = None, *,
                    banks: Optional[List[str]] = None,
+                   skip_saturated: bool = False,
                    ) -> Optional[Dict[str, str]]:
     """Deterministic, resumable pick: the bank with the LOWEST cursor goes
     next (keeps banks advancing together), sequential within a bank,
@@ -557,6 +595,13 @@ def pick_next_item(home: Optional[str] = None, *,
         if not names:
             # An explicit filter that matched nothing means "no work",
             # never "everything".
+            return None
+    if skip_saturated:
+        # §4MS: the IDLE walk skips saturated banks (an operator drain names
+        # its banks and is never filtered)
+        _sat = set(saturated_banks(home))
+        names = [n for n in names if n not in _sat]
+        if not names:
             return None
     cursor = _load_cursor(home)
     # Lowest served-count first; ties broken by name for determinism.

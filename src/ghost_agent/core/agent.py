@@ -3473,8 +3473,57 @@ def _backfilled_failure_reason(verifier: Optional[str], verifier_reason: str,
     return structural_reason(structural_cause_for_trajectory(traj))
 
 
+def fresh_reflectable(trajectories, already, reflector) -> list:
+    """§4MS: the failures reflection may read that it has not read yet —
+    the phase's real input (an empty list = nothing to do)."""
+    is_refl = getattr(reflector, "_is_reflectable", None)
+    return [t for t in (trajectories or [])
+            if getattr(t, "id", None) not in (already or set())
+            and (not callable(is_refl) or is_refl(t))]
+
+
+def interruption_marker(req_id) -> str:
+    """§4MS r1: a cancel at or past the request's deadline is the AGENT
+    being too slow (the interface's 1800 s client timeout reads like a
+    disconnect: fd89fd6d +1800 s, 2ba9ed1d) — a real failure, kept as an
+    abort. Earlier, it was cut from outside: an interruption."""
+    try:
+        from ..utils.logging import request_remaining_s
+        rem = request_remaining_s(str(req_id or ""))
+        if rem is not None and float(rem) <= 5.0:
+            return "[ATTEMPT_ABORTED_TURN]"
+    except Exception:  # noqa: BLE001
+        pass
+    return TURN_INTERRUPTED_MARKER
+
+
+class _NoOwnerSeed(Exception):
+    """§4MS: no real owner failure left to practise — self-play waits."""
+
+
+class _NothingToReflect(Exception):
+    """§4MS: the reflection phase found no new reflectable failure."""
+
+
+#: §4MS: the wall cap of one idle job (self-play, counterfactual replay) —
+#: the bench's per-item bound; a self-play tick ran 2,140 s unbounded
+IDLE_JOB_CAP_S = 900.0
+
+#: §4MO: the loop's own pre-dispatch blocks that ASK the user (clarify-first;
+#: an image retry that drops or replaces a subject with no photo). A batch
+#: holding one ends the tool phase. The TOOL's own first "no photo" is not
+#: here: it allows one respelled retry, as its text says.
+_ASK_THE_USER_STOPS = frozenset({"clarify_first", "subject_photo_missing"})
+
+#: §4MO r2: synthetic rows that already book a strike (`_strike_synthetic`)
+#: — not counted again as a "blocked batch"
+_STRUCK_BLOCK_CODES = frozenset({"tool_disabled", "tool_call_parse_error", "bad_json_arguments",
+                                 "empty_write_blocked", "constraint_violation",
+                                 "invocation_error", "unknown_tool"})
+
 #: Tool refusals that cannot change within the request (§4LV): retrying is
 #: pointless, so the turn loop ends the tool phase on the first one.
+
 _DEAD_END_REFUSALS = frozenset({"not_owner_write", "confirm_dead_end",
                                 "forget_not_confirmed", "reset_not_confirmed"})
 
@@ -3553,11 +3602,10 @@ _FORMAT_BOUND_RE = re.compile(
     r"\bin \d+ words\b|μία? (?:γραμμή|λέξη|πρόταση)|σύντομα", re.IGNORECASE)
 
 
-#: world-fact predicates whose value is a moving target (§4ME F3)
-_TRANSIENT_WORLD_PREDICATE = re.compile(
-    # whole `_`-separated words: "RELEASED_IN 2008" is a stable fact (review)
-    r"(?:^|_)(?:VERSION|LATEST|CURRENT|NEWEST|PRICE|COSTS?|STOCK|RATE|SCORE|RANK|RANKING)(?:_|$)",
-    re.IGNORECASE)
+#: world-fact predicates whose value is a moving target (§4ME F3; the one
+#: definition lives in memory/graph.py since §4MM — every writer applies it)
+from ..memory.graph import TRANSIENT_WORLD_PREDICATE as _TRANSIENT_WORLD_PREDICATE  # noqa: E402,F401 — tests import it from here
+from ..memory.graph import is_moving_target_world_fact as _is_moving_target_world_fact  # noqa: E402
 
 
 #: a status question — what has happened / where are we — not a request for
@@ -5610,6 +5658,9 @@ TRUNCATED_ANSWER_NOTE = ("⚠️ This answer was cut off — the model server st
 #: FAILED; like every abort marker it is stripped from a channel MEMBER's
 #: copy (the owner's reply and the trajectory keep it)
 UPSTREAM_ABORT_MARKER = "[ATTEMPT_ABORTED_UPSTREAM]"
+#: §4MS: a turn cut by a client disconnect or a process shutdown — not an
+#: attempt that failed (outcome UNKNOWN; `trajectory_may_teach` refuses it)
+from ..distill.outcome_heuristics import TURN_INTERRUPTED_MARKER  # noqa: E402
 
 # Strategic planner output cap. RAISED 4096 → 8192 on 2026-08-11 (operator),
 # sized from 167 recorded planner calls over four days rather than doubled by
@@ -5846,8 +5897,14 @@ def deadline_needs_report(remaining_s, floor_s: float, force_final_response, for
 
 def declared_wait_s(fname: str, t_args) -> float:
     """How long a tool call DECLARES it will wait, in seconds — the browser's
-    `sleep` / `settle_ms` actions (the fd89fd6d sleep). Unknown → 0."""
+    `sleep` / `settle_ms` actions (the fd89fd6d sleep) — or, for an image
+    render, how long renders of its kind have taken (§4MO). Unknown → 0."""
     try:
+        if fname == "image_generation" and isinstance(t_args, dict):   # the healed name (fname is canonical here)
+            # §4MO: a render's duration is not declared but measured — the
+            # longest of this node's last three of the same kind
+            from ..tools.image_gen import expected_render_seconds
+            return expected_render_seconds(t_args)
         if fname != "browser" or not isinstance(t_args, dict):
             return 0.0
         total = float(t_args.get("settle_ms") or 0) / 1000.0
@@ -6598,6 +6655,23 @@ _BLEED_STRONG = ("<tools>", "You may call one or more functions",
                  # paraphrased bleed can carry it with no other marker.
                  "(Tool schemas are advertised via the native")
 _BLEED_WEAK = ("# Tools", '{"type": "function"')
+
+
+def reply_tap_unsafe(text: str) -> bool:
+    """§4MP r2 M3: content that must never reach a client live — any call
+    shape the parsers accept (`_TOOL_MARKUP_RE`, `_FN_TAG_RE`: `<tool_call>`,
+    `<tool …>`, `<function=…>`, `<function_name=…>`), think tags, a tool
+    result, a chat-template token, or prompt bleed (strong AND weak markers:
+    stopping the live stream only costs the fast path). The reply tap's
+    private copy missed four of these."""
+    if not text:
+        return False
+    if _TOOL_MARKUP_RE.search(text) or _FN_TAG_RE.search(text):
+        return True
+    low = text.lower()
+    if any(m in low for m in ("<think", "</think", "<tool_response", "<parameter", "<|im_", "<|endoftext")):
+        return True
+    return any(m in text for m in _BLEED_STRONG) or any(m in text for m in _BLEED_WEAK)
 
 
 # --- stream-scrub hold-back classifier (§ finalize/stream R1 B-1, R2 C1/M4) --
@@ -8153,8 +8227,19 @@ def detect_coding_intent(lc: str, messages: Optional[List[Dict]] = None) -> tupl
             has_coding_intent = True
     if any(ext in lc for ext in [".py", ".js", ".html", ".css", ".ts", ".tsx", ".jsx", ".sh"]) or re.search(r'\bscript\b', lc):
         has_coding_intent = True
-    if any(re.search(k, lc) for k in _DBA_KEYWORDS):
-        has_coding_intent = True
+    # §4MO: a DBA word counts unless it only names a FILE
+    # ("remove the ingested document postgresql-19-A4.pdf") or the message
+    # is a moving-target LOOKUP ("what is the latest version of postgresql?")
+    # — both loaded the long specialist persona: +8 s of prefill, no gain
+    _dba_lc = re.sub(r"\S+\.(?:pdf|txt|md|csv|json|docx?|xlsx?|html?|zip|tar|gz)\b", " ", lc)
+    if any(re.search(k, _dba_lc) for k in _DBA_KEYWORDS):
+        try:
+            from ..memory.episodes import is_moving_target_question as _mtq
+            _lookup = _mtq(lc)
+        except Exception:  # noqa: BLE001
+            _lookup = False
+        if not _lookup:
+            has_coding_intent = True
 
     is_meta_task = any(re.search(k, lc) for k in _META_KEYWORDS)
     if re.match(r'^[\d\s\+\-\*\/\(\)\=\?]+$', lc):
@@ -9012,6 +9097,44 @@ def _turn_generated_images(tools_run_this_turn) -> List[str]:
     return out
 
 
+def _foreign_image_note(text, tools_run_this_turn, sandbox_root=None, include_missing: bool = True) -> str:
+    """§4MM: a note when the reply SHOWS a generated image (`gen_*`) and this
+    request generated NONE, else "". Turn 40 described an image no tool made
+    (its link pointed at nothing); turn 43 showed an earlier turn's image
+    under a new description — and the verifier confirmed it. A request that
+    DID generate one is left alone (an edit shows before AND after — r2).
+    Run before missing links are dropped. ``include_missing=False``: links to
+    files that do not exist are left to the caller's own missing-file note
+    (the streamed path — r2: two notes for one link)."""
+    try:
+        if _turn_generated_images(tools_run_this_turn):
+            return ""
+        earlier, missing = [], []
+        for m in _DOWNLOAD_LINK_RE.finditer(str(text or "")):
+            name = os.path.basename(m.group(2).split("?", 1)[0])
+            if not name.startswith("gen_") or name in earlier or name in missing:
+                continue
+            exists = True
+            if sandbox_root is not None:
+                _, _gone = _drop_missing_download_links(f"![x](/api/download/{name})", sandbox_root)
+                exists = not _gone
+            (earlier if exists else missing).append(name)
+        if not include_missing:
+            missing = []
+        if not (earlier or missing):
+            return ""
+        parts = []
+        if earlier:
+            parts.append(", ".join(f"`{n}`" for n in earlier[:3])
+                         + (" is" if len(earlier) == 1 else " are") + " from an earlier request")
+        if missing:
+            parts.append(", ".join(f"`{n}`" for n in missing[:3])
+                         + (" does" if len(missing) == 1 else " do") + " not exist")
+        return "\n\nℹ️ No image was generated in this request — " + "; ".join(parts) + "."
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _unshown_image_note(text, tools_run_this_turn, sandbox_root=None) -> str:
     """The markdown line for the LAST image generated this request when the
     reply DISPLAYS none of them, else "" (§4MG). Live 2026-10-07: the time
@@ -9167,12 +9290,14 @@ def _missing_subject_block(fname, raw_args, tools_run_this_turn) -> Optional[str
     if str(fname or "") != "image_generation":
         return None
     missing, found = [], []
+    no_photo_rows = 0
     for t in (tools_run_this_turn or []):
         if not isinstance(t, dict) or t.get("_synthetic"):
             continue
         body = str(t.get("content") or "").lstrip()
         if not body.startswith(_MISSING_SUBJECT_HEAD):
             continue
+        no_photo_rows += 1
         k = body.rfind(_MISSING_SUBJECT_TAIL)
         if k < 0:
             continue
@@ -9207,6 +9332,13 @@ def _missing_subject_block(fname, raw_args, tools_run_this_turn) -> Optional[str
                 "them to upload a photo or to confirm a generic stand-in. (Only a CORRECTED "
                 "spelling may be tried, once.)")
     if kept and all(_respelled(m) for m in missing):
+        if no_photo_rows >= 2:
+            # §4MR: "a corrected spelling, ONCE" was only text — each failed
+            # respelling is a fresh no-photo row with no strike, and a probe
+            # ran 6 photo searches on variants of one name
+            return (f"SYSTEM BLOCK — a corrected spelling was already tried and also found no photo "
+                    f"of {who}. Do NOT try another spelling. Reply to the user NOW: ask them to "
+                    "upload a photo or to confirm a generic stand-in.")
         return None
     return (f"SYSTEM BLOCK — ask the user first: no photo of {who} was found earlier in this "
             "request, and the user has not agreed to a stand-in. Do NOT render a picture without "
@@ -10912,6 +11044,46 @@ class GhostAgent:
         except Exception as exc:  # noqa: BLE001
             logger.debug("pretty_log suppressed in idle phase: %s", exc)
 
+    def _owner_active(self) -> bool:
+        """§4MS: a user request is being served (the idle tick checked this
+        only at its START, and a self-play tick ran up to 2,140 s)."""
+        _lc = getattr(self.context, "llm_client", None)
+        return (getattr(_lc, "foreground_requests", 0) or 0) > 0
+
+    async def _run_idle_job(self, coro, label: str, cap_s: float = IDLE_JOB_CAP_S):
+        """§4MS: run one idle job with a wall cap, and stop it the moment a
+        user request arrives. Fresh self-play and the counterfactual replays
+        had NO bound (`synthetic_self_play` has no internal timeout) and
+        never re-checked for the owner: 19 owner turns started inside one
+        and waited a median 37 s for their first model call (12 s clean).
+        Returns the job's result, or None when it was stopped."""
+        task = asyncio.ensure_future(coro)
+        t0 = time.monotonic()
+        why = ""
+        try:
+            while not task.done():
+                await asyncio.wait({task}, timeout=1.0)
+                if task.done():
+                    break
+                if self._owner_active():
+                    why = "a user request arrived"
+                    break
+                if time.monotonic() - t0 > cap_s:
+                    why = f"it passed its {int(cap_s)} s cap"
+                    break
+            if why:
+                task.cancel()
+                pretty_log("Idle Job", f"{label} stopped — {why}", level="WARNING", icon=Icons.STOP)
+                try:
+                    await asyncio.wait({task}, timeout=60.0)     # let its cleanup run, bounded
+                except Exception:  # noqa: BLE001
+                    pass
+                return None
+            return task.result()
+        finally:
+            if not task.done():
+                task.cancel()
+
     def _bio_roll(self, p: float) -> bool:
         """Probability gate for the idle phases. Returns True deterministically
         under ``--bio-deterministic`` (so the B3 control/treatment arms fire the
@@ -11498,14 +11670,8 @@ class GhostAgent:
                     # OSError 28) escaped the tick with the anchor still at
                     # datetime.min, refiring every 60s tick and starving
                     # phases 2.5c→3b while the watchdog reported alive.
-                    _idle_ran.append("reflection")
                     self._last_reflection_at = datetime.datetime.now()
                     try:
-                        pretty_log(
-                            "Biological Hook",
-                            "Agent is idle. Entering reflection cycle on recent failures...",
-                            icon=Icons.BRAIN_THINK,
-                        )
                         # Loaded from disk once so restarts don't re-reflect
                         # the oldest failures (the loop progresses through the
                         # backlog instead of redoing work every boot).
@@ -11534,6 +11700,22 @@ class GhostAgent:
                         _refl_trajs = await asyncio.to_thread(
                             lambda: list(_iter_teachable_refl(traj_collector.iter_trajectories(
                                 since_days=REFLECTION_WINDOW_DAYS))))
+                        # §4MS: the INPUT is what changed or not — failures
+                        # it may reflect that it has not. The corpus
+                        # fingerprint above re-armed on every append (probe,
+                        # member) and reset on every boot: 152 of 157 passes
+                        # reflected nothing ("0 of 29, dup-skipped 29").
+                        _fresh = fresh_reflectable(_refl_trajs, already, reflector)
+                        if not _fresh:
+                            self._reflection_corpus_fp = _refl_corpus_fp
+                            logger.debug("Reflection skipped: no new reflectable failure")
+                            raise _NothingToReflect()
+                        _idle_ran.append("reflection")
+                        pretty_log(
+                            "Biological Hook",
+                            f"Agent is idle. Reflecting on {len(_fresh)} new failure(s)...",
+                            icon=Icons.BRAIN_THINK,
+                        )
                         report = await reflector.run(
                             failed_source=lambda: _refl_trajs,
                             sink=_sink,
@@ -11586,6 +11768,8 @@ class GhostAgent:
                                 logger.debug(
                                     "reflection→frontier wiring skipped: %s", _e,
                                 )
+                    except _NothingToReflect:
+                        pass
                     except Exception as e:
                         logger.warning(f"Reflection phase failed: {e}")
                     finally:
@@ -12821,7 +13005,7 @@ class GhostAgent:
                         )
                         pid = target.get("id")
                         from .project_advancer import (
-                            advance_once as _advance_once,
+                            advance_unattended as _advance_unattended,   # §4MQ: the gated unattended step
                             pinned_project_context as _pin_ctx,
                         )
 
@@ -12918,7 +13102,7 @@ class GhostAgent:
                         # wrong project's activity view.
                         from ..workspace import pinned_event_project as _pin_evt
                         with _pin_evt(pid):
-                            result = await _advance_once(
+                            result = await _advance_unattended(
                                 ctx, pid, tool_runner=_aa_tool_runner,
                                 llm_classifier=_aa_classify,
                                 code_generator=_aa_code_gen,
@@ -13193,9 +13377,24 @@ class GhostAgent:
                 # here the finally now also guarantees the LOAD-BEARING
                 # idle-clock reset runs even on a preamble raise).
                 self._last_selfplay_at = datetime.datetime.now()
+                # §4MS: on DISK now — the file was written only at the next
+                # tick, so a restart mid-phase lost the anchor and the phase
+                # re-ran inside its cooldown (self-play 85 min after a 4 h one)
+                _sync_idle_anchors(self, ctx)
                 try:
+                    # §4MS (operator: "retarget to my failures"): practise only
+                    # what a real owner turn got wrong — no unpractised
+                    # failure, no self-play (nor counterfactual replay)
+                    from .owner_seeds import mark_used as _mark_seed_used, pick_owner_failure_seed
+                    _seed_home = (Path(ctx.memory_dir).parent
+                                  if isinstance(getattr(ctx, "memory_dir", None), (str, Path)) else None)
+                    _owner_seed = await asyncio.to_thread(
+                        pick_owner_failure_seed, getattr(ctx, "trajectory_collector", None), _seed_home)
+                    if _owner_seed is None:
+                        raise _NoOwnerSeed()
                     pretty_log("Biological Hook",
-                               "Agent is deeply idle. Initiating Synthetic Self-Play...",
+                               "Agent is deeply idle. Self-play on a recent failure of yours "
+                               f"({_owner_seed['source_id'][:8]})...",
                                icon=Icons.TOOL_CODE)
                     # §4CB R2 A-MIN-9: import inside the try (same as phase 2).
                     from .dream import Dreamer
@@ -13211,8 +13410,9 @@ class GhostAgent:
                             from .counterfactual import (
                                 load_replay_candidates, run_counterfactual_batch)
                             if load_replay_candidates(1):
-                                _cf = await run_counterfactual_batch(
-                                    dreamer, ctx)
+                                _cf = await self._run_idle_job(
+                                    run_counterfactual_batch(dreamer, ctx),
+                                    "counterfactual replay") or {}
                                 if _cf.get("replayed"):
                                     _ran_cf = True
                                     self._record_autonomous_activity(
@@ -13225,12 +13425,19 @@ class GhostAgent:
                                         f"{_cf['regressions']} regression(s), "
                                         f"{_cf['stable']} stable")
                         except Exception as _cfe:
-                            logger.debug("counterfactual slot skipped: %s", _cfe)
-                    if not _ran_cf:
-                        await dreamer.synthetic_self_play(
-                            model_name=getattr(ctx.args, 'model', 'default'),
-                            is_background=True
-                        )
+                            # §4MS: was DEBUG — a broken replay arm quietly
+                            # became fresh self-play, invisible in production
+                            logger.warning("counterfactual slot skipped: %s", _cfe)
+                    if not _ran_cf and not self._owner_active():
+                        await self._run_idle_job(
+                            dreamer.synthetic_self_play(
+                                model_name=getattr(ctx.args, 'model', 'default'),
+                                is_background=True, seed_override=_owner_seed),
+                            "self-play")
+                        # only a run that CONCLUDED uses its seed (r1 M5: a
+                        # run stopped by the owner burned one of ~4 a fortnight)
+                        if getattr(dreamer, "last_self_play_status", None):
+                            _mark_seed_used(_seed_home, _owner_seed["source_id"])
                         # §4CB R1 B-M2: `last_self_play_status` is stamped
                         # ONLY at sim conclusion (dream.py), so unset ⟺ the
                         # session never concluded — generation/setup/validator
@@ -13259,6 +13466,11 @@ class GhostAgent:
                             logger.info(
                                 "self-play session did not conclude — "
                                 "no ledger row minted")
+                except _NoOwnerSeed:
+                    # a heartbeat: "ran and correctly declined" — without it
+                    # the EXPECT_PERIODIC liveness view reads DEAD (r1 M4)
+                    self._record_idle_attempt("self_play", "declined")
+                    logger.debug("Self-play: no unpractised owner failure — not running")
                 except Exception as _spe:
                     # NAME self-play in the log (the tick handler's catch-all
                     # otherwise attributes the crash to "the tick"), then
@@ -13374,7 +13586,8 @@ class GhostAgent:
         # the one file nothing trains on).
         _bench_source = "drain" if _drain_active else "idle"
         if (getattr(ctx.args, "no_bench", False) is not True
-                and (_drain_active or _idle_eligible)):
+                and (_drain_active or _idle_eligible)
+                and not self._owner_active()):         # §4MS: the tick may be minutes old
             since_last_bench = (datetime.datetime.now()
                                 - self._last_bench_at).total_seconds()
             if (_drain_active or since_last_bench
@@ -13385,7 +13598,8 @@ class GhostAgent:
                     from ..eval import banks as _banks
                     _bench_item = _banks.pick_next_item(
                         banks=(self._bench_drain_banks if _drain_active
-                               else None))
+                               else None),
+                        skip_saturated=not _drain_active)   # §4MS: operator decision
                 except Exception as _bpe:  # noqa: BLE001
                     _pick_raised = True
                     logger.debug("bench pick skipped: %s", _bpe)
@@ -13515,6 +13729,7 @@ class GhostAgent:
                         # Anchor BEFORE the await (phase convention): a slow
                         # run must not make the next tick double-fire.
                         self._last_bench_at = datetime.datetime.now()
+                        _sync_idle_anchors(self, ctx)   # §4MS: before the run, not at the next tick
                         # R3 MAJOR-4: `_bench_last_item_at` is written in
                         # the finally, so it moves when an item ENDS. That
                         # cannot answer the question its own comment
@@ -14399,7 +14614,7 @@ class GhostAgent:
                         # a world fact that goes stale by design ("Postgresql
                         # HAS_VERSION 18.4" outlived 18.6 and answered a later
                         # "latest version?" — §4ME F3) is not stored
-                        if _TRANSIENT_WORLD_PREDICATE.search(_canon(_p)):
+                        if _is_moving_target_world_fact(_canon(_p), _o):
                             _unattributed += 1
                             continue
                         _attributed.append(_t)
@@ -17759,9 +17974,10 @@ class GhostAgent:
         OFF-HOST second model — so this wait costs the MAIN inference slot
         nothing. Code default 65s (below); ``GHOST_CRITIC_REPAIR_BUDGET``
         overrides, 0 disables (pure defer, the pre-2026-07-07 async
-        behaviour). §4MK (2026-10-08): the production launcher sets 25 —
-        the operator's decision after 65s held 27/83 owner turns and caught
-        2 refutes, both false.
+        behaviour). §4MK (2026-10-08): the launcher set 25 (65s held 27/83
+        owner turns and caught 2 refutes, both false); §4MO (same day,
+        operator): the launcher sets 0 — at 25 s, 0 of 14 owner verdicts
+        landed in time. A verdict still corrects at the next message.
 
         ⚠ MEASURED AGAINST THE POPULATION IT EXISTS FOR (2026-08-22, 115
         verdicts over 16 days of live log). This window's whole purpose is to
@@ -17794,12 +18010,12 @@ class GhostAgent:
             on the pure-defer path;
           * the verdict runs on the OFF-HOST critic node, so the wait costs
             the main inference slot nothing;
-          * STREAMED TURNS NEVER REACH IT. The stream gate spawns the
+          * a streamed FORCED FINAL never reaches it (its gate spawns the
             verdict straight into `_attach_late_verdict_handler` with
-            `force_correction=True` — a streamed reply is already delivered
-            and cannot be repaired. So the web UI, where a human is actually
-            waiting, pays none of this; the cost lands on non-streamed
-            callers (the API, and Slack).
+            `force_correction=True`). ⚠ §4MR: since §4MP every other
+            streamed turn ends through the in-loop exit, which DOES await
+            this budget — with a budget above 0 the web UI would pay it
+            again. At 0 (the launcher, §4MO) nobody does.
 
         ⚠ CAVEAT ON THE TABLE ABOVE, since that last point cuts both ways:
         the latencies were pooled over ALL verdicts in the log, streamed and
@@ -21845,8 +22061,8 @@ class GhostAgent:
                                              effective_report_floor(_glog.request_deadline_s(
                                                  request_id_context.get() or ""))):
                         _dl_note = (
-                            f"SYSTEM PREFLIGHT — deadline: this call was NOT run. It declares a "
-                            f"{_dl_wait:.0f} s wait but this request's time runs out in about "
+                            f"SYSTEM PREFLIGHT — deadline: this call was NOT run. It would take about "
+                            f"{_dl_wait:.0f} s but this request's time runs out in about "
                             f"{int(max(0.0, _dl_remaining))} s and the last {int(DEADLINE_REPORT_FLOOR_S)} s are "
                             "reserved for your report. Do not wait: report what exists now (files, "
                             "URLs, what remains) or take an action that returns immediately.")
@@ -22816,7 +23032,10 @@ class GhostAgent:
                                 "is_read_only", False) is True
                             # A member's outcomes are not the owner's competence (R9, MAJOR:
                             # failing member searches lowered the owner's web prior).
-                            if not _outcome.is_rejection and not _is_sim and not requester_is_member():
+                            # §4MS: and a PROBE's (or job/sched turn's) outcomes are
+                            # not the owner's competence either — only real user turns
+                            if (not _outcome.is_rejection and not _is_sim and not requester_is_member()
+                                    and turn_origin(self.context) == "user"):
                                 _mc.record_outcome(fname, success=not _tool_failed, duration_s=_dur)
                         except Exception as _mcexc:
                             logger.debug("metacog outcome hook failed: %s", _mcexc)
@@ -23657,8 +23876,8 @@ class GhostAgent:
                 # (Metacog per-tool outcomes are now recorded inside
                 # the enumerate(results) loop above, keyed per result.)
 
-                # §4JJ search-yield steer (behind the `search_yield_steer`
-                # arm). Req e69cab30: 36 searches, none opened, nothing
+                # §4JJ search-yield steer (the `search_yield_steer` arm was
+                # concluded, §4LF; since §4MO everyone is steered). Req e69cab30: 36 searches, none opened, nothing
                 # shipped after 677 s; the no-progress breaker needs an
                 # IDENTICAL query. Counted over the batch in call order;
                 # once per request; tools KEPT — the measurement says the
@@ -23679,9 +23898,6 @@ class GhostAgent:
                             and not strikes.search_yield_steered
                             and not force_stop and not force_final_response):
                         strikes.search_yield_steered = True
-                        from . import experiments as _sy_exp
-                        _sy_req = str(getattr(ts, "req_id", "")
-                                      or request_id_context.get() or "")
                         if requester_is_member():
                             # A member cannot open a result (no browser, no
                             # download), so "open one" is not an option and
@@ -23695,30 +23911,30 @@ class GhostAgent:
                                 level="WARNING", icon=Icons.WARN)
                             messages.append({"role": "user",
                                              "content": member_search_yield_steer(_sy_run)})
-                        elif (_sy_arm := _sy_exp.arm_for(self.context, "search_yield_steer", _sy_req)):
-                            _sy_treat = (_sy_arm == _sy_exp.TREATMENT)
-                            _sy_exp.mark_trigger(self.context, _sy_req,
-                                                 "search_yield_steer_fired", _sy_treat)
+                        else:
+                            # §4MO operator decision (2026-10-08): the owner is
+                            # steered at the same count as a member — the arm
+                            # was concluded (§4LF) and left the owner with no
+                            # bound at all (one turn: 22 searches, 225 s, the
+                            # last ~100 s rewordings). Tools kept.
                             pretty_log(
                                 "Search Yield",
                                 f"{_sy_run} web searches in a row and no result opened — "
-                                + ("steering: open one or answer (tools kept)" if _sy_treat
-                                   else "control arm: no steer"),
+                                "steering: open one or answer (tools kept)",
                                 level="WARNING", icon=Icons.WARN)
-                            if _sy_treat:
-                                messages.append({"role": "user", "content": (
-                                    f"SYSTEM ALERT: you have run {_sy_run} web searches in a row "
-                                    "and have not opened a single result. Search results are "
-                                    "snippets; another query of the same kind will not produce "
-                                    "new evidence. Do ONE of these NOW:\n"
-                                    "1. OPEN the one result most likely to hold the answer — "
-                                    "browser(operation='extract_text', url=<its URL>, "
-                                    "max_chars=8000) — and read it.\n"
-                                    "2. ANSWER from the snippets you already have: state what "
-                                    "they support, and name plainly each part of the question "
-                                    "you could NOT confirm and what you searched for it.\n"
-                                    "Do NOT run another web_search before doing one of these."
-                                )})
+                            messages.append({"role": "user", "content": (
+                                f"SYSTEM ALERT: you have run {_sy_run} web searches in a row "
+                                "and have not opened a single result. Search results are "
+                                "snippets; another query of the same kind will not produce "
+                                "new evidence. Do ONE of these NOW:\n"
+                                "1. OPEN the one result most likely to hold the answer — "
+                                "browser(operation='extract_text', url=<its URL>, "
+                                "max_chars=8000) — and read it.\n"
+                                "2. ANSWER from the snippets you already have: state what "
+                                "they support, and name plainly each part of the question "
+                                "you could NOT confirm and what you searched for it.\n"
+                                "Do NOT run another web_search before doing one of these."
+                            )})
                 except Exception as _sy_exc:  # noqa: BLE001 — a steer must never sink the batch
                     logger.debug("search-yield steer skipped: %s", _sy_exc)
 
@@ -24200,6 +24416,7 @@ class GhostAgent:
                             _request_sys3_prev_justification = sys3_result.get('justification', '')
                             messages.append({"role": "user", "content": f"SYSTEM 3 PIVOT #{pivot_num}: The previous approach failed. The strategy has been entirely rewritten. Justification: {sys3_result.get('justification')}. Follow the new plan."})
                             strikes.member_refused_batches = 0   # this batch ran a call (§4KL); the tail is skipped
+                            strikes.blocked_batches = 0          # §4MR: same reason — it ran a call
                             return False  # was `continue` — the region is the loop-body tail
 
                     if execution_failure_count >= 6 or total_fail >= 8:
@@ -24337,8 +24554,62 @@ class GhostAgent:
             _batch_rows = (tools_run_this_turn or [])[_rows_at_batch_start:]
             _ran = any(not _t.get("_synthetic") for _t in _batch_rows)
             _refused = any(_t.get("_member_refused") for _t in _batch_rows)
+            # §4MO: the OWNER too — a batch where every call was blocked
+            # before it ran (status-only, untrusted egress, clarify-first,
+            # deadline, idempotency…) is no progress either; only members
+            # were counted, so an owner's repeats ran to the turn cap
+            _row_codes = [getattr(_t.get("content"), "reason_code", None) for _t in _batch_rows]
+            _all_blocked = (bool(_batch_rows) and not _ran and not _refused
+                            and not any(_t.get("name") == "system_parse_error" for _t in _batch_rows)
+                            and not any(_c in _STRUCK_BLOCK_CODES for _c in _row_codes))
+            # §4MO: a designed stop asks the USER. It was only logged, so the
+            # model went round it (a probe renamed the subject and ran 4
+            # searches on the owner's name after "no photo — the user
+            # decides"). Decided after the whole batch so the alert follows
+            # every tool result. Not a breaker: the question IS the answer.
+            _ask_user_code = next((_c for _t, _c in zip(_batch_rows, _row_codes)
+                                   if _t.get("_synthetic") and _c in _ASK_THE_USER_STOPS), None)
+            if _ask_user_code and not force_final_response:
+                force_final_response = True
+                _ask_text = next(str(_t.get("content") or "") for _t, _c in zip(_batch_rows, _row_codes)
+                                 if _c == _ask_user_code)
+                logger.info("designed stop (%s) — tools closed, asking the user", _ask_user_code)
+                messages.append({"role": "user", "content": (
+                    "SYSTEM ALERT: the request stopped to let the USER decide — tools are now "
+                    "closed. Do not try another way around it. Ask the user exactly what was "
+                    "asked, in one or two sentences: " + _ask_text[:300])})
+            # "do the task directly" may still need tools — the SECOND batch
+            # with a refused project creation closes them
+            if "project_not_requested" in _row_codes:
+                _prb = getattr(strikes, "project_refusal_batches", 0)
+                strikes.project_refusal_batches = (_prb if isinstance(_prb, int) else 0) + 1
+                if strikes.project_refusal_batches >= 2 and not force_final_response:
+                    force_final_response = True
+                    logger.info("project creation refused twice — tools closed")
+                    messages.append({"role": "user", "content": (
+                        "SYSTEM ALERT: creating a project was refused twice — the owner did "
+                        "not ask for one. Tools are now closed: answer with what you have.")})
             if _ran:
                 strikes.member_refused_batches = 0
+                strikes.blocked_batches = 0
+            elif _all_blocked:
+                # a test double hands the loop a mock ledger: count only an int
+                _bb = getattr(strikes, "blocked_batches", 0)
+                strikes.blocked_batches = (_bb if isinstance(_bb, int) else 0) + 1
+                if (not force_final_response
+                        and strikes.blocked_batches >= MEMBER_REFUSAL_REPORT_AT):
+                    force_final_response = True
+                    self.context._breaker_forced_final = True
+                    stamp_loop_breaker(self.context, str(getattr(ts, "req_id", "") or ""),
+                                       "blocked_calls")
+                    pretty_log("Local Guard",
+                               f"{MEMBER_REFUSAL_REPORT_AT} batches of blocked calls — forcing the report",
+                               level="WARNING", icon=Icons.STOP)
+                    messages.append({"role": "user", "content": blocker_report_alert(
+                        "blocked calls",
+                        f"your last {MEMBER_REFUSAL_REPORT_AT} rounds of tool calls were all blocked "
+                        "before they ran — no more will be attempted",
+                        last_user_content)})
             elif _refused:
                 strikes.member_refused_batches += 1
                 if (not force_final_response
@@ -24860,8 +25131,15 @@ class GhostAgent:
             final_ai_content = _scrub_member_download_links(
                 final_ai_content, self._member_files() | _gen_now)
         else:
+            _foreign_note = _foreign_image_note(final_ai_content, tools_run_this_turn,
+                                                getattr(self.context, "sandbox_dir", None))
             final_ai_content, _dl_missing = _drop_missing_download_links(
                 final_ai_content, getattr(self.context, "sandbox_dir", None))
+            if _foreign_note:
+                # before the verifier gate: the judge reads it too
+                final_ai_content = (final_ai_content or "").rstrip() + _foreign_note
+                pretty_log("Image Provenance", "the reply showed an image this request did not generate",
+                           level="WARNING", icon=Icons.WARN)
             if _dl_missing:
                 pretty_log("Missing File Link",
                            f"removed {len(_dl_missing)} link(s) to files that do not exist: "
@@ -25963,7 +26241,10 @@ class GhostAgent:
             if (getattr(self.context, "current_project_id", None) is None
                     and final_ai_content
                     and turn_origin(self.context) == "user"
-                    and not requester_is_member()):
+                    and not requester_is_member()
+                    # §4MM turn 04: never in a shared channel — members read
+                    # it, and it quoted their wrapped message as the title
+                    and not reply_is_public()):
                 _sp = getattr(self.context, "scratchpad", None)
                 _already = False
                 try:
@@ -25972,10 +26253,14 @@ class GhostAgent:
                     _already = False
                 if not _already:
                     from .project_safety import should_suggest_promotion as _ssp
+                    from ..utils.logging import FOREIGN_MESSAGE_LABELS as _FML
                     _uturns = [
                         m.get("content") for m in messages
                         if isinstance(m, dict) and m.get("role") == "user"
                         and isinstance(m.get("content"), str)
+                        # §4MM turn 04: a member's wrapped message is not the
+                        # owner's turn — it became the offered project's title
+                        and not m.get("content").lstrip().startswith(_FML)
                     ]
                     _aturns = [
                         m.get("content") for m in messages
@@ -26954,6 +27239,19 @@ class GhostAgent:
                         thinking_line_buf = ""
 
                 stop_printing = False
+                # §4MP: a streamed request's text goes out as it is generated
+                # (held, latched on markup, committed or retracted at the end)
+                from .reply_tap import reply_tap_context as _rtc
+                _tap = _rtc.get() if stream_response else None
+                # with thinking on, content before any reasoning may itself be
+                # unparsed reasoning (§4KO/§4KP) — held until reasoning arrives
+                _tap_thinking_off = thinking_disabled(payload)
+                if _tap is not None:
+                    try:
+                        _tap.bind(str(req_id or ""))
+                        _tap.begin_generation(unsafe=reply_tap_unsafe)
+                    except Exception:  # noqa: BLE001 — never costs the turn
+                        _tap = None
 
                 async for chunk in self.context.llm_client.stream_chat_completion(payload, use_coding=has_coding_intent):
                     self._heartbeat() # Heartbeat to prevent Hippocampus from waking up
@@ -27036,6 +27334,12 @@ class GhostAgent:
                                     text_chunk = delta["content"]
                                     full_content += text_chunk
                                     content_token_count += 1
+                                    if _tap is not None:
+                                        try:
+                                            _tap.feed(full_content,
+                                                      may_release=_tap_thinking_off or bool(reasoning_content))
+                                        except Exception:  # noqa: BLE001
+                                            logger.debug("reply tap feed failed", exc_info=True)
                                     if not stop_printing:
                                         if _tail_has_stop_marker(full_content, text_chunk):
                                             stop_printing = True
@@ -27181,6 +27485,8 @@ class GhostAgent:
                                         break
 
                                 if "tool_calls" in delta and delta["tool_calls"]:
+                                    if _tap is not None:
+                                        _tap.tool_call_seen()
                                     if not msg.get("tool_calls"):
                                         msg["tool_calls"] = []
                                     for tc_chunk in delta["tool_calls"]:
@@ -27871,40 +28177,29 @@ class GhostAgent:
                 tool_calls = []
                 msg["tool_calls"] = []
 
-            # Reasoning-channel divergence guard. Some models (Qwen-class
-            # reasoning variants in particular) emit `reasoning_content`
-            # explicitly disclaiming tool use ("I can answer directly
-            # without using any tools") AND still emit a structured
-            # tool_call in the same response. Trust the reasoning: drop
-            # the contradicting tool_calls and re-run the turn in
-            # final-generation mode so the model produces prose. This
-            # avoids the wasted strike on a tool call the model itself
-            # said wasn't needed (e.g. spurious `knowledge_base` saves
-            # of prose the user asked us to compose).
+            # Reasoning-channel divergence — TELEMETRY ONLY since §4MO.
+            # The guard used to DROP every tool call and switch tools off
+            # for the turn whenever the reasoning matched "without tools" /
+            # "answer directly from my knowledge". A word match on a plan
+            # cannot tell a disclaimer from a step: it dropped the profile
+            # correction "No tools needed for the calculation; I'll use
+            # update_profile" (never saved), the search after "…or search
+            # to verify. Let me search", a repair round's browser call
+            # ("hallucinated … without tool evidence"), and turn 40's call
+            # before "…without tools first, then generate an image" (the
+            # image was never made). §4MM's "then <tool>" exemption missed
+            # that live case. A lexical rule that keeps flip-flopping is
+            # inverted, not patched again: the calls run; the divergence is
+            # logged so it can still be measured.
             elif tool_calls and not force_final_response:
                 rc = locals().get("reasoning_content", "") or (msg.get("reasoning_content") or "")
-                if rc:
-                    _NO_TOOL_DISCLAIM_PATTERNS = (
-                        r"\bwithout\s+(?:needing\s+)?(?:any\s+|using\s+|calling\s+)?tools?\b",
-                        r"\bno\s+tools?\s+(?:are\s+)?(?:needed|required|necessary)\b",
-                        r"\bdon'?t\s+need\s+(?:any\s+|to\s+(?:use|call)\s+)?tools?\b",
-                        r"\banswer\s+(?:this\s+)?directly\s+from\s+(?:my\s+)?knowledge\b",
-                        r"\bI\s+can\s+answer\s+(?:this\s+)?directly\b",
-                    )
-                    if any(re.search(p, rc, re.IGNORECASE) for p in _NO_TOOL_DISCLAIM_PATTERNS):
-                        dropped = [tc.get("function", {}).get("name", "?") for tc in tool_calls]
-                        logger.warning(
-                            "Dropping %d tool_call(s) — reasoning channel disclaimed tools (names=%s, reasoning_head=%r)",
-                            len(tool_calls), dropped, rc[:200],
-                        )
-                        tool_calls = []
-                        msg["tool_calls"] = []
-                        force_final_response = True
-                        # Re-run the turn in final-generation mode rather
-                        # than emitting the bad-turn message — its
-                        # think-stripped content is empty, so falling
-                        # through would surface nothing useful.
-                        return "continue"
+                if rc and re.search(r"\bwithout\s+(?:needing\s+)?(?:any\s+|using\s+|calling\s+)?tools?\b"
+                                    r"|\bno\s+tools?\s+(?:are\s+)?(?:needed|required|necessary)\b"
+                                    r"|\banswer\s+(?:this\s+)?directly\b", rc, re.IGNORECASE):
+                    logger.info(
+                        "reasoning mentions answering without tools AND the turn called %s — kept (§4MO; "
+                        "telemetry only), reasoning_head=%r",
+                        [tc.get("function", {}).get("name", "?") for tc in tool_calls], rc[:160])
 
             # Telemetry for un-caught divergences. When BOTH channels
             # emit and neither drop fired, the regex set above missed
@@ -29069,6 +29364,18 @@ class GhostAgent:
                 # `context.last_user_content`. Set BEFORE any tool
                 # dispatch path can run in this turn.
                 self.context.last_user_content = last_user_content
+                # §4MM r2: the conversation's recent user messages (newest
+                # last, this one included) — "call it Snake" answers the
+                # agent's question about the project asked for a turn before
+                try:
+                    from ..utils.logging import FOREIGN_MESSAGE_LABELS as _FML_r
+                    self.context.recent_user_contents = [
+                        m["content"] for m in messages
+                        if isinstance(m, dict) and m.get("role") == "user"
+                        and isinstance(m.get("content"), str)
+                        and not m["content"].lstrip().startswith(_FML_r)][-4:]
+                except Exception:  # noqa: BLE001
+                    self.context.recent_user_contents = [last_user_content]
                 try:            # the user's own words, for content-provenance sinks (§4MB)
                     from ..utils.provenance import note_user_message as _note_um
                     _note_um(last_user_content, req_id)
@@ -31704,8 +32011,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # QWEN-AGENT METHODOLOGY: Bypass Native Tools & Use String Prompts
                     # -----------------------------------------------------------------
                     target_tool = locals().get("required_tool", "all")
-                    # With the planner disabled, default to final generation (stream directly).
-                    # If the model returns tool_calls, the turn loop below will handle them.
+                    # With the planner off, target_tool is "all": every turn is the
+                    # tools-on call, and its text reaches a streaming client through
+                    # the reply tap (§4MP) — only a forced final (or a planner's
+                    # "none") takes the streamed final-generation path.
                     # str(... or "all"): planners routinely emit `"required_tool": null`,
                     # which arrives here as None — .lower() on it would 500 the request.
                     # …unless a verifier repair re-entry is running: its
@@ -32553,13 +32862,19 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             # ledger; six long user turns this month the same way. Record
             # what happened and name the cause, then let the cancellation
             # propagate — it must still unwind the semaphore.
+            # §4MS: an INTERRUPTION, not the agent's failed attempt — booked
+            # FAILED it taught (reflection reinforced a lesson from a turn the
+            # owner re-sent 2 s later; a deploy-cut bench item that had
+            # answered correctly fed the PRM as a failure). Its own marker:
+            # outcome stays UNKNOWN and no consumer learns from it.
             self._record_aborted_turn(
                 req_id=req_id,
                 reason="cancelled: client disconnected or process shutdown",
                 messages=locals().get("messages"),
                 user_request=str(locals().get("last_user_content") or ""),
                 model=str(locals().get("model") or ""),
-                partial=str(locals().get("final_ai_content") or ""))
+                partial=str(locals().get("final_ai_content") or ""),
+                marker=interruption_marker(req_id))
             raise
 
         finally:
@@ -34744,6 +35059,28 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             except Exception as _ml_exc:  # noqa: BLE001
                 logger.debug("streamed missing-link check skipped: %s", _ml_exc)
 
+            # §4MM: an image shown that this request did not generate
+            try:
+                if not requester_is_member():
+                    # the VISIBLE text (raw `full_content` still holds
+                    # tool-call markup — a vision call's /api/download/ arg)
+                    _fi_base = locals().get("_final_view")
+                    if not isinstance(_fi_base, str):
+                        _fi_base = full_content or ""
+                    _fi_note = _foreign_image_note(
+                        _fi_base + "\n\n" + str(locals().get("_ff_retry_text") or ""),
+                        stream_tools_snapshot, getattr(self.context, "sandbox_dir", None),
+                        include_missing=False)
+                    if _fi_note:
+                        yield f"data: {json.dumps({'id': f'chatcmpl-{req_id}', 'object': 'chat.completion.chunk', 'created': created_time, 'model': stream_model, 'choices': [{'index': 0, 'delta': {'content': _fi_note}, 'finish_reason': None}]})}\n\n".encode('utf-8')
+                        full_content = (full_content or "") + _fi_note
+                        if locals().get("_stream_effective_content"):
+                            _stream_effective_content = _stream_effective_content + _fi_note
+                        pretty_log("Image Provenance", "the streamed reply showed an image this request did not generate",
+                                   level="WARNING", icon=Icons.WARN)
+            except Exception as _fi_exc:  # noqa: BLE001
+                logger.debug("streamed image-provenance check skipped: %s", _fi_exc)
+
             # §4MG: a request that generated an image shows it, even when the
             # streamed reply (a forced report, a retry) linked none
             try:
@@ -36278,7 +36615,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
 
     def _record_aborted_turn(self, *, req_id: str, reason: str, messages=None,
                              user_request: str = "", model: str = "",
-                             partial: str = "") -> None:
+                             partial: str = "", marker: str = "[ATTEMPT_ABORTED_TURN]") -> None:
         """§4IB — write the trajectory of a turn that did not finish.
 
         A Stop-button cancel, a client disconnect, a proxy timeout or a
@@ -36298,7 +36635,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             pass
         try:
             _msgs = list(messages) if isinstance(messages, list) else []
-            _note = f"[ATTEMPT_ABORTED_TURN] Turn aborted: {reason}."
+            _note = f"{marker} Turn aborted: {reason}."
             _content = (f"{partial}\n\n{_note}" if str(partial or "").strip()
                         else _note)
             self._record_turn_trajectory(

@@ -353,7 +353,7 @@ class EpisodeSource:
                            if p.is_dir()), reverse=True)
             from ..memory.skills import iter_teachable
             for day in days:
-                yield from iter_teachable(collector.iter_trajectories(day=day))
+                yield from iter_teachable(collector.iter_trajectories(day=day), consumer="dream_replay")   # §4MS: kinds too
         except Exception as exc:  # noqa: BLE001
             logger.debug("replay: real corpus unavailable (%s)", exc)
 

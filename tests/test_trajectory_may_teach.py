@@ -75,6 +75,8 @@ TEACHING_SITES = {
     # §4KJ R9: foresight precedent reaches owner prompts; cluster counts steer self-play
     ("core/foresight.py", "_seed_from_trajectories"),
     ("core/dream.py", "synthetic_self_play"),
+    # §4MS: self-play is seeded only by a real owner failure
+    ("core/owner_seeds.py", "pick_owner_failure_seed"),
 }
 NON_TEACHING_ALLOWLIST = {
     # kwargs callers (R2 review): world model, feedback ledger, replay, experiments, health

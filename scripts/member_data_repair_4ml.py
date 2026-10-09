@@ -165,6 +165,9 @@ def member_episode_ids(member_reqs: dict, owner_texts: set = frozenset()) -> lis
 
 
 def main() -> int:
+    if APPLY:   # §4MN: never beside the agent (single-writer stores)
+        from ghost_agent.memory.store_lock import assert_no_other_writer
+        assert_no_other_writer(MEM, "member_data_repair_4ml.py")
     who = requesters()
     member = {r for r, w in who.items() if w == "member"}
     changed, member_tids, member_reqs, owner_texts = stamp_trajectories(who)

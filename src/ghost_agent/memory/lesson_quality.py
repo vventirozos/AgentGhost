@@ -441,3 +441,60 @@ def unknown_tool_calls(text) -> list:
         elif tool == "file_system" and op not in ACCEPTED_OPS:
             bad.append(f"file_system(operation='{op}')")
     return bad
+
+
+_INTERFACE_WORD_RE = re.compile(r"\b(?:parameters?|params?|arguments?|kwargs?)\b", re.I)
+_IDENT_RE = re.compile(r"`([A-Za-z_][\w.-]*)`|\b([a-z]+(?:_[a-z0-9]+)+)\b|\b([A-Za-z_]\w*)\s*="
+                       r"|\b(?:the\s+)?([a-z_]+)\s+(?:parameter|argument)s?\b")
+
+
+def _known_tool_surface(tool_defs=None):
+    """(tool names, every parameter name and enum value the tools have).
+    ``tool_defs``: the live advertised set — the static list lacks the tools
+    added per context (image_generation, vision, …)."""
+    tools, names = set(), set()
+    try:
+        if tool_defs is None:
+            from ..tools.registry import TOOL_DEFINITIONS as tool_defs
+        for d in tool_defs:
+            fn = (d or {}).get("function") or {}
+            if fn.get("name"):
+                tools.add(str(fn["name"]).lower())
+            for p, spec in ((fn.get("parameters") or {}).get("properties") or {}).items():
+                names.add(str(p).lower())
+                for v in (spec or {}).get("enum") or []:
+                    names.add(str(v).lower())
+    except Exception:  # noqa: BLE001
+        pass
+    return tools, names | tools
+
+
+def heuristic_invents_interface(text, tool_defs=None) -> bool:
+    """§4MS: an idle-written lesson that tells the model how to call a TOOL
+    must name real parameters. A dream heuristic said "use the available
+    imagination/creative parameters" — none exist (image_gen treats an
+    `imagination_prompt` as a hallucination) — and it reached an owner turn.
+
+    Only text ABOUT a tool call is checked (it names a real tool, or says
+    parameter/argument): shell flags and code identifiers elsewhere are not
+    tool interface. True when such text names a snake_case / backticked /
+    `x=` identifier no tool has, or speaks of parameters without naming one."""
+    t = str(text or "")
+    tools, known = _known_tool_surface(tool_defs)
+    if not known:
+        return False                     # no schema to check against — never block on that
+    low = t.lower()
+    names_tool = any(re.search(rf"(?<![\w-]){re.escape(n)}(?![\w-])", low) for n in tools)
+    speaks_params = bool(_INTERFACE_WORD_RE.search(t))
+    if not (names_tool or speaks_params):
+        return False
+    idents = {next(g for g in m.groups() if g).lower() for m in _IDENT_RE.finditer(t)
+              if not (m.start() > 0 and t[m.start() - 1] == ".")}       # `obj.method` — a library call
+    # r1: a dotted name is a library call (`page.query_selector`), not a
+    # tool parameter — unless it starts with a tool's name; "the action
+    # parameter" names `action`
+    idents = {i for i in idents if len(i) > 2 and ("." not in i or i.split(".")[0] in tools)
+              and i not in ("the", "this", "that", "each", "any", "all", "available", "creative")}
+    if idents - known:
+        return True
+    return speaks_params and not (idents & known)

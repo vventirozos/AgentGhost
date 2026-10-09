@@ -52189,3 +52189,555 @@ saturation.
 1. `:8080` keeps binding `0.0.0.0`.
 2. The 2,015 test-written "hello"/"world" entries were deleted from `~/.ghost_history`: 2,996 → 981 entries, file mode 0600. prompt_toolkit loads the file cleanly.
 3. Graph triplets from member turns, the shared member identity and the 2-hex status match are accepted as is.
+
+## §4MM — audit of real turns: is the answer the owner got right? (2026-10-08, operator: "proceed with audit of real turns") — R0 scope, written first
+**Question.** On the owner's real requests, is the final answer right? Graded against what was asked and what the turn's own tools returned. Specifically:
+- the facts are correct;
+- "done" means done;
+- the request's constraints, language and format are honoured;
+- it acts when it should act and asks when it should ask;
+- no wasted calls or slow paths.
+
+**Population.** A census, not a sample: every owner `user_request` trajectory from 2026-10-01 to 10-08 — **48 turns**. Members, probes, sims and bench are excluded, and roles follow the §4ML repair.
+
+**Comparison.** §4ME graded a sample of 112 turns from 09-16 → 10-07: 54 right, 24 partial, 24 wrong, 10 undetermined.
+
+**Method.**
+1. Three fresh, read-only graders, 16 turns each, on a snapshot (trajectories, full tool results, log slices). Each grade gives:
+   - a verdict: right, partial, wrong or undetermined;
+   - the failure class;
+   - the mechanism: prompt, tool, memory, planner/loop, verifier, router, or model limit;
+   - the quoted evidence.
+2. I re-read every partial and wrong grade before it counts.
+3. Rank classes by frequency × cost, then class fixes with behaviour tests.
+4. The usual protocol: battery with NOOP, fresh reader on my fixes, suite once, gated deploy, labelled probes, journal and memory.
+
+**Not in scope:** changing the model; re-grading §4ME's turns.
+**Threat model:** the turns are the owner's private content. Graders read them only in the snapshot, and quote no more than they need to.
+
+### §4MM — outcome (2026-10-08)
+**Grades.** All 48 owner turns, graded by three fresh graders; I re-read the high-stakes ones.
+- **24 right (50%), 12 partial (25%), 11 wrong (23%), 1 undetermined.** §4ME's sample was 48% / 21% / 21%.
+- Every non-right turn was then attributed against current code by a fresh reader:
+  - 10 still OPEN, 5 PARTLY fixed, 1 FIXED;
+  - 8 MODEL limits with no system lever: invented banter facts about named people (04–06), the car-wash trick (09), the news gloss (28), the ND→Tsipras swap (29), wrong SQL specifics (31), US-scale flu figures (25).
+- Recast by the attribution: 02 and 03 were the 0.2 s STT clip (fixed §4ML); 19 is the known §4LU incident.
+
+**Fixed (open classes, ranked by turns × cost):**
+1. **Moving-target world facts** (17, 24: "PostgreSQL 18.4"):
+   - `TRANSIENT_WORLD_PREDICATE` now lives in `memory/graph.py` and is refused at `add_triplets` (every writer). Owner statements and durable relations are exempt.
+   - Moving-target *questions* (`is_moving_target_question`, question-shaped, EN+GR) are never hydrated as precedent and are marked in recall.
+   - `scripts/memory_repair_4mm.py --apply`: 7 graph rows archived and deleted (HAS_VERSION/HAS_PRICE, incl. both 18.4 and 18.6); 5 stale-answer episodes forgotten.
+   - This also closes a trap: the 45-day prune would have deleted 18.6 around 10-28 and left 18.4 alone.
+2. **Image "false done"** (40, 43):
+   - `_foreign_image_note` on both deliverers: a request that generated no image and shows a `gen_*` one says so ("from an earlier request" / "does not exist").
+   - The no-tool disclaimer guard keeps a call the reasoning says it will make ("…without tools first, then generate an image").
+3. **Unasked projects** (34, 38; 37's "no trace remains"):
+   - `_create_not_requested` gates `create` and `promote_from_context` on interactive turns as a designed stop (`project_not_requested`). It allows:
+     - a project word or a build verb in the message;
+     - a build request among the last 4 user messages;
+     - a short yes.
+   - It refuses a negated create.
+   - Measured on history: refuses 3 of 41 past creates (34, 38 and one reuse).
+   - The delete result now lists what is kept.
+4. **Forget preview** (18, 19): numbered once, defaults first; a long qualified yes confirms only a strict subset named in `items`.
+5. **Digest provenance** (16): `log_event` stamps probe origin; `summarize_since` skips probe events and `probe_created` projects.
+6. **Promotion footer** (04): never on a public reply; member-wrapped rows are excluded.
+7. **Not-executed note** (47): reworded, so it no longer claims a parse failure. The legacy wording is still stripped.
+
+**Not done:**
+- F8, query expansion on content-free inputs (03): low cost after the 4 s cap. Gating it lexically would change retrieval for every short follow-up.
+- Model-limit classes: no system lever.
+- The disclaimer guard is still a word-match (the reader's `notify_operator` "send a Slack" case).
+
+**Defects inside my own fixes (R8): 4 MAJOR + 7 MINOR from the fresh reader, plus 3 of mine.**
+- **MAJOR:**
+  - `items="1-N"` counted as "narrowed", so a long qualified yes could delete everything;
+  - the "no project" regex refused real asks ("I have no project for this, please set one up");
+  - the gate read only the latest message, and `promote_from_context` was ungated;
+  - the provenance note fired on an edit that showed before and after.
+- **MINOR:**
+  - duplicate notes on the stream;
+  - owner statements refused at the graph;
+  - the episode regex matched tasks ("release the build now");
+  - "make sure" let creates through;
+  - the old note wording was no longer stripped;
+  - the dry run opened the live graph db for writing;
+  - one vacuous numbering test.
+- **Mine:**
+  - the digest test used a wrong event name (`status_rollup`), so half of it passed vacuously;
+  - turn 38's own history ("show all projects", "delete projects …") would have reopened the gate once I read recent turns, so recent turns count only for BUILD intent;
+  - a test leaked `request_id_context` into a later test (`test_requester_role`), now reset.
+
+**Verification:**
+- `tests/test_4mm_audit.py`: 40 tests, 0 source-text pins (ratchet holds).
+- Battery bat60: 35 mutants; all killed except 1 equivalent ("broad negation": the create verb is still required); the NOOP control survives.
+- Full suite once after the last code edit: **29,116 passed, 0 failed**.
+- Deploy: 95151 → 60865 (gated bootout, repair applied, bootstrap; one process).
+- Probes (labelled):
+  - "latest version of postgresql?" → **18.6 (Aug 13, 2026)**, read from postgresql.org;
+  - the test-the-theory request → answered directly, no project and no tool call;
+  - "show me gen_25cb6240.png" → shown, with "ℹ️ … is from an earlier request".
+
+## §4MN — health of the data stores (2026-10-08, operator: "ok review the health of the data stores") — R0 scope, written first
+**Property under review.** Every store the agent depends on is:
+- **intact:** SQLite `integrity_check`, parseable JSON/JSONL;
+- **consistent with its siblings:** episodes ↔ vector twins, lessons ↔ vector rows, graph ↔ its archive, projects ↔ workspace folders, trajectories ↔ corrections overlay, the notification ledger ↔ consumer watermarks;
+- **recoverable:** a backup that exists, is complete, and restores on a copy;
+- **bounded:** a known growth rate and a retention rule for every directory;
+- **crash-safe:** a kill mid-write never leaves a store unreadable or half-written.
+
+**Inventory at R0.** `Data/` is 812 MB: system 594 MB (eval 207, memory 169, `ghost-agent.log.1` 79, trajectories 65, foresight 26, bench 16) and sandbox 217 MB.
+- There are 87 `.bak` / `.pre-*` repair copies (92 MB), and nothing prunes them.
+- Two `projects.db` files exist: `system/` and `system/memory/`.
+
+**Threat model.** Not an attacker: crash, disk full, concurrent writers (the agent, the idle phases, scripts), and an operator restoring the wrong copy.
+
+**Method.**
+- Three fresh, read-only lenses on COPIES (`sqlite3 .backup`, `cp`): integrity and cross-store consistency; backups, restore and retention/growth; crash safety, by fault injection on copies only.
+- Nothing is deleted. A cleanup list goes to the operator.
+- Then the usual protocol: class fixes with behaviour pins, battery with NOOP, fresh reader on my fixes, suite once, gated deploy, journal and memory.
+
+**Out of scope:** the content quality of memories (§4MJ, §4MM); the sandbox's user files beyond size.
+
+### §4MN — outcome (2026-10-08)
+**Lenses:**
+- **Integrity:** no corruption anywhere. 5 databases pass `integrity_check`; 0 torn lines in 971 JSONL files; cross-store links consistent.
+- **Backups:** **CRIT: no backup of any kind.** No Time Machine destination, no scheduled copy, code not in git. Plus 4 MAJOR:
+  - the chroma repair copies cannot be restored (no HNSW folder);
+  - profile delete and `reset_all` kept no copy;
+  - the HNSW index grows forever;
+  - the deletion archives drop fields.
+- **Crash safety:** **CRIT:** two processes writing chroma segfaulted the store on every open (4/7 when the first was SIGTERMed), and the agent crash-looped at boot. Plus 2 MAJOR: a torn `embedder.json` refuses boot forever; a concurrent forget loses its archive line.
+- **Operator decisions:** off-disk destination: **local only for now**; git for the code: **no**.
+
+**Fixed:**
+- **Single writer.** `memory/store_lock.py` takes a flock on `memory/store.writer.lock`:
+  - at the top of `main()` (exit 75; launchd retries) and in `VectorMemory.__init__`;
+  - repair scripts call `assert_no_other_writer`;
+  - verified live: `memory_repair_4mm.py --apply` beside the running agent prints "refusing to run: … (pid 92432 ghost-agent)".
+- **Verified paired snapshots** (`memory/snapshot.py`, `scripts/snapshot_stores.py`):
+  - What is copied: SQLite via the backup API, chroma with its segment folder, JSON/JSONL stores, and the sandbox (via `copytree_nofollow`; files over 50 MB skipped).
+  - Each snapshot is written to `.partial`, verified (integrity_check, plus chroma opening from a copy with random self-queries), then renamed. A failure is logged at ERROR and leaves nothing behind.
+  - The newest 7 are kept in `system/backups/`.
+  - The dream's `_daily_store_care` runs it at most every 22 h, **before** the REM freshness gate.
+- **Write paths:**
+  - `embedder.json` is written atomically, only on change; a torn one is kept aside as evidence and re-stamped.
+  - The episode archive keeps every column, is fsynced before the delete, and its purge runs under the lock.
+  - The graph archive keeps `valid_from`/`valid_until`.
+  - Profile removals (`delete`, `remove_item`, `drop_previous[_mentioning]`, `prune_value`) archive first and fail closed. An archive failure reads "Error: …", so the forget report never shows ✅ for it.
+  - `reset_all` dumps every row first (paged; fail closed; a partial dump is removed).
+- **One retention rule:** 30 days for every forget/reset copy (episodes, profile values, reset dumps, graph archive), enforced daily by the dream.
+- **Reapers:**
+  - orphan acquired-skill vectors are reaped by the dream reconcile;
+  - a hard delete removes the project's `CHANGELOG.<id>.md`.
+- **Compaction** (`scripts/compact_vector_store.py`): applied live with the agent stopped.
+  - Pre-compact snapshot taken; 425/425 rows kept, 0 missing.
+  - `chroma.sqlite3` 43 MB → 2.5 MB; HNSW 58.8 MB → 0.17 MB; old segment removed.
+  - Self-recall at k=1 on the post snapshot: 1 tie (identical docs) and 1 approximate miss, which is rank 0 at a wider k. It was 2 misses before, one needing k=200.
+
+**Defects inside my own fixes (R8): 4 MAJOR + 9 MINOR from the fresh reader, plus 2 of mine.**
+- **MAJOR:**
+  - a refused profile removal reported as ✅;
+  - a raising snapshot left 185 MB of `.partial` every attempt;
+  - the forget/reset copies had no consistent retention and the owner was not told;
+  - the snapshot sat behind the REM freshness gate (no traffic = no backup).
+- **MINOR:**
+  - the exit code was really 3 inside the lifespan;
+  - the lock was taken after other stores had written;
+  - `reembed_memory.py` was unguarded;
+  - the torn-sidecar evidence was overwritten;
+  - the profile purge was broken by one bad line;
+  - `drop_previous` was not archived;
+  - the snapshot skipped the live `profile_removed.jsonl`;
+  - verification sampled only the oldest rows;
+  - the sandbox was left out;
+  - the self-play skills copy was a no-op (reverted).
+- **Mine:**
+  - a mocked dream context made a `./MagicMock` folder in the repo (now `_real_dir`);
+  - the §4GI symlink class gate flagged the snapshot copies (the sandbox now goes through `copytree_nofollow`; the agent-only sites are allowlisted with a reason). Also an unbound `_dump` in a handler (lint gate).
+
+**Verification:**
+- `tests/test_4mn_stores.py`: 28 tests (real subprocess lock, real chroma snapshot/restore/compaction).
+- Battery bat61: 34 mutants, all killed except 2 equivalents (copy order without concurrency; the mock type check behind `is_dir`); NOOP survives.
+- Full suite once after the last code edit: **29,145 passed, 1 failed**: `test_a_deploy_stages_probes_installs_and_restarts`, a timing flake under load (an empty fake `setsid` log). It passes 3/3 alone and is untouched by this work.
+- Deploy: 60865 → 92432 (bootout, compaction, bootstrap; one process; lock held; 425 fragments; 0 errors).
+- Snapshots on disk: `pre-compact` (202 MB) and `post-4mn` (107 MB, verified, 0.5 s).
+
+**Not done:**
+- m1: a crash between a project's row delete and its folder/graph/episode cleanup has no resume.
+- m2/m3: fixed temp names and same-second sidecar names in a few writers (no live damage).
+- `Data/AI/Logs` (launchd stdout, 128 MB) is not rotated.
+- `trajectory_results/` and `bench/trajectories` are outside the archive.
+- The cleanup list (repair copies, the 0-byte `system/projects.db`, the 22 changelogs of deleted projects, `kh-probe`) went to the operator; nothing was deleted.
+
+### §4MN cleanup (2026-10-08, operator: "yes")
+- **Deleted: 127 items, 159 MB.** Every repair copy (`.bak`, `.pre-*`, `*.removed-4mi*`, retired config copies), including:
+  - the §4ML pre-repair set that still held members' data: 55 trajectory copies, foresight, calibration, episodic, playbook, and the Slack reply-index copy;
+  - the 10-07 chroma copy (superseded by the verified `pre-compact` snapshot);
+  - the 0-byte `system/projects.db` and the stray `Data/projects.db-wal/-shm`;
+  - 22 changelogs of deleted projects;
+  - `eval/fallback_fix` and `eval/flip_i_logit_probe` (Aug, unreferenced);
+  - `memory_backup_1783967766.jsonl`.
+- The dead `kh-probe` notification consumer was removed, with the agent briefly stopped (93565, one process).
+- **Kept:** `system/services.pre-4lr-cleanup-20261005T140143.bak/jj_app.py` carries the user-immutable flag (`uchg`), most likely from a deliberately protected original, so it was not overridden (9.7 KB).
+- The verified snapshots in `system/backups/` remain the restore path.
+
+## §4MO — the planner and turn loop: where a turn's time goes, and when it stops (2026-10-08, operator: "proceed") — R0 scope, written first
+**Property under review.**
+- A turn spends its time on work that moves the answer forward.
+- It stops when the answer is ready, and never before the promised step happened (no "done" prose without the artifact).
+- It recognises a dead end (a refused or blocked call, a repeated identical call) within one or two repeats.
+- A simple request (a greeting, a one-line question) is answered quickly.
+- Every forced stop (loop breaker, deadline, budget) says honestly what was not done.
+
+**Population.** All 85 owner `user_request` turns from 2026-09-25 to 10-08: median 27.8 s, p90 313 s, max 1,576 s, 2.6 h in total. Members, probes, sims and bench excluded. Plus the agent log for the same window (`ghost-agent.log.1` + `.log`).
+
+**Known cases from §4MM:**
+- 47: 1,576 s, nothing usable;
+- 19: 488 s, 28 identical blocked calls;
+- 02/03: 50 s for a greeting;
+- 40: "done" prose without the image.
+
+**Method.**
+1. Three fresh, read-only lenses on a snapshot:
+   - **Timing:** a per-turn breakdown into prefill, generation, tool time, waits (verifier await, image node, Nova), and the steps after the answer was ready.
+   - **Loop control:** stopping, the loop breaker, idempotency blocks, the deadline and forced final, dead-end refusals, planner/DONE. Each stuck or slow turn traced to code.
+   - **Fast path:** greeting and short-turn latency (router, re-prefill §4LE, thinking, expansion); first-token time.
+2. Class fixes with behaviour pins.
+3. The usual protocol: battery with NOOP, fresh reader on my fixes, suite once, gated deploy, labelled probes, journal and memory.
+
+**Not in scope:** changing the model; the image node's own render time.
+
+### §4MO — outcome (2026-10-08)
+**Lenses** (3 fresh, read-only, on 85 owner turns totalling 3.10 h):
+- **Timing.** Image renders were 56.5% of the time; the in-turn verifier wait was 9.4%.
+- **Loop control.** Nothing runs unbounded: the 40-turn and 1,800 s caps hold, and db37e1c7 was already fixed.
+- **Fast path.** F1 MAJOR: token streaming has been lost since the planner went off on 10-04.
+
+**Operator decisions (AskUserQuestion):**
+- The verifier wait is OFF (`GHOST_CRITIC_REPAIR_BUDGET=0` in the launcher); at 25 s, 0 of 14 owner verdicts landed in time.
+- The owner's search run is steered at 10, the same as members. The concluded arm left the owner unbounded: one turn ran 22 searches in 225 s.
+
+**Shipped:**
+- **The "without tools" reasoning guard is TELEMETRY ONLY.** Reader measurement over its live firings: it prevented 0 harmful writes and 1 spurious render (f0cc4009), and wrongly dropped 5 needed calls (a profile correction, a search, a repair-round browser call, turn 40's image). This is a flip-flopping lexical rule, so it was inverted rather than patched. `_disclaimer_then_uses_the_tool` was removed.
+- **Designed stops close the tool phase.** These are the loop's own pre-dispatch blocks: clarify-first, and the no-photo block on a retry that drops or replaces the subject.
+  - The decision is made at the batch tail, so the alert follows every tool result.
+  - The tool's OWN first "no photo" still allows one respelled retry.
+  - `project_not_requested` closes tools on the 2nd refused BATCH (`strikes.project_refusal_batches`).
+  - Both sites are named non-breakers in the 4ji site pin.
+- **Image renders get a measured expected duration** (`expected_render_seconds`: the max of the last 3 renders of the same kind, with defaults of edit 600 s and generate 240 s; edit = subjects or any `_REF_KEYS`). A render that would end inside the report reserve is refused before it starts. Case a171b275: an 860 s edit was started with 863 s left.
+- **Owner blocked-only batches.** Three in a row force the report (`strikes.blocked_batches`). Excluded: parse errors and blocks that already book a strike (`_STRUCK_BLOCK_CODES`).
+- **The fast path:**
+  - A DBA word inside a file name or a moving-target lookup no longer loads the specialist persona (+8 s prefill).
+  - Query decomposition runs only for compound requests (it cost 1.4–2.9 s before the first token).
+  - The overview's learning summary is served stale-while-refresh (`allow_stale=True`, one refresh per key under a lock). An explicit `action='learning'` is always fresh.
+- **Experiment spec.** `search_yield_steer` now defaults to `enabled=False`, matching the live registry; the dead locals were removed.
+
+**Fresh reader on my fixes:**
+- **M1:** the 4ji force-final site pin failed; the new sites were unclassified, and a dummy clause masked one of them.
+- **M2:** the designed-stop close never fired for the real clarify-first or no-photo blocks. Both are synthetic rows that `continue` before the check, and my test used a stub no real code produces.
+- **Minors:** closing tools on the tool's first no-photo killed the respelled retry; project refusals were counted per result; struck rows were double-counted; render_kind ignored reference synonyms; the alert landed between tool results; the explicit learning report could be served stale, and its refresh had a race; `test_max_sub_queries_capped` was vacuous (and its fake sub-queries were too short to survive validation); the docs still described the removed helper.
+- All of these were fixed. Half-wrong: "declared_wait_s gets the raw name" — fname is canonical by then (agent.py ~21722); only the unregistered alias was dropped. Accepted: the DBA lookup check reads the whole message, and the render history is process-global and measured in wall time.
+
+**Batteries:**
+- bat62 (r1): all mutants killed after pinning survivors 5 and 12.
+- bat63 (r2): 11 of 11 killed; the NOOP control survived; tree == pristine.
+
+**Suite once:** 29,165 passed and 5 failed. All 5 were mine, fixed and re-run (213 passed):
+- 2 imagine-preflight tests: a mock ledger met the new counter. The counters are now int-guarded.
+- The deadline-note wording pin.
+- A bus fan-out test using a single-clause query, now compound.
+- A selfhood streamed-turn test that rode the old disclaimer guard; it now rides a designed stop.
+
+The gates were re-checked: 108 passed.
+
+**Deploy (gated).** foreground_requests was 0. Bootout, then bootstrap. The first bootstrap gave EIO while the job was still unloading; the retry worked. One listener (pid 55793), the env shows `GHOST_CRITIC_REPAIR_BUDGET=0`, and the boot log is clean.
+
+**Probes (X-Ghost-Origin: probe):**
+- **Greeting:** 15.0 s (§4MM worst: 50 s).
+- **No-photo image request** for an invented name: the tool reported no photo; the model retried without the subject; the pre-dispatch block stopped that and closed tools; the reply asked "upload a photo, or a generic person?". 26.9 s, no render, no searches.
+
+**Open (operator):**
+- F1: restore token streaming (stream the tools-on call, with a hand-back when a tool call appears). This is a core-loop round.
+- Proposed: multi-day / long-horizon requests as durable jobs with bounded steps, progress gates, budgets, checkpoints and a kill switch.
+
+## §4MP — restore token streaming (2026-10-08, operator: "proceed with both") — R0 scope, written first
+**Property.** A streamed request (`stream: true`) whose answer needs no tool shows its first answer token as soon as the model produces it. It must not wait for the whole tools-on generation, and it must not lose any of the checks the final reply passes today.
+
+**Known (§4MO F1).** Since the planner went off on 10-04, the tools-on call is not streamed. A tool-free answer from it reaches a streaming client in one chunk, 4–13 s later than its first token.
+
+**Method.**
+1. Fresh read-only lenses map:
+   - the stream path (where the tools-on call is made, how its no-tool answer is delivered, what ran before 10-04);
+   - every check or rewrite applied to a final reply before the client sees it (smoothing, think stripping, language, foreign-image note, corrections, verifier);
+   - the llama-server streaming-with-tools behaviour.
+2. Design: stream the tools-on call, emit content deltas while no tool call has appeared, and hand back to the loop when one does. Decide which checks must hold the text and which can run after it.
+3. Behaviour pins, a battery with NOOP, a fresh reader, the suite once, a gated deploy, labelled streamed probes (first-token time, a tool turn, a no-tool turn), journal and memory.
+
+**Not in scope:** the model; non-streamed clients (they must be byte-identical).
+
+## §4MQ — multi-day / long-horizon requests (2026-10-08, operator: "proceed with both") — R0 scope, written first
+**Property.** A request that needs hours or days runs to completion across many short, bounded steps, without ever running unbounded. It must:
+- survive restarts;
+- make measurable progress per step, or stop and ask;
+- respect per-job budgets (steps, wall time, GPU minutes);
+- yield the main slot to the owner's live traffic;
+- check in with the owner at defined points;
+- be visible and killable at any time.
+
+**Method.**
+1. A fresh read-only lens maps what exists and how it is bounded: projects and tasks, the idle advancer and autopilot (§4LQ operator decision: opt-in, unattended holds), the scheduler, detached jobs, the activity ledger, notifications.
+2. Build only the gaps, on top of the existing project machinery. No parallel system.
+3. The usual protocol.
+
+**Not in scope:** new external services or keyed APIs (no-identity egress).
+
+### §4MP — outcome (2026-10-08)
+**Lens.** Streaming was never switched off by a flag. The tools-on call streamed from llama-server internally (agent.py `_run_internal_turn`), but its text reached a client only after finalize. On 30 streamed owner turns since 10-04, first content to delivery had a median of 11.2 s and a p90 of 57.8 s (including the then-on 25 s verifier wait). Only the planner's treatment arm had ever streamed. The comment "with the planner disabled … stream directly" was wrong and has been corrected.
+
+**Shipped** (`core/reply_tap.py`, the route, `_run_internal_turn`, three clients). An owner's streamed request gets a `ReplyTap`:
+- **Hold:** nothing is sent before 240 chars. Of tool-call generations, 84% write no text first; of the rest, the p90 is 238 chars.
+- **Reasoning gate:** with thinking on, nothing is released before reasoning arrives on its own channel.
+- **Latch** on the agent's SHARED detectors (`reply_tap_unsafe`: `_TOOL_MARKUP_RE`, `_FN_TAG_RE`, think/result tags, template tokens, strong+weak bleed), on raw-JSON calls and on native call deltas. Shown text is retracted at once. An open `<` tail is never sent.
+- **At the end:** an exact-prefix commit sends the rest; otherwise a `ghost.retract` frame and the whole reply. A new generation, a streamed forced final, or an error frame retracts first.
+- **Turn as a task:** the turn runs as a task; its changed context variables are copied back for the drain; frames carry the registry's id (`bind`).
+- **Opt-outs:** `X-Ghost-Stream: final` (piped CLI), members, `GHOST_STREAM_TAP=0`.
+- **Clients:** web `_applyStreamRetract` (app.js v13.8, matrix_graph v13.8); ClockworkPi `frame_retract` + `retract_response` + `_silence`; CLI prints "↺ revised" / piped output asks for final.
+
+**Fresh reader:**
+- 0 CRIT, 4 MAJOR:
+  - M1 the turn's contextvars were lost to the streamed drain;
+  - M2 tag-less reasoning was streamed and spoken;
+  - M3 the private latch regex missed raw-JSON, `<tool …>`, `<function_name=…>` and prompt bleed;
+  - M4 an error left the partial text as the reply.
+- 10 minors, among them: the id after a registry rename, the whitespace seam, a quadratic rescan, the pending `_get` future, the narration kept on screen through the tool phase, and the docs.
+- All fixed except: MINOR 5 (a disconnect during a send leaves the turn to finish; foreground release unaffected), 7 (empty bubble after a retract), 8 (resume replay re-speaks). These are accepted and noted.
+
+**Batteries:** bat66 16/16 (one survivor pinned with a real-loop native-call test); bat67 r2 10/10 (one survivor pinned with a real-loop no-reasoning test); NOOP survived both.
+
+**Probes (streamed, X-Ghost-Origin: probe):**
+
+| Probe | First content | Turn total | Result |
+|---|---|---|---|
+| 250-word answer | 11.1 s | 17.9 s | the burst used to land at the end; committed |
+| Search turn (3 tools) | 21.7 s | 23.1 s | committed, no narration or markup leaked; a 241-char answer gains little |
+| Greeting | 11.8 s | 16.0 s | committed |
+
+Zero retracts on all three. The `Reply Stream — committed | retracted` log line is the instrument for the retract rate; check it at the ~10-22 re-census.
+
+**ClockworkPi:** the device is offline. Its client change ships with the next `deploy.sh`.
+
+### §4MQ — outcome (2026-10-08)
+**Lens.** Almost all of the needed machinery already existed:
+- opt-in autopilot (§4LQ);
+- unattended holds;
+- the step cap of 50;
+- the claim lock;
+- the boot reaper;
+- persistent scheduler and sandbox jobs;
+- the ledger → Slack DM path.
+
+**Gaps found:**
+- no progress gate (a "wrote index.html" step counted as progress);
+- budgets the model's `metadata=` could raise;
+- no wall cap on a step;
+- the owner's "finish it" batch never checked the clock;
+- no check-in cadence;
+- a weak status view and kill switch;
+- a crashed step was never charged.
+
+Live: 3 projects, none on autopilot, 1 unattended step in 30 days.
+
+**Shipped** (`advance_unattended`, the ONLY unattended entry: the idle loop and every non-owner batch):
+- autopilot must be ON;
+- one step per project at a time (the in-flight marker carries a boot id; a dead process's step is charged as lost);
+- an unattended runtime allowance (`unattended_runtime_seconds`, default 6 h since your last look, reset on resume; the owner's own runs don't count);
+- a 45-min wall cap per step (only its own claimed leaf goes back to READY; a raising step is charged too);
+- a progress gate (a task now DONE; held NEEDS_USER is neutral; 3 steps without progress → pause);
+- a check-in every 10 steps that moved forward.
+
+Every pause turns autopilot OFF and notifies ONCE (only on the on→off transition).
+
+Batches:
+- non-owner batches stop on `autopilot_off` / `autopilot_paused`;
+- every batch stops before a step that would cross the request's report reserve (`deadline`).
+
+Tool:
+- budget keys are system-only, set through the owner-only `action=budget` (`steps_cap`, `runtime_cap_hours` = the unattended allowance, `checkpoint_every`);
+- `autopilot project_id=all enabled=false` is the kill switch;
+- status shows the budget view.
+
+**Fresh reader:**
+- 2 CRIT:
+  - C1 a paused project was still stepped by background batches, with a notification on every run;
+  - C2 "stop all" did not stop a running batch.
+- 3 MAJOR:
+  - a concurrent step charged a phantom lost step;
+  - a timeout reopened other steps' leaves;
+  - lifetime runtime (the owner's own work) tripped the unattended cap forever.
+- 4 MINOR.
+- All fixed and pinned. Three tests that drove background batches on non-autopilot projects now run as the owner, which is the semantics they pin.
+
+**Batteries:** bat64 15/15 (an AST-pin survivor tightened to the call); bat65 r2 12/12 (three survivors pinned); NOOP survived both.
+
+**Not probed live:** no project has autopilot on, and a probe cannot opt one in (§4LQ).
+
+**Suite once (both rounds):** 29,229 passed and 5 failed. Four were mine, all fixed:
+- the cache-bust pair `matrix_graph` v13.8;
+- the speech hold cleared on a retract;
+- the ledger test runs as the owner.
+
+The fifth was a selfhood flake that passes alone. Gated deploy: pid 1304, clean boot, web serves app.js v13.8.
+
+## §4MR — fresh-eye verification of every change this session (2026-10-09, operator: "verify all your changes with fresh eye reviewers") — R0 scope, written first
+**Property.** Every change shipped in §4MK–§4MQ does what its journal entry claims on the REAL path. It introduces no new defect, its tests fail when the feature is removed, and its docs match the code. The round-2 fixes of §4MO, §4MP and §4MQ have had no reader of their own.
+
+**Method.** Five fresh, read-only reviewers who wrote none of this. Each gets its own lens and must deliver ranked findings with file:line, a concrete scenario, and a repro where possible:
+1. §4MO final state (designed stops at the batch tail, struck codes, project-refusal batches, render reserve, learning report, decomposition, search-steer spec).
+2. §4MP final state (ReplyTap, the route task + contextvar copy-back, the agent feed, the three clients).
+3. §4MQ final state (`advance_unattended` and its gates, batch stops, budget/kill-switch tool actions).
+4. Cross-cutting: how §4MO/§4MP/§4MQ interact, plus the live log since the 22:54 deploy (read-only).
+5. §4MK–§4MN re-verification.
+
+Then: class fixes with pins, a battery with NOOP, the suite once, a gated deploy if code changed, probes, journal and memory.
+
+### §4MR — outcome (2026-10-09)
+**Reviewers.** Five fresh, read-only reviewers, each checking by execution. 0 CRIT overall. Per lens:
+
+**§4MO, 1 MAJOR + 5 minor:**
+- MAJOR, fixed: "one corrected spelling" after no photo was only text, and a run respelled 6 times, each a photo search. The second no-photo row now blocks any further spelling, which is a designed stop.
+- Fixed: the multi-part detector. Greek `;` is the question mark, and "or"/"ή" offers alternatives inside one question, so neither counts any more; κι/ύστερα/unaccented forms were added.
+- Fixed: a System-3 pivot now resets the blocked-batch count.
+- Fixed: a pin at the explicit `action='learning'` call site.
+- Fixed: stale docstrings and docs (verifier budget 25→0; the claim that "streamed turns never reach" the repair await is false since §4MP; the search-steer arm; the learning trailer for a stale copy).
+- Accepted: DBA lookups lose the persona.
+
+**§4MP, 1 MAJOR + 5 minor:**
+- MAJOR: no test covered the route cancelling the turn task on disconnect (without that line a closed tab held the turn lock). The pin is now in the suite.
+- Fixed: a hard stop after live text now retracts and ends with `[DONE]`.
+- Fixed: CRLF answers commit.
+- Fixed: the docs.
+- Fixed: the scheduled-turn reset now clears the reply tap (`main.py`).
+- Accepted: reasoning that spills into the content when the reasoning channel IS present streams until `</think>` latches.
+
+**§4MQ, 3 MAJOR + 5 minor:**
+- MAJOR: a crashed coding executor left its leaf IN_PROGRESS, so the gate never paused and the owner's batch said done. The crash path now reopens the task; any step that returns with its leaf still claimed gets it reopened; a batch stops `step_crashed`, and never says `project_done` while a task is IN_PROGRESS (`in_progress`).
+- MAJOR: the owner's resume cleared a live step's marker, letting two steps run at once. The resume no longer touches the marker.
+- MAJOR: the real `claim_sink` was never pinned. Real-path pins now exist (a real coding step scored "moved", a real timeout reopening its leaf).
+- Fixed: `busy` stop reason.
+- Fixed: the owner's autoadvance discloses that it turned autopilot back on (the turn-on itself stays the §4LQ decision).
+- Fixed: the kill note says a running step finishes first.
+- Fixed: a pause appears in the "while you were away" digest.
+- Fixed: the finished-in-grace label.
+
+**Cross-cutting, 2 MAJOR + 3 minor:**
+- MAJOR: a batch's FIRST step was never checked against the report reserve; it is now checked with `FIRST_STEP_ESTIMATE_S` = 120 s.
+- MAJOR: an exhausted step budget (or the lifetime caps) blocked silently with autopilot on; it is now a pause plus one notice.
+- Fixed: the `Reply Stream` line now carries the request id and logs the forced-final, error and stop exits.
+- Fixed: docs drift (the budget raise via update, the concluded arm, steps_cap = all steps, the orphan `runtime_cap_seconds`).
+- Live since the 22:54 deploy: 3 probe requests, 0 errors, 3/3 committed.
+
+**§4MK–§4MN, 2 MAJOR + 4 minor:**
+- MAJOR: the daily snapshot tore when taken inside the agent process (chroma's own SQLite; POSIX locks don't exclude within a process). It is now `take_snapshot_isolated`: a child process, with the vector lock held.
+- MAJOR: 26 older `--apply` repair scripts wrote stores without the writer lock (3 opened chroma directly). All 26 now refuse beside the agent, with an AST-enumerated pin.
+- Fixed: moving-target facts are also known by the OBJECT's shape (a version under a release predicate, money), at both writers; reversed questions are recognised.
+- Fixed: the restore procedure moves the live folder aside (a stale WAL corrupted a restored database).
+- Fixed: the web client keeps only raster types for authed image blobs (`_safeImageBlobType`, v13.9: an SVG opened in a new tab could script the page).
+- Fixed: two weak pins (the boot-lock order; every `verify_claim` evidence wrapped).
+- Holds, checked by execution: the writer lock, a restorable newest snapshot (903/903 hashes), compaction, the §4ML key-leak fixes, the §4MK flags, the §4MM notes.
+
+**Battery bat68:** 23/23 killed. The NOOP was first killed by my own wrong deadline-test expectation, then by a §4MN dream test that stubbed the old snapshot function. Both fixed; then three masked survivors pinned (each layer of the crash reopen alone; a Greek mid-text `;`). NOOP survived.
+
+**Suite once:** 29,259 passed and 15 failed, all mine: a removed import that older tests use, and client version pins that must move with app.js (matrix_graph v13.9). All were fixed, the failed files re-ran 273 passed, and the gates passed (290).
+
+**Deploy (gated):** pid 76080, clean boot, web app.js v13.9.
+
+**Probes:**
+- A streamed answer: first text 5.5 s of 9.3 s, committed, with the request id logged.
+- An invented-name image: one photo search, then the reply asked the user; no render, no respelling, 10.3 s.
+
+**Open / operator:**
+- Whether the owner's autoadvance should keep turning autopilot back on after "stop all" (§4LQ says yes; it is now disclosed).
+- The ClockworkPi client update is still pending its `deploy.sh` (device offline).
+
+## §4MS — the idle cycle: what runs while the owner is away (2026-10-09, operator: "do 1") — R0 scope, written first
+**Property.** Every job that runs without the owner must:
+- produce something a later turn or the operator actually uses;
+- write only correct, non-duplicate, correctly attributed memory (never from probes, sims or members as if from the owner);
+- cost main-slot time in proportion to that value;
+- never delay or degrade a live owner turn;
+- fail loudly and stay bounded.
+
+The idle cycle covers the dream phases (consolidation, REM, reflection, journal, synthesis, graph compression, skill graduation, lesson distillation, store care and snapshot), self-play, the idle advancer (autopilot), the scheduler, job wakes, the biological daemon and watchdog, the youtube canary, verifier late verdicts, and anything else started off a request.
+
+**Known:** "Reflection complete: reflected 0 of 29 scanned (dup-skipped 29)" on every pass. Background LLM calls wait for a foreground request for at most 600 s, then run anyway (§4MQ lens).
+
+**Method.**
+1. Three fresh read-only lenses:
+   - **Inventory and cost:** every idle job, its trigger, frequency, duration and main-slot seconds, measured from the logs.
+   - **Value and memory quality:** what each job writes, who consumes it, the no-op rate, and a sample of written memories graded for correctness, duplication and attribution.
+   - **Interference and safety:** the impact on owner latency, overlap with live turns, failures, bounds, and behaviour across restarts.
+2. Class fixes with pins, a battery with NOOP, a fresh reader on my fixes, the suite once, a gated deploy, labelled probes, journal and memory.
+
+**Not in scope:** the models themselves; operator decisions already taken (autopilot opt-in, self-play on, skill prune off) unless the data shows harm.
+
+### §4MS — outcome (2026-10-09)
+**Lenses (3, fresh, read-only):**
+- **Cost.** The main slot is busy 2.7% of wall time. Background work is 1.1× the owner's own over the last 3 days (5× over 8). Owner calls waited a median 0.3 s.
+- **Value.** 81% of idle-written lessons never reached an owner turn, and 74% of those that did were irrelevant. A third of a 42-item sample was wrong, duplicate, junk or probe-rooted. One wrong lesson ("imagination/creative parameters") reached an owner turn. Self-play had no effect on owner behaviour; reflection was read by no one.
+- **Interference.** Self-play was unbounded (up to 2,140 s); 19 owner turns waited a median 37 s for their first call. A parked background call was released INTO a live owner turn at 600 s (44 of 105 parks; one owner call took 500 s). Disconnects and restarts were booked FAILED and taught.
+
+**Operator decisions:**
+1. Self-play is retargeted to owner failures.
+2. Saturated bench banks are retired.
+3. Cleanup: preview, then confirm. The operator confirmed "yes, apply all".
+
+**Shipped:**
+- **Background deferral (`core/llm.py`).** `BackgroundDeferred`: a parked main-slot call is deferred, never released into a live request; the caller is named.
+- **Bounded idle jobs.** `_run_idle_job` gives a 900 s cap and cancels on owner arrival, for self-play and counterfactual. Bench does not start while the owner is active.
+- **Self-play seeds (`core/owner_seeds.py`).** Self-play runs only on a real owner FAILED turn from the last 14 days that used tools, was not aborted and was not yet practised. A seeded run is GENERATED from its brief: no template, journal pick or fallback. With no seed the phase does not run and logs a `declined` heartbeat. A seed is used only by a run that concluded. At deploy 3 seeds exist and none is a skill gap, so self-play will be rare.
+- **Grounded heuristics.** `heuristic_invents_interface` drops a dream heuristic about a tool call that does not name real parameters (checked against the live tool set).
+- **Usage counters.** Lesson counters use the full usage gate (probes and internal turns too).
+- **Consumer keys** at foresight, frontier, dream_replay and gepa_tool_fixtures.
+- **Competence** counts only real user turns.
+- **Interruptions.** A disconnect or shutdown records `[TURN_INTERRUPTED]` (UNKNOWN, never teaches), except a cancel at or past the deadline, which stays an abort. An idle coding leaf stops on deferral.
+- **Reflection** runs only on new reflectable failures.
+- **Anchors** for self-play and bench are written when set.
+- **Bench.** `saturated_banks` (≥90% over the last 30 graded runs) is skipped by the idle walk; all three banks are saturated, so the idle bench is off. `GHOST_BENCH_KEEP_BANKS` overrides.
+- **Snapshot names** are unique within a second (a collision found by the battery).
+- **Built then removed:** an activity-ledger repeat dedupe. The digest's ×N and the counterfactual recheck tally read those repeats.
+
+**Fresh reader on my fixes:**
+- 1 CRIT: the cleanup `--apply` crashed after rewriting the playbook (`VectorMemory` signature), and a re-run was refused.
+- 5 MAJOR:
+  - the 36 trigger backfills would have orphaned rows from retrieval (dropped);
+  - the seed's hint never reached the generator;
+  - the 4 live seeds were not practisable, with a false DEAD alarm;
+  - a stopped run burned its seed;
+  - deferral counted as a crashed coding attempt.
+- Minors included the timeout-as-interruption, the heuristic check's false positives and archive tombstones. All fixed.
+
+**Batteries:**
+- bat70: 32 mutants (2 invalid then corrected).
+- The first pass was masked by a real snapshot-name collision; it was fixed and pinned.
+- Then 4 survivors were pinned with behaviour tests (no seed → no Dreamer; the seed helper; rule 0 against a loop-breaker turn; a passed tool-using turn).
+- All killed; NOOP survived.
+
+**Suite once:** 29,309 passed and 4 failed: a ClockworkPi flake (passes alone), two old text pins on the changed dream code, and the ratchet (+2 text pins of mine, made parsed). All fixed; the gates passed.
+
+**Deploy:**
+- Gated bootout.
+- Cleanup `--apply` on the live store after snapshot `20261009T074200Z-pre-4ms-cleanup`:
+  - 3 lessons retracted as operator tombstones;
+  - 3 counter sets reset;
+  - 1 memory deleted;
+  - `extract_html_content` retired;
+  - playbook 129 → 126.
+- Bootstrap: pid 36991, clean boot, 423 fragments.
+
+**Probe:** a streamed answer committed. The idle-cycle changes only act after an hour of idle time and could not be probed in this window; covered by tests and the battery.
+
+**Open:**
+- Self-play now rarely runs: owner failures are rarely labelled (45 of 104 recent owner turns are UNKNOWN). A labelling round would feed it.
+- Bench banks are retired until new, harder banks exist.

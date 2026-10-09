@@ -12,9 +12,9 @@ def mock_chroma():
 from pathlib import Path
 
 @pytest.mark.asyncio
-async def test_vector_search_rag_document_priority(mock_chroma):
+async def test_vector_search_rag_document_priority(mock_chroma, tmp_path):
     """Verify that RAG document memory types receive priority -5 and 1.25 threshold"""
-    memory = VectorMemory(memory_dir=Path("/tmp"), upstream_url=None)
+    memory = VectorMemory(memory_dir=tmp_path, upstream_url=None)   # §4MN: not the shared /tmp (single-writer lock)
     memory.collection = MagicMock()
     
     # Mocking chromadb collection query response
@@ -37,9 +37,9 @@ async def test_vector_search_rag_document_priority(mock_chroma):
     assert "Document content" in results
 
 @pytest.mark.asyncio
-async def test_vector_search_rag_document_suppression(mock_chroma):
+async def test_vector_search_rag_document_suppression(mock_chroma, tmp_path):
     """Verify that RAG documents beyond 1.25 distance are suppressed entirely"""
-    memory = VectorMemory(memory_dir=Path("/tmp"), upstream_url=None)
+    memory = VectorMemory(memory_dir=tmp_path, upstream_url=None)   # §4MN: not the shared /tmp (single-writer lock)
     memory.collection = MagicMock()
     
     # Document with distance 1.30 (fails 1.25 threshold)

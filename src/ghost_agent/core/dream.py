@@ -1369,6 +1369,7 @@ def detect_tool_patterns(skill_memory) -> list:
 # cycle — the heuristics loop below and _consolidate_episodes still call
 # _is_actionable_heuristic exactly as before.
 from ..memory.lesson_quality import _is_actionable_heuristic  # noqa: E402,F401
+from ..memory.lesson_quality import heuristic_invents_interface  # noqa: E402
 
 
 # Tools that should never anchor an auto-proposed macro: meta / control-flow
@@ -2445,6 +2446,26 @@ _DREAM_DEADLINE_S = 600.0
 _DREAM_CLIENT_TIMEOUT_S = 900.0
 
 
+def _real_dir(value):
+    """A real, existing directory as a Path, else None (§4MN: a mocked
+    context's `memory_dir` stringifies to "MagicMock/…" and the daily store
+    care then created that folder in the working directory)."""
+    if not isinstance(value, (str, Path)):
+        return None
+    p = Path(value)
+    return p if p.is_dir() else None
+
+
+def initial_self_play_seed(seed_override=None) -> dict:
+    """§4MS: the seed a self-play run starts from — an owner-failure seed
+    when the idle phase passes one (with its brief), else a cold start the
+    frontier may refine."""
+    seed = {"mode": "cold_start", "cluster_key": None, "hint": ""}
+    if isinstance(seed_override, dict) and seed_override.get("hint"):
+        seed = {**seed, **seed_override}
+    return seed
+
+
 class Dreamer:
     """
     Active Memory Consolidation System.
@@ -2693,6 +2714,10 @@ class Dreamer:
             fresh = len(current_fragment_key - last_fragment_key)
         else:
             fresh = len(current_fragment_key)
+        # §4MN r2: the daily store care runs BEFORE the freshness gate — a
+        # quiet day skips REM, and "no new traffic" must not mean "no
+        # backup" (145 of 185 cycles skipped REM; runs of 24 in a row)
+        await self._daily_store_care()
         if isinstance(last_fragment_key, frozenset) and fresh < self.REDREAM_MIN_NEW_FRAGMENTS:
             if fresh:
                 msg = (f"Skipping REM — only {fresh} new fragment(s) since "
@@ -2948,12 +2973,24 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             heuristics = result_json.get("heuristics", [])
             kept_heuristics = 0
             dropped_heuristics = 0
+            # §4MS: the LIVE tool set (the static list lacks per-context tools)
+            try:
+                from ..tools.registry import get_active_tool_definitions as _gatd
+                _live_tool_defs = _gatd(self.context, serve_tuned=False)
+            except Exception:  # noqa: BLE001
+                _live_tool_defs = None
             for h in heuristics:
                 if h:
                     # Actionability gate: only imperative behavioral rules
                     # reach SkillMemory. Observations / actor profiles (and
                     # operator requests misattributed to the agent) are
                     # dropped here — see _is_actionable_heuristic.
+                    if heuristic_invents_interface(h, _live_tool_defs):      # §4MS
+                        dropped_heuristics += 1
+                        pretty_log("Dream Skip",
+                                   f"Dropped heuristic naming a tool interface that does not exist: {str(h)[:70]}...",
+                                   icon=Icons.SKIP)
+                        continue
                     if not _is_actionable_heuristic(h):
                         dropped_heuristics += 1
                         pretty_log(
@@ -3153,6 +3190,7 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             except Exception as _rcx:
                 logger.debug("memory reconcile skipped: %s", _rcx)
 
+
             # RRF-weight refit from the usefulness ledger: the post-turn
             # hydration judge appends (intent, source, used) observations;
             # once enough accumulate, refit the fusion matrix, persist it,
@@ -3266,6 +3304,117 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             pretty_log("Dream Mode", msg, level="ERROR", icon=Icons.FAIL)
             return msg
 
+    #: §4MN: the newest snapshot older than this → take one (env override)
+    SNAPSHOT_EVERY_S = 22 * 3600
+
+    #: §4MN r2 (one rule for every copy a forget or reset keeps): 30 days,
+    #: enforced here — not only by the next forget
+    ARCHIVE_RETENTION_DAYS = 30
+
+    async def _daily_store_care(self) -> None:
+        """The verified snapshot and the archive retention. Never raises; a
+        failure is said at ERROR (a silent backup failure is the worst kind)."""
+        try:
+            await self._maybe_snapshot()
+        except Exception as e:  # noqa: BLE001
+            pretty_log("Store Snapshot", f"FAILED: {type(e).__name__}: {e}"[:240], level="ERROR", icon=Icons.FAIL)
+        try:
+            await asyncio.to_thread(self._purge_forget_archives)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("archive retention skipped: %s: %s", type(e).__name__, e)
+
+    def _purge_forget_archives(self) -> dict:
+        """Drop forget/reset copies older than `ARCHIVE_RETENTION_DAYS`:
+        forgotten episodes, removed profile values, `reset_all` dumps."""
+        mdir = _real_dir(getattr(self.context, "memory_dir", None))
+        if mdir is None:
+            return {}
+        import time as _t
+        out = {}
+        try:
+            from ..memory.profile import purge_removed_archive
+            out["profile"] = purge_removed_archive(mdir / "profile_removed.jsonl", self.ARCHIVE_RETENTION_DAYS)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("profile archive purge skipped: %s", e)
+        em = getattr(self.context, "episodic_memory", None)
+        if em is not None and hasattr(em, "_purge_forgotten_archive"):
+            try:
+                with em._lock:
+                    em._purge_forgotten_archive()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("episode archive purge skipped: %s", e)
+        cutoff = _t.time() - self.ARCHIVE_RETENTION_DAYS * 86400
+        gone = 0
+        for f in mdir.glob("vector_reset_*.jsonl"):
+            try:
+                if f.stat().st_mtime < cutoff:
+                    f.unlink()
+                    gone += 1
+            except OSError:
+                continue
+        out["vector_reset"] = gone
+        # the graph archive (forget/prune/compress rows) — the same rule
+        try:
+            ga = mdir / "graph_pruned_archive.jsonl"
+            if ga.exists():
+                import json as _j
+                import os as _o
+                rows = ga.read_text(encoding="utf-8").splitlines()
+                keep = []
+                for r in rows:
+                    try:
+                        if float((_j.loads(r) or {}).get("archived_at") or 0) < cutoff:
+                            continue
+                    except Exception:  # noqa: BLE001 — unreadable: kept
+                        pass
+                    keep.append(r)
+                if len(keep) != len(rows):
+                    tmp = ga.with_name(f"{ga.name}.{_o.getpid()}.tmp")
+                    with open(tmp, "w", encoding="utf-8") as fh:
+                        fh.write("".join(k + "\n" for k in keep))
+                        fh.flush()
+                        _o.fsync(fh.fileno())
+                    _o.replace(tmp, ga)
+                out["graph"] = len(rows) - len(keep)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("graph archive purge skipped: %s", e)
+        return out
+
+    async def _maybe_snapshot(self) -> str:
+        """Take a verified store snapshot when the newest is older than
+        `SNAPSHOT_EVERY_S` (`memory/snapshot.py`). ``GHOST_SNAPSHOTS=0``
+        turns it off. A snapshot that fails verification is not published
+        and is said LOUDLY — a silent backup failure is the worst kind."""
+        if os.getenv("GHOST_SNAPSHOTS", "1").strip().lower() in ("0", "false", "no", "off"):
+            return ""
+        mdir = _real_dir(getattr(self.context, "memory_dir", None))
+        if mdir is None:
+            return ""
+        home = Path(mdir).parent.parent
+        from ..memory.snapshot import latest_snapshot, take_snapshot_isolated
+        dest = home / "system" / "backups"
+        last = latest_snapshot(dest)
+        import time as _t
+        if last is not None and _t.time() - last.stat().st_mtime < self.SNAPSHOT_EVERY_S:
+            return ""
+        # §4MR: from a child process, with the vector writers paused — an
+        # in-process copy tore while the agent wrote (see the helper)
+        _mem = getattr(self, "memory", None)
+        _hold = None
+        try:
+            if _is_real_component(_mem) and callable(getattr(_mem, "_get_lock", None)):
+                _hold = _mem._get_lock()
+        except Exception:  # noqa: BLE001
+            _hold = None
+        res = await asyncio.to_thread(take_snapshot_isolated, home, dest, "auto", _hold)
+        if not res.get("ok"):
+            pretty_log("Store Snapshot", "FAILED verification — not published: "
+                       + "; ".join(res.get("problems") or [])[:200], level="ERROR", icon=Icons.FAIL)
+            return "store snapshot FAILED"
+        pretty_log("Store Snapshot", f"{res['files']} files, {res['bytes'] // (1 << 20)} MB, verified in "
+                   f"{res['seconds']}s → {Path(res['path']).name}", icon=Icons.MEM_SAVE)
+        return f"snapshot {Path(res['path']).name}"
+
     async def _reconcile_memory_stores(self) -> str:
         """Run the cross-store reconcile and return a short report fragment
         for the dream's metrics note (``""`` when nothing was repaired).
@@ -3309,6 +3458,20 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             parts.append(f"{len(report['outlines_dropped'])} orphan outline(s) dropped")
         if report.get("episode_vectors_deleted"):
             parts.append(f"{report['episode_vectors_deleted']} orphan episode vector(s) reaped")
+        # §4MN: acquired-skill vectors whose skill is gone — the purge ran
+        # only when the owner called manage_skills (6 of 8 rows orphaned
+        # since 10-05); the reconcile is the reaper for every other store
+        try:
+            from ..tools.acquired_skills import AcquiredSkillManager
+            _mdir = getattr(self.context, "memory_dir", None)
+            if _mdir is not None:
+                _mgr = AcquiredSkillManager.get_shared(
+                    Path(_mdir), mem, legacy_sandbox_dir=getattr(self.context, "sandbox_dir", None))
+                _sk = await asyncio.to_thread(_mgr.purge_orphaned_skill_embeddings)
+                if _sk:
+                    parts.append(f"{_sk} orphan skill vector(s) reaped")
+        except Exception as _se:  # noqa: BLE001
+            logger.debug("skill-vector reconcile skipped: %s", _se)
         if not parts:
             # Skips are worth a line even with no repairs: an invariant that
             # can never be CHECKED is the silent-inoperative-subsystem shape.
@@ -4579,7 +4742,8 @@ Return ONLY a JSON object with:
 
     @_template_fallback_on_defective_challenge
     async def synthetic_self_play(self, model_name: str = "qwen-3.6-35b-a3", is_background: bool = False, injected_challenge: dict = None,
-                                  bench_meta: dict = None, *, force_template: bool = False):
+                                  bench_meta: dict = None, *, force_template: bool = False,
+                                  seed_override: dict = None):
         """``bench_meta`` (§4BF Track 1b, admissions per 1c): marks this run
         as a BENCH-BANK item — an externally-graded task injected via
         ``injected_challenge``. Effects: a real TrajectoryCollector is
@@ -4643,8 +4807,12 @@ Return ONLY a JSON object with:
         from ..memory.frontier import FrontierTracker as _FrontierTrackerCls
         raw_tracker = getattr(self.context, 'frontier_tracker', None)
         frontier_tracker = raw_tracker if isinstance(raw_tracker, _FrontierTrackerCls) else None
-        seed = {"mode": "cold_start", "cluster_key": None, "hint": ""}
-        if frontier_tracker is not None:
+        seed = initial_self_play_seed(seed_override)
+        # §4MS: the idle phase passes a seed from a real owner failure — the
+        # frontier's own pick (templates the owner never asks for) is skipped
+        if seed.get("mode") == "owner_failure":
+            pass
+        elif frontier_tracker is not None:
             try:
                 # Frontier-aware path: when --frontier-selfplay is on AND
                 # both the PRM scorer and trajectory collector are wired,
@@ -4691,7 +4859,7 @@ Return ONLY a JSON object with:
                         _candidate_clusters = sorted(set(_TEMPLATES.keys()) | _seen_clusters)
                         from ..memory.skills import iter_teachable
                         _counts = count_trajectories_by_cluster(
-                            iter_teachable(_traj_collector.iter_trajectories())   # member turns never steer self-play (§4KJ R9)
+                            iter_teachable(_traj_collector.iter_trajectories(), consumer="frontier")   # member turns never steer self-play (§4KJ R9); §4MS: nor probes
                         )
                         _unc = compute_cluster_uncertainty(_prm_scorer, _candidate_clusters)
                         _rar = compute_cluster_rarity(_counts, _candidate_clusters)
@@ -4950,7 +5118,11 @@ Return ONLY a JSON object with:
             except Exception:
                 return None
         _resolved_tier = _resolve_tier(_cluster_key) if _cluster_key else None
-        _tpl = try_template(_cluster_key, tier=_resolved_tier)
+        # §4MS r1: a seed from a real OWNER failure is GENERATED from its
+        # brief — a template, a journal pick or a random template never sees
+        # the hint (every seeded run had become a random CSV/SQL drill)
+        _owner_mode = seed.get("mode") == "owner_failure"
+        _tpl = None if _owner_mode else try_template(_cluster_key, tier=_resolved_tier)
         _tpl_source = "cluster"
         # Cluster of the template ACTUALLY used for generation (proposal H
         # saturation stats). Stays "" for LLM-generated, journal-mined and
@@ -4998,7 +5170,7 @@ Return ONLY a JSON object with:
         # new to teach the agent, so journal-mined challenges become
         # the PRIMARY source of novel material: bump the probability
         # to 0.75 so the loop actually reaches for them.
-        if _tpl is None and not gen_ok:
+        if _tpl is None and not gen_ok and not _owner_mode:
             journal_prob = 0.75 if _saturated else 0.25
             _journal_tpl = self._try_journal_challenge(probability=journal_prob)
             if _journal_tpl is not None:
@@ -5024,7 +5196,7 @@ Return ONLY a JSON object with:
         #     from `pick_random_template(exclude=saturated_clusters)`
         #     so the expert templates get airtime; the other 50% fall
         #     through to LLM-gen for genuinely novel shapes.
-        if _tpl is None and not gen_ok and not _cluster_key and not _saturated:
+        if _tpl is None and not gen_ok and not _cluster_key and not _saturated and not _owner_mode:
             _tpl = pick_random_template(
                 exclude_clusters=_saturated, tier_resolver=_resolve_tier,
                 cluster_weights=_template_weights(),
@@ -5036,7 +5208,7 @@ Return ONLY a JSON object with:
                 # exposed (the return is a bare 3-tuple).
                 _used_template_cluster = str(
                     getattr(_ct_mod, "_LAST_TEMPLATE_KEY", "") or "")
-        elif _tpl is None and not gen_ok and _saturated:
+        elif _tpl is None and not gen_ok and _saturated and not _owner_mode:
             # Saturation coin-flip: previously 50/50 between rotating to
             # a non-saturated template and falling through to LLM-gen.
             # The log-eval showed this still produced ~8 near-identical
@@ -5727,7 +5899,7 @@ Return ONLY a JSON object with:
             # that confuses its own XML output.
             rejection_feedback = reason.replace("<", "&lt;").replace(">", "&gt;")
 
-        if not gen_ok:
+        if not gen_ok and not _owner_mode:     # §4MS r1: an owner seed never falls back to a template
             # Last-resort deterministic fallback (2026-07-27 log eval): a
             # 3/3 quality-gate rejection used to forfeit the ENTIRE idle
             # slot — the overnight trace lost a ~2h window to one

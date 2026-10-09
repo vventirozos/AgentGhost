@@ -236,6 +236,14 @@ def frame_unlabelable(data) -> bool:
     return isinstance(ghost, dict) and ghost.get("labelable") is False
 
 
+def frame_retract(data) -> bool:
+    """§4MP ``ghost.retract: true`` — the agent dropped the reply text it had
+    streamed (a tool call followed, or the finished reply was rewritten); the
+    frames after it carry the reply that replaces it."""
+    ghost = data.get("ghost") if isinstance(data, dict) else None
+    return isinstance(ghost, dict) and ghost.get("retract") is True
+
+
 def frame_content(data) -> str:
     """The text a stream frame carries, or ``""`` — for ANY frame shape.
 

@@ -14,16 +14,20 @@ Budget model:
       this project. Defaults to :data:`DEFAULT_STEPS_CAP` when unset.
     - ``steps_used`` — incremented after every completed tick.
   When ``steps_used >= steps_cap`` the advancer refuses to proceed and
-  logs a ``budget_exhausted`` event. The user has to raise the cap
-  explicitly (via ``manage_projects`` update) before autoadvance
-  resumes — budgets are a hard stop, not a soft warning.
+  logs a ``budget_exhausted`` event (unattended: autopilot pauses and the
+  owner is told, §4MR). Only the owner raises the cap (``manage_projects``
+  action=budget, §4MQ — the model's ``metadata=`` cannot) — budgets are a
+  hard stop, not a soft warning. The cap counts EVERY advancer step, the
+  owner's batches too.
 
 The classifier is intentionally a keyword heuristic. An LLM classifier
 can be plugged in later by passing ``llm_classifier=...``; the tests
 verify both paths.
 """
 
+import asyncio
 import logging
+import os
 import re
 import threading
 import time
@@ -728,8 +732,12 @@ async def advance_once(
     code_generator: Optional[Callable[[str], Awaitable[str]]] = None,
     coding_executor: Optional[Callable[..., Awaitable[Any]]] = None,
     owner_requested: bool = False,
+    claim_sink: Optional[list] = None,
 ) -> AdvanceResult:
     """Run a single autoadvance tick for ``project_id``.
+
+    ``claim_sink`` (§4MQ): when given, the id of the leaf this tick claims is
+    appended to it — the unattended gate resets only ITS leaf on a timeout.
 
     ``owner_requested=False`` (the idle loop): a task the VERIFIER filed on its
     own ("Verifier follow-up: …") is never built — the owner did not ask for
@@ -855,6 +863,8 @@ async def advance_once(
                 _n.status = TaskStatus.NEEDS_USER
         if nxt:
             plan.update_status(nxt.id, TaskStatus.IN_PROGRESS)
+            if claim_sink is not None:
+                claim_sink.append(nxt.id)
     if not nxt:
         _metacog_set_task(context, None)  # nothing executing → clear
         # Stamped OUTSIDE the claim lock (it re-acquires the project lock):
@@ -1014,6 +1024,14 @@ async def advance_once(
             # standard of proof. The leaf stays open and the next tick retries
             # it with the full gate set.
             logger.warning("coding_executor crashed: %s", e)
+            # §4MR: "left open" must mean claimable — the leaf stayed
+            # IN_PROGRESS, so no tick could retry it and the progress gate
+            # saw nothing until the next boot's reaper
+            try:
+                store.update_task(nxt.id, status="READY",
+                                  failure_reason=f"coding executor crashed: {type(e).__name__}")
+            except Exception:  # noqa: BLE001
+                logger.debug("crashed leaf not reset", exc_info=True)
             return AdvanceResult(
                 True, nxt.id, "blocked",
                 f"coding executor crashed on '{nxt.id}' "
@@ -1442,6 +1460,301 @@ def idle_candidates(store) -> list:
             if (p.get("metadata") or {}).get("autopilot")]
 
 
+# ------------------------------------------------------------------ §4MQ
+# Multi-day work = many short, bounded UNATTENDED steps on an autopilot
+# project. Each step must move the plan forward, or autopilot pauses and the
+# owner is told once; it never runs past its own wall cap; a step lost to a
+# crash is charged; and every `checkpoint_every` steps that moved forward the
+# owner is asked to look before more run. Every pause turns autopilot OFF —
+# only the owner's own turn turns it back on (§4LQ).
+
+#: consecutive unattended steps that moved nothing forward → autopilot pauses
+NO_PROGRESS_PAUSE_AT = 3
+#: unattended steps that moved forward between owner check-ins (owner may change)
+DEFAULT_CHECKPOINT_EVERY = 10
+#: one unattended step's wall cap (a build that verifies can run long; a
+#: sandbox job is promoted and survives its turn on its own)
+UNATTENDED_STEP_TIMEOUT_S = 45 * 60
+#: unattended runtime a project may spend when the owner set no cap
+DEFAULT_UNATTENDED_RUNTIME_CAP_S = 6 * 3600
+#: a batch's FIRST step has no measured duration yet — this is its estimate
+#: (§4MR: the first step was never checked; a build takes minutes)
+FIRST_STEP_ESTIMATE_S = 120.0
+
+#: metadata keys only the system or the owner's `action=budget` may write
+BUDGET_METADATA_KEYS = (
+    "steps_cap", "steps_used", "runtime_cap_seconds", "runtime_used_seconds",
+    "tool_call_cap", "tool_call_used", "checkpoint_every", "no_progress_streak",
+    "steps_since_checkpoint", "step_in_flight", "autopilot_paused", "last_autoadvance_ts",
+    "unattended_runtime_seconds", "unattended_runtime_cap_seconds")
+
+#: this process — a `step_in_flight` stamped by another boot is a step that
+#: died with its process; one stamped by this boot is a step still running
+_BOOT_ID = f"{os.getpid()}-{int(time.time())}"
+
+
+def _task_status(store, project_id, task_id) -> str:
+    try:
+        for t in store.list_tasks(project_id) or []:
+            if str(t.get("id")) == str(task_id):
+                return str(t.get("status") or "").upper()
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _step_score(store, project_id, task_id) -> str:
+    """"moved" when the task the step worked on is now DONE; "held" when it
+    waits on the owner (NEEDS_USER — the hold already told them and stops
+    the project; not progress, not a failure); else "none". A written file
+    or a summary is not progress ("wrote index.html" was booked as a step
+    for months, §4MQ lens)."""
+    if not task_id:
+        return "none"
+    st = _task_status(store, project_id, task_id)
+    return "moved" if st == "DONE" else ("held" if st == "NEEDS_USER" else "none")
+
+
+def _step_moved_forward(store, project_id, res) -> bool:
+    return _step_score(store, project_id, getattr(res, "task_id", None)) == "moved"
+
+
+def pause_autopilot(context, project_id, reason: str, detail: str = "") -> None:
+    """Turn autopilot OFF, record why, and tell the owner — ONCE: only the
+    on → off transition notifies (r2 C1: every later run re-notified)."""
+    store = getattr(context, "project_store", None)
+    if store is None:
+        return
+    rec = {"reason": str(reason), "detail": str(detail)[:300], "ts": time.time()}
+    was_on = {"v": False}
+
+    def _off(m):
+        was_on["v"] = bool(m.get("autopilot"))
+        if was_on["v"]:
+            m["autopilot"] = False
+            m["autopilot_paused"] = rec
+        return m
+    try:
+        _bump_meta(store, project_id, _off)
+    except Exception:  # noqa: BLE001
+        logger.warning("autopilot pause not recorded for %s", project_id, exc_info=True)
+        return
+    if not was_on["v"]:
+        return
+    try:
+        store.log_event(project_id, None, "autopilot_paused", rec)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        title = ((store.get_project(project_id) or {}).get("title")) or project_id
+        from .autonomous_activity import get_activity_log, SEVERITY_NOTIFY
+        log = get_activity_log(context)
+        if log is not None:
+            log.record("project",
+                       f"autopilot paused on '{str(title)[:60]}' — {reason}"
+                       + (f": {str(detail)[:160]}" if detail else "")
+                       + ". Say 'resume autopilot on it' to continue.",
+                       severity=SEVERITY_NOTIFY, kind="autopilot_paused",
+                       project_id=str(project_id))
+    except Exception as e:  # noqa: BLE001
+        logger.debug("autopilot pause notify skipped: %s", e)
+    pretty_log("Autopilot", f"paused {str(project_id)[:8]} — {reason}", icon=Icons.STOP, level="WARNING")
+
+
+def resume_autopilot_metadata() -> Dict[str, Any]:
+    """The metadata an OWNER's resume writes: autopilot on, gates reset — the
+    unattended runtime too: each look grants a fresh allowance (r2 M3)."""
+    # NOT `step_in_flight`: a step of this process may be running; clearing
+    # its marker let a second step start beside it (§4MR M2). A marker left
+    # by a dead process is charged as a lost step on the next tick, as it
+    # should be.
+    return {"autopilot": True, "autopilot_paused": None, "no_progress_streak": 0,
+            "steps_since_checkpoint": 0, "unattended_runtime_seconds": 0}
+
+
+def _bump_meta(store, project_id, mutate) -> Dict[str, Any]:
+    if callable(getattr(store, "_atomic_metadata_update", None)):
+        return store._atomic_metadata_update(project_id, mutate) or {}
+    meta = dict(((store.get_project(project_id) or {}).get("metadata")) or {})
+    meta = mutate(meta) or meta
+    store.update_project(project_id, metadata=meta)
+    return meta
+
+
+def _unattended_cap_s(meta) -> float:
+    cap = meta.get("unattended_runtime_cap_seconds")
+    return DEFAULT_UNATTENDED_RUNTIME_CAP_S if cap is None else float(cap)
+
+
+async def advance_unattended(context, project_id: str, *, step_timeout_s: Optional[float] = None,
+                             **kw) -> AdvanceResult:
+    """ONE unattended step under the §4MQ gates — the only entry for the idle
+    loop and for every non-owner batch: autopilot must be ON; one step per
+    project at a time; the lost-step charge; the unattended runtime cap; the
+    wall cap; the progress gate; the check-in cadence. ``kw`` goes to
+    `advance_once`."""
+    from ..utils.aio import wait_for as _wait_for
+    store = getattr(context, "project_store", None)
+    if store is None:
+        return AdvanceResult(False, None, "idle", "project_store missing on context")
+    meta = dict(((store.get_project(project_id) or {}).get("metadata")) or {})
+    if not meta.get("autopilot"):
+        # r2 C1/C2: a paused (or never opted-in) project is not advanced by a
+        # background run — only the owner's own turn turns autopilot on
+        return AdvanceResult(True, None, "blocked",
+                             "autopilot is off — only the owner's own turn turns it on")
+    _mine = {"boot": _BOOT_ID, "ts": time.time(), "id": os.urandom(4).hex()}
+    _claim = {"lost": False, "busy": False}
+
+    def _enter(m):
+        prev = m.get("step_in_flight")
+        if isinstance(prev, dict) and prev.get("boot") == _BOOT_ID:
+            _claim["busy"] = True               # a step of THIS process is running (r2 M1)
+            return m
+        if prev:                                # stamped by a process that died mid-step
+            _claim["lost"] = True
+            m["no_progress_streak"] = int(m.get("no_progress_streak") or 0) + 1
+        m["step_in_flight"] = _mine
+        return m
+    meta = _bump_meta(store, project_id, _enter)
+    if _claim["busy"]:
+        return AdvanceResult(True, None, "blocked", "another unattended step on this project is running")
+    try:
+        if _claim["lost"]:
+            _increment_budget(store, project_id)
+            try:
+                store.log_event(project_id, None, "autopilot_step_lost",
+                                {"streak": meta.get("no_progress_streak")})
+            except Exception:  # noqa: BLE001
+                pass
+            if int(meta.get("no_progress_streak") or 0) >= NO_PROGRESS_PAUSE_AT:
+                pause_autopilot(context, project_id, "no progress",
+                                f"{NO_PROGRESS_PAUSE_AT} steps in a row moved nothing forward "
+                                "(one was lost to a restart)")
+                return AdvanceResult(True, None, "blocked", "autopilot paused: no progress")
+        # §4MR: an exhausted step budget (or the lifetime runtime / tool-call
+        # caps) blocked every tick silently with autopilot left ON — it is a
+        # pause like the others: autopilot off, the owner told once
+        _bud = _get_budget(store, project_id)
+        if _bud["used"] >= _bud["cap"]:
+            pause_autopilot(context, project_id, "step budget used",
+                            f"{_bud['used']}/{_bud['cap']} steps — the owner raises it with action=budget")
+            return AdvanceResult(True, None, "blocked", "autopilot paused: step budget")
+        from .project_safety import check_budget as _check_budget
+        _sec = _check_budget(meta)
+        if not _sec.allowed:
+            pause_autopilot(context, project_id, "budget used", _sec.reason)
+            return AdvanceResult(True, None, "blocked", "autopilot paused: " + _sec.reason)
+        if float(meta.get("unattended_runtime_seconds") or 0) >= _unattended_cap_s(meta):
+            pause_autopilot(context, project_id, "runtime budget used",
+                            f"{_unattended_cap_s(meta) / 3600:.1f} h of unattended work since your last look")
+            return AdvanceResult(True, None, "blocked", "autopilot paused: runtime budget")
+        t0 = time.time()
+        timeout = UNATTENDED_STEP_TIMEOUT_S if step_timeout_s is None else float(step_timeout_s)
+        claimed: list = []
+        try:
+            res = await _wait_for(advance_once(context, project_id, owner_requested=False,
+                                               claim_sink=claimed, **kw), timeout)
+        except asyncio.TimeoutError:
+            res = _after_abort(store, project_id, claimed, t0,
+                               "timeout", f"step passed its {int(timeout)} s cap")
+        except Exception as e:  # noqa: BLE001 — r2 m3: a raising step is charged and scored too
+            logger.warning("unattended step on %s raised: %s", project_id, e, exc_info=True)
+            res = _after_abort(store, project_id, claimed, t0, "error", f"step raised {type(e).__name__}: {e}")
+        else:
+            # §4MR: a step that RETURNED with its leaf still claimed (a path
+            # that stopped without closing it) would wedge the leaf until the
+            # next boot — and score nothing, so the gate never paused
+            for _tid in claimed:
+                if _task_status(store, project_id, _tid) == "IN_PROGRESS":
+                    try:
+                        store.update_task(_tid, status="READY",
+                                          failure_reason="unattended step ended without closing it")
+                    except Exception:  # noqa: BLE001
+                        logger.debug("left-claimed leaf not reset", exc_info=True)
+        _elapsed = time.time() - t0
+        _bump_meta(store, project_id, lambda m: {**m, "unattended_runtime_seconds": float(
+            m.get("unattended_runtime_seconds") or 0) + _elapsed})
+    finally:
+        def _leave(m):
+            cur = m.get("step_in_flight")
+            if isinstance(cur, dict) and cur.get("id") == _mine["id"]:
+                m["step_in_flight"] = None
+            return m
+        _bump_meta(store, project_id, _leave)
+    # only a step that WORKED on a task (or was aborted) is scored; a tick
+    # that claimed nothing is not a step
+    if not (res.task_id or res.classification in ("timeout", "error")):
+        return res
+    score = _step_score(store, project_id, res.task_id)
+    if score == "held":
+        return res                     # waits on the owner — the hold already said so (r2 m1)
+
+    def _score(m):
+        if score == "moved":
+            m["no_progress_streak"] = 0
+            m["steps_since_checkpoint"] = int(m.get("steps_since_checkpoint") or 0) + 1
+        else:
+            m["no_progress_streak"] = int(m.get("no_progress_streak") or 0) + 1
+        return m
+    meta = _bump_meta(store, project_id, _score)
+    if int(meta.get("no_progress_streak") or 0) >= NO_PROGRESS_PAUSE_AT:
+        pause_autopilot(context, project_id, "no progress",
+                        f"{NO_PROGRESS_PAUSE_AT} steps in a row moved nothing forward (last: {res.summary[:120]})")
+    else:
+        every = meta.get("checkpoint_every")
+        every = DEFAULT_CHECKPOINT_EVERY if every is None else int(every)
+        if score == "moved" and every > 0 and int(meta.get("steps_since_checkpoint") or 0) >= every:
+            pause_autopilot(context, project_id, "check-in",
+                            f"{every} steps done since your last look — review the project before more run")
+    return res
+
+
+def _after_abort(store, project_id, claimed, t0, kind, why) -> AdvanceResult:
+    """A step that timed out or raised: ITS leaf (only — r2 M2) goes back to
+    READY, and the step is charged — unless it had in fact finished in the
+    cancel grace (r2 m2: then it was charged already and is scored as is)."""
+    tid = claimed[0] if claimed else None
+    if kind == "timeout" and tid and _task_status(store, project_id, tid) != "IN_PROGRESS":
+        return AdvanceResult(True, tid, "finished", f"finished as the cap hit ({why})")
+    if tid:
+        try:
+            store.update_task(tid, status="READY", failure_reason=f"unattended {why}")
+        except Exception:  # noqa: BLE001
+            logger.debug("aborted leaf not reset", exc_info=True)
+    _increment_budget(store, project_id)
+    try:
+        from .project_safety import record_runtime
+        record_runtime(store, project_id, seconds=time.time() - t0)
+    except Exception:  # noqa: BLE001
+        pass
+    return AdvanceResult(True, tid, kind, why)
+
+
+def _paused_since(store, project_id, t0: float) -> bool:
+    try:
+        rec = ((store.get_project(project_id) or {}).get("metadata") or {}).get("autopilot_paused")
+        return bool(rec) and float(rec.get("ts") or 0) >= t0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _batch_would_cross_deadline(next_step_s: float) -> bool:
+    """True when this request's client deadline would arrive inside its
+    report reserve before another step of ``next_step_s`` could finish.
+    No deadline known (a background run) → False."""
+    try:
+        from ..utils.logging import request_id_context, request_remaining_s, request_deadline_s
+        rid = request_id_context.get() or ""
+        remaining = request_remaining_s(rid)
+        if remaining is None:
+            return False
+        from .agent import effective_report_floor
+        return float(next_step_s) > float(remaining) - effective_report_floor(request_deadline_s(rid))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _is_unrequested_task(node) -> bool:
     """A task nobody asked for: filed by the verifier on its own."""
     return str(getattr(node, "description", "") or "").lstrip().lower().startswith("verifier follow-up:")
@@ -1497,15 +1810,33 @@ async def advance_many(
     stop_reason = "count_reached"
     consecutive_fails = 0
 
+    _batch_t0 = time.time()
+    _longest_step = 0.0
     for _ in range(limit):
-        res = await advance_once(
-            context, project_id,
-            tool_runner=tool_runner,
-            llm_classifier=llm_classifier,
-            code_generator=code_generator,
-            coding_executor=coding_executor,
-            owner_requested=owner_requested,
-        )
+        # §4MQ: a batch inside a request stops BEFORE a step that would end
+        # inside the report reserve — "finish the project" ran up to 40
+        # builds in one tool call and nothing checked the clock
+        if _batch_would_cross_deadline(_longest_step or FIRST_STEP_ESTIMATE_S):
+            stop_reason = "deadline"
+            break
+        _step_t0 = time.time()
+        _kw = dict(tool_runner=tool_runner, llm_classifier=llm_classifier,
+                   code_generator=code_generator, coding_executor=coding_executor)
+        if owner_requested:
+            res = await advance_once(context, project_id, owner_requested=True, **_kw)
+        else:
+            # a scheduled task's, sub-agent's or probe's batch runs under
+            # the unattended gates (§4MQ) — and stops when they pause
+            res = await advance_unattended(context, project_id, **_kw)
+        _longest_step = max(_longest_step, time.time() - _step_t0)
+        _off = not owner_requested and res.summary.startswith("autopilot is off")
+        if not owner_requested and (_off or _paused_since(store, project_id, _batch_t0)):
+            stop_reason = "autopilot_off" if _off else "autopilot_paused"
+            if res.task_id:
+                advanced.append({"task_id": res.task_id, "classification": res.classification,
+                                 "status": (store.get_task(res.task_id) or {}).get("status"),
+                                 "summary": res.summary})
+            break
         cls = (res.classification or "").lower()
         if cls == "idle":
             # No ready leaf — all tasks terminal, or the rest are blocked by a
@@ -1524,9 +1855,22 @@ async def advance_many(
                         # tasks wait on the owner — "done" would be relayed as
                         # "all tasks are complete" (§4LQ review R1)
                         stop_reason = "needs_user"
+                    elif "IN_PROGRESS" in _sts:
+                        # §4MR: claimed and never closed (another run, or an
+                        # interrupted one) — not "all tasks are complete"
+                        stop_reason = "in_progress"
                 except Exception:
                     logger.debug("idle-stop ledger scan skipped",
                                  exc_info=True)
+            break
+        if cls == "blocked" and res.summary.startswith("another unattended step"):
+            stop_reason = "busy"                  # §4MR: not a budget
+            break
+        if cls == "blocked" and res.task_id and res.summary.startswith("coding executor crashed"):
+            advanced.append({"task_id": res.task_id, "classification": res.classification,
+                             "status": (store.get_task(res.task_id) or {}).get("status"),
+                             "summary": res.summary})
+            stop_reason = "step_crashed"          # §4MR: was reported as a budget stop
             break
         if cls == "blocked":
             # budget exhaustion, a non-ACTIVE project, or a project that just

@@ -604,5 +604,26 @@
   <li><strong>Self-play containment:</strong> the solver goes through <code>restrict_tool_surface</code> (schema, dispatch dict and <code>_subagent_allowed_tools</code>; macros dropped as a class), <code>browser</code> is denied, <code>default_db</code> / notify targets are cleared, the container runs with <code>network=none</code> (<code>GHOST_SELFPLAY_NETWORK=bridge</code> restores Tor egress) and job promotion is off. The journal-mining branch logs when it yields nothing. The adaptive cooldown no longer shortens on a tie (delta 0).</li>
 </ul>
 
+
+<h2 id="4mn">§4MN (2026-10-08): daily verified snapshots; skill-vector reaping</h2>
+<ul>
+  <li><strong><code>_daily_store_care</code></strong> runs <em>before</em> the REM freshness gate, because a quiet day skips REM (145 of 185 cycles) and "no new traffic" must not mean "no backup". It takes the snapshot and enforces the archive retention: one rule, 30 days, for forgotten episodes, removed profile values, <code>vector_reset_*</code> dumps and the graph archive, applied here rather than only on the next forget. A context whose <code>memory_dir</code> is not a real, existing directory does nothing (a test's MagicMock had made a <code>./MagicMock</code> folder).</li>
+  <li><strong><code>_maybe_snapshot</code></strong> takes a snapshot (<code>memory/snapshot.py</code>) when the newest is older than 22 h. What a snapshot holds:
+    <ul>
+      <li>every SQLite database, through the online-backup API;</li>
+      <li>the chroma segment folders together with <code>chroma.sqlite3</code>;</li>
+      <li>the JSON/JSONL stores.</li>
+    </ul>
+    It also includes the sandbox (project files; any single file over 50 MB is skipped). It leaves out eval, bench, tokenizer, logs, LLM recordings and repair copies. A snapshot that raises (disk full, a locked database) removes its <code>.partial</code> and is logged at ERROR. Each snapshot is written to <code>.partial</code>, verified (every database passes <code>integrity_check</code>, and chroma opens from a copy and its sampled vectors find themselves), then renamed. The newest 7 are kept in <code>system/backups/</code>. A failed verification is logged at ERROR and nothing is published. <code>GHOST_SNAPSHOTS=0</code> turns it off. By the operator's decision (2026-10-08) snapshots are local only for now. Restore: stop the agent and copy the snapshot's files back, with the whole <code>memory/</code> folder together (<code>scripts/snapshot_stores.py</code>).</li>
+  <li><strong>Orphan skill vectors:</strong> the reconcile now also reaps acquired-skill vectors whose skill is gone. The purge used to run only when the owner called <code>manage_skills</code>, and 6 of 8 rows had been orphaned for days.</li>
+  <li><strong>Self-play</strong> copies the live skill store (<code>memory/acquired_skills</code>), not the pre-migration sandbox folder.</li>
+</ul>
+
+<h2 id="4ms">§4MS: grounded heuristics, owner-seeded self-play, bounded runs</h2>
+<ul>
+  <li>A REM heuristic that speaks about a tool call must name real tool parameters (<code>memory.lesson_quality.heuristic_invents_interface</code>, checked against the LIVE tool set; "the action parameter" names <code>action</code>, and a library call like <code>page.query_selector</code> is not a parameter). "Use the available imagination/creative parameters" was saved and reached an owner turn, and no such parameter exists.</li>
+  <li><code>synthetic_self_play(seed_override=…)</code> takes a seed from a real owner failure (<code>core/owner_seeds.py</code>). In <code>owner_failure</code> mode the challenge is always generated from the seed's brief: no template, no journal pick, no template fallback. The idle tick no longer calls it without a seed.</li>
+  <li>The daily snapshot runs in a child process (§4MR).</li>
+</ul>
 </body>
 </html>

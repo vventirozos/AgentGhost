@@ -1925,6 +1925,16 @@ class MainWindow(QWidget):
                                     if err_msg is None:
                                         err_msg = _err
                                     continue       # the agent may still send its fallback sentence
+                                if agentapi.frame_retract(data):
+                                    # §4MP: drop what was shown and said; the
+                                    # reply that follows replaces it
+                                    if held is not None:
+                                        held.clear()
+                                    elif self.current_response_text:
+                                        self._silence()
+                                        self.speech = SpeechChunker()
+                                        self.update_chat_signal.emit("retract_response", "")
+                                    continue
                                 if (data.get("ghost") or {}).get("reasoning_unparsed") is True and held is None:
                                     held = []
                                 # Any frame shape: a usage-only frame has an
@@ -2193,6 +2203,10 @@ class MainWindow(QWidget):
             for image_path in reply_images(self.current_response_text):
                 self.show_image_signal.emit(image_path)
 
+        elif action == "retract_response":
+            # §4MP: the streamed text was retracted — the bubble starts over
+            self.current_response_text = ""
+            self.chat_display.update_agent(render_reply(""))
         elif action == "stop_thinking":
             self._close_thinking()
             return

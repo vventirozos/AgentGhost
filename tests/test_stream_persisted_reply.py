@@ -28,7 +28,7 @@ def _stream_src():
 
 
 def test_the_note_is_the_shared_constant():
-    assert "could not be parsed and was NOT executed" in UNPARSED_TOOL_CALL_NOTE
+    assert "was NOT executed" in UNPARSED_TOOL_CALL_NOTE and "could not be parsed" not in UNPARSED_TOOL_CALL_NOTE   # §4MM: true for both causes
 
 
 def test_the_2026_09_08_opener_is_what_the_record_now_loses():

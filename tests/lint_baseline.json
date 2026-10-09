@@ -82,7 +82,6 @@
     "unused-import|src/ghost_agent/main.py|Unused TOOL_DEFINITIONS imported from tools.registry": 1,
     "unused-import|src/ghost_agent/main.py|Unused import _env": 1,
     "unused-import|src/ghost_agent/main.py|Unused import datetime": 1,
-    "unused-import|src/ghost_agent/main.py|Unused import sys": 1,
     "unused-import|src/ghost_agent/main.py|Unused prm_consumer_is_live imported from core.agent": 1,
     "unused-import|src/ghost_agent/main.py|Unused prm_consumer_why_no_reader imported from core.agent": 1,
     "unused-import|src/ghost_agent/memory/competence.py|Unused Iterable imported from typing": 1,

@@ -78,6 +78,32 @@ def _fold(text: str) -> str:
 _CALL_MARKUP_RE = re.compile(r"</?(?:tool_call|tool_response|function_call|think)>", re.I)
 
 
+#: §4MM: a request whose answer is a MOVING TARGET — the latest version, the
+#: current price. Its stored outcome ("PostgreSQL 18.4, released May 14")
+#: is true only on the day it was answered; hydrated as precedent it
+#: answered the same question wrong twice (and was confirmed by the verifier).
+MOVING_TARGET_QUESTION_RE = re.compile(
+    r"\b(?:latest|newest|current|most recent|up[- ]to[- ]date)\b[^.?!]{0,40}"
+    r"\b(?:version|release|price|cost|rate|score|ranking|stable)\b"
+    # §4MR: the reversed order — "what version of PostgreSQL is current?",
+    # "which postgres release is newest?", "the price of gold today"
+    r"|\b(?:version|release|price|cost|rate)\b[^.?!]{0,40}\b(?:current|newest|latest|today|now)\b"
+    r"|τελευταία\s+έκδοση|τελευταια\s+εκδοση|πιο\s+πρόσφατη\s+έκδοση|πιο\s+προσφατη\s+εκδοση"
+    r"|τρέχουσα\s+(?:έκδοση|τιμή)|τρεχουσα\s+(?:εκδοση|τιμη)|τιμή\s+\S+\s+τώρα|τιμη\s+\S+\s+τωρα",
+    re.IGNORECASE)
+#: r2: a QUESTION about it — "set the current learning rate to 0.01", "show
+#: the current score in the chess game", "fix the current build so the
+#: release works" are tasks, and their episodes are ordinary precedent
+_QUESTION_SHAPE_RE = re.compile(
+    r"[?;]\s*$|\?|\b(?:what|which|whats|what's|tell me|look up|search|find out|fact[- ]check|check)\b"
+    r"|^\s*(?:is|are)\b|(?<!\w)(?:ποια|ποιο|πόσο|ποσο|ψάξε|ψαξε|βρες)(?!\w)", re.IGNORECASE)
+
+
+def is_moving_target_question(text: str) -> bool:
+    t = str(text or "")
+    return bool(MOVING_TARGET_QUESTION_RE.search(t) and _QUESTION_SHAPE_RE.search(t))
+
+
 def _strip_call_markup(text: str) -> str:
     """§4MJ: tool-call / think tags out of a stored outcome before it is
     rendered into a prompt."""
@@ -1231,7 +1257,8 @@ class EpisodicMemory:
             return [(r[0], str(r[1] or "")) for r in self._mention_hits(conn, target)]
 
     #: how long a forgotten episode stays in ``episodes_forgotten.jsonl``
-    #: (§4LA: append-only, verbatim, forever)
+    #: (§4LA: append-only and verbatim — every column since §4MN — for
+    #: this many days, then purged; it was documented as "forever")
     FORGOTTEN_RETENTION_DAYS = 30
 
     def _archive_path(self) -> Path:
@@ -1251,8 +1278,13 @@ class EpisodicMemory:
                         keep.append(ln)
                 except Exception:  # noqa: BLE001 — an unreadable line is dropped
                     continue
-            tmp = p.with_suffix(".jsonl.tmp")
-            tmp.write_text("".join(k + "\n" for k in keep), encoding="utf-8")
+            # §4MN: a unique temp name (two purges no longer share one) and
+            # fsynced before the swap
+            tmp = p.with_name(f"{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write("".join(k + "\n" for k in keep))
+                fh.flush()
+                os.fsync(fh.fileno())
             os.replace(tmp, p)
         except OSError:
             pass
@@ -1271,30 +1303,40 @@ class EpisodicMemory:
             return 0
         with self._lock, closing(sqlite3.connect(self.db_path)) as conn:
             q = ",".join("?" * len(ids))
-            rows = conn.execute(f"SELECT id, trigger, context, outcome, lesson, timestamp FROM episodes WHERE id IN ({q})",
-                                ids).fetchall()
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(f"SELECT * FROM episodes WHERE id IN ({q})", ids).fetchall()
             if not rows:
                 return 0
             try:
                 now = time.time()
                 with open_append(self._archive_path()) as fh:
                     for r in rows:
-                        acts = [dict(zip(("action_order", "tool_name", "tool_args", "result"), a)) for a in conn.execute(
-                            "SELECT action_order, tool_name, tool_args, result FROM episode_actions "
-                            "WHERE episode_id = ? ORDER BY action_order", (r[0],)).fetchall()]
-                        fh.write(json.dumps({"id": r[0], "trigger": r[1], "context": r[2], "outcome": r[3],
-                                             "lesson": r[4], "timestamp": r[5], "actions": acts, "forgot": reason,
-                                             "forgot_at": now}, ensure_ascii=False) + "\n")
+                        # §4MN: EVERY column — the archive dropped the label
+                        # (outcome_success), req_id, cluster and the actions'
+                        # success, so a forget could not be undone faithfully
+                        acts = [dict(a) for a in conn.execute(
+                            "SELECT * FROM episode_actions WHERE episode_id = ? ORDER BY action_order",
+                            (r["id"],)).fetchall()]
+                        rec = dict(r)
+                        rec.update({"actions": acts, "forgot": reason, "forgot_at": now})
+                        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    # durable BEFORE the delete commits (the graph archive
+                    # fsyncs too) — a crash between them must not lose both
+                    fh.flush()
+                    os.fsync(fh.fileno())
             except OSError as e:
                 # NOTHING was deleted (the archive comes first) — and that is
                 # not "already gone" (§4MD M8: a privacy request was told so)
                 logger.warning("episode archive write failed (%s): nothing deleted", e)
                 self.last_archive_failed = True
                 return 0
-            found = [r[0] for r in rows]
+            found = [r["id"] for r in rows]
             conn.executemany("DELETE FROM episode_actions WHERE episode_id = ?", [(i,) for i in found])
             conn.executemany("DELETE FROM episodes WHERE id = ?", [(i,) for i in found])
             conn.commit()
+            # §4MN: the purge rewrites the archive — under the same lock, or a
+            # concurrent forget's lines are lost between its read and its swap
+            self._purge_forgotten_archive()
         coll = getattr(vector_memory, "collection", None)
         if coll is not None:
             for i in found:
@@ -1304,7 +1346,6 @@ class EpisodicMemory:
                     self.last_twin_failures.append(i)
                     logger.warning("episode %s deleted but its vector twin was NOT (%s) — recall may still show "
                                    "it until the next reconcile", i, e)
-        self._purge_forgotten_archive()
         return len(found)
 
     def count_mentions(self, target: str) -> int:
@@ -1509,6 +1550,11 @@ class EpisodicMemory:
         )
         if ep.get("lesson"):
             entry += f" | Lesson: {ep['lesson'][:100]}"
+        if is_moving_target_question(ep.get("trigger")):
+            # §4MM: the answer was true on its day only — say so wherever it
+            # is shown (recall), so it is never read as the current value
+            entry += (f" | ⚠ a moving-target answer from {age or 'an earlier day'} — "
+                      f"the value may have changed; check a current source")
         return entry
 
     def format_for_context(self, episodes: List[Dict], max_chars: int = 2000) -> str:

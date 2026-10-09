@@ -421,8 +421,8 @@ class ProjectStore:
         """Update project fields. ``metadata`` is MERGED (shallow) into the
         existing metadata by default — the blob carries system state
         (design_ledger, config, steps_used/cap, research index, runtime
-        counters) that a whole-dict replace silently destroyed, e.g. the
-        documented budget-raise ``metadata={"steps_cap": 100}``. Pass
+        counters) that a whole-dict replace silently destroyed (a budget
+        raise is now the owner's ``manage_projects action=budget``, §4MQ). Pass
         ``metadata_replace=True`` for a deliberate full replacement."""
         project_id = _canon_id(project_id)
         if not fields:
@@ -2065,6 +2065,17 @@ class ProjectStore:
                   payload: Optional[Dict[str, Any]] = None) -> int:
         project_id = _canon_id(project_id)
         task_id = _canon_id(task_id) or None
+        # §4MM turn 16: an event written by a PROBE turn says so — the
+        # "While you were away" digest reported a probe's fork of an owner
+        # project ("Chess Coach v4 → FAILED") as the agent's own work
+        try:
+            from ..utils.logging import is_probe_request_id, request_id_context, request_origin_context
+            if (is_probe_request_id(request_id_context.get())
+                    or str(request_origin_context.get() or "") == "probe"):
+                payload = dict(payload or {})
+                payload.setdefault("origin", "probe")
+        except Exception:  # noqa: BLE001 — provenance is best-effort
+            pass
         with self._lock, self._connect() as conn:
             cur = conn.execute(
                 "INSERT INTO project_events(project_id, task_id, type, payload_json, ts) "

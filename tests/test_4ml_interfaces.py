@@ -68,6 +68,9 @@ def _page_js() -> str:
              _block("(function installAuthFetch() {"),
              "const AUTHED_BLOB_CACHE_MAX=100; const _authedBlobCache=new Map(); let currentRenderState=null;",
              extract_js_function(APP, "_evictAuthedBlobCache"),
+             # §4MR: the raster-only blob type rule the image path calls
+             APP[APP.index("const _RASTER_IMAGE_TYPES"):APP.index(");", APP.index("const _RASTER_IMAGE_TYPES")) + 2],
+             extract_js_function(APP, "_safeImageBlobType"),
              extract_js_function(APP, "_toAuthedBlobUrl")]
     return f"window.GHOST_API_KEY = {json.dumps(KEY)};\n" + "\n".join(parts)
 

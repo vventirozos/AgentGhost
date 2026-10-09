@@ -654,7 +654,7 @@ def test_every_forced_report_names_the_request():
     it ships an alert the model can only answer in general."""
     calls = [c for c in ast.walk(_TREE) if isinstance(c, ast.Call)
              and getattr(c.func, "id", "") == "blocker_report_alert"]
-    assert len(calls) == 7
+    assert len(calls) == 8                                   # +1 §4MO: the owner's blocked-calls report
     for c in calls:
         assert len(c.args) == 3 and ast.unparse(c.args[2]) == "last_user_content", ast.unparse(c)[:120]
 
@@ -669,7 +669,7 @@ def test_only_the_thinking_loop_breakers_ask_for_the_answer():
             any(k.arg == "answer_first" and ast.literal_eval(k.value) is True for k in c.keywords))
     assert kinds["thinking loop"] == {True}
     assert all(v == {False} for k, v in kinds.items() if k != "thinking loop"), kinds
-    assert len(kinds) >= 7 and len(calls) == 7
+    assert len(kinds) >= 8 and len(calls) == 8   # +1 §4MO: the owner's blocked-calls report
 
 
 @pytest.mark.parametrize("answer_first", [False, True])

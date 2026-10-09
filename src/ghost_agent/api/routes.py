@@ -1255,6 +1255,20 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                 _fg_released = True
                 _mark_foreground(agent, -1)
 
+        # §4MP: the tools-on generation's text streams as it is generated —
+        # an owner's streamed request only (a member's turn never streams,
+        # R8). GHOST_STREAM_TAP=0 restores the finished-reply path.
+        _tap = None
+        # A client that cannot take streamed text back (piped CLI output)
+        # sends `X-Ghost-Stream: final` and gets the finished reply only.
+        if (os.environ.get("GHOST_STREAM_TAP", "1").strip().lower() not in ("0", "false", "no", "off")
+                and (request.headers.get("X-Ghost-Stream") or "").strip().lower() != "final"
+                and parse_requester_role(request.headers.get("X-Ghost-Requester")) != "member"):
+            from ..core.reply_tap import ReplyTap
+            if not request_id:
+                request_id = str(uuid.uuid4())[:8]      # the agent's own format (handle_chat)
+            _tap = ReplyTap(request_id, model, int(time.time()))
+
         async def stream_generator():
             # Track whether any real content chunk has shipped to the
             # client. If yes, an additional `delta.content` error chunk
@@ -1269,9 +1283,76 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                 # Yield an SSE comment to send HTTP headers instantly and keep reverse proxies alive
                 yield b": processing request...\n\n"
 
-                content, created_time, req_id = await agent.handle_chat(body, background_tasks, request_id=request_id)
+                if _tap is None:
+                    content, created_time, req_id = await agent.handle_chat(body, background_tasks, request_id=request_id)
+                else:
+                    # §4MP: run the turn as a task and forward the tap's
+                    # frames while it generates (the task copies this
+                    # context, so the agent finds the tap)
+                    import contextvars as _cv
+                    from ..core.reply_tap import reply_tap_context as _rtc
+
+                    async def _turn_capturing_context():
+                        _r = await agent.handle_chat(body, background_tasks, request_id=request_id)
+                        return _r, _cv.copy_context()
+
+                    _tok = _rtc.set(_tap)
+                    try:
+                        _turn = asyncio.ensure_future(_turn_capturing_context())
+                    finally:
+                        _rtc.reset(_tok)
+                    _get = None
+                    try:
+                        while not _turn.done():
+                            _get = asyncio.ensure_future(_tap.queue.get())
+                            _done, _ = await asyncio.wait({_turn, _get}, return_when=asyncio.FIRST_COMPLETED)
+                            if _get in _done:
+                                content_started = True
+                                yield _get.result()
+                            else:
+                                _get.cancel()
+                            _get = None
+                        while not _tap.queue.empty():
+                            content_started = True
+                            yield _tap.queue.get_nowait()
+                        if _turn.cancelled():
+                            # §4MR: a HARD stop cancelled the turn task itself
+                            # (the registry holds it now). Live text must not
+                            # stay as the reply of a stopped turn: retract it
+                            # and end the stream properly.
+                            for _rf in _tap.retract_before_stream():
+                                yield _rf
+                            pretty_log("Reply Stream", f"{request_id} stopped — streamed text retracted",
+                                       icon=Icons.WARN)
+                            yield b"data: [DONE]\n\n"
+                            return
+                        (content, created_time, req_id), _turn_ctx = _turn.result()
+                    finally:
+                        if _get is not None and not _get.done():
+                            _get.cancel()      # r2: a disconnect inside the wait left it pending
+                        if not _turn.done():
+                            _turn.cancel()     # the client went away mid-turn (parity: the await was cancelled)
+                    # r2 M1: awaited in place, the turn's context variables
+                    # (trajectory id, event project, conversation key…) stayed
+                    # visible to the streamed drain below; a task runs on a
+                    # COPY — put back every value the turn changed
+                    _here = _cv.copy_context()
+                    for _var, _val in _turn_ctx.items():
+                        if _var is _rtc:
+                            continue
+                        if _var not in _here or _here[_var] is not _val:
+                            _var.set(_val)
 
                 if hasattr(content, '__aiter__'):
+                    if _tap is not None:
+                        for _rf in _tap.retract_before_stream():
+                            yield _rf
+                        if _tap.released_generations:
+                            # §4MR: the instrument must see the forced finals too
+                            pretty_log("Reply Stream",
+                                       f"{req_id} retracted for a streamed final"
+                                       + (f" · retracted: {', '.join(_tap.retracts)}" if _tap.retracts else ""),
+                                       icon=Icons.WARN)
                     # Streamed final generation: accumulate the deltas so the
                     # session records what the user actually saw (this path
                     # bypasses the finalize tail, so nothing else knows the
@@ -1299,11 +1380,22 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                     # True` — a MagicMock agent answers truthy to anything.
                     _unlabelable = (getattr(agent, "is_trivial_reply", None) is not None
                                     and agent.is_trivial_reply(req_id) is True)
-                    async for chunk in agent.context.llm_client.stream_openai(
-                            model, content, created_time, req_id,
-                            extra={"ghost": {"labelable": False}} if _unlabelable else None):
-                        content_started = True
-                        yield chunk
+                    _extra = {"ghost": {"labelable": False}} if _unlabelable else None
+                    if _tap is not None and _tap.released_generations:
+                        # §4MP: the rest of the reply, or a retract and all of it
+                        _tap.bind(req_id)
+                        for chunk in _tap.finish(content, extra=_extra, created=created_time):
+                            content_started = True
+                            yield chunk
+                        pretty_log("Reply Stream",
+                                   f"{req_id} {_tap.outcome} · {len(content or '')} chars"
+                                   + (f" · retracted: {', '.join(_tap.retracts)}" if _tap.retracts else ""),
+                                   icon=Icons.WARN if _tap.retracts else Icons.LLM_REPLY)
+                    else:
+                        async for chunk in agent.context.llm_client.stream_openai(
+                                model, content, created_time, req_id, extra=_extra):
+                            content_started = True
+                            yield chunk
             except Exception as e:
                 # Opaque error id on the wire (matches the non-streaming path) —
                 # the raw str(e) leaked upstream URLs / file paths / Python
@@ -1311,6 +1403,14 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                 _eid = _log_internal_error("chat_proxy (streaming)")
                 err_msg = f"internal server error (error_id={_eid})"
                 error_event = {"error": {"message": err_msg, "type": "InternalError"}}
+                if _tap is not None:
+                    # r2 M4: streamed text is not the reply of a failed turn
+                    for _rf in _tap.retract_before_stream():
+                        yield _rf
+                        content_started = False     # nothing of the reply is shown any more
+                    if _tap.released_generations:
+                        pretty_log("Reply Stream", f"{request_id} retracted for an error",
+                                   icon=Icons.WARN)
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode('utf-8')
                 # Only emit a content chunk for visual display when
                 # NO content has streamed yet — otherwise it gets

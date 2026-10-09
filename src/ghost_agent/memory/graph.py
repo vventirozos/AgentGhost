@@ -34,6 +34,35 @@ def _fold(text) -> str:
     t = unicodedata.normalize("NFD", str(text or "").casefold())
     return "".join(ch for ch in t if not unicodedata.combining(ch))
 
+#: world-fact predicates whose value is a moving target (§4ME F3, moved here
+#: §4MM so every writer and the one-off cleanup share it). Whole
+#: `_`-separated words: "RELEASED_IN 2008" is a stable fact.
+TRANSIENT_WORLD_PREDICATE = re.compile(
+    r"(?:^|_)(?:VERSION|LATEST|CURRENT|NEWEST|PRICE|COSTS?|STOCK|RATE|SCORE|RANK|RANKING)(?:_|$)",
+    re.IGNORECASE)
+
+
+#: §4MR: the predicate's WORDS were the only signal — "postgresql HAS_RELEASE
+#: 18.4", "bitcoin TRADES_AT $61,000" were stored. The OBJECT's shape says it
+#: too: a version number under a release-ish predicate, or a money amount.
+_VERSION_OBJECT_RE = re.compile(r"^v?\d+(?:\.\d+){1,3}[a-z0-9.+-]*$", re.IGNORECASE)
+_RELEASEISH_PREDICATE_RE = re.compile(r"(?:^|_)(?:RELEASES?|VERSIONS?|BUILDS?|EDITION)(?:_|$)", re.IGNORECASE)
+_MONEY_OBJECT_RE = re.compile(
+    r"^[$€£¥]\s?\d|\d[\d,.]*\s?(?:usd|eur|gbp|€|\$|£|dollars?|euros?|btc|ευρώ|ευρω)\b", re.IGNORECASE)
+
+
+def is_moving_target_world_fact(predicate, obj) -> bool:
+    """A world fact whose value moves — by its predicate's words, or by its
+    object's shape (a version under a release predicate, an amount of money).
+    "RELEASED_IN 2008" stays: a year is not a version."""
+    p, o = str(predicate or ""), str(obj or "").strip()
+    if TRANSIENT_WORLD_PREDICATE.search(p):
+        return True
+    if _VERSION_OBJECT_RE.match(o) and _RELEASEISH_PREDICATE_RE.search(p):
+        return True
+    return bool(_MONEY_OBJECT_RE.search(o))
+
+
 class GraphMemory:
     """Knowledge graph with SQLite persistence + in-memory NetworkX routing.
 
@@ -235,6 +264,15 @@ class GraphMemory:
                         continue
                     if pn in self._DECAYING_PREDICATES and not raw:
                         continue
+                    # §4MM: a world fact whose value moves (VERSION, LATEST,
+                    # PRICE…) is never stored, at ANY writer: "postgresql
+                    # HAS_VERSION 18.4" (July) sat beside 18.6, outranked it,
+                    # and answered "latest version?" wrong twice. F3 (§4ME)
+                    # gated one writer only. An owner fact is not a world fact.
+                    if (not raw and is_moving_target_world_fact(pn, on)
+                            and "user" not in (sn, on)            # r2: the owner's own statement
+                            and not self._is_owner_fact(sn, pn, on)):
+                        continue
                     try:
                         # Temporal conflict resolution: if the same subject+predicate
                         # exists with a DIFFERENT object, expire the old edge instead
@@ -349,6 +387,18 @@ class GraphMemory:
         try:
             path = Path(self.db_path).parent / self._ARCHIVE_FILENAME
             ts = _time.time()
+            # §4MN: the validity window too — without it a restored EXPIRED
+            # edge came back as current (best-effort: a row may be gone)
+            _valid = {}
+            try:
+                with sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True) as _rc:
+                    for row in rows:
+                        _v = _rc.execute("SELECT valid_from, valid_until FROM triplets WHERE subject=? "
+                                         "AND predicate=? AND object=?", (row[0], row[1], row[2])).fetchone()
+                        if _v:
+                            _valid[(row[0], row[1], row[2])] = _v
+            except Exception:  # noqa: BLE001
+                _valid = {}
             with open_append(path) as fh:
                 for row in rows:
                     rec = {"archived_at": ts, "reason": reason,
@@ -358,6 +408,8 @@ class GraphMemory:
                         rec["weight"] = row[3]
                     if len(row) > 4:
                         rec["timestamp"] = row[4]
+                    if (row[0], row[1], row[2]) in _valid:
+                        rec["valid_from"], rec["valid_until"] = _valid[(row[0], row[1], row[2])]
                     fh.write(_json.dumps(rec, ensure_ascii=False) + "\n")
                 fh.flush()
                 _os.fsync(fh.fileno())

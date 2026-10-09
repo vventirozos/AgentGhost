@@ -627,3 +627,11 @@ async def test_bench_phase_records_even_when_run_never_concludes():
     rec.assert_called_once()
     assert rec.call_args.kwargs["passed"] is False
     assert "NO_RESULT" in rec.call_args.kwargs["status"]
+
+
+@pytest.fixture(autouse=True)
+def _owner_seed_for_self_play(monkeypatch):
+    """§4MS: idle self-play now needs a real owner failure to practise —
+    these tests are about the phase's mechanics, so they provide one."""
+    from tests.helpers import provide_owner_seed
+    provide_owner_seed(monkeypatch)

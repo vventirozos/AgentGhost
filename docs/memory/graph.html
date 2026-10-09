@@ -168,5 +168,14 @@
   <li><code>sync_owner_mirrors</code> keeps the mirror of an ON-DEMAND profile field (the address, a <code>*_description</code>) EMPTY, which also removes an edge written before this.</li>
 </ul>
 
+
+<h2 id="4mm">§4MM (2026-10-08): moving-target world facts are never stored</h2>
+<p><code>TRANSIENT_WORLD_PREDICATE</code> (VERSION, LATEST, CURRENT, NEWEST, PRICE, COST, STOCK, RATE, SCORE, RANK, RANKING as whole <code>_</code>-separated words) is defined here and applied in <code>add_triplets</code>, the single writer path. A triplet with such a predicate is refused unless the owner is one end (<code>user …</code>), it is a durable relation (<code>_is_owner_fact</code>: family, work, residence…), or it is a <code>raw</code> profile mirror. A known limit of the word list: stable world facts with these words (<code>INTRODUCED_IN_VERSION</code>, <code>HAS_SAMPLE_RATE</code>) are refused too. <code>RELEASED_IN 1996</code> is stable and stays.</p>
+<p><strong>§4MR: the object's shape counts too.</strong> <code>is_moving_target_world_fact(predicate, object)</code> is applied at both writers (<code>add_triplets</code> and the agent's extraction filter). It is true for the predicate words above, for a version-shaped object under a release-ish predicate (<code>postgresql HAS_RELEASE 18.4</code>), and for any money amount (<code>bitcoin TRADES_AT $61,000</code>, <code>PRICED_AT 1199 eur</code>). The word list alone had let those through. A year is not a version: <code>RELEASED_IN 2008</code> is kept.</p>
+<p><strong>Why:</strong> <code>postgresql HAS_VERSION 18.4</code> (July) sat beside <code>18.6</code> and outranked it, and "what is the latest version of postgresql?" was answered 18.4 twice. Before this, §4ME F3 gated only the smart-memory writer. Had the stale row stayed, the 45-day <code>prune_stale_edges</code> would have deleted the newer weight-1 row first, leaving the wrong value alone.</p>
+<p><code>scripts/memory_repair_4mm.py</code> archived and deleted the seven live rows of this kind (agent stopped).</p>
+
+<h2 id="4mn">§4MN (2026-10-08): archived edges keep their validity window</h2>
+<p><code>_archive_rows</code> records <code>valid_from</code> and <code>valid_until</code>. Without them, a restored expired edge came back as current.</p>
 </body>
 </html>

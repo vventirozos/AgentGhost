@@ -231,7 +231,7 @@ async def test_forget_lists_and_removes_the_lessons_that_mention_it(monkeypatch,
     assert "lesson" in out and "Denaxas" in out and "nginx" not in out
     token = re.search(r"confirm='([^']+)'", out).group(1)
     # the user's confirmation (a later turn) is the forget tests' own concern
-    monkeypatch.setattr(M, "_confirm_allowed", lambda plan: "")
+    monkeypatch.setattr(M, "_confirm_allowed", lambda plan, selection=None: "")
     res = await M.forget_execute(token, "all", tmp_path, vm, None, None, skill_memory=sm)
     assert "Removed lesson" in res
     assert [r["trigger"] for r in _rows(sm)] == ["When restarting the nginx service after a config change"]

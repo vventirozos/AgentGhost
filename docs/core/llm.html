@@ -583,6 +583,9 @@
     cancellation. Swarm charges only node faults (not a 4xx), and a client closed at shutdown is not a node fault.</li>
   </ul>
 
+
+<h2 id="4ms">§4MS: a parked background call is deferred, never released into a live request</h2>
+<p><code>_wait_for_foreground_clear(task_label)</code> still parks a main-slot background call while a user request is active. After 600 s it used to <em>run anyway</em>, inside the request: in 44 of 105 parks the call ran during an owner turn, and one owner call took 500 s instead of about 30 s. It now raises <code>BackgroundDeferred</code>, with a WARNING naming the caller. Callers that catch it skip that piece of work (reflection re-queues the item; narratives and the post-mortem log it; an idle coding build stops). A leaked foreground counter now silences main-slot background work until a restart, where before it delayed it by 10 minutes; the counter is hardened (§4GJ). The 120 s park line also names the caller.</p>
 </main>
 </body>
 </html>

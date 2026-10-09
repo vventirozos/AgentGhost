@@ -1289,6 +1289,17 @@ class GhostCLI:
                     # becomes self.text (→ history, → /save).
                     if (obj.get("ghost") or {}).get("labelable") is False:
                         self._turn_unlabelable = True
+                    if (obj.get("ghost") or {}).get("retract") is True:
+                        # §4MP: the agent dropped the text it streamed (a tool
+                        # call followed, or the reply was rewritten). Printed
+                        # lines cannot be taken back: mark it, start again.
+                        if held is not None:
+                            held.clear()
+                        elif printer.text:
+                            printer.settle()
+                            self.notice("↺ revised — the reply continues below", "mute")
+                            printer = _StreamPrinter()
+                        continue
                     if (obj.get("ghost") or {}).get("reasoning_unparsed") is True and held is None:
                         held = []
                     chunk = ((obj.get("choices") or [{}])[0]
@@ -2061,8 +2072,13 @@ def one_shot(api: GhostAPI, prompt: str, session_id: str | None) -> int:
         printer.settle()
 
     try:
+        # §4MP: piped output cannot take back streamed text — ask for the
+        # finished reply only (no retracts); a terminal gets live tokens
+        _hdrs = {"X-Request-ID": request_id}
+        if not render:
+            _hdrs["X-Ghost-Stream"] = "final"
         with api.http.post(api._url("/v1/chat/completions"), json=body,
-                           headers={"X-Request-ID": request_id},
+                           headers=_hdrs,
                            stream=True, timeout=(10, None)) as resp:
             if resp.status_code != 200:
                 try:
@@ -2095,6 +2111,15 @@ def one_shot(api: GhostAPI, prompt: str, session_id: str | None) -> int:
                 # Sanitized HERE, not in feed(): the piped branch below
                 # bypasses the printer entirely, and `ghost -p q | less -R`
                 # is still a terminal on the other end.
+                if (obj.get("ghost") or {}).get("retract") is True:
+                    # §4MP (a terminal: piped output asked for no retracts)
+                    if held is not None:
+                        held.clear()
+                    elif render and printer.text:
+                        printer.settle()
+                        console.print(Text(" " * GUTTER + "↺ revised — the reply continues below", style="mute"))
+                        printer = _StreamPrinter()
+                    continue
                 if (obj.get("ghost") or {}).get("reasoning_unparsed") is True and held is None:
                     held = []
                 chunk = _safe((obj.get("choices") or [{}])[0]

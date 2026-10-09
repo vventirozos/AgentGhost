@@ -712,7 +712,7 @@ class Foresight:
             if n_calls >= _SEED_CALL_CAP:
                 break
             from ..memory.skills import iter_teachable
-            for traj in iter_teachable(collector.iter_trajectories(day=day)):   # never a member's turn (§4KJ R9)
+            for traj in iter_teachable(collector.iter_trajectories(day=day), consumer="foresight"):   # never a member's turn (§4KJ R9); §4MS: nor a probe's (REAL_ONLY)
                 # Real user work only: self-play/reflection trajectories
                 # are synthetic by construction (and mostly excluded
                 # upstream anyway — the collector is detached in dream's

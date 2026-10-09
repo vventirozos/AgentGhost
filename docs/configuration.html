@@ -249,6 +249,8 @@
       <tr><td><code>GHOST_TRAJ_FULL_RESULTS</code></td><td><code>1</code></td><td>Trajectories (§4LH): tool results longer than the row's 4,000 chars are kept in full under <code>system/trajectory_results/</code>. <code>0</code> disables.</td></tr>
       <tr><td><code>GHOST_DEAD_HOST_MEMO</code></td><td><code>1</code></td><td>Browser (§4LG): a clearnet host that failed twice the same repeatable way within 6 h is skipped with its cause. <code>0</code> disables.</td></tr>
       <tr><td><code>GHOST_BROWSER_COMMIT_RETRY</code></td><td><code>0</code></td><td>Browser (§4LG): retry a navigation timeout once with the commit milestone (recovered 1 of 17). <code>1</code> enables.</td></tr>
+      <tr><td><code>GHOST_BENCH_KEEP_BANKS</code></td><td>(empty)</td><td>§4MS: comma-separated bench banks the idle walk keeps running even when saturated (≥90% over the last 30 graded runs).</td></tr>
+      <tr><td><code>GHOST_STREAM_TAP</code></td><td><code>1</code></td><td>§4MP: an owner's streamed request receives the tools-on generation's text as it is generated (held 240 chars, retracted if a tool call follows or the reply is rewritten). <code>0</code> restores the finished-reply stream.</td></tr>
       <tr><td><code>GHOST_VERIFY_REBUTTAL_EVIDENCE_CHARS</code></td><td><code>1800</code></td><td>Verifier: characters of evidence quoted into the rebuttal prompt when the model contests a refute.</td></tr>
     </tbody>
   </table></div>

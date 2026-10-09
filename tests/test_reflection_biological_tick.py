@@ -61,7 +61,9 @@ async def test_reflection_phase_fires_when_wired_and_cooldown_elapsed():
         seen_failures=1, reflected_ok=1,
     ))
     mock_collector = MagicMock()
-    mock_collector.iter_trajectories = MagicMock(return_value=iter([]))
+    # §4MS: the phase runs only when there IS a new reflectable failure
+    from ghost_agent.distill.schema import Trajectory
+    mock_collector.iter_trajectories = MagicMock(return_value=iter([Trajectory(outcome="failed")]))
     mock_collector.append = MagicMock()
 
     ctx = _make_ctx(idle_secs=1200, reflector=mock_reflector, collector=mock_collector)

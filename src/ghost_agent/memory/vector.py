@@ -101,8 +101,8 @@ def _embedder_sidecar_mismatch(sidecar_path, current_model: str,
       * no sidecar, store EMPTY             → None (fresh store; caller stamps)
       * no sidecar, store NON-empty         → mismatch (legacy MiniLM store)
     """
+    p = Path(sidecar_path)
     try:
-        p = Path(sidecar_path)
         if p.exists():
             data = json.loads(p.read_text() or "{}")
             stored = str((data or {}).get("model") or "").strip()
@@ -112,8 +112,19 @@ def _embedder_sidecar_mismatch(sidecar_path, current_model: str,
                     f"agent is configured for '{current_model}'"
                 )
             return None
-    except Exception as e:  # noqa: BLE001 — unreadable sidecar = treat as absent
-        logger.debug("embedder sidecar unreadable (%s)", e)
+    except Exception as e:  # noqa: BLE001
+        # §4MN: a sidecar that EXISTS but cannot be parsed is a torn write
+        # (it is rewritten on every boot), not a legacy store — refusing to
+        # boot with "re-embed everything" was the wrong cure for a crash
+        # mid-write. Say so loudly and go on; the boot re-stamps it.
+        logger.warning("embedder sidecar %s is unreadable (%s) — a torn write; treating the model as "
+                       "unknown and re-stamping it (the torn file is kept beside it)", p, e)
+        try:                                      # r2: keep the evidence, never overwrite it
+            import time as _t
+            p.rename(p.with_name(f"{p.name}.torn-{int(_t.time())}"))
+        except OSError:
+            pass
+        return None
     if fragment_count > 0:
         return (
             f"the vector store holds {fragment_count} fragments but carries no "
@@ -375,6 +386,10 @@ class VectorMemory:
             icon=Icons.VECTOR_EMBED,
         )
 
+        # §4MN: one writer process per store — raises StoreLockedError (NOT
+        # caught below: a second writer must not open chroma at all)
+        from .store_lock import acquire_writer_lock
+        acquire_writer_lock(self.chroma_dir, "VectorMemory")
         try:
             self.client = chromadb.PersistentClient(
                 path=str(self.chroma_dir),
@@ -491,11 +506,20 @@ class VectorMemory:
             path = getattr(self, "_embedder_sidecar", None)
             if path is None:
                 return
-            Path(path).write_text(json.dumps({
+            # §4MN: atomically, and only when the content changes — it was
+            # rewritten in place on every boot (a kill mid-write tore it)
+            try:
+                cur = json.loads(Path(path).read_text() or "{}")
+            except Exception:  # noqa: BLE001
+                cur = {}
+            if cur.get("model") == EMBED_MODEL_NAME and cur.get("dim") == EXPECTED_EMBED_DIM:
+                return
+            from ..utils.json_store import write_json_atomic
+            write_json_atomic(path, {
                 "model": EMBED_MODEL_NAME,
                 "dim": EXPECTED_EMBED_DIM,
                 "stamped_at": get_utc_timestamp(),
-            }))
+            })
         except Exception as e:  # noqa: BLE001
             logger.debug("embedder sidecar stamp failed: %s", e)
 

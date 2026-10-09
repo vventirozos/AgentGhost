@@ -366,5 +366,7 @@
   <li><code>ghost --probe</code> marks every turn <code>X-Ghost-Origin: probe</code>: it runs normally and never teaches.</li>
   <li><code>~/.ghost_history</code> is created owner-only (0600). A test had been writing "hello"/"world" into the real file.</li>
 </ul>
+<h2 id="4mp">Live tokens and retracts (§4MP, 2026-10-08)</h2>
+<p>The agent now streams its reply as it is generated. If a tool call follows the streamed text, or the finished reply is rewritten, it sends <code>{"ghost": {"retract": true}}</code>. Printed lines cannot be taken back, so the REPL and a terminal one-shot settle the printer, print "↺ revised — the reply continues below", and start a fresh printer; only the replacement is kept as the reply. Piped one-shot output sends <code>X-Ghost-Stream: final</code> and receives the finished reply only, so scripts never see a retract.</p>
 </body>
 </html>

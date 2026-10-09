@@ -76,7 +76,8 @@ class OutcomeStatus(str, Enum):
 #: §4MI: REJECTED outcomes that are a DESIGNED stop — the agent is told to
 #: ask the user and reply now. Not a failure of the call (see
 #: `distill.outcome_heuristics.is_designed_stop`, pinned equal to this).
-DESIGNED_STOP_REASONS = frozenset({"clarify_first", "subject_photo_missing", "confirm_dead_end"})
+DESIGNED_STOP_REASONS = frozenset({"clarify_first", "subject_photo_missing", "confirm_dead_end",
+                                   "project_not_requested"})
 
 
 #: Statuses that imply the call changed NOTHING unless it says otherwise.

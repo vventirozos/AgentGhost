@@ -155,5 +155,16 @@ def main() -> int:
     return backfill(args.db or _default_db(), apply=args.apply)
 
 
+# §4MR: a store writer must be the ONLY writer — refuse beside the running
+# agent (two chroma writers left the store segfaulting on open, §4MN)
+if __name__ == "__main__" and "--apply" in __import__("sys").argv:
+    import os as _os4mr, sys as _sys4mr
+    from pathlib import Path as _P4mr
+    _sys4mr.path.insert(0, str(_P4mr(__file__).resolve().parents[1] / "src"))
+    from ghost_agent.memory.store_lock import assert_no_other_writer as _no_other_writer
+    _no_other_writer(_P4mr(_os4mr.environ.get("GHOST_HOME", "/Users/vasilis/Data/AI/Data/")) / "system" / "memory",
+                     _P4mr(__file__).name)
+
+
 if __name__ == "__main__":
     raise SystemExit(main())

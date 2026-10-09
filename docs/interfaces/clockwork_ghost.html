@@ -655,5 +655,7 @@
   <li><code>turnstatus.stream_log_lines</code> verifies TLS by default; the client passes <code>VOICE_VERIFY_TLS</code> explicitly.</li>
   <li>Not yet on the device: it was offline on 2026-10-08 (last seen 6 days earlier). Deploy with <code>deploy.sh</code> when it is back. The probe now sends the header with the minted id and checks that a foreign corridor is ignored.</li>
 </ul>
+<h2 id="4mp">Retracted text (§4MP, 2026-10-08)</h2>
+<p>The agent streams its reply as it is generated and may retract it (<code>{"ghost": {"retract": true}}</code>) when a tool call follows or the reply is rewritten. <code>agentapi.frame_retract</code> detects the frame. <code>send_chat_request</code> then silences queued and playing speech (<code>_silence</code>), starts a new <code>SpeechChunker</code>, and emits <code>retract_response</code>, which empties the bubble and <code>current_response_text</code>. A held (§4KP) reply just drops what it held. A retract when nothing was shown changes nothing.</p>
 </body>
 </html>

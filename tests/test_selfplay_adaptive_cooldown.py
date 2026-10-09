@@ -161,3 +161,11 @@ async def test_missing_frontier_tracker_uses_baseline(tmp_path):
         await agent._biological_tick()
 
     assert agent._current_selfplay_cooldown == GhostAgent._SELFPLAY_COOLDOWN
+
+
+@pytest.fixture(autouse=True)
+def _owner_seed_for_self_play(monkeypatch):
+    """§4MS: idle self-play now needs a real owner failure to practise —
+    these tests are about the phase's mechanics, so they provide one."""
+    from tests.helpers import provide_owner_seed
+    provide_owner_seed(monkeypatch)

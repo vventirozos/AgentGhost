@@ -30,6 +30,9 @@ REASON = ("operator 2026-10-08 (§4MK): both refutes were false — decimal GB r
 
 def main() -> int:
     apply = "--apply" in sys.argv
+    if apply:   # §4MN: never beside the agent (single-writer stores)
+        from ghost_agent.memory.store_lock import assert_no_other_writer
+        assert_no_other_writer(Path(os.environ.get("GHOST_HOME", "/Users/vasilis/Data/AI/Data/")) / "system" / "memory", "memory_repair_4mk_lesson.py")
     home = Path(os.environ.get("GHOST_HOME", "/Users/vasilis/Data/AI/Data/"))
     mem = home / "system" / "memory"
     playbook = mem / "skills_playbook.json"

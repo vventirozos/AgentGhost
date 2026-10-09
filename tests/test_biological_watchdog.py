@@ -284,9 +284,10 @@ async def test_tick_phase3_triggers_self_play():
          patch("ghost_agent.core.agent.random.random", return_value=0.05):
         await agent._biological_tick()
     MockDreamer.assert_called_once_with(agent.context)
-    mock_dreamer.synthetic_self_play.assert_awaited_once_with(
-        model_name="test-model", is_background=True
-    )
+    mock_dreamer.synthetic_self_play.assert_awaited_once()
+    _kw = mock_dreamer.synthetic_self_play.await_args.kwargs
+    assert _kw["model_name"] == "test-model" and _kw["is_background"] is True
+    assert _kw["seed_override"]["mode"] == "owner_failure"          # §4MS: seeded by an owner failure
     mock_dreamer.dream.assert_not_called()
 
 
@@ -457,3 +458,11 @@ def test_main_module_does_not_import_apscheduler():
     import ghost_agent.main as m
     assert not hasattr(m, "AsyncIOScheduler")
     assert not hasattr(m, "SQLAlchemyJobStore")
+
+
+@pytest.fixture(autouse=True)
+def _owner_seed_for_self_play(monkeypatch):
+    """§4MS: idle self-play now needs a real owner failure to practise —
+    these tests are about the phase's mechanics, so they provide one."""
+    from tests.helpers import provide_owner_seed
+    provide_owner_seed(monkeypatch)

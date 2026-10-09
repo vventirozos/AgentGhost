@@ -65,6 +65,9 @@ from .schema import Trajectory, Outcome
 
 
 _ATTEMPT_ABORTED_RE = re.compile(r"\[ATTEMPT_ABORTED_[A-Z_]+\]")
+#: §4MS: a turn cut by a client disconnect or a process shutdown — the agent
+#: did not fail it; it stays UNKNOWN and teaches nothing
+TURN_INTERRUPTED_MARKER = "[TURN_INTERRUPTED]"
 
 # The failure_reason stamped when a trajectory is FAILED *solely* because a
 # tool call broke — no refute, no shape-heuristic finding. Shared so the
@@ -265,7 +268,8 @@ def looks_like_tool_error(result: str, tool_name: str = "") -> bool:
 #: "structural failure", debited two surfaced lessons as present-on-FAILURE,
 #: and made the turn a router/PRM negative and a post-mortem candidate. The
 #: same set lives in `tools.outcome.DESIGNED_STOP_REASONS` (pinned equal).
-DESIGNED_STOP_REASONS = frozenset({"clarify_first", "subject_photo_missing", "confirm_dead_end"})
+DESIGNED_STOP_REASONS = frozenset({"clarify_first", "subject_photo_missing", "confirm_dead_end",
+                                   "project_not_requested"})
 _DESIGNED_STOP_MARK_RE = re.compile(r"\[designed stop: ([a-z_]+)\]\s*$")
 
 
@@ -729,6 +733,11 @@ def classify_chat_outcome(
     # Already labelled — respect the existing verdict. We never
     # demote PASSED, never overrule an explicit FAILED.
     if current != Outcome.UNKNOWN.value:
+        return FailureClassification(outcome=current, reason="")
+
+    # 0. §4MS: interrupted from outside (disconnect, shutdown) — not a
+    # failure of the attempt; nothing below may promote it
+    if traj.final_response and TURN_INTERRUPTED_MARKER in traj.final_response:
         return FailureClassification(outcome=current, reason="")
 
     # 1. Runtime abort markers — strongest available signal.

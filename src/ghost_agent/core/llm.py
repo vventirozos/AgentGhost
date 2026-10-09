@@ -240,6 +240,13 @@ def compute_tor_proxy(url: str, tor_proxy: Optional[str]) -> Optional[str]:
     return tor_proxy.replace("socks5://", "socks5h://")
 
 
+class BackgroundDeferred(RuntimeError):
+    """§4MS: a background main-slot call that waited its whole park while a
+    USER request stayed active. It used to run anyway, inside the user's
+    turn (44 of 105 parks; one owner call took 500 s instead of ~30 s).
+    The caller gets this instead and its job retries in a later window."""
+
+
 class NodeSaturated(Exception):
     """We could not get a permit for this node before the deadline.
 
@@ -3030,7 +3037,7 @@ class LLMClient:
             if self.main_slot_idle_windows == 0:
                 self._idle_window_admits = 0
 
-    async def _wait_for_foreground_clear(self):
+    async def _wait_for_foreground_clear(self, task_label: str = ""):
         """Park a background caller until the foreground is idle.
 
         Two signals, two budgets:
@@ -3046,6 +3053,7 @@ class LLMClient:
           minutes after req 70.
         """
         waited = 0.0
+        request_active = False
         while waited < 600.0:
             async with self._foreground_lock:
                 request_active = self.foreground_requests > 0
@@ -3084,13 +3092,19 @@ class LLMClient:
             if waited == 120.0:
                 pretty_log(
                     "BG Queue Wait",
-                    "Background LLM call parked 120s waiting for the "
-                    "foreground to clear (user request active). Will keep "
-                    "waiting up to 600s.",
+                    f"Background LLM call ({task_label or 'unlabelled'}) parked 120s waiting for "
+                    "the foreground to clear (user request active). Will keep waiting up to 600s.",
                     icon=Icons.RETRY,
                 )
             await asyncio.sleep(1.0)
             waited += 1.0
+        if request_active:
+            # §4MS: never released INTO a live user request — it used to run
+            # anyway at 600 s and slowed the user's own calls by minutes
+            pretty_log("BG Queue Wait",
+                       f"Background LLM call ({task_label or 'unlabelled'}) DEFERRED after 600s — a user "
+                       "request is still active; the job will retry later", level="WARNING", icon=Icons.WARN)
+            raise BackgroundDeferred(f"background call deferred: {task_label or 'unlabelled'}")
 
     async def chat_completion(self, payload: Dict[str, Any], use_swarm: bool = False, use_worker: bool = False, use_vision: bool = False, use_coding: bool = False, use_critic: bool = False, is_background: bool = False, timeout: Optional[float] = None, off_main_only: bool = False, task_label: str = "", require_healthy: bool = False, slot_wait: Optional[float] = None, total_budget: Optional[float] = None) -> Dict[str, Any]:
         if is_background:
@@ -3148,7 +3162,7 @@ class LLMClient:
             import contextlib as _ctxlib
             async with _ctxlib.AsyncExitStack() as _bg_stack:
                 if targets_main_node:
-                    await self._wait_for_foreground_clear()
+                    await self._wait_for_foreground_clear(task_label)
                     await _bg_stack.enter_async_context(self._bg_queue_sem)
                 _result = await self._do_chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, use_critic, timeout, off_main_only, task_label, require_healthy, slot_wait, total_budget)
                 _repair_think_split(_result)     # §4KP: a mentioned </think> is not the close
@@ -3996,7 +4010,7 @@ class LLMClient:
 
     async def stream_chat_completion(self, payload: Dict[str, Any], use_coding: bool = False, is_background: bool = False):
         if is_background:
-            await self._wait_for_foreground_clear()
+            await self._wait_for_foreground_clear("stream")
             async with self._bg_queue_sem:
                 # §4KP: a mentioned </think> is not the close
                 async for chunk in _repair_think_split_stream(self._do_stream_chat_completion(payload, use_coding)):

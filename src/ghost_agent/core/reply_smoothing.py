@@ -633,8 +633,9 @@ def strip_system_notes(text: str) -> str:
         out = re.sub(r"\n{3,}", "\n\n", REMOVED_NOTE_RE.sub("", out)).rstrip()
     # the unparsed-call note is ours too (review §4IY: the judge and the binder read it as the
     # model's words — "artifact: machine noise")
-    if UNPARSED_TOOL_CALL_NOTE in out:
-        out = out.replace("\n\n" + UNPARSED_TOOL_CALL_NOTE, "").replace(UNPARSED_TOOL_CALL_NOTE, "")
+    for _note in (UNPARSED_TOOL_CALL_NOTE, LEGACY_UNPARSED_TOOL_CALL_NOTE):
+        if _note in out:
+            out = out.replace("\n\n" + _note, "").replace(_note, "")
     return out.rstrip("\n") if out != text else out
 
 
@@ -711,7 +712,14 @@ def _call_markup_spans(text: str) -> List[_CallSpan]:
 _PRESERVED_CALL_RE = re.compile(
     r"<function(?:=|\s+name=[\"']?)replan\b", re.IGNORECASE)
 _BALANCED_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+#: §4MM turn 47: worded for BOTH causes — a malformed call, and a
+#: well-formed one written into a final report that runs no tools (the
+#: deadline report). "could not be parsed" was false for the second.
 UNPARSED_TOOL_CALL_NOTE = (
+    "[A tool call written in this reply was NOT executed — "
+    "the step it described did not happen.]")
+#: the wording before §4MM — still in stored replies; the stripper removes both
+LEGACY_UNPARSED_TOOL_CALL_NOTE = (
     "[A tool call in this reply could not be parsed and was NOT executed — "
     "the step it described did not happen.]")
 

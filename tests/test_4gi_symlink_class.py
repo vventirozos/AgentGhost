@@ -299,6 +299,17 @@ def _kw(call, name):
 #: sandbox. Short by construction: this is the same shape as the four-file
 #: list that let round 2's three readers hide, so every entry needs a reason.
 TREE_OP_ALLOWLIST = {
+    # §4MN: the store snapshot. `system/` is the AGENT's own state, never
+    # model-writable (the model's tree is `sandbox/`, which `_copy_sandbox`
+    # copies with copytree_nofollow); the verify step copies the snapshot's
+    # own output into a temp dir.
+    ("src/ghost_agent/memory/snapshot.py", "copy"):
+        "copies files under GHOST_HOME/system (agent-only state, not model-writable) and the snapshot's own "
+        "output; the model-writable sandbox goes through copytree_nofollow",
+    ("src/ghost_agent/memory/snapshot.py", "copytree"):
+        "verify copies the snapshot's own chroma segment folder (written by take_snapshot) into a temp dir",
+    ("src/ghost_agent/core/dream.py", "walk-read"):
+        "§4MN archive retention: globs vector_reset_*.jsonl in the memory dir (agent-only, not model-writable)",
     ("src/ghost_agent/evolve/mutator.py", "copytree"):
         "copies the REPO's src/ into a throwaway mutation tree; the model "
         "cannot plant a link in the checkout it is not running from",

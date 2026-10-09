@@ -84,6 +84,8 @@ def test_parse_advance_count(raw, expected):
 
 
 # --------------------------------------------------------------- advance_many loop
+# §4MQ: these pin the LOOP's stop conditions — run as the owner's batch (a
+# background batch now runs only on an autopilot project, under the gates).
 
 class _FakeStore:
     def __init__(self, task_status=None, project_status="ACTIVE"):
@@ -116,7 +118,7 @@ async def test_advance_many_count_reached(monkeypatch):
         AdvanceResult(True, "t3", "coding", "ok"),
         AdvanceResult(True, "t4", "coding", "ok"),  # extra, should not run
     ])
-    r = await advance_many(ctx, "p", max_tasks=3)
+    r = await advance_many(ctx, "p", owner_requested=True, max_tasks=3)
     assert r.count == 3
     assert r.stop_reason == "count_reached"
 
@@ -129,7 +131,7 @@ async def test_advance_many_all_until_done(monkeypatch):
         AdvanceResult(True, "t2", "research", "ok"),
         AdvanceResult(True, None, "idle", "no ready leaf"),
     ])
-    r = await advance_many(ctx, "p", max_tasks=None)
+    r = await advance_many(ctx, "p", owner_requested=True, max_tasks=None)
     assert r.count == 2
     assert r.stop_reason == "project_done"
 
@@ -142,7 +144,7 @@ async def test_advance_many_stops_on_needs_user(monkeypatch):
         AdvanceResult(True, "t2", "needs_user", "needs human"),
         AdvanceResult(True, "t3", "coding", "should not run"),
     ])
-    r = await advance_many(ctx, "p", max_tasks=None)
+    r = await advance_many(ctx, "p", owner_requested=True, max_tasks=None)
     assert r.count == 2
     assert r.stop_reason == "needs_user"
 
@@ -155,7 +157,7 @@ async def test_advance_many_stops_on_failure(monkeypatch):
         AdvanceResult(True, "t2", "coding", "tool produced no usable result"),
         AdvanceResult(True, "t3", "coding", "should not run"),
     ])
-    r = await advance_many(ctx, "p", max_tasks=None, stop_on_fail=True)
+    r = await advance_many(ctx, "p", owner_requested=True, max_tasks=None, stop_on_fail=True)
     assert r.count == 2
     assert r.stop_reason == "failed"
 
@@ -168,7 +170,7 @@ async def test_advance_many_continues_past_failure_when_allowed(monkeypatch):
         AdvanceResult(True, "t2", "coding", "ok"),
         AdvanceResult(True, None, "idle", "done"),
     ])
-    r = await advance_many(ctx, "p", max_tasks=None, stop_on_fail=False)
+    r = await advance_many(ctx, "p", owner_requested=True, max_tasks=None, stop_on_fail=False)
     assert r.count == 2
     # advanced both, but one FAILED → reported distinctly from a clean finish
     assert r.stop_reason == "completed_with_failures"
@@ -186,7 +188,7 @@ async def test_advance_many_circuit_breaker_on_repeated_failures(monkeypatch):
         AdvanceResult(True, "t3", "coding", "x"),
         AdvanceResult(True, "t4", "coding", "should not run"),
     ])
-    r = await advance_many(ctx, "p", max_tasks=None, stop_on_fail=False,
+    r = await advance_many(ctx, "p", owner_requested=True, max_tasks=None, stop_on_fail=False,
                            max_consecutive_fails=3)
     assert r.count == 3
     assert r.stop_reason == "repeated_failures"
@@ -205,7 +207,7 @@ async def test_advance_many_consecutive_counter_resets_on_success(monkeypatch):
         AdvanceResult(True, "t4", "coding", "x"),
         AdvanceResult(True, None, "idle", "done"),
     ])
-    r = await advance_many(ctx, "p", max_tasks=None, stop_on_fail=False,
+    r = await advance_many(ctx, "p", owner_requested=True, max_tasks=None, stop_on_fail=False,
                            max_consecutive_fails=3)
     assert r.count == 4
     assert r.stop_reason == "completed_with_failures"
@@ -216,13 +218,13 @@ async def test_advance_many_blocked_budget_vs_done(monkeypatch):
     # blocked + project still ACTIVE → budget/inactive
     ctx = SimpleNamespace(project_store=_FakeStore(project_status="ACTIVE"))
     _script(monkeypatch, [AdvanceResult(True, None, "blocked", "budget")])
-    r = await advance_many(ctx, "p", max_tasks=None)
+    r = await advance_many(ctx, "p", owner_requested=True, max_tasks=None)
     assert r.stop_reason == "budget_or_inactive"
 
     # blocked because the last task rolled the project to DONE → project_done
     ctx2 = SimpleNamespace(project_store=_FakeStore(project_status="DONE"))
     _script(monkeypatch, [AdvanceResult(True, None, "blocked", "project is DONE")])
-    r2 = await advance_many(ctx2, "p", max_tasks=None)
+    r2 = await advance_many(ctx2, "p", owner_requested=True, max_tasks=None)
     assert r2.stop_reason == "project_done"
 
 
@@ -231,12 +233,22 @@ async def test_advance_many_hard_cap(monkeypatch):
     ctx = SimpleNamespace(project_store=_FakeStore({"t": "DONE"}))
     # never finishes — every tick returns a DONE task
     _script(monkeypatch, [AdvanceResult(True, "t", "coding", "ok")] * 10)
-    r = await advance_many(ctx, "p", max_tasks=None, hard_cap=3)
+    r = await advance_many(ctx, "p", owner_requested=True, max_tasks=None, hard_cap=3)
     assert r.count == 3
     assert r.stop_reason == "hard_cap"
 
 
 # --------------------------------------------------------------- tool path (real store)
+
+@pytest.fixture(autouse=True)
+def _owner_turn():
+    """The tool's autoadvance below is the OWNER's (§4MQ: a non-owner batch
+    needs autopilot and runs under the unattended gates)."""
+    from ghost_agent.utils.logging import request_id_context
+    tok = request_id_context.set("req-owner-pacing")
+    yield
+    request_id_context.reset(tok)
+
 
 @pytest.fixture
 def context(tmp_path):

@@ -458,7 +458,7 @@ def _forget_profile(profile_memory, target: str, related: bool = False, qualifie
         mention = _entity_of(target_lc) or target_lc
         if hasattr(profile_memory, "drop_previous_mentioning"):
             for line in profile_memory.drop_previous_mentioning(mention):
-                out.append(f"✅ Profile: {line}")
+                out.append(_profile_line(line, line))      # an archive refusal is not a ✅ (§4MN r2)
         for cat, sub in list(data.items()):
             if not isinstance(sub, dict):
                 continue
@@ -2249,6 +2249,11 @@ async def forget_preview(target, sandbox_dir=None, memory_system=None, profile_m
         rid = str(request_id_context.get() or "")
     except Exception:  # noqa: BLE001
         rid = ""
+    # §4MM turn 18: number ONCE, defaults first — lessons were appended after
+    # the episodes, so the list read 1, 2, 15 and the model renumbered it: its
+    # "remove 1, 2, 3" would have deleted an episode, not the lesson it showed
+    items = [it for it in plan.items if it["default"]] + [it for it in plan.items if not it["default"]]
+    plan.items[:] = items
     token = _store_plan({"target": str(target), "items": plan.items, "rid": rid, "ts": _t.time(), "kind": "forget"})
     main = [f"{n}. {it['label']}" for n, it in enumerate(plan.items, 1) if it["default"]]
     extra = [f"{n}. {it['label']}" for n, it in enumerate(plan.items, 1) if not it["default"]]
@@ -2330,7 +2335,7 @@ def _not_the_user(rid: str) -> bool:
         return True
 
 
-def _confirm_allowed(plan: dict):
+def _confirm_allowed(plan: dict, selection=None):
     """The confirmation must come from the USER, in a LATER turn than the
     preview, and the preview must have been shown to the user: the model
     cannot preview and confirm in the same breath, and no background turn
@@ -2356,7 +2361,26 @@ def _confirm_allowed(plan: dict):
     if _src:
         return (f"this request read outside content ({', '.join(_src[:3])}) before the confirmation — "
                 f"ask the user to confirm in a new message")
-    if not user_confirms(user_message(rid), str(plan.get("token") or "")):
+    # §4MM r2: "narrowed" = the call picks a STRICT subset of the preview —
+    # neither everything ("1-N") nor exactly the default list ("all" by
+    # another name). A long qualified yes then confirms only that subset.
+    _narrowed = False
+    try:
+        if str(selection if selection is not None else "all").strip().lower() not in ("all", "*", "yes", ""):
+            _chosen, _bad = _pick(plan.get("items") or [], selection)
+            _ids = {id(x) for x in _chosen}
+            _all = {id(x) for x in plan.get("items") or []}
+            _defaults = {id(x) for x in plan.get("items") or [] if x.get("default")}
+            _narrowed = bool(_ids) and not _bad and _ids != _all and _ids != _defaults
+    except Exception:  # noqa: BLE001
+        _narrowed = False
+    if not user_confirms(user_message(rid), str(plan.get("token") or ""), narrowed=_narrowed):
+        if user_confirms(user_message(rid), str(plan.get("token") or ""), narrowed=True):
+            # §4MM turn 19: a long "Yes, confirm — delete ONLY the stored copy
+            # of …" qualifies the list — it is a yes to the items it names,
+            # never to the whole default list
+            return ("the user's yes names WHICH items — pass exactly those as `items` (the numbers from the "
+                    "preview); a yes with conditions never confirms the whole list")
         return ("the user's message does not confirm it — show them the preview and ask; confirm only "
                 "when they answer yes")
     return None
@@ -2375,7 +2399,7 @@ _DENY_RE = re.compile(
     r"οχι|μην|μη|ακυρο|ακυρωσε|σταματα|περιμενε)(?!\w)", re.IGNORECASE)
 
 
-def user_confirms(message: str, token: str = "") -> bool:
+def user_confirms(message: str, token: str = "", narrowed: bool = False) -> bool:
     """Does the user's own message confirm a preview? The token quoted, a
     selection of the listed items ("1, 3", "1-4"), or a SHORT message that
     OPENS with yes and holds nothing back. Fail-safe: a miss means the model
@@ -2388,7 +2412,9 @@ def user_confirms(message: str, token: str = "") -> bool:
         return False
     if re.fullmatch(r"[\d\s,\-\[\]]+", text):
         return True                                   # a selection
-    return len(text) <= 80 and bool(_AFFIRM_RE.match(text))
+    # a LONG message that opens with yes usually qualifies it ("yes, but only
+    # the PDF") — it confirms only when the call names the items (`narrowed`)
+    return (len(text) <= 80 or narrowed) and bool(_AFFIRM_RE.match(text))
 
 
 def _pick(items: list, selection):
@@ -2425,7 +2451,7 @@ async def forget_execute(token, selection="all", sandbox_dir=None, memory_system
     if plan is None:
         return ToolOutcome.rejected("Error: unknown or expired confirmation token — run the forget preview again.",
                                     reason_code="forget_token_unknown")
-    why = _confirm_allowed(plan)
+    why = _confirm_allowed(plan, selection)
     if why:
         return ToolOutcome.rejected(f"NOT deleted: {why}.", reason_code="forget_not_confirmed")
     chosen, bad = _pick(plan["items"], selection)
@@ -3983,6 +4009,42 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
                     snapshot = memory_system.collection.get()
 
                 all_ids = snapshot.get("ids", []) or []
+                # §4MN: every row this wipe removes, kept first (fsynced) —
+                # the one vector delete with no copy; identity, document and
+                # auto rows do not re-embed themselves. No dump, no wipe.
+                # (only for a real store directory — the catalogue resets
+                # below skip a non-Path the same way)
+                if all_ids and isinstance(getattr(memory_system, "chroma_dir", None), Path):
+                    _dump = None
+                    try:
+                        import json as _json
+                        import os as _os
+                        import time as _time
+                        _dump = memory_system.chroma_dir / f"vector_reset_{int(_time.time())}.jsonl"
+                        # documents a page at a time — never the whole store
+                        # in memory at once (the scan above stays metadata-only)
+                        with open(_dump, "w", encoding="utf-8") as _fh:
+                            for _p in range(0, len(all_ids), 500):
+                                _page = memory_system.collection.get(ids=all_ids[_p:_p + 500],
+                                                                     include=["documents", "metadatas"])
+                                _pids = _page.get("ids") or []
+                                _docs = _page.get("documents") or []
+                                _mts = _page.get("metadatas") or []
+                                for _i, _id in enumerate(_pids):
+                                    _fh.write(_json.dumps({"id": _id,
+                                                           "document": _docs[_i] if _i < len(_docs) else None,
+                                                           "metadata": _mts[_i] if _i < len(_mts) else None},
+                                                          ensure_ascii=False, default=str) + "\n")
+                            _fh.flush()
+                            _os.fsync(_fh.fileno())
+                    except Exception as _de:  # noqa: BLE001
+                        if _dump is not None:                 # no half-written copy left behind (r2)
+                            try:
+                                _dump.unlink()
+                            except OSError:
+                                pass
+                        raise RuntimeError(f"could not keep a copy of the rows first ({_de}) — NOTHING was "
+                                           f"wiped") from _de
                 # What this wipe ORPHANS, counted from the SAME snapshot.
                 # `reset_all` deletes the `document` / `episode` / `skill` /
                 # `acquired_skill` rows `_FORGET_PROTECTED_TYPES` protects,

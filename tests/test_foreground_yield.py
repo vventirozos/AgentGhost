@@ -9,6 +9,8 @@ behind full background generations for ~12 minutes. The fix adds
 parks background callers while either signal is hot.
 """
 import asyncio
+
+import pytest
 import inspect
 
 from ghost_agent.core.llm import LLMClient
@@ -88,12 +90,16 @@ async def test_task_only_blocking_keeps_30s_cap(monkeypatch):
 
 async def test_leaked_counter_hard_ceiling(monkeypatch):
     """A leaked foreground_requests must not deadlock background work
-    forever — the 600-tick hard ceiling releases it."""
+    forever — the 600-tick hard ceiling ends the wait. §4MS: by DEFERRING
+    the call (it used to run anyway, inside whatever request was live — 44
+    of 105 parks), loudly; the job retries in a later window."""
+    from ghost_agent.core.llm import BackgroundDeferred
     c = _bare_client()
     c.foreground_requests = 1  # never cleared
     sleeps: list = []
     _instant_sleep(monkeypatch, sleeps)
-    await c._wait_for_foreground_clear()
+    with pytest.raises(BackgroundDeferred):
+        await c._wait_for_foreground_clear()
     assert 595 <= len(sleeps) <= 605
 
 
@@ -170,7 +176,7 @@ async def _skip_wait_probe(monkeypatch, client, **call_kwargs):
     """Run chat_completion with instrumented wait/do; return (waited, done)."""
     waited, done = [], []
 
-    async def fake_wait():
+    async def fake_wait(*_a):
         waited.append(True)
 
     async def fake_do(payload, *a, **kw):
@@ -293,5 +299,8 @@ async def test_long_park_emits_visibility_log(monkeypatch):
     logs: list = []
     monkeypatch.setattr(
         llm_mod, "pretty_log", lambda *a, **k: logs.append(a))
-    await c._wait_for_foreground_clear()
-    assert sum(1 for a in logs if "BG Queue Wait" in str(a)) == 1
+    with pytest.raises(llm_mod.BackgroundDeferred):            # §4MS: deferred at 600 s
+        await c._wait_for_foreground_clear("judge")
+    parked = [a for a in logs if "BG Queue Wait" in str(a)]
+    assert len(parked) == 2 and "parked 120s" in str(parked[0]) and "DEFERRED" in str(parked[1])
+    assert all("judge" in str(a) for a in parked)              # the caller is named

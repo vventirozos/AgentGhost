@@ -323,7 +323,7 @@ class TestWiringPins:
         src = (Path(__file__).resolve().parents[1]
                / "src" / "ghost_agent" / "core" / "dream.py").read_text()
         assert "injected_challenge: dict = None" in src
-        assert "if _tpl is None and not gen_ok:" in src
+        assert "if _tpl is None and not gen_ok and not _owner_mode:" in src   # §4MS: owner seeds never take a journal pick
         assert "self.last_self_play_status = str(status_str)" in src
         assert "if not injected_challenge:" in src  # replays not re-persisted
 

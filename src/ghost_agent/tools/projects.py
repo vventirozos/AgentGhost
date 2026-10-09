@@ -55,7 +55,7 @@ _DUPLICATE_CREATE_LOOP_WINDOW_SECONDS = 600.0
 _ACTIONS = {
     # project-level
     "create", "list", "get", "switch", "exit", "update", "delete",
-    "archive", "resume", "status",
+    "archive", "resume", "status", "budget",
     # task-level
     "task_add", "task_update", "task_decompose", "task_next", "task_list",
     # artifacts / events / durable working memory
@@ -1197,7 +1197,22 @@ _ADVANCE_STOP_BLURB = {
                          "then re-run autoadvance.",
     "needs_user": "Paused: a task needs your input/decision before continuing.",
     "budget_or_inactive": "Paused: the project's step budget is exhausted "
-                          "(raise steps_cap to continue) or it is not ACTIVE.",
+                          "(the owner raises it with action=budget) or it is not ACTIVE.",
+    "deadline": "Stopped before the next task: this request's time is nearly up and "
+                "another task would end inside the time reserved for the report. "
+                "Tell the user what is done; they can continue in a new message.",
+    "in_progress": "Not done: some tasks are still marked in progress (another run may be "
+                   "building them, or a run was interrupted) — do NOT report the project as "
+                   "complete; tell the user which tasks are open.",
+    "busy": "Not run: another unattended step on this project is still running — "
+            "try again when it has finished.",
+    "step_crashed": "Stopped: the build step crashed before it could finish (the task "
+                    "is open again, ready to retry) — tell the user what failed.",
+    "autopilot_off": "Not run: autopilot is off for this project, and only the owner's "
+                     "own turn turns it on — a scheduled or background run cannot.",
+    "autopilot_paused": "Stopped: the unattended safety gates paused this project "
+                        "(no progress, a check-in, or its runtime budget) — tell the "
+                        "user why; only their own turn resumes it.",
     "failed": "Stopped: a task FAILED — review it before continuing.",
     "no_store": "Project store unavailable.",
 }
@@ -1223,7 +1238,8 @@ def _advance_batch_instruction(batch, max_tasks) -> str:
     # manual build thrashed ~700s and broke project scoping).
     stopped_early = batch.stop_reason in (
         "failed", "repeated_failures", "budget_or_inactive", "needs_user",
-        "project_failed")
+        "project_failed", "autopilot_paused", "autopilot_off", "busy", "step_crashed",
+        "in_progress")
     if stopped_early:
         return (
             f"Autonomous batch ran {batch.count} task(s) ({done} DONE{tail}). "
@@ -1428,6 +1444,25 @@ def _link_task_in_graph(context, project_id: str, task_id: str, description: str
         logger.debug("graph task link skipped", exc_info=True)
 
 
+def _remove_project_changelog(context, project_id: str) -> bool:
+    """§4MN: a hard delete leaves no per-project `CHANGELOG.<id>.md` in the
+    workspace root (22 of them, 234 KB, outlived their projects). Only this
+    project's file; best-effort."""
+    try:
+        wm = getattr(context, "workspace_model", None)
+        root = getattr(wm, "root", None)
+        pid = str(project_id or "").strip()
+        if root is None or not pid or not re.fullmatch(r"[A-Za-z0-9_-]+", pid):
+            return False
+        f = Path(root) / f"CHANGELOG.{pid}.md"
+        if f.is_file() and not f.is_symlink():
+            f.unlink()
+            return True
+    except Exception as e:  # noqa: BLE001
+        logger.debug("project changelog removal skipped: %s", e)
+    return False
+
+
 def _forget_project_episodes(context, project_id: str, title: str) -> int:
     """§4MJ: hard delete's episode leg — the episodes naming the project (by
     id, and by its title when no live project shares it) are archived and
@@ -1519,6 +1554,71 @@ def _probe_turn_now() -> bool:
         return False
 
 
+#: §4MM: the owner's own words asking for a PROJECT (EN + GR). Turns 34/38:
+#: "Test the theory that 4-layer recursive thinking…" created a project
+#: twice (once minutes after the owner deleted it), offered a plan and
+#: stopped — the owner asked for the test, not a project, and had to add
+#: "don't create a project" before getting the answer (six retries).
+_PROJECT_ASK_RE = re.compile(
+    r"(?<!\w)(?:projects?|workspace|initiative|track (?:it|this|that)|as a tracked|"
+    r"πρότζεκτ|προτζεκτ|έργο|εργο|έργα|εργα|εργασία|εργασια)(?!\w)", re.IGNORECASE)
+
+
+#: …and the owner's words REFUSING one ("don't create a project, just do
+#: it" — turns 40/43, after the two unasked creates). Checked first: the
+#: word "project" is in it.
+# r2: only a negated CREATE ("don't create/make/start a project") or
+# "without a project" — "I have no project for this, please set one up",
+# "don't stop until the project is finished" are asks, not refusals
+_NO_PROJECT_RE = re.compile(
+    r"(?<!\w)(?:(?:don'?t|do\s+not|never|no\s+need\s+to)\s+(?:\w+\s+)?"
+    r"(?:create|make|start|open|set\s+up|spin\s+up)\s+(?:a\s+|any\s+|the\s+|new\s+|another\s+)*projects?"
+    r"|without\s+(?:creating\s+|making\s+)?(?:a\s+|any\s+)?(?:new\s+)?projects?"
+    r"|(?:μην|μη)\s+(?:φτιάξεις|φτιαξεις|δημιουργήσεις|δημιουργησεις|ανοίξεις|ανοιξεις)\s+(?:\w+\s+)?(?:πρότζεκτ|προτζεκτ|έργο|εργο)"
+    r"|χωρίς\s+(?:\w+\s+)?(?:πρότζεκτ|προτζεκτ|έργο|εργο))(?!\w)", re.IGNORECASE)
+#: a request to BUILD something is project work without the word ("build the
+#: pipeline", "delete it and make something else"): 0 of 77 past owner
+#: build requests without "project" created one, so allowing them costs nothing
+_BUILD_ASK_RE = re.compile(
+    r"(?<!\w)(?:build|make(?!\s+sure)|create|develop|implement|set\s+up|scaffold|deploy|start|"
+    r"φτιάξε|φτιαξε|δημιούργησε|δημιουργησε|στήσε|στησε|ανάπτυξε|αναπτυξε)(?!\w)", re.IGNORECASE)
+
+
+def _create_not_requested(context) -> str:
+    """The refusal text when an INTERACTIVE turn (the owner's or a probe's)
+    creates a project the request did not ask for, else "". Background
+    runs (scheduled, autonomous, sub-agents) are not gated here."""
+    try:
+        from ..core.agent import turn_origin
+        if turn_origin(context) not in ("user", "probe"):
+            return ""
+    except Exception:  # noqa: BLE001
+        return ""
+    ask = str(getattr(context, "last_user_content", "") or "")
+    if not ask.strip():
+        return ""
+    if _NO_PROJECT_RE.search(ask):
+        return ("NOT created: the owner said not to create a project. Do the task directly in this "
+                "conversation now.")
+    # this message, or the conversation's last few (r2: "call it Snake"
+    # answers the agent's question about a project asked for a turn before)
+    if _PROJECT_ASK_RE.search(ask) or _BUILD_ASK_RE.search(ask):
+        return ""
+    # an EARLIER message counts only when it asked to BUILD something: turn
+    # 38's history held "show all projects" and "delete projects …"
+    recent = [m for m in (getattr(context, "recent_user_contents", None) or []) if isinstance(m, str)]
+    if any(_BUILD_ASK_RE.search(m) for m in recent[-4:]):
+        return ""
+    # a short yes to the agent's own offer ("do it", "ok, proceed") — 3 of
+    # the 5 past creates whose request never said "project" were exactly that
+    from .memory import user_confirms
+    if user_confirms(ask):
+        return ""
+    return ("NOT created: the request did not ask for a project. Do the task directly in this "
+            "conversation now — answer, run, or build what was asked. Offer a project only if the work "
+            "clearly needs one, and create it when the owner says so.")
+
+
 def _owner_turn_now() -> bool:
     """Is this the OWNER's own turn? Not a probe, a scheduled task, a
     sub-agent or any other background run (review M5: a `sched-`/`sub-`
@@ -1533,6 +1633,25 @@ def _owner_turn_now() -> bool:
         return False
     from .memory import _not_the_user
     return not _not_the_user(rid)
+
+
+def _budget_view(store, project_id) -> Dict[str, Any]:
+    """§4MQ: the unattended budget and the gates' state, for status/budget."""
+    from ..core.project_advancer import (DEFAULT_STEPS_CAP, DEFAULT_CHECKPOINT_EVERY,
+                                         DEFAULT_UNATTENDED_RUNTIME_CAP_S, NO_PROGRESS_PAUSE_AT)
+    m = ((store.get_project(project_id) or {}).get("metadata") or {})
+    cap_s = m.get("unattended_runtime_cap_seconds")
+    return {
+        "autopilot": bool(m.get("autopilot")),
+        "steps": f"{int(m.get('steps_used') or 0)}/{int(m.get('steps_cap') or DEFAULT_STEPS_CAP)}",
+        "unattended_hours": f"{float(m.get('unattended_runtime_seconds') or 0) / 3600:.1f}/"
+                         f"{float(cap_s if cap_s is not None else DEFAULT_UNATTENDED_RUNTIME_CAP_S) / 3600:.1f}",
+        "checkpoint_every": int(m.get("checkpoint_every") if m.get("checkpoint_every") is not None
+                                else DEFAULT_CHECKPOINT_EVERY),
+        "steps_since_checkpoint": int(m.get("steps_since_checkpoint") or 0),
+        "no_progress_streak": f"{int(m.get('no_progress_streak') or 0)}/{NO_PROGRESS_PAUSE_AT}",
+        "paused": m.get("autopilot_paused") or None,
+    }
 
 
 def _autopilot_on(store, project_id) -> bool:
@@ -1636,6 +1755,10 @@ def _lifecycle_confirmation(store, act, rid, token):
 #: them (review M2: a probe set `probe_created` on an owner project, then
 #: deleted it with no confirmation)
 _SYSTEM_METADATA_KEYS = ("probe_created", "autopilot")
+#: §4MQ: the budget and the unattended gates' state — written by the system or
+#: by the owner's `action=budget`, never by the model's `metadata=` (a
+#: background turn could raise its own cap)
+from ..core.project_advancer import BUDGET_METADATA_KEYS as _BUDGET_KEYS  # noqa: E402
 
 
 async def tool_manage_projects_for_model(context, **kwargs):
@@ -1661,7 +1784,14 @@ async def tool_manage_projects_for_model(context, **kwargs):
             # "updated" and the idle loop kept building)
             return _err("autopilot is not metadata: use manage_projects action=autopilot "
                         "enabled=true|false, on the owner's request — nothing changed")
-        kwargs["metadata"] = {k: v for k, v in _md.items() if k not in _SYSTEM_METADATA_KEYS}
+        _bk = sorted(k for k in _md if k in _BUDGET_KEYS)
+        if _bk and act != "budget":
+            return _err(f"{', '.join(_bk)} {'is' if len(_bk) == 1 else 'are'} budget, not metadata: use "
+                        "manage_projects action=budget on the owner's request — nothing changed")
+        if act != "budget":
+            kwargs["metadata"] = {k: v for k, v in _md.items() if k not in _SYSTEM_METADATA_KEYS}
+        else:
+            kwargs["metadata"] = _md
     if act in _CONFIRMED_ACTIONS:
         store = getattr(context, "project_store", None)
         if store is not None:
@@ -2347,6 +2477,10 @@ async def tool_manage_projects(
         if act == "create":
             if not title:
                 return _err("title is required for action=create")
+            _not_asked = _create_not_requested(context)
+            if _not_asked:
+                from .outcome import ToolOutcome
+                return ToolOutcome.rejected(_not_asked, reason_code="project_not_requested")
             # Capture the user's explicit constraints at the moment of
             # creation — both the ones the model passed and the ones we can
             # extract deterministically from the triggering message
@@ -2911,9 +3045,14 @@ async def tool_manage_projects(
                 _set_current(context, None)
             _unlink_project_in_graph(context, rid, _gone.get("title", ""))
             _forget_project_episodes(context, rid, _gone.get("title", ""))
+            _remove_project_changelog(context, rid)
             return _ok({"deleted": True, "project_id": rid, "hard": True,
-                        "note": "Project, its tasks/artifacts/events, and its "
-                                "workspace files were permanently removed."})
+                        "note": "Project, its tasks/artifacts/events, its workspace files, its "
+                                "knowledge-graph edges and the episodes that name it were "
+                                "permanently removed. KEPT (say so if asked — do not claim "
+                                "'no trace remains'): past conversation records (trajectories), "
+                                "general lessons learned while working on it, and vector-memory "
+                                "entries until the next memory reconcile."})
 
         if act == "archive":
             # Soft delete: flips status to ARCHIVED; the project (and its
@@ -3012,12 +3151,73 @@ async def tool_manage_projects(
                                 "manage_projects action=list shows the real ones")
                 return _ok({"current": cur, "mode": "project" if cur else "free_chat",
                             "project": rid, "autopilot": _autopilot_on(store, rid),
+                            "budget": _budget_view(store, rid),
                             "briefing": _briefing(store, rid)})
             if not cur:
                 return _ok({"current": None, "mode": "free_chat"})
             return _ok({"current": cur, "mode": "project",
                         "autopilot": _autopilot_on(store, cur),
+                        "budget": _budget_view(store, cur),
                         "briefing": _briefing(store, cur)})
+
+        if act == "budget":
+            # §4MQ: the owner sets a project's unattended budget — steps,
+            # runtime hours, check-in cadence. Without values it reports the
+            # budget and the gates' state. Only the owner's own turn changes it.
+            if project_id or title:
+                project_id, _berr = _resolve_project_ref(store, project_id, title)
+                if _berr:
+                    return _err(_berr)
+            if not project_id:
+                return _err("no such project (pass project_id or title, or switch first) — nothing changed")
+            _p = store.get_project(project_id)
+            if not _p:
+                return _err(f"project not found: {project_id}")
+            _want = metadata if isinstance(metadata, dict) else {}
+            _set = {}
+            for _k, _cast, _lo, _hi in (("steps_cap", int, 0, 1000), ("checkpoint_every", int, 0, 1000),
+                                        ("runtime_cap_hours", float, 0.0, 24.0 * 30)):
+                if _k in _want and _want[_k] is not None:
+                    try:
+                        _v = _cast(_want[_k])
+                    except (TypeError, ValueError):
+                        return _err(f"{_k} must be a number, got {_want[_k]!r} — nothing changed")
+                    if not (_lo <= _v <= _hi):
+                        return _err(f"{_k} must be between {_lo} and {_hi} — nothing changed")
+                    _set[_k] = _v
+            _unknown = sorted(set(_want) - {"steps_cap", "checkpoint_every", "runtime_cap_hours"})
+            if _unknown:
+                return _err(f"budget takes steps_cap, runtime_cap_hours, checkpoint_every — not "
+                            f"{', '.join(_unknown)}; nothing changed")
+            if _set:
+                if not _owner_turn_now():
+                    return _err("only the owner's own turn changes a budget — a probe or "
+                                "background run cannot")
+                if "runtime_cap_hours" in _set:
+                    # the UNATTENDED allowance between the owner's looks (r2
+                    # M3: the lifetime runtime counted the owner's own work)
+                    _set["unattended_runtime_cap_seconds"] = round(_set.pop("runtime_cap_hours") * 3600.0)
+                store.update_project(project_id, metadata=_set)
+            return _ok({"project": project_id, "budget": _budget_view(store, project_id)})
+
+        if act == "autopilot" and str(project_id or title or "").strip().lower() in ("all", "*"):
+            # §4MQ: one command stops every unattended project
+            if enabled is None or str(enabled).strip().lower() not in (
+                    "0", "false", "no", "off", "disable", "disabled"):
+                return _err("project 'all' takes enabled=false only (pausing everything); "
+                            "turn autopilot on one project at a time — nothing changed")
+            if not _owner_turn_now():
+                return _err("only the owner's own turn changes autopilot — "
+                            "a probe or background run cannot")
+            _off = []
+            for _p in store.list_projects() or []:
+                if (_p.get("metadata") or {}).get("autopilot"):
+                    store.update_project(_p["id"], metadata={"autopilot": False})
+                    _off.append(_p.get("title") or _p["id"])
+            return _ok({"autopilot_off": _off,
+                        "note": ((f"autopilot turned off on {len(_off)} project(s); a step already "
+                                  "running finishes first (up to 45 min) and no new one starts")
+                                 if _off else "no project had autopilot on")})
 
         if act == "autopilot":
             # §4LQ: the idle loop advances a project only with autopilot on.
@@ -3045,8 +3245,12 @@ async def tool_manage_projects(
             if not _owner_turn_now():
                 return _err("only the owner's own turn changes autopilot — "
                             "a probe or background run cannot")
-            store.update_project(project_id, metadata={"autopilot": want})
+            # §4MQ: the owner's resume resets the unattended gates
+            from ..core.project_advancer import resume_autopilot_metadata
+            store.update_project(project_id, metadata=(resume_autopilot_metadata() if want
+                                                       else {"autopilot": False}))
             return _ok({"project": project_id, "autopilot": want,
+                        "budget": _budget_view(store, project_id),
                         "note": ("the idle loop may now advance this project between your turns"
                                  if want else "the idle loop will no longer advance this project")})
 
@@ -4469,9 +4673,19 @@ async def tool_manage_projects(
             # (§4LP). A probe's, a scheduled task's or a sub-agent's advance
             # is not the owner's opt-in, and runs under the unattended rules.
             _by_owner = _owner_turn_now()
+            _autopilot_note = ""
             if _by_owner:
                 try:
-                    store.update_project(project_id, metadata={"autopilot": True})   # merges (§4LZ C2)
+                    from ..core.project_advancer import resume_autopilot_metadata
+                    _prev = (store.get_project(project_id) or {}).get("metadata") or {}
+                    store.update_project(project_id, metadata=resume_autopilot_metadata())   # merges (§4LZ C2); §4MQ: resets the gates
+                    # §4MR: say so — after "stop all" one "do the next task"
+                    # silently restarted unattended work overnight
+                    if not _prev.get("autopilot"):
+                        _why = ((_prev.get("autopilot_paused") or {}).get("reason") or "")
+                        _autopilot_note = ("autopilot is now ON for this project: the idle loop will continue it "
+                                           "between your turns" + (f" (it had paused: {_why})" if _why else "")
+                                           + " — tell the user, and that 'stop autopilot' turns it off")
                 except Exception:  # noqa: BLE001
                     pass
             from ..workspace import pinned_event_project as _pin_evt
@@ -4497,6 +4711,8 @@ async def tool_manage_projects(
                 "stop_reason": batch.stop_reason,
                 "agent_instruction": _advance_batch_instruction(batch, max_tasks),
             }
+            if _autopilot_note:
+                _adv_payload["autopilot"] = _autopilot_note
             if batch.stop_reason == "needs_user":
                 # name what waits, or the model cannot tell the owner (§4LQ F5)
                 try:
@@ -4604,6 +4820,12 @@ async def tool_manage_projects(
         if act == "promote_from_context":
             if not title:
                 return _err("title is required for promotion")
+            # §4MM r2: the same gate as `create` — one deliverer gated, the
+            # other open, is the §4LZ class
+            _not_asked = _create_not_requested(context)
+            if _not_asked:
+                from .outcome import ToolOutcome
+                return ToolOutcome.rejected(_not_asked, reason_code="project_not_requested")
             pid = store.create_project(
                 title=title, kind=_infer_kind(title, goal, kind), goal=goal,
                 metadata={"promoted_from_context": True},
@@ -4697,7 +4919,16 @@ MANAGE_PROJECTS_TOOL_DEF = {
             "the call with its confirm_token only after they say yes. "
             "`autopilot` (enabled=true|false, only on the user's request) "
             "lets the idle loop advance the project between their turns, or "
-            "stops it; without `enabled` it reports the setting. "
+            "stops it; without `enabled` it reports the setting; "
+            "project_id='all' with enabled=false stops every project (a step "
+            "already running finishes first). Autopilot "
+            "pauses itself after 3 steps with no progress, at each check-in, or "
+            "when its budget is used — tell the user why. `budget` (only on the "
+            "user's request; metadata={steps_cap, runtime_cap_hours, "
+            "checkpoint_every}) sets the project's budget — steps_cap counts "
+            "every advance step (the user's too), runtime_cap_hours is the "
+            "unattended time between the user's looks; without metadata it "
+            "reports it. "
             "`promote_from_context` only when the user has explicitly "
             "accepted a suggestion to convert the current chat into a "
             "project. `research` to web-research a topic (pass `topic`) or "

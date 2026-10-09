@@ -36,7 +36,10 @@ _ROLLUP_EVENTS = ("project_auto_rollup",)
 # release/version-related ever surfaced).
 _MILESTONE_EVENTS = ("project_released", "version_forked",
                      "release_rehearsal_failed", "autoadvance_failed",
-                     "budget_exhausted", "project_reopened")
+                     "budget_exhausted", "project_reopened",
+                     # §4MR: an unattended pause was only a push (held in
+                     # quiet hours) and `status` — never in chat
+                     "autopilot_paused")
 _RELEVANT = frozenset(_ADVANCE_EVENTS + _NEEDS_USER_EVENTS + _ROLLUP_EVENTS
                       + _MILESTONE_EVENTS)
 
@@ -48,6 +51,7 @@ _MILESTONE_PHRASES = {
     "autoadvance_failed": "hit a FAILED build during autoadvance",
     "budget_exhausted": "exhausted its step budget",
     "project_reopened": "was reopened ({reason})",
+    "autopilot_paused": "PAUSED its autopilot — {reason} (say 'resume autopilot' to continue)",
 }
 
 # DONE/FAILED project lists grow without bound, and only the most recently
@@ -99,6 +103,8 @@ def summarize_since(store, last_event_id: int, *, per_project_limit: int = 50) -
     for p in candidates:
         pid = p.get("id")
         title = str(p.get("title") or pid or "project")[:40]
+        # §4MM: a project a probe created is a test fixture, not the agent's work
+        _probe_project = bool((p.get("metadata") or {}).get("probe_created"))
         try:
             events = store.list_events(pid, limit=per_project_limit)
         except Exception:
@@ -114,6 +120,8 @@ def summarize_since(store, last_event_id: int, *, per_project_limit: int = 50) -
             etype = ev.get("type")
             if etype not in _RELEVANT:
                 continue
+            if _probe_project or (ev.get("payload") or {}).get("origin") == "probe":
+                continue                         # a probe's side effect (§4MM): watermark advances, nothing shown
             if etype in _ADVANCE_EVENTS:
                 if (ev.get("payload") or {}).get("owner_requested"):
                     continue                     # the owner's own run, not "on my own" (§4LP)

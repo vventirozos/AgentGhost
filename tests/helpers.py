@@ -196,3 +196,14 @@ def extract_js_listener(source: str, event: str) -> str:
             if depth == 0:
                 return "function handler(e) " + source[j:k + 1]
     raise AssertionError(f"unbalanced braces extracting the {event} listener")
+
+
+def provide_owner_seed(monkeypatch, source_id: str = "seedtraj0001"):
+    """§4MS: idle self-play runs only on a real owner failure. Tests of the
+    phase's MECHANICS (cooldowns, anchors, ledger rows) provide one."""
+    import ghost_agent.core.owner_seeds as _os
+    seed = {"mode": "owner_failure", "cluster_key": None, "hint": "practise the failed task",
+            "source_id": source_id}
+    monkeypatch.setattr(_os, "pick_owner_failure_seed", lambda *a, **k: dict(seed))
+    monkeypatch.setattr(_os, "mark_used", lambda *a, **k: None)
+    return seed

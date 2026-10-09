@@ -66,6 +66,25 @@ _GRAPH_HUB_WORDS = frozenset({"project", "projects", "sandbox", "workspace", "ta
                               "file", "files", "folder", "thing", "things"})
 
 
+#: §4MO: a request with more than one part — a conjunction joining clauses,
+#: several questions, a semicolon between clauses (EN + GR). Commas alone do
+#: not count. §4MR: "or"/"ή" offers alternatives inside ONE question ("drive
+#: or walk?") and no longer counts; Greek writes "?" as ";" — mapped before
+#: matching, so a single Greek question is not "compound" (measured: every
+#: Greek question of 8+ words was); "κι"/"ύστερα"/unaccented forms added.
+_COMPOUND_RE = re.compile(
+    r"(?<!\w)(?:and|then|also|plus|as well as|versus|vs\.?|compare|και|κι|επίσης|επισης|μετά|μετα|ύστερα|υστερα)(?!\w)"
+    r"|\?[^?]+\?|\w[^;\n]{6,};\s+\w", re.IGNORECASE)
+_GREEK_RE = re.compile(r"[\u0370-\u03ff\u1f00-\u1fff]")
+
+
+def _is_compound_request(text: str) -> bool:
+    t = str(text or "")
+    if _GREEK_RE.search(t):
+        t = t.replace(";", "?")           # the Greek question mark
+    return bool(_COMPOUND_RE.search(t))
+
+
 def _episode_is_hydratable(ep, query: str) -> bool:
     """§4MJ: may this episode enter the prompt for ``query``?
 
@@ -83,6 +102,12 @@ def _episode_is_hydratable(ep, query: str) -> bool:
             return True
         if ("outcome_success" in ep and not ep.get("outcome_success")
                 and not str(ep.get("lesson") or "").strip()):
+            return False
+        # §4MM: a past answer to "latest version / current price" is stale
+        # by construction — never precedent in the prompt (recall still shows
+        # it, marked as dated)
+        from ..memory.episodes import is_moving_target_question
+        if is_moving_target_question(ep.get("trigger")):
             return False
         from ..memory.skills import _mostly_non_latin, _shared_content_words
         if _mostly_non_latin(query) and _shared_content_words(query, str(ep.get("trigger") or "")) < 2:
@@ -786,6 +811,11 @@ class MemoryBus:
         # worker call is enough before the reply)
         _basis = str(basis or "").strip()
         if len((_basis or query).split()) < 8 or (_basis and _basis != query.strip()):
+            return sub_queries
+        # §4MO: …and for a SINGLE-clause request — nothing to decompose. It
+        # cost 1.4–2.9 s before the first token on nearly every turn ("do
+        # you, as an AI, believe in death?", "please repeat the string …")
+        if not _is_compound_request(_basis or query):
             return sub_queries
 
         # Try LLM-based decomposition via worker pool

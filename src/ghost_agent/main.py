@@ -1176,9 +1176,14 @@ async def _handle_chat_foreground(context, body, request_id: str):
     # + the workspace event project (§4LI review: a scheduled turn with no
     # active project stamped its events with the creating turn's project)
     from .workspace.model import _EVENT_PROJECT_OVERRIDE
+    # + the reply tap (§4MR): a job added inside a streamed turn would carry
+    # that turn's tap into every later fire (inert while these bodies never
+    # stream — defence in depth)
+    from .core.reply_tap import reply_tap_context
     _clean = [(v, v.set(x)) for v, x in ((requester_role_context, "owner"), (reply_surface_context, ""),
                                          (client_deadline_context, 0.0), (verify_purpose_context, ""),
-                                         (trajectory_id_context, ""), (_EVENT_PROJECT_OVERRIDE, None))]
+                                         (trajectory_id_context, ""), (_EVENT_PROJECT_OVERRIDE, None),
+                                         (reply_tap_context, None))]
     _mark_foreground(context.agent, +1)
     try:
         return await context.agent.handle_chat(
@@ -1852,6 +1857,13 @@ async def lifespan(app):
             else:
                 pretty_log("Memory Offline", "Collection not loaded", level="WARNING", icon=Icons.WARN)
         except Exception as e:
+            from .memory.store_lock import StoreLockedError
+            if isinstance(e, StoreLockedError):
+                # §4MN: a repair script is writing the stores — never run beside
+                # it (and never memoryless). Normally caught at the top of
+                # main(); this is the backstop (exit 3 inside the lifespan)
+                pretty_log("Memory Locked", str(e), level="ERROR", icon=Icons.FAIL)
+                sys.exit(75)
             pretty_log("Memory Failed", str(e), level="ERROR", icon=Icons.FAIL)
 
         # Wire previously-dead intelligence modules. Each is independent;
@@ -3644,6 +3656,18 @@ def main():
     # Ensure directories exist
     sandbox_dir.mkdir(parents=True, exist_ok=True)
     memory_dir.mkdir(parents=True, exist_ok=True)
+
+    # §4MN r2: the single-writer lock FIRST — before any store is opened
+    # (the profile, playbook and journal constructors write on a fresh
+    # store) and before the embedder loads. Here, outside the ASGI
+    # lifespan, the exit code is really 75 (inside it uvicorn turns any
+    # startup exit into 3); launchd KeepAlive retries.
+    from .memory.store_lock import acquire_writer_lock, StoreLockedError
+    try:
+        acquire_writer_lock(memory_dir, "ghost-agent")
+    except StoreLockedError as _lk:
+        print(f"⛔ {_lk} — exiting; launchd retries.", file=sys.stderr)
+        sys.exit(75)
     
     print(f"👻 Ghost Agent (Ollama Compatible) running on {args.host}:{args.port}")
     enforce_api_key_policy(args.api_key, args.host)

@@ -24,6 +24,9 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     mem = Path(a.home) / "system" / "memory"
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    if a.apply:   # §4MN: never beside the agent (single-writer stores)
+        from ghost_agent.memory.store_lock import assert_no_other_writer
+        assert_no_other_writer(mem, "memory_repair_4mj_episodes.py")
     from ghost_agent.memory.episodes import EpisodicMemory
     con = sqlite3.connect(f"file:{mem / 'projects.db'}?mode=ro", uri=True)
     live = [r[0] for r in con.execute("SELECT title FROM projects")]

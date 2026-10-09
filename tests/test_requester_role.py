@@ -145,7 +145,7 @@ def test_the_api_sets_the_role_before_every_handle_chat():
     par = _parents(tree)
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
              and n.func.attr == "handle_chat"]
-    assert len(calls) == 2, len(calls)
+    assert len(calls) == 3, len(calls)          # §4MP: the streamed path runs the turn as a task (2 sites in one generator)
     for call in calls:
         top = _enclosing_def(call, par)
         while _enclosing_def(par.get(top), par) is not None:

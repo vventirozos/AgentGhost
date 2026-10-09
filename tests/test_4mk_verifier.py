@@ -72,11 +72,14 @@ def test_the_claim_route_receives_the_earlier_turn_block():
     from ghost_agent.core import agent as A
     tree = ast.parse(inspect.getsource(A))
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "verify_claim"]
-    assert calls
+    assert len(calls) >= 2
+    # §4MR: EVERY claim-route call wraps its evidence — the old pin checked
+    # only calls whose evidence mentioned `claim_evidence`, so a renamed
+    # local made it pass with no call checked at all
     for c in calls:
         ev = next((k.value for k in c.keywords if k.arg == "evidence"), None)
-        if ev is not None and "claim_evidence" in ast.dump(ev):
-            assert isinstance(ev, ast.Call) and ev.func.id == "_with_earlier_turn_evidence", ast.dump(ev)
+        assert isinstance(ev, ast.Call) and getattr(ev.func, "id", "") == "_with_earlier_turn_evidence", \
+            ast.dump(ev) if ev is not None else "no evidence= keyword"
 
 
 def test_the_two_stage_prompts_fence_every_section():

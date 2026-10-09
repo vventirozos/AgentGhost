@@ -444,10 +444,10 @@ READWRITE_HARD_STOP = 5
 # useless queries trip nothing until the turn cap. Measured on Aug+Sep (75
 # requests with >=4 searches): every request that ended with nothing had a
 # run of >=10 consecutive un-opened searches — but so did 26 that answered
-# from snippets. So this is a steer with the tools KEPT, never a stop, and
-# it ships behind the `search_yield_steer` randomized arm: the corpus cannot
-# say whether an earlier nudge helps or hurts the answerers, only live
-# traffic can. One steer per request; the existing caps remain the stops.
+# from snippets. So this is a steer with the tools KEPT, never a stop. It
+# shipped behind the `search_yield_steer` randomized arm; the arm was
+# concluded (§4LF) and since §4MO (operator) every requester is steered.
+# One steer per request; the existing caps remain the stops.
 SEARCH_YIELD_STEER = 10
 #: Tools whose call OPENS a search result (reset the un-opened run).
 SEARCH_OPEN_TOOLS = frozenset({"browser", "deep_research"})
@@ -488,6 +488,10 @@ class StrikeLedger:
         # nothing (no non-synthetic row) — a model that keeps trying after it
         # has read the refusal. A batch in which any call executed resets it.
         self.member_refused_batches: int = 0
+        # §4MO: consecutive batches where every call was blocked before it
+        # ran (any requester) — the report is forced at MEMBER_REFUSAL_REPORT_AT
+        self.blocked_batches: int = 0
+        self.project_refusal_batches: int = 0  # §4MO: 2nd batch with a refused project closes tools
 
     # -- failure path ------------------------------------------------------
 

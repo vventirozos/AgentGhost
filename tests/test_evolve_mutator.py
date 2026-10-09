@@ -2746,3 +2746,11 @@ def test_a_NEW_FILE_section_still_starts_its_own_offset(tmp_path):
     out, _ = M.repair_hunk_starts(d, repo)
     heads = [l for l in out.splitlines() if l.startswith("@@")]
     assert heads == ["@@ -1,2 +1,3 @@", "@@ -1,2 +1,3 @@"], heads
+
+
+@pytest.fixture(autouse=True)
+def _owner_seed_for_self_play(monkeypatch):
+    """§4MS: idle self-play now needs a real owner failure to practise —
+    these tests are about the phase's mechanics, so they provide one."""
+    from tests.helpers import provide_owner_seed
+    provide_owner_seed(monkeypatch)

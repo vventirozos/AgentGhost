@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=13.7';
+import * as matrixGraphFace from './matrix_graph.js?v=13.9';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -1902,6 +1902,22 @@ function _revealAgentBubble(div) {
     return true;
 }
 
+// §4MP: the agent retracted the reply text it had streamed (a tool call
+// followed it, or the finished reply was rewritten). Drop the text, the
+// bubble's render and any speech of it; the frames that follow replace it.
+// Returns whether anything was dropped.
+function _applyStreamRetract() {
+    if (currentAccumulatedContent === "") return false;
+    stopTTS();
+    currentAccumulatedContent = "";
+    currentStreamPrefixLen = 0;
+    currentSpeechHold = false;
+    currentTTSMutedLength = 0;
+    _cancelScheduledStreamRender();
+    if (currentAgentMessageDiv) currentAgentMessageDiv.innerHTML = "";
+    return true;
+}
+
 function _renderStreamingContent() {
     if (!currentAgentMessageDiv || currentAccumulatedContent === "") return;
     const displayContent = _stripInternalTags(currentAccumulatedContent, currentStreamPrefixLen);
@@ -3012,6 +3028,14 @@ async function sendMessage(isResume = false) {
                     // it (trivial fast path): no thumbs for this bubble.
                     if (data.ghost && data.ghost.labelable === false) currentTurnUnlabelable = true;
                     if (data.ghost && data.ghost.reasoning_unparsed === true) currentSpeechHold = true;   // §4KP
+                    // §4MP: the agent streams its reply as it is generated; when a
+                    // tool call follows the text, or the finished reply was
+                    // rewritten, it RETRACTS what it sent — drop it (and any speech
+                    // of it); what follows replaces it.
+                    if (data.ghost && data.ghost.retract === true) {
+                        _applyStreamRetract();
+                        continue;
+                    }
 
                     if (data.choices && data.choices[0] && data.choices[0].delta && data.choices[0].delta.content) {
                         chunkContent = data.choices[0].delta.content;
@@ -4804,6 +4828,16 @@ function _evictAuthedBlobCache() {
     }
 }
 
+// §4MR: the blob types an authed image may keep — raster only (SVG and
+// anything else become inert octet-streams, which an <img> cannot show and
+// a new tab downloads instead of running).
+const _RASTER_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp',
+                                     'image/avif', 'image/bmp']);
+function _safeImageBlobType(type) {
+    const t = String(type || '').split(';')[0].trim().toLowerCase();
+    return _RASTER_IMAGE_TYPES.has(t) ? t : 'application/octet-stream';
+}
+
 async function _toAuthedBlobUrl(rawSrc) {
     if (!rawSrc || !_ownApiUrl(rawSrc, '/api/download/')) return rawSrc;
     if (_authedBlobCache.has(rawSrc)) {
@@ -4815,7 +4849,12 @@ async function _toAuthedBlobUrl(rawSrc) {
     }
     const res = await fetch(rawSrc);
     if (!res.ok) throw new Error(`image fetch ${res.status}`);
-    const blob = await res.blob();
+    const raw = await res.blob();
+    // §4MR: a blob keeps the server's type, and a blob: URL opened in a new
+    // tab runs in THIS origin — an agent-linked SVG could then script the
+    // page and read the key. Only raster types stay images.
+    const safeType = _safeImageBlobType(raw.type);
+    const blob = safeType === raw.type ? raw : new Blob([raw], { type: safeType });
     const blobUrl = URL.createObjectURL(blob);
     _authedBlobCache.set(rawSrc, blobUrl);
     _evictAuthedBlobCache();

@@ -215,5 +215,26 @@ time_penalty = age_days / (30 · log(retrieval_count + e))</code></pre>
   <p class="note">&sect;4LA: an episode twin ranks with the facts (p_score 1, like auto), not above them — an old "I'm a
   doctor" turn outranked the owner's correction at −12.</p>
 </main>
+
+<h2 id="4mn">§4MN (2026-10-08): one writer, a torn sidecar, compaction</h2>
+<ul>
+  <li><strong>Single writer.</strong> <code>VectorMemory.__init__</code> takes an exclusive, non-blocking <code>flock</code> on <code>&lt;memory&gt;/store.writer.lock</code> (<code>memory/store_lock.py</code>) before chroma opens. A second process gets <code>StoreLockedError</code>; the OS releases the lock on exit, crash or kill. The agent takes it at the top of <code>main()</code>, before any store is constructed and before the embedder loads, and exits 75 when a repair script holds it; KeepAlive retries. It never runs without memory, and a refused boot writes nothing. Repair scripts call <code>assert_no_other_writer</code>. Why: two processes writing chroma, the first then SIGTERMed (the deploy path), left a store that segfaulted on every open (4 of 7 runs). The agent then crash-looped with no Python error, and the recovery script crashed on the same read.</li>
+  <li><strong><code>embedder.json</code></strong> is written atomically and only when it changes; it used to be rewritten in place on every boot. A sidecar that exists but cannot be parsed is a torn write. The torn file is moved aside to <code>embedder.json.torn-&lt;ts&gt;</code> as evidence, a warning is logged and the sidecar is re-stamped, instead of refusing to boot forever with "re-embed everything".</li>
+  <li><strong>Compaction.</strong> The HNSW index keeps one slot per vector ever added: 35,087 slots for 423 live rows, 58 MB loaded into RAM whole, and two live vectors no longer found themselves. <code>scripts/compact_vector_store.py</code> runs with the agent stopped:
+    <ol>
+      <li>takes a verified snapshot;</li>
+      <li>rewrites the collection from its own stored embeddings, with no model call;</li>
+      <li>checks every id and sampled self-queries;</li>
+      <li>optimises the full-text index (97% of <code>chroma.sqlite3</code>, which nothing queries) and VACUUMs;</li>
+      <li>removes segment folders the segments table no longer names.</li>
+    </ol>
+    On a copy of the live store: 43 MB → 2.5 MB of SQLite, and 58 MB → 168 KB of index.</li>
+</ul>
+<h2 id="4mr">§4MR (2026-10-09): snapshots from a child process; every repair script takes the lock</h2>
+<ul>
+  <li><strong>The daily snapshot is taken from a child process</strong> (<code>memory.snapshot.take_snapshot_isolated</code>), while the dream holds <code>VectorMemory._get_lock()</code>. Taken inside the agent process, the copy of <code>chroma.sqlite3</code> tore while the agent wrote vectors: chroma writes through its own bundled SQLite, and POSIX file locks do not exclude within one process. A reviewer measured 6 of 6 copies torn. Verification refused every one, so the cost was a missed daily backup. Across processes the file locks hold (5 of 5 clean); holding the in-process lock also pauses the agent's own writers for the copy.</li>
+  <li><strong>Every repair script that writes stores under <code>--apply</code></strong> calls <code>assert_no_other_writer</code> before its main block. 26 older scripts did not, and three of them opened chroma on the live store directly, which is the two-writer case that left the store segfaulting. The pin enumerates the scripts from their AST (an <code>--apply</code> constant plus a store-opening call).</li>
+  <li><strong>Restore:</strong> move the live <code>memory/</code> folder aside, then copy the snapshot's folder into its place (<code>scripts/snapshot_stores.py</code>). Copying <em>into</em> a live folder left a crash's <code>-wal</code> there, and SQLite replayed it onto the restored database.</li>
+</ul>
 </body>
 </html>

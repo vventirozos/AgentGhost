@@ -481,6 +481,12 @@ async def build_coding_task_agentic(context, description: str, *, tool_runner: T
             detail_parts.append(witness)
             continue
         except Exception as e:  # noqa: BLE001
+            # §4MS: a background leaf deferred for a live user request is
+            # not a crashed attempt — stop the build; the step's gate
+            # reopens the leaf for a later window
+            from .llm import BackgroundDeferred as _BgDeferred
+            if isinstance(e, _BgDeferred):
+                raise
             witness = f"attempt {attempt} crashed: {type(e).__name__}: {e}"
             detail_parts.append(witness)
             continue

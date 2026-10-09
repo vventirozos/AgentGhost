@@ -244,9 +244,9 @@
     shallow-<em>merges</em> it into the existing metadata inside a single
     <code>BEGIN IMMEDIATE</code> transaction. The metadata blob carries system state
     (design ledger, config slot, <code>steps_used/steps_cap</code>, research index, runtime
-    counters), so the old whole-dict replace made even the documented budget-raise
-    <code>action=update metadata={"steps_cap": 100}</code> silently destroy all of it —
-    that call now touches only <code>steps_cap</code>.</li>
+    counters), so the old whole-dict replace made a budget-raise through
+    <code>action=update metadata=…</code> silently destroy all of it. (Since §4MQ the model's
+    <code>metadata=</code> cannot name a budget key at all; the owner uses <code>action=budget</code>.)</li>
     <li><strong>No replace from the tool surface.</strong> The tool deliberately does not
     expose the store's <code>metadata_replace</code> flag: merge is the only behavior
     reachable from the LLM; a true whole-dict replacement is a deliberate store-API call
@@ -434,10 +434,19 @@
         <li>The gate resolves the target exactly once (<code>_lifecycle_target</code>): an id (any case), a title, or the current project. A name that matches nothing is refused — it used to fall through to the current project, and <code>unrelease</code>, which ignores <code>title</code>, un-released that one. The confirmed action runs on the project the preview named.</li>
         <li>No preview for an action that will refuse anyway (releasing a project that is not DONE or has no directions; un-releasing one that is not RELEASED): the action's own error comes back.</li>
         <li><code>probe_created</code> and <code>autopilot</code> are system-only metadata keys: the model's <code>metadata=</code> (object or JSON string) cannot set them. <code>probe_created</code> is dropped; <code>autopilot</code> is refused with a pointer to <code>action=autopilot</code>, so "turn it off" is never a silent no-op.</li>
+        <li><strong>Budget keys are system-only too</strong> (&sect;4MQ, <code>project_advancer.BUDGET_METADATA_KEYS</code>): the step, runtime and tool-call caps and counters, <code>checkpoint_every</code>, and the gates' state. The model's <code>metadata=</code> naming one is refused with a pointer to <code>action=budget</code>, because a background turn could otherwise raise its own cap.</li>
         <li>A current project that no longer exists is refused, not previewed.</li>
       </ul>
     </li>
     <li><strong>Idle autoadvance is opt-in.</strong> The idle loop advances only ACTIVE projects with <code>metadata.autopilot</code> (<code>project_advancer.idle_candidates</code>). The owner's own <code>autoadvance</code> turns it on; <code>action=autopilot enabled=true|false</code> turns it on or off for the project named by <code>project_id</code> or <code>title</code> (the current one only when neither is given), and without <code>enabled</code> reports it (so does <code>status</code>). Any other <code>enabled</code> value is refused. Only the owner's turn counts (<code>_owner_turn_now</code>): a probe, a scheduled task (<code>sched-</code>), a job or a sub-agent neither opts in nor counts as "asked" — their advances run under the unattended rules. At deploy no project had autopilot, so idle advancing stops until you opt a project in.</li>
+    <li><strong>Budgets, pauses and a kill switch</strong> (&sect;4MQ):
+      <ul>
+        <li><code>action=budget</code> with <code>metadata={steps_cap, runtime_cap_hours, checkpoint_every}</code> sets a project's unattended budget; only your own turn can do this. <code>runtime_cap_hours</code> is the unattended allowance between your looks (<code>unattended_runtime_cap_seconds</code>), not a lifetime cap on your own runs. Without metadata it reports the budget. Values are range-checked, and unknown keys are refused.</li>
+        <li><code>status</code>, <code>budget</code> and <code>autopilot</code> show the budget view: steps used/cap, unattended hours used/cap since your last look, the check-in cadence, the no-progress streak and the last pause.</li>
+        <li><code>action=autopilot project_id=all enabled=false</code> turns autopilot off on every project. It never turns them all on.</li>
+        <li>Turning autopilot on (or your own <code>autoadvance</code>) resets the gates: no pause, streak 0, check-in count 0, allowance 0. A step already running keeps its marker. When your <code>autoadvance</code> turns autopilot back on, the result says so in an <code>autopilot</code> field, including the pause it cleared.</li>
+        <li>A batch has three new stop reasons: <code>deadline</code> (the request's time is nearly up), <code>autopilot_paused</code> (an unattended batch hit a gate) and <code>autopilot_off</code> (a background batch on a project without autopilot does not run).</li>
+      </ul></li>
     <li><strong>No DONE on weak evidence while unattended.</strong> See <a href="../core/project_advancer.html#4lp">project_advancer</a>.</li>
     <li><strong>The digest counts only work nobody asked for.</strong> An owner-run step is logged with <code>owner_requested</code> and skipped by "While you were away"; with nothing advanced the header reads "project updates", never "advanced 0".</li>
   </ul>
@@ -446,5 +455,18 @@
   <h2 id="4lu">Confirming a preview with "yes" <span class="tag">2026-10-05 &sect;4LU</span></h2>
   <p>forget, reset_all and manage_projects release/unrelease/delete are two steps: a preview with a token, then the user's confirmation in a LATER turn. The token lives in the preview's tool result, and the chat API / web history carry only reply text — so on the "yes" turn the model no longer had it, and the confirmation failed (found deleting the PostgreSQL manual). Each preview is now stamped with its conversation (<code>conversation_key_context</code>, the hash of the first user message, set by <code>reconcile_conversation</code>), and a confirm whose token is missing, unknown or just <code>'yes'</code> resolves to the newest live preview of that kind in THIS conversation, for the same target (<code>memory._resolve_plan</code>). Who may confirm is unchanged: <code>_confirm_allowed</code> still requires the user, in a later turn; member turns carry no conversation and get no fallback; another conversation's preview is never used. The preview instructions tell the model it may pass <code>'yes'</code>. Pins: <code>tests/test_4lu_confirm.py</code>.</p>
 </main>
+
+<h2 id="4mm">§4MM (2026-10-08): a project is created when the owner wants one</h2>
+<p><code>_create_not_requested</code> gates <code>action=create</code> on <em>interactive</em> turns (the owner's or a probe's); background runs are not gated. Rules, in order:</p>
+<ol>
+  <li>A negated <em>create</em> ("don't create/make/start a project", "without a project", "μην φτιάξεις πρότζεκτ") → refused. Only a negated create counts: "I have no project for this, please set one up" is an ask.</li>
+  <li>The message names a project ("project", "workspace", "initiative", "track this", "πρότζεκτ", "έργο", "εργασία") or asks to build something ("build", "make" but not "make sure", "create", "develop", "start", "set up", "φτιάξε", …) → allowed.</li>
+  <li>One of the conversation's last four user messages asked to <em>build</em> something → allowed. "Call it Snake" answers the agent's question after "create a project for a snake game". Turn 38's history ("show all projects", "delete projects …") never asked to build, so it does not count (<code>context.recent_user_contents</code>).</li>
+  <li>A short yes to the agent's own offer ("do it", "ok, proceed") → allowed.</li>
+  <li>Anything else → refused.</li>
+</ol>
+<p>The same gate covers <code>action=promote_from_context</code>. Measured on history: of 41 past owner creates, it refuses 3. Two are turns 34 and 38; the third reused an existing project.</p>
+<p>A refusal is a <em>designed stop</em> (<code>project_not_requested</code>): no strike and no turn failure. The model is told to do the task directly. Turns 34 and 38 had created a project from "Test the theory that 4-layer recursive thinking …", the second time minutes after the owner deleted the first. It took six retries before the owner got the answer.</p>
+<p>The hard-delete result now lists what was removed and what was <strong>kept</strong>: trajectories, general lessons, and vector entries until the next reconcile. It used to say "no trace remains", which was not true.</p>
 </body>
 </html>

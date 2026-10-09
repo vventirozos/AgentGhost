@@ -1240,12 +1240,12 @@ async def test_full_streamed_turn_snapshots_lockdown_at_build_site(tmp_path: Pat
         return (f"data: {_json.dumps({'choices': [{'delta': delta}]})}\n\n"
                 .encode())
 
-    # Two-act script: response 1 emits a tool_call while the reasoning
-    # channel disclaims tools — the dual-channel drop at the "reasoning
-    # channel disclaimed tools" guard sets force_final_response and
-    # loops; response 2 is then a FORCED-FINAL generation, which with
-    # stream:true takes the client-SSE branch that builds StreamState
-    # (the build site under test). Verified against the live guard.
+    # Two-act script: response 1 emits a tool_call that a designed stop
+    # (clarify-first, patched below) blocks — the batch tail sets
+    # force_final_response and loops; response 2 is then a FORCED-FINAL
+    # generation, which with stream:true takes the client-SSE branch that
+    # builds StreamState (the build site under test). §4MO: the "reasoning
+    # disclaimed tools" guard this used to ride is telemetry only now.
     call_n = {"n": 0}
 
     def make_stream(*a_, **k_):
@@ -1276,7 +1276,9 @@ async def test_full_streamed_turn_snapshots_lockdown_at_build_site(tmp_path: Pat
     body = {"messages": [{"role": "user", "content": "stream an answer"}],
             "stream": True}
     with patch("ghost_agent.core.agent.get_active_tool_definitions",
-               side_effect=arm_and_no_tools):
+               side_effect=arm_and_no_tools), \
+            patch("ghost_agent.core.agent._clarify_first_block",
+                  return_value="SYSTEM BLOCK — clarify first: ask the user."):
         out = await a.handle_chat(
             body, background_tasks=MagicMock(), request_id="req-mood-snap")
 

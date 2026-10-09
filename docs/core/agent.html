@@ -211,8 +211,9 @@
     (review, 2026-09-09). Now <code>unparsed_call_markup_present</code> — the one predicate both paths use: call
     dialects only, not <code>&lt;tool_response&gt;</code>, not inline code, not the cognitive watchdog's own
     <code>replan</code> marker — is evaluated BEFORE the scrub, and if it held, the reply ends with one line:
-    "[A tool call in this reply could not be parsed and was NOT executed — the step it described did not
-    happen.]" No tool-count gate: the turn whose only call failed to parse ran zero tools. The finalize scrub
+    "[A tool call written in this reply was NOT executed — the step it described did not happen.]" (§4MM:
+    reworded from "could not be parsed", which was false for a well-formed call written into a final report that
+    runs no tools) No tool-count gate: the turn whose only call failed to parse ran zero tools. The finalize scrub
     also gained the stream scrub's backtick guard. Pins: <code>tests/test_reply_toolcall_scrub.py</code>
     (executed through <code>_finalize_and_return</code>).</li>
     <li><strong>The smoothing gate stays at ≥2 real tool runs.</strong> §4FS lowered it to ≥1 for a day: a
@@ -1453,7 +1454,7 @@
     <li><strong>A figure the request already contains is an echo, not content.</strong> <code>_NARRATION_CONTENT_RE</code> counts any 2+-digit figure as content, so the two figures copied from the user's own request made the announcement an answer. The user's request is now threaded through the predicate (<code>narration_only(text, request=)</code>, <code>forced_final_has_no_answer(…, request)</code>, <code>is_narration_only_trim(…, request)</code>, <code>reply_shape_check.refute_narration_only(…, request=)</code>, the agent's <code>_forced_final_has_no_answer</code> / <code>_announced_work_without_acting</code> wrappers) and <code>_mask_request_echoes</code> blanks, before the content check, every figure that appears verbatim in the request. A figure the reply <em>contributes</em> still counts; a caller that passes no request gets the pre-§4JI verdict, never a wider one. The three loop call sites — the forced-final decision, the zero-tool work nudge and the shape refutation — pass <code>last_user_content</code> / <code>request_text</code>.</li>
     <li><strong>The work nouns in their other forms.</strong> "κάνω πιο στοχευμένες αναζητήσεις" named no work — the Greek rule matched only <em>κάνω [μια] αναζήτηση/έρευνα/έλεγχο/επαλήθευση</em> in the singular, directly after the verb; "searches" was not "search". Now: up to three words between <em>κάνω</em> and the noun, singular and plural with either accent (αναζήτηση / αναζητήσεις, έλεγχο / ελέγχους), <code>search(?:es)?</code>.</li>
     <li><strong>"You" plus a reporting verb points back at the request.</strong> <code>_NARRATION_ADDRESSED_RE</code> read "the items you mention" as addressed to the user; "you mention / asked / said / sent / gave …" is exempt, a question, "your", and "you" as the agent of future work remain an address.</li>
-    <li><strong>The no-progress breaker arms the §4IG flag.</strong> Six breaker sites set <code>force_final_response</code> without <code>context._breaker_forced_final</code> — the no-progress hard stop, the never-extracted navigate, the §4IB same-error report, the Failure Cap, the Think-Loop Halt and the blocked-preflight stop — so a tool call on their forced final was not the §4IG no-answer. All six arm it now; the four forced finals that are <em>not</em> a breaker (the one-task latch, the latch repair round, the no-tool disclaimer, the planner's "no tool") are named as such in the pin, and any new unlisted site must arm.</li>
+    <li><strong>The no-progress breaker arms the §4IG flag.</strong> Six breaker sites set <code>force_final_response</code> without <code>context._breaker_forced_final</code> — the no-progress hard stop, the never-extracted navigate, the §4IB same-error report, the Failure Cap, the Think-Loop Halt and the blocked-preflight stop — so a tool call on their forced final was not the §4IG no-answer. All six arm it now; the four forced finals that are <em>not</em> a breaker (the one-task latch, the latch repair round, the no-tool disclaimer (removed in §4MO), the planner's "no tool") are named as such in the pin, and any new unlisted site must arm.</li>
     <li><strong>Measured before shipping:</strong> on the 2,922 recorded replies (leading digest banners peeled to the loop's view) the shipped predicate marks 8 narration-only without the request and 9 with it — the one new hit is e69cab30 itself. The search-capability gap (36 off-topic results for a Greek legal specific) is what the turn actually failed on; that is a retrieval problem, not a guard, and is left as observed.</li>
   </ul>
   <p class="note">
@@ -1946,5 +1947,70 @@
   </ul>
   <p>Details: <a href="../tools/vision.html#4lm">vision &sect;4LM</a>.</p>
 </main>
+
+<h2 id="4mm">§4MM (2026-10-08): image provenance, the disclaimer guard, the promotion footer</h2>
+<ul>
+  <li><strong><code>_foreign_image_note</code>:</strong> when a request generated <em>no</em> image and its reply shows a <code>gen_*</code> one, the reply ends with "ℹ️ No image was generated in this request — `gen_x.png` is from an earlier request / does not exist". A request that did generate one is left alone, since an edit shows before and after. The streamed path leaves missing files to its own "do not exist" note. Turn 40 had described an image no tool made; turn 43 showed an earlier turn's image under a new description, and the verifier confirmed it.</li>
+  <li><strong>The no-tool disclaimer guard</strong> keeps the call when the reasoning says it will use the tool after the no-tool step: "…without tools first, then generate an image" The guard had dropped that image call. <em>Superseded in §4MO:</em> the guard no longer drops anything, and the exemption helper was removed.</li>
+  <li><strong>The project-promotion footer</strong> is never offered on a public reply, and a member's wrapped message is never counted as an owner turn or used as the title.</li>
+  <li><strong>The not-executed note</strong> now reads "A tool call written in this reply was NOT executed". It no longer says "could not be parsed", which was false for a well-formed call written into a report turn.</li>
+</ul>
+
+<h2 id="4mo">§4MO (2026-10-08): the turn loop — stopping, dead ends, deadlines, the fast path</h2>
+<ul>
+  <li><strong>The "without tools" guard is telemetry only.</strong> It used to drop every tool call and switch tools off whenever the reasoning matched "without tools" or "answer directly". Things it broke:
+    <ul>
+      <li>a profile correction ("No tools needed for the calculation; I'll use update_profile") was never saved;</li>
+      <li>a search and a repair round's browser call were dropped;</li>
+      <li>turn 40's image was never made.</li>
+    </ul>
+    The §4MM exemption missed that live case. A word rule that keeps flip-flopping is inverted, not patched again: the calls run, and the divergence is logged.</li>
+  <li><strong>A designed stop that asks the user closes the tool phase.</strong> These are the loop's own pre-dispatch blocks (<code>_ASK_THE_USER_STOPS</code>):
+    <ul>
+      <li><code>clarify_first</code>;</li>
+      <li>the no-photo block (<code>subject_photo_missing</code>), which fires on an image retry that drops or replaces a subject the tool found no photo for.</li>
+    </ul>
+    The decision is made after the whole batch, so the alert ("ask the user exactly what was asked") follows every tool result. A probe had renamed the subject and run four searches after "no photo — the user decides". The tool's <em>own</em> first "no photo" does not close tools: it allows one retry with a corrected spelling, as its text says. <code>project_not_requested</code> ("do the task directly") closes tools on the second <em>batch</em> holding a refusal (<code>strikes.project_refusal_batches</code>). Two refusals in one batch count once, because the model has not read either yet. Neither stop is a breaker: the answer is due, and the question to the user is that answer.</li>
+  <li><strong>Image renders have an expected duration.</strong> <code>declared_wait_s</code> reads <code>tools.image_gen.expected_render_seconds</code>: the longest of the node's last three renders of the same kind, with defaults of 600 s and 240 s. A render is an edit when it has subjects or any reference-image key the tool accepts (<code>_REF_KEYS</code>); otherwise it is a generate. A render that would end inside the report reserve is refused before it starts. In turn a171b275, an edit started with 863 s left right after an 860 s one; a slower render would have shipped nothing after 26 minutes.</li>
+  <li><strong>Blocked-only batches end in a report for every requester.</strong> Three batches in a row where every call was blocked before it ran force the report (<code>strikes.blocked_batches</code>); before, only members were counted. Parse errors keep their own branch. Blocks that already book a strike (<code>_STRUCK_BLOCK_CODES</code>: unknown or disabled tool, bad JSON, empty write, constraint violation, invocation error) are not counted a second time.</li>
+  <li><strong>The owner's search run is steered at 10</strong> (operator decision), the same as members. The experiment arm was concluded and left the owner unbounded: one turn ran 22 searches in 225 s. The spec's default is now <code>enabled=False</code>, matching the live registry.</li>
+  <li><strong>The in-turn verifier wait is OFF</strong> (operator decision; the launcher sets <code>GHOST_CRITIC_REPAIR_BUDGET=0</code>). At 25 s, 0 of 14 owner verdicts landed in time. A verdict still corrects at the next message.</li>
+  <li><strong>The fast path:</strong>
+    <ul>
+      <li>A DBA word inside a file name or a moving-target lookup ("what is the latest version of postgresql?") no longer loads the specialist persona, which cost +8 s of prefill.</li>
+      <li>Query decomposition runs only for a request with several parts (<code>_is_compound_request</code>). It cost 1.4–2.9 s before the first token on nearly every turn.</li>
+      <li>The overview's learning summary (<code>allow_stale=True</code>) is served from the last report, up to a day old, and refreshed in the background. Before, every greeting paid a 3.3 s corpus walk. Only one refresh runs per key. An explicit <code>action='learning'</code> is never served stale.</li>
+    </ul></li>
+  <li><strong>Token streaming</strong> (found here: since the planner went off on 10-04, streamed clients got the whole reply in one burst) was restored in <a href="#4mp">§4MP</a>.</li>
+  <li><strong>Multi-part detection</strong> (§4MR): "or"/"ή" offers alternatives inside one question ("drive or walk?") and no longer counts as a second part. In Greek text <code>;</code> is the question mark: it is mapped to <code>?</code> before matching, so a single Greek question is no longer decomposed. "κι", "ύστερα" and the unaccented forms count as joining words. A <code>;</code> between clauses still counts.</li>
+  <li><strong>A System-3 pivot batch</strong> resets the blocked-batch count too (§4MR): it ran a call, and it returns before the batch tail.</li>
+  <li><strong>One corrected spelling</strong> (§4MR): after the tool's "no photo", one respelled retry is allowed. A second no-photo answer blocks any further spelling and closes tools (<code>_missing_subject_block</code>). A reviewer's run had tried 6 spellings, each a photo search.</li>
+</ul>
+
+<h2 id="4mp">§4MP (2026-10-08): live tokens on the tools-on generation</h2>
+<p>When the planner arm was concluded (10-04), every answer came from the tools-on call. That call streams from llama-server internally, but a streaming client got the finished reply in one burst, after finalize: on owner turns the first content arrived about 11 s late (p90 58 s, including the old 25 s verifier wait). The comment "with the planner disabled, default to final generation (stream directly)" no longer described the code.</p>
+<p><code>_run_internal_turn</code> now feeds the request's <code>ReplyTap</code> (<code>core/reply_tap.py</code>) when <code>stream_response</code> is set:</p>
+<ul>
+  <li><code>begin_generation()</code> before each upstream call.</li>
+  <li><code>feed(full_content)</code> on each content delta.</li>
+  <li><code>tool_call_seen()</code> on a native tool-call delta.</li>
+</ul>
+<p>The tap holds the first <code>HOLD_CHARS</code> (240) characters. Of the 16% of tool-call generations that write text before the call, the p90 is 238 characters. Any markup latches the tap off. At the end the route commits, or sends one retract and the whole reply; see <a href="../api/routes.html">routes</a>.</p>
+<p>The prompt, the tools and the payload bytes are unchanged, so the prompt cache is unaffected (§4LE).</p>
+<p>Clients:</p>
+<ul>
+  <li>Web: <code>_applyStreamRetract</code> clears the bubble and stops speech.</li>
+  <li>ClockworkPi: <code>agentapi.frame_retract</code>, then the <code>retract_response</code> signal clears the bubble, and <code>_silence</code> stops speech.</li>
+  <li>CLI: a terminal prints "↺ revised" and starts the reply again; piped output asks for the final reply only.</li>
+</ul>
+
+<h2 id="4ms">§4MS (2026-10-09): the idle cycle</h2>
+<ul>
+  <li><strong>Idle jobs are bounded and yield to the owner.</strong> <code>_run_idle_job(coro, label, cap_s=IDLE_JOB_CAP_S)</code> runs fresh self-play and the counterfactual replays with a 900 s wall cap, and cancels them the moment a user request arrives (<code>_owner_active()</code>). The bench phase does not start while one is active. The tick used to check for the owner only at its start, and a self-play tick ran up to 2,140 s. Owner turns that started inside one waited a median 37 s for their first model call, against 12 s clean.</li>
+  <li><strong>Self-play practises only your failures</strong> (operator decision, <code>core/owner_seeds.py</code>). A run needs a seed: a real owner turn from the last 14 days whose outcome is FAILED, that used tools, that was not aborted, and that has not been practised (<code>selfplay/owner_seeds_used.json</code>; a seed is marked used only by a run that concluded). The seed's request and failure become the generator's brief (<code>synthetic_self_play(seed_override=…)</code>). A seeded run never takes a template, a journal-mined challenge, or the template fallback after failed generation. Without a seed the whole phase, counterfactual replay included, does not run, and records a <code>declined</code> heartbeat so liveness does not read it as dead. Before: 341 runs in 14 days, 93% first-try passes, no effect on owner turns. At deploy only 3 seeds existed, none of them a skill gap, so self-play will run rarely; it waits for real failures.</li>
+  <li><strong>Reflection reads only what is new</strong> (<code>fresh_reflectable</code>): reflectable failures not yet reflected. With none, the pass is skipped without a log line. 152 of 157 passes had reflected nothing.</li>
+  <li><strong>Interrupted turns are not failures.</strong> A client disconnect or a process shutdown records <code>[TURN_INTERRUPTED]</code> instead of <code>[ATTEMPT_ABORTED_TURN]</code>: the outcome stays UNKNOWN and <code>trajectory_may_teach</code> refuses the row. An owner's Stop is still recorded as an abort, and so is a cancel at or past the request's deadline (<code>interruption_marker</code>): the interface's 1800 s timeout reads like a disconnect, but it is the agent being too slow. An idle coding build whose call is deferred for a live request stops (<code>BackgroundDeferred</code> propagates out of the leaf loop) instead of counting a crashed attempt and retrying.</li>
+  <li><strong>Competence counts only real user turns</strong> (a probe's tool outcomes no longer move the owner's prior). The self-play and bench cooldown anchors are written to disk when set, not at the next tick. A failing counterfactual slot logs a WARNING (it was DEBUG).</li>
+</ul>
 </body>
 </html>

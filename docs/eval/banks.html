@@ -345,6 +345,9 @@ EOF</pre>
   recovered on wrap.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+
+<h2 id="4ms">§4MS: saturated banks retire from the idle walk</h2>
+<p>Operator decision (2026-10-09). <code>saturated_banks()</code> lists banks whose last <code>SATURATION_WINDOW</code> (30) graded runs pass at <code>SATURATION_PASS_RATE</code> (90%) or more; aborted and no-result runs are not grades. The idle bench (<code>pick_next_item(skip_saturated=True)</code>) skips them; an operator drain is never filtered. <code>GHOST_BENCH_KEEP_BANKS=a,b</code> keeps a bank running. At deploy all three banks (gsm8k, gsm8k_text, mbpp; 94.5% in October) were saturated, so the idle bench stops.</p>
 </main>
 </body>
 </html>

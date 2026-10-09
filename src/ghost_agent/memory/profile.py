@@ -9,6 +9,8 @@ from ..utils.logging import pretty_log, Icons
 from .temporal import anchor as _anchor, derive as _derive
 from .temporal import has_anchor as _has_anchor, signature as _signature
 
+logger = logging.getLogger("GhostAgent")
+
 # Keys whose value is inherently SINGLE-valued, so a second write is a
 # CORRECTION and must REPLACE rather than merge.
 #
@@ -192,6 +194,42 @@ def mentions(value, target) -> bool:
     if " " in t:
         return re.search(r"(?<!\w)" + re.escape(t) + r"(?!\w)", v) is not None
     return t in re.split(r"[^\w.\-]+|(?<!\w)[.\-]|[.\-](?!\w)", v) or t in re.split(r"\W+", v)
+
+def purge_removed_archive(path, days: float) -> int:
+    """§4MN: drop `profile_removed.jsonl` lines older than ``days`` — line by
+    line (one unreadable line no longer stops the whole purge: r2), to a
+    unique, fsynced temp file. Also called from the dream so the retention
+    holds without a next forget. Returns lines dropped."""
+    import time as _time
+    p = Path(path)
+    if not p.exists():
+        return 0
+    cutoff = _time.time() - float(days) * 86400
+    try:
+        rows = p.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return 0
+    keep = []
+    for r in rows:
+        if not r.strip():
+            continue
+        try:
+            ts = float((json.loads(r) or {}).get("removed_at") or 0)
+        except Exception:  # noqa: BLE001 — unreadable: keep (never lose data to a parse error)
+            keep.append(r)
+            continue
+        if ts >= cutoff:
+            keep.append(r)
+    dropped = len([r for r in rows if r.strip()]) - len(keep)
+    if dropped:
+        tmp = p.with_name(f"{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write("".join(k + "\n" for k in keep))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, p)
+    return dropped
+
 
 class ProfileMemory:
     def __init__(self, path: Path):
@@ -429,10 +467,49 @@ class ProfileMemory:
             if item is None:
                 item = (data.get(str(category).lower()) or {}).get(str(key).lower())
             if isinstance(item, dict) and "previous" in item:
+                if not self._archive_removed(_c, _k, item["previous"], "drop_previous"):
+                    return self._ARCHIVE_FAILED
                 del item["previous"]
                 self.save(data)
                 return f"Removed the previous value of {category}.{key}"
         return f"No previous value of {category}.{key}"
+
+    #: §4MN: profile values removed by a forget/delete, kept this many days so
+    #: a mistaken forget can be undone (episodes and graph edges were archived;
+    #: the owner's own facts were the one store deleted with no copy)
+    REMOVED_RETENTION_DAYS = 30
+    # starts with "Error": every caller's error test reads it as a refusal
+    # (r2: the forget report printed "✅ Removed" over this line)
+    _ARCHIVE_FAILED = "Error: the profile value could not be archived first — NOTHING was removed."
+
+    def _archive_removed(self, cat: str, key: str, value, how: str) -> bool:
+        """Append the value about to be removed to `profile_removed.jsonl`
+        (fsynced) and drop lines past the retention. False = could not be
+        archived: the caller removes nothing (fail closed, as episodes do)."""
+        import time as _time
+        path = self.file_path.with_name("profile_removed.jsonl")
+        try:
+            from ..utils.json_store import open_append
+        except Exception:  # noqa: BLE001
+            open_append = None
+        try:
+            line = json.dumps({"removed_at": _time.time(), "category": cat, "key": key,
+                               "value": value, "how": how}, ensure_ascii=False, default=str) + "\n"
+            if open_append is not None:
+                with open_append(path) as fh:
+                    fh.write(line)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+            else:  # pragma: no cover
+                with open(path, "a", encoding="utf-8") as fh:
+                    fh.write(line)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+        except OSError as e:
+            logger.warning("profile removal archive failed (%s) — nothing removed", e)
+            return False
+        purge_removed_archive(path, self.REMOVED_RETENTION_DAYS)
+        return True
 
     def remove_item(self, category: str, key: str, item_text: str) -> str:
         """Remove ONE exact item from a list field (the forget executor's
@@ -447,6 +524,9 @@ class ProfileMemory:
             keep = [i for i in items if str(unwrap(i)) != str(item_text)]
             if len(keep) == len(items):
                 return f"No item {item_text!r} in {cat}.{k}"
+            if not self._archive_removed(cat, k, [i for i in items if str(unwrap(i)) == str(item_text)],
+                                         "remove_item"):
+                return self._ARCHIVE_FAILED
             if keep:
                 data[cat][k] = keep if len(keep) > 1 else keep[0]
             else:
@@ -473,6 +553,10 @@ class ProfileMemory:
                     continue
                 for k, item in sub.items():
                     if isinstance(item, dict) and "previous" in item and mentions(unwrap(item["previous"]), t):
+                        if not self._archive_removed(cat, k, item["previous"], f"previous mentioning {t}"):
+                            # said, never skipped silently (r2)
+                            out.append(f"Error: the previous value of {cat}.{k} could not be archived — NOT removed")
+                            continue
                         del item["previous"]
                         out.append(f"Removed the previous value of {cat}.{k}")
             if out:
@@ -691,6 +775,8 @@ class ProfileMemory:
                 cat, k = self.canonicalize(cat, k)
 
             if cat in data and k in data[cat]:
+                if not self._archive_removed(cat, k, data[cat][k], "delete"):
+                    return self._ARCHIVE_FAILED
                 del data[cat][k]
                 # Clean up empty categories
                 if not data[cat]:
@@ -743,12 +829,15 @@ class ProfileMemory:
                 return mentions(unwrap(val), target_lc)
 
             existing = data[cat][k]
+            _how = f"prune:{target_lc}"
 
             if isinstance(existing, list):
                 removed = [it for it in existing if _mentions(it)]
                 if not removed:
                     return f"No matching value under {cat}.{k}"
                 kept = [it for it in existing if not _mentions(it)]
+                if not self._archive_removed(cat, k, removed, _how):
+                    return self._ARCHIVE_FAILED
                 if kept:
                     # Collapse a singleton list back to a scalar for tidiness
                     # (mirrors how update() promotes scalar→list only when >1).
@@ -765,6 +854,8 @@ class ProfileMemory:
 
             # Scalar value.
             if _mentions(existing):
+                if not self._archive_removed(cat, k, existing, _how):
+                    return self._ARCHIVE_FAILED
                 del data[cat][k]
                 if not data[cat]:
                     del data[cat]

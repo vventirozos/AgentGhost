@@ -432,7 +432,8 @@ class TestBusSubQueriesAreLogged:
             ["auth middleware architecture", "schema migration patterns"])}}]})
         caplog.set_level(logging.INFO)
         await bus.hydrate_context(
-            "How should I handle the authentication migration given compliance requirements",
+            # compound: a single-clause request is not decomposed (§4MO)
+            "How should I handle the authentication migration and what does compliance require",
             llm_client=llm)
         lines = [r.getMessage() for r in caplog.records
                  if "memory bus sub-queries" in r.getMessage()]

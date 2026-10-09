@@ -695,3 +695,11 @@ class TestRestoreMocksPurge_S4:
         assert (tmp_path / ".setup.py").exists()
         assert (tmp_path / ".validator.py").exists()
         assert (tmp_path / "acquired_skills" / "skill.py").exists()
+
+
+@pytest.fixture(autouse=True)
+def _owner_seed_for_self_play(monkeypatch):
+    """§4MS: idle self-play now needs a real owner failure to practise —
+    these tests are about the phase's mechanics, so they provide one."""
+    from tests.helpers import provide_owner_seed
+    provide_owner_seed(monkeypatch)

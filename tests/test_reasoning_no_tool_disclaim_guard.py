@@ -80,91 +80,41 @@ def _bogus_kb_call():
 # -----------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_no_tool_disclaim_drops_tool_calls_and_regens():
-    """The bug pattern from the production trace: the model thinks 'I
-    can answer directly without using any tools' AND emits a
-    knowledge_base tool_call. The guard must drop the call, set
-    force_final_response, and re-run the turn so the model produces
-    prose instead."""
-    agent = _make_agent()
-
-    kb_mock = AsyncMock(return_value="<should not be invoked>")
-    agent.available_tools["knowledge_base"] = kb_mock
-
-    captured_payloads = []
-
-    async def mock_chat(payload, *a, **kw):
-        captured_payloads.append(payload)
-        if len(captured_payloads) == 1:
-            return {
-                "choices": [{
-                    "message": {
-                        "content": "",
-                        "reasoning_content": (
-                            "The user is asking for a checklist. This is a "
-                            "general knowledge question and I can answer this "
-                            "directly without using any tools."
-                        ),
-                        "tool_calls": [_bogus_kb_call()],
-                    }
-                }]
-            }
-        return {"choices": [{"message": {"content": "Here is the checklist.", "tool_calls": []}}]}
-
-    agent.context.llm_client.chat_completion = mock_chat
-    body = {
-        "messages": [{"role": "user", "content": "write me a checklist for a database migration"}],
-        "model": "test",
-    }
-    await agent.handle_chat(body, MagicMock())
-
-    kb_mock.assert_not_called()
-    assert len(captured_payloads) >= 2, (
-        f"Expected at least one regen call after the disclaim drop; "
-        f"got {len(captured_payloads)} call(s). The guard should `continue` "
-        f"the turn loop rather than break."
-    )
-
-    second_prompt = _all_content(captured_payloads[1])
-    assert "Final-generation turn" in second_prompt, (
-        "After dropping disclaim-contradicting tool_calls, the regen "
-        "turn must run in final-generation mode (slim 'answer directly' "
-        "header)."
-    )
-    assert "DO NOT emit any <tool_call>" in second_prompt
+_LIVE_DIVERGENCES = [
+    # §4MO: real reasonings whose calls the old guard dropped — each call was needed
+    ("No tools needed for the calculation; I'll use update_profile to correct it.",),
+    ("I could answer directly from my knowledge, or do a quick search to verify. Let me search.",),
+    ("The earlier reply hallucinated the figure without tool evidence; I'll check the page with the browser.",),
+    ("Let me run the layers directly without tools first, then generate an image at the end.",),
+    ("I can answer this directly without using any tools.",),       # a real disclaimer: STILL kept
+]
 
 
 @pytest.mark.asyncio
-async def test_disclaim_phrase_no_tools_needed_also_caught():
-    """The pattern set covers several phrasings. 'No tools are needed' is
-    one of them — verify it triggers the same drop."""
+@pytest.mark.parametrize("reasoning", [r[0] for r in _LIVE_DIVERGENCES])
+async def test_a_reasoning_that_mentions_no_tools_never_drops_the_call(reasoning):
+    """§4MO (inverted): the guard dropped every call and switched tools off
+    on a word match — a profile correction never saved, a search and a
+    repair's browser call dropped, turn 40's image never made. A lexical
+    rule that kept flip-flopping is now TELEMETRY ONLY: the call runs."""
     agent = _make_agent()
-    kb_mock = AsyncMock(return_value="<should not be invoked>")
+    kb_mock = AsyncMock(return_value="LIBRARY CONTENTS (0 files):")
     agent.available_tools["knowledge_base"] = kb_mock
-
     captured = []
 
     async def mock_chat(payload, *a, **kw):
         captured.append(payload)
         if len(captured) == 1:
-            return {
-                "choices": [{
-                    "message": {
-                        "content": "",
-                        "reasoning_content": "No tools are needed for this. I'll explain directly.",
-                        "tool_calls": [_bogus_kb_call()],
-                    }
-                }]
-            }
+            return {"choices": [{"message": {
+                "content": "", "reasoning_content": reasoning,
+                "tool_calls": [{"id": "tc-1", "function": {
+                    "name": "knowledge_base", "arguments": json.dumps({"action": "list_docs"})}}]}}]}
         return {"choices": [{"message": {"content": "Done.", "tool_calls": []}}]}
 
     agent.context.llm_client.chat_completion = mock_chat
-    body = {"messages": [{"role": "user", "content": "explain transactions"}], "model": "test"}
+    body = {"messages": [{"role": "user", "content": "show me my saved docs"}], "model": "test"}
     await agent.handle_chat(body, MagicMock())
-
-    kb_mock.assert_not_called()
-    assert len(captured) >= 2
+    kb_mock.assert_called_once()
 
 
 # -----------------------------------------------------------------

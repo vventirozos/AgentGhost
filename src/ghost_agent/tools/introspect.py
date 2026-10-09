@@ -23,6 +23,7 @@ degrades to a clear message instead of crashing.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -548,14 +549,22 @@ def _apply_report_view(text: str, *, verbose: bool, section: str,
             f"sections: {', '.join(names) or '(none)'})")
 
 
-def _learning_report_cached(memory_dir, args, *, now=None) -> Tuple[str, float]:
+def _learning_report_cached(memory_dir, args, *, now=None, allow_stale=False) -> Tuple[str, float]:
     """``(report, age_seconds)`` — one corpus walk per
-    ``_LEARNING_CACHE_TTL_S``. ``now`` is injectable for tests."""
+    ``_LEARNING_CACHE_TTL_S``. ``allow_stale``: the overview's summary may
+    be served up to ``_LEARNING_STALE_MAX_S`` old while it refreshes; an
+    explicit action='learning' never is (r2). ``now`` is injectable for tests."""
     from ..core.learning_health import render_learning_health
     key = f"{memory_dir}|{id(args)}"
     t = time.time() if now is None else float(now)
     hit = _LEARNING_CACHE.get(key)
     if hit is not None and 0.0 <= (t - hit[0]) < _LEARNING_CACHE_TTL_S:
+        return hit[1], t - hit[0]
+    if allow_stale and hit is not None and 0.0 <= (t - hit[0]) < _LEARNING_STALE_MAX_S:
+        # §4MO: serve the last report (its age is printed) and refresh it in
+        # the background — greetings come hours apart, so the 600 s cache was
+        # always cold and every "how's things" paid a 3.3 s corpus walk
+        _refresh_learning_in_background(key, memory_dir, args)
         return hit[1], t - hit[0]
     text = render_learning_health(memory_dir, args)
     _LEARNING_CACHE.clear()
@@ -563,9 +572,42 @@ def _learning_report_cached(memory_dir, args, *, now=None) -> Tuple[str, float]:
     return text, 0.0
 
 
+#: §4MO: a report older than this is recomputed in the request (too stale)
+_LEARNING_STALE_MAX_S = 24 * 3600
+_LEARNING_REFRESHING: set = set()
+_LEARNING_REFRESH_LOCK = threading.Lock()
+
+
+def _refresh_learning_in_background(key, memory_dir, args):
+    """Start one refresh per key (check-and-add under a lock — r2: two
+    overview calls could both start a walk). Returns the thread, or None."""
+    with _LEARNING_REFRESH_LOCK:
+        if key in _LEARNING_REFRESHING:
+            return None
+        _LEARNING_REFRESHING.add(key)
+
+    def _run():
+        try:
+            from ..core.learning_health import render_learning_health
+            text = render_learning_health(memory_dir, args)
+            _LEARNING_CACHE.clear()
+            _LEARNING_CACHE[key] = (time.time(), text)
+        except Exception:  # noqa: BLE001 — the stale report stays
+            pass
+        finally:
+            with _LEARNING_REFRESH_LOCK:
+                _LEARNING_REFRESHING.discard(key)
+    th = threading.Thread(target=_run, name="learning-report-refresh", daemon=True)
+    th.start()
+    return th
+
+
 def _learning_trailer(age: float) -> str:
     if age <= 0.0:
         return ""
+    if age > _LEARNING_CACHE_TTL_S:      # §4MR: the overview may show a stale copy (≤ 24 h)
+        return (f"\n(learning numbers computed {age / 3600:.1f} h ago — a fresh walk is "
+                "running in the background)")
     return (f"\n(learning numbers computed {age:.0f}s ago — the corpus walk "
             f"re-runs at most every {int(_LEARNING_CACHE_TTL_S // 60)} min)")
 
@@ -689,7 +731,7 @@ async def _overview_learning(context) -> str:
         return "Learning: memory_dir unavailable."
     try:
         text, age = await _asyncio.to_thread(
-            _learning_report_cached, _md, getattr(context, "args", None))
+            _learning_report_cached, _md, getattr(context, "args", None), allow_stale=True)
     except Exception as e:  # noqa: BLE001
         return f"Learning: unavailable ({type(e).__name__}: {e})"
     heads = [l.strip() for l in text.split("\n")

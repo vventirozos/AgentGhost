@@ -342,5 +342,8 @@
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
+
+<h2 id="4mm">§4MM (2026-10-08): probe-origin events</h2>
+<p><code>log_event</code> stamps <code>payload.origin = "probe"</code> on an event written during a probe request. <code>core/project_digest.summarize_since</code> skips such events, and every event of a <code>probe_created</code> project; the watermark still advances. Before this, a probe's fork of an owner project ("Chess Coach v4 → FAILED") appeared in the owner's "While you were away" banner as the agent's own work.</p>
 </body>
 </html>

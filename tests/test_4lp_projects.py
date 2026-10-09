@@ -637,7 +637,8 @@ async def test_one_owner_step_takes_back_exactly_the_task_it_runs(store):
 
 async def test_a_batch_that_stops_on_held_tasks_says_they_need_the_owner(store):
     from ghost_agent.core.project_advancer import advance_many, _HELD_MARK
-    pid = store.create_project("App")
+    # §4MQ: a background (non-owner) batch runs only on an autopilot project
+    pid = store.create_project("App", metadata={"autopilot": True})
     store.update_project(pid, status="ACTIVE")
     v = store.add_task(pid, "Verify the full pipeline")
     store.update_task(v, status="NEEDS_USER", result_summary=f"wrote x — needs a real check — {_HELD_MARK}")

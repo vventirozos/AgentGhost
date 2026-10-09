@@ -57,6 +57,10 @@ def main() -> int:
     if not chroma_dir.exists():
         print(f"ERROR: no vector store at {chroma_dir}")
         return 2
+    # §4MN: never beside the agent — even opening chroma replays its queue
+    # into the index (a write); a second writer corrupts it
+    from ghost_agent.memory.store_lock import assert_no_other_writer
+    assert_no_other_writer(chroma_dir, "reembed_memory.py")
 
     # Refuse to run against a live agent — Chroma is single-writer.
     try:

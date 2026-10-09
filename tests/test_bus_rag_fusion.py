@@ -43,7 +43,7 @@ class TestQueryDecomposition:
                 "compliance requirements",
             ])}}],
         })
-        query = "How should I handle the authentication migration given compliance requirements"
+        query = "How should I handle the authentication migration and what do the compliance requirements say"
         sub = await bus._decompose_query(query, llm_client=mock_llm)
         assert len(sub) >= 3  # Original + decomposed
         assert query in sub
@@ -60,12 +60,17 @@ class TestQueryDecomposition:
         mock_llm = MagicMock()
         mock_llm.route = AsyncMock(return_value={
             "choices": [{"message": {"content": json.dumps([
-                "q1", "q2", "q3", "q4", "q5", "q6",
+                "postgres streaming replication options", "mysql group replication modes",
+                "postgres failover steps with patroni", "mysql failover with orchestrator",
+                "logical versus physical replication", "replication lag monitoring tools",
             ])}}],
         })
-        query = "a long query with many words to trigger decomposition via LLM"
+        # compound (§4MO: a single-clause request is never decomposed, which
+        # made this cap check pass without reaching the model)
+        query = "compare the replication options and explain the failover steps for each"
         sub = await bus._decompose_query(query, llm_client=mock_llm)
-        assert len(sub) <= 4  # Original + max 3
+        assert mock_llm.route.await_count == 1
+        assert len(sub) == 4  # Original + max 3 (six offered)
 
 
 class TestDedupItems:

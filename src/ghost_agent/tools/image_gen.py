@@ -1,4 +1,7 @@
 import asyncio
+import time
+import functools
+import collections
 import json
 import uuid
 import base64
@@ -100,7 +103,7 @@ def _resolve_reference(name, sandbox_dir) -> Path:
     raise ValueError(f"reference image {name!r} not found in the sandbox")
 
 
-async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=None, steps: int = 0, width: int = 0, height: int = 0, seed=None, negative_prompt: str = "", reference_images=None, transparent=False, subjects=None, tor_proxy=None, **kwargs):
+async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_dir=None, steps: int = 0, width: int = 0, height: int = 0, seed=None, negative_prompt: str = "", reference_images=None, transparent=False, subjects=None, tor_proxy=None, **kwargs):
     # --- PARAMETER HALLUCINATION HEALING ---
     prompt = prompt or kwargs.get("image") or kwargs.get("description") or kwargs.get("subject") or kwargs.get("text")
     # §4KD: a list prompt went to the node verbatim (422 ×3), an int crashed
@@ -492,3 +495,37 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
         )
     except Exception as e:
         return f"ERROR generating image: {str(e)}"
+
+
+#: §4MO: how long renders take on THIS node, by kind ("edit" = a reference
+#: photo or subjects; "generate" = text only), newest last. The turn loop's
+#: deadline check reads it: a render that would end inside the report
+#: reserve is refused BEFORE it starts (a 614 s edit started with 863 s left
+#: right after an 860 s one, and the turn nearly shipped nothing).
+RECENT_RENDER_SECONDS = {"edit": collections.deque(maxlen=3), "generate": collections.deque(maxlen=3)}
+#: before any render was timed (measured 09-25 → 10-08: edits 205–860 s)
+DEFAULT_RENDER_SECONDS = {"edit": 600.0, "generate": 240.0}
+
+
+def render_kind(t_args) -> str:
+    a = t_args if isinstance(t_args, dict) else {}
+    # every reference synonym the tool accepts (r2: `input_image` timed as a generate)
+    return "edit" if (a.get("subjects") or any(a.get(k) for k in _REF_KEYS)) else "generate"
+
+
+def expected_render_seconds(t_args) -> float:
+    kind = render_kind(t_args)
+    seen = RECENT_RENDER_SECONDS[kind]
+    return float(max(seen)) if seen else DEFAULT_RENDER_SECONDS[kind]
+
+
+@functools.wraps(_tool_generate_image_impl)
+async def tool_generate_image(*args, **kwargs):
+    t0 = time.monotonic()
+    out = await _tool_generate_image_impl(*args, **kwargs)
+    try:
+        if str(out).lstrip().startswith("SUCCESS: Image generated"):
+            RECENT_RENDER_SECONDS[render_kind(kwargs)].append(time.monotonic() - t0)
+    except Exception:  # noqa: BLE001 — timing is best-effort
+        pass
+    return out

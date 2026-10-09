@@ -169,7 +169,7 @@ async def test_a_long_wait_is_refused_before_it_runs_and_is_not_a_strike(monkeyp
     # the synthetic tool message rides inside the volatile state block the
     # loop wraps around the last messages — search every message's text
     text = "\n".join(str(m.get("content")) for p in _payloads(ctx) for m in p)
-    assert "SYSTEM PREFLIGHT — deadline" in text and "60 s wait" in text and "about 330 s" in text
+    assert "SYSTEM PREFLIGHT — deadline" in text and "take about 60 s" in text and "about 330 s" in text
     assert "served at" in out
 
 

@@ -205,5 +205,8 @@ Value := str                      # LEGACY — as_of unknown
     <li>Not covered, accepted: deliberate obfuscation (base64, double URL-encoding, spelled-out numbers).</li>
   </ul>
 </main>
+
+<h2 id="4mn">§4MN (2026-10-08): removals are archived first</h2>
+<p><code>delete</code>, <code>remove_item</code>, <code>drop_previous_mentioning</code> and <code>prune_value</code> append the removed value to <code>profile_removed.jsonl</code> (fsynced, kept 30 days like forgotten episodes) <em>before</em> changing the profile. If the archive cannot be written, nothing is removed, and the result starts with "Error:" so the forget report shows ⚠️, never ✅. The 30-day retention is also enforced daily by the dream (<code>purge_removed_archive</code>, line by line, so one unreadable line no longer stops it). The owner's own facts had been the one store deleted with no copy.</p>
 </body>
 </html>

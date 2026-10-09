@@ -194,7 +194,7 @@ DEFAULT_SPECS: Tuple[ExperimentSpec, ...] = (
         name="search_yield_steer",
         arms=(CONTROL, TREATMENT),
         traffic=1.0,
-        enabled=True,
+        enabled=False,   # concluded §4LF; §4MO: the owner is always steered (operator)
         description=(
             "§4JJ: after SEARCH_YIELD_STEER consecutive web searches with no "
             "result opened, the treatment appends one open-or-answer steer "

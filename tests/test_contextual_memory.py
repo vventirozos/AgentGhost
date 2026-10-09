@@ -28,10 +28,10 @@ def mock_context():
     return ctx
 
 @pytest.mark.asyncio
-async def test_time_decayed_salience():
+async def test_time_decayed_salience(tmp_path):
     """Verify that newer memories rank higher than older ones with identical semantic distance."""
     with patch("ghost_agent.memory.vector.chromadb"):
-        vm = VectorMemory(Path("/tmp"), "http://mock")
+        vm = VectorMemory(tmp_path, "http://mock")   # §4MN: not the shared /tmp (single-writer lock)
     
     vm.collection = MagicMock()
     

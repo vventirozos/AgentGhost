@@ -226,11 +226,13 @@ async def test_no_member_steer_on_a_final_or_stopped_turn(monkeypatch, member_ro
     assert _member_alerts(ts) == [] and strikes.search_yield_steered is False
 
 
-async def test_the_owner_path_is_unchanged_on_control(monkeypatch):
+async def test_the_owner_gets_the_owners_steer_not_the_members(monkeypatch):
+    """§4MO operator decision: the owner is steered at 10 outright (no arm,
+    no trigger) — with the OWNER's text (open a result), never the member's."""
     agent = _sy_agent()
     seen = _no_arm_calls(monkeypatch, E.CONTROL)
     ts, _ = await _run_searches(agent, SK.SEARCH_YIELD_STEER + 1, StrikeLedger(), set())
-    assert _member_alerts(ts) == [] and seen["mark_trigger"] == ["search_yield_steer_fired"]
+    assert _member_alerts(ts) == [] and seen["mark_trigger"] == []
 
 
 def test_the_member_steer_names_no_tool_the_member_lacks():

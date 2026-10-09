@@ -447,6 +447,9 @@ and none can reach a verdict at current traffic. Fixed here (what runs and how o
   checked under its real id (<code>watch_&lt;hash&gt;</code>), and the agent's own job (the idle dream monitor) does
   not count toward <code>MAX_TASKS</code>.</li>
 </ul>
+
+<h2 id="4ms">§4MS: repeats stay</h2>
+<p>About 66% of the ledger repeats the previous record of its phase (241 "stable pass", 227 "τ=0.81", 165 "graduated N"). A write-time dedupe was built and then removed in the same round: the digest's <code>[phase] ×N</code> counts and the counterfactual loop's "recheck still failing" tally read those repeats as information. The jobs that re-ran with nothing new are the cause, and those were gated instead (reflection, self-play, bench).</p>
 </main>
 </body>
 </html>

@@ -770,3 +770,11 @@ class TestPrmConsumersOffBranch:
              patch("ghost_agent.core.agent.random.random",
                    return_value=0.99):
             await agent._biological_tick()   # must not raise
+
+
+@pytest.fixture(autouse=True)
+def _owner_seed_for_self_play(monkeypatch):
+    """§4MS: idle self-play now needs a real owner failure to practise —
+    these tests are about the phase's mechanics, so they provide one."""
+    from tests.helpers import provide_owner_seed
+    provide_owner_seed(monkeypatch)

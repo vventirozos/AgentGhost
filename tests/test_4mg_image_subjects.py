@@ -385,10 +385,13 @@ async def test_the_loop_refuses_the_stand_in_and_the_agent_asks(monkeypatch, tmp
     await agent.handle_chat({"messages": [{"role": "user", "content": "draw Vasilis Ventiroplakos on the Acropolis"}]},
                             FakeBgTasks(), request_id="web-4mg-ms")
     assert img.await_count == 1                      # the stand-in render never ran
-    third = ctx.llm_client.chat_completion.call_args_list[2]
-    payload = third.args[0] if third.args and isinstance(third.args[0], dict) else third.kwargs
-    seen = "\n".join(str(m.get("content") or "") for m in payload.get("messages", []) if isinstance(m, dict))
-    assert "ask the user first" in seen
+    # §4MO: a designed stop now closes the tool phase at once — the stand-in
+    # call is never even dispatched; the model is told to ask the user
+    seen = ""
+    for call in ctx.llm_client.chat_completion.call_args_list[1:]:
+        payload = call.args[0] if call.args and isinstance(call.args[0], dict) else call.kwargs
+        seen += "\n".join(str(m.get("content") or "") for m in payload.get("messages", []) if isinstance(m, dict))
+    assert "ask the user first" in seen or "Ask the user exactly what the tool asked" in seen
 
 
 # ---------------------------------------------------------------------------

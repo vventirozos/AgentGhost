@@ -601,5 +601,13 @@
   <li><strong><code>iter_teachable(trajectories, consumer=)</code></strong> applies the admissibility matrix's task kinds for the named consumer (router/PRM: <code>user_request</code>+<code>bench</code>; post-mortem, skills-auto, REM seeds, macro mining: <code>user_request</code> only) and judges a reflection COPY by its source's role (<code>extra.source_requester_role</code>). Fails closed for a named consumer.</li>
 </ul>
 
+
+<h2 id="4ms">§4MS: usage counters and readers</h2>
+<ul>
+  <li>Every lesson counter (<code>record_retrieval</code>, <code>record_helpful_retrieval</code>, <code>credit_recent_retrievals</code>, <code>record_retrievals_bulk</code>) checks <code>usage_credit_blocked()</code>, which covers probes, members and internal turns. Three of them checked members only, and probe turns had credited lessons that pruning and graduation read.</li>
+  <li>Every trajectory reader passes its consumer key to <code>iter_teachable</code> (foresight, frontier seeding, dream replay, GEPA tool fixtures): only member turns had been filtered, and probe turns got through.</li>
+  <li><code>trajectory_may_teach</code> refuses an interrupted turn (<code>[TURN_INTERRUPTED]</code>).</li>
+  <li>One-off cleanup <code>scripts/idle_cleanup_4ms.py</code> (operator-confirmed). It retracts three wrong idle lessons as operator tombstones (<code>removed_by_trigger</code>, so they are never re-learned), resets the retrieval and helpful counters of three probe-inflated rows (the outcome counters stay), deletes one misread memory, and retires an unused self-play skill. It is idempotent: a re-run changes nothing. A planned backfill of 36 dream triggers cut at 80 characters was dropped: each row's vector twin and <code>task</code> are keyed by the old trigger, so a new trigger would have orphaned the row from retrieval.</li>
+</ul>
 </body>
 </html>

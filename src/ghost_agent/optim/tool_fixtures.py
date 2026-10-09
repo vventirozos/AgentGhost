@@ -313,7 +313,7 @@ def _trajectory_index(trajectory_root: Path) -> Dict[str, Any]:
     collector = TrajectoryCollector(root=trajectory_root, session_id="reader")
     index: Dict[str, Any] = {}
     from ..memory.skills import iter_teachable
-    for traj in iter_teachable(collector.iter_trajectories()):   # member turns never tune tool descriptions (§4KJ R7)
+    for traj in iter_teachable(collector.iter_trajectories(), consumer="gepa_tool_fixtures"):   # member turns never tune tool descriptions (§4KJ R7); §4MS: nor probes
         sid = getattr(traj, "session_id", "") or ""
         if not sid:
             continue

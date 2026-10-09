@@ -202,7 +202,7 @@ class TestReadOnlySkillMemoryWhitelist:
         pre_clear = src.index("self.last_selfplay_hydrated_triggers = None")
         # Must sit with the other stale-value pre-clears, before any of
         # the generation logic (and therefore before any early return).
-        assert pre_clear < src.index("seed = {")
+        assert pre_clear < src.index("seed = initial_self_play_seed(")   # §4MS: the seed's start moved into a helper
 
 
 # ---------------------------------------------------------------------------
