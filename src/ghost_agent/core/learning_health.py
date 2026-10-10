@@ -599,6 +599,7 @@ def collect_learning_health(memory_dir, args: Any = None) -> Dict[str, Any]:
             "outcome_pos": sum(1 for o in outs if o >= 0.5),
             "outcome_verified_neg": sum(1 for o in outs if o == 0.0),
             "outcome_verified_pos": sum(1 for o in outs if o == 1.0),
+            "outcome_placeholder": sum(1 for o in outs if abs(o - 0.83) < 1e-9),   # §4ND
             "platt_a": params.get("platt_a"),
             "brier_raw": params.get("brier_raw"),
             "brier_base_rate": params.get("brier_base_rate"),
@@ -1915,11 +1916,17 @@ def render_learning_health(memory_dir, args: Any = None) -> str:
             _hdr_brier = f"Brier {_b_hdr} (in-sample)"
         else:
             _hdr_brier = "Brier UNREADABLE"
+        # §4ND (operator: "ranking only"): the header the overview shows is
+        # no probability claim — the Brier it carried ("0.05") reached
+        # greetings as a fact. It names what the score is for.
+        _auc_hdr = _hdr_num(cal.get("auc"))
         lines.append(
-            f"\nCALIBRATION: {_n_epoch} samples, "
-            f"{_hdr_brier}, threshold {_show(cal.get('threshold'))}"
+            f"\nCALIBRATION: confidence is a RANKING, not a probability — {_n_epoch} samples, "
+            + (f"ranking AUC {_auc_hdr:.2f}, " if isinstance(_auc_hdr, (int, float)) and _auc_hdr >= 0 else "")
+            + "deep verification on the lowest 15% of recent turns"
             + (f" · {_n_other} older-epoch rows excluded from the fit"
-               if _n_other else ""))
+               if _n_other else "")
+            + f" · ({_hdr_brier} — not a calibrated probability)")
         # ⚠ ABSENT MAY BE OMITTED; PRESENT-BUT-UNUSABLE MUST BE NAMED.
         # Dropping the clause for an unusable value is the silent-omission
         # anti-pattern this same round fixed for the negative-class line.
@@ -1930,6 +1937,9 @@ def render_learning_health(memory_dir, args: Any = None) -> str:
             + (f", effort {_show(_w_effort)}"
                if _w_effort is not None else "")
             + f"; outcomes {cal['outcome_pos']}+/{cal['outcome_neg']}-"
+            # §4ND: the unverified placeholder is not a success
+            + (f" (of which {cal['outcome_placeholder']} are the unverified "
+               f"placeholder, not outcomes)" if cal.get("outcome_placeholder") else "")
             + (f" ({cal['outcome_verified_pos']}+/"
                f"{cal['outcome_verified_neg']}- verifier-checked)"
                if cal.get("outcome_verified_pos") is not None else ""))
@@ -2460,10 +2470,14 @@ def render_learning_health(memory_dir, args: Any = None) -> str:
                 lines.append(
                     f"  resolution: this corpus cannot resolve a Brier "
                     f"difference smaller than {_hw:+.5f}"
-                    + (f" — the observed effect is {_obs:.5f}, "
-                       f"{_hw / _obs:.1f}x smaller, so `indistinguishable` "
-                       f"here means CANNOT MEASURE, not measured-equal"
-                       if _obs else ""))
+                    # §4ND: the "cannot measure" reading only when the
+                    # effect really is smaller than the resolution (it printed
+                    # whatever the verdict, 0.0049 resolution vs 0.0058 effect)
+                    + ((f" — the observed effect is {_obs:.5f}, "
+                        f"{_hw / _obs:.1f}x smaller, so `indistinguishable` "
+                        f"here means CANNOT MEASURE, not measured-equal")
+                       if _obs and _obs < _hw else
+                       (f" — the observed effect ({_obs:.5f}) is above it" if _obs else "")))
             # THE NUMBER EVERY OTHER VERDICT RESTS ON. Every feature verdict,
             # weight and Brier comparison here is estimated from the negative
             # class, and the live store carries 18 of them in 694 rows.
@@ -2540,15 +2554,25 @@ def render_learning_health(memory_dir, args: Any = None) -> str:
                                        "_METACOG_ARBITER_ENABLED", False))
             except Exception:  # noqa: BLE001
                 _arb_on = None
-            if _arb_on is False:
+            # §4ND: since §4EC (09-04) the low-confidence verification depth
+            # ALSO acts on this score — the "CONSUMER DEAD" line was false
+            # for five weeks and the model repeated it to the owner
+            try:
+                from .verifier import _conf_depth_enabled as _cde
+                _depth_on = bool(_cde())
+            except Exception:  # noqa: BLE001
+                _depth_on = None
+            if _arb_on is False and _depth_on:
                 lines.append(
-                    "  ⚠ CONSUMER DEAD: the only thing that reads this "
-                    "threshold is metacog arbitration, hard-disabled by "
-                    "_METACOG_ARBITER_ENABLED in core/agent.py.")
+                    "  consumer: low-confidence verification depth (§4EC) — "
+                    "the lowest 15% of recent turns get a 3-sample verdict; "
+                    "metacog arbitration stays off.")
+            elif _arb_on is False and _depth_on is False:
                 lines.append(
-                    "    the score is recorded and calibrated; NOTHING acts "
-                    "on it. Treat these numbers as a measurement, not as a "
-                    "behaviour.")
+                    "  ⚠ CONSUMER DEAD: metacog arbitration is hard-disabled "
+                    "(_METACOG_ARBITER_ENABLED) and low-confidence depth is "
+                    "off (GHOST_VERIFY_DEPTH_CONF=0) — NOTHING acts on this "
+                    "score. Treat these numbers as a measurement.")
             # ⚠ THE GUARD WENT ON A NAME LIST, NOT ON THE BOUNDARY. `brier`,
             # `brier_cv` and `brier_base_rate` were each guarded by name
             # while this dict raised three separate ways — a list has no

@@ -116,6 +116,15 @@ k = 10  (MemoryBus._RRF_K on the hydration path; 60 is only the classmethod defa
   </p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+  <h2 id="4nc">Graph links and episodes are no longer auto-loaded <span class="tag">2026-10-10 &sect;4NC</span></h2>
+  <p>Operator decision ("Off in prompts, keep recall"), measured on 86 real owner requests.</p>
+  <ul>
+    <li><strong>The graph tier</strong> was 20% relevant and 16% harmful when loaded (about 53 tokens a turn). One image request's subject surfaced on 7 unrelated turns, and riddle details were stored as world facts.</li>
+    <li><strong>The episodic tier</strong> was 15% relevant and 19% harmful (about 59 tokens a turn). A two-month-old "all systems green" greeting episode surfaced on 12 requests.</li>
+    <li><strong>The switch:</strong> <code>MemoryBus._fetch_graph</code> and <code>_fetch_episodic</code> return nothing unless <code>GHOST_BUS_GRAPH_TIER=1</code> / <code>GHOST_BUS_EPISODIC_TIER=1</code>. The switches are read per call, like <code>GHOST_BUS_VECTOR_TIER</code>, and the tier instrumentation shows them as "-".</li>
+    <li><strong>Nothing is deleted:</strong> the stores are still written and stay searchable by <code>recall</code>, which does not go through these fetchers. The skill, session and profile tiers are unchanged.</li>
+    <li><strong>The owner's facts are kept</strong> (r1 review). A first-person question about the owner ("where do I live?", §4KZ) still gets <code>owner_facts_matching</code> through <code>MemoryBus._owner_facts</code>; only the topical edges are off.</li>
+  </ul>
 </main>
 
 <h2 id="4mj">§4MJ (2026-10-08) — what each tier may inject</h2>

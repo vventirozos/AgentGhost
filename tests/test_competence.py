@@ -100,7 +100,7 @@ class TestCompetenceProfile:
         cp.record("shell", "ls", success=True)
         s = cp.get_context_string()
         assert "shell" in s
-        assert "n=1" in s
+        assert "n <10" in s           # §4MV: a band — the block rides the stable prompt prefix
 
     def test_known_domains_list(self):
         assert "shell" in KNOWN_DOMAINS

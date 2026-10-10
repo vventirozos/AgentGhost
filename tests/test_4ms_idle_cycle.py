@@ -317,7 +317,9 @@ def test_self_play_is_seeded_only_by_an_unpractised_owner_failure(tmp_path):
     col = _Collector([owner_fail, probe_fail, member_fail, passed, interrupted, no_tools, aborted])
     seed = O.pick_owner_failure_seed(col, tmp_path)
     assert seed and seed["source_id"] == owner_fail.id and seed["mode"] == "owner_failure"
-    assert "sum the CSV by month" in seed["hint"] and "wrong totals" in seed["hint"]
+    # §4MT: the hint is a structured brief — never the owner's words
+    assert "sum the CSV by month" not in seed["hint"] and "wrong totals" not in seed["hint"]
+    assert seed["brief"]["shape"] == "code_data"
     O.mark_used(tmp_path, owner_fail.id)
     assert O.pick_owner_failure_seed(col, tmp_path) is None
 
@@ -327,7 +329,7 @@ def test_no_owner_failure_means_no_self_play():
     seed exists (AST: the seed pick precedes the Dreamer)."""
     tree = _agent_tree()
     src = ast.unparse(next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef)
-                           and n.name == "_biological_tick"))
+                           and n.name == "_self_play_slot_body_inner"))     # §4MT: the slot body
     i_seed = src.index("pick_owner_failure_seed")
     assert src.index("raise _NoOwnerSeed()") > i_seed
     assert src.index("dreamer = Dreamer(ctx)", i_seed) > src.index("raise _NoOwnerSeed()")
@@ -410,7 +412,9 @@ def test_a_seeded_run_is_generated_from_the_brief_never_a_template_or_journal_pi
 def test_a_seed_is_used_only_by_a_run_that_concluded_and_no_seed_is_a_declined_heartbeat():
     tree = _agent_tree()
     fn = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == "_biological_tick")
-    ifs = [n for n in ast.walk(fn) if isinstance(n, ast.If) and "_mark_seed_used" in ast.unparse(n)
+    # §4MT: the slot's body lives in `_self_play_slot_body`; its handlers stay in the tick
+    body = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == "_self_play_slot_body_inner")
+    ifs = [n for n in ast.walk(body) if isinstance(n, ast.If) and "_mark_seed_used" in ast.unparse(n)
            and not any("_mark_seed_used" in ast.unparse(b) for b in [n.test])]
     assert any("last_self_play_status" in ast.unparse(n.test) for n in ifs)
     handlers = [h for h in ast.walk(fn) if isinstance(h, ast.ExceptHandler) and getattr(h.type, "id", "") == "_NoOwnerSeed"]

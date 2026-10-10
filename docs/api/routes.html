@@ -177,5 +177,15 @@ auth rejected  path=/api/game/move ip=127.0.0.1 ua=curl/8.0-intruder    &lt;- WA
   <p>Round 6 taught the workspace wipe to unfreeze a directory before removing it, so a tree the <em>archive</em> had frozen could not survive and carry stale contents into the restored workspace. Released projects are frozen for a different reason: releasing a project chmods its workspace read-only, and the OS half of that immutability was the last thing standing between a restore and the human-attested deliverables inside it. Round 5's tolerant delete could not get through it; round 6 could &mdash; silently, reporting no failures and a success while the project rows pointed at a deleted directory. A restore replaces the workspace, and a released project is not part of what the archive owns, so the wipe now skips it outright. The wipe's own unlink branch also had no handler, so one read-only directory at the sandbox root aborted the whole loop and returned an opaque 500 <em>after</em> the sandbox had been cleared; it now records what it could not remove instead of raising.</p>
 <section><h3>Member downloads (§4KJ R8)</h3><p>With <code>X-Ghost-Requester: member</code>, <code>/api/download</code> serves only a file whose name is EXACTLY a member file name (no path separator, so no project fallback). The route loads the persisted member-file list itself, so a download right after a restart works. A member download never falls back to a project folder. A member-role chat request ignores <code>session_id</code>: stored sessions are the owner's history. A thumb on a member's turn is refused with 403 (final, not retryable).</p></section>
 </main>
+
+<h2 id="4mt-operator">§4MT: <code>/api/operator/self-play-slot</code></h2>
+<p><code>POST</code> runs the self-play idle slot once, now, in the live process. It is the same <code>GhostAgent._self_play_slot_body</code> the idle tick runs:</p>
+<ul>
+  <li>withdraw failing proven lessons;</li>
+  <li>run one leg of a pending lesson proof;</li>
+  <li>otherwise, run the reaction-judge pass and one owner-failure practice.</li>
+</ul>
+<p>It is refused with 409 while a user request is live or another slot is running. It starts off-loop and returns at once; <code>GET</code> returns <code>{state, started, finished, outcome}</code>. It moves the tick's self-play anchor, so the tick does not repeat the slot straight after. It is protected by the API key.</p>
+<p>A body of <code>{"calibrate": "&lt;shape&gt;", "n": 3}</code> instead measures how hard a practice shape is for the real solver (<code>start_practice_calibration</code>). It runs <code>n</code> fresh renders (at most 6) the way a lesson-proof control leg does: an injected challenge, owner-practice grading and no lesson in the prompt. So it writes no lesson, persists no challenge and uses no seed. <code>GET</code> returns the per-run scores (3, 2 or 1 for a pass on attempt 1, 2 or 3; 0 for a fail).</p>
 </body>
 </html>

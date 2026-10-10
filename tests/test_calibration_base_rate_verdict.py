@@ -985,7 +985,7 @@ async def test_the_activity_ledger_records_the_missing_licence(tmp_path,
     calib = [sm for ph, sm in recorded if ph == "calibration"]
     assert calib, f"no calibration activity was recorded; got {recorded}"
     summary = calib[-1]
-    assert "NO base-rate licence" in summary, (
+    assert "does NOT rank outcomes" in summary, (   # §4ND: the ledger names a non-ranking score
         "a refit whose score is indistinguishable from a constant was "
         f"recorded as an unqualified success: {summary!r}")
 

@@ -998,6 +998,9 @@ def test_learning_health_survives_non_numeric_outcome_row(tmp_path):
         {"outcome": "not-a-number", "ts": "2026-08-05T10:00:01"},
         {"outcome": 0.0, "ts": "2026-08-05T10:00:02"},
     ]
+    from ghost_agent.core.calibration import CURRENT_EPOCH
+    for r in rows:      # §4ND bumped the epoch: untagged August rows are history now
+        r["epoch"] = CURRENT_EPOCH
     (calib / "calibration.jsonl").write_text(
         "\n".join(_json.dumps(r) for r in rows) + "\n")
     report = lh.collect_learning_health(md)   # pre-fix: TypeError here

@@ -586,6 +586,12 @@ radius = σ̂ · sqrt( 2(nρ² + 1) / (n²ρ²) · log( sqrt(nρ² + 1) / α ) )
   encoding loop). ⚠ Two instrument lessons outlived it: <code>leaf_bench</code> cannot test a live ARM at all
   (coding leaves are <code>sub-leaf-*</code>, excluded from enrolment by design), and a DISCRIMINATING smoke must drive
   the same route the run will drive — the first attempt passed while both arms ran the incumbent.</p>
-  </main>
+    <h2 id="4nd">Safe defaults: nothing restarts by accident <span class="tag">2026-10-10 &sect;4ND</span></h2>
+  <ul>
+    <li><strong>No verdict was ever reachable.</strong> At the owner's traffic (about 3 labelled turns a day, verifier noise shrinking any effect to about 0.7 of its size), a 10% → 5% effect needs 1.7 years with the arm on every turn, and 17 years on a 10% trigger. The 2026-10-04 conclusion stands.</li>
+    <li><strong>Every <code>DEFAULT_SPECS</code> entry is now disabled.</strong> The loader falls back to them when <code>experiments.json</code> is missing or malformed, and seven enabled defaults would have silently restarted randomisation on live traffic. <code>CONCLUDED_DEFAULTS</code> names them so the machinery's own tests can re-enable them.</li>
+    <li><strong>Nothing enabled, nothing announced.</strong> <code>any_enabled(context)</code> gates <code>announce_new_verdicts</code>, which walked the corpus about 4 times a day for nothing. The reports say "no experiment is enabled — no stamps are expected" instead of the false "regressing NOW" alarm.</li>
+  </ul>
+</main>
 </body>
 </html>

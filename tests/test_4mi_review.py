@@ -1000,9 +1000,12 @@ def test_r2_the_idle_tick_records_those_results():
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
              and getattr(n.func, "attr", "") == "_record_idle_attempt" and n.args
              and isinstance(n.args[0], ast.Constant) and n.args[0].value in ("dream", "self_play")]
-    by = {c.args[0].value: c.args[1] for c in calls}
-    assert isinstance(by["dream"], ast.Call) and by["dream"].func.id == "idle_attempt_result_for_dream"
-    assert isinstance(by["self_play"], ast.Name) and by["self_play"].id == "SELF_PLAY_UNCONCLUDED_ATTEMPT"
+    by = {}
+    for c in calls:
+        by.setdefault(c.args[0].value, []).append(c.args[1])
+    assert any(isinstance(a, ast.Call) and a.func.id == "idle_attempt_result_for_dream" for a in by["dream"])
+    # §4MT: the slot body (and its proof-leg branch) record the same constant
+    assert any(isinstance(a, ast.Name) and a.id == "SELF_PLAY_UNCONCLUDED_ATTEMPT" for a in by["self_play"])
 
 
 def test_r2_a_refused_fragment_does_not_fall_to_the_fuzzy_tier(tmp_path):

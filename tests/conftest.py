@@ -129,6 +129,58 @@ def _logging_handlers_are_per_test():
         lg.propagate = prop
 
 
+# The test files that exercise the negative controls themselves — they run
+# the real thing (a pytest subprocess over the evolve pins).
+_REAL_NEGATIVE_CONTROLS = {"test_evolve_negative_controls", "test_4ec_negctl_pins"}
+
+
+@pytest.fixture(autouse=True)
+def _negative_controls_stubbed_in_idle_ticks(request, monkeypatch):
+    """The idle tick's weekly negative-controls phase is DUE on every tick
+    in a test (an isolated GHOST_HOME has no state file), and it spawns a
+    pytest subprocess: ~26 s per `_biological_tick` call, measured
+    2026-10-10 as the bulk of the slowest test files (bio_r1_fixes,
+    biological_watchdog, prm/reflection/selfhood biological phases). Tests
+    that pass THROUGH the tick get an empty run back instantly; the files
+    that test the controls keep the real one."""
+    if request.node.module.__name__.rsplit(".", 1)[-1] in _REAL_NEGATIVE_CONTROLS:
+        yield
+        return
+    from ghost_agent.evolve import negative_controls as _NC
+
+    def _no_run(canonical_root, home, *, deep=False, only=None, materialize=None):
+        return _NC.ControlRun(ts="test", deep=deep, selected=list(only or ()))
+    monkeypatch.setattr(_NC, "run_negative_controls", _no_run)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _producer_lessons_on_for_their_tests(monkeypatch):
+    """§4NC: production writes lessons only from approved rules and the
+    owner's dictation (GHOST_PRODUCER_LESSONS defaults OFF). The producers'
+    code stays (the switch re-opens it), so their own tests keep exercising
+    it with the switch ON; tests/test_4nc_producers.py pins the production
+    default by clearing it."""
+    monkeypatch.setenv("GHOST_PRODUCER_LESSONS", "1")
+    # …and the graph / episodic hydration tiers (off in production, §4NC)
+    monkeypatch.setenv("GHOST_BUS_GRAPH_TIER", "1")
+    monkeypatch.setenv("GHOST_BUS_EPISODIC_TIER", "1")
+    monkeypatch.setenv("GHOST_POSTMORTEM_ENGINE", "1")
+    # §4ND: the experiment / calibration machinery switched off in production
+    # stays exercised by its own tests (tests/test_4nd_*.py pin production)
+    for _k in ("GHOST_HYDRATION_JUDGE", "GHOST_ROUTER", "GHOST_FORESIGHT", "GHOST_GEPA_AUTONOMY",
+               "GHOST_RISK_GOVERNOR", "GHOST_COMPETENCE_PROMPT", "GHOST_CONF_COMPETENCE",
+               "GHOST_AUTO_SKILLS", "GHOST_CODING_PRACTICE"):
+        monkeypatch.setenv(_k, "1")
+    # …and the experiment machinery's own tests read the concluded defaults
+    # as they were (production defaults are all disabled; pinned in 4nd tests)
+    import dataclasses as _dc
+    from ghost_agent.core import experiments as _exp
+    monkeypatch.setattr(_exp, "DEFAULT_SPECS", tuple(
+        _dc.replace(_s, enabled=True) if _s.name in _exp.CONCLUDED_DEFAULTS else _s
+        for _s in _exp.DEFAULT_SPECS))
+
+
 @pytest.fixture(autouse=True)
 def _no_quiet_hours_by_clock(monkeypatch):
     """§4LI: quiet hours read the WALL CLOCK (default 23-07); five
@@ -296,9 +348,13 @@ def _released_workspaces_stay_removable(tmp_path_factory):
     # the per-user root (`pytest-of-<user>`), above a worker's `popen-gwN`
     _user_root = next((a for a in base.parents if a.name.startswith("pytest-of-")), None)
     _this_run = next((a for a in [base, *base.parents] if a.parent == _user_root), None)
-    for sib in (_user_root.iterdir() if _user_root is not None else []):
-        if sib != _this_run and sib.name.startswith("pytest-") and not sib.is_symlink() and sib.is_dir():
-            _clear(sib)
+    # the earlier runs' folders are shared by every xdist worker: ONE worker
+    # walks them (each walk is ~10 s over ~290k entries — twelve of them at
+    # once was a measurable share of the suite's start, 2026-10-10)
+    if os.environ.get("PYTEST_XDIST_WORKER", "gw0") == "gw0":
+        for sib in (_user_root.iterdir() if _user_root is not None else []):
+            if sib != _this_run and sib.name.startswith("pytest-") and not sib.is_symlink() and sib.is_dir():
+                _clear(sib)
     yield
     _clear(base)
 

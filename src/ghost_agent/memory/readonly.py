@@ -136,7 +136,7 @@ class ReadOnlySkillMemory(_ReadOnlyProxy):
         "record_retrieval", "record_helpful_retrieval",
         "credit_recent_retrievals", "record_retrievals_bulk",
         "record_surfaced_outcomes",
-        "prune_low_utility", "mark_verified", "remove_by_trigger",
+        "prune_low_utility", "mark_verified", "remove_by_trigger", "remove_rows",
         # quarantine_lesson landed 2026-07-17, AFTER the 2026-07-14 façade
         # hardening — without this entry a delegated sub-agent (e.g. via
         # counterfactual regression checks) could quarantine a REAL operator

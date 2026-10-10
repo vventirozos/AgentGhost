@@ -170,7 +170,12 @@ class ExperimentSpec:
         return tuple(1.0 / n for _ in range(n)) if n else ()
 
 
-# The built-in experiment set. A JSON file at
+# The built-in experiment set. §4ND (operator: "safe defaults"): EVERY spec is
+# disabled here — all nine were concluded 2026-10-04 (§4LF), and the loader
+# falls back to this set when experiments.json is missing or malformed, so an
+# enabled default would silently restart randomisation on live traffic. A
+# future experiment is switched on deliberately, in experiments.json.
+# A JSON file at
 # $GHOST_HOME/system/experiments.json overrides this wholesale (see
 # `load_registry`), which is how the operator turns one off without a deploy —
 # though a *new* consumer always needs a code change anyway.
@@ -179,7 +184,7 @@ DEFAULT_SPECS: Tuple[ExperimentSpec, ...] = (
         name="use_planning",
         arms=(CONTROL, TREATMENT),
         traffic=1.0,
-        enabled=True,
+        enabled=False,   # §4ND: concluded — a missing/broken experiments.json must not restart it
         description=(
             "Strategic planner path (router-gated decompose, consumes the "
             "planning.decompose GEPA artifact) on turns where it WOULD fire "
@@ -208,7 +213,7 @@ DEFAULT_SPECS: Tuple[ExperimentSpec, ...] = (
         name="risk_steer",
         arms=(CONTROL, TREATMENT),
         traffic=1.0,
-        enabled=True,
+        enabled=False,   # §4ND: concluded — a missing/broken experiments.json must not restart it
         description=(
             "core.risk depth/effort steer on deep struggling turns "
             "(treatment) vs no steer (control)."
@@ -218,7 +223,7 @@ DEFAULT_SPECS: Tuple[ExperimentSpec, ...] = (
         name="fs_batch",
         arms=(CONTROL, TREATMENT),
         traffic=1.0,
-        enabled=True,
+        enabled=False,   # §4ND: concluded — a missing/broken experiments.json must not restart it
         description=(
             "file_system macro: multi-path read (`paths`) + post-edit "
             "verification state on replace (treatment) vs one path per call "
@@ -231,7 +236,7 @@ DEFAULT_SPECS: Tuple[ExperimentSpec, ...] = (
         name="foresight_note",
         arms=(CONTROL, TREATMENT),
         traffic=1.0,
-        enabled=True,
+        enabled=False,   # §4ND: concluded — a missing/broken experiments.json must not restart it
         description=(
             "§4K Phase 3: on a FAILED tool call with strong failing "
             "precedent (foresight index: exact/class basis, support ≥3, "
@@ -246,7 +251,7 @@ DEFAULT_SPECS: Tuple[ExperimentSpec, ...] = (
         name="imagine_preflight",
         arms=(CONTROL, TREATMENT),
         traffic=1.0,
-        enabled=True,
+        enabled=False,   # §4ND: concluded — a missing/broken experiments.json must not restart it
         description=(
             "§4CL I1: on a tool call the foresight precedent index says "
             "will fail (exact/class basis, support >=3, >=2 real precedent "
@@ -264,7 +269,7 @@ DEFAULT_SPECS: Tuple[ExperimentSpec, ...] = (
         name="verify_depth",
         arms=(CONTROL, TREATMENT),
         traffic=1.0,
-        enabled=True,
+        enabled=False,   # §4ND: concluded — a missing/broken experiments.json must not restart it
         description=(
             "§4BQ's first CONSUMER: on a turn the complexity router calls "
             "confidently HARD (label=hard, not escalated), the treatment "
@@ -296,7 +301,7 @@ DEFAULT_SPECS: Tuple[ExperimentSpec, ...] = (
         name="evidence_gate",
         arms=(CONTROL, TREATMENT),
         traffic=1.0,
-        enabled=True,
+        enabled=False,   # §4ND: concluded — a missing/broken experiments.json must not restart it
         description=(
             "§4FD (2026-09-07): when EVERY evidence-bearing tool call so far "
             "in the turn came back empty, weak (recall best match LOW) or "
@@ -794,6 +799,23 @@ def assignments_for_request(context, req_id: str) -> Dict[str, str]:
     except Exception:  # noqa: BLE001
         pass
     return {}
+
+
+#: §4ND: the seven defaults that were enabled until the operator concluded them —
+#: kept by name so a test of the experiment machinery can re-enable them
+CONCLUDED_DEFAULTS = frozenset({"use_planning", "risk_steer", "fs_batch", "foresight_note",
+                                "imagine_preflight", "verify_depth", "evidence_gate"})
+
+
+def any_enabled(context) -> bool:
+    """§4ND: is any experiment switched on for this context? Fails OPEN
+    (True) when the registry cannot be read, so a broken read never hides a
+    live experiment's verdict."""
+    try:
+        reg = load_registry(registry_path_for_context(context))
+        return any(getattr(s, "enabled", False) for s in reg.specs.values())
+    except Exception:  # noqa: BLE001
+        return True
 
 
 def arm_for(context, name: str, req_id: str = "") -> str:
@@ -2116,9 +2138,11 @@ def render_brief_report(summary: Dict[str, Dict[str, ArmStats]], *,
         _rec_st = int(coverage.get("recent_stamped", 0))
         if _rec_n:
             _pct = 100.0 * _rec_st / _rec_n
+            _none_on = expected_names is not None and not set(expected_names)
             lines.append(f"recent stamp coverage: {_rec_st}/{_rec_n} "
                          f"({_pct:.0f}%)"
-                         + ("  ⚠ below 90% — the stamp is regressing NOW"
+                         + ("  (no experiment is enabled — no stamps are expected)" if _none_on   # §4ND
+                            else "  ⚠ below 90% — the stamp is regressing NOW"
                             if _pct < 90.0 else ""))
     for name in sorted(summary):
         arms = summary[name]
@@ -2284,7 +2308,9 @@ def render_report(summary: Dict[str, Dict[str, ArmStats]], *,
             _rec_pct = 100.0 * _rec_st / _rec_n
             lines.append(f"  recent {_rec_st}/{_rec_n} ({_rec_pct:.0f}%) — "
                          f"the trailing window, and the one to watch")
-            if _rec_pct < 90.0:
+            if expected_names is not None and not set(expected_names):
+                lines.append("  (no experiment is enabled — no stamps are expected)")   # §4ND
+            elif _rec_pct < 90.0:
                 lines.append("  ⚠ the RECENT window is below 90% — the stamp "
                              "is regressing NOW. Check enrollment, not the "
                              "corpus age.")

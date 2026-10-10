@@ -209,7 +209,7 @@ def _root() -> Optional[Path]:
 def persist_challenge(*, challenge: str, setup_script: str,
                       validation_script: str, status: str,
                       cluster: str = "", source: str = "",
-                      trajectory_id: str = "") -> Optional[str]:
+                      trajectory_id: str = "", graded_on: str = "artifact") -> Optional[str]:
     """Append a concluded self-play challenge spec to the replay ledger.
     Returns the challenge id, or None when disabled/undecisive/unusable.
     Never raises — persistence must not break a sim conclusion."""
@@ -231,6 +231,9 @@ def persist_challenge(*, challenge: str, setup_script: str,
             "cluster": str(cluster or ""),
             "source": str(source or ""),
             "trajectory_id": str(trajectory_id or ""),
+            # §4MT: a reply-graded challenge's validator reads answer.txt,
+            # which only a reply-graded run writes — see load_replay_candidates
+            "graded_on": str(graded_on or "artifact"),
         }
         with _LOCK:
             root.mkdir(parents=True, exist_ok=True)
@@ -325,7 +328,13 @@ def load_replay_candidates(limit: int = DEFAULT_BATCH_LIMIT) -> List[dict]:
     eligible = [c for c in challenges
                 if c.get("id") and c["id"] not in done
                 and attempts.get(c["id"], 0) < MAX_INCONCLUSIVE_ATTEMPTS
-                and _normalize_status(c.get("status")) is not None]
+                and _normalize_status(c.get("status")) is not None
+                # §4MT (fresh reader, CRIT): a reply-graded practice replayed
+                # here has no answer.txt seam (no seed, no bench item) — every
+                # replay exits 5, reads as a regression, and quarantined the
+                # lessons it hydrated. Its proof is lesson_proof's fresh renders.
+                and str(c.get("graded_on") or "artifact") == "artifact"
+                and str(c.get("source") or "") != "owner_practice"]
     # §4JF ordering: a pending candidate gets its reproducing replay FIRST
     # (a lesson's fate hangs on it), fresh challenges next, and confirmed
     # regressions last — re-eligible only while their recheck budget holds.

@@ -605,7 +605,8 @@ def test_competence_counts_low_weight_records(tmp_path):
     assert cp.observations("vision", "describe") == 4
     # …and the cell is now actually consulted instead of the neutral prior.
     assert cp.estimate("vision", "describe") != 0.5
-    assert "n=4" in cp.get_context_string()
+    # rendered (as a band since §4MV — the block rides the stable prefix)
+    assert "vision: " in cp.get_context_string() and "n <10" in cp.get_context_string()
 
     reopened = CompetenceProfile(tmp_path)
     assert reopened.observations("vision", "describe") == 4

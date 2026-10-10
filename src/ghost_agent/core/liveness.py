@@ -834,7 +834,8 @@ PROBES: List[Probe] = [
     # LIVENESS signal is the state file's own last_run_epoch, not the
     # ledger count (a quiet week is healthy; a state file that stopped
     # advancing is a dead loop wearing a quiet week's clothes).
-    Probe("gepa.autonomy", EXPECT_PERIODIC,
+    # §4ND: GEPA autonomy defaults OFF (GHOST_GEPA_AUTONOMY=1 to run)
+    Probe("gepa.autonomy", EXPECT_GATED,
           "system/gepa_autonomy_state.json",
           _gepa_autonomy_probe,
           alarm_if_zero=True,
@@ -866,7 +867,8 @@ PROBES: List[Probe] = [
                      # prose under its own title ("drafting —").
                      exclude=r"(?:thinking|drafting) —"),
           denominator=DEN_REQUESTS),
-    Probe("router.decisions", EXPECT_PERIODIC,
+    # §4ND: the router is off unless GHOST_ROUTER=1 — GATED, not a DEAD alarm
+    Probe("router.decisions", EXPECT_GATED,
           "system/ghost-agent.log — complexity-router lines",
           _log_probe(r"complexity router", window_h=24.0),
           alarm_if_zero=True,

@@ -1412,8 +1412,9 @@ async def tool_browser(
     # §4LN: a refused/challenge page was booked "pulled" before this check
     # ran, and the dedup then dropped the later REAL pull (persisted); a
     # url-less re-read of the sidecar page is not a new visit either.
+    from ..utils.logging import is_probe_request_id as _ipr, request_id_context as _ridc
     if (workspace_model is not None and getattr(workspace_model, "enabled", False)
-            and not _blocked and not parsed.get("used_last_url")
+            and not _ipr(_ridc.get()) and not _blocked and not parsed.get("used_last_url")   # §4MW r2: a probe books no visit
             and not (operation == "interact" and _interact_read_failed(parsed))):
         try:
             _hit_url = parsed.get("url") or parsed.get("final_url")

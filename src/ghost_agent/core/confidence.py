@@ -190,6 +190,62 @@ class CompositeConfidence:
         except Exception:  # pragma: no cover — defensive
             pass
 
+    #: §4ND (operator: "ranking only, fixed threshold"): deep verification
+    #: fires for the lowest RANK_QUANTILE of recent turns, not under a fitted
+    #: probability threshold that flipped 0.81↔0.85 with every refit (moving
+    #: the deep-verified share between ~12% and ~32%)
+    RANK_QUANTILE = 0.15
+    rank_threshold_raw = None   # set from recent turns by `set_rank_threshold`
+
+    def _blend(self, p, entropy_component, entropy_observed, eff, effort_observed) -> float:
+        """The weighted blend of the observed components. §4ND: competence
+        (error-free tool calls, AUC 0.51 = chance, yet weight 0.6) joins only
+        with GHOST_CONF_COMPETENCE=1; nothing observed → neutral 0.5."""
+        from ..utils.helpers import env_flag
+        parts = [(self.w_competence, p)] if env_flag("GHOST_CONF_COMPETENCE") else []
+        if entropy_observed:
+            parts.append((self.w_entropy, entropy_component))
+        if effort_observed:
+            parts.append((self.w_effort, eff))
+        _wsum = sum(w for w, _ in parts)
+        if _wsum > 0:
+            return sum(w * v for w, v in parts) / _wsum
+        if parts:   # r1: observed but zero-weighted — their mean, never competence
+            return sum(v for _, v in parts) / len(parts)
+        return 0.5
+
+    def raw_from_row(self, row: dict):
+        """The raw (pre-Platt, pre-penalty) composite a logged calibration row
+        would get NOW (current weights and switches); None if unusable."""
+        try:
+            return _clamp_unit(self._blend(
+                _clamp_unit(float(row.get("competence_component", 0.5))),
+                _clamp_unit(float(row.get("entropy_component", 0.5))),
+                bool(row.get("entropy_observed")),
+                _clamp_unit(float(row.get("effort_component", 0.5))),
+                bool(row.get("effort_observed"))))
+        except (TypeError, ValueError):
+            return None
+
+    def set_rank_threshold(self, rows, *, min_rows: int = 50) -> None:
+        """The RANK_QUANTILE cut of recent turns' raw composites. Fewer than
+        `min_rows` usable rows leaves the fitted threshold in charge."""
+        vals = sorted(v for v in (self.raw_from_row(r) for r in rows or ()) if v is not None)
+        if len(vals) < min_rows:
+            self.rank_threshold_raw = None
+            return
+        k = max(0, min(len(vals) - 1, int(round(self.RANK_QUANTILE * (len(vals) - 1)))))
+        self.rank_threshold_raw = vals[k]
+
+    def _below(self, composite, raw_pre_penalty, outcome_penalty) -> bool:
+        """Low confidence: in the lowest rank of recent turns (raw scale, so a
+        refit's map cannot move it), or — before the cut exists — under the
+        fitted threshold. An outcome penalty still pulls a turn below."""
+        if self.rank_threshold_raw is None:
+            return composite < self.threshold
+        raw_final = _clamp_unit(raw_pre_penalty * (1.0 - _clamp_unit(outcome_penalty)))
+        return raw_final <= self.rank_threshold_raw
+
     def score(self, *, normalised_entropy=None,
               competence_p_success: float,
               n_observations: int = 0,
@@ -261,13 +317,7 @@ class CompositeConfidence:
         # is — byte-identical to the previous behaviour in both cases.
         effort_observed = effort is not None
         eff = _clamp_unit(0.5 if effort is None else effort)
-        parts = [(self.w_competence, p)]
-        if entropy_observed:
-            parts.append((self.w_entropy, entropy_component))
-        if effort_observed:
-            parts.append((self.w_effort, eff))
-        _wsum = sum(w for w, _ in parts)
-        composite = (sum(w * v for w, v in parts) / _wsum) if _wsum > 0 else p
+        composite = self._blend(p, entropy_component, bool(entropy_observed), eff, effort_observed)
         # Fuse the verbalised-uncertainty pressure as a multiplicative
         # penalty (defaults to no-op at λ = 0).
         pressure = _clamp_unit(uncertainty_pressure)
@@ -301,7 +351,7 @@ class CompositeConfidence:
             entropy_component=entropy_component,
             competence_component=p,
             threshold=self.threshold,
-            below_threshold=composite < self.threshold,
+            below_threshold=self._below(composite, raw_pre_penalty, outcome_penalty),
             uncertainty_pressure=pressure,
             pre_penalty_composite=pre_penalty,
             # The RAW (pre-Platt) pre-penalty score. Calibration records this

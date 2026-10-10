@@ -99,6 +99,15 @@ class ReplyTap:
         self.retracts: List[str] = []
         self.released_generations = 0
         self.outcome = "not streamed"
+        self.lead = ""              # §4MU: text the finalize will put at the reply's head
+
+    def set_lead(self, text: str) -> None:
+        """§4MU: the finalize prepends a staged block (a deferred correction
+        or caveat from an earlier turn) to the reply. Streamed without it,
+        the shown text no longer prefixed the final one and the whole reply
+        was retracted — and with every verdict now late, more of them queue
+        one. The tap opens the stream with it instead."""
+        self.lead = str(text or "")
 
     # ── the agent's side ──────────────────────────────────────────────
     def bind(self, req_id: str) -> None:
@@ -151,6 +160,8 @@ class ReplyTap:
             if not piece:
                 return
             self.released_generations += 1
+            if self.lead and not self.sent:
+                piece = self.lead + piece
         self._gen_sent = safe_end
         self._send_text(piece)
 

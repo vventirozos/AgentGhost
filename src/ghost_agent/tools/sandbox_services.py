@@ -186,9 +186,7 @@ MANAGE_SERVICES_TOOL_DEFINITION = {
                         "different port. Apps that WRITE runtime state "
                         "(saves, uploads, databases) must write it under "
                         "$GHOST_SERVICE_STATE_DIR, NOT into the project "
-                        "workspace — a RELEASED workspace is read-only, and "
-                        "workspace writes will crash the released app. The "
-                        "state dir survives restarts and releases."
+                        "workspace (a RELEASED workspace is read-only)."
                     ),
                 },
                 "port": {
@@ -203,10 +201,7 @@ MANAGE_SERVICES_TOOL_DEFINITION = {
                         "OUTSIDE that range are reachable only inside the "
                         "sandbox (the user's browser and serve-remote cannot "
                         "reach them) — never name one for something the user "
-                        "must open. The "
-                        "granted port is exported as the PORT env var — "
-                        "bind that (`port=int(os.environ.get('PORT', "
-                        "<default>))`). Pass 0 ONLY for a service that "
+                        "must open. Bind $PORT. Pass 0 ONLY for a service that "
                         "listens on no port at all. restart: omit — it "
                         "keeps the stored port (to MOVE a service: stop, "
                         "then start with the new port). adopt: REQUIRED — the "

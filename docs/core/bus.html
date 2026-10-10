@@ -162,6 +162,14 @@
   <p><code>_decompose_query(query, llm_client, basis=raw_user_text)</code>: the 8-word gate reads the user's own words,
   and no split runs when the query was already rewritten by the expansion (one worker call before the reply is enough);
   the route call gives up after 4 s (the keyword split is the fallback).</p>
+  <h2 id="4nc">Graph links and episodes are no longer auto-loaded <span class="tag">2026-10-10 &sect;4NC</span></h2>
+  <p>Operator decision ("Off in prompts, keep recall"), measured on 86 real owner requests.</p>
+  <ul>
+    <li><strong>The graph tier</strong> was 20% relevant and 16% harmful when loaded (about 53 tokens a turn). One image request's subject surfaced on 7 unrelated turns, and riddle details were stored as world facts.</li>
+    <li><strong>The episodic tier</strong> was 15% relevant and 19% harmful (about 59 tokens a turn). A two-month-old "all systems green" greeting episode surfaced on 12 requests.</li>
+    <li><strong>The switch:</strong> <code>MemoryBus._fetch_graph</code> and <code>_fetch_episodic</code> return nothing unless <code>GHOST_BUS_GRAPH_TIER=1</code> / <code>GHOST_BUS_EPISODIC_TIER=1</code>. The switches are read per call, like <code>GHOST_BUS_VECTOR_TIER</code>, and the tier instrumentation shows them as "-".</li>
+    <li><strong>Nothing is deleted:</strong> the stores are still written and stay searchable by <code>recall</code>, which does not go through these fetchers. The skill, session and profile tiers are unchanged.</li>
+  </ul>
 </main>
 
 <h2 id="4mj">§4MJ (2026-10-08) — what each tier may inject</h2>

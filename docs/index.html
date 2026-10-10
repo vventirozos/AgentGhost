@@ -21,6 +21,7 @@
     <a href="memory.html">What it remembers</a>
     <a href="tools.html">What it can do</a>
     <a href="self-improvement.html">How it improves itself</a>
+    <a href="learning-loop.html">The learning loop</a>
 
     <h3>Running it</h3>
     <a href="safety.html">Safety and privacy</a>
@@ -154,7 +155,11 @@
     </a>
     <a class="card" href="self-improvement.html">
       <h3>How it improves itself</h3>
-      <p>The self-check on every answer, the background learning passes, and how it tunes its own prompts.</p>
+      <p>The self-check on every answer, the background passes, and how it tunes its own prompts.</p>
+    </a>
+    <a class="card" href="learning-loop.html">
+      <h3>The learning loop</h3>
+      <p>From your 👎 to a rule you approve and a test that keeps it fixed — with a worked example.</p>
     </a>
     <a class="card" href="safety.html">
       <h3>Safety and privacy</h3>
@@ -270,8 +275,8 @@
   <h3>It rewrites its own prompts, and mostly declines to</h3>
   <p>Three internal prompts — task decomposition, tool choice, and self-critique — are tuned by an optimizer trained on the agent's own successful turns, using the same local model with no teacher and no external service. It's capped at 16 rounds because longer optimization drifts toward gaming the metric, and a tuned prompt only ships if it beats the hand-written one. <a href="self-improvement.html">How prompt tuning works →</a></p>
 
-  <h3>It turns repeated work into named skills</h3>
-  <p>When several separate successful turns solve something with the same sequence of tools, that becomes a reusable skill — keeping the shortest validated path as the exemplar. Skills are re-tested later rather than trusted forever, since tools get renamed and models drift. <a href="self-improvement.html">How skills are extracted →</a></p>
+  <h3>It learns from you, and asks before it changes</h3>
+  <p>A 👎, or a next message that says the answer missed, starts a loop: while you're away Ghost asks itself the same question again, works out what went wrong and one rule that would fix it, tests the rule on the same question and on your regression tests, and then asks you. Nothing changes until you say "learn rule N". The same complaint becomes a test that is re-asked after every update, so a fix that breaks later is reported. It does not grade or teach itself — measured, that didn't work. <a href="learning-loop.html">The learning loop, with a worked example →</a></p>
 
   <h3>It can search Tor hidden services</h3>
   <p>Normal search engines don't index <code>.onion</code> sites, so there's a separate path through the dedicated onion engines. Each retry is forced onto a fresh Tor circuit, because whether an engine answers depends on which exit you drew — and engines that share a search index are counted once, so corroboration means independent sources. <a href="tools.html">How onion search works →</a></p>
@@ -280,7 +285,7 @@
   <p>Outbound traffic goes through Tor, and this is enforced rather than intended: a boot-time probe plus a process-wide block on direct connections to public addresses. If Tor is unreachable, Ghost won't start. A silently-cleartext agent is worse than a stopped one. <a href="safety.html">How that's enforced →</a></p>
 
   <h3>It works while you're away</h3>
-  <p>Given a quiet stretch, Ghost consolidates memory, reviews turns that failed, extracts skills, retrains two small local models (&#9888; &sect;4BN: only the router leg retrains on a default box &mdash; the PRM leg is consumer-gated and skips), and practises against problems it invents for itself. None of it interrupts you, and none of it runs while you're active. Ask it what it did — the answer reads from a real ledger, not the model's recollection. <a href="self-improvement.html">The full idle schedule →</a></p>
+  <p>Given a quiet stretch, Ghost tidies its memory stores, replays your recent failures to find a rule worth proposing to you, and re-runs the regression tests you kept. None of it interrupts you, and none of it runs while you're active. Ask it what it did — the answer reads from a real ledger, not the model's recollection. <a href="self-improvement.html">The full idle schedule →</a></p>
 
   <h2>Every advanced feature, in one table</h2>
 
@@ -302,13 +307,13 @@
       </tr>
       <tr>
         <td><a href="memory/episodes.html"><strong>Episodic memory</strong></a></td>
-        <td>Whole past episodes — the sequence of actions and how it turned out — recalled by resemblance to the situation you're in now.</td>
-        <td><span class="badge good">on</span></td>
+        <td>Whole past episodes — the sequence of actions and how it turned out — recalled when you ask. Since 2026-10-10 they are no longer added to every prompt (15% relevant, 19% harmful).</td>
+        <td><span class="badge warn">on request</span></td>
       </tr>
       <tr>
         <td><a href="memory/graph.html"><strong>Knowledge graph</strong></a></td>
-        <td>Entities and the relationships between them, walked outward from whatever you just mentioned.</td>
-        <td><span class="badge good">on</span></td>
+        <td>Entities and the relationships between them. Facts about you still reach every prompt; the rest is recalled when you ask (added to every prompt it was 20% relevant, 16% harmful).</td>
+        <td><span class="badge warn">on request</span></td>
       </tr>
       <tr>
         <td><a href="memory/profile.html"><strong>User profile</strong></a></td>
@@ -317,7 +322,7 @@
       </tr>
       <tr>
         <td><a href="memory/skills.html"><strong>Lessons playbook</strong></a></td>
-        <td>What it learned from its own failures, retrieved when the current situation rhymes with the one that taught it.</td>
+        <td>Holds the rules <em>you</em> approved — they go into every one of your prompts. Ghost no longer writes lessons for itself. <a href="learning-loop.html">The learning loop →</a></td>
         <td><span class="badge good">on</span></td>
       </tr>
       <tr>
@@ -349,7 +354,7 @@
       </tr>
       <tr>
         <td><a href="core/verifier.html"><strong>Verify-depth routing</strong></a></td>
-        <td>Turns that look hard get a three-vote verdict instead of a single sample; easy ones don't pay for it.</td>
+        <td>The least confident 15% of answers get the deeper verification; the rest don&rsquo;t pay for it.</td>
         <td><span class="badge good">on</span></td>
       </tr>
       <tr>
@@ -364,8 +369,8 @@
       </tr>
       <tr>
         <td><a href="core/planning.html"><strong>Complexity router</strong></a></td>
-        <td>A small model trained on its own history predicts how hard your request is, which decides whether to plan and how hard to verify.</td>
-        <td><span class="badge good">on</span></td>
+        <td>A small model that predicted how hard a request is. Nothing used its label (§4ND).</td>
+        <td><span class="badge bad">off</span></td>
       </tr>
       <tr>
         <td><a href="configuration.html"><strong>Pre-flight failure guard</strong></a></td>
@@ -374,8 +379,8 @@
       </tr>
       <tr>
         <td><a href="core/foresight.html"><strong>Foresight world model</strong></a></td>
-        <td>Predicts what each tool call will return before running it, then grades the prediction against what actually happened.</td>
-        <td><span class="badge good">on</span></td>
+        <td>Predicted each tool call's result and graded the prediction. Nothing consumed it (§4ND).</td>
+        <td><span class="badge bad">off</span></td>
       </tr>
       <tr>
         <td><a href="core/hypothesis.html"><strong>Hypothesis grounding</strong></a></td>
@@ -384,13 +389,13 @@
       </tr>
       <tr>
         <td><a href="core/confidence.html"><strong>Confidence and calibration</strong></a></td>
-        <td>Token-level entropy and its own track record per domain fused into one score, refit hourly against what really happened.</td>
+        <td>Answers are <em>ranked</em> by confidence to pick the ones that get the deeper check. It is not treated as a probability — measured against outcomes it isn't one (§4ND).</td>
         <td><code>--enable-metacog</code></td>
       </tr>
       <tr>
         <td><a href="core/risk.html"><strong>Risk governor</strong></a></td>
-        <td>On a turn that's visibly struggling, one nudge to bank the progress made or stop and report honestly.</td>
-        <td><span class="badge good">on</span></td>
+        <td>A nudge on turns that looked like they were struggling. Its depth estimates were 10–26 points wrong (§4ND).</td>
+        <td><span class="badge bad">off</span></td>
       </tr>
 
       <tr class="group"><td colspan="3">Learning from its own runs</td></tr>
@@ -401,8 +406,8 @@
       </tr>
       <tr>
         <td><a href="self-improvement.html"><strong>Autonomous tuning loop</strong></a></td>
-        <td>That loop runs itself end to end: mines its own training data, launches the runs, promotes winners, retires losers, no operator.</td>
-        <td><span class="badge good">on</span></td>
+        <td>Ran prompt tuning end to end with no operator. Stopped with the self-run experiments (§4ND); tuning you start by hand still works.</td>
+        <td><span class="badge bad">off</span></td>
       </tr>
       <tr>
         <td><a href="self-improvement.html"><strong>Live prompt deploys</strong></a></td>
@@ -411,8 +416,8 @@
       </tr>
       <tr>
         <td><a href="algorithms/skill_acquisition.html"><strong>Skill acquisition</strong></a></td>
-        <td>Tool sequences that keep working become named skills, kept at the shortest validated path and re-tested later rather than trusted forever.</td>
-        <td><span class="badge good">on</span></td>
+        <td>Turned repeated tool sequences into skills. They were trivial and quoted old requests into prompts (§4ND).</td>
+        <td><span class="badge bad">off</span></td>
       </tr>
       <tr>
         <td><a href="tools/acquired_skills.html"><strong>Tools it writes itself</strong></a></td>
@@ -426,42 +431,42 @@
       </tr>
       <tr>
         <td><a href="algorithms/dream_cycle.html"><strong>Dream cycle</strong></a></td>
-        <td>Idle-time consolidation: recent turns become durable memory and heuristics while you're away.</td>
+        <td>Idle-time upkeep of the memory stores: merging, pruning, re-tuning how much each store is trusted. It no longer writes lessons (§4NC).</td>
         <td><span class="badge good">on</span></td>
       </tr>
       <tr>
         <td><a href="algorithms/dream_cycle.html"><strong>Self-play</strong></a></td>
-        <td>Invents problems for itself and solves them in an isolated sandbox, scored on whether the answer was actually right.</td>
+        <td>Now: replays <em>your</em> real failures, diagnoses one rule, tests it and proposes it to you — and runs your regression tests. Invented practice problems are retired. <a href="learning-loop.html">The learning loop →</a></td>
         <td><span class="badge good">on</span></td>
       </tr>
       <tr>
         <td><a href="core/adversarial_generator.html"><strong>Adversarial practice</strong></a></td>
-        <td>Practice is aimed at the problem families it currently fails most, not the ones it already handles.</td>
-        <td><span class="badge good">on</span></td>
+        <td>Aimed invented practice at its weakest problem families. Retired with invented practice — it passed 8 of 9 at the first try.</td>
+        <td><span class="badge bad">off</span></td>
       </tr>
       <tr>
         <td><a href="self-improvement.html"><strong>Reflection</strong></a></td>
-        <td>Failed turns are reviewed on idle time and become lessons the playbook can retrieve later.</td>
-        <td><span class="badge good">on</span></td>
+        <td>Reviewed failed turns and wrote lessons from them. Its lessons rarely reached the turn they were for (§4NC).</td>
+        <td><span class="badge bad">off</span></td>
       </tr>
       <tr>
         <td><a href="audit_fixes.html"><strong>Post-mortems</strong></a></td>
-        <td>Its worst runs get a whole-transcript review that files a classified defect report about its own tooling.</td>
+        <td>Its worst runs get a whole-transcript review that files a classified defect report about its own tooling. Its lessons are off (§4NC).</td>
         <td><code>--postmortem</code></td>
       </tr>
       <tr>
         <td><a href="eval/banks.html"><strong>Benchmark flywheel</strong></a></td>
-        <td>One externally-graded task per idle tick, kept strictly apart from evidence it graded itself.</td>
-        <td><span class="badge good">on</span></td>
+        <td>One externally-graded task per idle tick. Retired from the idle cycle (§4MS).</td>
+        <td><span class="badge bad">off</span></td>
       </tr>
       <tr>
         <td><a href="core/experiments.html"><strong>Live randomised arms</strong></a></td>
-        <td>Changes ship as A/B arms on real traffic with anytime-valid intervals — production <em>is</em> the experiment.</td>
-        <td><span class="badge good">on</span></td>
+        <td>Changes shipped as A/B arms on real traffic. With this traffic no arm could reach a verdict, so all are disabled (§4ND).</td>
+        <td><span class="badge bad">off</span></td>
       </tr>
       <tr>
         <td><a href="core/feedback.html"><strong>Human feedback</strong></a></td>
-        <td>A thumbs up or down writes a ground-truth label that outranks every machine verdict about that turn.</td>
+        <td>A 👍/👎 writes a ground-truth label that outranks every machine verdict — and a 👎 starts the <a href="learning-loop.html">learning loop</a>.</td>
         <td><span class="badge good">on</span></td>
       </tr>
 

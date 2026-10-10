@@ -77,9 +77,9 @@ def test_a_crash_looping_phase_still_alarms(tmp_path):
     """The same property, driven through the real liveness view."""
     led = _live_ledger(tmp_path)
     for _ in range(12):                       # twelve consecutive crashes
-        record_attempt(led, "router_train", ATTEMPT_ENTERED)
-    assert _row(led, "router_train")["alarm"] is True
-    assert "router_train" in activity_liveness(led)["alarms"]
+        record_attempt(led, "self_play", ATTEMPT_ENTERED)
+    assert _row(led, "self_play")["alarm"] is True
+    assert "self_play" in activity_liveness(led)["alarms"]
 
 
 def test_a_declining_phase_does_not_alarm(tmp_path):
@@ -132,9 +132,9 @@ def test_non_finite_timestamps_are_dropped(tmp_path, bad):
 def test_a_stale_decline_alarms_again(tmp_path):
     led = _live_ledger(tmp_path)
     attempts_path(led).write_text(json.dumps(
-        {"router_train": {"ts": time.time() - 48 * 3600,
+        {"self_play": {"ts": time.time() - 48 * 3600,
                           "result": ATTEMPT_DECLINED}}))
-    assert _row(led, "router_train")["alarm"] is True
+    assert _row(led, "self_play")["alarm"] is True
 
 
 # ══ the store: concurrency, corruption, failure ══════════════════════════
@@ -188,22 +188,22 @@ def test_one_bad_row_does_not_discard_the_others(tmp_path):
 
 @pytest.mark.parametrize("content", [
     "{ corrupt", "", "[]", "null",
-    '{"router_train": true}', '{"router_train": "123"}',
-    '{"router_train": {"ts": "x"}}',
+    '{"self_play": true}', '{"self_play": "123"}',
+    '{"self_play": {"ts": "x"}}',
     # ⚠ THE LEGACY FORMAT, AND IT IS ON THE LIVE BOX RIGHT NOW. The
     # first-generation code wrote a BARE timestamp; that file cannot prove a
     # run declined, so it must read as ENTERED and keep the alarm. The
     # earlier params were keyed "p" while the assertion is on
-    # "router_train", so this branch was never exercised for the phase
+    # the phase under test, so this branch was never exercised for the phase
     # under test — one unpinned line away from a permanent false green.
-    '{"router_train": 1788068709.491002}',
+    '{"self_play": 1788068709.491002}',
 ])
 def test_unreadable_shapes_degrade_to_the_alarm(tmp_path, content):
     """Every corrupt shape must fall back to the OLD alarm. Failure may not
     buy silence — this module's own comment calls a false green worse."""
     led = _live_ledger(tmp_path)
     attempts_path(led).write_text(content)
-    assert _row(led, "router_train")["alarm"] is True
+    assert _row(led, "self_play")["alarm"] is True
 
 
 def test_record_attempt_never_raises():
@@ -268,7 +268,7 @@ def test_the_suppression_is_reported_not_silent(tmp_path):
     zero nobody looked at."""
     from ghost_agent.core.learning_health import render_learning_health
     led = _live_ledger(tmp_path)
-    record_attempt(led, "router_train", ATTEMPT_DECLINED)
+    record_attempt(led, "self_play", ATTEMPT_DECLINED)
     mem = tmp_path / "memory"
     mem.mkdir()
     out = render_learning_health(mem)
@@ -278,7 +278,7 @@ def test_the_suppression_is_reported_not_silent(tmp_path):
     # `dream` (which never ran) while `router_train` — the row that actually
     # declined — got nothing, and the test stayed green.
     lines = out.splitlines()
-    idx = next(i for i, ln in enumerate(lines) if "router_train" in ln)
+    idx = next(i for i, ln in enumerate(lines) if "self_play" in ln)
     assert lines[idx + 1].strip().startswith("└ RAN"), (
         f"the explanation is not attached to the router_train row:\n"
         + "\n".join(lines[max(0, idx - 2):idx + 3]))
@@ -292,7 +292,7 @@ def test_the_reported_age_is_the_real_one(tmp_path):
     from ghost_agent.core.learning_health import render_learning_health
     led = _live_ledger(tmp_path)
     attempts_path(led).write_text(json.dumps(
-        {"router_train": {"ts": time.time() - 20 * 3600,
+        {"self_play": {"ts": time.time() - 20 * 3600,
                           "result": ATTEMPT_DECLINED}}))
     mem = tmp_path / "memory"
     mem.mkdir()
@@ -476,10 +476,10 @@ def test_a_mock_context_cannot_write_a_heartbeat(tmp_path, monkeypatch):
 def test_suppression_is_phase_general(tmp_path):
     """⚠ `and not (phase == "router_train" and _suppresses(...))` survived
     every test, because every liveness test used router_train. When
-    prm_train or self_play get wired, the mechanism must already work for
+    prm_train or router_train get wired, the mechanism must already work for
     them — a router-only suppression would be invisible until then."""
     led = _live_ledger(tmp_path)
-    for phase in ("prm_train", "self_play", "dream", "skills_auto"):
+    for phase in ("prm_train", "router_train", "dream", "skills_auto"):
         attempts_path(led).write_text(json.dumps(
             {phase: {"ts": time.time(), "result": ATTEMPT_DECLINED}}))
         r = _row(led, phase)
@@ -622,8 +622,8 @@ def test_a_missing_result_key_does_not_suppress(tmp_path):
     if the default is wrong. It was absent from the corrupt-shape list."""
     led = _live_ledger(tmp_path)
     attempts_path(led).write_text(json.dumps(
-        {"router_train": {"ts": time.time()}}))
-    assert _row(led, "router_train")["alarm"] is True
+        {"self_play": {"ts": time.time()}}))
+    assert _row(led, "self_play")["alarm"] is True
 
 
 def test_the_default_outcome_is_entered():
@@ -925,7 +925,7 @@ async def test_the_liveness_view_still_alarms_on_a_raising_trainer(
     from ghost_agent.core.learning_health import activity_liveness
     await _run_router_phase(tmp_path, monkeypatch, _ExceptionTrainer)
     led = tmp_path / "system" / "autonomous_activity.jsonl"
-    assert "router_train" in activity_liveness(led)["alarms"]
+    assert "self_play" in activity_liveness(led)["alarms"]
 
 
 def test_the_trainer_marks_its_own_exceptions():

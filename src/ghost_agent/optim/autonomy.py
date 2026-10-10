@@ -119,8 +119,10 @@ def autonomy_enabled() -> bool:
     fully autonomous loop; `GHOST_GEPA_AUTONOMY=0` turns both jobs off.
     Read per call (not at import) so the flag can be flipped without a
     restart; the off-set idiom matches `verifier.py`'s kill switches."""
-    return os.getenv("GHOST_GEPA_AUTONOMY", "1").strip().lower() \
-        not in ("0", "false", "no", "off")
+    # §4ND (operator: "stop them"): default OFF — every target was
+    # `could_not_measure` (no fixtures while GHOST_LLM_RECORD=0)
+    return os.getenv("GHOST_GEPA_AUTONOMY", "0").strip().lower() \
+        in ("1", "true", "yes", "on")
 
 
 def auto_revert_enabled() -> bool:

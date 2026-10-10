@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.regression — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Related</h3>
+    <a href="agent.html#4mw-loop">failure replay (agent)</a>
+    <a href="agent.html#4nb">rule commands</a>
+    <a href="feedback.html">feedback (👍/👎)</a>
+    <a href="../self-improvement.html">Self-improvement guide</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
+  <h1>core / regression.py</h1>
+  <p class="subtitle">§4NE (2026-10-10): the owner's regression suite. The
+  owner's own failure evidence becomes test cases the owner approves; kept
+  tests are re-asked after every code change and daily, and a failure is
+  reported. Tests: <code>tests/test_4ne_regression_suite.py</code>.</p>
+
+  <h2>Why</h2>
+  <p>The §4NA–§4ND reviews measured every autonomous producer of lessons,
+  skills, routing and calibration, and switched most of them off: none
+  could show it made real turns better. The one improvement signal that
+  held up was the owner's own judgement. This module does not try to make
+  the agent better by itself; it makes regressions <em>visible</em>, so a
+  change to the code or a candidate rule is checked against the questions
+  the owner already said were answered wrong.</p>
+
+  <h2>Where the feedback comes from</h2>
+  <ul>
+    <li><strong>Candidates</strong> (<code>candidates</code>): owner turns from the last
+    <code>CANDIDATE_DAYS</code> (14) through <code>iter_teachable(consumer="frontier")</code>,
+    so member and probe turns never count. Evidence is either a human 👎
+    (<code>outcome_source</code> starting <code>HUMAN_SOURCE_PREFIX</code>, outcome failed),
+    or the reaction judge's verdict <code>True</code> together with the owner's next
+    message. A verifier refute alone is <em>not</em> evidence. Only replayable
+    (read-only) requests qualify, because a test run is a probe and cannot write.</li>
+    <li><strong>Drafting</strong> (<code>_draft</code>): the main model, in the idle slot,
+    writes an <code>expectation</code> and up to a few <code>checks</code> from the request,
+    the old reply and the evidence. <code>clean_checks</code> keeps only known kinds
+    with short bounded values; a draft with no checks is no draft
+    (<code>undraftable</code>).</li>
+    <li><strong>Approval</strong>: the proposal is an activity notification that opens with
+    its commands, like candidate rules. Nothing runs until the owner keeps it.</li>
+  </ul>
+
+  <h2>Checks</h2>
+  <p>Deterministic, on the reply text and the turn's recorded tool calls
+  (<code>evaluate</code>). No model judges a test.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Kind</th><th>Passes when</th></tr></thead>
+    <tbody>
+      <tr><td><code>contains_any</code></td><td>the reply contains at least one value (case-insensitive)</td></tr>
+      <tr><td><code>contains_all</code></td><td>it contains every value</td></tr>
+      <tr><td><code>not_contains</code></td><td>it contains none of them</td></tr>
+      <tr><td><code>tool_used</code> / <code>tool_not_used</code></td><td>the turn did / did not call the named tool</td></tr>
+      <tr><td><code>opened_domain</code></td><td>a tool call opened a URL on that domain or a subdomain (suffix match on the host, so <code>evilpostgresql.org</code> does not pass for <code>postgresql.org</code>)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>Owner commands</h2>
+  <p>Owner turns only (<code>request_kind == "owner"</code>, not a public surface),
+  routed from <code>agent._owner_rule_note</code>. The command must be the whole
+  message ("keep test 3 for the exam" is ordinary chat). The answer is the
+  agent's own outcome line, prepended as a banner, as with rule commands.</p>
+  <ul>
+    <li><strong>keep test N</strong> — the test becomes <code>kept</code> (refused when it has no checks). On a kept test it adopts a waiting redraft; it says so when the redraft is still being made, and "already kept" otherwise (no suite-wide re-run). "show test N" and the list show a waiting redraft.</li>
+    <li><strong>edit test N: &lt;what a right answer must do&gt;</strong> — the next idle step redrafts the checks from the owner's words and shows them. A <em>kept</em> test stays in the suite on its current checks meanwhile; "keep test N" adopts the redraft, and an unadopted redraft lapses after <code>PROPOSAL_TTL_S</code> with the test still kept (r4). Any other test goes to <code>edited</code> and comes back as a proposal.</li>
+    <li><strong>forget test N</strong> — state <code>forgotten</code>; it never runs again.</li>
+    <li><strong>show test N</strong>, <strong>show regression tests</strong> — read them.</li>
+    <li><strong>run regression tests</strong> — every kept test is due at the next idle slot.</li>
+  </ul>
+  <p>The suite-wide commands name the <em>regression</em> tests because "run tests"
+  and "list the tests" are ordinary coding requests (r1). A numbered command
+  is ordinary chat while no regression test exists at all.</p>
+
+  <h2>The idle step</h2>
+  <p><code>advance(agent, ctx, home)</code> runs in the self-play slot right after
+  the failure-replay step, through <code>_run_idle_job(…, "regression")</code>, so the
+  owner arriving stops it. One unit of work per slot, in this order:</p>
+  <ol>
+    <li>expire proposals older than <code>PROPOSAL_TTL_S</code> (7 days);</li>
+    <li>redraft one <code>edited</code> test from the owner's words;</li>
+    <li>run due tests — kept tests not yet run on this code
+    (<code>code_fingerprint</code>: a hash of the path, size and mtime of every
+    <code>.py</code> file in the package, taken once when the
+    agent process loads the module, so it is the code that is <em>running</em>), or not run for <code>RUN_EVERY_S</code> (24 h), or all of them
+    after "run regression tests"; at most <code>MAX_CASES_PER_RUN</code> (2) per slot, no more
+    than the replay loop's own budget for one capped idle job. Each result is saved as it
+    finishes, so a cut keeps what ran. The owner arriving stops the run (a cancel note
+    anywhere in the reply, even after partial output, means "stopped", never a failed check).
+    A run that breaks (an error, not a failed check) is recorded as "could not run" — shown
+    that way in "show test N", never as FAIL — and is not retried until the next day or
+    deploy. A test the idle job's time cap cuts <code>MAX_STARTS</code> (2) times is booked
+    "could not run" too, so one slow test cannot hold the rest of the suite and every new
+    proposal behind it; a stop for the owner's arrival is not counted
+    (<code>owner_stopped</code>, also called by the agent when it cancels the job for the owner;
+    it forgives only a run started in the same step, so an earlier cap strike stays counted).
+    A cancel note counts only where the agent puts it — a line in the reply's last
+    paragraph — not when a reply quotes it. A failure is notified; an all-pass run is
+    logged as info;</li>
+    <li>otherwise draft one new proposal, unless <code>MAX_OPEN_PROPOSALS</code> (3)
+    are already waiting. A case written for the same failure while the draft
+    was being made is not added twice, and a re-asked request (<code>same_request</code>)
+    is one test. When the model cannot be asked (busy, timeout) nothing is decided: that
+    failure waits <code>DRAFT_BACKOFF_S</code> (1 h), doubling up to a day, while other failures
+    are drafted (r4: a fixed try limit turned "busy" into "undraftable" for good). Only a draft
+    with no usable checks is set aside as <code>undraftable</code>.</li>
+  </ol>
+  <p>No data home means no store: the step returns <code>""</code>.</p>
+
+  <h2>Test runs are probes, held read-only</h2>
+  <p>A run is <code>handle_chat</code> with request id <code>probe-rt-&lt;n&gt;-&lt;run&gt;</code>.
+  It runs unattended, so it is held read-only at tool dispatch and keeps the
+  owner's project binding exactly like a failure replay:
+  <code>failure_replay.is_replay_request</code> covers both prefixes
+  (<code>UNATTENDED_PREFIXES</code>). The original turn being read-only is not
+  enough, because on replay the model may pick any tool (r1, CRIT).
+  The probe prefix keeps it out of every teaching reader, the outcome
+  ledgers and owner memory, like the failure-replay runs. The run's tools are
+  read back by that id (<code>_tools_for</code>, the one documented
+  <code>include_probes=True</code> opt-in here). A cancelled run raises, so it is
+  not booked as a failure.</p>
+
+  <h2>Candidate rules are run against the suite</h2>
+  <p>In <code>failure_replay</code> a candidate rule that fixed its own failure also
+  runs the kept tests with the rule in place (<code>run_suite(…, rule=…, record=False)</code>;
+  the trial is not written into the tests' history). If that run is cut twice,
+  the rule is still proposed and says its tests could not be run; a run the owner
+  interrupted before any test finished is simply retried without spending one of the
+  stage's tries, and errors are named
+  ("could not run: test 2"), never folded into the pass count. The proposal then says
+  <em>your tests with it: 4/5 pass, FAILING: test 2</em>, so the owner sees
+  what a rule would break before saying "learn rule N".</p>
+
+  <h2>Store</h2>
+  <p><code>$GHOST_HOME/system/regression/cases.json</code>: <code>{"cases": [...], "meta": {...}}</code>.
+  Every read-modify-write goes through <code>update(home, fn)</code> under one lock,
+  so an owner command and the idle step never overwrite each other. The
+  draft (a model call) happens outside the lock; the write re-checks state.</p>
+  <p>Case states: <code>proposed</code> → <code>kept</code> | <code>edited</code> → <code>proposed</code> |
+  <code>forgotten</code> | <code>expired</code>; <code>undraftable</code> when the model gave no usable checks.
+  An edit whose words cannot be drafted leaves the test exactly as it was (checks and state —
+  a forgotten test stays forgotten) and tells the owner; a newer "edit test N" made while a draft is in flight wins.</p>
+  <p><code>opened_domain</code> values are stored as bare hosts
+  (<code>https://www.PostgreSQL.org/docs</code> → <code>postgresql.org</code>); a value with
+  no dot, with spaces, or a bare TLD is dropped, since no page could match it or every page would.</p>
+  <p>An <code>undraftable</code> case was never shown to the owner, so it does not block a new
+  failure on the same request, and it does not make numbered commands suite commands. The
+  same failure with the same evidence is not redrafted (r3: newest-first candidates put it
+  first every slot, starving older failures); new evidence on it reopens it.</p>
+
+  <h2>What it does not do</h2>
+  <ul>
+    <li>It never changes the agent. A failing test is a report to the owner, not a trigger for an automatic fix.</li>
+    <li>It never runs a request that can write (files, memory, messages).</li>
+    <li>It does not judge answers with a model: a check a program cannot run is not a check.</li>
+  </ul>
+</main>
+</body>
+</html>

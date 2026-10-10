@@ -722,3 +722,12 @@ def env_positive(name: str, default: float) -> float:
         logger.warning("%s=%r is not positive — using %s", name, raw, default)
         return float(default)
     return val
+
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    """§4ND: an operator on/off switch, read per call. Unset → `default`."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return bool(default)
+    return raw.strip().lower() in ("1", "true", "yes", "on")

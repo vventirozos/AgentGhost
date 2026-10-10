@@ -226,9 +226,15 @@ def test_a_DEAD_consumer_is_stated_beside_the_number(monkeypatch, tmp_path):
                         raising=False)
     monkeypatch.setattr(LH, "collect_learning_health",
                         lambda md: {"calibration": _cal()})
+    # §4ND: dead only when the §4EC low-confidence depth is off too —
+    # otherwise that consumer is named instead (the old notice was false)
+    monkeypatch.setenv("GHOST_VERIFY_DEPTH_CONF", "0")
     out = LH.render_learning_health(tmp_path)
     assert "CONSUMER DEAD" in out
     assert "_METACOG_ARBITER_ENABLED" in out, "the operator must be told WHERE"
+    monkeypatch.delenv("GHOST_VERIFY_DEPTH_CONF")
+    out = LH.render_learning_health(tmp_path)
+    assert "CONSUMER DEAD" not in out and "low-confidence verification depth" in out
 
 
 def test_the_dead_notice_DISAPPEARS_when_the_consumer_is_enabled(monkeypatch, tmp_path):

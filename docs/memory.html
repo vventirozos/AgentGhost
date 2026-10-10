@@ -21,6 +21,7 @@
     <a class="current" href="memory.html">What it remembers</a>
     <a href="tools.html">What it can do</a>
     <a href="self-improvement.html">How it improves itself</a>
+    <a href="learning-loop.html">The learning loop</a>
 
     <h3>Running it</h3>
     <a href="safety.html">Safety and privacy</a>
@@ -60,8 +61,8 @@
   <p>That's also why a wrong entry here is more annoying than anywhere else — it follows every single turn until you fix it.</p>
   <span class="badge">memory/profile.py</span>
 
-  <h3>4. Lessons — mistakes it doesn't want to repeat</h3>
-  <p>When Ghost gets something wrong and then gets it right, it can record the pair: what it tried, why it failed, what worked. Later, when a similar task comes up, the relevant lessons are pulled in alongside the facts.</p>
+  <h3>4. Rules — what you told it to do differently</h3>
+  <p>Rules you approved. Since October 2026 Ghost no longer writes lessons for itself — measured, they rarely reached the turn they were for. A rule is added only when you adopt one it proposes after replaying a failure ("learn rule 3") or dictate one ("learn this rule: …"), and every adopted rule is in the prompt of every one of your turns. <a href="learning-loop.html">How the learning loop works →</a></p>
   <p>Ask it <em>"what have you learned this week?"</em> and it will read this store back to you rather than making something up.</p>
   <span class="badge">memory/skills.py</span>
 
@@ -121,8 +122,8 @@
     <dt>You want a topic gone entirely</dt>
     <dd>Ask it to forget the topic by name. It first shows you a numbered list of everything it found — files, facts, profile fields, graph facts, past conversations — and deletes only what you confirm in your reply ("yes", or "only 1 and 3"). The stored items are removed, not just suppressed. Wiping all memory works the same way: it says what would go and waits for your yes.</dd>
 
-    <dt>It learned the wrong lesson</dt>
-    <dd>Lessons are recorded automatically, so a bad one can get in. If the self-check later refuses the answer a lesson came from, Ghost removes that lesson on its own. You can also list them (<em>"show me your lessons"</em>) and ask it to drop a specific one.</dd>
+    <dt>A rule is doing more harm than good</dt>
+    <dd>Say <em>"show all rules"</em>, then <em>"forget rule N"</em> — it shows what will be removed — and <em>"confirm forget rule N"</em>. "learn rule N" brings it back.</dd>
   </dl>
 
   <div class="note warn">

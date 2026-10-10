@@ -88,7 +88,9 @@ def test_every_opt_in_states_its_reason():
             if "probe" not in window.lower():
                 offenders.append(f"{path.relative_to(root)}:{src[:m.start()].count(chr(10)) + 1}")
     assert not offenders, offenders
-    assert found == 7, f"{found} opt-ins — a new one is a decision, record it here"
+    # 8: §4MW — the failure-replay loop looks its own probe replays up by id
+    # 9: §4NE — the regression suite reads its own test runs back by id
+    assert found == 9, f"{found} opt-ins — a new one is a decision, record it here"
 
 
 # --- the perfection protocol ----------------------------------------------

@@ -99,6 +99,7 @@ class TestParamsRoundTrip:
                     "competence_component": c, "uncertainty_pressure": 0.0,
                     "outcome": y, "domain": "",
                     "ts": "2026-08-01T00:00:00.000000Z",
+                    "epoch": C.CURRENT_EPOCH,   # §4ND bumped the epoch; these are current rows
                 }) + "\n")
         return C.CalibrationTracker(d)
 

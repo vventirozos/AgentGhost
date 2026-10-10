@@ -666,6 +666,37 @@ async def youtube_canary_run(request: Request):
         return JSONResponse({"started": False, "error": f"{type(e).__name__}: {e}"}, status_code=500)
 
 
+@router.post("/api/operator/self-play-slot", dependencies=[Security(verify_api_key)])
+async def operator_self_play_slot(request: Request):
+    """Operator trigger (§4MT supervised run): run the self-play idle slot ONCE
+    now — the same `_self_play_slot_body` the idle tick runs (withdraw failing
+    proven lessons; a pending proof leg; else the reaction-judge pass and one
+    owner-failure practice). Refused while a user request is live or another
+    slot runs. Starts off-loop and returns at once; poll the GET for the
+    outcome."""
+    agent = get_agent(request)
+    llm = getattr(getattr(agent, "context", None), "llm_client", None)
+    if int(getattr(llm, "foreground_requests", 0) or 0) > 0:
+        return JSONResponse({"started": False, "error": "a user request is live"}, status_code=409)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 — no body: the plain slot
+        body = {}
+    if isinstance(body, dict) and body.get("calibrate"):
+        # how hard is a practice shape for the real solver (no seed, no lesson)
+        started = agent.start_practice_calibration(str(body["calibrate"]), int(body.get("n") or 3))
+    else:
+        started = agent.start_supervised_self_play_slot()
+    return JSONResponse({"started": started, "poll": "GET /api/operator/self-play-slot"},
+                        status_code=200 if started else 409)
+
+
+@router.get("/api/operator/self-play-slot", dependencies=[Security(verify_api_key)])
+async def operator_self_play_slot_status(request: Request):
+    agent = get_agent(request)
+    return JSONResponse(dict(getattr(agent, "_supervised_slot", None) or {"state": "never run"}))
+
+
 @router.get("/api/health", dependencies=[Security(verify_api_key)])
 async def api_health(request: Request):
     """Runtime introspection for the operator + NetMon + the RSS supervisor
@@ -1114,6 +1145,9 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
 
     # Extract Request ID if provided (for Slack Bot correlation)
     request_id = request.headers.get("X-Request-ID")
+    from ..utils.logging import prompt_arm_context, parse_prompt_arm, probe_rule_context
+    prompt_arm_context.set("")                    # §4MV: production never carries an arm
+    probe_rule_context.set("")                    # §4MW: …nor a rule under test
     # §4FB (2026-09-06): `X-Ghost-Origin: probe` marks a DIAGNOSTIC turn —
     # an operator/Claude probe exercising the live path. It runs exactly
     # like a user turn but must never teach (no lesson, reflection,
@@ -1123,6 +1157,10 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
         if not is_probe_request_id(request_id):
             request_id = PROBE_REQUEST_PREFIX + (
                 str(request_id or "").strip() or uuid.uuid4().hex[:8])
+        # §4MV: a probe may select an experiment arm
+        prompt_arm_context.set(parse_prompt_arm(request.headers.get("X-Ghost-Arm")))
+        # §4MW: a candidate rule under test (the replay-the-real-failure loop)
+        probe_rule_context.set(str(request.headers.get("X-Ghost-Probe-Rule") or "")[:800])
         # (§4FF's `X-Ghost-Prompt-Variant` probe header was retired here on
         # 2026-09-21, §4JG — no prompt variant exists to select.)
     # Who is asking (multi-user surfaces only). Anything but "member" is the

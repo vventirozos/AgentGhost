@@ -21,6 +21,7 @@
     <a href="memory.html">What it remembers</a>
     <a href="tools.html">What it can do</a>
     <a href="self-improvement.html">How it improves itself</a>
+    <a href="learning-loop.html">The learning loop</a>
 
     <h3>Running it</h3>
     <a href="safety.html">Safety and privacy</a>
@@ -90,7 +91,13 @@
     <dd>Durable facts about you. Special because it's <em>always present</em> in the prompt rather than searched — which is why a wrong entry here is so persistent.</dd>
 
     <dt>Lesson</dt>
-    <dd>A recorded mistake-and-fix pair. Retrieved alongside facts when a similar task comes up. Sometimes called a playbook entry.</dd>
+    <dd>A recorded mistake-and-fix pair in the playbook. Since October 2026 the only new ones are <em>rules</em> you approved, and those go into every one of your prompts. See <a href="learning-loop.html">the learning loop</a>.</dd>
+
+    <dt>Rule</dt>
+    <dd>One sentence you adopted ("learn rule N", or "learn this rule: …") that is put in the prompt of every one of your turns, under <code>### OWNER RULES</code>. Proposed by the learning loop after it replayed one of your failures and tested the rule.</dd>
+
+    <dt>Regression test</dt>
+    <dd>A question you said was answered wrong, plus checks a program can run on the reply ("mentions 18.6", "opens postgresql.org"). Proposed from your 👎; kept only when you say "keep test N"; re-asked after every update and daily.</dd>
 
     <dt>Skill</dt>
     <dd>Confusingly, two things. An <em>acquired skill</em> is a reusable tool Ghost wrote for itself. A <em>lesson</em> is stored in something called SkillMemory. When someone says "show me your skills" they usually mean the first; "what have you learned" means the second.</dd>
@@ -131,19 +138,19 @@
     <dd>Memory consolidation. Reviews recent memories, merges duplicates, generalises repeated patterns. Runs after about ten minutes of quiet.</dd>
 
     <dt>Self-play</dt>
-    <dd>Ghost inventing a challenge for itself, attempting it, and scoring the result. Practice. Runs after about an hour of quiet.</dd>
+    <dd>The idle slot after about an hour of quiet. Today it replays one of <em>your</em> recent failures, diagnoses it, tests a rule and proposes it to you, and runs your regression tests. Invented challenges are retired: Ghost passed 8 of 9 at the first try, so they taught nothing.</dd>
 
     <dt>Reflection</dt>
-    <dd>Re-reading recent failed turns and writing down what went wrong, which becomes lessons.</dd>
+    <dd>Re-reading recent failed turns and writing down what went wrong as lessons. Off since October 2026 (<code>GHOST_PRODUCER_LESSONS</code>): those lessons rarely reached the turn they were for.</dd>
 
     <dt>Post-mortem</dt>
     <dd>Deeper than reflection: reads the <em>whole transcript</em> of a bad run and files a classified defect report — bad choice, bad setting, or broken tool. Off by default.</dd>
 
     <dt>Frontier</dt>
-    <dd>The edge of what Ghost is uncertain about. Self-play aims here rather than practising things it already handles.</dd>
+    <dd>The edge of what Ghost is uncertain about. Invented practice used to aim here; it is retired.</dd>
 
     <dt>Distillation</dt>
-    <dd>Compressing many recorded turns into something smaller and reusable — a lesson, a skill, a trained scorer.</dd>
+    <dd>Compressing many recorded turns into something smaller and reusable — a lesson, a skill, a trained scorer. Today only the plan scorer is still trained this way.</dd>
 
     <dt>GEPA</dt>
     <dd>The optimizer used to rewrite Ghost's own internal prompts from its successful turns. Run offline by you, not during the idle loop. A tuned prompt only replaces the hand-written one if it wins an A/B comparison.</dd>
@@ -183,7 +190,7 @@
     <dd>A small local model that scores whether a partial plan looks like it's heading somewhere useful &mdash; judging the working, not just the answer. Ghost <em>can</em> train it on its own recorded turns, but that idle retrain is <strong>consumer-gated</strong> (&sect;4BN): it skips unless something actually reads a PRM value, and on a default box nothing does. <em>(R20 MAJOR-3: this caveat was previously spliced into the term name itself &mdash; markdown backticks rendering literally in a beginner glossary, with "any of this" pointing at text from a different page. Rewritten where it belongs, in the definition.)</em></dd>
 
     <dt>Router</dt>
-    <dd>A small local classifier that predicts how hard a request is, so easy ones can go to a cheap machine. Off unless you point at a trained one.</dd>
+    <dd>A small local classifier that predicts how hard a request is. Off (<code>GHOST_ROUTER</code>): nothing used its label.</dd>
 
     <dt>MCTS · Monte Carlo Tree Search</dt>
     <dd>Exploring several possible next actions and looking a step ahead before committing, rather than taking the first plausible one. Only on hard problems, and only with <code>--deep-reason</code> &#9888; &sect;4BN: the lookahead half is <strong>module-gated off</strong> (<code>_MCTS_TURNSTART_ENABLED = False</code>) &mdash; only the hypothesis testing is live; boot says so.</dd>

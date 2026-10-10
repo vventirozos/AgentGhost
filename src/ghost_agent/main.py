@@ -3239,6 +3239,10 @@ async def lifespan(app):
                 _cp = _ct.load_params() if _ct is not None else None
                 if _cp is not None and getattr(context.metacog, "confidence", None) is not None:
                     context.metacog.confidence.apply_fitted(_cp)
+                # §4ND: deep verification = the lowest 15% of recent owner turns
+                if _ct is not None and getattr(context.metacog, "confidence", None) is not None:
+                    from .core.calibration import recent_turn_rows as _rtr
+                    context.metacog.confidence.set_rank_threshold(_rtr(_ct.history_path))
                     from .core.metacog_log import emit as _mc_emit, Subsystem as _mc_ss
                     _mc_emit(_mc_ss.CALIB, **calib_startup_fields(_cp))
             except Exception as _capx:  # pragma: no cover — defensive

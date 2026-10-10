@@ -4865,122 +4865,66 @@ MANAGE_PROJECTS_TOOL_DEF = {
     "function": {
         "name": "manage_projects",
         "description": (
-            "Create and operate on long-term projects (coding or general) "
-            "with task/subtask trees that survive across sessions. Use this "
-            "when the user wants to START a new named multi-step effort, "
-            "RESUME prior work, inspect the task tree, advance a task, or "
-            "switch projects. GATING for `create`: only create a project when "
-            "(1) the user EXPLICITLY asks to start/track a project, OR (2) the "
-            "deliverable GENUINELY spans MULTIPLE files/modules AND needs "
-            "MULTIPLE turns to build. Do NOT use this for ad-hoc chat or "
-            "one-shot queries — those stay in free-chat mode. A self-contained "
-            "SINGLE-FILE deliverable (even a large one — a one-file browser OS, "
-            "game, or script) is a one-shot: build it directly with file_system "
-            "write, do NOT create a project for it. Past similar projects in "
-            "memory are NOT a reason to create a new one. Do NOT call `create` "
-            "twice for the same effort — if a project already appears in "
-            "DYNAMIC SYSTEM STATE under CURRENT PROJECT, work on THAT one. "
-            "Workflow: `create` or `switch` to enter project mode; "
-            "`task_decompose` (with ONLY `subtasks`, no `task_id`) to "
-            "fan out a fresh project's top-level tasks; `task_decompose` "
-            "WITH `task_id` to break a specific task into subtasks; "
-            "`task_add` for one-off SINGLE additions — if the user "
-            "provides a LIST (numbered, bulleted, or comma-separated) "
-            "of 2+ tasks to add, use `task_decompose` with "
-            "subtasks=[…] instead; looping task_add N times wastes N-1 "
-            "turns AND frequently produces duplicates when the model "
-            "re-reads the user's list mid-loop. `task_next` to find "
-            "the next leaf to execute; `task_update` to mark DONE/"
-            "FAILED/PAUSED/NEEDS_USER (pass `task_ids=[…]` to update "
-            "many at once — strongly preferred over looping). IMPORTANT: "
-            "`task_add` creates tasks in PENDING status; 'Added' does "
-            "NOT mean 'Done'. Do NOT mark a task DONE until its "
-            "described work is actually complete. PACING: after you "
-            "create or decompose a plan, present it and STOP — advance "
-            "ONE task per explicit user go-ahead ('proceed to next "
-            "task'), never the whole tree in a single turn (that floods "
-            "the context window on large projects). `resume` when "
-            "the user asks to pick up "
-            "an old project. GRANULARITY when decomposing: make each task "
-            "own a FILE or bounded function you can build+verify alone; do "
-            "NOT split one file into N tasks. MEMORY: `ledger` records a "
-            "durable fact (file layout, key API/function name, convention) "
-            "that is surfaced in the briefing every turn — use it (or pass "
-            "`ledger=…` on a DONE task_update) so later turns inherit what "
-            "you learned instead of re-reading files. `exit` to leave "
-            "project mode; "
-            "`archive` to HIDE a project (reversible — status→ARCHIVED, "
-            "files kept, `resume` brings it back); `delete` to "
-            "PERMANENTLY remove a project and ALL its data — tasks, "
-            "artifacts, events, AND its workspace files on disk (NOT "
-            "reversible). Use `delete` only when the user clearly means "
-            "to erase it; otherwise prefer `archive`. `release`, `unrelease` "
-            "and `delete` first return a preview: ask the user, and repeat "
-            "the call with its confirm_token only after they say yes. "
-            "`autopilot` (enabled=true|false, only on the user's request) "
-            "lets the idle loop advance the project between their turns, or "
-            "stops it; without `enabled` it reports the setting; "
-            "project_id='all' with enabled=false stops every project (a step "
-            "already running finishes first). Autopilot "
-            "pauses itself after 3 steps with no progress, at each check-in, or "
-            "when its budget is used — tell the user why. `budget` (only on the "
-            "user's request; metadata={steps_cap, runtime_cap_hours, "
-            "checkpoint_every}) sets the project's budget — steps_cap counts "
-            "every advance step (the user's too), runtime_cap_hours is the "
-            "unattended time between the user's looks; without metadata it "
-            "reports it. "
-            "`promote_from_context` only when the user has explicitly "
-            "accepted a suggestion to convert the current chat into a "
-            "project. `research` to web-research a topic (pass `topic`) or "
-            "auto-derive several from the project goal (omit `topic`) — each "
-            "is summarized into research/<slug>.md in the project workspace "
-            "and listed under RESEARCH NOTES in the briefing; `research_list` "
-            "to see what has already been researched (read a brief with "
-            "file_system before re-researching the same thing). "
-            "`artifact_list` to read back recorded artifacts — the "
-            "deliverable file manifest, notes, urls, and stored tool_call "
-            "outputs (optionally scope with task_id and/or artifact_kind; "
-            "long payloads are truncated to 400 chars). "
-            "`cleanup` to remove debris from the project workspace NOW "
-            "(stray screenshots, caches, helper scaffolding) — "
-            "deliverables, source files and media referenced by the code "
-            "are never touched; use when the user asks to tidy up. "
-            "`describe_file` to record WHAT a file is/does the moment you "
-            "learn it (file_path + description, optional file_role) — it "
-            "feeds the per-file map in the briefing and PROJECT_MAP.md, so "
-            "future sessions read the right file instead of everything; "
-            "call it whenever you create a file or work out an undescribed "
-            "one. `file_history` (file_path) to see every recorded action "
-            "that touched a file — check it BEFORE re-reading a large file "
-            "to answer 'what changed / what was tried'. "
-            "`release` (ONLY when the USER explicitly confirms the project "
-            "works): promotes a DONE project to RELEASED — pass `directions` "
-            "(a usage runbook for the user); the tool tidies the workspace, "
-            "COLD-STARTS the services / verifies deliverables (release "
-            "rehearsal), and freezes a release dossier + RELEASE.md. A "
-            "RELEASED project is IMMUTABLE: to change it use "
-            "`create_version` (optional description = the requested "
-            "change), which forks a v(n+1) copy — files, ledger, config "
-            "(port bumped), file map carried over; task history and the "
-            "release dossier stay with the released version, which keeps "
-            "running untouched. `unrelease` (user command only) demotes "
-            "RELEASED→DONE for in-place fixes (dossier retained; re-release "
-            "bumps its revision). `verify_release` health-checks a released "
-            "project against its dossier (restarts dead services, probes "
-            "ports, reports drift) — use when the user asks whether a "
-            "released app still runs. `task_delete` (task_id) removes a "
-            "mistaken/duplicate task permanently. "
-            "`search` (query) finds WHICH project touched a file / used a "
-            "technique — searches every project's deliverables, file map, "
-            "ledger, journal, and research; use it before answering 'which "
-            "project did X'. `set_dependency` (depends_on=[ids/titles]) "
-            "makes this project wait for others: autoadvance holds until "
-            "every dependency is DONE/RELEASED (empty list clears; cycles "
-            "rejected). `clone` (project_id=SOURCE, title=NEW name, "
-            "optional description/goal) starts a FRESH project from an "
-            "existing one's files+knowledge WITHOUT lineage — use for "
-            "'make another one like X'; for changing a RELEASED project "
-            "itself use create_version instead."
+            "Create and operate on long-term projects (coding or general) with task/subtask trees that "
+            "survive across sessions. Use this when the user wants to START a new named multi-step "
+            "effort, RESUME prior work, inspect the task tree, advance a task, or switch projects. GATING "
+            "for `create`: only create a project when (1) the user EXPLICITLY asks to start/track a "
+            "project, OR (2) the deliverable GENUINELY spans MULTIPLE files/modules AND needs MULTIPLE "
+            "turns to build. Do NOT use this for ad-hoc chat or one-shot queries — those stay in "
+            "free-chat mode. A self-contained SINGLE-FILE deliverable (even a large one — a one-file "
+            "browser OS, game, or script) is a one-shot: build it directly with file_system write, do NOT "
+            "create a project for it. Past similar projects in memory are NOT a reason to create a new "
+            "one. Do NOT call `create` twice for the same effort — if a project already appears in "
+            "DYNAMIC SYSTEM STATE under CURRENT PROJECT, work on THAT one. Workflow: `create` or `switch` "
+            "to enter project mode; `task_decompose` (with ONLY `subtasks`, no `task_id`) to fan out a "
+            "fresh project's top-level tasks; `task_decompose` WITH `task_id` to break a specific task "
+            "into subtasks; `task_add` for one-off SINGLE additions — if the user provides a LIST "
+            "(numbered, bulleted, or comma-separated) of 2+ tasks to add, use `task_decompose` with "
+            "subtasks=[…] instead. `task_next` to find the next leaf to execute; `task_update` to mark "
+            "DONE/FAILED/PAUSED/NEEDS_USER (pass `task_ids=[…]` to update many at once — strongly "
+            "preferred over looping). IMPORTANT: `task_add` creates tasks in PENDING status; 'Added' does "
+            "NOT mean 'Done'. Do NOT mark a task DONE until its described work is actually complete. "
+            "PACING: after you create or decompose a plan, present it and STOP — advance ONE task per "
+            "explicit user go-ahead ('proceed to next task'), never the whole tree in a single turn (that "
+            "floods the context window on large projects). `resume` when the user asks to pick up an old "
+            "project. `ledger` records a durable fact surfaced every turn (or pass `ledger=…` on a DONE "
+            "task_update). `exit` to leave project mode; `archive` to HIDE a project (reversible — "
+            "status→ARCHIVED, files kept, `resume` brings it back); `delete` to PERMANENTLY remove a "
+            "project, ALL its data AND its files (NOT reversible). Use `delete` only when the user "
+            "clearly means to erase it; otherwise prefer `archive`. `release`, `unrelease` and `delete` "
+            "first return a preview: ask the user, and repeat the call with its confirm_token only after "
+            "they say yes. `autopilot` (enabled=true|false, only on the user's request) lets the idle "
+            "loop advance the project between their turns, or stops it; without `enabled` it reports the "
+            "setting; project_id='all' with enabled=false stops every project (a step already running "
+            "finishes first). Autopilot pauses itself after 3 steps with no progress, at each check-in, "
+            "or when its budget is used — tell the user why. `budget` (only on the user's request; "
+            "metadata={steps_cap, runtime_cap_hours, checkpoint_every}) sets the project's budget — "
+            "steps_cap counts every advance step (the user's too), runtime_cap_hours is the unattended "
+            "time between the user's looks; without metadata it reports it. `promote_from_context` only "
+            "when the user has explicitly accepted a suggestion to convert the current chat into a "
+            "project. `research` to web-research a topic (pass `topic`) or auto-derive several from the "
+            "project goal (omit `topic`); `research_list` lists the briefs (research/<slug>.md) — read "
+            "one with file_system before re-researching. `artifact_list` to read back recorded artifacts "
+            "(scope with task_id/artifact_kind; long payloads are cut to 400 chars). `cleanup` to remove debris from the project workspace "
+            "NOW (never deliverables or sources) when the user asks to tidy up. `describe_file` to record "
+            "WHAT a file is/does the moment you learn it (file_path + description, optional file_role); "
+            "call it whenever you create a file or work out an undescribed one. `file_history` "
+            "(file_path) to see every recorded action that touched a file — check it BEFORE re-reading a "
+            "large file to answer 'what changed / what was tried'. `release` (ONLY when the USER "
+            "explicitly confirms the project works): promotes a DONE project to RELEASED — pass "
+            "`directions` (a usage runbook for the user); it cold-starts services, verifies deliverables "
+            "and freezes a release dossier. A RELEASED project is IMMUTABLE: to change it use "
+            "`create_version` (optional description = the requested change), which forks a v(n+1) copy; "
+            "the released version keeps running untouched. `unrelease` (user command only) demotes "
+            "RELEASED→DONE for in-place fixes. `verify_release` health-checks a released project against "
+            "its dossier — use when the user asks whether a released app still runs. `task_delete` "
+            "(task_id) removes a mistaken/duplicate task permanently. `search` (query) finds WHICH "
+            "project touched a file / used a technique; use it before answering 'which project did X'. "
+            "`set_dependency` (depends_on=[ids/titles]) makes this project wait for others: autoadvance "
+            "holds until every dependency is DONE/RELEASED. `clone` (project_id=SOURCE, title=NEW name, "
+            "optional description/goal) starts a FRESH project from an existing one's files+knowledge "
+            "WITHOUT lineage — use for 'make another one like X'; for changing a RELEASED project itself "
+            "use create_version instead."
         ),
         "parameters": {
             "type": "object",
@@ -5009,13 +4953,13 @@ MANAGE_PROJECTS_TOOL_DEF = {
                 "alternatives": {"type": "array", "items": {"type": "string"}},
                 "postconditions": {"type": "array", "items": {"type": "string"}},
                 "constraints": {"type": "array", "items": {"type": "string"},
-                                "description": "EXPLICIT user requirements/prohibitions quoted from their message, verbatim or near-verbatim (e.g. \"don't come up with some random AI\", \"YOU will play against me\", \"no external libraries\"). Pass on create/task_add/task_decompose/task_update. They are re-shown every turn in the briefing and GATE task completion: a task with constraints cannot go DONE without result evidence addressing them. Negations and role assignments (what the user said YOU must do) belong here, never paraphrased away."},
+                                "description": "EXPLICIT user requirements/prohibitions quoted from their message, verbatim or near-verbatim (e.g. \"don't come up with some random AI\", \"YOU will play against me\", \"no external libraries\"). Pass on create/task_add/task_decompose/task_update. They GATE task completion. Negations and role assignments (what the user said YOU must do) belong here, never paraphrased away."},
                 "depends_on": {"type": "array", "items": {"type": "string"},
                                "description": "task_add: ids of sibling tasks that must be DONE before THIS task becomes eligible to run (a prerequisite edge, distinct from parent/child). Use it to order peer tasks; omit for independent tasks."},
                 "sequential": {"type": "boolean",
                                "description": "task_decompose: when true, chain the subtasks so each one only runs after the previous is DONE (the autoadvancer executes them in order). Default false = all subtasks independently runnable."},
                 "topic": {"type": "string",
-                          "description": "action=research: a single topic to research now. The agent web-searches it, summarizes the findings into research/<slug>.md in the project workspace, and surfaces it in the project briefing. Omit topic (and topics) to auto-derive several topics from the project goal + open tasks."},
+                          "description": "action=research: a single topic to research now. Saved as research/<slug>.md. Omit topic (and topics) to auto-derive several topics from the project goal + open tasks."},
                 "topics": {"type": "array", "items": {"type": "string"},
                            "description": "action=research: an explicit list of topics to research (each persisted as its own brief). If omitted and no single topic is given, topics are auto-derived from the project."},
                 "max_topics": {"type": "integer",
@@ -5023,7 +4967,7 @@ MANAGE_PROJECTS_TOOL_DEF = {
                 "result": {"type": "string", "description": "Short result summary (task_update with status=DONE)."},
                 "failure_reason": {"type": "string"},
                 "subtasks": {"type": "array", "items": {"type": "string"},
-                             "description": "Ordered subtask descriptions for task_decompose / promote_from_context. GRANULARITY: make each task own a FILE or a clearly-bounded function/module you can build AND verify on its own (e.g. 'src/parser.py: parse the CSV', 'apps/terminal.js: terminal app'). AVOID splitting one file into N tasks (e.g. 6 tasks that all edit index.html) — that forces re-reading the whole file every turn and does not scale. Prefer a thin shell/entrypoint + one file per feature."},
+                             "description": "Ordered subtask descriptions for task_decompose / promote_from_context. GRANULARITY: make each task own a FILE or a clearly-bounded function/module you can build AND verify on its own (e.g. 'src/parser.py: parse the CSV', 'apps/terminal.js: terminal app'). Do NOT split one file into N tasks; prefer a thin entrypoint + one file per feature."},
                 "artifact_kind": {"type": "string",
                                   "enum": ["file", "url", "note", "tool_call"]},
                 "payload": {"type": "string",
@@ -5040,11 +4984,11 @@ MANAGE_PROJECTS_TOOL_DEF = {
                 "enabled": {"type": "boolean",
                             "description": "action=autopilot: true lets the idle loop advance this project between the owner's turns, false stops it; omit to report. Only on the owner's request."},
                 "count": {"type": "string",
-                          "description": "action=autoadvance: how many tasks to advance autonomously in a bounded loop — a number (e.g. \"3\") or \"all\" to run to completion. Use this ONLY for an explicit MULTI-task request: 'do the next 3 tasks' → count=\"3\"; 'proceed with all remaining tasks' / 'finish the project' → count=\"all\". A single 'proceed'/'next' you do YOURSELF as one focused full turn — do NOT route that here (autoadvance runs a lighter single-step-per-task executor). The loop checkpoints each task and stops at the first of: done · a task that needs you · budget · a FAILED task."},
+                          "description": "action=autoadvance: how many tasks to advance autonomously in a bounded loop — a number (e.g. \"3\") or \"all\" to run to completion. Use this ONLY for an explicit MULTI-task request: 'do the next 3 tasks' → count=\"3\"; 'proceed with all remaining tasks' / 'finish the project' → count=\"all\". A single 'proceed'/'next' you do YOURSELF as one focused full turn — do NOT route that here (autoadvance runs a lighter single-step-per-task executor)."},
                 "ledger": {"type": "string",
-                           "description": "action=ledger: ONE durable fact to append to the project's design ledger — file layout, a key function/API name, a convention, where something lives (e.g. 'windows are .window divs, opened via openApp(id), drag via makeDraggable'). The ledger is surfaced in the project briefing every turn, so the next turn inherits these facts instead of re-reading files to rediscover them. Omit `ledger` to read the current ledger back. May also be passed on a task_update status=DONE to record the decision as the task closes."},
+                           "description": "action=ledger: ONE durable fact to append to the project's design ledger (file layout, key API name, convention), surfaced in the briefing every turn. Omit `ledger` to read the current ledger back. May also be passed on a task_update status=DONE to record the decision as the task closes."},
                 "config_key": {"type": "string",
-                               "description": "action=config: the name of ONE durable project setting to record — an env var, key flag, dependency version, the model, a port, a DB URI (e.g. 'GHOST_MODEL', 'port', 'torch'). Surfaced in the project briefing every turn so the next turn runs/builds under the right settings instead of re-discovering them from requirements.txt / env / argv. Omit both config_key and config_value to read the current config map back; pass config_key with an empty config_value to delete that setting."},
+                               "description": "action=config: the name of ONE durable project setting to record — an env var, key flag, dependency version, the model, a port, a DB URI (e.g. 'GHOST_MODEL', 'port', 'torch'). Surfaced in the briefing every turn. Omit both config_key and config_value to read the current config map back; pass config_key with an empty config_value to delete that setting."},
                 "config_value": {"type": "string",
                                  "description": "action=config: the value for `config_key` (e.g. 'qwen-3.6-35b-a3', '8000', '2.3.1'). Empty value deletes the key."},
                 "file_path": {"type": "string",

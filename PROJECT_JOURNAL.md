@@ -52741,3 +52741,783 @@ The idle cycle covers the dream phases (consolidation, REM, reflection, journal,
 **Open:**
 - Self-play now rarely runs: owner failures are rarely labelled (45 of 104 recent owner turns are UNKNOWN). A labelling round would feed it.
 - Bench banks are retired until new, harder banks exist.
+
+## §4MT — make self-play useful (2026-10-09, operator: "i want self-play to be useful") — R0 scope, written first
+**Property.** Self-play is useful when three things hold:
+1. It practises what the OWNER's turns actually get wrong: a steady supply of real, correctly identified failures.
+2. Each practice run is a self-contained, machine-checkable challenge of the same skill.
+3. What it learns reaches the owner's next turn of that kind, and measurably improves it (or is withdrawn when it does not).
+
+**Known (§4MS):**
+- Seeds come only from `outcome == FAILED` owner turns that used tools: 3 in 14 days, none a skill gap.
+- 45 of 104 recent owner turns are UNKNOWN.
+- Self-play lessons reached owner turns twice in 14 days, both irrelevant.
+- The §4MM audit hand-graded 48 owner turns (50% right): a ground truth for failure signals.
+
+**Method.** Three fresh read-only lenses:
+1. **Failure signals.** Every signal the system records about an owner turn going wrong, scored for precision and recall against the §4MM hand grades: verifier REFUTED/UNCERTAIN, late corrections, thumbs-down, the owner re-asking or correcting next turn, loop breakers, forced reports, deadline reports, empty or no-answer replies, tool error streaks, and post-mortem defects.
+2. **Practicability.** Which failure shapes in the real owner population can become an offline, machine-checkable challenge (code/data/parsing vs web research vs conversation). How the generator would turn a brief into one, and what it must never copy (privacy).
+3. **The loop back.** How a self-play lesson is keyed, retrieved and credited on owner turns. Why lessons missed or misfired. How to measure improvement (a counterfactual replay of the original failing turn).
+
+Then the usual protocol.
+
+**Not in scope:** the model; keyed external APIs.
+
+### §4MT — lenses and operator decisions (2026-10-09)
+**Failure signals (lens 1).** Only 1 of 23 hand-graded wrong/partial owner turns was recorded FAILED. PASSED is a coin flip: 13 right / 10 wrong-or-partial; 9 failures were CONFIRMED then PASSED.
+
+A seed-only **suspect-failure** rule — FAILED, any-stage REFUTED, UNCERTAIN, or a tool-error streak ≥ 2, deduped by `same_request` — measured:
+- precision 9/10;
+- recall 9/23 (60% of the tool-using failures);
+- about 7 true failures a week, against about 1 under the current rule.
+
+The owner's next-message reactions are the only signal for no-tool turns. The lexical correction gate opened 4 times in 170 pairs, so it is to be replaced by a judge, not patched. 9% of "owner" turns were pre-header test traffic.
+
+**Practicability (lens 2).** Of 75 FAILED owner turns, 37 (49%) are one skill: say only what the evidence shows (research grounding, tool-output fidelity, honest failure). Today's coding-drill format fits 9%. Fixtures plus reply grading (the existing bench `answer.txt` seam) reach about 63%, and stub tools about 69%.
+- A shape mapper over code-written `failure_reason` prefixes agrees 79% with the hand labels.
+- The brief must be structured fields only — the raw request and failure_reason quote profile facts and Slack ids.
+- A rare-token leak gate is needed.
+
+**Loop back (lens 3).**
+- Self-play lessons reach 1 of 311 owner turns: trigger distance 0.45 against a 0.30 gate, and the curriculum doesn't match.
+- No lesson links back to its seed.
+- Counterfactual has no with/without arm.
+- Nothing withdraws a lesson that rides on failures.
+- Owner retries come within minutes (median 0.12–0.4 h), so self-play helps only later same-kind turns (about 8 a month).
+
+**Operator decisions:**
+1. Ship the suspect rule now; build the next-message judge, calibrate it on the 48 graded pairs, and enable it only if accurate.
+2. Evidence skills first (research grounding, tool-output fidelity, honest failure) plus code/data.
+3. Lessons are proven against a no-lesson control, linked to their seed, surfaced near the seed request by stored embedding (no text kept), and withdrawn after 2 later failures.
+
+### §4MT — outcome (2026-10-09)
+**Built**
+
+*Supply* (`core/owner_seeds.py`):
+- **Suspect-failure rule:** an owner turn is a seed candidate if it is FAILED, has any-stage REFUTED, then UNCERTAIN, or has a tool-error streak of 2 or more. Aborted turns never qualify. Re-asks are deduped with `same_request`.
+- **Next-message reaction judge** (`distill/reaction_judge.py`), run on the main model with no thinking at temperature 0. It runs at the start of the self-play slot, judges up to 12 turns, and caches each verdict to `selfplay/reaction_verdicts.json` as it goes.
+- **Judge calibration**, on the 26 hand-graded §4MM turns that have an adjacent next message (same channel, within 20 min):
+  - precision 5/6, recall 5/17; two runs agreed 26/26;
+  - 4 of its 5 catches are failures the rule misses; rule ∪ judge gives 9/17 at 9/10;
+  - it is ON (`GHOST_REACTION_JUDGE=0` turns it off). The bar (precision matching the rule's, plus failures the rule misses) was chosen after this one small measurement.
+
+*Brief* (`core/practice_brief.py`):
+- Structured fields only: shape, skill, right behaviour, tool names, argument keys and status, and a neutral domain.
+- The shape mapper abstains on loops and format failures.
+- The seed carries only hashes of the source's rare tokens. A generated challenge, or its setup, that shares one is rejected (in the validator-repair path too).
+
+*Practice* (`core/practice_templates.py`):
+- Randomised offline fixtures for research grounding, tool-output fidelity and honest failure, graded on the REPLY through the `answer.txt` seam (`_reply_graded`), with their own wrapper. The bench wrapper's numeric clause is parsed as a number-only constraint.
+- A failing validator names what is wrong, never the value.
+- Owner practice has its own lesson gate:
+  - struggled-then-won → lesson;
+  - failed → lesson (held for proof);
+  - first-try pass → none.
+  The frontier is not recorded: practice classified as the mastered `python_general`, which had silenced every lesson.
+- An owner seed whose generation fails every gate stops (no template fallback). Two such runs, or two cap stops, retire the seed. An owner stop or an infra error does not count.
+
+*Proof* (`core/lesson_proof.py`):
+- A newly written owner-practice lesson is linked to its seed (`seed_trajectory_id`) and quarantined `proof_pending`, in the same thread as the write.
+- It is proved by 3 paired legs, one per idle slot:
+  - each pair is one fresh render, solved with and without the lesson, with alternating arm order;
+  - a shape with no template re-solves its own challenge;
+  - scoring is 3/2/1/0.
+- Kept only if the lesson arm wins ≥ 1 pair and loses none. The release and the seed embedding apply to exactly the row under proof.
+- A second row of a trigger under proof is held as `proof_duplicate`. A hold that fails is held as `proof_unavailable`. A proof ends inconclusive after 3 infra retries or `MAX_STARTED_LEGS` started legs, which covers a leg the cap always cancels.
+- Practice-format lessons (`ANSWER:` / `STATUS` lines, fixture files) are refused.
+- An unproven re-learn never rewrites or verifies a live row (`replace_text=False`).
+- Graduation skips quarantined rows.
+- Reply-graded challenges are never counterfactual candidates. Replays have no seam: they read as regressions and quarantined lessons.
+
+*Loop back:*
+- A proven lesson is retrieved when the request's BGE query embedding is ≥ 0.78 from its seed request's embedding (`memory.skills._seed_linked_matches`). Mostly non-Latin requests abstain.
+- Calibration used 143 distinct owner requests over 30 days. Same tool family: 86% at ≥ 0.78 against a 40% base rate, about 3 neighbours a month; web is weaker at 61%.
+- Withdrawal: 2 later owner turns that used the lesson and then showed a suspect failure (rule or reaction) quarantine it as `proof_withdrawn`.
+
+**Review**
+- Fresh reader r1 on my build: 2 CRIT, 5 MAJOR, 6 minor.
+  - CRIT: replays of reply-graded challenges quarantined lessons.
+  - CRIT: a 3/3-rejected owner challenge ran anyway, a leak-gate reject included.
+  - MAJOR: reinforce rewrote live rows unproven; a capped leg blocked self-play forever; graduation ignored quarantine; mastered python_general silenced every lesson; a lesson was held with no proof queued.
+- Fresh reader r2 on the r1 fixes: 4 MAJOR, all inside them.
+  - The proof tested a duplicate row, and KEPT released both.
+  - A cancel between the write and the hold left the lesson live.
+  - `_sp_ret` counted infra errors and missed cap stops.
+  - Format lessons would win every proof.
+  All fixed and pinned.
+- Batteries:
+  - bat71: 33/40, survivors pinned.
+  - bat72: 27/29, then 29/29.
+  - bat73: 15/17, then 16/17 + 1 equivalent (the ANSWER-line version must already equal the true one).
+  - The NOOP control survived every round.
+- Tests: `tests/test_4mt_selfplay_useful.py` (93); the §4MS seed test flipped to a no-leak assertion.
+- Docs: `core/dream.html`, `core/agent.html`, `memory/skills.html`, `configuration.html`, `self-improvement.html`.
+
+**Live dry run (read-only, before deploy).** The current pick is a research_grounding seed (UNCERTAIN, news_headlines) with no rare-token leak. 31 tool-using adjacent pairs are available to the judge.
+
+**Known limits**
+- Three proof pairs is weak power, so only a clean record is kept. When a baseline already passes first try, every pair ties and the lesson is not kept.
+- The reaction "channel" is Slack versus the rest, as in the calibration.
+- The adaptive self-play cooldown stays at its base, because owner practice records no frontier.
+- Re-measure the judge and the seed similarity at the next hand-graded census (~2026-10-21, with §4MF's follow-ups).
+
+**Suite (once):**
+- First run: 29,079 passed, 5 failed, all §4MT gates.
+  - The symlink gate: the verdict reader used plain `read_text` → `read_text_nofollow`.
+  - The trajectory-consumer classification: `judge_reactions` and `withdraw_failing` are teaching sites, and `_seed_request_embedding` is a by-id lookup (allowlisted, read count pinned).
+  - Two evolve negative controls, which run those pins.
+- All five files re-run green (144).
+
+**Deploy:** gated on `foreground_requests == 0`, then bootout and bootstrap. One agent process, :8000 listener, health OK.
+
+**Labelled probe (live model, scratch home, nothing written to the live store):**
+- The reaction judge judged 12 real owner turns: 4 FAILED, 8 OK, none unreadable.
+- Live suspect failures over 14 days rise from 14 to 17 (uncertain 8, reaction 3, failed 2, tool-error streak 2, refuted 2).
+- The next pick is a research_grounding seed (UNCERTAIN).
+- The first live practice and proof legs run in idle time; check `selfplay/lesson_proofs.json` and the activity log.
+
+## §4MU — speed, end to end (2026-10-09, operator: "do 1") — R0 scope, written first
+**Why now:** §4LE measured owner turns on 2026-10-04: median 17.6 s; model generation 45%, tools 40%; 83% of prompt tokens reused from cache. Since then many changes have added per-turn work or contention for the single main model slot:
+- the verifier rework (§4MK, await 0 s per §4MO);
+- hydration tiers (§4MJ);
+- request-scoped lessons;
+- turn-loop stops (§4MO);
+- ReplyTap streaming (§4MP);
+- unattended steps (§4MQ);
+- idle-job caps and deferred background calls (§4MS);
+- the reaction judge and proof legs (§4MT).
+
+Nobody has measured the result as a whole.
+
+**Questions:**
+1. What does an owner turn cost now? Time to first visible token, then total, by phase: pre-reply hooks, hydration, prefill, generation, tools, verifier and finalize. Compare with the §4LE baseline.
+2. Does the prompt cache still hold? Per-request bytes before the tail, checkpoint re-prefills and their causes, and the size of the tool and system blocks.
+3. What waits on what? Background work on the main slot during or just before owner turns, parked or deferred calls, worker-node calls before the first token, and work that holds the reply after it is written.
+
+**Method:** three fresh read-only lenses, measuring on COPIES:
+- the agent log since 2026-10-04, joined to the llama-server log;
+- trajectories;
+- the tokenizer.
+
+Then the protocol: class fixes with behaviour pins, a battery with a NOOP control, a fresh reader on my fixes, the full suite once, a gated deploy, labelled probes, and journal and memory updates.
+
+**Not in scope:** changing the model or its quantisation; the operator's earlier open calls (`-np 2`, checkpoint step, `use_planning`, tool-doc trim) are re-surfaced with fresh numbers, not decided here.
+
+### §4MU — lenses (2026-10-09)
+Three fresh lenses on copies (agent log joined to llama-server print_timing, anchored to 1 s; tokenizer = live GGUF).
+- **Turn cost (lens 1).** Owner median since the 10-08 21:39 deploy is **10.3 s** (p90 19.0, n=8, all short). Over 10-04→10-08 it was 29.6 s (p90 133 s, n=29); the §4LE baseline was 17.6 s.
+  - Most of the drop: the reply no longer waits for the verifier. That wait was 470 s over 12 turns, median 36.7 s; `GHOST_CRITIC_REPAIR_BUDGET` 65 → 25 → 0.
+  - Time now: model 77% (prefill ≈ generation), tools/other 17.5%, pre-model 5.7%, announcement check 5.6%.
+  - Estimated first streamed byte ≈ 12–15 s on long replies. Replies under the 240-char hold stream nothing early.
+- **Cache (lens 2).** Owner prompt-token reuse 92.4% (was 83%); 38 of 41 first turns hit the whole warmed head. The tool block is 23,423 tokens (manage_projects 3,878) and the system prompt 5,231 + profile.
+  - MAJOR: the head re-warm loop ran between an owner request's model calls (a long tool run) and cut the live conversation back to the head. 5 of 97 continuations, ≈39 s, up to 12.5 s each. The guard reads only the server's "request in progress" and "anything since the last re-warm".
+  - Minor: a composed-skill approval mid-request re-prefilled 31.4k tokens (intended, 1 event); resume points sit 2,048 tokens before the head end (checkpoint step); the owner's public-Slack head is never warmed (1 event, ≈3 s); a main-slot verifier escalation delayed one owner call by 2.6 s.
+- **Waits (lens 3).** The main slot made an owner call wait in 1 of 136 calls (median 0.0 s; busy 1.8% of wall time).
+  - MAJOR: Nova is both the worker and the critic. A previous turn's DEFERRED verification running there timed out the next turn's pre-reply worker calls: expand/decompose at the 4 s cap, the announcement check at its 3 s cap. All 6 critical-path timeouts in the window happened during such a verify; 2 of the 8 post-deploy turns. With the budget at 0 this overlap is built in.
+  - Minor: a late verifier escalation on main is a foreground call whenever another request is live (`_bounded_fallback_kwargs`); waits on the turn lock are not logged (the start is logged after the semaphore); the critic route line names no purpose.
+- **Also (lens 1):** a queued "On my previous answer" caveat prepended at finalize no longer matches the streamed text, so ReplyTap retracts the reply (1 seen; more expected with every verdict now late). Per-request hydration is pinned to the conversation's first user message, so a hydration change re-prefills the whole history (3.0–4.5 s on call 1, growing with length). That is a design call for the operator, untested.
+
+### §4MU — outcome (2026-10-09)
+**Fixes:**
+- **Head re-warm loop (`rewarm_main_prefix_loop`).** It skips any tick while a request is live, and a parked `main-prefix-*` call is never admitted into an image render's idle window. Before this, the re-warm cut the live conversation back to the head on 5 of 97 owner continuations, costing up to 12.5 s each.
+- **Pre-reply worker chores.** `route()` takes the fallback at once for EXPAND_QUERY and DECOMPOSE_QUERY while a deferred verification is in flight on the node the worker shares with the critic. This uses `LLMClient.note_deferred_verify`, counted by `_attach_late_verdict_handler`, and compares URLs normalised. All six critical-path timeouts of the week fell inside such a verification. The announcement check is NOT skipped: its fallback ships a reply that only announces work (fresh-reader MAJOR on my first version, which skipped it).
+- **ReplyTap.** A staged correction or caveat is sent first (`ReplyTap.set_lead`), byte-identical to the finalize's head insert, unless a start-with rule applies. A queued caveat had retracted whole streamed replies.
+- **Logging.** A "Turn Queue" line when the turn lock is held; the critic route line names its caller.
+
+**Not changed, put to the operator:**
+- Per-request hydration is pinned to the conversation's first user message. A hydration change re-prefills the whole history: 3.0–4.5 s on call 1, growing with length. Moving it next to the current message is a behaviour change and untested.
+- A late verifier escalation on main is foreground while another request is live (once in a week, 2.6 s).
+- The owner's public-Slack head is not warmed (once, ≈3 s).
+- The open §4LE calls: `-np 2`, checkpoint step, `use_planning`, a tool-doc trim. The tool block is 23.4k tokens and `manage_projects` alone is 3.9k.
+
+**Verification:**
+- Battery bat74: 12/13, plus 1 equivalent. bat75: 4/4. The NOOP survived both.
+- Fresh reader: 1 MAJOR (the announcement skip), fixed and pinned, plus minors. Fixed: the render-window race, URL normalisation, the log wording. Accepted: the counter is process-wide; the lead/finalize constraint inputs differ, and a mismatch just falls back to the retract.
+- `tests/test_4mu_speed.py`: 18 tests.
+- Full suite once: 29,418 passed, 3 failed — a constraint-scoping gate's argument name, and `self.context` on a bare agent in two stagger tests. Fixed; those files re-run green.
+
+**Deploy:** gated (foreground 0). One process, listener on :8000.
+
+**Probes (labelled, streamed):** "In two sentences: what does PostgreSQL's VACUUM do?" took 12.5 s (first byte 10.9 s). The follow-up took 10.4 s (first byte 8.8 s). No retracts; the announcement check ran.
+
+## §4MV — measure the two open speed calls (2026-10-09, operator: "do 3") — R0 scope, written first
+These are two decisions the operator has not taken, to be settled with numbers.
+
+**(A) Hydration placement.** Per-request memory is pinned to the conversation's FIRST user message (`_compose_injection`). A change re-prefills the whole history: 3.0–4.5 s on call 1, and the cost grows with length (§4MU). The variant puts it next to the LATEST user message.
+
+**(B) Tool-doc trim.** The tool block is 23.4k tokens and renders BEFORE the system prompt. The cost is cold prefill, prefill after eviction, and per-token attention.
+
+**Method:**
+1. Three read-only lenses: the implementation and risks of A; the trim candidates for B with owner usage per tool; a SAFE replay set of real owner turns (read-only tools only, single and multi-turn) with their original replies.
+2. Arms behind a probe-only per-request switch (`X-Ghost-Arm`, honoured only with `X-Ghost-Origin: probe`), so no production turn changes.
+3. Paired replays on the live model, gated on `foreground_requests == 0`, measuring prefill, first byte, total, and answer/tool-choice quality against the original and against each other (blind judge plus hand check).
+
+**Decision stays with the operator.** No production default changes in this round.
+
+**Not in scope:** `-np 2` (memory/hardware), the model.
+
+### §4MV — lenses and speed bench (2026-10-09)
+**Lenses.**
+- (A) The per-request block also changes because of the competence table's counts: 98–99% of owner follow-ups have a new hash. Placing the block at the tail is a small diff behind a probe-only contextvar. It REGRESSES members, whose block is almost never new (+1.5–4 s on ~90% of their requests), so it would be owner-only. The emergency prune and L3 compression need a guard. Log-based estimate: 0.9 s per follow-up.
+- (B) Owner usage over 92 days: 9 tools never called (1,799 tokens), 5 rare (1,065). T1 is 63 sentence-level description edits, keeping every pinned sentence: −1,759 tokens. T2 (hiding the never-used tools) has no mechanism, because the catalog was retired in §4FX.
+- (C) A safe replay set: 25 single turns + 9 conversations, all read-only. I dropped three items: client DB names that could go out in a search, a thread naming a family member, and a reply that names third parties.
+
+**Speed bench.** Live main model, gated on foreground == 0, temperature 0, no thinking, ignore_eos; llama's own timings; deterministic replicates.
+- **Cold head prefill:** control 29,719 tokens in 31.8 s; T1 27,939 in 29.3 s (−2.5 s); T1+T2 26,144 in 26.9 s (−5.0 s).
+- **Warm, with identical output and a fresh 2,387-token tail** (n=10 per arm, two rounds identical):
+  - tail prefill: control 3,593 ms; T1 3,466 ms (−3.5%); T1+T2 3,338 ms (−7%);
+  - decode: 12.72, 12.63 and 12.38 ms/token (≈ noise to −3%).
+  - Per owner request (~4 main calls), that is ≈ −0.5 s for T1 and ≈ −1.1 s for T1+T2, plus the cold saving on ~2% of calls. This is below lens B's estimate.
+- **Placement** (4-request conversation, block changed every request, 2 replicates identical):
+  - production re-prefills block + all history: 2,000 → 2,136 → 2,272 → 2,408 tokens (3.1 → 3.7 s), growing per exchange;
+  - tail re-prefills a constant 1,229 tokens (2.0 s), because the checkpoint after the previous exchange is reused;
+  - saving 1.4–1.75 s per follow-up with a SHORT synthetic history (~136 tokens per exchange). It grows ~0.5 s per real exchange (median 347 tokens). Real follow-ups carry a median of 1,614 history tokens, so ≈ 2.4 s per follow-up — lens A's upper-end case.
+
+### §4MV — paired replays and outcome (2026-10-09)
+**Arms built, probe-only.**
+- `X-Ghost-Arm` is honoured only with `X-Ghost-Origin: probe`, through `utils.logging.prompt_arm()`, which re-checks the probe request id. Production always reads "".
+- `hyd_tail`: `_compose_injection(placement=…)` plus `_request_message_index`.
+- `tools_trim`: `registry.apply_description_trim`, from `tools/trim_t1_edits.json`.
+- The arm is stamped in the prefill log line and in `extra.prompt_arm`.
+- Tests: `tests/test_4mv_speed_arms.py` (19). Battery bat76: 11/11, NOOP survived. Suite: 29,438 passed; 2 gate failures fixed (the lint baseline re-locked after `json` became used; the volatile-tag reader uses the literal).
+- Deployed gated.
+
+**Replays.**
+- Set: 47 requests (22 singles, 25 turns in 8 conversations) with the original replies as history, so every arm saw identical history.
+- Blocks: prod, then tools_trim, then hyd_tail (multi-turn only, 24). 118 requests, 0 errors, all trajectories stamped with their arm.
+- Joined to llama print_timing.
+- The probe guard held: one trim replay called notify_operator; the probe was refused and nothing was sent.
+
+**Speed in real turns** (paired medians):
+- tools_trim − prod: total +0.34 s, warm prefill 0 tokens, decode −0.10 ms/token. That is noise; tool-heavy turns diverge in behaviour, which swamps it.
+- hyd_tail − prod on follow-ups (n=16): prefill −162 tokens (mean −805), first byte −1.06 s, total −0.35 s.
+- One 152 s cold reload of the trim head is a design artefact: the production re-warm evicted the probe head.
+
+**Quality.** A blind judge with randomised A/B labels saw 71 pairs. Its self-consistency: of 24 production replies judged twice, 23 got the same correctness.
+- tools_trim vs prod: prod preferred 16, trim 13, equal 18 (sign test p=0.71). Correct/partial/wrong: 30/13/4 vs 31/13/3. One trim reply triplicated its text and called notify_operator unprompted.
+- hyd_tail vs prod: prod preferred 8, hyd 3, equal 13 (p=0.23). Wrong 4 vs 2. hyd_tail added extra tools on 3 news/math turns and left one stub.
+
+**Reading.**
+- (B) The trim is quality-neutral within this power and buys ≈3.5% of warm tail prefill (≈0.1 s per call) plus 2.5 s per cold head (~2% of calls). A small win.
+- (A) Moving the block buys about 1 s to first byte on follow-ups, leans worse on quality (not significant), and would regress Slack members.
+- The bigger lever lens A found is untested: the per-request block changes on EVERY request because the competence table's counts move. A stable block would save the block's own re-prefill (1–5k tokens) under either placement.
+
+**Put to the operator.** The arms stay probe-only, so no production default changed.
+
+**Operator decision (2026-10-09): "Trim only, then stabilise".**
+- **The trim is in the tool sources.** Edits were applied in `tools/registry.py`, `tools/projects.py` and `tools/sandbox_services.py`. Where a description is built from concatenated literals, the edit went through the AST.
+- **Two mistakes in that tooling, both caught.** AST column offsets are UTF-8 bytes, which I had used as character indices; the second was an implicit concatenation containing an f-string. Together they cut the head of `manage_services`' port description. The file was restored from the battery copy and its 2 edits applied by hand, and the served tool list now equals the measured T1 byte-for-byte.
+- **The suite then caught 5 edits that removed pinned sentences** (WebGL2/SwiftShader, vision's limits, image modes, "speech-to-text", forget's exact match). They are restored. Shipped saving: −1,589 tokens (measured T1: −1,759).
+- **Removed:** the runtime applier and both arms. The probe-arm plumbing stays with no arms defined.
+- **Stabilise.** The competence table renders bands (`n 100+`, 5% steps) and the recurring-uncertainty counts render as bands (`2+`/`5+`/`10+`). A line changes only when a band is crossed; the provisional mark still uses the exact numbers.
+- **Tests:** `test_4mv_speed_arms.py` rewritten (12); 2 pins moved to bands (test_competence, test_memory_store_durability).
+- **Battery bat77:** 6/6, NOOP survived.
+- **Suite:** 29,426 passed, 8 failed (the 5 pins, lint imports, 1 competence pin, 1 network flake). All fixed; the 8 files re-run green.
+- **Still to measure:** whether the stable-prefix hash now repeats between consecutive owner requests. It was 1.6%. The wake-up prefix and graduated skills are query-keyed, so some churn is legitimate. Re-measure from the live log after a week of traffic.
+- **Deploy and probe (labelled).** Two consecutive PostgreSQL questions in one conversation: stable-prefix 16,542 → 16,947 chars, different hashes. Most of the block is query-keyed (wake-up recall, hydrated memory, graduated skills), so banding the counters removes only the meaningless churn. Consecutive blocks will still differ whenever the hydrated memory does. The remedy for that is placement (hyd_tail), which leaned worse on quality. Expect only a small realised gain from the stabilisation; the re-measure (stable-prefix repeat rate, now 1.6%) stays on the list.
+
+### §4MU/§4MV — verification round r2 (2026-10-09, operator: "proceed")
+Two fresh readers worked from the source snapshots (bat74, bat75).
+1. Every §4MV change, line by line.
+2. The unreviewed §4MU r1 fixes, plus interactions across §4MT/§4MU/§4MV.
+
+**What reader 1 verified.** Masking every string literal, the AST of the 3 tool files is identical to the snapshot, and so are the comments. Applying the 56 edits to the snapshot reproduces the live strings exactly. Every edit hit a tool or parameter description, nothing else.
+
+**Found and fixed:**
+- **MAJOR (reader 2): the §4MU skip of EXPAND/DECOMPOSE during a deferred verification is REVERTED.** It was keyed on whole verdict tasks (108–146 s). After the deploy it skipped 32 times against 2 dispatches; before it, 71% of the calls made inside a verification succeeded (10 ok / 4 failed). The counter, `worker_busy_with_deferred_verify` and `_PRE_REPLY_ROUTE_TASKS` are removed.
+- **MAJOR (reader 1): the docs overclaimed "no longer churns".** Reworded. The banded lines were still ordered by exact values (both readers), so they are now ordered by band, then name; uncertainty items are chosen by band, then text.
+- **Minor:**
+  - A queued head re-warm re-checks `foreground_requests` after the background permit.
+  - A competence cell under n=30 shows a coarse quarter with no interval, and an interval that rounds to a point is dropped.
+  - Two description sentences restored: the image seed caveat, and "Project DONE retires all constraints automatically". The browser's "last-URL sidecar" became "remembered last URL".
+  - The routes import moved out of the §4FB comment block.
+  - Per-module docs (competence, uncertainty) updated; test docstring and journal counts corrected.
+
+**Accepted:**
+- A start-with mismatch still retracts the stream (the previous behaviour).
+- The reaction judge's short prefixes churn the main cache once per idle pass.
+- One unexplained cold re-warm at Logs/ghost-agent.log:45900 — to look at.
+
+**Verification:**
+- Battery bat78: 4/6, then 6/6 (the ordering test made to really cross inside one band; a seed-caveat pin added). NOOP survived.
+- Full suite: 29,433 passed, 0 failed.
+- Deployed gated: one process, :8000.
+- Probe: a follow-up dispatched its query expansion to Nova (not skipped); no retracts.
+
+### §4MT — live self-play, supervised trigger, harder exercises (2026-10-09, operator: "proceed with the supervised self-play run", "make the practice exercises harder")
+**First live run (idle slot, 17:27).** The seed was owner turn f6d03525 (UNCERTAIN, news). It mapped to research_grounding, with a fresh fixture in the sandbox. The solver read the manifest and the page, answered right on the first try and rejected the beta, so the validator passed it. That wrote no lesson (by design), and the seed was marked used. The reaction cache was filled (12 verdicts). End to end it works, but the exercise taught nothing.
+
+**Supervised trigger.**
+- The slot body is extracted from `_biological_tick` into `_self_play_slot_body(ctx)`; its handlers, idle clock and cooldown stay in the tick.
+- `POST /api/operator/self-play-slot` (API key) runs it once now, in the live process, and is refused while a user request is live.
+- `{"calibrate": shape, "n": k}` runs k fresh renders as lesson-proof CONTROL legs: no lesson, no persisted challenge, no seed.
+- Tests updated; battery bat79 4/4.
+
+**Harder exercises.** v2, then v3 (traps from the real failure shapes, combined: an LTS track under newer feature releases, a sister product, a withdrawn release plus a stale cached copy, a support end to compute or declare unknown; three pages with a repeated item; exit-0-without-usable-output and a retry to a new file). Solvers and traps were checked over 25 seeds.
+
+**Calibration.**
+- v2, inline (all files given, 12k tokens): 16 of 18.
+- v3, inline: research 6/6, fidelity 4/6, honest 5/6.
+- v3 in the REAL solver (operator calibration, 3 each): research 3/3 first try, fidelity 3/3 first try, honest 2/3 first try (one struggled-then-won).
+- **Reading:** handed a closed folder of evidence, the solver is reliable — it opens every file and scripts the counting. The owner's real failures were of another kind: an answer from prior knowledge over the evidence (PostgreSQL 18.4 vs 18.6, the Elden Ring boss), and results never opened. A closed fixture of invented products cannot produce either. The next format is a design call for the operator.
+- Suite green after a lint rename (`_i`). Deployed.
+
+## §4MW — replay the real failure (2026-10-09, operator: "proceed, run it manually on this week's failures first") — R0 scope, written first
+**Why.** Synthetic self-play does not reach the owner's failures (§4MS: 341 runs, no effect; §4MT: v3 exercises passed 8/9 first try in the real solver). Those failures are conditions, not skills: memory over evidence, a source never opened, tool loops, long context.
+
+**Manual loop, on this week's suspect owner failures** (`owner_seeds.failure_signal` plus the reaction cache):
+1. Select read-only, privacy-safe requests.
+2. Replay each as a labelled probe in the LIVE environment (Tor web, real tools) with its original history, twice. Does it still fail, and the same way?
+3. Diagnose from the trace.
+4. Propose ONE fix — a lesson, a prompt rule or a tool behaviour — test it on a replay of the same request, and check it on unrelated replays (no regression).
+5. Report to the operator. Nothing ships without a decision. The question is whether this loop finds real, fixable causes before it is automated.
+
+**Not in scope:** automating it; synthetic self-play changes (pending the outcome).
+
+### §4MW — manual round 1 (2026-10-09)
+**Infrastructure.** `X-Ghost-Probe-Rule` (probe-only, re-checked in `utils.logging.probe_rule()`, ≤800 chars) adds a candidate rule to the per-turn state block, so a fix is tested on a replay before anything ships. Tests are in test_4mv_speed_arms.py.
+
+**Case 1 — "what is the latest version of postgresql?"** (twice live: 18.4)
+- **Diagnosis.**
+  - Original trace: the snippets of the official pages said only "19 Beta 4"; an old LinkedIn snippet said 18.4; no page was opened.
+  - Replays (2/2) opened the downloads page, the release-notes index and the 18 release notes, and answered "PostgreSQL 18, released 2025-09-25".
+  - Truth (postgresql.org/support/versioning): 18.6.
+  - Cause: the latest MAJOR taken for the latest version, and the vendor's version table never reached.
+- **Fix tested** (a one-sentence rule: the latest POINT release, from the vendor's version/support/download table, naming the page): 2/2 now say 18.6 from the versioning page. They still attach 18.0's date, which that page does not give.
+- **Generality.** Node.js and nginx were right without the rule (26.11.1 / 24.21.0; 1.31.6 / 1.30.5) and stay right with it (2+2). A fixable cause, verified.
+
+**Case 2 — "in UK, how many people have been imprisoned for social media posts?"**
+- **Diagnosis:** the environment plus attribution.
+  - The search backend returns junk (Hindi astrology, K-pop, Polish prison statistics).
+  - Bot challenges (403) blocked factually.co, the Lords Library, The Register and The Guardian.
+  - Replies cite pages they never read ("per a fact-check by factually" — blocked; only its snippet was seen) and estimate unsupported totals.
+- **Fix tested** (rule: say sources were blocked; do not attribute to unread pages): 0/2 — ignored. Needs a tool-level change, and the search backend's relevance is its own problem.
+
+**Case 3 — "hello ghost, how's things today?"** (recorded failed: "all systems green")
+- **Diagnosis.** The introspect overview contains no health check. Its ⚠ lines are design notes (a dead consumer, a disarmed steer), not health. "All systems green" is a claim with no source, made 2/2.
+- **Fixes tested:**
+  - (a) forbid the phrase: became "all systems operational", 0/2;
+  - (b) list what needs attention first: "nothing needs attention … all systems green", 0/2.
+- Needs a tool-level change: the overview should state that health is not checked, or carry a real health line.
+
+**Case 4 — "give me a morning briefing"** (refuted: "Chess Coach v4 → FAILED"). Not reproduced, because the projects state has changed. Unfixable by replay after the fact.
+
+**Reading of round 1.** The loop finds real causes that the original record does not show. It turned up a NEW failure mode in case 1, and two causes that are tool or environment, not behaviour.
+- A one-line rule fixed 1 of 3 and generalised without regression.
+- Prose rules did NOT move behaviour anchored in tool output or habit (2 cases): those fixes are code, and need the operator.
+- 1 case in 4 cannot be replayed (moving state).
+
+### §4MW — fixes applied (operator: "ship the latest-version rule; blocked page → not read; status needs a health line; then automate")
+**What shipped:**
+- **Lesson** (`learn_skill`, owner-approved, verified): "when asked for the latest version of a piece of software" → the latest POINT release from the vendor's version/support/download table, naming the page; a major's release date is not the point release's. It was written with the agent stopped (single writer), and its vector twin was re-embedded at boot.
+- **`tools/introspect.py` `OVERVIEW_HEALTH_LINE`** opens the overview: it is not a health check, and only `system_utility check_health` is.
+- **`tools/browser_routes.py` `BLOCKED_PAGE_HINT`:** all that is known of a blocked page is its search snippet; say so if it is used.
+- **Tests:** `tests/test_4mw_replay_fixes.py` (2), plus the probe-rule tests.
+
+**Replays after the fixes** (live, no test rule, 2 each):
+
+| Case | Result |
+|---|---|
+| PostgreSQL | 18.6, 2/2 (was 18.4 live; "18" in the base replays) |
+| Node.js | right, 2/2 |
+| nginx | right, 2/2 |
+| "How's things" | no health claim, 2/2 (was "all systems green" 2/2) |
+| UK | blocked hosts not named, 1/1 where blocks occurred |
+
+The UK result is weak evidence: one replay answered from snippets only, and the search backend's relevance is still poor.
+
+### §4MW — automated loop (operator: "replace it, but keep coding practice"; "propose, you approve")
+**Verifier as the automatic judge, measured against today's ground truth.** It would have adopted none of the 3 real fixes:
+- it CONFIRMED the wrong "all systems green" 2/2;
+- it split 2–2 on the corrected PostgreSQL answer.
+
+Operator: propose, you approve.
+
+**Built: `core/failure_replay.py`,** in the self-play slot after the reaction-judge pass. Synthetic practice remains for code/data failures only (`pick_owner_failure_seed(shapes={"code_data"})`).
+- One case at a time, one stage per slot: base (2 probe replays) → diagnose (main model: cause plus one general rule; a rule naming the case is dropped; tool/environment causes get none) → test (2 replays with the rule) → propose (after the verdicts or 45 min).
+- The proposal is a notify-severity digest item with the adopt phrase "learn this rule: …".
+
+**Fresh reader r1: 1 CRIT, 4 MAJOR, ~10 minor.** All fixed except the accepted ones below.
+- CRIT: read-only was inferred from the original turn, and the replay could call any tool unattended → enforced at dispatch.
+- MAJOR:
+  - the read-only table held write tools (`workspace_track`; web_search's project write-back);
+  - history was always empty (sessions are keyed per request) → follow-ups are not replayed;
+  - replays rebound the owner's project and evicted his pending corrections → member branch and no probe corrections;
+  - a stage could re-run forever → bounded and abandoned.
+- Accepted:
+  - adoption relies on the model calling learn_skill;
+  - the cache re-warm can land between replay calls;
+  - `OVERVIEW_HEALTH_LINE` costs ~260 chars of the overview cap.
+
+**Verification:**
+- Batteries: bat80 10/10, bat81 11/11; NOOP survived both.
+- `tests/test_4mw_replay_fixes.py`: 38.
+- **Suite:** 29,480 passed. Gate registrations were fixed (the trajectory-consumer classification, the probe opt-in count 7 → 8); the ClockworkPi deploy test is a known parallel flake that passes alone.
+- **Deploy:** gated.
+- **First live case** (supervised trigger, 3 slots): the owner's "hello ghost, how's things today?" (recorded failed).
+  - Replayed 2×.
+  - Diagnosed `unsupported_claim`, quoting the new OVERVIEW_HEALTH_LINE.
+  - Rule: "Do not assert system health status or specific performance metrics unless a dedicated health check confirms them".
+  - Tested 2×. The proposal waits for the verdicts.
+  - The case overlaps the overview code fix already shipped; the proposal shows the evidence and the owner decides.
+- **Label fix:** the supervised status reported "ran one lesson-proof leg" for replay stages; it now reports the stage.
+
+## §4MX — verify §4MW, Nova saturation, web search relevance (2026-10-09, operator: "verify your changes and fix the still open issues … dig into [the SATURATED lines]") — R0 scope, written first
+**Lenses (3, read-only)** — reported:
+- **§4MW r2 fresh reader: 2 MAJOR, 8 minor.**
+  - The read-only guard is bypassable when `action` and `operation` disagree.
+  - The proposal is truncated before its rule.
+- **Nova.**
+  - All 29 SATURATED events and 20 main fallbacks were probe bursts.
+  - Cause: unbounded concurrent DEFERRED verdicts — 4–6 in flight × 2 permits against cap 4. The cap is right (`/props` total_slots 4).
+  - 7 critic calls held a permit 120 s and timed out: thinking on, max_tokens 2048, decode shared across slots.
+  - Fallbacks made 12 turns wait up to 27 s on main.
+- **Search.**
+  - 34% of the results the model sees are off-topic (hand-labelled 41/120; proxy 37.5% over 15,968).
+  - Causes: the first engine to answer wins (yandex ~80%; yahoo ~10% at 71% off-topic); a weak batch gate (one loose substring match passes a batch; "UK" ignored; "127" substring); nothing dropped; long queries; quotes and numbers lost.
+
+**Operator decisions:**
+- Search may DROP off-topic results (reverses §4IL "never drop"), keeping ≥ 3, with a "low relevance" label when nothing passes.
+- The critic keeps thinking but is capped at ~1024 tokens.
+
+**Plan:**
+1. Fix the r2 items.
+2. Nova:
+   - bound the concurrent deferred verdicts;
+   - no main fallback for after-the-reply verdicts (wait longer, off-main only);
+   - cap critic tokens;
+   - bound web-summary fan-out per node;
+   - keepalive: busy ≠ dead.
+3. Search:
+   - per-result relevance drop;
+   - a tighter batch gate (all-caps acronyms, whole-word numbers, ≥2 matches);
+   - a stricter gate for yahoo;
+   - keep number+noun phrases in scoring and reformulation;
+   - registry guidance on shorter queries.
+4. Then the protocol: tests and docs, a battery, a fresh reader, the suite, a gated deploy, probes.
+
+### §4MX — outcome (2026-10-09)
+**Nova (what the operator saw: "SATURATED … falling back to main upstream").**
+- Cause, confirmed: deferred verdicts were unbounded. Each holds up to 2 Nova permits, and 4–6 ran together during replay bursts. They waited the in-turn 30 s, then re-ran on the 35B; owner turns queued behind them.
+- Shipped:
+  - A deferred-critic lane (`verifier._critic_lane`): at most 3 of Nova's 4 permits for deferred calls, so in-turn calls always find one. At most 2 for requests nobody waits for (probe, test, background, system).
+  - Deferred verdicts (`_bounded_verdict(deferred=True)`, front-door and post-stream tasks; the repair verdict is not deferred) wait 120 s for a permit and run `off_main_only`.
+  - `OffMainNodeUnavailable.saturated` tells "only busy" from "down". When Nova is only busy, the verdict is skipped and its later calls stop at once (`nova_busy`). A down node still falls back as before.
+  - Thinking critic capped at 1024 tokens (operator).
+  - Keepalive: "busy is not down" for up to 5 misses.
+- **Not done:**
+  - Web-summary fan-out per node: 1 owner turn in 2 months (09-18), and it degrades to raw page text.
+  - **Open risk:** a thinking critic that runs out of tokens returns unparseable output, and that still falls through to worker → main. Measure the count of main-model verdict fallbacks after deploy.
+
+**Search (operator: allow dropping).**
+- `prune_off_topic` drops results under 30% query-word coverage (stems, glued tokens), unless the result names the subject plus one detail. It also drops other-script results for a Latin query unless they name the subject.
+- At least 3 results always remain, backfilled from beyond the top 8. A batch where nothing passes is labelled `LOW_RELEVANCE_NOTE` and is not written back as project findings.
+- Replayed over 2,058 recorded searches: 23% of results dropped, 6% of searches labelled low. A hand read of 40 random drops per round found the remaining losses in long, many-detail queries.
+- A number named by its word ("section 127", "άρθρο 223", "version 1.27") survives reformulation.
+- web_search/deep_research text: 3–6 keywords; engines named correctly (Mojeek was stale).
+- **Not done:** a tighter batch gate and a Yahoo-specific gate. The per-result drop covers them; revisit only if the off-topic share stays high.
+
+**§4MW verify.** The r2 items were fixed earlier this round. r2 of §4MX found that `conv_user_turns` counted mid-turn steers, which would have refused steered failures as follow-ups. It is now counted on the incoming request.
+
+**Protocol:**
+- Fresh readers: r1 found 2 MAJOR + 9 MINOR; r2 found 2 MAJOR + 3 MINOR in the r1 fixes (a verdict-level bound held cheap verdicts; the over-count above).
+- All fixed except: the thinking-cap fallthrough (measure), and the stream drain's `request_kind` read from a copied context (low).
+- Batteries bat82/83/84: 21/26 → 17/17 → 8/8 valid mutants killed (round 1 survivors fixed by stronger pins).
+- Pins: tests/test_4mx_nova_and_search.py.
+- **Deploy + probe (2026-10-10 00:12):**
+  - Gated deploy; healthy in 50 s.
+  - Burst of 5 concurrent labelled research probes (probe-mx-*): 0 SATURATED, 0 main fallbacks, 0 "Nova busy" skips, 0 "stopped answering". Deferred verdicts landed late as designed.
+  - Search relevance fired 41×, 8 labelled low relevance (mostly the model's code-laden "section 127" rewrites).
+  - Answers: nginx 1.30.4, Tempi, Revolut, Volvo EX30 sourced.
+  - The section-127 statistics question ran out of turn budget (the known-hard UK case; not attributed to the drop).
+
+## §4MY — open items + verify every change of this session (2026-10-10, operator: "fix the open items and verify all your changes") — R0 scope, written first
+Open items:
+- (1) the thinking-cap fallthrough risk;
+- (2) the stream-drain lane read from a copied context;
+- (3) two contradicting "latest version" lessons, one with a stale "e.g. 18.6".
+
+Verification:
+- three fresh read-only readers across §4MU/§4MV, §4MW and §4MX;
+- then readers on each round of my fixes until no MAJOR remains;
+- a battery per round;
+- one suite;
+- a gated deploy;
+- probes.
+
+### §4MY — outcome
+- **(1) Measured, closed.** `verify_claim` was run on 15 recorded tool turns against Nova (thinking ON, live config), at max_tokens 1024 and 2048.
+  - Both caps: 1 call in ~46 hit the cap and 2 were unparseable.
+  - Tokens p50 193, p90 ~520. Verdict differences between runs (5/15) are judge noise, not the cap.
+  - The cap only halves the runaway call.
+- **(2) Fixed.** The lane is decided once from the verdict's own req_id.
+- **(3) `scripts/lesson_fix_4mx.py`** (rehearsed on a copy of the stores):
+  - removes the 09-15 "prefer the version in the search results" lesson (archived first);
+  - re-learns the verified rule with a neutral example (vector twin rewritten).
+  - Applied at deploy with the agent stopped.
+- **Fresh readers:**
+  - **§4MU/§4MV:** 1 MINOR (small-cell order still churned → sort by the displayed quarter); the block-stability comment overstated (several other per-request churn sources); 2 trim losses restored (artifact_list 400-char cut; browser url reuse is per request).
+  - **§4MX:** 2 MAJOR (a lane call that waited did not re-check nova_busy; the "in-turn always finds a permit" claim was false, since worker/critic share Nova → lanes 2/1 and an honest comment) + 4 MINOR (unbounded lane wait → LaneBusy at 600 s; keepalive log vs breaker → one `_ping_excused` rule; waited front door not deferred; Greek ν.δ./Π.Δ.) + filler words.
+  - **§4MW:** 3 MAJOR + 4 MINOR:
+    - the proposal was cut in the chat banner → numbered commands come first;
+    - "learn this rule:" was wired to nothing → a deterministic owner-only `owner_rule_command` ("show rule N" / "learn rule N" / quoted text) adopts before the model runs;
+    - page text could shape a rule → `rule_from_content` + a marked, defused probe RULE;
+    - minors: 7-day lookups, abandoned cases reported, probes never consume the owner's corrections.
+  - **r3 reader:** 3 MAJOR + 5 MINOR in those fixes:
+    - stale ledger saves erased `adopted_at` → one lock, owner fields survive, adoption checked on disk;
+    - the diagnosis's text was stored → only the rule + a checked situation;
+    - "adopted" was reported over a kept foreign text → written as the owner's dictation and read back;
+    - widened dictation false positives → scoped to "learn this rule:";
+    - prefix commands hijacked questions → whole-message only;
+    - renumbering → numbered at save;
+    - log/breaker timing → judged at the miss;
+    - `_acquire_by` swallowed a cancel → never awaits the abandoned acquire.
+- **Batteries:**
+  - bat85: 24/25 valid after 3 pins strengthened;
+  - bat86: 12/12 after 2 race pins.
+- **Pins:** `tests/test_4mx_rule_commands.py`, `tests/test_4mx_nova_and_search.py`, `tests/test_4mv_speed_arms.py`.
+- **Deploy (2026-10-10 01:33):**
+  - Suite green: 29,580 passed; the one tripwire was a comment ending in "(r3)", reworded.
+  - Gated deploy; `lesson_fix_4mx.py --apply` ran with the agent stopped: 130 → 129 rows, ok. The vector store no longer has "e.g. 18.6" or the snippet lesson.
+- **Probes (probe-my-*, 3 concurrent):**
+  - 0 SATURATED / main fallbacks / Nova busy / stopped answering; 0 tracebacks.
+  - The rewritten lesson was retrieved: the model's thinking quotes "e.g., X.Y.Z". But the PostgreSQL answer cited Wikipedia, not the vendor page — the rule is read, not fully followed.
+  - Greek ν. 4624/2019 and the Tesla price were answered from Greek sources.
+
+## §4MZ — (1) adopt candidate rule 1; (2) the member/public wall after §4MM–§4MY (2026-10-10, operator: "do 1 and 2") — R0 scope, written first
+**(1)** "learn rule 1" was sent as the owner's message (no probe header — it IS the owner's instruction).
+- The deterministic adoption ran: the ledger has `adopted_at` and the playbook has the row.
+- But the model's reply asked the owner to confirm, ignoring the note (the correction-banner lesson, again).
+- Fix: the outcome line is PREPENDED to the reply, the way corrections are.
+- The adopted row's trigger is the rule's own first sentence (the case predates the `when` field). It is re-keyed by a script at deploy, agent stopped.
+
+**(2)** The Slack open-channel item in memory was stale. §4MJ measured the member wall end to end (0/13 owner private terms in member prompts; public owner turns skip hydration). §4ML repaired the pre-wall rows; the operator accepted the residuals (member graph triplets, shared member identity).
+- **Property now:** no code shipped since §4MJ (§4MM–§4MY) lets a member or a public-channel turn read, change or receive owner data, nor lets member input reach the owner's stores. Paths:
+  - the replay loop;
+  - rule commands;
+  - deferred verdicts and corrections;
+  - search/browser write-backs;
+  - the activity digest;
+  - notifications.
+- **Threat model:**
+  - **Untrusted:** a member's message text, a member identity in a channel thread, page text.
+  - **Trusted:** the owner, by API key or Slack owner id.
+- **Method:**
+  - two read-only lenses: code since §4MJ × the member/public gates; a live member-role probe with the probe header scanned for owner private terms;
+  - fixes with pins, a battery, a fresh reader, the suite, a gated deploy, probes.
+
+### §4MZ — outcome (2026-10-10)
+**(1) Rule 1 adopted and re-keyed.**
+- The adoption ran deterministically on the owner's "learn rule 1" (06:38).
+- Fixes:
+  - The outcome line is now the agent's: `RuleNote.banner` → `_owner_rule_banner_ctx` → prepended once by `_take_active_correction`, with the banner separator, as the stream lead, defused and capped.
+  - `scripts/lesson_rekey_4mz.py` re-keyed the lesson to "when asked how you are, how things are going, or about the system's status, health or performance" (agent stopped, ok, 130 rows).
+- Measured on a store copy, the lesson is retrieved for "is everything ok with the system?", but NOT for "hello ghost, how's things today ?" / "how are you doing today?" — even with those words in the trigger. The retriever needs content-word overlap or a close embedding; a short greeting has neither.
+- Live probe `probe-mz-greet`:
+  - the model called introspect first and stated no metrics, but still said "running smoothly";
+  - the overview's health line ("do not call the system healthy, green or fine") was read and only partly followed.
+- **Open, the operator's call:** retrieval for greeting-shaped requests (or a status-question hook).
+
+**(2) Member/public wall: holds.**
+- Lens A (code since §4MJ): no breach in either direction; every new path gated by role or surface (list in its report). 2 minors:
+  - the reaction judge paired a public-channel turn with the owner's next DM → `extra["surface"]` + `_channel` keyed `:public`, FIXED;
+  - a channel request is replayed with owner DM context — accepted.
+- Lens B (13 live member probes, probe + member headers): no owner term, banner or store write; impersonation and "learn rule 1" contained.
+- The memory note was stale; marked CLOSED.
+
+**Protocol:**
+- fresh reader on §4MZ: 1 MAJOR (no separator → reply glued to the line) + 5 MINOR, 3 fixed. Left: the record omits the line (same as correction banners); a cancelled turn shows no line, and a retry says "already adopted";
+- bat87 10/10, bat88 3/3;
+- suite green after one lead-pin update;
+- gated deploy 07:19.
+
+## §4NA — do lessons reach and change the turns they are for? (2026-10-10, operator: "proceed with: check whether lessons actually reach and change the turns they're meant for") — R0 scope, written first
+**Property:** for each live lesson,
+- (a) it is FOUND for the owner requests it applies to — measured separately for greetings/short questions;
+- (b) when present, the reply FOLLOWS it more often than without it.
+
+**Population:** the owner's real requests over the last 14 days. Never member, probe, sim or replay rows.
+
+**Method:**
+1. **Retrieval:** offline, on a COPY of the stores. The live retrieval path runs per request, and applicability is labelled by independent readers on a candidate set (surfaced ∪ embedding top-k), giving recall and precision per lesson and per request shape.
+2. **Compliance:** live labelled probes, owner idle, gated on foreground_requests==0. For applicable (lesson, request) pairs, two probe arms: lesson injected vs all lessons withheld (a probe-only switch). The replies are judged blind by independent readers.
+3. **Fixes** where the misses are: retrieval, wording, or a code check for the health-claim and latest-version rules.
+4. **Retirement list** (never applicable / never followed) → operator approval before any store write.
+
+**Constraints:**
+- every live call is a probe;
+- store writes only with the agent stopped;
+- the usual protocol: pins, battery, fresh reader, suite, gated deploy, probes, docs.
+
+### §4NA/§4NB — outcome (2026-10-10)
+**Measured (86 real owner requests, 14 days):**
+- **Reach:**
+  - 67 applicable (request, lesson) pairs, 12 found (18%); 60% of surfaced lessons applied.
+  - Short requests: 4/32 pairs found. 52/55 misses fall to the trigger gate.
+  - Simulated gates: one fewer shared word → 28% reach at 46% precision; looser distance → 39–43% at 35–38%. Not adopted.
+- **Effect:** 20 live probe pairs (all lessons withheld vs one injected via the new probe-only `X-Ghost-Arm: no_lessons`), judged blind.
+  - The lesson changed the reply in 3/20, all owner-approved rules. Same in 11, control better in 3, neither in 3.
+  - Better overall: lesson 5, control 3, same 12.
+- **Store:** 26/130 lessons applied to anything; 56 judged bad → retired on operator approval (130 → 74, archived + tombstoned).
+
+**Shipped:**
+- `OWNER RULES` block: adopted rules (`origin: owner_rule`) on every owner turn, still retrieved as before.
+- Owner-only commands "show all rules", and "forget rule N" → "confirm forget rule N" (15-minute window, removal by row identity, read back, state as newest-wins timestamps, the owner can re-adopt past a tombstone).
+- The version rule numbered as rule 2.
+
+**Readers (three rounds):** a MAJOR each round, all fixed:
+- the read-only wrapper hid owner rules from replays;
+- the tombstone exception was keyed on dictation wording, so any "remember…" turn could revive retired lessons;
+- plus minors.
+
+**Protocol:** batteries bat89–bat92 all valid mutants killed; the suite green after 2 fixes (a mock store, the readonly writer list); gated deploy 09:09 with `lesson_retire_4na.py` (ok).
+
+**Live probes after deploy:**
+- **Rule 2 FOLLOWED:** the agent opened postgresql.org/support/versioning and answered 18.6 with the supported-versions table (the no-lesson control answered "17").
+- **Rule 1 present on both greetings but NOT followed:** "running smoothly" with no health check. Reach is fixed; compliance for this rule is not.
+- **Open, the operator's call:** a narrow post-check, the greeting running the real health check (~20 s, network test over Tor), or accept the phrase as phatic.
+- **Operator decision (2026-10-10): "3" — leave it.** "Running smoothly" on a greeting is treated as small talk. Rule 1 stays adopted and in the standing block, and it still blocks invented metrics. No post-check, and no health check on greetings. Do not reopen without the operator.
+
+## §4NC — the idle producers: what dreaming, reflection and distillation write, and is any of it worth it? (2026-10-10, operator: "do 1") — R0 scope, written first
+**Property:** every background producer that writes into a store later read into owner prompts must:
+- pay for its model time and store churn;
+- produce items that are retrieved for, and relevant to, the owner's real requests;
+- not displace better items in the prompt budget.
+
+**Producers in scope:** every idle or post-turn writer of lessons, knowledge-graph triplets, episodes, vector memories, profile or owner facts, and selfhood or autobiography. That covers dream (consolidation and patterns), reflection, failure distillation, journal post-mortems, episode recording, smart-memory and graph extraction, and any other writer found.
+
+**Leads:**
+- §4NA: dream wrote 55/130 lessons, many retired as vague or confused.
+- §4MJ: episodic precision 0.16, graph precision 0.09.
+- §4MS: the idle cycle's job caps.
+
+**Method:**
+- Lens A, inventory and cost: each producer's trigger, store, frequency and model time over 14 days of logs, and the volume written.
+- Lens B, value: for each store, the share of writes ever loaded into an owner prompt, and the relevance of a blind-labelled sample of recent writes.
+- Then a decision per producer — keep / fix / narrow / off. Switching a producer off is the operator's call.
+- Then the usual protocol for any code change.
+
+**Constraints:** read-only lenses; never touch live stores; no live traffic beyond labelled probes.
+
+### §4NC — outcome (2026-10-10)
+**Lenses:**
+- **A (inventory):** 23 producers. Six lesson writers wrote ~131 lessons in 14 days; ~80% were since removed by hand.
+  - reflection: 142 runs → 5 reflected;
+  - PostMortemEngine: 129/130 runs empty;
+  - skills-auto: 178 identical runs;
+  - macro mint: 2,036 skip lines;
+  - REM: 78 min of Nova.
+- **B (value, 86 real requests replayed, blind labels):**
+  - graph tier: 20% relevant / 16% harmful, 53 tok/turn;
+  - episodic tier: 15% / 19%, 59 tok/turn (the stale "all systems green" greeting episode on 12/86);
+  - dream lessons: 3 surfacings, 0 relevant;
+  - vector store: background output never reaches a prompt.
+- One lens-A claim refuted: the self-play report is already gated to practice questions (§4LB).
+
+**Operator decisions — all four recommended options:**
+1. Only approved rules create lessons.
+2. Retire the dream/distilled lessons.
+3. Graph and episodes off in prompts, recall kept.
+4. Stop the busywork.
+
+**Shipped:**
+- **Lesson gate:** `learn_lesson` allows only `LESSON_SOURCES_ALLOWED` = {learn_skill, operator_repair}; `GHOST_PRODUCER_LESSONS=1` restores the old behaviour.
+- **Lesson-only phases skipped:** dream episodes, distill and REM; idle and correction reflection; the journal post-mortem; deferred Perfect-It.
+- **Store maintenance** moved to `Dreamer._store_maintenance`, run from the skip path at most every 6 h.
+- **Bus:** graph/episodic tiers off (`GHOST_BUS_GRAPH_TIER` / `GHOST_BUS_EPISODIC_TIER`, read per call); owner facts kept (`_owner_facts`).
+- **Busywork:**
+  - PostMortemEngine off (`GHOST_POSTMORTEM_ENGINE`);
+  - skills-auto skips an unchanged trajectory store;
+  - the macro-mint line at DEBUG;
+  - the dream_mode/self_play/SLEEP texts honest;
+  - self-play says "No lesson saved".
+- **Retired:** 46 dream/distilled lessons, 74 → 28 (`scripts/lesson_retire_4nc.py`).
+
+**Reader r1:** 2 MAJOR, both fixed:
+- skipping REM had stopped graph pruning, compression, reconcile and the RRF refit;
+- three producers still made their model call.
+
+Plus 3 MINOR fixed: false "learned"/"saved" lines, owner facts dropped with the graph tier, stale model-facing texts.
+
+**Protocol:** bat93 12/12, bat94 8/8 (one pin tightened); the suite green after 4 fixes (gate order behind the Slack backstop; the conftest switch for the PostMortemEngine tests; the reconcile pin moved; a module fixture source).
+
+**Deploy 10:33; probes:**
+- "where do I live?" → Athens, owner facts intact;
+- "generate an image based on this project" asked which project instead of pulling a stale politician episode;
+- hydration line `v=- g=- s=1 e=- sess=5`.
+
+## §4ND — experiments and calibration: does any of it decide or change anything? (2026-10-10, operator: "review the experiments and calibration") — R0 scope, written first
+**Property:** every live experiment (randomised arm), calibration loop or estimator must:
+- reach a verdict it could act on within a bounded time (enough power on real traffic);
+- feed a decision or prompt that changes behaviour, with the effect correct;
+- cost less than it returns (prompt tokens, model time, per-turn work, operator attention, log noise).
+
+**In scope:**
+- `core/experiments.py` (live arms, triggered blocks);
+- confidence and Brier calibration;
+- the adaptive thresholds;
+- the competence profile and the uncertainty tracker (as estimators, not prompt layout — that was §4MV);
+- PPI;
+- router calibration and the held-out gates;
+- the risk governor's calibrated parts;
+- anything else that "calibrates" or "decides on evidence".
+
+**Leads:**
+- the overview: "8 live arms have no decided verdict";
+- §4CE: verdicts without power;
+- §4BR: a gate calibrated on the wrong statistic;
+- §4AA: a router gate anti-correlated with quality;
+- PPI judge too weak (λ≈0–0.4).
+
+**Method:**
+- Lens A, inventory and state: each mechanism's inputs, sample sizes, decision rule, verdict status, consumers, per-turn and idle cost, and log volume.
+- Lens B, value and correctness: do the consumers change behaviour; is the estimate right (re-compute it from raw data); would the decision differ with a correct estimate?
+- Then a decision per mechanism — keep / fix / conclude / retire (retiring is the operator's call) — and the protocol for any code change.
+
+## §4NE — a regression suite from the owner's confirmed failures (2026-10-10, operator: "yes, finish §4ND then build it") — R0 scope, written first
+**Why:** §4NA–§4ND showed that background self-improvement without independent ground truth made the agent worse or changed nothing. The literature agrees: self-graded memory inflates its own errors, and the gains reported in 2026 all came from executable checks or labels. The one ground truth this agent has is the owner.
+
+**Property:** a failure the owner confirms becomes a stored test case — the request plus deterministic checks. Every candidate rule, and every deploy, is replayed against all kept cases. A regression is reported, and the owner decides. Nothing enters the suite without the owner's confirmation; no model judge decides pass or fail where a deterministic check can.
+
+**Parts:**
+1. **The case store** (`system/regression/cases.json`): id, request, checks (contains / not_contains / tool_used / tool_not_used / opened_domain), the expectation in words, state (proposed → kept, or expired / forgotten), source, and run history.
+2. **Proposals:**
+   - from the owner's evidence — a 👎, a correction caught by the reaction judge, a replay-loop rule;
+   - a draft of checkable expectations, shown once ("Test proposal N: … say keep test N / edit test N: … / ignore");
+   - expiry after 7 days.
+3. **Owner commands**, owner-only like the rule commands: keep / edit / forget test N, show tests.
+4. **The runner:**
+   - labelled probes (`probe-rt-…`), owner idle, capped per pass;
+   - deterministic checks only, on the reply text and the trajectory's tool calls;
+   - a run after each deploy and daily;
+   - a regression goes into the digest at notify level.
+5. **The gate on rules:** a replay-loop rule is run against the kept suite with the rule injected, and the proposal says "suite: N pass, M regress".
+
+**Constraints:**
+- probes never teach;
+- no store writes beside the agent (the case store is owned by the agent process);
+- member and public turns can neither propose nor run anything;
+- the usual protocol.
+
+### §4ND / §4NE — outcome (2026-10-10)
+**§4ND (experiments and calibration) shipped** — operator decisions applied: dead weight stopped, "ranking only, fixed threshold", competence table removed, safe experiment defaults; coding self-play off; skills-auto off (it did nothing useful: trivial sequences quoting old requests on 19/86 turns).
+- Switches (default off, `utils.helpers.env_flag`): GHOST_HYDRATION_JUDGE, GHOST_ROUTER, GHOST_FORESIGHT, GHOST_RISK_GOVERNOR, GHOST_COMPETENCE_PROMPT, GHOST_CONF_COMPETENCE, GHOST_AUTO_SKILLS, GHOST_CODING_PRACTICE, GHOST_GEPA_AUTONOMY; every experiment spec `enabled=False`.
+- Confidence = a ranking: the lowest 15% of recent owner turns get deep verification (`set_rank_threshold`), epoch `2026-10-10.ranking`.
+- experiments.json: the search_yield_steer entry's note now says the steer is unconditional in code since §4MO (applied with the agent stopped; backup `experiments.json.bak-4nd`).
+- Suite fallout fixed: 27 failures (regression step with no home, unregistered probe opt-in and trajectory consumers, tests that pinned the router/imagine gate as live and an old calibration epoch).
+
+**§4NE (the owner's regression suite) shipped** — `core/regression.py`; owner commands keep/edit/forget/show test N, show/run regression tests; kept tests replay as `probe-rt-` probes after every deploy and daily; candidate rules are run against the kept suite.
+- **Five fresh-reader rounds.** r1: 1 CRIT + 3 MAJOR + 4 MINOR; r2: 6 MAJOR + 5 MINOR; r3: 1 MAJOR + 3 MINOR; r4: 1 MODERATE + 1 MINOR; r5: 4 LOW (3 fixed, no serious finding). As before, nearly every MAJOR was inside the previous round's fix.
+  - CRIT: test runs were not held read-only (`is_replay_request` matched only `probe-fr-`) → `UNATTENDED_PREFIXES`.
+  - Notable MAJORs: "run tests"/"list the tests" hijacked coding chat (now "regression tests"); results saved only at the end (now per case, 2 per slot, `MAX_STARTS` cap-strike limit, owner stops forgiven); a busy model discarded the owner's evidence (now doubling backoff, never a verdict); an infra error shown as FAIL; a failed redraft dropped a kept test; an undraftable failure redrafted every slot; a kept test edited out of the suite (now `redraft`/`pending`, keeps running on old checks).
+- Batteries bat97–bat101: final 62/62 valid mutants killed, NOOP survived.
+- **Open (accepted, LOW):** with no LLM client at all an edited test retries daily forever and never reports; a hard `/api/turn/cancel` of the idle job books a cap strike.
+
+**Test-suite speed (operator: "do 1 and 2").** `scripts/run_suite.py`: one pytest invocation, `-n 12 --dist loadfile`, JUnit timings + slowest-files report.
+- Measured cause: every test driving `_biological_tick` ran the REAL weekly negative-controls phase (a pytest subprocess, ~26 s per tick) — due on every tick in an isolated home. ~45% of all test time (bio_r1_fixes 868 s, biological_watchdog 618 s, prm/gepa/selfhood/reflection phases). Fix: conftest autouse stub except in the two negative-controls test files. Also: the temp-tree immutable-flag walk now runs on worker gw0 only.
+- **Full suite: ~19.5 min (three sequential parts) → 5 min 12 s; 29,766 passed, 0 failed.**
+- Trap: the shell exports GHOST_API_KEY blank; the runner replaces a blank key with "x" (the first combined run's 148 errors were all this).
+
+**Docs.** New guide page `docs/learning-loop.html` (operator: "the whole learning loop visible, its own page, a practical example"): the loop diagram, every step, the commands, the PostgreSQL case end to end, what is off and why, limits. Fixed stale claims on index (17 feature rows, two prose sections), memory, glossary (+Rule, +Regression test), how-it-works, configuration, tools, troubleshooting, self-improvement; new `core/regression.html`; agent.html §4ND/§4NE.
+
+**Deploy 14:5x:** gated (foreground 0), bootout → experiments.json note → bootstrap, healthy in 20 s, no startup errors. Probe `probe-4ne-a1` "latest version of postgresql?": 18.6 from postgresql.org/support/versioning (rule 2 followed; still attaches 18.0's date); no router/foresight/judge lines after the restart (the router classifier and skill store still LOAD at boot — load cost only). Test commands are owner-only and cannot be exercised by a probe by design; the wiring is covered by `test_the_command_runs_for_the_owner_only` through the real `_owner_rule_note`.

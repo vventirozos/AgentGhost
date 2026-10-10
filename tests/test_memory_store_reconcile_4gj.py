@@ -649,7 +649,12 @@ def test_the_rem_cycle_awaits_the_reconciler():
 
     from ghost_agent.core.dream import Dreamer
 
-    tree = ast.parse(inspect.getsource(Dreamer.dream).lstrip())
+    # §4NC: the reconcile moved with the rest of the store maintenance into
+    # `_store_maintenance`, which the dream cycle awaits on both paths
+    dream_tree = ast.parse(inspect.getsource(Dreamer.dream).lstrip())
+    assert [n for n in ast.walk(dream_tree) if isinstance(n, ast.Await) and isinstance(n.value, ast.Call)
+            and getattr(n.value.func, "attr", "") == "_store_maintenance"], "store maintenance is unwired"
+    tree = ast.parse(inspect.getsource(Dreamer._store_maintenance).lstrip())
     calls = [n for n in ast.walk(tree)
              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
              and n.func.attr == "_reconcile_memory_stores"]

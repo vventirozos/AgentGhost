@@ -72,7 +72,7 @@ def env(tmp_path_factory):
     sm.learn_lesson(
         "deploy fails with EACCES", "retrying the copy blindly",
         "When a deploy fails with EACCES, verify the publish path ownership first.",
-        memory_system=vm,
+        memory_system=vm, source="operator_repair",   # §4NC: a module fixture runs before the conftest switch
     )
 
     epi = EpisodicMemory(root / "epi")

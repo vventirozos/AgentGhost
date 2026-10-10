@@ -21,6 +21,7 @@
     <a href="memory.html">What it remembers</a>
     <a class="current" href="tools.html">What it can do</a>
     <a href="self-improvement.html">How it improves itself</a>
+    <a href="learning-loop.html">The learning loop</a>
 
     <h3>Running it</h3>
     <a href="safety.html">Safety and privacy</a>
@@ -107,7 +108,7 @@
   <p>That means a lot of "Ghost picked the wrong tool" problems are description problems, and they're fixed by editing text rather than code. The descriptions live in <code>src/ghost_agent/tools/registry.py</code>.</p>
 
   <div class="note">
-    <strong>If it reaches for the wrong tool repeatedly,</strong> tell it directly in the moment ("use the document search, not general recall"). It records corrections like this as lessons, so the same mistake is less likely next time. <a href="memory.html">How lessons work →</a>
+    <strong>If it reaches for the wrong tool repeatedly,</strong> tell it directly in the moment ("use the document search, not general recall"). To make it stick, say <em>"learn this rule: for my documents, use the document search"</em> — the rule is then in every prompt. A 👎 also starts the <a href="learning-loop.html">learning loop</a>.
   </div>
 
   <h2>The full toolbox</h2>

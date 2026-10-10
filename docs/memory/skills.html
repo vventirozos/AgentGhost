@@ -590,6 +590,50 @@
   frequency is the value from before that turn's +1.</li>
   <li><code>forget</code> also finds a name in a lesson's code example and saved previous version.</li>
 </ul>
+  <h2 id="4na">Do lessons reach and change the turns they are for? <span class="tag">2026-10-10 &sect;4NA</span></h2>
+  <p><strong>Measured</strong> on the owner's 86 real requests from 14 days (store copy; applicability labelled blind by three independent readers on each request's 12 nearest lessons plus whatever was retrieved):</p>
+  <ul>
+    <li><strong>Reach:</strong> 67 applicable (request, lesson) pairs, 12 found (18%); 60% of what surfaced applied. Short requests (≤ 6 words): 4 of 32 applicable pairs found. 52 of the 55 misses fall to the trigger gate (shared words / trigger distance, §4KW–§4MI).</li>
+    <li><strong>Simulated gate settings:</strong> one fewer shared word required doubles reach (28%) at about the same precision (46%). Looser whole-lesson distance gives 39–43% reach at 35–38% precision. <em>Not adopted</em>: see the next point.</li>
+    <li><strong>Effect:</strong> 20 live probe pairs, each request with every lesson withheld (the probe-only <code>X-Ghost-Arm: no_lessons</code>, <code>_lessons_withheld</code>) against one applicable lesson injected, judged blind.
+      <ul>
+        <li>The lesson changed the reply in 3. All three were the two owner-approved rules: the health check ran before a greeting answer, and the version rules turned a wrong "PostgreSQL 17" into 18.</li>
+        <li>In 11 the model did it anyway. 3 were slightly worse with the lesson, and 3 were followed in neither run.</li>
+      </ul>
+      More reach would mostly deliver lessons that change nothing.</li>
+    <li><strong>The store:</strong> 26 of 130 lessons applied to anything; 56 were judged bad (1 harmful, 29 test-harness drills, 14 vague, 12 stale one-request scripts). Retired on the operator's approval (<code>scripts/lesson_retire_4na.py</code>, archived and tombstoned): 130 → 74.</li>
+  </ul>
+  <p><strong>Shipped: the owner's adopted rules are standing, not retrieved.</strong></p>
+  <ul>
+    <li><code>SkillMemory.owner_rules()</code> returns the rows with <code>origin: owner_rule</code> (adopted with "learn rule N", or approved by the operator), verified and general, at most <code>OWNER_RULES_MAX</code> = 6.</li>
+    <li>The agent renders them as <code>### OWNER RULES</code> in the per-request state block on every turn that may see the owner's private context (<code>_owner_rules_block</code>: not a member, not a public reply, not an isolated delegate, not the <code>no_lessons</code> arm).</li>
+    <li>They are still <em>retrieved</em> as before, so retrieval credit, attribution and the planner's lesson list keep working; the block comes in addition (r1 review: dropping them from retrieval broke all three). A quarantined rule is not shown. The playbook read is cached by modification time. <code>owner_rules</code> passes the read-only wrapper, so replays and self-play see the rules too. The trigger and the rule are both defused.</li>
+    <li><strong>Known and left:</strong> the pure-greeting fast path ("good morning ghost") builds no state block, so it carries its own "do not mention internal state" line instead of the rules.</li>
+  </ul>
+  <p>Pins: <code>tests/test_4na_lesson_reach.py</code>.</p>
+  <h2 id="4nc">Only approved rules and dictation create lessons <span class="tag">2026-10-10 &sect;4NC</span></h2>
+  <p><strong>Operator decision</strong> ("Only approved rules"), after the producer review measured 14 days of output.</p>
+  <ul>
+    <li><strong>The six background lesson writers</strong> (dream heuristics and patterns, failure distillation, self-play, bench, reflection, post-mortems) wrote about 131 lessons. About 80% were removed by hand.</li>
+    <li><strong>Dream's 44 remaining lessons</strong> surfaced 3 times in 86 replayed requests, with no relevant hit.</li>
+    <li><strong>The lessons that changed replies</strong> were approved rules (§4NA).</li>
+  </ul>
+  <p>The changes:</p>
+  <ul>
+    <li><code>learn_lesson</code> writes only for <code>LESSON_SOURCES_ALLOWED</code> = <code>learn_skill</code> (the owner's dictation and "learn rule N") and <code>operator_repair</code>. <code>GHOST_PRODUCER_LESSONS=1</code> re-opens every source.</li>
+    <li>The phases that only write lessons no longer spend model time: dream's episode consolidation, failure distillation and REM (81 REM cycles were 78 minutes of Nova), idle reflection, and the journal post-mortem. Dream's daily store care and backups still run.</li>
+    <li>The 46 dream and distilled lessons were retired (<code>scripts/lesson_retire_4nc.py</code>, archived and tombstoned): 74 → 28.</li>
+    <li>The test suite runs with producer lessons ON (<code>tests/conftest.py</code>), so the producers' own tests keep exercising their code; <code>tests/test_4nc_producers.py</code> pins the production defaults.</li>
+    <li><strong>r1 review:</strong>
+      <ul>
+        <li>The store maintenance that lived only in REM's tail now runs from the REM-skip path too, at most every <code>STORE_MAINTENANCE_EVERY_S</code> (6 h). That covers graph stale-edge pruning (the only uncapped tier), node compression, the cross-store reconcile and the RRF refit (<code>Dreamer._store_maintenance</code>).</li>
+        <li>The journal post-mortem consumer, deferred Perfect-It and post-turn correction reflection no longer make their model call when their lesson would be refused.</li>
+        <li>Perfect-It logs "saved" only on a real write. A self-play run says "No lesson saved" rather than "Learned trigger".</li>
+        <li>The <code>dream_mode</code>, <code>self_play</code> and SLEEP/REST texts no longer promise lesson-making.</li>
+        <li>PostMortemEngine is off unless <code>GHOST_POSTMORTEM_ENGINE=1</code>. skills-auto skips when the trajectory store is unchanged. The macro-mint skip line is at DEBUG.</li>
+      </ul>
+    </li>
+  </ul>
 </main>
 
 <h2 id="4mi">§4MI (2026-10-08) — admission, credit and retraction</h2>
@@ -608,6 +652,12 @@
   <li>Every trajectory reader passes its consumer key to <code>iter_teachable</code> (foresight, frontier seeding, dream replay, GEPA tool fixtures): only member turns had been filtered, and probe turns got through.</li>
   <li><code>trajectory_may_teach</code> refuses an interrupted turn (<code>[TURN_INTERRUPTED]</code>).</li>
   <li>One-off cleanup <code>scripts/idle_cleanup_4ms.py</code> (operator-confirmed). It retracts three wrong idle lessons as operator tombstones (<code>removed_by_trigger</code>, so they are never re-learned), resets the retrieval and helpful counters of three probe-inflated rows (the outcome counters stay), deletes one misread memory, and retires an unused self-play skill. It is idempotent: a re-run changes nothing. A planned backfill of 36 dream triggers cut at 80 characters was dropped: each row's vector twin and <code>task</code> are keyed by the old trigger, so a new trigger would have orphaned the row from retrieval.</li>
+</ul>
+
+<h2 id="4mt">§4MT: seed-linked retrieval</h2>
+<ul>
+  <li>A proven owner-practice lesson (<code>proof: kept</code>, not quarantined, carrying <code>seed_embedding</code>) also enters the vector branch when the user's request has a cosine of at least <code>SEED_SIM_MIN = 0.78</code> with the request it was learnt from (<code>_seed_linked_matches</code>, BGE query embeddings). Its trigger describes a practice drill, so trigger distance alone almost never admitted one: self-play lessons reached 1 of 311 owner turns (distance 0.45 against a 0.30 gate). Calibration used 30 days of owner requests (143 distinct, tool-using, Latin-script). At 0.78 or above, 86% of pairs were the same kind of task (same tool family), against a 40% base rate, with about 3 matching requests per request in a month. The web-research family is weaker, at 61%. A mostly non-Latin request abstains. Request-scoped rules still apply.</li>
+  <li>Lessons under proof are quarantined (<code>quarantine_reason</code> <code>proof_pending</code>, <code>proof_failed</code>, <code>proof_inconclusive</code> or <code>proof_withdrawn</code>) and never reach a prompt.</li>
 </ul>
 </body>
 </html>

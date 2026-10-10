@@ -478,6 +478,8 @@ class MemoryBus:
             got = " ".join(
                 f"{tag}=" + ("-" if stores.get(name) is None
                              or (name == "vector" and not self._VECTOR_TIER_ENABLED)
+                             or (name == "graph" and not self._GRAPH_TIER_ENABLED)
+                             or (name == "episodic" and not self._EPISODIC_TIER_ENABLED)
                              else str(len(cands.get(name) or ())))
                 for name, tag in self._TIER_TAGS)
             kept = " ".join(f"{tag}{surv.get(name, 0)}"
@@ -758,6 +760,19 @@ class MemoryBus:
             self._fetch_session(query, exclude_session_id=exclude_session_id),
         )
     _VECTOR_TIER_ENABLED = os.getenv("GHOST_BUS_VECTOR_TIER", "0").strip().lower() in ("1", "true", "yes", "on")
+    # §4NC (operator: "Off in prompts, keep recall"): on 86 real owner requests
+    # the graph tier was 20% relevant / 16% harmful and the episodic tier 15% /
+    # 19% (a stale "all systems green" greeting episode on 12 requests; one
+    # image request's subject on 7 unrelated ones). Both stay stored and
+    # searchable by `recall`; they are no longer auto-loaded into prompts.
+    # Read per call (not frozen at import), like the operator switches elsewhere.
+    @property
+    def _GRAPH_TIER_ENABLED(self) -> bool:
+        return os.getenv("GHOST_BUS_GRAPH_TIER", "0").strip().lower() in ("1", "true", "yes", "on")
+
+    @property
+    def _EPISODIC_TIER_ENABLED(self) -> bool:
+        return os.getenv("GHOST_BUS_EPISODIC_TIER", "0").strip().lower() in ("1", "true", "yes", "on")
 
     @staticmethod
     def _dedup_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1009,9 +1024,25 @@ class MemoryBus:
         chunks = [c.strip() for c in mem_string.split("\n---\n") if c.strip()]
         return [{"source": "vector", "text": c} for c in chunks]
 
+    async def _owner_facts(self, query: str) -> List[str]:
+        """The owner's facts asked for by their kind (§4KZ) — kept when the
+        topical graph tier is off (§4NC r1: the measurement was on topical
+        edges; "where do I live?" must still find the answer)."""
+        _own = getattr(self.graph, "owner_facts_matching", None)
+        if not (callable(_own) and self._asks_about_owner(query)):
+            return []
+        try:
+            owned = await asyncio.to_thread(_own, query, 8)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"MemoryBus owner-fact fetch failed: {e}")
+            return []
+        return [e for e in owned if isinstance(e, str)] if isinstance(owned, list) else []
+
     async def _fetch_graph(self, query: str) -> List[Dict[str, Any]]:
         if not self.graph:
             return []
+        if not self._GRAPH_TIER_ENABLED:      # §4NC: topical edges off, owner facts kept
+            return [{"source": "graph", "text": e} for e in await self._owner_facts(query) if e]
         words = [w for w in self._extract_query_terms(query) if w not in _GRAPH_HUB_WORDS]
         if not words:
             return []
@@ -1096,7 +1127,7 @@ class MemoryBus:
         return [{"source": "skill", "text": playbook.strip()}]
 
     async def _fetch_episodic(self, query: str, raw_user_text: str = "") -> List[Dict[str, Any]]:
-        if not self.episodic:
+        if not self.episodic or not self._EPISODIC_TIER_ENABLED:
             return []
         try:
             # vector_memory closes the semantic-recall loop: episodes are

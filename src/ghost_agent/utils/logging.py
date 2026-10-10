@@ -41,6 +41,51 @@ trajectory_id_context = contextvars.ContextVar("trajectory_id", default="")
 #: `X-Ghost-Client-Timeout`); 0.0 = unknown / no deadline. The turn loop
 #: reserves the last minutes for a state report (`request_remaining_s`).
 client_deadline_context = contextvars.ContextVar("client_deadline_s", default=0.0)
+#: §4MV: an EXPERIMENT arm for a labelled probe (`X-Ghost-Arm`, honoured only
+#: with `X-Ghost-Origin: probe`). Production requests always read "".
+prompt_arm_context = contextvars.ContextVar("prompt_arm", default="")
+#: §4MV measured `hyd_tail` (not adopted) and `tools_trim` (baked into the
+#: tool sources). §4NA: `no_lessons` — the lesson-compliance control arm
+#: (every playbook lesson withheld; probes only).
+PROMPT_ARMS: frozenset = frozenset({"no_lessons"})
+
+
+#: §4MW: a candidate RULE under test, sent by an operator probe
+#: (`X-Ghost-Probe-Rule`, honoured only with `X-Ghost-Origin: probe`) — the
+#: replay-the-real-failure loop tests a fix on a replay before anything ships.
+probe_rule_context = contextvars.ContextVar("probe_rule", default="")
+
+
+def probe_rule() -> str:
+    """The rule under test for THIS request — "" unless it is a probe."""
+    rule = str(probe_rule_context.get() or "")
+    if not rule:
+        return ""
+    try:
+        if not is_probe_request_id(request_id_context.get()):
+            return ""
+    except Exception:  # noqa: BLE001
+        return ""
+    return rule[:800]
+
+
+def parse_prompt_arm(value) -> str:
+    v = str(value or "").strip().lower()
+    return v if v in PROMPT_ARMS else ""
+
+
+def prompt_arm() -> str:
+    """The arm of the CURRENT request — "" unless it is a probe (checked
+    again here: an arm can never reach a production turn)."""
+    arm = str(prompt_arm_context.get() or "")
+    if not arm:
+        return ""
+    try:
+        if not is_probe_request_id(request_id_context.get()):
+            return ""
+    except Exception:  # noqa: BLE001
+        return ""
+    return arm
 
 # §4FB (2026-09-06): a DIAGNOSTIC request — an operator/Claude probe sent
 # through the live user path to exercise it. It must run exactly like a user

@@ -77,6 +77,13 @@ TEACHING_SITES = {
     ("core/dream.py", "synthetic_self_play"),
     # §4MS: self-play is seeded only by a real owner failure
     ("core/owner_seeds.py", "pick_owner_failure_seed"),
+    # §4MT: the reaction judge labels seeds; withdrawal retires lessons on owner failures
+    ("core/owner_seeds.py", "judge_reactions"),
+    ("core/lesson_proof.py", "withdraw_failing"),
+    # §4MW: the failure-replay loop picks owner failures (iter_teachable)
+    ("core/failure_replay.py", "pick_case"),
+    # §4NE: regression-test candidates are owner failures (iter_teachable)
+    ("core/regression.py", "candidates"),
 }
 NON_TEACHING_ALLOWLIST = {
     # kwargs callers (R2 review): world model, feedback ledger, replay, experiments, health
@@ -93,6 +100,13 @@ NON_TEACHING_ALLOWLIST = {
     ("distill/collector.py", "<module>"),                                   # a docstring example
     ("optim/tool_fixtures.py", "<module>"), ("optim/tool_fixtures.py", "_trajectory_index"),
     ("prm/trainer.py", "<module>"), ("prm/trainer.py", "summary"),
+    # §4MT: a lookup BY ID of the seed already picked through iter_teachable —
+    # it embeds that request (vector only, no text kept); it selects nothing
+    ("core/dream.py", "_seed_request_embedding"),
+    # §4MW: looks up its OWN probe replays by request id; teaches nothing
+    ("core/failure_replay.py", "_resolve_trajectories"),
+    # §4NE: reads its OWN test run (probe-rt-…) back by request id; teaches nothing
+    ("core/regression.py", "_tools_for"),
 }
 
 
@@ -239,6 +253,9 @@ EXPECTED_ALLOWLISTED_READS = {   # one read each, as of 2026-09-24 — a new rea
     ("tools/memory.py", "_maybe_retrain_router"): 1, 
     ("core/feedback.py", "find_trajectory_for_request"): 1, ("core/admissibility.py", "iter_bench_trajectories"): 1,
     ("core/experiments.py", "_summaries_from_trajectories"): 1, ("core/experiments.py", "announce_new_verdicts"): 1,
+    ("core/dream.py", "_seed_request_embedding"): 1,                  # §4MT: a by-id lookup
+    ("core/failure_replay.py", "_resolve_trajectories"): 1,          # §4MW: its own replays
+    ("core/regression.py", "_tools_for"): 1,                         # §4NE: its own test runs
     ("core/learning_health.py", "_framing_leak_health"): 1, ("core/learning_health.py", "_experiment_health_lines"): 1,
     ("core/agent.py", "_run_prm_online_update"): 1, ("optim/tool_fixtures.py", "_trajectory_index"): 1,
 }

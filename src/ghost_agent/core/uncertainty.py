@@ -371,9 +371,18 @@ class UncertaintyTracker:
         parts = [
             "### RECURRING UNCERTAINTIES (unresolved across multiple past turns):"
         ]
+        # §4MV r2: chosen and ordered by band, then text — picking by the
+        # exact count changed membership/order below a band crossing
+        def _rank(c):
+            return 3 if c >= 10 else (2 if c >= 5 else 1)
+        recurring = sorted(recurring, key=lambda tc: (-_rank(tc[1]), str(tc[0])))
         for text, count in recurring[:limit]:
+            # §4MV: a band, not the exact count — this block rides the stable
+            # per-request context, and a count that moves re-prefills the
+            # whole conversation history after it
+            band = "10+" if count >= 10 else ("5+" if count >= 5 else "2+")
             parts.append(
-                f"  - {text[:200]} (flagged {count}× — resolve this if it is in scope)"
+                f"  - {text[:200]} (flagged {band}× — resolve this if it is in scope)"
             )
         return "\n".join(parts)
 

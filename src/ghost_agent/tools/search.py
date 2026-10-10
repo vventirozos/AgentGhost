@@ -372,6 +372,7 @@ the a an of and or to in for on with by from at is are was were be been
 being as that this these those it its into about over under how what
 when where which who why not no do does did can could should would will
 may might must i you he she they we us our your their his her
+much many
 """.split())
 
 # Below this many content words a query carries too little signal for
@@ -503,6 +504,103 @@ def rank_on_topic(query: str, results: List[Dict]) -> List[Dict]:
     hit = [r for r in results or [] if result_on_topic(r, dist)]
     miss = [r for r in results or [] if not result_on_topic(r, dist)]
     return hit + miss
+
+
+# ── §4MX: per-result drop (operator decision, reverses §4IL "never drop") ──
+# Measured over 1,9xx results the model actually saw (2026-09/10): about 1 in
+# 3 was off-topic — a Russian page for an English query, a page sharing one
+# word of eight. Dropping results under 30% query-word coverage (title +
+# snippet + URL) and non-Latin pages for a Latin-script query halves that
+# (34% → 17%) at the cost of ~1 good result in 9; at least
+# ``_KEEP_MIN_RESULTS`` always remain (the best of the rest), and a search
+# where NOTHING passes is labelled, not passed off as normal results.
+_KEEP_MIN_RESULTS = 3
+_MIN_RESULT_COVERAGE = 0.30
+LOW_RELEVANCE_NOTE = (
+    "NOTE: low relevance — none of these results matches most of the query's "
+    "words. Do not treat them as an answer: open one only if its title is "
+    "clearly about the question, or search again with fewer, more specific "
+    "keywords.")
+
+
+def _nonlatin_share(text: str) -> float:
+    import unicodedata
+    letters = [c for c in text or "" if c.isalpha()]
+    if not letters:
+        return 0.0
+    return sum(1 for c in letters
+               if not unicodedata.name(c, "").startswith("LATIN")) / len(letters)
+
+
+def result_coverage(result: Dict, tokens: List[str]) -> float:
+    """Share of the query's content words found in the result: a whole word
+    of title+snippet, or (5+ letters) anywhere in the flattened
+    title+snippet+URL — the engines' space-stripped snippets glue words."""
+    if not tokens:
+        return 1.0
+    title, body = result.get("title") or "", result.get("body") or ""
+    text = _rel_fold(f"{title} {body}")
+    words = set(re.findall(r"\w+", text, re.UNICODE))
+    flat = re.sub(r"\W+", "", _rel_fold(
+        f"{title} {body} {result.get('href') or result.get('url') or ''}"),
+        flags=re.UNICODE)
+    def _found(t: str) -> bool:
+        if t in words or (len(t) >= 5 and t in flat):
+            return True
+        # a short uncommon token glued into a name: "llm" in "LLM4Decompile"
+        if len(t) >= 3 and not _in_dictionary(t) and t in flat:
+            return True
+        # plural/inflection: "accidents" finds "accident", "crises" "crisis",
+        # "decompilation" "decompile"
+        for suf, _rep in _STEM_SUFFIXES + (("ation", ""), ("ion", "")):
+            stem = t[:-len(suf)] if t.endswith(suf) else ""
+            if len(stem) >= 4 and stem in flat:
+                return True
+        return False
+    return sum(1 for t in tokens if _found(t)) / len(tokens)
+
+
+def _carries_subject(result: Dict, tokens: List[str]) -> bool:
+    """The leading content word AND one more: a long query's real page names
+    its subject and one detail ("Revolut … breach") at 2 of 8 words."""
+    if len(tokens) < 2 or result_coverage(result, tokens[:1]) < 1.0:
+        return False
+    return result_coverage(result, tokens[1:]) * (len(tokens) - 1) >= 1
+
+
+def prune_off_topic(query: str, results: List[Dict]) -> Tuple[List[Dict], bool]:
+    """(results to show, low_relevance). Order is preserved; dropped rows
+    are those under ``_MIN_RESULT_COVERAGE`` or in another script than a
+    Latin query. A query with fewer than 2 content words is not judged; a
+    row with no title/snippet text is not judged (no evidence either way)."""
+    rows = list(results or [])
+    tokens = [t for t in _rel_tokens(query) if not _YEAR_RE.fullmatch(t)]
+    if len(tokens) < 2 or not rows:
+        return rows, False
+    latin_query = _nonlatin_share(query) <= 0.3
+    scored = []
+    for i, r in enumerate(rows):
+        prose = f"{r.get('title') or ''} {r.get('body') or ''}".strip()
+        if not prose:
+            scored.append((i, r, True, 1.0))
+            continue
+        cov = result_coverage(r, tokens)
+        subject = _carries_subject(r, tokens)
+        # another script is dropped only when it does not name the subject:
+        # a Greek page about the Latin-named thing is still the page
+        ok = (cov >= _MIN_RESULT_COVERAGE or subject) and not (
+            latin_query and _nonlatin_share(prose) > 0.3 and not subject)
+        scored.append((i, r, ok, cov))
+    kept = {i for i, _r, ok, _c in scored if ok}
+    judged = [(r, ok) for _i, r, ok, _c in scored
+              if f"{r.get('title') or ''}{r.get('body') or ''}".strip()]
+    low = bool(judged) and not any(ok for _r, ok in judged)
+    if len(kept) < _KEEP_MIN_RESULTS:
+        rest = sorted((x for x in scored if x[0] not in kept),
+                      key=lambda x: (-x[3], x[0]))
+        for i, *_ in rest[:_KEEP_MIN_RESULTS - len(kept)]:
+            kept.add(i)
+    return [r for i, r, *_ in scored if i in kept], low
 
 
 def _results_are_off_topic(query: str, results: List[Dict]) -> bool:
@@ -1157,6 +1255,16 @@ def truncate_query(query: str, limit: int = 35) -> str:
     return (query[:limit] + "..") if len(query) > limit else query  # type: ignore
 
 
+#: §4MX: a number bound to the word before it names a thing, not a detail.
+_NAMED_NUMBER_RE = re.compile(
+    r"\b(?:section|sections|s\.|article|art\.|chapter|clause|rule|regulation|"
+    r"paragraph|schedule|part|title|act|law|bill|directive|amendment|"
+    r"άρθρο|άρθρου|άρθρα|ν\.\s?δ\.|π\.\s?δ\.|ν\.|νόμος|νόμου|παράγραφος|κεφάλαιο|νδ|πδ|"
+    r"version)"
+    r"\s*\d+(?:\.\d+)*(?:/\d+)?\b",
+    re.IGNORECASE | re.UNICODE)
+
+
 def _reformulate_query(query: str) -> List[str]:
     """Generate 2 reformulated search queries when the original fails.
 
@@ -1167,9 +1275,24 @@ def _reformulate_query(query: str) -> List[str]:
     reformulations = []
 
     # Strategy 1: Remove overly specific terms (versions, dates, numbers)
-    broader = _re.sub(r'\b\d{4}\b', '', query)       # Remove years
+    # …except a number that NAMES the thing (§4MX): "section 127
+    # communications act" broadened to "section communications act" — a
+    # different law. Held aside as a placeholder, restored after.
+    _held: List[str] = []
+
+    def _hold(m):
+        if len(_held) >= 26:
+            return m.group(0)
+        _held.append(m.group(0))
+        return f"\x00{chr(ord('a') + len(_held) - 1)}\x00"   # no digit: the strip below must not eat it
+    broader = _NAMED_NUMBER_RE.sub(_hold, query)
+    broader = _re.sub(r'\b\d{4}\b', '', broader)     # Remove years
     broader = _re.sub(r'\bv?\d+\.\d+\b', '', broader)  # Remove version numbers
     broader = _re.sub(r'\b\d+\b', '', broader)         # Remove other numbers
+    broader = _re.sub(r'\x00([a-z])\x00',
+                      lambda m: (_held[ord(m.group(1)) - ord('a')]
+                                 if ord(m.group(1)) - ord('a') < len(_held) else ""),
+                      broader)
     broader = _re.sub(r'\s+', ' ', broader).strip()
     if broader and broader != query and len(broader) > 5:
         reformulations.append(broader)
@@ -1235,6 +1358,25 @@ def _clean_for_cpp(text: str) -> str:
     # Strip structural braces that confuse the Llama.cpp peg-native grammar parser
     return text.replace("{", "[").replace("}", "]").replace("<", "(").replace(">", ")")
 
+def _prune_and_log(query: str, results: List[Dict]) -> Tuple[List[Dict], bool]:
+    """§4MX: apply `prune_off_topic` to everything the engine returned (a
+    dropped row in the top 8 is backfilled from below), and say what was
+    dropped. Never raises — a pruning bug must not sink a search."""
+    try:
+        top = list(results or [])
+        kept, low = prune_off_topic(query, top)
+    except Exception:  # noqa: BLE001
+        logger.debug("search prune skipped", exc_info=True)
+        return list(results or []), False
+    if len(kept) < len(top) or low:
+        pretty_log("Search Relevance",
+                   f"dropped {len(top) - len(kept)} of {len(top)} off-topic result(s)"
+                   + (" — none matched well; labelled low relevance" if low else "")
+                   + f" ‹{truncate_query(query)}›",
+                   icon=Icons.TOOL_SEARCH)
+    return kept, low
+
+
 async def tool_search_ddgs(query: str, tor_proxy: str):
     # Fail-closed (§4P): under --mandatory-tor a falsy proxy is replaced with
     # the loopback Tor default so the (always-public) search engines are never
@@ -1298,7 +1440,10 @@ async def tool_search_ddgs(query: str, tor_proxy: str):
             if _wiki:
                 pretty_log("Wiki Supplement", f"el.wikipedia: {_wiki[0]['title'][:60]} — placed first",
                            icon=Icons.TOOL_SEARCH)
+            valid_results, _low = _prune_and_log(query, valid_results)
             clean_output = format_search_results(merge_wiki_first(_wiki, valid_results)[:8])
+            if _low and not _wiki:
+                clean_output = LOW_RELEVANCE_NOTE + "\n\n" + clean_output
             _cache_put(_cache_key, clean_output)
             return clean_output
         if wave == 0:
@@ -1326,7 +1471,10 @@ async def tool_search_ddgs(query: str, tor_proxy: str):
         pretty_log("Search Retry", f"Reformulated: {truncate_query(reformulated)}", icon=Icons.TOOL_SEARCH)
         valid_results = await _race_search_wave(reformulated, tor_proxy, 10 + ridx)
         if valid_results:
+            valid_results, _low = _prune_and_log(reformulated, valid_results)
             clean_output = format_search_results(valid_results[:8])
+            if _low:
+                clean_output = LOW_RELEVANCE_NOTE + "\n\n" + clean_output
             result = f"[Reformulated query: '{reformulated}']\n\n{clean_output}"
             _cache_put(_cache_key, result)
             return result
@@ -1377,6 +1525,9 @@ def _record_project_findings(context, query: str, output: str) -> Optional[str]:
     try:
         if context is None or getattr(context, "is_pinned_project_context", False):
             return None
+        from ..utils.logging import is_probe_request_id, request_id_context
+        if is_probe_request_id(request_id_context.get()):
+            return None         # §4MW r1: a probe (a failure replay) writes nothing into a project
         pid = getattr(context, "current_project_id", None)
         store = getattr(context, "project_store", None)
         if not pid or store is None:
@@ -1424,7 +1575,10 @@ async def tool_search(query: Optional[str] = None, anonymous: bool = False, tor_
     if _site_note and isinstance(out, str):
         from .outcome import append_note
         out = append_note(out, "\n\n" + _site_note)
-    rel = _record_project_findings(context, query, out)
+    # §4MX r1: a low-relevance batch is not a finding — the label does not
+    # survive the findings parser, so coding leaves would read it as research
+    rel = (None if isinstance(out, str) and LOW_RELEVANCE_NOTE in out
+           else _record_project_findings(context, query, out))
     if rel and isinstance(out, str):
         # Tell the model where the results now live, so it can point a
         # build at them instead of re-searching.
@@ -1532,6 +1686,9 @@ def record_loaded_sources(workspace_model, urls, page_contents, failed, *, sourc
     answered "have I read this?" wrongly and deduped the later real pull).
     ``page_contents`` is the gather result, one per url."""
     n = 0
+    from ..utils.logging import is_probe_request_id, request_id_context
+    if is_probe_request_id(request_id_context.get()):
+        return 0                # §4MW r1: a probe (a failure replay) records nothing
     for u, c in zip(urls, page_contents):
         if not isinstance(c, str) or failed(c):
             continue

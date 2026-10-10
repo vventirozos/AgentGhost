@@ -390,9 +390,11 @@ def test_the_idle_phase_is_registered_for_the_liveness_alarm():
     means a zero over the window is an ALARM, which is correct here: a
     stale allow-list is exactly the failure worth waking up for."""
     from ghost_agent.core.autonomous_activity import (
-        EXPECT_PERIODIC, PHASE_EXPECTATION, _PHASE_LABELS,
+        EXPECT_GATED, PHASE_EXPECTATION, _PHASE_LABELS,
     )
-    assert PHASE_EXPECTATION.get("imagine_gate") == EXPECT_PERIODIC
+    # §4ND: an operator switch (GHOST_FORESIGHT, default off) — registered,
+    # but a zero over the window is the expected state, not an alarm
+    assert PHASE_EXPECTATION.get("imagine_gate") == EXPECT_GATED
     assert _PHASE_LABELS.get("imagine_gate")   # renders, not a raw slug
 
 

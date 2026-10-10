@@ -21,6 +21,7 @@
     <a href="memory.html">What it remembers</a>
     <a href="tools.html">What it can do</a>
     <a class="current" href="self-improvement.html">How it improves itself</a>
+    <a href="learning-loop.html">The learning loop</a>
 
     <h3>Running it</h3>
     <a href="safety.html">Safety and privacy</a>
@@ -40,7 +41,11 @@
   <p class="subtitle">Two separate things: a check that runs on every answer, and a set of background passes that only run when you've left it alone.</p>
 
   <div class="note">
-    <strong>To be clear about what this isn't.</strong> None of this retrains the language model. The model file never changes. What changes is what Ghost <em>remembers</em>, what it has <em>learned to avoid</em>, and a few small local models it trains itself for scoring and routing. Everything happens on your machine.
+    <strong>To be clear about what this isn't.</strong> None of this retrains the language model. The model file never changes. What changes is what Ghost <em>remembers</em>, the <em>rules you have approved</em>, and a small local model it trains for scoring plans. Everything happens on your machine.
+  </div>
+
+  <div class="note good">
+    <strong>Looking for how it learns from you?</strong> The whole loop — your 👎, the replays while you're away, the rule it proposes, your decision, and the regression tests that keep a fix fixed — has its own page with a worked example: <a href="learning-loop.html">The learning loop</a>.
   </div>
 
   <h2>Part one: checking its own answers</h2>
@@ -116,25 +121,23 @@ idle 1..10s   …and round again, forever</code></pre>
         <p>Things noted during the conversation are sitting in a queue. This pass works through them and decides what's worth keeping, then writes it into long-term memory. Until this runs, something you just mentioned may not be findable.</p>
       </li>
       <li>
-        <h4>After ~10 minutes — consolidate memory</h4>
-        <p>The project calls this the dream cycle, or REM. It reviews recent memories, merges duplicates, generalises repeated patterns into something reusable, and tunes how much each memory store is trusted for different kinds of question.</p>
+        <h4>After ~10 minutes — tidy memory</h4>
+        <p>The project calls this the dream cycle, or REM. It merges duplicate memories, prunes and compresses the stores, and re-tunes how much each memory store is trusted for different kinds of question. Since 2026-10-10 (§4NC) it no longer turns memories into lessons; on a quiet day it only runs this upkeep, about every six hours.</p>
         <p>It skips itself when there's nothing new, and backs off further each time it skips — so a quiet afternoon doesn't produce a log full of "nothing to do".</p>
       </li>
       <li>
-        <h4>After ~15 minutes — review what went wrong</h4>
-        <p>Recent failed turns get re-read and critiqued, and what comes out of that becomes lessons. Around the same window, Ghost also updates its running first-person account of what it's been doing, and its record of what changed in your files.</p>
+        <h4>After ~15 minutes — keep its own records</h4>
+        <p>Ghost updates its running first-person account of what it's been doing, and its record of what changed in your files. Reviewing failed turns used to write lessons here too. That is off since 2026-10-10 (§4NC): measured on real turns, those lessons reached the turn they were meant for 18% of the time and changed the reply in 3 of 20.</p>
       </li>
       <li>
-        <h4>Every couple of hours — extract reusable skills</h4>
-        <p>Looks across successful runs for a procedure that keeps recurring and turns it into a named, reusable skill instead of something re-derived every time.</p>
+        <h4>Every few hours — retrain the plan scorer</h4>
+        <p>A small local model that scores whether a partial plan looks like it's going somewhere, trained on Ghost's own recorded turns. Skipped when nothing new has been recorded. The request router and automatic skill extraction are switched off since 2026-10-10 (§4ND): nothing used the router's labels, and the extracted "skills" were trivial sequences that quoted old requests back into prompts.</p>
       </li>
       <li>
-        <h4>Every few hours — retrain its own small models</h4>
-        <p>Two little local models: one that scores whether a partial plan looks like it's going somewhere, one that routes requests to the cheapest machine that can handle them. Both are trained on Ghost's own recorded turns. Skipped entirely when nothing new has been recorded since the last retrain.</p>
-      </li>
-      <li>
-        <h4>After ~1 hour — practise</h4>
-        <p>Self-play. Ghost generates a challenge for itself, attempts it, scores the result, and keeps what it learned. It aims at the areas where it's least certain rather than picking at random, and the interval adapts: when practice is producing something, it comes back sooner.</p>
+        <h4>After ~1 hour — replay your failures, and run your tests</h4>
+        <p>Ghost picks a recent turn of yours that went wrong — you gave it a 👎, or your next message showed the reply missed — and asks the same question again as a labelled test, with and without a candidate rule. If the rule fixes it, Ghost tells you: <em>Candidate rule 3 — say “show rule 3” to read it, “learn rule 3” to adopt it</em>. Nothing is learnt until you say so; “show all rules” lists them and “forget rule N” removes one (after you confirm).</p>
+        <p>The same evidence also becomes <strong>regression tests</strong> (§4NE). Ghost drafts one — the question, what a right answer must contain, and checks a program can run — and asks you: “keep test 4”, “edit test 4: it must name the vendor's page”, or “forget test 4” (“show regression tests” lists them). Kept tests are re-asked after every update to Ghost and once a day, and a failing one is reported to you. A candidate rule is also run against your kept tests, so its proposal says whether it breaks any of them. See <a href="core/regression.html">core.regression</a>.</p>
+        <p>With no recent failure and no test due, nothing runs. Coding practice is off since 2026-10-10.</p>
       </li>
     </ol>
     <p class="caption">Times are how long you've been quiet. Each phase also has its own cooldown between runs.</p>
@@ -217,7 +220,7 @@ idle 1..10s   …and round again, forever</code></pre>
   <div class="note">
     <strong>Does the tuned prompt actually help, once it's live?</strong> Until now nothing could answer that. The optimizer's decision rests entirely on a few dozen test examples checked <em>before</em> deployment; afterwards the prompt just runs, and no record connected a real turn to the prompt version that produced it — even though the code had been computing that identifier all along and discarding it. One tuned prompt served every planning turn for weeks on a result nobody could reproduce, and that was invisible for exactly this reason.
     <p>Turns now record which tuned prompt served them. But that on its own isn't enough to justify <em>removing</em> one: a new prompt goes live everywhere at once, so "things got worse after we deployed it" is confounded by everything else that changed that week. So the agent can optionally <em>withhold</em> the tuned prompt from a random share of turns and compare the two groups — which is the difference between a comparison that can support a decision and one that just looks like it can. Where that randomisation isn't switched on, the analysis says so and declines to give a number.</p>
-    <p>When the withheld group does better by a clear margin, a maintenance command retires the tuned prompt — the autonomous live judge runs it daily, and since the epoch-swap work the retirement takes effect within about a minute of the file being renamed &mdash; the running process notices the change and serves the hand-written prompt again, no restart needed. There's also a cooling-off period between promotions: each optimisation run is a fresh roll of the dice, so running it every week against a slowly-growing test set is really just rolling repeatedly until something passes.</p>
+    <p>When the withheld group does better by a clear margin, a maintenance command retires the tuned prompt — the autonomous live judge used to run it daily (off since 2026-10-10, §4ND: <code>GHOST_GEPA_AUTONOMY=1</code> turns it back on), and since the epoch-swap work the retirement takes effect within about a minute of the file being renamed &mdash; the running process notices the change and serves the hand-written prompt again, no restart needed. There's also a cooling-off period between promotions: each optimisation run is a fresh roll of the dice, so running it every week against a slowly-growing test set is really just rolling repeatedly until something passes.</p>
     <p>Since the Phase 3 work, the agent also <em>launches</em> these optimisation runs itself: a deep-idle job picks one target per day (the tool-description gate, or one of three allow-listed prompt signatures), at most once per week per target, and simply runs the gate script and reads its exit code. All the "should we even run?" questions — enough data, recent-enough promotion, healthy upstream — already live inside the gate as cheap refusals, so the launcher adds no judgement of its own, and it can never pass any of the operator-only override flags. A promotion notifies and deploys itself within a minute; a rejection is just logged, because a gate saying no is the system working. Kill switch: <code>GHOST_GEPA_AUTO_OPTIMIZE=0</code>.</p>
     <p><em>Nothing is switched on by default, and there is no data yet</em> — the recording started after the current agent did. The tool reports "not enough evidence", which is the correct answer and worth more than a confident one.</p>
   </div>
@@ -293,9 +296,9 @@ idle 1..10s   …and round again, forever</code></pre>
       <span class="dir">Previous</span>
       <span class="to">What it can do</span>
     </a>
-    <a class="next" href="safety.html">
+    <a class="next" href="learning-loop.html">
       <span class="dir">Next</span>
-      <span class="to">Safety and privacy</span>
+      <span class="to">The learning loop</span>
     </a>
   </div>
 

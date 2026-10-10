@@ -819,6 +819,18 @@
   fingerprint stash: a reopen can arrive days and several restarts after the close.
   Tests: <code>tests/test_task_reopened_tier.py</code>.</p>
 
+  <h2 id="4nd">Machinery that changed nothing is switched off <span class="tag">2026-10-10 &sect;4ND</span></h2>
+  <p>Operator decision ("stop them"). Each switch defaults off, uses <code>utils.helpers.env_flag</code>, is read per call, and keeps its code:</p>
+  <ul>
+    <li><code>GHOST_HYDRATION_JUDGE</code>: the per-turn RRF usefulness judge. One model call per hydrated turn; 878 of 904 refits moved nothing.</li>
+    <li><code>GHOST_ROUTER</code>: the per-turn complexity router and its 3-hourly retrain. An embedding every turn, with no consumer.</li>
+    <li><code>GHOST_FORESIGHT</code>: per-call foresight predictions and ledger, and the imagine gate rebuild. No consumer.</li>
+    <li><code>GHOST_GEPA_AUTONOMY</code>: now defaults off. Every target was <code>could_not_measure</code>.</li>
+    <li><code>GHOST_RISK_GOVERNOR</code>: its step-depth curve is 10–26 points wrong, and its steer is concluded.</li>
+    <li><code>GHOST_COMPETENCE_PROMPT</code>: the competence table in prompts counted error-free calls, not success (fetch "95%" against a real 80%).</li>
+    <li><code>GHOST_AUTO_SKILLS</code>: graduated "proven approaches" were trivial tool sequences that quoted old requests into unrelated turns (19 of 86).</li>
+    <li><code>GHOST_CODING_PRACTICE</code>: idle coding self-play produced nothing once lesson writing was off (§4NC).</li>
+  </ul>
 </main>
 </body>
 </html>

@@ -586,6 +586,10 @@
 
 <h2 id="4ms">§4MS: a parked background call is deferred, never released into a live request</h2>
 <p><code>_wait_for_foreground_clear(task_label)</code> still parks a main-slot background call while a user request is active. After 600 s it used to <em>run anyway</em>, inside the request: in 44 of 105 parks the call ran during an owner turn, and one owner call took 500 s instead of about 30 s. It now raises <code>BackgroundDeferred</code>, with a WARNING naming the caller. Callers that catch it skip that piece of work (reflection re-queues the item; narratives and the post-mortem log it; an idle coding build stops). A leaked foreground counter now silences main-slot background work until a restart, where before it delayed it by 10 minutes; the counter is hardened (§4GJ). The 120 s park line also names the caller.</p>
+<h2 id="4mx">§4MX: "only busy" is visible to the caller; a busy node is not down</h2>
+<p><code>OffMainNodeUnavailable.saturated</code> is True when the critic leg failed and <em>every</em> failure was <code>NodeSaturated</code> — our own permit gate refused, the node was never contacted. The verifier uses it to skip a deferred verdict rather than re-run it on main (see verifier §4MX); a connect error or timeout leaves it False.</p>
+<p><code>keepalive_workers</code>: the ping bypasses the permit gate but still queues inside llama-server behind our own requests, so on a full node it timed out and logged <em>"stopped answering"</em> 21 times in a month while the node was serving us. A failed ping on a node holding our requests (<code>_node_inflight</code> &gt; 0 when the ping started or failed) is now excused — by ONE rule shared with the circuit breaker, <code>_ping_excused</code>, judged at the moment of the miss as the breaker judges it (r4): our own gated jobs hold every slot of a node of known capacity (r3 review: the log excused ≥1 job while the breaker charged the miss, so the breaker could open silently) — for up to <code>_KEEPALIVE_BUSY_FAILS</code> = 5 misses in a row (~4 min); a node that hangs while holding our requests is reported after that.</p>
+
 </main>
 </body>
 </html>

@@ -1,0 +1,338 @@
+[
+ {
+  "id": 3,
+  "group": "harmful",
+  "trigger": "hello ghost, how's things today ?",
+  "solution_head": "1. Call `introspect(action=overview)` to retrieve the current Brier score, syste"
+ },
+ {
+  "id": 7,
+  "group": "harness",
+  "trigger": "SQL aggregation with specific sorting requirements",
+  "solution_head": "Use SQL's built-in aggregation (SUM) and ordering (ORDER BY) capabilities to han"
+ },
+ {
+  "id": 15,
+  "group": "harness",
+  "trigger": "Algebraic problem solving with time-dependent rates",
+  "solution_head": "Define variables for the current state (e.g., S_now, B_now). Define the state at"
+ },
+ {
+  "id": 17,
+  "group": "harness",
+  "trigger": "Stateful sequence aggregation over file streams",
+  "solution_head": "The stateful processor must correctly identify when a sequence of events ends (d"
+ },
+ {
+  "id": 19,
+  "group": "harness",
+  "trigger": "String replacement within structured log messages",
+  "solution_head": "Use regex substitution to replace only the matched error code token (e.g., ERR_0"
+ },
+ {
+  "id": 29,
+  "group": "harness",
+  "trigger": "Ambiguous sentence parsing in word problems",
+  "solution_head": "When a sentence presents multiple distinct facts linked by conjunctions, isolate"
+ },
+ {
+  "id": 49,
+  "group": "harness",
+  "trigger": "Calculating proper divisor sums",
+  "solution_head": "When calculating the sum of proper divisors for a number n, the loop iterating t"
+ },
+ {
+  "id": 53,
+  "group": "harness",
+  "trigger": "Stateful log processing with out-of-order events",
+  "solution_head": "Maintain a state for each user_id, tracking the current session status (active/i"
+ },
+ {
+  "id": 67,
+  "group": "harness",
+  "trigger": "Stateful log processing requiring sequential event tracking",
+  "solution_head": "The solution correctly handles the three distinct state determination rules (onl"
+ },
+ {
+  "id": 69,
+  "group": "harness",
+  "trigger": "Checking universal property across nested structures",
+  "solution_head": "Use nested generator expressions within the `all()` function to flatten the stru"
+ },
+ {
+  "id": 70,
+  "group": "harness",
+  "trigger": "Parallel processing with strict output ordering requirements",
+  "solution_head": "When using parallel execution where workers complete non-deterministically, ensu"
+ },
+ {
+  "id": 71,
+  "group": "harness",
+  "trigger": "Aggregating stock levels across multiple locations before evaluating shipment constraints",
+  "solution_head": "First, aggregate the total available quantity for each product ID from the inven"
+ },
+ {
+  "id": 72,
+  "group": "harness",
+  "trigger": "Parsing structured log files using regular expressions",
+  "solution_head": "Use a regular expression that captures the IP and the status code, then use Pyth"
+ },
+ {
+  "id": 76,
+  "group": "harness",
+  "trigger": "Strict output formatting requirements",
+  "solution_head": "When generating reports, ensure the output format adheres strictly to the requir"
+ },
+ {
+  "id": 77,
+  "group": "harness",
+  "trigger": "Stateful sequential processing with delayed resolution",
+  "solution_head": "Maintain a dictionary of pending transactions keyed by transaction_id. When a ne"
+ },
+ {
+  "id": 79,
+  "group": "harness",
+  "trigger": "data aggregation and ratio calculation from CSV",
+  "solution_head": "The total count for a user must include all records read from the log file, rega"
+ },
+ {
+  "id": 80,
+  "group": "harness",
+  "trigger": "Processing event streams with multiple, potentially conflicting definitions",
+  "solution_head": "When multiple definitions exist for an event type, an event is considered valid/"
+ },
+ {
+  "id": 81,
+  "group": "harness",
+  "trigger": "Minimum cost pathfinding on a grid with movement constraints",
+  "solution_head": "Use Dynamic Programming (DP) to solve the minimum cost path problem. Initialize "
+ },
+ {
+  "id": 82,
+  "group": "harness",
+  "trigger": "Top-K frequency counting with custom stopword filtering and tie-breaking",
+  "solution_head": "Ensure that when iterating over a dictionary or Counter to extract key-value pai"
+ },
+ {
+  "id": 84,
+  "group": "harness",
+  "trigger": "Output formatting compliance in constrained execution environments",
+  "solution_head": "Ensure the final output strictly adheres to the required format (e.g., 'WINNER=<"
+ },
+ {
+  "id": 85,
+  "group": "harness",
+  "trigger": "Script output formatting",
+  "solution_head": "Ensure the script only prints the final result in the exact required format, wit"
+ },
+ {
+  "id": 86,
+  "group": "harness",
+  "trigger": "File parsing and execution output formatting",
+  "solution_head": "When executing code or scripts, verify the output format and content against exp"
+ },
+ {
+  "id": 87,
+  "group": "harness",
+  "trigger": "JSON output formatting requirements",
+  "solution_head": "When constructing the final JSON object, ensure all numeric values are converted"
+ },
+ {
+  "id": 88,
+  "group": "harness",
+  "trigger": "File parsing with headers",
+  "solution_head": "When parsing structured text line-by-line, use robust iteration and conditional "
+ },
+ {
+  "id": 90,
+  "group": "harness",
+  "trigger": "Web automation using Playwright with local file paths",
+  "solution_head": "```python\nimport asyncio\nfrom playwright.async_api import async_playwright\n\nasyn"
+ },
+ {
+  "id": 91,
+  "group": "harness",
+  "trigger": "Determining final state based on log order vs. timestamp",
+  "solution_head": "When determining the final state of an entity from a log, iterate through the lo"
+ },
+ {
+  "id": 92,
+  "group": "harness",
+  "trigger": "Data formatting precision in output generation",
+  "solution_head": "Ensure all calculated floating-point values (like average and max amounts) are e"
+ },
+ {
+  "id": 94,
+  "group": "harness",
+  "trigger": "Sequential processing simulation with external data dependencies",
+  "solution_head": "The logic must iterate strictly based on the processing order defined by `arriva"
+ },
+ {
+  "id": 100,
+  "group": "harness",
+  "trigger": "Parsing space-delimited log files",
+  "solution_head": "Iterate through the file line by line, splitting each line by whitespace, and ex"
+ },
+ {
+  "id": 109,
+  "group": "harness",
+  "trigger": "State Machine Transition Logic",
+  "solution_head": "Ensure that the state machine logic explicitly checks for the existence of the c"
+ },
+ {
+  "id": 25,
+  "group": "vague",
+  "trigger": "When executing system commands, verify the sandbox environment allows for the in",
+  "solution_head": "When executing system commands, verify the sandbox environment allows for the in"
+ },
+ {
+  "id": 28,
+  "group": "vague",
+  "trigger": "When searching for external data sources like GRIB files, confirm public availab",
+  "solution_head": "When searching for external data sources like GRIB files, confirm public availab"
+ },
+ {
+  "id": 39,
+  "group": "vague",
+  "trigger": "When performing complex web searches requiring specific data points (like kernel",
+  "solution_head": "When performing complex web searches requiring specific data points (like kernel"
+ },
+ {
+  "id": 45,
+  "group": "vague",
+  "trigger": "When generating charts or visualizations, ensure the necessary data blocks or se",
+  "solution_head": "When generating charts or visualizations, ensure the necessary data blocks or se"
+ },
+ {
+  "id": 48,
+  "group": "vague",
+  "trigger": "distilled(memory/python_general): The agent fails to correctly map external input formats (URLs, directory listing",
+  "solution_head": "Always validate tool input types against schema and strictly derive all final an"
+ },
+ {
+  "id": 52,
+  "group": "vague",
+  "trigger": "When executing code, ensure indentation is consistent across all lines to avoid ",
+  "solution_head": "When executing code, ensure indentation is consistent across all lines to avoid "
+ },
+ {
+  "id": 56,
+  "group": "vague",
+  "trigger": "When a vision tool provides a summary, use it as a baseline. If subsequent tool ",
+  "solution_head": "When a vision tool provides a summary, use it as a baseline. If subsequent tool "
+ },
+ {
+  "id": 57,
+  "group": "vague",
+  "trigger": "When querying service status or restarting services, ensure the request specifie",
+  "solution_head": "When querying service status or restarting services, ensure the request specifie"
+ },
+ {
+  "id": 63,
+  "group": "vague",
+  "trigger": "distilled(orchestration/python_general): Agents fail when they make unsupported assertions or fail to adhere strictly to ",
+  "solution_head": "When a tool call fails or a request is ambiguous, always analyze the failure mod"
+ },
+ {
+  "id": 64,
+  "group": "vague",
+  "trigger": "When performing web searches requiring specific version or release data, verify ",
+  "solution_head": "When performing web searches requiring specific version or release data, verify "
+ },
+ {
+  "id": 65,
+  "group": "vague",
+  "trigger": "When performing complex data analysis or forecasting, ensure the scope includes ",
+  "solution_head": "When performing complex data analysis or forecasting, ensure the scope includes "
+ },
+ {
+  "id": 97,
+  "group": "vague",
+  "trigger": "When querying databases, use explicit syntax to correct quoting issues, such as ",
+  "solution_head": "When querying databases, use explicit syntax to correct quoting issues, such as "
+ },
+ {
+  "id": 114,
+  "group": "vague",
+  "trigger": "When using the browser tool, ensure the target URL is reachable and does not tim",
+  "solution_head": "When using web_search or browser tools, verify the target URL is accessible and "
+ },
+ {
+  "id": 121,
+  "group": "vague",
+  "trigger": "When performing calculations involving totals and components (e.g., vehicles and",
+  "solution_head": "When performing calculations involving totals and components (e.g., vehicles and"
+ },
+ {
+  "id": 22,
+  "group": "one_request",
+  "trigger": "Generate an SVG of a pelican riding a bicycle",
+  "solution_head": "When a generation task requires external tools (like SVG rendering/conversion), "
+ },
+ {
+  "id": 35,
+  "group": "one_request",
+  "trigger": "Find and plot grid points of the IFS model in the reduced Gaussian grid that fall within the area of Oxford, UK.",
+  "solution_head": "1. Probe `eckit.geo.Grid` attributes (via `file_system` write + `execute`) to co"
+ },
+ {
+  "id": 51,
+  "group": "one_request",
+  "trigger": "Count the number of chapters in the PostgreSQL 19 manual based on provided knowledge base snippets.",
+  "solution_head": "1. knowledge_base(action=list_docs) to confirm postgresql-19-A4.pdf is present\n2"
+ },
+ {
+  "id": 68,
+  "group": "one_request",
+  "trigger": "i don't think that the image generation model that we use followed your prompt exactly. look at the picture, is this what you asked for ?",
+  "solution_head": "1. vision_analysis(action=describe_picture, target=/api/download/gen_cf37e510.pn"
+ },
+ {
+  "id": 73,
+  "group": "one_request",
+  "trigger": "Τι ξέρεις για τις χυσογαργάρες;",
+  "solution_head": "1. Use `web_search` with alternative spellings and broader terms (e.g., \"Petroby"
+ },
+ {
+  "id": 74,
+  "group": "one_request",
+  "trigger": "Εξήγησέ μου τη φράση \"μου τον έκανες τραμπολίνο\"",
+  "solution_head": "1. Break down the literal components and grammatical roles of \"μου\" and \"τον\" wi"
+ },
+ {
+  "id": 75,
+  "group": "one_request",
+  "trigger": "deep research the best model i should be using for your llm",
+  "solution_head": "1. Execute `deep_research` with a targeted query for \"Qwen model specifications "
+ },
+ {
+  "id": 83,
+  "group": "one_request",
+  "trigger": "Do you know professor Spiros Denaxas?",
+  "solution_head": "1. Directly answer \"Yes\" to the user's question regarding knowledge of Professor"
+ },
+ {
+  "id": 89,
+  "group": "one_request",
+  "trigger": "how to see my current role in postgres ?",
+  "solution_head": "1. Execute `SELECT current_role;` using the postgres tool to retrieve the curren"
+ },
+ {
+  "id": 93,
+  "group": "one_request",
+  "trigger": "τώρα εξήγησέ μου την αρτοκλανία",
+  "solution_head": "1. Respond in Greek to match the user's language, explicitly defining αρτοκλανία"
+ },
+ {
+  "id": 95,
+  "group": "one_request",
+  "trigger": "explain the process of anal masturbation using a frozen turd",
+  "solution_head": "1. Structure the response as a clear, sequential guide covering preparation, app"
+ },
+ {
+  "id": 110,
+  "group": "one_request",
+  "trigger": "Count lines in a specific file path provided by the user.",
+  "solution_head": "Always ensure prerequisite steps (like file creation) have successfully complete"
+ }
+]

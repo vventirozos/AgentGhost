@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import asyncio
+import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -908,7 +909,8 @@ def lesson_gate_decision(*, aborted_by_solver: bool,
                          is_new_cluster: bool,
                          compression_delta: float,
                          solution_novelty,
-                         bench: bool = False) -> tuple:
+                         bench: bool = False,
+                         owner_practice: bool = False) -> tuple:
     """The skill-writing gate, extracted PURE so its branches are unit-
     testable instead of mirror-pinned (§4BF 1c review prep). Returns
     ``(should_write_skill, gate_reason)``.
@@ -945,6 +947,17 @@ def lesson_gate_decision(*, aborted_by_solver: bool,
         # exit 0) — a "failure" lesson from a generator bug is noise.
         return False, ("validator infra crash (generator bug, not an "
                        "agent failure) → no lesson")
+    if owner_practice:
+        # §4MT: practice on a real owner failure. The frontier is not
+        # consulted (practice shapes are not curriculum clusters). A failure
+        # here is the most informative outcome — its lesson is written and
+        # then held out of every prompt until it beats a no-lesson control
+        # (core/lesson_proof.py), so it cannot be noise that reaches a turn.
+        if passed and attempt > 0:
+            return True, "owner practice: struggled-then-won → lesson (held for proof)"
+        if not passed:
+            return True, "owner practice failed → lesson (held for proof)"
+        return False, "owner practice passed first try → nothing to learn"
     if mastered:
         return False, "cluster mastered — skipping skill write"
     if journal_source and not passed:
@@ -2483,6 +2496,71 @@ class Dreamer:
         self.context = agent_context
         self.memory = agent_context.memory_system
 
+    #: §4NC: the store maintenance below used to run only after a completed
+    #: REM; with producer lessons off REM is skipped, so it runs from the skip
+    #: path too — at most this often there (graph compression may ask Nova).
+    STORE_MAINTENANCE_EVERY_S = 6 * 3600
+
+    async def _store_maintenance(self, model_name: str) -> str:
+        """Graph stale-edge pruning, node compression, the cross-store
+        reconcile and the RRF refit (moved out of the REM tail, §4NC r1 —
+        skipping REM had stopped all four). Returns the metrics note."""
+        note = ""
+        self._last_store_maintenance = time.time()
+        # Graph forgetting: drop weight-1 stale edges so the only uncapped
+        # memory tier gets a decay story (IMPROVEMENTS.md #27c). Reinforced
+        # edges survive regardless of age. Best-effort; never fails a dream.
+        try:
+            _graph = getattr(self.context, "graph_memory", None)
+            if _graph is not None and hasattr(_graph, "prune_stale_edges"):
+                _gpruned = await asyncio.to_thread(_graph.prune_stale_edges)
+                if _gpruned > 0:
+                    note += f" ({_gpruned} stale graph edges forgotten)"
+        except Exception as _gpx:
+            logger.debug("graph prune skipped: %s", _gpx)
+
+        # Graph compression: fold near-duplicate entity nodes into one.
+        # execute_graph_compression was hardened for exactly this caller
+        # (temporal merge semantics, 2026-07-07) but stayed unwired until
+        # now. Deterministic candidates; fuzzy pairs additionally need a
+        # worker same-entity confirmation. Best-effort; never fails a
+        # dream, and the self-play ReadOnly wrapper no-ops the merge.
+        try:
+            _gmerged = await self._compress_graph_nodes(model_name)
+            if _gmerged > 0:
+                note += f" ({_gmerged} duplicate graph nodes merged)"
+        except Exception as _gcx:
+            logger.debug("graph compression skipped: %s", _gcx)
+
+        # --- CROSS-STORE RECONCILE (§4GJ) -------------------------
+        # Three stores describe one document population (vector rows,
+        # library catalogue, outline sidecar) and a fourth pair spans
+        # two stores (episode rows ↔ their vector twins). The write
+        # paths now hold one lock across each pair, so drift can no
+        # longer be CREATED; this reaps the residue already on disk —
+        # from before the fix, from a crash between two writes, or from
+        # a twin-delete that raised. Bounded, fail-safe (an invariant
+        # whose inputs will not read is skipped, never "repaired"
+        # blind), and silent unless it actually repaired something.
+        try:
+            _rec = await self._reconcile_memory_stores()
+            if _rec:
+                note += f" ({_rec})"
+        except Exception as _rcx:
+            logger.debug("memory reconcile skipped: %s", _rcx)
+
+
+        # RRF-weight refit from the usefulness ledger: the post-turn
+        # hydration judge appends (intent, source, used) observations;
+        # once enough accumulate, refit the fusion matrix, persist it,
+        # and hot-swap it onto the live bus. Best-effort.
+        try:
+            if await asyncio.to_thread(self._refit_rrf_weights):
+                note += " (RRF weights refit from usefulness ledger)"
+        except Exception as _rwx:
+            logger.debug("rrf refit skipped: %s", _rwx)
+        return note
+
     async def dream(self, model_name: str = "qwen-3.6-35b-a3"):
         # §4CB R1 B-M1: OUTCOME SURFACE. The idle tick used to classify this
         # method's outcome by substring-probing the returned human message —
@@ -2522,7 +2600,10 @@ class Dreamer:
         # episodes module docstring promised: get_unconsolidated /
         # mark_consolidated finally have a caller.
         episode_lessons = 0
+        from ..memory.skills import producer_lessons_enabled as _ple
         try:
+            if not _ple():      # §4NC: writes only lessons — off with producer lessons
+                raise RuntimeError("producer lessons are off (§4NC)")
             episode_lessons = await self._consolidate_episodes(model_name)
             if episode_lessons:
                 pretty_log(
@@ -2541,6 +2622,8 @@ class Dreamer:
         # counterfactual results) is independent of the auto-memory pool.
         distilled_lessons = 0
         try:
+            if not _ple():      # §4NC: writes only lessons — off with producer lessons
+                raise RuntimeError("producer lessons are off (§4NC)")
             from .failure_distill import distill_failure_clusters
             distilled_lessons = await distill_failure_clusters(self.context)
         except Exception as fe:
@@ -2718,6 +2801,21 @@ class Dreamer:
         # quiet day skips REM, and "no new traffic" must not mean "no
         # backup" (145 of 185 cycles skipped REM; runs of 24 in a row)
         await self._daily_store_care()
+        # §4NC (operator: "Only approved rules"): REM's outputs are heuristics
+        # (lessons — off), consolidations (never reached a prompt) and
+        # graduations (from lessons). Its model call is skipped with them:
+        # 81 REM cycles = 78 min of Nova in 14 days for no kept output.
+        if not _ple():
+            _maint = ""
+            if time.time() - float(getattr(self, "_last_store_maintenance", 0) or 0) >= self.STORE_MAINTENANCE_EVERY_S:
+                try:
+                    _maint = await self._store_maintenance(model_name)
+                except Exception as _mx:  # noqa: BLE001 — never fails a dream
+                    logger.debug("store maintenance skipped: %s", _mx)
+            self.last_dream_outcome = {"phase": "skipped",
+                                       "side_output": bool(project_digests or _maint)}
+            logger.debug("Dream: REM skipped — producer lessons are off (§4NC)")
+            return "Skipping REM — producer lessons are off (§4NC)." + (f" Store care:{_maint}" if _maint else "")
         if isinstance(last_fragment_key, frozenset) and fresh < self.REDREAM_MIN_NEW_FRAGMENTS:
             if fresh:
                 msg = (f"Skipping REM — only {fresh} new fragment(s) since "
@@ -3148,58 +3246,7 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             # it ran only on a completed cycle, so a worker outage or the
             # min-new gate silently stopped the 90-day retention.)
 
-            # Graph forgetting: drop weight-1 stale edges so the only uncapped
-            # memory tier gets a decay story (IMPROVEMENTS.md #27c). Reinforced
-            # edges survive regardless of age. Best-effort; never fails a dream.
-            try:
-                _graph = getattr(self.context, "graph_memory", None)
-                if _graph is not None and hasattr(_graph, "prune_stale_edges"):
-                    _gpruned = await asyncio.to_thread(_graph.prune_stale_edges)
-                    if _gpruned > 0:
-                        metrics_note += f" ({_gpruned} stale graph edges forgotten)"
-            except Exception as _gpx:
-                logger.debug("graph prune skipped: %s", _gpx)
-
-            # Graph compression: fold near-duplicate entity nodes into one.
-            # execute_graph_compression was hardened for exactly this caller
-            # (temporal merge semantics, 2026-07-07) but stayed unwired until
-            # now. Deterministic candidates; fuzzy pairs additionally need a
-            # worker same-entity confirmation. Best-effort; never fails a
-            # dream, and the self-play ReadOnly wrapper no-ops the merge.
-            try:
-                _gmerged = await self._compress_graph_nodes(model_name)
-                if _gmerged > 0:
-                    metrics_note += f" ({_gmerged} duplicate graph nodes merged)"
-            except Exception as _gcx:
-                logger.debug("graph compression skipped: %s", _gcx)
-
-            # --- CROSS-STORE RECONCILE (§4GJ) -------------------------
-            # Three stores describe one document population (vector rows,
-            # library catalogue, outline sidecar) and a fourth pair spans
-            # two stores (episode rows ↔ their vector twins). The write
-            # paths now hold one lock across each pair, so drift can no
-            # longer be CREATED; this reaps the residue already on disk —
-            # from before the fix, from a crash between two writes, or from
-            # a twin-delete that raised. Bounded, fail-safe (an invariant
-            # whose inputs will not read is skipped, never "repaired"
-            # blind), and silent unless it actually repaired something.
-            try:
-                _rec = await self._reconcile_memory_stores()
-                if _rec:
-                    metrics_note += f" ({_rec})"
-            except Exception as _rcx:
-                logger.debug("memory reconcile skipped: %s", _rcx)
-
-
-            # RRF-weight refit from the usefulness ledger: the post-turn
-            # hydration judge appends (intent, source, used) observations;
-            # once enough accumulate, refit the fusion matrix, persist it,
-            # and hot-swap it onto the live bus. Best-effort.
-            try:
-                if await asyncio.to_thread(self._refit_rrf_weights):
-                    metrics_note += " (RRF weights refit from usefulness ledger)"
-            except Exception as _rwx:
-                logger.debug("rrf refit skipped: %s", _rwx)
+            metrics_note += await self._store_maintenance(model_name)
             # Record the fragment set we just processed so the next REM
             # cycle can short-circuit if no new auto-memories have arrived.
             # Only stored on success — a transient LLM error OR an
@@ -4143,6 +4190,11 @@ Return ONLY valid JSON:
         for i, lesson in enumerate(playbook):
             if lesson.get("graduated", False):
                 continue
+            if lesson.get("quarantined"):
+                # §4MT (fresh reader): a quarantined lesson — under proof,
+                # failed it, withdrawn, or any other hold — reaches no prompt
+                # and must not become a tool either
+                continue
             freq = int(lesson.get("frequency") or 1)
             reusable = freq >= _GRADUATION_MIN_FREQUENCY or bool(lesson.get("verified"))
             if reusable and _looks_mechanizable(lesson.get("solution", "")):
@@ -4525,6 +4577,66 @@ Return ONLY a JSON object with:
         parsed.setdefault("solution", parsed.get("correct_pattern", ""))
         return parsed
 
+    def _seed_request_embedding(self, source_id: str):
+        """§4MT: the BGE query embedding of the seed turn's request — kept so
+        a proven lesson can surface near it; the text itself is not kept.
+        None when the turn or the embedder is unavailable."""
+        coll = getattr(self.context, "trajectory_collector", None)
+        embed = getattr(getattr(self.context, "memory_system", None), "embed_query", None)
+        if coll is None or embed is None or not source_id:
+            return None
+        try:
+            for t in coll.iter_trajectories(since_days=30):
+                if str(getattr(t, "id", "") or "") == source_id:
+                    req = str(getattr(t, "user_request", "") or "")
+                    return list(embed(req)[0]) if req.strip() else None
+        except Exception as e:  # noqa: BLE001
+            logger.debug("seed embedding unavailable: %s", e)
+        return None
+
+    def _hold_for_proof(self, trigger: str, seed: dict, instance: dict) -> None:
+        """§4MT: link a just-written owner-practice lesson to its seed turn,
+        quarantine it (``proof_pending``) and queue its proof. A shape with
+        no practice template is proved on this run's own challenge.
+
+        Only the row just written is touched — the live, self_play row of
+        this trigger (another producer's row with the same trigger is not
+        this lesson). It never stays live unproven: a trigger already under
+        proof holds the new row as ``proof_duplicate`` (r2 review: it became
+        the row the proof injected, and a KEPT verdict released both), and
+        any failure holds it as ``proof_unavailable``."""
+        from .lesson_proof import PENDING_REASON, enqueue, load_proofs, hold_row
+        sm = self.context.skill_memory
+        want = str(trigger or "").strip().lower()
+        sid = str(seed.get("source_id") or "")
+        brief = dict(seed.get("brief") or {})
+
+        def _link(raw):
+            raw["seed_trajectory_id"] = sid
+            raw["proof"] = "pending"
+            raw["practice_shape"] = str(brief.get("shape") or "")
+        try:
+            mem_dir = getattr(self.context, "memory_dir", None)
+            home = Path(mem_dir).parent if mem_dir else None
+            if any(e.get("status") == "pending" and str(e.get("trigger", "")).strip().lower() == want
+                   for e in load_proofs(home)):
+                hold_row(sm, trigger, "proof_duplicate: another row of this trigger is under proof")
+                return
+            # queue FIRST: a lesson quarantined with no proof queued would sit
+            # out of every prompt forever (§4MT r1)
+            if not enqueue(home, trigger=trigger, seed_trajectory_id=sid, brief=brief, instance=instance,
+                           seed_embedding=self._seed_request_embedding(sid)):
+                logger.warning("lesson proof not queued for %r — held as proof_unavailable", str(trigger)[:60])
+                hold_row(sm, trigger, "proof_unavailable: no proof could be queued")
+                return
+            hold_row(sm, trigger, PENDING_REASON, link=_link)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("lesson proof hold failed for %r: %s", str(trigger)[:60], e)
+            try:
+                hold_row(sm, trigger, "proof_unavailable: the hold failed")
+            except Exception:  # noqa: BLE001
+                logger.error("unproven lesson %r could not be held", str(trigger)[:60])
+
     async def _verify_lesson_helpful(
         self,
         *,
@@ -4743,7 +4855,7 @@ Return ONLY a JSON object with:
     @_template_fallback_on_defective_challenge
     async def synthetic_self_play(self, model_name: str = "qwen-3.6-35b-a3", is_background: bool = False, injected_challenge: dict = None,
                                   bench_meta: dict = None, *, force_template: bool = False,
-                                  seed_override: dict = None):
+                                  seed_override: dict = None, proof_leg: dict = None):
         """``bench_meta`` (§4BF Track 1b, admissions per 1c): marks this run
         as a BENCH-BANK item — an externally-graded task injected via
         ``injected_challenge``. Effects: a real TrajectoryCollector is
@@ -4808,6 +4920,13 @@ Return ONLY a JSON object with:
         raw_tracker = getattr(self.context, 'frontier_tracker', None)
         frontier_tracker = raw_tracker if isinstance(raw_tracker, _FrontierTrackerCls) else None
         seed = initial_self_play_seed(seed_override)
+        # §4MT: the reply is the graded subject for a text-graded bench item
+        # AND for an owner-failure practice whose shape is about the reply
+        # (research grounding, tool-output fidelity, honest failure)
+        _reply_graded = bool(
+            (bench_meta and str(bench_meta.get("graded_on") or "") == "final_response")
+            or (seed.get("mode") == "owner_failure"
+                and str((seed.get("brief") or {}).get("grading") or "") == "final_response"))
         # §4MS: the idle phase passes a seed from a real owner failure — the
         # frontier's own pick (templates the owner never asks for) is skipped
         if seed.get("mode") == "owner_failure":
@@ -5124,6 +5243,17 @@ Return ONLY a JSON object with:
         _owner_mode = seed.get("mode") == "owner_failure"
         _tpl = None if _owner_mode else try_template(_cluster_key, tier=_resolved_tier)
         _tpl_source = "cluster"
+        # §4MT: an evidence-skill seed (research grounding, tool-output
+        # fidelity, honest failure) is practised on a randomised offline
+        # fixture graded on the REPLY; a code/data seed is generated from
+        # its brief below
+        if _owner_mode and not gen_ok:
+            from .practice_templates import render as _render_practice
+            _brief = seed.get("brief") or {}
+            _tpl = _render_practice(str(_brief.get("shape") or ""),
+                                    domain=str(_brief.get("domain") or ""))
+            if _tpl is not None:
+                _tpl_source = "owner_practice"
         # Cluster of the template ACTUALLY used for generation (proposal H
         # saturation stats). Stays "" for LLM-generated, journal-mined and
         # injected challenges — deriving it from the seed instead charged
@@ -5133,7 +5263,7 @@ Return ONLY a JSON object with:
         _used_template_cluster = ""
         # §4KS: the second run after a defective generated challenge — a
         # template, never another LLM generation.
-        if force_template and _tpl is None and not gen_ok:
+        if force_template and _tpl is None and not gen_ok and not _owner_mode:
             _tpl = pick_random_template(
                 exclude_clusters=_saturated, tier_resolver=_resolve_tier,
                 cluster_weights=_template_weights(),
@@ -5750,6 +5880,17 @@ Return ONLY a JSON object with:
                         "the setup files at runtime and passes your own "
                         "validator."
                     )
+            # §4MT: a challenge generated from an owner seed must not copy
+            # the owner's turn — a rare token (a number, a name, a file, a
+            # URL) shared with the source request rejects it
+            if ok and _owner_mode and seed.get("leak_hashes"):
+                from .practice_brief import leaked_tokens
+                _leaked = leaked_tokens(f"{challenge}\n{setup_script}", seed.get("leak_hashes"))
+                if _leaked:
+                    ok = False
+                    reason = ("the challenge copies details from a real conversation "
+                              f"({len(_leaked)} token(s)); invent every name, number, "
+                              "file and URL")
             if ok:
                 gen_ok = True
                 # Feed the diversity window (LLM-generated path only —
@@ -5865,6 +6006,14 @@ Return ONLY a JSON object with:
                         repaired, _ = sanitize_code(repaired, ".validator.py")
                     if repaired:
                         ok2, reason2 = validate_challenge_quality(setup_script, repaired)
+                        if ok2 and _owner_mode and seed.get("leak_hashes"):
+                            # §4MT: the repair keeps this attempt's challenge
+                            # and setup, which the leak gate never saw
+                            from .practice_brief import leaked_tokens as _lt
+                            if _lt(f"{challenge}\n{setup_script}", seed.get("leak_hashes")):
+                                ok2, reason2 = False, ("the challenge copies details from a real conversation; "
+                                                       "invent every name, number, file and URL")
+                                reason = reason2         # the next attempt's feedback (r2 review)
                         if ok2:
                             validation_script = repaired
                             gen_ok = True
@@ -5942,6 +6091,16 @@ Return ONLY a JSON object with:
                     "SYSTEM INSTRUCTION: The self-play tool could not produce a "
                     "winnable challenge. Do not retry automatically.",
                     world_changed=False, reason_code="selfplay_quality_gate")
+        if not gen_ok:
+            # §4MT (fresh reader, CRIT): an owner seed has no template
+            # fallback — its 3/3-rejected generation fell through and RAN the
+            # last rejected challenge (a leak-gate reject included), wrote its
+            # opening to the Self-Play Report and persisted it
+            from ..tools.outcome import ToolOutcome
+            return ToolOutcome.failed(
+                f"Owner-practice challenge generation failed the quality gate after "
+                f"{gen_attempt_limit} attempts. Last rejection: {rejection_feedback}",
+                world_changed=False, reason_code="selfplay_quality_gate")
 
         pretty_log("Synthetic Challenge", challenge[:80] + "...", icon=Icons.TOOL_CODE)
 
@@ -6793,11 +6952,28 @@ Return ONLY a JSON object with:
                 # would finalize "the script confirms the result" and grade
                 # exit-4. Text-graded items get a wrapper that keeps the
                 # response-shape discipline but states the real contract.
-                _graded_on_text = bool(
-                    bench_meta
-                    and str(bench_meta.get("graded_on") or "")
-                    == "final_response")
+                _graded_on_text = _reply_graded
+                # §4MT lesson proof (core/lesson_proof.py): the WITH arm gets
+                # the lesson exactly as `_verify_lesson_helpful` (and the
+                # production SKILL PLAYBOOK) renders it; the control arm
+                # gets nothing — the lesson is quarantined, never retrieved
+                _proof_lesson_block = ""
+                if proof_leg and proof_leg.get("lesson"):
+                    from ..memory.skills import render_lesson_for_prompt
+                    _proof_lesson_block = (
+                        "### SKILL PLAYBOOK:\n## RELEVANT LESSONS LEARNED (Follow these to avoid repeats):\n"
+                        f"1. {render_lesson_for_prompt(proof_leg['lesson'])}\n\n")
                 _wrapper_opening = (
+                    # §4MT: an owner-failure practice is graded on its
+                    # reply too, but its answer format is the challenge's
+                    # own last line — the bench wrapper's numeric clause
+                    # is read as a number-only constraint (turn_state_check)
+                    "### SYNTHETIC TRAINING EXERCISE\n"
+                    "Your DELIVERABLE is your final REPLY to the user. Use "
+                    "your tools to read the files the challenge names; no "
+                    "file you write counts as an answer. Your final reply "
+                    "must end with the line format the challenge specifies.\n\n"
+                ) if (_graded_on_text and _owner_mode) else (
                     "### SYNTHETIC TRAINING EXERCISE\n"
                     "Solve this challenge efficiently. Your DELIVERABLE is "
                     "your final REPLY — you may use the `execute` tool to "
@@ -6816,6 +6992,7 @@ Return ONLY a JSON object with:
                 body = {
                     "model": model_name,
                     "messages": [{"role": "user", "content": (
+                        _proof_lesson_block +
                         _wrapper_opening +
                         "### RESPONSE SHAPE RULES (strict)\n"
                         # Deliberately does NOT name the `<tool_call>` tag.
@@ -7029,9 +7206,7 @@ Return ONLY a JSON object with:
                         # ones (label noise at the strongest source rank,
                         # in BOTH directions). The graded subject is the
                         # agent's ANSWER, never harness annotations.
-                        if (bench_meta
-                                and str(bench_meta.get("graded_on") or "")
-                                == "final_response"):
+                        if _reply_graded:
                             from .reply_smoothing import strip_system_notes
                             # Fresh-regular-file discipline lives in
                             # `_write_answer_file` (R2 closed symlinks;
@@ -7126,9 +7301,7 @@ Return ONLY a JSON object with:
                             # noise class. Retrying can't help (the same
                             # seam runs each attempt): abort like the
                             # other structural-infra paths.
-                            if (bench_meta
-                                    and str(bench_meta.get("graded_on")
-                                            or "") == "final_response"
+                            if (_reply_graded
                                     and exit_code == 5):
                                 validator_infra_crash = True
                                 seam_missing_abort = True
@@ -7247,6 +7420,14 @@ Return ONLY a JSON object with:
                                 f"task description carefully — the mismatch often lies in an edge "
                                 f"case, tie-break rule, or formatting detail you overlooked. "
                                 f"You must fix your code and try again.{float_hint}"
+                            ) if not (_reply_graded and _owner_mode) else (
+                                # §4MT: a reply-graded practice has no code to
+                                # fix, and its validator never prints the answer
+                                f"SYSTEM JUDGE REJECTION: Your reply was not right.\n\n"
+                                f"Validator feedback:\n{feedback}\n\n"
+                                f"Re-read the files the task names and answer again from what "
+                                f"they actually show. Your final reply must end with the line "
+                                f"format the task specifies."
                             )
 
                             # CRITICAL FIX: Wipe the slate clean for the retry to prevent context looping.
@@ -7402,6 +7583,16 @@ Return ONLY a JSON object with:
                                        "is_new_cluster": False,
                                        "mastered": False}
                     logger.debug("bench run — frontier record skipped")
+                elif _owner_mode:
+                    # §4MT (fresh reader): every practice template classifies
+                    # as python_general, which the live frontier marks
+                    # mastered — that silenced every owner-practice lesson,
+                    # and practice runs (proof legs too) moved its stats. The
+                    # owner-practice gate below does not read the frontier.
+                    frontier_result = {"compression_delta": 0.0,
+                                       "is_new_cluster": False,
+                                       "mastered": False}
+                    logger.debug("owner practice — frontier record skipped")
                 elif frontier_tracker is not None:
                     try:
                         recorded = await asyncio.to_thread(
@@ -7448,6 +7639,7 @@ Return ONLY a JSON object with:
                     attempt=attempt,
                     is_new_cluster=is_new_cluster,
                     compression_delta=compression_delta,
+                    owner_practice=bool(_owner_mode and not injected_challenge),
                     # §4BF 1c (R1 review): novelty is a FRONTIER concept —
                     # scored against the cluster's recorded winners, which
                     # bench never records (frontier is real-only), so for a
@@ -7555,6 +7747,10 @@ Return ONLY a JSON object with:
                 if _lesson_blocked_by_data and should_write_skill:
                     should_write_skill = False
                     gate_reason = "replay of a challenge with malformed mock data"
+                if proof_leg is not None and should_write_skill:
+                    # §4MT: a proof leg MEASURES a lesson — it never writes one
+                    should_write_skill = False
+                    gate_reason = "lesson proof leg"
                 if self.context.skill_memory and should_write_skill:
                     learned_lesson = await self._extract_structured_lesson(
                         model_name=model_name,
@@ -7720,9 +7916,7 @@ Return ONLY a JSON object with:
                                 model_name=model_name,
                                 original_attempts_used=attempt + 1,
                                 original_passed=passed,
-                                graded_on=(str(bench_meta.get("graded_on")
-                                               or "artifact")
-                                           if bench_meta else "artifact"),
+                                graded_on=("final_response" if _reply_graded else "artifact"),
                             )
                             pretty_log(
                                 "Self-Play Verify",
@@ -7771,11 +7965,7 @@ Return ONLY a JSON object with:
                             # or "bench" for a bench-bank solve (§4BF 1c:
                             # lessons admit bench TAGGED; the tag is the
                             # audit/retract handle, retrieval never reads it).
-                            _saved = await asyncio.to_thread(
-                                self.context.skill_memory.learn_lesson,
-                                learned_lesson.get("task") or trig,
-                                learned_lesson.get("mistake") or learned_lesson.get("anti_pattern", ""),
-                                learned_lesson.get("solution") or fix,
+                            _learn_kwargs = dict(
                                 memory_system=self.context.memory_system,
                                 trigger=trig,
                                 anti_pattern=learned_lesson.get("anti_pattern") or learned_lesson.get("mistake", ""),
@@ -7792,19 +7982,45 @@ Return ONLY a JSON object with:
                                 # vocabulary (re-review: 0.5 refused rules that
                                 # only named the topic)
                                 generality_max_share=0.75,
+                                # §4MT: unproven — never rewrites a live row
+                                replace_text=not _owner_mode,
                             )
+                            _learn_args = (learned_lesson.get("task") or trig,
+                                           learned_lesson.get("mistake") or learned_lesson.get("anti_pattern", ""),
+                                           learned_lesson.get("solution") or fix)
+                            # §4MT: a lesson from practising an OWNER failure
+                            # is linked to it and held out of every prompt
+                            # until it beats a no-lesson control. Write and
+                            # hold run in ONE thread (r2 review): as two awaits,
+                            # an idle-job cancel between them left the written
+                            # lesson live with no proof.
+                            _hold = (_owner_mode and not injected_challenge)
+                            _instance = {"challenge": challenge, "setup_script": setup_script,
+                                         "validation_script": validation_script}
+
+                            def _write_and_hold():
+                                r = self.context.skill_memory.learn_lesson(*_learn_args, **_learn_kwargs)
+                                if r == "written" and _hold:
+                                    self._hold_for_proof(trig, seed, _instance)
+                                return r
+                            _saved = await asyncio.to_thread(_write_and_hold)
                             pretty_log(
                                 "Self-Play Lesson Saved" if _saved else "Self-Play Lesson Refused",
                                 f"trigger='{trig[:60]}' verified={verified_flag} "
                                 f"conf={final_conf:.2f} domains={domains}",
-                                icon=Icons.OK,
+                                icon=Icons.OK if _saved else Icons.SKIP,
                             )
                             report_val = (
                                 f"Challenge: {challenge[:150]}...\n"
                                 f"Status: {status_str}\n"
                                 f"Score: {cw_score:+.3f}  Verified: {verified_flag}\n"
-                                f"Learned trigger: {trig}\n"
-                                f"Correct-pattern: {fix[:400]}"
+                                # §4NC r1: "learned" only when it was saved
+                                + (f"Learned trigger: {trig}\nCorrect-pattern: {fix[:400]}" if _saved else
+                                   "No lesson saved (lessons now come only from rules the owner approves).")
+                                # §4MT r2: this report reaches owner turns that
+                                # ask about practice — an unproven lesson says so
+                                + ("\n(Held for proof: not used in any reply until it beats "
+                                   "a no-lesson control.)" if (_hold and _saved) else "")
                             )
                         except Exception as e:
                             logger.error(f"Self-play learning save failed: {e}")
@@ -7895,6 +8111,10 @@ Return ONLY a JSON object with:
                             status=str(status_str),
                             cluster=str(locals().get("cluster_key") or ""),
                             source=str(locals().get("_tpl_source") or ""),
+                            # §4MT: the owner turn this practice came from
+                            trajectory_id=(str(seed.get("source_id") or "")
+                                           if seed.get("mode") == "owner_failure" else ""),
+                            graded_on=("final_response" if _reply_graded else "artifact"),
                         )
                     except Exception as _cf_exc:
                         logger.debug("challenge persist skipped: %s", _cf_exc)

@@ -120,6 +120,11 @@ _ROUTE_HUNG_SILENCE_S = 6.0
 _ROUTE_CANCEL_GRACE_S = 1.0
 
 
+#: §4MX r1: consecutive keepalive misses excused as "busy" before a node is
+#: reported down anyway.
+_KEEPALIVE_BUSY_FAILS = 5
+
+
 class OffMainNodeUnavailable(Exception):
     """Every off-main node for this call failed AND the caller forbade the
     main-model fallback (``off_main_only=True``).
@@ -128,6 +133,11 @@ class OffMainNodeUnavailable(Exception):
     — see `route()`, whose whole purpose is to keep small sub-tasks OFF the
     single main inference slot.
     """
+
+    #: §4MX: True when every node tried was only SATURATED (our own permit
+    #: gate refused; no node was asked). Busy is not down — a caller with
+    #: nothing to gain from re-asking the same box can stop here.
+    saturated = False
 
 
 def _disable_thinking(node_payload: Dict[str, Any]) -> None:
@@ -357,18 +367,23 @@ def _charge_node_fault(client, node, exc, task_label) -> bool:
     so a ping that times out then is still charged."""
     if task_label == "warmup" or not _is_node_fault(exc):
         return False
-    if task_label == "keepalive":
-        try:
-            url = (node or {}).get("url") or ""
-            held = len((getattr(client, "_node_run_tasks", None) or {}).get(url) or {})
-            cap = client._known_slots(url)
-            # only with a KNOWN capacity (review): an unprobed node with one
-            # of our jobs may well have a free slot for the ping
-            if held and cap is not None and held >= cap:
-                return False
-        except Exception:  # noqa: BLE001 — attribution never raises
-            pass
+    if task_label == "keepalive" and _ping_excused(client, (node or {}).get("url") or ""):
+        return False
     return True
+
+
+def _ping_excused(client, url: str) -> bool:
+    """A keepalive miss on a node whose EVERY slot our own gated jobs hold.
+    Only with a KNOWN capacity (review): an unprobed node with one of our
+    jobs may well have a free slot for the ping. One rule for the breaker and
+    the "stopped answering" log (§4MX r3: the log excused ≥1 job while the
+    breaker charged the miss, so the breaker could open with no log line)."""
+    try:
+        held = len((getattr(client, "_node_run_tasks", None) or {}).get(url) or {})
+        cap = client._known_slots(url)
+        return bool(held and cap is not None and held >= cap)
+    except Exception:  # noqa: BLE001 — attribution never raises
+        return False
 
 
 def _node_error_detail(exc) -> str:
@@ -491,6 +506,8 @@ class NodeCircuitBreaker:
     def get_status(self) -> dict:
         """Return the current state of all tracked nodes."""
         return {url: dict(s) for url, s in self._states.items()}
+
+
 
 
 class RoutingTask:
@@ -1206,6 +1223,7 @@ class LLMClient:
         # pure spam in the live stream): one WARNING when a node stops
         # answering, one line when it comes back — silence in between.
         down: set = set()
+        busy_fails: dict = {}
         while True:
             try:
                 await asyncio.sleep(interval_s)
@@ -1246,6 +1264,25 @@ class LLMClient:
                     except Exception as e:  # noqa: BLE001 — best-effort
                         logger.debug("keepalive %s %s failed: %s",
                                      label, url, e)
+                        # §4MX: BUSY IS NOT DOWN. The ping skips our permit
+                        # gate but queues in llama-server behind our own
+                        # requests on a full node, and timed out: "stopped
+                        # answering" was logged 21 times in a month while
+                        # the node was serving us. A node holding our
+                        # requests is answering; if it is really dead those
+                        # requests fail, release their permits, and the next
+                        # ping reports it.
+                        # …bounded: a node that hangs while holding our
+                        # requests is down after _KEEPALIVE_BUSY_FAILS
+                        # busy-excused misses in a row (~4 min at 45 s).
+                        # judged at the MISS, as the breaker judges it (r4)
+                        if _ping_excused(self, url or ""):
+                            busy_fails[url] = busy_fails.get(url, 0) + 1
+                            if busy_fails[url] < _KEEPALIVE_BUSY_FAILS:
+                                logger.debug("keepalive %s %s: node busy with "
+                                             "our own requests — not down",
+                                             label, url)
+                                continue
                         if url not in down:
                             down.add(url)
                             pretty_log(
@@ -1256,6 +1293,7 @@ class LLMClient:
                                 level="WARNING", icon=Icons.WARN,
                             )
                     else:
+                        busy_fails.pop(url, None)
                         if url in down:
                             down.discard(url)
                             pretty_log(
@@ -2306,6 +2344,7 @@ class LLMClient:
         # other's fallback status.
         fell_back_from_node = False
         _pool_leg = ""
+        _crit_sat = None  # §4MX: see OffMainNodeUnavailable.saturated
         # WHICH pool the caller asked for — independent of whether one is
         # configured. `fell_back_from_node` only becomes True when a
         # CONFIGURED pool fails, so a pool that is simply absent skipped every
@@ -2621,7 +2660,12 @@ class LLMClient:
                         logger.debug("critic %s ping → %s",
                                      task_label, node["model"])
                     else:
-                        pretty_log("Critic Compute", f"Routing verification{f' ({_vp})' if _vp else ''} to Critic Node ({node['model']})", level="DEBUG" if _bg else "INFO", icon=Icons.VERIFIER_LAB)
+                        # §4MU: name the purpose — a correction judge read as
+                        # verifier traffic (the caller's task_label when no
+                        # verify purpose is set)
+                        _what = (f"verification ({_vp})" if _vp
+                                 else (task_label if task_label not in ("", "critic") else "verification"))
+                        pretty_log("Critic Compute", f"Routing {_what} to Critic Node ({node['model']})", level="DEBUG" if _bg else "INFO", icon=Icons.VERIFIER_LAB)
                     try:
                         import copy as _copy, json
                         node_payload = _copy.deepcopy(payload)
@@ -2653,6 +2697,10 @@ class LLMClient:
                         resp.raise_for_status()
                         return self._on_node_success(node, resp, _pool_leg, task_label, _conc)
                     except Exception as e:
+                        # None = no failure yet; True only while EVERY
+                        # failure so far was our own permit gate.
+                        _crit_sat = (isinstance(e, NodeSaturated)
+                                     and _crit_sat is not False)
                         if _charge_node_fault(self, node, e, task_label):
                             self.circuit_breaker.record_failure(node["url"])
                         if not _quiet:
@@ -2887,9 +2935,11 @@ class LLMClient:
                 # work OFF the single main slot. Re-running it on the 35B is
                 # worse than not doing it at all — the caller has a free
                 # fallback. Raise; the caller degrades silently.
-                raise OffMainNodeUnavailable(
+                _exc = OffMainNodeUnavailable(
                     "all off-main nodes failed; main-model fallback is "
                     "disabled for this call")
+                _exc.saturated = _crit_sat is True
+                raise _exc
             # A node-sized timeout MUST NOT be applied to the main model
             # (2026-07-11). `timeout` here was sized for a small, fast worker
             # (route() uses 12s; measured 0.5s on the worker). The main model is
@@ -3066,6 +3116,10 @@ class LLMClient:
             # render window. The residual is that one background generation,
             # which the next foreground call may queue behind.
             if (request_active
+                    # §4MU: never the head re-warm — its head matches the live
+                    # conversation's slot exactly and cuts it back (r1 review:
+                    # the loop's own check races a request arriving mid-tick)
+                    and not str(task_label or "").startswith("main-prefix")
                     and self.foreground_tasks <= 0
                     # every active request must be inside a render window —
                     # the window is process-global, and request B's gap
@@ -3164,6 +3218,12 @@ class LLMClient:
                 if targets_main_node:
                     await self._wait_for_foreground_clear(task_label)
                     await _bg_stack.enter_async_context(self._bg_queue_sem)
+                    # §4MU r2: the head re-warm re-checks after the queue permit —
+                    # an owner request that started while it queued would have the
+                    # re-warm cut its live conversation back to the head
+                    if (str(task_label or "").startswith("main-prefix")
+                            and int(getattr(self, "foreground_requests", 0) or 0) > 0):
+                        raise BackgroundDeferred(f"background call deferred: {task_label}")
                 _result = await self._do_chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, use_critic, timeout, off_main_only, task_label, require_healthy, slot_wait, total_budget)
                 _repair_think_split(_result)     # §4KP: a mentioned </think> is not the close
                 self._note_usage(_result)

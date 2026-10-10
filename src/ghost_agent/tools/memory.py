@@ -4524,7 +4524,9 @@ async def _run_self_play_loop(context, *, model_name: str, max_cycles: int, stop
                     )
                 # Router classifier retrain rides the same cadence as PRM.
                 try:
-                    await asyncio.to_thread(_maybe_retrain_router, context)
+                    from ..utils.helpers import env_flag as _ef_rtm
+                    if _ef_rtm("GHOST_ROUTER"):     # §4ND
+                        await asyncio.to_thread(_maybe_retrain_router, context)
                 except Exception as _re:
                     pretty_log(
                         "Self-Play Loop",

@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The learning loop — Ghost Agent</title>
+<meta name="description" content="How Ghost turns your feedback into rules and regression tests: where the feedback comes from, what happens while you're away, what you decide, and a worked example from start to finish.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Start here</h3>
+    <a href="index.html">What Ghost Agent is</a>
+    <a href="getting-started.html">Install and run it</a>
+    <a href="interfaces.html">Interfaces</a>
+
+    <h3>How it works</h3>
+    <a href="how-it-works.html">One message, end to end</a>
+    <a href="memory.html">What it remembers</a>
+    <a href="tools.html">What it can do</a>
+    <a href="self-improvement.html">How it improves itself</a>
+    <a class="current" href="learning-loop.html">The learning loop</a>
+
+    <h3>Running it</h3>
+    <a href="safety.html">Safety and privacy</a>
+    <a href="configuration.html">Settings that matter</a>
+    <a href="troubleshooting.html">When something breaks</a>
+
+    <h3>Reference</h3>
+    <a href="glossary.html">Glossary</a>
+    <a href="reference.html">Deep reference</a>
+    <span class="nav-note">A page per module, written for maintainers.</span>
+  </nav>
+</aside>
+
+<main>
+  <span class="eyebrow">How it works</span>
+  <h1>The learning loop</h1>
+  <p class="subtitle">How a wrong answer becomes a rule Ghost follows and a test it has to keep passing — and why you, not Ghost, make the decision at each step that changes it.</p>
+
+  <div class="note">
+    <strong>The short version.</strong> Ghost does not teach itself. It notices when you were unhappy with an answer, works out — while you're away — what went wrong and what single rule would have fixed it, tries that rule on the same question, and then <em>asks you</em>. If you say yes, the rule goes into every answer from then on. Your complaint also becomes a <em>regression test</em> that is re-asked after every update, so a fix that later breaks is reported to you instead of going unnoticed.
+  </div>
+
+  <h2>Why it works this way</h2>
+  <p>Until October 2026 Ghost ran many self-teaching passes: it reviewed its own failures, practised on invented exercises, extracted "skills", and wrote lessons for itself. Measured on real conversations, those lessons reached the turn they were meant for 18% of the time and changed the answer in 3 of 20 cases; some made answers worse. The judge it used to grade itself agreed with a wrong answer ("all systems green") two times out of two. Teaching itself, graded by itself, did not work.</p>
+  <p>The one signal that held up was yours. So the loop on this page is built around your judgement: Ghost does the slow work — replaying, diagnosing, testing — and you make the one decision that changes its behaviour. The self-teaching passes are switched off (<a href="#off">listed below</a>).</p>
+
+  <h2>The whole loop</h2>
+  <div class="diagram">
+    <svg viewBox="0 0 920 560" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The learning loop: you ask, Ghost answers, you react; while you are away Ghost replays the failure, diagnoses it and tests a rule against it and your kept tests; it proposes the rule to you; you decide; an adopted rule goes into every prompt, which shapes the next answer. Your thumbs-down also drafts a regression test that you can keep; kept tests re-run after every update and daily.">
+      <defs>
+        <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path class="d-arrow" d="M0,1 L9,5 L0,9 Z"/>
+        </marker>
+        <marker id="ara" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path class="d-arrow accent" d="M0,1 L9,5 L0,9 Z"/>
+        </marker>
+      </defs>
+
+      <text class="d-title" x="20" y="16">While you're talking to it</text>
+      <rect class="d-box" x="20" y="28" width="260" height="62" rx="7"/>
+      <text class="d-label" x="150" y="54" text-anchor="middle">1 · You ask</text>
+      <text class="d-sub" x="150" y="74" text-anchor="middle">web, Slack, the console</text>
+
+      <rect class="d-box" x="330" y="28" width="260" height="62" rx="7"/>
+      <text class="d-label" x="460" y="54" text-anchor="middle">2 · Ghost answers</text>
+      <text class="d-sub" x="460" y="74" text-anchor="middle">with your adopted rules in its prompt</text>
+
+      <rect class="d-box accent" x="640" y="28" width="260" height="62" rx="7"/>
+      <text class="d-label" x="770" y="54" text-anchor="middle">3 · You react</text>
+      <text class="d-sub" x="770" y="74" text-anchor="middle">👎, or "that's wrong, it's …"</text>
+
+      <path class="d-line" d="M280,59 L326,59" marker-end="url(#ar)"/>
+      <path class="d-line" d="M590,59 L636,59" marker-end="url(#ar)"/>
+
+      <text class="d-title" x="640" y="130">While you're away (idle)</text>
+      <rect class="d-box" x="640" y="142" width="260" height="62" rx="7"/>
+      <text class="d-label" x="770" y="168" text-anchor="middle">4 · Replay the question</text>
+      <text class="d-sub" x="770" y="188" text-anchor="middle">asked again 2× · read-only · labelled</text>
+
+      <rect class="d-box" x="640" y="232" width="260" height="62" rx="7"/>
+      <text class="d-label" x="770" y="258" text-anchor="middle">5 · Diagnose</text>
+      <text class="d-sub" x="770" y="278" text-anchor="middle">the cause + ONE general rule</text>
+
+      <rect class="d-box" x="640" y="322" width="260" height="62" rx="7"/>
+      <text class="d-label" x="770" y="348" text-anchor="middle">6 · Test the rule</text>
+      <text class="d-sub" x="770" y="368" text-anchor="middle">2× on the question + your kept tests</text>
+
+      <path class="d-line" d="M770,90 L770,138" marker-end="url(#ar)"/>
+      <path class="d-line" d="M770,204 L770,228" marker-end="url(#ar)"/>
+      <path class="d-line" d="M770,294 L770,318" marker-end="url(#ar)"/>
+
+      <rect class="d-box" x="640" y="450" width="260" height="62" rx="7"/>
+      <text class="d-label" x="770" y="476" text-anchor="middle">7 · Proposal to you</text>
+      <text class="d-sub" x="770" y="496" text-anchor="middle">"Candidate rule 3 — learn rule 3 …"</text>
+      <path class="d-line" d="M770,384 L770,446" marker-end="url(#ar)"/>
+
+      <text class="d-title" x="20" y="440">Your decision</text>
+      <rect class="d-box accent" x="330" y="450" width="260" height="62" rx="7"/>
+      <text class="d-label" x="460" y="476" text-anchor="middle">8 · You decide</text>
+      <text class="d-sub" x="460" y="496" text-anchor="middle">"learn rule 3" · or ignore it</text>
+      <path class="d-line" d="M640,481 L594,481" marker-end="url(#ar)"/>
+
+      <rect class="d-box accent" x="20" y="450" width="260" height="62" rx="7"/>
+      <text class="d-label" x="150" y="476" text-anchor="middle">9 · Rule in every prompt</text>
+      <text class="d-sub" x="150" y="496" text-anchor="middle">### OWNER RULES · up to 6</text>
+      <path class="d-line" d="M330,481 L284,481" marker-end="url(#ar)"/>
+
+      <path class="d-line accent" d="M150,450 L150,94" marker-end="url(#ara)"/>
+      <text class="d-sub" x="160" y="275">shapes every later answer</text>
+
+      <text class="d-title" x="330" y="130">The safety net</text>
+      <rect class="d-group" x="330" y="142" width="260" height="242" rx="9"/>
+      <text class="d-label" x="460" y="170" text-anchor="middle">Your regression tests</text>
+      <text class="d-sub" x="460" y="196" text-anchor="middle">a 👎 drafts a test proposal:</text>
+      <text class="d-sub" x="460" y="214" text-anchor="middle">the question + checks a program runs</text>
+      <text class="d-sub" x="460" y="242" text-anchor="middle">"keep test 4" adds it</text>
+      <text class="d-sub" x="460" y="270" text-anchor="middle">re-asked after every update</text>
+      <text class="d-sub" x="460" y="288" text-anchor="middle">and once a day</text>
+      <text class="d-sub" x="460" y="316" text-anchor="middle">a failure is reported to you</text>
+      <text class="d-sub" x="460" y="344" text-anchor="middle">every candidate rule is</text>
+      <text class="d-sub" x="460" y="362" text-anchor="middle">checked against them (step 6)</text>
+      <path class="d-line" d="M700,90 L560,138" marker-end="url(#ar)"/>
+      <path class="d-line" d="M590,350 L636,350" marker-end="url(#ar)"/>
+    </svg>
+    <p class="caption">Orange outline = a step where you are involved. Nothing on the right-hand side changes Ghost's behaviour by itself.</p>
+  </div>
+
+  <h2>Step by step</h2>
+  <div class="diagram">
+    <ol class="flow">
+      <li>
+        <h4>Ghost records the turn</h4>
+        <p>Every answer to you is recorded with the tools it used and the pages it opened. Turns from other people (Slack members, public channels) and Ghost's own test runs are recorded too, but they never feed this loop — only your own turns can.</p>
+      </li>
+      <li>
+        <h4>Your reaction is the signal</h4>
+        <p>Two things count as you saying an answer was wrong: a <strong>👎</strong> on the reply (web page or Slack), and <strong>your next message</strong> showing it missed — "no, the latest is 18.6", "that's not what I asked". A small judge reads your next message while Ghost is idle and decides whether it was a correction. Other warning signs — the self-check doubting the answer, a run of failed tool calls — can put a turn on the list to be replayed, but they never become a test, and nothing is adopted on their word.</p>
+        <p class="where">core/owner_seeds.py — <code>failure_signal</code>, <code>judge_reactions</code>; core/feedback.py — the 👍/👎</p>
+      </li>
+      <li>
+        <h4>While you're away: replay it</h4>
+        <p>After about an hour of quiet, Ghost picks the newest such turn that only <em>read</em> things (searches, pages, files) — a request that changed something is never replayed — and asks itself the same question twice more. These replays are labelled as tests: they cannot write files, send messages or change memory, even if the model tries.</p>
+        <p class="where">core/failure_replay.py — <code>pick_case</code>, the <code>base</code> stage; one stage per idle slot</p>
+      </li>
+      <li>
+        <h4>Diagnose: what went wrong, and one rule</h4>
+        <p>The main model reads the original answer, the two replays and what each one actually saw, and writes down the cause and <em>one</em> general rule that would have prevented it — or says there isn't one. A rule that names the specific case, or that was obviously shaped by a web page's text, is thrown away.</p>
+        <p class="where">the <code>diagnose</code> stage</p>
+      </li>
+      <li>
+        <h4>Test the rule</h4>
+        <p>The question is asked twice more, this time with the candidate rule in the prompt. Then your kept regression tests are run with the rule too, so a rule that fixes one answer but breaks another shows up before you see it.</p>
+        <p class="where">the <code>test</code> and <code>suite</code> stages</p>
+      </li>
+      <li>
+        <h4>The proposal reaches you</h4>
+        <p>At the top of your next reply, under <em>Background activity while you were away</em>, you see one line that starts with the commands, then the rule, the evidence (what the self-check said before and after) and how your tests did. If you have push notifications set up (ntfy or a webhook), it arrives there too.</p>
+      </li>
+      <li>
+        <h4>You decide</h4>
+        <p>"learn rule N" adopts it. Ignoring it does nothing. Ghost never adopts a rule because its own judge liked it.</p>
+      </li>
+      <li>
+        <h4>The rule shapes every later answer</h4>
+        <p>An adopted rule goes into a short <code>### OWNER RULES</code> block in the prompt of every one of your turns (up to six rules). It is not shown to Slack members or in public channels. "forget rule N" removes it after you confirm.</p>
+        <p class="where">core/agent.py — <code>_owner_rules_block</code>; memory/skills.py — <code>owner_rules</code></p>
+      </li>
+    </ol>
+  </div>
+
+  <h2>The safety net: regression tests</h2>
+  <p>A rule fixes the next answer; a test makes sure it <em>stays</em> fixed. The same 👎 that starts a replay also drafts a test proposal: your question, one sentence saying what a right answer must do, and up to four checks a program can run — for example "the reply contains 18.6", "it opened postgresql.org", "it did not say all systems green". No model grades a test; either the check passes or it doesn't.</p>
+  <ul>
+    <li><strong>You approve every test.</strong> A proposal does nothing until you say "keep test N", and it lapses after a week if you don't. At most three proposals wait at once.</li>
+    <li><strong>Kept tests run by themselves.</strong> After every update to Ghost and once a day, while you're idle, two at a time. A failure — or a test that could not run — is reported to you the same way a proposal is.</li>
+    <li><strong>They guard the rules.</strong> Every candidate rule is run against your kept tests before it is proposed, and the proposal says "your tests with it: 4/5 pass, FAILING: test 2".</li>
+    <li><strong>They are test runs, not conversations.</strong> Read-only, labelled, never learned from.</li>
+  </ul>
+
+  <h2>What you can say</h2>
+  <p>Each command has to be the whole message. The answer appears at the top of the reply, written by Ghost itself rather than the model.</p>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>You say</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td><code>show rule 3</code></td><td>The whole candidate rule, its cause and its evidence.</td></tr>
+      <tr><td><code>learn rule 3</code></td><td>Adopts it: from your next message on, it is in every prompt.</td></tr>
+      <tr><td><code>learn this rule: …</code></td><td>Adopts a rule you write yourself.</td></tr>
+      <tr><td><code>show all rules</code></td><td>Adopted, waiting for you, and forgotten — by number.</td></tr>
+      <tr><td><code>forget rule 3</code></td><td>Shows what would be removed. Nothing changes yet.</td></tr>
+      <tr><td><code>confirm forget rule 3</code></td><td>Removes it (within 15 minutes of the preview). A bare "yes" never confirms.</td></tr>
+      <tr><td><code>keep test 4</code></td><td>Adds the proposed test to your suite.</td></tr>
+      <tr><td><code>edit test 4: it must name the vendor's page</code></td><td>Redrafts the checks from your words and shows them again. A kept test keeps running on its old checks until you keep the new ones.</td></tr>
+      <tr><td><code>forget test 4</code></td><td>The test is never run again.</td></tr>
+      <tr><td><code>show test 4</code>, <code>show regression tests</code></td><td>One test with its last result, or the whole suite.</td></tr>
+      <tr><td><code>run regression tests</code></td><td>Every kept test runs at the next idle moment.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2 id="example">A worked example, start to finish</h2>
+  <p>This is the PostgreSQL case that shaped the loop. The wrong answer, the replays, the diagnosis, the tested rule and the final result are what actually happened in October 2026. That first round was run by hand, before the loop was automatic, and the rule was approved in a review session. The proposal, the "learn rule" command and the test proposal below show what the loop does with the same complaint today. In the real ledger this rule is rule 2.</p>
+
+  <div class="diagram">
+    <ol class="flow">
+      <li>
+        <h4>You ask, Ghost answers wrong</h4>
+        <p><strong>You:</strong> "what is the latest version of postgresql?"<br>
+        <strong>Ghost:</strong> "The latest version is PostgreSQL 18.4." — twice, on two different days.</p>
+        <p>The truth, on postgresql.org's versioning page: 18.6. Ghost had searched, read only the search snippets (an old LinkedIn post said 18.4), and never opened the vendor's page.</p>
+      </li>
+      <li>
+        <h4>You react</h4>
+        <p>A 👎 on the reply, or a next message like "that's out of date, it's 18.6". Either one marks the turn as your failure.</p>
+      </li>
+      <li>
+        <h4>Replay (while you're away)</h4>
+        <p>Ghost asks itself the question twice more. Both replays open the downloads page and the release notes this time — and answer "PostgreSQL 18, released 2025-09-25". Better sources, still wrong: they report the newest <em>major</em> version, not the newest release.</p>
+      </li>
+      <li>
+        <h4>Diagnose</h4>
+        <p><strong>Cause:</strong> the latest major version was taken for the latest version, and the vendor's version table was never reached.<br>
+        <strong>Rule:</strong> "When asked for the latest version of software, give the latest point release, read from the vendor's own version, support or download table, and name the page."</p>
+      </li>
+      <li>
+        <h4>Test the rule</h4>
+        <p>Asked twice more with the rule: both answers now say <strong>18.6</strong>, from postgresql.org/support/versioning. Checked on other software too, so the rule doesn't only fit this one case: Node.js and nginx were right without it and stayed right with it.</p>
+      </li>
+      <li class="optional">
+        <h4>The test proposal (what the suite adds today)</h4>
+        <p>From the same 👎, a test is drafted and shown to you:</p>
+        <pre><code>Test proposal 4 — say “keep test 4”, “edit test 4: …”, or ignore:
+for “what is the latest version of postgresql?”, the answer names
+the newest point release from postgresql.org
+(checks: mentions one of 18.6; opens postgresql.org).</code></pre>
+        <p>You say <strong>"keep test 4"</strong>. From then on it is re-asked after every update and daily. When PostgreSQL 18.7 ships the test will start failing — and you'll be told, which is your cue to <code>edit test 4: must say 18.7</code>. A test pins a fact; when the fact moves, you move the test.</p>
+      </li>
+      <li>
+        <h4>The proposal reaches you</h4>
+        <pre><code>Background activity while you were away:
+  - [self-play] Candidate rule 2 — say “show rule 2” to read it,
+    “learn rule 2” to adopt it: When asked for the latest version …</code></pre>
+      </li>
+      <li>
+        <h4>You decide</h4>
+        <p><strong>You:</strong> "learn rule 2"<br>
+        <strong>Ghost (top of the reply, written by Ghost itself):</strong> "✓ Rule 2 adopted — saved as a lesson: “When asked for the latest version …”"</p>
+        <p>From your next message on, the rule is in the <code>### OWNER RULES</code> block of every prompt.</p>
+      </li>
+      <li>
+        <h4>The next time</h4>
+        <p>After the rule was adopted, the same question opened postgresql.org/support/versioning and answered <strong>18.6</strong>, with the table of supported versions. The same question asked <em>without</em> the rule (a labelled control) answered "17". The rule is what made the difference.</p>
+      </li>
+    </ol>
+  </div>
+
+  <div class="note warn">
+    <strong>Not every failure has a rule.</strong> In the same round, "how many people in the UK have been imprisoned for social media posts?" failed because the search engine returned junk and the good sources blocked the request. A rule ("say the sources were blocked") was tried and fixed it 0 times out of 2 — the problem was the tools, not the model's behaviour. A third case, a greeting answered with an invented "all systems green", got a rule that was adopted but that the model still doesn't follow on small talk; that one was left as is. The loop shows you this evidence instead of pretending every failure is fixable by a sentence in the prompt.
+  </div>
+
+  <h2>How to see it working</h2>
+  <dl class="kv terms">
+    <dt>In the chat</dt>
+    <dd>"show all rules" and "show regression tests". Proposals and test failures appear under <em>Background activity while you were away</em> at the top of your next reply. Routine outcomes — an abandoned replay, a test run where everything passed — go only to the activity ledger, so they don't clutter the chat.</dd>
+    <dt>Ask Ghost</dt>
+    <dd>"what did you do while I was away?" — it reads the activity ledger (<code>introspect</code>, action <code>activity</code>), not its own recollection.</dd>
+    <dt>On disk</dt>
+    <dd><code>$GHOST_HOME/system/selfplay/failure_replays.json</code> — every replay case, its stages, replies, diagnosis and verdicts.<br>
+    <code>$GHOST_HOME/system/regression/cases.json</code> — every test, its checks, its state and its run history.<br>
+    The adopted rules are playbook rows with origin <code>owner_rule</code>.</dd>
+    <dt>In the log</dt>
+    <dd><code>Rule Command</code> and <code>Test Command</code> lines for your commands; the idle slot's outcome line for each replay stage and test run.</dd>
+  </dl>
+
+  <h2 id="off">What is switched off, and why</h2>
+  <p>These used to run on their own. Each was measured on real turns, found not to help, and switched off in October 2026. The code is still there behind a switch, so any of them can be turned back on with an environment variable set to <code>1</code> — but nothing on this page depends on them.</p>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>What</th><th>What it did</th><th>Why it is off</th></tr></thead>
+    <tbody>
+      <tr><td>Self-written lessons<br><code>GHOST_PRODUCER_LESSONS</code></td><td>Reflection, post-mortems and memory consolidation wrote lessons for itself.</td><td>Reached their turn 18% of the time; changed the answer in 3 of 20. Only your rules are written now.</td></tr>
+      <tr><td>Practice on invented exercises<br>research: removed; coding: <code>GHOST_CODING_PRACTICE</code></td><td>Solved made-up problems to learn from them.</td><td>Research practice passed 8 of 9 at the first try — nothing to learn — and was replaced by replaying your real failures. Coding practice was switched off with it, at your request.</td></tr>
+      <tr><td>Automatic skills<br><code>GHOST_AUTO_SKILLS</code></td><td>Turned repeated tool sequences into "skills".</td><td>Trivial sequences that quoted old requests back into 19 of 86 prompts.</td></tr>
+      <tr><td>Graph and episode memory in prompts<br><code>GHOST_BUS_GRAPH_TIER</code>, <code>GHOST_BUS_EPISODIC_TIER</code></td><td>Added related memories to every prompt.</td><td>20% / 15% relevant, 16% / 19% harmful. Facts about you stay on; recall on request stays on.</td></tr>
+      <tr><td>Routing, foresight, risk steering, competence table<br><code>GHOST_ROUTER</code>, <code>GHOST_FORESIGHT</code>, <code>GHOST_RISK_GOVERNOR</code>, <code>GHOST_COMPETENCE_PROMPT</code></td><td>Per-turn predictions and steers.</td><td>Nothing used their output, or it was measurably wrong.</td></tr>
+      <tr><td>Self-run experiments, prompt-tuning judge<br>experiment specs; <code>GHOST_GEPA_AUTONOMY</code></td><td>A/B arms on live traffic; a daily judge for tuned prompts.</td><td>The experiments had too little traffic to ever reach a verdict; the prompt-tuning judge was stopped with them. Prompt tuning you start by hand still works.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The self-check on every answer still runs, and its confidence is still used — but as a <em>ranking</em>: the least confident 15% of answers get the deeper check. It is not treated as a probability, because measured against outcomes it isn't one. Details: <a href="core/agent.html#4nd">core.agent §4ND</a>.</p>
+
+  <h2>Limits, honestly</h2>
+  <ul>
+    <li><strong>It needs you.</strong> With no 👎 and no corrections, the loop does nothing. That is intended: there is no signal it can trust without you.</li>
+    <li><strong>Only read-only questions.</strong> A request that wrote a file or sent a message is never replayed, so failures of that kind get no rule and no test.</li>
+    <li><strong>Slow by design.</strong> One stage per idle slot: a replay case takes several idle periods to reach you. On a busy day nothing moves.</li>
+    <li><strong>A rule is a sentence in the prompt.</strong> The model can ignore it, as with the greeting rule. A kept test is how you find out.</li>
+    <li><strong>Tests pin facts that move.</strong> A "latest version" test will fail when the version changes. That failure is correct — edit the test.</li>
+  </ul>
+  <p>For the module-level detail: <a href="core/agent.html#4mw-loop">the failure-replay loop</a>, <a href="core/agent.html#4nb">rule commands</a>, <a href="core/regression.html">core.regression</a>, <a href="core/feedback.html">core.feedback</a>.</p>
+
+  <div class="pager">
+    <a class="prev" href="self-improvement.html">
+      <span class="dir">Previous</span>
+      <span class="to">How it improves itself</span>
+    </a>
+    <a class="next" href="safety.html">
+      <span class="dir">Next</span>
+      <span class="to">Safety and privacy</span>
+    </a>
+  </div>
+</main>
+</body>
+</html>

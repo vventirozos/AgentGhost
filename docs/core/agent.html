@@ -1946,6 +1946,9 @@
     <li><code>_salvage_vision_args</code> reads each field from its own tag.</li>
   </ul>
   <p>Details: <a href="../tools/vision.html#4lm">vision &sect;4LM</a>.</p>
+  <h2 id="4mx">Verdicts in flight are bounded; spawned verdicts are deferred <span class="tag">2026-10-09 &sect;4MX</span></h2>
+  <p><code>_compute_verifier_verdict</code> is wrapped by <code>_bounded_verdict</code> (a decorator, so its pins still read the body by name; the concurrency bound itself is on the critic calls — <a href="verifier.html#4mx">verifier §4MX</a>). Its <code>deferred</code> keyword — passed by the gated front door's task and the post-stream task (not the repair verdict, which the turn waits on) — sets <code>verifier.deferred_verdict_context</code> for that verdict only: a longer wait for Nova and no main-model re-run when Nova is merely busy (see <a href="verifier.html#4mx">verifier §4MX</a>). The inline (blocking) call site is unchanged. Pins: <code>tests/test_4mx_nova_and_search.py</code>.</p>
+  <p><strong>§4MX r2 — the turn count comes from the request.</strong> <code>conv_user_turns</code> (the §4MW failure replay refuses follow-ups) was counted on the turn's working list, which also carries mid-turn user-role steers ("SYSTEM ALERT …"), so a steered one-shot turn read as a follow-up. <code>handle_chat</code> now counts user messages on the request as the client sent it (<code>_count_user_turns</code>, injected <code>&lt;tool_response</code> / <code>&lt;system_state_update&gt;</code> / <code>&lt;session_context&gt;</code> excluded) into <code>_conv_user_turns_ctx</code>, which <code>_record_turn_trajectory</code> reads.</p>
 </main>
 
 <h2 id="4mm">§4MM (2026-10-08): image provenance, the disclaimer guard, the promotion footer</h2>
@@ -2012,5 +2015,257 @@
   <li><strong>Interrupted turns are not failures.</strong> A client disconnect or a process shutdown records <code>[TURN_INTERRUPTED]</code> instead of <code>[ATTEMPT_ABORTED_TURN]</code>: the outcome stays UNKNOWN and <code>trajectory_may_teach</code> refuses the row. An owner's Stop is still recorded as an abort, and so is a cancel at or past the request's deadline (<code>interruption_marker</code>): the interface's 1800 s timeout reads like a disconnect, but it is the agent being too slow. An idle coding build whose call is deferred for a live request stops (<code>BackgroundDeferred</code> propagates out of the leaf loop) instead of counting a crashed attempt and retrying.</li>
   <li><strong>Competence counts only real user turns</strong> (a probe's tool outcomes no longer move the owner's prior). The self-play and bench cooldown anchors are written to disk when set, not at the next tick. A failing counterfactual slot logs a WARNING (it was DEBUG).</li>
 </ul>
+
+<h2 id="4mt">§4MT (2026-10-09): useful self-play</h2>
+<ul>
+  <li><strong>More of your failures become seeds.</strong> <code>owner_seeds.failure_signal</code> marks a tool-using owner turn as a suspect failure for any of these, in order:
+    <ul>
+      <li>its outcome is FAILED;</li>
+      <li>any verifier verdict on it was REFUTED, then UNCERTAIN;</li>
+      <li>two tool calls in a row failed;</li>
+      <li>the reaction judge read your next message as showing the reply failed.</li>
+      <li><strong>Fresh-reader fixes (r1).</strong>
+    <ul>
+      <li>A seed whose run returns without concluding (generation failed its gates) is counted. It is retired after 2 such runs (<code>owner_seeds.note_unconcluded</code>); a run stopped because you arrived does not count. Otherwise the newest seed would take every slot.</li>
+      <li>A proof leg is counted when it starts, and a proof ends as <code>inconclusive</code> after <code>MAX_STARTED_LEGS</code> started legs. Before this, a leg the 900 s cap always cancelled blocked self-play forever.</li>
+      <li>A concluded or abandoned proof of a re-learnt trigger is replaced with a fresh one.</li>
+      <li>Reaction verdicts are saved one at a time, so a pass stopped for you keeps them. An unreadable verdict is cached rather than re-judged on every pass.</li>
+      <li>Withdrawal counts reaction-judged failures too.</li>
+      <li>Known limit: the judge's "channel" is Slack versus everything else, as in the calibration, and 12 of 93 turns record no duration, which overstates the gap.</li>
+    </ul>
+  </li>
+</ul>
+    An aborted turn is never a seed. On the 47 hand-graded §4MM turns the rule was right 9 times in 10 and found 9 of the 23 wrong or partial ones; FAILED alone found 1. A re-asked request is one seed (<code>same_request</code>). The label is used only to pick seeds and is never written to the corpus.</li>
+  <li><strong>The reaction judge</strong> (<code>distill/reaction_judge.py</code>, <code>owner_seeds.judge_reactions</code>) runs at the start of a self-play slot, on the main model with no thinking and temperature 0. It judges up to 12 not-yet-judged tool-using owner turns whose next owner message on the same channel started within 20 minutes, and caches the verdicts in <code>selfplay/reaction_verdicts.json</code>. Calibration covered the 26 hand-graded turns that have such a next message, and two runs agreed 26/26. It was right on 5 of the 6 turns it flagged and caught 5 of the 17 failures; 4 of those 5 were missed by the rule. Rule and judge together catch 9 of 17, right 9 times in 10. That is a small sample, and the bar was set after this measurement. <code>GHOST_REACTION_JUDGE=0</code> turns it off.</li>
+  <li><strong>The seed is a brief, not your words</strong> (<code>core/practice_brief.py</code>). The failure's shape comes from the code-written failure reason and the tool families used. It agreed with hand labels on 79% of 75 failed turns. Shapes with no practice format abstain, such as protocol loops and output format. The brief holds the shape, the skill, the right behaviour, the tool names with their argument keys and status, and a neutral practice domain. The §4MS hint carried 400 characters of the request plus a failure reason that quoted profile facts and Slack ids.</li>
+  <li><strong>The self-play slot</strong> now does the following, in order:
+    <ul>
+      <li>withdraws failing proven lessons (<code>lesson_proof.withdraw_failing</code>);</li>
+      <li>if a lesson proof is pending, runs one leg of it instead of new practice (the slot records the leg's outcome);</li>
+      <li>otherwise runs the reaction-judge pass, then picks a seed as before.</li>
+    </ul>
+  </li>
+  <li><strong>Withdrawal:</strong> a proven lesson that was in the prompt of 2 owner turns which later showed a suspect failure (both after it was proven) is quarantined with <code>proof_withdrawn</code>.</li>
+  <li><strong>Second fresh-reader fixes (r2).</strong>
+    <ul>
+      <li><code>_run_idle_job</code> records why it stopped (<code>_last_idle_stop</code>: <code>owner</code>, <code>cap</code> or empty).</li>
+      <li>A seed is counted toward retirement only when its run failed every generation gate (<code>selfplay_quality_gate</code>) or ran past the cap.</li>
+      <li>A stop because you arrived does not count, and neither does an infra error such as Docker being down.</li>
+      <li>A judge call that fails on one turn caches that turn as unjudgeable and moves on. Only a busy slot, a connection error or a timeout ends the pass.</li>
+    </ul>
+  </li>
+</ul>
+
+<h2 id="4mu">§4MU (2026-10-09): speed, end to end</h2>
+<p>Measured on a week of agent and llama-server logs joined at 1 s resolution:</p>
+<ul>
+  <li>Owner turns since the 10-08 deploy: median 10.3 s, p90 19.0 s (only 8 turns). The §4LE baseline was 17.6 s; 10-04 to 10-08 was 29.6 s.</li>
+  <li>Most of the drop: the reply no longer waits for the verifier. That wait used to hold 12 turns for a median of 36.7 s.</li>
+  <li>Prompt-token reuse on owner turns: 92.4% (was 83%).</li>
+  <li>The main slot made an owner call wait once in 136 calls.</li>
+</ul>
+<p>Fixes:</p>
+<ul>
+  <li><strong>The head re-warm skips while a request is live.</strong> Admitted into an image render's idle window, the re-warm matched the owner's slot exactly and cut the live conversation back to the head. That happened on 5 of 97 owner continuations and cost up to 12.5 s of re-prefill each. The head is already in the slot during a request.</li>
+  <li><strong>Pre-reply worker chores yield to a deferred verification.</strong> When the previous turn's verification is running on the node the worker pool shares with the critic, <code>route()</code> returns the fallback at once for the query expansion and the decomposition. The announcement check is not skipped: its fallback would ship a reply that only announces work, so it is a guard, not a chore (fresh-reader r1). (<code>LLMClient.worker_busy_with_deferred_verify</code>, counted by <code>_attach_late_verdict_handler</code>). All six critical-path timeouts of the week (3–4 s each) fell inside such a verification, and their answer was discarded for the same fallback.</li>
+  <li>Pool URLs are compared normalised (trailing <code>/</code> and <code>/v1</code> removed). A parked <code>main-prefix-*</code> call is never admitted into an image render's idle window, which closes a race where a request arrives during the loop's tick.</li>
+  <li><strong>A staged correction or caveat leads the stream.</strong> The finalize puts it at the reply's head. Streamed without it, the shown text no longer prefixed the final reply and the whole reply was retracted. <code>ReplyTap.set_lead</code> sends it first, except when a start-with rule puts it lower (then the old retract applies).</li>
+  <li><strong>Visibility:</strong> a wait on the turn lock is logged ("Turn Queue"), and the critic route line names the caller's purpose.</li>
+</ul>
+<p>Known and not changed:</p>
+<ul>
+  <li>A late verifier escalation on the main model is a foreground call while another request is live (one 2.6 s delay in a week).</li>
+  <li>The owner's public-Slack system prompt is not warmed.</li>
+  <li>A composed-skill approval mid-request re-prefills the tool block (intended).</li>
+</ul>
+
+<h2 id="4mv">§4MV (2026-10-09): the two speed calls, measured and decided</h2>
+<p>Both options were measured three ways: a deterministic bench on the live model; 47 real owner requests replayed as labelled probes with identical history; and a blind judge, which gave the same correctness 23 times out of 24 when it saw the same reply twice.</p>
+<ul>
+  <li><strong>Tool-description trim: shipped.</strong>
+    <ul>
+      <li>The change: 56 sentence-level edits (history notes, rationale, repeated examples, text that duplicates a parameter's own description), −1,589 tokens of the 23.4k-token tool block. Names, parameters and required lists are unchanged.</li>
+      <li>The suite caught 5 edits that removed sentences tests pin as past fixes: the browser's WebGL2/SwiftShader capability, what vision's text extraction cannot read, image generation's three modes, transcription's "no speech-to-text library", and forget's exact-match deletion. Those are restored. The replays measured the trim WITHOUT them, so production is the more conservative version.</li>
+      <li>Bench: −2.5 s per cold head and −3.5% of warm tail prefill.</li>
+      <li>Quality: no difference measured (current replies preferred 16 times, trimmed 13, p=0.71).</li>
+      <li>The text is edited in the tool sources (<code>tools/registry.py</code>, <code>tools/projects.py</code>, <code>tools/sandbox_services.py</code>), not patched at runtime.</li>
+    </ul>
+  </li>
+  <li><strong>Memory next to the latest message: not adopted.</strong>
+    <ul>
+      <li>Speed: about 1 s sooner to first byte on follow-ups.</li>
+      <li>Quality: it leaned worse (preferred 3 times against 8, p=0.23), and it would slow Slack members.</li>
+    </ul>
+  </li>
+  <li><strong>The competence and uncertainty counters no longer churn the per-request block.</strong> The block still changes with the memory hydrated for each question, so the realised gain is small. A labelled probe found two consecutive PostgreSQL questions at 16,542 and 16,947 characters. The competence table rendered exact counts ("n=847", "74%"). The recurring-uncertainty block did the same ("flagged 7×"). Both ride the stable context before the whole history, so the block changed after every turn: 98–99% of owner follow-ups re-prefilled it plus all history after it. Both now render bands: <code>n 100+</code>, percentages to the nearest 5%, and <code>flagged 5+×</code>. A line changes only when a band is crossed. Lines are ordered by band, then name. A cell under n=30 shows a coarse quarter ("~75%") with no interval, and an interval that rounds to a point is dropped. The provisional mark is still decided on the exact numbers.</li>
+  <li><strong>Fresh-reader r2.</strong>
+    <ul>
+      <li>The §4MU skip of query expansion and decomposition during a deferred verification is REVERTED. It was keyed on whole verdict tasks (108–146 s), fired 32 times against 2 dispatches after deploy, and 71% of the calls made inside a verification had succeeded before it.</li>
+      <li>A head re-warm that queued for a background permit re-checks for a live request after the permit is taken.</li>
+      <li>Two description sentences are restored: the image seed caveat for edits and <code>subjects</code> renders, and "Project DONE retires all constraints automatically". The browser's "last-URL sidecar" became "remembered last URL".</li>
+    </ul>
+  </li>
+  <li>The probe-only arm switch (<code>X-Ghost-Arm</code>, honoured only with <code>X-Ghost-Origin: probe</code>, checked again in <code>utils.logging.prompt_arm()</code>) remains, with no arms defined.</li>
+</ul>
+
+<h2 id="4mt-slot">§4MT: the self-play slot body</h2>
+<p>The self-play slot's body is extracted from <code>_biological_tick</code> into <code>_self_play_slot_body(ctx)</code>. It raises <code>_ProofLegRan</code> or <code>_NoOwnerSeed</code>. Its exception handlers, heartbeats, the idle-clock reset and the cooldown stay in the tick. The operator's supervised run (<code>start_supervised_self_play_slot</code>, behind <code>POST /api/operator/self-play-slot</code>) calls the same body.</p>
+
+<h2 id="4mw">§4MW (2026-10-09): replaying the owner's real failures</h2>
+<p>This replaces synthetic practice as the way to learn from failures. The owner's real failed requests (read-only ones) are replayed in the live environment as labelled probes, the cause is diagnosed from the trace, and a fix is tested on a replay before it ships. A candidate rule rides a probe as <code>X-Ghost-Probe-Rule</code>. It is honoured only with <code>X-Ghost-Origin: probe</code> and re-checked in <code>utils.logging.probe_rule()</code>, and it is added to the per-turn state block as <code>### RULE</code>.</p>
+<p>Round 1 found three fixes, all shipped:</p>
+<ul>
+  <li><strong>A lesson (owner-approved): "latest version" means the latest point release.</strong>
+    <ul>
+      <li>Found on: "latest version of postgresql?" (live: 18.4).</li>
+      <li>Diagnosis: replays answered "18". They took the latest MAJOR version and never reached the vendor's version table; the truth was 18.6.</li>
+      <li>Fix: the lesson says to read the latest point release from the vendor's version, support or download table and name the page.</li>
+      <li>Result: replays answered 18.6, 2/2. Node.js and nginx stayed right, 4/4.</li>
+    </ul>
+  </li>
+  <li><strong>The introspect overview opens with <code>OVERVIEW_HEALTH_LINE</code>.</strong>
+    <ul>
+      <li>Found on: "how's things?", answered "all systems green" from an overview that contains no health check.</li>
+      <li>Two prose rules did not move it.</li>
+      <li>Fix: the overview now says first that it is not a health check, and that only <code>system_utility check_health</code> is.</li>
+      <li>Result: replays stopped claiming health.</li>
+    </ul>
+  </li>
+  <li><strong>A blocked page's hint says that only its search-result snippet is known.</strong>
+    <ul>
+      <li>Found on: the UK social-media question, whose replies credited a fact-check site the browser had been refused.</li>
+      <li>Result: after the change, the replies did not name the blocked hosts.</li>
+    </ul>
+  </li>
+</ul>
+<p>Still open: the web search backend's relevance, which returned unrelated results on the UK question. One case in four could not be replayed, because the state behind it had changed.</p>
+
+<h2 id="4mw-loop">§4MW: the failure-replay loop in the self-play slot</h2>
+<p>Operator, 2026-10-09: "replace it, but keep coding practice" and "propose, you approve". The self-play slot runs, in order:</p>
+<ol>
+  <li>withdraw failing proven lessons;</li>
+  <li>run one leg of a pending lesson proof;</li>
+  <li>run the reaction-judge pass;</li>
+  <li><strong>advance the failure-replay loop by one stage</strong> (<code>core/failure_replay.py</code>);</li>
+  <li>only when there is no replay work, synthetic practice, on a <em>code/data</em> owner failure only (<code>pick_owner_failure_seed(shapes={"code_data"})</code>).</li>
+</ol>
+<p>The loop works on one case at a time, one stage per slot, with its state in <code>selfplay/failure_replays.json</code>:</p>
+<ul>
+  <li><code>base</code>: two labelled-probe replays (<code>probe-fr-…</code>) of a READ-ONLY owner failure. Every original tool call must be read-only, and the request must contain no action verb (<code>replayable</code>).</li>
+  <li><code>diagnose</code>: the main model reads the traces and returns a cause plus at most one general rule. A rule that shares a rare token with the request is dropped. Tool or environment causes and failures that did not reproduce get no rule.</li>
+  <li><code>test</code>: two replays with the rule (the <code>X-Ghost-Probe-Rule</code> path).</li>
+  <li><code>propose</code>: once the verifier's verdicts have landed, or after 45 minutes, a notify-severity digest item with the cause, the verdicts before and with the rule, and the phrase that adopts it: "learn this rule: …".</li>
+</ul>
+<p>Nothing is adopted automatically. Against ground truth, the verifier confirmed a wrong "all systems green" twice and split 2–2 on the corrected PostgreSQL answer, so its verdicts are shown as evidence only.</p>
+
+<h3>§4MW fresh-reader fixes (r1)</h3>
+<ul>
+  <li><strong>CRIT: a replay is held read-only at DISPATCH.</strong> <code>failure_replay.replay_tool_refusal</code> sits beside the member guard. Any tool or action outside <code>READ_ONLY_TOOLS</code> is refused for a <code>probe-fr-</code> turn, whatever the original turn did; the model may choose different tools on replay, unattended. <code>workspace_track</code> left the table.</li>
+  <li>A probe turn writes no project research (<code>web_search</code> write-back, deep-research workspace artifacts), queues the owner no correction or caveat (they took the owner's three correction slots), and promotes no user correction.</li>
+  <li>A replay takes the member branch of the project binding: no rebinding of the owner's project.</li>
+  <li>Follow-ups (under 5 words, or opening with a pronoun, a connective or a confirmation) are not replayed. The store keys a session by request id, so their conversation cannot be rebuilt.</li>
+  <li>A stage is counted before it runs and retried once; then the case is <code>abandoned</code>, because a replay cut by the idle cap had re-run forever. A stage error no longer escapes the slot.</li>
+  <li>Further fixes:
+    <ul>
+      <li>A re-asked request is one case (<code>same_request</code>).</li>
+      <li>Request ids are unique per attempt.</li>
+      <li>A cancelled turn is not an answer.</li>
+      <li>The verdict wait runs from the last replay.</li>
+      <li>Blocking reads run in threads.</li>
+      <li>The slot body runs one at a time.</li>
+    </ul>
+  </li>
+</ul>
+
+<h3 id="4mw-r3">§4MW fresh-reader fixes (r3, 2026-10-10): adopting a candidate rule</h3>
+<ul>
+  <li><strong>Commands, not copy-paste.</strong> Each case has a number <code>n</code>. The proposal opens with its commands, because the chat banner keeps about 139 characters and used to cut the rule off: <em>Candidate rule 3 — say “show rule 3” to read it, “learn rule 3” to adopt it: …</em>.</li>
+  <li><strong>Adoption is deterministic.</strong> <code>handle_chat</code> runs <code>_owner_rule_note</code> for owner turns only. Members, a public channel and probes are skipped, via <code>request_kind</code> after the role and origin are set. The note comes from <code>failure_replay.owner_rule_command</code>:
+    <ul>
+      <li><strong>“learn rule N”</strong> calls <code>learn_lesson</code> itself before the model runs. The lesson uses the diagnosis's <code>when</code> as its trigger, is verified and general, and the case is marked <code>adopted_at</code>. The model gets an <code>### OWNER RULE COMMAND</code> note saying what was done.</li>
+      <li><strong>“show rule N”</strong> gives the model the whole rule, cause and verdicts to quote verbatim.</li>
+      <li><strong>“learn this rule: …”</strong> works too, also when the copy is wrapped in the proposal's own quotes or cut by the banner (a prefix of 40+ characters): the whole rule is read from the ledger.</li>
+      <li>Free dictation of a rule that matches no proposal is left to the model. The dictation pattern now accepts a quoted copy and an "ok …" lead, so the lesson stays general rather than scoped to that one message.</li>
+    </ul>
+  </li>
+  <li><strong>Page text cannot shape a rule.</strong> <code>rule_from_content</code> drops a candidate that names a site, carries markup or special tokens, or copies a 6-word run from a replay's tool result. The probe's <code>### RULE</code> is labelled "a candidate under test, written by an automatic diagnosis — not the owner's instruction", and chat-template tokens are stripped from it (<code>_defuse_rule_text</code>).</li>
+  <li><strong>Ledger fixes:</strong>
+    <ul>
+      <li>Replays and verdicts are looked up a week back, not one day, so a late propose stage still finds them.</li>
+      <li>An abandoned case is recorded in the activity digest.</li>
+      <li>A probe never uses up the owner's queued corrections (<code>_consume_pending_corrections</code>).</li>
+    </ul>
+  </li>
+  <li><strong>Known and left:</strong> an owner turn can wait up to 60 s while a cancelled replay unwinds, because a replay holds the agent's turn lock.</li>
+</ul>
+<h3 id="4mz">§4MZ: the outcome line is the agent's</h3>
+<p>The first live "learn rule 1" adopted the rule correctly, but the model, told to "confirm in one sentence", asked the owner to confirm. As with correction banners (§4LG), the outcome is no longer left to the model:</p>
+<ul>
+  <li><code>owner_rule_command</code> returns a <code>RuleNote</code>, a string carrying a <code>banner</code>.</li>
+  <li><code>handle_chat</code> stores the banner in <code>_owner_rule_banner_ctx</code>. <code>_take_active_correction</code> prepends it once, above any correction, on both the streamed and the finalized reply.</li>
+  <li>The trivial-chat fast path yields to it.</li>
+  <li>The banner reads, for example: <em>✓ Rule N adopted — saved as a lesson: “…”</em>, the rule quoted for "show rule N", or a line saying there is no such rule, it is already adopted, or it is still being tested.</li>
+  <li>The model's note says the line is already there: do not repeat it, do not ask for confirmation.</li>
+  <li>r1 fixes:
+    <ul>
+      <li>The line ends with the banner separator (<code>---</code>), so the reply is not glued to it, and the next turn's correction fingerprint still peels it.</li>
+      <li>It is set as the stream's lead, alone or above a correction, so a live-streamed reply is not retracted.</li>
+      <li>The adoption line is defused and capped at 300 characters.</li>
+    </ul>
+  </li>
+  <li><strong>Known and left:</strong>
+    <ul>
+      <li>The turn record stores the reply without the line, the same as correction banners.</li>
+      <li>A cancelled turn shows no line, though the adoption stands; a retry answers "already adopted".</li>
+    </ul>
+  </li>
+</ul>
+<h3 id="4nb">§4NB: "show all rules", and "forget rule N" with preview and confirm</h3>
+<p>Operator, 2026-10-10: "add forget rule N with preview and confirm", "also add a show all rules". Both are owner-only, like the other rule commands, and each answer is the agent's own outcome line.</p>
+<ul>
+  <li><strong>“show all rules”</strong> (also “show rules”, “list my rules”) lists every rule by number in three groups: <em>Adopted</em>, <em>Proposed, waiting for you</em> and <em>Forgotten</em>. An adopted rule with no number is listed too. "show all rules of chess" is an ordinary question, not the command.</li>
+  <li><strong>“forget rule N”</strong> is the preview. It shows the rule and stamps <code>forget_preview_at</code>, and removes nothing.</li>
+  <li><strong>“confirm forget rule N”</strong> must name the action and the number; a bare "yes" never confirms. It must come within <code>FORGET_CONFIRM_S</code> (15 min) of a preview made after the adoption. It removes every playbook row carrying the rule's text from both stores (<code>remove_by_trigger</code>: archived and tombstoned), reads the store back, and stamps <code>forgotten_at</code>.</li>
+  <li><strong>State is timestamps.</strong> <code>is_adopted</code> means <code>adopted_at</code> is newer than <code>forgotten_at</code>. On every save the newest value of each owner field wins, so a stale writer can never undo an adoption or a forget.</li>
+  <li><strong>Bringing a rule back:</strong> "learn rule N" re-adopts a forgotten rule. <code>learn_lesson</code> lets the owner's own dictation pass a tombstone; an idle producer still cannot re-mint a retracted trigger.</li>
+  <li>The operator-approved "latest version" rule got a ledger number at deploy (rule 2), so it is shown, listed and forgotten like the others.</li>
+  <li><strong>r1 review:</strong>
+    <ul>
+      <li>The tombstone exception is keyed on the rule path (<code>origin="owner_rule"</code>), not on dictation wording. A first cut let any owner turn saying "remember…" revive a retired lesson through the model's own <code>learn_skill</code>.</li>
+      <li>Confirm removes exactly the rule's rows (<code>origin</code> owner_rule plus the rule's text) by row identity (<code>SkillMemory.remove_rows</code>), never the first row sharing a trigger.</li>
+      <li>A forgotten rule keeps its trigger, so re-adopting restores the same situation.</li>
+      <li>The version rule's entry carries no request, so it never blocks replays of a later re-ask.</li>
+    </ul>
+  </li>
+</ul>
+<h3 id="4nd">§4NC/§4ND (2026-10-10): operator switches, default off</h3>
+<p>The producers and calibration reviews measured each idle and per-turn mechanism and switched off the ones with no measured effect. Each reads its switch per call through <code>utils.helpers.env_flag</code>, so setting it to <code>1</code> in the launcher brings it back without a code change. Tests pin production behaviour with the switches cleared (<code>tests/test_4nc_producers.py</code>, <code>tests/test_4nd_calibration.py</code>); legacy tests turn them on in <code>tests/conftest.py</code>.</p>
+<div class="scroll"><table>
+  <thead><tr><th>Switch</th><th>What it brings back</th><th>Why it is off</th></tr></thead>
+  <tbody>
+    <tr><td><code>GHOST_PRODUCER_LESSONS</code></td><td>reflection, post-mortem, Perfect-It and correction lessons; dream consolidation and failure distillation</td><td>lessons reached their turn 18% of the time; only owner rules are written now</td></tr>
+    <tr><td><code>GHOST_BUS_GRAPH_TIER</code> / <code>GHOST_BUS_EPISODIC_TIER</code></td><td>graph and episode tiers in the prompt (owner facts stay on)</td><td>20% / 15% relevant, 16% / 19% harmful</td></tr>
+    <tr><td><code>GHOST_HYDRATION_JUDGE</code></td><td>the per-turn relevance judge</td><td>a model call per turn for weights that barely moved</td></tr>
+    <tr><td><code>GHOST_ROUTER</code></td><td>per-turn routing and its retrain</td><td>nothing read the label</td></tr>
+    <tr><td><code>GHOST_FORESIGHT</code></td><td>the foresight ledger and imagination gate</td><td>a write per tool call with no consumer</td></tr>
+    <tr><td><code>GHOST_RISK_GOVERNOR</code></td><td>the risk steer</td><td>its depth curve was 10–26 points wrong</td></tr>
+    <tr><td><code>GHOST_COMPETENCE_PROMPT</code> / <code>GHOST_CONF_COMPETENCE</code></td><td>the competence table in prompts / in the confidence blend</td><td>it counted error-free calls, not success</td></tr>
+    <tr><td><code>GHOST_AUTO_SKILLS</code></td><td>skills-auto extraction and its prompt block</td><td>trivial sequences quoting old requests on 19/86 turns</td></tr>
+    <tr><td><code>GHOST_CODING_PRACTICE</code></td><td>coding self-play</td><td>operator: "turn off coding self-play too"</td></tr>
+    <tr><td><code>GHOST_GEPA_AUTONOMY</code></td><td>the daily prompt-optimiser judge</td><td>stopped with the §4ND dead weight (operator: "stop them")</td></tr>
+  </tbody>
+</table></div>
+<p>Confidence is now a <strong>ranking</strong>, not a probability: after each refit the threshold is the score at the lowest 15% of recent real turns (<code>confidence.set_rank_threshold</code>), and those turns get deep verification. All live experiments default to disabled (<code>experiments.DEFAULT_SPECS</code>); the announcer runs only when one is enabled.</p>
+
+<h3 id="4ne">§4NE (2026-10-10): the owner's regression suite in the self-play slot</h3>
+<p>After the failure-replay step, the slot calls <code>regression.advance</code> through <code>_run_idle_job(…, "regression")</code>. A non-empty outcome ends the slot (<code>_ProofLegRan</code>), and so does the owner arriving mid-step. <code>_owner_rule_note</code> also routes the owner's test commands ("keep test N", "edit test N: …", "forget test N", "show test N", "show regression tests", "run regression tests") to <code>regression.owner_test_command</code>, and the answer is the outcome banner, as with rule commands. A candidate rule's proposal now reports how the owner's kept tests do with it. Test runs (<code>probe-rt-…</code>) are held read-only at dispatch and keep the project binding, through the same <code>is_replay_request</code> check as failure replays. See <a href="regression.html">core.regression</a>.</p>
+<h3 id="4mw-r4">r4 (a fresh reader on r3)</h3>
+<ul>
+  <li><strong>One ledger lock.</strong> <code>save</code> holds <code>_LEDGER_LOCK</code>. The owner's <code>adopted_at</code> on disk survives a writer holding an older copy: the idle stage, <code>refund_try</code>, or the owner's own cancel of the replay. Adoption checks the ledger on disk under <code>_ADOPT_LOCK</code>, so a rule is never adopted twice. Rows are numbered before any trim can shift their positions.</li>
+  <li><strong>Only what the owner saw is stored.</strong> The lesson is the rule plus a situation (<code>_safe_when</code>: the diagnosis's <code>when</code>, only if it passes the rule's own checks, else the rule's head). The diagnosis's explanation, written after it read pages, is never stored. The "show" note defuses every field (<code>prompt_safety.defuse_text</code>) and labels the diagnosis's words as data.</li>
+  <li><strong>The owner's text, or no claim.</strong> The write is made as the owner's dictation (<code>generality_context="learn this rule: …"</code>, so a near-twin from another producer is replaced, as §4LC intended). The stored text is read back; if the store kept something else, the note says the rule could NOT be adopted as written.</li>
+  <li><strong>Matching tightened.</strong> A command must be the whole message, so "show rule 3 of PEP 8 …" is a question. The dictation pattern accepts a quoted copy or an "ok/yes" lead only before "learn this rule:" (r3's general lead made "ok, note that the server is down?" a dictation).</li>
+</ul>
+<p>Pins: <code>tests/test_4mx_rule_commands.py</code>.</p>
 </body>
 </html>

@@ -191,6 +191,20 @@ if r.below_threshold:
     three-way renormalisation — the fit must optimise the formula the agent actually evaluates.</li>
   </ul>
 
+  <h2 id="4nd">Confidence is a ranking: the lowest 15% <span class="tag">2026-10-10 &sect;4ND</span></h2>
+  <p>Operator decision ("ranking only, fixed threshold"). Recomputed from raw data:</p>
+  <ul>
+    <li><strong>No better than guessing:</strong> the headline in-sample Brier 0.047 was 0.0014 on placeholder rows and 0.102 on rows with a real verdict, against 0.107 for always guessing the base rate. That gap does not survive correcting for the verifier's known false refutes.</li>
+    <li><strong>A weak, real ranking:</strong> AUC 0.67, mostly from the tool-call effort term.</li>
+    <li><strong>An unstable threshold:</strong> the fitted τ flipped between 0.81 and 0.85, moving the deep-verified share between about 12% and 32%.</li>
+  </ul>
+  <p>The changes:</p>
+  <ul>
+    <li><code>CompositeConfidence.set_rank_threshold(rows)</code> takes the <code>RANK_QUANTILE</code> (0.15) cut of recent owner turns' raw composites. The rows are the last 300 <code>source=turn, origin=user</code> rows of <code>calibration.jsonl</code> (<code>calibration.recent_turn_rows</code>).</li>
+    <li>The cut is taken at boot and after every idle refit. <code>_below</code> compares the raw score after any outcome penalty with the cut, so a refit's Platt map cannot move it. With fewer than 50 rows the fitted τ stays in charge.</li>
+    <li><strong>No competence term.</strong> It counted error-free tool calls (AUC 0.51, chance) at the largest weight; <code>_blend</code> includes it only with <code>GHOST_CONF_COMPETENCE=1</code>.</li>
+    <li><strong>No probability claims.</strong> The activity line reads "confidence ranking refit (AUC …; deep verification on the lowest 15% of recent turns — a ranking, not a probability)", or says plainly that the score does not rank. The learning report's header says it is a ranking. The outcome counts name the unverified placeholder rows. The "resolution" line no longer contradicts itself. The false "CONSUMER DEAD" warning now names the §4EC depth consumer.</li>
+  </ul>
 </main>
 </body>
 </html>

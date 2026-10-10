@@ -131,6 +131,26 @@ class _Cell:
         self.samples += 1
 
 
+#: §4MU/§4MV: this block rides the per-request STABLE context, before the
+#: whole conversation history. Rendered exactly ("n=847", "74%"), it changed
+#: after every turn. Coarse values change only when a band is crossed; the
+#: provisional mark is still decided on the exact numbers. ⚠ One churn source
+#: of several (r3 review): the hydrated memory before it and the workspace
+#: prefix also change per request, so the measured gain is small (§4MV).
+_N_BANDS = ((1000, "1000+"), (300, "300+"), (100, "100+"), (30, "30+"), (10, "10+"))
+
+
+def _n_band(n: int) -> str:
+    for floor, label in _N_BANDS:
+        if n >= floor:
+            return label
+    return "<10"
+
+
+def _pct5(x: float) -> str:
+    return f"{int(round(max(0.0, min(1.0, float(x))) * 20)) * 5}%"
+
+
 class CompetenceProfile(FailClosedStore):
     """In-memory + JSON-backed capability map.
 
@@ -266,7 +286,13 @@ class CompetenceProfile(FailClosedStore):
         if not roll:
             return ""
         lines = ["### Competence (per-domain p(success), 95% CI, n):"]
-        for d in sorted(roll, key=lambda k: roll[k][0]):
+        # §4MV r2: ordered by the DISPLAYED value, then name — sorting by the
+        # exact mean swapped two lines of one band with no band crossed (and
+        # a small cell shows a quarter, so it sorts by that quarter: r3)
+        def _shown(k):
+            mean, n = roll[k]
+            return int(round(mean * 4)) * 25 if n < 30 else int(_pct5(mean).rstrip("%"))
+        for d in sorted(roll, key=lambda k: (_shown(k), k)):
             mean, n = roll[d]
             lo, hi = wilson_interval(mean, n)
             # ⚠ PRECISION TRAVELS WITH THE NUMBER (audit 2026-08-10).
@@ -284,8 +310,16 @@ class CompetenceProfile(FailClosedStore):
             # percentages"), so 6470 observations elsewhere license a 17-
             # observation cell to render with full authority.
             mark = ("  ⚠ provisional" if (n < 30 or (hi - lo) > 0.20) else "")
+            if n < 30:
+                # §4MV r2: one sample moves a small cell's mean by 3%+ — a
+                # 5% band still churned on most updates. A small cell says
+                # only a coarse quarter, no interval.
+                lines.append(f"  - {d}: ~{int(round(mean * 4)) * 25}% (n {_n_band(n)}){mark}")
+                continue
+            _lo, _hi = _pct5(lo), _pct5(hi)
+            _ci = "" if _lo == _hi else f"95% CI {_lo}-{_hi}, "      # "85%-85%" read as certainty
             lines.append(
-                f"  - {d}: {mean:.0%} (95% CI {lo:.0%}-{hi:.0%}, n={n}){mark}")
+                f"  - {d}: {_pct5(mean)} ({_ci}n {_n_band(n)}){mark}")
         return "\n".join(lines)
 
     # ---------------------------------------------------------- helpers

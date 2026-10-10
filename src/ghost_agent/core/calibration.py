@@ -89,7 +89,7 @@ SCHEMA_VERSION = "ghost.calibration.v1"
 # is what keeps the fit valid. Expect the loop to go quiet for a while after
 # a bump (the fit bails below the sample floor rather than crossing epochs),
 # which is the correct behaviour: no fit beats a fit on incomparable rows.
-CURRENT_EPOCH = "2026-07-27.graded"
+CURRENT_EPOCH = "2026-10-10.ranking"   # §4ND: competence left the composite — a feature change
 
 # Epoch boundaries for rows written BEFORE the field existed, newest first.
 # Every row recorded from now on carries an explicit `epoch`, so this table
@@ -1239,13 +1239,22 @@ def _composite_for(sample, w_e: float, lam: float, w_eff: float = 0.0) -> float:
     never actually evaluates.
     """
     w_c = max(0.0, 1.0 - w_e - w_eff)
-    parts = [(w_c, sample.competence_component)]
+    # §4ND: mirrors `CompositeConfidence._blend` — competence only with
+    # GHOST_CONF_COMPETENCE=1, zero weights → the observed mean, nothing → 0.5
+    from ..utils.helpers import env_flag as _ef_cc
+    _comp_on = _ef_cc("GHOST_CONF_COMPETENCE")
+    parts = [(w_c, sample.competence_component)] if _comp_on else []
     if sample.entropy_observed:
         parts.append((w_e, sample.entropy_component))
     if getattr(sample, "effort_observed", False):
         parts.append((w_eff, sample.effort_component))
     tot = sum(w for w, _ in parts)
-    c = (sum(w * v for w, v in parts) / tot) if tot > 0 else sample.competence_component
+    if tot > 0:
+        c = sum(w * v for w, v in parts) / tot
+    elif parts:
+        c = sum(v for _, v in parts) / len(parts)
+    else:
+        c = sample.competence_component if _comp_on else 0.5
     return _clamp01(c * (1.0 - lam * sample.uncertainty_pressure))
 
 
@@ -2953,3 +2962,24 @@ __all__ = [
     # the three that obey it today.
     "announce_level",
 ]
+
+
+
+def recent_turn_rows(path, n: int = 300) -> list:
+    """§4ND: the last `n` OWNER turn rows of calibration.jsonl (source turn,
+    origin user) — the population the low-confidence rank cut is taken from."""
+    import json as _json
+    from pathlib import Path as _P
+    rows = []
+    try:
+        with open(_P(path), encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    r = _json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(r, dict) and r.get("source") == "turn" and r.get("origin") == "user":
+                    rows.append(r)
+    except OSError:
+        return []
+    return rows[-n:]

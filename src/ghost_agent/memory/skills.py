@@ -331,6 +331,48 @@ def remember_evidence(lesson: dict, incoming: list) -> None:
     lesson["evidence_keys"] = keys[-EVIDENCE_KEYS_MAX:]
 
 
+#: §4MT: cosine (BGE query embeddings) between a new request and the request
+#: a proven owner-practice lesson was learnt from, above which the lesson is
+#: surfaced. Calibrated on 30 days of owner requests (143 distinct, tool-
+#: using, Latin-script): pairs at ≥ 0.78 are the same kind of task (same tool
+#: family) 86% of the time against a 40% base rate, ~3 neighbours per request
+#: a month. Web-research neighbours are weaker (61%) — the label is coarse.
+SEED_SIM_MIN = 0.78
+
+
+def _cosine(a, b) -> float:
+    try:
+        num = sum(float(x) * float(y) for x, y in zip(a, b))
+        na = sum(float(x) * float(x) for x in a) ** 0.5
+        nb = sum(float(y) * float(y) for y in b) ** 0.5
+        return num / (na * nb) if na and nb else 0.0
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def _seed_linked_matches(playbook, memory_system, request: str):
+    """(row, cosine) for every proven, live, seed-linked lesson whose seed
+    request embedding sits within ``SEED_SIM_MIN`` of ``request``. The
+    English embedder cannot judge a mostly non-Latin request: abstain."""
+    rows = [p for p in (playbook or []) if isinstance(p, dict) and p.get("proof") == "kept"
+            and p.get("seed_embedding") and not p.get("quarantined")]
+    if not rows or not str(request or "").strip() or _mostly_non_latin(request):
+        return []
+    embed = getattr(memory_system, "embed_query", None)
+    if embed is None:
+        return []
+    try:
+        qv = list(embed(str(request))[0])
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for p in rows:
+        c = _cosine(qv, p["seed_embedding"])
+        if c >= SEED_SIM_MIN:
+            out.append((p, c))
+    return out
+
+
 def _normalize_lesson(lesson: dict) -> dict:
     """Fill in missing schema fields with defaults without dropping
     existing ones. Safe to call on both legacy and new-style lessons."""
@@ -1019,6 +1061,39 @@ _AUTONOMOUS_SOURCES = frozenset({"self_play", "bench", "dream", "dream_pattern",
 #: archive reasons that mark an OPERATOR retraction (a tombstone)
 _TOMBSTONE_REASONS = frozenset({"removed_by_trigger"})
 
+
+
+#: §4NC (operator, 2026-10-10: "Only approved rules"): the sources that may
+#: still write a lesson — the owner's own (`learn_skill`: dictation and the
+#: rules adopted with "learn rule N") and the operator's repair scripts. Six
+#: background writers (dream, failure distillation, self-play, bench,
+#: reflection, post-mortems) wrote ~131 lessons in 14 days; ~80% were removed
+#: by hand, and the ones that changed replies were approved rules.
+#: GHOST_PRODUCER_LESSONS=1 re-opens every source (the old behaviour).
+LESSON_SOURCES_ALLOWED = frozenset({"learn_skill", "operator_repair"})
+
+
+def producer_lessons_enabled() -> bool:
+    return os.environ.get("GHOST_PRODUCER_LESSONS", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def producer_may_write(source) -> bool:
+    return producer_lessons_enabled() or str(source or "") in LESSON_SOURCES_ALLOWED
+
+#: §4NA: owner-adopted rules shown on every owner turn (each ≤ 300 chars)
+OWNER_RULES_MAX = 6
+
+
+def _lessons_withheld() -> bool:
+    """§4NA: the compliance measurement's control arm — a labelled probe sent
+    with `X-Ghost-Arm: no_lessons` gets no playbook lesson on any surface.
+    `prompt_arm()` is "" for every production request."""
+    try:
+        from ..utils.logging import prompt_arm
+        return prompt_arm() == "no_lessons"
+    except Exception:  # noqa: BLE001
+        return False
+
 #: a vector twin this close is the same lesson in other words, whoever wrote it
 _SAME_LESSON_DISTANCE = 0.08
 
@@ -1034,6 +1109,10 @@ _DICTATED_RE = re.compile(
     r"check|prefer|avoid|when|if|please|you|ask|reply|answer|write|run|keep)\b"
     r"|" + _CLAUSE + r"(?:always|never)\s+(?!\w+ed\b)(?:use|do|run|check|ask|reply|answer|write|prefer|avoid|make|"
     r"keep|put|call|start|add|include|say|give|send|test|verify|read|open|try|show|tell|save|commit|push)\b"
+    # §4MX r4: a replay's proposal copied with its own quotes, or "ok, learn
+    # this rule: …" — that phrase only (a general "ok/yes" lead made "ok,
+    # note that the server is down?" a dictation)
+    r"|^[\s\"'“”‘’«»]*(?:(?:ok|okay|yes|sure)[\s,!.]+)?learn\s+this\s+rule\s*:"
     r"|(?<!\w)(?:θυμ[ήη]σου|να\s+θυμ[άα]σαι|μ[άα]θε|σημε[ίι]ωσε)(?!\w)"
     r"|(?<!\w)(?:στο\s+εξ[ήη]ς|απ[όο]\s+τ[ώω]ρα\s+και\s+(?:στο\s+εξ[ήη]ς|π[έε]ρα))(?!\w)",
     re.IGNORECASE)
@@ -1063,7 +1142,12 @@ _VALIDATOR_FRAMING_RE = re.compile(
     r"|\bhidden[\s-]+tests?\b|\binput\.txt\b|\btest[\s-]+harness(?:es)?\b|\bgraders?\b"
     r"|\bsatisf(?:y|ies|ying)\s+(?:the\s+)?(?:tests?|checkers?|checks?)\b"
     r"|\bself[\s-]?play\b|\bcoded\s+stand-ins?\b|\bembedded\s+AI\s+opponents?\b|\bfinal\s+turns?\b"
-    r"|\bsynthetic\s+training\b",
+    r"|\bsynthetic\s+training\b"
+    # §4MT: the owner-practice FORMAT (its answer line and fixture files) —
+    # a failed-on-format practice yields "end with an ANSWER: line", which
+    # wins every proof pair against a control that needed the retry
+    r"|\b(?:ANSWER|STATUS)\s*(?::|\s+line\b)|\banswer\.txt\b|\bMANIFEST\.txt\b"
+    r"|\bweb/(?:results\.json|pages)\b|\btool_result\.json\b|\bline\s+format\b",
     re.IGNORECASE)
 
 
@@ -1675,9 +1759,13 @@ class SkillMemory:
         source_request: str = "",
         generality_context: str = "",
         generality_max_share: float = 0.5,
+        replace_text: bool = True,
     ):
         """Write a lesson to the playbook. Accepts both legacy positional
         args (task/mistake/solution) and the new structured kwargs.
+        ``replace_text=False`` (§4MT) keeps a dedup hit from rewriting the
+        existing row's fix — an unproven owner-practice lesson must not
+        reach a live row's text without its proof.
         ``origin`` (§4FD) names the population that wrote it — see
         ``make_lesson``; every production caller passes it (pinned).
 
@@ -1701,6 +1789,10 @@ class SkillMemory:
         Backward-compatible: pre-existing callers ignore the return value.
         """
         if playbook_writes_blocked():        # §4KD: Slack never teaches
+            return None
+        if not producer_may_write(source):  # §4NC: only approved rules and dictation
+            logger.info("learn_lesson: %s lessons are off (§4NC) — not written: %r",
+                        source or "?", str(trigger or task or "")[:80])
             return None
         if not source_trajectory_id:
             # §4LC: a write during a turn carries the turn's id (learn_skill,
@@ -1773,7 +1865,12 @@ class SkillMemory:
             # a lesson the operator RETRACTED is not re-learned by the next
             # idle cycle (producers review: no tombstone — dream and self-play
             # re-minted retracted rules)
-            if (scope != _SCOPE_REQUEST and _normalize_trigger(effective_trigger) in self._tombstones()
+            # …but the owner re-adopting a forgotten RULE ("learn rule N",
+            # origin owner_rule) brings it back (§4NB). Keyed on the rule path,
+            # not on dictation wording (r1 MAJOR: any owner turn saying
+            # "remember…" let the model's learn_skill revive retired lessons)
+            if (scope != _SCOPE_REQUEST and str(origin or "") != "owner_rule"
+                    and _normalize_trigger(effective_trigger) in self._tombstones()
                     and not self._live_trigger(effective_trigger)):
                 logger.info("learn_lesson: %s lesson matches a retracted one — not re-learned: %r",
                             source or "?", effective_trigger[:100])
@@ -1905,8 +2002,11 @@ class SkillMemory:
                             # into dream's tesseract rule and reported saved)
                             _owner_says = bool(_dictated) and (
                                 effective_correct.strip() != str(existing.get("solution") or "").strip())
+                            # §4MT: ``replace_text=False`` (an owner-practice
+                            # lesson, unproven) never rewrites a live row
                             _replaced = _owner_says or (
-                                not _foreign and len(effective_correct) > len(existing.get("solution") or ""))
+                                replace_text and not _foreign
+                                and len(effective_correct) > len(existing.get("solution") or ""))
                             if _replaced and source_trajectory_id:
                                 # §4MI: `previous_version` is one level deep —
                                 # a second replacement used to drop the
@@ -1960,7 +2060,7 @@ class SkillMemory:
                             if domains:
                                 merged = sorted(set(existing.get("domains", [])) | set(_ensure_list(domains)))
                                 existing["domains"] = merged
-                            _set_verified = bool(verified and not existing.get("verified")
+                            _set_verified = bool(verified and replace_text and not existing.get("verified")
                                                  and (not _foreign or _owner_says))
                             # §4LC: a reinforcement is UNDONE when its turn is
                             # retracted (a refuted turn's +1 / verified made the
@@ -2150,7 +2250,7 @@ class SkillMemory:
                             # into dream's tesseract rule and reported saved)
                             _owner_says = bool(_dictated) and (
                                 effective_correct.strip() != str(existing.get("solution") or "").strip())
-                            _replaced = _owner_says or (not _foreign and _same_trigger
+                            _replaced = _owner_says or (replace_text and not _foreign and _same_trigger
                                          and len(effective_correct) > len(existing.get("solution") or ""))
                             if _replaced and source_trajectory_id:
                                 # §4MI: `previous_version` is one level deep —
@@ -2202,7 +2302,9 @@ class SkillMemory:
                                         existing["source_refs"] = refs[:20]
                                     existing["source_trajectory_id"] = \
                                         source_trajectory_id
-                            _set_verified = bool(verified and not existing.get("verified")
+                            # §4MT: an unproven re-learn (replace_text=False)
+                            # never marks a live row verified either
+                            _set_verified = bool(verified and replace_text and not existing.get("verified")
                                                  and (not _foreign or _owner_says))
                             # §4LC: a reinforcement is UNDONE when its turn is
                             # retracted (a refuted turn's +1 / verified made the
@@ -3019,6 +3121,8 @@ class SkillMemory:
         per window, structurally crushing hit_rate and mis-flagging good
         lessons as stale.
         """
+        if _lessons_withheld():          # §4NA: a probe arm with every lesson withheld
+            return []
         items, _branch = self._playbook_items_and_branch(
             query, memory_system,
             distance_threshold=distance_threshold, limit=limit,
@@ -3048,6 +3152,35 @@ class SkillMemory:
                 for p in playbook)
         except Exception:  # noqa: BLE001 — never break a write
             return False
+
+    def owner_rules(self) -> list:
+        """§4NA: the rules the OWNER adopted ("learn rule N", or approved by
+        the operator) — rendered on every owner turn by the agent, not left
+        to retrieval: measured on 86 real requests, retrieval found an
+        applicable lesson 18% of the time and never for a greeting, while
+        these two rules were the ones that changed replies. At most
+        ``OWNER_RULES_MAX``, newest last; general rows only."""
+        # r1: still RETRIEVED as before (credit, attribution, the planner's
+        # lessons) — the block is in addition; a quarantined rule is not shown
+        try:
+            fp = getattr(self, "file_path", None)
+            mt = fp.stat().st_mtime_ns if fp is not None and fp.exists() else None
+        except Exception:  # noqa: BLE001
+            mt = None
+        cached = getattr(self, "_owner_rules_cache", None)
+        if mt is not None and cached and cached[0] == mt:
+            return list(cached[1])
+        try:
+            rows = self._load_playbook()
+        except Exception:  # noqa: BLE001
+            return []
+        out = [r for r in rows if isinstance(r, dict) and r.get("origin") == "owner_rule"
+               and str(r.get("verified")).lower() == "true" and r.get("scope") != _SCOPE_REQUEST
+               and not r.get("quarantined") and (r.get("solution") or "").strip()]
+        out = out[-OWNER_RULES_MAX:]
+        if mt is not None:
+            self._owner_rules_cache = (mt, out)
+        return list(out)
 
     def _filter_quarantined(self, items):
         """Drop lessons a counterfactual regression QUARANTINED (2026-07-17).
@@ -3450,6 +3583,19 @@ class SkillMemory:
                         # Lower distance is better; higher bm25 is better.
                         combined = (1.0 - dist) + bm25 * 0.4
                         candidates.append((combined, dist, doc, meta or {}, trigger))
+                # §4MT: a PROVEN owner-practice lesson also enters when the
+                # user's request sits near the request whose failure it was
+                # learnt from (its stored embedding — no text is kept). Its
+                # trigger is about a practice drill, so trigger distance
+                # alone almost never admitted one (1 of 311 owner turns).
+                for _row, _cos in _seed_linked_matches(playbook_snapshot, memory_system, _scope_q):
+                    _st = _row.get("trigger") or _row.get("task") or ""
+                    if any(str(c[4]).strip().lower() == _st.strip().lower() for c in candidates):
+                        continue
+                    if not _scope_admits(_row, _scope_q):
+                        continue
+                    candidates.append((_cos + 0.4, 1.0 - _cos, lesson_embedding_text(_row),
+                                       {"trigger": _st}, _st))
                 if candidates:
                     candidates.sort(key=lambda t: -t[0])
                     chosen = candidates[:limit]
@@ -3549,6 +3695,9 @@ class SkillMemory:
         sub-agent façade and the dream simulator both pass it, otherwise
         their lesson sets leak into ``last_playbook_triggers`` mid-turn
         and the outcome arms book the wrong lessons."""
+        if _lessons_withheld():          # §4NA: a probe arm with every lesson withheld
+            self.last_playbook_triggers = [] if stamp_triggers else getattr(self, "last_playbook_triggers", [])
+            return ""
         # Reset the attribution side-channel UP FRONT: the empty branches
         # below return early, and without this reset a turn whose own
         # retrieval is empty would inherit the PREVIOUS turn's trigger
@@ -3815,6 +3964,27 @@ class SkillMemory:
                 out.append((raw.get("trigger") or raw.get("task") or "",
                             _lesson_scope(raw) == _SCOPE_REQUEST))
         return out
+
+    def remove_rows(self, predicate, memory_system=None) -> int:
+        """§4NB: archive and delete EXACTLY the rows `predicate` selects (not
+        the first row sharing a trigger), with their vector twins; archived
+        as an operator retraction (a tombstone). Fail closed: rows that
+        cannot be archived are kept. Returns how many were removed."""
+        if playbook_writes_blocked():        # §4KD: Slack never teaches
+            return 0
+        removed = []
+        with self._get_lock():
+            playbook = self._load_playbook()
+            hit = [r for r in playbook if predicate(r)]
+            if not hit or not self._archive_lessons(hit, "removed_by_trigger"):
+                return 0
+            ids = {id(r) for r in hit}
+            self._save_playbook_unlocked([r for r in playbook if id(r) not in ids])
+            removed = hit
+        if memory_system is not None:
+            for r in removed:
+                _delete_lesson_twin(memory_system, r)
+        return len(removed)
 
     def remove_by_trigger(self, trigger: str, memory_system=None) -> bool:
         """Delete the first lesson with a matching trigger. Returns True

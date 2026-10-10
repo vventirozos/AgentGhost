@@ -110,7 +110,9 @@ BLOCKED_PAGE_HINT = (
     "This site refused the fetch — the text below (if any) is the challenge or "
     "error page, NOT the article. Do not cite this page as a source you read. "
     "A retry from here will not pass the challenge: use a secondary source that "
-    "quotes it and attribute the claim to that source."
+    "quotes it and attribute the claim to that source. All you know of THIS "
+    "page is its search-result snippet: if you use it, say it is from a search "
+    "snippet of an unread page."
 )
 
 

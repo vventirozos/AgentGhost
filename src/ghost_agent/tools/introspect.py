@@ -813,8 +813,18 @@ def _overview_workspace(context) -> str:
         return f"Workspace (24h): unavailable ({type(e).__name__})"
 
 
+#: §4MW (replay of a real failure, 2026-10-09): "how's things?" was answered
+#: "all systems green" from an overview that contains no health check (2/2
+#: replays; two prose rules did not move it). The overview says so up front.
+OVERVIEW_HEALTH_LINE = (
+    "Health: NOT checked by this overview — nothing below is a system health "
+    "check. Only system_utility(action='check_health') reports the live checks; "
+    "without it, do not call the system healthy, green or fine.")
+
+
 async def _render_overview(self_model, context) -> str:
-    parts = [_overview_selfhood(self_model),
+    parts = [OVERVIEW_HEALTH_LINE,
+             _overview_selfhood(self_model),
              _overview_activity(context),
              await _overview_learning(context),
              await _overview_experiments(context),

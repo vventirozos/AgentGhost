@@ -122,8 +122,9 @@ PHASE_EXPECTATION = {
     "self_play": EXPECT_PERIODIC,
     "calibration": EXPECT_PERIODIC,
     "dream": EXPECT_PERIODIC,
-    "skills_auto": EXPECT_PERIODIC,
-    "router_train": EXPECT_PERIODIC,
+    # §4ND: operator switches, default off (GHOST_AUTO_SKILLS / GHOST_ROUTER)
+    "skills_auto": EXPECT_GATED,
+    "router_train": EXPECT_GATED,
     # ⚠ NOT periodic-on-a-24h-window. `negative_controls` runs on a SEVEN
     # DAY interval (evolve/negative_controls.py: INTERVAL_S = 7*24*3600),
     # so EXPECT_PERIODIC against a 24h alarm window brands a healthy weekly
@@ -169,7 +170,7 @@ PHASE_EXPECTATION = {
     # exactly the failure this registry exists to make visible — a zero
     # here means the question "is the precedent index good enough to
     # steer with yet?" has stopped being asked.
-    "imagine_gate": EXPECT_PERIODIC,
+    "imagine_gate": EXPECT_GATED,           # §4ND: GHOST_FORESIGHT, default off
     # §4DC Phase 0+1: the GEPA supply watch / live judge. ON_OUTPUT —
     # the jobs run on their own wall clock, but a ledger row is written
     # only on a TRANSITION (supply parked->ready, a retirement, an

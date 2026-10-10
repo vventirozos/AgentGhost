@@ -13,6 +13,7 @@ Two capabilities:
 from ..utils.json_store import open_append  # torn-tail-safe JSONL appends (§4MF)
 import asyncio
 import base64
+import contextlib
 import datetime
 import functools
 import inspect
@@ -53,6 +54,107 @@ _CRITIC_CALL_TIMEOUT = env_positive("GHOST_CRITIC_CALL_TIMEOUT", 120.0)
 # already been refused by, which needs saturation to be visible to the
 # caller; until then, 30 + route()'s 45 keeps the pair under 75s.
 _VERIFY_SLOT_WAIT_S = env_positive("GHOST_VERIFY_SLOT_WAIT", 30.0)
+
+# §4MX (Nova lens): a DEFERRED verdict — the reply has already shipped — has
+# no user waiting on it, so the 30 s above (sized for a caller on the critical
+# path) only turned Nova being busy into a re-run on the main model: 20 such
+# fallbacks in one replay burst, 12 owner turns queued behind them. A deferred
+# verdict waits longer for a Nova permit, never runs on main, and when Nova was
+# only BUSY (every refusal our own permit gate) it gives up: a verdict is
+# optional, and the worker leg is the same box. A node that is DOWN (connect
+# error, timeout) still falls through as before.
+import contextvars as _cv
+deferred_verdict_context: "_cv.ContextVar[bool]" = _cv.ContextVar(
+    "deferred_verdict", default=False)
+_DEFERRED_SLOT_WAIT_S = env_positive("GHOST_VERIFY_DEFERRED_SLOT_WAIT", 120.0)
+#: §4MX (Nova lens): nothing bounded deferred verdicts — during replay bursts
+#: 4-6 ran together on Nova's 4 permits (judge + claim binder each), 13 calls
+#: waited 30 s and 20 re-ran on main. Deferred critic calls now take at most
+#: DEFERRED_CRITIC_CALLS of the 4, a call nobody waits for at all (probe,
+#: replay/bench, self-play, scheduled, sub-agent, system) at most
+#: INTERNAL_CRITIC_CALLS. ⚠ NOT a reservation: worker chores (`route()`), the
+#: knowledge shadow and in-turn calls share Nova's permits (worker and critic
+#: are one box) and take them without this lane — it leaves them two of four,
+#: it cannot guarantee them one (r3 review). Per event loop (an asyncio
+#: primitive binds to one). A lane wait longer than LANE_WAIT_S counts as
+#: "Nova only busy": the verdict is skipped, not queued without end.
+DEFERRED_CRITIC_CALLS = 2
+INTERNAL_CRITIC_CALLS = 1
+LANE_WAIT_S = 600.0
+_LANE_SEMS: "dict" = {}
+
+
+class LaneBusy(Exception):
+    """The deferred lane stayed full for LANE_WAIT_S — Nova is only busy."""
+    saturated = True
+
+
+async def _acquire_by(sem: "asyncio.Semaphore", deadline: float) -> None:
+    """``sem.acquire()`` until a loop-time deadline; raises LaneBusy after.
+    A permit won in the same step as a cancel or a timeout is given back
+    (stdlib/`utils.aio.wait_for` would leak it on that race)."""
+    fut = asyncio.ensure_future(sem.acquire())
+    try:
+        done, _ = await asyncio.wait({fut}, timeout=max(0.0, deadline - asyncio.get_running_loop().time()))
+    except BaseException:
+        if fut.done() and not fut.cancelled() and fut.exception() is None:
+            sem.release()
+        else:
+            fut.cancel()
+        raise
+    if fut in done:
+        return
+    # r4: never AWAIT the abandoned acquire — a cancel of THIS task arriving
+    # there was turned into LaneBusy and lost. A permit it still wins is
+    # handed straight back.
+    fut.add_done_callback(lambda f: sem.release()
+                          if not f.cancelled() and f.exception() is None else None)
+    fut.cancel()
+    raise LaneBusy(f"deferred critic lane full for {LANE_WAIT_S:.0f} s")
+
+
+def internal_request(rid=None) -> bool:
+    """A request nobody is waiting for (`request_kind`)."""
+    from ..utils.logging import request_kind
+    return request_kind(rid) in ("probe", "background", "test", "system")
+
+
+class _critic_lane:
+    """``async with _critic_lane():`` — the deferred lane, plus the internal
+    lane for a request nobody waits for."""
+
+    async def __aenter__(self):
+        loop = asyncio.get_running_loop()
+        sems = _LANE_SEMS.get(loop)
+        if sems is None:
+            for old in [k for k in _LANE_SEMS if k.is_closed()]:
+                _LANE_SEMS.pop(old, None)
+            sems = _LANE_SEMS[loop] = (asyncio.Semaphore(DEFERRED_CRITIC_CALLS),
+                                       asyncio.Semaphore(INTERNAL_CRITIC_CALLS))
+        self._held = [sems[0]]
+        mark = deferred_verdict_context.get()
+        if (mark.get("internal") if isinstance(mark, dict) and "internal" in mark
+                else internal_request()):
+            self._held.insert(0, sems[1])
+        deadline = loop.time() + LANE_WAIT_S
+        for i, s in enumerate(self._held):
+            try:
+                await _acquire_by(s, deadline)
+            except BaseException:
+                for t in self._held[:i]:
+                    t.release()
+                raise
+        return self
+
+    async def __aexit__(self, *exc):
+        for s in reversed(self._held):
+            s.release()
+        return False
+
+
+#: §4MX operator decision "keep thinking, cap it": a thinking critic ran the
+#: full 120 s under load and returned nothing (7 calls), then re-ran on main.
+_CRITIC_THINK_MAX_TOKENS = int(env_positive("GHOST_CRITIC_THINK_MAX_TOKENS", 1024))
 
 # The verdict is a tiny JSON object — it does NOT need a reasoning model's
 # <think> prelude, and that prelude is the dominant latency on an off-host
@@ -2552,7 +2654,17 @@ class Verifier:
                 if json_only:
                     critic_payload["stop"] = ["\n"]
             else:
-                critic_payload = payload
+                critic_payload = dict(payload)
+                critic_payload["max_tokens"] = min(
+                    int(payload.get("max_tokens") or _CRITIC_THINK_MAX_TOKENS),
+                    _CRITIC_THINK_MAX_TOKENS)
+            _deferred = deferred_verdict_context.get()
+            if isinstance(_deferred, dict) and _deferred.get("nova_busy"):
+                # an earlier call of THIS verdict already found Nova only busy:
+                # stop now rather than queue another 120 s per call (§4MX r1)
+                if route_out is not None:
+                    route_out["route"] = "failed"
+                return {}
             try:
                 # ⚠ `is_background` HERE TOO. `_bounded_fallback_kwargs` was
                 # written for exactly this defect — its own test file says so:
@@ -2569,20 +2681,30 @@ class Verifier:
                 # critic's own timeout; take only the background flag.
                 _crit_kw = dict(_bounded_fallback_kwargs(self.llm_client))
                 _crit_kw.pop("timeout", None)
-                result = await self.llm_client.chat_completion(
-                    critic_payload, use_critic=True,
-                    # ⚠ NO `total_budget` HERE, DELIBERATELY. `slot_wait`
-                    # bounds only how long we QUEUE for Nova's permit; the
-                    # verdict itself keeps its full `_CRITIC_CALL_TIMEOUT`.
-                    # R5 conflated the two and silently cut this call from
-                    # 120s to 30s — against the live distribution (n=39:
-                    # median 24.4s, p90 56.7s) that failed 28.2% of verdicts
-                    # AND charged each one to Nova as a node fault, because
-                    # a ReadTimeout is a node fault. A slow verdict is not a
-                    # sick node.
-                    timeout=_CRITIC_CALL_TIMEOUT,
-                    slot_wait=_VERIFY_SLOT_WAIT_S, **_crit_kw,
-                )
+                _lane = _critic_lane() if _deferred else contextlib.nullcontext()
+                async with _lane:
+                    if isinstance(_deferred, dict) and _deferred.get("nova_busy"):
+                        # a parallel call of THIS verdict (the claim binder runs
+                        # beside the judge) found Nova busy while this one
+                        # waited in the lane (r3 review)
+                        raise LaneBusy("this verdict already found Nova busy")
+                    result = await self.llm_client.chat_completion(
+                        critic_payload, use_critic=True,
+                        # ⚠ NO `total_budget` HERE, DELIBERATELY. `slot_wait`
+                        # bounds only how long we QUEUE for Nova's permit; the
+                        # verdict itself keeps its full `_CRITIC_CALL_TIMEOUT`.
+                        # R5 conflated the two and silently cut this call from
+                        # 120s to 30s — against the live distribution (n=39:
+                        # median 24.4s, p90 56.7s) that failed 28.2% of verdicts
+                        # AND charged each one to Nova as a node fault, because
+                        # a ReadTimeout is a node fault. A slow verdict is not a
+                        # sick node.
+                        timeout=_CRITIC_CALL_TIMEOUT,
+                        slot_wait=(_DEFERRED_SLOT_WAIT_S if _deferred
+                                   else _VERIFY_SLOT_WAIT_S),
+                        **({"off_main_only": True} if _deferred else {}),
+                        **_crit_kw,
+                    )
                 text = (
                     result.get("choices", [{}])[0]
                     .get("message", {})
@@ -2610,6 +2732,25 @@ class Verifier:
                     return parsed
             except Exception as exc:
                 logger.debug("Verifier critic-pool call failed: %s", exc)
+                if _deferred and getattr(exc, "saturated", False):
+                    _first = not (isinstance(_deferred, dict) and _deferred.get("nova_busy"))
+                    if isinstance(_deferred, dict):
+                        _deferred["nova_busy"] = True
+                    try:
+                        if _first:          # one line per verdict, not per call
+                            from ..utils.logging import Icons, pretty_log
+                            _why = (str(exc) if isinstance(exc, LaneBusy)
+                                    else f"no Nova permit in {_DEFERRED_SLOT_WAIT_S:.0f} s")
+                            pretty_log(
+                                "Verifier",
+                                f"Nova busy ({_why}) — this deferred verdict is "
+                                f"skipped (not re-run on the main model)",
+                                icon=Icons.VERIFIER_LAB, level="INFO")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    if route_out is not None:
+                        route_out["route"] = "failed"
+                    return {}
 
         # Try routing to worker pool first (cheaper, different perspective).
         # `LLMClient.route()` returns the extracted content string, NOT a

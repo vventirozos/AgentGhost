@@ -88,5 +88,15 @@
   <p><code>get_context_string()</code> / <code>by_domain()</code> were computed on every tool outcome (39 live cells) but rendered NOWHERE — the docstring's "used by the planner" was aspirational. Now injected into the system-prompt continuity blocks (agent.py), gated on <code>_COMPETENCE_MIN_OBS</code> (20) total observations so a cold profile doesn't inject small-n noise, so the model can prefer a domain it's reliable in and be cautious in a weak one. Tests: <code>tests/test_memory_audit_fixes_2026_07_26.py::TestCompetenceContextString</code>. Also: saves fsync before rename.</p>
 
 </main>
+
+<h2 id="4mv">§4MV: banded rendering</h2>
+<p><code>get_context_string()</code> rides the per-request stable prompt block, so it renders bands instead of exact values:</p>
+<ul>
+  <li><code>n</code> as <code>&lt;10</code>, <code>10+</code>, <code>30+</code>, <code>100+</code>, <code>300+</code> or <code>1000+</code>;</li>
+  <li>percentages to the nearest 5%, ordered by the value SHOWN, then name (a small cell sorts by its displayed quarter — r3: two small cells swapped lines with no visible change);</li>
+  <li>a cell under n=30 as a coarse quarter (<code>~75%</code>) with no interval;</li>
+  <li>an interval that rounds to a point is omitted.</li>
+</ul>
+<p>The provisional mark uses the exact numbers. Exact counts had changed the block, and so re-prefilled the whole history after it, on every turn.</p>
 </body>
 </html>

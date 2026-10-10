@@ -100,6 +100,7 @@ class ReadOnlySkillMemory:
         "find_by_trigger", "file_path",
         "_load_playbook", "_get_lock", "_playbook_items_and_branch",
         "_filter_quarantined",
+        "owner_rules",          # §4NA r1: replays and self-play see the owner's adopted rules too
     })
 
     def __init__(self, real_sm):
