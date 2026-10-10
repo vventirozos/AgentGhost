@@ -38,7 +38,7 @@
 <main>
   <span class="eyebrow">How it works</span>
   <h1>How it improves itself</h1>
-  <p class="subtitle">Two separate things: a check that runs on every answer, and a set of background passes that only run when you've left it alone.</p>
+  <p class="subtitle">Two separate things: a check that runs on every answer, and a set of background passes that only run when you've left it alone. Since October 2026 the only thing that changes how it answers is a rule <em>you</em> approved.</p>
 
   <div class="note">
     <strong>To be clear about what this isn't.</strong> None of this retrains the language model. The model file never changes. What changes is what Ghost <em>remembers</em>, the <em>rules you have approved</em>, and a small local model it trains for scoring plans. Everything happens on your machine.
@@ -74,7 +74,7 @@
       </li>
       <li>
         <h4>Whatever happens is recorded</h4>
-        <p>A refused answer also un-learns anything it taught. If Ghost recorded a lesson during a turn whose answer got refused, that lesson is removed — otherwise a single bad turn poisons future ones.</p>
+        <p>The verdict is stored with the turn. A refused or doubtful answer of yours can be put on the list for the <a href="learning-loop.html">learning loop</a> to replay — but nothing is ever adopted on the self-check's word, because measured against the truth it is wrong too often (it confirmed an invented "all systems green" two times out of two). If a lesson was written during a refused turn it is still removed; since October 2026 Ghost no longer writes lessons for itself, so this only matters if those producers are switched back on.</p>
       </li>
     </ol>
   </div>
@@ -83,7 +83,7 @@
   <p>If the reply streams word by word, the text has already reached you by the time the check finishes. Blocking would buy nothing. So the check runs in the background and, if it refuses, you get a correction notice at the top of the <em>next</em> reply. It's not silent — but it is after the fact.</p>
 
   <h3>When you correct it yourself</h3>
-  <p>Telling Ghost it got something wrong is a much stronger signal than anything it can generate on its own, and it's treated that way: the turn gets marked as failed, and it goes into the material the background passes learn from. It needs both a recognisable correction phrase and genuine overlap with the previous message, so an ordinary follow-up question isn't mistaken for a correction.</p>
+  <p>Telling Ghost it got something wrong is a much stronger signal than anything it can generate on its own, and it's treated that way: the turn gets marked as failed. It needs both a recognisable correction phrase and genuine overlap with the previous message, so an ordinary follow-up question isn't mistaken for a correction. While you're away, a small judge also reads your next message after each answer and decides whether it showed the answer missed. Your 👎 and these corrections are what the <a href="learning-loop.html">learning loop</a> starts from: they are the only signals that can lead to a rule or a regression test.</p>
 
   <h2>Part two: what it does while you're away</h2>
 
@@ -95,7 +95,7 @@
 
   <p>So on a busy day, almost none of this runs. That's intended.</p>
 
-  <p>One consequence is easy to misread. Most phases only run while you've been idle between fifteen and sixty minutes; past that the window closes. What re-opens it is self-play finishing — it is the only phase that resets the idle clock, which is what lets a three-hour or six-hour cooldown matter at all during a long absence. Turning self-play off with <code>--no-self-play</code> therefore does far more than its name suggests: nothing re-arms the window, so after the first hour away, every other phase is gated out too and only journal consolidation keeps running. Treat that flag as "most of the idle machine off", not "self-play off".</p>
+  <p>One mechanism is easy to misread. Most phases only run while you've been idle between fifteen and sixty minutes. Past an hour that window rolls over and opens again, so during a long absence each phase gets another chance after its cooldown. Until October 2026 only self-play finishing re-opened the window, which meant <code>--no-self-play</code> quietly stopped almost everything else too; the window now rolls on its own (§4LF), and the roll never touches the clock that records when you were last active.</p>
 
   <div class="note warn">
     <strong>If you use <code>--bio-time-scale</code> to exercise these loops quickly:</strong> it now divides the phase cooldowns and the loop's own tick interval as well as the idle windows. Until 2026-08-08 it only compressed the windows — the cooldowns kept their real durations, so a phase with a three-hour cooldown could fire at most once no matter how many accelerated epochs a run claimed to cover. The helper meant to scale them existed and had a passing unit test, but nothing ever called it. Any measurement taken with this flag before that date covers roughly one epoch per phase, whatever it says.
@@ -109,7 +109,7 @@ idle ~11s     dream starts — and runs for ~60 real seconds
 idle ~71s     the 15–60s window has already closed
               self-play (no upper bound) fires and resets the idle clock
 idle 1..10s   …and round again, forever</code></pre>
-  <p>The middle of the window is never sampled, so reflection, post-mortems, skill extraction, the PRM and router retrains, calibration, the tidy pass, both narrative consolidations, stale-question surfacing and project auto-advance <strong>can never run</strong> — and they report zero firings, which reads exactly like "we measured them and they did nothing."</p>
+  <p>The middle of the window is never sampled, so post-mortems, the plan-scorer retrain, calibration, the tidy pass, both narrative consolidations, stale-question surfacing and project auto-advance <strong>can never run</strong> — and they report zero firings, which reads exactly like "we measured them and they did nothing."</p>
   <div class="note">
     <strong>Practical rule:</strong> keep the scale at <strong>20 or below</strong> (a window of at least ~2 minutes). The agent now warns loudly at boot if the scale you chose makes the window narrower than the work, and names the phases that would silently never fire. Every ablation number recorded before 2026-08-09 measured dreaming and self-play only.
   </div>
@@ -144,6 +144,7 @@ idle 1..10s   …and round again, forever</code></pre>
   </div>
 
   <h3>Two more that are off by default</h3>
+  <p>Both stay off unless you turn them on. Post-mortems still file defect reports when enabled, but the lessons they used to write are off with the other self-written lessons.</p>
   <dl class="kv terms">
     <dt>Post-mortems</dt>
     <dd>Reads the entire transcript of its worst failed runs and files a classified defect report: <em>I chose badly</em>, <em>a setting allowed this</em>, or <em>a tool is broken</em>. The last kind can carry a proposed test and patch — stored for a human to read, <strong>never applied automatically</strong>. Turn on with <code>--postmortem</code>. Since 2026-09-07 (§4FD) a turn a human marked 👎 is selected regardless of its structural severity and ranked first — the engine had run 156 idle cycles over six weeks and analysed nothing, because its severity is a blend of loop shapes and a confabulation on a clean transcript scores ~0.01 — and every analysed failure is shown its nearest <em>passing</em> sibling (same task kind, request-text overlap) as a CONTRAST block, which the literature measures as the reflection shape that improves more and breaks fewer passing cases (arXiv 2606.30840).</dd>
@@ -155,23 +156,24 @@ idle 1..10s   …and round again, forever</code></pre>
 
   <p>Every one of those passes reads the same thing: a <strong>trajectory</strong> — one JSON line per turn recording what was asked, which tools ran in what order, what came back, and how it ended. They're written append-only to <code>$GHOST_HOME/system/trajectories/</code>, redacted on the way out, and if the write fails the turn carries on regardless. A logging failure must never break a user request.</p>
 
-  <p>That one log is the input to five different consumers, each asking a different question of it:</p>
+  <p>That one log was built to feed several consumers, each asking a different question of it. In October 2026 each one was measured on real turns; most turned out not to help and are switched off (their code stays, behind a switch):</p>
 
   <div class="scroll">
   <table>
-    <thead><tr><th>Reads trajectories to ask</th><th>Produces</th></tr></thead>
+    <thead><tr><th>Reads trajectories to ask</th><th>Produces</th><th>Today</th></tr></thead>
     <tbody>
-      <tr><td>What went wrong in this turn?</td><td>A lesson.</td></tr>
-      <tr><td>What about the agent itself made this fail?</td><td>A classified defect report.</td></tr>
-      <tr><td>Which procedures keep recurring?</td><td>A new reusable skill.</td></tr>
-      <tr><td>Does a half-finished plan look like it's going somewhere?</td><td>A trained step-scorer.</td></tr>
-      <tr><td>How hard is this request likely to be?</td><td>A trained router.</td></tr>
+      <tr><td>Which of your answers did you say were wrong?</td><td>A replay case, a candidate rule for you to approve, a regression test proposal.</td><td><span class="badge good">on</span> — <a href="learning-loop.html">the learning loop</a></td></tr>
+      <tr><td>What went wrong in this turn?</td><td>A self-written lesson.</td><td><span class="badge bad">off</span> — reached its turn 18% of the time (<code>GHOST_PRODUCER_LESSONS</code>)</td></tr>
+      <tr><td>What about the agent itself made this fail?</td><td>A classified defect report.</td><td><span class="badge warn">opt-in</span> — <code>--postmortem</code></td></tr>
+      <tr><td>Which procedures keep recurring?</td><td>A new reusable skill.</td><td><span class="badge bad">off</span> — trivial sequences that quoted old requests (<code>GHOST_AUTO_SKILLS</code>)</td></tr>
+      <tr><td>Does a half-finished plan look like it's going somewhere?</td><td>A trained step-scorer.</td><td><span class="badge good">on</span></td></tr>
+      <tr><td>How hard is this request likely to be?</td><td>A trained router.</td><td><span class="badge bad">off</span> — nothing used its label (<code>GHOST_ROUTER</code>)</td></tr>
     </tbody>
   </table>
   </div>
 
-  <h3>How a skill gets extracted</h3>
-  <p>Worth spelling out, because "the agent learns new abilities" is vague and the actual rule is not:</p>
+  <h3>How a skill was extracted (switched off)</h3>
+  <p>Kept for reference — this is what <code>GHOST_AUTO_SKILLS=1</code> brings back. Worth spelling out, because "the agent learns new abilities" is vague and the actual rule is not:</p>
   <ul>
     <li>Only turns that <strong>passed</strong> are considered, and only those using <strong>two or more tools</strong> — a one-tool solve isn't a reusable procedure, it <em>is</em> the tool.</li>
     <li>Turns are grouped by the exact sequence of tools they used. A group becomes a candidate only once several <em>distinct</em> turns support it, so one lucky run can't become a skill.</li>
@@ -180,14 +182,14 @@ idle 1..10s   …and round again, forever</code></pre>
   <p>Skills are also re-tested later rather than trusted forever. A skill is only as good as the moment it was learned, and tools get renamed, libraries upgrade, and the model itself drifts. Re-verification decides whether each one stays active, gets deprecated, or is kept under watch.</p>
 
   <!-- 4KS:lessons -->
-  <h3>What makes a lesson count</h3>
-  <p>Each lesson carries a count of how often it has been learned, and that count matters: it raises the lesson's standing, and from three it can be turned into a reusable skill. The count only rises when the lesson is learned again <em>from something new</em> — a different conversation, a different practice challenge, a new failure case. Re-reading the same material and arriving at the same rule does not count. Without that, a rule could climb to the top simply because the nightly review kept re-deriving it from the same notes.</p>
+  <h3>What made a self-written lesson count (switched off)</h3>
+  <p>This applies only if <code>GHOST_PRODUCER_LESSONS=1</code> brings self-written lessons back; the rules you approve don't need it. Each lesson carries a count of how often it has been learned, and that count matters: it raises the lesson's standing, and from three it can be turned into a reusable skill. The count only rises when the lesson is learned again <em>from something new</em> — a different conversation, a different practice challenge, a new failure case. Re-reading the same material and arriving at the same rule does not count. Without that, a rule could climb to the top simply because the nightly review kept re-deriving it from the same notes.</p>
   <p>Practice lessons are also put to the test. When the agent needed more than one attempt at a practice challenge, the lesson it draws is tried immediately: the challenge is run once more with the lesson in hand. If that run fails, the lesson is thrown away — unless the run failed for a reason that has nothing to do with the lesson, such as the model being unreachable. And no lesson is drawn from a practice challenge whose own data turns out to be malformed.</p>
   <!-- /4KS:lessons -->
 
-  <h3>The two small models it trains</h3>
-  <p>Both are plain logistic regression in numpy, saved as JSON. That's a deliberate ceiling: they're trained on a few thousand of the agent's own turns, which is not enough data to justify anything bigger, and a model you can read as a list of weights is one you can debug.</p>
-  <p>The router in particular is built to fail safe — a low-confidence prediction escalates to the full pool rather than gambling on the cheap path. The worst it can do is fail to save you a call. It never blocks a request.</p>
+  <h3>The small models it trains</h3>
+  <p>The plan scorer, and the router when it is switched on, are plain logistic regression in numpy, saved as JSON. That's a deliberate ceiling: they're trained on a few thousand of the agent's own turns, which is not enough data to justify anything bigger, and a model you can read as a list of weights is one you can debug.</p>
+  <p>The router was built to fail safe — a low-confidence prediction escalates to the full pool rather than gambling on the cheap path — but it is off since October 2026: nothing downstream used its prediction.</p>
 
   <h2>It tunes its own prompts — offline, and against a baseline</h2>
 
@@ -221,7 +223,7 @@ idle 1..10s   …and round again, forever</code></pre>
     <strong>Does the tuned prompt actually help, once it's live?</strong> Until now nothing could answer that. The optimizer's decision rests entirely on a few dozen test examples checked <em>before</em> deployment; afterwards the prompt just runs, and no record connected a real turn to the prompt version that produced it — even though the code had been computing that identifier all along and discarding it. One tuned prompt served every planning turn for weeks on a result nobody could reproduce, and that was invisible for exactly this reason.
     <p>Turns now record which tuned prompt served them. But that on its own isn't enough to justify <em>removing</em> one: a new prompt goes live everywhere at once, so "things got worse after we deployed it" is confounded by everything else that changed that week. So the agent can optionally <em>withhold</em> the tuned prompt from a random share of turns and compare the two groups — which is the difference between a comparison that can support a decision and one that just looks like it can. Where that randomisation isn't switched on, the analysis says so and declines to give a number.</p>
     <p>When the withheld group does better by a clear margin, a maintenance command retires the tuned prompt — the autonomous live judge used to run it daily (off since 2026-10-10, §4ND: <code>GHOST_GEPA_AUTONOMY=1</code> turns it back on), and since the epoch-swap work the retirement takes effect within about a minute of the file being renamed &mdash; the running process notices the change and serves the hand-written prompt again, no restart needed. There's also a cooling-off period between promotions: each optimisation run is a fresh roll of the dice, so running it every week against a slowly-growing test set is really just rolling repeatedly until something passes.</p>
-    <p>Since the Phase 3 work, the agent also <em>launches</em> these optimisation runs itself: a deep-idle job picks one target per day (the tool-description gate, or one of three allow-listed prompt signatures), at most once per week per target, and simply runs the gate script and reads its exit code. All the "should we even run?" questions — enough data, recent-enough promotion, healthy upstream — already live inside the gate as cheap refusals, so the launcher adds no judgement of its own, and it can never pass any of the operator-only override flags. A promotion notifies and deploys itself within a minute; a rejection is just logged, because a gate saying no is the system working. Kill switch: <code>GHOST_GEPA_AUTO_OPTIMIZE=0</code>.</p>
+    <p><strong>Off by default since 2026-10-10 (§4ND, <code>GHOST_GEPA_AUTONOMY</code>):</strong> the self-launching described next. Tuning you start by hand works as before. Since the Phase 3 work, the agent could also <em>launch</em> these optimisation runs itself: a deep-idle job picks one target per day (the tool-description gate, or one of three allow-listed prompt signatures), at most once per week per target, and simply runs the gate script and reads its exit code. All the "should we even run?" questions — enough data, recent-enough promotion, healthy upstream — already live inside the gate as cheap refusals, so the launcher adds no judgement of its own, and it can never pass any of the operator-only override flags. A promotion notifies and deploys itself within a minute; a rejection is just logged, because a gate saying no is the system working. Kill switch: <code>GHOST_GEPA_AUTO_OPTIMIZE=0</code>.</p>
     <p><em>Nothing is switched on by default, and there is no data yet</em> — the recording started after the current agent did. The tool reports "not enough evidence", which is the correct answer and worth more than a confident one.</p>
   </div>
 
@@ -248,8 +250,10 @@ idle 1..10s   …and round again, forever</code></pre>
   <dl class="kv terms">
     <dt>"What did you do while I was away?"</dt>
     <dd>Reads the background activity ledger — which passes ran, what came out of them, over whatever window you name.</dd>
-    <dt>"What have you learned this week?"</dt>
-    <dd>Reads the lesson list back. This is a real read of stored records, not the model recalling from context.</dd>
+    <dt>"show all rules"</dt>
+    <dd>The rules you adopted, the ones waiting for you, and the forgotten ones — read from the store by Ghost itself, not recalled by the model.</dd>
+    <dt>"show regression tests"</dt>
+    <dd>Your kept and proposed tests, each with its last result.</dd>
     <dt>"Is your learning actually working?"</dt>
     <dd>Health telemetry for the learning loop itself: are lessons being used, are the retrains succeeding, is the confidence calibration fitting. This is the page to check when you suspect a subsystem has quietly stopped running.</dd>
     <dt>"What have you found broken in yourself?"</dt>
@@ -265,6 +269,7 @@ idle 1..10s   …and round again, forever</code></pre>
   </ul>
   <p>A third instrument was dead in the other direction. The arm-stamp coverage alarm exists so that a broken stamp can't hide, but its denominator was every user turn ever recorded — most of them from before the framework shipped — so a <em>total</em> stamp outage would have moved the headline from 16.8% to about 16.3%, under an "under half" warning that had been permanently on. It now reports a trailing window beside the lifetime figure, and the window is the one that raises the alarm.</p>
   <p><strong>The general rule this leaves behind:</strong> absence of evidence is evidence of absence only when the design could have found something. Any instrument that reports a null result should be able to tell you what it <em>would</em> have taken to see one.</p>
+  <p><strong>What was done about it (October 2026, §4ND).</strong> At this agent's traffic no randomised arm could reach a verdict within a useful time, so every arm is disabled. The confidence score is now used only as a <em>ranking</em> — the least confident 15% of answers get the deeper check — and no longer reported as a probability, because re-computed from raw data it was no better than guessing the base rate. The improvement signal that remains is the one that has power: your own verdict, through <a href="learning-loop.html">the learning loop</a> and its regression tests.</p>
 
   <div class="note warn">
     <strong>The characteristic failure mode here is silence.</strong> A learning pass that has stopped running looks exactly like a learning pass with nothing to do — both produce no output. If you want to know whether this machinery is alive, check <code>biological_watchdog_alive</code> on the health endpoint and ask for the activity ledger. Don't infer it from the absence of errors.
@@ -277,9 +282,9 @@ idle 1..10s   …and round again, forever</code></pre>
   <table>
     <thead><tr><th>Flag</th><th>Turns off</th></tr></thead>
     <tbody>
-      <tr><td><code>--no-dream</code></td><td>Memory consolidation. Leaves reflection and self-play running.</td></tr>
-      <tr><td><code>--no-self-play</code></td><td>Practice. Leaves the rest running.</td></tr>
-      <tr><td><code>--no-reflection</code></td><td>Reviewing failed turns.</td></tr>
+      <tr><td><code>--no-dream</code></td><td>Memory upkeep. Leaves the rest running.</td></tr>
+      <tr><td><code>--no-self-play</code></td><td>The learning loop's idle work: replaying your failures and running your regression tests. Leaves the rest running.</td></tr>
+      <tr><td><code>--no-reflection</code></td><td>Reviewing failed turns (its lessons are already off).</td></tr>
       <tr><td><code>--no-trajectories</code></td><td>Recording turns at all. This also disables reflection, since it has nothing to read.</td></tr>
       <tr><td><code>--no-verifier</code></td><td>The self-check. Not recommended outside an experiment — see below.</td></tr>
       <tr><td><code>--no-memory</code></td><td>Everything. Ghost becomes a plain chat wrapper.</td></tr>
@@ -287,8 +292,28 @@ idle 1..10s   …and round again, forever</code></pre>
   </table>
   </div>
 
+  <p>The other direction — switches that are <strong>off</strong> unless you set them to <code>1</code> (environment variables, read on every use):</p>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Switch</th><th>Brings back</th></tr></thead>
+    <tbody>
+      <tr><td><code>GHOST_PRODUCER_LESSONS</code></td><td>Self-written lessons: reflection, post-mortem, correction and memory-consolidation lessons.</td></tr>
+      <tr><td><code>GHOST_BUS_GRAPH_TIER</code>, <code>GHOST_BUS_EPISODIC_TIER</code></td><td>Graph and episode memories in every prompt (facts about you are always in).</td></tr>
+      <tr><td><code>GHOST_AUTO_SKILLS</code></td><td>Skill extraction and its prompt block.</td></tr>
+      <tr><td><code>GHOST_CODING_PRACTICE</code></td><td>Coding practice on invented exercises.</td></tr>
+      <tr><td><code>GHOST_ROUTER</code></td><td>The request router and its retrain.</td></tr>
+      <tr><td><code>GHOST_FORESIGHT</code></td><td>Tool-result predictions and the imagination gate.</td></tr>
+      <tr><td><code>GHOST_RISK_GOVERNOR</code></td><td>The risk steer.</td></tr>
+      <tr><td><code>GHOST_HYDRATION_JUDGE</code></td><td>The per-turn memory relevance judge.</td></tr>
+      <tr><td><code>GHOST_COMPETENCE_PROMPT</code>, <code>GHOST_CONF_COMPETENCE</code></td><td>The competence table in prompts / in the confidence score.</td></tr>
+      <tr><td><code>GHOST_GEPA_AUTONOMY</code></td><td>Self-launched prompt tuning and its daily judge.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Why each is off is on <a href="learning-loop.html#off">the learning loop page</a>.</p>
+
   <div class="note">
-    <strong>Why <code>--no-verifier</code> exists.</strong> When the check runs late (on a streamed answer), it can't change what you already read — its only payoff is cross-session, by scrubbing bad lessons and queueing a correction. That's a real benefit but not an obvious one, and it costs a full extra model call per turn. The flag exists so you can measure the difference rather than assume it.
+    <strong>Why <code>--no-verifier</code> exists.</strong> When the check runs late (on a streamed answer), it can't change what you already read — its only payoff is cross-session: queueing a correction and marking the turn so the learning loop can replay it. That's a real benefit but not an obvious one, and it costs a full extra model call per turn. The flag exists so you can measure the difference rather than assume it.
   </div>
 
   <div class="pager">
@@ -303,7 +328,7 @@ idle 1..10s   …and round again, forever</code></pre>
   </div>
 
   <footer>
-    <p>Checked against <code>core/agent.py</code> (the idle loop), <code>core/verifier.py</code> and <code>core/dream.py</code> on 2026-08-04. Timings are defaults and can be changed — see <a href="configuration.html">Settings that matter</a>.</p>
+    <p>Checked against <code>core/agent.py</code> (the idle loop), <code>core/verifier.py</code>, <code>core/dream.py</code>, <code>core/failure_replay.py</code> and <code>core/regression.py</code> on 2026-10-10. Timings are defaults and can be changed — see <a href="configuration.html">Settings that matter</a>.</p>
   </footer>
 </main>
 </body>
