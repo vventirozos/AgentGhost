@@ -639,6 +639,8 @@ _BLIND_STRIP = (re.compile(r"\n*_Could not verify against the sources read: [^\n
 GOLD_EVERY_DAYS = 14
 GOLD_N = 30
 GRADES = ("RIGHT", "PARTIAL", "WRONG", "FAILED-HONEST", "N/A")
+#: §4QY: the grader's kind label (the 10-21 census graded kinds, but ingest dropped them)
+GOLD_KINDS = ("image", "build", "bookkeeping", "status", "knowledge", "chat")
 #: task outcomes that are a mechanical sign the task did not get done
 BAD_TASK_OUTCOMES = frozenset({"failed", "mixed", "blocked", "made_not_shown", "never_run",
                                "last_run_failed", "no_evidence"})
@@ -671,11 +673,18 @@ assistant could see — the earlier turns and the tool results — and the world
 - **N/A**: nothing gradable (small talk). Grade correctness only: whether a
   request should have been refused is not part of this grade.
 
+Also give each item ONE `kind`, the first that applies: **image** (made or
+edited a picture), **build** (wrote or ran code), **bookkeeping** (files,
+projects, rules, memory, tasks), **status** (about the assistant itself),
+**knowledge** (facts about the world: explanations, how-to, news, products,
+versions, people, places), **chat** (anything else).
+
 Check world facts you can with web search. Never put a name, address,
 account or any other personal detail from the items into a search. Write one
 JSON object per line to the output path you were given:
-`{"id": ..., "grade": ..., "reason": "..."}`. Final message: counts per
-grade only. You do not know how the replies were produced; do not guess.
+`{"id": ..., "grade": ..., "kind": ..., "reason": "..."}`. Final message:
+counts per grade only. You do not know how the replies were produced; do not
+guess.
 """
 
 
@@ -806,12 +815,9 @@ def ingest_gold(grades_path, home=None, date: Optional[str] = None) -> dict:
     if base is None:
         return {"error": "GHOST_HOME is not set"}
     gdir = base / GOLD_DIR_REL
+    date = _gold_date(gdir, date)
     if date is None:
-        dates = sorted(p.name for p in gdir.iterdir()
-                       if p.is_dir() and not p.is_symlink() and not p.name.startswith(".")) if gdir.is_dir() else []
-        if not dates:
-            return {"error": "no gold sample drawn yet"}
-        date = dates[-1]
+        return {"error": "no gold sample drawn yet"}
     d = gdir / date
     try:
         from ..tools.file_system import read_text_nofollow     # §4GI: a listed folder, a planted link
@@ -826,13 +832,304 @@ def ingest_gold(grades_path, home=None, date: Optional[str] = None) -> dict:
             bad += 1
             continue
         counts[g] = counts.get(g, 0) + 1
+        kind = str(r.get("kind") or "").strip().lower()
         good.append({"id": r["id"], "tid": tid, "grade": g, "reason": str(r.get("reason") or "")[:500],
+                     "kind": kind if kind in GOLD_KINDS else "",
                      "graded_at": datetime.datetime.utcnow().isoformat() + "Z"})
     if not good:                       # r2 m2: a typo'd path must not wipe the grades
         return {"error": f"no gradable rows in {grades_path} ({bad} rejected) — nothing written", "rejected": bad}
     (d / "grades.jsonl").write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in good),
                                     encoding="utf-8")
-    return {"date": date, "ingested": len(good), "rejected": bad, "grades": counts, "of": len(key)}
+    kinds: Dict[str, int] = {}
+    for x in good:                     # §4QY r1 m13: a grader who skipped `kind` shows here
+        kinds[x["kind"] or "none"] = kinds.get(x["kind"] or "none", 0) + 1
+    return {"date": date, "ingested": len(good), "rejected": bad, "grades": counts, "kinds": kinds, "of": len(key)}
+
+
+# ── §4QY: why knowledge answers fail ────────────────────────────────────────
+# Every knowledge turn graded WRONG/PARTIAL lands in one bucket: A = no lookup
+# returned anything (answered from memory; read mechanically off the tool
+# rows), B = looked up, but the faulted specific is in no tool result, C = it
+# IS in a tool result (the source was wrong). B/C need a reader who sees the
+# tool results; the packets reuse the gold ids, so no second key is written.
+SPLIT_GRADES = ("WRONG", "PARTIAL")
+SPLIT_BUCKETS = ("B", "C", "OTHER")
+SPLIT_TOOL_CHARS = 50_000
+#: the owner's memory text stays at the gold sample's 1,500 (privacy parity);
+#: knowledge_base is the owner's DOCUMENTS, evidence a reader must see whole (r2 m3)
+SPLIT_MEMORY_CHARS = 1_500
+_SPLIT_CAPPED = _MEMORY_TOOLS - {"knowledge_base"}
+#: pre-registered (journal §4QY): below this share of A, a "should I look it
+#: up first?" decision is the wrong lever (§4PK fired on 3.4 %)
+SPLIT_A_FLOOR = 0.20
+SPLIT_MIN_N = 8
+SPLIT_BRIEF = """# Knowledge-failure split brief (§4QY)
+
+Each file in `pool/` is one reply an AI assistant gave its owner that a blind
+grader marked WRONG or PARTIAL; `grader_reason` says why. `tools` holds what
+each tool the assistant called RETURNED, in order; `earlier_turns` holds the
+same conversation's previous turns within the hour, with their tools — the
+assistant could see those too. `cut: true` = the text shown here is not the
+whole result. Judge every item on its own.
+
+Find the specific the grader faulted (if several, the main one) and put the
+item in ONE bucket:
+- **B**: that specific is NOT in any tool result — the reply added it beyond
+  what was read (from memory, a guess, or a misreading that changes it).
+- **C**: that specific IS in a tool result (this turn's or an earlier
+  turn's) — the reply reported its source
+  faithfully and the source was wrong, stale, or about something else.
+- **OTHER**: the fault is not a wrong specific (an omission, a different
+  question answered, a format problem), or you cannot tell — say why. A
+  `cut` result that might hold the specific counts here.
+
+Judge only against the tool results; do not search the web. Write one JSON
+object per line to the output path you were given:
+`{"id": ..., "bucket": "B" | "C" | "OTHER", "claim": "<the faulted specific, short>", "where": "<tool + short quote if C, else empty>"}`.
+Final message: counts per bucket only. You do not know how the replies were
+produced; do not guess.
+"""
+
+
+def _split_rows(grades: Path) -> List[dict]:
+    """The knowledge WRONG/PARTIAL rows of a grades file, one per id (the
+    last line for an id wins: a grader's correction, r2 m2)."""
+    last = {str(r.get("id")): r for r in _load_jsonl(grades)}
+    return [r for r in last.values() if r.get("kind") == "knowledge" and r.get("grade") in SPLIT_GRADES]
+
+
+def _grades_digest(rows: List[dict]) -> str:
+    import hashlib
+    return hashlib.sha256(json.dumps(sorted([str(r.get("id")), str(r.get("grade")), str(r.get("reason") or "")]
+                                            for r in rows)).encode()).hexdigest()
+
+
+def _gold_date(gdir: Path, date: Optional[str]) -> Optional[str]:
+    if date is not None:
+        return date
+    dates = sorted(p.name for p in gdir.iterdir()
+                   if p.is_dir() and not p.is_symlink() and not p.name.startswith(".")) if gdir.is_dir() else []
+    return dates[-1] if dates else None
+
+
+#: tools whose result is evidence about the world: the owner's documents and
+#: files count, recall (owner facts) does not (r1 M3: transcripts, weather)
+_LOOKUP_TOOLS = _RESEARCH_TOOLS | {"knowledge_base", "file_system", "system_utility", "youtube_transcribe",
+                                   "vision_analysis"}
+
+
+def _row_has_evidence(c: dict) -> bool:
+    """One stored row brought back evidence: the agent's own empty-result
+    reading (`evidence_gate`, r1 m8: "No results" or a bot-check page is no
+    evidence) where it knows the tool, else the row's class."""
+    if not isinstance(c, dict) or _tname(c) not in _LOOKUP_TOOLS:
+        return False
+    args = c.get("arguments") if isinstance(c.get("arguments"), dict) else {}
+    if _tname(c) == "system_utility" and args.get("action") != "check_weather":
+        return False                   # r2 m4: a health or location check is not world evidence
+    try:
+        from .evidence_gate import EVIDENCE_TOOLS, assess_turn_evidence
+        if _tname(c) in EVIDENCE_TOOLS:
+            return assess_turn_evidence([loop_shape(c)]).substantive > 0
+    except Exception:  # noqa: BLE001
+        pass
+    return tool_class(c) in ("ok", "partial")
+
+
+def _looked_up(t: dict, earlier: Iterable[dict] = ()) -> bool:
+    """A lookup returned evidence in this turn or in an earlier turn the
+    reply could see (r1 M2); a failed or empty search is no evidence: A."""
+    return any(_row_has_evidence(c) for u in (t, *earlier) for c in (u.get("tool_calls") or []))
+
+
+def _full_results(base: Path, days: Iterable[str]) -> Dict[tuple, dict]:
+    """(trajectory id, tool index) → the §4LH sidecar row: a trajectory row
+    keeps 4,000 chars per result, the full text lives beside it (r1 C1)."""
+    out: Dict[tuple, dict] = {}
+    for day in days:
+        for f in sorted((base / "system" / "trajectory_results" / day).glob("*.jsonl")):
+            for r in _load_jsonl(f):
+                if isinstance(r.get("index"), int):
+                    out[(str(r.get("trajectory_id")), r["index"])] = r
+    return out
+
+
+def _split_tools(t: dict, full: Dict[tuple, dict]) -> List[dict]:
+    rows = []
+    for i, c in enumerate(t.get("tool_calls") or []):
+        if not isinstance(c, dict):
+            continue
+        side = full.get((str(t.get("id")), i))
+        txt = str((side or {}).get("result") or c.get("result") or c.get("error") or "")
+        cap = SPLIT_MEMORY_CHARS if _tname(c) in _SPLIT_CAPPED else SPLIT_TOOL_CHARS
+        txt = _redact_packet(txt)
+        rows.append({"name": _tname(c), "returned": txt[:cap],
+                     "cut": len(txt) > cap or bool((side or {}).get("truncated"))
+                            or (side is None and len(str(c.get("result") or "")) >= 4000)})
+    return rows
+
+
+def _earlier_in_channel(turns: List[dict], t: dict, k: int = 3) -> List[dict]:
+    """The same conversation's previous turns within HISTORY_WINDOW_S, oldest
+    first — the window the gold packets show."""
+    now, ch = _epoch(t.get("timestamp")), _channel(t)
+    prev = sorted((u for u in turns if u is not t and _channel(u) == ch
+                   and 0 <= now - _epoch(u.get("timestamp")) <= HISTORY_WINDOW_S),
+                  key=lambda u: _epoch(u.get("timestamp")))
+    return prev[-k:]
+
+
+def draw_split(home=None, date: Optional[str] = None) -> dict:
+    """Bucket the knowledge WRONG/PARTIAL turns of a graded gold sample: A
+    mechanically, the rest into blind packets under gold/<date>/split/pool
+    with SPLIT_BRIEF beside them. Never redrawn. Returns {dir, a, drawn,
+    missing, of} or {error}."""
+    import shutil
+    import tempfile
+    base = _home(home)
+    if base is None:
+        return {"error": "GHOST_HOME is not set"}
+    gdir = base / GOLD_DIR_REL
+    date = _gold_date(gdir, date)
+    if date is None:
+        return {"error": "no gold sample drawn yet"}
+    d = gdir / date
+    out = d / "split"
+    if out.exists():
+        return {"error": f"the {date} split was already drawn: read it, or remove {out} to draw again"}
+    rows = _split_rows(d / "grades.jsonl")
+    if not rows:
+        return {"error": f"no knowledge WRONG/PARTIAL rows in the {date} grades (were they graded with a kind?)"}
+    try:
+        days = json.loads((d / "meta.json").read_text(encoding="utf-8"))["days"]
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"no window for the {date} sample: {e}"}
+    turns, _ = _owner_turns(base / "system", days)
+    by_id = {str(t.get("id")): t for t in turns}
+    full = _full_results(base, days)
+    a, drawn, missing = [], [], []
+    stage = Path(tempfile.mkdtemp(prefix=".split-", dir=d))
+    try:
+        pool = stage / "pool"
+        pool.mkdir()
+        for r in rows:
+            t = by_id.get(str(r.get("tid")))
+            if t is None:
+                missing.append(r["id"])
+                continue
+            earlier = _earlier_in_channel(turns, t)
+            if not _looked_up(t, earlier):
+                a.append(r["id"])
+                continue
+            drawn.append(r["id"])
+            (pool / f"{r['id']}.json").write_text(json.dumps({
+                "id": r["id"], "asked_on": str(t.get("timestamp") or "")[:10],
+                "earlier_turns": [{"question": _redact_packet(str(u.get("user_request") or ""))[:1500],
+                                   "reply": _redact_packet(_blind_reply(str(u.get("final_response") or "")))[:1500],
+                                   "tools": _split_tools(u, full)} for u in earlier],
+                "question": _redact_packet(str(t.get("user_request") or "")),
+                "tools": _split_tools(t, full),
+                "reply": _redact_packet(_blind_reply(str(t.get("final_response") or ""))),
+                "grader_reason": _redact_packet(str(r.get("reason") or ""))}, ensure_ascii=False, indent=1),
+                encoding="utf-8")
+        (stage / "brief.md").write_text(SPLIT_BRIEF, encoding="utf-8")
+        (stage / "meta.json").write_text(json.dumps({"a": a, "drawn": drawn, "missing": missing, "of": len(rows),
+                                                     "grades": _grades_digest(rows)}), encoding="utf-8")
+        os.replace(stage, out)
+    except BaseException:              # r1 m10: no stage folder left behind, whatever failed
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+    return {"dir": str(out), "a": len(a), "drawn": len(drawn), "missing": len(missing), "of": len(rows)}
+
+
+def split_decision(counts: Dict[str, int]) -> dict:
+    """The pre-registered rule over {A, B, C, OTHER, DISAGREE} counts: A is a
+    candidate only at SPLIT_A_FLOOR of the known buckets; the largest
+    candidate names the lever; a tie goes to B (the lever kind that has moved
+    answers here, §4OJ), then A (its first step is a silent shadow), then C."""
+    n = sum(counts.get(k, 0) for k in ("A", "B", "C", "OTHER", "DISAGREE"))
+    a_share = counts.get("A", 0) / n if n else 0.0
+    cands = {"B": counts.get("B", 0), "C": counts.get("C", 0)}
+    if a_share >= SPLIT_A_FLOOR:
+        cands["A"] = counts.get("A", 0)
+    order = ("B", "A", "C")
+    lever = (max(order, key=lambda k: (cands.get(k, -1), -order.index(k)))
+             if any(cands.values()) else None)
+    return {"n": n, "a_share": round(a_share, 3), "lever": lever, "underpowered": n < SPLIT_MIN_N}
+
+
+def ingest_split(reader_paths, home=None, date: Optional[str] = None) -> dict:
+    """Join the readers' bucket files to a drawn split. With two or more
+    readers an item counts in a bucket only when ALL of them rated it and
+    agree (DISAGREE otherwise; rated by fewer = PARTLY_READ, outside n, r1
+    M4). A reader file with no usable row is refused. Writes
+    split/result.json; returns it, or {error}."""
+    base = _home(home)
+    if base is None:
+        return {"error": "GHOST_HOME is not set"}
+    gdir = base / GOLD_DIR_REL
+    date = _gold_date(gdir, date)
+    if date is None:
+        return {"error": "no gold sample drawn yet"}
+    sd = gdir / date / "split"
+    try:
+        meta = json.loads((sd / "meta.json").read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"no split drawn for {date}: {e}"}
+    drawn = set(meta.get("drawn") or [])
+    # r1 m9 / r2 m6: grades re-ingested after the draw (ids, grade or reason) → stale
+    if _grades_digest(_split_rows(gdir / date / "grades.jsonl")) != meta.get("grades"):
+        return {"error": f"the {date} grades changed after the split was drawn — remove {sd} and draw it again"}
+    paths = [Path(p) for p in reader_paths]
+    # r2 m1: one file twice is one reader, not an agreement; two files with the
+    # same bytes may be honest agreement on a short sample, so only flagged
+    if len({p.resolve() for p in paths}) < len(paths):
+        return {"error": "the same reader file was given twice — nothing written"}
+    blobs = []
+    for p in paths:
+        try:
+            blobs.append(p.read_bytes())
+        except OSError:
+            blobs.append(None)
+    identical = len(paths) > 1 and None not in blobs and len(set(blobs)) < len(blobs)
+    readers, rejected, conflicts = [], 0, 0
+    for p in paths:
+        got, bad_ids = {}, set()
+        for r in _load_jsonl(Path(p)):
+            gid = str(r.get("id") or "")
+            b = str(r.get("bucket") or "").strip().upper()
+            if gid not in drawn or b not in SPLIT_BUCKETS:
+                rejected += 1
+            elif got.get(gid, b) != b:            # r1 m5: one reader, two buckets → that rating is void
+                bad_ids.add(gid)
+            else:
+                got[gid] = b
+        conflicts += len(bad_ids)
+        for gid in bad_ids:
+            got.pop(gid, None)
+        if not got:
+            return {"error": f"no usable rows in {p} ({rejected} rejected so far) — nothing written"}
+        readers.append(got)
+    counts = {"A": len(meta.get("a") or []), "B": 0, "C": 0, "OTHER": 0, "DISAGREE": 0,
+              "PARTLY_READ": 0, "UNREAD": 0}
+    for gid in sorted(drawn):
+        seen = [r[gid] for r in readers if gid in r]
+        if not seen:
+            counts["UNREAD"] += 1
+        elif len(seen) < len(readers):
+            counts["PARTLY_READ"] += 1
+        else:
+            counts[seen[0] if len(set(seen)) == 1 else "DISAGREE"] += 1
+    rated = counts["B"] + counts["C"] + counts["OTHER"] + counts["DISAGREE"]
+    missing = len(meta.get("missing") or [])
+    res = {"date": date, "readers": len(readers), "rejected": rejected, "conflicts": conflicts,
+           "identical_files": identical, "counts": counts,
+           "agreement": {"agreed": rated - counts["DISAGREE"], "of": rated} if len(readers) > 1 else None,
+           "missing": missing,
+           "complete": counts["UNREAD"] == counts["PARTLY_READ"] == missing == 0 and len(readers) > 1,
+           "rule": {"a_floor": SPLIT_A_FLOOR, "min_n": SPLIT_MIN_N}, **split_decision(counts)}
+    (sd / "result.json").write_text(json.dumps(res, indent=1), encoding="utf-8")
+    return res
 
 
 def _graded_sample_days(base: Path, days: float = GOLD_EVERY_DAYS) -> List[str]:
