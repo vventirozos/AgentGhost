@@ -2,7 +2,8 @@
 
 Redesign #1: a non-tool turn is NOT automatically chit-chat. A graded/factual
 query must sample near-greedy (temp low, presence_penalty=0) instead of the
-conversational temp=1.0 / presence_penalty=1.5 profile, which samples AWAY from
+conversational temp=1.0 / presence_penalty=1.5 profile (§4RG-b: now presence 0 and the factual profile
+sits on the same card set; the routing is kept), which sampled AWAY from
 the correct answer tokens.
 """
 
@@ -46,9 +47,10 @@ def test_conversational_queries_not_factual(q):
     assert _is_factual_query(q) is False
 
 
-def test_factual_turn_samples_near_greedy():
+def test_factual_turn_uses_the_card_profile():
+    # §4RG-b: was near-greedy (<= 0.3); the card gives one thinking-mode set
     sp = get_sampling_params(is_tool_turn=False, query="what is 7 times 6?")
-    assert sp["temperature"] <= 0.3
+    assert sp["temperature"] == 1.0 and sp["top_p"] == 0.95
     assert sp["presence_penalty"] == 0
     assert sp == FACTUAL_SAMPLING_PARAMS
 

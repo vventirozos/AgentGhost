@@ -1203,6 +1203,8 @@ async def isolated_replay_context(
                       "_recent_trajectories_for_correction",
                       "_census_ctx",          # §4PL: per-request prompt stash
                       "_po_carries",          # §4PO: per-request carried answers
+                      "_effort_due",          # §4RB: booked xhigh notes
+                      "_state_anchors",       # §4RC: anchored state blocks
                       "_surfaced_triggers_by_traj",
                       "_flushed_triggers_by_traj",
                       "_composed_skill_registry"):

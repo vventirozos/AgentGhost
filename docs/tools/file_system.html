@@ -167,6 +167,7 @@ SyntaxError: Unexpected identifier 't'</pre>
     <li><strong>Checkers:</strong> <code>.py</code> → in-process <code>ast.parse</code>; <code>.json</code> → <code>json.loads</code>; <code>.js/.mjs/.cjs</code> → <code>node --check</code> (skipped silently when node isn't on PATH; 10s timeout); <code>.html/.htm</code> → each inline <code>&lt;script&gt;</code> block is extracted and <code>node --check</code>ed, and a parse error is remapped from the block-local line back to the <em>HTML file</em> line (e.g. <code>line 100: Invalid shorthand property initializer</code>) so the model edits the right line. External (<code>src=</code>), <code>type=module</code>, and non-JS (<code>text/babel</code>, JSON) blocks are skipped to avoid false positives. Other extensions are not checked.</li>
     <li><strong>A fresh <code>write</code> always stands.</strong> The file is on disk either way — the agent needs to read its own broken file to fix it. The warning rides the same tool result, so the fix lands on the very next turn. <strong>A <code>replace</code> that <em>introduces</em> a syntax error does NOT stand</strong> — see the regression-rollback section below.</li>
     <li><strong>Fail-safe:</strong> any checker error returns "" — a broken checker can never fail a good write. A <code>pretty_log</code> WARNING mirrors the failure to the operator stream.</li>
+    <li><strong>The file is named as the model knows it (§4RD, 2026-10-24).</strong> node and bash print the path they were given, which is the HOST path (<code>/Users/…/Data/sandbox/webos/apps.js:8</code>). The model only knows the sandbox, so in req e2c7c7f4 it ran <code>cd /Users/…</code> in <code>execute</code> ("No such file or directory") and then <code>find /</code> to locate its own file. The host path is now replaced by the filename the tool was called with (<code>webos/apps.js:8</code>). Pins: <code>tests/test_4rd_tool_args_literal.py</code>.</li>
   </ul>
   <p>Production motivation (req EA → req 70, 2026-06-11): data.js/game.js shipped with unescaped apostrophes in single-quoted strings; four bare SUCCESS messages later the verifier confirmed a build that throws on load, and the bug cost an 807-second debugging session that still misdiagnosed it. Covered by <code>tests/test_write_syntax_check.py</code>.</p>
   <p><strong>Inline-<code>&lt;script&gt;</code> extension (2026-06-20):</strong> the single-file browser-OS benchmark builds in one turn now (a cohesive deliverable is no longer split per-feature — see <a href="projects.html">manage_projects</a>), so the whole app lives in one <code>index.html</code> with all JS inline. The <code>.js</code> checker never saw it: a one-character typo (<code>content='…'</code> written <code>content=</code> → <em>Invalid shorthand property initializer</em>) wrote a bare SUCCESS, the browser loaded a blank page, and the model spent ~760s + a thinking-loop abort re-reading 32KB chunks unable to localise it. <code>_syntax_feedback</code> now parses inline <code>&lt;script&gt;</code> blocks and names the offending HTML line at write time. Helpers <code>_inline_js_blocks</code> / <code>_node_check_source</code> / <code>_remap_node_diag</code>; covered by <code>tests/test_html_syntax_feedback.py</code>.</p>
@@ -834,7 +835,7 @@ arguments - Unterminated string", so it regenerated the same full-size write. Th
   <code>more_parts=true</code>; the last part <code>append=true</code> only. With <code>more_parts</code> a syntax error is
   noted ("More parts follow … checked when you write the LAST part"), never booked as a failure — part 1 of a
   <code>.py</code> is never complete. The last part is checked like any write
-  (<code>written_but_syntax_failed</code>). <code>tool_append_file</code>: it stays operation <code>write</code>, so every write
+  (<code>written_but_syntax_failed</code>). An <code>edit</code>/<code>replace</code> on a file still written in parts keeps its syntax note (an edit may be the step that finishes the file) but carries <code>syntax_failed_file_in_parts</code> instead, so it is not read as "the edit broke it" (§4RB r2: the xhigh escalation). <code>tool_append_file</code>: it stays operation <code>write</code>, so every write
   guard applies unchanged (sandbox containment, released projects, the projects folder); the new file is written
   tmp-then-rename; the target must exist (<code>append_target_missing</code>); a part of 200+ characters that the file
   already ENDS with is refused (<code>duplicate_append</code> — a re-send after a cut-off or a "continue" landed twice);
@@ -934,12 +935,39 @@ arguments - Unterminated string", so it regenerated the same full-size write. Th
 
   <h2 id="4oa">Cut-off loops <span class="tag">2026-10-12 &sect;4OA</span></h2>
   <p>Five of 4,592 turns had a reply stopped by the 16k-token output limit, but those five held 72 minutes of generation:
-  the model re-sent the same ~75 KB file from the top, cut at the same point each time. Now: after one cut, the rest of the
-  request's replies are capped at 8k tokens (a repeat cut costs ~2 min); the cut note says which cut-off this is, the minutes
+  the model re-sent the same ~75 KB file from the top, cut at the same point each time. Now: <s>after one cut, the rest of the
+  request's replies are capped at 8k tokens</s> (removed by <a href="#4rf">&sect;4RF</a>: every reply keeps 16k); the cut note says which cut-off this is, the minutes
   spent, and for a cut list how many items it holds, how many repeat, and the numbers the request named; a cut restart of a
   file in parts that is not clearly longer than the saved parts is refused with the way forward; a turn a guard ends says
   which guard and why instead of "ran out of budget"; and the edit-churn brake treats a failing run as the verification it
   is. Pins: <code>tests/test_4oa_long_turns.py</code>.</p>
+
+  <h2 id="4rf">A cut inside the thinking is named as the limit <span class="tag">2026-10-25 &sect;4RF</span></h2>
+  <p>A live WebOS turn on Qwen3.8-27B thought for 16,252 tokens (51,214 characters, the whole app drafted inside its
+  thinking), hit the 16k-token output limit (<code>stop: length</code>) and produced no answer and no tool call. The
+  continuation for cut answers needs visible text, so the turn fell through to the stall branch: the log said
+  "Model stalled after thinking" and the model was told it had "stopped abruptly". Now a <code>length</code> stop with
+  only thinking logs <code>Cut off at the output limit while thinking (N chars of thinking, no answer)</code>, and the
+  retry is told the real cause: the limit was hit while thinking, and how to write a file in parts (<code>cut_in_thinking_message</code> plus the
+  &sect;4OA cut note: which cut-off this is and the minutes the cuts took). Nothing caps or shortens the thinking
+  (the model card says lower effort can make agentic tasks slower); a reply that stops on its own with only thinking is
+  still a stall.</p>
+  <p><strong>The cut thinking is kept as the draft</strong> (operator: "go with option 1"). History keeps no thinking, so
+  the retry used to start from nothing: DB's 51 KB of planned app was gone and the rebuilt app had a different app list.
+  Now the alert carries the cut thinking verbatim between <code>----- YOUR DRAFT …</code> and
+  <code>----- END OF YOUR DRAFT -----</code>, with "Do not plan it again: build on it". It stays in the request's history
+  (append-only, so read once, ~2 min for 16k tokens at ~142 tok/s), so every later part and a second cut see every draft;
+  it is never stored in the session (only the user's messages and the final reply are). Log:
+  <code>Retrying with the thinking kept as the draft</code>. Pinned through <code>handle_chat</code> at the production
+  history budget (174,000): with the test default (4,000) compaction drops the first draft.</p>
+  <p><strong>No lower limit after a cut</strong> (operator: "remove the step-down altogether and keep 16k for
+  everything"). &sect;4OA capped every reply after a cut at 8k tokens. Measured on Qwen3.8 (2,788 replies): thinking p99
+  1,094 tokens at medium, the largest non-drafting reply 3,448; all six cuts were inside the thinking, and in two
+  requests (5A, 6F) the 8k replies after the first cut were cut again inside the thinking: three cuts, ~18 min. <code>max_tokens_after_cut_offs</code> and <code>LENGTH_STOP_RETRY_MAX_TOKENS</code> are
+  removed; every reply keeps 16k (<code>DEFAULT_TOOL_TURN_MAX_TOKENS</code>). 16k itself stays: 5&times; the largest
+  normal reply, and a larger limit only makes a drafting reply fail later (~23 tok/s: 32k = ~24 min). The system's
+  continuation rounds for a cut write (&sect;4OB, thinking off) keep their own 8k. Pins:
+  <code>tests/test_4rf_cut_in_thinking.py</code>, <code>tests/test_4oa_long_turns.py</code>.</p>
 
   <h2 id="4ob">A cut write is continued automatically <span class="tag">2026-10-12 &sect;4OB</span></h2>
   <p>The model cannot know a file's length before writing it, so the parts protocol (decide <code>more_parts</code> up
@@ -948,7 +976,7 @@ arguments - Unterminated string", so it regenerated the same full-size write. Th
   round the model is shown the request and the file's head and tail — thinking off, no tools — and asked for only the text
   that follows; each answer is appended through the append tool's guards until the end marker
   <code>&lt;&lt;&lt;END OF FILE&gt;&gt;&gt;</code>; a round that restarts the file, repeats its tail or is prose is
-  dropped (two abort); bounded by 6 rounds of 8k tokens and the request's time budget. The model sees one result: "Wrote N
+  dropped (two abort); bounded by 6 rounds of 8k tokens and the request's time budget (§4RK: 480 s per round and 1,500 s in all — the 27B generates ~23 tok/s, so a full round is ~356 s before its prefill; the old 300 s could not finish one). The model sees one result: "Wrote N
   bytes in K parts — continued automatically". If the rounds run out the file stays in progress with the usual note.
   Log line: <code>write continued</code>. Pins: <code>tests/test_4ob_write_continuation.py</code>.</p>
   <p><strong>Two guards from the first live probe.</strong> A 300-fact page was cut with ~1,000 facts already saved; six

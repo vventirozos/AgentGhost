@@ -150,6 +150,7 @@ ICON_CLASS = {
 
     # --- raw thinking (the floor) ---
     "🧠": "think",
+    "🔋": "think",    # BRAIN_EFFORT (§4RB)
     "💭": "think",
     "💬": "think",
     "🤖": "think",

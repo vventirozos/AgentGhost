@@ -185,7 +185,7 @@ class TestAdaptiveSampling:
     def test_sampling_params_vary_by_task(self):
         """Coding sub-classification stays wired but all sub-profiles are now
         pinned to the model-card coding values (2026-06-22), so every coding
-        turn — creative / precise / balanced — runs at temp 0.6. Only the
+        turn — creative / precise / balanced — runs at temp 1.0 (§4RG). Only the
         coding-vs-general split varies. Non-coding tool turns also use the base
         coding profile (the fix for over-eager duplicate setter calls).
         """
@@ -197,15 +197,18 @@ class TestAdaptiveSampling:
         non_coding_tool = get_sampling_params(True, "update the user profile with the name")
 
         # All coding sub-profiles collapse to the same model-card values.
-        assert creative["temperature"] == precise["temperature"] == balanced["temperature"] == 0.6
+        assert creative["temperature"] == precise["temperature"] == balanced["temperature"] == 1.0
         # The coding-vs-general split still holds.
-        assert general["temperature"] > creative["temperature"]
+        # §4RG/§4RG-b: every thinking-mode profile sits on the card's one set
+        # (temp 1.0, presence 0); the routing stays wired for a measured deviation
+        assert general["temperature"] == creative["temperature"] == 1.0
+        assert general["presence_penalty"] == creative["presence_penalty"] == 0
         # Non-coding tool turn must NOT get the warm conversational profile
         # (that was the bug — `update_profile` calls at temp 1.0 were
         # re-issued in subsequent turns). Must match the base coding profile.
-        assert non_coding_tool["temperature"] == 0.6
+        assert non_coding_tool["temperature"] == 1.0
         assert non_coding_tool["presence_penalty"] == 0
-        assert non_coding_tool["temperature"] < general["temperature"]
+        assert non_coding_tool["presence_penalty"] == general["presence_penalty"] == 0
 
     def test_non_coding_ignores_query(self):
         """Conversational turns (is_tool_turn=False) always return the

@@ -162,7 +162,7 @@ class TestNonThinkingSamplingProfiles:
             GENERAL_SAMPLING_PARAMS,
         )
         assert CODING_SAMPLING_PARAMS == {
-            "temperature": 0.6,
+            "temperature": 1.0,     # §4RG: Qwen3.8 card thinking-mode value
             "top_p": 0.95,
             "top_k": 20,
             "min_p": 0,
@@ -173,7 +173,7 @@ class TestNonThinkingSamplingProfiles:
             "top_p": 0.95,
             "top_k": 20,
             "min_p": 0,
-            "presence_penalty": 1.5,
+            "presence_penalty": 0,     # §4RG-b: card thinking-mode value (was the instruct 1.5)
         }
 
 

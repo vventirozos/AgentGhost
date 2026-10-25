@@ -114,7 +114,15 @@ def test_cancelled_error_is_recorded_and_re_raised():
     h = hs[0]
     assert any(isinstance(s, ast.Raise) and s.exc is None for s in h.body), "must re-raise bare"
     kw = {k.arg: k.value for k in _records(h)[0].keywords}
-    assert isinstance(kw["reason"], ast.Constant) and "cancelled" in kw["reason"].value
+    reason = kw["reason"]
+    # §4RD-c: a turn the owner already stopped is booked as a Stop; any other
+    # cut keeps the interruption marker — both reasons say "cancelled"
+    branches = [reason.body, reason.orelse] if isinstance(reason, ast.IfExp) else [reason]
+    assert all(isinstance(b, ast.Constant) and "cancelled" in b.value for b in branches)
+    marker = kw["marker"]
+    assert isinstance(marker, ast.IfExp) and ast.unparse(marker.test) == ast.unparse(reason.test)
+    assert isinstance(marker.body, ast.Constant) and marker.body.value == "[ATTEMPT_ABORTED_TURN]"
+    assert ast.unparse(marker.orelse) == "interruption_marker(req_id)"
 
 
 def test_stop_button_cancel_is_recorded_before_it_returns():

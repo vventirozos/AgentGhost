@@ -87,14 +87,14 @@ def test_handle_chat_delegates_to_the_method():
     assert "_dispatch_and_process_tool_batch(_ts)" in src
     # the pipeline body moved out — its landmarks must be gone from handle_chat
     assert "pending_idempotent = set()" not in src
-    assert "SYSTEM 3 PIVOT" not in src
+    assert "Recovery Plan #{pivot_num}" not in src          # §4RI: the pivot's landmark is its log title
 
 
 def test_method_carries_the_pipeline_landmarks():
     src = inspect.getsource(GhostAgent._dispatch_and_process_tool_batch)
-    for marker in ("pending_idempotent = set()", "SYSTEM 3 PIVOT",
-                   "Failure Cap",  # was "Loop Breaker" (title de-collided 2026-07-24)
-                   "unescape_xml_values"):
+    for marker in ("pending_idempotent = set()", "Recovery Plan #{pivot_num}",   # §4RI: was "SYSTEM 3 PIVOT"
+                   "Failure Cap"):  # was "Loop Breaker" (title de-collided 2026-07-24)
+                   # "unescape_xml_values" left with the blanket decode (§4RD)
         assert marker in src, f"pipeline landmark missing: {marker}"
     # the two rewritten control-flow statements
     assert "return True  # was `break`" in src

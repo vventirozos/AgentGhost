@@ -415,11 +415,11 @@ def _strip_cdata_envelope(content: str) -> str:
 def _try_html_unescape_rescue(content: str, ext: str) -> str:
     """If `content` fails to parse and contains HTML entities, try
     decoding them — but only commit the decode if the decoded content
-    ACTUALLY parses. This is the other half of the XML-leak-through
-    case: the LLM emits ``&quot;`` / ``&amp;`` inside a parameter body
-    and the tool-call parser's ``unescape_xml_values`` post-pass misses
-    it (edge cases: arguments that couldn't be round-tripped through
-    ``json.loads``, e.g. trailing garbage in the XML tool call).
+    ACTUALLY parses. The XML-leak-through case: the LLM emits
+    ``&quot;`` / ``&amp;`` inside a parameter body. Tool arguments are
+    otherwise passed through literally (§4RD removed the blanket
+    decode that corrupted real entities), so this parse-gated rescue is
+    the only decode a written .py file gets.
 
     Only fires for Python (``ext == "py"``) so the gate is meaningful —
     other languages have different syntactic shapes that ``ast.parse``

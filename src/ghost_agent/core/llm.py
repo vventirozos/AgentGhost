@@ -177,6 +177,30 @@ def _disable_thinking(node_payload: Dict[str, Any]) -> None:
     node_payload["chat_template_kwargs"] = kw
 
 
+#: §4QZ: probe arm → the chat template's `reasoning_effort` (Qwen3.8-27B:
+#: xhigh / medium / low; a template without the variable ignores it, so the
+#: 35B is unaffected). Probes only: production keeps the server's default.
+EFFORT_ARMS = {"effort_low": "low", "effort_medium": "medium", "effort_xhigh": "xhigh"}
+
+
+def with_probe_effort(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """The payload for the MAIN server: unchanged (the same object) unless
+    this request is a probe on an effort arm, then a copy whose
+    `chat_template_kwargs` carry that `reasoning_effort` — `setdefault`, so a
+    caller's own kwargs win, and a thinking-off turn stays thinking-off."""
+    try:
+        from ..utils.logging import prompt_arm
+        level = EFFORT_ARMS.get(prompt_arm())
+    except Exception:  # noqa: BLE001
+        level = None
+    if not level or not isinstance(payload, dict):
+        return payload
+    kw = payload.get("chat_template_kwargs")
+    kw = dict(kw) if isinstance(kw, dict) else {}
+    kw.setdefault("reasoning_effort", level)
+    return {**payload, "chat_template_kwargs": kw}
+
+
 def compute_tor_proxy(url: str, tor_proxy: Optional[str]) -> Optional[str]:
     """Decide whether traffic to ``url`` must egress via Tor.
 
@@ -3260,7 +3284,7 @@ class LLMClient:
                 if timeout is not None:
                     kwargs["timeout"] = timeout
                 async with self._main_node_lock:
-                    resp = await self.http_client.post("/v1/chat/completions", json=payload, **kwargs)
+                    resp = await self.http_client.post("/v1/chat/completions", json=with_probe_effort(payload), **kwargs)
                 resp.raise_for_status()
                 # A 200 with an empty / non-JSON body crashed here as
                 # `json.JSONDecodeError: Expecting value: line 1 column 1 (char
@@ -4150,7 +4174,9 @@ class LLMClient:
                             self._node_slot(node,
                                             wait_timeout=_gate_wait(_untried)))
                     # We use stream() to keep the connection open and read chunks.
-                    req = client_to_use.build_request("POST", "/v1/chat/completions", json=payload)
+                    req = client_to_use.build_request(
+                        "POST", "/v1/chat/completions",
+                        json=payload if node is not None else with_probe_effort(payload))   # §4QZ: main only
                     self._inflight_inc(_base)
                     _stack.callback(self._inflight_dec, _base)
                     _conc_at_send = self._own_inflight(_base)

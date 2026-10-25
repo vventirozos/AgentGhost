@@ -48,17 +48,20 @@ class TestFinalTextAssembly:
         assert ts.final_ai_content == expected
 
 
-# ── D14: argument un-escaping recurses through lists and dicts ────────────────
+# ── D14 (§4RD, inverted): arguments are NOT un-escaped ───────────────────────
+# The blanket html.unescape pass corrupted real entities (req e2c7c7f4); the
+# arguments reach the tool literally — see tests/test_4rd_tool_args_literal.py.
 @pytest.mark.asyncio
-async def test_xml_unescape_recurses_and_keeps_non_strings():
+async def test_arguments_reach_the_tool_literally():
     agent = _dispatch_agent(); seen = {}
 
     async def t(**kw):
         seen.update(kw); return "ok"
     agent.available_tools = {"t": t}
-    ts = _ts(tool_calls=[_call("t", {"a": ["&amp;", {"k": "&lt;"}], "n": 1, "d": {"k": "&gt;"}, "s": "&quot;"})])
+    args = {"a": ["&amp;", {"k": "&lt;"}], "n": 1, "d": {"k": "&gt;"}, "s": "&quot;"}
+    ts = _ts(tool_calls=[_call("t", args)])
     await agent._dispatch_and_process_tool_batch(ts)
-    assert seen == {"a": ["&", {"k": "<"}], "n": 1, "d": {"k": ">"}, "s": '"'}
+    assert seen == args
 
 
 # ── D5 / D16 / D18: the three synthetic-error branches keep the batch going ──

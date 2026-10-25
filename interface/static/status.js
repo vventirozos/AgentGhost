@@ -140,6 +140,8 @@ export function initStatus(_ctx) {
             healthFailNote = _healthFailureNote(e);
         }
         window.__ghostHealth = health;
+        // §4RB: every health result, for readers outside this module (effort.js)
+        try { window.dispatchEvent(new CustomEvent('ghost-health', { detail: health })); } catch (_) { /* old browser */ }
         await pollInterfaceHealth();
         applyToChip();
         feedFace();

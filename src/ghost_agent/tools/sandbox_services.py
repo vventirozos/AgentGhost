@@ -76,7 +76,8 @@ async def tool_manage_services(action: str = None, name: str = None,
         defers to a DECLARED status precisely so a tool that quotes a crash
         can say "that crash is not mine". The supervisor signals its own
         failures with an `Error:` head (services.py: exited immediately,
-        workdir missing, port reserved, already running, launch failed).
+        workdir missing, port reserved, launch failed). "Already running"
+        is a `Note:` since §4RI — information, declared ok, no strike.
         """
         from .outcome import ToolOutcome
         # If the supervisor already SAID, keep its answer. Classifying by an
@@ -93,8 +94,9 @@ async def tool_manage_services(action: str = None, name: str = None,
         if _t.lstrip().startswith(("Error:", "ERROR:")):
             # REJECTED, not FAILED. Every remaining `Error:` return in the
             # supervisor is a VALIDATION refusal that launched nothing —
-            # "no service named X", "port is reserved", "already running",
-            # "workdir does not exist … Nothing was launched". The three
+            # "no service named X", "port is reserved", "workdir does not
+            # exist … Nothing was launched" ("already running" is a Note:
+            # since §4RI, booked ok). The three
             # paths that actually spawned a process, and the two bind
             # failures, all declare `ToolOutcome.failed` themselves and are
             # passed through above. Booking a refusal FAILED armed the

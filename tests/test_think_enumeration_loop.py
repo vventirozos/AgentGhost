@@ -84,7 +84,9 @@ def test_tight_budget_carries_anti_enumeration_rule():
     assert "SINGLE next one" in THINK_BUDGET_TIGHT
 
 
-def test_tight_budget_still_caps_sentences():
-    """The original 5-sentence cap must survive the anti-enumeration
-    additions — it's the baseline defense."""
-    assert "Maximum 5 sentences" in THINK_BUDGET_TIGHT
+def test_tight_budget_no_longer_caps_sentences():
+    """§4RK: the 5-sentence cap (Qwen3.5/3.6) is gone — Qwen3.8's depth is the
+    server's reasoning_effort; the anti-enumeration rule is the defense that
+    stays (the test above)."""
+    assert "sentences" not in THINK_BUDGET_TIGHT
+    assert "then act" in THINK_BUDGET_TIGHT

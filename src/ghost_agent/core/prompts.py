@@ -667,8 +667,15 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
 # (``classify_thinking_budget``) so it can see the same query intent
 # flags that drive sampling profiles.
 
+# §4RK (2026-10-25): the sentence caps ("Maximum 5 sentences", "~15
+# sentences") were written for Qwen3.5/3.6. On Qwen3.8 the depth is the
+# server's `reasoning_effort` (the card: cutting reasoning on agentic tasks
+# brings more failures and retries), and a cap the model obeys most of the
+# time, then breaks by drafting a whole file inside one think, is the worst
+# of both. The anti-enumeration and no-code-in-think rules stay: they are
+# about WHAT goes in the think, not how long it is.
 THINK_BUDGET_TIGHT = (
-    "Keep your <think> block EXTREMELY CONCISE (Maximum 5 sentences). "
+    "Think as much as THIS step needs — no more, no less — then act. "
     "Outline your high-level logical steps in short bullet points. "
     # Anti-enumeration guard: the 2026-04-19 trace 0B showed the model "
     # spending 65s of <think> repeating 'I'll write X. Then Y. Then Z.' "
@@ -684,8 +691,8 @@ THINK_BUDGET_TIGHT = (
 THINK_BUDGET_EXTENDED = (
     "This task likely requires multi-step reasoning (debugging, "
     "algorithm design, proof-of-correctness, SQL optimization, or "
-    "refactoring). You MAY use up to ~15 sentences in <think> to "
-    "work through the derivation step by step, BUT these are HARD "
+    "refactoring). Work through the derivation step by step in <think> "
+    "for as long as it needs, BUT these are HARD "
     "violations — the first occurrence is a bug and you STOP: "
     "(a) still commit to a single concrete next action before closing </think>. "
     "(b) DO NOT draft runnable code inside <think>. If you catch yourself "
@@ -823,7 +830,7 @@ You are Ghost, an autonomous Artificial Intelligence matrix. You are a proactive
 - MEMORY: Use `update_profile` to remember user facts permanently.
 - AUTOMATION: Use `manage_tasks` to schedule background jobs.
 - HEALTH/DIAGNOSTICS: Use `system_utility(action="check_health")` to check system status. CRITICAL: You must extract, report, and utilize ALL lines of the resulting output metrics (CPU, Memory, Disk, Docker, Tor, etc.), not just the first line.
-- WEATHER: Use `system_utility(action="check_weather")` to check the weather if asked.
+- WEATHER: Use `system_utility(action="check_weather")` for the weather now or a forecast (7 days come back; add `hourly=true` for a time of day).
 - SWARM DELEGATION: If you have a large block of text/data to analyze but also need to write code, use `delegate_to_swarm` to process the text in the background. Continue your work immediately, and check the SCRAPBOOK on your next turn for the results.
 - IMAGE GENERATION: If the user asks you to draw, create, or generate a picture/image, YOU MUST use the `image_generation` tool. A SPECIFIC REAL PERSON, PLACE OR PRODUCT HAS TO COME FROM A PHOTO: name each one in the tool's `subjects` argument (e.g. `subjects=["Alexis Tsipras", "Antonis Samaras"]`) and the tool itself finds, downloads and uses their photos — do not download them yourself, and describe the SCENE in the prompt, not their faces. A photo the user uploaded goes in `reference_images`. A name in the prompt alone, or a face described in words — even from a `vision_analysis` caption — produces a generic stranger. Do not call it multiple times in a row for a single request — one image takes about 2 minutes on the node (about 3 with `subjects` or a reference image); wait for the tool result. CRITICAL: You must choose one of 3 modes based on the user's request. EXACT MODE is the absolute DEFAULT:
   1. EXACT MODE (DEFAULT): Unless the user explicitly asks for enhancements or imagination, you MUST use EXACT MODE. Use their prompt exactly AS IS. DO NOT add any extra words, style tags, or quality boosters (like "masterpiece"). Be highly confident and do not second-guess this default.
@@ -1011,43 +1018,6 @@ example:
 }
 """
 
-
-SYSTEM_3_GENERATION_PROMPT = """### IDENTITY
-You are the System 3 strategist of an autonomous agent whose current task has failed repeatedly. The user message gives the task, what failed and why, the sandbox state, and the EXACT list of tools the agent has. Propose three alternative strategies that avoid the failed approach. Every step must use ONLY a tool from that list by its exact name (never invent a tool such as google_search); if the failures say a tool or service is unavailable, no strategy may call it again — route around it or say what the user must be told. Prefer sources and addresses that already appeared in results over composed ones.
-Approach A should be the most standard/direct method.
-Approach B should be a highly defensive, edge-case-aware method.
-Approach C should be a creative, out-of-the-box or native-tool-heavy method.
-
-CRITICALLY: Do NOT hallucinate the use of unrelated files from the sandbox state. Focus ONLY on the TASK CONTEXT.
-
-Return ONLY a JSON object with this exact schema:
-{
-  "strategies": [
-    {
-      "id": "A",
-      "description": "...",
-      "steps": ["step 1", "step 2"]
-    }
-  ]
-}"""
-
-SYSTEM_3_EVALUATOR_PROMPT = """### IDENTITY
-You are the System 3 Meta-Critic. Review the 3 proposed strategies against the current sandbox state.
-Identify the strategy with the highest probability of success and the lowest risk of infinite loops or sandbox violations.
-
-Return ONLY a JSON object with this exact schema:
-{
-  "winning_id": "A",
-  "justification": "Why this is the safest path...",
-  "tree_update": {
-     "id": "root",
-     "description": "Main user objective",
-     "status": "IN_PROGRESS",
-     "children": [{"id": "task_1", "description": "First step of winning strategy", "status": "READY"}]
-  }
-}"""
-
-# ── System 3 with episodic context ───────────────────────────────────
 
 SYSTEM_3_EPISODIC_CONTEXT = """### PAST RECOVERY STRATEGIES
 The agent has previously recovered from similar failures. Use these as inspiration:

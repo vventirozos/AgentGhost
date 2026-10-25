@@ -166,15 +166,15 @@ def test_a_stop_pressed_mid_round_ends_the_round_now(tmp_path):
 
 def test_the_completion_result_carries_the_cap_note(tmp_path):
     """Fails where the model finished a continued file and never learned that
-    its later replies stay capped at 8k (review C MAJOR)."""
+    it was cut, from the cut note (review C MAJOR; the 8k cap it named is gone, §4RF)."""
     class Done:
         async def chat_completion(self, payload, timeout=None, task_label=""):
             return {"choices": [{"message": {"content": "]\n" + W.END_MARKER}, "finish_reason": "stop"}]}
     ctx = _Ctx(tmp_path)
     ctx.llm_client = Done()
     r = asyncio.run(W.continue_cut_write(ctx, "g.py", _saved(ctx, "g.py", "x = [\n    1,\n"), ask="a list",
-                                         cap_note="\nThis is cut-off #1 — later replies are limited to ~8k tokens."))
-    assert "the file is complete." in str(r) and "later replies are limited to ~8k tokens" in str(r)
+                                         cap_note="\nThis is cut-off #1 in this request — send parts of at most ~15 KB."))
+    assert "the file is complete." in str(r) and "This is cut-off #1 in this request" in str(r)
 
 
 def test_a_parts_write_logs_a_deferred_syntax_check_not_an_error(tmp_path, capsys):

@@ -325,6 +325,49 @@ footer#input-area-wrapper {
     animation: slideInLeft 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
 #turn-status.hidden { display: none; }
+
+/* §4RB: reasoning-effort selector beside the mic/send buttons. A grey bars
+   icon (operator 10-24): hollow bars = Default, 1/2/3 filled = Low/Med/X-high.
+   The native select sits invisibly over the icon (a tap opens the system
+   picker); the icon reads its value with :has(option:checked), and the wrap
+   hides whenever effort.js hides the select. */
+#effort-wrap {
+    position: relative;
+    flex-shrink: 0;
+    width: 28px;
+    height: 28px;
+    align-self: center;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+    color: rgba(255, 255, 255, 0.38);
+    transition: color 0.15s ease, background-color 0.15s ease;
+}
+#effort-wrap:has(#effort-select.hidden) { display: none; }
+#effort-wrap:hover,
+#effort-wrap:has(#effort-select:focus-visible) { color: rgba(255, 255, 255, 0.72); background-color: rgba(255, 255, 255, 0.05); }
+#effort-wrap:has(#effort-select:focus-visible) { outline: 1px solid var(--accent-color); outline-offset: 1px; }
+#effort-icon rect { fill: currentColor; fill-opacity: 0; stroke: currentColor; stroke-width: 1; }
+#effort-wrap:has(option[value="low"]:checked) .b1,
+#effort-wrap:has(option[value="medium"]:checked) :is(.b1, .b2),
+#effort-wrap:has(option[value="xhigh"]:checked) rect { fill-opacity: 1; }
+#effort-select {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    opacity: 0;
+    border: none;
+    -webkit-appearance: none;
+    appearance: none;
+    font-size: 16px;   /* iOS zooms on focus below 16px */
+    cursor: pointer;
+}
+#effort-select option { background: var(--bg-color); color: var(--text-color); }
+#effort-select.hidden { display: none; }
 #turn-status-clock {
     flex-shrink: 0;
     font-family: var(--font-mono);
@@ -362,6 +405,12 @@ footer#input-area-wrapper {
     gap: 16px;
     width: 100%;
     max-width: 750px;
+    /* 2026-10-25 (operator: the phone composer buttons "seem to overlap"):
+       content-box made the pill 100% + 28px padding + 2px border — 30px
+       wider than the footer's content box, centred by the footer's
+       align-items so it spilled 15px past each side (5px from a phone's
+       screen edge; 786px against the 750px max on desktop). */
+    box-sizing: border-box;
     background: rgba(14, 9, 24, 0.62);
     border: 1px solid rgba(75, 26, 122, 0.4);
     border-radius: 30px;
@@ -567,22 +616,53 @@ body.zen-mode .icon-btn:hover {
     }
 
     footer#input-area-wrapper {
-        padding: 0 20px 24px 20px;
-    }
-
-    #input-area {
-        border-radius: 24px;
-        padding: 8px 8px 8px 20px;
+        padding: 0 12px 12px 12px;
+        padding-bottom: max(12px, env(safe-area-inset-bottom));
+        padding-left: max(12px, env(safe-area-inset-left));
+        padding-right: max(12px, env(safe-area-inset-right));
         gap: 12px;
     }
 
-    #chat-input {
-        font-size: max(1rem, 16px);
+    /* Phone composer (2026-10-25, operator: the three buttons "seem weird on
+       mobile (iphone) like they are overlapping"). Measured at 375px: the
+       text field had 175px, beside a 52px mic, a 28px effort icon centred
+       on its own axis and a 44px send at flex-end — three sizes on three
+       baselines. Now two rows inside the pill: the text field takes the
+       whole first row; the controls sit under it on one row, same 40px
+       targets as the phone header — mic and effort on the left, send on
+       the right (margin-left: auto, so the row keeps its shape when the
+       effort switch is off and #effort-wrap is display:none).
+       Pinned (rendered, WebKit) in tests/test_interface_composer_mobile.py. */
+    #input-area {
+        flex-wrap: wrap;
+        align-items: center;
+        border-radius: 24px;
+        padding: 4px 8px 8px 8px;
+        gap: 2px 8px;
     }
 
-    #send-btn {
-        width: 44px;
-        height: 44px;
+    #chat-input {
+        flex: 1 1 100%;
+        font-size: max(1rem, 16px);
+        padding: 10px 10px 8px 10px;
+    }
+
+    /* #input-area prefix: the base #mic-btn rule sits LATER in this file at
+       the same specificity and kept the mic at 52px (caught by the rendered pin). */
+    #input-area #mic-btn,
+    #input-area #send-btn,
+    #input-area #effort-wrap {
+        width: 40px;
+        height: 40px;
+        align-self: center;
+    }
+
+    #input-area #effort-wrap {
+        border-radius: 50%;
+    }
+
+    #input-area #send-btn {
+        margin-left: auto;
     }
 }
 
@@ -2291,6 +2371,30 @@ body.zen-mode #rail-scrim {
 }
 @media (pointer: coarse) {
     .message:has(> .msg-actions)::before { width: 86px; }
+}
+/* Phone bubbles (2026-10-25, operator: "the way it wraps text around the
+   timer, the word placement and line wrapping etc"). In a ~240px text
+   column the 86px first-line reservation left two or three words on the
+   first line and the rest below it, with the time + ⋯ hanging over the
+   corner. Under 480px the overlay leaves the corner: no reservation, and
+   .msg-actions becomes a footer row in normal flow, right-aligned under
+   the text. On an agent bubble the thumbs row floats left into that same
+   footer row (flow-root contains the float), so the bubble grows by one
+   row, not two. Desktop keeps the hover overlay. Rendered pins:
+   tests/test_interface_composer_mobile.py. */
+@media (max-width: 480px) {
+    .message:has(> .msg-actions)::before { content: none; }
+    .msg-actions {
+        position: static;
+        justify-content: flex-end;
+        margin-top: 6px;
+        opacity: 0.55;
+    }
+    .message.agent:has(> .msg-actions) { display: flow-root; }
+    .message.agent:has(> .msg-actions) > .msg-feedback {
+        float: left;
+        margin-top: 2px;    /* measured: centres the thumbs on the 34px menu button's row */
+    }
 }
 .msg-time {
     font-family: var(--font-mono);

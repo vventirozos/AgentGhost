@@ -1124,6 +1124,10 @@ class TestChrome:
             theme=cli.Theme(_THEME), highlight=False))
         g = cli.GhostCLI(self._api(host))
         g.session_id = "a1b2c3d4e5f6"
+        # 2026-10-24: the status line moved from the banner to the toolbar
+        # pinned under the prompt; it is the same _banner_line, checked here
+        # above the banner's rule + hint exactly as before.
+        cli.console.print(g._banner_line(width))
         g.banner()
         import re
         plain = re.sub(r"\x1b\[[0-9;]*m", "", buf.getvalue())
@@ -1413,3 +1417,186 @@ class TestInterfaces4ML:
             monkeypatch.setattr(cli.sys, "argv", argv)
             assert cli.main() == 0
             assert seen["origin"] == want
+
+
+class TestEffort:
+    """/effort (2026-10-24): the web page's reasoning-effort selector for the
+    terminal — the level rides each chat request as X-Ghost-Effort; Default
+    sends nothing (the model server's own level)."""
+
+    _DONE = [b'data: {"choices":[{"delta":{"content":"ok"}}]}', b"data: [DONE]"]
+
+    def _cli(self, monkeypatch, effort_on=True):
+        buf = io.StringIO()
+        monkeypatch.setattr(cli, "console", cli.Console(
+            file=buf, width=100, theme=cli.Theme(_THEME), highlight=False))
+        api = cli.GhostAPI("http://localhost:9", "k")
+        sent = []
+
+        def _post(*a, **k):
+            sent.append(dict(k.get("headers") or {}))
+            return _FakeSSE(list(self._DONE))
+
+        monkeypatch.setattr(api.http, "post", _post)
+        monkeypatch.setattr(api, "health", lambda timeout=(10, 30): (
+            200, {"status": "ok", "reasoning_effort": effort_on}))
+        return cli.GhostCLI(api), api, sent, buf
+
+    @pytest.mark.parametrize("typed,wire", [
+        ("low", "low"), ("med", "medium"), ("medium", "medium"),
+        ("xhigh", "xhigh"), ("X-High", "xhigh"), ("high", "xhigh")])
+    def test_a_picked_level_rides_the_chat_request(self, monkeypatch, typed, wire):
+        g, _, sent, _ = self._cli(monkeypatch)
+        assert g.dispatch(f"/effort {typed}") is True
+        g.chat_turn("q")
+        assert sent[-1]["X-Ghost-Effort"] == wire
+        assert sent[-1]["X-Request-ID"]
+
+    def test_default_sends_nothing(self, monkeypatch):
+        g, _, sent, _ = self._cli(monkeypatch)
+        g.chat_turn("q")                                # never set
+        g.dispatch("/effort xhigh")
+        g.dispatch("/effort default")                   # and back
+        g.chat_turn("q")
+        assert all("X-Ghost-Effort" not in h for h in sent), sent
+
+    def test_bare_shows_and_junk_is_refused(self, monkeypatch):
+        g, _, sent, buf = self._cli(monkeypatch)
+        g.dispatch("/effort med")
+        g.dispatch("/effort")
+        assert "effort: Med" in buf.getvalue()
+        for bad in ("/effort turbo", "/effort low high"):
+            g.dispatch(bad)
+            assert g.effort == "medium", bad            # unchanged
+        assert buf.getvalue().count("usage: /effort") == 2
+
+    def test_switch_off_is_said(self, monkeypatch):
+        g, _, _, buf = self._cli(monkeypatch, effort_on=False)
+        g.dispatch("/effort low")
+        assert "switch is off" in buf.getvalue()
+        g2, _, _, buf2 = self._cli(monkeypatch, effort_on=True)
+        g2.dispatch("/effort low")
+        assert "switch is off" not in buf2.getvalue()
+
+    def test_one_shot_carries_the_flag_level(self, monkeypatch):
+        g, api, sent, _ = self._cli(monkeypatch)
+        monkeypatch.setattr(cli.sys, "stdout", io.StringIO())   # piped
+        assert cli.one_shot(api, "q", None, "xhigh") == 0
+        assert cli.one_shot(api, "q", None) == 0
+        assert sent[0]["X-Ghost-Effort"] == "xhigh"
+        assert "X-Ghost-Effort" not in sent[1]
+
+
+class TestEffortBanner:
+    """The banner shows the effort level (2026-10-24) — only while the agent's
+    switch is on, and it is the LAST optional segment to go as the window narrows."""
+
+    def _line(self, monkeypatch, width, switch=True, effort=""):
+        buf = io.StringIO()
+        monkeypatch.setattr(cli, "console", cli.Console(
+            file=buf, force_terminal=True, width=width, height=40,
+            theme=cli.Theme(_THEME), highlight=False))
+        api = cli.GhostAPI("http://eva:8000", "k")
+        api.health = lambda timeout=(2, 5): (200, {"uptime_s": 60, "reasoning_effort": switch})
+        g = cli.GhostCLI(api)
+        g.session_id = "a1b2c3d4e5f6"
+        g.effort = effort
+        cli.console.print(g._banner_line(width))       # the pinned status line
+        g.banner()
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", buf.getvalue())
+        return [l for l in plain.split("\n") if l.strip()]
+
+    @pytest.mark.parametrize("effort,label", [("", "default"), ("low", "low"),
+                                              ("medium", "med"), ("xhigh", "x-high")])
+    def test_the_level_is_shown(self, monkeypatch, effort, label):
+        head = self._line(monkeypatch, 100, effort=effort)[0]
+        assert f"effort {label}" in head and "eva:8000" in head and "online" in head
+
+    def test_switch_off_shows_no_level(self, monkeypatch):
+        assert "effort" not in self._line(monkeypatch, 100, switch=False, effort="xhigh")[0]
+
+    def test_effort_outlives_host_and_session_and_never_wraps(self, monkeypatch):
+        mid = self._line(monkeypatch, 52, effort="xhigh")[0]
+        assert "effort x-high" in mid and "a1b2c3d4" not in mid
+        for width in (16, 24, 34, 44, 52, 64, 80, 120):
+            assert len(self._line(monkeypatch, width, effort="xhigh")) == 3, width
+
+
+class TestStatusToolbar:
+    """The status line pinned under the prompt (2026-10-24, operator: "make
+    the banner permanent on the bottom")."""
+
+    def _g(self, monkeypatch):
+        api = cli.GhostAPI("http://eva:8000", "k")
+        calls = []
+        api.health = lambda timeout=(2, 5): (calls.append(1), (200, {
+            "uptime_s": 60, "reasoning_effort": True}))[1]
+        g = cli.GhostCLI(api)
+        g.session_id = "a1b2c3d4e5f6"
+        monkeypatch.setattr(cli.shutil, "get_terminal_size",
+                            lambda fallback=(80, 24): os.terminal_size((100, 24)))
+        return g, calls
+
+    @staticmethod
+    def _plain(ansi):
+        from prompt_toolkit.formatted_text import to_plain_text
+        return to_plain_text(ansi)
+
+    def test_drawing_never_touches_the_network(self, monkeypatch):
+        g, calls = self._g(monkeypatch)
+        line = self._plain(g.status_toolbar())
+        assert calls == [] and "checking" in line and "ghost" in line
+
+    def test_the_background_probe_fills_liveness_and_effort(self, monkeypatch):
+        g, calls = self._g(monkeypatch)
+        monkeypatch.setattr(cli, "STATUS_REFRESH_S", 3600)
+        g._start_status_refresh()
+        deadline = time.time() + 5
+        while g._probe_cache is None and time.time() < deadline:
+            time.sleep(0.01)
+        line = self._plain(g.status_toolbar())
+        assert "online" in line and "effort default" in line, line
+        assert len(calls) == 1
+        g.dispatch("/effort xhigh")                # shows at once, no redraw probe
+        assert "effort x-high" in self._plain(g.status_toolbar())
+
+    def test_the_probe_thread_has_its_own_session(self, monkeypatch):
+        g, _ = self._g(monkeypatch)
+        monkeypatch.setattr(cli, "STATUS_REFRESH_S", 3600)
+        seen = []
+        real = cli.threading.Thread
+        monkeypatch.setattr(cli.threading, "Thread", lambda **kw: (
+            seen.append(kw), real(**kw))[1])
+        g._start_status_refresh()
+        prober = seen[0]["target"].__closure__
+        apis = [c.cell_contents for c in prober
+                if isinstance(c.cell_contents, cli.GhostCLI)]
+        assert apis and all(a.api.http is not g.api.http for a in apis if a is not g)
+
+    def test_the_session_wires_the_toolbar(self, monkeypatch, tmp_path):
+        g, _ = self._g(monkeypatch)
+        made = {}
+
+        class Stop(Exception):
+            pass
+
+        def fake_session(**kw):
+            made.update(kw)
+            return object()
+
+        def stop():
+            raise Stop()
+        monkeypatch.setattr(cli, "PromptSession", fake_session)
+        monkeypatch.setattr(cli, "HISTORY_FILE", tmp_path / "hist")
+        monkeypatch.setattr(g, "_start_status_refresh", stop)
+        with pytest.raises(Stop):
+            g.chat()
+        assert made["bottom_toolbar"] == g.status_toolbar
+        assert made["style"] is cli.PROMPT_STYLE
+        # the stock toolbar is reverse video (a white bar); merged the way the
+        # app merges it, this one is not
+        from prompt_toolkit.styles import default_ui_style, merge_styles
+        stock = default_ui_style().get_attrs_for_style_str("class:bottom-toolbar")
+        assert stock.reverse is True                 # the world the rule exists for
+        merged = merge_styles([default_ui_style(), cli.PROMPT_STYLE])
+        assert merged.get_attrs_for_style_str("class:bottom-toolbar").reverse is False

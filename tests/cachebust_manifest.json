@@ -1,11 +1,15 @@
 {
   "app.js": {
-    "sha": "ced786a8ef17bf48",
-    "version": "15.0"
+    "sha": "01e621d842fcf4dc",
+    "version": "15.5"
+  },
+  "effort.js": {
+    "sha": "40ad7b946907c142",
+    "version": "1.2"
   },
   "matrix_graph.js": {
     "sha": "87535fb54d0a42a6",
-    "version": "15.0"
+    "version": "15.5"
   },
   "notifications.js": {
     "sha": "487030a97676874f",
@@ -20,15 +24,15 @@
     "version": "7.12"
   },
   "status.js": {
-    "sha": "fe8cf9c7e37aa86b",
-    "version": "7.5"
+    "sha": "721355af97675461",
+    "version": "7.6"
   },
   "style.css": {
-    "sha": "84e28388126ab9ed",
-    "version": "6.7"
+    "sha": "068421d7cf42ecc9",
+    "version": "6.8"
   },
   "workspace.js": {
-    "sha": "dd9be3ab772bf2c5",
-    "version": "9.1"
+    "sha": "10aaf36d7b7a0e9b",
+    "version": "9.2"
   }
 }

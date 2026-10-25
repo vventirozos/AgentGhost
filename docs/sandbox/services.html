@@ -111,6 +111,9 @@
   137s postmortem).</strong> The container's original PID&nbsp;1
   (<code>sleep infinity</code>) never reaped orphans, so every dead launcher
   became a permanent <em>zombie</em> — and zombies pass <code>kill -0</code>.
+  <strong>§4RI (2026-10-25):</strong> a <code>start</code> on a service that is already running returns a
+  <code>Note:</code> (pid, the directory it serves, its URL), declared ok — it used to be an <code>Error:</code>
+  head, REJECTED, and a failure strike (request 43fe95a2: strike 1 of the 4 that fired a recovery plan).
   A service that never started looked "already running", <code>stop</code>
   no-op'd against it, and the exited-immediately diagnostic never fired.
   Fixes: docker.py now runs the container with <code>init=true</code> (tini
@@ -491,6 +494,20 @@ bin/unserve-remote.sh 8100    # tear down (or `… all` to reset every mapping)<
     dropped <code>cd</code> into the workdir) is the same command.</li>
   </ul>
   <p>Pins: <code>tests/test_4nw_webos_defects.py</code>.</p>
+
+  <h2 id="4rd">"Exited immediately" that never started <span class="tag">2026-10-25 &sect;4RD</span></h2>
+  <p>Request e2c7c7f4: <code>start</code> said "service 'webos' exited immediately … (no log output)". Nothing had run. The supervisor
+    unlinked the stale <code>.log</code>/<code>.pid</code> from the HOST right before the launch. Across the OrbStack bind mount the container
+    then sometimes saw <code>/workspace/.services</code> as missing: <code>&gt; …/webos.log</code> failed with "Directory nonexistent", and the
+    launch line's exit code (<code>echo $!</code>'s) was 0. Measured on the live sandbox: host unlink then launch failed in 1–5 of 20 launches;
+    unlinking inside the container, in the launch itself, failed 0 of 50.</p>
+  <ul>
+    <li>The launch now runs <code>rm -f &lt;stem&gt;.log &lt;stem&gt;.pid;</code> in the container before <code>setsid nohup</code>. The host no longer touches them.</li>
+    <li>A launch whose output says "cannot create" (<code>_launch_redirect_failed</code>) is tried once more after 0.5 s.</li>
+    <li>If it fails again, the registry row is removed and the call is REJECTED (not FAILED, so the same start may be re-issued):
+      "'&lt;name&gt;' was not started — the sandbox could not create its log file (…). Nothing is running." with the shell's own error.</li>
+  </ul>
+  <p>Pins: <code>tests/test_4rd_service_launch.py</code>; battery <code>scripts/mutate_4rd_b.py</code>.</p>
 </main>
 </body>
 </html>

@@ -2129,7 +2129,7 @@ def _batch_would_cross_deadline(next_step_s: float) -> bool:
         if remaining is None:
             return False
         from .agent import effective_report_floor
-        return float(next_step_s) > float(remaining) - effective_report_floor(request_deadline_s(rid))
+        return float(next_step_s) > float(remaining) - effective_report_floor(request_deadline_s(rid), rid)   # §4RA r2: sized
     except Exception:  # noqa: BLE001
         return False
 

@@ -190,21 +190,3 @@ async def test_local_guard_removed_for_data_files():
         assert "Blocked overwrite of data file" not in all_messages_str
         assert "SYSTEM BLOCK: You attempted to overwrite 'dataset.csv'" not in all_messages_str
 
-def test_unescape_xml_values():
-    import html
-    def unescape_xml_values(val):
-        if isinstance(val, str):
-            return html.unescape(val).replace('\\"', '"').replace("\\'", "'")
-        elif isinstance(val, dict):
-            return {k: unescape_xml_values(v) for k, v in val.items()}
-        elif isinstance(val, list):
-            return [unescape_xml_values(v) for v in val]
-        return val
-
-    # Test escaped XML entities
-    raw_dict = {"input": "sudo rm -rf &amp;&amp; touch test", "escaped_str": "print(\\\"hello\\\")"}
-    cleaned = unescape_xml_values(raw_dict)
-    
-    assert cleaned["input"] == "sudo rm -rf && touch test"
-    assert cleaned["escaped_str"] == 'print("hello")'
-

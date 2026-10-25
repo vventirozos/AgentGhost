@@ -4710,6 +4710,16 @@ async def _syntax_feedback(path: Path, filename: str, *, in_progress: bool = Fal
         return ""
     if not err:
         return ""
+    # §4RD: node/bash name the file by the HOST path they were given; the model
+    # only knows the sandbox, so it ran `cd /Users/…/sandbox/webos` ("No such
+    # file or directory") and then `find /` to locate it (req e2c7c7f4)
+    # longest first: /private/tmp/x contains /tmp/x (r1)
+    try:
+        _resolved = str(path.resolve()) if path.is_absolute() else ""
+    except (OSError, RuntimeError):      # a symlink loop (r2)
+        _resolved = ""
+    for _host in sorted({str(path), _resolved} - {""}, key=len, reverse=True):
+        err = err.replace(_host, str(filename))
     _first = err.splitlines()[0] if err.splitlines() else err
     if in_progress:
         # operator (2026-10-12): a part of a file cannot parse until its last part
@@ -5140,8 +5150,11 @@ async def _write_replace_guarded(path: Path, prev_content: str, new_content: str
     if str(filename).lower().endswith((".html", ".htm")) and not _is_in_progress(path):
         _text += await asyncio.to_thread(html_handler_note, new_content)   # §4OI (iii): advisory
     if _syn:
+        # §4RB r2: an edit adding to a file still written in parts (the §4NZ habit) keeps its
+        # syntax note (edits may finish the file) but is not "the edit broke it"
         return ToolOutcome.partial(_text, world_changed=True,
-                                   reason_code="written_but_syntax_failed")
+                                   reason_code=("syntax_failed_file_in_parts" if _is_in_progress(path)
+                                                else "written_but_syntax_failed"))
     return _text
 
 

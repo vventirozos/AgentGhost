@@ -1551,9 +1551,14 @@ async def tool_browser(
         # inside — 5 live rows where EVERY action failed were booked a clean
         # success, and 24 more where some did. The per-action results are
         # right here; the envelope just never used them.
-        _interact_status = (
-            "failed" if (err_count and not ok_count)
-            else "partial" if err_count else "ok")
+        # §4RJ: a throw inside the model's own `evaluate` is that step's RESULT, not a failed action (43fe95a2; a timed-out evaluate stays one) — see docs/tools/browser.html
+        _script_errs = [r for r in action_results if not r.get("ok") and r.get("action") == "evaluate" and "timed out" not in str(r.get("error") or "")]
+        _own_script_only = bool(err_count) and len(_script_errs) == err_count and ok_count > 0
+        _interact_status = "ok" if _own_script_only else "failed" if (err_count and not ok_count) else "partial" if err_count else "ok"
+        if _own_script_only:
+            header = header.replace("STATUS: OK", f"STATUS: OK ({err_count} evaluate step{'s' if err_count != 1 else ''} "
+                                    "threw inside YOUR script — the page loaded and the other actions ran; read the ERR "
+                                    "line and fix the script, or treat the throw as that check's result)", 1)
         # §4LN: and the header the MODEL reads says so too. `STATUS: OK` over
         # "0 OK, 3 errors" (live probe B2) also unlocked the verifier's
         # interaction-evidence cap, which matches that header text.

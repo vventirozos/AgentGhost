@@ -178,7 +178,7 @@ async def test_an_owner_batch_stops_before_a_step_that_would_cross_the_deadline(
     monkeypatch.setattr(G, "request_remaining_s", lambda rid: 30.03)
     monkeypatch.setattr(G, "request_deadline_s", lambda rid="": 1800.0)
     import ghost_agent.core.agent as A
-    monkeypatch.setattr(A, "effective_report_floor", lambda d: 30.0)
+    monkeypatch.setattr(A, "effective_report_floor", lambda d, req_id=None: 30.0)
     batch = await PA.advance_many(ctx, pid, max_tasks=None, owner_requested=True)
     # §4MR: the FIRST step is checked too (an estimate stands in for a duration)
     assert batch.stop_reason == "deadline" and batch.count == 0

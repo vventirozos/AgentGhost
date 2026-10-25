@@ -1183,15 +1183,20 @@ async def test_a_members_message_never_relabels_a_prior_turn(monkeypatch, tmp_pa
         assert bool(seen) is expect, role
 
 
-async def test_system_3_never_runs_for_a_member():
+async def test_system_3_recovery_hint_is_empty_for_a_member():
+    """§4RI: the pivot is a steer in the conversation; its only owner-data
+    input is the episodic recovery hint, which a member never gets."""
     agent = GhostAgent(make_context())
     agent.context.llm_client.chat_completion = AsyncMock(return_value=_resp('{"hypotheses": []}'))
+    agent.context.episodic_memory = MagicMock()
+    agent.context.episodic_memory.search_recoveries = MagicMock(return_value=[{"trigger": "t", "outcome": "o"}])
     t1 = requester_role_context.set("member")
     try:
-        out = await agent._run_system_3_pivot("cat /workspace/projects/p1/.env", "err", "", "m")
+        out = await agent._recovery_episodes_hint("cat /workspace/projects/p1/.env")
     finally:
         requester_role_context.reset(t1)
-    assert out == {}
+    assert out == ""
+    agent.context.episodic_memory.search_recoveries.assert_not_called()
     agent.context.llm_client.chat_completion.assert_not_awaited()
 
 

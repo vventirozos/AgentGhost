@@ -54,6 +54,7 @@
       <tr><td><code>/sessions · /resume · /new · /clear</code></td><td><code>/api/sessions</code> CRUD — <code>/clear</code> rotates the session id (a local-only clear would lie: the server merges stored history back in)</td></tr>
       <tr><td><code>/good · /bad [why…]</code> (aliases <code>/+1 · /-1</code>)</td><td><code>POST /api/feedback</code> — human outcome label on a completed reply; see <a href="#rating">Rating</a></td></tr>
       <tr><td><code>/health · /turns · /cancel [hard]</code></td><td><code>/api/health</code>, <code>/api/turns</code>, <code>/api/turn/cancel</code></td></tr>
+      <tr><td><code>/effort [default|low|med|xhigh]</code></td><td><code>X-Ghost-Effort</code> on every chat request (2026-10-24, §4RB): the web page's reasoning-effort selector for the terminal. Default (the start state) sends no header — the model server's own level. Bare <code>/effort</code> shows the level; aliases <code>medium</code>, <code>x-high</code>/<code>high</code> → xhigh, <code>auto</code>/<code>off</code> → Default. Setting a new level notes the cost (the whole prompt is re-processed once, ~3 min); either way <code>/api/health</code> is asked, and while it reports <code>reasoning_effort</code> not true the CLI says the level is ignored. One-shot: <code>ghost --effort xhigh -p …</code> (the REPL also starts at that level). The status line shows the level (<code>effort default</code> / <code>low</code> / <code>med</code> / <code>x-high</code>) only while the agent's switch is on, and it is the last optional segment dropped as the window narrows (after the session id and the host). Tests: <code>tests/test_ghost_cli.py::TestEffort</code>, <code>::TestEffortBanner</code>.</td></tr>
       <tr><td><code>/notify</code></td><td><code>/api/notifications/pending</code> + ack, consumer <code>ghost-cli</code> (watermark acked AFTER display so a crash re-serves)</td></tr>
       <tr><td><code>/memory fix|rm</code></td><td><code>/api/memory/correct</code> · <code>/api/memory/delete</code></td></tr>
       <tr><td><code>/upload · /download</code></td><td><code>/api/upload</code> · <code>/api/download/{name}</code> (sandbox files)</td></tr>
@@ -214,6 +215,18 @@
   <h2 id="chrome">The look — 2026-08-27</h2>
   <p>Three structural problems, all visible in the first screenful:</p>
   <ul>
+    <li><strong>Status line pinned under the prompt (2026-10-24, operator).</strong> The banner's
+    one-line status — <code>👻 ghost · effort … · host · session · ● online uptime</code> — is no longer
+    printed at start-up; it is prompt_toolkit's <code>bottom_toolbar</code> (<code>GhostCLI.status_toolbar</code>,
+    the same <code>_banner_line</code> rendered to ANSI, style <code>bottom-toolbar: noreverse</code> instead of
+    the stock white bar). It sits on the terminal's last row while the prompt is waiting and is
+    erased while a reply streams. Drawing it never touches the network: liveness comes from a
+    daemon thread (<code>_start_status_refresh</code>) that probes <code>/api/health</code> at start and every
+    <code>STATUS_REFRESH_S</code> (30 s) on its OWN <code>requests.Session</code> (a Session shared with a streaming
+    turn is not thread-safe) and redraws the prompt; the effort segment reads <code>self.effort</code>, so a
+    <code>/effort</code> shows at once. The start-up banner is now the rule + hint line. Tests:
+    <code>tests/test_ghost_cli.py::TestStatusToolbar</code>; <code>TestChrome</code>'s never-wrap / drop-order pins now
+    measure the status line directly.</li>
     <li><strong>The banner wrapped.</strong> Its rule was a hardcoded 52 columns and it
     assembled the full URL, the session id and <code>up 3h 20m</code> unconditionally — so it
     under-ran a wide window and spilled onto a second line in a narrow one.

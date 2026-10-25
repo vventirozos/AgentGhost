@@ -48,7 +48,7 @@
     <thead><tr><th>Action</th><th>Handler</th><th>Behaviour</th></tr></thead>
     <tbody>
       <tr><td><code>check_health</code></td><td><code>tool_check_health</code> (line 291)</td><td>Platform / CPU / memory / disk via <code>psutil</code>; Docker version via subprocess; Internet ping (Cloudflare 1.1.1.1); Tor anonymity check; agent internals (LLM client, memory, graph, sandbox, idle-scheduler status — reported as <code>Idle Scheduler=Running</code>, formerly <code>Biological Daemon=</code>, §4NN).</td></tr>
-      <tr><td><code>check_weather</code></td><td><code>tool_get_weather</code> (line 27)</td><td>Open-Meteo first (geolocation + forecast), <code>wttr.in</code> fallback. Looks up location in <a href="../memory/profile.html">profile_memory</a>. 3 retries with Tor identity refresh.</td></tr>
+      <tr><td><code>check_weather</code></td><td><code>tool_get_weather</code></td><td>Open-Meteo first (geocoder, then current conditions + a 7-day daily forecast; <code>hourly=true</code> adds today and tomorrow in 3-hour steps), <code>wttr.in</code> fallback asked by the geocoder's coordinates. Looks up location in <a href="../memory/profile.html">profile_memory</a> (never for a member). 3 retries with Tor identity refresh. See <a href="#4re">§4RE</a>.</td></tr>
       <tr><td><code>check_location</code></td><td><code>tool_check_location</code> (line 267)</td><td>Searches profile for location/city/address keys.</td></tr>
     </tbody>
   </table></div>
@@ -82,6 +82,16 @@
     <li><strong>Unknown tool:</strong> the reply lists every tool (it cut at 40 — <code>web_search</code> fell off) and, for a member, only member tools; a member is never told to use <code>execute</code>.</li>
   </ul>
   <p>Pins: <code>tests/test_4lv_small_tools.py</code>.</p>
+  <h2 id="4re">Forecasts <span class="tag">2026-10-25 &sect;4RE</span></h2>
+  <p>The operator asked for forecasts (no API keys, through Tor). <code>check_weather</code> asked Open-Meteo for current conditions only, so "will it rain tomorrow?" had nothing to stand on. The same keyless <code>/v1/forecast</code> endpoint gives days and hours.</p>
+  <ul>
+    <li><strong>Every answer carries the outlook.</strong> The request adds <code>daily=…&amp;forecast_days=7&amp;timezone=auto</code> (<code>_forecast_url</code>). <code>_open_meteo_report</code> keeps the current lines (<code>Condition</code>/<code>Temp</code>/<code>Wind</code>/<code>Humidity</code>) and adds one line per day: condition, min–max °C, chance of rain, rain mm, maximum wind. Days are labelled "Today Sun 25 Oct", "Tomorrow Mon 26 Oct", then "Tue 27 Oct", from the forecast's own day order in the PLACE's time zone, never this host's clock, so the model does no date arithmetic. A normal answer is about 13 lines. A null reading is "?", never "None" (<code>_num</code>, <code>_cond</code>).</li>
+    <li><strong><code>hourly=true</code></strong> (schema boolean; a string "true" is accepted, <code>_wants_hourly</code>) adds today and tomorrow every <code>HOURLY_STEP_H</code> (3) hours, from the current hour (the place's <code>current.time</code>) to the end of tomorrow: temperature, condition, chance of rain.</li>
+    <li><strong>The fallback asks by coordinates.</strong> When the geocoder resolved the place, wttr.in is asked <code>/&lt;lat&gt;,&lt;lon&gt;?format=j1</code>. By name, its "Athens" was Athens, Georgia (US): 9–22 °C and sunny, while Athens, Greece had rain (measured over Tor). <code>_wttr_report</code> renders j1 in the same shape (3 days; hourly from its 3-hour slots). Every remote field is cut to one bounded control-free line (<code>_wttr_text</code> → <code>_wttr_line</code>). Without coordinates the report says the match was "by name only". A 200 that is not the j1 shape is a failed source, never a report.</li>
+    <li>One fetch path (<code>_http_client</code>: curl_cffi, else httpx) replaces the two duplicated ones. The geocoder's answer is kept across retries. Tor egress, identity rotation and refusal recording (§4FS) are unchanged.</li>
+    <li><strong>Prompt cost:</strong> the schema and the one-line prompt hint changed, so the first message after the deploy re-processes the head once. Both are static text and identical on every request.</li>
+  </ul>
+  <p>Pins: <code>tests/test_4re_weather_forecast.py</code>.</p>
 </main>
 </body>
 </html>

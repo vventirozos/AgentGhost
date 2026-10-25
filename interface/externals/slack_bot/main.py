@@ -115,6 +115,18 @@ app = AsyncApp(token=os.environ.get("SLACK_BOT_TOKEN"))
 # Configuration
 # ---------------------------------------------------------------------------
 GHOST_API_URL = os.environ.get("GHOST_API_URL", "http://localhost:8000/api/chat")
+#: §4RA: how long the bot waits for one (non-streamed) agent reply. It sends no
+#: X-Ghost-Client-Timeout, so the agent uses its own budget (GHOST_MAX_REQUEST_S,
+#: 60 min in production) and never extends a Slack request. Turns run one at a
+#: time and the request clock starts when the turn STARTS, so a message can wait
+#: behind an extended coding request (up to 180 min, queueing accepted by the
+#: operator 2026-10-24): 180 min queued + 60 min of its own + 15 min margin.
+try:
+    AGENT_TIMEOUT_S = float(os.environ.get("GHOST_SLACK_AGENT_TIMEOUT", "15300") or 15300)
+except ValueError:
+    AGENT_TIMEOUT_S = 15300.0
+if AGENT_TIMEOUT_S <= 0:
+    AGENT_TIMEOUT_S = 15300.0
 GHOST_API_BASE = re.sub(r"/api/chat/?$", "", GHOST_API_URL)
 # Never ship a default secret — the key must be EXPLICITLY configured. An
 # EMPTY value is allowed and means "the agent runs with auth disabled"
@@ -1250,7 +1262,7 @@ async def _process_message(messages: list, say, thread_ts: str | None = None,
             else:
                 messages.append({"role": "user", "content": note})
 
-        async with httpx.AsyncClient(timeout=3600.0) as client:
+        async with httpx.AsyncClient(timeout=AGENT_TIMEOUT_S) as client:
             # NOTE: no model field — the agent 404s any name that isn't its
             # configured model (the old pinned name broke every request
             # after a model upgrade); omitting it always matches.

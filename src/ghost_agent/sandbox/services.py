@@ -501,15 +501,23 @@ def already_running_message(name, entry: dict, command) -> str:
             _variants.add(_n(add_default_port(v, entry.get("port"), loopback=True)[0]))
         except Exception:  # noqa: BLE001
             pass
-    head = f"Error: service '{name}' is already running (pid {entry.get('pid')})"
+    # §4RI (request 43fe95a2): "already running" is INFORMATION, not a
+    # refusal. The `Error:` head made the tool declare it REJECTED, which
+    # counted as a failure strike — strike 1 of the 4 that fired a recovery
+    # plan — for a call whose only fault was that the server was already
+    # there. The note names the port and the directory it serves, so the
+    # model can use it without a second call.
+    _where = ((f" serving {entry.get('workdir')}" if entry.get("workdir") else "")
+              + (f" at http://127.0.0.1:{entry.get('port')}/" if entry.get("port") else ""))
+    head = f"Note: service '{name}' is already running (pid {entry.get('pid')}){_where} — nothing was launched"
     if old and new and old not in _variants:
-        return (f"{head} with a DIFFERENT command: `{old[:200]}`"
+        return (f"{head}; it runs a DIFFERENT command: `{old[:200]}`"
                 + (f" (port {entry.get('port')})" if entry.get("port") else "") + ". "
-                f"action='restart' would relaunch THAT stored command, not yours — "
-                f"to run `{new[:200]}`, do action='stop' (name='{name}') and then "
+                f"Use it as it is if it serves what you need. action='restart' would relaunch THAT stored "
+                f"command, not yours — to run `{new[:200]}`, do action='stop' (name='{name}') and then "
                 f"action='start' with the new command.")
     _port = f" on port {entry.get('port')}" if entry.get("port") else ""
-    return (f"{head} with this same command{_port} — nothing to do. action='restart' "
+    return (f"{head}; same command{_port} — nothing to do. action='restart' "
             f"relaunches it (e.g. to pick up changed code).")
 
 
@@ -534,6 +542,12 @@ def _same_port(port, entry: dict) -> bool:
 
 
 from ..tools.outcome import ToolOutcome
+
+
+def _launch_redirect_failed(out: str) -> bool:
+    """The background launch's log redirection failed (§4RD): sh says
+    "cannot create …" ("Directory nonexistent", "Permission denied")."""
+    return "cannot create" in str(out or "")
 
 
 class ServiceSupervisor:
@@ -1486,11 +1500,13 @@ class ServiceSupervisor:
                 # you forget a required argument?" and it retries the same
                 # call until it burns its strikes.
                 return f"Error: {_ve}"
-            for _stale in (f"{stem}.log", f"{stem}.pid"):
-                try:
-                    (self.host_dir / _stale).unlink()
-                except OSError:
-                    pass
+            # §4RD: the stale log/pid go INSIDE the launch below, not from the
+            # host. A host-side unlink right before the launch made the bind
+            # mount show `.services` as missing to the container 1–5 times in
+            # 20 (measured 2026-10-25): the log redirection failed with
+            # "Directory nonexistent", nothing ran, and the service read as
+            # "exited immediately" with "(no log output)" (req e2c7c7f4).
+            # In the container: 0 failures in 50.
 
             # Persist the entry (with its credential) BEFORE the process
             # launches (2026-07-30 follow-up): a service's FIRST act may be
@@ -1514,11 +1530,26 @@ class ServiceSupervisor:
             self._save(reg)
 
             inner = (
+                f"rm -f {CONTAINER_SERVICES_DIR}/{stem}.log {CONTAINER_SERVICES_DIR}/{stem}.pid; "
                 f"cd {shlex.quote(wd)} && "
                 f"setsid nohup sh {CONTAINER_SERVICES_DIR}/{stem}.cmd.sh "
                 f"> {CONTAINER_SERVICES_DIR}/{stem}.log 2>&1 & echo $!"
             )
             out, code = self._exec(f"sh -c {shlex.quote(inner)}", timeout=30)
+            if code == 0 and _launch_redirect_failed(out):
+                # the exit code is `echo $!`'s — a redirection that failed in
+                # the background shows only in the output (§4RD): once more
+                time.sleep(0.5)
+                out, code = self._exec(f"sh -c {shlex.quote(inner)}", timeout=30)
+                if code == 0 and _launch_redirect_failed(out):
+                    reg.pop(key, None)
+                    self._save(reg)
+                    # nothing ran: a rejection, so the same start may be re-issued
+                    return ToolOutcome.rejected(
+                        f"Error: '{name}' was not started — the sandbox could not create its "
+                        f"log file ({out.strip()[:200]}). Nothing is running. Tried twice; if the "
+                        f"error names the path itself (e.g. 'Is a directory'), fix that path "
+                        f"before starting again.", reason_code="service_launch_failed")
             if code != 0:
                 reg.pop(key, None)
                 self._save(reg)

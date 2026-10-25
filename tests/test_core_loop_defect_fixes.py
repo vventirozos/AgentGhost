@@ -95,8 +95,11 @@ def test_raw_json_fallback_logs():
     assert "has non-JSON" in SRC  # raw-JSON tool-call arguments warning
 
 
-def test_unescape_step_logs():
-    assert "JSON at the unescape step" in SRC
+def test_no_blanket_unescape_step():
+    # §4RD: the blanket decode (and its "unescape step" warning) is gone —
+    # tool arguments reach the tool literally
+    assert "JSON at the unescape step" not in SRC
+    assert "unescape_xml_values" not in SRC
 
 
 # --- 3. bounded journal appends (behavioural) ------------------------------

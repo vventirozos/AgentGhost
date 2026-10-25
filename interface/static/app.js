@@ -1,4 +1,5 @@
-import * as matrixGraphFace from './matrix_graph.js?v=15.0';
+import * as matrixGraphFace from './matrix_graph.js?v=15.7';
+import { initEffortSelector, effortForPayload } from './effort.js?v=1.2';   // §4RB
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -17,6 +18,7 @@ let activeFace = matrixGraphFace;
 const chatLog = document.getElementById('chat-log');
 const chatInput = document.getElementById('chat-input');
 const sendBtn = document.getElementById('send-btn');
+const effortSelect = initEffortSelector(document, window);   // §4RB: hidden unless the agent says it is on
 const fullscreenBtn = document.getElementById('fullscreen-btn');
 const statusText = document.getElementById('status-text');
 const connectionDot = document.getElementById('connection-dot');
@@ -251,6 +253,7 @@ const ICON_CLASS = {
 
     // --- raw thinking (the floor) ---
     '🧠': 'think',    // BRAIN_SUM — the one that was drowning everything
+    '🔋': 'think',    // BRAIN_EFFORT (§4RB)
     '💭': 'think',    // BRAIN_THINK
     '💬': 'think',    // LLM_ASK
     '🤖': 'think',    // LLM_REPLY
@@ -1903,7 +1906,10 @@ function scrollToBottomDuringStream() {
     _streamScrollScheduled = true;
     requestAnimationFrame(() => {
         _streamScrollScheduled = false;
-        chatLog.scrollTo({ top: chatLog.scrollHeight, behavior: 'auto' });
+        // 'instant', not 'auto': #chat-log has `scroll-behavior: smooth`, and
+        // 'auto' means "use the CSS value" — so every frame started a fresh
+        // smooth animation that trailed the growing reply (the jitter).
+        chatLog.scrollTo({ top: chatLog.scrollHeight, behavior: 'instant' });
     });
 }
 
@@ -1939,6 +1945,41 @@ function _applyStreamRetract() {
     return true;
 }
 
+// Re-render the streaming bubble without rebuilding its images (2026-10-24).
+// A plain innerHTML swap made a fresh <img> every frame: a fresh authed
+// fetch, a raw 401 frame, then the 🖼️ button arriving async — the image
+// area flickered and the reply hopped. Images _processChatLogArtifacts has
+// already taken (and their broken-image badges) are carried across, keyed by
+// their original src. The new markup is parsed in an inert <template> and a
+// matched <img> is swapped for a comment there, so the duplicate never
+// starts a load; the kept node goes back in after, button before it.
+function _replaceStreamBubble(div, html) {
+    const kept = new Map();
+    div.querySelectorAll('img.placeholder-added, .broken-image-badge').forEach(el => {
+        const src = el.dataset.ghostSrc;
+        if (!src) return;
+        if (!kept.has(src)) kept.set(src, []);
+        kept.get(src).push(el);
+    });
+    if (!kept.size) { div.innerHTML = html; return; }
+    const t = document.createElement('template');
+    t.innerHTML = html;
+    const swaps = [];
+    t.content.querySelectorAll('img').forEach(img => {
+        const old = (kept.get(img.getAttribute('src') || '') || []).shift();
+        if (!old) return;
+        const mark = document.createComment('');
+        img.replaceWith(mark);
+        swaps.push([mark, old]);
+    });
+    div.replaceChildren(t.content);
+    for (const [mark, old] of swaps) {
+        const btn = old._ghostPlaceholderBtn;
+        mark.replaceWith(old);
+        if (btn) old.before(btn);
+    }
+}
+
 function _renderStreamingContent() {
     if (!currentAgentMessageDiv || currentAccumulatedContent === "") return;
     const displayContent = _stripInternalTags(currentAccumulatedContent, currentStreamPrefixLen);
@@ -1952,11 +1993,14 @@ function _renderStreamingContent() {
         setTurnStatusDesc('writing the reply…', '💬');
         if (typeof activeFace.setPhase === 'function') activeFace.setPhase('write');
     }
-    currentAgentMessageDiv.innerHTML = renderMarkdown(displayContent);
+    // Pinned is read BEFORE the re-render: measured after it, one frame that
+    // adds a paragraph or a code block (>50 px) read as "the reader scrolled
+    // up", following stopped, and the next frame caught up — the hop.
+    const wasPinned = _isNearBottom();
+    _replaceStreamBubble(currentAgentMessageDiv, renderMarkdown(displayContent));
     // Streaming-cursor glyph; removed in sendMessage's finally.
     currentAgentMessageDiv.classList.add('streaming');
-    const isAtBottom = Math.abs(chatLog.scrollHeight - chatLog.scrollTop - chatLog.clientHeight) <= 50;
-    if (isAtBottom) scrollToBottomDuringStream();
+    if (wasPinned) scrollToBottomDuringStream();
     else _noteNewContentBelow();
     decorateCodeBlocks(currentAgentMessageDiv);
 }
@@ -3028,6 +3072,10 @@ async function sendMessage(isResume = false) {
             messages: chatHistory.map(toWireMessage),
             stream: true
         };
+        // §4RB: the effort selector, when shown and not the default (the interface
+        // turns it into the X-Ghost-Effort header)
+        const _effort = effortForPayload(effortSelect);
+        if (_effort) payload.reasoning_effort = _effort;
         // Durable sessions: when the workspace module holds an active
         // session id, bind the turn to it. The AGENT is the source of
         // truth for session history and merges tolerantly, so replaying
@@ -5219,6 +5267,7 @@ function _processChatLogArtifacts() {
     document.querySelectorAll('#chat-log img').forEach(img => {
         if (img.classList.contains('placeholder-added')) return;
         img.classList.add('placeholder-added');
+        img.dataset.ghostSrc = img.getAttribute('src') || '';   // _replaceStreamBubble's key
         // _handleChatImage owns the error-listener lifecycle — it has
         // to wait until AFTER the authed blob-URL swap to attach it,
         // so the expected 401 on the initial unauthed load doesn't
@@ -5275,6 +5324,7 @@ function _showBrokenImagePlaceholder(img) {
     const name = (img.getAttribute('alt') || img.getAttribute('src') || 'image')
         .split('/').pop().split('?')[0].slice(0, 64);
     badge.textContent = `🖼️ image unavailable — ${name}`;
+    badge.dataset.ghostSrc = img.dataset.ghostSrc || '';   // a streaming re-render keeps the badge
     img.replaceWith(badge);
 }
 
@@ -5813,7 +5863,7 @@ window.GhostCore = {
     toggleLogConsole: () => { if (logToggleBtn) logToggleBtn.click(); },
 };
 
-import('./workspace.js?v=9.1').catch(e => {
+import('./workspace.js?v=9.2').catch(e => {
     // ⚠ VISIBLE, not console-only. This module owns the sessions rail, and
     // with it `window.__ghostSessionId` — so when it fails to load, every
     // turn silently reverts to CLIENT-CARRIED history: no durable session,

@@ -583,7 +583,8 @@ async def _handle_chat_foreground(context, body, request_id: str):
     from fastapi import BackgroundTasks
     from .api.routes import _mark_foreground
     from .utils.logging import (requester_role_context, reply_surface_context, client_deadline_context,
-                                verify_purpose_context, trajectory_id_context, requester_member_context)
+                                verify_purpose_context, trajectory_id_context, requester_member_context,
+                                effort_override_context)
     # §4LD: an autonomous turn is the OWNER's, on no surface, with no client
     # deadline — never the context of whichever turn last added a scheduler
     # job (APScheduler's wake-up copies the caller's contextvars into every
@@ -600,7 +601,8 @@ async def _handle_chat_foreground(context, body, request_id: str):
                                          (requester_member_context, ""),            # §4QG
                                          (client_deadline_context, 0.0), (verify_purpose_context, ""),
                                          (trajectory_id_context, ""), (_EVENT_PROJECT_OVERRIDE, None),
-                                         (reply_tap_context, None))]
+                                         (reply_tap_context, None),
+                                         (effort_override_context, ""))]                # §4RB: no web override
     _mark_foreground(context.agent, +1)
     try:
         return await context.agent.handle_chat(

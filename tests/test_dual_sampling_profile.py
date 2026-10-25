@@ -2,8 +2,8 @@
 
 Model-card policy (Qwen 3.5):
 * General conversation: temperature=1.0, top_p=0.95, top_k=20,
-  min_p=0, presence_penalty=1.5.
-* Coding / precise tasks: temperature=0.6, top_p=0.95, top_k=20,
+  min_p=0, presence_penalty=0 (§4RG-b; was the instruct 1.5).
+* Coding / precise tasks: temperature=1.0 (§4RG; was 0.6), top_p=0.95, top_k=20,
   min_p=0, presence_penalty=0.
 
 The earlier wiring only dropped to 0.6 when the sub-classifier decided
@@ -16,7 +16,7 @@ the loop burned an extra turn before the model conceded.
 These tests pin the new policy:
 * is_tool_turn=False → general profile (temp 1.0, pp 1.5).
 * is_tool_turn=True + is_coding=False → base precise profile
-  (temp 0.6, pp 0).
+  (temp 1.0, pp 0).
 * is_tool_turn=True + is_coding=True → sub-classified (creative /
   precise / balanced).
 """
@@ -40,11 +40,11 @@ def test_general_profile_matches_model_card():
     assert GENERAL_SAMPLING_PARAMS["top_p"] == 0.95
     assert GENERAL_SAMPLING_PARAMS["top_k"] == 20
     assert GENERAL_SAMPLING_PARAMS["min_p"] == 0
-    assert GENERAL_SAMPLING_PARAMS["presence_penalty"] == 1.5
+    assert GENERAL_SAMPLING_PARAMS["presence_penalty"] == 0   # §4RG-b (was 1.5)
 
 
 def test_coding_profile_matches_model_card():
-    assert CODING_SAMPLING_PARAMS["temperature"] == 0.6
+    assert CODING_SAMPLING_PARAMS["temperature"] == 1.0   # §4RG: Qwen3.8 card (was 0.6)
     assert CODING_SAMPLING_PARAMS["top_p"] == 0.95
     assert CODING_SAMPLING_PARAMS["top_k"] == 20
     assert CODING_SAMPLING_PARAMS["min_p"] == 0
@@ -59,7 +59,7 @@ def test_conversation_turn_uses_general_profile():
     p = get_sampling_params(is_tool_turn=False)
     assert p == GENERAL_SAMPLING_PARAMS
     assert p["temperature"] == 1.0
-    assert p["presence_penalty"] == 1.5
+    assert p["presence_penalty"] == 0
 
 
 def test_non_coding_tool_turn_uses_base_precise_profile():
@@ -68,20 +68,20 @@ def test_non_coding_tool_turn_uses_base_precise_profile():
     the coding base profile, not the warm conversational one."""
     p = get_sampling_params(is_tool_turn=True, is_coding=False)
     assert p == CODING_SAMPLING_PARAMS
-    assert p["temperature"] == 0.6
+    assert p["temperature"] == 1.0
     assert p["presence_penalty"] == 0
 
 
 def test_coding_tool_turn_sub_classifies_creative():
     # The classifier still picks "creative" for these keywords, but the
     # sub-profiles are now all pinned to the model-card coding values (2026-06-22),
-    # so the temperature is 0.6 regardless of sub-class.
+    # so the temperature is 1.0 regardless of sub-class (§4RG).
     p = get_sampling_params(
         is_tool_turn=True,
         query="design and brainstorm alternative approaches",
         is_coding=True,
     )
-    assert p["temperature"] == 0.6  # model-card coding value (was 0.8)
+    assert p["temperature"] == 1.0  # model-card thinking value (§4RG; was 0.6, before that 0.8)
 
 
 def test_coding_tool_turn_sub_classifies_precise_for_sql():
@@ -90,7 +90,7 @@ def test_coding_tool_turn_sub_classifies_precise_for_sql():
         query="write the exact SQL migration for the users table",
         is_coding=True,
     )
-    assert p["temperature"] == 0.6  # model-card coding value (was 0.3)
+    assert p["temperature"] == 1.0  # model-card thinking value (§4RG; was 0.6, before that 0.3)
 
 
 def test_coding_tool_turn_sub_classifies_balanced_for_plain_code():
@@ -99,7 +99,7 @@ def test_coding_tool_turn_sub_classifies_balanced_for_plain_code():
         query="implement a helper function",
         is_coding=True,
     )
-    assert p["temperature"] == 0.6  # balanced (same temp as base precise)
+    assert p["temperature"] == 1.0  # balanced (same temp as base precise)
 
 
 # ---------------------------------------------------------------------------

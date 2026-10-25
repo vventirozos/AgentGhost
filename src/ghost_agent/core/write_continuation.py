@@ -43,9 +43,13 @@ logger = logging.getLogger("GhostAgent")
 CUT_WRITE_CONTINUATIONS = 6
 CONTINUATION_MAX_TOKENS = 8192
 CLOSE_ROUND_MAX_TOKENS = 4096   # a close-only round thinks, then writes a short closer (probe 4)
-CONTINUATION_TIMEOUT_S = 300.0
+# §4RK (2026-10-25): sized to the 27B's measured generation rate (~23 tok/s,
+# llama log medians): a full 8,192-token round is ~356 s of generation plus
+# the prefill, so the old 300 s could never finish one; 480 s can. The total
+# follows (three full rounds); the request's own time budget still bounds it.
+CONTINUATION_TIMEOUT_S = 480.0
 #: wall clock for ALL rounds — other tools of the batch wait for this call
-CONTINUATION_TOTAL_S = 600.0
+CONTINUATION_TOTAL_S = 1500.0
 END_MARKER = "<<<END OF FILE>>>"
 #: head/tail of the file shown to the model each round
 _HEAD_CHARS = 1200
@@ -370,6 +374,7 @@ async def continue_cut_write(context, path: str, inner, *, ask: str = "", llm=No
         if llm is None:
             return first
         req_id = str(request_id_context.get() or "")
+        _note_progress(req_id, path)              # §4RA r2 M-B: the saved first part is progress
         t0 = time.monotonic()
         rounds, bad, done, appended, prev_finish, why = 0, 0, False, 0, None, ""
         while rounds < CUT_WRITE_CONTINUATIONS and not done:
@@ -478,6 +483,7 @@ async def continue_cut_write(context, path: str, inner, *, ask: str = "", llm=No
                     continue
                 else:
                     appended += 1
+                    _note_progress(req_id, path)  # §4RA r2 M-B: and so is each appended part
             prev_finish = finish
             size = hp.stat().st_size
             pretty_log("Write Continued",
@@ -539,6 +545,19 @@ def _cancelled(cancelled) -> bool:
         return False
 
 
+def _note_progress(req_id: str, path: str) -> None:
+    """§4RA: a continued part of a CODE file is coding progress — the turn
+    loop's hook only sees the write once the whole continuation returns, so a
+    long single-file build earned no extension while it ran (r2 M-B)."""
+    try:
+        from .agent import is_code_progress
+        if is_code_progress("file_system", "append", path, False):
+            from ..utils import logging as _glog
+            _glog.note_code_progress(req_id, f"continued {path}")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _time_left(req_id: str) -> bool:
     try:
         from ..utils import logging as _glog
@@ -546,7 +565,7 @@ def _time_left(req_id: str) -> bool:
         remaining = _glog.request_remaining_s(req_id)
         if remaining is None:
             return True
-        floor = effective_report_floor(_glog.request_deadline_s(req_id))
+        floor = effective_report_floor(_glog.request_deadline_s(req_id), req_id)   # §4RA review m6: the sized reserve
         return float(remaining) - float(floor) >= _MIN_REMAINING_S
     except Exception:  # noqa: BLE001
         return True

@@ -35,15 +35,27 @@ logger = logging.getLogger("GhostAgent")
 # Reason strings surfaced to the operator / stored on the turn.
 REASON_USER = "cancelled by user"
 
+#: §4RD-c: how often a generation in flight reads its cancel flag (seconds).
+#: A cooperative Stop used to wait for the whole generation — minutes on
+#: the 27B — because the flag was read only between model calls.
+CANCEL_POLL_S = 0.2
+
 
 class TurnCancelled(Exception):
     """Raised at a turn-loop boundary when a cooperative cancel was
     requested. Caught by ``handle_chat``, which returns the partial work
     instead of an error — so cancelling is a clean stop, not a crash."""
 
-    def __init__(self, req_id: str = "", reason: str = REASON_USER):
+    def __init__(self, req_id: str = "", reason: str = REASON_USER,
+                 partial: Optional[str] = None, lead: str = ""):
         self.req_id = req_id
         self.reason = reason
+        # §4RD-c: raised MID-generation, the text the client was shown
+        # (None at a loop boundary: the turn's last reply text stands)
+        self.partial = partial
+        # the tap's opening block (owner-rule banner, a staged correction),
+        # which the partial no longer starts with: it goes back at the head
+        self.lead = lead
         super().__init__(f"turn {req_id} cancelled: {reason}")
 
 

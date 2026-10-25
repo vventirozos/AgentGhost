@@ -16,6 +16,15 @@ import re
 THINKING_LOOP_PROBE_EVERY = 500     # run the repetition probe every N chars
 THINKING_LOOP_WINDOW = 200          # length of the n-gram we look for
 THINKING_LOOP_THRESHOLD = 3         # window appearing >= N times = loop
+# §4RK (2026-10-25): the N occurrences must be RECENT. Seven live aborts on
+# Qwen3.8 were zero loops: four long deliberations that restated a quoted
+# list item, three turns quoting the same transcript passage to compare it —
+# the 200-char tail had appeared three times across 5–14k chars of varied
+# reasoning. A runaway repeats its block back to back (or with a short
+# filler), so the three occurrences sit inside the last ~2k chars; a quote
+# re-used after 1–4k chars of commentary does not. Longer-period repeats are
+# the paragraph probe's job (same line ≥ 6×).
+THINKING_LOOP_MAX_GAP = 3 * THINKING_LOOP_WINDOW     # 600: window + up to 400 chars of filler
 # Conservative (500/200/3): needs ~600 chars of genuine repetition before firing.
 # The aggressive (300/150/2) was tuned to kill a weak model's enumeration loops
 # fast at an "acceptable false-positive risk"; a strong model rarely produces
@@ -227,7 +236,11 @@ def _detect_thinking_loop(buf: str) -> bool:
     if len(buf) < THINKING_LOOP_WINDOW * THINKING_LOOP_THRESHOLD:
         return False
     tail = buf[-THINKING_LOOP_WINDOW:]
-    return buf.count(tail) >= THINKING_LOOP_THRESHOLD
+    # §4RK: counted in the recent region only (see THINKING_LOOP_MAX_GAP) —
+    # bounded work per probe, and a passage quoted three times across the
+    # whole buffer is not a loop
+    recent = buf[-(THINKING_LOOP_THRESHOLD * THINKING_LOOP_MAX_GAP + THINKING_LOOP_WINDOW):]
+    return recent.count(tail) >= THINKING_LOOP_THRESHOLD
 
 
 def _tail_has_stop_marker(buf: str, new_token: str) -> bool:

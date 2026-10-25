@@ -31,6 +31,9 @@ from ..utils.logging import (Icons, pretty_log, ORIGIN_PROBE, PROBE_REQUEST_PREF
 
 logger = logging.getLogger("GhostAgent")
 
+#: §4RD: the session's copy of a streamed reply the client closed mid-way
+STREAM_CUT_NOTE = "_(Reply cut off: the stream was closed before it ended.)_"
+
 # ── Store calls off the event loop (§4GI, 2026-09-13) ─────────────────────────
 # The operator "surgery" routes (memory correct/delete, skill-twin delete,
 # lesson quarantine) called the vector store and the playbook DIRECTLY from
@@ -66,6 +69,7 @@ class StoreCallTimeout(Exception):
 # bounded pool moves the blast radius back inside this module: when it is
 # full the next store call queues and answers 504 on its own budget, and the
 # sandbox, the file tools and the embedder keep their threads.
+
 def _store_worker_count() -> int:
     """How wide the store pool is. Env-tunable, like its sibling timeout.
 
@@ -632,6 +636,14 @@ async def operator_self_play_slot_status(request: Request):
     return JSONResponse(dict(getattr(agent, "_supervised_slot", None) or {"state": "never run"}))
 
 
+def _effort_enabled() -> bool:
+    try:
+        from ..core.effort import enabled
+        return bool(enabled())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 @router.get("/api/health", dependencies=[Security(verify_api_key)])
 async def api_health(request: Request):
     """Runtime introspection for the operator + NetMon + the RSS supervisor
@@ -732,6 +744,7 @@ async def api_health(request: Request):
         "uptime_s": round(_time.monotonic() - boot_mono, 1) if boot_mono else None,
         "asyncio_tasks": live_tasks,
         "foreground_requests": getattr(llm, "foreground_requests", None),
+        "reasoning_effort": _effort_enabled(),            # §4RB: the web UI shows its selector only then
         "foreground_tasks": getattr(llm, "foreground_tasks", None),
         "biological_watchdog_alive": (bio_task is not None and not bio_task.done()),
         "memory_system_loaded": getattr(context, "memory_system", None) is not None,
@@ -1130,6 +1143,11 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
     except (TypeError, ValueError):
         _cdl = 0.0
     client_deadline_context.set(_cdl if _cdl > 0 else 0.0)
+    # §4RB: the operator's reasoning-effort override (web UI); "" = auto. The
+    # agent reads it only while GHOST_REASONING_EFFORT=1.
+    from ..core.effort import parse_override as _parse_effort
+    from ..utils.logging import effort_override_context
+    effort_override_context.set(_parse_effort(request.headers.get("X-Ghost-Effort")))
 
     # ---- durable sessions (2026-07-11) --------------------------------
     # With `session_id`, the SERVER is the source of truth for history: the
@@ -1323,6 +1341,25 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                         if _get is not None and not _get.done():
                             _get.cancel()      # r2: a disconnect inside the wait left it pending
                         if not _turn.done():
+                            # §4RD-c: the client went away while the turn ran —
+                            # the session keeps the text it was shown, marked cut
+                            # (a task: nothing is awaited reliably in a closing generator)
+                            try:
+                                from ..core.turns import get_turn_registry as _gtr, REASON_USER as _ru
+                                _stopped = _gtr(agent).is_cancelled(request_id)
+                            except Exception:  # noqa: BLE001
+                                _stopped = False
+                            # r2 m3: a Stop before anything showed still keeps the
+                            # question in the session, so the next message has it
+                            if _tap.sent.strip() or _stopped:
+                                try:
+                                    from ..utils.logging import spawn_bg as _spawn_cut
+                                    _note = f"_(Turn cancelled: {_ru}.)_" if _stopped else STREAM_CUT_NOTE
+                                    _spawn_cut(_persist_session(
+                                        (_tap.sent.rstrip() + "\n\n" + _note).lstrip()),
+                                        name="session-cut")
+                                except Exception:  # noqa: BLE001 — never break the close
+                                    pass
                             _turn.cancel()     # the client went away mid-turn (parity: the await was cancelled)
                     # r2 M1: awaited in place, the turn's context variables
                     # (trajectory id, event project, conversation key…) stayed
@@ -1350,16 +1387,37 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                     # bypasses the finalize tail, so nothing else knows the
                     # text). Parse-failure of a chunk just contributes nothing.
                     _acc, _pre = [], []
-                    async for chunk in content:
-                        content_started = True
-                        (_pre if _sse_is_stream_prefix(chunk) else _acc).append(_sse_delta_text(chunk))
-                        # The frames are llama-server's, with llama's id;
-                        # the feedback contract is OUR id (see the helper).
-                        yield _restamp_sse_request_id(chunk, req_id)
                     # §4KO: a leaked reasoning prefix is not stored as history;
                     # the stream prefix (a correction banner) is kept whole
                     from ..core.agent import strip_raw_orphan_reasoning
                     from ..core.sessions import utf16_len
+                    _stream_ended = False
+                    try:
+                        async for chunk in content:
+                            content_started = True
+                            (_pre if _sse_is_stream_prefix(chunk) else _acc).append(_sse_delta_text(chunk))
+                            # The frames are llama-server's, with llama's id;
+                            # the feedback contract is OUR id (see the helper).
+                            yield _restamp_sse_request_id(chunk, req_id)
+                        _stream_ended = True
+                    except Exception:
+                        _stream_ended = True    # an upstream error, not a hang-up: the handler below reports it (r1)
+                        raise
+                    finally:
+                        if not _stream_ended and "".join(_acc + _pre).strip():   # r1: text, not empty deltas
+                            # §4RD: the client went away mid-reply (closed at the
+                            # yield: GeneratorExit/OSError, or cancelled) — the
+                            # session keeps what streamed, marked cut, so the next
+                            # message's history has it. A task: nothing may be
+                            # awaited reliably inside a closing generator.
+                            try:
+                                from ..utils.logging import spawn_bg as _spawn_cut
+                                _cut_pre = "".join(_pre)
+                                _spawn_cut(_persist_session(
+                                    _cut_pre + strip_raw_orphan_reasoning("".join(_acc)).rstrip()
+                                    + "\n\n" + STREAM_CUT_NOTE, utf16_len(_cut_pre)), name="session-cut")
+                            except Exception:  # noqa: BLE001 — never break the close
+                                pass
                     _pre_text = "".join(_pre)
                     await _persist_session(_pre_text + strip_raw_orphan_reasoning("".join(_acc)),
                                            utf16_len(_pre_text))   # §4KP: JS string units, any device

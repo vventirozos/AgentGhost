@@ -47,6 +47,10 @@ client_deadline_context = contextvars.ContextVar("client_deadline_s", default=0.
 #: §4MV: an EXPERIMENT arm for a labelled probe (`X-Ghost-Arm`, honoured only
 #: with `X-Ghost-Origin: probe`). Production requests always read "".
 prompt_arm_context = contextvars.ContextVar("prompt_arm", default="")
+#: §4RB: the operator's reasoning-effort override for this request (web UI,
+#: `X-Ghost-Effort`: low / medium / xhigh; "" = auto). Read only while
+#: GHOST_REASONING_EFFORT=1.
+effort_override_context = contextvars.ContextVar("effort_override", default="")
 #: §4NG: the request's server-side session id ("" when none) — `recall` keeps
 #: the ACTIVE conversation out of its "past conversations" hits.
 active_session_context = contextvars.ContextVar("active_session_id", default="")
@@ -65,8 +69,11 @@ active_session_context = contextvars.ContextVar("active_session_id", default="")
 #: §4QT: `look_critic` — the render look asked of the critic pool (nova) instead of the
 #: main server's vision pool; implies the look.
 #: §4QX: `look_owned` — the system shows the look line; the model writes only what is missing.
+#: §4QZ: `effort_low` / `effort_medium` / `effort_xhigh` — the main server's chat-template
+#: `reasoning_effort` for this request (core/llm.py `with_probe_effort`).
 PROMPT_ARMS: frozenset = frozenset({"no_lessons", "quote_bound", "experience", "fact_history", "render_look",
-                                    "look_critic", "check_critic", "look_owned"})
+                                    "look_critic", "check_critic", "look_owned",
+                                    "effort_low", "effort_medium", "effort_xhigh"})
 
 
 #: §4MW: a candidate RULE under test, sent by an operator probe
@@ -599,12 +606,7 @@ def _req_started(req_id: str) -> Optional[float]:
 def request_remaining_s(req_id: str) -> Optional[float]:
     """Seconds until the client's deadline for this request, or ``None``
     when no deadline is known (no header, or the request isn't tracked)."""
-    try:
-        deadline = float(client_deadline_context.get() or 0.0)
-    except Exception:  # noqa: BLE001
-        deadline = 0.0
-    if deadline <= 0:
-        deadline = server_request_cap_s(req_id)
+    deadline = request_deadline_s(req_id)
     if deadline <= 0:
         return None
     elapsed = request_elapsed_s(req_id)
@@ -613,13 +615,131 @@ def request_remaining_s(req_id: str) -> Optional[float]:
     return deadline - elapsed
 
 
-def request_deadline_s(req_id: str = "") -> float:
-    """The deadline in force: the client's, else the server cap (0 = none)."""
+def _client_deadline() -> float:
     try:
         d = float(client_deadline_context.get() or 0.0)
     except Exception:  # noqa: BLE001
         d = 0.0
-    return d if d > 0 else server_request_cap_s(req_id)
+    return d if d > 0 else 0.0
+
+
+def base_deadline_s(req_id: str = "") -> float:
+    """The deadline before any extension (0 = none): the server cap, never past
+    the client's own timeout. §4RA: the lower of the two — the client used to
+    win outright, which was the same number while both were 1800 s; with the
+    web interface's timeout raised to the extension ceiling, its header would
+    otherwise have made the ceiling the normal budget."""
+    client, cap = _client_deadline(), server_request_cap_s(req_id)
+    if client > 0 and cap > 0:
+        return min(client, cap)
+    return client or cap
+
+
+def extension_ceiling_s(req_id: str = "") -> float:
+    """§4RA: the longest a request may run with extensions —
+    ``GHOST_MAX_REQUEST_EXTENDED_S`` (default 0 = no extensions), never past
+    the client's own timeout, never below the base. Only a client that SENT
+    its timeout is extended (review m4: a client that says nothing may hang
+    up first — the CLI, scripts, the Slack bot); background kinds (no server
+    cap) never are."""
+    base = base_deadline_s(req_id)
+    try:
+        ceil = float(os.environ.get("GHOST_MAX_REQUEST_EXTENDED_S", "0") or 0.0)
+    except ValueError:
+        ceil = 0.0
+    client = _client_deadline()
+    if base <= 0 or ceil <= 0 or client <= 0 or server_request_cap_s(req_id) <= 0:
+        return base
+    return max(base, min(ceil, client))
+
+
+#: §4RA: one extension step, and how close to the deadline a request must be
+#: before it takes one (the 27B spends up to ~1000 s on one write turn)
+EXTENSION_STEP_S = 900.0
+#: §4RA: progress this recent earns a step — two steps, so a write that took
+#: a whole long turn to generate still counts once it lands
+PROGRESS_WINDOW_S = 1800.0
+
+
+def note_report_floor(req_id: str, floor_s: float) -> None:
+    """§4RA r2 M-A: the report reserve last computed for this request
+    (`core.agent.effective_report_floor`). A slow model's reserve (up to a
+    quarter of the deadline) is larger than one step; earning only inside the
+    last step forced the report before a second step could be earned."""
+    try:
+        f = max(0.0, float(floor_s or 0.0))
+    except (TypeError, ValueError):
+        return
+    with _REQ_STATE_LOCK:
+        s = _REQ_STATE.get(req_id)
+        if s is not None:
+            s["floor_s"] = f
+
+
+def note_code_progress(req_id: str, what: str = "") -> None:
+    """§4RA: this request just made coding progress (the turn loop decides
+    what counts — `core.agent.is_code_progress`)."""
+    with _REQ_STATE_LOCK:
+        s = _REQ_STATE.get(req_id)
+        if s is not None:
+            s["progress_t"] = time.monotonic()
+            s["progress_what"] = str(what or "")
+
+
+def request_progress_what(req_id: str) -> str:
+    """What the request's last coding progress was ("" = none yet)."""
+    with _REQ_STATE_LOCK:
+        return str((_REQ_STATE.get(req_id) or {}).get("progress_what") or "")
+
+
+def request_extension_s(req_id: str) -> float:
+    """Seconds this request's deadline has moved out so far."""
+    with _REQ_STATE_LOCK:
+        s = _REQ_STATE.get(req_id)
+        return float((s or {}).get("extended_s") or 0.0)
+
+
+def _earn_extension(req_id: str, base: float, ceil: float) -> float:
+    """§4RA: the request's extension after earning what it can NOW: while it
+    is within `EXTENSION_STEP_S` of its deadline — beyond its report reserve
+    (r2 M-A) — and made coding progress in the last `PROGRESS_WINDOW_S`, the
+    deadline moves out a step at a time, up to the ceiling. Earned on READ, so every check — the turn-start report
+    check, the preflight wait refusal, image waits, the write continuation —
+    sees the same extended deadline (review M2/M3: a grant made only at a
+    turn start, once the reserve was reached, came too late for a long turn
+    and was invisible inside one)."""
+    with _REQ_STATE_LOCK:
+        s = _REQ_STATE.get(req_id)
+        if s is None:
+            return 0.0
+        have = float(s.get("extended_s") or 0.0)
+        pt = s.get("progress_t")
+        if ceil <= base or pt is None:
+            return have
+        now = time.monotonic()
+        if now - float(pt) > PROGRESS_WINDOW_S:
+            return have
+        elapsed = now - float(s["started"])
+        room = ceil - base
+        window = EXTENSION_STEP_S + float(s.get("floor_s") or 0.0)
+        # bounded and exact at the ceiling (r2 M-D: `base + (ceil - base) < ceil`
+        # can hold in floating point, and the loop spun under the lock)
+        for _ in range(int(room // EXTENSION_STEP_S) + 2):
+            if have >= room or base + have - elapsed >= window:
+                break
+            have = room if room - have <= EXTENSION_STEP_S else have + EXTENSION_STEP_S
+        s["extended_s"] = have
+        return have
+
+
+def request_deadline_s(req_id: str = "") -> float:
+    """The deadline in force (0 = none): `base_deadline_s`, plus what the
+    request earned by coding progress (§4RA), never past the ceiling."""
+    base = base_deadline_s(req_id)
+    if base <= 0:
+        return 0.0
+    ceil = extension_ceiling_s(req_id)
+    return min(base + _earn_extension(req_id, base, ceil), max(base, ceil))
 
 
 def server_request_cap_s(req_id: str = "") -> float:
@@ -735,6 +855,7 @@ class Icons:
     BRAIN_CTX    = "🧩"
     BRAIN_ROUTE  = "🧭"   # semantic routing / skill selection
     BRAIN_AIM    = "🎯"   # self-play frontier targeting
+    BRAIN_EFFORT = "🔋"   # §4RB: the reasoning effort a turn is sent with
     LLM_ASK      = "💬"   # LLM request (wide-base; was 🗣️, a narrow-base+VS16 glyph)
     LLM_REPLY    = "🤖"
 

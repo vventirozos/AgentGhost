@@ -230,7 +230,8 @@ class TestPreviouslyUnpinnedGuards:
     """MAJOR (lens C-2): three live guards that were deletable-green."""
 
     @pytest.mark.asyncio
-    async def test_arg_unescaping_at_dispatch(self):
+    async def test_args_reach_the_tool_literally_at_dispatch(self):
+        # §4RD: inverted — the blanket decode corrupted real entities (req e2c7c7f4)
         agent = _dispatch_agent()
         box = {}
 
@@ -242,7 +243,7 @@ class TestPreviouslyUnpinnedGuards:
         ts = _ts(tool_calls=[_call("web_search",
                                    {"query": "a &amp; b &lt;x&gt;"}, "w0")])
         await agent._dispatch_and_process_tool_batch(ts)
-        assert box["query"] == "a & b <x>"
+        assert box["query"] == "a &amp; b &lt;x&gt;"
 
     @pytest.mark.asyncio
     async def test_mid_loop_strike_cap_stops_processing(self):

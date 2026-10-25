@@ -74,6 +74,10 @@ def test_remaining_time_is_deadline_minus_elapsed_and_none_without_a_deadline(mo
         assert r0 is not None and 1195.0 < r0 <= 1200.0
         glog.client_deadline_context.set(1800.0)
         r = glog.request_remaining_s(rid)
+        # §4RA: the lower of the client's timeout and the server cap (the client used to win)
+        assert r is not None and 1195.0 < r <= 1200.0
+        monkeypatch.setenv("GHOST_MAX_REQUEST_S", "0")
+        r = glog.request_remaining_s(rid)
         assert r is not None and 1795.0 < r <= 1800.0
         assert glog.request_remaining_s("never-opened") is None
     finally:

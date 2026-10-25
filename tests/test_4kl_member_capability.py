@@ -654,10 +654,7 @@ async def test_a_pivot_batch_resets_the_refusal_count(monkeypatch, member_role):
         return "Error: upstream search engine unreachable (connection refused)"
     agent.available_tools = {"web_search": failing}
 
-    async def _pivot(**kw):
-        return {"justification": "switch approach",
-                "tree_update": {"id": "root", "description": "Answer", "status": "IN_PROGRESS", "children": []}}
-    monkeypatch.setattr(agent, "_run_system_3_pivot", _pivot)
+    # §4RI: the pivot is an in-line steer; nothing to patch
     _no_arm_calls(monkeypatch, "control")
     strikes = StrikeLedger()
     strikes.member_refused_batches = 2

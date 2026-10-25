@@ -26,15 +26,15 @@ def fs(sb, **kw):
     return asyncio.run(tool_file_system(sandbox_dir=sb, **kw))
 
 
-def test_after_a_cut_reply_the_request_gets_a_lower_output_limit():
-    """Fails where every reply of a looping request got the full 16k tokens
-    (~5 min each) — six of them took 27.6 min of probe-ap2-h."""
-    rid = request_id_context.get()
-    assert A.max_tokens_after_cut_offs(rid, 16384) == 16384
-    A.note_length_stop(rid, 280.0)
-    assert A.max_tokens_after_cut_offs(rid, 16384) == A.LENGTH_STOP_RETRY_MAX_TOKENS
-    assert A.max_tokens_after_cut_offs("another-request", 16384) == 16384
-    assert A.max_tokens_after_cut_offs(rid, 4000) == 4000          # never raised
+def test_a_cut_reply_does_not_lower_the_output_limit():
+    """§4RF (operator: "remove the step-down altogether and keep 16k for
+    everything"). Fails where a cut turned on an 8k limit for the rest of the
+    request: on Qwen3.8 every cut was inside the thinking and the 8k replies
+    after it were cut again inside the thinking (5A, 6F)."""
+    assert not hasattr(A, "max_tokens_after_cut_offs")
+    assert not hasattr(A, "LENGTH_STOP_RETRY_MAX_TOKENS")
+    A.note_length_stop(request_id_context.get(), 280.0)
+    assert "limited to" not in A.cut_round_note(request_id_context.get(), "", "")
 
 
 def test_the_cut_note_names_the_round_the_minutes_and_the_count():
@@ -117,33 +117,25 @@ def test_the_requested_counts_skip_years_ranges_and_dimensions(text, asked):
     assert (f"numbers in the request: {asked} —" in note) if asked else "numbers in the request" not in note
 
 
-def test_the_turn_loop_records_length_stops_and_applies_the_lower_limit():
+def test_the_turn_loop_records_length_stops_and_keeps_the_limit():
     """Enumerated over the parsed source (both sites sit deep in the turn
     loop): a `stream_finish_reason == "length"` branch calls
-    note_length_stop, and the function that builds the payload's
-    max_tokens passes it through max_tokens_after_cut_offs first."""
+    note_length_stop (the cut note reads it), and the payload's max_tokens
+    is never lowered by a cut count (§4RF: the 8k step-down is gone)."""
     import ast
     from pathlib import Path
-    tree = ast.parse(Path(A.__file__).read_text(encoding="utf-8"))
+    src = Path(A.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(src)
     recorded = any(
         isinstance(n, ast.If) and "stream_finish_reason" in ast.unparse(n.test) and "'length'" in ast.unparse(n.test)
         and any(isinstance(c, ast.Call) and getattr(c.func, "id", "") == "note_length_stop" for c in ast.walk(n))
         for n in ast.walk(tree))
     assert recorded
-    wired = False
-    for fn in ast.walk(tree):
-        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        lowered = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Assign)
-                   and any(getattr(t, "id", "") == "tool_turn_max_tokens" for t in n.targets)
-                   and isinstance(n.value, ast.Call) and getattr(n.value.func, "id", "") == "max_tokens_after_cut_offs"]
-        used = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Dict)
-                for k, v in zip(n.keys, n.values)
-                if isinstance(k, ast.Constant) and k.value == "max_tokens"
-                and isinstance(v, ast.Name) and v.id == "tool_turn_max_tokens"]
-        if lowered and used and min(lowered) < min(used):
-            wired = True
-    assert wired
+    lowered = [ast.unparse(n) for n in ast.walk(tree) if isinstance(n, ast.Assign)
+               and any(getattr(t, "id", "") == "tool_turn_max_tokens" for t in n.targets)
+               and ("length_stops" in ast.unparse(n.value) or "_LENGTH_STOPS" in ast.unparse(n.value)
+                    or "cut_off" in ast.unparse(n.value))]
+    assert not lowered, lowered
 
 
 def test_a_cut_restart_shorter_than_the_saved_parts_keeps_them(tmp_path):
@@ -164,7 +156,7 @@ def test_a_cut_restart_shorter_than_the_saved_parts_keeps_them(tmp_path):
 
 def test_a_reused_request_id_starts_with_a_clean_count():
     """Fails where one cut in a scheduled task (sched-<job>, the same id on
-    every fire) capped every later run at 8k and told it "cut-off #5"."""
+    every fire) told every later run it was "cut-off #5"."""
     import ast
     from pathlib import Path
     A.note_length_stop("sched-daily", 300.0)

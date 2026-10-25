@@ -92,8 +92,8 @@ async def test_override_tight_forces_tight(agent):
         "Debug this traceback and optimize the query.",  # 2 EXTENDED keywords
     )
     body = _combined_user_content(payload)
-    assert "EXTREMELY CONCISE" in body  # TIGHT wording
-    assert "up to ~15 sentences" not in body  # EXTENDED wording absent
+    assert "Think as much as THIS step needs" in body  # TIGHT wording
+    assert "HARD violations" not in body  # EXTENDED wording absent
 
 
 @pytest.mark.asyncio
@@ -110,7 +110,7 @@ async def test_no_override_still_auto_classifies(agent):
         "Debug this traceback and optimize the query.",
     )
     body = _combined_user_content(payload)
-    assert "up to ~15 sentences" in body, (
+    assert "HARD violations" in body, (
         "Without an override, a debug+optimize query must reach EXTENDED."
     )
 
@@ -127,7 +127,7 @@ async def test_bogus_override_is_ignored(agent):
     )
     body = _combined_user_content(payload)
     # Two EXTENDED keywords → classifier would pick EXTENDED.
-    assert "up to ~15 sentences" in body, (
+    assert "HARD violations" in body, (
         "Invalid override value should fall through to the classifier, not "
         "silently clamp to TIGHT."
     )

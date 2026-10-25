@@ -614,7 +614,7 @@ TOOL_DEFINITIONS = [
             }
         }
     },
-    {"type": "function", "function": {"name": "system_utility", "description": "MANDATORY for Real-Time Data. Use this to perform DIAGNOSTICS/FULL HEALTH CHECK, get user location, or get the weather. (Do NOT use this for time, the exact current time is already in your SYSTEM STATE).", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["check_weather", "check_health", "check_location"]}, "location": {"type": "string", "description": "Required ONLY for 'check_weather'. Specify the city name (e.g., 'Paris'). Leave empty for local weather."}}, "required": ["action"]}}},
+    {"type": "function", "function": {"name": "system_utility", "description": "MANDATORY for Real-Time Data. Use this to perform DIAGNOSTICS/FULL HEALTH CHECK, get user location, or get the weather: current conditions plus a 7-day daily forecast, every day labelled with its weekday and date (answer 'tomorrow' / 'at the weekend' from those labels). (Do NOT use this for time, the exact current time is already in your SYSTEM STATE).", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["check_weather", "check_health", "check_location"]}, "location": {"type": "string", "description": "Required ONLY for 'check_weather'. Specify the city name (e.g., 'Paris'). Leave empty for local weather."}, "hourly": {"type": "boolean", "description": "Only for 'check_weather': true also returns today and tomorrow in 3-hour steps — for a time of day ('this evening', 'at 6pm'). Default false."}}, "required": ["action"]}}},
     {
         "type": "function",
         "function": {

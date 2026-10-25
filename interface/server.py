@@ -1550,6 +1550,16 @@ async def _relay_task_stream(task, offset: int = 0):
             yield b": ping\n\n"
 
 
+#: §4RB: the levels the page may choose (the agent validates again)
+_EFFORT_LEVELS = ("low", "medium", "xhigh")
+
+
+def _effort_header(value) -> dict:
+    """The upstream header for the page's effort choice; {} for auto or junk."""
+    v = str(value or "").strip().lower().replace("-", "")
+    return {"X-Ghost-Effort": v} if v in _EFFORT_LEVELS else {}
+
+
 @app.post("/api/chat", dependencies=[Depends(verify_interface_key)])
 async def chat_proxy(request: Request):
     """Proxies chat requests to the Ghost Agent."""
@@ -1566,6 +1576,10 @@ async def chat_proxy(request: Request):
         if isinstance(msgs, list) and len(msgs) > MAX_CHAT_MESSAGES:
             return _err_json(413, f"Too many messages ({len(msgs)} > {MAX_CHAT_MESSAGES} cap)")
         is_streaming = body.get("stream", False)
+        # §4RB: the reasoning-effort selector (low / medium / xhigh; absent =
+        # auto) rides the body from the page and goes upstream as a header —
+        # the agent's chat schema has no such field
+        _effort = _effort_header(body.pop("reasoning_effort", None))
 
         if is_streaming:
             task_id = str(uuid.uuid4())
@@ -1608,7 +1622,8 @@ async def chat_proxy(request: Request):
                     # 30 min of work, a 60 s sleep started with 61 s left, and the
                     # stitched narration delivered as the reply).
                     _up_headers = {"X-Ghost-Key": GHOST_API_KEY,
-                                   "X-Ghost-Client-Timeout": str(int(CHAT_TIMEOUT_S))}
+                                   "X-Ghost-Client-Timeout": str(int(CHAT_TIMEOUT_S)),
+                                   **_effort}
                     if t.get("request_id"):
                         _up_headers["X-Request-ID"] = t["request_id"]
                     async with client.stream("POST", "http://localhost:8000/api/chat", json=payload, headers=_up_headers, timeout=_chat_timeout()) as response:
@@ -1742,7 +1757,8 @@ async def chat_proxy(request: Request):
                 "http://localhost:8000/api/chat",
                 json=body,
                 headers={"X-Ghost-Key": GHOST_API_KEY,
-                         "X-Ghost-Client-Timeout": str(int(CHAT_TIMEOUT_S))},   # §4JP
+                         "X-Ghost-Client-Timeout": str(int(CHAT_TIMEOUT_S)),   # §4JP
+                         **_effort},                                            # §4RB
                 timeout=_chat_timeout(),
             )
             # Propagate the upstream status — returning the body with an
@@ -1875,6 +1891,9 @@ async def chat_task_state(task_id: str):
     }
 
 AGENT_CANCEL_TIMEOUT_S = 4.0
+#: §4RD: after the agent accepted a Stop, how long the relay may keep reading
+#: so the agent's stream ends on its own (its record and session text run)
+STOP_DRAIN_GRACE_S = 5.0
 
 
 async def _cancel_agent_turn(request_id: str) -> dict:
@@ -1921,12 +1940,30 @@ async def chat_cancel_proxy(task_id: str):
     """
     task = active_chat_tasks.get(task_id)
     if task and not task["done"]:
-        if task["background_task"]:
-            task["background_task"].cancel()
-        task["done"] = True
         # The user ENDED this turn — a "Reply ready" push 12s after they
         # hit Stop would be noise. The push probe checks this flag.
         task["cancelled"] = True
+        rid = task.get("request_id")
+        # §4RD: the AGENT first, then the relay. Tearing the relay down first
+        # hung up on the agent mid-reply: its drain was closed at a yield, so
+        # the turn's record, outcome and session text never ran, and the Stop
+        # read as a dropped client (req e2c7c7f4: 46 min, no ledger row).
+        # A cooperative cancel ends the stream on the agent's next chunk —
+        # give the relay a few seconds to read that end before cutting it.
+        verdict = await _cancel_agent_turn(rid) if rid else None
+        bg = task.get("background_task")
+        if (verdict and verdict.get("cancelled") and isinstance(bg, asyncio.Future)
+                and not bg.done()):
+            try:
+                await asyncio.wait_for(asyncio.shield(bg), STOP_DRAIN_GRACE_S)
+            except asyncio.CancelledError:
+                if not bg.cancelled():          # r1: only the relay's own cancel (a second Stop, the janitor) is ours to absorb
+                    raise
+            except Exception:  # noqa: BLE001 — a timeout or the worker's own error: cut it below
+                pass
+        if bg and not (isinstance(bg, asyncio.Future) and bg.done()):
+            bg.cancel()
+        task["done"] = True
         # Stamp + wake HERE, not only in the worker's finally: a reader
         # parked on new_data_event otherwise stayed parked until the
         # cancelled worker got around to its finally — and a worker
@@ -1936,10 +1973,8 @@ async def chat_cancel_proxy(task_id: str):
         ev = task.get("new_data_event")
         if ev is not None:
             ev.set()
-        rid = task.get("request_id")
         if rid:
-            return {"status": "cancelled", "request_id": rid,
-                    "agent": await _cancel_agent_turn(rid)}
+            return {"status": "cancelled", "request_id": rid, "agent": verdict}
         return {"status": "cancelled"}
     return _err_json(404, "not_found_or_done")
 

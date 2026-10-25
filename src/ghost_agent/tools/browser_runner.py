@@ -603,10 +603,16 @@ async def _with_context(profile_dir, proxy, timeout_ms, op_fn):
             try:
                 result = await asyncio.wait_for(op_fn(page), timeout=max(1.0, timeout_ms / 1000.0 + 5.0))
             except asyncio.TimeoutError:
+                # §4RI (request 43fe95a2): two interact calls timed out on a page
+                # with a 3.3 s boot animation; the model was never told that the
+                # budget is its own `timeout_ms` (divided per action for
+                # interact) and tried smaller selectors instead.
                 raise RuntimeError(
                     f"the op exceeded its {int(timeout_ms)} ms budget — the page kept the browser busy "
-                    "(a slow load, a spinning script, or waits that add up); use a different source, "
-                    "a smaller selector, or fewer actions")
+                    "(a slow load, a spinning script, or waits that add up); pass a larger timeout_ms "
+                    "(for interact it is split across the actions, so a page with a boot animation or "
+                    "a long wait needs more — e.g. timeout_ms=60000 — or fewer actions per call), "
+                    "or use a different source or a smaller selector")
             if _SSRF_VIOLATIONS:
                 raise RuntimeError(
                     "blocked: the page redirected to a non-public address "

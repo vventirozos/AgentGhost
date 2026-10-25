@@ -257,6 +257,9 @@ class TestTheUnattendedPathReadsTheStatus:
             "_parse_verdict", "_verdict_score_probe", "_error_key",
             "_syntax_fail_reason", "_replace_failure_kind",
             "_log_verify_outcome", "_normalize_tool_error", "parse_plan_verdict",
+            # §4RD: reads the container shell's stdout of a service launch,
+            # before any tool result exists
+            "_launch_redirect_failed",
         }
 
         found = {}          # name -> (path, lineno, body)

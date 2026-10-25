@@ -123,6 +123,7 @@ class TestBubbleRevealsOnVisibleText:
         fn = (extract_js_function(app_js, "_stripOrphanThinkClose")      # §4KO: called by _stripInternalTags
               + extract_js_function(app_js, "_stripInternalTags")
               + extract_js_function(app_js, "_revealAgentBubble")
+              + extract_js_function(app_js, "_replaceStreamBubble")     # 2026-10-24: no processed image → innerHTML
               + extract_js_function(app_js, "_renderStreamingContent"))
         pre = _DOM_SHIM + f"""
 const status = [];
@@ -136,6 +137,7 @@ function setTurnStatusDesc(t, i) {{ status.push(t); }}
 const activeFace = {{ setPhase(p) {{ status.push('phase:' + p); }} }};   // 2026-09-11: the reveal sets the write gait
 const chatLog = {{ scrollHeight: 100, scrollTop: 0, clientHeight: 100 }};
 function scrollToBottomDuringStream() {{}}
+function _isNearBottom() {{ return true; }}
 function _noteNewContentBelow() {{}}
 function decorateCodeBlocks() {{}}
 """
@@ -740,7 +742,19 @@ class TestStopIsOneCall:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def test_touched_modules_bumped(index_html, app_js):
-    assert "app.js?v=15.0" in index_html and "style.css?v=6.7" in index_html
-    assert "workspace.js?v=9.1" in app_js and "matrix_graph.js?v=15.0" in app_js
+    assert "app.js?v=15.7" in index_html and "style.css?v=7.2" in index_html
+    assert "workspace.js?v=9.2" in app_js and "matrix_graph.js?v=15.7" in app_js
     ws = (_STATIC / "workspace.js").read_text(encoding="utf-8")
     assert "notifications.js?v=7.2" in ws
+
+
+# 2026-10-24: streaming jitter. #chat-log has `scroll-behavior: smooth`, so a
+# per-frame scrollTo({behavior:'auto'}) animated every frame; and "pinned" was
+# measured after the re-render had grown the bubble.
+def test_stream_scroll_is_instant_and_pinned_is_read_before_render(app_js_nc):
+    i = app_js_nc.index("function scrollToBottomDuringStream")
+    assert "behavior: 'instant'" in app_js_nc[i:i + 700]
+    i = app_js_nc.index("function _renderStreamingContent")
+    body = app_js_nc[i:i + 1600]
+    assert body.index("const wasPinned = _isNearBottom();") < body.index("_replaceStreamBubble(currentAgentMessageDiv, renderMarkdown(")
+    assert "if (wasPinned) scrollToBottomDuringStream();" in body

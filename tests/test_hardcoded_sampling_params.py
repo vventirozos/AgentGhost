@@ -4,8 +4,8 @@ The legacy code dynamically raised the temperature on tool-call
 failures, emitting "Adjusting variance to X to solve error" log lines.
 That adaptive loop was removed in favor of two fixed profiles:
 
-  General (non-coding): temp=1.0, top_p=0.95, top_k=20, min_p=0, presence_penalty=1.5
-  Coding  (specialist): temp=0.6, top_p=0.95, top_k=20, min_p=0, presence_penalty=0
+  General (non-coding): temp=1.0, top_p=0.95, top_k=20, min_p=0, presence_penalty=0 (§4RG-b; was 1.5)
+  Coding  (specialist): temp=1.0 (§4RG, was 0.6), top_p=0.95, top_k=20, min_p=0, presence_penalty=0
 
 These tests pin the profiles, prove the selector picks the right one
 based on coding intent, and confirm the agent threads those exact
@@ -36,13 +36,13 @@ def test_general_profile_matches_spec():
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0,
-        "presence_penalty": 1.5,
+        "presence_penalty": 0,     # §4RG-b: card thinking-mode value (was the instruct 1.5)
     }
 
 
 def test_coding_profile_matches_spec():
     assert CODING_SAMPLING_PARAMS == {
-        "temperature": 0.6,
+        "temperature": 1.0,     # §4RG: Qwen3.8 card thinking-mode value (was 0.6)
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0,
@@ -73,10 +73,10 @@ def test_get_sampling_params_returns_independent_copy():
     The module-level constants must stay pristine."""
     a = get_sampling_params(True)
     a["temperature"] = 42.0
-    assert CODING_SAMPLING_PARAMS["temperature"] == 0.6
+    assert CODING_SAMPLING_PARAMS["temperature"] == 1.0
     b = get_sampling_params(False)
     b["presence_penalty"] = 42.0
-    assert GENERAL_SAMPLING_PARAMS["presence_penalty"] == 1.5
+    assert GENERAL_SAMPLING_PARAMS["presence_penalty"] == 0
 
 
 def test_get_sampling_params_truthy_and_falsy_inputs():
@@ -136,7 +136,7 @@ def test_payload_merges_sampling_params_without_extras():
         **sampling,
         "frequency_penalty": 0.0,
     }
-    assert payload["temperature"] == 0.6
+    assert payload["temperature"] == 1.0
     assert payload["top_p"] == 0.95
     assert payload["top_k"] == 20
     assert payload["min_p"] == 0
@@ -152,7 +152,7 @@ def test_payload_general_profile_merge():
     sampling = get_sampling_params(is_tool_turn=False)
     payload = {"model": "m", "messages": [], "stream": False, **sampling}
     assert payload["temperature"] == 1.0
-    assert payload["presence_penalty"] == 1.5
+    assert payload["presence_penalty"] == 0
     assert payload["top_p"] == 0.95
     assert payload["top_k"] == 20
     assert payload["min_p"] == 0
@@ -169,7 +169,7 @@ def test_payload_general_profile_merge():
     (False, True,  GENERAL_SAMPLING_PARAMS),  # conversational even if coding flag set
 ])
 def test_selector_contract(is_tool_turn, is_coding, expected):
-    """Every non-conversational turn must drop temperature to 0.6.
+    """Every non-conversational turn must use the tool-turn profile (§4RG: 1.0, presence 0).
 
     The earlier contract gated the drop on coding-intent only, which
     left `update_profile` / `web_search` / `manage_tasks` on temp=1.0
@@ -184,11 +184,11 @@ def test_selector_contract(is_tool_turn, is_coding, expected):
 ])
 def test_all_coding_subprofiles_pinned_to_model_card(query):
     """The creative/precise/balanced sub-profiles stay WIRED but every one is
-    pinned to the model-card coding values (temp=0.6, top_p=0.95, top_k=20) —
+    pinned to the model-card thinking-mode values (temp=1.0, top_p=0.95, top_k=20; §4RG) —
     so NO coding turn drifts off-spec regardless of which keywords it hits."""
     p = get_sampling_params(True, query, is_coding=True)
     assert p == CODING_SAMPLING_PARAMS
-    assert p["temperature"] == 0.6 and p["top_p"] == 0.95 and p["top_k"] == 20
+    assert p["temperature"] == 1.0 and p["top_p"] == 0.95 and p["top_k"] == 20
 
 
 def test_coding_subprofiles_dict_all_equal_spec():

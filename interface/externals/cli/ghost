@@ -28,7 +28,8 @@ agent's real feature surface:
   turn server-side (releasing the global turn lock) instead of merely
   closing our socket while the agent keeps working. ``/turns`` shows
   what's running or queued; ``/cancel [hard]`` unwedges a stuck turn.
-* **Operations** — ``/health`` (runtime introspection), ``/notify``
+* **Operations** — ``/health`` (runtime introspection), ``/effort``
+  (reasoning effort for your messages, as the web page's selector), ``/notify``
   (pending autonomous-activity notifications, watermark-acked),
   ``/memory fix|rm`` (surgical vector-memory corrections).
 * **Files & workspace** — ``/upload``/``/download`` move files in and out
@@ -43,11 +44,15 @@ raw text when piped, rendered when stdout is a terminal.
 from __future__ import annotations
 
 import argparse
+import copy
+import io
 import json
 import os
 import re
 import shlex
+import shutil
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -67,6 +72,7 @@ if not os.environ.get("GHOST_CLI_WARN"):
 
 import requests
 from prompt_toolkit import PromptSession
+from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import NestedCompleter, PathCompleter
 from prompt_toolkit.shortcuts import CompleteStyle
@@ -121,7 +127,7 @@ PALETTE = {
 # headers, magenta headings — which belonged to no palette at all and were
 # the loudest thing on screen in any reply containing a table or a code
 # span. The theme owns them now, so a reply looks like the rest of the app.
-console = Console(theme=Theme({
+THEME = Theme({
     **PALETTE,
     "status.spinner":        PALETTE["ghost"],
     "rule.line":             PALETTE["faint"],
@@ -144,7 +150,8 @@ console = Console(theme=Theme({
     "markdown.block_quote":  PALETTE["mute"],
     "markdown.table.border": PALETTE["faint"],
     "markdown.table.header": f"bold {PALETTE['mute']}",
-}), highlight=False)
+})
+console = Console(theme=THEME, highlight=False)
 
 
 def _default_key() -> str:
@@ -163,7 +170,16 @@ def _default_key() -> str:
 
 DEFAULT_KEY = _default_key()
 
-PROMPT_STYLE = Style.from_dict({"p": PALETTE["you"]})
+PROMPT_STYLE = Style.from_dict({
+    "p": PALETTE["you"],
+    # The status line pinned under the prompt (2026-10-24). prompt_toolkit's
+    # stock toolbar is reverse video — a white bar; this one is plain chrome,
+    # coloured by the ANSI it carries.
+    "bottom-toolbar": "noreverse",
+})
+
+#: Seconds between the status line's background health probes.
+STATUS_REFRESH_S = 30
 
 bindings = KeyBindings()
 @bindings.add("c-d")
@@ -181,6 +197,7 @@ COMPLETER = NestedCompleter.from_nested_dict({
     "/sessions": {"rm": None},
     "/resume": None,
     "/health": None, "/turns": None,
+    "/effort": {"default": None, "low": None, "med": None, "xhigh": None},
     "/cancel": {"hard": None},
     "/notify": None,
     "/memory": {"fix": None, "rm": None},
@@ -213,6 +230,20 @@ RATE_CMDS = {
 #: lands can 404. The operator is sitting at the prompt, so retry
 #: synchronously and report the truth instead of firing and forgetting.
 RATE_RETRY_DELAYS = (0.5, 2.0, 4.0)
+
+# --- reasoning effort (§4RB) ------------------------------------------------
+# The web page's effort selector, for the terminal: the level rides each chat
+# request as the X-Ghost-Effort header the agent reads (owner turns only;
+# ignored unless /api/health reports reasoning_effort: true). "" = Default —
+# nothing is sent and the model server's own level applies.
+#: What the operator may type → wire level.
+EFFORT_ALIASES = {
+    "default": "", "auto": "", "off": "",
+    "low": "low",
+    "med": "medium", "medium": "medium",
+    "xhigh": "xhigh", "x-high": "xhigh", "high": "xhigh",
+}
+EFFORT_LABELS = {"": "Default", "low": "Low", "medium": "Med", "xhigh": "X-high"}
 #: Feedback is a tiny POST. It needs its OWN timeout because the retry
 #: multiplies it: with _json's default (10, 60) the four attempts could
 #: freeze the prompt for 4x70s + 6.5s ≈ 287s against a hung agent.
@@ -525,6 +556,7 @@ HELP = """[bold]conversation[/]
 [bold]agent[/]
   [you]/health[/]                runtime health of the agent
   [you]/turns[/]                 in-flight + queued turns
+  [you]/effort[/] \\[level]        reasoning effort: default|low|med|xhigh [dim](bare = show)[/]
   [you]/cancel[/] \\[hard]         cancel the turn the agent is running — any client's (hard = force-release)
   [you]/notify[/]                show + ack pending autonomous-activity notifications
   [you]/memory fix[/] "old" "new"  correct one vector-memory fragment
@@ -618,12 +650,15 @@ class GhostAPI:
 
     # -- chat --------------------------------------------------------------
     def chat_stream(self, messages: list[dict], session_id: str,
-                    request_id: str) -> requests.Response:
+                    request_id: str, effort: str = "") -> requests.Response:
+        headers = {"X-Request-ID": request_id}
+        if effort:                                  # §4RB: Default sends nothing
+            headers["X-Ghost-Effort"] = effort
         return self.http.post(
             self._url("/v1/chat/completions"),
             json={"messages": messages, "stream": True,
                   "session_id": session_id},
-            headers={"X-Request-ID": request_id},
+            headers=headers,
             stream=True, timeout=(10, None),   # connect 10s; agent ends the read
         )
 
@@ -753,34 +788,84 @@ class GhostCLI:
         # Set by stream_reply: "" | "cancelled" | "error". A turn the agent
         # never finished is not rateable — see cmd_rate.
         self._turn_interrupted = ""
+        # §4RB: reasoning effort for this client's turns ("" = Default), and
+        # whether the agent's switch is on (set by the banner's health probe).
+        self.effort = ""
+        self._effort_switch = False
+        # The pinned status line's liveness segment, refreshed off-thread
+        # (see _start_status_refresh) so drawing it never waits on the network.
+        self._probe_cache: Text | None = None
 
     # -- presentation ----------------------------------------------------
     def banner(self) -> None:
-        """Identity, endpoint, session and liveness on ONE line that never
-        wraps, over a rule that spans the window.
+        """The start-up hint under a rule that spans the window. The status
+        line (identity, effort, endpoint, session, liveness) is no longer
+        printed here: it is pinned under the prompt (2026-10-24, operator) —
+        see status_toolbar.
 
         The old banner hardcoded a 52-column rule and unconditionally
         assembled the full URL, the session id and 'up 3h 20m' — so it
         under-ran a wide terminal and WRAPPED in a narrow one, which is
         what the operator saw first, every time."""
         console.print()
-        console.print(self._banner_line(console.width))
         console.print(_rule())
         console.print(self._hint_line(console.width))
         console.print()
 
-    def _banner_line(self, width: int) -> Text:
-        """Identity and liveness are never what gets cut; the endpoint and
-        the session id are, in that order, as the window narrows."""
+    def status_toolbar(self) -> ANSI:
+        """The pinned status line under the prompt — _banner_line rendered to
+        ANSI for prompt_toolkit. Called on every redraw, so it never touches
+        the network: liveness comes from the background probe's cache, the
+        effort level straight from self.effort (a /effort shows at once)."""
+        width = shutil.get_terminal_size((80, 24)).columns
+        probe = self._probe_cache or Text("○ checking…", style="faint")
+        buf = io.StringIO()
+        Console(file=buf, force_terminal=True, color_system="truecolor",
+                width=width + 10, theme=THEME, highlight=False,
+                ).print(self._banner_line(width, probe), end="")
+        return ANSI(buf.getvalue())
+
+    def _start_status_refresh(self) -> None:
+        """Probe health now and every STATUS_REFRESH_S on a daemon thread,
+        redrawing the prompt when the answer lands. The thread gets its OWN
+        requests.Session — one Session shared with a streaming turn is not
+        thread-safe."""
+        api = copy.copy(self.api)
+        api.http = requests.Session()
+        api.http.headers.update(self.api.http.headers)
+        prober = copy.copy(self)
+        prober.api = api
+
+        def _loop() -> None:
+            while True:
+                text = prober._probe()
+                self._effort_switch = prober._effort_switch
+                self._probe_cache = text
+                app = self.prompt_session.app if self.prompt_session else None
+                if app is not None and app.is_running:
+                    app.invalidate()
+                time.sleep(STATUS_REFRESH_S)
+
+        threading.Thread(target=_loop, name="ghost-status", daemon=True).start()
+
+    def _banner_line(self, width: int, probe_text: Text | None = None) -> Text:
+        """Identity and liveness are never what gets cut; the session id,
+        the endpoint and the effort level are, in that order, as the window
+        narrows. Effort shows only while the agent's switch is on (the
+        probe's health answer says) — off, a level means nothing."""
         host = self.api.base_url.split("://", 1)[-1]
         sep = ("  ·  ", "faint")
         probe = Text("  ·  ", style="faint")
-        probe.append_text(self._probe())
+        probe.append_text(self._probe() if probe_text is None else probe_text)
+        optional = [[sep, (host, "mute")],
+                    [sep, (self.session_id[:8], "faint")]]
+        if self._effort_switch:
+            optional.insert(0, [sep, ("effort ", "faint"),
+                                (EFFORT_LABELS[self.effort].lower(),
+                                 "you" if self.effort else "mute")])
         return _fit_line(
             head=[("  👻 ghost", "bold ghost")],
-            optional=[[sep, (host, "mute")],
-                      [sep, (self.session_id[:8], "faint")]],
-            tail=probe, width=width)
+            optional=optional, tail=probe, width=width)
 
     def _hint_line(self, width: int) -> Text:
         return _fit_line(
@@ -797,6 +882,8 @@ class GhostCLI:
         except requests.RequestException:
             return Text("○ unreachable", style="err")
         if status == 200:
+            self._effort_switch = (isinstance(data, dict)
+                                   and data.get("reasoning_effort") is True)
             # Compact ("3h20m", not "up 3h 20m") — this is the segment the
             # banner can least afford to spend width on.
             up = _dur(data.get("uptime_s")).replace(" ", "")
@@ -860,7 +947,7 @@ class GhostCLI:
 
         try:
             with self.api.chat_stream(self.history, self.session_id,
-                                      request_id) as resp:
+                                      request_id, self.effort) as resp:
                 if resp.status_code != 200:
                     _settle()
                     self._turn_interrupted = "error"
@@ -1253,6 +1340,33 @@ class GhostCLI:
                              else Text(_safe(val)))
             console.print(line)
 
+    def cmd_effort(self, args: list[str]) -> None:
+        """/effort [level] — set (or, bare, show) the reasoning effort sent
+        with this client's messages. Health is asked either way: while the
+        agent's switch is off the header is ignored, and saying so beats a
+        level that silently does nothing."""
+        if len(args) > 1 or (args and args[0].lower() not in EFFORT_ALIASES):
+            self.notice("usage: /effort [default|low|med|xhigh]", "err")
+            return
+        if args:
+            new = EFFORT_ALIASES[args[0].lower()]
+            changed = new != self.effort
+            self.effort = new
+            self.notice(f"✓ effort: {EFFORT_LABELS[new]}"
+                        + (" (the model server's own level)" if not new else ""), "mute")
+            if changed:
+                self.notice("a change of level re-processes this conversation once on the "
+                            "next message (seconds; longer for a long conversation)", "faint")
+        else:
+            self.notice(f"effort: {EFFORT_LABELS[self.effort]}", "mute")
+        try:
+            status, data = self.api.health(timeout=(2, 5))
+        except requests.RequestException:
+            return
+        if status == 200 and isinstance(data, dict) and data.get("reasoning_effort") is not True:
+            self.notice("the agent's effort switch is off (GHOST_REASONING_EFFORT) — "
+                        "the level is ignored until it is on", "notice")
+
     def cmd_turns(self) -> None:
         status, data = self.api.turns()
         if status != 200:
@@ -1555,6 +1669,8 @@ class GhostCLI:
                     self.cmd_health()
                 case "/turns":
                     self.cmd_turns()
+                case "/effort":
+                    self.cmd_effort(args)
                 case "/cancel":
                     self.cmd_cancel(hard=args[:1] == ["hard"])
                 case "/notify":
@@ -1614,7 +1730,9 @@ class GhostCLI:
             reserve_space_for_menu=0,
             complete_style=CompleteStyle.READLINE_LIKE,
             complete_while_typing=False,
+            bottom_toolbar=self.status_toolbar,
         )
+        self._start_status_refresh()
         self.banner()
         while True:
             try:
@@ -1644,7 +1762,8 @@ class GhostCLI:
 
 # --- one-shot (scripting) mode ---------------------------------------------
 
-def one_shot(api: GhostAPI, prompt: str, session_id: str | None) -> int:
+def one_shot(api: GhostAPI, prompt: str, session_id: str | None,
+             effort: str = "") -> int:
     """Send one message and stream the reply to stdout — rendered Markdown
     when stdout is a terminal, raw text when piped (script-friendly).
     With --session the server merges the stored history in, so this can
@@ -1670,6 +1789,8 @@ def one_shot(api: GhostAPI, prompt: str, session_id: str | None) -> int:
         # §4MP: piped output cannot take back streamed text — ask for the
         # finished reply only (no retracts); a terminal gets live tokens
         _hdrs = {"X-Request-ID": request_id}
+        if effort:                                  # §4RB: --effort
+            _hdrs["X-Ghost-Effort"] = effort
         if not render:
             _hdrs["X-Ghost-Stream"] = "final"
         with api.http.post(api._url("/v1/chat/completions"), json=body,
@@ -1774,12 +1895,16 @@ def main() -> int:
                         help="one-shot: send TEXT ('-' reads stdin), print reply, exit")
     parser.add_argument("--session", metavar="ID",
                         help="server-side session id to resume / continue")
+    parser.add_argument("--effort", choices=sorted(set(EFFORT_ALIASES) - {"auto", "off"}),
+                        help="reasoning effort for this run's messages (the REPL's /effort); "
+                             "default = the model server's own level")
     parser.add_argument("--health", action="store_true",
                         help="print agent health and exit")
     parser.add_argument("--probe", action="store_true",
                         help="mark every turn as a diagnostic probe (X-Ghost-Origin: probe): "
                              "it runs normally but never teaches the agent")
     args = parser.parse_args()
+    effort = EFFORT_ALIASES.get(args.effort or "default", "")
 
     api = GhostAPI(args.url, args.key)
     if args.probe:
@@ -1805,9 +1930,10 @@ def main() -> int:
         if not prompt:
             print("ghost: empty prompt", file=sys.stderr)
             return 1
-        return one_shot(api, prompt, args.session)
+        return one_shot(api, prompt, args.session, effort)
 
     cli = GhostCLI(api, session_id=args.session)
+    cli.effort = effort
     if args.session:
         try:
             cli.cmd_resume(args.session)

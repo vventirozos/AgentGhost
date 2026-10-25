@@ -735,3 +735,78 @@ def test_a_non_image_file_written_as_an_image_becomes_a_file_link():
               " d.querySelectorAll('img').length, d.querySelector('img').getAttribute('src')]; })()")
     res, _ = asyncio.run(_run_page(script))
     assert res == ["/api/download/probe-oj/tea-notes.md", "Tea Notes", 1, "/api/download/a.png"], res
+
+
+def test_streaming_rerender_keeps_processed_images_in_chromium():
+    """2026-10-24 image flicker. Fails where each streaming frame rebuilt the
+    bubble with innerHTML: the processed <img> was replaced by a fresh one (a
+    new /api/download load, no 🖼️ button until the async swap), so the image
+    area flickered and the reply hopped."""
+    pw = _chromium_or_skip()
+    fn = extract_js_function(APP, "_replaceStreamBubble")
+
+    async def go():
+        loads = []
+        async with pw.async_playwright() as p:
+            try:
+                b = await p.chromium.launch()
+            except Exception as e:  # noqa: BLE001
+                pytest.skip(f"chromium unavailable: {e}")
+            pg = await b.new_page()
+
+            async def origin(route):
+                await route.fulfill(status=200, content_type="text/html",
+                                    body="<html><body><div id=m></div></body></html>")
+
+            async def download(route):
+                loads.append(route.request.url)
+                await route.fulfill(status=401, body="")
+
+            await pg.route(f"https://{HOST}/", origin)
+            await pg.route(f"https://{HOST}/api/download/**", download)
+            await pg.goto(f"https://{HOST}/")
+            await pg.add_script_tag(content=fn + "\nwindow._replaceStreamBubble = _replaceStreamBubble;")
+            out = await pg.evaluate("""async () => {
+                const div = document.getElementById('m');
+                const img1 = '<p><img src="/api/download/a.png" alt="a"></p>';
+                const wait = () => new Promise(r => setTimeout(r, 300));
+                _replaceStreamBubble(div, '<p>one</p>' + img1);
+                const first = div.querySelector('img');
+                // what _processChatLogArtifacts + _handleChatImage do to it
+                first.classList.add('placeholder-added');
+                first.dataset.ghostSrc = first.getAttribute('src');
+                const btn = document.createElement('button');
+                first.before(btn);
+                first._ghostPlaceholderBtn = btn;
+                await wait();
+                _replaceStreamBubble(div, '<p>one</p>' + img1 + '<p>two</p>'
+                    + '<p><img src="/api/download/b.png" alt="b"></p>');
+                const imgs = [...div.querySelectorAll('img')];
+                const res = {
+                    same: imgs[0] === first,
+                    btnBefore: first.previousSibling === btn,
+                    buttons: div.querySelectorAll('button').length,
+                    secondFresh: !imgs[1].classList.contains('placeholder-added'),
+                    text: div.textContent,
+                };
+                // a broken-image badge is carried too
+                const badge = document.createElement('div');
+                badge.className = 'broken-image-badge';
+                badge.dataset.ghostSrc = '/api/download/b.png';
+                imgs[1].replaceWith(badge);
+                _replaceStreamBubble(div, '<p>one</p>' + img1 + '<p>two</p>'
+                    + '<p><img src="/api/download/b.png" alt="b"></p><p>three</p>');
+                res.badgeKept = div.querySelector('.broken-image-badge') === badge;
+                res.imgCount = div.querySelectorAll('img').length;
+                await wait();
+                return res;
+            }""")
+            await b.close()
+            return out, loads
+
+    out, loads = asyncio.run(go())
+    assert out["same"] and out["btnBefore"] and out["buttons"] == 1, out
+    assert out["secondFresh"] and "two" in out["text"], out
+    assert out["badgeKept"] and out["imgCount"] == 1, out
+    # a.png loaded once (first frame), b.png once (its first frame) — no reloads
+    assert sorted(u.rsplit("/", 1)[1] for u in loads) == ["a.png", "b.png"], loads

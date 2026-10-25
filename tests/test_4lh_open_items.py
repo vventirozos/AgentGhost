@@ -584,8 +584,17 @@ async def test_a_member_never_waits_at_the_gate_after_a_failed_search(agent, mon
     monkeypatch.setenv("GHOST_CRITIC_ASYNC", "0")
     monkeypatch.setenv("GHOST_CRITIC_GATE_TIMEOUT", "30")
 
+    # §4RJ: the pin used to be `wall-clock < 1.2 s` against a 1.5 s verdict —
+    # a proxy that failed under the 8-worker suite load (1.49 s with no wait
+    # at all). The mechanism: the reply must come back BEFORE the verdict
+    # lands, so the verdict is held on an event the test releases afterwards;
+    # a gate that waits hangs on it and the wait_for below names that.
+    release = asyncio.Event()
+    landed = {"v": False}
+
     async def slow(*a, **k):
-        await asyncio.sleep(1.5)
+        await release.wait()
+        landed["v"] = True
         return _verdict(VerifyVerdict.CONFIRMED)
     verifier, vmock = _make_verifier([])
     vmock.side_effect = slow
@@ -597,11 +606,17 @@ async def test_a_member_never_waits_at_the_gate_after_a_failed_search(agent, mon
         {"choices": [{"message": {"content": "", "tool_calls": [
             {"id": "t1", "function": {"name": "web_search", "arguments": '{"query": "launch"}'}}]}}]},
         _final("The search failed, so I could not find the launch year.")])
-    t0 = time.monotonic()
     with patch("ghost_agent.core.agent.pretty_log"):
-        await agent.handle_chat({"messages": [{"role": "user", "content": "when did it launch?"}]},
-                                background_tasks=MagicMock(), requester_role="member")
-    assert time.monotonic() - t0 < 1.2
+        try:
+            await asyncio.wait_for(
+                agent.handle_chat({"messages": [{"role": "user", "content": "when did it launch?"}]},
+                                  background_tasks=MagicMock(), requester_role="member"),
+                timeout=20.0)
+        except asyncio.TimeoutError:
+            raise AssertionError("the member's reply waited at the verifier gate")
+    assert not landed["v"], "the verdict landed before the reply: the gate waited"
+    release.set()                      # let a background verdict finish cleanly
+    await asyncio.sleep(0)
 
 
 @pytest.mark.parametrize("text", ["\n" * 100000, ". " * 50000, "[" * 50000, "`" * 33000, "http://" * 20000,

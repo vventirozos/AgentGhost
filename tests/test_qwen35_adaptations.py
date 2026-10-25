@@ -60,7 +60,7 @@ def test_agent_temperature_fixed_profiles():
     assert "current_temp" not in agent_src
     assert "args.temperature" not in agent_src
     assert "get_sampling_params(" in agent_src
-    assert CODING_SAMPLING_PARAMS["temperature"] == 0.6
+    assert CODING_SAMPLING_PARAMS["temperature"] == 1.0   # §4RG
     assert GENERAL_SAMPLING_PARAMS["temperature"] == 1.0
     assert get_sampling_params(True)["presence_penalty"] == 0
-    assert get_sampling_params(False)["presence_penalty"] == 1.5
+    assert get_sampling_params(False)["presence_penalty"] == 0   # §4RG-b

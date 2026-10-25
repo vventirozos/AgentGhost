@@ -52,6 +52,7 @@ _MANIFEST_PATH = Path(__file__).with_name("cachebust_manifest.json")
 _CARRIER = {
     "app.js": "index.html",
     "matrix_graph.js": "app.js",
+    "effort.js": "app.js",          # §4RB
     "workspace.js": "app.js",
     "sessions.js": "workspace.js",
     "status.js": "workspace.js",
@@ -64,6 +65,7 @@ _CARRIER = {
 _ANCESTORS = {
     "app.js": [],
     "matrix_graph.js": ["app.js"],
+    "effort.js": ["app.js"],
     "workspace.js": ["app.js"],
     "sessions.js": ["workspace.js", "app.js"],
     "status.js": ["workspace.js", "app.js"],

@@ -24,7 +24,205 @@ def _server_name(resp) -> str:
     return raw or "the server"
 
 
-async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = None):
+#: §4RE (2026-10-25): every weather answer carries a daily outlook, so "will
+#: it rain tomorrow / at the weekend" needs no second call and no date
+#: arithmetic by the model (each day is labelled with its weekday and date in
+#: the PLACE's local calendar). `hourly=true` adds today and tomorrow in steps.
+FORECAST_DAYS = 7
+HOURLY_STEP_H = 3
+_OM_CURRENT = "temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m"
+_OM_DAILY = ("weather_code,temperature_2m_max,temperature_2m_min,"
+             "precipitation_probability_max,precipitation_sum,wind_speed_10m_max")
+_OM_HOURLY = "temperature_2m,precipitation_probability,weather_code"
+
+
+def _wants_hourly(value) -> bool:
+    """A model may send the flag as a string."""
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in ("true", "1", "yes", "y")
+
+
+def _http_client(proxy_url):
+    """The one client every weather request uses (curl_cffi when present)."""
+    if curl_requests:
+        proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+        return curl_requests.AsyncSession(impersonate="chrome110", proxies=proxies, timeout=20.0, verify=True)
+    return httpx.AsyncClient(proxy=proxy_url, timeout=20.0, verify=True)
+
+
+def _forecast_url(lat, lon, hourly: bool) -> str:
+    url = (f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&"
+           f"current={_OM_CURRENT}&daily={_OM_DAILY}&forecast_days={FORECAST_DAYS}&"
+           f"timezone=auto&wind_speed_unit=kmh")
+    return url + (f"&hourly={_OM_HOURLY}" if hourly else "")
+
+
+def _num(v, unit: str = "") -> str:
+    """A reading as text, or "?" — a missing or non-numeric value never
+    renders as "None" (a forecast array may carry nulls)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return "?"
+    return f"{round(float(v), 1):g}{unit}"
+
+
+def _cond(code) -> str:
+    """A WMO code as words; a null code (a forecast array carries them) is "?"."""
+    if code is None:
+        return "?"
+    return WMO_CONDITIONS.get(code, f"code {code}")
+
+
+def _day_label(iso_date: str, index: int) -> str:
+    """'Today Sun 25 Oct' — relative words from the forecast's own day order,
+    so the label is the PLACE's calendar, not this host's."""
+    try:
+        d = datetime.date.fromisoformat(str(iso_date)[:10])
+        stamp = d.strftime("%a %d %b").replace(" 0", " ")
+    except (TypeError, ValueError):
+        stamp = _wttr_text(iso_date, 10)
+    return {0: "Today ", 1: "Tomorrow "}.get(index, "") + stamp
+
+
+def _col(block: dict, key: str, i: int):
+    try:
+        return (block.get(key) or [])[i]
+    except (IndexError, TypeError, AttributeError):
+        return None
+
+
+def _forecast_lines(js: dict, hourly: bool, now_s: str) -> list:
+    """The daily outlook and (on request) the hourly rows of an Open-Meteo
+    answer. Remote text is cut to bounded control-free lines (§4LV)."""
+    lines = []
+    tz = _wttr_text(js.get("timezone"), 40)
+    daily = js.get("daily") or {}
+    days = [str(d)[:10] for d in list(daily.get("time") or [])[:FORECAST_DAYS]]
+    if days:
+        lines.append(f"Daily forecast ({tz or 'local time'}):")
+        for i, day in enumerate(days):
+            lines.append(
+                f"- {_day_label(day, i)}: {_cond(_col(daily, 'weather_code', i))}, "
+                f"{_num(_col(daily, 'temperature_2m_min', i))}–{_num(_col(daily, 'temperature_2m_max', i))}°C, "
+                f"chance of rain {_num(_col(daily, 'precipitation_probability_max', i), '%')}, "
+                f"rain {_num(_col(daily, 'precipitation_sum', i), ' mm')}, "
+                f"wind up to {_num(_col(daily, 'wind_speed_10m_max', i), ' km/h')}")
+    if not hourly:
+        return lines
+    if len(now_s) < 13:                     # r1 m3: no "now" to start from — say so, show none
+        lines.append("Hourly: not available (the source gave no local time).")
+        return lines
+    hb = js.get("hourly") or {}
+    times = [str(t) for t in (hb.get("time") or [])]
+    dates = days or sorted({t[:10] for t in times})          # r1 m4: bounded without the daily block
+    first_day, last_day = (dates[0], dates[1] if len(dates) > 1 else dates[0]) if dates else ("", "")
+    rows, seen = [], set()
+    for i, t in enumerate(times):
+        if (len(t) < 16 or t[:13] < now_s[:13] or not last_day or t[:10] > last_day
+                or t[:16] in seen):                          # r1 m6: a repeated hour (DST) once
+            continue
+        try:
+            if int(t[11:13]) % HOURLY_STEP_H:
+                continue
+        except ValueError:
+            continue
+        seen.add(t[:16])
+        label = "Today" if t[:10] == first_day else ("Tomorrow" if t[:10] == last_day else _wttr_text(t[:10], 10))
+        rows.append(f"- {label} {_wttr_text(t[11:16], 5)}: {_num(_col(hb, 'temperature_2m', i), '°C')}, "
+                    f"{_cond(_col(hb, 'weather_code', i))}, "
+                    f"chance of rain {_num(_col(hb, 'precipitation_probability', i), '%')}")
+    if rows:
+        lines.append(f"Hourly, today and tomorrow (every {HOURLY_STEP_H} h, local time):")
+        lines.extend(rows[:2 * 24 // HOURLY_STEP_H])
+    return lines
+
+
+def _open_meteo_report(name: str, js: dict, hourly: bool) -> str:
+    curr = js.get("current") or {}
+    cond = WMO_CONDITIONS.get(curr.get("weather_code"), f"code {curr.get('weather_code')}")
+    now_s = _wttr_text(curr.get("time"), 16)
+    lines = [
+        f"REPORT (Source: Open-Meteo): Weather in {_wttr_text(name, 120)}",
+        f"Now{' (' + now_s[11:16] + ' local time)' if len(now_s) >= 16 else ''}:",
+        f"Condition: {cond}",
+        f"Temp: {curr.get('temperature_2m')}°C",
+        f"Wind: {curr.get('wind_speed_10m')} km/h",
+        f"Humidity: {curr.get('relative_humidity_2m')}%",
+    ]
+    try:
+        lines.extend(_forecast_lines(js, hourly, now_s))
+    except Exception as _fe:  # noqa: BLE001 — r1 m5: a bad forecast block never costs the current weather
+        logger.debug("weather forecast block unreadable: %s", _fe)
+        lines.append("Forecast: not available (the source's forecast could not be read).")
+    return "\n".join(lines)
+
+
+def _wttr_text(v, limit: int = 40) -> str:
+    """A remote field: one short control-free line (§4LV)."""
+    return _wttr_line(str(v if v is not None else ""))[:limit]
+
+
+def _wttr_slot(h) -> str:
+    """A j1 slot time ("0", "300" … "2100") as "HH:MM", or "" (r1 M1: the
+    field went into the report raw)."""
+    t = str((h or {}).get("time") if isinstance(h, dict) else "")
+    return f"{t.zfill(4)[:2]}:{t.zfill(4)[2:]}" if t.isascii() and t.isdigit() and len(t) <= 4 and int(t) < 2400 else ""
+
+
+def _wttr_report(js: dict, name: str, by_name: bool, hourly: bool) -> str:
+    """wttr.in's j1 answer as the same report shape. Raises on an answer
+    that is not the j1 shape (the caller treats it as a failed source)."""
+    cur = (js.get("current_condition") or [])[0]
+    days = list(js.get("weather") or [])[:FORECAST_DAYS]
+    if not isinstance(cur, dict) or not days:
+        raise ValueError("not a wttr.in forecast")
+    desc = lambda h: _wttr_text(((h.get("weatherDesc") or [{}])[0] or {}).get("value"))
+    if by_name:
+        # r1 m8: name the place it matched, the failure this exists for
+        area = ((js.get("nearest_area") or [{}])[0] or {})
+        _v = lambda k: _wttr_text(((area.get(k) or [{}])[0] or {}).get("value"), 40)
+        matched = ", ".join(x for x in (_v("areaName"), _v("region"), _v("country")) if x)
+        where = (f"'{_wttr_text(name, 80)}' (wttr.in matched it by name only"
+                 + (f", to {matched}" if matched else "") + " — it may not be the place meant)")
+    else:
+        where = _wttr_text(name, 120)
+    obs = _wttr_text(cur.get("localObsDateTime"), 24)
+    obs_h = None
+    try:
+        obs_h = datetime.datetime.strptime(obs, "%Y-%m-%d %I:%M %p").hour
+    except ValueError:
+        pass
+    lines = [f"REPORT (Source: wttr.in, quoted data): Weather in {where}",
+             f"Now{' (observed ' + obs + ' local time)' if obs else ''}:",
+             f"Condition: {desc(cur)}",
+             f"Temp: {_wttr_text(cur.get('temp_C'), 8)}°C",
+             f"Wind: {_wttr_text(cur.get('windspeedKmph'), 8)} km/h",
+             f"Humidity: {_wttr_text(cur.get('humidity'), 8)}%",
+             "Daily forecast (local time):"]
+    for i, d in enumerate(days):
+        hrs = [h for h in (d.get("hourly") or [])[:8] if isinstance(h, dict)]   # j1: 8 slots a day
+        noon = next((h for h in hrs if _wttr_slot(h) == "12:00"), hrs[len(hrs) // 2] if hrs else {})
+        rain = [int(h.get("chanceofrain")) for h in hrs if str(h.get("chanceofrain") or "").isdigit()]
+        lines.append(f"- {_day_label(_wttr_text(d.get('date'), 10), i)}: {desc(noon)}, "
+                     f"{_wttr_text(d.get('mintempC'), 8)}–{_wttr_text(d.get('maxtempC'), 8)}°C, "
+                     f"chance of rain {str(max(rain)) + '%' if rain else '?'}")
+    if hourly:
+        lines.append("Hourly, today and tomorrow (every 3 h, local time):")
+        for i, d in enumerate(days[:2]):
+            for h in (d.get("hourly") or [])[:8]:
+                slot = _wttr_slot(h)
+                if not slot:
+                    continue
+                if i == 0 and obs_h is not None and int(slot[:2]) < obs_h - obs_h % 3:   # r1 m2: past slots
+                    continue
+                lines.append(f"- {'Today' if i == 0 else 'Tomorrow'} {slot}: "
+                             f"{_wttr_text(h.get('tempC'), 8)}°C, {desc(h)}, "
+                             f"chance of rain {_wttr_text(h.get('chanceofrain'), 4)}%")
+    return "\n".join(lines)
+
+
+async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = None, hourly=False):
+    hourly = _wants_hourly(hourly)
     if not location and profile_memory and not requester_is_member():   # a member's "weather?" gets no owner location (R3)
         # Narrow to Exception (was a bare `except:` catching BaseException —
         # it swallowed CancelledError/KeyboardInterrupt and hid every
@@ -38,7 +236,7 @@ async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = 
         except Exception as _ploc_err:
             logger.debug("profile location lookup failed: %s", _ploc_err)
 
-    pretty_log("System Weather", f"Location: {location}", icon=Icons.TOOL_SEARCH)
+    pretty_log("System Weather", f"Location: {location}{' · hourly' if hourly else ''}", icon=Icons.TOOL_SEARCH)
     if not location:
         return "SYSTEM ERROR: No location provided. You MUST specify a city (e.g., 'London') or update your profile."
 
@@ -55,11 +253,11 @@ async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = 
 
     last_error = None
     geo_not_found = False  # geocoder answered 200 but knew no such place
+    place = None           # (lat, lon, name) once the geocoder resolved it — the fallback asks by it (§4RE)
     for attempt in range(3):
         try:
-            if curl_requests:
-                proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-                async with curl_requests.AsyncSession(impersonate="chrome110", proxies=proxies, timeout=20.0, verify=True) as client:
+            async with _http_client(proxy_url) as client:
+                if place is None:
                     geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={urllib.parse.quote(location)}&count=1&language=en&format=json"
                     geo_resp = await client.get(geo_url)
                     if geo_resp.status_code in [401, 403, 503] and mode == "TOR":
@@ -69,125 +267,64 @@ async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = 
                         continue
                     if geo_resp.status_code == 200 and geo_resp.json().get("results"):
                         res = geo_resp.json()["results"][0]
-                        lat, lon = res["latitude"], res["longitude"]
                         # with region and country: an "Athens" match can be Georgia, US (§4LV)
-                        name = ", ".join(x for x in (res.get("name"), res.get("admin1"), res.get("country")) if x)
-                        w_url = (
-                            f"https://api.open-meteo.com/v1/forecast?"
-                            f"latitude={lat}&longitude={lon}&"
-                            f"current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m&"
-                            f"wind_speed_unit=kmh"
-                        )
-                        w_resp = await client.get(w_url)
-                        if w_resp.status_code in [401, 403, 503] and mode == "TOR":
-                            last_error = f"HTTP {w_resp.status_code} from {_server_name(w_resp)}"  # §4FS: record the refusal
-                            await asyncio.to_thread(request_new_tor_identity)
-                            await asyncio.sleep(5)
-                            continue
-                        if w_resp.status_code == 200:
-                            curr = w_resp.json().get("current", {})
-                            cond = WMO_CONDITIONS.get(curr.get("weather_code"),
-                                                      f"code {curr.get('weather_code')}")
-                            return (
-                                f"REPORT (Source: Open-Meteo): Weather in {name}\n"
-                                f"Condition: {cond}\n"
-                                f"Temp: {curr.get('temperature_2m')}°C\n"
-                                f"Wind: {curr.get('wind_speed_10m')} km/h\n"
-                                f"Humidity: {curr.get('relative_humidity_2m')}%"
-                            )
+                        place = (res["latitude"], res["longitude"],
+                                 ", ".join(x for x in (res.get("name"), res.get("admin1"), res.get("country")) if x))
                     elif geo_resp.status_code == 200:
                         # 200 with no results = the geocoder knows no such
                         # place. Record it so the final message can say so
                         # instead of the opaque "failed: None".
                         geo_not_found = True
                         last_error = None  # a definitive answer outranks an earlier transient refusal (review, 2026-09-09)
-                    break
-            else:
-                async with httpx.AsyncClient(proxy=proxy_url, timeout=20.0, verify=True) as client:
-                    geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={urllib.parse.quote(location)}&count=1&language=en&format=json"
-                    geo_resp = await client.get(geo_url)
-                    if geo_resp.status_code in [401, 403, 503] and mode == "TOR":
-                        last_error = f"HTTP {geo_resp.status_code} from {_server_name(geo_resp)}"  # §4FS: record the refusal
-                        await asyncio.to_thread(request_new_tor_identity)
-                        await asyncio.sleep(5)
-                        continue
-                    if geo_resp.status_code == 200 and geo_resp.json().get("results"):
-                        res = geo_resp.json()["results"][0]
-                        lat, lon = res["latitude"], res["longitude"]
-                        # with region and country: an "Athens" match can be Georgia, US (§4LV)
-                        name = ", ".join(x for x in (res.get("name"), res.get("admin1"), res.get("country")) if x)
-                        w_url = (
-                            f"https://api.open-meteo.com/v1/forecast?"
-                            f"latitude={lat}&longitude={lon}&"
-                            f"current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m&"
-                            f"wind_speed_unit=kmh"
-                        )
-                        w_resp = await client.get(w_url)
-                        if w_resp.status_code in [401, 403, 503] and mode == "TOR":
-                            last_error = f"HTTP {w_resp.status_code} from {_server_name(w_resp)}"  # §4FS: record the refusal
-                            await asyncio.to_thread(request_new_tor_identity)
-                            await asyncio.sleep(5)
-                            continue
-                        if w_resp.status_code == 200:
-                            curr = w_resp.json().get("current", {})
-                            cond = WMO_CONDITIONS.get(curr.get("weather_code"),
-                                                      f"code {curr.get('weather_code')}")
-                            return (
-                                f"REPORT (Source: Open-Meteo): Weather in {name}\n"
-                                f"Condition: {cond}\n"
-                                f"Temp: {curr.get('temperature_2m')}°C\n"
-                                f"Wind: {curr.get('wind_speed_10m')} km/h\n"
-                                f"Humidity: {curr.get('relative_humidity_2m')}%"
-                            )
-                    elif geo_resp.status_code == 200:
-                        # 200 with no results = the geocoder knows no such
-                        # place. Record it so the final message can say so
-                        # instead of the opaque "failed: None".
-                        geo_not_found = True
-                        last_error = None  # a definitive answer outranks an earlier transient refusal (review, 2026-09-09)
-                    break 
+                        break
+                    else:
+                        break
+                lat, lon, name = place
+                w_resp = await client.get(_forecast_url(lat, lon, hourly))
+                if w_resp.status_code in [401, 403, 503] and mode == "TOR":
+                    last_error = f"HTTP {w_resp.status_code} from {_server_name(w_resp)}"  # §4FS: record the refusal
+                    await asyncio.to_thread(request_new_tor_identity)
+                    await asyncio.sleep(5)
+                    continue
+                if w_resp.status_code == 200:
+                    return _open_meteo_report(name, w_resp.json() or {}, hourly)
+                break
         except Exception as e:
             last_error = e
             if mode == "TOR":
                 await asyncio.to_thread(request_new_tor_identity)
                 await asyncio.sleep(5)
                 continue
-            
+
     pretty_log("Weather Warn", f"Open-Meteo failed: {last_error}", level="WARNING", icon=Icons.WARN)
 
+    # §4RE: by the geocoder's coordinates when it answered — by name, wttr.in's
+    # "Athens" was Athens, Georgia (US) while Open-Meteo's was Greece
+    w_query = f"{place[0]},{place[1]}" if place else urllib.parse.quote(location)
     for attempt in range(3):
         try:
-            url = f"https://wttr.in/{urllib.parse.quote(location)}?format=3"
-            if curl_requests:
-                proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-                async with curl_requests.AsyncSession(impersonate="chrome110", proxies=proxies, timeout=20.0, verify=True) as client:
-                    resp = await client.get(url)
-                    if resp.status_code in [401, 403, 503] and mode == "TOR":
-                        last_error = f"HTTP {resp.status_code} from {_server_name(resp)}"  # §4FS: record the refusal
-                        await asyncio.to_thread(request_new_tor_identity)
-                        await asyncio.sleep(5)
-                        continue
-                    if resp.status_code == 200 and "<html" not in resp.text.lower():
-                        return f"REPORT (Source: wttr.in, quoted data): {_wttr_line(resp.text)}"
-                    break
-            else:
-                async with httpx.AsyncClient(proxy=proxy_url, timeout=20.0, verify=True) as client:
-                    resp = await client.get(url)
-                    if resp.status_code in [401, 403, 503] and mode == "TOR":
-                        last_error = f"HTTP {resp.status_code} from {_server_name(resp)}"  # §4FS: record the refusal
-                        await asyncio.to_thread(request_new_tor_identity)
-                        await asyncio.sleep(5)
-                        continue
-                    if resp.status_code == 200 and "<html" not in resp.text.lower():
-                        return f"REPORT (Source: wttr.in, quoted data): {_wttr_line(resp.text)}"
-                    break
+            async with _http_client(proxy_url) as client:
+                resp = await client.get(f"https://wttr.in/{w_query}?format=j1")
+                if resp.status_code in [401, 403, 503] and mode == "TOR":
+                    last_error = f"HTTP {resp.status_code} from {_server_name(resp)}"  # §4FS: record the refusal
+                    await asyncio.to_thread(request_new_tor_identity)
+                    await asyncio.sleep(5)
+                    continue
+                if resp.status_code == 200 and "<html" not in resp.text.lower():
+                    try:
+                        return _wttr_report(resp.json() or {}, place[2] if place else location,
+                                            by_name=place is None, hourly=hourly)
+                    except Exception as _shape:  # noqa: BLE001 — not the j1 shape: a failed source
+                        if not geo_not_found:     # r1 m1: "no such place" stays the answer
+                            last_error = f"wttr.in answered without a forecast ({type(_shape).__name__})"
+                break
         except Exception as e:
             last_error = e
             if mode == "TOR":
                 await asyncio.to_thread(request_new_tor_identity)
                 await asyncio.sleep(5)
                 continue
-                
+
     pretty_log("Weather Error", str(last_error), level="ERROR", icon=Icons.FAIL)
 
     # Location genuinely not found (geocoder answered 200-empty and both
@@ -529,7 +666,7 @@ async def tool_system_utility(action: str = None, tor_proxy: str = None, profile
     # unknown-action branch and a valid diagnostic silently didn't run.
     action = str(action).strip().strip("\"'").strip().lower()
     if action == "check_weather":
-        return await tool_get_weather(tor_proxy, profile_memory, location)
+        return await tool_get_weather(tor_proxy, profile_memory, location, hourly=kwargs.get("hourly", False))
     elif action == "check_health":
         return await tool_check_health(context)
     elif action == "check_location":

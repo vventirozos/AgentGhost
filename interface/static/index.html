@@ -42,7 +42,7 @@
          touch. -->
     <script defer src="/static/vendor/marked.min.js"></script>
     <script defer src="/static/vendor/purify.min.js"></script>
-    <link rel="stylesheet" href="/static/style.css?v=6.7">
+    <link rel="stylesheet" href="/static/style.css?v=7.2">
 </head>
 
 <body>
@@ -248,6 +248,28 @@
                         <line x1="8" y1="23" x2="16" y2="23"></line>
                     </svg>
                 </button>
+                <!-- §4RB: reasoning effort for the messages you send (Default = nothing is
+                     sent: the model server's own level). Shown only while the agent reports
+                     the switch on (GHOST_REASONING_EFFORT=1, the 27B); status.js toggles it. -->
+                <!-- 2026-10-24 (operator): a grey bars icon — hollow = Default, 1/2/3 filled =
+                     Low/Med/X-high — with the native select laid invisibly over it, so a
+                     tap still opens the system picker. The icon follows the select by CSS
+                     (:has(option:checked)); the wrap hides with it. -->
+                <span id="effort-wrap">
+                <svg id="effort-icon" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+                    <rect class="b1" x="1.5" y="10.5" width="3" height="4" rx="0.5"></rect>
+                    <rect class="b2" x="6.5" y="7.5" width="3" height="7" rx="0.5"></rect>
+                    <rect class="b3" x="11.5" y="3.5" width="3" height="11" rx="0.5"></rect>
+                </svg>
+                <select id="effort-select" class="hidden"
+                        title="Reasoning effort for your messages. Default is the model server's own level. A change of level re-processes this conversation once on the next message (seconds; longer for a long conversation)"
+                        aria-label="Reasoning effort">
+                    <option value="">Default</option>
+                    <option value="xhigh">X-high</option>
+                    <option value="medium">Med</option>
+                    <option value="low">Low</option>
+                </select>
+                </span>
                 <button id="send-btn" aria-label="Send message">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                         stroke-linecap="round" stroke-linejoin="round">
@@ -333,7 +355,7 @@
 
     <div id="toast-stack" aria-live="polite"></div>
 
-    <script type="module" src="/static/app.js?v=15.0"></script>
+    <script type="module" src="/static/app.js?v=15.7"></script>
 </body>
 
 </html>

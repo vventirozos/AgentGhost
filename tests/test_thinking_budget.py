@@ -98,7 +98,7 @@ class TestQwenPromptPlaceholder:
             render_think_budget_guidance("tight"),
         )
         assert "{think_budget_guidance}" not in rendered
-        assert "EXTREMELY CONCISE" in rendered
+        assert "DO NOT enumerate future tool calls" in rendered      # §4RK: the cap wording is gone
 
     def test_extended_substitution_produces_no_placeholder(self):
         rendered = QWEN_TOOL_PROMPT.replace(
@@ -106,7 +106,7 @@ class TestQwenPromptPlaceholder:
             render_think_budget_guidance("extended"),
         )
         assert "{think_budget_guidance}" not in rendered
-        assert "up to ~15 sentences" in rendered
+        assert "DO NOT draft runnable code inside <think>" in rendered   # §4RK: the ~15-sentence cap is gone
 
     def test_anti_paralysis_rule_still_present(self):
         """Sanity: the downstream anti-paralysis rule must survive both

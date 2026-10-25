@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from itertools import zip_longest
 
-from .prompts import SYSTEM_PROMPT, SPECIALIST_SYSTEM_PROMPT, SPECIALIST_TOOL_XML_LEGACY, SPECIALIST_TOOL_XML_NATIVE, SMART_MEMORY_PROMPT, SYSTEM_3_GENERATION_PROMPT, SYSTEM_3_EVALUATOR_PROMPT, THINK_BUDGET_TIGHT, THINK_BUDGET_EXTENDED
+from .prompts import SYSTEM_PROMPT, SPECIALIST_SYSTEM_PROMPT, SPECIALIST_TOOL_XML_LEGACY, SPECIALIST_TOOL_XML_NATIVE, SMART_MEMORY_PROMPT, THINK_BUDGET_TIGHT, THINK_BUDGET_EXTENDED
 from .planning import TaskTree
 # Shared "what did this call operate on" helper — same definition the
 # in-run no-progress loop-breaker and the pre-flight guard agree on what
@@ -41,6 +41,7 @@ from ..utils.logging import (Icons, ORIGIN_PROBE, pretty_log, request_id_context
                              requester_role_context, requester_is_member, parse_requester_role,
                              requester_member_context, requester_member_id, parse_requester_member)
 from ..utils import logging as _glog
+from . import effort as _effort
 from ..utils.constraints import extract_constraints, render_constraint_block, request_forbids_running
 # Live randomized arms + the risk governor that is measured by one of them.
 # Imported as modules (not names) so a test can monkeypatch either surface in
@@ -57,29 +58,40 @@ from . import regression as _regression_boot  # noqa: F401 — §4NE r1: fingerp
 # for everything the main agent does by default: user chat, self-play
 # worker solving a challenge, debugging. The `<think>` budget is still
 # regulated by the system prompt's THINK_BUDGET_* directives.
+# §4RG (2026-10-25): the Qwen3.8-27B card gives ONE thinking-mode set —
+# temperature 1.0, top_p 0.95, top_k 20, min_p 0, presence 0 — and no separate
+# coding value; 0.6 was the Qwen3.6 card's coding value (the abliterated RVN
+# build inherits the base card: Heretic minimises KL from the original).
 CODING_SAMPLING_PARAMS = {
-    "temperature": 0.6,
+    "temperature": 1.0,
     "top_p": 0.95,
     "top_k": 20,
     "min_p": 0,
     "presence_penalty": 0,
 }
+# §4RG-b (2026-10-25, operator: "make all settings according to the model's
+# card"): presence 1.5 was the card's INSTRUCT value; its thinking-mode set is
+# presence 0, and the card warns 1.5 "can occasionally result in language
+# mixing" (cf. the §4JR Greek drift).
 GENERAL_SAMPLING_PARAMS = {
     "temperature": 1.0,
     "top_p": 0.95,
     "top_k": 20,
     "min_p": 0,
-    "presence_penalty": 1.5,
+    "presence_penalty": 0,
 }
 # FACTUAL / DETERMINISTIC answer turn — a non-tool turn whose query has a single
-# correct answer (math, counting, lookup, "what is X"). The conversational
-# profile (temp=1.0, presence_penalty=1.5) is actively harmful here: high temp
-# injects answer variance and presence_penalty=1.5 *discourages re-using the
-# exact tokens that ARE the answer* (the number / name). Near-greedy with no
-# presence penalty samples toward correctness. See `_is_factual_query`.
+# correct answer (math, counting, lookup, "what is X"). It used to run
+# near-greedy (temp 0.2, top_p 0.9) on the reasoning that the conversational
+# profile's presence_penalty=1.5 discouraged re-using the exact answer tokens.
+# §4RG-b: the Qwen3.8 card gives one thinking-mode set for every turn and the
+# conversational profile no longer carries a presence penalty, so this profile
+# sits on the card too (operator: "make all settings according to the model's
+# card"). The `_is_factual_query` routing stays wired so a measured deviation
+# is a one-line change away.
 FACTUAL_SAMPLING_PARAMS = {
-    "temperature": 0.2,
-    "top_p": 0.9,
+    "temperature": 1.0,
+    "top_p": 0.95,
     "top_k": 20,
     "min_p": 0,
     "presence_penalty": 0,
@@ -605,15 +617,15 @@ NON_THINKING_GENERAL_PARAMS = {
 
 # Adaptive sampling profiles for coding sub-tasks. The classifier + routing
 # stay wired (so per-sub-task tuning is a one-line change away), but all three
-# profiles are pinned to the model-card CODING values (temp=0.6, top_p=0.95,
-# top_k=20) — the recommended sampling for this model. The earlier spread
+# profiles are pinned to the model-card thinking-mode values (temp=1.0, top_p=0.95,
+# top_k=20; §4RG, was the Qwen3.6 coding value 0.6) — the recommended sampling for this model. The earlier spread
 # (creative temp=0.8/top_k=40, precise temp=0.3/top_p=0.90/top_k=10) drifted
 # coding turns off the model-card values; collapsing them to the "balanced"
 # baseline keeps every coding turn on-spec while preserving the mechanism.
 _CODING_TASK_PROFILES = {
-    "creative":  {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0, "presence_penalty": 0},
-    "precise":   {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0, "presence_penalty": 0},
-    "balanced":  {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0, "presence_penalty": 0},
+    "creative":  {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0, "presence_penalty": 0},
+    "precise":   {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0, "presence_penalty": 0},
+    "balanced":  {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0, "presence_penalty": 0},
 }
 
 _CREATIVE_KEYWORDS = {"design", "architect", "brainstorm", "creative", "alternative", "refactor", "naming", "generate", "invent"}
@@ -2591,6 +2603,86 @@ def _render_volatile_block(dynamic_state: str, pending_request="") -> str:
     )
 
 
+# ── §4RC: the state block is shown whole ONCE per request, then stays put.
+# It used to be rebuilt as the trailing message of every turn, so each tool
+# turn dropped the previous copy and re-processed a new one: ~650 tokens at
+# the median, 1.4k at p90 and 5k on coding turns (10-07 → 10-24: 18.4M chars
+# on later turns ≈ 10 h of 27B prompt processing). With GHOST_STATE_ANCHOR=1
+# the request's first (whole) block is re-inserted where it was shown, and
+# each later turn's trailing message — never kept — carries every section
+# that changed since that block. A turn therefore re-processes at most what
+# it did before, minus the sections that never changed, and the history
+# holds exactly one block (reviews r1–r3: every scheme that KEPT changes
+# piled up copies on coding requests and re-read history at a reset). The
+# trailing message is still a <system_state_update> (provenance header, the
+# pending request), so the model's view of "whose message is last" is
+# unchanged.
+STATE_ANCHOR_ENV = "GHOST_STATE_ANCHOR"
+#: The one block kept in place counts against the history budget
+#: (``_state_anchor_extra_tokens``) and the read headroom.
+_STATE_ANCHOR_MAX_REQUESTS = 32
+
+
+def _state_anchor_enabled() -> bool:
+    return os.environ.get(STATE_ANCHOR_ENV, "0").strip() == "1"
+
+
+def _msg_fingerprint(msgs) -> str:
+    """Role + content of every request message an anchored block was shown
+    after. Any change before it (r4: compression summarising an earlier
+    request's tool output kept the message right before the block) means
+    the prompt diverges there anyway, and the block is shown whole again —
+    what the old layout cost."""
+    h = hashlib.sha1()
+    for m in msgs:
+        try:
+            raw = json.dumps([m.get("role"), m.get("content")], sort_keys=True,
+                             ensure_ascii=False, default=str)
+        except Exception:  # noqa: BLE001
+            raw = repr(m)
+        h.update(raw.encode("utf-8", "ignore"))
+        h.update(b"\x00")
+    return h.hexdigest()[:16]
+
+
+def _state_sections(parts, sandbox_root) -> dict:
+    """The turn's state as ordered named sections, host sandbox paths
+    scrubbed per section; joined, the text the block always had."""
+    out = {}
+    for key, text in parts:
+        out[key] = out.get(key, "") + _scrub_host_sandbox_paths(text or "", sandbox_root)
+    return out
+
+
+def _state_sections_pinned(sections: dict, final_directive, playbook) -> dict:
+    """Under the pin the final-answer directive and the playbook ride the
+    front of the block (unscrubbed, as before); joined, the pinned block."""
+    return {"final_directive": (final_directive + "\n") if final_directive else "",
+            "playbook": playbook or "", **sections}
+
+
+_STATE_CHANGES_INTRO = ("(Changes since the state update at the start of this request — "
+                        "every section not listed here is unchanged.)\n")
+_STATE_NO_CHANGE = "(No change since the state update at the start of this request.)"
+
+
+def _state_changes(base: dict, sections: dict) -> str:
+    """§4RC: every section that differs from the request's first block
+    (``base``), at its current value, plus one line per section that went
+    away. Sent each turn and never kept (r3: keeping changes, even only
+    the rarer ones, piled up copies on coding requests), so a turn
+    re-processes at most what the old layout did, minus the sections that
+    never changed."""
+    out = [t for k, t in sections.items() if t and base.get(k) != t]
+    for key, text in base.items():
+        if text and not sections.get(key):
+            first = next((ln.strip() for ln in text.splitlines() if ln.strip()), key)
+            out.append(f'(The earlier "{first[:80]}" section no longer applies.)\n')
+    if not out:
+        return _STATE_NO_CHANGE
+    return _STATE_CHANGES_INTRO + "\n".join(x.rstrip("\n") + "\n" for x in out)
+
+
 # ── §4KV: the label between the injected context and the user text it rides on.
 # The pinned <session_context> block is prefixed onto the FIRST user message
 # (a position that never moves, for the KV cache) and used to be followed by
@@ -3444,14 +3536,18 @@ def _backfilled_failure_reason(verifier: Optional[str], verifier_reason: str,
     return structural_reason(structural_cause_for_trajectory(traj))
 
 
-def interruption_marker(req_id) -> str:
+def interruption_marker(req_id, remaining_s: Optional[float] = None) -> str:
     """§4MS r1: a cancel at or past the request's deadline is the AGENT
     being too slow (the interface's 1800 s client timeout reads like a
     disconnect: fd89fd6d +1800 s, 2ba9ed1d) — a real failure, kept as an
     abort. Earlier, it was cut from outside: an interruption."""
     try:
-        from ..utils.logging import request_remaining_s
-        rem = request_remaining_s(str(req_id or ""))
+        # §4RD r2: a caller past the request's END (the streamed drain — its
+        # request clock is already closed) passes the remaining time it kept
+        if remaining_s is None:
+            from ..utils.logging import request_remaining_s
+            remaining_s = request_remaining_s(str(req_id or ""))
+        rem = remaining_s
         if rem is not None and float(rem) <= 5.0:
             return "[ATTEMPT_ABORTED_TURN]"
     except Exception:  # noqa: BLE001
@@ -5874,8 +5970,8 @@ def classify_thinking_budget(query: str,
                              in_active_project: bool = False) -> str:
     """Pick the <think> block guidance for this turn.
 
-    Returns either ``"tight"`` (the 5-sentence anti-paralysis cap used
-    historically for everything) or ``"extended"`` (up to ~15 sentences
+    Returns either ``"tight"`` (the anti-paralysis directive used
+    historically for everything; the 5-sentence cap it carried went with §4RK) or ``"extended"`` (step-by-step derivation; §4RK: no sentence cap
     for genuine multi-step reasoning). See ``prompts.THINK_BUDGET_*``
     for the prompt text each returns.
 
@@ -6000,10 +6096,10 @@ def get_sampling_params(is_tool_turn: bool, query: str = "", is_coding: bool = F
 
     Policy (matches the Qwen 3.6 35B-A3 model card):
     * Conversational turn (greetings, chit-chat, no tool expected) →
-      GENERAL_SAMPLING_PARAMS: temperature=1.0, presence_penalty=1.5.
+      GENERAL_SAMPLING_PARAMS: temperature=1.0, presence_penalty=0 (§4RG-b; was 1.5).
     * Any tool-using turn (coding OR a non-coding tool like
       update_profile / web_search / manage_tasks) → CODING_SAMPLING_PARAMS
-      by default: temperature=0.6, presence_penalty=0.
+      by default: temperature=1.0 (§4RG; was 0.6), presence_penalty=0.
     * Coding tool turns additionally get sub-classified
       (creative / precise / balanced) so algorithm design gets slightly
       higher temp and SQL / security / regex get lower temp.
@@ -6069,8 +6165,10 @@ DEFAULT_TOOL_TURN_MAX_TOKENS = 16384
 # "length" on every continuation (mis-reported finish_reason, runaway) can't
 # loop forever — each continuation is a full upstream round-trip.
 MAX_TRUNCATION_CONTINUATIONS = 3
-#: one continuation call's budget (§4MD M2)
-TRUNCATION_CONTINUATION_TIMEOUT_S = 180.0
+#: one continuation call's budget (§4MD M2). §4RK: 180 → 480 s — at the 27B's
+#: ~23 tok/s a continuation of a few thousand tokens plus its prefill did not
+#: fit 180 s, so the cut answer shipped with the "could not finish" note.
+TRUNCATION_CONTINUATION_TIMEOUT_S = 480.0
 #: the visible note on an answer the model server cut and the agent could not finish (§4MD M1)
 TRUNCATED_ANSWER_NOTE = ("⚠️ This answer was cut off — the model server stopped in the middle of "
                          "the reply, so it is incomplete.")
@@ -6165,6 +6263,30 @@ def turn_budget_extension_fits(remaining_s, report_floor_s) -> bool:
         return False
 
 
+#: §4RA: files whose successful writes count as coding progress — a coding
+#: request still making it earns deadline extensions (utils/logging
+#: `request_deadline_s`; the 27B at ~20 tok/s spent 22–30 min writing one
+#: 44–78 KB web build, §4QZ, and a flat budget cut the larger builds mid-file)
+CODE_PROGRESS_EXTS = (".py", ".sh", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
+                      ".html", ".htm", ".css", ".json", ".go", ".rs", ".c", ".h",
+                      ".cpp", ".java", ".rb", ".php", ".sql")
+#: the file_system operations that WRITE code (not delete/download/move/copy — review m2)
+CODE_WRITE_OPS = frozenset({"write", "append", "edit", "replace"})
+
+
+def is_code_progress(fname, op, target, is_error, *, ran_written=False) -> bool:
+    """§4RA: a successful write to a code file, or a successful run of a
+    file this request wrote. Prose (.md/.txt), other operations and failed,
+    refused or unresolved calls are not progress."""
+    if is_error:
+        return False
+    if fname == "execute":
+        return bool(ran_written)
+    if fname != "file_system" or str(op or "").lower() not in CODE_WRITE_OPS:
+        return False
+    return str(target or "").lower().endswith(CODE_PROGRESS_EXTS)
+
+
 def request_checkpoint_namespace(req_id) -> str:
     """The scratchpad scope a request's turn checkpoints live in."""
     return f"req:{str(req_id or '').strip() or 'anon'}"
@@ -6201,7 +6323,9 @@ def effective_report_floor(deadline_s, req_id=None) -> float:
     except (TypeError, ValueError):
         d = 0.0
     if req_id:
-        return sized_report_floor(DEADLINE_REPORT_FLOOR_S, d, req_id)
+        floor = sized_report_floor(DEADLINE_REPORT_FLOOR_S, d, req_id)
+        _glog.note_report_floor(str(req_id), floor)          # §4RA r2 M-A: the extension window sees it
+        return floor
     if d <= 0:
         return DEADLINE_REPORT_FLOOR_S
     return min(DEADLINE_REPORT_FLOOR_S, max(30.0, 0.25 * d))
@@ -6214,12 +6338,18 @@ def _span(secs: float) -> str:
     return f"{secs:.0f} s"
 
 
-def client_deadline_line(deadline_s) -> str:
+def client_deadline_line(deadline_s, ceiling_s=0.0) -> str:
     """§4NV: the turn's time budget and the ACTUAL report reserve (it is
     capped at a quarter of the budget — a flat "5 min" was wrong for any
-    budget under 20 min)."""
-    return (f"time budget {_span(deadline_s)} (the last {_span(effective_report_floor(deadline_s))} "
+    budget under 20 min). §4RA: and the extension ceiling, when there is one."""
+    line = (f"time budget {_span(deadline_s)} (the last {_span(effective_report_floor(deadline_s))} "
             "are kept for the final report)")
+    try:
+        if float(ceiling_s or 0.0) > float(deadline_s or 0.0):
+            line += f"; extendable to {_span(ceiling_s)} while code is being written"
+    except (TypeError, ValueError):
+        pass
+    return line
 
 
 def deadline_needs_report(remaining_s, floor_s: float, force_final_response, force_stop) -> bool:
@@ -6331,6 +6461,19 @@ EDIT_CHURN_TOTAL_STEERS = 4
 #: §4QB-c (operator 2026-10-20): prose has nothing to run — fixing 17 quotes
 #: in one write-up was stopped as "edited again and again without being run"
 EDIT_CHURN_EXEMPT_SUFFIXES = (".md", ".txt")
+
+
+def _is_parts_continuation(args) -> bool:
+    """§4RI: a `write` with `append` is the NEXT PART of one file written in
+    parts (§4NU), not another edit of it. Request 43fe95a2: write + two
+    appends of webos/index.html counted as "3 unverified edits" and the
+    brake steered in the middle of the file."""
+    if not isinstance(args, dict):
+        return False
+    if str(args.get("operation") or "").strip().lower() != "write":
+        return False
+    v = args.get("append")
+    return bool(v) and str(v).strip().lower() not in ("false", "0", "no", "")
 
 
 def edit_churn_decision(churn: dict, target: str) -> str:
@@ -7114,10 +7257,11 @@ def normalize_fs_append_alias(args):
 
 
 #: §4OA: replies of a request that hit the output limit — req id → [count,
-#: seconds]. A turn that was cut once gets a lower limit for the rest of the
-#: request (probe-ap2-h: six 16k-token replies, 27.6 of its 32 minutes).
+#: seconds], read by the cut note. §4RF: the lower limit a cut turned on for
+#: the rest of the request (8k) is gone — on Qwen3.8 every cut was inside the
+#: thinking, and the 8k replies after it were cut again inside the thinking
+#: (5A, 6F: three cuts, ~18 min); every reply keeps 16k.
 _LENGTH_STOPS: "dict[str, list]" = {}
-LENGTH_STOP_RETRY_MAX_TOKENS = 8192
 
 
 def note_length_stop(req_id, secs) -> None:
@@ -7135,15 +7279,6 @@ def note_length_stop(req_id, secs) -> None:
 def length_stops(req_id) -> tuple:
     row = _LENGTH_STOPS.get(str(req_id or ""))
     return (row[0], row[1]) if row else (0, 0.0)
-
-
-def max_tokens_after_cut_offs(req_id, configured: int) -> int:
-    """§4OA: after a reply of this request hit the output limit, the rest
-    of the request's replies get at most LENGTH_STOP_RETRY_MAX_TOKENS — a
-    repeat cut costs ~2 min instead of ~5, and the cut part is still saved."""
-    if length_stops(req_id)[0] >= 1:
-        return min(int(configured), LENGTH_STOP_RETRY_MAX_TOKENS)
-    return int(configured)
 
 
 _LIST_ITEM_RE = re.compile(r"^\s*(?:[\"'`].{12,}[\"'`],?\s*$|[-*•]\s+\S.{10,}|\d{1,4}[.)]\s+\S.{10,}|<li\b[^>]*>\s*\S.{10,}"
@@ -7180,8 +7315,7 @@ def cut_round_note(req_id, saved_text: str, user_text: str) -> str:
     parts = []
     if n >= 1:
         parts.append(f"This is cut-off #{n} in this request — the cut replies took ~{secs / 60:.0f} min; "
-                     f"later replies are limited to ~{LENGTH_STOP_RETRY_MAX_TOKENS // 1000}k tokens INCLUDING "
-                     f"your thinking, so send parts of at most ~15 KB.")
+                     f"send parts of at most ~15 KB.")
     items, asked = list_item_stats(saved_text, user_text)
     if len(items) >= 20:
         dup = len(items) - len(set(items))
@@ -7200,6 +7334,28 @@ def cut_off_call_message(tool_name: str, raw_len: int) -> str:
         f"after {raw_len:,} characters of arguments, so the call never finished and NOTHING ran "
         "or was written. This is a LENGTH problem, not a syntax problem: re-sending the same call "
         "will be cut off again. " + BIG_FILE_GUIDANCE)
+
+
+def cut_in_thinking_message(draft: str, note: str = "") -> str:
+    """§4RF: what the model is told when its reply hit the output limit while
+    it was still thinking — no answer, no tool call. Before this it was told
+    it had "stopped abruptly" (a stall), which names the wrong cause: the
+    live turn had drafted a whole web app inside 16k tokens of thinking, and
+    the retry started from nothing (history keeps no thinking). The cut
+    thinking now rides along verbatim as the model's draft, so the ~12 min
+    it took become the start of the work (operator: "go with option 1").
+    Only the cause is named; the thinking itself is not limited. `note` is
+    the §4OA cut note (round, minutes)."""
+    draft = str(draft or "")
+    return (
+        "SYSTEM ALERT: your reply hit the OUTPUT LIMIT while you were still thinking — "
+        f"{len(draft):,} characters of thinking, then the cut, so no answer and no tool call "
+        "came out. Your thinking up to the cut is below, verbatim, as YOUR DRAFT. Do not plan "
+        "it again: build on it. Put the code or text it already holds straight into the tool "
+        "call or the answer, then continue from where it stops. If you are writing a file: "
+        + BIG_FILE_GUIDANCE + str(note or "")
+        + "\n\n----- YOUR DRAFT (your own thinking up to the cut, verbatim) -----\n"
+        + draft + "\n----- END OF YOUR DRAFT -----")
 
 
 def _tool_call_truncated(content: str) -> bool:
@@ -7839,6 +7995,16 @@ _TC_PARAM_RE = re.compile(
     r'(.*?)(?=</parameter>|<parameter[\s=]|<function[\s=]|</function>|</tool_call>|<tool_call\b|$)',
     re.DOTALL | re.IGNORECASE,
 )
+
+
+def _html_attr(value: str) -> str:
+    """A quoted XML attribute value from a text-dialect tool call, decoded:
+    inside ``value="…"`` a quote can only be written ``&quot;`` (§4RD). The
+    ONLY decode a tool argument gets — element bodies and native calls are
+    literal, so an entity there is the model's own text (an HTML escape
+    table, a `&lt;` the page must show)."""
+    import html as _html
+    return _html.unescape(value)
 
 
 def _value_has_leaked_framing(value) -> bool:
@@ -9941,17 +10107,30 @@ _SUBJECT_REFERENCE_RE = re.compile(r"^REFERENCE PHOTO: (\S+) — (?:left to righ
 _EDIT_REFERENCE_RE = re.compile(r"^EDITED FROM: (\S+)\s*$", re.MULTILINE)
 
 
-def _system3_user_message(task_context, recovery_hint, error_context, sandbox_state, tool_names) -> str:
-    """The recovery planner's user turn. §4PC: the planner ran blind — no
-    tool list — and proposed `google_search` (no such tool); the evaluator
-    then replaced the task tree with that plan."""
+def pivot_steer_message(pivot_num: int, failures: int, last_error, tool_names, recovery_hint: str = "",
+                        prev_error: str = "") -> str:
+    """§4RI: the SYSTEM 3 PIVOT steer the model gets after repeated failures —
+    in the conversation, so the planner is the main model with the full
+    context (it used to be two side calls that displaced the KV slot, see the
+    trigger site). §4PC: the tool list is spelled out so no invented tool is
+    proposed; a dead tool or service is not retried."""
     names = sorted({str(n) for n in (tool_names or []) if n})
-    return (f"### TASK CONTEXT:\n{task_context}\n\n"
-            f"{recovery_hint}"
-            f"### ERROR CONTEXT (what failed and why):\n{str(error_context)[:3000]}\n\n"
-            f"### CURRENT SANDBOX STATE:\n{str(sandbox_state)[:1500]}\n\n"
-            "### TOOLS THE AGENT HAS (use these exact names, nothing else): "
-            + (", ".join(names) if names else "(none listed — propose steps that need no tool)"))
+    err = " ".join(str(last_error or "").split())[:600]
+    parts = [f"SYSTEM 3 PIVOT #{int(pivot_num)}: {int(failures)} tool calls in a row have failed"
+             + (f" — the last: {err}" if err else "") + ". Stop repeating that approach."]
+    if int(pivot_num) >= 2 and str(prev_error or "").strip():
+        parts.append("The approach you took after the first pivot failed too"
+                     f" ({' '.join(str(prev_error).split())[:400]}); choose something different from both.")
+    parts.append("Before your next tool call, in your reasoning lay out three DIFFERENT ways forward — "
+                 "A: the most standard, direct method; B: a defensive, edge-case-aware method; "
+                 "C: a creative or native-tool-heavy method — using ONLY these tools: "
+                 + (", ".join(names) if names else "(none listed — steps that need no tool)")
+                 + ". Never invent a tool; a tool or service that is unavailable is not retried. "
+                 "Pick the one with the best chance of success and the lowest risk of looping, say which "
+                 "in one sentence, then ACT on it now.")
+    if str(recovery_hint or "").strip():
+        parts.append(str(recovery_hint).strip())
+    return "\n\n".join(parts)
 
 
 class _UrlProvenance:
@@ -14118,6 +14297,11 @@ class GhostAgent:
             llm = getattr(self.context, "llm_client", None)
             if llm is None:
                 return
+            if not quiet and _effort.enabled():
+                # §4RC: the server's default level, for Default turns' trajectories
+                from .llm import _node_key
+                await asyncio.to_thread(_effort.refresh_server_default,
+                                        _node_key(getattr(llm, "upstream_url", "")))
             request_state = self._RequestState(self)
             profile_str = await request_state.get_profile_str()
             base_prompt = SYSTEM_PROMPT.replace("{{PROFILE}}", profile_str)
@@ -14162,6 +14346,7 @@ class GhostAgent:
                     payload["tools"] = all_tools
                     payload["tool_choice"] = "auto"
                     payload["parallel_tool_calls"] = True
+            payload = self._warm_up_effort(payload)        # §4RB r3: the level the last turn used
 
             _est_tokens = (len(base_prompt)
                            + len(json.dumps(payload.get("tools", [])))) // 4
@@ -16720,7 +16905,8 @@ class GhostAgent:
 
     @staticmethod
     def _compose_injection(req_messages, stable_injection, dynamic_state, pin,
-                           pending_request=None, first_user_is_request=False):
+                           pending_request=None, first_user_is_request=False,
+                           sections=None, anchor=None):
         """Place the per-turn stable + volatile context into ``req_messages``.
 
         Returns the (mutated) list. ``pending_request`` is the CURRENT
@@ -16746,6 +16932,12 @@ class GhostAgent:
         keeping the ``[stable + instruction]`` prefix byte-identical on
         later turns. Native tool defs still travel in the payload ``tools``
         field, so tool-calling does not depend on the text block's position.
+
+        §4RC: with ``anchor`` (the request's record, a dict this mutates) and
+        ``sections`` (``dynamic_state`` as ordered named parts), the blocks
+        the request was already shown are re-inserted where they were first
+        shown and only the changed sections are appended — see
+        ``STATE_ANCHOR_ENV``.
         """
         def _prefix_content(existing, prefix_text):
             """Prepend injection text to message content that may be a STRING
@@ -16834,7 +17026,33 @@ class GhostAgent:
         # Turn 1 still gets its own trailing message for the original reason:
         # folding there would make turn 1's pinned first message differ from
         # every later turn's, so turn 2 could not reuse the pinned prefix.
-        req_messages.append({"role": "user", "content": volatile_block})
+        if anchor is None or sections is None:
+            req_messages.append({"role": "user", "content": volatile_block})
+            return req_messages
+        # §4RC: anchored. The request's first block stays where it was
+        # shown (an index into this turn's rebuilt list, one entry per
+        # history message); the trailing message carries what changed since
+        # and is never kept.
+        n = len(req_messages)
+        blocks = anchor.get("blocks") or []
+        held = bool(blocks) and all(
+            0 < pos <= n and _msg_fingerprint(req_messages[:pos]) == fp for pos, fp, _t in blocks)
+        if held:
+            for i, (pos, _fp, text) in enumerate(blocks):
+                req_messages.insert(pos + i, {"role": "user", "content": text})
+            sent = _render_volatile_block(_state_changes(anchor.get("base") or {}, sections),
+                                          pending_request)
+            anchor["last"] = "delta"
+        else:
+            sent = volatile_block
+            anchor["last"] = "whole (history moved)" if blocks else "whole"
+            anchor["blocks"] = [(n, _msg_fingerprint(req_messages), sent)] if n else []
+            anchor["base"] = dict(sections)
+        anchor["sent_chars"] = len(sent)
+        # r4: what the prompt carries beyond the old layout's one whole block
+        anchor["over_chars"] = max(0, sum(len(t) for _p, _f, t in anchor.get("blocks") or [])
+                                   + len(sent) - len(volatile_block)) if held else 0
+        req_messages.append({"role": "user", "content": sent})
         return req_messages
 
     def _critic_async_enabled(self) -> bool:
@@ -18906,6 +19124,198 @@ class GhostAgent:
             logger.debug("pending corrections not loaded: %s", e)
             return []
 
+    def _warm_up_effort(self, payload):
+        """§4RB r3: the head warm-up at the level the last main turn was sent
+        at ("" = the template default, nothing sent) — the template writes the
+        level before the tools block, so a warm-up at another level replaces
+        the cached prompt the next turn needs. The same object when the switch
+        is off or the last turn used the default."""
+        try:
+            if not _effort.enabled():
+                return payload
+            return _effort.apply(payload, str(getattr(self, "_main_effort_level", "") or ""))
+        except Exception:  # noqa: BLE001
+            return payload
+
+    def _with_turn_effort(self, payload, req_id):
+        """§4RB: the payload for this turn with the reasoning effort the
+        owner picked for this request in the web UI; the same object when
+        the switch is off, no level was picked, the turn does not think, or a
+        probe arm sets the effort itself (core/llm `with_probe_effort`). The
+        agent never picks a level: unset, the 27B thinks at the llama server's
+        own --chat-template-kwargs level, and each change of level
+        re-processes the whole prompt (the template puts it before the tools
+        block: 32k tokens took 190 s) — operator 2026-10-24."""
+        try:
+            if not _effort.enabled():
+                return payload
+            from .llm import EFFORT_ARMS
+            from ..utils.logging import prompt_arm, effort_override_context, request_kind
+            if prompt_arm() in EFFORT_ARMS:
+                return payload
+            # r4: only the owner's own turns pick a level and move the warm-up — a member's
+            # pick, or a failure replay / scheduled task / job at the default between two
+            # owner messages, made the owner's next message re-process the whole prompt.
+            # r5: a sub-agent / project leaf the owner's request delegated (sub-…) keeps
+            # the inherited pick — it does the real work — but does not move the warm-up
+            rid_s = str(req_id or "")
+            kind = request_kind(rid_s or None)
+            owner = kind == "owner"
+            inherited = kind == "background" and rid_s.startswith("sub-")
+            level = _effort.parse_override(effort_override_context.get()) if (owner or inherited) else ""
+            if owner and not _effort.thinking_off(payload):
+                # r3 M: the head re-warm warms THIS level — warming the default under a
+                # Low/Med pick re-processed the whole prompt on every message
+                self._main_effort_level = level
+            if not level:
+                if owner and not _effort.thinking_off(payload):
+                    # §4RC: a Default turn records the level the llama server gave it
+                    # (its --chat-template-kwargs; looked up, not assumed — it can change)
+                    from .llm import _node_key
+                    default = _effort.server_default(
+                        _node_key(getattr(getattr(self.context, "llm_client", None), "upstream_url", "")))
+                    if default:
+                        from . import turn_facts as _tf
+                        _tf.record(self.context, str(req_id or ""), reasoning_effort=default,
+                                   reasoning_effort_default=True)
+                return payload
+            out = _effort.apply(payload, level)
+            if out is not payload:
+                # keyed by request id: the streamed trajectory is written after the turn
+                # lock is released, when self.context belongs to the next request
+                from . import turn_facts as _tf
+                rid = str(req_id or "")
+                if _tf.facts_for(self.context, rid).get("reasoning_effort") != level:   # once per request
+                    pretty_log("Reasoning Effort", f"{level} — set for this request", icon=Icons.BRAIN_EFFORT)
+                _tf.record(self.context, rid, reasoning_effort=level)
+            return out
+        except Exception as exc:  # noqa: BLE001 — never block a turn on this
+            logger.debug("reasoning effort skipped: %s", exc)
+            return payload
+
+    async def _effort_default_refresh(self, req_id) -> None:
+        """§4RC r1: an owner request at Default looks the llama server's level up
+        before its first turn (a local text render, milliseconds; 1 s at most),
+        so a llama restart with a new level, or one still loading at the agent's
+        boot, is not recorded from the cache. A failure keeps the last value."""
+        try:
+            from ..utils.logging import effort_override_context, request_kind
+            if (not _effort.enabled() or request_kind(str(req_id or "") or None) != "owner"
+                    or _effort.parse_override(effort_override_context.get())):
+                return
+            from .llm import _node_key
+            url = _node_key(getattr(getattr(self.context, "llm_client", None), "upstream_url", ""))
+            if url:
+                await asyncio.to_thread(_effort.refresh_server_default, url, 1.0)
+        except Exception as exc:  # noqa: BLE001 — never block a turn on this
+            logger.debug("server effort level not looked up: %s", exc)
+
+    def _effort_escalate(self, req_id, why):
+        """§4RB: book the first sign this request is stuck (once per request);
+        `_effort_note_due` appends the xhigh note before the next turn that
+        thinks. Nothing when the switch is off, the owner picked a level for
+        this request (the pick wins), or a probe arm sets the effort itself."""
+        try:
+            if not why or not _effort.enabled():
+                return
+            from .llm import EFFORT_ARMS
+            from ..utils.logging import prompt_arm, effort_override_context, request_kind
+            rid = str(req_id or "")
+            if not rid or prompt_arm() in EFFORT_ARMS:
+                return
+            kind = request_kind(rid)
+            if (kind == "owner" or (kind == "background" and rid.startswith("sub-"))) \
+                    and _effort.parse_override(effort_override_context.get()):
+                return
+            from . import turn_facts as _tf
+            due = getattr(self.context, "_effort_due", None)
+            if not isinstance(due, dict):
+                due = {}
+                self.context._effort_due = due
+            if rid in due or _tf.facts_for(self.context, rid).get("effort_escalated"):
+                return
+            due[rid] = str(why)
+            while len(due) > 32:                       # a request that ended before its next turn
+                due.pop(next(iter(due)))
+            pretty_log("Reasoning Effort", f"xhigh from the next thinking turn — {why}", icon=Icons.BRAIN_EFFORT)
+        except Exception as exc:  # noqa: BLE001 — never block a turn on this
+            logger.debug("effort escalation skipped: %s", exc)
+
+    def _effort_note_due(self, req_id, thinks=True) -> str:
+        """§4RB: the xhigh note to append now ("" = none): once, on the first
+        turn that thinks after `_effort_escalate` booked this request's first
+        failure (a report / loop-retry turn with thinking off keeps it
+        waiting). Recorded in the trajectory (`effort_escalated`) only when
+        placed."""
+        try:
+            if not thinks or not _effort.enabled():
+                return ""
+            rid = str(req_id or "")
+            due = getattr(self.context, "_effort_due", None)
+            why = due.pop(rid, None) if isinstance(due, dict) else None
+            if not why:
+                return ""
+            from . import turn_facts as _tf
+            _tf.record(self.context, rid, effort_escalated=why)
+            return _effort.escalation_note(why)
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _state_anchor(self, req_id):
+        """§4RC: this request's anchored state-block record (a dict
+        ``_compose_injection`` fills), or None when GHOST_STATE_ANCHOR is
+        off. Bounded; a reused id is cleared by ``_state_anchor_reset``."""
+        if not _state_anchor_enabled():
+            return None
+        try:
+            from collections import OrderedDict as _OD
+            reg = getattr(self.context, "_state_anchors", None)
+            if not isinstance(reg, _OD):
+                reg = _OD()
+                self.context._state_anchors = reg
+            rid = str(req_id or "")
+            rec = reg.get(rid)
+            if rec is None:
+                rec = reg[rid] = {}
+            reg.move_to_end(rid)
+            while len(reg) > _STATE_ANCHOR_MAX_REQUESTS:
+                reg.popitem(last=False)
+            return rec
+        except Exception:  # noqa: BLE001 — never break a turn; the block is then shown whole
+            return None
+
+    def _state_anchor_extra_tokens(self, req_id) -> int:
+        """§4RC: what the last turn's prompt carried beyond the old layout's
+        one whole block (the kept block + the changes − a whole block), in
+        tokens. The injection reserve already covers one whole block; r4:
+        subtracting the kept block whole pruned history earlier than before."""
+        try:
+            reg = getattr(self.context, "_state_anchors", None)
+            rec = reg.get(str(req_id or "")) if isinstance(reg, dict) else None
+            return int(int((rec or {}).get("over_chars") or 0) / 3.5)
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _state_anchor_reset(self, req_id):
+        """§4RC: a reused request id (sched-/job-) starts with the block whole."""
+        reg = getattr(self.context, "_state_anchors", None)
+        if isinstance(reg, dict):
+            reg.pop(str(req_id or ""), None)
+
+    def _effort_reset(self, req_id):
+        """§4RB: a reused request id (sched-/job-) starts without an earlier
+        run's escalation."""
+        try:
+            rid = str(req_id or "")
+            due = getattr(self.context, "_effort_due", None)
+            if isinstance(due, dict):
+                due.pop(rid, None)
+            from . import turn_facts as _tf
+            if _tf.facts_for(self.context, rid).get("effort_escalated"):
+                _tf.record(self.context, rid, effort_escalated="")
+        except Exception:  # noqa: BLE001
+            pass
+
     def _take_active_correction(self) -> str:
         """Return the staged correction banner and clear it (one-shot, so it
         prepends to exactly one reply). Empty string when none is staged."""
@@ -19330,7 +19740,7 @@ class GhostAgent:
                         attr_matches = re.finditer(r'([a-zA-Z0-9_-]+)=["\'](.*?)["\']', func_match.group(0))
                         for a in attr_matches:
                             if a.group(1).lower() not in ['name', 'function', 'tool_call']:
-                                args_val[a.group(1)] = a.group(2)
+                                args_val[a.group(1)] = _html_attr(a.group(2))
 
                         # Format 0a (CDATA envelope) retired in §4EC: bodies are masked
                         # before ANY structural regex (see _mask_cdata) and restored at
@@ -19357,7 +19767,7 @@ class GhostAgent:
                         # Format 2: <parameter name="x" value="y" /> (Handles inner quotes)
                         alt_matches = list(re.finditer(r'<parameter\s+name=["\']([^"\']+)["\']\s+value=(["\'])(.*?)\2\s*(?:/|>.*?</parameter>)', block_content, re.DOTALL | re.IGNORECASE))
                         for p in alt_matches:
-                            args_val[p.group(1)] = p.group(3)
+                            args_val[p.group(1)] = _html_attr(p.group(3))
 
                         # Format 3: Bare tags <action>check_health</action> (Handles missing closing tags)
                         bare_tags = list(re.finditer(r'<([a-zA-Z0-9_-]+)>(.*?)(?=</\1>|<[a-zA-Z0-9_-]+>|<[a-zA-Z0-9_-]+ |</function>|</tool_call>|$)', block_content, re.DOTALL | re.IGNORECASE))
@@ -19371,13 +19781,13 @@ class GhostAgent:
                         attr_tags = list(re.finditer(r'<parameter\s+([a-zA-Z0-9_-]+)=(["\'])(.*?)\2\s*(?:/|>.*?</parameter>)', block_content, re.DOTALL | re.IGNORECASE))
                         for a in attr_tags:
                             if a.group(1).lower() != 'name' and a.group(1).lower() not in args_val:
-                                args_val[a.group(1)] = a.group(3)
+                                args_val[a.group(1)] = _html_attr(a.group(3))
 
                         # Format 5: Direct attribute tags <action="check_health"> (Handles inner quotes)
                         direct_attr = list(re.finditer(r'<([a-zA-Z0-9_-]+)=(["\'])(.*?)\2\s*(?:/|>.*?</\1>|>)', block_content, re.DOTALL | re.IGNORECASE))
                         for d in direct_attr:
                             if d.group(1).lower() not in ['function', 'tool_call', 'parameter', 'arguments', 'parameters', 'kwargs'] and d.group(1).lower() not in args_val:
-                                args_val[d.group(1)] = d.group(3)
+                                args_val[d.group(1)] = _html_attr(d.group(3))
 
                         # Format 5b: Bounds-aware REPAIR pass — Format 1's non-greedy
                         # regex truncates param bodies at the FIRST `</parameter>` it
@@ -19596,7 +20006,8 @@ class GhostAgent:
                                         "type": "function",
                                         "function": {
                                             "name": "execute",
-                                            "arguments": json.dumps({"filename": f_match.group(1), "content": raw_content})
+                                            # §4RD: a slice of JSON source — its quotes are still escaped
+                                            "arguments": json.dumps({"filename": f_match.group(1), "content": raw_content.replace('\\"', '"')})
                                         }
                                     })
                                     continue
@@ -19618,7 +20029,7 @@ class GhostAgent:
                                         if raw_content.endswith(','): raw_content = raw_content[:-1].strip('\r\n')
                                         if raw_content.endswith('"""'): raw_content = raw_content[:-3].strip('\r\n')
                                         elif raw_content.endswith('"') or raw_content.endswith("'"): raw_content = raw_content[:-1].strip('\r\n')
-                                        args_dict["content"] = raw_content
+                                        args_dict["content"] = raw_content.replace('\\"', '"')   # §4RD: a JSON slice
 
                                     if rw_match:
                                         raw_rw = rw_match.group(1).strip('\r\n')
@@ -19626,7 +20037,7 @@ class GhostAgent:
                                         if raw_rw.endswith(','): raw_rw = raw_rw[:-1].strip('\r\n')
                                         if raw_rw.endswith('"""'): raw_rw = raw_rw[:-3].strip('\r\n')
                                         elif raw_rw.endswith('"') or raw_rw.endswith("'"): raw_rw = raw_rw[:-1].strip('\r\n')
-                                        args_dict["replace_with"] = raw_rw
+                                        args_dict["replace_with"] = raw_rw.replace('\\"', '"')   # §4RD: a JSON slice
 
                                     tool_calls.append({
                                         "id": f"call_{uuid.uuid4().hex[:8]}",
@@ -20006,29 +20417,15 @@ class GhostAgent:
             messages.append(msg)
             last_was_failure = False
 
-            if tool_calls:
-                import html
-                def unescape_xml_values(val):
-                    if isinstance(val, str):
-                        return html.unescape(val).replace('\\"', '"').replace("\\'", "'")
-                    elif isinstance(val, dict):
-                        return {k: unescape_xml_values(v) for k, v in val.items()}
-                    elif isinstance(val, list):
-                        return [unescape_xml_values(v) for v in val]
-                    return val
-
-                for tc in tool_calls:
-                    try:
-                        args_dict = json.loads(tc["function"]["arguments"], strict=False)
-                        tc["function"]["arguments"] = json.dumps(unescape_xml_values(args_dict))
-                    except Exception:
-                        pretty_log(
-                            "Agent Parser",
-                            f"Arguments for tool "
-                            f"'{tc.get('function', {}).get('name')}' are not valid "
-                            f"JSON at the unescape step — leaving them raw",
-                            level="WARNING", icon=Icons.WARN,
-                        )
+            # §4RD: tool arguments reach the tool EXACTLY as the model wrote
+            # them. A blanket html.unescape + `\\"`→`"` pass ran here on every
+            # string of every call; req e2c7c7f4 wrote `'"': "&quot;"` into a
+            # JS escape table and the file got `'"': """` (a syntax error),
+            # then two edits were REJECTED as "old_string and new_string are
+            # identical" because both sides decoded to the same text — ~1000 s
+            # of a deadline-cut build. Native calls carry literal values; only
+            # a quoted XML ATTRIBUTE in the text fallback is entity-encoded,
+            # and that parser decodes those values where it reads them.
 
             # Reset the per-BATCH read budget before dispatching this
             # assistant message's tool calls. Parallel whole-file reads
@@ -20058,6 +20455,7 @@ class GhostAgent:
                     # Reuse the same reserve _history_budget subtracts.
                     _occ = _estimate_messages_tokens(messages)
                     _inj = min(_INJECTION_RESERVE_TOKENS, max(0, _mc - 32000))
+                    _inj += self._state_anchor_extra_tokens(request_id_context.get())   # §4RC r2: blocks kept in place
                     _headroom = int(max(0, 0.80 * _mc - _occ - _inj) * 3.5)
                     _cap = min(_cap, _headroom)
                 except Exception:
@@ -21735,7 +22133,8 @@ class GhostAgent:
                     # get a verify-now steer (see the module constants
                     # for the incident this encodes). Counters live on
                     # request_state — per-request, no TurnState churn.
-                    if fname == "file_system" and is_mutating and not _res_is_error:
+                    if (fname == "file_system" and is_mutating and not _res_is_error
+                            and not _is_parts_continuation(_recorded_args)):     # §4RI
                         _churn = getattr(request_state, "_edit_churn", None)
                         # isinstance, not None-check: a mocked request_state
                         # auto-fabricates attributes, and the counters must
@@ -22302,6 +22701,47 @@ class GhostAgent:
                                             "is known and what is blocked."
                                         )})
                     except Exception:
+                        pass
+                    try:
+                        # §4RA: coding progress earns deadline extensions. After the futility
+                        # record above, so a run counts only when IT judged the run progress
+                        # (failures fell / passes rose / new output) for a file THIS request
+                        # wrote (r1 M1: any file named; r2 M-E: re-reads and identical re-runs)
+                        _written = getattr(self.context, "_script_iter", None)
+                        _earned_recs = []
+                        if fname == "execute" and isinstance(_written, dict):
+                            for _k in futility_keys_in_command(a_hash, written_keys=_written.keys()):
+                                _r = _written.get(_k)
+                                # the verdict compares with the previous run only, so alternating errors,
+                                # a volatile port/pid (r3 M1) or alternating test counts (r4) read as
+                                # progress forever — a run counts once per REWRITE of its file
+                                if (isinstance(_r, dict) and _r.get("progress") is True
+                                        and _r.get("writes", 0) > _r.get("writes_at_earn", 0)):
+                                    _earned_recs.append(_r)
+                        _refused = _res_unresolved or bool(getattr(_outcome, "is_rejection", False))
+                        if is_code_progress(fname, ptool_op, ptarget,
+                                            _refused or (_res_is_error and fname != "execute"),   # a failing run that
+                                            ran_written=bool(_earned_recs)):                     # converges counts
+                            for _r in _earned_recs:                       # r4: only a run that COUNTED uses it up
+                                _r["writes_at_earn"] = _r.get("writes", 0)
+                            _glog.note_code_progress(request_id_context.get() or "",
+                                                     f"wrote {ptarget}" if fname == "file_system"
+                                                     else "ran a file it wrote")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    # §4RA end
+                    try:
+                        # §4RB: the first sign the work is stuck → xhigh from the next turn
+                        _ran_failed = (fname == "execute" and _res_is_error and isinstance(_written, dict)
+                                       and bool(set(futility_keys_in_command(a_hash, written_keys=_written.keys()))
+                                                & set(_written.keys())))
+                        _stuck = _effort.stuck_reason(fname, ptool_op, ptarget, refused=_refused,
+                                                      result_text=str(str_res or ""),
+                                                      ran_written_failed=_ran_failed,
+                                                      reason_code=getattr(_outcome, "reason_code", "") or "")
+                        if _stuck:
+                            self._effort_escalate(request_id_context.get(), _stuck)
+                    except Exception:  # noqa: BLE001
                         pass
 
                     if fname and not is_mutating and not _res_is_error:
@@ -23116,50 +23556,40 @@ class GhostAgent:
                     )
                     if sys3_trigger:
                         pivot_num = 2 if _request_sys3_fired_once else 1
-                        # Count the ATTEMPT, not the success. `_run_system_3_pivot`
-                        # returns {} on any exception — including a 120 s LLM
-                        # timeout — and on that path nothing below runs, so a
-                        # `>=` trigger re-armed every single turn.
+                        # Count the ATTEMPT (a `>=` trigger re-armed every turn).
                         _request_sys3_fired_once = (
                             int(_request_sys3_fired_once or 0) + 1)
                         pretty_log(f"Recovery Plan #{pivot_num}", "repeated failures — stepping back to choose a different approach", icon=Icons.RETRY)
-
-                        # On second pivot, include first pivot's justification
-                        extra_context = ""
-                        if pivot_num == 2:
-                            prev_just = _request_sys3_prev_justification
-                            extra_context = f"\n\n### PREVIOUS PIVOT (failed):\n{prev_just[:500]}"
-
-                        sys3_result = await self._run_system_3_pivot(
-                            task_context=last_user_content,
-                            error_context=(last_error_res or '') + extra_context,
-                            sandbox_state=str(sandbox_state),
-                            model=model
-                        )
-                        if sys3_result.get("tree_update"):
-                            task_tree.load_from_json(sys3_result["tree_update"])
-                            current_plan_json = task_tree.to_json()
-                            # ONLY the first pivot decays the counter. The
-                            # second must not, or the trigger re-arms for
-                            # ever: 5 fires pivot #2, −2 leaves 3, two more
-                            # failures reach 5, and it fires again. Executed
-                            # against this method's own arithmetic, that is
-                            # 11 pivots in 25 all-failing turns with
-                            # `execution_failure_count >= 6` NEVER reached —
-                            # the task tree rewritten every other turn and no
-                            # force-final-response, for ever. Holding at 5
-                            # lets the next structural failure hit the cap,
-                            # which is what "at most two pivots" (see
-                            # `pivot_num`) always meant.
-                            if pivot_num == 1:
-                                execution_failure_count = max(0, execution_failure_count - 2)
-                            transient_failure_count = 0
-                            last_was_failure = False
-                            _request_sys3_prev_justification = sys3_result.get('justification', '')
-                            messages.append({"role": "user", "content": f"SYSTEM 3 PIVOT #{pivot_num}: The previous approach failed. The strategy has been entirely rewritten. Justification: {sys3_result.get('justification')}. Follow the new plan."})
-                            strikes.member_refused_batches = 0   # this batch ran a call (§4KL); the tail is skipped
-                            strikes.blocked_batches = 0          # §4MR: same reason — it ran a call
-                            return False  # was `continue` — the region is the loop-body tail
+                        # §4RI: the pivot is a steer INSIDE the conversation, not two
+                        # side calls on the main server. Request 43fe95a2: on a long
+                        # coding request the conversation's KV state outgrows
+                        # --cache-ram (llama: "prompt state size 5123 MiB exceeds cache
+                        # size limit 4096 MiB, skipping"), so the generator/evaluator
+                        # calls displaced the slot and the next turn re-processed ~110k
+                        # tokens (~17 min) — for a planner that saw a 1.5 KB summary.
+                        # The main model holds the full context at its current effort:
+                        # it lays out the alternatives and picks one in its own
+                        # reasoning. The episodic recovery hint (a memory lookup, no
+                        # LLM, owner only) still rides along. No task-tree rewrite
+                        # (§4PC: the evaluator once replaced the tree with a plan that
+                        # named a tool that does not exist).
+                        _recovery_hint = await self._recovery_episodes_hint(last_error_res or "")
+                        messages.append({"role": "user", "content": pivot_steer_message(
+                            pivot_num, execution_failure_count, last_error_res,
+                            list((getattr(self, "available_tools", None) or {}).keys()),
+                            _recovery_hint, _request_sys3_prev_justification)})
+                        _request_sys3_prev_justification = str(last_error_res or "")[:500]
+                        # ONLY the first pivot decays the counter. The second must
+                        # not, or the trigger re-arms for ever: 5 fires pivot #2, −2
+                        # leaves 3, two more failures reach 5, and it fires again
+                        # (11 pivots in 25 all-failing turns, the cap never reached).
+                        if pivot_num == 1:
+                            execution_failure_count = max(0, execution_failure_count - 2)
+                        transient_failure_count = 0
+                        last_was_failure = False
+                        strikes.member_refused_batches = 0   # this batch ran a call (§4KL); the tail is skipped
+                        strikes.blocked_batches = 0          # §4MR: same reason — it ran a call
+                        return False  # was `continue` — the region is the loop-body tail
 
                     if execution_failure_count >= 6 or total_fail >= 8:
                         # Distinct title (was "Loop Breaker", shared by 3
@@ -25207,6 +25637,8 @@ class GhostAgent:
             # wrong instruction for a turn that just emitted 629 of
             # them.
             tool_call_flood_detected = False
+            reasoning_content = ""        # §4RF: bound on every path to the cut-in-thinking branch
+            stream_finish_reason = None
             try:
                 payload["stream"] = True
                 full_content = ""
@@ -25363,8 +25795,20 @@ class GhostAgent:
                     except Exception:  # noqa: BLE001 — never costs the turn
                         _tap = None
 
+                # §4RD-c: a cooperative Stop lands inside the generation (a
+                # live-streamed reply ran on for minutes, the client hung up,
+                # and the Stop was booked as an interruption)
+                from .turns import CANCEL_POLL_S as _cancel_poll_s
+                _cancel_read_at = 0.0
+                _cancelled_mid_gen = False
                 async for chunk in self.context.llm_client.stream_chat_completion(payload, use_coding=has_coding_intent):
                     self._heartbeat() # Heartbeat to prevent Hippocampus from waking up
+                    if (_turn_reg is not None and stream_finish_reason is None     # r1: a finished reply is not cut
+                            and time.monotonic() - _cancel_read_at >= _cancel_poll_s):
+                        _cancel_read_at = time.monotonic()
+                        if _turn_reg.is_cancelled(req_id):
+                            _cancelled_mid_gen = True
+                            break
                     try:
                         chunk_str = chunk.decode("utf-8")
                         if chunk_str.startswith("data: ") and chunk_str.strip() != "data: [DONE]":
@@ -25626,6 +26070,22 @@ class GhostAgent:
                         logger.debug(f"XML Tool parse text stream chunk error: {type(e).__name__}")
 
                 _flush_thinking()
+                if _cancelled_mid_gen:
+                    # what the client was shown is the partial reply; without
+                    # a tap, this generation's text when it is reply text
+                    _lead = ""
+                    if _tap is not None:
+                        _shown = _tap.sent
+                        if _tap.lead and _shown.startswith(_tap.lead):     # r2 m2: the head, not mid-reply
+                            _lead, _shown = _tap.lead, _shown[len(_tap.lead):]
+                    elif (msg.get("tool_calls") or reply_tap_unsafe(full_content)
+                          or not (_tap_thinking_off or reasoning_content)):
+                        _shown = ""
+                    else:
+                        _shown = full_content
+                    _t = _turn_reg.get(req_id)
+                    raise TurnCancelled(req_id, getattr(_t, "reason", "") or "cancelled",
+                                        partial=_shown, lead=_lead)
                 thinking_duration = time.monotonic() - thinking_started
                 try:
                     from .task_state import note_reply_seconds as _note_reply_s, note_reply_tokens as _note_reply_t   # §4OE-1
@@ -26019,6 +26479,8 @@ class GhostAgent:
                         force_final_response = True
                         self.context._breaker_forced_final = True  # §4JI: a tool call on this forced final IS the no-answer
                     return "continue"
+            except TurnCancelled:
+                raise                    # §4RD-c: a Stop, not an LLM failure
             except (httpx.ConnectError, httpx.ConnectTimeout):
                 # the marker books the turn FAILED (§4MD M3: an outage was
                 # "turn outcome ok" and credited every lesson shown in it)
@@ -26701,9 +27163,17 @@ class GhostAgent:
                         return "break"
                     return "continue"
                 if not clean_ui and not force_final_response and not is_final_generation:
-                    pretty_log("Agent Parser", "Model stalled after thinking. Forcing retry.", level="WARNING", icon=Icons.WARN)
                     messages.append(msg)
-                    messages.append({"role": "user", "content": "SYSTEM ALERT: You generated a thought process but stopped abruptly without outputting a valid XML <tool_call> or a response to the user. DO NOT STOP. If you need to use a tool, output the required XML <tool_call> block. If the task is fully complete, provide your final response to the user."})
+                    if stream_finish_reason == "length" and reasoning_content:
+                        # §4RF: the limit, not a stall — name the cause, never cap the thinking
+                        pretty_log("Agent Parser", f"Cut off at the output limit while thinking "
+                                   f"({len(reasoning_content):,} chars of thinking, no answer). "
+                                   f"Retrying with the thinking kept as the draft.", level="WARNING", icon=Icons.WARN)
+                        messages.append({"role": "user", "content": cut_in_thinking_message(
+                            reasoning_content, cut_round_note(request_id_context.get(), "", last_user_content))})
+                    else:
+                        pretty_log("Agent Parser", "Model stalled after thinking. Forcing retry.", level="WARNING", icon=Icons.WARN)
+                        messages.append({"role": "user", "content": "SYSTEM ALERT: You generated a thought process but stopped abruptly without outputting a valid XML <tool_call> or a response to the user. DO NOT STOP. If you need to use a tool, output the required XML <tool_call> block. If the task is fully complete, provide your final response to the user."})
                     execution_failure_count += 1
                     return "continue"
 
@@ -26852,6 +27322,8 @@ class GhostAgent:
                         force_final_response = True
                         force_stop = False
                         _repair_reentry_active = True
+                        self._effort_escalate(request_id_context.get(),                      # §4RB
+                                              "the answer is being regenerated after a check")
                         _repair_reentry_tools_at = _real_tool_rows(tools_run_this_turn)
                         _repair_reentry_rows_at = len(tools_run_this_turn or [])
                         final_ai_content = ""
@@ -27208,6 +27680,8 @@ class GhostAgent:
                         repair_round += 1
                         force_final_response = False
                         _repair_reentry_active = True
+                        self._effort_escalate(request_id_context.get(),                      # §4RB
+                                              "a check found a problem in the answer")
                         cross_turn_repeat_hits = 0    # a repair round is a fresh attempt (§4KL)
                         # The repair has its tools back: the breaker's report
                         # shaping (thinking off, a tool call = no answer) must
@@ -27410,13 +27884,19 @@ class GhostAgent:
                     raise TurnCancelled(req_id, _active_turn.reason)
                 char_budget = int(self.context.args.max_context * 3.5)
                 _LENGTH_STOPS.pop(str(req_id or ""), None)   # §4OA: a reused id (sched-/job-) starts fresh
+                self._effort_reset(req_id)                   # §4RB: and without its escalation
+                self._state_anchor_reset(req_id)             # §4RC: and its state block whole
+                await self._effort_default_refresh(req_id)   # §4RC: the server's level, for the record
                 pretty_log("Request Initialized", special_marker="BEGIN",
                            origin=_turn_origin)
                 # §4JP: say on the turn's first lines whether a client deadline
                 # is known — the live evidence that the header made it here.
                 _cdl = float(_glog.client_deadline_context.get() or 0.0)
                 if _cdl > 0:
-                    pretty_log("Client Deadline", client_deadline_line(_cdl),
+                    # §4RA: the budget IN FORCE (the server cap may be lower than the header)
+                    pretty_log("Client Deadline",
+                               client_deadline_line(_glog.request_deadline_s(str(req_id or "")),
+                                                    _glog.extension_ceiling_s(str(req_id or ""))),
                                icon=Icons.REQ_WAIT, level="INFO")
                 messages, model, stream_response = body.get("messages", []), body.get("model", "qwen-3.6-35b-a3"), body.get("stream", False)
                 if requester_is_member():
@@ -27650,6 +28130,7 @@ class GhostAgent:
                 # code files this request. See the futility breaker in the
                 # dispatch pipeline.
                 self.context._script_iter = {}
+                self.context._extension_logged = 0.0                # §4RA: last extension logged
                 self.context._fetch_memo = {}                       # §4OE-4: what this request fetched
                 self.context._url_provenance = _UrlProvenance()     # §4PC: addresses this request was GIVEN
                 try:
@@ -28419,6 +28900,10 @@ class GhostAgent:
                     # the reserved turn (tools off, the §4IG flag armed).
                     _remaining_s = _glog.request_remaining_s(str(req_id or ""))
                     _floor_now = effective_report_floor(_glog.request_deadline_s(str(req_id or "")), str(req_id or ""))
+                    # §4RA r2 M-A: read again with THIS reserve noted — a reserve that grew
+                    # this turn must widen the extension window before the report check
+                    _remaining_s = _glog.request_remaining_s(str(req_id or ""))
+                    _floor_now = effective_report_floor(_glog.request_deadline_s(str(req_id or "")), str(req_id or ""))
                     if _remaining_s is not None and getattr(self.context, "_reserve_logged", None) != int(_floor_now):
                         self.context._reserve_logged = int(_floor_now)              # §4OG-4 (l): one line per change
                         from .task_state import reply_rate_tok_s as _rr, report_turn_estimate_s as _rte
@@ -28427,6 +28912,15 @@ class GhostAgent:
                                    f"slowest rate {_rr(str(req_id or '')):.0f} tok/s → report+retry ≈ "
                                    f"{int(_rte(str(req_id or '')))} s; longest reply {int(_max_reply_s(str(req_id or '')))} s)",
                                    icon=Icons.BRAIN_CTX, durable_only=True)
+                    _ext_now = _glog.request_extension_s(str(req_id or ""))
+                    if _ext_now > float(getattr(self.context, "_extension_logged", 0.0) or 0.0):
+                        # §4RA: the deadline moved out (earned on read, by coding progress)
+                        self.context._extension_logged = _ext_now
+                        pretty_log("Time Budget",
+                                   f"extended to {_span(_glog.request_deadline_s(str(req_id or '')))} "
+                                   f"(ceiling {_span(_glog.extension_ceiling_s(str(req_id or '')))}) — "
+                                   f"{_glog.request_progress_what(str(req_id or '')) or 'coding progress'}",
+                                   level="WARNING", icon=Icons.WARN)
                     if deadline_needs_report(_remaining_s, _floor_now, force_final_response, force_stop):
                         force_final_response = True
                         _report_turn_forced = True
@@ -28622,7 +29116,7 @@ class GhostAgent:
                     _injection_reserve = min(
                         _INJECTION_RESERVE_TOKENS, max(0, _ctx_cap - 32000))
                     _history_budget = (
-                        max(1000, _ctx_cap - _injection_reserve)
+                        max(1000, _ctx_cap - _injection_reserve - self._state_anchor_extra_tokens(req_id))
                         if _ctx_cap else self.context.args.max_context)
                     _pre_prune_tokens = _estimate_messages_tokens(messages)
                     messages = await self._prune_context(messages, max_tokens=_history_budget, model=model)
@@ -28859,20 +29353,23 @@ class GhostAgent:
                     # loud formatting makes it the FIRST thing read every
                     # coding turn, after which CURRENT TIME / SCRAPBOOK /
                     # project briefing / SANDBOX STATE follow normally.
-                    dynamic_state = ""
+                    # §4RC: built as named sections (joined, the text is what it always was) so an
+                    # anchored request can append only the sections that changed
+                    _ds_parts = []
                     if has_coding_intent:
                         # Project-aware since 2026-07-18: the static
                         # "/workspace" wording taught the model to `cd`
                         # OUT of its project scope (see _render_cwd_pin).
-                        dynamic_state += _render_cwd_pin(
-                            getattr(self.context, "current_project_id", None))
+                        _ds_parts.append(("cwd_pin", _render_cwd_pin(
+                            getattr(self.context, "current_project_id", None))))
                     # Minute precision (not seconds): a second-precision
                     # timestamp changes on every turn of the same request,
                     # busting the upstream prefix KV-cache for everything that
                     # follows this block. The model never needs sub-minute
                     # resolution; minute precision keeps the block byte-stable
                     # across the turns of a single request so the cache holds.
-                    dynamic_state += f"### DYNAMIC SYSTEM STATE\nCURRENT TIME: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} (Day: {datetime.datetime.now().strftime('%A')})\n\nSCRAPBOOK:\n{scratch_data}\n\n"
+                    _ds_parts.append(("time", f"### DYNAMIC SYSTEM STATE\nCURRENT TIME: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} (Day: {datetime.datetime.now().strftime('%A')})\n\n"))
+                    _ds_parts.append(("scrapbook", f"SCRAPBOOK:\n{scratch_data}\n\n"))
                     try:                                                               # §4OE-1
                         from .task_state import (render_task_state as _rts, recall_state_of_work as _rsow,
                                                  render_state_of_work as _rrsow)
@@ -28882,13 +29379,13 @@ class GhostAgent:
                             _ts_prefix = _pdp_ts(_pss_ts(self.context)[0])
                         except Exception:  # noqa: BLE001
                             _ts_prefix = ""
-                        dynamic_state += _rts(locals().get("tools_run_this_turn") or [],
+                        _ds_parts.append(("task_state", _rts(locals().get("tools_run_this_turn") or [],
                                               ask=str(last_user_content or ""), turn=int(turn or 0),
-                                              link_prefix=_ts_prefix)
+                                              link_prefix=_ts_prefix)))
                         _sow_sid = str((body or {}).get("session_id") or "") if isinstance(body, dict) else ""
                         if _sow_sid and not requester_is_member():
                             _sow_block = _rrsow(_rsow(getattr(self.context, "scratchpad", None), _sow_sid))
-                            dynamic_state += _sow_block
+                            _ds_parts.append(("state_of_work", _sow_block))
                             if _sow_block and getattr(self.context, "_sow_shown_sid", "") != _sow_sid:
                                 self.context._sow_shown_sid = _sow_sid              # §4OG-4 (g)
                                 pretty_log("State Of Work", f"shown to the model (session {_sow_sid[:24]}, {len(_sow_block)} chars)",
@@ -28897,15 +29394,15 @@ class GhostAgent:
                         pass
                     # §4MW: an operator probe's candidate rule under test (probes only)
                     if _glog.probe_rule():
-                        dynamic_state += ("### RULE (a candidate under test, written by an automatic "
+                        _ds_parts.append(("probe_rule", "### RULE (a candidate under test, written by an automatic "
                                           "diagnosis — not the owner's instruction)\n"
-                                          f"{_defuse_rule_text(_glog.probe_rule())}\n\n")
+                                          f"{_defuse_rule_text(_glog.probe_rule())}\n\n"))
                     from . import quote_bound as _qbr
                     if _qbr.active():                                            # §4OJ-b: non-streamed replies
-                        dynamic_state += _qbr.RULE
+                        _ds_parts.append(("quote_rule", _qbr.RULE))
                     if _owner_rule_note_ctx.get():
-                        dynamic_state += f"### OWNER RULE COMMAND\n{_owner_rule_note_ctx.get()}\n\n"
-                    dynamic_state += _owner_rules_block(self.context)    # §4NA
+                        _ds_parts.append(("owner_rule_command", f"### OWNER RULE COMMAND\n{_owner_rule_note_ctx.get()}\n\n"))
+                    _ds_parts.append(("owner_rules", _owner_rules_block(self.context)))    # §4NA
                     try:
                         from .prompts import build_project_briefing
                         _proj_store = getattr(self.context, "project_store", None)
@@ -28934,7 +29431,7 @@ class GhostAgent:
                                 services=self._project_services_brief(
                                     _proj_id))
                             if _briefing:
-                                dynamic_state += _briefing + "\n"
+                                _ds_parts.append(("briefing", _briefing + "\n"))
                     except Exception:
                         logger.debug("project briefing skipped", exc_info=True)
                     # EXPLICIT CONSTRAINTS OF THE CURRENT REQUEST — surfaced
@@ -28945,7 +29442,7 @@ class GhostAgent:
                     # up with some random AI, YOU will play against me"
                     # first appears). Deterministic extraction, no LLM call.
                     if _request_constraint_block:
-                        dynamic_state += _request_constraint_block + "\n\n"
+                        _ds_parts.append(("request_constraints", _request_constraint_block + "\n\n"))
                     # (§4NN: the §4FD EVIDENCE CHECK steer rode the
                     # `evidence_gate` experiment arm, disabled since §4ND —
                     # it left with the experiments registry.)
@@ -28963,14 +29460,14 @@ class GhostAgent:
                                            _repair_reentry_active):
                         force_final_response = True
                     if has_coding_intent:
-                        dynamic_state += f"CURRENT SANDBOX STATE:\n{sandbox_state}\n\n"
+                        _ds_parts.append(("sandbox_state", f"CURRENT SANDBOX STATE:\n{sandbox_state}\n\n"))
 
                     # Rewrite any leaked HOST-absolute sandbox path (from a
                     # recalled memory / scratchpad / workspace narrative) to its
                     # container /workspace form, so the model never builds a
                     # `cd /Users/.../sandbox/...` that ENOENTs in the container.
-                    dynamic_state = _scrub_host_sandbox_paths(
-                        dynamic_state, getattr(self.context, "sandbox_dir", None))
+                    _ds_sections = _state_sections(_ds_parts, getattr(self.context, "sandbox_dir", None))
+                    dynamic_state = "".join(_ds_sections.values())
 
                     # -----------------------------------------------------------------
                     # QWEN-AGENT METHODOLOGY: Bypass Native Tools & Use String Prompts
@@ -28987,6 +29484,13 @@ class GhostAgent:
                     # dual-dialect nudge in intra-request history — 2026-08-01).
                     _render_native = bool(getattr(
                         getattr(self.context, "args", None), "native_tools", False))
+                    _effort_note = self._effort_note_due(          # §4RB: appended once, never moved
+                        req_id, thinks=not ((is_final_generation and getattr(self.context, "_breaker_forced_final", False))
+                                            or loop_retry_is_no_think(messages, last_user_content)))
+                    if _effort_note:
+                        messages.append({"role": "user", "content": _effort_note})
+                        pretty_log("Reasoning Effort", f"xhigh note placed — turn {turn+1} thinks at xhigh",
+                                   icon=Icons.BRAIN_EFFORT)
                     req_messages = []
                     for m in messages:
                         if m.get("role") == "tool":
@@ -29090,6 +29594,7 @@ class GhostAgent:
                         if fetched_playbook:
                             _volatile_prefix += fetched_playbook
                         dynamic_state = _volatile_prefix + dynamic_state
+                        _ds_sections = _state_sections_pinned(_ds_sections, _final_gen_directive, fetched_playbook)
                     else:
                         _stable_injection = f"{tool_header_block}\n\n{active_persona}{fetched_playbook}{fetched_context}{_continuity_tail}"
                     # Measurement hook: a stable hash across a request's turns
@@ -29180,6 +29685,7 @@ class GhostAgent:
                             {**m, "content": member_steer_caveat(m.get("content"), _blocked)}
                             if m.get("role") == "user" and isinstance(m.get("content"), str) else m
                             for m in req_messages]
+                    _anchor = self._state_anchor(req_id) if _pin_stable else None   # §4RC
                     req_messages = self._compose_injection(
                         req_messages, _stable_injection, dynamic_state, _pin_stable,
                         # The CURRENT request (not the session's first message):
@@ -29187,7 +29693,14 @@ class GhostAgent:
                         # can never read as "no pending question" (req 2422eb25).
                         pending_request=last_user_content,
                         first_user_is_request=_one_user_message_arrived,
+                        sections=_ds_sections if _anchor is not None else None,
+                        anchor=_anchor,
                     )
+                    if _anchor is not None:
+                        pretty_log("Prefill Cache",
+                                   f"state block {_anchor.get('last', '?')} — sent {_anchor.get('sent_chars', 0)} ch "
+                                   f"of {len(dynamic_state)}, {len(_anchor.get('blocks') or [])} in place",
+                                   icon=Icons.BRAIN_CTX, durable_only=True)
                     # §4PL: what the model was given this iteration (prompt,
                     # injected state, hydrated memory) for the census's no-tool
                     # detector — keyed by request, bounded, read at turn end
@@ -29244,8 +29757,6 @@ class GhostAgent:
                         tool_turn_max_tokens = int(_cfg_max) if _cfg_max else DEFAULT_TOOL_TURN_MAX_TOKENS
                     except (TypeError, ValueError):
                         tool_turn_max_tokens = DEFAULT_TOOL_TURN_MAX_TOKENS
-                    tool_turn_max_tokens = max_tokens_after_cut_offs(                 # §4OA
-                        request_id_context.get(), tool_turn_max_tokens)
                     if locals().get("_report_turn_forced") and locals().get("force_final_response"):
                         from .task_state import FORCED_REPORT_MAX_TOKENS                # §4OE-1
                         tool_turn_max_tokens = min(tool_turn_max_tokens, FORCED_REPORT_MAX_TOKENS)
@@ -29378,6 +29889,7 @@ class GhostAgent:
                         pretty_log("Turn Budget",
                                    "thinking-loop retry — thinking OFF for this turn (tools stay on)",
                                    icon=Icons.WARN, level="WARNING")
+                    payload = self._with_turn_effort(payload, req_id)   # §4RB
                     pretty_log("LLM Request", f"Turn {turn+1} | Temp {sampling_params['temperature']:.2f}", icon=Icons.LLM_ASK)
 
                     if is_final_generation and stream_response:
@@ -29723,7 +30235,15 @@ class GhostAgent:
                        f"{req_id}: {_tc.reason}", icon=Icons.STOP)
             _partial = ""
             try:
-                _partial = str(locals().get("final_ai_content") or "")
+                _kept = str(locals().get("final_ai_content") or "")
+                _mid = getattr(_tc, "partial", None)                  # §4RD-c: stopped mid-generation
+                # r1 M1: an answer an earlier round kept (§4PO, §4LH) stays first
+                # r3: alone, the shown text is kept byte for byte, so the
+                # tap commits it (a stripped space read as a rewrite: retract + resend)
+                _partial = (str(getattr(_tc, "lead", "") or "")
+                            + ("\n\n".join(x for x in (_kept.strip(), str(_mid or "").strip()) if x)
+                               if _kept.strip() else str(_mid or ""))) \
+                    if _mid is not None else _kept
             except Exception:  # noqa: BLE001
                 _partial = ""
             try:                                                     # §4OJ-b r2 m7: a partial keeps no marker
@@ -29759,14 +30279,19 @@ class GhostAgent:
             # owner re-sent 2 s later; a deploy-cut bench item that had
             # answered correctly fed the PRM as a failure). Its own marker:
             # outcome stays UNKNOWN and no consumer learns from it.
+            # §4RD-c r1 M2: the owner pressed Stop and the cut came before the
+            # turn reached a check (prefill, a tool run, a continuation): the
+            # hang-up after the proxy's grace is that Stop, not an interruption
+            _stopped = bool(getattr(locals().get("_active_turn"), "cancelled", False))
             self._record_aborted_turn(
                 req_id=req_id,
-                reason="cancelled: client disconnected or process shutdown",
+                reason=("cancelled: stopped before the turn reached a check" if _stopped
+                        else "cancelled: client disconnected or process shutdown"),
                 messages=locals().get("messages"),
                 user_request=str(locals().get("last_user_content") or ""),
                 model=str(locals().get("model") or ""),
                 partial=str(locals().get("final_ai_content") or ""),
-                marker=interruption_marker(req_id))
+                marker="[ATTEMPT_ABORTED_TURN]" if _stopped else interruption_marker(req_id))
             raise
 
         finally:
@@ -30864,6 +31389,10 @@ class GhostAgent:
 
         async def stream_wrapper():
             full_content = ""
+            # §4RD: the drain's finally reads the text so far through this — a
+            # stream closed at a yield (Stop: the proxy hangs up first) never
+            # reaches the tail that records the turn
+            _drain_flags["partial"] = lambda: full_content
             _um_failed_stream = False     # §4LK: set before [DONE]; read by the record
             # §4O B-MAJOR-1: the internal drain sets stream_errored on an
             # upstream abort frame and recovers; this USER-FACING final
@@ -31988,6 +32517,7 @@ class GhostAgent:
                     # the corpus and the six other consumers cannot disagree
                     # about what this turn said.
                     _traj_content = _treated_content
+                    _drain_flags["recorded"] = True                 # §4RD: the tail decided; the finally must not book again
                     if (isinstance(_traj_content, str)
                             and _traj_content.strip()):
                         # §4KS: the streamed turn's reply, on the operator's
@@ -32389,6 +32919,10 @@ class GhostAgent:
         # adds the number it was being mistaken for.
         _req_t0 = time.monotonic() - (
             _glog.request_elapsed_s(req_id) or 0.0)
+        try:                                                      # §4RD r2: read while the request is open
+            _req_deadline = float(_glog.request_deadline_s(req_id) or 0.0)
+        except Exception:  # noqa: BLE001
+            _req_deadline = 0.0
 
         async def _stream_then_unregister(_gen):
             _drain_t0 = time.monotonic()
@@ -32405,6 +32939,10 @@ class GhostAgent:
                     yield _chunk
                 _drained = True
             finally:
+                try:                                                     # §4RD: read before the unregister below
+                    _stop_seen = bool(getattr(_active_turn, "cancelled", False))   # identity, not the id (r1)
+                except Exception:  # noqa: BLE001
+                    _stop_seen = False
                 _turn_reg.unregister(req_id, _active_turn)
                 try:                                                     # §4OG-1 (h): the drain's report write is done
                     from ..tools.file_system import forget_request_receipts as _ffr2
@@ -32446,6 +32984,61 @@ class GhostAgent:
                                                    last_user_content, _stream_role)
                     except Exception:  # noqa: BLE001
                         pass
+                    if not _drain_flags.get("recorded"):
+                        # §4RD: closed before the tail ran — req e2c7c7f4 (46 min,
+                        # Stop during the report) left no trajectory, no outcome, no
+                        # reply line. Booked as the other aborts are (sync: no await
+                        # inside a closing generator).
+                        _sp_toks = None
+                        try:
+                            # r1 M2: the finally runs outside the request's contextvars (the
+                            # inner generator reset them; a GC close runs in another task)
+                            _sp_toks = (request_id_context.set(_stream_req_id),
+                                        requester_role_context.set(_stream_role),
+                                        requester_member_context.set(_stream_member),
+                                        prompt_arm_context.set(_stream_arm))
+                            _sp_text = str((_drain_flags.get("partial") or (lambda: ""))() or "")
+                            try:
+                                from .reply_smoothing import (_CORRECTION_BANNER_RE as _sp_banner,
+                                                              count_real_tools as _sp_count,
+                                                              treat_reply as _sp_treat)
+                                from .quote_bound import strip_leftover_markers as _sp_slm
+                                _sp_text = _sp_slm(_sp_banner.sub("", _sp_text, count=1))   # r1 m: as the tail
+                                _sp_text = _sp_treat(_sp_text, n_real_tools=_sp_count(stream_tools_snapshot))
+                            except Exception:  # noqa: BLE001 — the raw partial still beats no row
+                                pass
+                            _sp_stop = bool(_cancelled_mid_drain or _stop_seen)
+                            self._record_aborted_turn(
+                                req_id=req_id,
+                                reason=("the reply was stopped while it streamed" if _sp_stop
+                                        else "the client closed the stream before the reply ended"),
+                                messages=messages, user_request=last_user_content, model=model,
+                                partial=_sp_text,
+                                # r1 M1: a Stop is the owner's verdict (as the non-streamed
+                                # Stop); a hang-up from outside is an interruption (§4MS)
+                                **({} if _sp_stop else {"marker": interruption_marker(
+                                    req_id, (_req_deadline - (time.monotonic() - _req_t0))
+                                    if _req_deadline > 0 else None)}),
+                                # r1 M2: the drain's snapshots, not the live context
+                                project_id=str(self._drain_scope_pid(
+                                    getattr(self.context, "_project_work_pending", None),
+                                    req_id, _stream_captured_pid) or ""),
+                                pressure_lockdown=pressure_lockdown,
+                                elapsed_s=time.monotonic() - _req_t0,
+                                trajectory_id=current_trajectory_id,       # r2: the id the late verdict keys on
+                                temperature=self._sampling_temperature(payload))
+                        except Exception as _sp_exc:  # noqa: BLE001
+                            logger.warning("stopped-stream record skipped: %s: %s",
+                                           type(_sp_exc).__name__, _sp_exc)
+                        finally:
+                            if _sp_toks:
+                                for _sp_var, _sp_tok in zip((request_id_context, requester_role_context,
+                                                             requester_member_context, prompt_arm_context),
+                                                            _sp_toks):
+                                    try:
+                                        _sp_var.reset(_sp_tok)
+                                    except Exception:  # noqa: BLE001 — cross-context reset
+                                        pass
 
         async def _stream_in_request_context():
             # Re-enter the request's contextvars for the drain (see the
@@ -33061,7 +33654,10 @@ class GhostAgent:
 
     def _record_aborted_turn(self, *, req_id: str, reason: str, messages=None,
                              user_request: str = "", model: str = "",
-                             partial: str = "", marker: str = "[ATTEMPT_ABORTED_TURN]") -> None:
+                             partial: str = "", marker: str = "[ATTEMPT_ABORTED_TURN]",
+                             project_id: Optional[str] = None, pressure_lockdown: Optional[bool] = None,
+                             elapsed_s: Optional[float] = None, trajectory_id: str = "",
+                             temperature: Optional[float] = None) -> None:
         """§4IB — write the trajectory of a turn that did not finish.
 
         A Stop-button cancel, a client disconnect, a proxy timeout or a
@@ -33088,7 +33684,12 @@ class GhostAgent:
                 messages=_msgs, final_content=_content, req_id=req_id,
                 model=model, user_request=user_request,
                 execution_failed=False,
-                pressure_lockdown=bool(getattr(self.context, "_pressure_lockdown", False)))
+                # §4RD r1: a post-semaphore caller (the streamed drain) passes its
+                # snapshots; the live values belong to whichever request runs now
+                pressure_lockdown=(bool(pressure_lockdown) if pressure_lockdown is not None
+                                   else bool(getattr(self.context, "_pressure_lockdown", False))),
+                project_id=project_id, elapsed_s=elapsed_s,
+                trajectory_id=trajectory_id, temperature=temperature)
         except Exception as _exc:  # noqa: BLE001 — recording must never break the unwind
             logger.warning("aborted-turn record skipped for %s: %s: %s",
                            req_id, type(_exc).__name__, _exc)
@@ -33867,109 +34468,31 @@ class GhostAgent:
             )
         return traj
 
-    async def _run_system_3_pivot(self, task_context: str, error_context: str, sandbox_state: str, model: str) -> dict:
-        """System 3 Crisis Pivot: generate 3 alternative strategies and pick the safest one."""
-        if requester_is_member():
-            # A member's turn never runs System-3 (R8, CRIT): it reads the
-            # owner's episodic recoveries (its hypothesis grounding, which ran
-            # LLM-written shell at the sandbox root, was removed in §4NN).
-            return {}
+    async def _recovery_episodes_hint(self, error_context: str) -> str:
+        """§4RI: the past-recovery lines the in-line pivot steer carries — a
+        memory lookup, no LLM call. Empty for a member or a public reply
+        (the episodes are the owner's), and on any error."""
+        if requester_is_member() or reply_is_public():
+            return ""
+        _epi = getattr(self.context, "episodic_memory", None)
+        if _epi is None or not hasattr(_epi, "search_recoveries"):
+            return ""
         try:
-            # Past-recovery context. This closes the System-3 loop that was
-            # built on BOTH ends but connected on neither: search_recoveries
-            # had zero production callers and SYSTEM_3_EPISODIC_CONTEXT was
-            # referenced nowhere, so every crisis pivot ignored how past
-            # crises were actually survived. Best-effort, bounded.
-            recovery_hint = ""
-            # (§4LA) not into a PUBLIC reply: past turns are the owner's private
-            # record, and this pivot is automatic, not an explicit ask
-            _epi = None if reply_is_public() else getattr(self.context, "episodic_memory", None)
-            if _epi is not None and hasattr(_epi, "search_recoveries"):
-                try:
-                    _recs = await asyncio.to_thread(
-                        _epi.search_recoveries, error_context, 3,
-                        getattr(self.context, "memory_system", None))
-                    if _recs:
-                        from .prompts import SYSTEM_3_EPISODIC_CONTEXT
-                        _lines = [
-                            f"- [{_r.get('recovery_evidence', '?')}] "
-                            f"{str(_r.get('trigger') or '')[:120]} → "
-                            f"{str(_r.get('outcome') or '')[:160]}"
-                            for _r in _recs
-                        ]
-                        recovery_hint = SYSTEM_3_EPISODIC_CONTEXT.format(
-                            recovery_episodes="\n".join(_lines)) + "\n"
-                        pretty_log(
-                            "Recovery Plan",
-                            f"{len(_recs)} past recovery episode(s) inform the alternatives",
-                            icon=Icons.MEM_READ,
-                        )
-                except Exception as e:
-                    logger.debug(f"System-3 recovery context skipped: {e}")
-
-            # Step 1: Generate 3 distinct strategies
-            pretty_log("Recovery Plan", "drafting alternative approaches after the failures", icon=Icons.RETRY)
-            gen_user_msg = _system3_user_message(
-                task_context, recovery_hint, error_context, sandbox_state,
-                list((getattr(self, "available_tools", None) or {}).keys()))   # name → callable
-            # NO-THINK + token caps (2026-08-01, req 50855398): with the
-            # 120s wall (below) and thinking enabled, the generator spent
-            # its whole budget in the think channel and died on ReadTimeout
-            # — the crisis tool failed DURING the crisis, burning 120s for
-            # nothing. The output is a small JSON strategy list; the think
-            # phase is where the budget went. Same recipe as the other
-            # bounded JSON calls (constraint gate, research summarizer).
-            gen_payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_3_GENERATION_PROMPT},
-                    {"role": "user", "content": gen_user_msg + "\n\n/no_think"}
-                ],
-                "temperature": 0.7,
-                "max_tokens": 1500,
-                "chat_template_kwargs": {"enable_thinking": False},
-                "response_format": {"type": "json_object"}
-            }
-            use_swarm = bool(getattr(self.context.llm_client, 'swarm_clients', None))
-            # Bounded: the pivot is best-effort recovery INSIDE a stuck
-            # request — on the default 1200s client budget a busy upstream
-            # turned one pivot into a 20-minute hole (request 9c9b75aa:
-            # +2886s → +4101s ReadTimeout, dead air). Fail-open beats that.
-            gen_data = await self.context.llm_client.chat_completion(
-                gen_payload, use_swarm=use_swarm, timeout=120.0)
-            gen_content = gen_data["choices"][0]["message"].get("content", "")
-            strategies_json = extract_json_from_text(gen_content)
-            strategies = strategies_json.get("strategies", [])
-            if not strategies:
-                logger.warning("System 3 Generator returned no strategies.")
-                return {}
-
-            # Step 2: Evaluate and pick the safest strategy
-            pretty_log("Recovery Plan", "choosing the safest alternative", icon=Icons.RETRY)
-            eval_user_msg = (
-                f"### PROPOSED STRATEGIES:\n{gen_content}\n\n"
-                f"### CURRENT SANDBOX STATE:\n{sandbox_state[:1500]}"
-            )
-            eval_payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_3_EVALUATOR_PROMPT},
-                    {"role": "user", "content": eval_user_msg + "\n\n/no_think"}
-                ],
-                "temperature": 0.0,
-                "max_tokens": 700,
-                "chat_template_kwargs": {"enable_thinking": False},
-                "response_format": {"type": "json_object"}
-            }
-            eval_data = await self.context.llm_client.chat_completion(
-                eval_payload, use_swarm=use_swarm, timeout=120.0)
-            eval_content = str(eval_data["choices"][0]["message"].get("content") or "")
-            result = extract_json_from_text(eval_content)
-            pretty_log("Recovery Plan", f"chose {result.get('winning_id', '?')}: {result.get('justification', '')[:160]}", icon=Icons.RETRY)
-            return result
-        except Exception as e:
-            # repr(): a bare {e} rendered EMPTY for exception types with no
-            # message (2026-07-25 audit: "System 3 pivot failed: " — cause
-            # unknowable from the log).
-            logger.error("System 3 pivot failed: %r", e)
-            return {}
+            _recs = await asyncio.to_thread(
+                _epi.search_recoveries, error_context, 3,
+                getattr(self.context, "memory_system", None))
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"recovery episodes skipped: {e}")
+            return ""
+        if not _recs:
+            return ""
+        from .prompts import SYSTEM_3_EPISODIC_CONTEXT
+        _lines = [
+            f"- [{_r.get('recovery_evidence', '?')}] "
+            f"{str(_r.get('trigger') or '')[:120]} → "
+            f"{str(_r.get('outcome') or '')[:160]}"
+            for _r in _recs
+        ]
+        pretty_log("Recovery Plan", f"{len(_recs)} past recovery episode(s) inform the alternatives",
+                   icon=Icons.MEM_READ)
+        return SYSTEM_3_EPISODIC_CONTEXT.format(recovery_episodes="\n".join(_lines))

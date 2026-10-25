@@ -271,18 +271,13 @@ def test_syntax_feedback_names_double_escape(tmp_path):
 # System 3 pivot must fit its own 120s wall (no-think + token caps).
 
 
-def test_system3_calls_are_nothink_and_bounded():
+def test_system3_is_a_steer_in_the_conversation_not_side_calls():
+    """§4RI replaced the no-think/bounded generator+evaluator side calls
+    (this test used to pin their recipe) with a steer in the conversation:
+    the side calls displaced the KV slot on a long request (43fe95a2)."""
     src = (_SRC / "core" / "agent.py").read_text()
-    idx = src.find("SYSTEM_3_GENERATION_PROMPT},")
-    assert idx > 0
-    window = src[idx - 2000:idx + 3500]
-    assert window.count('"chat_template_kwargs": {"enable_thinking": False}') >= 1
-    assert '/no_think' in window
-    assert '"max_tokens": 1500' in window
-    eidx = src.find("SYSTEM_3_EVALUATOR_PROMPT},")
-    ewindow = src[eidx - 500:eidx + 1200]
-    assert '"max_tokens": 700' in ewindow
-    assert '/no_think' in ewindow
+    assert "SYSTEM_3_GENERATION_PROMPT" not in src and "SYSTEM_3_EVALUATOR_PROMPT" not in src
+    assert "def pivot_steer_message(" in src and "_recovery_episodes_hint(" in src
 
 
 # ===================================================================== F5

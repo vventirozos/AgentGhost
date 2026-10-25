@@ -150,7 +150,7 @@ def test_the_drain_reports_total_and_time_to_first_token():
     from ghost_agent.core import agent as agent_mod
     src = inspect.getsource(agent_mod)
     idx = src.index("async def _stream_then_unregister")
-    body = src[idx:idx + 2200]
+    body = src[idx:idx + 3000]   # §4RD: the finally reads the Stop first
     assert "Stream Drained" in body
     assert "TOTAL" in body and "first token" in body
     assert "_chunks" in body and "_bytes" in body
