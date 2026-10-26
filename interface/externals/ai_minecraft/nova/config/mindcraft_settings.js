@@ -4,7 +4,7 @@
 //
 // Differences from Mindcraft's stock settings, and why:
 //   host/port        the local Paper server (offline mode, Tailscale address)
-//   profiles         one bot, eva_body.json, driven by Gemma on nova
+//   profiles         one bot, eva_body.json, driven by the body model on nova
 //   load_memory      true: the body remembers across sessions, like Eva does
 //   auto_open_ui     false: nova is headless; the hub's monitor is the UI
 //   render_bot_view  true: the 3D viewer, proxied by the hub at /viewer/

@@ -1150,6 +1150,18 @@ async def test_after_an_outside_call_the_owners_call_gets_the_head_back(warm, mo
     assert any("restored the head over an outside call's state" in m for m in st["lines"])
 
 
+async def test_a_restore_does_not_spend_the_mark_while_an_outside_call_is_live(warm, monkeypatch):
+    """Review 10-26: a background caller's restore is not gated by the
+    /outside-call start; a look that started meanwhile replaces the head again."""
+    agent, llm, st = warm
+    await _warm_with_file(agent, st, quiet=True)
+    st["order"].clear()
+    _switch_env(agent, llm, st, monkeypatch, slot=6100)
+    llm._outside_slot_dirty, llm._outside_call_live = True, True
+    await agent._slot_switch_before(_turn(st))
+    assert st["order"] == ["restore"] and llm._outside_slot_dirty is True
+
+
 async def test_the_owners_call_waits_for_the_aborting_outside_call(warm, monkeypatch):
     agent, llm, st = warm
     await _warm_with_file(agent, st, quiet=True)
@@ -1229,14 +1241,79 @@ def test_the_outside_mark_is_spent_by_any_agent_call_on_the_slot():
     assert not outside_slot_dirty(llm)
 
 
-def test_ending_an_outside_call_marks_the_head_displaced_for_an_early_rewarm():
+def test_ending_an_outside_call_marks_the_head_displaced_but_no_early_rewarm_runs():
+    """2026-10-26 (operator): the early re-warm restored the head ~10 s after
+    every look, and her next look re-read its whole prompt (3,300 tokens,
+    12-17 s). The head stays out until a call needs it."""
     from types import SimpleNamespace
-    from ghost_agent.core.llm import note_outside_call
-    llm = SimpleNamespace(_head_ref=(10, "h", 0, "t"), _slot_session="sess-a", _slot_session_used=1.0)
+    from ghost_agent.core.llm import note_outside_call, head_rewarm_due, note_main_slot_prompt
+    llm = SimpleNamespace(_head_ref=(10, "h", 0, "t"), _slot_session="sess-a", _slot_session_used=1.0,
+                          foreground_requests=0, foreground_tasks=0, _main_streams_open=0)
     note_outside_call(llm, "end", "eva_world")
     assert llm._head_displaced is True and llm._head_displaced_early is True
     assert llm._head_displaced_by == "outside call: eva_world"
     assert llm._slot_session == "sess-a"            # an outside call owns nothing
+    llm._last_main_call_end = 0.0
+    assert head_rewarm_due(llm, 0.0) is False       # its state stays in the slot
+    note_main_slot_prompt(llm, {"messages": []}, label="a member's turn", background=True)
+    assert head_rewarm_due(llm, 0.0) is True        # an agent call spent the mark: the normal rules
+
+
+async def test_the_rewarm_loop_leaves_an_outside_calls_state_until_the_mark_is_spent(mock_context):
+    """Periodic ticks do not restore over it either; once an agent call
+    takes the slot, the next tick re-warms as before."""
+    from ghost_agent.core.agent import GhostAgent
+    agent = GhostAgent(mock_context)
+    llm = MagicMock(foreground_requests=0, _head_ref=None, _outside_slot_dirty=True)
+    mock_context.llm_client = llm
+    calls, ticks = [], []
+
+    async def warm(quiet=False, displaced_by=""):
+        calls.append(len(ticks))
+
+    async def metrics():
+        return (0, 500 + len(ticks))                 # something always "ran"
+
+    async def sleep(s):
+        ticks.append(s)
+        if len(ticks) == 3:
+            llm._outside_slot_dirty = False          # an agent call took the slot
+        if len(ticks) > 4:
+            raise asyncio.CancelledError
+
+    agent.warm_up_main_prefix = warm
+    with pytest.raises(asyncio.CancelledError):
+        await agent.rewarm_main_prefix_loop(period_s=180, sleep=sleep, metrics=metrics)
+    assert calls and calls[0] == 3                   # ticks 1-2 left her state alone
+
+
+async def test_after_skipping_for_an_outside_call_a_tick_with_nothing_new_stays_quiet(mock_context):
+    """The skipped tick records the token total: when the mark is then spent by
+    a request's head restore alone (nothing counted), the next periodic tick
+    reads "nothing ran" instead of re-warming the head it just got back."""
+    from ghost_agent.core.agent import GhostAgent
+    agent = GhostAgent(mock_context)
+    llm = MagicMock(foreground_requests=0, _head_ref=None, _outside_slot_dirty=True)
+    mock_context.llm_client = llm
+    calls, ticks = [], []
+
+    async def warm(quiet=False, displaced_by=""):
+        calls.append(len(ticks))
+
+    async def metrics():
+        return (0, 700)                              # nothing counted after the look
+
+    async def sleep(s):
+        ticks.append(s)
+        if len(ticks) == 2:
+            llm._outside_slot_dirty = False          # the head came back by restore
+        if len(ticks) > 3:
+            raise asyncio.CancelledError
+
+    agent.warm_up_main_prefix = warm
+    with pytest.raises(asyncio.CancelledError):
+        await agent.rewarm_main_prefix_loop(period_s=180, sleep=sleep, metrics=metrics)
+    assert calls == []
 
 
 @pytest.mark.parametrize("meanwhile", ["second_request", "mark_spent", "stream_opened"])

@@ -379,3 +379,21 @@ def test_missing_websockets_package_is_survivable(monkeypatch):
     asyncio.run(ts.stream_log_lines("wss://x/ws", on_line=lambda _l: None,
                                     on_state=states.append))
     assert states == [False]
+
+
+def test_real_pretty_log_lines_with_the_clock_column_drive_the_ticker(capsys):
+    """Review 10-26: the fixtures above predate the clock column; feed the
+    ticker lines the agent's own pretty_log prints today."""
+    from ghost_agent.utils import logging as glog
+    tok = glog.request_id_context.set("abcd1234ef")
+    try:
+        glog.pretty_log("Request", special_marker="BEGIN", icon="🔹")
+        glog.pretty_log("file read", "notes.md", icon="📖")
+    finally:
+        glog.request_id_context.reset(tok)
+    begin, body = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()][:2]
+    assert re.search(r"\d\d:\d\d:\d\d", re.sub(r"\x1b\[[0-9;]*m", "", body))   # the clock is there
+    t = _started()
+    t.note_line(begin)
+    assert t.note_line(body) is True
+    assert t.desc == "reading a file · notes.md" and t.icon == "📖"

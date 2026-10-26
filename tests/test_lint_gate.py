@@ -96,13 +96,14 @@ def findings():
     much ram and time … if needed disable tests that take too long"). This
     pass took 436 s of a 606 s suite: 8 pylint jobs beside 12 test workers,
     each holding the whole parsed tree, on a Mac whose llama wires 28 GB.
-    It runs with GHOST_LINT_GATE=1 (`scripts/run_suite.py --lint`), and
-    `ci.sh` still runs `scripts/lint.py` and fails the build on it; the
-    canaries below still run on every suite.
+    Alone it takes 71 s, so `scripts/run_suite.py` runs `scripts/lint.py`
+    by itself AFTER pytest (same verdict as `ci.sh`, which also runs it),
+    and these three tests run only with GHOST_LINT_GATE=1. The canaries
+    below still run in every suite.
     """
     if os.environ.get("GHOST_LINT_GATE") != "1":
-        pytest.skip("the full pylint pass (~4 min) is opt-in: GHOST_LINT_GATE=1, "
-                    "scripts/run_suite.py --lint, or python scripts/lint.py")
+        pytest.skip("the full pylint pass runs after the suite (scripts/run_suite.py) "
+                    "or with GHOST_LINT_GATE=1; alone: python scripts/lint.py")
     if lint_mod._pylint_path() is None:
         pytest.skip("pylint is not installed in this venv — the lint gate "
                     "CANNOT RUN and is therefore NOT green; install pylint "
@@ -1318,3 +1319,31 @@ def test_a_pylint_run_that_dies_leaves_no_orphaned_workers(tmp_path, monkeypatch
     else:
         os.kill(child, signal.SIGKILL)
         pytest.fail("the forked worker survived the runner's death — the process group was not killed")
+
+
+def test_the_suite_runner_runs_the_gate_after_the_tests_unless_told_not_to(tmp_path, monkeypatch, capsys):
+    """2026-10-26: the gate left the suite (436 s inside it, 71 s alone) and
+    became a step of scripts/run_suite.py. A full run must still end with it
+    and fail on it; a subset or --no-lint says it did not run."""
+    import run_suite
+    calls = []
+
+    def fake_run(cmd, cwd=None, env=None):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 3 if cmd[-1] == "scripts/lint.py" else 0)
+
+    monkeypatch.setattr(run_suite.subprocess, "run", fake_run)
+    monkeypatch.setattr(run_suite, "_longest_first", lambda files: files)
+    monkeypatch.setenv("SUITE_OUT", str(tmp_path))
+    monkeypatch.delenv("GHOST_LINT_GATE", raising=False)
+
+    monkeypatch.setattr(sys, "argv", ["run_suite.py"])
+    assert run_suite.main() == 3                       # the gate's failure fails the run
+    assert calls[0][1:3] == ["-m", "pytest"] and calls[1][-1] == "scripts/lint.py"
+    assert "lint gate: FAILED" in capsys.readouterr().out
+
+    for argv in (["run_suite.py", "--no-lint"], ["run_suite.py", "tests/test_x.py"]):
+        calls.clear()
+        monkeypatch.setattr(sys, "argv", argv)
+        assert run_suite.main() == 0
+        assert len(calls) == 1 and "lint gate NOT run" in capsys.readouterr().out

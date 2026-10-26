@@ -4,6 +4,9 @@ Opt-outs: --no-mandatory-tor on argv, or GHOST_MANDATORY_TOR=0."""
 
 import os
 import sys
+from pathlib import Path
+
+import pytest
 
 import ghost_agent._env as env
 
@@ -165,3 +168,25 @@ def test_the_LAST_flag_wins_like_argparse_does(monkeypatch):
     monkeypatch.setattr(sys, "argv",
                         ["x", "--mandatory-tor", "--no-mandatory-tor"])
     assert E._mandatory_tor_requested() is False
+
+
+
+_LOCAL_TOKENIZER = Path.home() / "Data/AI/Data/system/tokenizer"
+
+
+@pytest.mark.skipif(not (_LOCAL_TOKENIZER / "tokenizer.json").exists(),
+                    reason="needs the cached local tokenizer (no download in tests)")
+def test_loading_the_tokenizer_does_not_freeze_offline_under_no_mandatory_tor():
+    """2026-10-26 review: transformers became a lazy import, and its first
+    import landed inside load_tokenizer's temporary HF_HUB_OFFLINE=1 —
+    frozen offline for the process although the operator opted out."""
+    r = _fresh(
+        "import os\n"
+        "os.environ['GHOST_MANDATORY_TOR'] = '0'\n"
+        "import ghost_agent.utils.token_counter as t\n"
+        "from pathlib import Path\n"
+        f"assert t.load_tokenizer(Path({str(_LOCAL_TOKENIZER)!r})) is not None\n"
+        "import huggingface_hub.constants as C\n"
+        "print('OFFLINE=%s ENV=%s' % (C.HF_HUB_OFFLINE, os.environ.get('HF_HUB_OFFLINE')))\n")
+    assert r.returncode == 0, r.stderr[-800:]
+    assert "OFFLINE=False ENV=None" in r.stdout, r.stdout

@@ -5,8 +5,8 @@ Why: the suite used to run as three sequential invocations at -n 8 on a
 every worker busy until the end.
 
 Usage (from the repo root):
-    python scripts/run_suite.py                 # every tests/test_*.py, -n 12
-    python scripts/run_suite.py -n 10           # fewer workers
+    python scripts/run_suite.py                 # every tests/test_*.py, -n 8
+    python scripts/run_suite.py -n 12           # more workers (swaps the Mac)
     python scripts/run_suite.py --report-only   # re-read the last timing file
     python scripts/run_suite.py tests/test_x.py tests/test_y.py   # a subset
 
@@ -85,11 +85,11 @@ def _report(xml_path: Path, top: int) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("-n", type=int, default=12, help="xdist workers (default 12 of 14 cores)")
+    ap.add_argument("-n", type=int, default=8, help="xdist workers (default 8: 12 swapped the Mac, operator 2026-10-26)")
     ap.add_argument("--top", type=int, default=25)
     ap.add_argument("--report-only", action="store_true")
-    ap.add_argument("--lint", action="store_true",
-                    help="also run the full pylint gate (~4 min; test_lint_gate's findings)")
+    ap.add_argument("--no-lint", action="store_true",
+                    help="skip the pylint gate that runs after the tests (~70 s alone)")
     ap.add_argument("files", nargs="*")
     a = ap.parse_args()
     out = Path(os.environ.get("SUITE_OUT", "/tmp/ghost_suite"))
@@ -106,19 +106,28 @@ def main() -> int:
                GHOST_API_KEY=(os.environ.get("GHOST_API_KEY") or "").strip() or "x",
                PYTHONPATH="src:.")
     env.pop("FORCE_COLOR", None)
-    if a.lint:
-        env["GHOST_LINT_GATE"] = "1"
     cmd = [PY, "-m", "pytest", *files, "-n", str(a.n), "--dist", "loadfile", "-q",
            "-p", "no:cacheprovider", f"--junitxml={xml}", "-o", "junit_family=xunit1"]
     t0 = time.time()
-    rc = subprocess.run(cmd, cwd=ROOT, env=env).returncode
-    print(f"\nwall time: {time.time() - t0:.0f} s, exit {rc}")
-    if env.get("GHOST_LINT_GATE") != "1":
-        print("lint gate NOT run (opt-in): --lint, or python scripts/lint.py")
+    rc = pytest_rc = subprocess.run(cmd, cwd=ROOT, env=env).returncode
+    pytest_s = time.time() - t0
+    print(f"\nwall time: {pytest_s:.0f} s, exit {rc}")
+    # The pylint gate runs AFTER pytest, alone: inside the suite its 8 jobs
+    # shared the cores with 12 workers and took 436 s (71 s alone, 2026-10-26),
+    # so test_lint_gate's three gate tests skip unless GHOST_LINT_GATE=1.
+    # Same runner and verdict as ci.sh. Skipped for a subset or --no-lint.
+    if not a.files and not a.no_lint:
+        t1 = time.time()
+        lrc = subprocess.run([PY, "scripts/lint.py"], cwd=ROOT, env=env).returncode
+        lint = f"lint gate: {'OK' if lrc == 0 else 'FAILED'} in {time.time() - t1:.0f} s, exit {lrc}"
+        rc = rc or lrc
+    else:
+        lint = "lint gate NOT run: python scripts/lint.py"
     if xml.exists():
         if not a.files:     # a subset's times would drop every other file
             _save_times(_per_file(xml)[0])
         _report(xml, a.top)
+    print(f"\ntests: exit {pytest_rc}, wall {pytest_s:.0f} s · {lint}")
     return rc
 
 

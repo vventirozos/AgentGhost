@@ -89,6 +89,30 @@ test('standing still on purpose (!stay) is not stuck; the clock restarts when th
   assert.deepEqual(a.pending(), ['your body has not moved for 5 minutes while busy']);
 });
 
+test('standing idle does not count toward "stuck": the clock starts when she gets busy', () => {
+  // 10-26: 32 min "stopped" in one place, then a new goal → the alert 41 s in
+  const at = (kind) => ({ gameplay: { position: { x: -224, y: 64, z: -90 } }, action: { kind } });
+  const a = new Attention();
+  a.onState(at('thinking'), 0);
+  a.onState(at('stopped'), 1000);
+  a.onState(at('stopped'), 32 * 60e3);
+  a.onState(at('thinking'), 32 * 60e3 + 23e3);
+  a.onState(at('acting'), 32 * 60e3 + 41e3);
+  assert.deepEqual(a.pending(), ['your body stopped and is waiting']);
+  a.onState(at('acting'), 32 * 60e3 + STUCK_MS + 1000);   // 5 min busy since 32:00, not moving
+  assert.deepEqual(a.pending(), ['your body stopped and is waiting', 'your body has not moved for 5 minutes while busy']);
+});
+
+test('a stuck body that answers a message now and then is still stuck', () => {
+  // review 10-26: one non-busy sample must not restart the clock
+  const at = (kind) => ({ gameplay: { position: { x: 5, y: 64, z: 5 } }, action: { kind } });
+  const a = new Attention();
+  for (let t = 0; t <= STUCK_MS + 30e3; t += 1000) {
+    a.onState(at(t % 30e3 < 5e3 && t > 0 ? 'chatting' : 'acting'), t);   // 5 s of chat every 30 s
+  }
+  assert.ok(a.pending().includes('your body has not moved for 5 minutes while busy'));
+});
+
 // verbatim results from the 10-26 sessions
 const FAILS = ['Invalid block type: oak.', 'Command !goToCoordinates was given 3 args, but requires 4 args.',
   'Path not found, but attempting to navigate anyway using destructive movements. Pathfinding stopped: Cannot break stone with current tools.',

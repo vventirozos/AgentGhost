@@ -96,6 +96,7 @@ ICON_CLASS = {
     "🎨": "tool",
     "📄": "tool",
     "🎮": "tool",
+    "🧱": "tool",
     "🎲": "tool",
     "🧪": "tool",
     "📌": "tool",     # VERDICT_NOTE — §4OK: a verdict is information, not an error

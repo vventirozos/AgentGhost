@@ -10,7 +10,8 @@
 #      mineflayer: never send a non-finite position (server kicks for it);
 #      the viewer draws the body with Eva's skin, not Steve's, and can
 #      re-centre on her (the monitor's "find Eva" button);
-#      Mindcraft: a craft is reported only once the server has confirmed it
+#      Mindcraft: crafts one at a time, each reported only once the server
+#      has confirmed it
 #   3. Paper: bStats metrics off (no outbound reporting)
 set -euo pipefail
 
@@ -64,7 +65,7 @@ grep -q "EVA-WORLD-RECENTER v2" "$PVJ" || { echo "apply_patches: viewer recenter
 # 2f. Mindcraft: confirm a craft with the server before reporting it (see patch_craft.cjs)
 SK="$MC/src/agent/library/skills.js"
 "${NODE:-/opt/homebrew/opt/node@20/bin/node}" "$APP/scripts/patch_craft.cjs" "$SK"
-grep -q "EVA-WORLD-CRAFT-CHECK v1" "$SK" || { echo "apply_patches: craft check did not apply ($SK)" >&2; exit 1; }
+grep -q "EVA-WORLD-CRAFT-CHECK v3" "$SK" || { echo "apply_patches: craft check did not apply ($SK)" >&2; exit 1; }
 
 # 3. Paper metrics off
 mkdir -p "$WORLD/server/plugins/bStats"

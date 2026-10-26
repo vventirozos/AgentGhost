@@ -934,6 +934,11 @@ def head_rewarm_due(llm, settle_s: float) -> bool:
             return False
         if getattr(llm, "_head_displaced_early", False) is not True:
             return False
+        # §4RQ (operator 2026-10-26): an outside call's state stays in the slot
+        # until a call needs the head (its next look reuses it); the head
+        # comes back in that call's dispatch hook
+        if outside_slot_dirty(llm):
+            return False
         # r2: a deferred verdict still queued would displace it again at once
         _dv = getattr(llm, "_deferred_verdict_sem_obj", None)
         if _dv is not None and _dv.locked():
@@ -3624,6 +3629,25 @@ class LLMClient:
                            "request is still active; the job will retry later", level="WARNING", icon=Icons.WARN)
             raise BackgroundDeferred(f"background call deferred: {task_label or 'unlabelled'}")
 
+    async def _outside_head_before_background(self, payload, task_label: str) -> None:
+        """§4RQ: no re-warm puts the head back after an outside call (Eva's
+        World), so a background main call or stream that opens with the head
+        gets it restored first, through the request hook. Review (2026-10-26):
+        the outside call still live → defer (it aborts only for a request; the
+        hook would wait ~8 s and re-process the head behind it); a request that
+        started while the hook ran → defer (it must not queue behind this)."""
+        if (str(task_label or "").startswith("main-prefix")
+                or not outside_slot_dirty(self)
+                or not opens_with_head(payload, getattr(self, "_head_ref", None))):
+            return
+        if getattr(self, "_outside_call_live", False) is True:
+            raise BackgroundDeferred(f"background call deferred: {task_label or 'unlabelled'} "
+                                     "(an outside call is on the main slot)")
+        await self._before_main_dispatch(payload)
+        if int(getattr(self, "foreground_requests", 0) or 0) > 0:
+            raise BackgroundDeferred(f"background call deferred: {task_label or 'unlabelled'} "
+                                     "(a request started)")
+
     async def _before_main_dispatch(self, payload) -> None:
         """§4RP: the agent's hook, bounded; it never fails the call."""
         hook = getattr(self, "before_main_dispatch", None)
@@ -3732,6 +3756,7 @@ class LLMClient:
                         logger.info("background call %s deferred: the main slot holds a conversation "
                                     "inside its %.0fs window", task_label or "unlabelled", slot_keep_s())
                         raise BackgroundDeferred(f"background call deferred: {task_label} (slot kept)")
+                    await self._outside_head_before_background(payload, task_label)
                     # §4RO: the head warm-up restores the saved head here — past
                     # every re-check above, so it never lands on a live request
                     if before_dispatch is not None:
@@ -4610,6 +4635,8 @@ class LLMClient:
             if is_background:
                 await self._wait_for_foreground_clear("stream")
                 async with self._bg_queue_sem:
+                    if _on_main:
+                        await self._outside_head_before_background(payload, "stream")
                     _opened()
                     # §4KP: a mentioned </think> is not the close
                     async for chunk in _repair_think_split_stream(self._do_stream_chat_completion(payload, use_coding)):

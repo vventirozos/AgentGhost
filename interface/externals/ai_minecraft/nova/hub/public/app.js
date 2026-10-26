@@ -174,7 +174,7 @@ function renderStatus(s) {
     const mins = Math.max(0, Math.round((s.wakeAt - s.now) / 60000));
     notes.mind = s.mind.status === 'thinking' ? 'thinking now…' : (s.reasons.length ? `wants to look: ${s.reasons[0]}` : `next look in ~${mins} min`);
   } else notes.mind = '';
-  notes.body = s.gemma.avg_ms ? `~${(s.gemma.avg_ms / 1000).toFixed(1)} s per move${s.gemma.waiting ? ' · thinking' : ''}` : '';
+  notes.body = s.body_model.avg_ms ? `~${(s.body_model.avg_ms / 1000).toFixed(1)} s per move${s.body_model.waiting ? ' · thinking' : ''}` : '';
   $('feed-note').textContent = notes[feed];
 
   const box = $('vitals');

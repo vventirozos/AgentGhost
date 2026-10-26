@@ -77,11 +77,23 @@ logger = logging.getLogger("GhostAgent")   # §4NV: __name__ reached neither the
 AUDIO_NODE_URL = os.environ.get("GHOST_AUDIO_NODE_URL", "http://100.83.184.117:8088")
 AUDIO_NODE_MODEL = os.environ.get("GHOST_AUDIO_NODE_MODEL", "gemma")
 
-# 12 min: ~18k audio tokens at the measured 25 tok/s, leaving room in a
-# 32,768-token slot for the transcript. All four knobs go through
-# `env_positive`: "0", "abc" and negatives fall back to the default instead
-# of raising at import or producing zero windows (§4KE).
-WINDOW_SECONDS = env_positive("GHOST_AUDIO_WINDOW_S", 720.0)
+# The window must fit ONE llama-server slot: audio at ~25 tokens per second
+# (measured: a 720 s window = 18,068 prompt tokens), plus the transcript it
+# writes, plus the prompt. §4RR: the old 720 s was sized for a 32,768-token
+# slot; nova was re-sized to 4 × 16,384 on 2026-10-25 and every 12-minute
+# window then failed with HTTP 400 and was stored as a gap. The window is now
+# fitted to the node's real slot (`fit_window_seconds`, read from /props per
+# recording); this default is the cap, and on its own fits a 16k slot when
+# /props cannot be read. All four knobs go through `env_positive`: "0", "abc"
+# and negatives fall back to the default instead of raising at import or
+# producing zero windows (§4KE).
+WINDOW_SECONDS = env_positive("GHOST_AUDIO_WINDOW_S", 480.0)
+AUDIO_TOKENS_PER_S = 25.0
+# A dense window writes ~5 transcript tokens per second of speech (a 600 s
+# window in a 16k slot was cut off mid-transcript; 480 s finished).
+TRANSCRIPT_TOKENS_PER_S = 5.0
+PROMPT_RESERVE_TOKENS = 512
+MIN_WINDOW_SECONDS = 60.0
 # Enough to carry a sentence across a seam without meaningful duplication.
 WINDOW_OVERLAP_SECONDS = env_positive("GHOST_AUDIO_WINDOW_OVERLAP_S", 15.0)
 if WINDOW_OVERLAP_SECONDS >= WINDOW_SECONDS:
@@ -321,6 +333,30 @@ def _post_json(url: str, payload: dict, timeout: float) -> dict:
         raise TransientNodeError("audio node returned a non-JSON body") from exc
 
 
+def node_slot_ctx() -> Optional[int]:
+    """The audio node's per-slot context in tokens (llama-server ``/props``
+    ``default_generation_settings.n_ctx``), or None when it cannot be read."""
+    import httpx
+
+    try:
+        with httpx.Client(timeout=CONNECT_TIMEOUT_S) as client:
+            body = client.get(f"{AUDIO_NODE_URL}/props").json()
+        n = int(((body or {}).get("default_generation_settings") or {}).get("n_ctx") or 0)
+    except Exception as exc:  # noqa: BLE001
+        logger.info("audio node slot size unknown (%s) — keeping the configured window", exc)
+        return None
+    return n if n > 0 else None
+
+
+def fit_window_seconds(window_seconds: float, slot_ctx: Optional[int]) -> float:
+    """The longest window (≤ ``window_seconds``) whose audio + transcript +
+    prompt fit a ``slot_ctx``-token slot; ``window_seconds`` when unknown."""
+    if not slot_ctx:
+        return window_seconds
+    fit = (slot_ctx - PROMPT_RESERVE_TOKENS) / (AUDIO_TOKENS_PER_S + TRANSCRIPT_TOKENS_PER_S)
+    return max(MIN_WINDOW_SECONDS, min(window_seconds, fit))
+
+
 def build_payload(wav_bytes: bytes) -> dict:
     import base64
 
@@ -452,6 +488,7 @@ def iter_audio_chunks(
     max_consecutive_failures: int = MAX_CONSECUTIVE_FAILURES,
     sleep: Callable[[float], None] = time.sleep,
     total_budget_s: float = TOTAL_BUDGET_S,
+    slot_ctx_fn: Optional[Callable[[], Optional[int]]] = None,
 ) -> Iterator[str]:
     """Yield timestamp-stamped transcript chunks from a recording.
 
@@ -471,6 +508,19 @@ def iter_audio_chunks(
                        filename, total / 60, max_seconds / 60)
         total = max_seconds
     st.total_seconds = total
+
+    # §4RR: fit the window to the slot of the node the windows go to. An
+    # injected ``post_fn`` is not that node, so it is only sized on request.
+    if slot_ctx_fn is None and post_fn is None:
+        slot_ctx_fn = node_slot_ctx
+    if slot_ctx_fn is not None:
+        fitted = fit_window_seconds(window_seconds, slot_ctx_fn())
+        if fitted < window_seconds:
+            logger.info("audio ingest %s: %.0f s windows (the node's slot does not fit %.0f s)",
+                        filename, fitted, window_seconds)
+            window_seconds = fitted
+            if window_overlap >= window_seconds:
+                window_overlap = window_seconds / 4.0
 
     # Advance by (window - overlap) so consecutive windows share a seam.
     step = max(1.0, window_seconds - window_overlap)

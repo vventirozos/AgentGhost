@@ -719,7 +719,7 @@ def test_window_knobs_fall_back_instead_of_raising_or_zeroing(monkeypatch):
     monkeypatch.setenv("GHOST_AUDIO_MAX_TOKENS", "-5")
     try:
         importlib.reload(ai)
-        assert ai.WINDOW_SECONDS == 720.0 and ai.WINDOW_OVERLAP_SECONDS == 15.0 and ai.WINDOW_MAX_TOKENS == 8192
+        assert ai.WINDOW_SECONDS == 480.0 and ai.WINDOW_OVERLAP_SECONDS == 15.0 and ai.WINDOW_MAX_TOKENS == 8192
         monkeypatch.setenv("GHOST_AUDIO_WINDOW_S", "10")
         monkeypatch.setenv("GHOST_AUDIO_WINDOW_OVERLAP_S", "50")
         importlib.reload(ai)

@@ -139,9 +139,26 @@ say "3/5 upgrading yt-dlp + the PO-token plugin in $VENV"
 # the previous pins live with the PREVIOUS helper (POT_DIR is still the old
 # build here; it becomes <POT_DIR>.prev at the swap, which is what --rollback restores)
 mkdir -p "$POT_DIR"
-"$PY" -c 'import yt_dlp, importlib.metadata as m; print("yt-dlp==" + yt_dlp.version.__version__); print("bgutil-ytdlp-pot-provider==" + m.version("bgutil-ytdlp-pot-provider"))' > "$POT_DIR/PINS.prev" 2>/dev/null || true
+"$PY" -c 'import yt_dlp, importlib.metadata as m
+print("yt-dlp==" + yt_dlp.version.__version__); print("bgutil-ytdlp-pot-provider==" + m.version("bgutil-ytdlp-pot-provider"))
+try: print("yt-dlp-ejs==" + m.version("yt-dlp-ejs"))
+except m.PackageNotFoundError: pass' > "$POT_DIR/PINS.prev" 2>/dev/null || true
 "$VENV/bin/pip" install -q -U yt-dlp "bgutil-ytdlp-pot-provider==$PLUGIN_VER"
-"$PY" -c 'import yt_dlp, importlib.metadata as m; print("   yt-dlp", yt_dlp.version.__version__, "| plugin", m.version("bgutil-ytdlp-pot-provider"))'
+# §4RR: the JS-challenge solver scripts, at the version THIS yt-dlp pins (its
+# `default` extra) — without them every fetch warns "n challenge solving
+# failed … Some formats may be missing". Not `yt-dlp[default]`: that extra
+# would also move requests/urllib3/websockets under the agent.
+EJS_VER="$("$PY" -c 'import importlib.metadata as m, re
+print(next((re.search(r"==([^;\s]+)", r).group(1) for r in (m.requires("yt-dlp") or []) if r.replace("_", "-").startswith("yt-dlp-ejs") and "==" in r), ""))')"
+if [[ -n "$EJS_VER" ]]; then
+  "$VENV/bin/pip" install -q "yt-dlp-ejs==$EJS_VER"
+else
+  echo "   yt-dlp names no yt-dlp-ejs pin — solver scripts left as they are" >&2
+fi
+"$PY" -c 'import yt_dlp, importlib.metadata as m
+try: ejs = m.version("yt-dlp-ejs")
+except m.PackageNotFoundError: ejs = "not installed"
+print("   yt-dlp", yt_dlp.version.__version__, "| plugin", m.version("bgutil-ytdlp-pot-provider"), "| ejs", ejs)'
 
 say "4/5 swapping the helper and restarting $LABEL"
 sudo -n launchctl kill SIGTERM "$LABEL" 2>/dev/null || true

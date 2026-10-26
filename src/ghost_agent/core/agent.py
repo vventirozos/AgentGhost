@@ -14685,7 +14685,10 @@ class GhostAgent:
             return _head_saves.restore(hs["base"], hs["dir"], hs["key"])
         ok, detail, dt = await asyncio.to_thread(_restore_in_time)
         if ok:
-            llm._outside_slot_dirty = False
+            # review 2026-10-26: an outside call that started meanwhile (a
+            # background caller's restore is not gated by /outside-call start)
+            # replaces the head again — its mark stands
+            llm._outside_slot_dirty = getattr(llm, "_outside_call_live", False) is True
             release_slot_session(llm)
             pretty_log("Session Switch", f"restored the head over an outside call's state in {dt:.1f}s",
                        icon=Icons.HEAD_DISK)
@@ -14885,6 +14888,20 @@ class GhostAgent:
                     early = False
                 continue
             busy_since = None
+            # §4RQ (operator 2026-10-26: "avoid unneeded prefix warmups"): an
+            # outside call (Eva's World) left its state in the slot. Restoring
+            # the head now (0.4 s) made her next look re-read its whole prompt
+            # (~3,300 tokens, 12-17 s) even when it came 80 s later. The head
+            # comes back when a call needs it: a request's or a background
+            # call's dispatch hook (`_outside_slot_restore`, ~0.5 s). A call
+            # that does not open with the head spends the mark and the
+            # normal rules apply.
+            from .llm import outside_slot_dirty
+            if outside_slot_dirty(getattr(getattr(self, "context", None), "llm_client", None)):
+                logger.info("main-prefix re-warm: skipped, an outside call's state stays in the slot "
+                            "until a call needs the head")
+                last_total = total
+                continue
             # §4OT r3: a NAMED displacement skips the "nothing ran" check —
             # llama counts a prompt while it is still generating, so the
             # displacing call's tokens can already sit in `last_total`; a

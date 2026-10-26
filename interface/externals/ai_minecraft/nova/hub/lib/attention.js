@@ -9,6 +9,7 @@
 export const MIN_GAP_MS = 2 * 60 * 1000;
 export const STUCK_MS = 5 * 60 * 1000;
 const STUCK_RADIUS = 2;
+const IDLE_RESET_MS = 60 * 1000;
 const REPEAT_LIMIT = 4;
 export const FAIL_RUN = 6;
 
@@ -32,6 +33,7 @@ export class Attention {
     this.lastResponses = [];
     this.lastKind = null;
     this.failRun = 0;         // command results in a row that failed
+    this.idleSince = null;    // when the body last stopped being busy
   }
 
   // The latest time counts: a second death while she is thinking about the
@@ -80,9 +82,18 @@ export class Attention {
       this.anchor = { x: p.x, y: p.y, z: p.z, ts };
       return;
     }
-    if (!a || Math.hypot(p.x - a.x, p.y - a.y, p.z - a.z) > STUCK_RADIUS) {
+    // The clock counts busy time only. 10-26 12:06: the body stood "stopped"
+    // in one place for 32 min (Eva had told it to wait), got a new goal, and
+    // this alert fired 41 s later because the clock still ran from 11:33.
+    // Only a stretch of IDLE_RESET_MS restarts it (review): a stuck body that
+    // answers a message ("chatting") for a few seconds is still stuck.
+    const busy = kind === 'thinking' || kind === 'acting';
+    if (busy) this.idleSince = null;
+    else if (this.idleSince == null) this.idleSince = ts;
+    const rested = !busy && ts - this.idleSince >= IDLE_RESET_MS;
+    if (!a || rested || Math.hypot(p.x - a.x, p.y - a.y, p.z - a.z) > STUCK_RADIUS) {
       this.anchor = { x: p.x, y: p.y, z: p.z, ts };
-    } else if ((kind === 'thinking' || kind === 'acting') && ts - a.ts > STUCK_MS) {
+    } else if (busy && ts - a.ts > STUCK_MS) {
       this.raise('your body has not moved for 5 minutes while busy', ts);
       this.anchor = { ...a, ts }; // re-arm after another STUCK_MS
     }

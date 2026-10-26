@@ -194,6 +194,94 @@ async def test_a_background_call_opening_with_the_head_is_deferred_inside_the_wi
     assert len(sent) == 3
 
 
+async def test_after_an_outside_call_a_head_shaped_background_call_gets_the_head_back_first():
+    """§4RQ 2026-10-26: no re-warm restores the head after Eva's look any more,
+    so a background call that opens with the head would re-process 28k tokens
+    behind her state; it runs the same dispatch hook a request's call does."""
+    c = _bare_client()
+    L.note_head_reference(c, _head())
+    order = []
+
+    async def hook(p):
+        order.append("hook")
+
+    async def do(payload, *a, **k):
+        order.append("call")
+        return {"choices": [{"message": {"content": "x"}}], "_ghost_leg": {"served_by": "main"}}
+    c.before_main_dispatch = hook
+    c._do_chat_completion = do
+    c._outside_slot_dirty = True
+    await c.chat_completion(_head("job"), is_background=True, task_label="selfhood narrative")
+    assert order == ["hook", "call"]
+    c._outside_slot_dirty = True                        # (that call spent the mark)
+    order.clear()
+    await c.chat_completion(_head("v", system="Judge."), is_background=True, task_label="deferred-verdict")
+    assert order == ["call"]                            # no head in it: nothing to restore
+    c._outside_slot_dirty = True
+    order.clear()
+    await c.chat_completion(_head(), is_background=True, task_label="main-prefix-rewarm")
+    assert order == ["call"]                            # the warm-up restores by its own plan
+    order.clear()
+    await c.chat_completion(_head("job"), is_background=True, task_label="selfhood narrative")
+    assert order == ["call"]                            # mark spent: the head is not foreign
+
+
+async def test_a_background_restore_defers_while_the_outside_call_is_live_or_a_request_starts():
+    """Review 10-26: the look aborts only for a request — a background hook
+    would wait ~8 s and re-process the head behind it; and a request that
+    started while the hook restored must not queue behind the background call."""
+    c = _bare_client()
+    L.note_head_reference(c, _head())
+    order = []
+
+    async def hook(p):
+        order.append("hook")
+        if started_meanwhile:
+            c.foreground_requests = 1
+
+    async def do(payload, *a, **k):
+        order.append("call")
+        return {"choices": [{"message": {"content": "x"}}], "_ghost_leg": {"served_by": "main"}}
+    c.before_main_dispatch = hook
+    c._do_chat_completion = do
+    started_meanwhile = False
+    c._outside_slot_dirty, c._outside_call_live = True, True
+    with pytest.raises(L.BackgroundDeferred, match="outside call is on the main slot"):
+        await c.chat_completion(_head("job"), is_background=True, task_label="selfhood narrative")
+    assert order == []
+    c._outside_call_live = False
+    started_meanwhile = True
+    with pytest.raises(L.BackgroundDeferred, match="a request started"):
+        await c._outside_head_before_background(_head("job"), "selfhood narrative")
+    assert order == ["hook"]
+
+
+async def test_a_background_stream_that_opens_with_the_head_gets_it_back_first():
+    """Review 10-26: sub-agents and replays stream through BackgroundOnlyLLM."""
+    c = _bare_client()
+    L.note_head_reference(c, _head())
+    order = []
+
+    async def hook(p):
+        order.append("hook")
+
+    async def stream(payload, use_coding=False):
+        order.append("stream")
+        yield b"data: [DONE]"
+    c.before_main_dispatch = hook
+    c._do_stream_chat_completion = stream
+    c._outside_slot_dirty = True
+    async for _ in c.stream_chat_completion(_head("sub-agent turn"), is_background=True):
+        pass
+    assert order == ["hook", "stream"]
+    order.clear()
+    c._outside_slot_dirty, c._outside_call_live = True, True
+    with pytest.raises(L.BackgroundDeferred):
+        async for _ in c.stream_chat_completion(_head("sub-agent turn"), is_background=True):
+            pass
+    assert order == []
+
+
 # ── rule 3: the hook before a foreground main call ─────────────────────
 
 async def test_the_hook_runs_before_a_plain_main_call_only():

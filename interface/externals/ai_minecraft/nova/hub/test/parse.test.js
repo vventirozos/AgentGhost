@@ -58,7 +58,7 @@ test('mindcraft: command result', () => {
 });
 
 test('mindcraft: model timing and goal lines', () => {
-  assert.equal(parseMindcraftLine('Awaiting openai api response from model gemma-4-e4b', 'Eva').kind, 'model_wait');
+  assert.equal(parseMindcraftLine('Awaiting openai api response from model body', 'Eva').kind, 'model_wait');
   assert.equal(parseMindcraftLine('Received.', 'Eva').kind, 'model_done');
   assert.equal(parseMindcraftLine('Self-prompting started.', 'Eva').kind, 'goal_started');
   assert.equal(parseMindcraftLine('Agent did not use command in the last 3 auto-prompts. Stopping auto-prompting.', 'Eva').kind, 'goal_dropped');
@@ -89,7 +89,7 @@ test('MindcraftParser flushes a pending result when a known line arrives', async
   const p = new MindcraftParser('Eva');
   assert.deepEqual(p.feed('Agent executed: !collectBlocks and got: Action output:'), []);
   assert.deepEqual(p.feed('Collected 5 oak_log.'), []);
-  const evs = p.feed('Awaiting openai api response from model gemma-4-e4b');
+  const evs = p.feed('Awaiting openai api response from model body');
   assert.deepEqual(evs.map((e) => [e.kind, e.text]), [['command_result', 'Collected 5 oak_log.'], ['model_wait', undefined]]);
 });
 

@@ -174,8 +174,9 @@ python interface/externals/image_generation/img_gen_server.py
   <p>If you skip this step, the fallback inline provisioning still produces a correct image; it just takes longer on the first turn.</p>
 
   <h2>Test runner</h2>
-<pre><code>pytest -n 8 --dist loadfile              # full suite — ~4 min
-pytest                                   # same suite, serially — ~24 min
+<pre><code>python scripts/run_suite.py             # full suite (-n 8) + the lint gate after it
+python scripts/run_suite.py --no-lint   # tests only — ~5.5 min
+pytest -n 8 --dist loadfile              # the same tests without the runner's timing report
 pytest tests/test_agent_planning.py      # single file
 pytest -k "memory and not slack"         # filter
 black src interface tests
@@ -184,6 +185,16 @@ pylint src/ghost_agent
   <p>The suite is <strong>16,200+ tests</strong>. Serially that is ~24 minutes, which is too slow to
   run after every change &mdash; and the whole discipline here depends on running it after every
   change. <code>pytest-xdist</code> brings it to just over four minutes on a 14-core machine.</p>
+  <p><strong>Memory and time (2026-10-26).</strong> A full run took 10 minutes and swapped hard: every
+  worker imported <code>transformers</code> (and with it torch, scipy, sklearn, pandas — 425&nbsp;MB and
+  3.4&nbsp;s per process) through <code>utils/token_counter.py</code>, and the pylint gate's 8 jobs ran
+  beside the 12 test workers, taking 436&nbsp;s of the run (71&nbsp;s alone). The tokenizer import now
+  happens in <code>load_tokenizer</code> only (an agent import is 70&nbsp;MB, 0.3&nbsp;s), and the gate
+  runs once after the tests (<code>test_lint_gate</code>'s three gate tests run only with
+  <code>GHOST_LINT_GATE=1</code>). Result: tests 5&nbsp;min&nbsp;34&nbsp;s, peak 2.9&nbsp;GB (was 4.4).
+  Tests that look slow in the report (40–85&nbsp;s) were mostly starved, not slow: alone they take
+  0.04–5&nbsp;s. On the main Mac llama wires 28&nbsp;GB of 36, so the suite still pushes the machine
+  into swap at -n 12, so the runner defaults to <code>-n 8</code> since 2026-10-26 (operator); times above were measured at 12.</p>
   <p><code>--dist loadfile</code> is not optional. It keeps every test in a file on one worker, so
   module-level state a file sets up in one test and reads in another still works. Plain
   <code>--dist load</code> scatters tests within a file across workers and produces failures that

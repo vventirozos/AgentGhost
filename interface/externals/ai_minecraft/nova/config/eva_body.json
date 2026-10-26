@@ -6,7 +6,7 @@
     "model": {
         "api": "openai",
         "url": "http://127.0.0.1:8088/v1",
-        "model": "gemma-4-e4b",
+        "model": "body",
         "params": {
             "temperature": 0.6,
             "max_tokens": 700,

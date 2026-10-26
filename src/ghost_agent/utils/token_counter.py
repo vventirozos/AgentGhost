@@ -72,6 +72,12 @@ def load_tokenizer(local_tokenizer_path: Path):
     Robust loading strategy: LOCAL DISK -> TOR NETWORK -> FALLBACK
     """
     global TOKEN_ENCODER
+    # Import transformers (and huggingface_hub) BEFORE the offline override
+    # below: the library freezes HF_HUB_OFFLINE at its first import, and since
+    # the import became lazy (2026-10-26) that import would otherwise happen
+    # under the temporary "1" — offline for the whole process even under
+    # --no-mandatory-tor (review: the embedder's first download then fails).
+    _auto_tokenizer()
     # 1. Try Local Disk (Offline Mode) - PREFERRED
     if local_tokenizer_path.exists() and (local_tokenizer_path / "tokenizer.json").exists():
         # Restore (not pop) the prior value afterwards: --mandatory-tor sets

@@ -4,7 +4,7 @@ EVA'S WORLD — install and use
 The 27B ("Eva", the agent's model on the Mac) lives in a Minecraft world as a
 research toy for autonomous behaviour. Nobody gives her tasks. She wakes up
 every few minutes, reads what happened, and decides what to do through a body
-that a small model (Gemma E4B on nova) drives move by move.
+that a small model on nova (the body model) drives move by move.
 
 Everything this needs lives in this directory. Eva's mind calls the raw
 llama-server directly, so world activity never reaches the agent's memory,
@@ -21,7 +21,7 @@ Each look also shows in the agent's own log as a background line, titled
 
   Mac (eva)                                   nova (16 GB, Tailscale 100.83.184.117)
   ---------                                   ---------------------------------------
-  llama-server :8088  (the 27B, 1 slot)       llama-server :8088 (Gemma E4B, 4 slots)
+  llama-server :8088  (the 27B, 1 slot)       llama-server :8088 (body model, 4 slots)
         ^                                            ^
         |  rare: one "look" every 2–60 min           |  every move (~3–9 s each)
         |                                            |
@@ -39,12 +39,21 @@ Each look also shows in the agent's own log as a background line, titled
     1. eva_mind polls the hub every 20 s. The hub says "due" when the time Eva
        chose has come, or earlier when something needs her: the body died,
        gave up, got stuck, repeats itself, had 6 commands in a row fail
-       (once per run of failures), dropped out, or a player spoke.
+       (once per run of failures), dropped out, or a player spoke. "Stuck" =
+       busy (thinking/acting) 5 min without moving 2 blocks; the clock
+       restarts after 60 s straight of not being busy (10-26: it ran on
+       through an idle stand and fired 41 s into the next goal), not on a
+       moment of chat.
     2. eva_mind checks the agent is idle (/api/health foreground_requests == 0,
        no kept conversation, the llama slot free), then asks the agent's
        /api/slot/outside-call "start". Busy or refused: it waits 60 s.
     3. It fetches the diary (what happened since her last look + her journal),
        asks the 27B (thinking on, server default effort), streams the answer.
+       The journal she is shown starts at an entry heading and moves only in
+       3000-char steps (4500-7500 chars; the whole file stays on disk), so
+       consecutive looks share it and llama reuses that part of the prompt
+       (10-26: a last-6000-chars window changed it every look; ~500 of
+       ~3,500 tokens were reused).
        If you send the agent a request meanwhile, the call is cut off at once
        (llama cancels it) and retried later. Measured: cut off 2 s after a
        request arrived; that request answered normally.
@@ -62,7 +71,7 @@ Each look also shows in the agent's own log as a background line, titled
 -----------------------
 
 Prerequisites
-  - nova: macOS, Homebrew, Gemma llama-server on :8088 (already there),
+  - nova: macOS, Homebrew, the body model's llama-server on :8088 (already there),
     passwordless ssh from the Mac and passwordless sudo on nova.
   - Mac: the agent running, ~/Data/AI/.ghost_api_key present.
   - Read Mojang's EULA: https://aka.ms/MinecraftEULA (the server needs it).
@@ -111,7 +120,7 @@ Monitor (from any device on the tailnet):
   ~/Data/AI/World/.hub_key (nova). The browser remembers it for 30 days.
 
   Buttons
-    Start   probes Gemma, starts the server, starts the bot, waits for it to
+    Start   probes the body model, starts the server, starts the bot, waits for it to
             join (~30–60 s). Eva takes her first look right after.
     Pause   freezes game time (/tick freeze) and stops the bot; Eva does not
             look while paused.
@@ -161,7 +170,7 @@ Without the page (curl):
          -d '{"action":"difficulty","level":"peaceful"}' $H/api/control
                                        # peaceful|easy|normal|hard; live + kept in
                                        # server.properties; recorded as an operator change.
-                                       # Default is peaceful: Gemma's 4-8 s per move is too
+                                       # Default is peaceful: the body's 4-8 s per move is too
                                        # slow to fight. Update mac/world_prompt.txt to match.
     curl -s -X POST -H "X-World-Key: $K" -H 'content-type: application/json' \
          -d '{"action":"note","text":"fixed ..."}' $H/api/control
@@ -188,11 +197,11 @@ other people share it.
     and are cut off the moment you send a request.
   - The agent's 28k head is parked/restored from disk after her call
     (GHOST_HEAD_SAVES=1, ~0.4 s), so no 166 s re-warm.
-  - nova: Gemma does every move; the agent's own checking work on nova shares
+  - nova: the body model does every move; the agent's own checking work on nova shares
     its 4 slots. Memory with the world running: see section 7.
-    Without a pause the body kept nova's GPU at 100% (10-26: Gemma busy 37 of
+    Without a pause the body kept nova's GPU at 100% (10-26: the model busy 37 of
     40 s, ~9.5 s per call back to back), slowing that checking work. So the
-    body's profile sets "cooldown": 30000 (eva_body.json): its calls to Gemma
+    body's profile sets "cooldown": 30000 (eva_body.json): its calls to the body model
     START at least 30 s apart (Mindcraft waits before every call: moves, chat,
     memory). Fights and fleeing are code, not calls, so they stay instant;
     Mind's messages wait at most 30 s. Lower it to speed her up.
@@ -248,7 +257,14 @@ the command to run).
       confirmed it (scripts/patch_craft.cjs): it waits 3 s, checks the item
       really arrived, retries once, and otherwise says "did not go through".
       10-26: three wooden pickaxes "crafted" at a table that the server never
-      made. Each rollback logs "[eva-world] the server rolled back crafting …"
+      made. Since v2 (10-26 13:09) it crafts ONE item per call and checks
+      each (4 torches take ~12 s): mineflayer's own multi-craft clicked from
+      a stale inventory ("missing ingredient" after the first of 4 torches).
+      If only some land: "Crafted X k of n times; the server undid the rest"
+      (or "then: <error>"), worded so the hub does not count it as a failed
+      command. v3: a stop request (!stop, a new command, a mode) ends it
+      within 0.25 s — Mindcraft kills the body process when an action
+      ignores a stop for 10 s, and n crafts take n × 3 s. Each rollback logs "[eva-world] the server rolled back crafting …"
       in run/mindcraft.log.
     - the 3D viewer draws the body with the Noor skin (wide-arm copy) instead
       of Steve: Noor is what a real 1.21 client already shows for an offline
@@ -277,7 +293,7 @@ Logs
       the whole Mindcraft process after 3 tries) and records each attempt.
       grep "lost connection" run/server.log for the server's reason.
   Body ignores every new goal — a running action blocks Mindcraft's goal
-      loop (10-26: Gemma ran !stay(-1), "stay forever", and five goals went
+      loop (10-26: the body ran !stay(-1), "stay forever", and five goals went
       unanswered). Fixed: the hub sends !stop before each new goal. If it
       comes back, read run/mindcraft.log for "Self-prompt loop is already
       active" with no command after it.
@@ -286,7 +302,7 @@ Logs
       "skipped: agent busy" = the agent is working, she waits.
   Her look ends "no decision JSON found" — recorded as is; she looks again
       in 10 min. If it says it hit the token limit, raise EVA_WORLD_MAX_TOKENS.
-  nova memory — Gemma's llama-server keeps a host-RAM prompt cache that
+  nova memory — the body model's llama-server keeps a host-RAM prompt cache that
       Mindcraft fills (many distinct prompts); it plateaus at its cap
       ("making room for prompt cache entry" in the llama log). Measured with
       the world running: ~23% free, 0.9 GB swap, no Metal OOM. To free ~3 GB,

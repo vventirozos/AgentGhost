@@ -9,7 +9,7 @@
 // would end the argument early: quotes become single quotes, newlines spaces.
 
 // Eva's instructions run ~1,100 characters (first night: a 600 cap cut one
-// mid-sentence); Gemma has 16k of context per slot, so these are generous.
+// mid-sentence); the body model has 16k of context per slot, so these are generous.
 export const MAX_GOAL = 600;
 export const MAX_TEXT = 1500;
 // say goes through RCON, whose command limit is ~1446 bytes: room for the

@@ -30,7 +30,7 @@ const APP = path.resolve(HERE, '..');                       // ~/Data/AI/World/a
 const WORLD = path.resolve(APP, '..');                      // ~/Data/AI/World
 const CFG = {
   bind: '100.83.184.117', port: 8090, botName: 'Eva', mindName: 'Mind',
-  gemmaUrl: 'http://127.0.0.1:8088', java: '/opt/homebrew/opt/openjdk@21/bin/java',
+  modelUrl: 'http://127.0.0.1:8088', java: '/opt/homebrew/opt/openjdk@21/bin/java',
   node: '/opt/homebrew/opt/node@20/bin/node', serverHeap: '1536m', viewerPort: 3000,
   mindserverPort: 8080, rconPort: 25575,
   ...JSON.parse(fs.existsSync(path.join(APP, 'config', 'world.json')) ? fs.readFileSync(path.join(APP, 'config', 'world.json'), 'utf8') : '{}'),
@@ -56,7 +56,7 @@ const attention = new Attention();
 let latestState = null;
 let lastSnapshot = 0;
 let mind = { status: 'never seen', detail: '', ts: null };
-const gemma = { waitStart: null, latencies: [] };
+const bodyModel = { waitStart: null, latencies: [] };
 let memFreePct = null;
 
 const server = new Proc({
@@ -90,10 +90,10 @@ new Tail(mindcraft.logFile, (line) => {
 }).start();
 
 function onMindcraftEvent(e) {
-  if (e.kind === 'model_wait') { gemma.waitStart = Date.now(); return; }
+  if (e.kind === 'model_wait') { bodyModel.waitStart = Date.now(); return; }
   if (e.kind === 'model_done') {
-    if (gemma.waitStart) { gemma.latencies.push(Date.now() - gemma.waitStart); if (gemma.latencies.length > 30) gemma.latencies.shift(); }
-    gemma.waitStart = null; return;
+    if (bodyModel.waitStart) { bodyModel.latencies.push(Date.now() - bodyModel.waitStart); if (bodyModel.latencies.length > 30) bodyModel.latencies.shift(); }
+    bodyModel.waitStart = null; return;
   }
   if (e.kind === 'goal_started') return;
   if (W.session) record(e.kind, e);
@@ -194,16 +194,16 @@ function sendToBody(message) {
 }
 
 // ── health probes ───────────────────────────────────────────────────────
-async function probeGemma() {
+async function probeBodyModel() {
   const t0 = Date.now();
-  const r = await fetch(`${CFG.gemmaUrl}/v1/chat/completions`, {
+  const r = await fetch(`${CFG.modelUrl}/v1/chat/completions`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(90000),
     body: JSON.stringify({ messages: [{ role: 'user', content: 'Reply with the single word: ready' }], max_tokens: 8,
       chat_template_kwargs: { enable_thinking: false }, cache_prompt: false }),
   });
-  if (!r.ok) throw new Error(`gemma HTTP ${r.status}`);
+  if (!r.ok) throw new Error(`body model HTTP ${r.status}`);
   const j = await r.json();
-  if (!j.choices?.[0]?.message?.content?.trim()) throw new Error('gemma returned an empty reply');
+  if (!j.choices?.[0]?.message?.content?.trim()) throw new Error('the body model returned an empty reply');
   return Date.now() - t0;
 }
 
@@ -292,8 +292,8 @@ async function startWorld() {
   saveState();
   resetDog();
   try {
-    const ms0 = await probeGemma();
-    record('control', { action: 'gemma_ok', text: `Gemma answered in ${ms0} ms` });
+    const ms0 = await probeBodyModel();
+    record('control', { action: 'model_ok', text: `The body model answered in ${ms0} ms` });
     execFileSync('/bin/bash', [path.join(APP, 'scripts', 'apply_patches.sh')], { stdio: 'pipe' });
     serverReadyAt = 0;
     if (!server.alive()) server.start();
@@ -485,11 +485,11 @@ const CSP = "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8' };
 
 function status() {
-  const lat = gemma.latencies;
+  const lat = bodyModel.latencies;
   return {
     phase: W.phase, session: W.session, error: W.error, wakeAt: W.wakeAt, lastLookTs: W.lastLookTs, currentGoal: W.currentGoal,
     reasons: attention.pending(), state: bodyInGame() ? latestState : null, mind: mindView(), now: Date.now(), memFreePct,
-    gemma: { last_ms: lat.at(-1) ?? null, avg_ms: lat.length ? Math.round(lat.reduce((a, b) => a + b, 0) / lat.length) : null, waiting: !!gemma.waitStart },
+    body_model: { last_ms: lat.at(-1) ?? null, avg_ms: lat.length ? Math.round(lat.reduce((a, b) => a + b, 0) / lat.length) : null, waiting: !!bodyModel.waitStart },
     procs: { server: server.alive(), mindcraft: mindcraft.alive(), mindserver: !!ms?.connected }, controlBusy: busy,
     body: { inGame: bodyInGame(), lostSince: dog.lostSince, restarts: dog.attempts },
   };

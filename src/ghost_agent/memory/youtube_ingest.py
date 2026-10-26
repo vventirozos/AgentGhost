@@ -314,7 +314,12 @@ def ytdlp_base_command(proxy: str) -> List[str]:
 #: WARNING lines above the final ERROR): no circuit changes them, and the
 #: report must name them instead of "format not available" eight times
 _INFRA_RES = (
-    (re.compile(r"no supported javascript runtime|javascript runtime", re.I), "terminal",
+    # §4RR: ONLY yt-dlp's missing-runtime line ("No supported JavaScript runtime
+    # could be found"). The bare "javascript runtime" also matched the warning
+    # yt-dlp 2026.10 prints on EVERY fetch ("n challenge solving failed …
+    # Ensure you have a supported JavaScript runtime …"), so one bot-walled
+    # circuit ended the whole fetch as "repair the stack" instead of rotating.
+    (re.compile(r"no supported javascript runtime", re.I), "terminal",
      "no JavaScript runtime (deno) for yt-dlp — repair the stack (bin/update-youtube-stack.sh --verify)"),
     (re.compile(r"bgutil|pot server|pot provider|\bpo token|potoken", re.I), "retry",
      "PO-token helper error"),

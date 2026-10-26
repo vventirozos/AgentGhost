@@ -1,5 +1,5 @@
 """Eva's World (interface/externals/ai_minecraft) — the side project where the
-27B lives in a Minecraft world through a Gemma-driven body on nova.
+27B lives in a Minecraft world through a body driven by a small model on nova.
 
 The agent itself is untouched by that project; these pins cover the code that
 shares the agent's resources:
@@ -300,11 +300,14 @@ def test_body_profile_stays_local():
     # an embedding block without a url makes Mindcraft call api.openai.com
     assert p["embedding"]["url"].startswith("http://127.0.0.1")
     assert p["model"]["url"].startswith("http://127.0.0.1")
+    # 10-26 operator: the body model gets swapped on nova; the profile names
+    # no model family (llama-server serves its one model under any name)
+    assert p["model"]["model"] == "body"
     assert p["model"]["params"]["chat_template_kwargs"] == {"enable_thinking": False}
 
 
 def test_world_difficulty_matches_what_eva_is_told():
-    # peaceful: Gemma's 4-8 s per move is too slow to fight; the prompt must agree
+    # peaceful: the body's 4-8 s per move is too slow to fight; the prompt must agree
     props = (ROOT / "nova" / "config" / "server.properties.template").read_text()
     assert "\ndifficulty=peaceful\n" in props
     assert "peaceful difficulty" in (ROOT / "mac" / "world_prompt.txt").read_text()
@@ -463,48 +466,118 @@ module.exports = craftRecipe;
 """
 
 _CRAFT_HARNESS = r"""
-// A bot whose server undoes the first `rollbacks` crafts: mineflayer's own
-// inventory shows the item at once, the server's correction removes it 20 ms later.
-const [file, rollbacks] = [process.argv[2], Number(process.argv[3])];
-const inv = {}; let crafts = 0, collected = 0; const out = [];
+// A bot whose server undoes the crafts numbered in `undo` (1-based): mineflayer's
+// own inventory shows the item at once, the server's correction removes it 20 ms
+// later. Craft number `throwAt` throws mineflayer's "missing ingredient"; during
+// craft number `stopAt` Mindcraft asks the action to stop (bot.interrupt_code).
+const [file, item, num, limit, undo, throwAt, stopAt] = [process.argv[2], process.argv[3], Number(process.argv[4]),
+  Number(process.argv[5]), JSON.parse(process.argv[6]), Number(process.argv[7]), Number(process.argv[8])];
+const inv = {}; let crafts = 0, collected = 0; const out = [], counts = [];
 global.world = { getInventoryCounts: () => ({ ...inv }) };
 global.mc = { getItemId: () => 1 };
 global.log = (bot, m) => out.push(m);
 global.collectBlock = async () => { collected++; };
-const bot = { recipesFor: () => [{ again: true }],
-  craft: async () => { crafts++; inv.wooden_pickaxe = (inv.wooden_pickaxe || 0) + 1;
-    if (crafts <= rollbacks) setTimeout(() => { inv.wooden_pickaxe -= 1; }, 20); } };
+const bot = { interrupt_code: false, recipesFor: () => [{ again: true }],
+  craft: async (recipe, count) => { crafts++; counts.push(count);
+    if (crafts === stopAt) setTimeout(() => { bot.interrupt_code = true; }, 10);
+    if (crafts === throwAt) throw new Error('Error: missing ingredient');
+    inv[item] = (inv[item] || 0) + count;
+    if (undo.includes(crafts)) setTimeout(() => { inv[item] -= count; }, 20); } };
 const craftRecipe = require(file);
-craftRecipe(bot, 'wooden_pickaxe', 1, { first: true }, { num: 1 }, { table: true }, true).then((ok) =>
-  console.log(JSON.stringify({ ok, crafts, have: inv.wooden_pickaxe || 0, collected, out })));
+const t0 = Date.now();
+craftRecipe(bot, item, num, { first: true }, { num: limit }, { table: true }, true).then(
+  (ok) => console.log(JSON.stringify({ ok, crafts, counts, have: inv[item] || 0, collected, out, ms: Date.now() - t0 })),
+  (err) => console.log(JSON.stringify({ threw: String(err.message), crafts, counts, out })));
 """
 
 
-def _craft_run(tmp_path, rollbacks):
+def _craft_run(tmp_path, undo=(), num=1, limit=None, throw_at=0, item="wooden_pickaxe", source=None,
+               stop_at=0, settle_ms=80):
     f = tmp_path / "craft.cjs"
-    f.write_text(_CRAFT_FN)
+    f.write_text(source or _CRAFT_FN)
     r = subprocess.run(["node", str(ROOT / "nova" / "scripts" / "patch_craft.cjs"), str(f)],
                        capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, r.stderr
     h = tmp_path / "h.cjs"
     h.write_text(_CRAFT_HARNESS)
-    r = subprocess.run(["node", str(h), str(f), str(rollbacks)], capture_output=True, text=True, timeout=30,
-                       env={**os.environ, "EVA_CRAFT_SETTLE_MS": "80"})
+    r = subprocess.run(["node", str(h), str(f), item, str(num), str(limit or num), json.dumps(list(undo)), str(throw_at),
+                        str(stop_at)],
+                       capture_output=True, text=True, timeout=30, env={**os.environ, "EVA_CRAFT_SETTLE_MS": str(settle_ms)})
     assert r.returncode == 0, r.stderr
     return json.loads(r.stdout.strip().splitlines()[-1])
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
 def test_a_craft_the_server_undoes_is_retried_then_reported_as_not_done(tmp_path):
-    every = _craft_run(tmp_path, rollbacks=9)        # 10-26: every table craft rolled back
+    every = _craft_run(tmp_path, undo=range(1, 10))   # 10-26: every table craft rolled back
     assert every["ok"] is False and every["crafts"] == 2 and every["have"] == 0
     assert every["out"] == ["Crafting wooden_pickaxe did not go through: the server undid it, so nothing was used up."]
     assert every["collected"] == 1                    # a table it placed itself is picked back up
-    once = _craft_run(tmp_path, rollbacks=1)          # transient: the retry lands
+    once = _craft_run(tmp_path, undo=[1])             # transient: the retry lands
     assert once["ok"] is True and once["crafts"] == 2 and once["have"] == 1
     assert once["out"] == ["Successfully crafted wooden_pickaxe, you now have 1 wooden_pickaxe."]
-    clean = _craft_run(tmp_path, rollbacks=0)
+    clean = _craft_run(tmp_path)
     assert clean["ok"] is True and clean["crafts"] == 1
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_several_crafts_go_one_at_a_time_each_confirmed(tmp_path):
+    """10-26 12:23: !craftRecipe("torch", 4) → mineflayer's back-to-back multi-craft
+    made one, then threw "missing ingredient" from its stale inventory."""
+    four = _craft_run(tmp_path, item="torch", num=4)
+    assert four["ok"] is True and four["counts"] == [1, 1, 1, 1] and four["have"] == 4
+    assert four["out"] == ["Successfully crafted torch, you now have 4 torch."]
+    undone = _craft_run(tmp_path, item="torch", num=4, undo=[2])   # one undone mid-way: retried, all four land
+    assert undone["ok"] is True and undone["crafts"] == 5 and undone["have"] == 4
+    part = _craft_run(tmp_path, item="torch", num=4, undo=[3, 4])  # the third never lands
+    assert part["ok"] is True and part["crafts"] == 4 and part["have"] == 2
+    assert part["out"] == ["Crafted torch 2 of 4 times; the server undid the rest. You now have 2 torch."]
+    late = _craft_run(tmp_path, item="torch", num=4, throw_at=2)   # an error after one landed: say so
+    assert late["ok"] is True and late["have"] == 1
+    assert late["out"] == ["Crafted torch 1 of 4 times; then: missing ingredient. You now have 1 torch."]
+    first = _craft_run(tmp_path, item="torch", num=4, throw_at=1)  # nothing made: upstream's error path
+    assert "missing ingredient" in first["threw"] and first["crafts"] == 1
+    capped = _craft_run(tmp_path, item="torch", num=4, limit=2)    # ingredients for 2: upstream's message follows
+    assert capped["counts"] == [1, 1] and capped["have"] == 2
+    # a partial success is not worded as a failed command (the hub's FAIL_RUN pattern)
+    from re import search
+    attention = (ROOT / "nova" / "hub" / "lib" / "attention.js").read_text()
+    assert "'did not go through'" in attention
+    assert "did not go through" not in part["out"][0] and "did not go through" not in late["out"][0]
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_a_stop_request_ends_the_crafts_at_once(tmp_path):
+    """Review 10-26: Mindcraft's stop() kills the body process when an action
+    ignores bot.interrupt_code for 10 s; 8 crafts at 3 s each would."""
+    run = _craft_run(tmp_path, item="stick", num=8, stop_at=2, settle_ms=3000)
+    assert run["crafts"] == 2 and run["ms"] < 4000      # one full settle, then out of the second (unchecked: 24 s)
+    assert run["ok"] is True and run["out"] == ["Crafting stick was stopped after 2 of 8. You now have 2 stick."]
+    assert run["collected"] == 0                                  # no walking to the table after a stop
+    first = _craft_run(tmp_path, item="stick", num=8, stop_at=1, settle_ms=3000)
+    assert first["crafts"] == 1 and first["ms"] < 1500 and first["out"][0].startswith("Crafting stick was stopped after 1 of 8")
+
+
+
+def _old_block(name):
+    """A previous version's inserted block, as the patcher keeps it."""
+    src = (ROOT / "nova" / "scripts" / "patch_craft.cjs").read_text()
+    start = src.index(f"const {name} = `") + len(f"const {name} = `")
+    return src[start:src.index("`;\n", start)].replace("\\`", "`").replace("\\$", "$")
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+@pytest.mark.parametrize("old", ["V1", "V2"])
+def test_an_older_craft_check_is_upgraded(tmp_path, old):
+    """nova's skills.js carried v1, then v2, when the next version shipped."""
+    anchor = "    await bot.craft(recipe, Math.min(craftLimit.num, num), craftingTable);\n"
+    fn = _CRAFT_FN.replace(anchor, _old_block(old))
+    assert f"EVA-WORLD-CRAFT-CHECK v{old[1]}" in fn
+    four = _craft_run(tmp_path, item="torch", num=4, source=fn)
+    assert four["counts"] == [1, 1, 1, 1] and four["have"] == 4
+    patched = (tmp_path / "craft.cjs").read_text()
+    assert "CHECK v1" not in patched and "CHECK v2" not in patched
+    assert patched.count("EVA-WORLD-CRAFT-CHECK v3") == 1
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")

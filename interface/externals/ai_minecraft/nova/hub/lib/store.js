@@ -96,10 +96,22 @@ export class Store {
     return fs.existsSync(this.journalPath) ? fs.readFileSync(this.journalPath, 'utf8') : '';
   }
 
-  // The tail she is shown; the whole file stays on disk.
-  journalTail(maxChars = 6000) {
+  // The part she is shown; the whole file stays on disk. Its START moves only
+  // in steps (operator, 10-26): the last 6000 chars slid with every entry, and
+  // the journal comes right after the system prompt, so each look's prompt
+  // changed from there on and llama reused ~500 of ~3,500 tokens. Now it
+  // starts at the first entry heading at or after the last multiple of `step`
+  // below (length - minChars): minChars to minChars + step chars (about the
+  // old 6000 on average), and the same start for every look until the journal
+  // grows past the next step. A heading so late that less than half of
+  // minChars would remain is ignored (one very long entry): cut at the step.
+  journalTail(minChars = 4500, step = 3000) {
     const j = this.readJournal();
-    return j.length > maxChars ? '…' + j.slice(-maxChars) : j;
+    if (j.length <= minChars) return j;
+    const from = Math.floor((j.length - minChars) / step) * step;
+    const h = j.indexOf('\n## ', from);
+    const start = h >= 0 && j.length - (h + 1) >= minChars / 2 ? h + 1 : from;
+    return start === 0 ? j : '…' + j.slice(start);
   }
 
   savePrompt(hash, text) {

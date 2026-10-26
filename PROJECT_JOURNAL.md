@@ -56603,3 +56603,159 @@ profile (measured: still 6 calls/min); Stop + Start (which reruns apply_patches)
 clears the session, so Start opened session 2026-10-26_092646 (world, journal, body memory kept).
 After: llama busy 44/120 s, mean GPU 35%. Operator note recorded in the hub. Test: test_ai_minecraft
 (cooldown pinned). Docs: install.txt §4, docs/interfaces.html.
+
+**Test suite RAM and time (2026-10-26, operator: "run the full suite now. figure out why it needs so much ram and time and fix it, if needed disable tests that take too long.")**
+Baseline (scripts/run_suite.py, -n 12): 10 min 6 s, suite tree peak 4.4 GB, swap 4.9 → 13 GB, 2 failed
+(mine: 🧱 missing from app.js ICON_CLASS; a test substring wrapped by the new clock column). Causes:
+(1) utils/token_counter.py did `from transformers import AutoTokenizer` at module scope → torch,
+sklearn, scipy, pandas in EVERY worker: importing core.agent = 425 MB / 3.4 s. Now lazy
+(`_auto_tokenizer()`, module attribute `AutoTokenizer` kept for the tests that patch it): 70 MB / 0.3 s;
+main 453 → 99 MB. (2) test_lint_gate's module fixture (pylint -j 8 over src) took 436 s inside the
+suite, 71 s alone: the long pole. Its three gate tests now run only with GHOST_LINT_GATE=1 and
+run_suite.py runs scripts/lint.py alone AFTER pytest (same verdict as ci.sh; --no-lint, skipped for
+subsets; verdict printed last; pinned by test_the_suite_runner_runs_the_gate_after_the_tests…). (3) the
+"slow" tests at 40–85 s were starved: alone 0.04–5 s. Only one was slow by itself:
+test_sessions_merge_properties LIVE-cap simulation, 37 s → seeds 10 → 3 per tab count. After: tests
+5 min 34 s, peak 2.9 GB, 26,225 passed (1 failed: 🧱 also missing from the uConsole turnstatus map,
+fixed; that file is not redeployed to the device); lint gate OK in 71 s (107 baselined findings). Swap
+still grows (llama wires 28 of 36 GB). Docs: installation.html test runner.
+Operator 10-26 follow-up: "use -n 8 from now on" → run_suite.py default -n 8 (docs updated; not re-measured, per operator).
+
+**§4RQ addendum — log review, stuck clock (2026-10-26 ~12:40, operator: "what is eva doing, how is it going? read all logs and see if there's still any bug")**
+Read: mind log, agent log (🧱 lines, warnings since the 09:06 restart), hub log, body log (current
+session = from line 29655), server log, session events, journal. Clean: 43 looks since 09:06 all
+started+finished, none refused or cut; no restore failures or warnings since the restart; no body
+process exits or windowOpen timeouts this session (the 23 exits / 5 timeouts are earlier sessions);
+93 "Error with embedding model" are the configured word-overlap fallback. BUG fixed: the "not moved for
+5 minutes while busy" clock reset only on movement or !stay, so a body left "stopped" in one place
+(Eva had told it to wait, 11:33–12:05) tripped the alert 41 s into its next goal (also 12:26, ~11:23).
+attention.onState now restarts the anchor on every non-busy update (busy = thinking|acting); a body
+that is genuinely busy and still for 5 min still raises it. Hub test added (46 pass). Deployed with
+deploy.sh (hub adopted the world, same session, wake time kept). OPEN, not fixed: inventory desync
+between mineflayer and the server — stone_pickaxe rolled back 3× (once recovered on retry, twice
+reported by EVA-WORLD-CRAFT-CHECK), and !craftRecipe("torch", 4) threw "missing ingredient" after
+the first of four crafts (4 coal+4 sticks → 3+3 left); Eva noticed the torches arrived despite the
+error. Versions are supported (Paper 1.21.6, mineflayer 4.33.0 tested to 1.21.8); no server warnings.
+Candidate (untested): craft one at a time with the settle between, inside patch_craft.
+
+**§4RQ addendum — crafting one at a time (2026-10-26 13:09, operator: "try the one-at-a-time crafting fix")**
+mineflayer's bot.craft(recipe, n) runs craftOnce n times back to back, each clicking from the local
+inventory copy before the server confirmed the last craft: the 12:23 "missing ingredient" on
+!craftRecipe("torch", 4) (one craft landed, torches arrived) and the repeated stone_pickaxe rollbacks.
+patch_craft.cjs → EVA-WORLD-CRAFT-CHECK v2: one craft per bot.craft call, 3 s settle + count check
+after each, a craft the server undid is retried once, an error after ≥1 landed and a craft that never
+lands both end with "Crafted X k of n times; the rest did not go through. You now have N X." (returns
+true if k>0), nothing made = v1's "did not go through" / upstream's error. The patcher upgrades a v1
+file in place (exact v1 block → anchor → v2); apply_patches checks for v2. Cost: n × 3 s (4 torches
+≈ 12 s). Verified on a copy of nova's live skills.js (v1 → v2, idempotent, parses). Tests:
+test_ai_minecraft 49 (harness: per-call counts, undo by craft number, throw by craft number; v1
+upgrade). Deployed 13:09: deploy.sh, apply_patches on nova, body process restarted (skills.js is
+read per agent process; the profile is not — see the cooldown entry). Operator note recorded. Not yet
+seen live: check run/mindcraft.log for "rolled back crafting" / "of N times" after her next crafts.
+
+**§4RQ addendum — the head stays out after Eva's look (2026-10-26 13:29, operator: "if the agent was aware of what it's doing then we could … avoid unneeded prefix warmups" → "yes build it"; "eva and ghost are the same machine, same model same everything. ghost is just the agent software")**
+Measured (llama log): every look re-read its whole prompt, ~3,300 tokens / 12–17 s of 45–85 s,
+because ~10 s after each look the §4OT early re-warm restored the 28k head from disk (0.4 s) — even
+with looks 80 s apart. Now: `head_rewarm_due` answers no while `_outside_slot_dirty` stands, and
+`rewarm_main_prefix_loop` skips its ticks (named or periodic; info line, `last_total` updated) — her
+state stays in the slot. The head comes back on demand: a request's main call (existing
+`_outside_slot_restore` via `before_main_dispatch`), and NEW: a background main call that opens with
+the head runs the same hook first (`chat_completion`, after rule 5; `main-prefix*` excepted) — without
+it an idle job would have re-processed 28k behind her state. A call without the head spends the mark
+(normal rules). Cost: ~0.5 s on the owner's first call after a look. Tests: §4RQ block
+(test_4ro_head_saves: head_rewarm_due + loop skip until the mark is spent), test_4rp_slot_keep
+(background hook: head job yes, own-system-prompt no, warm-up no, spent mark no); 3 hand mutants, all
+killed; 846 passed in the slot/LLM/background files. Docs: core/llm.html §4RQ, api/routes.html.
+Deployed (agent restart 13:29, gated on fg 0 and Eva idle).
+
+**Fresh-eye review of the 10-26 changes (operator: "verify all your changes , fresh eye reviewers")**
+3 independent readers (slot change / logging+suite / Eva's World). Verified each finding against the
+code (Mindcraft's own source read on nova) before fixing. MAJOR, all fixed, tested, mutation-checked:
+(1) background restore could put a background call on the slot ahead of an owner request that started
+during the hook — new `LLMClient._outside_head_before_background`: defers while the outside call is
+live (the look aborts only for a request; the hook waited ~8 s then re-processed the head) and when a
+request started meanwhile; (2) background STREAMS (sub-agents, replays via BackgroundOnlyLLM) had no
+hook at all — now run it inside the queue permit; (3) lazy transformers import froze HF offline for
+the process under --no-mandatory-tor (first import happened inside load_tokenizer's temporary
+HF_HUB_OFFLINE=1; reproduced) — load_tokenizer imports first; fresh-process test; (4) craft v2 ignored
+bot.interrupt_code — Mindcraft's ActionManager.stop() cleanKills after 10 s, so stopping a 4+ craft
+would kill the body: v3 checks before each craft and every 250 ms of the settle, logs why a later craft
+threw, words a partial success so attention's FAILED pattern does not count it; patcher upgrades v1 or
+v2 (both paths give identical files; live v2 file verified); (5) the stuck clock reset on ONE non-busy
+sample — Mindcraft (full_state.js) reports cooldown waits as "thinking" (busy), but answering a message
+is "chatting": now only 60 s straight of non-busy restarts it (flicker test). MINOR fixed: a restore no
+longer clears the mark while an outside call is live; last_total pinned; a ticker test fed real
+pretty_log lines; docs (llm.html, routes.html "Both set a mark" corrected, __init__.py, install.txt).
+Accepted: concurrent background hooks may each post a restore (wasted work); ci.sh --fast has no lint
+gate now (it is "tests only"); 🧱 counts as "working" on the web face while she looks. 1,567 tests in
+the affected files + hub 46 pass. Deployed 14:26 (agent restart, deploy.sh, apply_patches → v3, body
+process restart, operator note).
+LIVE CHECK of restore-on-demand (13:30–14:21, 14 looks): the agent restored the head once (request 68,
+0.5 s), no restores after looks. BUT her looks still process ~2,800–3,000 of ~3,500 prompt tokens:
+llama f_keep 0.11–0.12. Cause: the hub's journalTail(6000) is a sliding last-6000-chars window placed
+right after the system prompt, so the user message changes from its first line every look; only the
+~500-token system prompt is reused. Saved so far: ~2–3 s per look, not 12–17 s. Proposal (not built,
+changes what she sees): a window that moves only in steps on entry boundaries, so consecutive looks
+share the journal prefix. No crafts happened 13:10–14:10; v3 not yet seen live.
+
+**§4RQ addendum — stepped journal window (2026-10-26 ~14:45, operator: "yes, build the stepped journal window")**
+store.journalTail(minChars 4500, step 3000): starts at the first "\n## " entry heading at or after
+floor((len − 4500)/3000)·3000, so what she is shown is 4500–7500 chars (about the old 6000), begins at
+an entry, and keeps the same start for every look until the journal grows past the next step (a heading
+leaving < 2250 chars is ignored → cut at the step). Before: the last 6000 chars slid every entry, right
+after the system prompt, so llama reused only the system prompt (f_keep 0.11–0.12). Hub tests: 60
+entries → the start moves 3–8 times (sliding: every entry), each unchanged start's view is a prefix of
+the next, always the journal's end, starts at "…## "; one 20k-char entry is cut at the step. Mutant
+(old sliding window) killed. Deployed via deploy.sh. Limit to watch: llama keeps ≤ 4 context checkpoints
+≥ 1024 tokens apart (this hybrid model resumes only from a checkpoint), so reuse stops at the last
+checkpoint before the journal's end, not exactly at it. Measurement pending (3 looks).
+Measured after the stepped window (looks 14:38, 14:58): llama f_keep 0.108 on the transition look
+(2,507 tokens processed, 13.2 s) → 0.518 and 0.654 after it (1,062 and 889 tokens, 5.8 s and 5.4 s).
+Before the change: f_keep 0.11–0.12, 2,800–3,000 tokens, 14–17 s per look. Saved ~9–10 s of prompt
+processing per look (about two-thirds), as predicted for the restore-on-demand + stepped window pair.
+
+**§4RQ addendum — body model swap, neutral naming, fresh world (2026-10-26 15:02–15:14, operator: "yes rename it, don't mention a model name if you can avoid it. then reset and clear the logs")**
+15:02 operator swapped nova's llama-server to a new small model (4 × 16k slots, MTP drafter); the body
+kept working (llama-server serves its one model under any requested name). First 6 min: 4 of 10
+body replies were an empty tab (2 tokens generated) vs ~8–10% before — Mindcraft's stock profile prompt
+says "If you have nothing to say or do, respond with just a tab", so this is obeyed instruction, not a
+fault; not changed (baseline run first). Rename: eva_body.json "model": "body"; hub.js gemmaUrl→modelUrl,
+probeGemma→probeBodyModel, event action gemma_ok→model_ok ("The body model answered in N ms"), status
+key gemma→body_model (public/app.js follows); prose in install.txt, mindcraft_settings.js, directives.js,
+docs/interfaces.html, tests. New pin: profile model == "body". Tests: 51 Python + 48 hub pass.
+Archived the Gemma-era record first (reset deletes without backup): nova
+~/Data/AI/World/archive/2026-10-26_gemma-e4b/ (data, run logs, body memory) + Mac
+~/Data/AI/Logs/archive/eva_world_mind_2026-10-26_gemma.log. Then stop → deploy → reset → emptied
+run/{mindcraft,server,hub}.log and eva_world_mind.log (reset does not touch logs) → start: session
+2026-10-26_151305, verified "Awaiting … from model body" and model_ok. Comparison baseline = the Gemma
+session's first hours from 08:58 (same early-game stage), not the pre-swap mid-game window.
+
+### §4RR — nova Bolt vs Gemma, reverted; two YouTube faults fixed (2026-10-26, operator: "i need these 2 compared" → "do 1 and 2, also verify that transcribe from youtube works" → "just revert back to gemma" → "fix the youtube bugs")
+**Comparison (against SAVED Gemma outputs, same gguf):** look on the §4QT 48 pictures, blind re-grade of
+both: Gemma 36/9/3 ACCURATE/MINOR/WRONG, Bolt 37/9/2, paired 7/7/34 → tie. Pixel check on the §4QW 97
+labelled items, production prompt: false refutes 1/84 both; missed wrong pictures Bolt 6/13 vs Gemma 2/13
+(Bolt CONFIRMED a samurai claim on a picture of dogs). Operator reverted: ~17:20 nova back on
+start-llama-server.sh.gemma (Bolt kept as .bolt); text + image decode probe OK, 55 tok/s.
+**Fault 1 — a bot wall became "repair the stack".** yt-dlp 2026.10.21 prints "n challenge solving failed …
+Ensure you have a supported JavaScript runtime …" on every fetch (deno present; EJS solver script /
+yt-dlp-ejs not installed). `_INFRA_RES` matched any "javascript runtime" → the first walled circuit was
+terminal; live: the captions run stopped after 1 circuit. Now only "no supported javascript runtime"
+(yt-dlp's real missing-runtime line). Operator "install yt-dlp-ejs": yt-dlp-ejs==0.8.0 (the version
+yt-dlp 2026.10.21 pins in its `default` extra) installed in the agent venv; live -F over Tor: no challenge
+warning, 26 formats. bin/update-youtube-stack.sh now installs the ejs version yt-dlp pins after each
+upgrade and saves it in PINS.prev (not `yt-dlp[default]`: that extra moves requests/urllib3 too).
+**Fault 2 — every 12-minute audio window failed.** 720 s = 18,068 prompt tokens; sized for 32k slots, nova
+is 4 × 16,384 since 10-25 → HTTP 400 → gap under "SUCCESS". Measured on Gemma: 720 s 400, 600 s cut at the
+slot, 480 s complete (72 s). Fix: `node_slot_ctx` (/props n_ctx) + `fit_window_seconds` (25 audio + 5
+transcript tok/s + 512) per recording in `iter_audio_chunks` (only when the windows go to the real node,
+i.e. no injected post_fn; `slot_ctx_fn` injectable); default cap 720 → 480 (fits 16k without /props);
+overlap shrinks with the window. End-to-end on Bolt at 480 s: Jobs Stanford 15:04 → 2.3 % WER vs manual
+captions.
+Pins tests/test_4rr_youtube_fixes.py (14, verbatim stderr); 4KE pin 720→480. Hand mutants 6/7 killed; the
+survivor (props n=0 returned as 0) is equivalent (fit treats 0 as unknown). Docs: memory/youtube_ingest.html
+#4rr, memory/vector.html audio section.
+§4RR self-read (17:35): the new summary print in update-youtube-stack.sh called m.version("yt-dlp-ejs")
+unguarded — under `set -euo pipefail` a yt-dlp that names no ejs pin would abort the update AFTER the pip
+upgrade and BEFORE the helper swap (new yt-dlp beside the old helper). Guarded; tested in a throwaway venv
+with and without ejs. Live probe (probe-93…): Jobs speech via captions in 88 s, circuit 1 bot-walled →
+rotated → resolved; reply facts all in the stored transcript.
