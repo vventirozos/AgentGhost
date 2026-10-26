@@ -405,6 +405,27 @@
   live turn (under-bubble placement, caption lifecycle thinking → worker verify → verifier-escalation,
   counting clock, hide-on-finish, zero JS errors; throwaway session deleted). Pins:
   <code>tests/test_interface_workspace.py::test_turn_status_line</code>.</p>
+  <p id="4rn"><strong>The clock counts from the SEND, across an app switch (§4RN, 2026-10-25).</strong> Operator:
+  "in the web ui, while on mobile, the request timer resets when i change focus or open another app". iOS
+  suspends the page and kills the reply fetch; the teardown stops the clock. Before: a same-page reattach
+  (<code>_resumeAttempt</code> → <code>sendMessage(true)</code>) kept the bubble and showed NO clock, and a
+  reload/discard rebuilt the bubble and restarted it at 0:00, because the send time lived only in memory.
+  Now <code>currentTurnStartedAt</code> is stamped on a new send and stored in the in-flight handle as
+  <code>startedAt</code> (the heartbeat keeps it). An adopted handle restores it (older handles fall back to
+  <code>ts</code>; a junk value means "now", and a start the device clock has since passed backwards is counted from now but still matches its bubble), and so does the reconcile path's still-running
+  placeholder. <code>startTurnTicker(afterEl, startedAt)</code> counts from it and shows the elapsed time at
+  once. <code>ensureAgentBubbleForResume</code> gives a surviving bubble its clock back when none runs, but
+  only a bubble made for THIS turn (<code>dataset.turnStart</code> = the send time). After a finished turn the
+  pointer still names that reply, and adopting another tab's turn would otherwise have clocked it. A
+  settled <code>reconcileFromSession</code> (recovered, not recovered, 404) always stops the clock, because a
+  partial reply has no <code>thinking</code> class. A same-turn restart keeps the log corridor it had adopted
+  (<code>tickerLastStart</code>/<code>tickerLastReqId</code>) and captions "working…" instead of
+  "starting…".
+  Pins: <code>tests/test_4rn_turn_clock_browser.py</code> (the real page in Chromium with a fetch double that
+  kills the stream as iOS does: reattach with and without a partial reply, reload, reload after the proxy lost
+  the stream, an unrecoverable reattach stopping the clock, cross-tab adoption under a finished reply, next
+  turn at 0:00) and the node-executed helpers at the end of
+  <code>tests/test_interface_silent_resume.py</code>. Cache-buster <code>app.js?v=15.9</code>.</p>
 
   <h2>Live log console (2026-07-13)</h2>
   <p>The header's ONLINE chip (<code>#status-indicator</code>; a separate terminal-icon <code>#logs-btn</code> until 2026-09-05) toggles a bottom-drawer console (<code>#log-console</code>) that renders the agent's pretty-log stream in near-realtime. No new transport: the same WebSocket <code>type:"log"</code> frames that drive the face's activity envelope and the planner monologue feed a 500-entry ring buffer, which collects <em>even while the drawer is closed</em> — opening shows recent history instead of starting blind. Lines are ANSI-stripped client-side (the server broadcasts raw pretty-stream lines), rendered as dim monospace with a jewel-accent left border from the same icon→color mapping the face uses, errors tinted crimson. Auto-scroll follows the tail until the user scrolls up; a "paused — N new" pill offers jump-to-live; DOM is capped at the buffer size. Drawer sits at <code>z-index:90</code> (below <code>#render-window</code>), respects <code>env(safe-area-inset-bottom)</code> on phones. Verified live headlessly (marker appended to the agent log appeared in the open drawer; history survived close/reopen). Pins: <code>tests/test_interface_log_console.py</code>.</p>

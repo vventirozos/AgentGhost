@@ -193,7 +193,7 @@
   <h2>Design notes</h2>
   <ul>
     <li><strong>Verbatim transcription, not intent extraction.</strong> The transcript goes
-      straight to the 35B agent, which is the thing that should interpret intent —
+      straight to the main model, which is the thing that should interpret intent —
       summarising on the small model would discard information before the smart model
       sees it. Verbatim also preserves the spoken language (no forced translation).</li>
     <li><strong>Text reaches <code>say</code> through a file</strong> (<code>-f</code>), never argv or a

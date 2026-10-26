@@ -33,7 +33,7 @@ from .tasks import BehavioralTask
 @dataclass
 class EvalContext:
     base_url: str = "http://127.0.0.1:8000"
-    model: str = "qwen-3.6-35b-a3"
+    model: str = "qwen3.8-27b"
     api_key: str = ""
     ghost_home: Optional[Path] = None
     sandbox_dir: Optional[Path] = None

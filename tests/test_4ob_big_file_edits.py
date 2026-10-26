@@ -187,7 +187,7 @@ def test_a_parts_write_logs_a_deferred_syntax_check_not_an_error(tmp_path, capsy
     out = capsys.readouterr().out
     lines = [ln for ln in out.splitlines() if "syntax check" in ln]
     assert len(lines) == 2 and all("⏳" in ln and "deferred" in ln and "❌" not in ln for ln in lines), out
-    assert "checked when the last part" in out
+    assert "checked when the last part" in " ".join(out.split())   # the line may wrap
     fs(tmp_path, operation="append", path="p.py", content="    3,\n")        # last part: still open → real error
     out = capsys.readouterr().out
     lines = [ln for ln in out.splitlines() if "syntax check" in ln]

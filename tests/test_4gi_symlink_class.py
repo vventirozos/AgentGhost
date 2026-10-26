@@ -308,6 +308,9 @@ TREE_OP_ALLOWLIST = {
         "output; the model-writable sandbox goes through copytree_nofollow",
     ("src/ghost_agent/memory/snapshot.py", "copytree"):
         "verify copies the snapshot's own chroma segment folder (written by take_snapshot) into a temp dir",
+    ("src/ghost_agent/core/head_saves.py", "walk-read"):
+        "§4RO prune/newest_head_for: globs head-*.bin/.json in GHOST_HOME/system/head_saves "
+        "(agent and llama-server state, not model-writable) and only stats/unlinks its own names",
     ("src/ghost_agent/core/dream.py", "walk-read"):
         "§4MN archive retention: globs vector_reset_*.jsonl in the memory dir (agent-only, not model-writable)",
     ("src/ghost_agent/tools/memory.py", "walk-read"):

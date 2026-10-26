@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=15.7';
+import * as matrixGraphFace from './matrix_graph.js?v=15.9';
 import { initEffortSelector, effortForPayload } from './effort.js?v=1.2';   // §4RB
 
 // --- Voice Globals ---
@@ -167,6 +167,7 @@ const ICON_CLASS = {
     '⚡': 'accent',   // SYSTEM_BOOT
     '🚀': 'accent',   // SYSTEM_READY
     '🌅': 'accent',   // BOOT_AWAKE
+    '💽': 'accent',   // HEAD_DISK (§4RO head saved/restored)
     '💤': 'idle',     // SYSTEM_SHUT
     '😴': 'idle',
     '🎬': 'accent',   // REQ_START
@@ -198,6 +199,7 @@ const ICON_CLASS = {
     '🎨': 'tool',     // IMAGE_GEN
     '📄': 'tool',     // REPORT_PDF
     '🎮': 'tool',     // GAME_MOVE
+    '🧱': 'tool',     // OUTSIDE_LOOK (§4RQ Eva's World look)
     '🎲': 'tool',     // UNCERTAINTY_DIE
     '🧪': 'tool',     // VERIFIER_LAB
     '📌': 'tool',     // VERDICT_NOTE — §4OK: a verdict is information, not an error
@@ -347,6 +349,10 @@ let currentSpeechHold = false;
 let _lastSentUserText = '';
 let currentThinkingInterval = null;
 let currentTTSMutedLength = 0;
+// When this turn was SENT (ms). The clock under the bubble counts from it, and
+// the in-flight handle carries it, so a reattach after the phone suspended the
+// page (or iOS reloaded it) keeps counting instead of restarting at 0:00.
+let currentTurnStartedAt = 0;
 
 const SEND_SVG = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>`;
 const CANCEL_SVG = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="9" y1="9" x2="15" y2="15"></line><line x1="15" y1="9" x2="9" y2="15"></line></svg>`;
@@ -2235,6 +2241,7 @@ function saveInflightHandle() {
         tabId: TAB_ID,
         ts: Date.now(),
         beat: Date.now(),
+        startedAt: currentTurnStartedAt || Date.now(),
     }));
     // Heartbeat while the owning tab streams: lets other tabs tell a
     // LIVE owner from a killed one.
@@ -2296,11 +2303,21 @@ function readInflightHandle() {
 // page (after a reload nothing of the original turn's DOM exists). No-op
 // when the original bubble is still attached (same-page Safari resume).
 function ensureAgentBubbleForResume() {
-    if (currentAgentMessageDiv && currentAgentMessageDiv.isConnected) return;
+    // Reuse the bubble only for ITS turn (stamped with the send time). After
+    // a finished turn the pointer still names that reply; adopting another
+    // tab's turn reused it, and §4RN would have put a running clock under it.
+    if (currentAgentMessageDiv && currentAgentMessageDiv.isConnected
+            && currentAgentMessageDiv.dataset.turnStart === String(currentTurnStartedAt)) {
+        // Same page: the bubble survived, but the dropped stream's teardown
+        // stopped its clock — give it back, counting from the send, not now.
+        if (!tickerTimer) startTurnTicker(currentAgentMessageDiv, currentTurnStartedAt);
+        return;
+    }
     dismissEmptyStateHero();
     currentAgentMessageDiv = document.createElement('div');
     currentAgentMessageDiv.className = 'message agent thinking';
     currentAgentMessageDiv.dataset.ts = String(Date.now());
+    currentAgentMessageDiv.dataset.turnStart = String(currentTurnStartedAt);
     const ind = document.createElement('span');
     ind.className = 'typing-indicator';
     ind.setAttribute('aria-label', 'Thinking');
@@ -2309,7 +2326,7 @@ function ensureAgentBubbleForResume() {
     ind.appendChild(document.createElement('span'));
     currentAgentMessageDiv.appendChild(ind);
     chatLog.appendChild(currentAgentMessageDiv);
-    startTurnTicker(currentAgentMessageDiv);
+    startTurnTicker(currentAgentMessageDiv, currentTurnStartedAt);
     scrollToBottom();
 }
 
@@ -2452,7 +2469,9 @@ async function reconcileFromSession(sid, handle) {
         if (stillRunning) {
             // The proxy's replay buffer is gone (restart) but the agent is
             // still computing. The reply will land in the session store when
-            // it finishes — keep a placeholder and poll.
+            // it finishes — keep a placeholder and poll. Its clock counts
+            // from the send the handle recorded (a reload lost the old one).
+            if (handle) currentTurnStartedAt = _turnStartFromHandle(handle);
             ensureAgentBubbleForResume();
             // Announce ONCE per recovery, not once per poll. The old guard
             // (`if (!reconcilePollTimer)`) conflated "first time" with "no poll
@@ -2511,9 +2530,12 @@ async function reconcileFromSession(sid, handle) {
                 return;
             }
         } catch (e) { if (!_reconcileBlocked(sid, handle, gen)) _scheduleReconcilePoll(sid, handle); return; }
+        // Settled (recovered / not recovered / 404): no turn runs, so no clock.
+        // §4RN: the resume bubble may hold a PARTIAL reply (no `thinking`
+        // class) and still carry the clock the recovery gave it.
+        stopTurnTicker();
         // A placeholder bubble that never streamed has nothing to show.
         if (currentAgentMessageDiv && currentAgentMessageDiv.classList.contains('thinking')) {
-            stopTurnTicker();
             currentAgentMessageDiv.remove();
             currentAgentMessageDiv = null;
         }
@@ -2584,6 +2606,7 @@ async function resumeOrReconcileInflightTurn() {
             // tab makes the heartbeat and all four terminal paths work.
             clearInflightHandle(h);
             currentTaskId = h.taskId;
+            currentTurnStartedAt = _turnStartFromHandle(h);
             currentChunkIndex = 0;
             currentAccumulatedContent = "";
             currentStreamPrefixLen = 0;
@@ -2710,6 +2733,10 @@ const turnStatusDescEl = document.getElementById('turn-status-desc');
 const turnStatusClockEl = document.getElementById('turn-status-clock');
 const turnStatusIconEl = document.getElementById('turn-status-icon');
 let tickerTimer = null, tickerStart = 0, tickerReqId = null;
+// The corridor the last stopped clock had adopted, and its turn's send time: a
+// reattach restarting the SAME turn's clock keeps captioning from its log lines
+// (its "request started" line streamed long ago and never repeats).
+let tickerLastStart = 0, tickerLastReqId = null;
 // §4ML: the corridor headers seen since send ({tag, rid8}) and this turn's
 // own request id once the proxy reports it. Adoption needs BOTH to agree:
 // "the first corridor after send" adopted a member's, a probe's or
@@ -2733,15 +2760,32 @@ function noteTickerOwnRid(rid) {
     _tryAdoptTicker();
 }
 
-function startTurnTicker(afterEl) {
+// The send time an in-flight handle recorded (older handles: when it was
+// saved, which is within a second or two of the send). Kept RAW even when
+// the device clock has since moved back: it is also the stamp that matches
+// the turn's bubble; startTurnTicker clamps what the clock counts from.
+function _turnStartFromHandle(h) {
+    const t = Number((h && (h.startedAt || h.ts)) || 0);
+    return t > 0 ? t : Date.now();
+}
+
+function _tickerClockText(startedAt, now) {
+    const s = Math.max(0, Math.floor((now - startedAt) / 1000));
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+// `startedAt`: when the turn was sent — a reattach passes the original send
+// time so the clock continues; a new turn passes nothing (now).
+function startTurnTicker(afterEl, startedAt) {
     stopTurnTicker();
     if (!turnStatusEl) return;
-    tickerStart = Date.now();
-    tickerReqId = null;
+    tickerStart = startedAt > 0 && startedAt <= Date.now() ? startedAt : Date.now();
+    const sameTurn = startedAt > 0 && startedAt === tickerLastStart && tickerLastReqId !== null;
+    tickerReqId = sameTurn ? tickerLastReqId : null;
     tickerSeen = [];
     tickerOwnRid = null;
-    turnStatusDescEl.textContent = 'starting…';
-    turnStatusClockEl.textContent = '0:00';
+    turnStatusDescEl.textContent = sameTurn ? 'working…' : 'starting…';
+    turnStatusClockEl.textContent = _tickerClockText(tickerStart, Date.now());
     turnStatusIconEl.textContent = '⏳';
     // Re-parent under the waiting reply bubble (the element survives
     // detachment by /clear or history repaints — appendChild re-adopts
@@ -2751,13 +2795,12 @@ function startTurnTicker(afterEl) {
     }
     turnStatusEl.classList.remove('hidden');
     tickerTimer = setInterval(() => {
-        const s = Math.floor((Date.now() - tickerStart) / 1000);
-        turnStatusClockEl.textContent =
-            `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+        turnStatusClockEl.textContent = _tickerClockText(tickerStart, Date.now());
     }, 1000);
 }
 
 function stopTurnTicker() {
+    if (tickerTimer) { tickerLastStart = tickerStart; tickerLastReqId = tickerReqId; }
     clearInterval(tickerTimer);
     tickerTimer = null;
     tickerReqId = null;
@@ -2994,6 +3037,7 @@ async function sendMessage(isResume = false) {
         const _userDiv = addMessage('user', text);
         
         currentTaskId = null;
+        currentTurnStartedAt = Date.now();
         currentChunkIndex = 0;
         currentAccumulatedContent = "";
         currentStreamPrefixLen = 0;
@@ -3022,6 +3066,7 @@ async function sendMessage(isResume = false) {
         currentAgentMessageDiv = document.createElement('div');
         currentAgentMessageDiv.className = 'message agent thinking';
         currentAgentMessageDiv.dataset.ts = String(Date.now());
+        currentAgentMessageDiv.dataset.turnStart = String(currentTurnStartedAt);
         // Build indicator via DOM APIs (no user-supplied content, but
         // keeps the file free of innerHTML = '<...>' patterns).
         const _ind = document.createElement('span');
@@ -3034,7 +3079,7 @@ async function sendMessage(isResume = false) {
         chatLog.appendChild(currentAgentMessageDiv);
         // Turn status line under the waiting bubble (`timer :
         // description - icon`) — see the Turn status block above.
-        startTurnTicker(currentAgentMessageDiv);
+        startTurnTicker(currentAgentMessageDiv, currentTurnStartedAt);
         scrollToBottom();
         currentThinkingInterval = null;
     } else {

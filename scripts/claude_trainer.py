@@ -63,7 +63,7 @@ Usage
 Env (all overridable by flags):
     GHOST_URL          default http://127.0.0.1:8000
     GHOST_API_KEY      sent as both X-Ghost-Key and Bearer (auth-tolerant)
-    GHOST_MODEL        default "qwen-3.6-35b-a3"
+    GHOST_MODEL        default "qwen3.8-27b"
     ANTHROPIC_API_KEY  required
     CLAUDE_MODEL       default "claude-opus-4-8"
 """
@@ -532,7 +532,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--tasks", type=int, default=6, help="How many tasks to generate")
     ap.add_argument("--ghost-url", default=os.environ.get("GHOST_URL", "http://127.0.0.1:8000"))
     ap.add_argument("--ghost-key", default=os.environ.get("GHOST_API_KEY", ""))
-    ap.add_argument("--ghost-model", default=os.environ.get("GHOST_MODEL", "qwen-3.6-35b-a3"))
+    ap.add_argument("--ghost-model", default=os.environ.get("GHOST_MODEL", "qwen3.8-27b"))
     ap.add_argument("--anthropic-key", default=os.environ.get("ANTHROPIC_API_KEY", ""))
     ap.add_argument("--claude-model", default=os.environ.get("CLAUDE_MODEL", "claude-opus-4-8"))
     ap.add_argument("--no-retention", action="store_true", help="Skip the fresh-conversation retest")

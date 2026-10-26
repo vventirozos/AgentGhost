@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Eva's mind (Eva's World). Always on, but it only calls the 27B when the
+     world is running, Eva is due to look, and the agent is idle; otherwise it
+     polls the hub every 20 s and sleeps. Installed by install_mac.sh, which
+     fills in the @...@ placeholders. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.local.eva-world-mind</string>
+    <key>UserName</key>
+    <string>@USER@</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>-u</string>
+        <string>@DIR@/eva_mind.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>@DIR@</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>@HOME@</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>@HOME@/Data/AI/Logs/eva_world_mind.log</string>
+    <key>StandardErrorPath</key>
+    <string>@HOME@/Data/AI/Logs/eva_world_mind.log</string>
+</dict>
+</plist>

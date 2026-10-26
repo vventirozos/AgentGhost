@@ -81,8 +81,6 @@ class TestRecoveryMachineryStillWired:
         assert "currentTaskId" in window, "resumes without a task to resume"
         assert "isProcessingRequest" in window, "resumes on top of a live turn"
 
-    def test_resume_bubble_still_present(self):
-        assert "ensureAgentBubbleForResume()" in _code()
 
     def test_real_errors_still_surface(self):
         code = _code()
@@ -155,3 +153,142 @@ class TestRecoveryMachineryStillWired:
         # concatenation, so no multi-word substring is contiguous.
         assert "durable" in window.lower()
         assert "sessions rail" in window.lower()
+
+
+# ── §4RN (2026-10-25): the turn clock keeps counting across an app switch ──
+# Operator: "in the web ui, while on mobile, the request timer resets when i
+# change focus or open another app". The dropped stream's teardown stopped the
+# clock; a reattach that rebuilt the bubble restarted it at 0:00 (`tickerStart
+# = now`), and a same-page reattach kept the bubble with no clock at all. The
+# in-flight handle now carries `startedAt`, an adopted handle restores it, and
+# the resume bubble (new or surviving) counts from it. EXECUTED under node —
+# these replace the old `"ensureAgentBubbleForResume()" in code` text pin.
+
+from tests.helpers import eval_js, extract_js_function  # noqa: E402
+
+# A fake page: clock elements, a controllable clock, inert timers.
+_PRELUDE = r"""
+let NOW = 1_000_000_000;
+Date.now = () => NOW;
+const el = () => ({ textContent: '', classList: { remove() {}, add() {} },
+                    insertAdjacentElement() {}, isConnected: true,
+                    appendChild() {}, setAttribute() {}, dataset: {} });
+const turnStatusEl = el(), turnStatusDescEl = el(), turnStatusClockEl = el(), turnStatusIconEl = el();
+let tickerTimer = null, tickerStart = 0, tickerReqId = null, tickerSeen = [], tickerOwnRid = null;
+let tickerLastStart = 0, tickerLastReqId = null;
+// a bubble made for the turn sent at `start`
+const bubble = (start) => { const b = el(); b.dataset.turnStart = String(start); return b; };
+let ticks = [];
+globalThis.setInterval = (fn) => { ticks.push(fn); return ticks.length; };
+globalThis.clearInterval = () => {};
+let currentTurnStartedAt = 0, currentAgentMessageDiv = null, currentTaskId = null;
+const store = {};
+const safeStorage = { get: (k) => store[k] ?? null, set: (k, v) => { store[k] = v; } };
+const TAB_ID = 'tab-1';
+function _inflightKey() { return 'ghost_inflight_turn:' + TAB_ID; }
+function storedSessionId() { return 'sess-1'; }
+globalThis.window = {};
+let inflightHeartbeat = null;
+const chatLog = { appendChild() {} };
+const document = { createElement: () => el() };
+function dismissEmptyStateHero() {}
+function scrollToBottom() {}
+"""
+
+_FNS = "\n".join(extract_js_function(_code(), n) for n in (
+    "_turnStartFromHandle", "_tickerClockText", "startTurnTicker", "stopTurnTicker",
+    "saveInflightHandle", "ensureAgentBubbleForResume"))
+
+
+def _run(code: str):
+    """`stmt; stmt; [result]` — the statements run, the last part is returned."""
+    body, _, result = code.rpartition(";")
+    return eval_js(_PRELUDE + _FNS, f"(() => {{ {body}; return {result}; }})()")
+
+
+def test_the_clock_text_counts_minutes_and_seconds():
+    assert _run("[_tickerClockText(0, 0), _tickerClockText(0, 59_999), _tickerClockText(0, 61_000),"
+                " _tickerClockText(0, 3_725_000), _tickerClockText(5_000, 0)]") == \
+        ["0:00", "0:59", "1:01", "62:05", "0:00"]
+
+
+def test_a_reattached_clock_continues_from_the_send_not_zero():
+    got = _run("startTurnTicker(el(), NOW - 95_000);"
+               " const first = turnStatusClockEl.textContent;"
+               " NOW += 2_000; ticks[ticks.length - 1]();"
+               " [first, turnStatusClockEl.textContent, tickerStart]")
+    assert got == ["1:35", "1:37", 1_000_000_000 - 95_000]
+
+
+def test_a_new_turn_and_a_bad_start_time_count_from_now():
+    got = _run("startTurnTicker(el()); const a = turnStatusClockEl.textContent;"
+               " startTurnTicker(el(), NOW + 60_000); const b = [turnStatusClockEl.textContent, tickerStart === NOW];"
+               " startTurnTicker(el(), NaN); [a, b, turnStatusClockEl.textContent]")
+    assert got == ["0:00", ["0:00", True], "0:00"]
+
+
+def test_the_in_flight_handle_carries_the_send_time():
+    got = _run("currentTaskId = 't1'; currentTurnStartedAt = NOW - 40_000; NOW += 1; saveInflightHandle();"
+               " const h = JSON.parse(store[_inflightKey()]); [h.startedAt, h.ts]")
+    assert got == [1_000_000_000 - 40_000, 1_000_000_001]
+
+
+def test_the_heartbeat_keeps_the_send_time():
+    got = _run("currentTaskId = 't1'; currentTurnStartedAt = NOW - 40_000; saveInflightHandle();"
+               " NOW += 5_000; ticks[ticks.length - 1]();"
+               " const h = JSON.parse(store[_inflightKey()]); [h.startedAt, h.beat]")
+    assert got == [1_000_000_000 - 40_000, 1_000_005_000]
+
+
+def test_a_handle_restores_its_send_time_and_old_handles_fall_back_to_ts():
+    got = _run("[_turnStartFromHandle({startedAt: NOW - 30_000, ts: NOW - 1_000}) === NOW - 30_000,"
+               " _turnStartFromHandle({ts: NOW - 7_000}) === NOW - 7_000,"
+               " _turnStartFromHandle({startedAt: NOW + 9_000}) === NOW + 9_000,"
+               " _turnStartFromHandle({startedAt: 'junk'}) === NOW,"
+               " _turnStartFromHandle(null) === NOW]")
+    assert got == [True, True, True, True, True]
+
+
+def test_a_rebuilt_resume_bubble_counts_from_the_send():
+    """Reload/discard path: no bubble, the handle's send time was restored."""
+    got = _run("currentTurnStartedAt = NOW - 125_000; currentAgentMessageDiv = null;"
+               " ensureAgentBubbleForResume(); [turnStatusClockEl.textContent, tickerTimer !== null]")
+    assert got == ["2:05", True]
+
+
+def test_a_same_page_resume_gives_the_surviving_bubble_its_clock_back():
+    """The dropped stream stopped the clock; the bubble survived."""
+    got = _run("currentTurnStartedAt = NOW - 20_000; const b = bubble(currentTurnStartedAt);"
+               " currentAgentMessageDiv = b;"
+               " startTurnTicker(currentAgentMessageDiv, currentTurnStartedAt); tickerReqId = 'ab12cd34';"
+               " stopTurnTicker(); NOW += 30_000; ensureAgentBubbleForResume();"
+               " [tickerTimer !== null, turnStatusClockEl.textContent, currentAgentMessageDiv === b,"
+               "  tickerReqId, turnStatusDescEl.textContent]")
+    # the same bubble, its clock from the send, and its log corridor kept
+    assert got == [True, "0:50", True, "ab12cd34", "working…"]
+
+
+def test_a_finished_reply_of_another_turn_is_not_reused_for_a_resume():
+    """Adopting another tab's turn: the pointer still names this tab's last,
+    FINISHED reply — the resume gets a new bubble, the old one no clock."""
+    got = _run("const old = bubble(NOW - 300_000); currentAgentMessageDiv = old;"
+               " currentTurnStartedAt = NOW - 20_000; ensureAgentBubbleForResume();"
+               " [currentAgentMessageDiv !== old, currentAgentMessageDiv.dataset.turnStart === String(NOW - 20_000),"
+               "  turnStatusClockEl.textContent, tickerReqId]")
+    assert got == [True, True, "0:20", None]
+
+
+def test_a_running_clock_is_not_restarted_by_a_second_resume_call():
+    got = _run("currentTurnStartedAt = NOW - 20_000; currentAgentMessageDiv = bubble(currentTurnStartedAt);"
+               " startTurnTicker(currentAgentMessageDiv, currentTurnStartedAt); const t = tickerTimer;"
+               " ensureAgentBubbleForResume(); [tickerTimer === t, ticks.length]")
+    assert got == [True, 1]
+
+
+def test_a_clock_set_back_still_matches_the_bubble_and_counts_from_now():
+    """The device clock moved back between send and reattach: the raw stamp
+    still finds the turn's bubble (no duplicate), the clock counts from now."""
+    got = _run("const start = NOW + 9_000; const b = bubble(start); currentAgentMessageDiv = b;"
+               " currentTurnStartedAt = _turnStartFromHandle({startedAt: start}); ensureAgentBubbleForResume();"
+               " [currentAgentMessageDiv === b, turnStatusClockEl.textContent, tickerStart === NOW]")
+    assert got == [True, "0:00", True]

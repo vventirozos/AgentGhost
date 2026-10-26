@@ -15,11 +15,19 @@ Writes the JUnit XML (per-test durations) to ``$SUITE_OUT`` (default
 loadfile`` keeps each file on one worker (module fixtures and the order
 assumptions some files make), so the wall time is bounded below by the
 slowest FILE — that list is the one to read.
+
+Files are passed slowest-first, by the per-file times of the last full run
+(``TIMES``, written after every run). xdist hands ``loadfile`` scopes out in
+collection order, which follows the argument order; alphabetical order put
+a 190 s file late in the queue and left one worker running it alone at the
+end. Longest-first keeps the tail near the slowest single file. Files with
+no recorded time go first.
 """
 from __future__ import annotations
 
 import argparse
 import collections
+import json
 import os
 import subprocess
 import sys
@@ -29,9 +37,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PY = sys.executable
+TIMES = ROOT / ".suite_file_times.json"
 
 
-def _report(xml_path: Path, top: int) -> None:
+def _per_file(xml_path: Path):
     root = ET.parse(xml_path).getroot()
     per_file = collections.Counter()
     per_test = []
@@ -44,6 +53,26 @@ def _report(xml_path: Path, top: int) -> None:
         f = mod.replace(".", "/") + ".py"
         per_file[f] += t
         per_test.append((t, f"{f}::{tc.get('name')}"))
+    return per_file, per_test
+
+
+def _longest_first(files):
+    try:
+        times = json.loads(TIMES.read_text())
+    except (OSError, ValueError):
+        return files
+    return sorted(files, key=lambda f: -times.get(f, float("inf")))
+
+
+def _save_times(per_file) -> None:
+    try:
+        TIMES.write_text(json.dumps({f: round(t, 2) for f, t in per_file.items()}, indent=0))
+    except OSError:
+        pass
+
+
+def _report(xml_path: Path, top: int) -> None:
+    per_file, per_test = _per_file(xml_path)
     total = sum(per_file.values())
     print(f"\n── timing ({len(per_test)} tests, {total:.0f} s of test time summed over workers) ──")
     print(f"slowest {top} files (a file runs on ONE worker — these bound the wall time):")
@@ -59,6 +88,8 @@ def main() -> int:
     ap.add_argument("-n", type=int, default=12, help="xdist workers (default 12 of 14 cores)")
     ap.add_argument("--top", type=int, default=25)
     ap.add_argument("--report-only", action="store_true")
+    ap.add_argument("--lint", action="store_true",
+                    help="also run the full pylint gate (~4 min; test_lint_gate's findings)")
     ap.add_argument("files", nargs="*")
     a = ap.parse_args()
     out = Path(os.environ.get("SUITE_OUT", "/tmp/ghost_suite"))
@@ -67,19 +98,26 @@ def main() -> int:
     if a.report_only:
         _report(xml, a.top)
         return 0
-    files = a.files or sorted(str(p.relative_to(ROOT)) for p in (ROOT / "tests").glob("test_*.py"))
+    files = a.files or _longest_first(
+        sorted(str(p.relative_to(ROOT)) for p in (ROOT / "tests").glob("test_*.py")))
     # a shell may export GHOST_API_KEY blank (seen live): the interface
     # refuses to import with an empty key, so a blank one is replaced
     env = dict(os.environ, HF_HUB_OFFLINE="1",
                GHOST_API_KEY=(os.environ.get("GHOST_API_KEY") or "").strip() or "x",
                PYTHONPATH="src:.")
     env.pop("FORCE_COLOR", None)
+    if a.lint:
+        env["GHOST_LINT_GATE"] = "1"
     cmd = [PY, "-m", "pytest", *files, "-n", str(a.n), "--dist", "loadfile", "-q",
            "-p", "no:cacheprovider", f"--junitxml={xml}", "-o", "junit_family=xunit1"]
     t0 = time.time()
     rc = subprocess.run(cmd, cwd=ROOT, env=env).returncode
     print(f"\nwall time: {time.time() - t0:.0f} s, exit {rc}")
+    if env.get("GHOST_LINT_GATE") != "1":
+        print("lint gate NOT run (opt-in): --lint, or python scripts/lint.py")
     if xml.exists():
+        if not a.files:     # a subset's times would drop every other file
+            _save_times(_per_file(xml)[0])
         _report(xml, a.top)
     return rc
 

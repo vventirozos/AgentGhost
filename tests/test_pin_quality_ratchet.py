@@ -614,7 +614,7 @@ _GRANDFATHERED_BASELINE = \
 #: the JSON cannot move it — the same reason `ALLOWED_SLACK` and the
 #: grandfather digest live here. An honest re-write updates this constant in
 #: the same change; `--write` prints the new digest for exactly that.
-_COMMITTED_BASELINE_DIGEST = "57d5fea32e1703ec4faa2104fc3f891e94b681970e01fb1833151bbb4603ae2e"
+_COMMITTED_BASELINE_DIGEST = "c79898d83eba8dab74f05b393a5379e1b19eb37db98197401ed6b0149fbe47c2"
 
 
 def baseline_digest(baseline: dict) -> str:

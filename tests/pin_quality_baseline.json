@@ -81,7 +81,7 @@
     "test_feedback_stream_id_restamp.py": 5,
     "test_finalize_extraction.py": 3,
     "test_foreground_yield.py": 12,
-    "test_futility_breaker_trio.py": 5,
+    "test_futility_breaker_trio.py": 3,
     "test_ghost_cli.py": 1,
     "test_ghostlog_viewer.py": 11,
     "test_grounded_file_verify.py": 5,
@@ -218,5 +218,5 @@
     "test_workspace_cleanup_deletion_guards.py": 1,
     "test_workspace_tidy.py": 3
   },
-  "total_textual": 909
+  "total_textual": 907
 }

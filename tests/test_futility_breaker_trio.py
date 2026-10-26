@@ -192,7 +192,9 @@ def test_turn_loop_has_else_clause_with_banner():
     found = False
     for node in ast.walk(tree):
         if isinstance(node, (ast.For, ast.While)):      # §4OG-1 (k): the loop is a `while` (the budget can extend once)
-            it = ast.get_source_segment(src, node.iter if isinstance(node, ast.For) else node.test) or ""
+            # ast.unparse, not get_source_segment: the latter re-splits the
+            # whole 28k-line module on every call (53 s for this one pin)
+            it = ast.unparse(node.iter if isinstance(node, ast.For) else node.test)
             if "effective_max_turns" in it:
                 assert node.orelse, "turn loop lost its else clause"
                 # §4IC: the banner text moved into `budget_exhausted_note`;

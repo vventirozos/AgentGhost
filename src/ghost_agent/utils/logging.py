@@ -54,6 +54,10 @@ effort_override_context = contextvars.ContextVar("effort_override", default="")
 #: §4NG: the request's server-side session id ("" when none) — `recall` keeps
 #: the ACTIVE conversation out of its "past conversations" hits.
 active_session_context = contextvars.ContextVar("active_session_id", default="")
+#: §4RP: which conversation owns the main llama slot after this request's calls
+#: — the session id (web; ``slack:<thread>:<user>`` from the bot), else
+#: ``fp:`` + the first-user-message fingerprint; "" outside a request
+slot_session_context = contextvars.ContextVar("slot_session", default="")
 #: §4MV measured `hyd_tail` (not adopted) and `tools_trim` (baked into the
 #: tool sources). §4NA: `no_lessons` — the lesson-compliance control arm
 #: (every playbook lesson withheld; probes only).
@@ -588,7 +592,7 @@ def _print_collapse_summary(run: dict) -> None:
         tag = _req_tag(req_id)
         rcol = _req_color(req_id)
         line = (
-            f"{rcol}│{RESET}  {rcol}{tag}{RESET}  {_icon_cell(icon)}  "
+            f"{rcol}│{RESET}  {rcol}{tag}{RESET}  {DIM}{_clock()}{RESET}  {_icon_cell(icon)}  "
             f"{DIM}{_format_delta(req_id)}{RESET}  "
             f"{DIM}{_fit_title(title_str)}  ⤷ repeated ×{n} in {span:.0f}s{RESET}"
         )
@@ -914,6 +918,7 @@ class Icons:
     CUT          = "🔻"   # context compaction / trim (wide-base; was ✂️)
     CONSTRAINT   = "🔗"   # explicit-user-constraint capture/steer/gate (wide-base; was ⛓️)
     GAME_MOVE    = "🎮"   # participant-mode game turn (/api/game/move) (wide-base; was ♟️)
+    OUTSIDE_LOOK = "🧱"   # §4RQ: Eva's World look on the main slot (/api/slot/outside-call)
     FEEDBACK_POS = "👍"   # human outcome label, positive (/api/feedback → corrections sidecar)
     FEEDBACK_NEG = "👎"   # human outcome label, negative (same channel; distinct so the
                           # stream shows the label's direction at a glance)
@@ -946,6 +951,7 @@ class Icons:
     # SYSTEM_BOOT / SYSTEM_READY stay 🌅-style brackets around the whole
     # boot sequence, while the specific lines in between use these.
     BOOT_AWAKE       = "🌅"   # process spark — the very first line
+    HEAD_DISK        = "💽"   # §4RO: the request head saved to / restored from disk
     SANDBOX_BOX      = "📦"   # sandbox container mount
     GRAPH_WEB        = "🪢"   # triplet / knowledge-graph store (wide-base; was 🕸️)
     VECTOR_EMBED     = "🧮"   # vector DB + sentence embeddings (was 🧬, colliding with MEM_EMBED)
@@ -1116,12 +1122,13 @@ def setup_logging(log_file: str, debug: bool = False, daemon: bool = False, verb
 #
 # Output anatomy for a normal log line:
 #
-#   │  R7  💭  +0.42s  thinking          128 tokens · 0.9s
-#   ^   ^    ^   ^         ^                  ^
-#   │   │    │   │         │                  └── content (one line, truncated)
-#   │   │    │   │         └── title (lowercased, bold, level-colored)
-#   │   │    │   └── delta from request start
-#   │   │    └── icon (emoji, picks itself)
+#   │  R7  11:02:41  💭  +0.42s  thinking          128 tokens · 0.9s
+#   ^   ^     ^      ^   ^         ^                  ^
+#   │   │     │      │   │         │                  └── content (one line, truncated)
+#   │   │     │      │   │         └── title (lowercased, bold, level-colored)
+#   │   │     │      │   └── delta from request start
+#   │   │     │      └── icon (emoji, picks itself)
+#   │   │     └── wall clock (every line, background ones too)
 #   │   └── 2-char request tag — colour FAMILY = origin (blue user · violet
 #   │       sim · amber bench · green SYSTEM · grey unclassified), shade
 #   │       within the family = deterministic per request (§4EZ)
@@ -1130,7 +1137,7 @@ def setup_logging(log_file: str, debug: bool = False, daemon: bool = False, verb
 # BEGIN frame:
 #   ┌─ R7 a8a93a27  request started  11:02:33 ─────────────────────────
 # END frame:
-#   └─ R7  request finished  +12.3s ──────────────────────────────────
+#   └─ R7  request finished  +12.3s  11:02:45 ────────────────────────
 #
 # Concurrent requests still interleave line-by-line, but each line carries
 # the colored 2-char tag so the eye can group them by stream — and the hue
@@ -1161,6 +1168,15 @@ def _truncate(content_str: str, limit: int) -> str:
 ICON_CELLS = 2
 
 
+def _clock() -> str:
+    """Wall-clock time for the CLOCK column (10-26, operator: every line,
+    background ones too — the "+Ns" delta alone could not be placed in the
+    day). It sits between the tag and the icon: the uConsole and web-client
+    tickers split on 2+ spaces and need the tag second and the delta right
+    after the icon."""
+    return datetime.datetime.now().strftime("%H:%M:%S")
+
+
 def _icon_display_width(icon: str) -> int:
     """Display width of ``icon`` in terminal cells, by base codepoint width.
     VS16 selectors, ZWJ, and combining marks are zero-advance."""
@@ -1180,12 +1196,13 @@ def _icon_cell(icon: str) -> str:
 
 # The column where content begins (and where wrapped continuation lines are
 # indented to). Derived from ONE formula so the layout can't silently drift:
-#   │ ·· TG ·· <icon> ·· +12.3s ·· <title>·· <content>
-#   1  2  2  2   2     2    6     2    18    2   →  content starts at col 39
+#   │ ·· TG ·· 08:54:12 ·· <icon> ·· +12.3s ·· <title>·· <content>
+#   1  2  2  2     8     2   2     2    6     2    24    2   →  content starts at col 55
 TITLE_WIDTH = 24   # §4NV: was 18 — 70 titles lost their last word ("upstream stream f…")
 _CONTENT_COL = (
     1            # left frame edge │
     + 2 + 2      # 2 spaces + 2-char request tag
+    + 2 + 8      # 2 spaces + HH:MM:SS clock
     + 2 + ICON_CELLS  # 2 spaces + icon field
     + 2 + 6      # 2 spaces + fixed 6-char delta
     + 2 + TITLE_WIDTH  # 2 spaces + padded title
@@ -1362,11 +1379,12 @@ def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str =
         _mirror(req_id, "request finished",
                 delta + (f" origin={_end_origin}" if _end_origin else ""),
                 "INFO", delta=delta)
-        visible = len(f"└─ {tag}  request finished  {delta} ")
+        _at = _clock()
+        visible = len(f"└─ {tag}  request finished  {delta}  {_at} ")
         rule = _fill_rule(visible + len(_osfx))
         line = (
             f"{rcol}└─ {BOLD}{tag}{RESET}  "
-            f"{DIM}request finished  {delta}{RESET} "
+            f"{DIM}request finished  {delta}  {_at}{RESET} "
             f"{rcol}{rule}{RESET}"
             + (f" {DIM}·{RESET} {rcol}{BOLD}{_end_origin}{RESET}"
                if _end_origin else "")
@@ -1378,7 +1396,7 @@ def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str =
         delta = _format_delta(req_id)
         title_str = title.lower().replace("_", " ")
         line = (
-            f"{rcol}│{RESET}  {rcol}{tag}{RESET}  {_icon_cell(icon)}  "
+            f"{rcol}│{RESET}  {rcol}{tag}{RESET}  {DIM}{_clock()}{RESET}  {_icon_cell(icon)}  "
             f"{DIM}{delta}{RESET}  "
             f"{BOLD}▼ {title_str}{RESET}"
         )
@@ -1391,7 +1409,7 @@ def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str =
         delta = _format_delta(req_id)
         title_str = title.lower().replace("_", " ")
         line = (
-            f"{rcol}│{RESET}  {rcol}{tag}{RESET}  {_icon_cell(icon)}  "
+            f"{rcol}│{RESET}  {rcol}{tag}{RESET}  {DIM}{_clock()}{RESET}  {_icon_cell(icon)}  "
             f"{DIM}{delta}{RESET}  "
             f"{BOLD}▲ {title_str}{RESET}"
         )
@@ -1472,7 +1490,7 @@ def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str =
     lvl_col = _LEVEL_COLOR.get(level.upper(), "")
     sep = "  " if stream_content else ""
     line = (
-        f"{rcol}│{RESET}  {rcol}{tag}{RESET}  {_icon_cell(icon)}  "
+        f"{rcol}│{RESET}  {rcol}{tag}{RESET}  {DIM}{_clock()}{RESET}  {_icon_cell(icon)}  "
         f"{DIM}{delta}{RESET}  "
         f"{lvl_col}{BOLD}{_fit_title(title_str)}{RESET}{sep}{stream_content}"
     )

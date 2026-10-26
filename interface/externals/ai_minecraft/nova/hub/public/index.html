@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Eva's World</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="login" class="login" hidden>
+  <form id="login-form">
+    <h1>Eva's World</h1>
+    <p>Enter the hub key (on nova: <code>~/Data/AI/World/.hub_key</code>).</p>
+    <input id="key" type="password" autocomplete="current-password" placeholder="hub key" required>
+    <button type="submit">Open</button>
+    <p id="login-err" class="err"></p>
+  </form>
+</div>
+
+<div id="app" hidden>
+  <header class="top">
+    <div class="title">
+      <div class="brand"><span id="orb" class="orb"></span><h1>Eva's World</h1></div>
+      <span id="phase" class="chip">…</span>
+      <span id="clock" class="muted"></span>
+    </div>
+    <nav class="tabs">
+      <button data-tab="live" class="on">Live</button>
+      <button data-tab="history">History</button>
+    </nav>
+    <div class="controls">
+      <button id="btn-start" data-action="start" class="primary">Start</button>
+      <button id="btn-pause" data-action="pause">Pause</button>
+      <button id="btn-resume" data-action="resume">Resume</button>
+      <button id="btn-stop" data-action="stop" class="danger">Stop</button>
+    </div>
+  </header>
+  <p id="banner" class="banner" hidden></p>
+  <section id="vitals" class="vitals" aria-label="status"></section>
+
+  <main id="tab-live" class="grid">
+    <section class="panel viewer">
+      <div class="panel-h"><h2><span class="dot"></span>World</h2><span class="muted hint">drag to orbit · scroll to zoom</span></div>
+      <div class="viewer-box">
+        <iframe id="viewer" title="3D view of the world" src="about:blank"></iframe>
+        <div id="viewer-off" class="viewer-off">The world is not running.</div>
+        <button id="find-eva" class="find" type="button" title="Point the camera at Eva" hidden>⌖ Find Eva</button>
+      </div>
+    </section>
+
+    <section class="panel text" data-feed="mind">
+      <div class="panel-h">
+        <label class="pick"><span class="dot"></span>
+          <select id="feed-pick" aria-label="Which text to show">
+            <option value="mind">Mind (eva)</option>
+            <option value="body">Body (Nova)</option>
+            <option value="journal">Journal</option>
+          </select>
+        </label>
+        <span id="feed-note" class="muted"></span>
+      </div>
+      <div id="eva-list" class="feed" data-for="mind"><div class="empty">No looks yet this session.</div></div>
+      <div id="body-list" class="feed mono" data-for="body" hidden></div>
+      <div id="journal" class="feed journal-feed" data-for="journal" hidden></div>
+    </section>
+  </main>
+
+  <main id="tab-history" class="history" hidden>
+    <section class="panel">
+      <div class="panel-h"><h2>Sessions</h2></div>
+      <ul id="sessions" class="sessions"></ul>
+    </section>
+    <section class="panel">
+      <div class="panel-h"><h2 id="hist-title">Pick a session</h2></div>
+      <div id="hist-list" class="feed"></div>
+    </section>
+  </main>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>

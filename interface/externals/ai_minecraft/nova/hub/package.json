@@ -1,0 +1,13 @@
+{
+  "name": "eva-world-hub",
+  "private": true,
+  "type": "module",
+  "description": "Eva's World hub: world control, event record, monitor page, mind API",
+  "scripts": {
+    "start": "node hub.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "socket.io-client": "4.8.1"
+  }
+}

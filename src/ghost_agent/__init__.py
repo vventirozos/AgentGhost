@@ -3,8 +3,9 @@
 `_env` is imported HERE, not only from `main`, because the env hardening
 it applies (telemetry opt-outs, and HF offline under mandatory-tor) only
 works if it lands BEFORE the first heavy third-party import — and
-`ghost_agent.utils.token_counter` does `from transformers import
-AutoTokenizer` at module scope. Any entry point that reaches a ghost
+`ghost_agent.utils.token_counter` imports `transformers` (lazily since
+2026-10-26, when `load_tokenizer` runs; other modules may still import
+heavy libraries at module scope). Any entry point that reaches a ghost
 module without going through `main` (a script, a test, a subagent) used
 to load huggingface_hub with the flags unset, which freezes
 `HF_HUB_OFFLINE=False` into the library's constants; `_OFFLINE_FLAGS`

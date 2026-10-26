@@ -324,7 +324,7 @@ def main() -> int:
                     help="comma list of task_id substrings to keep (post-calibration subset)")
     ap.add_argument("--repeats", type=int, default=15)
     ap.add_argument("--base-port", type=int, default=8010)
-    ap.add_argument("--model", default=os.getenv("GHOST_MODEL", "qwen-3.6-35b-a3"))
+    ap.add_argument("--model", default=os.getenv("GHOST_MODEL", "qwen3.8-27b"))
     ap.add_argument("--timeout", type=float, default=300.0)
     ap.add_argument("--boot-timeout", type=float, default=300.0)
     ap.add_argument("--seed", type=int, default=1234)

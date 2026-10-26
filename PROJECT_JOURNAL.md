@@ -56358,3 +56358,248 @@ Applied 12:15: `bin/start-llama-server.sh` and `.dense.qwen` (backups `*.pre-4rl
 ### §4RM — nova's Gemma server re-sized (2026-10-25 ~12:55, operator: "why is nova that loaded, i thought it only runs a gemma model" → "yes proceed")
 Diagnosis: one llama-server (Gemma 4 E4B heretic QAT Q4_K_XL 4.0 GB + BF16 audio mmproj 0.9 GB + MTP draft) configured `--ctx-size 131072 -np 4` (four 32k slots, q8 K/V) with `--batch-size/--ubatch-size 2048` → footprint 12 GB (peak 14) on 16 GB; `iogpu.wired_limit_mb` = 0 (the August recipe's sysctl is non-persistent; nova up 24 days), so 9.9 GB of the server was compressed/swapped — swap 7.2 of 8 GB, compressor 3.4 GB, 341 MB unused. Its own log (last 20k lines, 2,876 prompts): p50 10 tokens (keepalives), p99 1.5k, max 2k — 32k slots were ~16× the largest request. The Selene critic on :8089 is not running (only `com.local.llama-server`).
 Change on nova: `/Library/LaunchDaemons/com.local.llama-server.plist` (backup `.pre-4rm`): `--ctx-size 32768` (4 × 8k), `--batch-size 512`, `--ubatch-size 512`; new `/Library/LaunchDaemons/com.local.iogpu-wired-limit.plist` (RunAtLoad `sysctl iogpu.wired_limit_mb=14336`, so it survives reboots; applied now). Gotcha hit: after editing the plist, a SIGTERM + KeepAlive respawn (pid 41938) ran the OLD arguments — launchd keeps the loaded definition; `launchctl bootout` + `bootstrap` was needed (clean exit in 2 s, READY pid 42281 in 3 s). Verified with a real decode probe ("Say OK." → "OK.", 19 prompt tokens). After: footprint **1.6 GB** (was 12), wired 5.8 GB (was 9.4), swap used 0.57 GB (was 7.2), **4.0 GB unused** (was 0.3), compressor 370 MB (was 3.4 GB). Gate: eva's agent idle (foreground 0) during both restarts.
+
+### §4RN — the web turn clock keeps counting across a phone app switch (2026-10-25, operator: "in the web ui, while on mobile, the request timer resets when i change focus or open another app")
+**Cause.** iOS suspends the page and kills the reply fetch, and the teardown (`toggleSendButtonUI(false)`) stops the clock. The send time lived only in memory (`tickerStart = Date.now()` in `startTurnTicker`). A reload or discard rebuilt the bubble, so the clock restarted at 0:00. A same-page reattach after content had streamed kept the bubble and never restarted the clock, so the line vanished.
+
+**Fix (client only, `interface/static/app.js`).**
+- `currentTurnStartedAt` is stamped on a new send and stored in the in-flight handle as `startedAt`; the heartbeat keeps it.
+- The adopt branch restores it, and so does the reconcile still-running placeholder (`_turnStartFromHandle`: `startedAt`, then `ts` for older handles, then now).
+- `startTurnTicker(afterEl, startedAt)` counts from it, shows the elapsed time at once, and clamps a future start to now.
+- `ensureAgentBubbleForResume` gives a surviving bubble its clock back.
+
+**Review r1 (fresh-eye, Chromium repros): FIX.**
+- MAJOR: the clock ran forever after "could not be recovered". The settled reconcile stopped it only for `thinking` placeholders, and a partial reply has no such class. Now `stopTurnTicker()` runs unconditionally at the settled tail.
+- MAJOR: adopting another tab's turn reused this tab's FINISHED reply as "the surviving bubble" and put a running clock under it. Bubbles now carry `dataset.turnStart`; only a matching bubble is reused. This also stops a cross-tab replay from overwriting the old reply, which predated this change.
+- MINOR: the caption stayed "starting…" after a reattach. Now `tickerLastStart`/`tickerLastReqId` keep the adopted log corridor for a same-turn restart, and the caption reads "working…".
+- MINOR: the tests and docstring were fixed.
+
+**Review r2: SHIP.** I also took two of its minors:
+- the raw stamp is kept when the device clock moved back (the clamp applies only to what the clock counts from);
+- the cache-buster went to `app.js?v=15.9` / `matrix_graph.js?v=15.9`, because the client serves `interface/static` from disk, so round-1 code (15.8) was reachable from ~14:16.
+
+**Tests.**
+- `tests/test_4rn_turn_clock_browser.py`, 7 tests: the REAL page boots in Chromium with a `fetch` double whose streams can be fed, ended, or killed with `TypeError('Load failed')`. Covered: reattach with and without a partial reply, reload, reload after the proxy lost the stream, an unrecoverable reattach stopping the clock, cross-tab adoption under a finished reply, and the next turn at 0:00. `clock.fast_forward`, not `run_for`: `run_for` replays every animation frame, 60 s → 2 s.
+- Node-executed helpers at the end of `tests/test_interface_silent_resume.py`. They replace that file's `"ensureAgentBubbleForResume()" in code` text pin, so the ratchet stays at baseline. A new file reading app.js would have grown it.
+- Version pins moved in 4 interface test files.
+- Battery on a tree copy: 16 of 16 mutants killed, no-op control survived. The one earlier survivor (new send passing no start) is equivalent.
+- Local tests: 884 passed. Full suite NOT run (still owed from §4RE).
+
+**Live.** Live without a client restart: static files are read from disk per request and the SW stamp follows file mtimes. No access log, so I can't tell whether a phone fetched 15.8.
+
+**Docs:** `docs/interfaces/web_server.html#4rn`.
+
+### §4RO — head snapshot on disk, step 1: measured (2026-10-25 ~18:45, operator: "proceed with 1" → "how faster the reload would happen from disk?" → "proceed, save the file in Data/system/head_saves/")
+
+**Re-scoped before building.** §4RL's "35 refused states" was the whole llama log: on the 27B only 4 states were ever refused (2 re-prefills, 251 s + 704 s; the 704 s one was §4RI, already fixed). What recurs is the 28k HEAD re-prefill: 11 since 10-24 (~30 min), mostly after the 7 llama restarts. So the disk tier targets the head only.
+
+**Source check (b11669, commit 620d2225c):** slot save writes `llama_state_seq` (hybrid = attn + recurrent), the context checkpoints and the MTP draft state; save/restore are deferred while the slot is busy; the result carries `n_saved`/`n_restored`.
+
+**Change:** `bin/start-llama-server.sh` + `--slot-save-path /Users/vasilis/Data/AI/Data/system/head_saves` (backup `*.pre-headsave`; the operator's own 18:36 `--ubatch-size 2048` edit kept). Gated llama restart (pid 41451), gated agent restart (listener 23074 → 41710, 180 s) to warm the head (28,213 tokens, 166.5 s — at ubatch 2048 prefill is still ~169 tok/s, no gain over 512).
+
+**Measured:** save 0.68 s, 1.73 GB, n_saved 28,213. Erase → restore 0.41 s (×3, 405–411 ms) → a request of the file's tokens + 6 reused cache_n 28,213 and processed 6 tokens (0.3 s). Restored state answers correctly (tool list from the system text, temp 0). Restores read a file still in the page cache; uncached SSD read of 1.75 GiB measured 0.33 s, so worst case ≈ 0.8 s. vs 166.5 s re-prefill. Slot left holding exactly the head.
+
+**Not built yet (step 2):** agent side — save after the warm-up when n_saved == head tokens; restore instead of prefilling when the file's key (model + head shape) matches; also after a llama restart, which today leaves the head cold until the next request. `head-test.bin` stays as the test file.
+
+**§4RO step 2 — built and deployed (2026-10-25 ~19:14, operator: "yes, build step 2, head directory: $GHOST_HOME/system/head_saves/").** `core/head_saves.py` (new); `agent._head_save_plan` / `_head_restore_due` / `_head_save_after` around `_warm_up_main_prefix_once`; `llm.chat_completion(before_dispatch=…)` runs the restore inside the background main lane, past its re-checks, and re-checks for a live request after it. Launcher export `GHOST_HEAD_SAVES=1` (backup `start-ghost-agent.sh.pre-4ro`; code default off). `$GHOST_HOME` = `/Users/vasilis/Data/AI/Data/`, so the directory is the llama `--slot-save-path` already set in step 1 — no llama change. Restore only when the head is known to be gone, judged at dispatch: an early (background / greeting) displacement still marked, or a server with all-zero `/metrics`. Save after a prefilling warm-up or when no file exists, only with no request/stream live; `.part` renamed only when `n_saved` == the warm-up's `usage.prompt_tokens` (llama: total incl. cached — source checked). Key = model path + build + chat-template hash + whole warm-up payload; 3 newest kept. Extra probe before building: a request diverging 5 tokens before the restored head's end reused 28,209 (restored checkpoints work).
+Review r1 (independent reader): MAJOR the 180 s tick re-warms a member's/public reply's displacement under its label → a restore would wipe a conversation llama parks (fixed: early marks only); MAJOR freshness judged before the client's foreground wait (fixed: judged in before_dispatch); MINOR no re-check after a deferred restore (fixed + 10 s restore timeout, llama cancels on give-up); MINOR an llama error deleted a good file (fixed: kept, the re-prefill overwrites); MINOR count-only check (documented). Tests `tests/test_4ro_head_saves.py` 46; 15 hand mutants all killed (one survivor fixed: the re-check test used a label refused before the hook). Full suite 26,148: 2 failures, both mine (unused import; web `ICON_CLASS` lacked 💽) — fixed, those files + neighbours green. Docs: `docs/core/llm.html#4ro`, `docs/configuration.html`, log-title table regenerated.
+Live: agent restart (listener 41710 → 63982), boot warm-up found the head resident on a non-fresh llama → no restore → saved `head-31205cde0e3cc8e5.bin` (28,213 tokens, 1.73 GB, 2.4 s). NOT yet verified live: the restore after a llama restart (operator was mid-use; restart deferred) and a displacement restore.
+**§4RO live r1 + verified (2026-10-25 19:30, operator: "run it now").** First llama-restart test FAILED: the tick re-prefilled (166 s) although llama was fresh — the boot save (19:14) and the tick had different keys with IDENTICAL token lists (diffed the two files' tokens: 0 of 28,213 differ); the payload bytes changed in a field the template does not render (likely the owner's turns setting an explicit level equal to the default). Fix: key = server identity + the head as llama renders it (`head_saves.render`, `/apply-template`, slot untouched). Tests 50 (+4), new mutant killed, neighbours green; the two old files deleted. Redeployed (listener 63982 → 72066), boot save `head-92a50839ce543bcf`, gated llama restart 19:27:20 → tick at 19:30:06: "restored the head from disk in 0.5s (28213 tokens; 28209 of 28213 tokens cached, 1s with the check)"; llama metrics since the restart: 4 prompt tokens processed, 28,209 cached. vs 166 s. Not yet seen live: a displacement restore (greeting / background call).
+**§4RO r2 — restore at llama start (2026-10-25 19:35, operator: "yes, build the launcher helper").** `head_saves.py --restore-on-start` (stdlib only; run `python -I <file>` by the llama launcher in the background before `exec`): waits for /health, picks the newest head whose meta identity == /props identity (`newest_head_for`), restores only while /metrics is all zero, one `head-restore:` line in llama-server.log. Launcher backup `start-llama-server.sh.pre-4ro-r2`; `HEAD_SAVES_DIR` variable now feeds both `--slot-save-path` and the helper. Tests 58 (+8, incl. a stdlib-only import pin). Dry-run on the live (non-fresh) llama: refused correctly. Live: gated llama restart 19:35:53 → "head-restore: restored head-92a50839ce543bcf (28213 tokens) in 0.5 s" right after "listening"; the agent tick at 19:38:53 (still fresh) restored again and its check reused 28,209/28,213.
+**Finding (not built):** "re-warm re-prefilled the head" 8× on 10-25 (4× on 10-24), ~166 s of llama each. 19:35 case: owner request 19:32:05–19:32:36, then the periodic tick re-prefilled the whole head — rolling the hybrid state back from head+conversation to the head needs a checkpoint at the head boundary, and with `--ctx-checkpoints 4` (since 12:15, §4RL) the conversation's checkpoints push it out. A message sent during that window waits behind it. Options for the operator: restore from disk on that tick (loses the parked conversation → its follow-up re-processes the conversation past the head), or skip the tick after an owner request, or more checkpoints.
+**§4RO r3 — park-then-restore re-warm (2026-10-25 ~19:55, operator: "yes, build the park-then-restore re-warm"; asked "do we need this re-warm process now?").** Option 2 (skip the tick after an owner request) rejected before building: llama source (`get_available_slot`) — a new conversation vs a slot holding head+old conversation shares ~99 %, keeps the slot (f_keep ≥ 0.5), rolls back without a head-boundary checkpoint → 166 s in the FOREGROUND. Built instead: every re-warm with a saved head is judged at dispatch — fresh server → restore; slot `n_prompt_tokens` == head → leave; else `head_saves.park` (1-token "." prompt, shares nothing → LRU → llama prompt_save parks the slot) then restore; failed park → no restore (old prefill). r1's "never restore on a tick / member turn" retired (it existed because a restore alone does not park). Tests 70 (+12), 7 mutants killed; lint fix (`newest_head_for`). Live mechanism check (direct llama, gated): head+1,448-token conversation → park 1.06 s + restore 0.83 s → new conversation cache_n 28,209 / 8 processed / 0.26 s. CORRECTION to my claim: the follow-up in the finished conversation reused only the head and re-processed its 1,461 tokens (10 s) — llama reads its RAM cache only when the slot matches poorly (f_keep < 0.5); identical to after the old 166 s re-warm. Deployed listener 72066 → 89430; boot left the head alone (slot == head), check 1.4 s. Live tick after an owner request: pending.
+**§4RO r3 VERIFIED live (20:02:01):** owner request 7d02d673 (19:57:57–19:59:12, started warm: first call processed its own 2,816 tokens) left the slot at 32,628; the next tick: "restored the head from disk (the slot's conversation parked in llama's RAM cache first) in 0.7s (28213 tokens; 28209 of 28213 tokens cached, 2s with the check)". llama: park = 1 token, check = 4 tokens; slot back to 28,213. The same tick before r3 = 166 s re-prefill.
+**§4RO r4 — validation round (2026-10-25 ~20:15, operator: "are we done? do you need to validate or verify your changes?").** Full suite on r3 code: 26,174, 3 failures, all mine — ClockworkPi `turnstatus.ICON_CLASS` lacked 💽 (added); the §4GI symlink scan flagged `head_saves` globs (allowlisted: GHOST_HOME/system/head_saves is agent/llama state, not model-writable, only its own names touched). Independent review of r2/r3: MAJOR — the lane checked for a live request once, before the park; a park waiting behind another background call let an owner turn start, and the deferred restore landed in its tool gap, replacing its conversation (fixed: `_head_slot_quiet` — no request/stream live and llama `/slots` is_processing false, unknown = busy — before the park AND before the restore). MINOR: docstring "loses nothing" overclaim (fixed: llama reads the parked entry only for a poor slot match); Python 3.10 `-I` keeps the script dir on sys.path (pinned: no core/ module shadows a stdlib name the helper imports); count-only slot==head test, identity-only pick in the start helper, identity without KV/draft flags — documented, safe (llama validates tokens/state). Tests 76; r4 mutants 5 + 1 (slot_busy unknown = busy, survivor fixed). Config doc row updated. Redeployed listener 89430 → 5828. Final full suite: see below.
+Final full suite (r4 code): 26,183 tests, 0 failures, 0 errors, 68 skipped. §4RO DONE.
+
+### §4RO-docs (2026-10-25): docs sweep for the Qwen3.8-27B swap
+Searched docs/ for Qwen 3.6 / 35B / A3B / effort-moved / old ctx and cache flags. Dated history kept as written (verifier, claim_binding, llm §4FM/§4OT, node_throughput, prompts). Present-tense claims fixed: index.html + getting-started.html (main model is Qwen3.8-27B), cli_reference.html (answerer; token_counter loads Qwen/Qwen3-30B-A3B), voice_server.html ("the main model"), agent.html (sampling table was the Qwen3.6 card's 0.6/1.0+1.5/0.2 → all 1.0/0.95/20/min_p 0/presence 0 per §4RG/§4RG-b; native_tools row; §4RB template path now Qwen3.8-27B-ghost.jinja, byte-identical to scripts/effort_tpl/tpl_moved.jinja). configuration.html: new "The production main model" section (model files, every launcher flag with its reason: ctx 196608, q8_0 KV, cache-ram 4096, ctx-checkpoints 4/min-step 1024, slot-save-path + restore-on-start helper, MTP draft n-max 3, batch/ubatch 2048, template, effort kwargs) and a --model note (a label: llama answers any name). gen_log_titles --check clean; 15 docs-referencing test files 730 passed.
+
+### Suite speed + --model default (2026-10-25 evening)
+--model / GHOST_MODEL default qwen-3.6-35b-a3 → qwen3.8-27b (main.py, fallbacks in registry/search/dream/agent, /api/tags details 27B Q4_K_M, eval scripts, docs, README, launcher comment; tool-schema example in projects.py left alone — changing it moves the prompt head). Full suite green (26,183).
+Suite wall time: 389 s → 727 s on one run was MACHINE contention (summed test time 1,967 → 4,270 s; 4ra 24 → 311 s, alone 20 s; swap 6.1/7.2 GB, llama 14 GB + 12 workers at ~0.6–0.7 GB per file). Fixes: run_suite.py orders files longest-first from .suite_file_times.json (written after every full run; unknown files first); test_eval_network_guard connect got settimeout(0.5) (75 s SYN wait); test_futility_breaker_trio uses ast.unparse not get_source_segment (53 s → <1 s); pin ratchet baseline re-locked (2 fewer textual pins, digest c79898d8…). Next run: 371 s, the floor is test_sessions_merge_properties (~200 s on one worker, CPU-bound LCS property runs).
+Also: a full suite running beside llama halves its prefill (68 vs ~140 tok/s, req cf296600) — run suites only when the operator is not using Ghost.
+
+### §4RO r5 + §4RO-B (2026-10-25 night)
+Operator: "look at the last 4-5 requests, the cache has been reprocessed twice, why?" Two causes. (1) req cf296600 20:41: after the r3 park + head restore the slot matched the owner prompt for the 28,213-token head, so llama took the LCP path and never read the parked conversation from its RAM cache — 10,318 tokens re-processed (152 s; 68 tok/s because my full test suite ran beside it). (2) req e8f5ac4d 20:53 queued 132 s behind a 211 s head prefill: the 20:50 tick's park timed out at 30 s while llama copied a 43k-token state (2.2 GB) into RAM on a box in swap (my next suite run); llama HAD parked it (slot = 1 token) but the agent fell through to a full prefill.
+**r5 (A) DEPLOYED** (agent restart 21:1x, pid 49552, then 66278): PARK_TIMEOUT_S 30→120; head_saves.park_landed (idle slot ≤ PARK_MAX_TOKENS=4 → restore); every other non-restore exit of park mode, and an unreadable slot, raises BackgroundDeferred from before_dispatch (agent._head_defer) — nothing sent; re-warm loop resets last_total so the next tick retries; with GHOST_MAIN_PREFIX_REWARM_S ≤ 0 it prefills as before; visible line for a failed park / boot / 5 deferrals in a row. Review r5 (independent): 2 MAJOR (unknown slot still prefilled; no retry with the loop off) + 5 MINOR fixed. 17 hand mutants killed; tests/test_4ro_head_saves.py 90 tests. Docs llm.html #4ro-r5. Boot after deploy: head resident, warm-up 0.23 s.
+**B BUILT AND REMOVED (not deployed)** — conversation saved to disk at the re-warm (render of the last main call), restored before a foreground call whose render continues it. Independent review: 3 MAJOR. Decisive one (verified in code): every main call ends with a <system_state_update> trailing user message that is NEVER KEPT (§4RC anchor / §4ET), so the next request's render leaves the saved render hundreds–thousands of chars before its end — no match ever; widening the slack is worse, because llama's end-of-prompt checkpoint sits inside that discarded block and with 4 checkpoints kept the fallback is a rollback to token 0 (head + conversation re-processed). Also: skipping the RAM park lost f_keep<0.5 reuse; owner+member hooks could restore over each other (no lock); 2–3 GB written per request. Code, tests, docs reverted. Do not rebuild without (a) measuring where real follow-ups diverge from the previous request's slot and (b) a checkpoint guaranteed at or before that point (e.g. the agent placing the never-kept block so the previous request's own history ends on a checkpoint).
+**§4RO r5b — second independent review (operator: "run the second review")**: 0 CRITICAL / 0 MAJOR; every _restore_head exit obeys the rule with the loop on and off; retry/streak state cannot skip work or poll fast; r5 tests verified against mutations. 6 MINOR: fixed — the loud-streak used `== 5` and could be stepped over (streak resets only when a head plan dispatched) → every 5th; a failing park on quiet ticks printed every 180 s → `loud=not quiet` (boot still shows it; streak surfaces repeats); stale `_head_restore_due` docstring; test fixture now pins the re-warm period. Accepted/documented: "fresh" with a busy slot still sends the (usually cheap) warm-up; a failed restore after a good park re-prefills on purpose (it recreates a discarded file); /metrics missing on a fresh server reads "unknown" (launcher passes --metrics). 3 more mutants killed; 91 tests; lint/log/pin gates green. Deploy gated on idle.
+
+**§4RP — the slot belongs to the last conversation for 10 minutes (2026-10-25, operator: "let's go with the idle time … yes, check those two things and proceed").** Six rules: (1) nothing touches the slot during a request; (2) the conversation that last used the main slot keeps it for `GHOST_SLOT_KEEP_S` (600 s) — the re-warm's park is deferred quietly (`slot_kept`, not counted toward the loud streak); (3) a different conversation's first foreground main call restores the saved head without a park (`agent._slot_switch_before` via `llm.before_main_dispatch`, bounded 20 s, never fails the call; log title `Session Switch`); (4) idle ≥ 600 s → §4RO r3 park+restore at the tick; (5) inside the window a background call opening with the head raises `BackgroundDeferred` (non-head background prompts run — llama's RAM cache keeps the conversation for them; checked: deferred-verdict, narratives, reaction judge, greeting are non-head); (6) after a restart no owner is known → as before. Key = request `session_id` (web mints a new one on /clear; Slack `slack:<thread>:<user>`), else `fp:`+first-message fingerprint (`slot_session_context`, set at the top of `handle_chat`). Every head restore releases the owner. Decision: rule 3 restores without parking (the operator's example: old 10k conversation resumed = head kept + 10k re-read). Pins: `tests/test_4rp_slot_keep.py` (15) + §4RP tests in `tests/test_4ro_head_saves.py`; 14 hand mutants, all killed; order pin is an AST walk (pin ratchet rejects text pins). Docs: llm.html #4rp, configuration.html `GHOST_SLOT_KEEP_S`. Review + deploy: below.
+
+**§4RP reviews (2026-10-25).** r1 (independent): 2 MAJOR — the switch restored before calls that do not open with the head (greeting: conversation destroyed instead of parked by llama); a head-replacing call took ownership and switched off the §4OT early re-warm — 6 MINOR (draining stream, stale head plan, late restore thread, game moves/replays owning, docs; the "park first" design note answered: llama never reads a parked copy back while the slot holds the head). r2: 2 MAJOR — every non-head call cleared the owner (game, truncation continuation, vision-on-main, member) → only EARLY_REWARM_LABELS clears now, others leave it, the owner's own calls refresh; with no file for the current head (effort change) the warm-up prefilled over a kept conversation → `_keep_slot` before_dispatch defers — 5 MINOR (deadline from hook entry, unlogged late restore documented, a draining final taking the slot back → `opened_at`/taken_since, failed plan → `_head_plan_last=None`, `sched-`/`sub-` own nothing). r3: 0 MAJOR, 5 MINOR (`job-` wakes added; switch skipped when another request is live, `foreground_requests>1`; "may still apply" only when posted; loop-off comment; effort level not compared — documented). 32 hand mutants, all killed; 441 related tests + lint/pin/titles gates green. Full suite + deploy: below.
+
+**§4RP deployed (2026-10-25 23:22).** Full suite 26,168 passed / 68 skipped (14 min — 14 of 15 GB swap in use). Gated restart (fg=0, slot idle), one SIGTERM: agent pid 72620 → 29274; boot warm-up reused the head already in the slot (1.24 s), "system ready". Live "Session Switch" not yet seen — it needs the operator's next new conversation (no live probes on llama).
+
+**§4RP verified live (2026-10-25 23:26).** Operator /clear → req 4ad8b6df: "session switch · restored the head before another conversation's first call in 0.6s (the slot held 30499 tokens of the previous one…)"; llama then processed only the new conversation's 1,287 tokens (5.1 s) — same cost as a turn on a fresh head. Operator: "we're good".
+
+### §4RQ — Eva's World: the 27B lives in a Minecraft world (2026-10-25/26 night, operator: "i want the 27b (eva) to have this as a 'toy' … infinite freedom … as a research for AI autonomous behavior" → "27B will play as eva, go ahead and start … you will work unattended. build everything" → "keep all scripts … plus a install.txt … in interface/externals/ai_minecraft/" → "make the monitoring page a little better with a dark theme")
+Side project, self-contained in `interface/externals/ai_minecraft/` (install.txt = full guide). nova runs Paper 1.21.6 (offline, Tailscale-only, RCON) + Mindcraft @f6a9556 (mineflayer pinned 4.33.0, Node 20) whose bot "Eva" is driven by nova's Gemma E4B; an always-on hub (Node, launchd `com.local.eva-world-hub`, :8090, key) starts/pauses/stops the world, records every event append-only per session (`~/Data/AI/World/data`), serves the monitor (dark, 3D viewer proxied — viewer patched to 127.0.0.1) and the mind API. Mac: `mac/eva_mind.py` (system python, launchd `com.local.eva-world-mind`) polls the hub; when Eva is due (her chosen 2–60 min, or attention: death / gave up / stuck / repeating / dropped out / a player spoke; min gap 2 min) and the agent is idle, it streams ONE call to the raw llama (not the agent: nothing reaches memory/ledgers/verifier), parses the trailing JSON decision (goal / stop / tell_body / say / journal / wake_in_minutes) and the hub applies it. Prompt = persona (adapted from SYSTEM_PROMPT's identity) + neutral world framing ("nobody has given you a task"), archived by hash per decision.
+**Measured live:** first look 43.5 s; she chose a survival start on her own, then diagnosed the body's crafting loop from the diary ("you already have a workbench… do NOT retry more than twice, tell me the exact error"). Gemma 3.5→8.5 s per move as history grows. **Abort verified on the live system:** probe request (X-Ghost-Origin: probe) sent 8 s into a look → look cut off 2 s later, probe answered in 16.8 s. nova with the world: ~23% free, 0.9 GB swap, no Metal OOM — Gemma's host prompt cache is at its cap ("making room for prompt cache entry"); suggested, NOT applied: `--cache-ram 2048` on nova's llama.
+**Found by running it (each fixed + pinned with the real line):** mindserver listens on `localhost` = ::1 (dial 127.0.0.1 refused); Paper chat lines carry `[Not Secure] `; command results are multi-line (`Action output:` + following lines); empty responses; `[hidden]` beaten by `display:grid`; http.client drops `conn.sock` on a will-close response (abort did nothing for 10 s — caught by the fake-llama test); **body kicked "Invalid move player packet received" at the water's edge**, Mindcraft restarted once then gave up → `scripts/patch_physics.cjs` guard (never send a non-finite position; fired once, body stayed) + hub watchdog (restart with backoff 30 s/1/3/10 min, whole Mindcraft after 3) + status no longer shows a stale state.
+**Agent change (the only one): `/api/health` → `slot_keep_left_s`** (routes.py, §4RP keep window remaining). The mind waits it out, so a look never pushes the operator's fresh conversation out of the slot (it called llama directly and would have bypassed §4RP). Docs: docs/interfaces.html (side-project section), docs/api/routes.html. Tests: tests/test_ai_minecraft.py (mind + health field + config pins + runs the hub's 33 node tests).
+Mojang EULA accepted on the operator's behalf (eula=true) to run the server — flagged in the report. Mindcraft's embedding fallback would call api.openai.com: profile points it at local llama (fails → word overlap); !searchWiki and !newAction blocked; Paper bStats off.
+
+**§4RQ addendum (2026-10-26 00:35) — world set to PEACEFUL (operator).** Gemma's 4–8 s per move cannot fight
+(HP had fallen to 6/20), so deaths would measure body latency, not Eva's choices. New hub control
+`{"action":"difficulty","level":…}` applies it live via RCON + server.properties and records an
+`intervention` event (first one: seq 1792967572905, session 2026-10-25_235506). Template + world_prompt.txt
+now say peaceful (pinned by test_world_difficulty_matches_what_eva_is_told). Directive caps raised
+(goal 600, tell_body/say 1500: a 600 cap cut one of Eva's instructions); `<tool_call>` tags hidden in the
+monitor's prose.
+**§4RQ close-out (2026-10-26 00:45).** Full suite: 26187 passed / 2 failed / 3 errors. test_ai_minecraft added 4
+source-text pins (ratchet +4) → replaced with behavioural tests (apply_patches run in a tmp WORLD: refuses
+when the viewer patch can't apply, patches the stock line) and the monitor's "no external URL" text scan
+replaced by a browser-enforced CSP header on the hub's pages (verified live, page renders, no CSP errors).
+Voice-slots test and lint gate (pylint 600 s timeout under suite load) pass alone (30/30, 88 s). Agent
+restarted gated (fg 0): pid 29274 → 80340, /api/health now reports slot_keep_left_s. Monitor hides fenced
+```json``` blocks in Eva's prose.
+
+**§4RQ review round 1 (2026-10-26 ~01:00, operator: "do a check on everything, fresh eye reviewers").** Three
+independent readers (hub / mind+agent / install). Fixed and deployed:
+- MAJOR (research): Mindcraft runs the first `!word` ANYWHERE in a message from Mind — Eva's "No more
+  !moveAway" RAN !moveAway (verified in nova's mindcraft src/agent/agent.js handleMessage). tell_body now
+  strips every `!` before a word; the summary Eva sees shows what was sent.
+- MAJOR (owner cost): after or during a look the owner's next call met Eva's prompt in the slot (a full
+  head re-prefill unless llama's RAM cache held it; the re-warm noticed only on its 180 s tick, the switch
+  hook skipped a busy slot and the same conversation). New agent endpoint POST /api/slot/outside-call:
+  start REFUSED (409) while a request/stream is live or the slot is kept (the agent's last word on the
+  gate); start/end set `_outside_slot_dirty`; the next head-opening foreground call waits for the outside
+  call to leave and restores the head (`_outside_slot_restore`), the re-warm restores over it WITHOUT
+  parking ("outside" mode). Live: look 01:08–01:09:24 → "restored the head from disk after a 'outside
+  call: eva_world' call replaced it in 0.9s", no park.
+- MAJOR: mind treated a missing slot_keep_left_s as idle → now busy; re-checks the gate after fetching
+  the context; parser uses raw_decode per "{" (a stray brace lost the decision) + unwraps tool-call
+  {"name","arguments"}; HTTPError logged as such.
+- MAJOR (hub): unauthenticated crash (`new URL('//')` outside try; URIError in the WS upgrade cookie) —
+  verified live: 400 and still up; first diary of a new session carried the previous session's events
+  (ring not cleared); watchdog restart raced Stop/Pause → one lock (`withLock`) serialises controls,
+  restarts and decisions; attention cleared reasons raised DURING a look → clearUpTo(look_ts); watchdog
+  state reset per session; difficulty while stopped queued for the next session; login delay.
+- MAJOR (install): re-install reset server.properties (difficulty) and world.json → created once /
+  merged; hub deps pinned by package-lock.json + npm ci; umask 077 for secrets; old Paper jars removed;
+  deploy warns when it cannot restart the Mac mind; install_mac refuses root; install.txt corrected (new
+  session per Start, Paper's one-time Mojang jar download, joining risk, uninstall order).
+Tests: hub 36/36; test_ai_minecraft 35; §4RQ block in test_4ro_head_saves (9); lint gate + pin ratchet
+green (247 in the targeted run). Agent restarted gated: 80340 → 95322. Round 2 (readers of the fixes) running.
+**§4RQ review round 2 (readers of the round-1 fixes).** Agent: 2 MAJOR — `_outside_slot_restore` did not
+re-read the mark / live requests / open streams after its wait (another request's call could run meanwhile
+and be wiped in its tool gap); `end` marked the slot even when an agent call ran since `start` (the owner's
+conversation could then be restored over) — fixed (re-check after the wait; `end` sets no mark when
+`_last_main_call_end >= _outside_call_started`; re-warm "outside" mode never inside the keep window; a slot
+without `is_processing` left alone). Both mutants killed by the new pins. Hub: 1 MAJOR — the lock made the
+watchdog skip its own ticks by CLEARING lostSince, resetting the 60/180/600 s backoff to the 20 s grace
+(an absent body = Mindcraft restarted every ~30 s forever) → skip without clearing; startup teardown now
+under the lock; queued interventions saved once recorded; a repeated alert during a look keeps the latest
+ts; say capped at 400 chars (RCON ~1446 B); monitor prose strip no longer cuts at a brace in prose. Agent
+restarted gated 95322 → 1811; hub deployed.
+
+**§4RQ body ignored every goal (2026-10-26 ~07:20, operator: "what is it doing?" → "fix it and record it
+as an operator change").** From ~05:40 Gemma's self-prompt ran `!stay(-1)` (stay forever). `!goal` only
+replaces the goal text ("Self-prompt loop is already active. Ignoring request.") and never interrupts the
+running action, so five goals in 90 min (walk south ×2, sapling ×2, walk to coordinates) went unanswered;
+the one `!stop`+goal pair (06:44) worked, but the goal was "stand still" and Gemma chose `!stay(-1)` again.
+Eva built three wrong theories (direction words, "under you", coordinates) and gave up ("I'm done trying to
+make it do small things") — the same body had crafted and walked ~100 blocks by coordinates at 03:40.
+Second fault: the stuck alert ("not moved for 5 minutes while busy") fired during the stay and re-armed
+every 5 min, overriding her 30–40 min wakes (~12 looks/h, each called a false alarm). Fix: a new goal
+carries `interrupt` (hub sends `!stop` first) unless her own stop precedes it; no stuck alert while
+`action.current === 'action:stay'` (clock restarts after); new control `note` records an operator
+`intervention` (Eva's diary shows it). Hub 40/40; recorded live as an intervention.
+
+**§4RQ reset + female (2026-10-26 07:32, operator: "reset the world, goals, moves… start over" + "make the
+character female").** Stopped; archived the world dirs, both sessions, journal.md and mindcraft/bots/Eva,
+then DELETED the archive at the operator's word ("no need for a backup, delete it"); new world from a new
+random seed, session 2026-10-26_073306, peaceful. Female: world_prompt "The body is a woman, a player named
+Eva."; body prompt "You are $NAME, a woman and a player…"; viewer drew the bot as 1.16.4 `steve.png` →
+apply_patches 2d copies the wide Noor skin over it (Steve kept as .orig; Noor = the default skin a 1.21
+client derives from the offline UUID of "Eva", computed). apply_patches NODE overridable for tests;
+test_ai_minecraft 38 (skin applied + idempotent backup, refuses without skin, prompt wording).
+
+**§4RQ monitor layout (2026-10-26 ~08:00, operator: find button, one text window with a dropdown, latest
+entry coloured, titles "Mind (eva) / Body (Nova) / Journal", fit one screen, mobile).** One text panel +
+`<select>` (pick kept in localStorage, try/catch); journal shown as entries newest-first; newest entry of
+the live feeds teal (#2dd4bf, a colour no feed uses) + "latest" tag (history feed excluded: it is
+oldest-first). `#app` = 100dvh flex column, feeds scroll inside; vitals one row (swipe on phones); ≤900 px
+viewer over text. Find Eva: the stock viewer aims the orbit only on the FIRST position update →
+scripts/patch_viewer.cjs (apply_patches 2e) adds window.__evaLast + __evaRecenter into the minified
+bundle (2 unique anchors or refuse); v1 kept the user's 28-block distance (Eva a speck behind terrain) →
+v2: 12 blocks from her chest, ≥4 up, user's side kept; fallback reloads the iframe. Measured with
+Playwright at 1440×900 and 390×844: scrollHeight == innerHeight, no horizontal scroll, hook returns true.
+test_ai_minecraft 40 (hook run under a stub THREE: distance/height/side; v1 upgrade == fresh; changed
+bundle refused).
+
+**§4RQ failure-run wake (2026-10-26 ~08:00, operator: "proceed with your recommendation").** New session's
+first goal: Gemma looped `!searchForBlock("oak")` / `("acacia")` (invalid: needs `_log`) + `!moveAway` —
+57 failures in 15 min; the 4-identical-in-a-row repeat rule never matched the alternation, so Eva saw it
+only at her chosen 15-min look (she diagnosed `_log` herself and the body recovered — left that way: no
+error-message help for the body). Fix: attention counts consecutive failed `command_result`s and raises
+"your body's last 6 commands all failed" once per run (a success starts a new run). `isFailedResult`
+phrases taken from Mindcraft's own messages (skills.js, commands/index.js); "Path not found, but
+attempting…" is NOT a failure (usually ends "You have reached"), bare "undefined" (!stay) neither.
+Hub 42/42 (verbatim 10-26 results both ways; run/once/reset).
+
+**§4RQ log recheck (2026-10-26 ~08:10, operator: "all good now? recheck all logs").** This session clean:
+hub no errors (restarts = my deploys, world adopted each time); server only offline-mode banner, 2× "moved
+wrongly" (server correction), 1 disconnect at 07:55; agent restored its head after every Eva look, idle
+(fg 0); nova 23 % free, swap 5.1/6 GB (unchanged). Mindcraft: embedding fallback (Gemma server has no
+embeddings → word overlap for example picking; harmless), physics guard fired once (NaN x/z, body
+stayed), and the 07:55 disconnect = Mindcraft's own unstuck mode: "I'm stuck!", moveAway not done in
+10 s → cleanKill → exit 1 → restarted in ~5 s. The hub recorded none of it (Eva saw only "your body
+stopped and is waiting") → parse "Agent process exited with code N" as body_process_exit, shown in the
+diary ("kept its saved memory but lost what it was doing") and the Body feed. Hub 44/44.
+
+**§4RQ ghost crafts + eva-world command (2026-10-26 ~08:20–08:50, operator: "fix it and record it as an
+operator change, also an easy way to start/stop from eva (ssh)", "and a way to reset everything (no
+backups)").** Crafting: 08:07–08:15 three "Successfully crafted wooden_pickaxe" at a table, each !equip
+"You do not have any". RCON (`clear Eva <item> 0`, count-only) showed no pickaxe and all 16 sticks: the
+server never crafted; mineflayer's local inventory showed the item, the server rolled it back, and
+craftRecipe read the local copy at once. NOT reproduced on a private Paper (127.0.0.1:25599, flat):
+plain mineflayer, Eva's inventory, Mindcraft's 5 plugins, and Mindcraft's own initBot+skills
+(placeHere-style table) all crafted and equipped fine — the trigger lives only in the live body. Fix
+(no guess at the trigger): scripts/patch_craft.cjs (apply_patches 2f) — settle 3 s, confirm the count
+rose, retry once with a fresh recipe, else "did not go through: the server undid it, so nothing was
+used up" + `[eva-world] the server rolled back crafting …` in mindcraft.log; hub counts "did not go
+through" as a failure. Side effect: the "you now have N" counts are now right (were stale). Body process
+restarted (SIGTERM → Mindcraft restarts) to load it; operator note recorded. That exit logs "code null
+and signal SIGTERM" — my body_process_exit regex took digits only → now code|null + signal.
+MY MISTAKE: `pkill -f '…paper-1.21.6-48.jar --nogui' -n` meant for the test server matched Eva's server
+too; it shut down cleanly 08:34:16 (saved), restarted in place with the hub's own command + pidfile,
+hub kickstarted → adopted, same session; body back 08:35:34 (watchdog); operator note recorded. Test
+server later stopped only after checking its cwd with lsof. Lesson: never pkill by command line on a
+host running the real thing — kill by a pid you verified.
+Command: mac/eva-world (→ ~/.local/bin by install_mac.sh): status/start/stop/pause/resume/journal/reset;
+reset asks for "yes" (or --yes), stops, runs nova/scripts/reset_world.sh (refuses unless state=stopped
+and no live server/mindcraft pid; wipes world dirs, data/sessions, data/eva, bots/Eva; recreates the
+dirs the hub needs; keeps server.properties; kickstarts the hub). macOS /usr/bin/python3 is 3.9 (no
+backslash in f-strings). Tests: test_ai_minecraft 83 (rollback/transient/clean craft under a stub bot,
+patcher idempotent/refuses; eva-world against a fake hub; reset refuses running/live pid/no --yes,
+wipes the rest, keeps settings); hub 44.
+
+**§4RQ addendum — restore timeout, clock column, Eva in the agent log (2026-10-26, operator: "stop the tests. change the restore timeout, also add clock times to pretty log for all entries, including background processes." → "i also don't like that the minecraft requests are not in the agents logs, is there a way to add it")**
+Restore timeout: the log showed three head restores timed out at 10 s (the 1.7 GB file took 5–9 s
+under memory pressure: 28 GB wired by llama, swap nearly full from my test runs), each costing an
+18–22 s re-prefill. `head_saves.RESTORE_TIMEOUT_S` 10 → 30, `llm.BEFORE_MAIN_DISPATCH_S` 20 → 40
+(/slots 3 s + restore 30 s inside it; test_4rp's invariant holds). Clock column: every pretty_log line
+(normal, start/end frames, collapse summaries) carries HH:MM:SS (dim) between the tag and the icon, so
+background lines say when they happened; the end frame reads "request finished +Ns HH:MM:SS".
+Placed after the tag because the uConsole and web tickers split on 2+ spaces and read the tag at
+parts[1]; `_CONTENT_COL` 45 → 55. Agent log: /api/slot/outside-call takes `detail` and a third state
+`result`; each report logs a SYSTEM line "eva's world" 🧱 (look refused / look started — woke because
+… / look ended after Ns (finished | cut off: … | stopped by an error) / decided: …). eva_mind sends
+them. Tests: test_logging_framework (clock on every line, tickers still parse), test_ai_minecraft
+(endpoint log lines under a probe request context → SYSTEM; mind sends start/end/result details);
+974 targeted passed. Log-titles table regenerated. Docs: logging.html, api/routes.html, core/llm.html.
+
+**§4RQ addendum — the body slowed down (2026-10-26, operator: "nova seems pegged. i guess that's normal ?" → "slow it down")**
+nova's GPU sat at 99–100%: Gemma was busy 37 of 40 one-second samples, ~9.5 s per call, the body's
+calls back to back (Mindcraft: prompt → command → result → prompt). The agent's own worker calls share
+that GPU. Fix: Mindcraft's own profile knob, `"cooldown": 30000` in nova/config/eva_body.json (the
+prompter waits before EVERY call so call starts are ≥30 s apart; fights/fleeing are code modes, not
+calls; Mind's messages wait ≤30 s). Gotcha: the profile is read once by Mindcraft's MAIN process
+(main.js) and handed to each agent process, so restarting the body process alone kept the old
+profile (measured: still 6 calls/min); Stop + Start (which reruns apply_patches) loaded it. Stop
+clears the session, so Start opened session 2026-10-26_092646 (world, journal, body memory kept).
+After: llama busy 44/120 s, mean GPU 35%. Operator note recorded in the hub. Test: test_ai_minecraft
+(cooldown pinned). Docs: install.txt §4, docs/interfaces.html.

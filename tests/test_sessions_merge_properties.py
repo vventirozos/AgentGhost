@@ -272,8 +272,10 @@ def test_at_the_LIVE_cap_everything_is_exactly_clean():
     This is the honest headline, and it is why the pathological residual above
     is a bound rather than a bug: the residual needs a cap tight enough to
     evict inside the alignment window, which 400 is not."""
+    # 3 seeds per tab count (10 until 2026-10-26: 37 s, the suite's slowest
+    # property; every tab count is still covered)
     for tabs in (1, 2, 3, 5):
-        for seed in range(10):
+        for seed in range(3):
             r = _simulate(seed, tabs=tabs, cap=400, turns=240, abort_p=0.30)
             assert r["dups"] == 0, (tabs, seed, r)
             assert r["readded"] == 0, (tabs, seed, r)

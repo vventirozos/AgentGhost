@@ -88,7 +88,7 @@ REQ_BODY=$(python3 -c '
 import json, sys
 prompt = sys.argv[1]
 body = {
-    "model": "qwen-3.6-35b-a3",
+    "model": "qwen3.8-27b",
     "messages": [{"role": "user", "content": prompt}],
     "stream": False,
 }

@@ -146,7 +146,7 @@ def main() -> int:
     ap.add_argument("--base-port", type=int, default=8044)
     ap.add_argument("--delay", type=float, default=25.0,
                     help="seconds after the correction before probing (reflect_one is async)")
-    ap.add_argument("--model", default=os.getenv("GHOST_MODEL", "qwen-3.6-35b-a3"))
+    ap.add_argument("--model", default=os.getenv("GHOST_MODEL", "qwen3.8-27b"))
     ap.add_argument("--timeout", type=float, default=300.0)
     ap.add_argument("--boot-timeout", type=float, default=300.0)
     ap.add_argument("--seed", type=int, default=20260628)

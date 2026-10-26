@@ -1,0 +1,310 @@
+EVA'S WORLD — install and use
+=============================
+
+The 27B ("Eva", the agent's model on the Mac) lives in a Minecraft world as a
+research toy for autonomous behaviour. Nobody gives her tasks. She wakes up
+every few minutes, reads what happened, and decides what to do through a body
+that a small model (Gemma E4B on nova) drives move by move.
+
+Everything this needs lives in this directory. Eva's mind calls the raw
+llama-server directly, so world activity never reaches the agent's memory,
+ledgers, verifier or failure census. The one change in the agent itself is
+POST /api/slot/outside-call (§4RQ): Eva asks it before each look (refused
+while you are active or your conversation is kept) and tells it when she is
+done, so the agent restores its saved head instead of re-reading it.
+Each look also shows in the agent's own log as a background line, titled
+"eva's world" (🧱): why she woke, how long the look took and what she did.
+
+
+1. HOW IT FITS TOGETHER
+-----------------------
+
+  Mac (eva)                                   nova (16 GB, Tailscale 100.83.184.117)
+  ---------                                   ---------------------------------------
+  llama-server :8088  (the 27B, 1 slot)       llama-server :8088 (Gemma E4B, 4 slots)
+        ^                                            ^
+        |  rare: one "look" every 2–60 min           |  every move (~3–9 s each)
+        |                                            |
+  eva_mind.py  (launchd: com.local.eva-world-mind)   Mindcraft bot "Eva" (node, mineflayer)
+        |                                            |        |
+        |  HTTP + key                                |        v
+        +-----------> hub :8090  <-------------------+   Paper 1.21.6 server :25565
+                      (launchd: com.local.eva-world-hub)   (offline mode, RCON :25575)
+                      - starts/pauses/stops the world
+                      - records every event (append-only, per session)
+                      - serves the monitor page + proxies the 3D viewer
+                      - API Eva's mind uses (poll / context / decision)
+
+  One look:
+    1. eva_mind polls the hub every 20 s. The hub says "due" when the time Eva
+       chose has come, or earlier when something needs her: the body died,
+       gave up, got stuck, repeats itself, had 6 commands in a row fail
+       (once per run of failures), dropped out, or a player spoke.
+    2. eva_mind checks the agent is idle (/api/health foreground_requests == 0,
+       no kept conversation, the llama slot free), then asks the agent's
+       /api/slot/outside-call "start". Busy or refused: it waits 60 s.
+    3. It fetches the diary (what happened since her last look + her journal),
+       asks the 27B (thinking on, server default effort), streams the answer.
+       If you send the agent a request meanwhile, the call is cut off at once
+       (llama cancels it) and retried later. Measured: cut off 2 s after a
+       request arrived; that request answered normally.
+    4. Her decision (a JSON object at the end of her reply) goes back to the
+       hub, which applies it: goal / stop / message to the body / something
+       said aloud in world chat / a journal entry / when to look again.
+
+  Her freedom: anything a player can do through Mindcraft's commands, chosen
+  by her alone. Limits: no code execution (!newAction off), no outbound fetch
+  (!searchWiki off), no network beyond the box, no agent tools, and the world
+  only runs when you start it.
+
+
+2. INSTALL (first time)
+-----------------------
+
+Prerequisites
+  - nova: macOS, Homebrew, Gemma llama-server on :8088 (already there),
+    passwordless ssh from the Mac and passwordless sudo on nova.
+  - Mac: the agent running, ~/Data/AI/.ghost_api_key present.
+  - Read Mojang's EULA: https://aka.ms/MinecraftEULA (the server needs it).
+
+From the Mac, in this directory:
+
+    ACCEPT_MINECRAFT_EULA=yes ./deploy.sh --install
+
+What it does (all re-runnable):
+  on nova  (nova/scripts/install_nova.sh)
+    - brew: openjdk@21, node@20 (Mindcraft breaks on Node 24+), git
+    - Mindcraft cloned to ~/Data/AI/World/mindcraft at pinned commit f6a9556,
+      mineflayer pinned to 4.33.0 (Mindcraft's patches need exactly that)
+    - Paper 1.21.6 build 48, checked by SHA-256 (on its first start Paper
+      itself downloads the vanilla server jar from Mojang once, into
+      server/cache/: no account, no login — the only outbound fetch at runtime)
+    - server.properties from config/server.properties.template, created once
+      (offline mode, Tailscale address only, peaceful, RCON with a random
+      password); a re-run refreshes only the bind address and RCON password,
+      so a difficulty you set from the monitor stays
+    - hub key ~/Data/AI/World/.hub_key (random, chmod 600)
+    - apply_patches.sh (see section 6), hub deps from package-lock.json (npm ci)
+    - launchd service com.local.eva-world-hub (always on, does NOT start
+      the world by itself)
+  on the Mac
+    - deploy.sh copies the hub key to ~/Data/AI/.world_hub_key
+    - mac/install_mac.sh (run as yourself, not with sudo): launchd service com.local.eva-world-mind (always on; calls the 27B
+      only while the world runs and the agent is idle)
+
+Layout on nova after install:
+    ~/Data/AI/World/app/        this directory's nova/ (deployed copy)
+    ~/Data/AI/World/mindcraft/  Mindcraft
+    ~/Data/AI/World/server/     Paper + the world "evaworld"
+    ~/Data/AI/World/data/       the research record (see section 5)
+    ~/Data/AI/World/run/        logs, pidfiles, hub state
+
+
+3. USE
+------
+
+Monitor (from any device on the tailnet):
+
+    http://100.83.184.117:8090/
+
+  Key: the contents of ~/Data/AI/.world_hub_key (Mac) or
+  ~/Data/AI/World/.hub_key (nova). The browser remembers it for 30 days.
+
+  Buttons
+    Start   probes Gemma, starts the server, starts the bot, waits for it to
+            join (~30–60 s). Eva takes her first look right after.
+    Pause   freezes game time (/tick freeze) and stops the bot; Eva does not
+            look while paused.
+    Resume  the reverse.
+    Stop    saves and stops everything. The world, the body's memory and
+            Eva's journal stay. The next Start opens a NEW session in the
+            record (sessions/<date_time>/) in the same world; Eva's first
+            look of a session sees only that session's events (plus her
+            journal).
+
+  Layout (fits one screen, desktop or phone; only the text scrolls)
+    World    3D view (drag to orbit, scroll/pinch to zoom). "Find Eva" puts
+             the camera 12 blocks from her, from above, keeping your angle.
+    One text panel; the dropdown picks:
+      Mind (eva)   each look: why she woke, what she said, what she did;
+                   fold-outs with her full reasoning and the diary she saw
+      Body (Nova)  every command the small model issued and its result
+      Journal      her own notebook, one entry per look
+             Newest on top; the newest entry is teal (with a "latest" tag).
+             The page remembers your pick.
+    History  every past session, replayable
+
+  The page has no talk-to-Eva box on purpose: every human nudge would
+  contaminate the record. If you add one later, record it as an
+  "intervention" event (the diary already knows how to show that kind).
+
+From the Mac (eva), e.g. over ssh — the eva-world command:
+
+    eva-world status            world phase, where Eva is, what she does, next look
+    eva-world start | stop | pause | resume
+    eva-world journal           her journal
+    eva-world reset             stop + delete EVERYTHING: world, sessions, journal,
+                                prompts, body memory. No backup. Asks you to type
+                                "yes" (or: reset --yes). The next start makes a
+                                new world from a new seed; settings stay.
+
+  It lives in mac/eva-world, linked to ~/.local/bin/eva-world by install_mac.sh.
+  A one-off `ssh eva '…'` may not have ~/.local/bin on PATH:
+      ssh eva '~/.local/bin/eva-world status'
+
+Without the page (curl):
+
+    K=$(cat ~/Data/AI/.world_hub_key); H=http://100.83.184.117:8090
+    curl -s -H "x-world-key: $K" -X POST -H 'content-type: application/json' \
+         -d '{"action":"start"}' $H/api/control          # start|pause|resume|stop
+    curl -s -X POST -H "X-World-Key: $K" -H 'content-type: application/json' \
+         -d '{"action":"difficulty","level":"peaceful"}' $H/api/control
+                                       # peaceful|easy|normal|hard; live + kept in
+                                       # server.properties; recorded as an operator change.
+                                       # Default is peaceful: Gemma's 4-8 s per move is too
+                                       # slow to fight. Update mac/world_prompt.txt to match.
+    curl -s -X POST -H "X-World-Key: $K" -H 'content-type: application/json' \
+         -d '{"action":"note","text":"fixed ..."}' $H/api/control
+                                       # record an operator change to the harness;
+                                       # Eva's diary shows "the operator intervened: ..."
+    curl -s -H "x-world-key: $K" $H/api/status | python3 -m json.tool
+    curl -s -H "x-world-key: $K" $H/api/journal
+
+Joining the world yourself (optional): a Minecraft Java 1.21.6 client, any
+name, server 100.83.184.117. Offline mode means no account check, which is why
+the server listens on the Tailscale address only. Note that joining and
+speaking wakes Eva ("<you> spoke in the world"): that is an intervention.
+Anyone on the tailnet can join the same way, under any name — joining as
+"Eva" kicks the body out (duplicate login). There is no whitelist because
+the tailnet is the boundary; add one (whitelist on + whitelist add Eva) if
+other people share it.
+
+
+4. COST TO THE AGENT
+--------------------
+
+  - Eva's looks use the 27B's only slot for ~40–65 s each (measured: prefill
+    of her ~3–4k-token prompt plus thinking), only while the agent is idle,
+    and are cut off the moment you send a request.
+  - The agent's 28k head is parked/restored from disk after her call
+    (GHOST_HEAD_SAVES=1, ~0.4 s), so no 166 s re-warm.
+  - nova: Gemma does every move; the agent's own checking work on nova shares
+    its 4 slots. Memory with the world running: see section 7.
+    Without a pause the body kept nova's GPU at 100% (10-26: Gemma busy 37 of
+    40 s, ~9.5 s per call back to back), slowing that checking work. So the
+    body's profile sets "cooldown": 30000 (eva_body.json): its calls to Gemma
+    START at least 30 s apart (Mindcraft waits before every call: moves, chat,
+    memory). Fights and fleeing are code, not calls, so they stay instant;
+    Mind's messages wait at most 30 s. Lower it to speed her up.
+
+
+5. THE RESEARCH RECORD
+----------------------
+
+  ~/Data/AI/World/data/sessions/<id>/events.jsonl   one JSON event per line,
+      append-only. Kinds: eva_decision (diary, reasoning, reply, parsed
+      decision, applied actions, timings, prompt hash), directive,
+      body_response, command_result, bot_output, chat, join, leave, death,
+      goal_dropped, body_lost/body_restart/body_back, body_process_exit (Mindcraft
+      restarted the body itself: an exit code, e.g. its unstuck mode, or a signal), snapshot (every 30 s:
+      position, health, hunger, inventory), control, paused/resumed, error,
+      mind_status (skipped/interrupted looks).
+  ~/Data/AI/World/data/eva/journal.md               her journal
+  ~/Data/AI/World/data/eva/prompts/<hash>.txt       every system prompt she
+      was given, by hash (each eva_decision names its hash), so a change in
+      behaviour can be traced to a change in wording.
+  ~/Data/AI/World/mindcraft/bots/Eva/memory.json    the body's own memory
+
+
+6. CHANGING THINGS
+------------------
+
+Edit files HERE, then ./deploy.sh (copies, reinstalls hub deps, restarts the
+hub — a running world is adopted, not stopped — and restarts Eva's mind;
+that last step needs passwordless sudo on the Mac, otherwise deploy.sh prints
+the command to run).
+
+  mac/persona.txt          who Eva is (adapted from the agent's identity text)
+  mac/world_prompt.txt     the world framing + decision format. Keep it
+                           neutral: it IS the experimental condition.
+  nova/config/eva_body.json        the body's model + its prompt
+  nova/config/mindcraft_settings.js Mindcraft settings (copied in on start)
+  nova/config/server.properties.template  server settings (install only)
+  nova/hub/                hub + monitor page
+
+  apply_patches.sh runs before every world start and fails loudly if a patch
+  stopped applying:
+    - our settings/profile/keys copied over Mindcraft's
+    - the 3D viewer listens on 127.0.0.1 only and serves under /viewer
+      (reachable only through the hub, behind the key)
+    - mineflayer physics guard (scripts/patch_physics.cjs): never send a
+      non-finite position. The first session's body was kicked twice for
+      "Invalid move player packet received" at the water's edge; with the
+      guard it fired once and the body stayed.
+    - Paper bStats metrics off
+    - the 3D viewer gets a re-centre hook for "Find Eva"
+      (scripts/patch_viewer.cjs, into the viewer's minified bundle)
+    - Mindcraft's craftRecipe reports a craft only once the server has
+      confirmed it (scripts/patch_craft.cjs): it waits 3 s, checks the item
+      really arrived, retries once, and otherwise says "did not go through".
+      10-26: three wooden pickaxes "crafted" at a table that the server never
+      made. Each rollback logs "[eva-world] the server rolled back crafting …"
+      in run/mindcraft.log.
+    - the 3D viewer draws the body with the Noor skin (wide-arm copy) instead
+      of Steve: Noor is what a real 1.21 client already shows for an offline
+      player named "Eva" (the default skin follows the name's UUID)
+
+  Environment overrides for eva_mind.py (set in the launchd plist):
+    EVA_WORLD_HUB, EVA_WORLD_LLAMA, EVA_WORLD_AGENT, EVA_WORLD_POLL_S,
+    EVA_WORLD_MAX_TOKENS (default 6000, reasoning + reply)
+
+Tests
+    node --test nova/hub/test/*.test.js     (hub, 40 tests)
+    pytest tests/test_ai_minecraft.py       (from the agent root: Eva's mind,
+                                             config pins, and the hub tests)
+
+
+7. TROUBLESHOOTING
+------------------
+
+Logs
+    Mac:  ~/Data/AI/Logs/eva_world_mind.log
+    nova: ~/Data/AI/World/run/{hub,server,mindcraft}.log
+
+  "timed out waiting for the body to join" — read run/mindcraft.log. The
+      hub stops everything cleanly after a failed start; fix and press Start.
+  Body keeps dropping out — the hub restarts it (30 s, 1, 3, 10 min backoff;
+      the whole Mindcraft process after 3 tries) and records each attempt.
+      grep "lost connection" run/server.log for the server's reason.
+  Body ignores every new goal — a running action blocks Mindcraft's goal
+      loop (10-26: Gemma ran !stay(-1), "stay forever", and five goals went
+      unanswered). Fixed: the hub sends !stop before each new goal. If it
+      comes back, read run/mindcraft.log for "Self-prompt loop is already
+      active" with no command after it.
+  Eva never looks — monitor's "Eva's mind" tile: "offline" = the Mac service
+      is not polling (sudo launchctl kickstart -k system/com.local.eva-world-mind);
+      "skipped: agent busy" = the agent is working, she waits.
+  Her look ends "no decision JSON found" — recorded as is; she looks again
+      in 10 min. If it says it hit the token limit, raise EVA_WORLD_MAX_TOKENS.
+  nova memory — Gemma's llama-server keeps a host-RAM prompt cache that
+      Mindcraft fills (many distinct prompts); it plateaus at its cap
+      ("making room for prompt cache entry" in the llama log). Measured with
+      the world running: ~23% free, 0.9 GB swap, no Metal OOM. To free ~3 GB,
+      add `--cache-ram 2048` to nova's com.local.llama-server.plist.
+
+Start over (new world, empty journal, no body memory)
+    eva-world reset (Mac). It stops the world, then nova/scripts/reset_world.sh
+    deletes server/evaworld{,_nether,_the_end}, data/sessions/, data/eva/ and
+    mindcraft/bots/Eva/ — no backup — and restarts the hub. It refuses while
+    the world or any of its processes still runs. Done by hand once on
+    2026-10-26 07:32.
+
+Uninstall
+    nova: press Stop first (the server and the body run detached and would
+          keep running), then
+          sudo launchctl bootout system/com.local.eva-world-hub
+          sudo rm /Library/LaunchDaemons/com.local.eva-world-hub.plist
+          rm -rf ~/Data/AI/World           (deletes the world AND the record)
+    Mac:  sudo launchctl bootout system/com.local.eva-world-mind
+          sudo rm /Library/LaunchDaemons/com.local.eva-world-mind.plist
+          rm ~/Data/AI/.world_hub_key ~/.local/bin/eva-world

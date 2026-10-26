@@ -177,7 +177,7 @@ def main() -> int:
         # the agent's default. Memory per --memory (default off, see help).
         boot_flags += ([] if args.memory else ["--no-memory"])   # the agent has memory ON unless --no-memory
         args.ghost_url = f"http://127.0.0.1:{args.boot_port}"
-        args.ghost_model = args.ghost_model if args.ghost_model != "default" else "qwen-3.6-35b-a3"
+        args.ghost_model = args.ghost_model if args.ghost_model != "default" else "qwen3.8-27b"
         print(f"[gaia] booting isolated agent on :{args.boot_port} "
               f"(GHOST_HOME={ghost_home}, memory={'on' if args.memory else 'off'})")
         # Port-free preflight: if a stale agent already listens on the boot

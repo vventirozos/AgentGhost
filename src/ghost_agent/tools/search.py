@@ -2899,7 +2899,7 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
 _FACTCHECK_VERIFY_S = float(os.getenv("GHOST_FACTCHECK_VERIFY_S", "150") or 150)
 
 
-async def tool_fact_check(query: Optional[str] = None, statement: Optional[str] = None, llm_client=None, tool_definitions=None, deep_research_callable: Optional[Callable] = None, model_name: str = "qwen-3.6-35b-a3", max_context: int = 8192, **kwargs: Any):
+async def tool_fact_check(query: Optional[str] = None, statement: Optional[str] = None, llm_client=None, tool_definitions=None, deep_research_callable: Optional[Callable] = None, model_name: str = "qwen3.8-27b", max_context: int = 8192, **kwargs: Any):
     """Verify a claim: run deep_research on it, then have the model judge the
     claim strictly against that evidence.
 

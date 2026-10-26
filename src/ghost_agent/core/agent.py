@@ -42,6 +42,7 @@ from ..utils.logging import (Icons, ORIGIN_PROBE, pretty_log, request_id_context
                              requester_member_context, requester_member_id, parse_requester_member)
 from ..utils import logging as _glog
 from . import effort as _effort
+from . import head_saves as _head_saves
 from ..utils.constraints import extract_constraints, render_constraint_block, request_forbids_running
 # Live randomized arms + the risk governor that is measured by one of them.
 # Imported as modules (not names) so a test can monkeypatch either surface in
@@ -11130,6 +11131,32 @@ HEAD_POLL_S = 5.0
 HEAD_SETTLE_S = 10.0
 
 
+#: §4RO r5 review: deferrals in a row before one shows on screen
+HEAD_DEFER_LOUD_AFTER = 5
+
+
+#: §4RP review r2/r3: request ids of turns nobody is present for (main.py:
+#: scheduled tasks "sched-<job>", job resumes "sub-<id>" and "job-<id>" —
+#: the same set failure_census._NOT_OWNER_PREFIXES treats as not the owner)
+_UNOWNED_RID_PREFIXES = ("sched-", "sub-", "job-")
+
+
+def _set_slot_session(body) -> None:
+    """§4RP: the request's conversation key for main-slot ownership — its
+    session id, else a fingerprint of its first user message (the chat API
+    carries no conversation id); "" when neither exists."""
+    from ..utils.logging import slot_session_context
+    try:
+        sid = str((body.get("session_id") if isinstance(body, dict) else "") or "").strip()
+        if not sid:
+            from ..tools.projects import conversation_fingerprint
+            fp = conversation_fingerprint(body.get("messages") if isinstance(body, dict) else None)
+            sid = f"fp:{fp}" if fp else ""
+        slot_session_context.set(sid)
+    except Exception:  # noqa: BLE001
+        slot_session_context.set("")
+
+
 def rewarm_period_s() -> float:
     """GHOST_MAIN_PREFIX_REWARM_S: seconds between head re-warm ticks
     (default 180 — the head survives ~10 minutes of idle churn). Positive
@@ -14383,11 +14410,75 @@ class GhostAgent:
             # displaced when a later main call does not open with it
             from .llm import note_head_reference
             note_head_reference(llm, payload)
+            # §4RO: a head saved on disk replaces the prefill when the head is
+            # known to be gone — decided at dispatch, past the client's waits
+            _hs = await self._head_save_plan(llm, payload)
+            # §4RP rule 3: another conversation's first call puts the head
+            # back — the CURRENT head (review r1: kept only when a file
+            # existed, a changed head left the previous one in place; r2: a
+            # failed plan cleared to None, not left on the previous head); the
+            # hook reads the file's presence when it runs
+            self._head_plan_last = _hs
+            if _hs is not None:
+                llm.before_main_dispatch = self._slot_switch_before
+            _cc_kw = {}
+            if _hs is not None and _hs["have"]:
+                async def _restore_head(_hs=_hs):
+                    mode = await self._head_restore_due(_hs)
+                    if mode == "unknown":
+                        self._head_defer(_hs, "llama did not say what the slot holds", loud=not quiet)
+                        return               # (re-warm loop off: the prefill, as before r5)
+                    from .llm import slot_kept
+                    if mode == "park" and slot_kept(llm):
+                        # §4RP rule 4: the conversation that used the slot keeps
+                        # it until it has been idle GHOST_SLOT_KEEP_S (600 s)
+                        self._head_defer(_hs, "a conversation keeps the slot inside its idle window",
+                                         loud=False, count=False)
+                        return
+                    quiet_now = await self._head_slot_quiet(llm, _hs) if mode else False
+                    if mode == "park" and not quiet_now:
+                        self._head_defer(_hs, "the main slot is in use", loud=not quiet)
+                        return
+                    if not mode or not quiet_now:
+                        return
+                    if mode == "park":
+                        parked, why = await asyncio.to_thread(_head_saves.park, _hs["base"])
+                        if not parked and await asyncio.to_thread(_head_saves.park_landed, _hs["base"]):
+                            # r5: the reply was lost, the park was not (the
+                            # client timed out while llama copied the state)
+                            parked = True
+                        if not parked:
+                            # nothing restored over a conversation llama did not park
+                            self._head_defer(_hs, f"could not park the slot first: {why}", loud=not quiet)
+                            return
+                        _hs["parked"] = True
+                        # r4: the park can wait behind another call; a request
+                        # that started meanwhile owns the slot now
+                        if not await self._head_slot_quiet(llm, _hs):
+                            self._head_defer(_hs, "a request reached the slot during the park", loud=not quiet)
+                            return
+                    _hs["restore"] = True
+                    _hs["restored"], _hs["detail"], _hs["restore_s"] = await asyncio.to_thread(
+                        _head_saves.restore, _hs["base"], _hs["dir"], _hs["key"])
+                _cc_kw["before_dispatch"] = _restore_head
+            elif _hs is not None:
+                # §4RP rule 2, review r2 MAJOR: no file for this head yet (an
+                # effort change makes a new key) — the warm-up's prefill would
+                # replace the kept conversation just as surely
+                # (re-warm loop off: _head_defer returns and the prefill runs, as
+                # in _restore_head — there is no later tick to retry on)
+                async def _keep_slot(_hs=_hs):
+                    from .llm import slot_kept
+                    if slot_kept(llm):
+                        self._head_defer(_hs, "a conversation keeps the slot inside its idle window",
+                                         loud=False, count=False)
+                _cc_kw["before_dispatch"] = _keep_slot
             _t0 = time.time()
             _resp = await llm.chat_completion(
                 payload, is_background=True, timeout=300.0,
                 task_label=("main-prefix-redisplaced" if displaced_by
                             else "main-prefix-rewarm" if quiet else "main-prefix-warmup"),
+                **_cc_kw,
             )
             # §4N D-MAJOR-1 / R2 NIT-3: stash the warmed hash so the FIRST
             # live request can actually COMPARE (the two log lines existed
@@ -14396,6 +14487,10 @@ class GhostAgent:
             # never touched the cache must not arm a comparison that would
             # then "verify" a prefill which never happened.
             _dt = time.time() - _t0
+            if _hs is not None:
+                await self._head_save_after(llm, _hs, _resp, _dt, displaced_by=displaced_by)
+                if quiet and _hs.get("restored"):
+                    return
             if quiet:
                 # A re-warm does NOT re-arm the boot-time MISS check: that
                 # comparison fires once per boot by contract (review minor).
@@ -14444,6 +14539,286 @@ class GhostAgent:
         except Exception as e:  # noqa: BLE001 — warmup is best-effort
             logger.debug("main-prefix warmup skipped: %s: %s",
                          type(e).__name__, e)
+
+    def _head_defer(self, hs: Dict[str, Any], why: str, *, loud: bool = True,
+                    count: bool = True) -> None:
+        """§4RO r5: a park-mode re-warm that cannot restore sends NOTHING. Its
+        prefill would replace the slot's conversation as surely as a restore
+        and take 166-300 s that a turn arriving meanwhile waits behind (live
+        20:51: a park timed out, the prefill ran 211 s, the owner's next turn
+        queued 132 s). The re-warm loop retries on its next tick."""
+        from .llm import BackgroundDeferred
+        hs["detail"] = why
+        if rewarm_period_s() <= 0:
+            # r5 review: no re-warm loop, no retry — the prefill, as before r5
+            logger.info("head restore skipped: %s — the re-warm loop is off, the warm-up prefills", why)
+            return
+        self._head_rewarm_retry = True
+        streak = int(getattr(self, "_head_defer_streak", 0) or 0) + (1 if count else 0)
+        self._head_defer_streak = streak
+        if loud or (count and streak % HEAD_DEFER_LOUD_AFTER == 0):
+            # r5 review: a counter that never drops (a leaked open stream)
+            # would keep every tick deferring with nothing on screen; r5b:
+            # every Nth, not only the Nth — the streak resets only when a
+            # head plan dispatched, so one exact value could be stepped over
+            _n = f"; {streak} ticks in a row" if streak > 1 else ""
+            pretty_log("Main Prefix Warmup",
+                       f"head restore deferred ({why}{_n}) — nothing sent; the next re-warm tick retries",
+                       icon=Icons.HEAD_DISK)
+        else:
+            logger.info("head restore deferred: %s", why)
+        raise BackgroundDeferred(f"background call deferred: head restore ({why})")
+
+    async def _slot_switch_before(self, payload) -> None:
+        """§4RP rule 3: before a foreground main call of a conversation other
+        than the one that owns the slot, put the saved head back (~0.5 s), so
+        the call reuses the 28k head. Left to llama, a conversation whose
+        turns pushed the head's checkpoint out (only 4 kept) makes the next
+        conversation re-process from token 0 (~166 s plus its own text). The
+        previous conversation, if resumed, re-reads only its part past the head.
+        No owner known (after a restart), the same conversation, the slot busy
+        or already the bare head: nothing."""
+        from ..utils.logging import slot_session_context
+        from .llm import BEFORE_MAIN_DISPATCH_S, release_slot_session
+        # review r2: the deadline counts from the hook's entry, as the client's bound does
+        _late = time.monotonic() + BEFORE_MAIN_DISPATCH_S - _head_saves.RESTORE_TIMEOUT_S - 2.0
+        llm = getattr(getattr(self, "context", None), "llm_client", None)
+        hs = getattr(self, "_head_plan_last", None)
+        from .llm import outside_slot_dirty
+        if outside_slot_dirty(llm) and isinstance(hs, dict) and _head_saves.enabled():
+            await self._outside_slot_restore(llm, hs, payload, _late)
+            return
+        key = slot_session_context.get()
+        owner = getattr(llm, "_slot_session", None)
+        if not key or not owner or owner == key or not isinstance(hs, dict) or not _head_saves.enabled():
+            return
+        from .llm import opens_with_head
+        # review r1 MAJOR: a call that does not open with the head (its own
+        # system prompt) gains nothing from it — llama parks the kept
+        # conversation in its RAM cache for that call instead
+        if not opens_with_head(payload, getattr(llm, "_head_ref", None)):
+            return
+        # review r1: another request's main stream still draining; r3: another
+        # request live besides this one (two owner surfaces at once) — a
+        # switch in its tool gap would swap the slot on every call
+        if (int(getattr(llm, "_main_streams_open", 0) or 0) > 0
+                or int(getattr(llm, "foreground_requests", 0) or 0) > 1):
+            return
+        n_head = _head_saves.stored_tokens(hs["dir"], hs["key"])
+        if not n_head:
+            return
+        try:
+            slot = await asyncio.to_thread(
+                lambda: (_head_saves._http(hs["base"] + "/slots", timeout=3.0) or [{}])[_head_saves.SLOT_ID])
+        except Exception:  # noqa: BLE001
+            return
+        n = slot.get("n_prompt_tokens")
+        if slot.get("is_processing", True) or n is None or int(n) == n_head:
+            return
+        # review r1: the client's bound cancels the wait, not a thread that
+        # starts late — past this deadline the thread posts nothing, so a
+        # restore never reaches llama after the call it was for
+        def _restore_in_time():
+            if time.monotonic() > _late:
+                return False, "too late to post", 0.0
+            return _head_saves.restore(hs["base"], hs["dir"], hs["key"])
+        ok, detail, dt = await asyncio.to_thread(_restore_in_time)
+        if ok:
+            release_slot_session(llm)
+            pretty_log("Session Switch",
+                       f"restored the head before another conversation's first call in {dt:.1f}s "
+                       f"(the slot held {int(n)} tokens of the previous one; resumed later, it "
+                       f"re-reads its part past the head)", icon=Icons.HEAD_DISK)
+        else:
+            _maybe = ("" if detail == "too late to post" else
+                      " (after a timeout it may still apply the restore first)")
+            pretty_log("Session Switch",
+                       f"head restore before another conversation failed ({detail}) — llama "
+                       f"re-processes from the nearest checkpoint{_maybe}", icon=Icons.WARN)
+
+    async def _outside_slot_restore(self, llm, hs: Dict[str, Any], payload, late: float) -> None:
+        """§4RQ: a client outside the agent (Eva's World) used the slot — its
+        state shares nothing with this call, which would re-process the 28k
+        head. Wait for the outside call to leave (it aborts within seconds of
+        a request), then put the head back. Same refusals as the switch: a
+        call without the head, another request's stream or request live."""
+        from .llm import opens_with_head, outside_slot_dirty, release_slot_session
+        if not opens_with_head(payload, getattr(llm, "_head_ref", None)):
+            return
+        if (int(getattr(llm, "_main_streams_open", 0) or 0) > 0
+                or int(getattr(llm, "foreground_requests", 0) or 0) > 1):
+            return
+        n_head = _head_saves.stored_tokens(hs["dir"], hs["key"])
+        if not n_head:
+            return
+
+        def _read():
+            return (_head_saves._http(hs["base"] + "/slots", timeout=3.0) or [{}])[_head_saves.SLOT_ID]
+        while True:
+            try:
+                slot = await asyncio.to_thread(_read)
+            except Exception:  # noqa: BLE001 — llama answers /slots only between batches
+                slot = {}
+            if slot and "is_processing" not in slot:
+                return                       # a llama that does not say: leave it
+            if slot and not slot["is_processing"]:
+                break
+            if time.monotonic() > late:
+                pretty_log("Session Switch", "an outside call is still on the main slot — this call "
+                           "waits behind it and re-processes the head", icon=Icons.WARN)
+                return
+            await asyncio.sleep(0.5)
+        # review r2 MAJOR: the wait took seconds — another request may have
+        # run its call meanwhile (that spends the mark) and be in its tool gap
+        if (not outside_slot_dirty(llm)
+                or int(getattr(llm, "_main_streams_open", 0) or 0) > 0
+                or int(getattr(llm, "foreground_requests", 0) or 0) > 1):
+            return
+        n = slot.get("n_prompt_tokens")
+        if n is not None and int(n) == n_head:
+            llm._outside_slot_dirty = False
+            return
+
+        def _restore_in_time():
+            if time.monotonic() > late:
+                return False, "too late to post", 0.0
+            return _head_saves.restore(hs["base"], hs["dir"], hs["key"])
+        ok, detail, dt = await asyncio.to_thread(_restore_in_time)
+        if ok:
+            llm._outside_slot_dirty = False
+            release_slot_session(llm)
+            pretty_log("Session Switch", f"restored the head over an outside call's state in {dt:.1f}s",
+                       icon=Icons.HEAD_DISK)
+        else:
+            pretty_log("Session Switch", f"head restore over an outside call failed ({detail}) — llama "
+                       f"re-processes the head", icon=Icons.WARN)
+
+    async def _head_save_plan(self, llm, payload) -> Optional[Dict[str, Any]]:
+        """§4RO: None when head saves are off or the server cannot take them;
+        else this head's file key and whether a saved head exists for it."""
+        if not _head_saves.enabled():
+            return None
+        try:
+            d = _head_saves.head_dir()
+            base = _head_saves.server_base(getattr(llm, "upstream_url", ""))
+            if d is None or not _head_saves.supported(base):
+                return None
+            d.mkdir(parents=True, exist_ok=True)
+            ident = await asyncio.to_thread(_head_saves.server_identity, base)
+            rendered = await asyncio.to_thread(_head_saves.render, base, payload)
+            key = _head_saves.head_key(ident, rendered)
+            n_tokens = _head_saves.stored_tokens(d, key)
+            return {"base": base, "dir": d, "key": key, "identity": ident,
+                    "have": n_tokens is not None, "n_tokens": n_tokens, "parked": False,
+                    "restore": False, "restored": None, "detail": "", "restore_s": 0.0}
+        except Exception as e:  # noqa: BLE001 — best-effort, like the warm-up
+            logger.debug("head save plan skipped: %s: %s", type(e).__name__, e)
+            return None
+
+    async def _head_slot_quiet(self, llm, hs: Dict[str, Any]) -> bool:
+        """§4RO r4: no request or main-slot stream is live and llama is not
+        processing on the slot — checked before the park AND before the
+        restore (review r4 MAJOR: the lane's own check ran once, before both;
+        an owner turn that started in between had its conversation replaced
+        by the head in its tool gap)."""
+        if (int(getattr(llm, "foreground_requests", 0) or 0) > 0
+                or int(getattr(llm, "_main_streams_open", 0) or 0) > 0):
+            return False
+        try:
+            return not await asyncio.to_thread(_head_saves.slot_busy, hs["base"])
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _head_restore_due(self, hs: Dict[str, Any]) -> str:
+        """§4RO r3: how to put the head back instead of re-processing it,
+        judged at dispatch (r1: before the client's wait it went stale) — ""
+        (leave it: the slot holds exactly the head), "unknown" (r5: /slots
+        unreadable — the caller defers),
+        "fresh" (a server that has served nothing: restore), "outside" (§4RQ:
+        an outside client's call holds the slot — restore, no park), or "park" (the
+        slot holds something else — a finished conversation, a short call:
+        park it in llama's RAM cache, then restore). r1 refused restores on
+        ticks and after members' turns because a restore alone does not park;
+        the park step is what lifts that (operator 2026-10-25: the tick after an
+        owner request re-processed the head for 166 s, 8× that day)."""
+        try:
+            if await asyncio.to_thread(_head_saves.server_fresh, hs["base"]):
+                return "fresh"
+            n = await asyncio.to_thread(_head_saves.slot_tokens, hs["base"])
+            if n is None:
+                # r5 review: llama answers /slots only between batches — a slot
+                # copying state or mid-batch reads as unknown, and the prefill
+                # that followed queued 166-300 s behind it
+                return "unknown"
+            if n == hs.get("n_tokens"):
+                return ""
+            # §4RQ: an outside call's state is not worth a place in llama's RAM
+            # cache (it could push out a parked conversation): restore over it
+            from .llm import outside_slot_dirty, slot_kept
+            llm = getattr(getattr(self, "context", None), "llm_client", None)
+            # review r2: a kept conversation is never restored over, mark or not
+            return "outside" if outside_slot_dirty(llm) and not slot_kept(llm) else "park"
+        except Exception:  # noqa: BLE001
+            return "unknown"
+
+    async def _head_save_after(self, llm, hs: Dict[str, Any], resp, dt_s: float,
+                               *, displaced_by: str = "") -> None:
+        """§4RO: report a restore, and save the head when this warm-up had to
+        prefill it or no file exists yet — only while nothing else is on the
+        main slot (`head_saves.save` also refuses a slot that moved on)."""
+        self._head_defer_streak = 0          # the call went out: not deferred
+        try:
+            base, d, key = hs["base"], hs["dir"], hs["key"]
+            verdict, cached, prompt = rewarm_verdict(resp, dt_s)
+            if hs.get("restored"):
+                from .llm import release_slot_session
+                release_slot_session(llm)         # §4RP: the head owns the slot again
+                llm._outside_slot_dirty = False   # §4RQ
+                _after = f" after a '{displaced_by}' call replaced it" if displaced_by else ""
+                _parked = " (the slot's conversation parked in llama's RAM cache first)" if hs.get("parked") else ""
+                pretty_log(
+                    "Main Prefix Warmup",
+                    f"restored the head from disk{_after}{_parked} in {hs['restore_s']:.1f}s "
+                    f"({hs['detail']}; {cached} of {prompt} tokens cached, {dt_s:.0f}s with the check)",
+                    icon=Icons.HEAD_DISK,
+                )
+            elif hs.get("restore"):
+                pretty_log(
+                    "Main Prefix Warmup",
+                    f"head restore from disk failed ({hs.get('detail') or 'no reply'}) — "
+                    f"the warm-up re-processed it ({dt_s:.0f}s) and saves it again",
+                    icon=Icons.WARN,
+                )
+            if not _head_saves.supported(base):
+                pretty_log("Main Prefix Warmup",
+                           "head saves off: llama-server was started without --slot-save-path",
+                           icon=Icons.WARN)
+                return
+            if prompt <= 0:
+                return
+            if verdict != "evicted" and _head_saves.stored_tokens(d, key) is not None:
+                return
+            if (int(getattr(llm, "foreground_requests", 0) or 0) > 0
+                    or int(getattr(llm, "_main_streams_open", 0) or 0) > 0):
+                logger.info("head save skipped: a request reached the main slot first")
+                return
+            ok, detail = await asyncio.to_thread(
+                _head_saves.save, base, d, key, prompt, hs.get("identity", ""))
+            if ok:
+                pretty_log(
+                    "Main Prefix Warmup",
+                    f"saved the head to disk ({detail}) — after a restart or a displacement "
+                    f"it comes back in under a second instead of re-processing",
+                    icon=Icons.HEAD_DISK, durable_only=True,
+                )
+            elif not _head_saves.supported(base):
+                pretty_log("Main Prefix Warmup",
+                           "head saves off: llama-server was started without --slot-save-path",
+                           icon=Icons.WARN)
+            else:
+                logger.info("head save not kept: %s", detail)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("head save skipped: %s: %s", type(e).__name__, e)
 
     async def _main_slot_metrics(self) -> Tuple[Optional[int], Optional[int]]:
         """(requests_processing, prompt_tokens_total) from the main node's
@@ -14538,7 +14913,13 @@ class GhostAgent:
                              or (_dv is not None and _dv.locked()))
                     continue                 # and `last_total` stays as it was
             else:
+                self._head_rewarm_retry = False
                 await self.warm_up_main_prefix(quiet=True)
+                if getattr(self, "_head_rewarm_retry", False) is True:
+                    # §4RO r5: a deferred head restore sent nothing — the
+                    # next tick must not read "nothing ran" and skip it
+                    last_total = None
+                    continue
             _, after = await _metrics()
             last_total = after if after is not None else total
 
@@ -27801,6 +28182,12 @@ class GhostAgent:
         # §4NG review: `recall` leaves THIS conversation out of its past-conversation hits
         from ..utils.logging import active_session_context as _asc
         _asc.set(str((body.get("session_id") if isinstance(body, dict) else "") or ""))
+        # §4RP: who will own the main slot after this request; a probe or
+        # replay (an idle job's handle_chat, review r1) and an unattended
+        # scheduled task or job resume (review r2) own nothing
+        from ..utils.logging import is_probe_request_id as _is_probe_rid
+        _set_slot_session(None if (_is_probe_rid(req_id) or str(req_id).startswith(_UNOWNED_RID_PREFIXES))
+                          else body)
         # Who is asking on a multi-user surface ("owner" | "member" | "").
         # Read through `utils.logging.requester_is_member()` by the profile
         # block, the autobiographical handle and the smart-memory writers.
@@ -27898,7 +28285,7 @@ class GhostAgent:
                                client_deadline_line(_glog.request_deadline_s(str(req_id or "")),
                                                     _glog.extension_ceiling_s(str(req_id or ""))),
                                icon=Icons.REQ_WAIT, level="INFO")
-                messages, model, stream_response = body.get("messages", []), body.get("model", "qwen-3.6-35b-a3"), body.get("stream", False)
+                messages, model, stream_response = body.get("messages", []), body.get("model", "qwen3.8-27b"), body.get("stream", False)
                 if requester_is_member():
                     # A member's turn does not stream (R8): the streamed drain
                     # runs AFTER handle_chat's finally has restored the

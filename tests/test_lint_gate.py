@@ -34,6 +34,7 @@ import ast
 import builtins
 import json
 import shutil
+import os
 import subprocess
 import sys
 from collections import Counter
@@ -90,7 +91,18 @@ def findings():
         for "the gate ran and found nothing" by anyone reading pytest alone.
 
     The one change that is NOT acceptable is making all three skippable.
+
+    OPT-IN IN THE SUITE (operator, 2026-10-26: "figure out why it needs so
+    much ram and time … if needed disable tests that take too long"). This
+    pass took 436 s of a 606 s suite: 8 pylint jobs beside 12 test workers,
+    each holding the whole parsed tree, on a Mac whose llama wires 28 GB.
+    It runs with GHOST_LINT_GATE=1 (`scripts/run_suite.py --lint`), and
+    `ci.sh` still runs `scripts/lint.py` and fails the build on it; the
+    canaries below still run on every suite.
     """
+    if os.environ.get("GHOST_LINT_GATE") != "1":
+        pytest.skip("the full pylint pass (~4 min) is opt-in: GHOST_LINT_GATE=1, "
+                    "scripts/run_suite.py --lint, or python scripts/lint.py")
     if lint_mod._pylint_path() is None:
         pytest.skip("pylint is not installed in this venv — the lint gate "
                     "CANNOT RUN and is therefore NOT green; install pylint "

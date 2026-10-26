@@ -121,7 +121,7 @@ async def main() -> int:
                             help="Ghost API base URL (loopback only — the egress guard rejects external hosts).")
         parser.add_argument("--api-key", default=os.getenv("GHOST_API_KEY", ""),
                             help="X-Ghost-Key header value (falls back to $GHOST_API_KEY).")
-        parser.add_argument("--model", default=os.getenv("GHOST_MODEL", "qwen-3.6-35b-a3"))
+        parser.add_argument("--model", default=os.getenv("GHOST_MODEL", "qwen3.8-27b"))
         parser.add_argument("--timeout", type=float, default=300.0,
                             help="Per-task wall-clock in seconds. Applied both to the HTTP client and to EvalSuite.per_task_timeout_s. Default 300s — template tasks that trigger multi-turn tool use need more than the 60s default.")
         parser.add_argument("--suite", choices=("default", "capability", "behavioral", "offline", "post_learning"), default="default",

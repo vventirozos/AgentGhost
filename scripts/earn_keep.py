@@ -538,7 +538,7 @@ def main() -> int:
     r.add_argument("--track", default="A", choices=["A", "B"])
     r.add_argument("--repeats", type=int, default=3)
     r.add_argument("--base-port", type=int, default=8010)
-    r.add_argument("--model", default=os.getenv("GHOST_MODEL", "qwen-3.6-35b-a3"))
+    r.add_argument("--model", default=os.getenv("GHOST_MODEL", "qwen3.8-27b"))
     r.add_argument("--timeout", type=float, default=300.0)
     r.add_argument("--boot-timeout", type=float, default=300.0)
     r.add_argument("--seed", type=int, default=1234)

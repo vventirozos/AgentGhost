@@ -63,7 +63,9 @@ def test_guard_extra_allow_passes_named_host():
     with no_external_network(extra_allow=("10.0.0.5",)):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         # The connection itself will fail (10.0.0.5 likely unreachable);
-        # we only care that the guard doesn't raise first.
+        # we only care that the guard doesn't raise first. Without a timeout
+        # the unanswered SYN waits out the OS default (~75 s).
+        s.settimeout(0.5)
         try:
             s.connect(("10.0.0.5", 1))
         except NetworkEgressError:

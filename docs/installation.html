@@ -71,7 +71,7 @@
     <tbody>
       <tr><td><code>GHOST_API_KEY</code></td><td><em>unset</em></td><td>Value matched against the <code>X-Ghost-Key</code> header on every authed route. Mandatory for <code>interface/server.py</code>. The agent ships <strong>no default key</strong>: unset on a loopback bind means auth disabled; unset on a non-loopback bind refuses to boot (pass <code>--api-key ''</code> to explicitly disable auth on a trusted network).</td></tr>
       <tr><td><code>GHOST_HOME</code></td><td><code>~/ghost_llamacpp</code></td><td>Base directory; agent creates <code>sandbox/</code> and <code>system/memory/</code> beneath it.</td></tr>
-      <tr><td><code>GHOST_MODEL</code></td><td><code>qwen-3.6-35b-a3</code></td><td>Default model name advertised on Ollama-compatibility routes.</td></tr>
+      <tr><td><code>GHOST_MODEL</code></td><td><code>qwen3.8-27b</code></td><td>Default model name advertised on Ollama-compatibility routes.</td></tr>
       <tr><td><code>GHOST_SANDBOX_DIR</code></td><td>not read</td><td>The agent does not read this variable: the host directory bind-mounted at <code>/workspace</code> is always <code>$GHOST_HOME/sandbox</code> (<code>main.py</code> <code>main()</code>). Only the ablation scripts' examples still set it.</td></tr>
       <tr><td><code>GHOST_DEFAULT_DB</code></td><td><code>postgresql://ghost@127.0.0.1:5432/agent</code></td><td>DSN used by <code>postgres_admin</code> tool when no override given.</td></tr>
       <tr><td><code>GHOST_SANDBOX_MEM</code></td><td><code>4g</code></td><td>Memory cap for the sandbox container.</td></tr>

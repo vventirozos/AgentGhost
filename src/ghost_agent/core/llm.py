@@ -792,10 +792,18 @@ def note_head_reference(llm, payload) -> None:
 EARLY_REWARM_LABELS = frozenset({"greeting fast path"})
 
 
-def note_main_slot_prompt(llm, payload, label: str = "", background: bool = False) -> None:
+#: §4RQ: the label of a call made by a client outside the agent (Eva's World)
+OUTSIDE_CALL_LABEL = "outside call"
+
+
+def note_main_slot_prompt(llm, payload, label: str = "", background: bool = False,
+                          opened_at: Optional[float] = None) -> None:
     """A call just ran (or started streaming) on the MAIN slot: mark whether
     the slot still opens with the head. No reference yet → no mark."""
     try:
+        if not str(label or "").startswith(OUTSIDE_CALL_LABEL):
+            # §4RQ: the agent's own call holds the slot now, not the outside one
+            llm._outside_slot_dirty = False
         ref = getattr(llm, "_head_ref", None)
         if not isinstance(ref, tuple):
             return
@@ -804,9 +812,108 @@ def note_main_slot_prompt(llm, payload, label: str = "", background: bool = Fals
             background or str(label or "") in EARLY_REWARM_LABELS))
         llm._head_displaced_by = str(label or "unlabelled")
         llm._last_main_call_end = time.monotonic()
+        if not background:
+            # §4RP: a request's own call that opens with the head — its
+            # conversation owns the slot now. The greeting fast path owns
+            # nothing, so the §4OT early re-warm runs (review r1 MAJOR). Any
+            # other call without the head (a game move, a truncation
+            # continuation, a vision call served on main, a member's turn)
+            # leaves the owner as it was (review r2 MAJOR: clearing it lost
+            # the window to the next tick); one of the owner's own refreshes it.
+            # A stream that ends (opened_at: when it opened) after another
+            # conversation took the slot does not take it back (review r2
+            # MINOR: a final draining after the next turn's first call).
+            from ..utils.logging import slot_session_context
+            key = slot_session_context.get()
+            owner = getattr(llm, "_slot_session", None)
+            used = getattr(llm, "_slot_session_used", None)
+            taken_since = bool(owner and opened_at is not None and isinstance(used, (int, float))
+                               and used > opened_at)
+            if str(label or "") in EARLY_REWARM_LABELS:
+                llm._slot_session = None
+            elif key and (key == owner or (not llm._head_displaced and not taken_since)):
+                llm._slot_session = key
+                llm._slot_session_used = time.monotonic()
     except Exception:  # noqa: BLE001
         pass
 
+
+#: §4RP: how long the slot is kept for the conversation that last used it
+SLOT_KEEP_DEFAULT_S = 600.0
+
+
+def slot_keep_s() -> float:
+    """GHOST_SLOT_KEEP_S: seconds a conversation keeps the main slot after its
+    last call (default 600; 0 = off, the head comes back at the next tick)."""
+    raw = (os.getenv("GHOST_SLOT_KEEP_S") or "").strip()
+    try:
+        return max(0.0, float(raw)) if raw else SLOT_KEEP_DEFAULT_S
+    except ValueError:
+        return SLOT_KEEP_DEFAULT_S
+
+
+def slot_kept(llm, now: Optional[float] = None) -> bool:
+    """§4RP: a known conversation used the main slot less than
+    `slot_keep_s()` ago — the re-warm leaves its state alone."""
+    try:
+        if not getattr(llm, "_slot_session", None):
+            return False
+        used = getattr(llm, "_slot_session_used", None)
+        if not isinstance(used, (int, float)):
+            return False
+        now = time.monotonic() if now is None else now
+        return now - float(used) < slot_keep_s()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def note_outside_call(llm, state: str, label: str = "") -> None:
+    """§4RQ: a client outside the agent (Eva's World mind) starts or ends a
+    call on the main slot. Its state is worth nothing to the agent: until the
+    head is back (or an agent call takes the slot), the next foreground call
+    restores the head first and the re-warm restores it without parking."""
+    try:
+        if state == "start":
+            llm._outside_call_live = True
+            llm._outside_call_started = time.monotonic()
+            llm._outside_slot_dirty = True
+            return
+        llm._outside_call_live = False
+        started = getattr(llm, "_outside_call_started", None)
+        last = getattr(llm, "_last_main_call_end", None)
+        # review r2 MAJOR: an agent call ran since the start (a request that
+        # arrived before the outside call reached llama, which then cancelled
+        # behind it) — the slot may hold THAT conversation. The mark would let
+        # the head be restored over it, so it is left off; the plain
+        # displacement note below follows the normal rules (park, keep window).
+        ran_since = (isinstance(started, (int, float)) and isinstance(last, (int, float))
+                     and last >= started)
+        note_main_slot_prompt(llm, {"messages": []}, label=f"{OUTSIDE_CALL_LABEL}: {label}"[:80],
+                              background=True)
+        llm._outside_slot_dirty = not ran_since
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def outside_slot_dirty(llm) -> bool:
+    return getattr(llm, "_outside_slot_dirty", False) is True
+
+
+def release_slot_session(llm) -> None:
+    """§4RP: the head is back in the slot — no conversation owns it."""
+    try:
+        llm._slot_session = None
+    except Exception:  # noqa: BLE001
+        pass
+
+
+#: §4RP: the most the session-switch hook may add before a foreground call —
+#: above its own HTTP bounds (/slots 3 s + restore 30 s; 10-26: 20 → 40 with the
+#: restore's 10 → 30). A bound that fires
+#: abandons the wait, not the thread: a restore already posted lands before the
+#: call (llama queues tasks in order), and the hook's thread posts nothing
+#: past its deadline (review r1)
+BEFORE_MAIN_DISPATCH_S = 40.0
 
 #: r2: how long a deferred verdict's main call waits for the one-at-a-time lane
 DEFERRED_LANE_WAIT_S = 600.0
@@ -874,6 +981,10 @@ class LLMClient:
         # this replaced.
         self.node_throughput = NodeThroughput()
         self.foreground_tasks = 0
+        #: §4RP: ``async (payload) -> None`` run before a foreground main-slot
+        #: call (the agent puts the head back when another conversation owns
+        #: the slot)
+        self.before_main_dispatch = None
         # url -> monotonic deadline before which not to re-probe capacity
         self._node_cap_retry_at: Dict[str, float] = {}
         # url -> {task id: [concurrency-seconds, last_settle_ts, start_ts]}
@@ -3513,7 +3624,21 @@ class LLMClient:
                            "request is still active; the job will retry later", level="WARNING", icon=Icons.WARN)
             raise BackgroundDeferred(f"background call deferred: {task_label or 'unlabelled'}")
 
-    async def chat_completion(self, payload: Dict[str, Any], use_swarm: bool = False, use_worker: bool = False, use_vision: bool = False, use_coding: bool = False, use_critic: bool = False, is_background: bool = False, timeout: Optional[float] = None, off_main_only: bool = False, task_label: str = "", require_healthy: bool = False, slot_wait: Optional[float] = None, total_budget: Optional[float] = None) -> Dict[str, Any]:
+    async def _before_main_dispatch(self, payload) -> None:
+        """§4RP: the agent's hook, bounded; it never fails the call."""
+        hook = getattr(self, "before_main_dispatch", None)
+        if not callable(hook):
+            return
+        try:
+            from ..utils.aio import wait_for as _wait_for
+            # pylint infers the __init__ None; callable() checked just above
+            await _wait_for(hook(payload), BEFORE_MAIN_DISPATCH_S)  # pylint: disable=not-callable
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.info("before-main-dispatch hook skipped: %s: %s", type(e).__name__, e)
+
+    async def chat_completion(self, payload: Dict[str, Any], use_swarm: bool = False, use_worker: bool = False, use_vision: bool = False, use_coding: bool = False, use_critic: bool = False, is_background: bool = False, timeout: Optional[float] = None, off_main_only: bool = False, task_label: str = "", require_healthy: bool = False, slot_wait: Optional[float] = None, total_budget: Optional[float] = None, before_dispatch=None) -> Dict[str, Any]:
         if is_background:
             # The foreground wait protects exactly one resource: the MAIN
             # inference slot. A call that will be served by an off-main
@@ -3595,6 +3720,28 @@ class LLMClient:
                             and (getattr(self, "_head_displaced", False) is not True
                                  or (_dv is not None and _dv.locked()))):
                         raise BackgroundDeferred(f"background call deferred: {task_label}")
+                    # §4RP rule 5: a background call that opens with the head
+                    # would leave the slot as head + itself — the kept
+                    # conversation's follow-up then matches only the head and
+                    # re-reads everything past it. It waits out the window.
+                    # (A call that does not open with the head makes llama park
+                    # the conversation in its RAM cache and load it back.)
+                    if (not str(task_label or "").startswith("main-prefix")
+                            and slot_kept(self)
+                            and opens_with_head(payload, getattr(self, "_head_ref", None))):
+                        logger.info("background call %s deferred: the main slot holds a conversation "
+                                    "inside its %.0fs window", task_label or "unlabelled", slot_keep_s())
+                        raise BackgroundDeferred(f"background call deferred: {task_label} (slot kept)")
+                    # §4RO: the head warm-up restores the saved head here — past
+                    # every re-check above, so it never lands on a live request
+                    if before_dispatch is not None:
+                        await before_dispatch()
+                        # r1: llama defers a restore while the slot is busy — a
+                        # request that started meanwhile must not get the
+                        # warm-up cutting its conversation back to the head
+                        if (str(task_label or "").startswith("main-prefix")
+                                and int(getattr(self, "foreground_requests", 0) or 0) > 0):
+                            raise BackgroundDeferred(f"background call deferred: {task_label}")
                 _result = await self._do_chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, use_critic, timeout, off_main_only, task_label, require_healthy, slot_wait, total_budget)
                 _repair_think_split(_result)     # §4KP: a mentioned </think> is not the close
                 self._note_usage(_result)
@@ -3615,6 +3762,8 @@ class LLMClient:
             async with self._foreground_lock:
                 self.foreground_tasks += 1
             try:
+                if not (use_swarm or use_worker or use_vision or use_coding or use_critic or off_main_only):
+                    await self._before_main_dispatch(payload)
                 _result = await self._do_chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, use_critic, timeout, off_main_only, task_label, require_healthy, slot_wait, total_budget)
                 _repair_think_split(_result)     # §4KP: a mentioned </think> is not the close
                 self._note_usage(_result)
@@ -4455,6 +4604,7 @@ class LLMClient:
         def _opened():
             if _on_main and not _state["open"]:
                 _state["open"] = True
+                _state["opened_at"] = time.monotonic()
                 self._main_streams_open = int(getattr(self, "_main_streams_open", 0) or 0) + 1
         try:
             if is_background:
@@ -4469,6 +4619,8 @@ class LLMClient:
                 async with self._foreground_lock:
                     self.foreground_tasks += 1
                 try:
+                    if _on_main:
+                        await self._before_main_dispatch(payload)
                     _opened()
                     async for chunk in _repair_think_split_stream(self._do_stream_chat_completion(payload, use_coding)):
                         _state["answered"] = True
@@ -4482,7 +4634,8 @@ class LLMClient:
             if _state["open"]:
                 self._main_streams_open = max(0, int(getattr(self, "_main_streams_open", 1) or 1) - 1)
             if _on_main and _state["answered"]:
-                note_main_slot_prompt(self, payload, "stream", background=is_background)
+                note_main_slot_prompt(self, payload, "stream", background=is_background,
+                                      opened_at=_state.get("opened_at"))
 
     async def stream_openai(self, model: str, content: str, created_time: int, req_id: str,
                             extra: Optional[Dict[str, Any]] = None):

@@ -123,7 +123,7 @@ async def chat(client: httpx.AsyncClient, prompt: str, *, timeout: float = 180.0
     content. Each call is a fresh `messages` list — the selfhood
     module is the ONLY thing that can supply prior-turn context."""
     body = {
-        "model": "qwen-3.6-35b-a3",
+        "model": "qwen3.8-27b",
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
     }
@@ -375,7 +375,7 @@ async def section_d_narrative(report: TestReport):
         """Call the upstream LLM directly. Mirrors the closure
         main.py wires into SelfModel."""
         body = {
-            "model": "qwen-3.6-35b-a3",
+            "model": "qwen3.8-27b",
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.6,
             "max_tokens": 1024,

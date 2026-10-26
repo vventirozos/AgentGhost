@@ -3,8 +3,21 @@ import logging
 import os
 import threading
 from pathlib import Path
-from transformers import AutoTokenizer
 from functools import lru_cache
+
+# Imported on first use, not at module scope: `transformers` pulls in torch,
+# sklearn, scipy and pandas (~300 MB per process), and every module that
+# counts tokens imports this one. Only load_tokenizer needs it; the agent
+# calls that once at boot. Tests replace this attribute directly.
+AutoTokenizer = None
+
+
+def _auto_tokenizer():
+    global AutoTokenizer
+    if AutoTokenizer is None:
+        from transformers import AutoTokenizer as _cls
+        AutoTokenizer = _cls
+    return AutoTokenizer
 
 # Tokenizer source for token-budget accounting. Must come from a repo
 # that ships `tokenizer.json` matching the Qwen3 35B-A3B family (the
@@ -69,7 +82,7 @@ def load_tokenizer(local_tokenizer_path: Path):
         os.environ["HF_HUB_OFFLINE"] = "1"
         try:
             print(f"📂 Loading Tokenizer from local cache: {local_tokenizer_path}")
-            TOKEN_ENCODER = AutoTokenizer.from_pretrained(str(local_tokenizer_path), local_files_only=True)
+            TOKEN_ENCODER = _auto_tokenizer().from_pretrained(str(local_tokenizer_path), local_files_only=True)
             # Tokenizer became available — re-arm the warn-once gate AND
             # drop the LRU cache so previously-approximated counts are
             # recomputed accurately on next access.
@@ -95,7 +108,7 @@ def load_tokenizer(local_tokenizer_path: Path):
         original_timeout = getattr(huggingface_hub.constants, "HF_HUB_DOWNLOAD_TIMEOUT", 10)
         huggingface_hub.constants.HF_HUB_DOWNLOAD_TIMEOUT = 10
         try:
-            enc = AutoTokenizer.from_pretrained(QWEN_MODEL_ID)
+            enc = _auto_tokenizer().from_pretrained(QWEN_MODEL_ID)
             huggingface_hub.constants.HF_HUB_DOWNLOAD_TIMEOUT = original_timeout
             q.put(("SUCCESS", enc))
         except Exception as err:

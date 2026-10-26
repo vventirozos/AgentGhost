@@ -559,7 +559,7 @@ async def api_show(request: Request):
         "parameters": "stop \"<|im_start|>\"\nstop \"<|im_end|>\"",
         "template": "<|im_start|>system\n{{ .System }}<|im_end|>\n<|im_start|>user\n{{ .Prompt }}<|im_end|>\n<|im_start|>assistant\n",
         "details": {
-            "format": "gguf", "family": "qwen3", "families": ["qwen3"], "parameter_size": "35B-A3B", "quantization_level": "Q4_0"
+            "format": "gguf", "family": "qwen3", "families": ["qwen3"], "parameter_size": "27B", "quantization_level": "Q4_K_M"
         }
     }
 
@@ -570,8 +570,8 @@ async def list_models(request: Request):
         "models": [
             {
                 "name": model_name, "model": model_name, "modified_at": get_utc_timestamp(),
-                "size": 1000000000, "digest": "sha256:qwen-3.6-35b-a3",
-                "details": {"format": "gguf", "family": "qwen3", "families": ["qwen3"], "parameter_size": "35B-A3B", "quantization_level": "Q4_0"}
+                "size": 1000000000, "digest": "sha256:qwen3.8-27b",
+                "details": {"format": "gguf", "family": "qwen3", "families": ["qwen3"], "parameter_size": "27B", "quantization_level": "Q4_K_M"}
             }
         ]
     }
@@ -736,9 +736,23 @@ async def api_health(request: Request):
     except Exception:  # noqa: BLE001 — health must never raise
         mood = None
 
+    # §4RQ: seconds the main slot is still kept for the conversation that last
+    # used it (§4RP, GHOST_SLOT_KEEP_S); 0 when nothing owns it. Read by
+    # callers outside the agent that share the llama slot (Eva's World mind),
+    # so they leave a fresh conversation in place like the re-warm does.
+    slot_keep_left_s = 0.0
+    try:
+        from ..core.llm import slot_kept, slot_keep_s
+        if llm is not None and slot_kept(llm):
+            _used = float(getattr(llm, "_slot_session_used"))
+            slot_keep_left_s = round(max(0.0, slot_keep_s() - (_time.monotonic() - _used)), 1)
+    except Exception:  # noqa: BLE001 — health must never raise
+        slot_keep_left_s = 0.0
+
     return JSONResponse({
         "status": "ok",
         "mood": mood,
+        "slot_keep_left_s": slot_keep_left_s,
         "rss_mb": rss_mb,
         "rss_limit_mb": float(os.environ.get("GHOST_MAX_RSS_MB", "0") or "0"),
         "uptime_s": round(_time.monotonic() - boot_mono, 1) if boot_mono else None,
@@ -765,6 +779,65 @@ async def api_health(request: Request):
         "node_health": node_health,
         "config": getattr(app.state, "resolved_config", {}),
     })
+
+
+@router.post("/api/slot/outside-call", dependencies=[Security(verify_api_key)])
+async def api_slot_outside_call(request: Request):
+    """§4RQ: a client outside the agent that shares the main llama slot (Eva's
+    World mind) says when its call starts and ends. "start" is REFUSED (409)
+    while a request is live or a conversation keeps the slot — the last word
+    on the gate is the agent's own. "end" marks the slot as holding foreign
+    state, so the head comes back before the next call instead of a 28k
+    re-prefill. Registered above the catch-all.
+
+    10-26 (operator: the looks were missing from the agent's log): each call
+    is logged as a background line (🧱 "eva's world"), with the client's
+    optional ``detail`` (≤300 chars): why it woke, how the call ended. A
+    third state, "result", only logs (her decision is applied after "end")."""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    state = str((body or {}).get("state") or "")
+    label = str((body or {}).get("label") or "")[:40]
+    detail = " ".join(str((body or {}).get("detail") or "").split())[:300]
+    if state not in ("start", "end", "result"):
+        return JSONResponse({"error": "state must be start, end or result"}, status_code=400)
+    if state == "result":
+        _log_outside_call(f"decided: {detail}" if detail else "decided (no summary)")
+        return JSONResponse({"ok": True})
+    agent = getattr(request.app.state, "agent", None)
+    llm = getattr(getattr(agent, "context", None), "llm_client", None)
+    if llm is None:
+        return JSONResponse({"error": "no llm client"}, status_code=503)
+    from ..core.llm import note_outside_call, slot_kept
+    if state == "start":
+        fg = int(getattr(llm, "foreground_requests", 0) or 0)
+        streams = int(getattr(llm, "_main_streams_open", 0) or 0)
+        why = (f"{fg} request(s) live" if fg > 0 or streams > 0
+               else "a conversation keeps the slot" if slot_kept(llm) else "")
+        if why:
+            _log_outside_call(f"look refused: {why}")
+            return JSONResponse({"ok": False, "reason": why}, status_code=409)
+        note_outside_call(llm, state, label)
+        _log_outside_call("look started" + (f" — {detail}" if detail else ""))
+        return JSONResponse({"ok": True})
+    started = getattr(llm, "_outside_call_started", None)
+    took = f" after {time.monotonic() - started:.0f}s" if isinstance(started, (int, float)) else ""
+    note_outside_call(llm, state, label)
+    _log_outside_call(f"look ended{took}" + (f" ({detail})" if detail else ""))
+    return JSONResponse({"ok": True})
+
+
+def _log_outside_call(text: str) -> None:
+    """A background line (SYSTEM tag) whatever request context the HTTP call
+    arrived in: the look is not a request of the agent's."""
+    from ..utils.logging import request_id_context
+    tok = request_id_context.set("SYSTEM")
+    try:
+        pretty_log("eva's world", text, icon=Icons.OUTSIDE_LOOK)
+    finally:
+        request_id_context.reset(tok)
 
 
 @router.post("/api/pull")

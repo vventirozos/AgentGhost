@@ -64,6 +64,7 @@ ICON_CLASS = {
     "⚡": "accent",
     "🚀": "accent",
     "🌅": "accent",
+    "💽": "accent",   # HEAD_DISK (§4RO)
     "💤": "idle",
     "😴": "idle",
     "🎬": "accent",

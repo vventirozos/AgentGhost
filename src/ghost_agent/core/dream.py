@@ -196,7 +196,7 @@ class Dreamer:
             logger.warning("experience index sync skipped: %s", _xsx)
         return note
 
-    async def dream(self, model_name: str = "qwen-3.6-35b-a3"):
+    async def dream(self, model_name: str = "qwen3.8-27b"):
         """The idle housekeeping pass (§4NM: the REM / lesson side — the
         consolidation call, heuristics → lessons, episode consolidation,
         failure-cluster distillation, macro proposals, graduation, utility

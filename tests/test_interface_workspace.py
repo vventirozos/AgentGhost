@@ -174,7 +174,7 @@ def test_turn_status_line():
         < ts.index("turn-status-icon")
     js = _read("app.js")
     # Re-parented under the current waiting bubble each turn.
-    assert "startTurnTicker(currentAgentMessageDiv)" in js
+    assert "startTurnTicker(currentAgentMessageDiv, currentTurnStartedAt)" in js
     assert "insertAdjacentElement('afterend', turnStatusEl)" in js
     assert "noteTickerLine(data.content)" in js, "WS log frames must feed it"
     # Corridor filtering: only OUR request's lines update the caption —

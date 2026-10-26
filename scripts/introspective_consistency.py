@@ -527,7 +527,7 @@ async def main() -> int:
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--api-key", default=os.getenv("GHOST_API_KEY", ""))
     parser.add_argument(
-        "--model", default=os.getenv("GHOST_MODEL", "qwen-3.6-35b-a3")
+        "--model", default=os.getenv("GHOST_MODEL", "qwen3.8-27b")
     )
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument(

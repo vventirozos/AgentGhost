@@ -33,7 +33,7 @@ pip install -r requirements.txt
 
 export GHOST_HOME="$HOME/ghost"                # everything Ghost owns lives here
 export GHOST_API_KEY="..."                     # required for a non-loopback bind
-export GHOST_MODEL="qwen-3.6-35b-a3"           # must match what your LLM server serves
+export GHOST_MODEL="qwen3.8-27b"           # must match what your LLM server serves
 export TOR_PROXY="socks5://127.0.0.1:9050"
 
 python -m src.ghost_agent.main \

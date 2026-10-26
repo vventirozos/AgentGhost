@@ -11,7 +11,7 @@ set -u
 
 PROMPTS_FILE="${1:-init_personal_data.prompts}"
 AGENT_URL="http://127.0.0.1:8000/api/chat"
-MODEL="qwen-3.6-35b-a3"
+MODEL="qwen3.8-27b"
 TIMEOUT=2100
 
 if [ ! -f "$PROMPTS_FILE" ]; then

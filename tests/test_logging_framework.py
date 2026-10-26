@@ -250,8 +250,33 @@ def test_metacog_subsystem_icons_are_wide_base():
 
 def test_content_column_derives_from_layout_formula():
     # Single source of truth for the content/continuation-indent column.
-    assert _CONTENT_COL == 45          # §4NV: the title column is 24 wide (was 18)
+    assert _CONTENT_COL == 55          # §4NV: title 24 wide (was 18); 10-26: + 2 + 8 clock column
     assert len(glog._CONTINUATION_INDENT) == _CONTENT_COL
+
+
+def test_every_line_carries_the_clock_where_the_tickers_still_parse_it(capsys):
+    # 10-26 (operator): every line, background ones too, shows HH:MM:SS. It sits
+    # between the tag and the icon: the uConsole/web tickers split on 2+ spaces,
+    # want the tag at parts[1] and the delta right after the icon.
+    import re
+    glog.pretty_log("main prefix warmup", "restored the head", icon="💽")
+    glog.pretty_log("Section", special_marker="SECTION_START", icon="🔹")
+    out = [re.sub(r"\x1b\[[0-9;]*m", "", l) for l in capsys.readouterr().out.splitlines() if l.strip()]
+    assert len(out) == 2
+    for line in out:
+        parts = [p.strip() for p in re.split(r"\s{2,}", line) if p.strip()]
+        assert re.fullmatch(r"\d\d:\d\d:\d\d", parts[2]), parts
+        assert parts[3] in ("💽", "🔹")
+    assert parts_title(out[0]) == "main prefix warmup"
+
+
+def parts_title(line):
+    import re
+    parts = [p.strip() for p in re.split(r"\s{2,}", line) if p.strip()]
+    i = next(i for i, p in enumerate(parts) if "💽" in p) + 1
+    if re.match(r"^\+[\d.\s]*m?s$", parts[i]):          # the tickers' own delta rule
+        i += 1
+    return parts[i]
 
 
 def test_frame_rule_fills_terminal_width():

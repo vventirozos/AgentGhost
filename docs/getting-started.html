@@ -48,7 +48,7 @@
     <ol class="flow">
       <li>
         <h4>An LLM server</h4>
-        <p>Anything that speaks the OpenAI chat API: llama.cpp's <code>llama-server</code>, vLLM, or Ollama. Ghost's prompts are tuned for <strong>Qwen 3.6 35B-A3</strong>; a much smaller model will follow the tool-calling format badly and you'll see a lot of failed turns.</p>
+        <p>Anything that speaks the OpenAI chat API: llama.cpp's <code>llama-server</code>, vLLM, or Ollama. Ghost runs on <strong>Qwen3.8-27B</strong> (its prompts were developed on Qwen 3.6 35B-A3); a much smaller model will follow the tool-calling format badly and you'll see a lot of failed turns.</p>
         <span class="where">Ghost connects to this via <code>--upstream-url</code>. Default: <code>http://127.0.0.1:8088</code></span>
       </li>
       <li>
@@ -84,7 +84,7 @@ pip install -r requirements.txt</pre>
 
   <pre class="shell">export GHOST_HOME="$HOME/ghost"          # where everything is stored
 export GHOST_API_KEY="&lt;a long random string&gt;"
-export GHOST_MODEL="qwen-3.6-35b-a3"     # must match your LLM server's model name
+export GHOST_MODEL="qwen3.8-27b"     # must match your LLM server's model name
 export TOR_PROXY="socks5://127.0.0.1:9050"</pre>
 
   <div class="scroll">
@@ -103,7 +103,7 @@ export TOR_PROXY="socks5://127.0.0.1:9050"</pre>
       </tr>
       <tr>
         <td><code>GHOST_MODEL</code></td>
-        <td><code>qwen-3.6-35b-a3</code></td>
+        <td><code>qwen3.8-27b</code></td>
         <td>The model name Ghost asks the upstream server for. If this doesn't match what your LLM server serves, every request fails.</td>
       </tr>
       <tr>
