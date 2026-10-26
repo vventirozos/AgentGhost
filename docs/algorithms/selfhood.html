@@ -17,7 +17,7 @@
     <h3>Algorithms</h3>
     <a href="request_lifecycle.html">Request lifecycle</a>
     <a href="memory_hydration.html">Memory hydration (RRF)</a>
-    <a href="dream_cycle.html">Dream / self-play</a>
+    <a href="dream_cycle.html">Maintenance &amp; failure replay</a>
     <a href="skill_acquisition.html">Skill acquisition</a>
     <a href="circuit_breaker.html">Circuit breaker</a>
     <a class="current" href="selfhood.html">Selfhood (unified self)</a>
@@ -28,7 +28,7 @@
   <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
 
   <h1>Selfhood</h1>
-  <p class="subtitle">A five-component module that stitches the agent's episodic instances into one continuous first-person self. Each new process boot reads back what prior instances wrote — autobiographical experiences, open questions, mood, the running diary — and frames them as <em>mine</em> rather than as external knowledge.</p>
+  <p class="subtitle">A five-component module that stitches the agent's episodic instances into one continuous first-person self. Prior instances' writing — autobiographical experiences, open questions, the running diary — is read back <em>on demand</em> through <code>introspect</code> and framed as <em>mine</em> rather than as external knowledge. (Nothing is spliced into the prompt at boot any more: the wake-up prefix was removed on 2026-10-11, §4NM.)</p>
   <p class="note warn"><strong>Current state (2026-10-11, §4NM).</strong> The selfhood package, the <code>self_state</code> tool and the <code>introspect</code> surfaces stay. Two pieces were removed: the <strong>wake-up prefix</strong> (the first-person block spliced into the system prompt at session start — gated off since §4EU, deleted now) and the <strong>derived-mood idle job</strong> (phase 2.8c, which re-derived a mood while nobody was talking, the only path that could derive <code>idle</code>). The <strong>post-turn mood derivation stays</strong>: after each real owner turn <code>_record_turn_trajectory</code> calls <code>SelfModel.update_derived_mood</code>, which applies the rule table in <code>selfhood/mood.py</code> to the verdict streak and the context-pressure flag; <code>self_state</code> and <code>introspect</code> show the result with its age and provenance (self-set or derived). The agent reads its own past on demand through <code>introspect</code>. Sections below that describe the prefix or the idle job are kept as the record of how they worked.</p>
 
   <div class="note">
@@ -44,7 +44,7 @@
     <li><strong>Continuity tag</strong> — every autobiographical record carries <code>subject="self"</code> so retrieval layers treat it as the agent's own past rather than as external knowledge.</li>
     <li><strong>Self-state thread</strong> — open questions, unfinished tasks, current mood — the cross-session "state vector" that gives a new instance the sense of <em>resuming</em> instead of waking up blank. The agent now writes this itself through the <code>self_state</code> tool, so continuity is <em>active authorship</em>, not just passive recall.</li>
     <li><strong>Recognition / recall</strong> — the agent reads the above on demand through <code>introspect</code> and <code>SelfModel.recall_relevant()</code>; the search is <em>query-aware</em>, surfacing past experiences relevant to the current request, not only the most recent ones. (The wake-up prefix that used to splice this into the system prompt was removed on 2026-10-11, §4NM.)</li>
-    <li><strong>Narrative summariser</strong> — a periodic LLM-driven first-person diary regeneration; gives the diary a <em>voice</em> rather than a bullet-list. The diary is <em>meta-cognitive</em> — it folds in cluster patterns and the learning phases' failure signals, so it records what the agent has <em>learned about itself</em>, not just what it did.</li>
+    <li><strong>Narrative summariser</strong> — a periodic LLM-driven first-person diary regeneration; gives the diary a <em>voice</em> rather than a bullet-list. The diary is <em>meta-cognitive</em> — it folds in cluster patterns and (until their removal on 2026-10-11, §4NM) the learning phases' failure signals, so it records what the agent has <em>learned about itself</em>, not just what it did.</li>
   </ol>
 
   <div class="note">

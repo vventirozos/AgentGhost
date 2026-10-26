@@ -20,7 +20,7 @@
     <a href="how-it-works.html">One message, end to end</a>
     <a href="memory.html">What it remembers</a>
     <a href="tools.html">What it can do</a>
-    <a href="self-improvement.html">How it improves itself</a>
+    <a href="self-improvement.html">Checking and learning</a>
     <a href="learning-loop.html">The learning loop</a>
     <a href="long-horizon.html">Long tasks</a>
 
@@ -40,7 +40,7 @@
   <section class="hero">
     <span class="eyebrow">Documentation</span>
     <h1>Ghost Agent</h1>
-    <p class="subtitle">A self-hosted AI agent. It runs on your own hardware, remembers what you tell it, does the work in a sandbox, and checks its own answer before it replies.</p>
+    <p class="subtitle">A self-hosted AI agent. It runs on your own hardware, remembers what you tell it, does the work in a sandbox, and runs program checks on what it delivered — a page that loads, files that exist.</p>
     <div class="hero-meta">
       <span class="badge">Python 3.10+</span>
       <span class="badge">Runs locally</span>
@@ -63,7 +63,7 @@
       </li>
       <li>
         <h4>Ghost looks up what it already knows</h4>
-        <p>It searches everything it has stored about you and about past conversations, and puts the most relevant pieces in front of the model — before the model starts thinking.</p>
+        <p>It puts your profile, the facts it holds about you and the rules you approved in front of the model — before the model starts thinking. Older documents, notes and past conversations stay on disk and are searched when you ask it to recall something.</p>
       </li>
       <li>
         <h4>The model decides what to do</h4>
@@ -74,8 +74,8 @@
         <p>Tool result goes back to the model, which decides the next step. Most questions take one pass. Real tasks take several.</p>
       </li>
       <li>
-        <h4>A second model checks the answer</h4>
-        <p>Before you see it — or just after, if the reply is streaming — a separate check asks "does this actually answer what was asked, and is it supported by what the tools returned?" If not, Ghost gets a bounded chance to fix it.</p>
+        <h4>Mechanical checks look at what it delivered</h4>
+        <p>Mostly program checks, not a second opinion on the answer: does the page it built load without errors, are the files it claims on disk, is the reply an answer rather than narration, does an image show what the reply says. The reply waits up to 15 seconds for them; a page that throws or a missing file gets one repair round before sending. A failure found later is recorded. The second-model judge that used to read every answer is off since 2026-10-14 (§4OW).</p>
       </li>
     </ol>
     <p class="caption">The turn loop. Steps 3 and 4 repeat; step 5 runs once.</p>
@@ -121,9 +121,9 @@
   </dl>
 
   <div class="note">
-    <strong>A note on model choice.</strong> Ghost is developed and tested against <em>uncensored</em> models — for the main model and for the verifier that checks its answers. It works with a standard aligned model, but expect refusals on operations that are routine for an agent running on your own machine and unusual for a chat assistant: clearing out its own sandbox, deleting files you asked it to delete, searching Tor hidden services, or handling security material.
+    <strong>A note on model choice.</strong> Ghost is developed and tested against <em>uncensored</em> models — for the main model and for the helper models on the other nodes. It works with a standard aligned model, but expect refusals on operations that are routine for an agent running on your own machine and unusual for a chat assistant: clearing out its own sandbox, deleting files you asked it to delete, searching Tor hidden services, or handling security material.
     <br><br>
-    A refusal doesn't look like an error. The tool never runs, the model explains why it won't, and the turn completes normally — so it reads as "the feature is broken" when the model simply declined. If something won't work, check the log for the model refusing rather than the tool failing. The verifier matters here too: an aligned judge can reject a perfectly good answer on subject matter alone, which shows up as unexplained retries.
+    A refusal doesn't look like an error. The tool never runs, the model explains why it won't, and the turn completes normally — so it reads as "the feature is broken" when the model simply declined. If something won't work, check the log for the model refusing rather than the tool failing. If you turn the LLM judge back on (<code>GHOST_VERIFIER_JUDGE=1</code>, off by default since §4OW), the same applies to it: an aligned judge can reject a perfectly good answer on subject matter alone.
   </div>
 
   <p><a href="getting-started.html">Install and run it</a> has the full sequence, in order, with the environment variables spelled out.</p>
@@ -148,15 +148,15 @@
   <div class="card-grid">
     <a class="card" href="memory.html">
       <h3>What it remembers</h3>
-      <p>Six kinds of memory, what goes in each, and how to correct something it got wrong about you.</p>
+      <p>The kinds of memory, what goes in each, which ones reach a prompt, and how to correct something it got wrong about you.</p>
     </a>
     <a class="card" href="tools.html">
       <h3>What it can do</h3>
       <p>The toolbox — code, files, web, browser, images, projects, scheduled tasks — and when it reaches for each.</p>
     </a>
     <a class="card" href="self-improvement.html">
-      <h3>How it improves itself</h3>
-      <p>The self-check on every answer, the background passes, and how it tunes its own prompts.</p>
+      <h3>Checking and learning</h3>
+      <p>The mechanical checks after each answer, the idle-time jobs, and what was tried and removed.</p>
     </a>
     <a class="card" href="learning-loop.html">
       <h3>The learning loop</h3>
@@ -213,7 +213,7 @@
       <tr>
         <td><strong>Memory across sessions</strong></td>
         <td>A mature field now, with several dedicated frameworks. Usually one store — vectors, sometimes plus a graph — retrieved by top-<em>k</em> similarity.</td>
-        <td>Six stores, merged by <strong>rank rather than score</strong>, because similarity numbers from different stores aren't comparable. Only the parts measured as useful go into every prompt; the rest is searched when you ask. Source weights are learned per query intent.</td>
+        <td>Several stores. Every prompt gets your profile, the facts it holds about you and the rules you approved; the fact and document store, past episodes and past conversations are searched when you ask (<code>recall</code>). The prompt sources are merged by <strong>rank rather than score</strong>, with a fixed weight table — the learned weights were removed on 2026-10-11 (§4NN).</td>
       </tr>
       <tr>
         <td><strong>Anonymous egress</strong></td>
@@ -228,7 +228,7 @@
       <tr>
         <td><strong>Checking its own answers</strong></td>
         <td>A known pattern — a critic or reviewer agent, usually wired per workflow by the developer.</td>
-        <td>Runs on every substantive turn, unprompted. Asks whether the answer <em>addresses the question</em> before asking whether it's correct, escalates a cheap judge's refusal to the main model. With the launcher's settings it runs after the reply and a refusal is recorded and can start a replay in the learning loop (corrections are not shown to you since §4NF until proven); a bounded repair before sending is available but off here (<code>GHOST_CRITIC_ASYNC=1</code>). A refuted turn can be replayed by the <a href="learning-loop.html">learning loop</a>.</td>
+        <td>Mechanical checks on what the turn produced: does a built page load, are claimed files on disk, is the reply an answer, does an image show what the reply says. A page that throws or a missing file gets one repair round within a 15-second window before sending; a failure found later is recorded and is not shown to you. The second-model judge is off since 2026-10-14 (§4OW): measured on real turns it was wrong on 9 of 17 refusals. It does not check whether facts in an answer are true.</td>
       </tr>
       <tr>
         <td><strong>Learning from its own runs</strong></td>
@@ -265,14 +265,14 @@
   </div>
 
   <h3>What that costs</h3>
-  <p>The same table read the other way. A local model caps reasoning quality below what a frontier API gives you. Search over Tor against scrapers is slower and less accurate than a keyed search API. The self-check spends an extra model call on every substantive turn. The idle-time learning only happens if the machine stays on. And more moving parts means more that can quietly stop working — several subsystems here have been silently inert for weeks at a time before instrumentation caught them, which is why so much of the tooling is about detecting that specific failure.</p>
+  <p>The same table read the other way. A local model caps reasoning quality below what a frontier API gives you. Search over Tor against scrapers is slower and less accurate than a keyed search API. The answer checks are mechanical, so they catch a broken page or a missing file but not an invented fact — on hand-graded owner turns (2026-10-14 to 10-20) about 43% were right and 14% wrong, and invented knowledge is the main open failure. Failure replay and the regression tests only run if the machine stays on and idle. And more moving parts means more that can quietly stop working — several subsystems here have been silently inert for weeks at a time before instrumentation caught them, which is why so much of the tooling is about detecting that specific failure.</p>
 
   <h2>The unusual parts, in detail</h2>
 
   <p>The mechanism behind each of the rows above.</p>
 
-  <h3>It remembers across sessions, in six different shapes</h3>
-  <p>Closing the chat wipes nothing. Facts, relationships between things, a profile of you, the rules you approved, a running journal, and full past episodes are stored separately — because "what do I know about Postgres?", "who is Anna to me?" and "what went wrong last time?" want different shapes of answer. They're searched together and merged by rank rather than score. <a href="memory.html">How memory works →</a></p>
+  <h3>It remembers across sessions, in several shapes</h3>
+  <p>Closing the chat wipes nothing. Facts and documents, relationships between things, a profile of you, the rules you approved, a running journal, and past episodes and conversations are stored separately — because "what do I know about Postgres?", "who is Anna to me?" and "what went wrong last time?" want different shapes of answer. Only your profile, your facts and your rules go into every prompt; the rest is searched when you ask. <a href="memory.html">How memory works →</a></p>
 
   <h3>It checks what it delivered</h3>
   <p>After each reply, mechanical checks look at what the turn actually produced. Does the page it built load without errors? Are the files it says it wrote on disk? Is the reply an answer, not just narration of its work? Does an image show what the reply describes? A failure is recorded and can start a replay in the learning loop. Since 2026-10-14 (§4OW) the second-model <em>judge</em> that also read the answer against the evidence is off by default. Measured on a week of real use, it was wrong on 9 of 17 refusals, and none of them was shown to you. <code>GHOST_VERIFIER_JUDGE=1</code> turns it back on. <a href="self-improvement.html">How the self-check works →</a></p>
@@ -287,7 +287,7 @@
   <p>Outbound traffic goes through Tor, and this is enforced rather than intended: a boot-time probe plus a process-wide block on direct connections to public addresses. If Tor is unreachable, Ghost won't start. A silently-cleartext agent is worse than a stopped one. <a href="safety.html">How that's enforced →</a></p>
 
   <h3>It works while you're away</h3>
-  <p>Given a quiet stretch, Ghost tidies its memory stores, replays your recent failures to find a rule worth proposing to you, and re-runs the regression tests you kept. None of it interrupts you, and none of it runs while you're active. Ask it what it did — the answer reads from a real ledger, not the model's recollection. <a href="self-improvement.html">The full idle schedule →</a></p>
+  <p>Given a quiet stretch, Ghost files away facts from your recent turns, tidies its memory stores, replays your recent failures to find a rule worth proposing to you, and re-runs the regression tests you kept. None of it interrupts you, and none of it runs while you're active. Ask it what it did — the answer reads from a real ledger, not the model's recollection. <a href="self-improvement.html">The full idle schedule →</a></p>
 
   <h2>Every advanced feature, in one table</h2>
 
@@ -304,7 +304,7 @@
       <tr class="group"><td colspan="3">Memory and context</td></tr>
       <tr>
         <td><a href="core/bus.html"><strong>Rank-fusion memory</strong></a></td>
-        <td>Five stores searched in parallel and merged by <em>rank</em>, because similarity scores from different stores aren't comparable to each other. Since October 2026 only your lessons and rules and facts about you are added to every prompt; the vector, graph, episode and past-session stores answer when you ask (<code>recall</code>). The prompt tiers for those stores were removed on 2026-10-11 (§4NM).</td>
+        <td>The prompt's memory sources merged by <em>rank</em> with a fixed weight table, because similarity scores from different stores aren't comparable to each other. Since October 2026 only your lessons and rules and facts about you are added to every prompt; the vector, graph, episode and past-session stores answer when you ask (<code>recall</code>). The prompt tiers for those stores were removed on 2026-10-11 (§4NM).</td>
         <td><span class="badge good">on</span></td>
       </tr>
       <tr>
@@ -355,14 +355,19 @@
 
       <tr class="group"><td colspan="3">Answering, and checking the answer</td></tr>
       <tr>
-        <td><a href="core/verifier.html"><strong>Two-stage verifier</strong></a></td>
-        <td>A second model names the reply's weakest claims, then judges each one against what the tools actually returned.</td>
+        <td><a href="core/verifier.html"><strong>Mechanical checks</strong></a></td>
+        <td>After each reply: page load, written files, reply shape, turn state, memory claims, and the image pixel check. A page that throws or a missing file gets one repair round inside a 15-second window.</td>
         <td><span class="badge good">on</span></td>
       </tr>
       <tr>
+        <td><a href="core/verifier.html"><strong>LLM judge (two-stage verifier)</strong></a></td>
+        <td>A second model names the reply's weakest claims, then judges each one against what the tools actually returned. Off since 2026-10-14 (§4OW): wrong on 9 of 17 refusals measured on real turns.</td>
+        <td><span class="badge warn">off</span> <code>GHOST_VERIFIER_JUDGE=1</code></td>
+      </tr>
+      <tr>
         <td><a href="core/objection.html"><strong>Objection adjudication</strong></a></td>
-        <td>A judge's objection about a number or a quote is settled by arithmetic and string search <em>before</em> anyone's opinion is consulted.</td>
-        <td><span class="badge good">on</span></td>
+        <td>A judge's objection about a number or a quote is settled by arithmetic and string search <em>before</em> anyone's opinion is consulted. Only runs when the LLM judge is on.</td>
+        <td><span class="badge warn">off with the judge</span></td>
       </tr>
       <tr>
         <td><a href="configuration.html"><strong>Pre-flight failure guard</strong></a></td>
@@ -475,7 +480,7 @@
       </tr>
       <tr>
         <td><a href="algorithms/node_offload.html"><strong>Node offload</strong></a></td>
-        <td>Background, critic, vision and coding work sent to other machines, sized to each node's measured throughput.</td>
+        <td>Background, check, vision and coding work sent to other machines, sized to each node's measured throughput. In production one helper box (Nova) does research and fact extraction and the image look checks.</td>
         <td><code>--worker-nodes</code> etc.</td>
       </tr>
       <tr>
@@ -556,7 +561,7 @@
   </div>
 
   <footer>
-    <p>These pages are written from the source in <code>src/ghost_agent/</code> and <code>interface/</code>, and were last checked against it on <strong>2026-08-04</strong>. The feature table above — including every entry in its <em>Default</em> column — was verified against the code on <strong>2026-08-26</strong>.</p>
+    <p>These pages are written from the source in <code>src/ghost_agent/</code> and <code>interface/</code>, and were last checked against it on <strong>2026-08-04</strong>. The feature table above — including every entry in its <em>Default</em> column — was verified against the code on <strong>2026-08-26</strong>; the answer-checking, memory and learning claims on this page were corrected against the production launcher on <strong>2026-10-26</strong>.</p>
     <p>Where a page says something the code contradicts, the code is right — please open an issue.</p>
   </footer>
 </main>

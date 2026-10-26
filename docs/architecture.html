@@ -31,7 +31,7 @@
     <h3>Algorithms</h3>
     <a href="algorithms/request_lifecycle.html">Request lifecycle</a>
     <a href="algorithms/memory_hydration.html">Memory hydration</a>
-    <a href="algorithms/dream_cycle.html">Dream / self-play</a>
+    <a href="algorithms/dream_cycle.html">Maintenance &amp; failure replay</a>
     <a href="algorithms/skill_acquisition.html">Skill acquisition</a>
     <a href="algorithms/circuit_breaker.html">Circuit breaker</a>
     <a href="algorithms/selfhood.html">Selfhood (unified self)</a>
@@ -399,12 +399,12 @@
     <li><code>MemoryBus.hydrate_context</code> fans out to the skill tier (lessons, owner rules) and the owner-facts lookup and fuses results with Reciprocal Rank Fusion. The vector, topical graph, episodic and session tiers were removed from hydration on 2026-10-11 (&sect;4NM) and answer through <code>recall</code>.</li>
     <li>The combined system prompt + history + hydration is forwarded to the upstream LLM via <code>LLMClient.chat_completion</code>.</li>
     <li>The agent streams chunks back, parses any <code>&lt;tool_call&gt;</code> XML, executes the tool inside the Docker sandbox, and re-injects results.</li>
-    <li>The verifier optionally adjudicates before the final SSE chunk reaches the client. (The uncertainty tracker that also could was removed on 2026-10-11, §4NN.)</li>
+    <li>The verifier's mechanical checks run (page loads, claimed files exist, reply is an answer, image matches the reply). The reply waits up to 15 s for them (<code>GHOST_MECHANICAL_REPAIR_BUDGET</code>, §4OX) so a page that throws or a missing file gets one repair round; otherwise the reply ships and the checks finish in the background. (The uncertainty tracker was removed on 2026-10-11, §4NN; the LLM judge is off, §4OW.)</li>
   </ol>
 
   <p><strong>Prompt prefix caching.</strong> Per-turn latency is dominated by <em>prefill</em> of the context, not generation (probe: tiny prompt ~0.1s; ~17k-token context ~15.8s cold but ~2.7s when the upstream KV-cache is warm). To keep that cache warm across the turns of one request, the per-turn injection is ordered STABLE-first / VOLATILE-last: tool schemas, persona, playbook, hydrated memory and per-request continuity (all byte-identical across turns) precede the <code>dynamic_state</code> block, which is the only per-turn-varying content (sandbox state, plan focus, and a <em>minute</em>-precision timestamp — second precision would change every turn and bust the cache). A <code>Prefill Cache</code> log line emits a hash of the stable prefix each turn; a constant hash across a request means the prefix is cacheable.</p>
 
-  <p><strong>Verifier placement.</strong> (Since §4OW the LLM judge is off by default, <code>GHOST_VERIFIER_JUDGE</code>; the critic node then serves no verdicts, and only the mechanical arms run.) The self-evaluation verifier runs its LLM call on the worker pool by default, or on a dedicated <code>--critic-nodes</code> pool when one is configured — a separate, typically slower off-host model (e.g. a 9B on a spare Mac Mini) reserved for adjudication. Routing it there keeps the verdict off the foreground inference slot, so it never competes with the main model for the KV-cache. With a critic pool the post-response gate is <strong>non-blocking</strong>: the verdict is computed in the background while the answer ships immediately; a late high-confidence <code>REFUTED</code> can't amend the sent response but still retracts any lesson that turn produced. Tune the inline wait with <code>GHOST_CRITIC_GATE_TIMEOUT</code> (see the <a href="cli_reference.html#critic-gate">CLI reference</a>).</p>
+  <p><strong>Verifier placement.</strong> In production the verifier's LLM judge is <strong>off</strong> (§4OW, 2026-10-14: wrong on 9 of 17 refusals); only the mechanical arms run, and the image look check runs on Nova (<code>--critic-nodes</code> points at the same Nova server as <code>--worker-nodes</code>; the separate critic server was removed on 2026-10-25). The launcher sets <code>GHOST_CRITIC_ASYNC=1</code>, so checks finish after the reply ships, apart from the short mechanical repair window above. A failed check is recorded with the turn and can seed a <a href="learning-loop.html">failure replay</a>; it is not shown to the user. If <code>GHOST_VERIFIER_JUDGE=1</code> turns the judge back on, its calls run on the <code>--critic-nodes</code> pool (or the worker pool when none is set), off the foreground slot; its inline wait is <code>GHOST_CRITIC_REPAIR_BUDGET</code> (production sets 0) and <code>GHOST_CRITIC_GATE_TIMEOUT</code> (see the <a href="cli_reference.html#critic-gate">CLI reference</a>).</p>
 
   <h2>Repository layout</h2>
 <pre><code>Agent/

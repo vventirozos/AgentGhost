@@ -20,7 +20,7 @@
     <a href="how-it-works.html">One message, end to end</a>
     <a href="memory.html">What it remembers</a>
     <a href="tools.html">What it can do</a>
-    <a href="self-improvement.html">How it improves itself</a>
+    <a href="self-improvement.html">Checking and learning</a>
     <a class="current" href="learning-loop.html">The learning loop</a>
     <a href="long-horizon.html">Long tasks</a>
 
@@ -107,7 +107,7 @@
 
       <rect class="d-box accent" x="20" y="450" width="260" height="62" rx="7"/>
       <text class="d-label" x="150" y="476" text-anchor="middle">9 · Rule in every prompt</text>
-      <text class="d-sub" x="150" y="496" text-anchor="middle">### OWNER RULES · up to 6</text>
+      <text class="d-sub" x="150" y="496" text-anchor="middle">### OWNER RULES · up to 10</text>
       <path class="d-line" d="M330,481 L284,481" marker-end="url(#ar)"/>
 
       <path class="d-line accent" d="M150,450 L150,94" marker-end="url(#ara)"/>
@@ -139,7 +139,7 @@
       </li>
       <li>
         <h4>Your reaction is the signal</h4>
-        <p>Two things count as you saying an answer was wrong: a <strong>👎</strong> on the reply (web page or Slack), and <strong>your next message</strong> showing it missed — "no, the latest is 18.6", "that's not what I asked". While Ghost is idle, the main model reads your next message in a short check and decides whether it was a correction. Other warning signs — the self-check doubting the answer, a run of failed tool calls — can put a turn on the list to be replayed, but they never become a test, and nothing is adopted on their word.</p>
+        <p>Two things count as you saying an answer was wrong: a <strong>👎</strong> on the reply (web page or Slack), and <strong>your next message</strong> showing it missed — "no, the latest is 18.6", "that's not what I asked". While Ghost is idle, the main model reads your next message in a short check and decides whether it was a correction. Other warning signs — a failed check after the answer, a run of failed tool calls — can put a turn on the list to be replayed, but they never become a test, and nothing is adopted on their word.</p>
         <p class="where">core/owner_seeds.py — <code>failure_signal</code>, <code>judge_reactions</code>; core/feedback.py — the 👍/👎</p>
       </li>
       <li>
@@ -159,7 +159,7 @@
       </li>
       <li>
         <h4>The proposal reaches you</h4>
-        <p>At the top of your next reply, under <em>Background activity while you were away</em>, you see one line that starts with the commands, then the rule, the evidence (what the self-check said before and after) and how your tests did. If you have push notifications set up (ntfy or a webhook), it arrives there too.</p>
+        <p>At the top of your next reply, under <em>Background activity while you were away</em>, you see one line that starts with the commands, then the rule, the evidence (how the replays went with and without the rule, and any check verdicts they carry) and how your tests did. If you have push notifications set up (ntfy or a webhook), it arrives there too.</p>
       </li>
       <li>
         <h4>You decide</h4>
@@ -298,7 +298,7 @@ the newest point release from postgresql.org
   </dl>
 
   <h2 id="off">What was removed, and why</h2>
-  <p>These used to run on their own. Each was measured on real turns in October 2026, found not to help, switched off on 2026-10-10 (§4NC/§4ND) and deleted from the code on 2026-10-11 (§4NM). There is no switch that brings any of them back; nothing on this page depends on them. Lessons are written by exactly two things now: <code>learn_skill</code> (you dictating one) and <code>operator_repair</code>.</p>
+  <p>These used to run on their own. Each was measured on real turns in October 2026, found not to help, switched off on 2026-10-10 (§4NC/§4ND) and deleted from the code on 2026-10-11 (§4NM). There is no switch that brings any of them back — except the last row, the verifier's LLM judge, which is switched off rather than deleted; nothing on this page depends on them. Lessons are written by exactly two things now: <code>learn_skill</code> (you dictating one) and <code>operator_repair</code>.</p>
   <div class="scroll">
   <table>
     <thead><tr><th>What</th><th>What it did</th><th>Why it went</th></tr></thead>
@@ -315,7 +315,7 @@ the newest point release from postgresql.org
     </tbody>
   </table>
   </div>
-  <p>The self-check on every answer still runs, and its confidence is still used — but as a <em>ranking</em>: the least confident 15% of answers get the deeper check. It is not treated as a probability, because measured against outcomes it isn't one. Details: <a href="core/agent.html#4nd">core.agent §4ND</a>.</p>
+  <p>What still runs on every answer are the mechanical checks (does a built page load, do claimed files exist, is the reply an answer, does an image show what the reply says) — see <a href="self-improvement.html">Checking and learning</a>. The confidence score that once picked which answers got a deeper check was deleted on 2026-10-16 (§4PJ): it ranked answers no better than a coin flip.</p>
 
   <h2>Limits, honestly</h2>
   <ul>
@@ -330,7 +330,7 @@ the newest point release from postgresql.org
   <div class="pager">
     <a class="prev" href="self-improvement.html">
       <span class="dir">Previous</span>
-      <span class="to">How it improves itself</span>
+      <span class="to">Checking and learning</span>
     </a>
     <a class="next" href="safety.html">
       <span class="dir">Next</span>

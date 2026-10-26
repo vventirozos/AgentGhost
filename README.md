@@ -1,26 +1,37 @@
 # Ghost Agent
 
-A self-hosted AI agent. It runs on your own hardware, remembers what you tell it across sessions, does its work inside a Docker sandbox, and checks its own answer with a second model before replying.
+A self-hosted AI agent for one owner. It runs on your own hardware, remembers what you tell it across sessions, does its work inside a Docker sandbox, and sends all its network traffic through Tor.
 
-Ghost is not a model — it's the program around one. You point it at any OpenAI-compatible LLM server (llama.cpp, vLLM, Ollama) and it adds memory, tools, a sandbox, a self-check, and a set of background passes that learn from its own transcripts. Everything runs locally; the only traffic that leaves your machine goes out through Tor.
+Ghost is not a model — it's the program around one. You point it at any OpenAI-compatible LLM server (llama.cpp, vLLM, Ollama) and it adds memory, tools, a sandbox, after-reply checks, and a learning loop that you approve step by step. Everything runs locally; the only traffic that leaves your machine goes out through Tor.
 
 ## What it does
 
-- **Runs tasks, not just chat.** Writes and executes code, reads and writes files, drives a real browser, queries Postgres, generates PDFs — all inside a container that shares exactly one directory with your machine.
-- **Remembers across sessions.** Six stores — facts, relationships, your profile, lessons from its own mistakes, a journal, and full past episodes — searched in parallel and merged by rank rather than score.
-- **Refuses its own answers.** A second model reads the final answer against the evidence the tools actually returned, and asks whether it answers the question *before* asking whether it's correct. A high-confidence refusal sends Ghost back to fix it.
-- **Learns while idle.** Given a quiet stretch it consolidates memory, reviews failed turns into lessons, extracts repeated procedures into reusable skills, retrains two small local models, and practises against problems it invents for itself. None of it interrupts you.
-- **Tunes its own prompts.** An optimizer rewrites three internal prompts from Ghost's own successful turns, using the same local model — no teacher, no external service. Capped at 16 rounds, because longer optimization drifts toward gaming the metric, and a tuned prompt only ships if it beats the hand-written one.
-- **Searches Tor hidden services.** Ordinary search engines don't index `.onion` sites, so there's a separate path through the dedicated onion engines, with each retry forced onto a fresh circuit.
+- **Runs tasks, not just chat.** Writes and executes code, reads and writes files, drives a real browser, queries Postgres, generates PDFs and images — all inside a container that shares exactly one directory with your machine.
+- **Remembers you across sessions.** Your profile, the facts you've told it about yourself, and the rules you've approved go into every prompt. Documents and older notes are stored too, and searched when a question needs them.
+- **Checks what it can check mechanically.** After a reply, it checks the things a program can test: does the page it built load without errors, are the files it says it wrote really on disk, is the reply an answer rather than a description of its work, does a generated image show what the reply says it shows. A page that throws gets one short repair round. Other failures are recorded for the learning loop. These checks do **not** judge whether a factual answer is true.
+- **Learns only what you approve.** A 👎 or a correction from you starts an idle-time replay of that question. The replay ends in *one* proposed rule and a regression test. Neither takes effect until you say so, and kept tests re-run after every deploy.
+- **Searches Tor hidden services.** Ordinary search engines don't index `.onion` sites, so there's a separate path through the dedicated onion engines, with each retry forced onto a fresh circuit. Downloads go to a quarantine and are never run.
 - **Fails closed on the network.** A boot-time Tor probe plus a process-wide block on direct connections to public addresses. If Tor is unreachable, Ghost doesn't start.
 
 It holds no API keys for third-party services and has no ability to authenticate as you to anything.
+
+## What it doesn't do (any more)
+
+Earlier versions did a lot more on their own. Each of these was measured on real turns, didn't help, and was switched off or deleted:
+
+- **A second model judging every answer.** Off since 2026-10-14. It was wrong on 9 of the 17 answers it rejected.
+- **Self-teaching while idle.** Skill extraction, self-written lessons, reflection, post-mortems, practice on invented problems, and retraining two small local models were all removed on 2026-10-11.
+- **Prompt tuning.** No tuned prompt ever beat the hand-written one, so the optimizer was removed. Every prompt is hand-written.
+
+## What to expect
+
+Ghost runs a local model (Qwen3.8-27B today), so answers are less capable than a frontier hosted assistant's. In a graded sample of real owner turns from October 2026, about 43% of answers were right and 14% wrong. Facts the model makes up are the biggest open failure. The median reply takes about ten seconds; long tool-heavy turns can take minutes. That's the price of keeping everything on your own hardware and off the open network. If you need frontier-quality answers more than you need that privacy, this is the wrong tool.
 
 ## Requirements
 
 | | |
 | --- | --- |
-| **An LLM server** | Anything speaking the OpenAI chat API. Tuned around **Qwen 3.6 35B-A3**; the prompts assume roughly that capability. |
+| **An LLM server** | Anything speaking the OpenAI chat API. Runs on **Qwen3.8-27B** (developed on Qwen 3.6 35B-A3 before that); the prompts assume roughly that capability. A second, small model on another machine (Gemma 4 E4B) handles research extraction and image checks. |
 | **Docker** | Daemon running. Every piece of executed code goes into a container. |
 | **Tor** | A local daemon on `9050`. Ghost refuses to start without it. |
 | **Python 3.10+** | Plus `requirements.txt` (ChromaDB, PyTorch and sentence-transformers make the first install large). |
@@ -54,7 +65,7 @@ curl -s -H "X-Ghost-Key: $GHOST_API_KEY" \
      http://127.0.0.1:8000/api/health | python -m json.tool
 ```
 
-`memory_system_loaded` and `biological_watchdog_alive` must both be `true`. The first means memory loaded; the second means the background learning loop is alive. Nothing else will tell you if either is wrong.
+`memory_system_loaded` and `biological_watchdog_alive` must both be `true`. The first means memory loaded. The second means the idle scheduler is alive: that's what runs memory upkeep, failure replays and your regression tests (the key keeps an old name). Nothing else will tell you if either is wrong.
 
 ### Talk to it
 
@@ -78,9 +89,9 @@ Two tiers. The **guide** is written for a beginner-to-intermediate reader:
 | [Install and run it](https://vventirozos.github.io/AgentGhost/getting-started.html) | Prerequisites in order, environment variables, verifying the install. |
 | [Interfaces](https://vventirozos.github.io/AgentGhost/interfaces.html) | Web UI, Slack, voice, desktop client, CLI, HTTP API. |
 | [One message, end to end](https://vventirozos.github.io/AgentGhost/how-it-works.html) | The turn loop, and which step to blame when it goes wrong. |
-| [What it remembers](https://vventirozos.github.io/AgentGhost/memory.html) | The six stores, how they're merged, how to correct one. |
+| [What it remembers](https://vventirozos.github.io/AgentGhost/memory.html) | What's stored, what goes into every prompt, how to correct it. |
 | [What it can do](https://vventirozos.github.io/AgentGhost/tools.html) | The toolbox, and how Ghost chooses between tools. |
-| [How it improves itself](https://vventirozos.github.io/AgentGhost/self-improvement.html) | The self-check, the idle-time passes, and prompt tuning. |
+| [Checking and learning](https://vventirozos.github.io/AgentGhost/self-improvement.html) | The after-reply checks, the learning loop you approve, and idle-time upkeep. |
 | [Safety and privacy](https://vventirozos.github.io/AgentGhost/safety.html) | What leaves your machine, what can't, how it's enforced. |
 | [Settings that matter](https://vventirozos.github.io/AgentGhost/configuration.html) | The twenty flags worth knowing, out of sixty-four. |
 | [When something breaks](https://vventirozos.github.io/AgentGhost/troubleshooting.html) | Sorted by symptom. |
@@ -94,18 +105,15 @@ The **[deep reference](https://vventirozos.github.io/AgentGhost/reference.html)*
 src/ghost_agent/
   main.py        CLI entrypoint and FastAPI lifespan
   api/           HTTP routes (Ollama- and OpenAI-compatible)
-  core/          turn loop, planning, verifier, memory bus, idle-time passes
-  memory/        the six stores, plus scratchpad, sessions and projects
+  core/          turn loop, after-reply checks, memory bus, failure replay, idle scheduler
+  memory/        the stores, plus scratchpad, sessions and projects
   tools/         the toolbox and its registry
   sandbox/       Docker container lifecycle and supervised services
   selfhood/      first-person continuity across sessions
   workspace/     the outward-facing model of your files and tasks
-  distill/       trajectory recording — what every learning pass reads
-  reflection/    failure review and the post-mortem engine
-  skills_auto/   automatic skill extraction and re-verification
-  prm/ router/   the two small self-trained models
-  optim/         prompt optimization and tool-choice evaluation
-  eval/          the evaluation suite and benches
+  distill/       turn recording, reaction judging and correction detection
+  optim/         tool descriptions rendered from their signatures
+  eval/          the evaluation suite and the verifier's test bench
   utils/         logging, redaction, the Tor egress guard, tokenisation
 interface/       web UI, Slack bot, voice, desktop client, CLI
 docs/            this documentation set

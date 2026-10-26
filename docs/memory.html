@@ -20,7 +20,7 @@
     <a href="how-it-works.html">One message, end to end</a>
     <a class="current" href="memory.html">What it remembers</a>
     <a href="tools.html">What it can do</a>
-    <a href="self-improvement.html">How it improves itself</a>
+    <a href="self-improvement.html">Checking and learning</a>
     <a href="learning-loop.html">The learning loop</a>
     <a href="long-horizon.html">Long tasks</a>
 
@@ -44,9 +44,9 @@
   <p class="lede">The short version: closing the chat doesn't erase anything. Everything lives in files under <code>$GHOST_HOME/system/</code>: the stores in <code>system/memory/</code>, past conversations in <code>system/sessions/</code>, the turn record in <code>system/trajectories/</code>. Delete those and Ghost forgets you completely.</p>
 
   <h2>Why more than one store</h2>
-  <p>A single searchable pile of text is bad at some very ordinary questions. "What do I know about Postgres?" and "Who is Anna to me?" and "What went wrong last time I tried this?" want different shapes of answer. So Ghost keeps them separately and searches all of them at once.</p>
+  <p>A single searchable pile of text is bad at some very ordinary questions. "What do I know about Postgres?" and "Who is Anna to me?" and "What went wrong last time I tried this?" want different shapes of answer. So Ghost keeps them separately. Only some of them reach a prompt on their own — your profile, the facts it holds about you, and the rules you approved; the rest are searched when you ask it to recall something.</p>
 
-  <h2>The six kinds</h2>
+  <h2>The kinds</h2>
 
   <h3>1. Facts — the searchable pile</h3>
   <p>Individual pieces of knowledge, stored so they can be found by meaning rather than by exact words. Ask about "the database migration" and it will find a note that said "moving the schema over" — different words, same idea.</p>
@@ -54,7 +54,8 @@
   <span class="badge">memory/vector.py</span> <span class="badge">ChromaDB</span>
 
   <h3>2. Relationships — how things connect</h3>
-  <p>A graph of entities and the links between them. "Anna is my wife", "the NetMon project runs on the ghost machine", "this script depends on that service". Questions about <em>connections</em> are answered badly by a pile of text and well by a graph.</p>
+  <p>A graph of entities and the links between them. "Anna is my wife", "the NetMon project runs on the ghost machine". Questions about <em>connections</em> are answered badly by a pile of text and well by a graph.</p>
+  <p>Since §4OM (October 2026) only two things write to it: copies of your profile facts, and your projects. Free-form writes from conversation are off. The facts about you reach every prompt; the rest of the graph is searched when you ask.</p>
   <span class="badge">memory/graph.py</span>
 
   <h3>3. Your profile — the things that are always true</h3>
@@ -63,22 +64,22 @@
   <span class="badge">memory/profile.py</span>
 
   <h3>4. Rules — what you told it to do differently</h3>
-  <p>Rules you approved. Since October 2026 Ghost no longer writes lessons for itself — measured, they rarely reached the turn they were for. A rule is added only when you adopt one it proposes after replaying a failure ("learn rule 3"), and every adopted rule (up to six) is in the prompt of every one of your turns. A lesson you dictate in your own words is still stored and searched, but it is not one of those rules. <a href="learning-loop.html">How the learning loop works →</a></p>
-  <p>Ask it <em>"what have you learned this week?"</em> and it will read this store back to you rather than making something up.</p>
+  <p>Rules you approved. Since October 2026 Ghost no longer writes lessons for itself — measured, they rarely reached the turn they were for. A rule is added only when you adopt one it proposes after replaying a failure ("learn rule 3"), and your newest ten adopted rules are in the prompt of every one of your turns. A lesson you dictate in your own words is still stored and searched, but it is not one of those rules. <a href="learning-loop.html">How the learning loop works →</a></p>
+  <p>Say <em>"show all rules"</em> and the system lists them from the store, rather than the model recalling them.</p>
   <span class="badge">memory/skills.py</span>
 
   <h3>5. Episodes — what happened, in order</h3>
-  <p>Facts are isolated statements. Episodes are sequences: <em>I was asked to do X, I tried Y, it failed because Z, so I switched to W and that worked.</em> Causal chains, not trivia. This is what lets Ghost say "last time we hit this, the fix was…" instead of starting from scratch.</p>
+  <p>Facts are isolated statements. Episodes are sequences: <em>I was asked to do X, I tried Y, it failed because Z, so I switched to W and that worked.</em> Causal chains, not trivia. Since 2026-10-10 they are no longer added to prompts (measured on real turns: 15% relevant, 19% harmful, §4NC); they are searched only when you ask it to recall what happened.</p>
   <span class="badge">memory/episodes.py</span>
 
   <h3>6. The journal — the short-term buffer</h3>
-  <p>Not really a memory so much as an inbox. Things that happened during a conversation get queued here immediately, and a background pass later works through the queue, decides what's worth keeping, and files it into the stores above.</p>
+  <p>Not really a memory so much as an inbox. Your turns get queued here immediately, and a background pass later works through the queue: a model reads only <em>your own</em> lines, picks out facts you stated, and files them into the stores above.</p>
   <p>This is why something you mentioned thirty seconds ago might not be findable yet, but will be tomorrow. The queue drains after about two minutes of quiet.</p>
   <span class="badge">memory/journal.py</span>
 
   <h3>7. Experience — how past turns went</h3>
-  <p>A record of past requests like the one you just made, kept only for turns a human graded: the periodic answer census, or your own 👍/👎 on a reply. For each it keeps the steps the agent took and the pages that answered the question, and for a graded-wrong one, what the grader said went wrong. It does not keep the old answer as a fact (a version, a price, the weather or the news are readings of their day), only how the answer was found. When you ask something close to a graded turn, at most two lines are added to the prompt: how the right one was answered, and what to avoid from the wrong one.</p>
-  <p>This store is new (October 2026) and off in prompts until a blind replay shows it raises right answers without raising wrong ones; see the module page for the switch and the decision rule.</p>
+  <p>A record of past requests like the one you just made, kept only for turns a human graded: the periodic answer census, or your own 👍/👎 on a reply. For each it keeps the steps the agent took and the pages that answered the question, and for a graded-wrong one, what the grader said went wrong. It does not keep the old answer as a fact (a version, a price, the weather or the news are readings of their day), only how the answer was found. If it were switched on, a question close to a graded turn would add at most two lines to the prompt: how the right one was answered, and what to avoid from the wrong one.</p>
+  <p><strong>It is off in prompts</strong> (<code>GHOST_EXPERIENCE_TIER</code> unset). The October 2026 replay was inconclusive, so it stays off until a blind replay shows it raises right answers without raising wrong ones; the index keeps syncing. See the module page for the switch and the decision rule.</p>
   <span class="badge">memory/experience.py</span>
 
   <h3>8. The fact ledger — when you told it, and in which words</h3>
@@ -96,16 +97,16 @@
   <div class="diagram">
     <ol class="flow tight">
       <li>
-        <h4>Your question gets broken into a few sub-questions</h4>
-        <p>Asking three narrower versions of a question finds more than asking the broad one once.</p>
+        <h4>Your question is used as you wrote it</h4>
+        <p>No model rewrites or breaks it up (that was removed in §4NQ — it lost a fact about you). Only a message that lists two topics with "and also" or "as well as" is split into its parts, by keyword.</p>
       </li>
       <li>
-        <h4>Every store is searched for every sub-question, all at once</h4>
-        <p>Five stores × a few sub-questions, run in parallel — so this costs about as long as the slowest single search.</p>
+        <h4>The two prompt sources are searched at once</h4>
+        <p>Facts about you and the rules and lessons, run in parallel — so this costs about as long as the slower search.</p>
       </li>
       <li>
         <h4>The ranked lists are merged by position, not by score</h4>
-        <p>Items found by several sub-questions rise to the top. Exact duplicates collapse into one entry with a combined score, and a graph chain contained in a longer chain is dropped (§4MJ).</p>
+        <p>Each source's weight comes from a fixed table (§4NN removed the learned weights). Items found by several lists rise to the top. Exact duplicates collapse into one entry with a combined score, and a graph chain contained in a longer chain is dropped (§4MJ).</p>
       </li>
       <li>
         <h4>The top results are added to the conversation (pinned above its first message)</h4>
@@ -143,7 +144,7 @@
   <h2>Where it all lives on disk</h2>
   <dl class="kv">
     <dt>system/memory/</dt>
-    <dd>Every store. The vector database, the graph, your profile, lessons, episodes, the journal queue.</dd>
+    <dd>Every store. The vector database, the graph, your profile, lessons and rules, episodes, the journal queue.</dd>
     <dt>system/memory/embedder.json</dt>
     <dd>Records which embedding model built the vector store. If you change the embedding model, Ghost <strong>refuses to start</strong> rather than silently returning nonsense — the old vectors would still load, they'd just stop meaning anything. There's a re-embed script for when you genuinely want to switch.</dd>
     <dt>system/sessions/</dt>
@@ -164,7 +165,7 @@
   </div>
 
   <footer>
-    <p>Checked against <code>src/ghost_agent/memory/</code> and <code>core/bus.py</code> on 2026-10-08 (§4MJ). Per-store detail is in <a href="reference.html">the deep reference</a>.</p>
+    <p>Checked against <code>src/ghost_agent/memory/</code> and <code>core/bus.py</code> on 2026-10-08 (§4MJ); what reaches a prompt was re-checked against the production launcher on 2026-10-26. Per-store detail is in <a href="reference.html">the deep reference</a>.</p>
   </footer>
 </main>
 </body>

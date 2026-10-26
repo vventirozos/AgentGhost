@@ -33,14 +33,14 @@
   <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
 
   <h1>core / bus.py — MemoryBus</h1>
-  <p class="subtitle">In-memory pub/sub façade over Vector / Graph / Skill / Profile / Episodic stores. Hydrates context with Reciprocal Rank Fusion; publishes facts in parallel.</p>
+  <p class="subtitle">In-memory pub/sub façade over Vector / Graph / Skill / Profile / Episodic stores. Hydrates context with Reciprocal Rank Fusion over a fixed weight table; publishes facts in parallel. Since &sect;4NM (2026-10-11) only two tiers feed a prompt: the owner's facts (graph) and the skill tier (owner rules; auto lessons off). The other stores are searched only through <code>recall</code>.</p>
 
   <h2>Public surface</h2>
   <div class="scroll"><table>
     <thead><tr><th>Member</th><th>Signature</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>__init__</code></td><td><code>(vector_memory, graph_memory, skill_memory, profile_memory, episodic_memory, session_store)</code></td><td>All tiers are optional — missing ones are skipped at fan-out time.</td></tr>
-      <tr><td><code>async hydrate_context</code></td><td><code>(query, *, max_chars=6000, rrf_k=0 (→ _RRF_K=10), context_budget=0, turn_id="", raw_user_text="", exclude_session_id="") -&gt; str</code></td><td>Fetch all tiers in parallel, fuse with RRF, return sectioned markdown for prompt injection.</td></tr>
+      <tr><td><code>async hydrate_context</code></td><td><code>(query, *, max_chars=6000, rrf_k=0 (→ _RRF_K=10), context_budget=0, turn_id="", raw_user_text="", exclude_session_id="") -&gt; str</code></td><td>Fetch the live hydration tiers (owner facts + skill, since &sect;4NM) in parallel, fuse with RRF, return sectioned markdown for prompt injection.</td></tr>
       <tr><td><code>async publish_fact</code></td><td><code>(event_type, fact_data) -&gt; Dict[str, Any]</code></td><td>Fan-out write to vector, graph, profile, skill stores in parallel. Dedup-LRU gate prevents replays.</td></tr>
     </tbody>
   </table></div>
@@ -120,7 +120,7 @@
       <line x1="500" y1="240" x2="490" y2="280" stroke="#7aa7ff" marker-end="url(#bus1)"/>
       <line x1="680" y1="240" x2="520" y2="280" stroke="#7aa7ff" marker-end="url(#bus1)"/>
     </svg>
-    <p class="caption">Figure 5 — Memory-bus hydration: parallel fetch across tiers, RRF fusion at the end.</p>
+    <p class="caption">Figure 5 — Memory-bus hydration as designed: parallel fetch across tiers, RRF fusion at the end. Since &sect;4NM the VectorMemory and EpisodicMemory branches no longer feed hydration; only GraphMemory (owner facts) and SkillMemory (owner rules) do.</p>
   </div>
 
   <h2>Concurrency</h2>

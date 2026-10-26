@@ -20,7 +20,7 @@
     <a href="how-it-works.html">One message, end to end</a>
     <a href="memory.html">What it remembers</a>
     <a href="tools.html">What it can do</a>
-    <a href="self-improvement.html">How it improves itself</a>
+    <a href="self-improvement.html">Checking and learning</a>
     <a href="learning-loop.html">The learning loop</a>
     <a href="long-horizon.html">Long tasks</a>
 
@@ -64,7 +64,7 @@
     <dd>The recorded log of one turn: what was asked, what tools ran, what came back, how it ended. This is what the learning loop, the regression suite and <code>introspect</code> read.</dd>
 
     <dt>Streaming vs non-streaming</dt>
-    <dd>Whether the answer arrives word by word or in one piece. It matters more than it sounds: streamed answers are self-checked <em>after</em> they reach you, so a refusal is recorded after the fact (and, since §4NF, not shown to you) rather than repaired before sending.</dd>
+    <dd>Whether the answer arrives word by word or in one piece. It matters more than it sounds: streamed answers are checked <em>after</em> they reach you, so a failed check is recorded after the fact (and, since §4NF, not shown to you) rather than repaired before sending.</dd>
   </dl>
 
   <h2>Memory</h2>
@@ -77,10 +77,10 @@
     <dd>The model that turns text into those numbers. Changing it invalidates everything already stored — the old numbers stay valid-looking but stop meaning anything, which is why Ghost refuses to start on a mismatch.</dd>
 
     <dt>Graph memory</dt>
-    <dd>Entities and the relationships between them. Answers "how is X connected to Y?" where the searchable pile can't.</dd>
+    <dd>Entities and the relationships between them. Answers "how is X connected to Y?" where the searchable pile can't. Since §4OM only copies of your profile facts and your projects are written to it.</dd>
 
     <dt>Episode</dt>
-    <dd>A stored sequence of actions and their outcome — <em>I tried X, it failed because Y, so I did Z</em>. Unlike a fact, it has causality and order.</dd>
+    <dd>A stored sequence of actions and their outcome — <em>I tried X, it failed because Y, so I did Z</em>. Unlike a fact, it has causality and order. Searched only when you ask; not added to prompts since 2026-10-10.</dd>
 
     <dt>Journal</dt>
     <dd>The short-term queue. Things noticed during a conversation land here first, and a background pass files them into long-term memory a couple of minutes later.</dd>
@@ -108,16 +108,16 @@
 
   <dl class="kv terms">
     <dt>Verifier</dt>
-    <dd>The second model that reads a final answer against the evidence and decides whether it holds up.</dd>
+    <dd>The checks run on a finished turn. Since 2026-10-14 (§4OW) only the mechanical ones run: does a built page load, are claimed files on disk, is the reply an answer, does an image show what the reply says. The second-model <em>judge</em> that read the answer against the evidence is off (<code>GHOST_VERIFIER_JUDGE=1</code> turns it back on).</dd>
 
     <dt>Verdict · confirmed / refuted</dt>
-    <dd>The verifier's decision. "Refuted" means it thinks the answer doesn't hold — either it doesn't answer the question, or the evidence doesn't support it.</dd>
+    <dd>The verifier's decision. "Refuted" means a check failed — today a mechanical one, such as a page that throws or a file that isn't there.</dd>
 
     <dt>Escalation</dt>
-    <dd>When a cheap judge refuses an answer, the main model re-examines it and <em>its</em> verdict wins. This exists because the cheap judge refuses more often than it should.</dd>
+    <dd>Part of the LLM judge, so off with it: when the cheap judge refused an answer, the main model re-examined it and <em>its</em> verdict won, because the cheap judge refused more often than it should.</dd>
 
     <dt>Auto-repair</dt>
-    <dd>Ghost getting a bounded second attempt at an answer the verifier refused, with the critique in hand — rather than shipping something that just failed. Off on this machine: the launcher runs the check after the reply (<code>GHOST_CRITIC_ASYNC=1</code>, <code>GHOST_CRITIC_REPAIR_BUDGET=0</code>), and a refusal is recorded instead — not shown to you since §4NF until the verifier's precision is proven.</dd>
+    <dd>Ghost getting a bounded second attempt at an answer a check refused, with the failure in hand — rather than shipping something that just failed. With the judge off (§4OX) the reply waits up to 15 seconds for the mechanical checks, and a page that throws or a missing file gets one repair round before sending (<code>GHOST_MECHANICAL_REPAIR_BUDGET</code>). A failure found later is recorded, not shown to you (§4NF).</dd>
 
     <dt>Loop breaker</dt>
     <dd>A guard that stops Ghost repeating the same successful-but-useless action forever — clicking the same button, taking the same screenshot, concluding nothing. Fires on the third identical repeat.</dd>
@@ -248,7 +248,7 @@
     <dd>A machine for background and small jobs, so they don't compete with your conversation for the main model.</dd>
 
     <dt>Critic node</dt>
-    <dd>A machine dedicated to the self-check. Usually the most valuable one to add.</dd>
+    <dd>The machine that ran the LLM judge. With the judge off (§4OW) it serves the image look checks (<code>GHOST_VISUAL_CHECK_POOL=critic</code>); in production it is the same helper box as the worker node.</dd>
 
     <dt>Swarm</dt>
     <dd>Fanning one task out across several models in parallel.</dd>

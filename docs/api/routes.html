@@ -186,12 +186,10 @@ auth rejected  path=/api/game/move ip=127.0.0.1 ua=curl/8.0-intruder    &lt;- WA
 <h2 id="4mt-operator">§4MT: <code>/api/operator/self-play-slot</code></h2>
 <p><code>POST</code> runs the failure-replay idle slot (still logged as self-play) once, now, in the live process. It is the same <code>GhostAgent._self_play_slot_body</code> the idle tick runs:</p>
 <ul>
-  <li>withdraw failing proven lessons;</li>
-  <li>run one leg of a pending lesson proof;</li>
-  <li>otherwise, run the reaction-judge pass, then one stage of the owner-failure replay (&sect;4MW, <code>core/failure_replay.py</code>);</li>
-  <li>if the replay had nothing to do, one step of the owner regression suite (&sect;4NE, <code>core/regression.py</code>);</li>
-  <li>only then, and only with <code>GHOST_CODING_PRACTICE=1</code> (off since &sect;4ND), one code/data owner-failure practice.</li>
+  <li>run the reaction-judge pass (tool turns, then no-tool turns for the census), then one stage of the owner-failure replay (&sect;4MW, <code>core/failure_replay.py</code>);</li>
+  <li>if the replay had nothing to do, one step of the owner regression suite (&sect;4NE, <code>core/regression.py</code>).</li>
 </ul>
+<p class="note"><em>Corrected 2026-10-26.</em> This list used to begin with "withdraw failing proven lessons" and "run one leg of a pending lesson proof", and end with a <code>GHOST_CODING_PRACTICE</code> practice step; none of those is in the slot body any more (synthetic practice was removed in &sect;4NM). The <code>{"calibrate": …}</code> body described in the next paragraph is no longer read by the route: a POST always runs the slot.</p>
 <p>It is refused with 409 while a user request is live or another slot is running. It starts off-loop and returns at once; <code>GET</code> returns <code>{state, started, finished, outcome}</code>. It moves the tick's self-play anchor, so the tick does not repeat the slot straight after. It is protected by the API key.</p>
 <p>A body of <code>{"calibrate": "&lt;shape&gt;", "n": 3}</code> instead measures how hard a practice shape is for the real solver (<code>start_practice_calibration</code>). It runs <code>n</code> fresh renders (at most 6) the way a lesson-proof control leg does: an injected challenge, owner-practice grading and no lesson in the prompt. So it writes no lesson, persists no challenge and uses no seed. <code>GET</code> returns the per-run scores (3, 2 or 1 for a pass on attempt 1, 2 or 3; 0 for a fail).</p>
 </body>

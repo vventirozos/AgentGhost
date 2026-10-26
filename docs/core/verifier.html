@@ -23,7 +23,7 @@
   <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
 
   <h1>core / verifier.py — Verifier</h1>
-  <p class="subtitle">Reflective self-evaluation: a separate LLM call (worker pool when possible) confirms / refutes the agent's conclusion before it reaches the user.</p>
+  <p class="subtitle">After-reply checks on the agent's conclusion. In production (since 2026-10-14, <a href="#judge-off">§4OW</a>) only the <strong>mechanical</strong> arms run: reply shape, turn state, memory claim, the visual pixel check, WEB-EXEC and FILE-ARTIFACT. The separate-LLM judge (<code>verify_claim</code> / <code>verify_code_output</code>) is <strong>off</strong> (<code>GHOST_VERIFIER_JUDGE</code> unset); the judge material below is kept as the record of how it worked and was measured.</p>
 
   <h2>API</h2>
   <div class="scroll"><table>
@@ -284,7 +284,7 @@
   never shipped — the §4BL cap was NULLed by held-out validation and the probe
   mechanism retired (see above).</p>
 
-  <h2>The LLM judge is off; the mechanical checks stay (§4OW, 2026-10-14)</h2>
+  <h2 id="judge-off">The LLM judge is off; the mechanical checks stay (§4OW, 2026-10-14)</h2>
   <p><strong>Operator decision</strong> after §4OV. That audit labelled every refute on real traffic from 10-07 to 10-14 against the turn's own tool calls. 5 of 17 were clearly right and 9 false. In 14 of the 17, the main-model escalation upheld the cheap judge, because both saw the same evidence. Meanwhile the verdict was silent toward the owner, 0 member corrections were delivered, and each verdict spent 30 to 170&nbsp;s of the critic node (shared with the worker) plus main-model escalations. Its one real product was failure-replay seeds: 2 of the 3 adopted owner rules came from judge verdicts.</p>
   <p><code>GHOST_VERIFIER_JUDGE</code> (default off) skips <code>verify_claim</code> and <code>verify_code_output</code> in <code>_compute_verifier_verdict</code>, so everything inside them is skipped too: the claim binder, the escalation and the votes. The evidence pack is not built. The mechanical arms run as before: reply shape, turn state, memory claim, the visual pixel check, WEB-EXEC and FILE-ARTIFACT. A refute from one of them is grounded and keeps every consequence. With no mechanical finding the turn has no verdict, and the late handler logs nothing. Failure replay now seeds from mechanical refutes, owner reactions, tool-error streaks, the knowledge check and operator seeds. <strong>To check around 10-28:</strong> candidate rules per week, against 10-09 to 10-13 (5 replays, 4 rules).</p>
   <p>The §4OV changes ship underneath it and act whenever the judge is switched back on:</p>

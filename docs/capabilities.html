@@ -31,7 +31,7 @@
     <h3>Algorithms</h3>
     <a href="algorithms/request_lifecycle.html">Request lifecycle</a>
     <a href="algorithms/memory_hydration.html">Memory hydration</a>
-    <a href="algorithms/dream_cycle.html">Dream / self-play</a>
+    <a href="algorithms/dream_cycle.html">Maintenance &amp; failure replay</a>
     <a href="algorithms/skill_acquisition.html">Skill acquisition</a>
     <a href="algorithms/circuit_breaker.html">Circuit breaker</a>
   </nav>
@@ -57,7 +57,7 @@
   </div>
 
   <h2 id="research">Research &amp; synthesis</h2>
-  <p>Ghost Agent issues web searches through DuckDuckGo (over Tor when <code>--anonymous</code> is on), fetches the top results with SSRF-guarded HTTP, and folds the content into a single synthesised answer. PDFs are parsed with PyMuPDF; image-heavy pages are routed to the vision pool for OCR.</p>
+  <p>Ghost Agent issues web searches through DuckDuckGo, always over Tor (production runs with <code>--mandatory-tor</code>), fetches the top results with SSRF-guarded HTTP, and folds the content into a single synthesised answer. PDFs are parsed with PyMuPDF; image-heavy pages are routed to the vision pool for OCR.</p>
   <pre><code>&gt; Find the three most-cited 2025 papers on mixture-of-experts routing
   and give me a one-paragraph summary of each, with DOIs.</code></pre>
   <p><strong>Under the hood:</strong> <code>web_search</code> → <code>fetch_url</code> (retry + identity rotation on 401/403/503) → <code>vision</code> on any PDFs → vector memory for de-duplication → synthesis turn.</p>
@@ -101,7 +101,7 @@
   <p><strong>Tools:</strong> <a href="tools/vision.html"><code>vision</code></a>.</p>
 
   <h2 id="memory">Long-term memory</h2>
-  <p>Six independent stores keep different kinds of knowledge: semantic (<a href="memory/vector.html">vector</a>), factual (<a href="memory/graph.html">graph</a>), user-specific (<a href="memory/profile.html">profile</a>), procedural (<a href="memory/skills.html">skills</a>), chronological (<a href="memory/episodes.html">episodes</a>), and short-term (<a href="memory/journal.html">journal</a> + <a href="memory/scratchpad.html">scratchpad</a>). An adaptive threshold decides what is worth committing.</p>
+  <p>Six independent stores keep different kinds of knowledge: semantic (<a href="memory/vector.html">vector</a>), factual (<a href="memory/graph.html">graph</a>), user-specific (<a href="memory/profile.html">profile</a>), procedural (<a href="memory/skills.html">skills</a>), chronological (<a href="memory/episodes.html">episodes</a>), and short-term (<a href="memory/journal.html">journal</a> + <a href="memory/scratchpad.html">scratchpad</a>). An adaptive threshold decides what is worth committing. Not all of them go into every prompt: each turn carries your profile, the facts about you and the rules you adopted; documents and other facts are searched when needed (<code>recall</code>, <code>knowledge_base</code>). The graph, episode and session tiers were taken out of prompts after measuring them on real turns (§4NC, §4NM).</p>
   <pre><code>&gt; Remember that I prefer ISO-8601 dates everywhere, that my primary
   Postgres is at 10.0.1.4, and that I'm working from Athens (UTC+3).</code></pre>
   <p><strong>Under the hood:</strong> facts land in <a href="memory/profile.html">profile</a>; every subsequent system prompt includes them automatically. Observations from conversation also drop into the <a href="memory/journal.html">journal</a>, which the idle scheduler files into long-term memory. (The REM consolidation that used to generalise them into lessons was removed on 2026-10-11, §4NM.)</p>
@@ -127,8 +127,8 @@
   <p><strong>Under the hood:</strong> browser <code>MediaRecorder</code> → <code>/api/stt</code> (<code>ffmpeg</code> transcode → Gemma 4 audio node, verbatim transcript) → normal agent turn → <code>/api/tts</code> (<code>say</code> → WAV, buffered not streamed). All memory and tools are available as usual.</p>
   <p><strong>See also:</strong> <a href="interfaces/voice_server.html">Voice loop</a>.</p>
 
-  <h2 id="self">Self-improvement</h2>
-  <p>Since &sect;4MS&ndash;&sect;4NE (2026-10-10) the agent no longer learns on its own. In idle time it replays the owner&rsquo;s real failures and proposes <em>one</em> rule; nothing is adopted until the owner says &ldquo;learn rule N&rdquo;. Adopted rules ride every owner prompt (at most 6). The owner can also keep regression tests (&ldquo;keep test N&rdquo;), which re-run after each deploy and daily. See <a href="learning-loop.html">the learning loop</a>.</p>
+  <h2 id="self">Learning (only what you approve)</h2>
+  <p>Since &sect;4MS&ndash;&sect;4NE (2026-10-10) the agent no longer learns on its own. In idle time it replays the owner&rsquo;s real failures and proposes <em>one</em> rule; nothing is adopted until the owner says &ldquo;learn rule N&rdquo;. Adopted rules ride every owner prompt (the newest 10). The owner can also keep regression tests (&ldquo;keep test N&rdquo;), which re-run after each deploy and daily. See <a href="learning-loop.html">the learning loop</a>.</p>
   <p>The automatic learning paths that used to sit beside this — dream consolidation and the other lesson producers, automatic skill extraction, utility-ranked lesson pruning — were removed on 2026-10-11 (§4NM). What the agent still writes for itself is a <em>tool</em>: it can author a Python skill with <code>create_skill</code>, which is TDD-validated and registered as a first-class tool on the next turn; a skill that fails three times in a row is retired to <code>acquired_skills/retired/</code>.</p>
   <pre><code>&gt; "Write yourself a tool that converts Slack HTML into markdown."
   The agent calls create_skill("slack_html_to_md", …); it passes its test

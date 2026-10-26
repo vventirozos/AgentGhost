@@ -47,7 +47,7 @@
       <tr><td>visual</td><td>Multi-modal (image / PDF)</td><td><code>chat_completion(use_vision=True)</code></td></tr>
       <tr><td>coding</td><td>Code-specialist generation</td><td><code>chat_completion(use_coding=True)</code></td></tr>
       <tr><td>image_gen</td><td>Qwen-Image-2.1 generation/editing</td><td><code>generate_image()</code></td></tr>
-      <tr><td>critic</td><td>Verifier verdicts (<code>--critic-nodes</code>; takes precedence over the worker route)</td><td><code>get_critic_node()</code>, the verifier's critic leg</td></tr>
+      <tr><td>critic</td><td>Verifier verdicts (<code>--critic-nodes</code>; takes precedence over the worker route). In production the LLM judge is off (&sect;4OW, 2026-10-14) and the pool is the same Nova server as the worker; it carries the visual pixel check (<code>GHOST_VISUAL_CHECK_POOL=critic</code>).</td><td><code>get_critic_node()</code>, the verifier's critic leg</td></tr>
     </tbody>
   </table></div>
 

@@ -20,7 +20,7 @@
     <a href="how-it-works.html">One message, end to end</a>
     <a href="memory.html">What it remembers</a>
     <a href="tools.html">What it can do</a>
-    <a href="self-improvement.html">How it improves itself</a>
+    <a href="self-improvement.html">Checking and learning</a>
     <a href="learning-loop.html">The learning loop</a>
     <a href="long-horizon.html">Long tasks</a>
 
@@ -42,7 +42,7 @@
   <p class="subtitle">There are a few dozen command-line flags. About twenty are worth knowing; the rest exist to run experiments. This page is the twenty.</p>
 
   <div class="note">
-    <strong>The defaults are the recommended configuration.</strong> Almost everything here is already set the way it should be. Change things when you have a reason — a second machine to use, a feature you want off, a problem to diagnose.
+    <strong>The defaults are a sensible starting point.</strong> Almost everything here is already set the way it should be. Change things when you have a reason — a second machine to use, a feature you want off, a problem to diagnose. Production differs from the code defaults in a few places; the exec line of <code>bin/start-ghost-agent.sh</code> is the truth for what production runs, and this page notes the production value where it differs.
   </div>
 
   <h2>The ones you have to set</h2>
@@ -87,18 +87,18 @@
   <p>Each flag takes a comma-separated list of <code>url|model</code> pairs:</p>
 
   <pre class="shell">--worker-nodes "http://192.168.1.20:8088|gemma-4-e4b"
---critic-nodes "http://192.168.1.20:8089|selene-mini"</pre>
+--critic-nodes "http://192.168.1.20:8088|gemma-4-e4b"</pre>
 
-  <p>Worker and critic do <em>not</em> have to be the same model — and there's a good argument they shouldn't be: worker chores (summarising, classifying) want a fast generalist, while the critic's adjudication wants a judge-trained model that applies verification rubrics well. One box can serve both as two llama-server instances on different ports; on a 16&nbsp;GB machine that takes the dual-residency recipe (raised <code>iogpu.wired_limit_mb</code>, small <code>--ubatch-size</code> on both servers) — see the verifier reference's <a href="core/verifier.html">judge-model selection</a> section. Whatever model serves the critic must return verdicts inside <code>GHOST_VERIFY_WORKER_TIMEOUT</code> (45&nbsp;s) under real load — a judge that misses the deadline silently pushes its verdicts onto your main model.</p>
+  <p>Production points both at the same single server on the helper box Nova (Gemma 4 E4B, four slots). The separate critic server it used to run beside it was removed on 2026-10-25. The verifier's LLM judge is off (§4OW, 2026-10-14), so today the critic pool only runs the pixel check after an image reply (<code>GHOST_VISUAL_CHECK_POOL=critic</code>) and nothing that needs a judge-trained model. If you turn the judge back on (<code>GHOST_VERIFIER_JUDGE=1</code>), the old advice applies again: the critic must return verdicts inside <code>GHOST_VERIFY_WORKER_TIMEOUT</code> (45&nbsp;s) under real load, or its verdicts fall back onto your main model — see the verifier reference's <a href="core/verifier.html">judge-model selection</a> section.</p>
 
   <div class="scroll">
   <table>
     <thead><tr><th>Flag</th><th>Sends what to the other machine</th></tr></thead>
     <tbody>
-      <tr><td><code>--worker-nodes</code></td><td>Background and small jobs: summarising, classifying, compacting the conversation.</td></tr>
-      <tr><td><code>--critic-nodes</code></td><td>The self-check. <strong>The one worth doing first</strong> — it moves an entire extra model call per turn off your main model, and makes the check non-blocking as a side effect.</td></tr>
+      <tr><td><code>--worker-nodes</code></td><td>Background and small jobs: summarising, classifying, compacting the conversation, background fact extraction, speech-to-text. <strong>The one worth doing first</strong> — these are the model calls that otherwise compete with your conversation for the main slot.</td></tr>
+      <tr><td><code>--critic-nodes</code></td><td>The verifier's pool. With the LLM judge off (production since §4OW) it carries only the image pixel check; with the judge on, it would carry the judge's call on each checked turn.</td></tr>
       <tr><td><code>--coding-nodes</code></td><td>Code generation, if you have a model that's better at it.</td></tr>
-      <tr><td><code>--visual-nodes</code></td><td>Image analysis.</td></tr>
+      <tr><td><code>--visual-nodes</code></td><td>Image analysis. Production points this at the main server itself.</td></tr>
       <tr><td><code>--image-gen-nodes</code></td><td>Image generation. Without this, the image tool doesn't exist.</td></tr>
       <tr><td><code>--swarm-nodes</code></td><td>Parallel fan-out when a task is split across several models.</td></tr>
     </tbody>
@@ -111,14 +111,14 @@
 
   <h2>Turning background work off</h2>
 
-  <p>All on by default. Each one is an off switch so you can measure whether the thing is worth its cost. The self-teaching passes that used to have switches here (reflection, post-mortems, the router, the PRM) were removed on 2026-10-11 (§4NM). <a href="self-improvement.html">What each of these does →</a></p>
+  <p>All on by default, and all on in production. Each one is an off switch so you can measure whether the thing is worth its cost. The self-teaching passes that used to have switches here (reflection, post-mortems, the router, the PRM) were removed on 2026-10-11 (§4NM). <a href="self-improvement.html">What each of these does →</a></p>
 
   <div class="scroll">
   <table>
     <thead><tr><th>Flag</th><th>Effect</th></tr></thead>
     <tbody>
       <tr><td><code>--no-dream</code></td><td>Stops the idle maintenance phase: store maintenance (project digests, archive purges, graph prune/merge) and the daily verified snapshot. The lesson-writing consolidation it used to run was removed on 2026-10-11 (§4NM).</td></tr>
-      <tr><td><code>--no-self-play</code></td><td>Stops the idle failure-replay slot: replaying your failures and running your regression tests (<a href="learning-loop.html">the learning loop</a>).</td></tr>
+      <tr><td><code>--no-self-play</code></td><td><span class="badge bad">removed</span> No longer a flag: passing it is an argparse error. The idle failure-replay slot (replaying your failures and running your regression tests, <a href="learning-loop.html">the learning loop</a>) has no off switch of its own; <code>--no-trajectories</code> takes away the turns it reads.</td></tr>
       <tr><td><code>--no-trajectories</code></td><td>Stops recording turns. Also stops failure replay and the regression suite, which read them.</td></tr>
       <tr><td><code>--no-self-model</code></td><td>Stops the first-person diary and cross-session continuity.</td></tr>
       <tr><td><code>--no-workspace-model</code></td><td>Stops watching your files for changes.</td></tr>
@@ -127,12 +127,12 @@
   </table>
   </div>
 
-  <h3>And one that is off by default</h3>
+  <h3>And one that is off by default (on in production)</h3>
   <div class="scroll">
   <table>
     <thead><tr><th>Flag</th><th>Effect</th></tr></thead>
     <tbody>
-      <tr><td><code>--autoadvance-idle</code></td><td>Lets Ghost push one active project forward by one step while idle, unprompted.</td></tr>
+      <tr><td><code>--autoadvance-idle</code></td><td>Lets Ghost push one autopilot project forward by one bounded step while idle, unprompted. It stops at anything that needs you. The production launcher passes it.</td></tr>
     </tbody>
   </table>
   </div>
@@ -157,7 +157,7 @@
       </tr>
       <tr>
         <td><code>--no-verifier</code></td><td><span class="badge good">check is on</span></td>
-        <td>Disables the self-check entirely. Not recommended outside an experiment.</td>
+        <td>Disables the post-reply checks entirely, the mechanical ones included (page load, written files, reply shape, image pixels). Not recommended outside an experiment.</td>
       </tr>
     </tbody>
   </table>
@@ -169,7 +169,7 @@
   <table>
     <thead><tr><th>Flag</th><th>Default</th><th>What it does</th></tr></thead>
     <tbody>
-      <tr><td><code>--max-context</code></td><td><code>65536</code></td><td>How much conversation Ghost keeps in front of the model. Must fit what your LLM server was started with — setting it higher than the server's actual window causes failures deep into long conversations.</td></tr>
+      <tr><td><code>--max-context</code></td><td><code>65536</code> (production: <code>174000</code>)</td><td>How much conversation Ghost keeps in front of the model. Must fit what your LLM server was started with — setting it higher than the server's actual window causes failures deep into long conversations.</td></tr>
       <tr><td><code>--native-tools</code></td><td><span class="badge good">on</span></td><td>Sends tool definitions in the standard OpenAI format as well as in the prompt. Turn off with <code>--no-native-tools</code> if your model handles it badly.</td></tr>
       <tr><td><code>--deep-reason</code></td><td><span class="badge bad">removed</span></td><td>Removed (§4NN; dropped from the parser in §4NO): passing it is an argparse error. It used to add hypothesis testing after a failure; the HypothesisTester was deleted on 2026-10-11. (The MCTS lookahead it also used to switch on went in §4NM.)</td></tr>
       <tr><td><code>--perfect-it</code></td><td><span class="badge">off</span></td><td>Offers optimisation suggestions after a heavy task succeeds.</td></tr>
@@ -180,17 +180,17 @@
 
   <h2>Opt-in subsystems</h2>
 
-  <p>These are complete features that are off by default because they add cost.</p>
+  <p>These are off by default. Production turns on one of them, <code>--enable-metacog</code>.</p>
 
   <dl class="kv">
-    <dt>--enable-metacog</dt>
+    <dt>--enable-metacog <span class="badge good">on in production</span></dt>
     <dd>Logs each shell or SQL command that the safety checks block (a <code>metacog valid</code> line) and counts them; at shutdown one <code>metacog summary validator_blocks=N</code> line gives the total. At boot it prints <code>metacog boot state=enabled validators="shell, sql"</code>. The checks themselves run whether or not this is on. (Host-health monitoring and the re-plan alarms it used to turn on were removed in §4PT, 2026-10-17.)</dd>
 
     <dt>--metacog-mem-high (and the other host flags)</dt>
     <dd><strong>Removed §4PT — accepted and ignored.</strong> <code>--metacog-cpu-high</code>, <code>--metacog-mem-high</code>, <code>--metacog-mem-floor-mb</code>, <code>--metacog-mem-warn-free-mb</code>, <code>--metacog-disk-high</code> and <code>--metacog-host-heartbeat-s</code> set the trip points of the host-health monitor, which no longer exists. They are still accepted so a launcher that passes them keeps starting; the production launcher stopped passing them in §4PV (2026-10-17).</dd>
 
     <dt>--principle-gate</dt>
-    <dd>After each answer, checks it against the operating principles Ghost has written for itself and appends a note if it contradicts one. Never blocks — annotates. One extra model call per turn.</dd>
+    <dd>Off in production. When on: after each answer, checks it against the operating principles Ghost has written for itself and appends a note if it contradicts one. Never blocks — annotates. One extra model call per turn.</dd>
 
     <dt>--notify-webhook<br>--notify-ntfy</dt>
     <dd>Where to push notifications when something needs you. A LAN or tailnet target is reached directly; a public one only over Tor, and skipped if Tor is down.</dd>
@@ -283,12 +283,12 @@
       <tr><td><code>GHOST_LOOK_OWNED</code></td><td><code>0</code></td><td>&sect;4QX: <code>1</code> means the SYSTEM shows the look line under each looked-at picture (<code>What the picture shows: …</code>), and the model writes only what is missing compared with the request. It implies <code>GHOST_RENDER_LOOK</code>. A labelled probe selects it with <code>X-Ghost-Arm: look_owned</code>. In the pre-registered paired replay, replies with details the look never saw went from 22/36 to 9/36, hidden mismatches from 4 to 3, WRONG stayed at 2, and the turn was 5 s shorter (journal &sect;4QX). <strong>Production: ON since 2026-10-23</strong> (launcher export, operator "turn it on"). See <a href="tools/image_gen.html#4qx">the image tool</a>.</td></tr>
       <tr><td><code>GHOST_SUBJECTS_COLLAGE_RETRIES</code></td><td><code>2</code></td><td>§4OZ: after a multi-subject render the vision node is asked whether the picture is a side-by-side collage; on a confident YES the tool renders again — attempt 2 with a fresh seed (~2 min), attempt 3 with a fresh seed at guidance 4 (~4 min) — and keeps the last picture. <code>1</code> = reseed only, <code>0</code> = never check.</td></tr>
       <tr><td><code>GHOST_STREAM_TAP</code></td><td><code>1</code></td><td>§4MP: an owner's streamed request receives the tools-on generation's text as it is generated (held 240 chars, retracted if a tool call follows or the reply is rewritten). <code>0</code> restores the finished-reply stream.</td></tr>
-      <tr><td><code>GHOST_VERIFY_REBUTTAL_EVIDENCE_CHARS</code></td><td><code>1800</code></td><td>Verifier: characters of evidence quoted into the rebuttal prompt when the model contests a refute.</td></tr>
+      <tr><td><code>GHOST_VERIFY_REBUTTAL_EVIDENCE_CHARS</code></td><td><code>1800</code></td><td>Verifier: characters of evidence quoted into the rebuttal prompt when the model contests a refute. Only used while the LLM judge is on (<code>GHOST_VERIFIER_JUDGE=1</code>; off in production).</td></tr>
     </tbody>
   </table></div>
 
   <h2>The other flags</h2>
-  <p>Mostly cooldown timings, thresholds for the metacognition stack, and switches that exist to run controlled experiments (<code>--bio-time-scale</code> compresses the idle scheduler's hours-long windows into minutes so its jobs can be tested in an afternoon — never set it in production). They're all documented in <a href="cli_reference.html">the full CLI reference</a>, and every one carries its own help text:</p>
+  <p>Mostly cooldown timings (production sets <code>--self-narrative-cooldown 86400</code> and <code>--workspace-narrative-cooldown 21600</code>), the fact-extraction level (<code>--smart-memory</code>, production <code>0.9</code>), the old host-monitor thresholds (accepted and ignored since §4PT), and switches that exist to run controlled experiments (<code>--bio-time-scale</code> compresses the idle scheduler's hours-long windows into minutes so its jobs can be tested in an afternoon — never set it in production). They're all documented in <a href="cli_reference.html">the full CLI reference</a>, and every one carries its own help text:</p>
 
   <pre class="shell">python -m src.ghost_agent.main --help</pre>
 

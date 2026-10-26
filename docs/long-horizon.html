@@ -20,7 +20,7 @@
     <a href="how-it-works.html">One message, end to end</a>
     <a href="memory.html">What it remembers</a>
     <a href="tools.html">What it can do</a>
-    <a href="self-improvement.html">How it improves itself</a>
+    <a href="self-improvement.html">Checking and learning</a>
     <a href="learning-loop.html">The learning loop</a>
     <a class="current" href="long-horizon.html">Long tasks</a>
 
@@ -57,7 +57,7 @@
   <p>The fallback reply of a turn that produced no answer used to carry the last tool output only (700 characters of forty-nine fetched pages). It now carries the heads of every successful evidence-tool output, newest first, within a bound — what exists, so a "continue" can start from it.</p>
 
   <h2 id="record">The record of a delivered task</h2>
-  <p>Two things wrote a false failure over a delivered long task (§4OF). The "same tool error three times" rule that marks a turn failed for the learning loop fired on a build that went green after three failing runs and on a research turn whose report was on disk after four blocked pages; since §4OG it yields when the turn delivered — its last <code>execute</code> exited clean, or the reply hands over a file this turn wrote. And the verifier judged a report written as a file on the reply's one-line summary (it refuted the report for "lacking the Sources section" the file had): the document files a turn wrote (<code>.md</code>, <code>.txt</code>, <code>.html</code>, <code>.csv</code>…) are now read back from disk into the judge's evidence, as code already was for the code lens.</p>
+  <p>Two things wrote a false failure over a delivered long task (§4OF). The "same tool error three times" rule that marks a turn failed for the learning loop fired on a build that went green after three failing runs and on a research turn whose report was on disk after four blocked pages; since §4OG it yields when the turn delivered — its last <code>execute</code> exited clean, or the reply hands over a file this turn wrote. And the verifier judged a report written as a file on the reply's one-line summary (it refuted the report for "lacking the Sources section" the file had): the document files a turn wrote (<code>.md</code>, <code>.txt</code>, <code>.html</code>, <code>.csv</code>…) were then read back from disk into the judge's evidence, as code already was for the code lens. (The LLM judge itself has been off since §4OW, 2026-10-14; the mechanical checks that remain read the files on disk.)</p>
 
   <h2 id="reply">What the reply carries</h2>
   <p>Text the model writes beside a tool call predates that tool's result, so it is working narration ("Two remaining fixes…"), not the answer. It used to be dropped from the non-streamed reply only for lookup batches; the §4OF coding reply therefore opened with five superseded status notes written beside file and execute calls. Since §4OG the text beside any batch except a memory write is recorded and dropped — whole paragraphs only, never the answer itself, and never when what remains would not stand on its own; text beside a work batch (a file write, a command, a task update) goes only when what remains is at least one and a half times as long as it.</p>
@@ -86,7 +86,7 @@
 
   <h2 id="limits">What is still true</h2>
   <p>The language model server's host-side prompt cache was off from §4OH (2026-10-13) to §4QV (2026-10-23): it saved the previous conversation on every switch — 10 to 50 seconds before the first token after a long task — and never once restored one. §4QV found why: the machine had 0.1&nbsp;GB free (Apple's <code>fseventsd</code> held 25&nbsp;GB, and 37 orphaned pylint workers held 20&nbsp;GB of swap), so every save paged. With the memory back the cache is on again at 4&nbsp;GiB (<code>--cache-ram 4096</code> in the llama-server launcher): a vision call, another conversation or idle work no longer costs the owner's next turn a 30&nbsp;s re-read — the state is restored in seconds (journal §4QV).</p>
-  <p>A task that needs more than the budget is split by the report: the model is told to say where the work stands, and the next turn resumes from the state of work. Nothing runs unattended for hours by itself; the autopilot steps while you are away are bounded (see <a href="self-improvement.html">how it improves itself</a>). The guards stop loops; they do not plan — the plan is the model's, restated to it by the task state.</p>
+  <p>A task that needs more than the budget is split by the report: the model is told to say where the work stands, and the next turn resumes from the state of work. Nothing runs unattended for hours by itself; the autopilot steps while you are away are bounded (see <a href="self-improvement.html">checking and learning</a>). The guards stop loops; they do not plan — the plan is the model's, restated to it by the task state.</p>
 </main>
 </body>
 </html>

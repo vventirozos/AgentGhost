@@ -20,7 +20,7 @@
     <a href="how-it-works.html">One message, end to end</a>
     <a href="memory.html">What it remembers</a>
     <a href="tools.html">What it can do</a>
-    <a href="self-improvement.html">How it improves itself</a>
+    <a href="self-improvement.html">Checking and learning</a>
     <a href="learning-loop.html">The learning loop</a>
     <a href="long-horizon.html">Long tasks</a>
 
@@ -51,7 +51,7 @@
     <dt>memory_system_loaded</dt>
     <dd><code>false</code> means Ghost booted <strong>degraded</strong>: HTTP answers normally, but there's no memory and every background pass is silently disabled. It will chat with you and remember nothing.</dd>
     <dt>biological_watchdog_alive</dt>
-    <dd><code>false</code> means the background loop — the idle scheduler — died (the key keeps its old name). Ghost still answers, but it has stopped consolidating memory, maintenance and failure replay. The web status chip shows <em>idle scheduler DEAD</em>; at boot a healthy one logs <code>Idle Scheduler — started; jobs: …</code>. Nothing will tell you this — it just goes quiet.</dd>
+    <dd><code>false</code> means the background loop — the idle scheduler — died (the key keeps its old name). Ghost still answers, but it has stopped its idle work: maintenance, store hygiene, failure replay and the regression tests. The web status chip shows <em>idle scheduler DEAD</em>; at boot a healthy one logs <code>Idle Scheduler — started; jobs: …</code>. Nothing will tell you this — it just goes quiet.</dd>
   </dl>
 
   <h3>Beyond the two fields: the live verification harnesses</h3>
@@ -150,7 +150,7 @@ docker info --format '{{.ServerVersion}}'</pre>
 
   <h3>It won't do something, and explains why instead</h3>
   <p>If the model declines rather than the tool failing, that's model alignment, not a bug. Ghost is developed against uncensored models; a standard aligned one will refuse operations that are routine for an agent on your own machine — wiping its sandbox, deleting files on request, searching Tor hidden services, handling security material.</p>
-  <p>Tell them apart in the log: a broken tool logs a failure with its own icon, while a refusal shows the model reasoning (💭) and then a normal <code>✅ turn outcome</code> with no tool line at all. The second one means nothing ran. The same applies to the verifier — an aligned judge can refuse a sound answer on subject matter alone, which surfaces as retries you can't otherwise explain.</p>
+  <p>Tell them apart in the log: a broken tool logs a failure with its own icon, while a refusal shows the model reasoning (💭) and then a normal <code>✅ turn outcome</code> with no tool line at all. The second one means nothing ran. The same applied to the verifier's LLM judge while it was on — an aligned judge can refuse a sound answer on subject matter alone, which surfaced as retries you couldn't otherwise explain.</p>
 
   <h3>A tool that used to work now refuses to run</h3>
   <p>The pre-flight guard is doing its job. When the same tool fails the same way on the same target repeatedly, Ghost stops re-running it and hands the model the previous error instead. Fix the underlying cause and it'll clear.</p>
@@ -158,10 +158,10 @@ docker info --format '{{.ServerVersion}}'</pre>
   <h2>It's slow</h2>
 
   <h3>Every answer is slow</h3>
-  <p>Your model has one inference slot, and Ghost competes with itself for it: the self-check, conversation compaction and background classification are all model calls. Moving the self-check to a second machine with <code>--critic-nodes</code> is the highest-value change available — see <a href="configuration.html">Settings that matter</a>.</p>
+  <p>Your model has one inference slot, and Ghost competes with itself for it: conversation compaction, background fact extraction and classification are all model calls. Moving them to a second machine with <code>--worker-nodes</code> is the highest-value change available — see <a href="configuration.html">Settings that matter</a>. (The self-check used to be the biggest of these calls; its LLM judge is off since §4OW, 2026-10-14, and the checks that remain are mechanical.)</p>
 
   <h4>Finding out what a turn actually cost</h4>
-  <p>Every turn now records its real token cost, summed across each model call it made — the tool rounds, the self-check, and any work sent to a worker node. It lands in the turn's trajectory record and on the reply itself:</p>
+  <p>Every turn now records its real token cost, summed across each model call it made — the tool rounds and any work sent to a worker node. It lands in the turn's trajectory record and on the reply itself:</p>
   <pre class="shell">curl -s -X POST http://127.0.0.1:8000/api/chat \
   -H "X-Ghost-Key: $GHOST_API_KEY" -H "Content-Type: application/json" \
   -d '{"model":"'"$GHOST_MODEL"'","messages":[{"role":"user","content":"hello"}],"stream":false}' \
@@ -178,8 +178,8 @@ docker info --format '{{.ServerVersion}}'</pre>
   <h2>The answers are wrong</h2>
 
   <h3>It claims it did something it didn't</h3>
-  <p>This is the failure the self-check exists for. If it got through, check whether the answer was <em>streamed</em> — streamed replies are checked after they reach you, and the correction arrives at the top of the next reply rather than as an edit of the last one.</p>
-  <p>If it's happening often, confirm the check is actually running: <code>--no-verifier</code> disables it, and a critic node that's down means the check falls back to the main model, which is slower but should still run.</p>
+  <p>The self-check catches only part of this, mechanically: a file the reply says it wrote that is not on disk, a page it built that throws on load, a reply that narrates instead of answering, a picture that does not show what the reply says. When the file, page or reply check fails within about 15 seconds, the reply gets one repair round before it is sent; otherwise the failure is recorded (and can seed a failure replay), and you are generally not shown a correction. Other false claims are not checked: the LLM judge that read answers against the evidence is off since §4OW (2026-10-14). Correct it, or give it a 👎.</p>
+  <p>If the mechanical checks seem not to run at all, confirm they are on: <code>--no-verifier</code> disables them.</p>
 
   <h3>It answers a different question than the one asked</h3>
   <p>Tell it. Corrections are a strong signal — they mark the turn as failed, and a failed turn of yours can be replayed by the <a href="learning-loop.html">learning loop</a>, which may propose a rule and a regression test. A correction needs a recognisable correction phrase and real overlap with your previous message, so "no, I asked for the file paths, not the counts" registers where a fresh unrelated question doesn't.</p>
@@ -203,7 +203,7 @@ docker info --format '{{.ServerVersion}}'</pre>
 
   <h3>What one request looks like</h3>
 
-  <p>A request is framed top and bottom, so you can always see where one ends and the next begins. This is a real turn — asking for the weather, which makes the agent call a tool and then check its own answer:</p>
+  <p>A request is framed top and bottom, so you can always see where one ends and the next begins. This is a real turn from 2026-08-04 — asking for the weather, which makes the agent call a tool. Back then an LLM judge also checked the answer (the <code>verify</code> and <code>verifier</code> lines); that judge is off since §4OW (2026-10-14), so a turn like this one now ends at the reply:</p>
 
   <pre>┌─ 11 1165839c  request started  19:35:16 ─────────────────────────────────
 │  11  🧩  +0.08s  prefill cache       sys h=9ab1b534 chars=16757 · stable-prefix h=013475b7…
@@ -238,7 +238,7 @@ docker info --format '{{.ServerVersion}}'</pre>
   </table>
   </div>
 
-  <p>In that turn the useful reading is the <strong>timing</strong>: 7.8 seconds of thinking before the tool call, the tool itself returning in 10 milliseconds, and then 14 seconds waiting on the verifier. If this felt slow, the model and the self-check are the cost — not the weather lookup.</p>
+  <p>In that turn the useful reading is the <strong>timing</strong>: 7.8 seconds of thinking before the tool call, the tool itself returning in 10 milliseconds, and then 14 seconds waiting on the verifier's judge (off today). If this felt slow, the model was the cost — not the weather lookup.</p>
 
   <h3>The icons worth recognising</h3>
 
@@ -267,14 +267,14 @@ docker info --format '{{.ServerVersion}}'</pre>
 
   <h3>A warning, and why they're worth reading</h3>
 
-  <p>Warnings are deliberately rare, so when one appears it usually says something real. This one is from the same session:</p>
+  <p>Warnings are deliberately rare, so when one appears it usually says something real. This one is from the same session, from the LLM judge that is off today (§4OW) — you will not see this exact line in production:</p>
 
   <pre>│  48  🔶  +37.1s  agent               Verifier escalation OVERTURNED a cheap-judge refute:
                                        main model says CONFIRMED. Original issues:
                                        Memory usage is 90.7%, not 91%.
 │  48  🧪  +37.1s  verifier            CONFIRMED (95%) — All suspects are false alarms; claim…</pre>
 
-  <p>Read that as: the cheap judge rejected the answer for rounding 90.7% to 91%, the main model was asked to re-examine, and it overruled the rejection. Nothing is broken — but this is exactly the line that tells you the cheap judge is being too strict, which is worth knowing before you trust its refusals.</p>
+  <p>Read that as: the cheap judge rejected the answer for rounding 90.7% to 91%, the main model was asked to re-examine, and it overruled the rejection. Nothing was broken — but lines like this showed the cheap judge was too strict. Measured on real turns, 9 of 17 of its refutes were false, which is why it was switched off.</p>
 
   <h3>Grepping the durable file</h3>
 
@@ -322,8 +322,8 @@ grep "\[SYSTEM\]" "$GHOST_HOME/system/ghost-agent.log" | tail -40</pre>
         <p>Ask it: <em>"what did you do while I was away?"</em> That reads the real background activity ledger.</p>
       </li>
       <li>
-        <h4>Is the learning machinery alive?</h4>
-        <p>Ask it: <em>"is your learning working?"</em> That reports whether the background passes are actually running and succeeding, which absence of errors will not tell you.</p>
+        <h4>Is the idle work alive?</h4>
+        <p>Ask it: <em>"is your learning working?"</em> (or run <code>scripts/learning_health.py</code>). That reports whether the idle passes — maintenance, failure replay, regression tests — are actually running and succeeding, which absence of errors will not tell you.</p>
       </li>
       <li>
         <h4>What does it think is broken about itself?</h4>

@@ -20,7 +20,7 @@
     <a href="how-it-works.html">One message, end to end</a>
     <a href="memory.html">What it remembers</a>
     <a href="tools.html">What it can do</a>
-    <a href="self-improvement.html">How it improves itself</a>
+    <a href="self-improvement.html">Checking and learning</a>
     <a href="learning-loop.html">The learning loop</a>
     <a href="long-horizon.html">Long tasks</a>
 
@@ -97,7 +97,7 @@
 
   <p>There are five forms. <code>cube</code> is the default — a weight tensor: a tumbling crystal grid that activation waves heat as they cross it (until 2026-09-20 this form was called <code>lattice</code>). <code>tesseract</code> is an endless corridor of nested frames streaming past you. <code>vortex</code> is a black hole facing you, a dark centre with matter streaming outward past the camera. <code>descent</code> is a loss landscape with an optimizer bead rolling downhill. The fifth, <code>empty</code>, turns it off.</p>
 
-  <p>Whatever the form, the face has a vocabulary beyond hot and cold. While Ghost searches, a warm scan sweeps the body; while it reads, the body draws inward and slows; each tool call is a small kick; verifying tightens it toward stillness; writing the reply sends a slow wave toward you. A memory it recalls arrives as a comet from the edge that ignites one node. When the reply is done, the way it lets go tells you how it went: a verified answer crystallises and holds for a moment, a refuted one shudders and re-weaves, an ordinary stop just exhales. If Ghost is busy with itself in the background — a dream or a practice turn — a second, slower breath moves the edge. Its functional mood shifts the cold pole very slowly over hours. It leans toward the composer while you have something typed, breathes with your voice while you hold the microphone, and an error's kind shapes the flinch: a dropped connection flickers, a refusal freezes, a timeout fades. At rest it is not one uniform drift either — every few seconds one neighbourhood shivers. Each form speaks these signals in its own grammar: the black hole swallows faster while the reply streams and slows while Ghost reads; the tensor's runners sprint and its grid snaps true while verifying; the terrain's bead hurries.</p>
+  <p>Whatever the form, the face has a vocabulary beyond hot and cold. While Ghost searches, a warm scan sweeps the body; while it reads, the body draws inward and slows; each tool call is a small kick; verifying tightens it toward stillness; writing the reply sends a slow wave toward you. A memory it recalls arrives as a comet from the edge that ignites one node. When the reply is done, the way it lets go tells you how it went: a verified answer crystallises and holds for a moment, a refuted one shudders and re-weaves, an ordinary stop just exhales. If Ghost is busy with itself in the background — maintenance or a failure replay — a second, slower breath moves the edge. Its functional mood shifts the cold pole very slowly over hours. It leans toward the composer while you have something typed, breathes with your voice while you hold the microphone, and an error's kind shapes the flinch: a dropped connection flickers, a refusal freezes, a timeout fades. At rest it is not one uniform drift either — every few seconds one neighbourhood shivers. Each form speaks these signals in its own grammar: the black hole swallows faster while the reply streams and slows while Ghost reads; the tensor's runners sprint and its grid snaps true while verifying; the terrain's bead hurries.</p>
 
   <p>The button in the header opens a picker and your choice sticks. The colour scheme is deliberately two-pole — deep blue for cold analysis, dark red for hot intent — so the only thing your eye has to track is temperature. If you have reduced motion enabled in your OS, the dive is capped to a slight lean.</p>
 
@@ -158,9 +158,9 @@
   Run it with no arguments for an interactive session.</p>
   <p>Inside that session you can rate a reply, the same way the 👍/👎 buttons work in the
   web UI and the 👍/👎 reactions work in Slack: <code>/good</code> if the answer was right,
-  <code>/bad why it was wrong</code> if it wasn't. That is not a comment box — it is how
-  Ghost learns which of its answers were actually any good, and the reason you type on a
-  <code>/bad</code> is the most useful part.</p>
+  <code>/bad why it was wrong</code> if it wasn't. That is not a comment box — it labels the turn, a <code>/bad</code> turn of yours can be
+  replayed while Ghost is idle and turned into a proposed rule that you approve or not, and the
+  reason you type on a <code>/bad</code> is the most useful part.</p>
 
   <h2>The HTTP API</h2>
   <p>Everything above is a client of this. The API is Ollama-compatible, so tools that already speak Ollama can point at Ghost with no changes.</p>

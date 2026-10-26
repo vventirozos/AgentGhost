@@ -20,7 +20,7 @@
     <a class="current" href="how-it-works.html">One message, end to end</a>
     <a href="memory.html">What it remembers</a>
     <a href="tools.html">What it can do</a>
-    <a href="self-improvement.html">How it improves itself</a>
+    <a href="self-improvement.html">Checking and learning</a>
     <a href="learning-loop.html">The learning loop</a>
     <a href="long-horizon.html">Long tasks</a>
 
@@ -98,7 +98,7 @@
 
       <rect class="d-box" x="20"  y="356" width="280" height="70" rx="7"/>
       <text class="d-label" x="160" y="384" text-anchor="middle">Memory</text>
-      <text class="d-sub"   x="160" y="404" text-anchor="middle">six stores, on your disk</text>
+      <text class="d-sub"   x="160" y="404" text-anchor="middle">several stores, on your disk</text>
 
       <rect class="d-box" x="320" y="356" width="280" height="70" rx="7"/>
       <text class="d-label" x="460" y="384" text-anchor="middle">Docker sandbox</text>
@@ -106,7 +106,7 @@
 
       <rect class="d-box" x="620" y="356" width="280" height="70" rx="7"/>
       <text class="d-label" x="760" y="384" text-anchor="middle">LLM server</text>
-      <text class="d-sub"   x="760" y="404" text-anchor="middle">called by every Think and Check</text>
+      <text class="d-sub"   x="760" y="404" text-anchor="middle">called by every Think step</text>
     </svg>
     <p class="caption">Memory is files on your disk. The sandbox is a container. The LLM server is a separate process, usually on the same machine.</p>
   </div>
@@ -123,8 +123,8 @@
 
       <li>
         <h4>Ghost recalls what it knows — before the model sees anything</h4>
-        <p>This is the step people miss. Ghost doesn't hand your message straight to the model. First it searches its memory stores <em>in parallel</em> — facts about you, and rules and lessons — and merges the results into a single ranked list. (The general fact store, the graph's topical links, past episodes and past conversations are no longer searched on every message since October 2026; they answer when you ask it to recall something.)</p>
-        <p>Merging matters because the stores disagree. A fact that ranks 1st in one store and 4th in another should probably beat something that ranked 2nd in only one place. Ghost scores each result by its <em>position</em> in each list rather than by raw similarity, which lets it combine stores that don't share a scoring scale. The best few thousand characters get pasted in above your message.</p>
+        <p>This is the step people miss. Ghost doesn't hand your message straight to the model. Your profile is already in the instructions. On top of that it searches two sources <em>in parallel</em> — facts about you, and rules and lessons — and merges the results into a single ranked list. (The general fact store, the graph's topical links, past episodes and past conversations are no longer searched on every message since October 2026; they answer when you ask it to recall something.)</p>
+        <p>Merging matters because the stores disagree. A fact that ranks 1st in one store and 4th in another should probably beat something that ranked 2nd in only one place. Ghost scores each result by its <em>position</em> in each list rather than by raw similarity, which lets it combine stores that don't share a scoring scale. Each source's weight comes from a fixed table (§4NN removed the learned weights). The best few thousand characters get pasted in above your message.</p>
         <span class="where">MemoryBus.hydrate_context() &nbsp;·&nbsp; src/ghost_agent/core/bus.py</span>
         <p>If Ghost answers as though it forgot something it clearly knows, this is the step that failed — not the model. <a href="memory.html">What it remembers</a> covers how to inspect and correct it.</p>
       </li>
@@ -145,9 +145,9 @@
 
       <li>
         <h4>The result is checked</h4>
-        <p><strong>Since 2026-10-14 (§4OW) only the mechanical checks run.</strong> They look at whether the page loads without errors, whether the written files exist, whether the reply is an answer rather than narration, whether turn constraints were kept, and whether an image shows what the reply describes. The LLM judge described below is off by default: measured on a week of real traffic, 9 of its 17 refusals were wrong. <code>GHOST_VERIFIER_JUDGE=1</code> turns it back on.</p>
-        <p>With the judge on, a separate check reads the answer against the evidence the tools actually produced and asks two questions, in this order: <em>does this answer what was asked?</em> and <em>is it supported by the evidence?</em></p>
-        <p>Order matters. The most common real failure isn't a wrong number — it's answering a different question than the one asked, or claiming a file was written when nothing was. If the check refuses with high confidence, Ghost can get a bounded number of attempts to fix the answer before it ships. On this machine the launcher sets <code>GHOST_CRITIC_ASYNC=1</code>, so the check runs <em>after</em> the reply is sent and a refusal becomes a correction at the top of your next reply instead. Since 2026-10-10 (§4NF) that correction is <strong>not shown to you</strong> (2 of the last 3 shown corrections were false; the switch that showed them was removed on 2026-10-11, §4NM); the verdict is still recorded and can start a replay in the <a href="learning-loop.html">learning loop</a>.</p>
+        <p><strong>Since 2026-10-14 (§4OW) only the mechanical checks run.</strong> They are mostly programs, not a second model reading the answer (only the image check asks the helper model to look at the picture): they look at whether the page loads without errors, whether the written files exist, whether the reply is an answer rather than narration, whether turn constraints were kept, what the reply claims about memory, and whether an image shows what the reply describes. They do not check whether a fact in the answer is true.</p>
+        <p>The reply waits up to 15 seconds for them (<code>GHOST_MECHANICAL_REPAIR_BUDGET</code>, §4OX). A page that throws or a missing file gets one repair round before the reply is sent. A failure found later is recorded and can start a replay in the <a href="learning-loop.html">learning loop</a>; it is <strong>not shown to you</strong> (§4NF).</p>
+        <p>The LLM judge is off by default: measured on a week of real traffic, 9 of its 17 refusals were wrong. <code>GHOST_VERIFIER_JUDGE=1</code> turns it back on. With it on, a second model reads the answer against the evidence the tools produced and asks, in order, <em>does this answer what was asked?</em> and <em>is it supported by the evidence?</em> — and on this machine (<code>GHOST_CRITIC_ASYNC=1</code>) its verdict lands after the reply and is recorded, not shown.</p>
         <span class="where">src/ghost_agent/core/verifier.py</span>
       </li>
     </ol>
@@ -156,10 +156,10 @@
   <h2>Two things that behave differently than you'd expect</h2>
 
   <h3>Streaming answers are checked <em>after</em> they reach you</h3>
-  <p>(Since §4OW the check is the mechanical one; the LLM judge is off by default.) When the reply streams word by word (the web UI does this), the text has already left before the check finishes. Blocking it would buy nothing — the words are on your screen. So the check runs in the background instead, and if it refuses the answer, you would get a correction notice at the top of the <em>next</em> reply rather than a silent edit of the last one. Since 2026-10-10 (§4NF) that notice is not shown to you until a hand-graded check proves the verifier right often enough; the verdict is still recorded and can start a replay in the <a href="learning-loop.html">learning loop</a>.</p>
+  <p>(Since §4OW the check is the mechanical one; the LLM judge is off by default.) When the reply streams word by word (the web UI does this), the text has already left before the check finishes. Blocking it would buy nothing — the words are on your screen. So the check runs in the background instead. A failure it finds is recorded and can start a replay in the <a href="learning-loop.html">learning loop</a>; since 2026-10-10 (§4NF) no correction notice is shown to you.</p>
 
   <h3>Nothing happens instantly after you stop typing</h3>
-  <p>Ghost's background work is gated on you being idle. Two minutes of quiet before it starts consolidating its journal; ten minutes before memory upkeep; an hour before it replays your recent failures and runs your regression tests (<a href="learning-loop.html">the learning loop</a>). If you're chatting constantly, none of it runs — and it will never interrupt a turn in progress. <a href="self-improvement.html">How it improves itself</a> has the full schedule.</p>
+  <p>Ghost's background work is gated on you being idle. Two minutes of quiet before it files facts from your recent turns (the journal); ten minutes before memory upkeep; an hour before it replays your recent failures and runs your regression tests (<a href="learning-loop.html">the learning loop</a>). If you're chatting constantly, none of it runs — and it will never interrupt a turn in progress. <a href="self-improvement.html">Checking and learning</a> has the full schedule.</p>
 
   <h2>Reading the log when a turn goes wrong</h2>
   <p>The live console is designed to be watched. Each subsystem logs with its own icon, so you can follow a turn without reading every line. What to look for, by symptom:</p>
@@ -186,7 +186,7 @@
       <tr>
         <td>"Done!" but the file isn't there</td>
         <td>Step 5 should have caught it</td>
-        <td>Look for the verdict line. A refused answer that still shipped means the check ran late (streaming) — the correction is on the next turn.</td>
+        <td>Look for the verdict line. A refused answer that still shipped means the check landed after the reply (streaming, or past the 15-second window) — it is recorded, not shown to you.</td>
       </tr>
       <tr>
         <td>It stopped mid-task</td>

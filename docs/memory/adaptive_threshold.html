@@ -26,7 +26,7 @@
   <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
 
   <h1>memory / adaptive_threshold.py — AdaptiveThreshold</h1>
-  <p class="subtitle">Self-tuning recall acceptance threshold. Trades precision for recall based on observed usefulness.</p>
+  <p class="subtitle">Self-tuning recall acceptance threshold. Trades precision for recall based on observed usefulness. <strong>Not built in production:</strong> since &sect;4LF (2026-10-04) it exists only with <code>GHOST_ADAPTIVE_THRESHOLD=1</code>, which the launcher does not set; recall runs on the fixed <code>--smart-memory 0.9</code>.</p>
 
   <h2>Storage</h2>
   <ul>

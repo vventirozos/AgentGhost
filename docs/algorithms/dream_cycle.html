@@ -17,7 +17,7 @@
     <h3>Algorithms</h3>
     <a href="request_lifecycle.html">Request lifecycle</a>
     <a href="memory_hydration.html">Memory hydration (RRF)</a>
-    <a class="current" href="dream_cycle.html">Dream / self-play</a>
+    <a class="current" href="dream_cycle.html">Maintenance &amp; failure replay</a>
     <a href="skill_acquisition.html">Skill acquisition</a>
     <a href="circuit_breaker.html">Circuit breaker</a>
     <a href="selfhood.html">Selfhood (unified self)</a>
@@ -49,7 +49,7 @@
   <h2>Phase 3: failure replay</h2>
   <p>The slot wins a 20% roll after a 4&nbsp;h cooldown (<code>GHOST_SELFPLAY_COOLDOWN_S</code>, default 14400) and runs <em>one stage</em> of one case per slot:</p>
   <ol>
-    <li><strong>Seed.</strong> <code>core/owner_seeds.py</code> lists the owner's own turns that failed: a 👎 (<a href="../core/feedback.html">feedback</a>), a next message the reaction judge (<code>judge_reactions</code>, <code>GHOST_REACTION_JUDGE</code>) read as a correction (tool turns only: since §4PM the judge also reads no-tool turns, into a separate file the seeds never read; see <a href="../core/agent.html#4pm">§4PM</a>), a high-confidence verifier refute or a run of tool failures. Member, probe and test turns never qualify.</li>
+    <li><strong>Seed.</strong> <code>core/owner_seeds.py</code> lists the owner's own turns that failed: a 👎 (<a href="../core/feedback.html">feedback</a>), a next message the reaction judge (<code>judge_reactions</code>, <code>GHOST_REACTION_JUDGE</code>) read as a correction (tool turns only: since §4PM the judge also reads no-tool turns, into a separate file the seeds never read; see <a href="../core/agent.html#4pm">§4PM</a>), a verifier refute (since &sect;4OW, 2026-10-14, only the mechanical checks produce one; the LLM judge is off) or a run of tool failures. Member, probe and test turns never qualify.</li>
     <li><strong>Base.</strong> The newest read-only case (searches, pages, files — a request that changed something is never replayed) is asked again twice on an <a href="../core/isolation.html">isolated context</a>, labelled as a test: no writes, no messages, no memory.</li>
     <li><strong>Diagnose.</strong> The main model reads the original reply, the replays and what each saw, and writes the cause and <em>one</em> general rule — or none. A rule that names the case or echoes a web page is discarded.</li>
     <li><strong>Test.</strong> The question is asked twice more with the rule in the prompt, then the kept regression tests are run with it.</li>

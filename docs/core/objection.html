@@ -23,7 +23,7 @@
   <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
 
   <h1>core / objection.py — arithmetic before opinion</h1>
-  <p class="subtitle">Resolves the judge's objections that are decidable by arithmetic or string search, so the expensive model is spent only on genuine ambiguity — and so proven-real catches can never be overturned away.</p>
+  <p class="subtitle">Resolves the judge's objections that are decidable by arithmetic or string search, so the expensive model is spent only on genuine ambiguity — and so proven-real catches can never be overturned away. <strong>Off in production:</strong> this runs only inside the LLM judge, which has been off since 2026-10-14 (<a href="verifier.html#judge-off">§4OW</a>); it comes back with <code>GHOST_VERIFIER_JUDGE=1</code>.</p>
 
   <h2>Why it exists</h2>
   <p>Four rounds of escalation policy (rebuttal burden, verdict-tier routing, truncation guard, and two calibrations) all failed the <a href="verifier.html">verifier</a>'s ship gate, because every one of them was <strong>arbitrating opinions</strong>: the cheap judge says the claim is wrong, the main model says it is fine, and any rule that trusts one of them loses whatever the other was right about. Measured, those arms traced a single false-alarm-versus-catch trade curve — 0.591, 0.717, ~0.73 balanced — and never crossed it.</p>

@@ -170,7 +170,7 @@ python interface/externals/image_generation/img_gen_server.py
 # → builds ghost-agent-base:latest (~2 GB first run; ~5 min on warm cache)
 # → runs a Chromium launch smoke test at the end
 </code></pre>
-  <p>The image bakes apt system packages, the deep-learning pip stack, and <code>playwright install --with-deps chromium</code> at build time — self-play + browser tasks start instantly. The runtime gate checks both the <code>/root/.supercharged.v2</code> marker AND that the Chromium binary is actually on disk; if the marker is present but the binary is missing (the exact silent-failure mode the <code>v2</code> bump exists to catch), a full reinstall fires on next <code>ensure_running</code>.</p>
+  <p>The image bakes apt system packages, the deep-learning pip stack, and <code>playwright install --with-deps chromium</code> at build time — browser tasks start instantly. The runtime gate checks both the <code>/root/.supercharged.v2</code> marker AND that the Chromium binary is actually on disk; if the marker is present but the binary is missing (the exact silent-failure mode the <code>v2</code> bump exists to catch), a full reinstall fires on next <code>ensure_running</code>.</p>
   <p>If you skip this step, the fallback inline provisioning still produces a correct image; it just takes longer on the first turn.</p>
 
   <h2>Test runner</h2>

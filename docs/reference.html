@@ -20,7 +20,7 @@
     <a href="how-it-works.html">One message, end to end</a>
     <a href="memory.html">What it remembers</a>
     <a href="tools.html">What it can do</a>
-    <a href="self-improvement.html">How it improves itself</a>
+    <a href="self-improvement.html">Checking and learning</a>
     <a href="learning-loop.html">The learning loop</a>
     <a href="long-horizon.html">Long tasks</a>
 
@@ -62,12 +62,12 @@
   <p>Cross-cutting mechanisms, each spanning several modules. Usually the best place to start in this section.</p>
   <div class="card-grid">
     <a class="card" href="algorithms/request_lifecycle.html"><h3>Request lifecycle</h3><p>The turn loop in full detail.</p></a>
-    <a class="card" href="algorithms/memory_hydration.html"><h3>Memory hydration</h3><p>Retrieval fan-out and rank fusion.</p></a>
+    <a class="card" href="algorithms/memory_hydration.html"><h3>Memory hydration</h3><p>What goes into each prompt (profile, owner facts, owner rules), and rank fusion.</p></a>
     <a class="card" href="algorithms/dream_cycle.html"><h3>Maintenance cycle</h3><p>The idle-time store upkeep (formerly the dream cycle).</p></a>
     <a class="card" href="algorithms/skill_acquisition.html"><h3>Skill acquisition</h3><p>How <code>create_skill</code> turns a procedure into a tool.</p></a>
     <a class="card" href="algorithms/selfhood.html"><h3>Selfhood</h3><p>Autobiographical memory and continuity.</p></a>
     <a class="card" href="algorithms/workspace.html"><h3>Workspace continuity</h3><p>The outward-facing world model.</p></a>
-    <a class="card" href="algorithms/metacognition.html"><h3>Metacognition</h3><p>The optional self-monitoring stack.</p></a>
+    <a class="card" href="algorithms/metacognition.html"><h3>Metacognition</h3><p>Validator-block logging. The host monitoring and re-plan alarms were removed (§4PT).</p></a>
     <a class="card" href="algorithms/mandatory_tor.html"><h3>Mandatory Tor</h3><p>How fail-closed egress is enforced.</p></a>
     <a class="card" href="algorithms/circuit_breaker.html"><h3>Circuit breaker</h3><p>Taking failing nodes out of rotation.</p></a>
     <a class="card" href="algorithms/node_offload.html"><h3>Node offload</h3><p>Moving work to secondary machines.</p></a>
@@ -80,9 +80,9 @@
     <a class="card" href="core/agent.html"><h3>agent</h3><p>The turn loop, tool dispatch, streaming, sampling.</p></a>
     <a class="card" href="core/llm.html"><h3>llm</h3><p>Upstream client, node pools, routing, failover.</p></a>
     <a class="card" href="core/node_throughput.html"><h3>node_throughput</h3><p>Learned per-node speed &mdash; sizing work to what a node can actually finish.</p></a>
-    <a class="card" href="core/bus.html"><h3>bus</h3><p>Memory fan-out and rank fusion.</p></a>
-    <a class="card" href="core/verifier.html"><h3>verifier</h3><p>The self-check, escalation and repair.</p></a>
-    <a class="card" href="core/claim_binding.html"><h3>claim_binding</h3><p>Verdicts from validated quotes (§4IM) — bench arm + shadow ledger.</p></a>
+    <a class="card" href="core/bus.html"><h3>bus</h3><p>Memory retrieval and rank fusion with a fixed weight table.</p></a>
+    <a class="card" href="core/verifier.html"><h3>verifier</h3><p>The post-reply checks and repair. Only the mechanical checks run in production; the LLM judge and its escalation are off (§4OW).</p></a>
+    <a class="card" href="core/claim_binding.html"><h3>claim_binding</h3><p>Verdicts from validated quotes (§4IM). Part of the LLM judge, off in production (§4OW).</p></a>
     <a class="card" href="core/planning.html"><h3>planning</h3><p>Task trees and postcondition gating.</p></a>
     <a class="card" href="core/prompts.html"><h3>prompts</h3><p>The system prompt and its assembly.</p></a>
     <a class="card" href="core/context_manager.html"><h3>context_manager</h3><p>Context budgeting and compaction.</p></a>
@@ -93,9 +93,9 @@
     <a class="card" href="core/coding_loop.html"><h3>coding_loop</h3><p>The agentic edit-test executor for project leaves.</p></a>
     <a class="card" href="core/evidence_gate.html"><h3>evidence_gate</h3><p>The evidence-sufficiency check on a turn's tool results (its steer was removed in §4NN).</p></a>
     <a class="card" href="core/feedback.html"><h3>feedback</h3><p>Human 👍/👎 outcome labels.</p></a>
-    <a class="card" href="core/regression.html"><h3>regression</h3><p>The owner's regression suite: approved tests from real failures, re-run after every change.</p></a>
+    <a class="card" href="core/regression.html"><h3>regression</h3><p>The owner's regression suite: approved tests from real failures, re-run after each deploy and daily.</p></a>
     <a class="card" href="core/isolation.html"><h3>isolation</h3><p>Detached context, forked workspace, no-network sandbox &mdash; the substrate for failure replay.</p></a>
-    <a class="card" href="core/objection.html"><h3>objection</h3><p>Settling a judge's objections by arithmetic before spending a model call.</p></a>
+    <a class="card" href="core/objection.html"><h3>objection</h3><p>Settling a judge's objections by arithmetic before spending a model call. Idle while the LLM judge is off (§4OW).</p></a>
     <a class="card" href="core/strikes.html"><h3>strikes</h3><p>Error-strike accounting.</p></a>
     <a class="card" href="core/code_claims.html"><h3>code_claims</h3><p>Did this turn RUN what it wrote? The claim-keyed arm of the unverified-write guard.</p></a>
     <a class="card" href="core/failure_dimension.html"><h3>failure_dimension</h3><p>Harness-dimension failure tags.</p></a>
@@ -119,8 +119,8 @@
     <a class="card" href="memory/skills.html"><h3>skills</h3><p>The lesson playbook.</p></a>
     <a class="card" href="memory/journal.html"><h3>journal</h3><p>The short-term queue.</p></a>
     <a class="card" href="memory/episodes.html"><h3>episodes</h3><p>Action sequences and outcomes.</p></a>
-    <a class="card" href="memory/experience.html"><h3>experience</h3><p>Human-graded past turns: steps and sources.</p></a>
-    <a class="card" href="memory/fact_ledger.html"><h3>fact_ledger</h3><p>When each owner fact was stated, replaced or removed, and in whose words.</p></a>
+    <a class="card" href="memory/experience.html"><h3>experience</h3><p>Human-graded past turns: steps and sources. Built, off in production (§4QL).</p></a>
+    <a class="card" href="memory/fact_ledger.html"><h3>fact_ledger</h3><p>When each owner fact was stated, replaced or removed, and in whose words. Written always; not shown in prompts (§4QM).</p></a>
     <a class="card" href="memory/scratchpad.html"><h3>scratchpad</h3><p>Per-conversation notes.</p></a>
     <a class="card" href="memory/projects.html"><h3>projects</h3><p>The project store.</p></a>
     <a class="card" href="memory/frontier.html"><h3>frontier</h3><p>Per-cluster practice telemetry (idle since synthetic self-play was removed).</p></a>
@@ -174,7 +174,7 @@
   </div>
 
   <h2 id="coverage">What this reference doesn't cover</h2>
-  <p>Being straight about the gaps, so you don't go looking for a page that isn't here. As of 2026-08-04 these parts of <code>src/ghost_agent/</code> have no page in this section — though <a href="self-improvement.html">How it improves itself</a> explains what the background passes do:</p>
+  <p>Being straight about the gaps, so you don't go looking for a page that isn't here. As of 2026-08-04 these parts of <code>src/ghost_agent/</code> have no page in this section — though <a href="self-improvement.html">Checking and learning</a> explains what the background passes do:</p>
 
   <div class="scroll">
   <table>

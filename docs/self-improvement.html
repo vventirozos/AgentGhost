@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>How it improves itself — Ghost Agent</title>
-<meta name="description" content="Ghost Agent checks its own answers and runs background learning passes while idle. What each one does, when it fires, and how to see what happened.">
+<title>Checking and learning — Ghost Agent</title>
+<meta name="description" content="What Ghost Agent checks after each answer, what it does while idle, and how it learns only from rules you approve. What each part does, when it runs, and how to see what happened.">
 <link rel="stylesheet" href="assets/style.css">
 </head>
 <body>
@@ -20,7 +20,7 @@
     <a href="how-it-works.html">One message, end to end</a>
     <a href="memory.html">What it remembers</a>
     <a href="tools.html">What it can do</a>
-    <a class="current" href="self-improvement.html">How it improves itself</a>
+    <a class="current" href="self-improvement.html">Checking and learning</a>
     <a href="learning-loop.html">The learning loop</a>
     <a href="long-horizon.html">Long tasks</a>
 
@@ -38,11 +38,11 @@
 
 <main>
   <span class="eyebrow">How it works</span>
-  <h1>How it improves itself</h1>
-  <p class="subtitle">Two separate things: a check that runs on every answer, and a set of background passes that only run when you've left it alone. Since October 2026 the only thing that changes how it answers is a rule <em>you</em> approved.</p>
+  <h1>Checking and learning</h1>
+  <p class="subtitle">Three things: mechanical checks after every answer, the learning loop that turns your 👎 into a rule you can approve, and maintenance passes that only run when you've left it alone. Since October 2026 the only thing that changes how it answers is a rule <em>you</em> approved.</p>
 
   <div class="note">
-    <strong>To be clear about what this isn't.</strong> None of this retrains the language model. The model file never changes. What changes is what Ghost <em>remembers</em> and the <em>rules you have approved</em>. Everything happens on your machine.
+    <strong>To be clear about what this isn't.</strong> None of this retrains the language model. The model file never changes. What changes is what Ghost <em>remembers</em> and the <em>rules you have approved</em>. Everything happens on your own machines.
   </div>
 
   <div class="note good">
@@ -51,44 +51,37 @@
 
   <h2>Part one: checking its own answers</h2>
 
-  <p>The failure this exists to catch is specific and common: a model announces "I've created the file and it works" when nothing ran, or answers a subtly different question than the one you asked. It reads confidently either way, which is what makes it dangerous.</p>
+  <p>The failure this exists to catch is specific and common: a model announces "I've created the file and it works" when nothing ran, or describes a picture it never looked at. It reads confidently either way, which is what makes it dangerous.</p>
 
-  <p>So before an answer is final, a second pass reads it against the evidence the tools actually produced.</p>
+  <p>So after an answer, Ghost runs checks that a program can decide — not a second opinion from another model.</p>
 
   <div class="diagram">
     <ol class="flow">
-      <li>
-        <h4>Since 2026-10-14 (§4OW): mechanical checks only</h4>
-        <p>The steps below describe the LLM judge, which is <strong>off by default</strong> (<code>GHOST_VERIFIER_JUDGE=1</code> turns it on). It was wrong on 9 of 17 refusals in a week of real traffic. What runs on every turn are the mechanical checks: the page loads, the written files exist, the reply is an answer, the turn's constraints held, the memory claims match the profile, and an image shows what the reply says.</p>
-      </li>
       <li>
         <h4>The evidence is collected</h4>
         <p>What the tools returned this turn — command output, file contents, what the browser saw. Not the model's description of them; the actual results.</p>
       </li>
       <li>
-        <h4>Two questions, in this order</h4>
-        <p>First: <em>does this answer the question that was asked?</em> Second: <em>is it supported by the evidence?</em> Alignment comes first deliberately — "you asked for code and got a number" is a worse failure than a wrong number, and a check that only looks at correctness misses it entirely.</p>
-      </li>
-      <li>
-        <h4>A verdict, with a confidence</h4>
-        <p>Confirmed, or refused. A cheap local judge does the first pass; if it refuses, the main model re-examines the case, and <em>its</em> verdict wins. That second look exists because the cheap judge refuses more often than it should.</p>
+        <h4>Mechanical checks run</h4>
+        <p>Does a page it built load without errors? Do the files it says it wrote exist on disk? Is the reply an answer, and not just narration of what it is about to do? Did the turn's constraints hold? Do its claims about your memory match your profile? Does a rendered image show what the reply says (a look at the pixels, on the helper box)? On image turns the image tool looks at every render, and Ghost itself writes the line saying what the picture shows.</p>
       </li>
       <li class="optional">
-        <h4>If refused with high confidence — repair</h4>
-        <p>Ghost gets a bounded number of attempts (one by default) to fix the answer with the critique in hand, rather than shipping something it just failed. Error messages and aborts are never "repaired". The launcher sets <code>GHOST_CRITIC_ASYNC=1</code>, which skips this repair: every answer is sent first and checked afterwards, and a confident refusal becomes a correction at the top of your next reply. Since 2026-10-10 (§4NF) that correction is <strong>not shown to you</strong> (2 of the last 3 shown corrections were false; the switch that showed them was removed on 2026-10-11, §4NM); the verdict is still recorded and can start a replay in the <a href="learning-loop.html">learning loop</a>.</p>
+        <h4>A short repair window (§4OX)</h4>
+        <p>The reply waits up to 15 seconds for these checks (<code>GHOST_MECHANICAL_REPAIR_BUDGET</code>). If a page throws an error or a claimed file is missing, Ghost gets one round to fix it before the answer is sent. Otherwise the answer goes out and the checks finish afterwards (<code>GHOST_CRITIC_ASYNC=1</code>).</p>
       </li>
       <li>
         <h4>Whatever happens is recorded</h4>
-        <p>The verdict is stored with the turn. A refused or doubtful answer of yours can be put on the list for the <a href="learning-loop.html">learning loop</a> to replay — but nothing is ever adopted on the self-check's word, because measured against the truth it is wrong too often (it confirmed an invented "all systems green" two times out of two). Ghost no longer writes lessons for itself: the producers that did (reflection, post-mortems, distillation, dream consolidation) were removed on 2026-10-11 (§4NM).</p>
+        <p>The verdict is stored with the turn. You are generally not shown it. A failed check on one of your turns can put it on the list for the <a href="learning-loop.html">learning loop</a> to replay — but nothing is ever adopted on a check's word. Ghost no longer writes lessons for itself: the producers that did (reflection, post-mortems, distillation, dream consolidation) were removed on 2026-10-11 (§4NM).</p>
       </li>
     </ol>
   </div>
 
-  <h3>Streaming answers are checked late</h3>
-  <p>If the reply streams word by word, the text has already reached you by the time the check finishes. Blocking would buy nothing. So the check runs in the background and, if it refuses, you get a correction notice at the top of the <em>next</em> reply. It is after the fact — and since 2026-10-10 (§4NF) the correction is <strong>not shown to you</strong> at all: 2 of the last 3 shown corrections were false, and the switch that showed them was removed on 2026-10-11 (§4NM). The verdict is still recorded and can start a replay in the <a href="learning-loop.html">learning loop</a>.</p>
+  <div class="note">
+    <strong>The second-model judge is off (§4OW, 2026-10-14).</strong> Until then a second model also read each answer against the evidence, with the main model re-examining its refusals. Measured on a week of real traffic it was wrong on 9 of 17 refusals, so it was switched off; <code>GHOST_VERIFIER_JUDGE=1</code> turns it back on. The confidence score that came with it was deleted on 2026-10-16 (§4PJ): it ranked answers no better than a coin flip. Corrections shown to you at the top of the next reply were stopped on 2026-10-10 (§4NF), because 2 of the last 3 shown were false.
+  </div>
 
   <h3>When you correct it yourself</h3>
-  <p>Telling Ghost it got something wrong is a much stronger signal than anything it can generate on its own, and it's treated that way: the turn gets marked as failed. It needs both a recognisable correction phrase and genuine overlap with the previous message, so an ordinary follow-up question isn't mistaken for a correction. While you're away, the main model also reads your next message after each answer, in a short background check, and decides whether it showed the answer missed. Your 👎 and these corrections are what the <a href="learning-loop.html">learning loop</a> starts from: they are the only signals that can lead to a regression test. The self-check's doubts or a run of failed tool calls can also start a replay, but never a test.</p>
+  <p>Telling Ghost it got something wrong is a much stronger signal than anything it can generate on its own, and it's treated that way: the turn gets marked as failed. It needs both a recognisable correction phrase and genuine overlap with the previous message, so an ordinary follow-up question isn't mistaken for a correction. While you're away, the main model also reads your next message after each answer, in a short background check, and decides whether it showed the answer missed. Your 👎 and these corrections are what the <a href="learning-loop.html">learning loop</a> starts from: they are the only signals that can lead to a regression test. A failed check or a run of failed tool calls can also start a replay, but never a test.</p>
 
   <h2>Part two: what it does while you're away</h2>
 
@@ -107,7 +100,7 @@
   </div>
 
   <h3>There is a floor on how far you can compress time</h3>
-  <p>Accelerating the clock only works while the compressed window stays <em>wider than the work</em>. The gates shrink when you raise the scale; the work doesn't. A dream is a real model call and takes something like a minute whether the scale is 1 or 60.</p>
+  <p>Accelerating the clock only works while the compressed window stays <em>wider than the work</em>. The gates shrink when you raise the scale; the work doesn't. In August 2026, when this was observed, a dream was a real model call and took something like a minute whether the scale was 1 or 60 (dreaming and synthetic self-play were later removed, §4NM; the floor still applies to any job that takes real time).</p>
   <p>At <code>--bio-time-scale 60</code> the window for the middle phases is 45 seconds — narrower than a single dream. What was actually observed, tick by tick:</p>
   <pre><code>idle 1..10s   nothing eligible yet
 idle ~11s     dream starts — and runs for ~60 real seconds
@@ -144,11 +137,14 @@ idle 1..10s   …and round again, forever</code></pre>
     <p class="caption">Times are how long you've been quiet. Each phase also has its own cooldown between runs.</p>
   </div>
 
-  <h3>One more that is off by default</h3>
-  <p>It stays off unless you turn it on.</p>
+  <h3>Smaller jobs in the same loop</h3>
   <dl class="kv terms">
+    <dt>Store hygiene and tidy</dt>
+    <dd>Repairs the lesson index, removes expired temporary video transcripts, and deletes leftover screenshots and scratch files in project workspaces.</dd>
+    <dt>Stale questions</dt>
+    <dd>Lists its own open questions older than three days.</dd>
     <dt>Advancing projects on its own</dt>
-    <dd>When idle, push one active project forward by one step without being asked. Runs on hard per-project budgets with human gates. Turn on with <code>--autoadvance-idle</code>.</dd>
+    <dd>When idle, push one project you put on autopilot forward by one step. Runs on hard per-project budgets and stops at anything that needs you. Off in the code by default; the production launcher turns it on with <code>--autoadvance-idle</code>. It only touches projects you put on autopilot.</dd>
   </dl>
 
   <h2>What all of this is actually reading</h2>
@@ -163,7 +159,7 @@ idle 1..10s   …and round again, forever</code></pre>
     <tbody>
       <tr><td>Which of your answers did you say were wrong?</td><td>A replay case, a candidate rule for you to approve, a regression test proposal.</td><td><span class="badge good">on</span> — <a href="learning-loop.html">the learning loop</a></td></tr>
       <tr><td>Is a kept regression test still passing?</td><td>A pass/fail per test, reported to you on failure.</td><td><span class="badge good">on</span> — <a href="core/regression.html">core.regression</a></td></tr>
-      <tr><td>What did you do while I was away? Which experiment arms ran?</td><td>Ledger reads for <code>introspect</code>.</td><td><span class="badge good">on</span></td></tr>
+      <tr><td>What did you do while I was away?</td><td>Ledger reads for <code>introspect</code>.</td><td><span class="badge good">on</span></td></tr>
       <tr><td>What went wrong in this turn? (reflection)</td><td>A self-written lesson.</td><td><span class="badge bad">removed</span> — reached its turn 18% of the time</td></tr>
       <tr><td>What about the agent itself made this fail? (post-mortem)</td><td>A classified defect report.</td><td><span class="badge bad">removed</span> — 129 of 130 runs found nothing</td></tr>
       <tr><td>Which procedures keep recurring? (auto skills)</td><td>A new reusable skill.</td><td><span class="badge bad">removed</span> — trivial sequences that quoted old requests</td></tr>
@@ -217,28 +213,18 @@ idle 1..10s   …and round again, forever</code></pre>
     <thead><tr><th>Flag</th><th>Turns off</th></tr></thead>
     <tbody>
       <tr><td><code>--no-dream</code></td><td>Store maintenance and the daily snapshot. Leaves the rest running.</td></tr>
-      <tr><td><code>--no-self-play</code></td><td>The learning loop's idle work: replaying your failures and running your regression tests. Leaves the rest running.</td></tr>
       <tr><td><code>--no-trajectories</code></td><td>Recording turns at all. This also stops the learning loop, since it has nothing to read.</td></tr>
-      <tr><td><code>--no-verifier</code></td><td>The self-check. Not recommended outside an experiment — see below.</td></tr>
+      <tr><td><code>--no-verifier</code></td><td>The checks after each answer. Not recommended outside an experiment — see below.</td></tr>
       <tr><td><code>--no-memory</code></td><td>Everything. Ghost becomes a plain chat wrapper.</td></tr>
     </tbody>
   </table>
   </div>
 
-  <p>The other direction — switches that are <strong>off</strong> unless you set them to <code>1</code> (environment variables, read on every use):</p>
-  <div class="scroll">
-  <table>
-    <thead><tr><th>Switch</th><th>Brings back</th></tr></thead>
-    <tbody>
-      <tr><td><code>GHOST_HYDRATION_JUDGE</code></td><td>The per-turn memory relevance judge.</td></tr>
-      <tr><td><code>GHOST_CODING_PRACTICE</code></td><td>Coding practice on a seed from one of your own failed coding requests.</td></tr>
-    </tbody>
-  </table>
-  </div>
-  <p>The switches that used to sit beside these — <code>GHOST_PRODUCER_LESSONS</code>, <code>GHOST_AUTO_SKILLS</code>, <code>GHOST_SKILL_PRUNE</code>, <code>GHOST_ROUTER</code>, <code>GHOST_FORESIGHT</code>, <code>GHOST_RISK_GOVERNOR</code>, <code>GHOST_GEPA_AUTONOMY</code>, <code>GHOST_BUS_VECTOR_TIER</code>, <code>GHOST_BUS_GRAPH_TIER</code>, <code>GHOST_BUS_EPISODIC_TIER</code>, <code>GHOST_BUS_SESSION_TIER</code>, <code>GHOST_DREAM_REPLAY</code>, <code>GHOST_EVOLVE</code>, <code>GHOST_COMPETENCE_PROMPT</code>, <code>GHOST_CONF_COMPETENCE</code>, <code>GHOST_VERIFIER_SHOW_OWNER</code> — are gone with the code they switched (2026-10-11, §4NM). Why each went is on <a href="learning-loop.html#off">the learning loop page</a>.</p>
+  <p>There is no flag that turns off only the failure replay and regression runs (the old <code>--no-self-play</code> is gone). The other direction — switches that are <strong>off</strong> unless you set them to <code>1</code>: <code>GHOST_VERIFIER_JUDGE</code> (the second-model judge, above) and <code>GHOST_AUTO_LESSONS</code> (the old self-written lessons in prompts, see <a href="learning-loop.html#retired">the learning loop</a>).</p>
+  <p>The switches that used to sit beside these — <code>GHOST_HYDRATION_JUDGE</code>, <code>GHOST_CODING_PRACTICE</code>, <code>GHOST_PRODUCER_LESSONS</code>, <code>GHOST_AUTO_SKILLS</code>, <code>GHOST_SKILL_PRUNE</code>, <code>GHOST_ROUTER</code>, <code>GHOST_FORESIGHT</code>, <code>GHOST_RISK_GOVERNOR</code>, <code>GHOST_GEPA_AUTONOMY</code>, <code>GHOST_BUS_VECTOR_TIER</code>, <code>GHOST_BUS_GRAPH_TIER</code>, <code>GHOST_BUS_EPISODIC_TIER</code>, <code>GHOST_BUS_SESSION_TIER</code>, <code>GHOST_DREAM_REPLAY</code>, <code>GHOST_EVOLVE</code>, <code>GHOST_COMPETENCE_PROMPT</code>, <code>GHOST_CONF_COMPETENCE</code>, <code>GHOST_VERIFIER_SHOW_OWNER</code> — are gone with the code they switched (2026-10-11, §4NM). Why each went is on <a href="learning-loop.html#off">the learning loop page</a>.</p>
 
   <div class="note">
-    <strong>Why <code>--no-verifier</code> exists.</strong> When the check runs late (on a streamed answer), it can't change what you already read — its only payoff is cross-session: queueing a correction and marking the turn so the learning loop can replay it. That's a real benefit but not an obvious one, and it costs a full extra model call per turn. The flag exists so you can measure the difference rather than assume it.
+    <strong>Why <code>--no-verifier</code> exists.</strong> A check that finishes after the answer was sent can't change what you already read — its payoff is the short repair window and marking the turn so the learning loop can replay it. With the judge off the checks are mostly cheap program checks; the image look is the one that costs a model call. The flag exists so you can measure the difference rather than assume it.
   </div>
 
   <div class="pager">
@@ -253,7 +239,7 @@ idle 1..10s   …and round again, forever</code></pre>
   </div>
 
   <footer>
-    <p>Checked against <code>core/agent.py</code> (the idle loop), <code>core/verifier.py</code>, <code>core/dream.py</code>, <code>core/failure_replay.py</code> and <code>core/regression.py</code> on 2026-10-10, and against the §4NM removal list on 2026-10-11. Timings are defaults and can be changed — see <a href="configuration.html">Settings that matter</a>.</p>
+    <p>Checked against <code>core/agent.py</code> (the idle loop), <code>core/verifier.py</code>, <code>core/dream.py</code>, <code>core/failure_replay.py</code> and <code>core/regression.py</code> on 2026-10-10, and against the §4NM removal list on 2026-10-11. Part one re-checked against the production launcher on 2026-10-26 (§4OW, §4OX, §4PJ). Timings are defaults and can be changed — see <a href="configuration.html">Settings that matter</a>.</p>
   </footer>
 </main>
 </body>

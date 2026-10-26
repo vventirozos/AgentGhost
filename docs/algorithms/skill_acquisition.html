@@ -17,7 +17,7 @@
     <h3>Algorithms</h3>
     <a href="request_lifecycle.html">Request lifecycle</a>
     <a href="memory_hydration.html">Memory hydration (RRF)</a>
-    <a href="dream_cycle.html">Dream / self-play</a>
+    <a href="dream_cycle.html">Maintenance &amp; failure replay</a>
     <a class="current" href="skill_acquisition.html">Skill acquisition</a>
     <a href="circuit_breaker.html">Circuit breaker</a>
     <a href="selfhood.html">Selfhood (unified self)</a>
@@ -59,8 +59,8 @@
   <p>Until October 2026 the dream-cycle self-play wrote lessons into the <a href="../memory/skills.html">SkillMemory</a> playbook through a three-gate pipeline (structured extraction, a generalization guard, a re-run verification), and the playbook kept them by a utility score (<code>confidence·0.5 + hit_rate·0.8 + 0.3 if verified + log(freq)·0.1 + stale_penalty</code>) with low-utility pruning. Measured on real turns (§4NA–§4NC), those lessons reached the turn they were meant for 18% of the time and changed the reply in 3 of 20; the pruning had deleted 13 good lessons on noisy labels (§4AO). Synthetic self-play, the producer gates and the utility pruning were deleted. Today a lesson is written by exactly two sources (<code>LESSON_SOURCES_ALLOWED</code>, <code>memory/skills.py</code>): <code>learn_skill</code> — the owner's dictation, and rules adopted with "learn rule N" from the <a href="../learning-loop.html">learning loop</a> — and <code>operator_repair</code>.</p>
   <h3>What the playbook still does</h3>
   <ul>
-    <li><code>SkillMemory.get_playbook_items(query, memory_system)</code> — vector-search (distance &lt; 0.45) + BM25-lite re-rank, top 5 returned as <strong>per-lesson</strong> dicts <code>{text, trigger}</code> with <strong>no</strong> side effects; the MemoryBus entry point, so each lesson is ranked / gated / capped individually by RRF.</li>
-    <li>Adopted owner rules ride every owner prompt in the <code>### OWNER RULES</code> block (up to six), outside retrieval.</li>
+    <li><code>SkillMemory.get_playbook_items(query, memory_system)</code> — vector-search (distance &lt; 0.45) + BM25-lite re-rank, top 5 returned as <strong>per-lesson</strong> dicts <code>{text, trigger}</code> with <strong>no</strong> side effects; the MemoryBus entry point, so each lesson is ranked / gated / capped individually by RRF. <em>Since &sect;4ON (2026-10-13) it returns only the owner's adopted rules: lessons the agent wrote itself stay in the store but are kept out of prompts (<code>GHOST_AUTO_LESSONS</code> default 0, not set by the launcher).</em></li>
+    <li>Adopted owner rules ride every owner prompt in the <code>### OWNER RULES</code> block (up to ten, <code>OWNER_RULES_MAX</code>; six before &sect;4OR), outside retrieval.</li>
     <li><code>record_retrievals_bulk(triggers)</code> credits only lessons that actually entered the prompt, once per turn — telemetry for <code>introspect action='learning'</code>, not a retention score any more.</li>
     <li>Playbook capped at <code>PLAYBOOK_MAX = 300</code> (<code>GHOST_PLAYBOOK_MAX</code>); owner rules and dictated lessons are never evicted.</li>
   </ul>
