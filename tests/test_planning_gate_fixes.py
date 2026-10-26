@@ -48,7 +48,9 @@ def test_string_postconditions_not_graded_per_char():
         "id": "root", "description": "goal",
         "postconditions": "zqxj wvkp mfgh",  # tokens absent from any reply
     })
-    unsat = tree.root_postconditions_unsatisfied("something unrelated")
+    root = tree.nodes["root"]
+    root.result_summary = "something unrelated"
+    unsat = tree._check_postconditions(root)
     assert unsat == ["zqxj wvkp mfgh"]  # ONE unsatisfied item, not one per char
 
 
@@ -161,12 +163,14 @@ def test_human_gate_other_postconditions_still_enforced_after_approval():
     assert "HUMAN_GATE" not in node.failure_reason
 
 
-def test_root_response_gate_skips_human_gate_postconditions():
-    """root_postconditions_unsatisfied must not dump HUMAN_GATE text
-    into the user reply as an 'unsatisfied' item."""
+def test_postcondition_check_skips_human_gate_postconditions():
+    """A HUMAN_GATE postcondition is never textually graded into the
+    unsatisfied list (§4RS: was pinned through the removed root gate)."""
     tree = TaskTree()
-    tree.add_task("goal", postconditions=["HUMAN_GATE: sign-off"])
-    assert tree.root_postconditions_unsatisfied("any reply") == []
+    tid = tree.add_task("goal", postconditions=["HUMAN_GATE: sign-off"])
+    node = tree.nodes[tid]
+    node.result_summary = "any reply"
+    assert tree._check_postconditions(node) == []
 
 
 def test_project_plan_forwards_human_approved(store):

@@ -38,7 +38,6 @@ def _fs(**over):
     fields = dict(
         body={"messages": [], "stream": False},
         created_time=1234567890,
-        current_plan_json={},
         current_trajectory_id="traj-1",
         execution_failure_count=0,
         final_ai_content="All done.",

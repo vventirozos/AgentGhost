@@ -10913,7 +10913,6 @@ class InternalTurnState:
     continuity_text: Any = None
     created_time: Any = None
     cross_turn_repeat_hits: Any = None
-    current_plan_json: Any = None
     current_trajectory_id: Any = None
     effective_max_turns: Any = None
     executed_idempotent: Any = None
@@ -10982,7 +10981,6 @@ class TurnState:
     _request_sys3_fired_once: Any
     _request_sys3_prev_justification: Any
     consecutive_parse_errors: Any
-    current_plan_json: Any
     execution_failure_count: Any
     final_ai_content: Any
     fname: Any
@@ -11023,7 +11021,7 @@ class TurnState:
     # blind-regeneration guard lets the repair regenerate)
     repair_reentry_active: Any = False
 
-    MUTATED_FIELDS = ('_constraint_steer_pending', '_proj_task_closed_this_req', '_request_sys3_fired_once', '_request_sys3_prev_justification', 'consecutive_parse_errors', 'current_plan_json', 'execution_failure_count', 'final_ai_content', 'fname', 'force_final_response', 'force_stop', 'forget_was_called', 'last_was_failure', 'preflight_blocks_this_request', 'request_sandbox_state', 'transient_failure_count')
+    MUTATED_FIELDS = ('_constraint_steer_pending', '_proj_task_closed_this_req', '_request_sys3_fired_once', '_request_sys3_prev_justification', 'consecutive_parse_errors', 'execution_failure_count', 'final_ai_content', 'fname', 'force_final_response', 'force_stop', 'forget_was_called', 'last_was_failure', 'preflight_blocks_this_request', 'request_sandbox_state', 'transient_failure_count')
 
 
 @dataclass
@@ -11035,7 +11033,6 @@ class FinalizeState:
     """
     body: Any
     created_time: Any
-    current_plan_json: Any
     current_trajectory_id: Any
     execution_failure_count: Any
     final_ai_content: Any
@@ -20702,7 +20699,6 @@ class GhostAgent:
         _request_sys3_fired_once = ts._request_sys3_fired_once
         _request_sys3_prev_justification = ts._request_sys3_prev_justification
         consecutive_parse_errors = ts.consecutive_parse_errors
-        current_plan_json = ts.current_plan_json
         execution_failure_count = ts.execution_failure_count
         final_ai_content = ts.final_ai_content
         fname = ts.fname
@@ -24212,7 +24208,6 @@ class GhostAgent:
             ts._request_sys3_fired_once = _request_sys3_fired_once
             ts._request_sys3_prev_justification = _request_sys3_prev_justification
             ts.consecutive_parse_errors = consecutive_parse_errors
-            ts.current_plan_json = current_plan_json
             ts.execution_failure_count = execution_failure_count
             ts.final_ai_content = final_ai_content
             ts.fname = fname
@@ -24482,7 +24477,6 @@ class GhostAgent:
         """
         body = fs.body
         created_time = fs.created_time
-        current_plan_json = fs.current_plan_json
         current_trajectory_id = fs.current_trajectory_id
         execution_failure_count = fs.execution_failure_count
         final_ai_content = fs.final_ai_content
@@ -25330,39 +25324,6 @@ class GhostAgent:
         except Exception as e:
             logger.debug(f"Verifier gate skipped: {e}")
 
-        # Plan postcondition gate (proposal item #10). If the
-        # strategic planner produced a plan whose ROOT task
-        # declared postconditions, hold the final response to
-        # them — the plan stops being internal bookkeeping and
-        # becomes a success contract on the answer itself. A
-        # response that misses a declared postcondition gets a
-        # visible note rather than passing silently. Non-fatal.
-        try:
-            _plan_json = current_plan_json
-            if _plan_json and final_ai_content:
-                from .planning import TaskTree as _PlanTree
-                _ptree = _PlanTree()
-                _ptree.load_from_json(_plan_json)
-                _unsat = _ptree.root_postconditions_unsatisfied(
-                    final_ai_content
-                )
-                if _unsat:
-                    _pnote = (
-                        "**Plan check:** this response may not yet "
-                        "satisfy: " + "; ".join(_unsat[:3])
-                    )
-                    if _pnote[:48] not in final_ai_content:
-                        final_ai_content = (
-                            f"{final_ai_content}\n\n---\n{_pnote}"
-                        )
-                    pretty_log(
-                        "Plan Gate",
-                        f"{len(_unsat)} unsatisfied postcondition(s)",
-                        icon=Icons.BRAIN_PLAN,
-                    )
-        except Exception as e:
-            logger.debug(f"plan postcondition gate skipped: {e}")
-
         # --- SIGNIFICANT-TURN RECORD (costly-turn note + episode) ---
         if was_complex_task or execution_failure_count > 0:
             is_complete_failure = (execution_failure_count >= 3)
@@ -25976,7 +25937,6 @@ class GhostAgent:
         continuity_text = rs.continuity_text
         created_time = rs.created_time
         cross_turn_repeat_hits = rs.cross_turn_repeat_hits
-        current_plan_json = rs.current_plan_json
         current_trajectory_id = rs.current_trajectory_id
         effective_max_turns = rs.effective_max_turns
         executed_idempotent = rs.executed_idempotent
@@ -29051,7 +29011,6 @@ class GhostAgent:
                 was_complex_task = False
 
                 task_tree = TaskTree()
-                current_plan_json = {}
                 _request_sys3_fired_once = 0
                 _request_sys3_prev_justification = ""
                 force_final_response = False
@@ -30438,7 +30397,6 @@ class GhostAgent:
                         continuity_text=continuity_text,
                         created_time=created_time,
                         cross_turn_repeat_hits=cross_turn_repeat_hits,
-                        current_plan_json=current_plan_json,
                         current_trajectory_id=current_trajectory_id,
                         effective_max_turns=effective_max_turns,
                         executed_idempotent=executed_idempotent,
@@ -30522,7 +30480,6 @@ class GhostAgent:
                         _request_sys3_fired_once=_request_sys3_fired_once,
                         _request_sys3_prev_justification=_request_sys3_prev_justification,
                         consecutive_parse_errors=consecutive_parse_errors,
-                        current_plan_json=current_plan_json,
                         execution_failure_count=execution_failure_count,
                         final_ai_content=final_ai_content,
                         fname=fname,
@@ -30561,7 +30518,6 @@ class GhostAgent:
                         _request_sys3_fired_once = _ts._request_sys3_fired_once
                         _request_sys3_prev_justification = _ts._request_sys3_prev_justification
                         consecutive_parse_errors = _ts.consecutive_parse_errors
-                        current_plan_json = _ts.current_plan_json
                         execution_failure_count = _ts.execution_failure_count
                         final_ai_content = _ts.final_ai_content
                         fname = _ts.fname
@@ -30605,7 +30561,6 @@ class GhostAgent:
                 return await self._finalize_and_return(FinalizeState(
                     body=body,
                     created_time=created_time,
-                    current_plan_json=current_plan_json,
                     current_trajectory_id=current_trajectory_id,
                     execution_failure_count=execution_failure_count,
                     final_ai_content=final_ai_content,

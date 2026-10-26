@@ -75,7 +75,7 @@
   <pre><code>&gt; Build a Flask app with JWT auth and SQLite persistence. Put it in
   /workspace/auth-app, add pytest coverage, and make sure the tests
   pass before you tell me you're done.</code></pre>
-  <p><strong>Under the hood:</strong> <a href="core/planning.html"><code>planning</code></a> decomposes the goal → <code>projects</code> tool scaffolds state → coding-pool LLM writes files → <code>execute</code> runs pytest → <a href="core/verifier.html"><code>verifier</code></a> confirms each postcondition before advancing.</p>
+  <p><strong>Under the hood:</strong> <a href="core/planning.html"><code>planning</code></a> decomposes the goal → <code>projects</code> tool scaffolds state → coding-pool LLM writes files → <code>execute</code> runs pytest → a task closes as DONE only when the file it promised exists and isn't hollow (§4QA), its dependencies closed first, and its result text passes the task's postcondition check (a token-overlap heuristic, <a href="core/planning.html"><code>planning</code></a>). The <a href="core/verifier.html"><code>verifier</code></a> does not take part.</p>
   <p><strong>Tools:</strong> <a href="tools/projects.html"><code>projects</code></a>, <a href="tools/execute.html"><code>execute</code></a>, <a href="tools/file_system.html"><code>file_system</code></a>. <strong>See also:</strong> <a href="memory/projects.html">Project store</a>.</p>
 
   <h2 id="image">Image generation</h2>

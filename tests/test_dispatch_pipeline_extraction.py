@@ -35,7 +35,6 @@ def _make_ts(**over):
         _request_sys3_fired_once=False,
         _request_sys3_prev_justification="",
         consecutive_parse_errors=0,
-        current_plan_json="",
         execution_failure_count=0,
         final_ai_content="",
         fname="",

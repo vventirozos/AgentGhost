@@ -29,7 +29,6 @@ def _fs(**over):
     fields = dict(
         body={"messages": [], "stream": False},
         created_time=1234567890,
-        current_plan_json={},
         current_trajectory_id="traj-1",
         execution_failure_count=0,
         final_ai_content="All done.",
@@ -110,32 +109,9 @@ async def test_tool_response_scrubber_still_fires():
 
 
 # ── revived finalize gates (2026-07-20) ─────────────────────────────────────
+# (§4RS 2026-10-26: the plan-postcondition gate was removed — dead since §4NM.)
 # Both gates silently died in the step-3 extraction: they read handle_chat
 # locals via `locals().get(...)` from inside the extracted method, which can
 # never see them. They now ride FinalizeState — these tests pin that the
 # fields actually reach their consumers.
-
-@pytest.mark.asyncio
-async def test_plan_postcondition_gate_receives_the_plan():
-    agent = _make_agent()
-    plan = {
-        "id": "root", "description": "answer with a number",
-        "postconditions": ["the reply contains a number"],
-        "subtasks": [],
-    }
-    fs = _fs(current_plan_json=plan)
-    # The gate must at least ATTEMPT to load the plan — pin via the
-    # TaskTree loader getting called (MagicMock context keeps every
-    # downstream dependency inert, so a note may or may not append; the
-    # dead-variable regression made even the attempt impossible).
-    import ghost_agent.core.planning as planning_mod
-    called = {}
-    orig = planning_mod.TaskTree.load_from_json
-    planning_mod.TaskTree.load_from_json = (
-        lambda self, pj: called.setdefault("plan", pj) or orig(self, pj))
-    try:
-        await agent._finalize_and_return(fs)
-    finally:
-        planning_mod.TaskTree.load_from_json = orig
-    assert called.get("plan") == plan
 

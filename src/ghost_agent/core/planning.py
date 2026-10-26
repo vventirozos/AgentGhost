@@ -273,28 +273,6 @@ class TaskTree:
             unsat.append(pc_str)
         return unsat
                 
-    def root_postconditions_unsatisfied(self, response_text: str) -> List[str]:
-        """Check a FINAL agent response against the root task's postconditions.
-
-        ``_check_postconditions`` gates *internal* task completion; this
-        method gates the agent's actual user-facing answer against the
-        top-level plan's declared success criteria. That is what makes
-        the plan load-bearing on the response, not just on internal
-        bookkeeping. Returns the list of postconditions the response
-        does not appear to satisfy (empty when the root declares none,
-        or when all are satisfied)."""
-        if not self.root_id:
-            return []
-        root = self.nodes.get(self.root_id)
-        if root is None or not root.postconditions:
-            return []
-        saved = root.result_summary
-        root.result_summary = response_text or ""
-        try:
-            return self._check_postconditions(root)
-        finally:
-            root.result_summary = saved
-
     def depends_back(self, start: str, target: str) -> bool:
         """True when ``start`` really waits, directly or not, on ``target``
         (``start`` itself included) — a dependency that waits on its waiter.

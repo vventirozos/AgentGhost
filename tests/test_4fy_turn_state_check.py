@@ -577,12 +577,12 @@ def test_strip_system_notes_removes_every_finalize_appended_note():
              "💡 This looks like ongoing work (x). Want me to promote it?",
              "*This was one of the shakier answers I've given this week. Was it right?*",
              "**Verifier note:** x"]
-    # 3 f-string appends (plan note, self-check, nudge) + the Unverified
-    # literal = 4 appenders (§4NN: the uncertainty risk-summary append went;
-    # §4PJ: the label ask went with the confidence score — their heads stay in
-    # the stripper for stored replies); add another and this count AND the
-    # list above must grow together
-    assert (len(appends), note_lit, label_ask) == (3, 1, 0), (len(appends), note_lit, label_ask)
+    # 2 f-string appends (self-check, nudge) + the Unverified literal = 3
+    # appenders (§4NN: the uncertainty risk-summary append went; §4PJ: the
+    # label ask went with the confidence score; §4RS: the plan note went with
+    # the dead plan gate — their heads stay in the stripper for stored
+    # replies); add another and this count AND the list above must grow together
+    assert (len(appends), note_lit, label_ask) == (2, 1, 0), (len(appends), note_lit, label_ask)
     for h in heads:
         assert strip_system_notes(MOVE + "\n\n---\n" + h) == MOVE, h
     assert strip_system_notes(MOVE) == MOVE

@@ -138,8 +138,7 @@ def _make_ts(tool_calls):
     return TurnState(
         _constraint_steer_pending=None, _proj_task_closed_this_req=False,
         _request_sys3_fired_once=False, _request_sys3_prev_justification="",
-        consecutive_parse_errors=0, current_plan_json="",
-        execution_failure_count=0, final_ai_content="", fname="",
+        consecutive_parse_errors=0,        execution_failure_count=0, final_ai_content="", fname="",
         force_final_response=False, force_stop=False, forget_was_called=False,
         last_was_failure=False, preflight_blocks_this_request=0,
         request_sandbox_state="", transient_failure_count=0,
