@@ -859,7 +859,10 @@ class Icons:
     BRAIN_CTX    = "🧩"
     BRAIN_ROUTE  = "🧭"   # semantic routing / skill selection
     BRAIN_AIM    = "🎯"   # self-play frontier targeting
-    BRAIN_EFFORT = "🔋"   # §4RB: the reasoning effort a turn is sent with
+    # §4RB reasoning effort: one icon per level (operator 10-27); `effort_icon()`
+    EFFORT_LOW    = "🪫"
+    EFFORT_MEDIUM = "🔋"
+    EFFORT_XHIGH  = "🔥"
     LLM_ASK      = "💬"   # LLM request (wide-base; was 🗣️, a narrow-base+VS16 glyph)
     LLM_REPLY    = "🤖"
 
@@ -951,7 +954,14 @@ class Icons:
     # SYSTEM_BOOT / SYSTEM_READY stay 🌅-style brackets around the whole
     # boot sequence, while the specific lines in between use these.
     BOOT_AWAKE       = "🌅"   # process spark — the very first line
-    HEAD_DISK        = "💽"   # §4RO: the request head saved to / restored from disk
+    # §4RO/§4RV head saves (operator 10-27: one icon per event, not one for all)
+    HEAD_SAVE        = "💽"   # the head (owner or members) written to disk
+    HEAD_RESTORE     = "📀"   # the head read back from disk into the slot
+    HEAD_DEFER       = "🕒"   # a head restore put off to the next re-warm tick
+    HEAD_FAIL        = "📛"   # a head / conversation save or restore that did not happen
+    CONV_SAVE        = "📼"   # §4RV: a conversation written to disk before another call
+    CONV_RESTORE     = "🔙"   # §4RV: a conversation read back — it resumes where it stopped
+    CONV_LEFT        = "🧳"   # §4RW-f: a saved conversation left on disk (made at another effort level)
     SANDBOX_BOX      = "📦"   # sandbox container mount
     GRAPH_WEB        = "🪢"   # triplet / knowledge-graph store (wide-base; was 🕸️)
     VECTOR_EMBED     = "🧮"   # vector DB + sentence embeddings (was 🧬, colliding with MEM_EMBED)
@@ -968,6 +978,12 @@ class Icons:
     # --- IDE: Dream (§4CM) ---
     GEPA_AUTONOMY    = "🚜"   # §4DC/§4DF autonomous GEPA loop (supply watch / live judge / optimizer launcher / epoch swap)
     DREAM_REPLAY     = "🌀"   # replay of a recorded episode (isolation)
+
+
+def effort_icon(level: str) -> str:
+    """§4RB: the icon of a reasoning-effort level (low / medium / xhigh)."""
+    return {"low": Icons.EFFORT_LOW, "medium": Icons.EFFORT_MEDIUM,
+            "xhigh": Icons.EFFORT_XHIGH}.get(str(level or "").lower(), Icons.EFFORT_MEDIUM)
 
 
 logger = logging.getLogger("GhostAgent")

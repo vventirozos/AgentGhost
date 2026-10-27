@@ -1491,13 +1491,14 @@ class TestEffortBanner:
     """The banner shows the effort level (2026-10-24) — only while the agent's
     switch is on, and it is the LAST optional segment to go as the window narrows."""
 
-    def _line(self, monkeypatch, width, switch=True, effort=""):
+    def _line(self, monkeypatch, width, switch=True, effort="", default="medium"):
         buf = io.StringIO()
         monkeypatch.setattr(cli, "console", cli.Console(
             file=buf, force_terminal=True, width=width, height=40,
             theme=cli.Theme(_THEME), highlight=False))
         api = cli.GhostAPI("http://eva:8000", "k")
-        api.health = lambda timeout=(2, 5): (200, {"uptime_s": 60, "reasoning_effort": switch})
+        api.health = lambda timeout=(2, 5): (200, {"uptime_s": 60, "reasoning_effort": switch,
+                                                    "reasoning_effort_default": default})
         g = cli.GhostCLI(api)
         g.session_id = "a1b2c3d4e5f6"
         g.effort = effort
@@ -1506,18 +1507,31 @@ class TestEffortBanner:
         plain = re.sub(r"\x1b\[[0-9;]*m", "", buf.getvalue())
         return [l for l in plain.split("\n") if l.strip()]
 
-    @pytest.mark.parametrize("effort,label", [("", "default"), ("low", "low"),
-                                              ("medium", "med"), ("xhigh", "x-high")])
+    @pytest.mark.parametrize("effort,label", [("", "🔋 default"), ("low", "🪫 low"),
+                                              ("medium", "🔋 med"), ("xhigh", "🔥 x-high")])
     def test_the_level_is_shown(self, monkeypatch, effort, label):
         head = self._line(monkeypatch, 100, effort=effort)[0]
         assert f"effort {label}" in head and "eva:8000" in head and "online" in head
+
+    @pytest.mark.parametrize("default,label", [("xhigh", "🔥 default"), ("low", "🪫 default"),
+                                               ("", "effort default")])
+    def test_default_shows_the_servers_own_level(self, monkeypatch, default, label):
+        # §4RW (operator): the active icon also represents the default; an
+        # unknown server level shows the word alone
+        head = self._line(monkeypatch, 100, default=default)[0]
+        assert label in head and "effort  default" not in head
+
+    def test_the_icons_are_the_agents(self):
+        from ghost_agent.utils.logging import Icons
+        assert cli.EFFORT_ICONS == {"low": Icons.EFFORT_LOW, "medium": Icons.EFFORT_MEDIUM,
+                                    "xhigh": Icons.EFFORT_XHIGH}
 
     def test_switch_off_shows_no_level(self, monkeypatch):
         assert "effort" not in self._line(monkeypatch, 100, switch=False, effort="xhigh")[0]
 
     def test_effort_outlives_host_and_session_and_never_wraps(self, monkeypatch):
         mid = self._line(monkeypatch, 52, effort="xhigh")[0]
-        assert "effort x-high" in mid and "a1b2c3d4" not in mid
+        assert "effort 🔥 x-high" in mid and "a1b2c3d4" not in mid
         for width in (16, 24, 34, 44, 52, 64, 80, 120):
             assert len(self._line(monkeypatch, width, effort="xhigh")) == 3, width
 
@@ -1558,7 +1572,7 @@ class TestStatusToolbar:
         assert "online" in line and "effort default" in line, line
         assert len(calls) == 1
         g.dispatch("/effort xhigh")                # shows at once, no redraw probe
-        assert "effort x-high" in self._plain(g.status_toolbar())
+        assert "effort 🔥 x-high" in self._plain(g.status_toolbar())
 
     def test_the_probe_thread_has_its_own_session(self, monkeypatch):
         g, _ = self._g(monkeypatch)

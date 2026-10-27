@@ -386,7 +386,7 @@ def test_the_adoption_line_is_defused_and_capped(tmp_path):
     assert "<|im_start|>" not in b and len(b) < 360
 
 
-def test_handle_chat_stores_the_line_and_the_trivial_path_yields_to_it():
+def test_handle_chat_stores_the_line_and_reads_it_back():
     import ast, inspect
     from ghost_agent.core.agent import GhostAgent
     tree = ast.parse(inspect.getsource(GhostAgent))
@@ -394,11 +394,10 @@ def test_handle_chat_stores_the_line_and_the_trivial_path_yields_to_it():
     sets = [n for n in ast.walk(hc) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
             and n.func.attr == "set" and getattr(n.func.value, "id", "") == "_owner_rule_banner_ctx"]
     assert sets
-    reads = [n for n in ast.walk(tree) if isinstance(n, ast.BoolOp)
-             and any(isinstance(v, ast.UnaryOp) and isinstance(v.operand, ast.Call)
-                     and getattr(getattr(v.operand.func, "value", None), "id", "") == "_owner_rule_banner_ctx"
-                     for v in n.values)]
-    assert reads                                   # `and not _owner_rule_banner_ctx.get()` on the fast path
+    reads = [n for n in ast.walk(hc) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+             and n.func.attr == "get" and getattr(n.func.value, "id", "") == "_owner_rule_banner_ctx"]
+    assert reads                                   # the system-answered command reply (§4PY); the
+    #                                              # greeting fast path that also yielded to it is gone (§4RP-c)
 
 
 def test_a_public_turn_is_not_paired_with_the_next_dm_message():

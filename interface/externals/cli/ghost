@@ -244,6 +244,9 @@ EFFORT_ALIASES = {
     "xhigh": "xhigh", "x-high": "xhigh", "high": "xhigh",
 }
 EFFORT_LABELS = {"": "Default", "low": "Low", "medium": "Med", "xhigh": "X-high"}
+#: The agent's effort icons (utils/logging.py Icons.EFFORT_*): the bar shows
+#: the level's icon; on Default, the icon of the server's own level.
+EFFORT_ICONS = {"low": "🪫", "medium": "🔋", "xhigh": "🔥"}
 #: Feedback is a tiny POST. It needs its OWN timeout because the retry
 #: multiplies it: with _json's default (10, 60) the four attempts could
 #: freeze the prompt for 4x70s + 6.5s ≈ 287s against a hung agent.
@@ -792,6 +795,7 @@ class GhostCLI:
         # whether the agent's switch is on (set by the banner's health probe).
         self.effort = ""
         self._effort_switch = False
+        self._effort_default = ""      # the server's own level (health), for Default's icon
         # The pinned status line's liveness segment, refreshed off-thread
         # (see _start_status_refresh) so drawing it never waits on the network.
         self._probe_cache: Text | None = None
@@ -840,6 +844,7 @@ class GhostCLI:
             while True:
                 text = prober._probe()
                 self._effort_switch = prober._effort_switch
+                self._effort_default = prober._effort_default
                 self._probe_cache = text
                 app = self.prompt_session.app if self.prompt_session else None
                 if app is not None and app.is_running:
@@ -860,9 +865,11 @@ class GhostCLI:
         optional = [[sep, (host, "mute")],
                     [sep, (self.session_id[:8], "faint")]]
         if self._effort_switch:
-            optional.insert(0, [sep, ("effort ", "faint"),
-                                (EFFORT_LABELS[self.effort].lower(),
-                                 "you" if self.effort else "mute")])
+            icon = EFFORT_ICONS.get(self.effort or self._effort_default, "")
+            optional.insert(0, [sep, ("effort ", "faint")]
+                            + ([(icon + " ", "")] if icon else [])
+                            + [(EFFORT_LABELS[self.effort].lower(),
+                                "you" if self.effort else "mute")])
         return _fit_line(
             head=[("  👻 ghost", "bold ghost")],
             optional=optional, tail=probe, width=width)
@@ -884,6 +891,8 @@ class GhostCLI:
         if status == 200:
             self._effort_switch = (isinstance(data, dict)
                                    and data.get("reasoning_effort") is True)
+            self._effort_default = str((data or {}).get("reasoning_effort_default") or "") \
+                if isinstance(data, dict) else ""
             # Compact ("3h20m", not "up 3h 20m") — this is the segment the
             # banner can least afford to spend width on.
             up = _dur(data.get("uptime_s")).replace(" ", "")

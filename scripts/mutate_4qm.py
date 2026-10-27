@@ -198,7 +198,7 @@ m.MUT = [
     # ── §4QN operator items (2026-10-22) ──
     ("Q1 every short message skips memory", AG,
      "                should_fetch_memory = (not is_fact_check\n                                       and not self._is_strict_trivial_chat(lc)",
-     "                should_fetch_memory = (not is_fact_check\n                                       and not is_trivial_greeting"),
+     "                should_fetch_memory = (not is_fact_check\n                                       and not is_conversational"),
     ("Q2 'you're my assistant' casts a role", AT,
      "my(?!\\s+(?:ai\\b|assistant|agent|helper|ghost|memory))|as\\s+if)", "my|as\\s+if)"),
     ("Q3 'character designer' is a role", AT,

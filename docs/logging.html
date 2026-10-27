@@ -110,7 +110,7 @@
     formula (<code>_CONTENT_COL</code>) so it can't silently drift.
   </div>
 
-  <h2>Icon catalog</h2>
+  <h2 id="icons">Icon catalog</h2>
   <p>Icons are defined once in the <code>Icons</code> class and reused, so a glyph means the same thing everywhere. A selection:</p>
   <div class="scroll"><table>
     <thead><tr><th>Group</th><th>Icons</th></tr></thead>
@@ -121,6 +121,8 @@
       <tr><td>Tools</td><td>🌐 search · 🔬 deep/vision · 🐍 code · 🐚 shell · 🌎 browser · 🐘 postgres · 🎨 image · 📄 PDF</td></tr>
       <tr><td>Inference nodes</td><td>🔧 worker · 🛸 swarm edge</td></tr>
       <tr><td>Memory &amp; identity</td><td>📝 save · 🔎 recall · 📚 ingest · 📓 library · 🧬 embed · 🧮 vector-store boot · 💪 reinforce · 🧹 wipe · 🌙 maintenance cycle (<code>Icons.DREAM</code>) · 👤 profile · 🪞 self-state · 💡 lesson acquired · 📡 activity ledger · 🔀 event bus (🧾 belief and 🎲 uncertainty were retired with their subsystems, §4NN)</td></tr>
+      <tr id="4rw"><td>Head saves (§4RW)</td><td>💽 head saved · 📀 head restored · 🕒 restore deferred · 📛 save/restore did not happen · 📼 conversation saved · 🔙 conversation restored · 🧳 conversation left on disk (saved at another effort level) — see <a href="core/head_saves.html#logs">head_saves</a></td></tr>
+      <tr><td>Reasoning effort (§4RW)</td><td>🪫 low · 🔋 medium · 🔥 xhigh — the icon of the level the turn runs at, the server default included</td></tr>
       <tr><td>Status</td><td>✅ ok · ❌ fail · 🔶 warn · 🛑 stop · 🔄 retry · ⏩ skip · 💡 idea · 🔒 shield (security/guard) · 🔻 cut</td></tr>
     </tbody>
   </table></div>
@@ -566,6 +568,7 @@
     <tr><td><code>context optimization</code></td><td>🔻</td><td>INFO</td><td>core/agent.py</td></tr>
     <tr><td><code>context overflow</code></td><td>🔶</td><td>WARNING</td><td>core/agent.py</td></tr>
     <tr><td><code>context shield</code></td><td>🔒</td><td>INFO</td><td>core/agent.py</td></tr>
+    <tr><td><code>conversation</code></td><td>📛 📼 🔙 🧳</td><td>INFO</td><td>core/agent.py</td></tr>
     <tr><td><code>correction detect</code></td><td>🔗</td><td>INFO</td><td>tools/projects.py</td></tr>
     <tr><td><code>correction noted</code></td><td>🔶</td><td>WARNING</td><td>core/agent.py</td></tr>
     <tr><td><code>critic compute</code></td><td>🧪</td><td>(varies)</td><td>core/llm.py</td></tr>
@@ -634,6 +637,7 @@
     <tr><td><code>graph failed</code></td><td>❌</td><td>ERROR</td><td>main.py</td></tr>
     <tr><td><code>graph tombstone skip</code></td><td>🛑</td><td>INFO</td><td>core/agent.py</td></tr>
     <tr><td><code>graph updated</code></td><td>📝</td><td>INFO</td><td>core/agent.py</td></tr>
+    <tr><td><code>head disk</code></td><td>💽 📀 📛 🕒</td><td>INFO</td><td>core/agent.py</td></tr>
     <tr><td><code>human feedback</code></td><td>(varies) 🧪</td><td>INFO</td><td>core/agent.py, core/feedback.py</td></tr>
     <tr><td><code>idempotency guard</code></td><td>🛑</td><td>INFO</td><td>core/agent.py</td></tr>
     <tr><td><code>identity failed</code></td><td>❌</td><td>ERROR</td><td>main.py</td></tr>
@@ -698,7 +702,7 @@
     <tr><td><code>macro forgotten</code></td><td>🧹</td><td>INFO</td><td>tools/composed_skills.py</td></tr>
     <tr><td><code>macro run</code></td><td>📋</td><td>INFO</td><td>tools/composed_skills.py</td></tr>
     <tr><td><code>macro schema</code></td><td>📋</td><td>INFO</td><td>tools/composed_skills.py</td></tr>
-    <tr><td><code>main prefix warmup</code></td><td>✅ 🌅 💽 🔶</td><td>INFO</td><td>core/agent.py</td></tr>
+    <tr><td><code>main prefix warmup</code></td><td>✅ 🌅 🔶</td><td>INFO</td><td>core/agent.py</td></tr>
     <tr><td><code>maintenance digests</code></td><td>🧠</td><td>INFO</td><td>core/dream.py</td></tr>
     <tr><td><code>maintenance manifest</code></td><td>📝</td><td>INFO</td><td>core/dream.py</td></tr>
     <tr><td><code>member post link</code></td><td>🔒</td><td>INFO</td><td>core/agent.py</td></tr>
@@ -780,7 +784,7 @@
     <tr><td><code>quarantine inspect</code></td><td>🔒</td><td>INFO</td><td>tools/quarantine.py</td></tr>
     <tr><td><code>quarantine purge</code></td><td>🔒</td><td>INFO</td><td>tools/quarantine.py</td></tr>
     <tr><td><code>quote bound</code></td><td>🧩</td><td>INFO</td><td>core/agent.py, core/quote_bound.py</td></tr>
-    <tr><td><code>reasoning effort</code></td><td>🔋</td><td>INFO</td><td>core/agent.py</td></tr>
+    <tr><td><code>reasoning effort</code></td><td>(varies) 🔥</td><td>INFO</td><td>core/agent.py</td></tr>
     <tr><td><code>recovery plan</code></td><td>🔎</td><td>INFO</td><td>core/agent.py</td></tr>
     <tr><td><code>release failed</code></td><td>❌</td><td>WARNING</td><td>tools/projects.py</td></tr>
     <tr><td><code>release health</code></td><td>🔶</td><td>WARNING</td><td>tools/projects.py</td></tr>
@@ -854,7 +858,6 @@
     <tr><td><code>service probe unclear</code></td><td>🔶</td><td>WARNING</td><td>sandbox/services.py</td></tr>
     <tr><td><code>service registry</code></td><td>📦</td><td>INFO</td><td>main.py</td></tr>
     <tr><td><code>service stop</code></td><td>❌</td><td>ERROR</td><td>sandbox/services.py</td></tr>
-    <tr><td><code>session switch</code></td><td>💽 🔶</td><td>INFO</td><td>core/agent.py</td></tr>
     <tr><td><code>sessions</code></td><td>📔</td><td>INFO</td><td>main.py</td></tr>
     <tr><td><code>sessions failed</code></td><td>🔶</td><td>WARNING</td><td>main.py</td></tr>
     <tr><td><code>shell command</code></td><td>🐚</td><td>INFO</td><td>tools/execute.py</td></tr>
@@ -927,7 +930,6 @@
     <tr><td><code>trajectory logger</code></td><td>🔶 🧩</td><td>INFO</td><td>main.py</td></tr>
     <tr><td><code>trajectory logger failed</code></td><td>🔶</td><td>WARNING</td><td>main.py</td></tr>
     <tr><td><code>transient fail</code></td><td>🔶</td><td>WARNING</td><td>core/agent.py</td></tr>
-    <tr><td><code>trivial fast path</code></td><td>✅</td><td>INFO</td><td>core/agent.py</td></tr>
     <tr><td><code>truncated output</code></td><td>🔶</td><td>WARNING</td><td>core/agent.py</td></tr>
     <tr><td><code>tuned prompt update</code></td><td>🚜</td><td>INFO</td><td>core/agent.py</td></tr>
     <tr><td><code>turn aborted</code></td><td>🛑</td><td>WARNING</td><td>core/agent.py</td></tr>

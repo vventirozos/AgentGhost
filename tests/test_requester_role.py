@@ -190,9 +190,9 @@ async def _system_prompt(ctx):
     return payload["messages"][0]["content"]
 
 
-# "hi" and "thanks" take the trivial fast path (`_handle_trivial_chat`, its own
-# profile reader — R2 review found it leaking); "hello, who are you" takes the
-# full loop.
+# "hi" and "thanks" once took the trivial fast path (its own profile reader —
+# R2 review found it leaking); since §4RP-c every ask takes the full loop, and
+# the three still pin that a member's turn carries no profile.
 @pytest.mark.parametrize("ask", ["hi", "thanks", "hello, who are you"])
 async def test_a_member_turn_carries_no_profile_no_handle_no_smart_memory(monkeypatch, tmp_path, ask):
     agent, ctx, appended = _agent(monkeypatch, tmp_path)

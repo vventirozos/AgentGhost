@@ -64,7 +64,13 @@ ICON_CLASS = {
     "⚡": "accent",
     "🚀": "accent",
     "🌅": "accent",
-    "💽": "accent",   # HEAD_DISK (§4RO)
+    "💽": "accent",   # HEAD_SAVE (§4RO)
+    "📀": "accent",   # HEAD_RESTORE
+    "🕒": "accent",   # HEAD_DEFER
+    "📛": "accent",   # HEAD_FAIL
+    "📼": "accent",   # CONV_SAVE (§4RV)
+    "🔙": "accent",   # CONV_RESTORE (§4RV)
+    "🧳": "think",    # CONV_LEFT (§4RW-f)
     "💤": "idle",
     "😴": "idle",
     "🎬": "accent",
@@ -152,7 +158,9 @@ ICON_CLASS = {
 
     # --- raw thinking (the floor) ---
     "🧠": "think",
-    "🔋": "think",    # BRAIN_EFFORT (§4RB)
+    "🪫": "think",    # EFFORT_LOW (§4RB)
+    "🔋": "think",    # EFFORT_MEDIUM
+    "🔥": "think",    # EFFORT_XHIGH
     "💭": "think",
     "💬": "think",
     "🤖": "think",
@@ -176,7 +184,6 @@ ICON_CLASS = {
 
     # --- misc ---
     "🫥": "accent",
-    "🔥": "accent",
 }
 
 # Terminal-bookkeeping glyphs (human feedback receipts) that must never

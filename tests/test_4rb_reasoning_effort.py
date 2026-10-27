@@ -277,16 +277,23 @@ def _with_on(a, level):
 
 
 def test_the_warm_up_payload_goes_through_the_level():
+    """§4RU: the head is built by `_head_payload` (the owner's goes through
+    the level; the members' head does not), and the warm-up sends what it
+    returns."""
     tree = _agent_tree()
-    fn = [f for f in ast.walk(tree) if isinstance(f, ast.AsyncFunctionDef) and f.name == "_warm_up_main_prefix_once"][0]
-    sets = [n for n in ast.walk(fn) if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call)
+    build = [f for f in ast.walk(tree) if isinstance(f, ast.AsyncFunctionDef) and f.name == "_head_payload"][0]
+    sets = [n for n in ast.walk(build) if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call)
             and getattr(n.value.func, "attr", "") == "_warm_up_effort"]
     assert len(sets) == 1
     tgt, arg = sets[0].targets[0], sets[0].value.args[0]
     assert isinstance(tgt, ast.Name) and tgt.id == "payload" and isinstance(arg, ast.Name) and arg.id == "payload"
+    fn = [f for f in ast.walk(tree) if isinstance(f, ast.AsyncFunctionDef) and f.name == "_warm_up_main_prefix_once"][0]
+    built = [n for n in ast.walk(fn) if isinstance(n, ast.Assign) and isinstance(n.value, ast.Await)
+             and getattr(n.value.value.func, "attr", "") == "_head_payload"]
+    assert len(built) == 1 and built[0].targets[0].elts[0].id == "payload"
     # and the request that goes out is that payload
     sends = [n for n in ast.walk(fn) if isinstance(n, ast.Call) and any(
-        isinstance(a, ast.Name) and a.id == "payload" for a in n.args) and n.lineno > sets[0].lineno]
+        isinstance(a, ast.Name) and a.id == "payload" for a in n.args) and n.lineno > built[0].lineno]
     assert sends
 
 
@@ -304,9 +311,12 @@ def test_one_hook_per_turn_and_no_automatic_level():
     uses = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)
             and isinstance(n.value, ast.Name) and n.value.id == "_effort"}
     # the automatic part is the appended note, never a template level (each level change re-processes)
-    # (§4RC: server_default / refresh_server_default only READ the server's level, for the record)
+    # (§4RC: server_default / refresh_server_default only READ the server's level, for the record;
+    # §4RW-f: known_server_default, level_in_render and LEVELS read the level a call or a head
+    # renders, to tell a change of level — none of them picks one)
     assert uses == {"enabled", "parse_override", "apply", "thinking_off", "stuck_reason", "escalation_note",
-                    "server_default", "refresh_server_default"}
+                    "server_default", "refresh_server_default", "known_server_default",
+                    "level_in_render", "LEVELS"}
 
 
 def test_routes_and_autonomous_turns():
@@ -724,7 +734,7 @@ def test_placing_the_note_is_logged():
             and 0 < n.lineno - app.lineno <= 2]
     assert len(logs) == 1
     icon = next(k.value for k in logs[0].keywords if k.arg == "icon")
-    assert isinstance(icon, ast.Attribute) and icon.attr == "BRAIN_EFFORT"
+    assert isinstance(icon, ast.Attribute) and icon.attr == "EFFORT_XHIGH"
     msg = logs[0].args[1]
     assert isinstance(msg, ast.JoinedStr) and "turn" in "".join(
         v.value for v in msg.values if isinstance(v, ast.Constant))

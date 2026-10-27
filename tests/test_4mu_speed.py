@@ -156,7 +156,7 @@ def test_a_wait_on_the_turn_lock_is_logged_before_it_happens():
     from ghost_agent.core import agent as A
     src = ast.unparse(ast.parse(textwrap.dedent(inspect.getsource(A.GhostAgent))))
     i = src.index("if self.agent_semaphore.locked():")
-    assert "Turn Queue" in src[i:i + 300] and src.index("async with self.agent_semaphore:", i) > i
+    assert "Turn Queue" in src[i:i + 300] and src.index("async with self._turn_lock(req_id):", i) > i
 
 
 async def test_pre_reply_chores_run_even_while_a_verification_is_in_flight():

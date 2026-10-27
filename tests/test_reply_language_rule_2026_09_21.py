@@ -52,12 +52,13 @@ async def test_the_language_rule_reaches_the_model(monkeypatch):
     assert "NEVER translate a proper name" in system and "one script" in system
 
 
-async def test_the_trivial_chat_prompt_carries_the_language_line_too(monkeypatch):
+async def test_a_greeting_gets_the_full_prompt_and_its_language_line(monkeypatch):
     """"hello there" → "Γεια σου!" (b2f61b94, 2026-08-03): the trivial-chat
-    path has its OWN short prompt, which had no language line either."""
+    path had its OWN short prompt, which had no language line either. Since
+    §4RP-c a greeting takes the full turn and its system prompt."""
     system = await _system_text(monkeypatch, "hello there")
-    assert "concise conversational AI" in system
-    assert "in the language the user wrote in" in system
+    assert "concise conversational AI" not in system
+    assert "LANGUAGE: Reply in the language the user wrote their message in" in system
 
 
 # ── the measurement's classifier ────────────────────────────────────

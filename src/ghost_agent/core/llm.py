@@ -730,7 +730,7 @@ def served_leg(result) -> dict:
 
 # ── §4OT: does the single main slot still hold the request head? ─────────
 # llama runs one slot. A main-model call whose prompt does not start with the
-# head (a verifier call, the greeting fast path, a sub-agent, a member prompt)
+# head (a verifier call, a sub-agent, a member prompt)
 # replaces it, and the next owner call re-reads ~28k tokens (~40 s): every
 # big re-read since --cache-ram 0 had one before it (§4OS). The re-warm loop
 # reads this mark and re-sends the head as soon as the slot is quiet, instead
@@ -775,6 +775,19 @@ def opens_with_head(payload, ref) -> bool:
         return False
 
 
+def shares_head_tools(payload, ref) -> bool:
+    """§4RU-r: the call's tool list IS the warmed one — the template renders
+    tools first, so such a call reuses the whole tool block (~22k of the 28k
+    head) from a restored head even when its system text differs (the owner
+    on Slack: a public profile; live slack-de reused 27.7k from it, slack-be
+    re-processed 28.9k without it)."""
+    try:
+        tools = payload.get("tools") or []
+        return bool(tools) and _h(json.dumps(tools, sort_keys=True)) == ref[3]
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def note_head_reference(llm, payload) -> None:
     """The re-warm's payload IS the head: remember its shape."""
     shape = head_shape(payload)
@@ -788,8 +801,8 @@ def note_head_reference(llm, payload) -> None:
 #: §4OT r2: displacements by a REQUEST's own calls (a member's turn, a public
 #: reply, a profile change) are left to the 180 s tick — re-warming 10 s after
 #: them made the member's follow-up queue behind a 28k prefill. The early
-#: re-warm answers calls nobody was waiting for, plus the owner's greeting.
-EARLY_REWARM_LABELS = frozenset({"greeting fast path"})
+#: re-warm answers only calls nobody was waiting for (background calls; the
+#: owner's greeting fast path was one too until it was removed, §4RP-c).
 
 
 #: §4RQ: the label of a call made by a client outside the agent (Eva's World)
@@ -808,18 +821,16 @@ def note_main_slot_prompt(llm, payload, label: str = "", background: bool = Fals
         if not isinstance(ref, tuple):
             return
         llm._head_displaced = not opens_with_head(payload, ref)
-        llm._head_displaced_early = bool(llm._head_displaced and (
-            background or str(label or "") in EARLY_REWARM_LABELS))
+        llm._head_displaced_early = bool(llm._head_displaced and background)
         llm._head_displaced_by = str(label or "unlabelled")
         llm._last_main_call_end = time.monotonic()
         if not background:
             # §4RP: a request's own call that opens with the head — its
-            # conversation owns the slot now. The greeting fast path owns
-            # nothing, so the §4OT early re-warm runs (review r1 MAJOR). Any
-            # other call without the head (a game move, a truncation
-            # continuation, a vision call served on main, a member's turn)
-            # leaves the owner as it was (review r2 MAJOR: clearing it lost
-            # the window to the next tick); one of the owner's own refreshes it.
+            # conversation owns the slot now. A call without the head (a
+            # game move, a truncation continuation, a vision call served on
+            # main, a member's turn) leaves the owner as it was (review r2
+            # MAJOR: clearing it lost the window to the next tick); one of the
+            # owner's own refreshes it.
             # A stream that ends (opened_at: when it opened) after another
             # conversation took the slot does not take it back (review r2
             # MINOR: a final draining after the next turn's first call).
@@ -829,11 +840,13 @@ def note_main_slot_prompt(llm, payload, label: str = "", background: bool = Fals
             used = getattr(llm, "_slot_session_used", None)
             taken_since = bool(owner and opened_at is not None and isinstance(used, (int, float))
                                and used > opened_at)
-            if str(label or "") in EARLY_REWARM_LABELS:
-                llm._slot_session = None
-            elif key and (key == owner or (not llm._head_displaced and not taken_since)):
+            if key and (key == owner or (not llm._head_displaced and not taken_since)):
                 llm._slot_session = key
                 llm._slot_session_used = time.monotonic()
+                # §4RP-b: and which request of it — its next request re-reads
+                # from just past the head (the first message's label changes)
+                from ..utils.logging import request_id_context
+                llm._slot_request = str(request_id_context.get() or "")
     except Exception:  # noqa: BLE001
         pass
 
@@ -844,7 +857,9 @@ SLOT_KEEP_DEFAULT_S = 600.0
 
 def slot_keep_s() -> float:
     """GHOST_SLOT_KEEP_S: seconds a conversation keeps the main slot after its
-    last call (default 600; 0 = off, the head comes back at the next tick)."""
+    last call (default 600; 0 = off, the head comes back at the next tick).
+    §4RV (GHOST_CONV_KEEP=1): no keep window — the quiet time after the last
+    request before gap work (a missing head file) may displace the slot."""
     raw = (os.getenv("GHOST_SLOT_KEEP_S") or "").strip()
     try:
         return max(0.0, float(raw)) if raw else SLOT_KEEP_DEFAULT_S
@@ -852,12 +867,33 @@ def slot_keep_s() -> float:
         return SLOT_KEEP_DEFAULT_S
 
 
+#: §4RV: the conversation keeps the slot until another call needs it (no
+#: timer); before a call displaces it, it is saved to disk and restored before
+#: its next request. Off unless GHOST_CONV_KEEP=1 (it also changes the first
+#: message, `agent._stable_first_message`).
+CONV_KEEP_ENV = "GHOST_CONV_KEEP"
+
+
+def conv_keep_enabled() -> bool:
+    """One gate (review: the parts are useless apart): GHOST_CONV_KEEP=1 with
+    the head saves (the files) and the §4RC state anchor (the stable first
+    message needs the request's state block kept in place)."""
+    return all((os.getenv(k) or "").strip() == "1"
+               for k in (CONV_KEEP_ENV, "GHOST_HEAD_SAVES", "GHOST_STATE_ANCHOR"))
+
+
 def slot_kept(llm, now: Optional[float] = None) -> bool:
     """§4RP: a known conversation used the main slot less than
-    `slot_keep_s()` ago — the re-warm leaves its state alone."""
+    `slot_keep_s()` ago — the re-warm leaves its state alone. §4RV
+    (GHOST_CONV_KEEP=1): a known conversation owns the slot, however long
+    ago — there is no window; work that must displace it saves it first."""
     try:
         if not getattr(llm, "_slot_session", None):
             return False
+        if conv_keep_enabled() and callable(getattr(llm, "before_background_dispatch", None)):
+            # (review: only while the agent's hook can free it — no head-save
+            # plan, no hook, and the window applies as before)
+            return True
         used = getattr(llm, "_slot_session_used", None)
         if not isinstance(used, (int, float)):
             return False
@@ -903,6 +939,7 @@ def release_slot_session(llm) -> None:
     """§4RP: the head is back in the slot — no conversation owns it."""
     try:
         llm._slot_session = None
+        llm._slot_request = None
     except Exception:  # noqa: BLE001
         pass
 
@@ -913,7 +950,11 @@ def release_slot_session(llm) -> None:
 #: abandons the wait, not the thread: a restore already posted lands before the
 #: call (llama queues tasks in order), and the hook's thread posts nothing
 #: past its deadline (review r1)
-BEFORE_MAIN_DISPATCH_S = 40.0
+BEFORE_MAIN_DISPATCH_S = 150.0
+#: §4RU-r (review 10-27): 40 → 150 — the switch now WAITS for a busy slot (a
+#: reply still draining, a deferred verdict) instead of giving up; the call
+#: waits behind that work in llama anyway, so the wait costs nothing, and a
+#: give-up meant re-processing the head (~166 s)
 
 #: r2: how long a deferred verdict's main call waits for the one-at-a-time lane
 DEFERRED_LANE_WAIT_S = 600.0
@@ -990,6 +1031,13 @@ class LLMClient:
         #: call (the agent puts the head back when another conversation owns
         #: the slot)
         self.before_main_dispatch = None
+        #: §4RV: the agent's hook before a background main call (saves the
+        #: conversation that owns the slot first)
+        self.before_background_dispatch = None
+        #: §4RW-g: the agent's hook before a foreground call whose pool IS the
+        #: main server (the render look on the vision pool) — the request's
+        #: conversation goes to disk first
+        self.before_side_main_dispatch = None
         # url -> monotonic deadline before which not to re-probe capacity
         self._node_cap_retry_at: Dict[str, float] = {}
         # url -> {task id: [concurrency-seconds, last_settle_ts, start_ts]}
@@ -3648,6 +3696,51 @@ class LLMClient:
             raise BackgroundDeferred(f"background call deferred: {task_label or 'unlabelled'} "
                                      "(a request started)")
 
+    async def _before_background_main(self, payload, task_label: str) -> None:
+        """§4RV: a background call is about to run on the main slot — the
+        agent's hook saves the conversation that owns it first (bounded; never
+        fails the call). Not for the head's own warm-ups, which decide that
+        themselves (`main-prefix*`)."""
+        hook = getattr(self, "before_background_dispatch", None)
+        if not callable(hook) or str(task_label or "").startswith("main-prefix"):
+            return
+        worked = False                     # (the hook works only with no request live)
+        try:
+            from ..utils.aio import wait_for as _wait_for
+            worked = bool(await _wait_for(hook(payload, task_label), BEFORE_MAIN_DISPATCH_S))  # pylint: disable=not-callable
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.info("before-background hook skipped: %s: %s", type(e).__name__, e)
+        # review: a save can take a minute — a request that started meanwhile
+        # goes first (the conversation is on disk; deferring loses nothing).
+        # Review r2: only then — a call let in on purpose while one request
+        # waits on the image node (`_wait_for_foreground_clear`) passes
+        if worked and int(getattr(self, "foreground_requests", 0) or 0) > 0:
+            raise BackgroundDeferred(f"background call deferred: {task_label or 'unlabelled'} "
+                                     "(a request started during the conversation save)")
+
+    def _pool_is_main_box(self, use_swarm, use_worker, use_vision, use_coding, use_critic) -> bool:
+        """§4RW-g: the requested pool's every node is the main server (live:
+        the vision pool, http://127.0.0.1:8088)."""
+        flags = (("swarm", use_swarm), ("worker", use_worker), ("vision", use_vision),
+                 ("coding", use_coding), ("critic", use_critic))
+        pool = next((name for name, on in flags if on), None)
+        return bool(pool) and self._served_on_main_box(pool)
+
+    async def _before_side_main_dispatch(self, payload) -> None:
+        """§4RW-g: the agent's hook, bounded; it never fails the call."""
+        hook = getattr(self, "before_side_main_dispatch", None)
+        if not callable(hook):
+            return
+        try:
+            from ..utils.aio import wait_for as _wait_for
+            await _wait_for(hook(payload), BEFORE_MAIN_DISPATCH_S)  # pylint: disable=not-callable
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.info("before-side-main-dispatch hook skipped: %s: %s", type(e).__name__, e)
+
     async def _before_main_dispatch(self, payload) -> None:
         """§4RP: the agent's hook, bounded; it never fails the call."""
         hook = getattr(self, "before_main_dispatch", None)
@@ -3744,6 +3837,8 @@ class LLMClient:
                             and (getattr(self, "_head_displaced", False) is not True
                                  or (_dv is not None and _dv.locked()))):
                         raise BackgroundDeferred(f"background call deferred: {task_label}")
+                    # §4RV: the conversation that owns the slot goes to disk first
+                    await self._before_background_main(payload, task_label)
                     # §4RP rule 5: a background call that opens with the head
                     # would leave the slot as head + itself — the kept
                     # conversation's follow-up then matches only the head and
@@ -3754,7 +3849,9 @@ class LLMClient:
                             and slot_kept(self)
                             and opens_with_head(payload, getattr(self, "_head_ref", None))):
                         logger.info("background call %s deferred: the main slot holds a conversation "
-                                    "inside its %.0fs window", task_label or "unlabelled", slot_keep_s())
+                                    "%s", task_label or "unlabelled",
+                                    "(its save did not happen)" if conv_keep_enabled()
+                                    else f"inside its {slot_keep_s():.0f}s window")
                         raise BackgroundDeferred(f"background call deferred: {task_label} (slot kept)")
                     await self._outside_head_before_background(payload, task_label)
                     # §4RO: the head warm-up restores the saved head here — past
@@ -3787,9 +3884,22 @@ class LLMClient:
             async with self._foreground_lock:
                 self.foreground_tasks += 1
             try:
+                _side = False
                 if not (use_swarm or use_worker or use_vision or use_coding or use_critic or off_main_only):
                     await self._before_main_dispatch(payload)
-                _result = await self._do_chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, use_critic, timeout, off_main_only, task_label, require_healthy, slot_wait, total_budget)
+                elif not off_main_only and self._pool_is_main_box(use_swarm, use_worker, use_vision,
+                                                                  use_coding, use_critic):
+                    _side = True
+                    await self._before_side_main_dispatch(payload)
+                try:
+                    _result = await self._do_chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, use_critic, timeout, off_main_only, task_label, require_healthy, slot_wait, total_budget)
+                except BaseException:
+                    if _side:
+                        # §4RW-g review: a look that timed out mid-prefill left
+                        # its own tokens in the slot — counted as displaced, so
+                        # the request's next call restores what was just saved
+                        note_main_slot_prompt(self, payload, task_label)
+                    raise
                 _repair_think_split(_result)     # §4KP: a mentioned </think> is not the close
                 self._note_usage(_result)
                 # ⚠ Record WHICH LEG SERVED IT, not which was requested. The
@@ -4636,6 +4746,7 @@ class LLMClient:
                 await self._wait_for_foreground_clear("stream")
                 async with self._bg_queue_sem:
                     if _on_main:
+                        await self._before_background_main(payload, "stream")   # §4RV
                         await self._outside_head_before_background(payload, "stream")
                     _opened()
                     # §4KP: a mentioned </think> is not the close
@@ -4669,7 +4780,7 @@ class LLMClient:
         """SSE-wrap a finished string as OpenAI chat.completion.chunk frames.
 
         ``extra`` (2026-09-05): top-level fields merged into EVERY JSON
-        frame — the route uses it to mark a trivial-fast-path reply
+        frame — the route uses it to mark a system-answered reply
         ``{"ghost": {"labelable": false}}`` (no trajectory behind it, so no
         thumbs). None/empty leaves the frames byte-identical to before."""
         chunk_id = f"chatcmpl-{req_id}"
@@ -4690,7 +4801,7 @@ class LLMClient:
             }
             yield f"data: {json.dumps(content_chunk)}\n\n".encode('utf-8')
             # NOTE: previously this slept 10ms per chunk, adding ~1 second of
-            # artificial latency to a 1500-char trivial-fast-path response
+            # artificial latency to a 1500-char finished response
             # (100 chunks × 10ms). The sleep was never load-bearing — there is
             # no upstream backpressure here, we're just chunking an already-
             # complete string for SSE delivery — so it's been removed.

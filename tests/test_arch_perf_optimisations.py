@@ -1,6 +1,6 @@
 """Tests for the five architectural performance optimisations:
 
-  #3  Trivial-request fast path
+  #3  Trivial-request fast path (removed §4RP-c; the greeting detector stays)
   #4  Per-request RequestState cache
   #7  Tool-schema cache + intent-based filtering
   #1  KV-cache-stable system prompt
@@ -61,7 +61,7 @@ def _make_agent(*, llm_response="ok", with_tools=False, native_tools=False):
 
 
 # =====================================================================
-# #3 — Trivial-request fast path
+# #3 — the strict greeting detector (its fast path was removed, §4RP-c)
 # =====================================================================
 
 
@@ -99,15 +99,6 @@ def test_system_prompt_conversational_persona_is_softened():
     assert "aggressively efficient" not in SYSTEM_PROMPT
 
 
-def test_fast_path_lite_system_prompt_is_warm():
-    """The fast-path lite system prompt must use warm language too."""
-    import inspect
-    from ghost_agent.core.agent import GhostAgent
-    src = inspect.getsource(GhostAgent._handle_trivial_chat)
-    assert "concise conversational AI" in src
-    assert "Reply warmly" in src or "warm" in src.lower()
-
-
 def test_strict_greeting_detector_rejects_non_greetings():
     canon = GhostAgent._is_strict_trivial_chat
     for bad in ("run script.py", "what is 2+2?", "hello world write code",
@@ -122,152 +113,18 @@ def test_strict_greeting_detector_rejects_empty():
 
 
 @pytest.mark.asyncio
-async def test_trivial_fast_path_intercepts_real_greeting():
-    """A 'hi' message must skip the turn loop and call chat_completion only once."""
+async def test_a_greeting_takes_the_full_turn():
+    """§4RP-c: the greeting fast path is gone — "hi" runs the normal turn
+    with the full system prompt (the head the slot keeps), not a lite one."""
     agent = _make_agent(llm_response="hello back")
     body = {"messages": [{"role": "user", "content": "hi"}], "model": "test"}
     content, _, _ = await agent.handle_chat(body, MagicMock())
-    assert content == "hello back"
-    # Exactly one LLM call (the fast path), not the multi-turn loop.
-    assert agent.context.llm_client.chat_completion.await_count == 1
-    payload = agent.context.llm_client.chat_completion.await_args.args[0]
-    # The fast-path system prompt must NOT contain tool schemas.
+    assert "hello back" in content
+    payload = agent.context.llm_client.chat_completion.await_args_list[0].args[0]
     sys_msg = next(m["content"] for m in payload["messages"] if m["role"] == "system")
-    assert "<tool_def>" not in sys_msg
-    # Must be flagged as the lite system prompt.
-    assert "concise conversational AI" in sys_msg
-
-
-@pytest.mark.asyncio
-async def test_trivial_fast_path_does_not_intercept_real_request():
-    """A non-greeting must take the full turn loop."""
-    agent = _make_agent(llm_response="result")
-    body = {"messages": [{"role": "user", "content": "Run a calculation for me"}], "model": "test"}
-    await agent.handle_chat(body, MagicMock())
-    payload = agent.context.llm_client.chat_completion.await_args.args[0]
-    sys_msg = next(m["content"] for m in payload["messages"] if m["role"] == "system")
-    # The full turn loop installs the persona/profile system prompt with skill instruction.
-    assert "Acquired Skills" in sys_msg or "GHOST" in sys_msg.upper() or "Ghost" in sys_msg
-
-
-@pytest.mark.asyncio
-async def test_trivial_fast_path_returns_string_for_streaming_too():
-    """The fast path now ALWAYS returns a plain string, even when the
-    client requested stream=True. The route layer's `stream_openai` helper
-    handles SSE-wrapping (api/routes.py:163). This avoids any closure /
-    iterator-lifecycle bugs in nested async generators."""
-    agent = _make_agent(llm_response="hello there")
-    body = {"messages": [{"role": "user", "content": "hi"}], "model": "test", "stream": True}
-    content, _, _ = await agent.handle_chat(body, MagicMock())
-    assert isinstance(content, str)
-    assert content == "hello there"
-    # Exactly one chat_completion call (the fast path) — not the full loop.
-    assert agent.context.llm_client.chat_completion.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_trivial_fast_path_falls_through_on_empty_response():
-    """If the model returns an empty string, the fast path declines so the
-    full path can take a second crack at it."""
-    agent = _make_agent(llm_response="")
-    res = await agent._handle_trivial_chat(
-        last_user_content="hi", messages=[],
-        model="x", stream_response=False, req_id="r"
-    )
-    assert res is None
-
-
-@pytest.mark.asyncio
-async def test_trivial_fast_path_falls_through_on_llm_exception():
-    """An exception inside the LLM call must drop us back into the long path."""
-    agent = _make_agent()
-    agent.context.llm_client.chat_completion = AsyncMock(side_effect=RuntimeError("upstream down"))
-    res = await agent._handle_trivial_chat(
-        last_user_content="hi", messages=[],
-        model="x", stream_response=False, req_id="r"
-    )
-    assert res is None
-
-
-@pytest.mark.asyncio
-async def test_trivial_fast_path_strips_think_blocks():
-    """Some models leak <think>...</think>; the fast path must strip them."""
-    agent = _make_agent(llm_response="<think>thinking about the greeting</think>Hello!")
-    res = await agent._handle_trivial_chat(
-        last_user_content="hi", messages=[],
-        model="x", stream_response=False, req_id="r"
-    )
-    assert res is not None
-    content, _, _ = res
-    assert content == "Hello!"
-    assert "<think>" not in content
-
-
-@pytest.mark.asyncio
-async def test_trivial_fast_path_falls_through_on_no_llm():
-    """If the LLM client is missing, decline so the long path can handle it."""
-    agent = _make_agent()
-    agent.context.llm_client = None
-    res = await agent._handle_trivial_chat(
-        last_user_content="hi", messages=[], model="x", stream_response=False, req_id="r"
-    )
-    assert res is None
-
-
-@pytest.mark.asyncio
-async def test_trivial_fast_path_disables_thinking():
-    """The trivial path must suppress chain-of-thought on a reasoning model.
-
-    Regression test for the bug where greetings produced empty `content`
-    (the model spent its whole budget on a `<think>` block) and every
-    greeting fell through to the slow turn loop. We assert BOTH switches
-    the model honours are wired: the `enable_thinking` chat-template flag
-    and the portable `/no_think` soft-switch on the user message."""
-    agent = _make_agent(llm_response="hello back")
-    res = await agent._handle_trivial_chat(
-        last_user_content="hi", messages=[{"role": "user", "content": "hi"}],
-        model="x", stream_response=False, req_id="r"
-    )
-    assert res is not None
-    payload = agent.context.llm_client.chat_completion.await_args.args[0]
-    assert payload.get("chat_template_kwargs", {}).get("enable_thinking") is False
-    assert payload["messages"][-1]["content"].rstrip().endswith("/no_think")
-
-
-@pytest.mark.asyncio
-async def test_trivial_fast_path_recovers_reasoning_content_field():
-    """Reasoning models return chain-of-thought in a separate
-    `reasoning_content` field. When `content` is empty but the visible
-    answer trails the reasoning, the fast path must still recover a reply
-    rather than declining. This is the core fix for the empty-content bug."""
-    agent = _make_agent()
-    agent.context.llm_client.chat_completion = AsyncMock(return_value={
-        "choices": [{"message": {
-            "content": "Hey there, good to see you!",
-            "reasoning_content": "The user greeted me; reply warmly.",
-        }}]
-    })
-    res = await agent._handle_trivial_chat(
-        last_user_content="hi", messages=[],
-        model="x", stream_response=False, req_id="r"
-    )
-    assert res is not None
-    content, _, _ = res
-    assert content == "Hey there, good to see you!"
-    assert "reason" not in content.lower()
-
-
-@pytest.mark.asyncio
-async def test_trivial_fast_path_strips_unclosed_think_block():
-    """A model cut off mid-thought emits `<think>` with no closing tag.
-    Everything inside it is reasoning, so the visible reply is empty and
-    the path must decline (fall through) rather than leak the monologue."""
-    agent = _make_agent(llm_response="<think>still deciding how to greet")
-    res = await agent._handle_trivial_chat(
-        last_user_content="hi", messages=[],
-        model="x", stream_response=False, req_id="r"
-    )
-    assert res is None
+    assert "concise conversational AI" not in sys_msg
+    assert "### ROLE AND IDENTITY" in sys_msg
+    assert not hasattr(GhostAgent, "_handle_trivial_chat")
 
 
 # =====================================================================

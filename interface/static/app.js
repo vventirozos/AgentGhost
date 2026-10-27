@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=15.9';
+import * as matrixGraphFace from './matrix_graph.js?v=16.2';
 import { initEffortSelector, effortForPayload } from './effort.js?v=1.2';   // §4RB
 
 // --- Voice Globals ---
@@ -167,7 +167,13 @@ const ICON_CLASS = {
     '⚡': 'accent',   // SYSTEM_BOOT
     '🚀': 'accent',   // SYSTEM_READY
     '🌅': 'accent',   // BOOT_AWAKE
-    '💽': 'accent',   // HEAD_DISK (§4RO head saved/restored)
+    '💽': 'accent',   // HEAD_SAVE (§4RO)
+    '📀': 'accent',   // HEAD_RESTORE
+    '🕒': 'accent',   // HEAD_DEFER
+    '📛': 'accent',   // HEAD_FAIL
+    '📼': 'accent',   // CONV_SAVE (§4RV)
+    '🔙': 'accent',   // CONV_RESTORE (§4RV)
+    '🧳': 'think',    // CONV_LEFT (§4RW-f)
     '💤': 'idle',     // SYSTEM_SHUT
     '😴': 'idle',
     '🎬': 'accent',   // REQ_START
@@ -255,7 +261,9 @@ const ICON_CLASS = {
 
     // --- raw thinking (the floor) ---
     '🧠': 'think',    // BRAIN_SUM — the one that was drowning everything
-    '🔋': 'think',    // BRAIN_EFFORT (§4RB)
+    '🪫': 'think',    // EFFORT_LOW (§4RB)
+    '🔋': 'think',    // EFFORT_MEDIUM
+    '🔥': 'think',    // EFFORT_XHIGH
     '💭': 'think',    // BRAIN_THINK
     '💬': 'think',    // LLM_ASK
     '🤖': 'think',    // LLM_REPLY
@@ -280,7 +288,6 @@ const ICON_CLASS = {
 
     // --- misc ---
     '🫥': 'accent',   // MODE_GHOST
-    '🔥': 'accent',
 };
 
 // (The dwell/priority tables that arbitrated the center-stage
@@ -330,8 +337,9 @@ let currentAccumulatedContent = "";
 // "chatcmpl-<id>" envelope) — the handle /api/feedback labels ride on.
 // Distinct from currentTaskId, which is the interface proxy's stream handle.
 let currentReqId = null;
-// Set when the reply's frames say `ghost.labelable: false` — the trivial
-// fast path answered (a greeting), which writes NO trajectory, so a thumb
+// Set when the reply's frames say `ghost.labelable: false` — the system
+// answered without a model turn (an owner command, §4PY), which writes NO
+// trajectory, so a thumb
 // could never land (§4EX). The bubble then gets no thumbs at all instead
 // of an error on every tap. Reset wherever currentReqId is.
 let currentTurnUnlabelable = false;
@@ -672,7 +680,7 @@ function connectWebSocket() {
                     // Genuine failures only: ⚠️ warnings are routine (node
                     // fallbacks, heals) and kept tinting the face on
                     // ordinary healthy turns.
-                    if (['❌', '🛑', '🔥'].includes(icon)) activeFace.triggerSpike();
+                    if (['❌', '🛑'].includes(icon)) activeFace.triggerSpike();
                 }
                 if (data.is_error) activeFace.triggerSpike();
 
@@ -986,7 +994,7 @@ function extractIcon(logLine) {
 // full neon here would drag the whole theme bright again.
 const _ICON_CLASS_COLOR = {
     accent_ok:   '#16418c',  // ✅ settled blue — success = cooled
-    accent_err:  '#a3123a',  // ❌ 🛑 🔥 hot crimson (WARN 🔶 is routine, stays accent)
+    accent_err:  '#a3123a',  // ❌ 🛑 hot crimson (WARN 🔶 is routine, stays accent)
     accent:      '#1f3fa8',  // ⚡ 🚀 🎬 🏁 electric blue (dark)
     tool:        '#6e1530',  // dark arterial red — external action = heat
     memory:      '#14297a',  // deep indigo — stored, cold
@@ -999,7 +1007,7 @@ function getIconColor(icon) {
     // Error/success get special sub-colors — they're visually the
     // most meaningful accent events the user can see flash by.
     if (icon === '✅') return _ICON_CLASS_COLOR.accent_ok;
-    if (icon === '❌' || icon === '🛑' || icon === '🔥') {
+    if (icon === '❌' || icon === '🛑') {
         return _ICON_CLASS_COLOR.accent_err;
     }
     return _ICON_CLASS_COLOR[_iconClass(icon)] || _ICON_CLASS_COLOR.think;
@@ -1656,7 +1664,7 @@ function _thumbSvg(kind) {
 // timestamp/menu and could overlap the reply text (operator: "really bad").
 function _ensureFeedbackRow(div) {
     if (!div.classList.contains('agent') || !div.dataset.reqId) return;
-    // No trajectory behind this reply (trivial fast path, §4EX): a thumb
+    // No trajectory behind this reply (a system answer, §4EX): a thumb
     // could only ever fail, so offer none.
     if (div.dataset.unlabelable) return;
     if (div.querySelector(':scope > .msg-feedback')) return;
@@ -3223,7 +3231,7 @@ async function sendMessage(isResume = false) {
                         currentReqId = data.id.replace(/^chatcmpl-/, '');
                     }
                     // The route marks a reply that has no trajectory behind
-                    // it (trivial fast path): no thumbs for this bubble.
+                    // it (a system answer): no thumbs for this bubble.
                     if (data.ghost && data.ghost.labelable === false) currentTurnUnlabelable = true;
                     if (data.ghost && data.ghost.reasoning_unparsed === true) currentSpeechHold = true;   // §4KP
                     // §4MP: the agent streams its reply as it is generated; when a

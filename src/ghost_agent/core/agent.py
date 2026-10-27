@@ -12,6 +12,7 @@ import os
 import random
 import time
 import uuid
+import contextlib
 import re
 import unicodedata
 import sys
@@ -52,8 +53,9 @@ from . import regression as _regression_boot  # noqa: F401 — §4NE r1: fingerp
 # Sampling parameters for the current upstream model
 # (HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive). The model
 # publishes four canonical profiles in its card: two for thinking mode
-# (the default) and two for non-thinking mode. We pin all four here
-# verbatim so callers never have to remember the literal numbers.
+# (the default) and two for non-thinking mode. Only the thinking ones are
+# pinned now (§4RP-c removed the last non-thinking caller, the greeting
+# fast path), verbatim so callers never have to remember the numbers.
 #
 # THINKING MODE — model is emitting `<think>...</think>` preamble. Used
 # for everything the main agent does by default: user chat, self-play
@@ -599,22 +601,6 @@ def _call_mutated_world(fname: str, t_args: dict, is_mutating: bool) -> bool:
 # → destructive emergency recovery (2026-07-20). Prune and steer against
 # `max_context - this` so the assembled payload stays within budget.
 _INJECTION_RESERVE_TOKENS = 24000
-
-# NON-THINKING MODE — model skips the `<think>` block entirely. Used
-# for tasks where reasoning doesn't help and would just burn tokens:
-# structured-XML emission (self-play challenge generation), one-shot
-# JSON extraction, schema-constrained output. Callers opt in BOTH by
-# selecting these sampling params AND by wiring `chat_template_kwargs=
-# {"enable_thinking": False}` on the payload (see agent.py payload
-# assembly) or appending `/no_think` to the user message (the Qwen
-# portable soft-switch). Values are pinned from the model card exactly:
-NON_THINKING_GENERAL_PARAMS = {
-    "temperature": 0.7,
-    "top_p": 0.8,
-    "top_k": 20,
-    "min_p": 0,
-    "presence_penalty": 1.5,
-}
 
 # Adaptive sampling profiles for coding sub-tasks. The classifier + routing
 # stay wired (so per-sub-task tuning is a one-line change away), but all three
@@ -2667,14 +2653,69 @@ _STATE_CHANGES_INTRO = ("(Changes since the state update at the start of this re
 _STATE_NO_CHANGE = "(No change since the state update at the start of this request.)"
 
 
+_LISTING_COUNT_RE = re.compile(r"^(\d+) entries under ", re.M)
+_LISTING_SIGS_RE = re.compile(r"^(.*?\.py)  \[(?:def|class) ")
+
+
+def _listing_entries(text: str):
+    """The entry lines of a sandbox listing keyed by path, in order —
+    empty when it has none, is capped (a capped listing drops entries past
+    the cap, so a missing one need not be gone), or does not parse to the
+    count it states (review: names with two spaces or a newline collided,
+    and a deletion vanished from the diff)."""
+    out: dict = {}
+    m = _LISTING_COUNT_RE.search(text)
+    if not m or "more files NOT shown" in text:
+        return out
+    for ln in text.splitlines():
+        if ln.startswith("  ") and ln.strip() and not ln.startswith("  ..."):
+            sig = _LISTING_SIGS_RE.match(ln[2:])
+            out[sig.group(1) if sig else ln[2:]] = ln
+    return out if len(out) == int(m.group(1)) else {}
+
+
+def _listing_changes(base: str, cur: str) -> str:
+    """§4RW-d: the sandbox listing as the entries added, changed or removed
+    since the request's first block — that block still holds the rest. A
+    write used to put the whole listing (8.6k chars on the owner's 134-file
+    workspace) back on every later turn. "" when no diff can be trusted."""
+    old, new = _listing_entries(base), _listing_entries(cur)
+    if not old or not new:
+        return ""
+    added = [ln for p, ln in new.items() if p not in old]
+    changed = [ln for p, ln in new.items() if p in old and old[p] != ln]
+    removed = [p for p in old if p not in new]
+    count = next((ln for ln in cur.splitlines() if " entries under " in ln), "")
+    lines = ["CURRENT SANDBOX STATE — changes to the listing shown at the start of this "
+             "request (every other entry there still holds):"]
+    if count:
+        lines.append(count)
+    if added:
+        lines += ["Added:"] + added
+    if changed:
+        lines += ["Changed:"] + changed
+    if removed:
+        lines.append("Removed: " + ", ".join(f"`{p}`" for p in removed))
+    return "\n".join(lines) + "\n\n"
+
+
 def _state_changes(base: dict, sections: dict) -> str:
     """§4RC: every section that differs from the request's first block
     (``base``), at its current value, plus one line per section that went
     away. Sent each turn and never kept (r3: keeping changes, even only
     the rarer ones, piled up copies on coding requests), so a turn
     re-processes at most what the old layout did, minus the sections that
-    never changed."""
-    out = [t for k, t in sections.items() if t and base.get(k) != t]
+    never changed. §4RW-d: the sandbox listing goes as its entry changes
+    when those are shorter."""
+    out = []
+    for k, t in sections.items():
+        if not t or base.get(k) == t:
+            continue
+        if k.startswith("sandbox_state") and base.get(k):
+            d = _listing_changes(base[k], t)
+            if d and len(d) < len(t):
+                t = d
+        out.append(t)
     for key, text in base.items():
         if text and not sections.get(key):
             first = next((ln.strip() for ln in text.splitlines() if ln.strip()), key)
@@ -2747,6 +2788,55 @@ def _carrier_label(carrier_content, pending_request, otherwise: str, *,
                                    and not have.startswith("<tool_response")):
         return _INSTRUCTION_LABEL
     return otherwise
+
+
+# ── §4RV: the first message is the same on every request of a conversation.
+# llama checkpoints at the start of a prompt's last user message — the state
+# block — so a follow-up resumes right after the previous request's message,
+# but only if nothing before it changed. The <session_context> block carried
+# what each request brings (the thinking depth picked from its words, the
+# coding persona, the memory recalled for it, the workspace notes) and the
+# label flipped from [USER INSTRUCTION] to [CONVERSATION START …]: every
+# follow-up re-read the whole conversation from just past the head. With
+# GHOST_CONV_KEEP=1 those parts open the state block instead (once per
+# request; the §4RC anchor keeps it in place for the request's turns).
+_THINK_DEPTH_POINTER = ("(Set for each request: see THINKING DEPTH FOR THIS REQUEST in the "
+                        "system state update that follows the user's latest request.)\n")
+#: §4RV review: the request's context opens the state block under its own
+#: heading — it holds old questions (the memory's past conversations), and
+#: the block's header has just said where the pending request is
+_REQUEST_CONTEXT_HEAD = "CONTEXT FOR THIS REQUEST (background — not the request itself):"
+
+
+def _stable_first_message() -> bool:
+    """§4RV: on with GHOST_CONV_KEEP=1 under the §4RC state anchor (the
+    request's first state block stays where it was shown)."""
+    from .llm import conv_keep_enabled
+    return conv_keep_enabled() and _state_anchor_enabled()
+
+
+def _split_request_context(tool_header_block: str, think_guidance: str, persona: str,
+                           memory: str, continuity: str):
+    """§4RV: (the first message's block, the state block's opening sections
+    as an ordered dict). The tool header keeps its text with the
+    thinking-depth guidance replaced by a pointer; the sections carry the
+    guidance, the persona, the recalled memory and the workspace notes —
+    each its own section (review: the depth is re-picked every turn and can
+    change mid-request when a project opens or closes; as one section it
+    re-sent the whole persona on every later turn)."""
+    header = str(tool_header_block or "")
+    secs = {}
+    if think_guidance and think_guidance in header:
+        header = header.replace(think_guidance, _THINK_DEPTH_POINTER, 1)
+        secs["rc_think_depth"] = "THINKING DEPTH FOR THIS REQUEST:\n" + think_guidance.strip()
+    for name, text in (("rc_persona", persona), ("rc_memory", memory), ("rc_continuity", continuity)):
+        if str(text or "").strip():
+            secs[name] = str(text).strip()
+    if not secs:
+        return header, {}
+    out = {"request_context": _REQUEST_CONTEXT_HEAD + "\n\n"}
+    out.update({k: v + "\n\n" for k, v in secs.items()})
+    return header, out
 
 
 def _squeeze_evidence_noise(text: str) -> str:
@@ -11131,6 +11221,24 @@ HEAD_SETTLE_S = 10.0
 #: §4RO r5 review: deferrals in a row before one shows on screen
 HEAD_DEFER_LOUD_AFTER = 5
 
+#: §4RU review 10-27: a members' file older than this no longer means members
+#: still write — without it, one old file made every deploy that changed the
+#: prompt pay a ~50 s members' prefill forever
+MEMBER_HEAD_RECENT_S = 14 * 86400.0
+#: §4RU-r: how long a members' file found present is not planned again
+MEMBER_HEAD_RECHECK_S = 1800.0
+#: §4RU-r: unanswered /slots reads in a row after which the switch gives up
+SWITCH_UNREAD_LIMIT = 3
+#: §4RV: a conversation is saved only this far past the head (fewer tokens
+#: re-read faster than a save plus a restore, ~2 s)
+CONV_MIN_PAST_TOKENS = 1024
+#: §4RV: how long a background call's save waits for the slot to go idle
+CONV_SAVE_WAIT_S = 60.0
+#: §4RW review: a conversation save needs this much of its deadline, or it is not posted
+CONV_SAVE_MIN_S = 20.0
+#: §4RW review: processing the ~9k-token members' head takes ~50 s
+MEMBER_HEAD_MAKE_MIN_S = 60.0
+
 
 #: §4RP review r2/r3: request ids of turns nobody is present for (main.py:
 #: scheduled tasks "sched-<job>", job resumes "sub-<id>" and "job-<id>" —
@@ -11346,7 +11454,6 @@ class GhostAgent:
         # surfaced at the top of the next turn. See _record_late_verdict /
         # _consume_pending_corrections.
         self._pending_corrections = self._load_pending_corrections()
-        self._correction_active_this_turn = False
         self._active_correction = ""
         self.available_tools = get_available_tools(context)
         # Turns are SERIALIZED (was Semaphore(10)). Per-turn state lives on the
@@ -14327,50 +14434,7 @@ class GhostAgent:
                 await asyncio.to_thread(_effort.refresh_server_default,
                                         _node_key(getattr(llm, "upstream_url", "")))
             request_state = self._RequestState(self)
-            profile_str = await request_state.get_profile_str()
-            base_prompt = SYSTEM_PROMPT.replace("{{PROFILE}}", profile_str)
-            # Mirror the one config-driven system-slot splice a live request
-            # applies (handle_chat's perfect_it block) — byte-exactness.
-            if getattr(self.context.args, 'perfect_it', False) is True:
-                base_prompt = base_prompt.replace(
-                    "### TOOL ORCHESTRATION",
-                    '5. THE "PERFECT IT" PROTOCOL: Upon successfully completing a complex technical task, analyze the result (the most recent <tool_response> output in this conversation) and proactively suggest one concrete way to optimize it.\n\n### TOOL ORCHESTRATION'
-                )
-
-            # §4N D-MAJOR-1: match the live system slot byte-for-byte —
-            # append the stable skill instruction and \r-strip exactly as
-            # handle_chat's KV-stable composition does. Without this the
-            # warmed head diverged at the system-prompt boundary and every
-            # byte after was unreusable. (working_memory_context is empty on
-            # the warmup/self-play class; the one-shot hash check below
-            # reports honestly if any residual divergence remains.)
-            warmed_sys = (base_prompt + _STABLE_SKILL_INSTRUCTION).replace(
-                "\r", "")
-            payload = {
-                "model": getattr(self.context.args, "model", "default"),
-                "messages": [
-                    {"role": "system", "content": warmed_sys},
-                    {"role": "user", "content": "ok"},
-                ],
-                "stream": False,
-                "temperature": 0.0,
-                "max_tokens": 1,
-            }
-            if getattr(self.context.args, "native_tools", False) is True:
-                # Same builder + same neutral-query routing a live request's
-                # first turn resolves to; the payload mirrors the live shape
-                # (tool_choice/parallel flags don't affect the rendered
-                # prefix, but identical payloads leave nothing to reason
-                # about).
-                all_tools = request_state.get_active_tool_defs("")
-                if getattr(self, "disabled_tools", None):
-                    all_tools = [t for t in all_tools
-                                 if t["function"]["name"] not in self.disabled_tools]
-                if all_tools:
-                    payload["tools"] = all_tools
-                    payload["tool_choice"] = "auto"
-                    payload["parallel_tool_calls"] = True
-            payload = self._warm_up_effort(payload)        # §4RB r3: the level the last turn used
+            payload, base_prompt, warmed_sys = await self._head_payload(request_state)
 
             _est_tokens = (len(base_prompt)
                            + len(json.dumps(payload.get("tools", [])))) // 4
@@ -14417,10 +14481,23 @@ class GhostAgent:
             # hook reads the file's presence when it runs
             self._head_plan_last = _hs
             if _hs is not None:
+                self._conv_plan_last = _hs       # §4RW-e: a conversation save outlives a failed plan
                 llm.before_main_dispatch = self._slot_switch_before
+                llm.before_background_dispatch = self._conv_before_background   # §4RV
+                llm.before_side_main_dispatch = self._side_call_before           # §4RW-g
             _cc_kw = {}
-            if _hs is not None and _hs["have"]:
-                async def _restore_head(_hs=_hs):
+            # §4RW (operator 10-27: "i thought that changing xhigh didn't change the
+            # head"): the effort sentence closes the system block, so a level with no
+            # file yet starts from the newest saved head of this server and re-reads
+            # only the tail (~1k tokens, from its checkpoint) — 167 s from token 0 live
+            _near = None
+            if _hs is not None and not _hs["have"]:
+                _near_key = _head_saves.newest_head_for(_hs["dir"], _hs["identity"])
+                _near_n = _head_saves.stored_tokens(_hs["dir"], _near_key) if _near_key else None
+                if _near_n:
+                    _near = {**_hs, "key": _near_key, "n_tokens": _near_n, "have": True}
+            if _hs is not None and (_hs["have"] or _near is not None):
+                async def _restore_head(_hs=(_hs if _hs["have"] else _near)):
                     mode = await self._head_restore_due(_hs)
                     if mode == "unknown":
                         self._head_defer(_hs, "llama did not say what the slot holds", loud=not quiet)
@@ -14432,13 +14509,18 @@ class GhostAgent:
                         self._head_defer(_hs, "a conversation keeps the slot inside its idle window",
                                          loud=False, count=False)
                         return
-                    quiet_now = await self._head_slot_quiet(llm, _hs) if mode else False
-                    if mode == "park" and not quiet_now:
+                    if not mode:
+                        return
+                    if not await self._head_slot_quiet(llm, _hs):
+                        # review 10-27: every mode, not only park — a fresh or
+                        # outside restore skipped here sent the full prefill
                         self._head_defer(_hs, "the main slot is in use", loud=not quiet)
                         return
-                    if not mode or not quiet_now:
-                        return
-                    if mode == "park":
+                    from .llm import conv_keep_enabled
+                    if mode == "park" and not conv_keep_enabled():
+                        # (§4RV: no conversation owns the slot — what it holds
+                        # was saved to disk before it was displaced, or is no
+                        # conversation's; no RAM park)
                         parked, why = await asyncio.to_thread(_head_saves.park, _hs["base"])
                         if not parked and await asyncio.to_thread(_head_saves.park_landed, _hs["base"]):
                             # r5: the reply was lost, the park was not (the
@@ -14457,18 +14539,29 @@ class GhostAgent:
                     _hs["restore"] = True
                     _hs["restored"], _hs["detail"], _hs["restore_s"] = await asyncio.to_thread(
                         _head_saves.restore, _hs["base"], _hs["dir"], _hs["key"])
-                _cc_kw["before_dispatch"] = _restore_head
-            elif _hs is not None:
+                if _hs["have"]:
+                    _cc_kw["before_dispatch"] = _restore_head
+            if _hs is not None and not _hs["have"]:
                 # §4RP rule 2, review r2 MAJOR: no file for this head yet (an
                 # effort change makes a new key) — the warm-up's prefill would
                 # replace the kept conversation just as surely
                 # (re-warm loop off: _head_defer returns and the prefill runs, as
                 # in _restore_head — there is no later tick to retry on)
                 async def _keep_slot(_hs=_hs):
-                    from .llm import slot_kept
+                    from .llm import conv_keep_enabled, slot_keep_s, slot_kept
+                    if slot_kept(llm) and conv_keep_enabled() and self._idle_s() >= slot_keep_s():
+                        # §4RV: a gap — the new head file is made now; the
+                        # conversation goes to disk first
+                        await self._conv_displace(llm, "the head's prefill (no file for it yet)",
+                                                  stop=self._request_live_check(llm))
                     if slot_kept(llm):
                         self._head_defer(_hs, "a conversation keeps the slot inside its idle window",
                                          loud=False, count=False)
+                    if _near is not None:
+                        await _restore_head()
+                        for _f in ("restore", "restored", "detail", "restore_s", "parked"):
+                            _hs[_f] = _near[_f]
+                        _hs["near"] = True
                 _cc_kw["before_dispatch"] = _keep_slot
             _t0 = time.time()
             _resp = await llm.chat_completion(
@@ -14537,6 +14630,66 @@ class GhostAgent:
             logger.debug("main-prefix warmup skipped: %s: %s",
                          type(e).__name__, e)
 
+    async def _head_payload(self, request_state, *, member: bool = False):
+        """The head payload a warm-up sends — (payload, base system prompt,
+        warmed system text). §4RU: ``member=True`` builds the channel
+        members' head the same way: the member placeholder for the profile,
+        only `_MEMBER_ALLOWED_TOOLS`, and no effort (a member's turn runs at
+        the server's default level)."""
+        profile_str = (_MEMBER_PROFILE_PLACEHOLDER if member
+                       else await request_state.get_profile_str())
+        base_prompt = SYSTEM_PROMPT.replace("{{PROFILE}}", profile_str)
+        # Mirror the one config-driven system-slot splice a live request
+        # applies (handle_chat's perfect_it block) — byte-exactness.
+        if getattr(self.context.args, 'perfect_it', False) is True:
+            base_prompt = base_prompt.replace(
+                "### TOOL ORCHESTRATION",
+                '5. THE "PERFECT IT" PROTOCOL: Upon successfully completing a complex technical task, analyze the result (the most recent <tool_response> output in this conversation) and proactively suggest one concrete way to optimize it.\n\n### TOOL ORCHESTRATION'
+            )
+
+        # §4N D-MAJOR-1: match the live system slot byte-for-byte —
+        # append the stable skill instruction and \r-strip exactly as
+        # handle_chat's KV-stable composition does. Without this the
+        # warmed head diverged at the system-prompt boundary and every
+        # byte after was unreusable. (working_memory_context is empty on
+        # the warmup/self-play class; the one-shot hash check below
+        # reports honestly if any residual divergence remains.)
+        warmed_sys = (base_prompt + _STABLE_SKILL_INSTRUCTION).replace(
+            "\r", "")
+        payload = {
+            "model": getattr(self.context.args, "model", "default"),
+            "messages": [
+                {"role": "system", "content": warmed_sys},
+                {"role": "user", "content": "ok"},
+            ],
+            "stream": False,
+            "temperature": 0.0,
+            "max_tokens": 1,
+        }
+        if getattr(self.context.args, "native_tools", False) is True:
+            # Same builder + same neutral-query routing a live request's
+            # first turn resolves to; the payload mirrors the live shape
+            # (tool_choice/parallel flags don't affect the rendered
+            # prefix, but identical payloads leave nothing to reason
+            # about).
+            all_tools = request_state.get_active_tool_defs("")
+            if getattr(self, "disabled_tools", None):
+                all_tools = [t for t in all_tools
+                             if t["function"]["name"] not in self.disabled_tools]
+            if member:
+                # the live filter (`get_active_tool_defs`) reads the request's
+                # role; a re-warm tick has none, so filter here the same way
+                all_tools = [t for t in all_tools
+                             if ((t or {}).get("function") or {}).get("name") in _MEMBER_ALLOWED_TOOLS]
+            if all_tools:
+                payload["tools"] = all_tools
+                payload["tool_choice"] = "auto"
+                payload["parallel_tool_calls"] = True
+        if not member:
+            self._head_payload_base = payload          # §4RW-f: level-free, for a re-plan at a call's level
+            payload = self._warm_up_effort(payload)    # §4RB r3: the level the last turn used
+        return payload, base_prompt, warmed_sys
+
     def _head_defer(self, hs: Dict[str, Any], why: str, *, loud: bool = True,
                     count: bool = True) -> None:
         """§4RO r5: a park-mode re-warm that cannot restore sends NOTHING. Its
@@ -14559,9 +14712,8 @@ class GhostAgent:
             # every Nth, not only the Nth — the streak resets only when a
             # head plan dispatched, so one exact value could be stepped over
             _n = f"; {streak} ticks in a row" if streak > 1 else ""
-            pretty_log("Main Prefix Warmup",
-                       f"head restore deferred ({why}{_n}) — nothing sent; the next re-warm tick retries",
-                       icon=Icons.HEAD_DISK)
+            pretty_log("Head Disk", f"head restore deferred — {why}{_n}; the next re-warm tick retries",
+                       icon=Icons.HEAD_DEFER)
         else:
             logger.info("head restore deferred: %s", why)
         raise BackgroundDeferred(f"background call deferred: head restore ({why})")
@@ -14573,8 +14725,19 @@ class GhostAgent:
         turns pushed the head's checkpoint out (only 4 kept) makes the next
         conversation re-process from token 0 (~166 s plus its own text). The
         previous conversation, if resumed, re-reads only its part past the head.
-        No owner known (after a restart), the same conversation, the slot busy
-        or already the bare head: nothing."""
+        §4RP-b: the same conversation's NEXT request too (req 5a58a6ca, 206 s):
+        its first message's label turns from [USER INSTRUCTION] to
+        [CONVERSATION START …], so its prompt leaves the kept one ~650 tokens
+        past the head, where no checkpoint survives a request. Only the calls
+        of the request that holds the slot keep it.
+        §4RU: a channel member's call goes to `_member_head_before` instead.
+        §4RU-r (review 10-27): no owner (the head came back, or an unowned
+        request — a probe, a scheduled task — ran on it) restores as for
+        another conversation; a call whose tools are the head's but whose
+        system text differs (the owner on Slack) restores too; at most once
+        per request for each of the two; a busy slot is waited for
+        (`_restore_when_idle`). Nothing for the request that holds the slot,
+        a call outside the running turn, no file, or the bare head."""
         from ..utils.logging import slot_session_context
         from .llm import BEFORE_MAIN_DISPATCH_S, release_slot_session
         # review r2: the deadline counts from the hook's entry, as the client's bound does
@@ -14582,56 +14745,811 @@ class GhostAgent:
         llm = getattr(getattr(self, "context", None), "llm_client", None)
         hs = getattr(self, "_head_plan_last", None)
         from .llm import outside_slot_dirty
+        from .llm import conv_keep_enabled
+        _conv = conv_keep_enabled()
+        if requester_is_member():
+            # §4RW review MAJOR: any member call on the main slot replaces the
+            # owner's conversation — to disk first, whatever the call opens with
+            if _conv and getattr(llm, "_slot_session", None) and self._turn_holder_ok():
+                await self._conv_displace(llm, "a channel member's request", _late)
+            # §4RU: a channel member's call starts from the members' own head
+            # (first: it replaces an outside call's state as well)
+            await self._member_head_before(llm, payload, _late)
+            return
         if outside_slot_dirty(llm) and isinstance(hs, dict) and _head_saves.enabled():
             await self._outside_slot_restore(llm, hs, payload, _late)
             return
+        from ..utils.logging import request_id_context
         key = slot_session_context.get()
         owner = getattr(llm, "_slot_session", None)
-        if not key or not owner or owner == key or not isinstance(hs, dict) or not _head_saves.enabled():
+        if _conv and owner and owner != key and self._turn_holder_ok():
+            # §4RV: another conversation's (or an unowned request's) call
+            # replaces the one that owns the slot — to disk first
+            await self._conv_displace(llm, "another conversation's request", _late)
+            owner = None
+        # §4RW-g b: a request without a key passes only for its head after its own look
+        # (review: and only once that look displaced the slot — a marker left by a
+        # look that never reached it, or by an earlier run of the same sched- id,
+        # must not restore over the request's own conversation)
+        if ((not key and not (getattr(self, "_side_call_rid", None) == str(request_id_context.get() or "")
+                              and getattr(llm, "_head_displaced", False) is True))
+                or not isinstance(hs, dict) or not _head_saves.enabled()):
             return
-        from .llm import opens_with_head
-        # review r1 MAJOR: a call that does not open with the head (its own
-        # system prompt) gains nothing from it — llama parks the kept
-        # conversation in its RAM cache for that call instead
-        if not opens_with_head(payload, getattr(llm, "_head_ref", None)):
+        # §4RW-f (operator item 5): the effort sentence closes the system block,
+        # so a new level leaves the slot ~28.2k tokens in — past every checkpoint
+        # of the conversation held there. The head of the new level comes back
+        # (its file, else the nearest one) and only the conversation is re-read.
+        # Levels are read from what is rendered and sent (review: a thinking-off
+        # turn renders the medium head whatever the pick); None = unknown, and
+        # an unknown level moves nothing.
+        rid = str(request_id_context.get() or "")
+        # §4RW-g: this request's own look (vision pool = the main server) took
+        # the slot since its last call — its conversation comes back, though
+        # the request already decided its restore (live: 30k tokens re-read
+        # from token 0, 179 s, after a render look)
+        _after_side = (getattr(self, "_side_call_rid", None) == rid and bool(rid)
+                       and getattr(llm, "_head_displaced", False) is True)
+        cur_level = self._call_level(payload)
+        if cur_level is not None and hs.get("effort") not in (None, cur_level):
+            new_hs = await self._head_plan_for_level(llm, cur_level, rid)
+            if isinstance(new_hs, dict):
+                hs = self._head_plan_last = new_hs
+        slot_level = getattr(self, "_slot_level", None)
+        level_moved = slot_level is not None and cur_level is not None and slot_level != cur_level
+        if cur_level is not None:
+            self._slot_level = cur_level             # what this call leaves in the slot
+        held_by = getattr(llm, "_slot_request", None)
+        # §4RV: under GHOST_CONV_KEEP the next request's first message is the
+        # previous one's, so it resumes from llama's checkpoint — no head restore
+        next_request = (not _conv and owner == key and isinstance(held_by, str) and bool(held_by)
+                        and held_by != rid)
+        if owner and owner == key and not next_request and not level_moved and not (
+                _conv and getattr(llm, "_head_displaced", False) is True):
+            # (§4RW review MAJOR: under GHOST_CONV_KEEP the owner record can
+            # outlive its state — a member's turn after the owner's reply ended
+            # — and the request then skipped every restore: from token 0)
             return
-        # review r1: another request's main stream still draining; r3: another
-        # request live besides this one (two owner surfaces at once) — a
-        # switch in its tool gap would swap the slot on every call
-        if (int(getattr(llm, "_main_streams_open", 0) or 0) > 0
-                or int(getattr(llm, "foreground_requests", 0) or 0) > 1):
+        from .llm import opens_with_head, shares_head_tools
+        ref = getattr(llm, "_head_ref", None)
+        if opens_with_head(payload, ref):
+            kind = "head"
+        elif shares_head_tools(payload, ref):
+            kind = "tools"
+        else:
+            # review r1 MAJOR: a call with its own tool list gains nothing from
+            # the head — llama parks the kept conversation for it instead
+            if (payload.get("tools") if isinstance(payload, dict) else None) and \
+                    not getattr(self, "_switch_tools_miss_said", False):
+                self._switch_tools_miss_said = True
+                logger.info("head disk: a call's tool list is not the warmed head's — "
+                            "no restore for such calls (said once)")
+            return
+        # one decision per request for each kind: a call that already restored,
+        # or found the head, must not restore over its own request's
+        # conversation on the next call (a "tools" call never claims the slot).
+        # Round-2 review MAJOR: recorded per request id, and only for a call
+        # that is accepted — another request's call overwrote the record
+        if not self._turn_holder_ok():
+            return
+        done = getattr(self, "_switch_done", None)
+        if not isinstance(done, dict):
+            done = self._switch_done = {}
+        # §4RW-f (round 2 MAJOR): a moved level is never "already decided" — the
+        # conversation in the slot cannot resume across the sentence, so the
+        # request's earlier decision (A → B → back to A) does not hold
+        if kind in done.get(rid, ()) and not level_moved and not (_after_side and kind == "head"):
+            return
+        if kind == "head":
+            self._side_call_rid = None
+        done.setdefault(rid, set()).add(kind)
+        while len(done) > 16:
+            done.pop(next(iter(done)))
+        if _conv and key and kind == "head" and await self._conv_restore(llm, hs, key, rid, _late, level=cur_level):
             return
         n_head = _head_saves.stored_tokens(hs["dir"], hs["key"])
         if not n_head:
+            # §4RW: no file for this head yet (an effort level never saved) — the
+            # newest head of this server shares all but its tail
+            _near = _head_saves.newest_head_for(hs["dir"], hs.get("identity", ""))
+            n_head = _head_saves.stored_tokens(hs["dir"], _near) if _near else None
+            if not n_head:
+                return
+            # review: a re-warm that just processed THIS head (its save refused
+            # while this request came in) left exactly it — not the near file over it
+            if hs.get("prompt_n") and await asyncio.to_thread(
+                    _head_saves.slot_tokens, hs["base"]) == hs["prompt_n"]:
+                return
+            hs = {**hs, "key": _near, "n_tokens": n_head, "near": True}
+        res = await self._restore_when_idle(llm, hs, _late, skip_n=n_head)
+        if res is None:
             return
+        ok, detail, dt, n = res
+        _same = bool((level_moved or _after_side) and owner and owner == key)   # §4RW-f, §4RW-g
+        _whose = ("this request after its own picture look" if _after_side and not level_moved else
+                  f"this conversation at {cur_level or 'the default'} effort" if _same else
+                  "this conversation's next request" if next_request else
+                  "another conversation's first call" if owner else "this request")
+        if ok:
+            release_slot_session(llm)
+            _rest = ("it re-reads its part past the head" if next_request or _same or _after_side else
+                     f"replaced {n:,} tokens of the previous conversation")
+            if kind == "tools":
+                _rest += "; tools only, not the system text"
+            _what = "the nearest saved head" if hs.get("near") else "the head"   # §4RW-e
+            pretty_log("Head Disk", f"restored {_what} before {_whose} in {dt:.1f}s — {_rest}",
+                       icon=Icons.HEAD_RESTORE)
+        else:
+            _maybe = ("" if detail == "too late to post" else
+                      " (after a timeout it may still apply the restore)")
+            pretty_log("Head Disk",
+                       f"head restore before {_whose if next_request or _same or not owner else 'another conversation'} "
+                       f"failed ({detail}) — llama re-processes from the nearest checkpoint{_maybe}",
+                       icon=Icons.HEAD_FAIL)
+
+    async def _side_call_before(self, payload) -> None:
+        """§4RW-g: `LLMClient.before_side_main_dispatch` — a call of this
+        request on a pool that IS the main server (the render look: vision
+        pool = 127.0.0.1:8088) replaces the conversation it holds. Saved to
+        disk first; the request's next call that opens with the head restores
+        it (`_slot_switch_before`). Owner requests that hold the slot only.
+        §4RW-g b: a request without a conversation key (a probe, a scheduled
+        task) has nothing to save — its next head call gets the head back."""
+        from .llm import BEFORE_MAIN_DISPATCH_S, conv_keep_enabled, opens_with_head, shares_head_tools
+        from ..utils.logging import request_id_context, slot_session_context
+        llm = getattr(getattr(self, "context", None), "llm_client", None)
+        if llm is None or not conv_keep_enabled():
+            return
+        key, rid = slot_session_context.get(), str(request_id_context.get() or "")
+        if requester_is_member():
+            # §4RW-g c: a member's look replaces the members' head and the
+            # member's part — the member's next call gets the head back
+            # (`_member_head_before`). Nothing to save: members' turns are not
+            # kept. The time: only a main call that ENDS after it is the look.
+            if rid and self._turn_holder_ok():
+                self._member_side = (rid, time.monotonic())
+            return
+        owner = getattr(llm, "_slot_session", None)
+        why = ("no request id" if not rid else
+               "another conversation owns the slot" if key and owner != key else
+               "the slot was already displaced" if getattr(llm, "_head_displaced", False) is True else
+               "another turn holds the lock" if not self._turn_holder_ok() else "")
+        if why:
+            logger.info("conversation not saved before a side call on the main server: %s", why)
+            return
+        ref = getattr(llm, "_head_ref", None)
+        if opens_with_head(payload, ref) or shares_head_tools(payload, ref):
+            return
+        self._side_call_rid = rid                # (saved or not: its next head call restores)
+        if not key:
+            logger.info("side call on the main server: no conversation key — the head comes back after it")
+            return
+        _late = time.monotonic() + BEFORE_MAIN_DISPATCH_S - _head_saves.RESTORE_TIMEOUT_S - 2.0
+        await self._conv_save(llm, "this request's picture look", _late)
+
+    @staticmethod
+    def _call_level(payload) -> Optional[str]:
+        """§4RW-f: the effort level a main call's system block renders — None
+        when it cannot be known (the server's own level not looked up yet, or
+        a template without levels). Thinking off writes no sentence: the
+        medium head; Default is the server's own level."""
         try:
-            slot = await asyncio.to_thread(
-                lambda: (_head_saves._http(hs["base"] + "/slots", timeout=3.0) or [{}])[_head_saves.SLOT_ID])
+            default = _effort.known_server_default()
+            if not default:
+                return None
+            from .llm import with_probe_effort
+            payload = with_probe_effort(payload)    # r2: an arm's level is set only at the send
+            kw = (payload.get("chat_template_kwargs") or {}) if isinstance(payload, dict) else {}
+            if kw.get("enable_thinking") is False:
+                return "medium"
+            level = kw.get("reasoning_effort")
+            return level if level in _effort.LEVELS else default
         except Exception:  # noqa: BLE001
-            return
+            return None
+
+    async def _head_plan_for_level(self, llm, level: str, rid: str) -> Optional[Dict[str, Any]]:
+        """§4RW-f: the owner head's plan at ``level`` — the warm-up's own
+        level-free payload with the level set (review: rebuilding the head
+        inside a request re-stamped the tuned tool descriptions). A failure is
+        not retried in the same request."""
+        if getattr(self, "_level_plan_failed", None) == (rid, level):
+            return None
+        base = getattr(self, "_head_payload_base", None)
+        hs = None
+        if isinstance(base, dict):
+            kw = {k: v for k, v in (base.get("chat_template_kwargs") or {}).items() if k != "reasoning_effort"}
+            hs = await self._head_save_plan(llm, _effort.apply({**base, "chat_template_kwargs": kw}, level))
+        if not isinstance(hs, dict) or hs.get("effort") != level:
+            self._level_plan_failed = (rid, level)
+            return None
+        return hs
+
+    def _idle_s(self) -> float:
+        """Seconds since the last request (0 when unknown)."""
+        try:
+            return (datetime.datetime.now() - self.context.last_activity_time).total_seconds()
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    async def _slot_idle(self, base: str, late: float, stop=None) -> bool:
+        """§4RV: wait (until ``late``, or until ``stop()``) for llama's slot to
+        be idle — a save or a restore posted while it works lands in the
+        middle of a call."""
+        def _read():
+            return (_head_saves._http(base + "/slots", timeout=3.0) or [{}])[_head_saves.SLOT_ID]
+        unread = 0
+        while True:
+            try:
+                slot = await asyncio.to_thread(_read)
+                unread = 0                   # (round-3 review: failures in a row)
+            except Exception as e:  # noqa: BLE001 — llama answers /slots only between batches
+                slot = {}
+                _t = f"{type(e).__name__} {e}".lower()
+                if not ("timeout" in _t or "timed out" in _t):
+                    unread += 1
+                if unread >= SWITCH_UNREAD_LIMIT:
+                    return False
+            if slot and not slot.get("is_processing", True):
+                return True
+            if time.monotonic() > late or (stop is not None and stop()):
+                return False
+            await asyncio.sleep(0.5)
+
+    async def _conv_save(self, llm, why: str, late: Optional[float] = None, stop=None) -> bool:
+        """§4RV: save the conversation that owns the main slot to disk before
+        ``why`` replaces it — only when its call was the last one on the slot
+        (anything since, or a call without the head, means the slot holds
+        something else), once per state, and only past CONV_MIN_PAST_TOKENS
+        beyond the head (less re-reads faster than a save and a restore).
+        True when the state is on disk."""
+        from .llm import conv_keep_enabled
+        try:
+            if llm is None or not conv_keep_enabled() or not _head_saves.enabled():
+                return False
+            owner = getattr(llm, "_slot_session", None)
+            # §4RW-e (review): a plan that failed (a /props timeout in a tick)
+            # left None for up to a re-warm period, and a displacement then
+            # dropped the conversation unsaved. The save needs only the dir,
+            # the server and its identity — a key under a stale identity is
+            # never restored (the next plan's key differs).
+            hs = getattr(self, "_head_plan_last", None) or getattr(self, "_conv_plan_last", None)
+            if not owner or not isinstance(hs, dict):
+                return False
+            if hs is not getattr(self, "_head_plan_last", None):
+                try:
+                    ident = await asyncio.to_thread(_head_saves.server_identity, hs["base"])
+                except Exception:  # noqa: BLE001 — r3: /props down is not another model
+                    ident = hs.get("identity")
+                if ident != hs.get("identity"):
+                    return False      # round 2: llama now runs another model — not under the old identity
+            used = getattr(llm, "_slot_session_used", None)
+
+            def _still_it() -> bool:
+                # the owner's call is still the last one on the slot (review:
+                # re-read after every wait — another save, a switch or a call
+                # may have moved the slot on meanwhile)
+                # §4RW review: the conversation's own reply that ended during the
+                # wait refreshed `used` — still this conversation (only another
+                # owner, or a call since its last one, means the slot moved on)
+                last = getattr(llm, "_last_main_call_end", None)
+                cur = getattr(llm, "_slot_session_used", None)
+                return (getattr(llm, "_slot_session", None) == owner
+                        and isinstance(cur, (int, float))
+                        and not (isinstance(last, (int, float)) and last > cur)
+                        and getattr(llm, "_head_displaced", False) is not True)
+            lock = getattr(self, "_conv_lock", None)
+            if lock is None:
+                lock = self._conv_lock = asyncio.Lock()
+            async with lock:                     # one save or restore at a time
+                return await self._conv_save_locked(llm, why, late, hs, owner, used, _still_it, stop)
+        except Exception as e:  # noqa: BLE001 — best-effort: the old loss, never a failed call
+            logger.info("conversation save skipped: %s: %s", type(e).__name__, e)
+            return False
+
+    async def _conv_save_locked(self, llm, why, late, hs, owner, used, still_it, stop=None) -> bool:
+        """`_conv_save`'s body, under the conversation lock."""
+        try:
+            if getattr(llm, "_conv_saved", None) == (owner, used):
+                return True
+            if not still_it():
+                return False
+            # the head's size: this head's file, else (a changed head has none
+            # yet — the gap that makes it saves first) the newest owner head's
+            n_head = _head_saves.stored_tokens(hs["dir"], hs["key"])
+            if not n_head:
+                _prev = _head_saves.newest_head_for(hs["dir"], hs.get("identity", ""))
+                n_head = (_head_saves.stored_tokens(hs["dir"], _prev) if _prev else None) or 0
+            late = time.monotonic() + CONV_SAVE_WAIT_S if late is None else late
+            if not await self._slot_idle(hs["base"], late, stop):
+                logger.info("conversation not saved before %s: the main slot stayed busy", why)
+                return False
+            n = await asyncio.to_thread(_head_saves.slot_tokens, hs["base"])
+            if n is None or n < n_head + CONV_MIN_PAST_TOKENS or not still_it():
+                return False
+            key = _head_saves.conv_key(hs.get("identity", ""), owner)
+            save_s = min(_head_saves.SAVE_TIMEOUT_S, late - time.monotonic())
+            if save_s < CONV_SAVE_MIN_S:
+                # §4RW review: a 5 s bound on a multi-GB save timed out while llama
+                # kept writing (a .part file left for an hour, the slot released)
+                logger.info("conversation not saved before %s: %.0fs left of the deadline", why, save_s)
+                return False
+            t0 = time.monotonic()
+            ok, detail = await asyncio.to_thread(
+                _head_saves.save, hs["base"], hs["dir"], key, n, hs.get("identity", ""),
+                _head_saves.CONV, save_s, True,
+                ({"effort": self._slot_level} if getattr(self, "_slot_level", None) else None))   # §4RW-f
+            if not ok:
+                logger.info("conversation not saved before %s: %s", why, detail)
+                return False
+            # (llama runs the save before any call posted after it, so the
+            # file is this conversation; the "on disk" mark only while it is
+            # still what the slot holds)
+            if still_it():
+                llm._conv_saved = (owner, getattr(llm, "_slot_session_used", used))
+                # review r2: what a later claim may trust — this conversation,
+                # this many tokens, last on the slot
+                llm._conv_last_saved = (owner, _head_saves.stored_tokens(hs["dir"], key),
+                                        time.monotonic())
+            pretty_log("Conversation", f"saved to disk before {why} in {time.monotonic() - t0:.1f}s "
+                       f"({detail}) — its next request restores it",
+                       icon=Icons.CONV_SAVE)
+            return True
+        except Exception as e:  # noqa: BLE001 — best-effort: the old loss, never a failed call
+            logger.info("conversation save skipped: %s: %s", type(e).__name__, e)
+            return False
+
+    async def _conv_displace(self, llm, why: str, late: Optional[float] = None, stop=None) -> bool:
+        """§4RV: a call is about to replace the conversation that owns the
+        slot: save it, then no conversation owns the slot."""
+        from .llm import conv_keep_enabled, release_slot_session
+        if not conv_keep_enabled():
+            return False                   # review: off, nothing changes hands
+        owner = getattr(llm, "_slot_session", None)
+        saved = await self._conv_save(llm, why, late, stop)
+        # review r2: a save that found the slot moved on (the conversation's
+        # next request took it meanwhile) leaves that request its slot
+        # (and one stopped because a request started keeps it: that request
+        # may be the conversation's next one, which resumes from the slot)
+        # §4RW-e (round 2): a request that started during the save keeps the
+        # record even when the save succeeded — it may be the conversation's
+        # next request, whose own call would now be judged stale by the release
+        if stop is not None and stop():
+            return saved
+        if saved or getattr(llm, "_slot_session", None) == owner:
+            release_slot_session(llm)
+        return saved
+
+    @staticmethod
+    def _request_live_check(llm):
+        """A `stop` for `_conv_displace`: a foreground request is live."""
+        return lambda: int(getattr(llm, "foreground_requests", 0) or 0) > 0
+
+    async def _conv_before_background(self, payload, task_label: str) -> bool:
+        """§4RV: `LLMClient.before_background_dispatch` — a background main
+        call (a deferred verdict, a learning job) replaces the conversation.
+        True when it worked on the slot (the client then defers the call if a
+        request started meanwhile)."""
+        from .llm import conv_keep_enabled
+        llm = getattr(getattr(self, "context", None), "llm_client", None)
+        if not conv_keep_enabled() or llm is None or not getattr(llm, "_slot_session", None):
+            return False
+
+        def _request_live() -> bool:
+            return int(getattr(llm, "foreground_requests", 0) or 0) > 0
+        if _request_live():
+            # review r2: a call let in while a request waits on the image node
+            # runs inside that request — the slot is the request's, not saved
+            return False
+        await self._conv_displace(llm, f"a background '{task_label or 'unlabelled'}' call",
+                                  stop=_request_live)
+        return True
+
+    async def _conv_restore(self, llm, hs: Dict[str, Any], session: str, rid: str,
+                            late: float, level: Optional[str] = None) -> bool:
+        """§4RV: before a request's first call, put its conversation back
+        from disk (it holds the head too, and llama's checkpoint at its last
+        message). True when it is in the slot. §4RW-f: ``level`` is the
+        call's effort level (None: unknown)."""
+        ckey = _head_saves.conv_key(hs.get("identity", ""), session)
+        if not _head_saves.stored_tokens(hs["dir"], ckey):
+            return False
+        lock = getattr(self, "_conv_lock", None)
+        if lock is None:
+            lock = self._conv_lock = asyncio.Lock()
+        async with lock:
+            # (review: read under the lock — a save of this conversation may be
+            # replacing the file and its meta right now)
+            n_conv = _head_saves.stored_tokens(hs["dir"], ckey)
+            if not n_conv:
+                return False
+            saved_level = _head_saves.meta_field(hs["dir"], ckey, "effort")
+            if saved_level and level and str(saved_level) != level:
+                # §4RW-f: saved at another effort level — it parts from this request
+                # at the effort sentence, before any of its checkpoints: llama would
+                # re-read it from token 0. The head of this level is the better start.
+                pretty_log("Conversation", f"not restored — saved at {saved_level} effort, this request "
+                           f"runs at {level}; the head instead", icon=Icons.CONV_LEFT)
+                return False
+            _ls = getattr(llm, "_conv_last_saved", None)
+            _end = getattr(llm, "_last_main_call_end", None)
+            if (isinstance(_ls, tuple) and _ls[:2] == (session, n_conv)
+                    # round-3 review: and no call ran on the slot since that save
+                    and not (isinstance(_end, (int, float)) and _end > _ls[2])
+                    and await asyncio.to_thread(_head_saves.slot_tokens, hs["base"]) == n_conv):
+                # review: the slot still holds what the file holds (a gap job
+                # saved it, then deferred) — it is this conversation's again
+                ok, detail, dt, _n = True, "already in the slot", 0.0, n_conv
+            else:
+                # (review r2: "already here" is the claim above's call; an equal
+                # count alone is not this conversation)
+                res = await self._restore_when_idle(llm, {**hs, "key": ckey}, late, skip_n=-1)
+                if res is None:
+                    return False
+                ok, detail, dt, _n = res
+                if not ok and any(w in str(detail).lower() for w in ("timeout", "timed out")):
+                    # §4RW review MAJOR: llama finishes a restore the client gave
+                    # up on (a 6 GB file under swap) — the head restored after it
+                    # threw the conversation away. §4RW-e (review): /slots counts
+                    # the last completion's prompt, not what a restore loaded, so
+                    # the landing is checked by posting it once more — the file is
+                    # in the page cache now, and the reply carries n_restored
+                    # Round 2: a second timeout means llama is reading the file
+                    # from an idle slot — it lands; the head is not put over it.
+                    # Only posted when the request's deadline allows its bound.
+                    _bound = _head_saves.restore_timeout_s(hs["dir"], ckey)
+                    if (late - time.monotonic() >= _bound            # r3: the idle wait inside it too
+                            and await self._slot_idle(hs["base"], min(time.monotonic() + CONV_SAVE_WAIT_S,
+                                                                      late - _bound))):
+                        ok2, detail2, dt2 = await asyncio.to_thread(_head_saves.restore, hs["base"],
+                                                                    hs["dir"], ckey)
+                        if ok2:
+                            ok, detail, dt = True, f"{detail2}; the second try, after a timeout", dt + dt2
+                        elif any(w in str(detail2).lower() for w in ("timeout", "timed out")):
+                            ok, detail, dt = True, (f"{n_conv} tokens; llama is still reading it after "
+                                                    f"two timeouts"), dt + dt2
+        if not ok:
+            pretty_log("Conversation", f"restore failed ({detail}) — the head instead; llama "
+                       f"re-processes the conversation", icon=Icons.HEAD_FAIL)
+            return False
+        _head_saves.touch(hs["dir"], ckey)
+        now = time.monotonic()
+        llm._slot_session, llm._slot_session_used, llm._slot_request = session, now, rid
+        llm._conv_saved = (session, now)            # the slot is what the file holds
+        llm._head_displaced = False
+        pretty_log("Conversation", f"restored from disk in {dt:.1f}s ({detail}) — it resumes at "
+                   f"its last message", icon=Icons.CONV_RESTORE)
+        return True
+
+    @contextlib.asynccontextmanager
+    async def _turn_lock(self, req_id):
+        """The global turn lock (`agent_semaphore`), naming the request that
+        holds it (§4RU-r: a streamed turn stays registered as running while
+        its reply drains, after it released the lock — the next turn runs
+        meanwhile)."""
+        async with self.agent_semaphore:
+            rid = str(req_id or "")
+            self._turn_lock_rid = rid
+            try:
+                yield
+            finally:
+                if getattr(self, "_turn_lock_rid", None) == rid:
+                    self._turn_lock_rid = None
+
+    def _turn_holder_ok(self) -> bool:
+        """§4RU-r (review 10-27): may this call's restore run? A request
+        queued behind this one, or the previous turn's reply still draining,
+        is no reason to stop (as `foreground_requests > 1` / an open stream
+        they made the switch give up, and the call re-processed from token 0).
+        Refused when a turn holds the lock and this call is not that turn's:
+        the holder may sit in its tool gap (round-2 review MAJOR: a drained
+        turn's late call — still "running" in the registry — restored the
+        head under the next turn)."""
+        try:
+            from ..utils.logging import request_id_context
+            holder = getattr(self, "_turn_lock_rid", None)
+            return holder is None or holder == str(request_id_context.get() or "")
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _restore_when_idle(self, llm, hs: Dict[str, Any], late: float, *, skip_n: int,
+                                 park: bool = False):
+        """§4RU-r: wait (until ``late``) for llama's slot to be idle — a reply
+        still draining or a background verdict ahead of this call, which the
+        call would wait behind in llama anyway (review 10-27: giving up on a
+        busy slot brought back the 5a58a6ca re-processing) — then restore
+        ``hs``'s file, unless the slot holds ``skip_n`` tokens or llama does
+        not say. Reads llama's own state, not the agent's counters (a leaked
+        stream count once held every tick). The server identity is read again
+        (review: the plan can be a tick old — a llama restarted on another
+        model of the same shape would take the old state silently). ``park``
+        (a member's turn): park the slot's state in llama's RAM cache first,
+        as llama itself did before §4RU, unless it holds exactly the owner's
+        head (on disk). Returns (ok, detail, seconds, slot tokens), or None
+        when nothing was posted."""
+        def _read():
+            return (_head_saves._http(hs["base"] + "/slots", timeout=3.0) or [{}])[_head_saves.SLOT_ID]
+        unread = 0
+        while True:
+            try:
+                slot = await asyncio.to_thread(_read)
+                unread = 0
+            except Exception as e:  # noqa: BLE001 — llama answers /slots only between batches
+                slot = {}
+                # round-3 review: a read that TIMED OUT is a long batch (a
+                # prefill ahead of this call) — wait on; only a fast failure
+                # (refused, an HTTP error) means a llama that will not answer
+                _t = f"{type(e).__name__} {e}".lower()
+                if not ("timeout" in _t or "timed out" in _t):
+                    unread += 1
+                if unread >= SWITCH_UNREAD_LIMIT:
+                    # round-2 review: a wedged or slot-less llama cost ~118 s
+                    # before every request's first call
+                    logger.info("head disk: llama's /slots did not answer %d times — no restore", unread)
+                    return None
+            if slot and "is_processing" not in slot:
+                return None                  # a llama that does not say: leave it
+            if slot and not slot["is_processing"]:
+                break
+            if time.monotonic() > late:
+                logger.info("head disk: the main slot stayed busy past the deadline — no restore")
+                return None
+            await asyncio.sleep(0.5)
         n = slot.get("n_prompt_tokens")
-        if slot.get("is_processing", True) or n is None or int(n) == n_head:
-            return
-        # review r1: the client's bound cancels the wait, not a thread that
-        # starts late — past this deadline the thread posts nothing, so a
-        # restore never reaches llama after the call it was for
+        if n is None or int(n) == skip_n:
+            return None
+        try:
+            ident = await asyncio.to_thread(_head_saves.server_identity, hs["base"])
+        except Exception:  # noqa: BLE001
+            return None
+        if ident != hs.get("identity"):
+            logger.info("head disk: llama now runs another model/build/template than the "
+                        "saved head's — no restore until the next warm-up plans again")
+            return None
+        if park:
+            owner_hs = getattr(self, "_head_plan_last", None)
+            owner_n = (_head_saves.stored_tokens(owner_hs["dir"], owner_hs["key"])
+                       if isinstance(owner_hs, dict) else None)
+            if int(n) != owner_n:
+                # round-2 review: the park ends before the deadline, or is not sent
+                park_s = min(_head_saves.PARK_TIMEOUT_S, late - time.monotonic())
+                if park_s < 5.0:
+                    logger.info("members' head: too little of the deadline left to park first — no restore")
+                    return None
+                parked, why = await asyncio.to_thread(_head_saves.park, hs["base"], park_s)
+                if not parked and await asyncio.to_thread(_head_saves.park_landed, hs["base"]):
+                    parked = True
+                if not parked:
+                    logger.info("members' head: could not park the slot first (%s) — no restore", why)
+                    return None
+
         def _restore_in_time():
-            if time.monotonic() > _late:
+            # review r1: the client's bound cancels the wait, not a thread that
+            # starts late — past this deadline the thread posts nothing, so a
+            # restore never reaches llama after the call it was for
+            if time.monotonic() > late:
                 return False, "too late to post", 0.0
             return _head_saves.restore(hs["base"], hs["dir"], hs["key"])
         ok, detail, dt = await asyncio.to_thread(_restore_in_time)
+        return ok, detail, dt, int(n)
+
+    async def _member_head_plan(self, llm) -> Optional[Dict[str, Any]]:
+        """§4RU: the members' head — its payload, its file plan
+        (`_head_save_plan`, so the key follows the server and the rendered
+        text like the owner's) and its ``shape`` for `opens_with_head`."""
+        from .llm import head_shape
+        try:
+            payload, _, _ = await self._head_payload(self._RequestState(self), member=True)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("members' head plan skipped: %s: %s", type(e).__name__, e)
+            return None
+        shape = head_shape(payload)
+        hs = await self._head_save_plan(llm, payload) if shape is not None else None
+        if hs is None:
+            return None
+        hs["shape"], hs["payload"] = shape, payload
+        return hs
+
+    async def _member_head_before(self, llm, payload, late: float) -> None:
+        """§4RU: before a channel member's request's first call that opens with
+        the members' head, put the saved members' head back (~0.5 s). The slot
+        holds the owner's head or a conversation, which shares nothing with it
+        (the tools come first and differ), so llama re-processed the whole
+        ~8k-token head every time (slack-be). Only the request's first such
+        call: its later calls extend what it holds. No file yet: nothing (the
+        re-warm loop makes one while the agent is quiet). The member never
+        owns the slot, so the owner's next call gets the owner's head back
+        through the switch."""
+        from ..utils.logging import request_id_context
+        from .llm import opens_with_head
+        if not _head_saves.enabled():
+            return
+        self._member_head_wanted = True
+        rid = str(request_id_context.get() or "")
+        # §4RW-g c: this member request's own look ran on the slot since its
+        # restore (live slack-7e: the next call re-read 16.6k tokens, 94 s)
+        _side = getattr(self, "_member_side", None)
+        _end = getattr(llm, "_last_main_call_end", None)
+        after_look = (isinstance(_side, tuple) and _side[0] == rid and bool(rid)
+                      and isinstance(_end, (int, float)) and _end > _side[1])
+        if not rid or (rid == getattr(self, "_member_head_rid", None) and not after_look):
+            return
+        hs = await self._member_head_plan(llm)
+        if hs is None:
+            return
+        if not opens_with_head(payload, hs["shape"]):
+            if not getattr(self, "_member_head_miss_said", False):
+                self._member_head_miss_said = True
+                logger.info("members' head: a member's call does not open with it — no restore")
+            return
+        if not self._turn_holder_ok():
+            return                         # round-3 review: accept first, then record
+        self._member_head_rid = rid
+        if after_look:
+            self._member_side = None
+        from .llm import conv_keep_enabled
+        if conv_keep_enabled():
+            # §4RV: the owner's conversation goes to disk, not to llama's RAM
+            # cache (2 GB now: a conversation with its checkpoints is larger)
+            await self._conv_displace(llm, "a channel member's request", late)
+        if not hs["have"]:
+            # §4RW (operator 10-27: "i thought that once a member does a request it
+            # will be saved and recalled on the next slack request"): the request
+            # processes the members' head anyway — process it alone first, save it,
+            # and the call goes on from it (~1 s more than before, once)
+            await self._member_head_make(llm, hs, late)
+            return
+        res = await self._restore_when_idle(llm, hs, late, skip_n=hs["n_tokens"],
+                                            park=not conv_keep_enabled())
+        if res is None:
+            return
+        ok, detail, dt, _n = res
         if ok:
-            release_slot_session(llm)
-            pretty_log("Session Switch",
-                       f"restored the head before another conversation's first call in {dt:.1f}s "
-                       f"(the slot held {int(n)} tokens of the previous one; resumed later, it "
-                       f"re-reads its part past the head)", icon=Icons.HEAD_DISK)
+            _head_saves.touch(hs["dir"], hs["key"])      # "members write": used, not only saved
+            _when = ("a channel member's request after its own picture look" if after_look
+                     else "a channel member's request")
+            pretty_log("Head Disk", f"restored the members' head before {_when} "
+                       f"in {dt:.1f}s ({detail})", icon=Icons.HEAD_RESTORE)
         else:
-            _maybe = ("" if detail == "too late to post" else
-                      " (after a timeout it may still apply the restore first)")
-            pretty_log("Session Switch",
-                       f"head restore before another conversation failed ({detail}) — llama "
-                       f"re-processes from the nearest checkpoint{_maybe}", icon=Icons.WARN)
+            pretty_log("Head Disk", f"members' head restore failed ({detail}) — llama "
+                       f"re-processes the member's prompt", icon=Icons.HEAD_FAIL)
+
+    async def _member_head_make(self, llm, hs: Dict[str, Any], late: float) -> bool:
+        """§4RW: no members' file yet — before a member's first call, process the
+        members' head on the slot by itself and save it (kind member). The call
+        that follows reuses it, so the request pays what it paid before plus the
+        save. Gives up — the call then processes the head as before — when the
+        slot stays busy, the deadline is too close, or the slot moved on."""
+        try:
+            if not await self._slot_idle(hs["base"], late):
+                pretty_log("Head Disk", "members' head not saved — the main slot stayed busy; "
+                           "this request processes it as before", icon=Icons.HEAD_FAIL)
+                return False
+            left = late - time.monotonic()
+            if left < MEMBER_HEAD_MAKE_MIN_S:
+                pretty_log("Head Disk", f"members' head not saved — {left:.0f}s left of the deadline; "
+                           f"this request processes it as before", icon=Icons.HEAD_FAIL)
+                return False
+            t0 = time.monotonic()
+            body = {**hs["payload"], "stream": False, "max_tokens": 1}
+            resp = await asyncio.to_thread(
+                _head_saves._http, hs["base"] + "/v1/chat/completions", body, left)
+            dt = time.monotonic() - t0
+            _v, _cached, prompt = rewarm_verdict(resp, dt)
+            if prompt <= 0:
+                pretty_log("Head Disk", "members' head not saved — llama gave no token count",
+                           icon=Icons.HEAD_FAIL)
+                return False
+            ok, detail = await asyncio.to_thread(
+                _head_saves.save, hs["base"], hs["dir"], hs["key"], prompt,
+                hs.get("identity", ""), _head_saves.MEMBER)
+            if not ok:
+                pretty_log("Head Disk", f"members' head not saved ({detail})", icon=Icons.HEAD_FAIL)
+                return False
+            self._member_head_tried = hs["key"]
+            pretty_log("Head Disk", f"saved the members' head before a channel member's request "
+                       f"({detail}, {dt:.0f}s to process) — the next member request restores it",
+                       icon=Icons.HEAD_SAVE)
+            return True
+        except Exception as e:  # noqa: BLE001 — never fails the member's call
+            pretty_log("Head Disk", f"members' head not saved ({type(e).__name__}: {e})",
+                       icon=Icons.HEAD_FAIL)
+            return False
+
+    async def _member_head_refresh(self) -> bool:
+        """§4RU: make the members' head file when one is wanted (a member's
+        request ran since boot, or a members' file was saved before — a
+        deploy that changed the prompt makes a new key) and missing. Only
+        when no request has come for `slot_keep_s()` (the prefill holds the
+        slot ~50 s; a message in that time waits behind it), nothing is live
+        and the owner's head has a file to come back from. Prefills the
+        members' head, saves it, then restores the owner's head straight
+        away (no park: the slot holds only the members' head, now on disk).
+        One try per key. True when it sent anything."""
+        from .llm import outside_slot_dirty, release_slot_session, slot_keep_s, slot_kept
+        try:
+            if not _head_saves.enabled():
+                return False
+            llm = getattr(getattr(self, "context", None), "llm_client", None)
+            d = _head_saves.head_dir()
+            if llm is None or d is None:
+                return False
+            if not (getattr(self, "_member_head_wanted", False) is True
+                    or _head_saves.has_kind(d, _head_saves.MEMBER, within_s=MEMBER_HEAD_RECENT_S)):
+                return False
+            from .llm import conv_keep_enabled
+            if (int(getattr(llm, "foreground_requests", 0) or 0) > 0
+                    or int(getattr(llm, "_main_streams_open", 0) or 0) > 0
+                    or outside_slot_dirty(llm) or (slot_kept(llm) and not conv_keep_enabled())):
+                return False
+            if self._idle_s() < slot_keep_s():
+                return False
+            owner_hs = getattr(self, "_head_plan_last", None)
+            if (not isinstance(owner_hs, dict)
+                    or _head_saves.stored_tokens(owner_hs["dir"], owner_hs["key"]) is None):
+                return False
+            # round-2 review: now on every idle tick — a file found present is
+            # not planned again (two llama calls) for MEMBER_HEAD_RECHECK_S
+            # (round-3 review: keyed by the owner's head — a prompt or llama
+            # change makes a new owner key too, and is planned at once)
+            seen = getattr(self, "_member_head_seen", None)
+            if (isinstance(seen, tuple) and seen[0] == owner_hs["key"]
+                    and time.monotonic() - seen[1] < MEMBER_HEAD_RECHECK_S):
+                return False
+            hs = await self._member_head_plan(llm)
+            if hs is not None and hs["have"]:
+                self._member_head_seen = (owner_hs["key"], time.monotonic())
+            if hs is None or hs["have"] or hs["key"] == getattr(self, "_member_head_tried", None):
+                return False
+            if not await self._head_slot_quiet(llm, hs):
+                return False
+            from .llm import BackgroundDeferred
+            if slot_kept(llm):
+                # §4RV: a gap — the owner's conversation goes to disk first
+                await self._conv_displace(llm, "the channel members' head prefill",
+                                          stop=self._request_live_check(llm))
+                if slot_kept(llm):
+                    # §4RW-e r3: not saved, or a request started during the save —
+                    # the prefill would replace a conversation that is not on disk
+                    return False
+            self._member_head_tried = hs["key"]   # a failure is not retried every tick
+            t0 = time.time()
+            try:
+                resp = await llm.chat_completion(hs["payload"], is_background=True, timeout=300.0,
+                                                 task_label="main-prefix-members")
+            except BackgroundDeferred:
+                self._member_head_tried = None    # a request came first: sent nothing, retry
+                return False
+            dt = time.time() - t0
+            _verdict, _cached, prompt = rewarm_verdict(resp, dt)
+            if (int(getattr(llm, "foreground_requests", 0) or 0) > 0
+                    or int(getattr(llm, "_main_streams_open", 0) or 0) > 0):
+                # review: a request that arrived during the prefill is not a
+                # failed try — the next quiet tick makes the file
+                self._member_head_tried = None
+            elif prompt > 0:
+                ok, detail = await asyncio.to_thread(
+                    _head_saves.save, hs["base"], hs["dir"], hs["key"], prompt,
+                    hs.get("identity", ""), _head_saves.MEMBER)
+                if ok:
+                    pretty_log("Head Disk",
+                               f"saved the members' head ({detail}, {dt:.0f}s to process) — a "
+                               f"member's next request restores it in under a second",
+                               icon=Icons.HEAD_SAVE, durable_only=True)
+                else:
+                    logger.info("members' head save not kept: %s", detail)
+            # the owner's head back from its file — or the next tick re-warms it
+            # (review 10-27: only if the plan's server is still the one running)
+            if (owner_hs.get("identity") == hs.get("identity")
+                    and await self._head_slot_quiet(llm, owner_hs)):
+                ok, detail, rdt = await asyncio.to_thread(
+                    _head_saves.restore, owner_hs["base"], owner_hs["dir"], owner_hs["key"])
+                if ok:
+                    llm._head_displaced = False
+                    release_slot_session(llm)
+                    logger.info("owner's head restored after the members' head save (%s, %.1fs)", detail, rdt)
+            return True
+        except Exception as e:  # noqa: BLE001 — best-effort, like the warm-up
+            logger.debug("members' head refresh skipped: %s: %s", type(e).__name__, e)
+            return False
 
     async def _outside_slot_restore(self, llm, hs: Dict[str, Any], payload, late: float) -> None:
         """§4RQ: a client outside the agent (Eva's World) used the slot — its
@@ -14661,8 +15579,9 @@ class GhostAgent:
             if slot and not slot["is_processing"]:
                 break
             if time.monotonic() > late:
-                pretty_log("Session Switch", "an outside call is still on the main slot — this call "
-                           "waits behind it and re-processes the head", icon=Icons.WARN)
+                pretty_log("Head Disk", "head not restored: an outside call is still on the main "
+                           "slot — this call waits behind it and re-processes the head",
+                           icon=Icons.HEAD_FAIL)
                 return
             await asyncio.sleep(0.5)
         # review r2 MAJOR: the wait took seconds — another request may have
@@ -14687,11 +15606,11 @@ class GhostAgent:
             # replaces the head again — its mark stands
             llm._outside_slot_dirty = getattr(llm, "_outside_call_live", False) is True
             release_slot_session(llm)
-            pretty_log("Session Switch", f"restored the head over an outside call's state in {dt:.1f}s",
-                       icon=Icons.HEAD_DISK)
+            pretty_log("Head Disk", f"restored the head over an outside call's state in {dt:.1f}s",
+                       icon=Icons.HEAD_RESTORE)
         else:
-            pretty_log("Session Switch", f"head restore over an outside call failed ({detail}) — llama "
-                       f"re-processes the head", icon=Icons.WARN)
+            pretty_log("Head Disk", f"head restore over an outside call failed ({detail}) — llama "
+                       f"re-processes the head", icon=Icons.HEAD_FAIL)
 
     async def _head_save_plan(self, llm, payload) -> Optional[Dict[str, Any]]:
         """§4RO: None when head saves are off or the server cannot take them;
@@ -14709,6 +15628,7 @@ class GhostAgent:
             key = _head_saves.head_key(ident, rendered)
             n_tokens = _head_saves.stored_tokens(d, key)
             return {"base": base, "dir": d, "key": key, "identity": ident,
+                    "effort": _effort.level_in_render(rendered),     # §4RW-f: what this head renders
                     "have": n_tokens is not None, "n_tokens": n_tokens, "parked": False,
                     "restore": False, "restored": None, "detail": "", "restore_s": 0.0}
         except Exception as e:  # noqa: BLE001 — best-effort, like the warm-up
@@ -14743,6 +15663,7 @@ class GhostAgent:
         owner request re-processed the head for 166 s, 8× that day)."""
         try:
             if await asyncio.to_thread(_head_saves.server_fresh, hs["base"]):
+                self._forget_slot_owner("llama has served nothing since it started")   # §4RW-e
                 return "fresh"
             n = await asyncio.to_thread(_head_saves.slot_tokens, hs["base"])
             if n is None:
@@ -14770,55 +15691,97 @@ class GhostAgent:
         try:
             base, d, key = hs["base"], hs["dir"], hs["key"]
             verdict, cached, prompt = rewarm_verdict(resp, dt_s)
+            if prompt > 0:
+                hs["prompt_n"] = prompt          # §4RW: what this head is, file or not
             if hs.get("restored"):
                 from .llm import release_slot_session
                 release_slot_session(llm)         # §4RP: the head owns the slot again
                 llm._outside_slot_dirty = False   # §4RQ
-                _after = f" after a '{displaced_by}' call replaced it" if displaced_by else ""
-                _parked = " (the slot's conversation parked in llama's RAM cache first)" if hs.get("parked") else ""
+                _after = f" after a '{displaced_by}' call" if displaced_by else ""
+                _parked = "; the conversation parked in llama's RAM cache first" if hs.get("parked") else ""
+                _what = ("the nearest saved head (no file for this one yet)" if hs.get("near")
+                         else "the head")
                 pretty_log(
-                    "Main Prefix Warmup",
-                    f"restored the head from disk{_after}{_parked} in {hs['restore_s']:.1f}s "
-                    f"({hs['detail']}; {cached} of {prompt} tokens cached, {dt_s:.0f}s with the check)",
-                    icon=Icons.HEAD_DISK,
+                    "Head Disk",
+                    f"restored {_what}{_after} in {hs['restore_s']:.1f}s "
+                    f"({cached:,} of {prompt:,} tokens cached{_parked})",
+                    icon=Icons.HEAD_RESTORE,
                 )
+            elif (hs.get("restore") and verdict == "resident"
+                  and any(w in str(hs.get("detail") or "").lower() for w in ("timeout", "timed out"))):
+                # review 10-27: 9 "failed (TimeoutError)" lines were restores
+                # llama applied after the client gave up — the warm-up found
+                # the head cached
+                logger.info("head restore reply timed out (%s) but it landed: %d of %d tokens cached",
+                            hs.get("detail") or "no reply", cached, prompt)
             elif hs.get("restore"):
                 pretty_log(
-                    "Main Prefix Warmup",
-                    f"head restore from disk failed ({hs.get('detail') or 'no reply'}) — "
-                    f"the warm-up re-processed it ({dt_s:.0f}s) and saves it again",
-                    icon=Icons.WARN,
+                    "Head Disk",
+                    f"head restore failed ({hs.get('detail') or 'no reply'}) — "
+                    f"the warm-up re-processed it in {dt_s:.0f}s"
+                    + ("" if _head_saves.stored_tokens(d, key) is not None else " and saves it"),
+                    icon=Icons.HEAD_FAIL,
                 )
             if not _head_saves.supported(base):
-                pretty_log("Main Prefix Warmup",
+                pretty_log("Head Disk",
                            "head saves off: llama-server was started without --slot-save-path",
-                           icon=Icons.WARN)
+                           icon=Icons.HEAD_FAIL)
                 return
             if prompt <= 0:
                 return
             if verdict != "evicted" and _head_saves.stored_tokens(d, key) is not None:
                 return
-            if (int(getattr(llm, "foreground_requests", 0) or 0) > 0
-                    or int(getattr(llm, "_main_streams_open", 0) or 0) > 0):
-                logger.info("head save skipped: a request reached the main slot first")
+            if ((int(getattr(llm, "foreground_requests", 0) or 0) > 0
+                    or int(getattr(llm, "_main_streams_open", 0) or 0) > 0)
+                    and await asyncio.to_thread(_head_saves.slot_tokens, base) != prompt):
+                # §4RW: on screen — the next quiet re-warm has to make this file.
+                # Review: a request that is live but has not reached the slot yet
+                # leaves exactly the head there — saved (a call posted meanwhile
+                # runs first in llama, and the save's exact count refuses it)
+                pretty_log("Head Disk", "head not saved — a request reached the main slot first; "
+                           "the next quiet re-warm saves it", icon=Icons.HEAD_FAIL)
                 return
             ok, detail = await asyncio.to_thread(
                 _head_saves.save, base, d, key, prompt, hs.get("identity", ""))
             if ok:
                 pretty_log(
-                    "Main Prefix Warmup",
-                    f"saved the head to disk ({detail}) — after a restart or a displacement "
-                    f"it comes back in under a second instead of re-processing",
-                    icon=Icons.HEAD_DISK, durable_only=True,
+                    "Head Disk",
+                    f"saved the head ({detail}) — after a restart or a displacement it comes "
+                    f"back in under a second",
+                    icon=Icons.HEAD_SAVE, durable_only=True,
                 )
             elif not _head_saves.supported(base):
-                pretty_log("Main Prefix Warmup",
+                pretty_log("Head Disk",
                            "head saves off: llama-server was started without --slot-save-path",
-                           icon=Icons.WARN)
+                           icon=Icons.HEAD_FAIL)
             else:
-                logger.info("head save not kept: %s", detail)
+                pretty_log("Head Disk", f"head not saved ({detail})", icon=Icons.HEAD_FAIL)
         except Exception as e:  # noqa: BLE001
             logger.debug("head save skipped: %s: %s", type(e).__name__, e)
+
+    def _note_llama_restart(self, total: Optional[int]) -> None:
+        """§4RW-e (review): llama's prompt_tokens_total only falls when it
+        restarted. Its slot is then empty, but the record still named the
+        conversation that owned it — its next request skipped the restore
+        from its file and re-read everything."""
+        if not isinstance(total, int):
+            return
+        seen = getattr(self, "_llama_tokens_seen", None)
+        self._llama_tokens_seen = total
+        if isinstance(seen, int) and total < seen:
+            self._forget_slot_owner("llama restarted")
+
+    def _forget_slot_owner(self, why: str) -> None:
+        """The slot holds no conversation and no head: say so to the record."""
+        from .llm import release_slot_session
+        llm = getattr(getattr(self, "context", None), "llm_client", None)
+        if llm is None:
+            return
+        if getattr(llm, "_slot_session", None):
+            logger.info("head disk: %s — the slot record names no conversation now", why)
+            release_slot_session(llm)
+        llm._head_displaced = True
+        llm._head_displaced_by = why
 
     async def _main_slot_metrics(self) -> Tuple[Optional[int], Optional[int]]:
         """(requests_processing, prompt_tokens_total) from the main node's
@@ -14876,6 +15839,7 @@ class GhostAgent:
                 logger.debug("main-prefix re-warm: skipped, a request is live")
                 continue
             proc, total = await _metrics()
+            self._note_llama_restart(total)
             if proc is not None and proc > 0:
                 logger.debug("main-prefix re-warm: skipped, main slot busy (%d in flight)", proc)
                 # §4OT r4: a slot busy longer than a period (a wedged slot, an
@@ -14898,6 +15862,12 @@ class GhostAgent:
                 logger.info("main-prefix re-warm: skipped, an outside call's state stays in the slot "
                             "until a call needs the head")
                 last_total = total
+                continue
+            # §4RU: the members' head file, made while nobody is waiting — before
+            # the "nothing ran" skip (review 10-27: after member-only traffic
+            # every later tick skipped there and the file was never made)
+            if await self._member_head_refresh():
+                last_total = None
                 continue
             # §4OT r3: a NAMED displacement skips the "nothing ran" check —
             # llama counts a prompt while it is still generating, so the
@@ -14975,9 +15945,11 @@ class GhostAgent:
                     return str(getattr(llm, "_head_displaced_by", "") or "unlabelled")
                 return ""
 
-    # Allowlist of phrases that the trivial fast path is safe to intercept.
-    # Anything not on this list (even a 1-word "test") falls through to the
-    # full turn loop. The list is intentionally tight on **action verbs**
+    # Allowlist of a pure greeting / acknowledgement: such a message skips
+    # memory hydration and the verifier (it was also the gate of the greeting
+    # fast path, removed §4RP-c). Anything not on this list (even a 1-word
+    # "test") is a real request. The list is intentionally tight on
+    # **action verbs**
     # but generous on **pure-greeting filler words** (there/friend/buddy/
     # everyone/ghost/you/etc.) so common conversational openings like
     # "hello there", "hi friend", "hey ghost" don't get pushed into the
@@ -14999,8 +15971,7 @@ class GhostAgent:
         "👍", "❤️", "🙏", "😊", "🙂",
     })
     #: §4LE: Greek greetings/acks (accent-folded — the check folds the
-    #: message the same way). The fast path fired 5× in a week: every Greek
-    #: "γεια" or "ευχαριστώ" paid the full path (~3.7 s, two LLM calls).
+    #: message the same way).
     _STRICT_GREETING_TOKENS_EL = frozenset({
         "γεια", "σου", "σας", "χαιρετω", "καλημερα", "καλησπερα", "καληνυχτα",
         "ευχαριστω", "ευχαριστουμε", "πολυ", "ενταξει", "οκ", "τελεια", "ωραια",
@@ -15058,10 +16029,12 @@ class GhostAgent:
         return all(tok in cls._STRICT_GREETING_TOKENS or tok in cls._STRICT_GREETING_TOKENS_EL
                    for tok in tokens)
 
-    # Request ids the trivial fast path answered, bounded (2026-09-05, §4EX).
-    # Those turns write NO trajectory by design, so /api/feedback can never
-    # resolve them — before this the web UI offered thumbs on every greeting
-    # and each tap came back "no trajectory found". The chat route reads
+    # Request ids the system answered without a model turn, bounded
+    # (2026-09-05, §4EX; then the greeting fast path, removed §4RP-c — now an
+    # owner command §4PY or a member's post link §4QE). Those turns write NO
+    # trajectory, so /api/feedback can never resolve them — before this the
+    # web UI offered thumbs and each tap came back "no trajectory found".
+    # The chat route reads
     # `is_trivial_reply(req_id)` to stamp `ghost.labelable = false` on the
     # reply's SSE frames; app.js then renders no thumbs. Lazily created so
     # the constructor (and every test that builds a bare Agent) is untouched.
@@ -15080,157 +16053,10 @@ class GhostAgent:
             ids.pop(next(iter(ids)))
 
     def is_trivial_reply(self, req_id: str) -> bool:
-        """True when ``req_id`` was answered by the trivial fast path — a
-        reply with no trajectory behind it, hence nothing to label."""
+        """True when ``req_id`` was answered by the system without a model
+        turn — a reply with no trajectory behind it, hence nothing to label."""
         ids = getattr(self, "_trivial_req_ids", None)
         return isinstance(ids, dict) and str(req_id or "") in ids
-
-    async def _handle_trivial_chat(self,
-                                   last_user_content: str,
-                                   messages: List[Dict[str, Any]],
-                                   model: str,
-                                   stream_response: bool,
-                                   req_id: str):
-        """Fast path for `is_trivial_greeting` requests.
-
-        Returns the standard ``(content, created_time, req_id)`` tuple on
-        success, or ``None`` if the fast path declines (which makes the
-        caller fall through to the full turn loop). We decline if anything
-        about the request looks unsafe to short-circuit (no LLM client,
-        unparsable history, LLM call failed, etc.).
-
-        IMPORTANT: this method ALWAYS returns ``content`` as a plain string
-        even for streaming requests. The route layer's ``stream_openai``
-        helper handles SSE-wrapping the string for streaming clients
-        (`api/routes.py:163`). Returning a custom async generator here
-        risked closure / iterator-lifecycle bugs and is no longer used.
-        The trade-off: streaming clients see the response after the model
-        finishes (~300ms total) rather than token-by-token, but the entire
-        response is short by definition (256 tokens max), so the perceived
-        difference is negligible — and the path is now bug-free."""
-        if self.context.llm_client is None:
-            return None
-
-        created_time = int(datetime.datetime.now().timestamp())
-
-        # A pared-down system prompt: just persona + profile snapshot.
-        # NO tool schemas, NO dynamic state, NO skill playbook. The model
-        # is being asked to respond conversationally; tools cannot help.
-        try:
-            profile_context = await asyncio.to_thread(
-                self.context.profile_memory.get_context_string
-            ) if self.context.profile_memory else ""
-        except Exception:
-            profile_context = ""
-        profile_context = (profile_context or "").replace("\r", "")
-        if requester_is_member():
-            profile_context = _MEMBER_PROFILE_PLACEHOLDER   # a member's greeting gets the boundary, not the profile
-        elif reply_is_public():
-            profile_context = _public_profile(profile_context)
-
-        profile_block = ""
-        if profile_context:
-            profile_block = "### USER PROFILE ###\n" + profile_context + "\n"
-        lite_system = (
-            "You are Ghost, a concise conversational AI. The user has sent a "
-            "short greeting or trivial message. Reply warmly, in one or two "
-            "sentences, in the language the user wrote in. Do NOT call any "
-            "tools. Do NOT mention internal state. Do NOT preface with "
-            "filler.\n\n"
-            + profile_block
-        )
-
-        # Keep only the last few user/assistant turns so the model has a tiny
-        # bit of conversational context. Drop tool messages and system slots.
-        history_tail = [
-            m for m in messages[-12:]
-            if m.get("role") in ("user", "assistant")
-        ]
-
-        req_messages = [{"role": "system", "content": lite_system}]
-        for m in history_tail:
-            content_val = m.get("content", "")
-            if isinstance(content_val, list):
-                content_val = " ".join(
-                    block.get("text", "") for block in content_val
-                    if isinstance(block, dict) and block.get("type") == "text"
-                )
-            req_messages.append({"role": m["role"], "content": str(content_val)})
-
-        if not req_messages or req_messages[-1].get("role") != "user":
-            req_messages.append({"role": "user", "content": last_user_content})
-
-        # Disable thinking for the trivial path. This is a Qwen-style
-        # reasoning model: left to its own devices it spends the whole
-        # `max_tokens` budget on a `<think>` block and returns an EMPTY
-        # `content` field — exactly the bug that made every greeting fall
-        # through to the full turn loop. Chain-of-thought cannot improve a
-        # "hi"/"thanks" reply, so we suppress it via BOTH switches the model
-        # honours: the `enable_thinking` chat-template flag AND the portable
-        # `/no_think` soft-switch appended to the user message (see the
-        # NON_THINKING_* notes at the top of this module).
-        last_msg = req_messages[-1]
-        if not str(last_msg.get("content", "")).rstrip().endswith("/no_think"):
-            last_msg["content"] = f"{last_msg.get('content', '')} /no_think".strip()
-
-        payload = {
-            "model": model,
-            "messages": req_messages,
-            "max_tokens": 256,
-            "stream": False,
-            "chat_template_kwargs": {"enable_thinking": False},
-            **NON_THINKING_GENERAL_PARAMS,
-        }
-
-        pretty_log(
-            "Trivial Fast Path",
-            f"Bypassing turn loop ({'stream' if stream_response else 'sync'})",
-            icon=Icons.OK,
-        )
-
-        # Tag the heartbeat both before and after the LLM call so the
-        # biological watchdog never spuriously fires mid-bypass.
-        self._heartbeat()
-
-        try:
-            data = await self.context.llm_client.chat_completion(payload, task_label="greeting fast path")
-        except Exception as e:
-            logger.error(f"Trivial fast path LLM call failed: {e}")
-            return None  # fall through to full path
-
-        try:
-            msg = (data.get("choices") or [{}])[0].get("message", {}) or {}
-            content = msg.get("content") or ""
-            # Reasoning models return their chain-of-thought in a separate
-            # `reasoning_content` field. Even with thinking disabled, a model
-            # can occasionally route the whole reply there and leave `content`
-            # empty. Mirror the full path (agent.py ~4106): fold reasoning in
-            # so the <think>-stripper below can recover any text after it.
-            reasoning = msg.get("reasoning_content")
-            if reasoning:
-                content = f"<think>\n{reasoning}\n</think>\n{content}"
-        except Exception as e:
-            logger.error(f"Trivial fast path response parse failed: {e}")
-            return None
-
-        # Strip <think>...</think> preamble (closed or not) so the user sees
-        # only the visible reply. The unclosed variant matters: if the model
-        # was cut off mid-thought, everything after the last </think> — or
-        # nothing — is the real answer.
-        content = re.sub(
-            r"<think>.*?(?:</think>|$)", "", content, flags=re.DOTALL | re.IGNORECASE
-        ).strip()
-
-        # If, after stripping, the model gave us nothing usable, fall through
-        # so the full path can take a second crack at it.
-        if not content:
-            logger.warning("Trivial fast path returned empty content; falling through to full path")
-            return None
-
-        self._heartbeat()
-        pretty_log("Trivial Fast Path", f"Resolved in {len(content)} chars", icon=Icons.OK)
-
-        return content, created_time, req_id
 
     # Max bounded VERIFIER-GATE AUTO-REPAIR rounds per request. When the
     # verifier REFUTES the final answer (or it finalised on an unverified
@@ -17301,7 +18127,7 @@ class GhostAgent:
     @staticmethod
     def _compose_injection(req_messages, stable_injection, dynamic_state, pin,
                            pending_request=None, first_user_is_request=False,
-                           sections=None, anchor=None):
+                           sections=None, anchor=None, stable_label=False):
         """Place the per-turn stable + volatile context into ``req_messages``.
 
         Returns the (mutated) list. ``pending_request`` is the CURRENT
@@ -17333,6 +18159,11 @@ class GhostAgent:
         the request was already shown are re-inserted where they were first
         shown and only the changed sections are appended — see
         ``STATE_ANCHOR_ENV``.
+
+        §4RV: ``stable_label`` — the first message's label is
+        ``_CONVERSATION_START_LABEL`` on every request (the instruction label
+        on a conversation's first request turned into it on the second, so the
+        follow-up's prompt left the kept one right after the head).
         """
         def _prefix_content(existing, prefix_text):
             """Prepend injection text to message content that may be a STRING
@@ -17389,8 +18220,9 @@ class GhostAgent:
             req_messages[first_user_idx]["content"] = _prefix_content(
                 _first,
                 f"{stable_block}\n\n"
-                + _carrier_label(_first, pending_request, _CONVERSATION_START_LABEL,
-                                 holds_request=first_user_is_request),
+                + (_CONVERSATION_START_LABEL if stable_label else
+                   _carrier_label(_first, pending_request, _CONVERSATION_START_LABEL,
+                                  holds_request=first_user_is_request)),
             )
         # The volatile block ALWAYS rides its own trailing message — it is
         # never folded into an existing one.
@@ -19299,11 +20131,9 @@ class GhostAgent:
 
         Earlier this injected a system note asking the model to open with the
         correction — but the model reliably ignored it (it judged an unrelated
-        correction irrelevant to the new question, and the trivial-chat fast
-        path dropped it entirely). So the banner is now prepended to the
-        response text directly (see ``_take_active_correction``), and a turn
-        flag skips the trivial fast path (which returns via its own route and
-        would bypass the prepend). Returns ``messages`` unchanged.
+        correction irrelevant to the new question). So the banner is now
+        prepended to the response text directly (see
+        ``_take_active_correction``). Returns ``messages`` unchanged.
         """
         corrections = getattr(self, "_pending_corrections", None)
         self._active_correction = ""
@@ -19322,7 +20152,6 @@ class GhostAgent:
             self._pending_corrections = list(corrections)
             self._save_pending_corrections()
         if not corrections:
-            self._correction_active_this_turn = False
             return messages
         # §4LG: a "previous answer" needs a previous answer in THIS thread. A
         # fresh chat that repeats an earlier first message shares its
@@ -19336,7 +20165,6 @@ class GhostAgent:
                 c for c in corrections
                 if not (isinstance(c, dict) and (_now - c.get("ts", _now)) > _correction_ttl(c))]
             self._save_pending_corrections()
-            self._correction_active_this_turn = False
             return messages
 
         now = time.monotonic()
@@ -19388,7 +20216,6 @@ class GhostAgent:
         # conversation, bounded by the cap; drop everything else.
         self._pending_corrections = _trim_corrections(kept)
         self._save_pending_corrections()
-        self._correction_active_this_turn = bool(surface)
         if not surface:
             return messages
 
@@ -19571,7 +20398,12 @@ class GhostAgent:
                         _node_key(getattr(getattr(self.context, "llm_client", None), "upstream_url", "")))
                     if default:
                         from . import turn_facts as _tf
-                        _tf.record(self.context, str(req_id or ""), reasoning_effort=default,
+                        from ..utils.logging import effort_icon
+                        rid = str(req_id or "")
+                        if _tf.facts_for(self.context, rid).get("reasoning_effort") != default:   # once per request
+                            pretty_log("Reasoning Effort", f"{default} — the server default",
+                                       icon=effort_icon(default))
+                        _tf.record(self.context, rid, reasoning_effort=default,
                                    reasoning_effort_default=True)
                 return payload
             out = _effort.apply(payload, level)
@@ -19581,7 +20413,8 @@ class GhostAgent:
                 from . import turn_facts as _tf
                 rid = str(req_id or "")
                 if _tf.facts_for(self.context, rid).get("reasoning_effort") != level:   # once per request
-                    pretty_log("Reasoning Effort", f"{level} — set for this request", icon=Icons.BRAIN_EFFORT)
+                    from ..utils.logging import effort_icon
+                    pretty_log("Reasoning Effort", f"{level} — picked for this request", icon=effort_icon(level))
                 _tf.record(self.context, rid, reasoning_effort=level)
             return out
         except Exception as exc:  # noqa: BLE001 — never block a turn on this
@@ -19632,7 +20465,7 @@ class GhostAgent:
             due[rid] = str(why)
             while len(due) > 32:                       # a request that ended before its next turn
                 due.pop(next(iter(due)))
-            pretty_log("Reasoning Effort", f"xhigh from the next thinking turn — {why}", icon=Icons.BRAIN_EFFORT)
+            pretty_log("Reasoning Effort", f"xhigh from the next thinking turn — {why}", icon=Icons.EFFORT_XHIGH)
         except Exception as exc:  # noqa: BLE001 — never block a turn on this
             logger.debug("effort escalation skipped: %s", exc)
 
@@ -28239,7 +29072,7 @@ class GhostAgent:
                 # started" is logged only once the lock is held
                 pretty_log("Turn Queue", f"[{str(req_id)[:8]}] waiting for the turn in progress to finish",
                            icon=Icons.RETRY)
-            async with self.agent_semaphore:
+            async with self._turn_lock(req_id):
                 _turn_reg.mark_running(req_id)
                 # A cancel that landed while we were queued: stop before doing
                 # any work (the flag is set; the task may not have been killed
@@ -28793,52 +29626,11 @@ class GhostAgent:
 
                 is_conversational = not has_coding_intent and not is_meta_task and not has_action_verb
 
-                # OPTIMIZATION: Detect trivial greetings to bypass heavy processing
-                is_trivial_greeting = (
-                    is_conversational and
-                    len(lc.split()) <= 5 and
-                    "remember" not in lc and
-                    "previous" not in lc
-                )
-
-                # ============================================================
-                # ARCHITECTURAL OPTIMISATION #3: TRIVIAL-REQUEST FAST PATH
-                # ------------------------------------------------------------
-                # A "hi", "thanks", "ok cool" used to traverse the entire
-                # turn loop: prune_context + tool schema gen + skill recall +
-                # planner gate + KV-cache rebuild, even though none of it can
-                # affect the response. This bypass collapses ~2.5s of work
-                # into ~300ms by skipping straight to one tool-less LLM call.
-                #
-                # We use a STRICT greeting detector (match against an
-                # explicit allowlist) — `is_trivial_greeting` alone is too
-                # broad: it fires on any 5-word conversational message and
-                # would intercept legitimate tool-bearing requests.
-                # ============================================================
-                if (is_trivial_greeting and last_user_content
-                        and self._is_strict_trivial_chat(lc)
-                        and not getattr(self, "_correction_active_this_turn", False)
-                        and not _owner_rule_banner_ctx.get()):
-                    fast_result = await self._handle_trivial_chat(
-                        last_user_content=last_user_content,
-                        messages=messages,
-                        model=model,
-                        stream_response=stream_response,
-                        req_id=req_id,
-                    )
-                    if fast_result is not None:
-                        # No trajectory is written for this reply (a
-                        # greeting is not corpus material), so nothing a
-                        # thumb could label: remember the id so the route
-                        # can mark the frames and the UI shows no thumbs.
-                        self._note_trivial_reply(req_id)
-                        await self._census_fast(req_id, fast_result[0])   # §4PM
-                        return fast_result
-
-                # §4QN: only a STRICT greeting/ack skips memory. `is_trivial_greeting`
-                # is ANY ≤5-word conversational message — "where do i live ?",
-                # "what's my dogs name ?", "news", "weather" — and none of them reached
-                # a single memory tier (§4QM operator item 1; hydration costs ~0.6 s).
+                # §4QN: only a STRICT greeting/ack skips memory. The old loose test
+                # (any ≤5-word conversational message, removed with the fast path,
+                # §4RP-c) also caught "where do i live ?", "what's my dogs name ?",
+                # "news", "weather" — and none of them reached a single memory tier
+                # (§4QM operator item 1; hydration costs ~0.6 s).
                 should_fetch_memory = (not is_fact_check
                                        and not self._is_strict_trivial_chat(lc)
                                        # §4KY: no private memory in a public reply
@@ -29823,7 +30615,10 @@ class GhostAgent:
                                            _repair_reentry_active):
                         force_final_response = True
                     if has_coding_intent:
-                        _ds_parts.append(("sandbox_state", f"CURRENT SANDBOX STATE:\n{sandbox_state}\n\n"))
+                        # §4RW-d (review): keyed by project — a switch mid-request lists
+                        # another root, which goes whole, not as a diff against the old one
+                        _ds_parts.append((f"sandbox_state:{getattr(self.context, 'current_project_id', None) or ''}",
+                                          f"CURRENT SANDBOX STATE:\n{sandbox_state}\n\n"))
 
                     # Rewrite any leaked HOST-absolute sandbox path (from a
                     # recalled memory / scratchpad / workspace narrative) to its
@@ -29853,7 +30648,7 @@ class GhostAgent:
                     if _effort_note:
                         messages.append({"role": "user", "content": _effort_note})
                         pretty_log("Reasoning Effort", f"xhigh note placed — turn {turn+1} thinks at xhigh",
-                                   icon=Icons.BRAIN_EFFORT)
+                                   icon=Icons.EFFORT_XHIGH)
                     req_messages = []
                     for m in messages:
                         if m.get("role") == "tool":
@@ -29949,6 +30744,7 @@ class GhostAgent:
                     #   (b) the final-gen directive — see above.
                     # Unpinned mode keeps the exact original composition (cache is
                     # not a concern there, and the existing layout tests pin it).
+                    _stable_first = _pin_stable and _stable_first_message()   # §4RV
                     if _pin_stable:
                         _stable_injection = f"{tool_header_block}\n\n{active_persona}{fetched_context}{_continuity_tail}"
                         _volatile_prefix = ""
@@ -29958,6 +30754,16 @@ class GhostAgent:
                             _volatile_prefix += fetched_playbook
                         dynamic_state = _volatile_prefix + dynamic_state
                         _ds_sections = _state_sections_pinned(_ds_sections, _final_gen_directive, fetched_playbook)
+                        if _stable_first:
+                            # §4RV: the first message is the same on every request
+                            # of a conversation; what each request brings (thinking
+                            # depth, persona, recalled memory, workspace notes)
+                            # opens the state block at the end instead
+                            _stable_injection, _req_ctx = _split_request_context(
+                                tool_header_block, render_think_budget_guidance(think_budget),
+                                active_persona, fetched_context, continuity_text)
+                            dynamic_state = "".join(_req_ctx.values()) + dynamic_state
+                            _ds_sections = {**_req_ctx, **_ds_sections}
                     else:
                         _stable_injection = f"{tool_header_block}\n\n{active_persona}{fetched_playbook}{fetched_context}{_continuity_tail}"
                     # Measurement hook: a stable hash across a request's turns
@@ -30058,6 +30864,7 @@ class GhostAgent:
                         first_user_is_request=_one_user_message_arrived,
                         sections=_ds_sections if _anchor is not None else None,
                         anchor=_anchor,
+                        stable_label=_stable_first,
                     )
                     if _anchor is not None:
                         pretty_log("Prefill Cache",
@@ -33434,8 +34241,8 @@ class GhostAgent:
                 created_time, req_id)
 
     async def _census_fast(self, req_id, reply, kind: str = "fast") -> None:
-        """§4PM: the census's only trace of a turn the trivial fast path
-        answered (it writes no trajectory). Owner turns only (the census
+        """§4PM: the census's only trace of a turn the system answered without
+        a model turn (it writes no trajectory). Owner turns only (the census
         decides); off the event loop; never raises."""
         try:
             from . import failure_census as _fc

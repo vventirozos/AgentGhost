@@ -299,21 +299,21 @@ def test_consume_corrections_noop_when_empty(agent):
     assert agent._take_active_correction() == ""
 
 
-def test_consume_sets_turn_flag_to_skip_trivial_path(member_turn, agent):
-    """A pending correction sets the turn flag so the trivial-chat fast path
-    (which returns via its own route and would bypass the prepend) is skipped;
-    no pending → flag off."""
+def test_consume_stages_the_banner_only_when_one_surfaces(member_turn, agent):
+    """A pending correction for this conversation stages the banner; no
+    pending → nothing staged. (The turn flag it once set only kept the
+    greeting fast path off; both were removed, §4RP-c.)"""
     _m = [{"role": "assistant", "content": "earlier answer"}, {"role": "user", "content": "q"}]
     agent._pending_corrections = [{"member": True, "note": "prev answer was truncated",
                                    "conv": agent._conversation_fingerprint(_m)}]
     with patch("ghost_agent.core.agent.pretty_log"):
         agent._consume_pending_corrections(_m)
-    assert agent._correction_active_this_turn is True
+    assert agent._take_active_correction()
 
     agent._pending_corrections = []
     with patch("ghost_agent.core.agent.pretty_log"):
         agent._consume_pending_corrections([{"role": "assistant", "content": "earlier answer"}, {"role": "user", "content": "q"}])
-    assert agent._correction_active_this_turn is False
+    assert agent._take_active_correction() == ""
 
 
 # --------------------------------------------------------------------------
@@ -485,7 +485,6 @@ def test_correction_surfaces_only_in_originating_conversation(member_turn, agent
     with patch("ghost_agent.core.agent.pretty_log"):
         agent._consume_pending_corrections(_msgs("unrelated question in B"))
     assert agent._take_active_correction() == ""
-    assert agent._correction_active_this_turn is False
     assert len(agent._pending_corrections) == 1  # held for conversation A
 
     # A's own next turn surfaces it and clears it.

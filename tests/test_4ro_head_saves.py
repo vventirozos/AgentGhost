@@ -20,6 +20,7 @@ import pytest
 
 from ghost_agent.core import head_saves as H
 from ghost_agent.core import llm as L
+from ghost_agent.utils.logging import Icons
 
 pytestmark = pytest.mark.asyncio
 
@@ -31,6 +32,12 @@ def _clean(monkeypatch, tmp_path):
     monkeypatch.delenv(H.ENV, raising=False)
     monkeypatch.setenv("GHOST_HOME", str(tmp_path))
     H._unsupported.clear()
+
+    def _no_live_llama(url, body=None, timeout=5.0):
+        # review 10-27: a test that forgot its stub posted a real slot save to
+        # the live llama (a 1.7 GB .part file in the live directory)
+        raise AssertionError(f"test reached the network: {url}")
+    monkeypatch.setattr(H, "_http", _no_live_llama)
     yield
     H._unsupported.clear()
 
@@ -151,6 +158,18 @@ def test_restore_asks_for_the_file_name_and_checks_the_count(monkeypatch, tmp_pa
     ok, detail, _ = H.restore(BASE, d, "k")
     assert ok and "28213" in detail
     assert calls == [(BASE + "/slots/0?action=restore", {"filename": "head-k.bin"})]
+
+
+def test_a_restore_marks_the_file_used(monkeypatch, tmp_path):
+    """§4RW-e (review): prune keeps by last use, and the head every boot
+    restores was never marked used — the oldest save, so the first pruned."""
+    import os
+    d = _dir(tmp_path)
+    _store(d, "k")
+    os.utime(d / "head-k.json", (1000, 1000))
+    monkeypatch.setattr(H, "_http", lambda *a, **k: {"n_restored": 28213})
+    assert H.restore(BASE, d, "k")[0]
+    assert (d / "head-k.json").stat().st_mtime > 1000
 
 
 def test_a_restore_with_the_wrong_count_is_discarded(monkeypatch, tmp_path):
@@ -389,6 +408,9 @@ def warm(mock_context, monkeypatch, tmp_path):
     from ghost_agent.core.agent import GhostAgent
     monkeypatch.setenv(H.ENV, "1")
     monkeypatch.delenv("GHOST_MAIN_PREFIX_REWARM_S", raising=False)   # the loop on (180 s)
+    # §4RU-r: the switch waits for a busy slot up to the hook's bound less the
+    # restore's — 1 s here, so a slot that stays busy gives up quickly
+    monkeypatch.setattr(L, "BEFORE_MAIN_DISPATCH_S", H.RESTORE_TIMEOUT_S + 3.0)
     llm = MagicMock()
     llm.upstream_url = BASE + "/v1"
     llm.foreground_requests = 0
@@ -404,7 +426,7 @@ def warm(mock_context, monkeypatch, tmp_path):
     st["busy"] = False
     monkeypatch.setattr(H, "slot_busy", lambda base: st["busy"])
 
-    def park(base):
+    def park(base, timeout=H.PARK_TIMEOUT_S):
         st["order"].append("park")
         if st.get("request_during_park"):
             llm.foreground_requests = 1
@@ -425,7 +447,11 @@ def warm(mock_context, monkeypatch, tmp_path):
         return (True, f"{n} tokens, 1.73 GB")
     monkeypatch.setattr(H, "restore", restore)
     monkeypatch.setattr(H, "save", save)
-    monkeypatch.setattr(A, "pretty_log", lambda title, msg=None, **kw: st["lines"].append(str(msg)))
+    def _log(title, msg=None, **kw):
+        st["lines"].append(str(msg))
+        st["logged"].append((title, str(msg), kw.get("icon")))     # §4RW: the icon per event
+    st["logged"] = []
+    monkeypatch.setattr(A, "pretty_log", _log)
 
     async def cc(payload, **kw):
         st["kw"] = kw
@@ -448,6 +474,7 @@ async def _warm_with_file(agent, st, **kw):
     st["restores"].clear()
     st["saves"].clear()
     st["lines"].clear()
+    st["logged"].clear()
     st["order"].clear()
     await agent.warm_up_main_prefix(**kw)
 
@@ -456,6 +483,7 @@ async def test_the_first_warmup_saves_the_head(warm):
     agent, llm, st = warm
     await agent.warm_up_main_prefix(quiet=True)
     assert st["saves"] == [28213] and not st["restores"] and st["sent"] == 1
+    assert [(t, i) for t, m, i in st["logged"] if "saved the head" in m] == [("Head Disk", Icons.HEAD_SAVE)]   # §4RW
 
 
 async def test_with_no_file_yet_a_kept_conversation_is_not_prefilled_over(warm):
@@ -488,6 +516,8 @@ async def test_a_slot_holding_anything_else_is_parked_then_restored(warm, label)
     await _warm_with_file(agent, st, quiet=True, displaced_by=label)
     assert st["order"] == ["park", "restore"]
     assert any("parked in llama's RAM cache first" in m for m in st["lines"])
+    assert any(i == Icons.HEAD_RESTORE and t == "Head Disk" for t, m, i in st["logged"]
+               if "restored the head" in m)                                    # §4RW
 
 
 async def test_a_park_that_fails_restores_nothing_and_sends_nothing(warm):
@@ -643,12 +673,20 @@ async def test_a_prefill_overwrites_a_stale_file(warm):
 async def test_no_save_while_a_request_holds_the_slot(warm):
     agent, llm, st = warm
     llm.foreground_requests = 1
+    st["slot"] = 30500                                   # the request's call reached it
     await agent.warm_up_main_prefix(quiet=True)
     assert not st["saves"]
-    llm.foreground_requests = 0
-    llm._main_streams_open = 1
+    assert any(i == Icons.HEAD_FAIL and "head not saved" in m for t, m, i in st["logged"])
+
+
+async def test_a_live_request_that_has_not_reached_the_slot_lets_the_head_be_saved(warm):
+    """§4RW review: the slot still holds exactly the head — saving it is safe
+    (llama's exact count refuses a call that slipped in first)."""
+    agent, llm, st = warm
+    llm.foreground_requests = 1
+    st["slot"] = 28213
     await agent.warm_up_main_prefix(quiet=True)
-    assert not st["saves"]
+    assert st["saves"] == [28213]
 
 
 async def test_a_failed_restore_says_so_and_saves_again(warm, monkeypatch):
@@ -663,7 +701,8 @@ async def test_a_failed_restore_says_so_and_saves_again(warm, monkeypatch):
     monkeypatch.setattr(H, "restore", bad_restore)
     st["saves"].clear()
     await agent.warm_up_main_prefix(quiet=True, displaced_by="x")
-    assert any("head restore from disk failed (Unable to restore slot)" in m for m in st["lines"])
+    assert any("head restore failed (Unable to restore slot)" in m for m in st["lines"])
+    assert [i for t, m, i in st["logged"] if "head restore failed" in m] == [Icons.HEAD_FAIL]   # §4RW
     assert st["saves"] == [28213] and list(d.glob("head-*.bin"))
 
 
@@ -684,6 +723,7 @@ async def test_a_server_without_slot_saves_turns_it_off_with_one_line(warm, monk
     await agent.warm_up_main_prefix(quiet=True)
     await agent.warm_up_main_prefix(quiet=True)
     assert sum("started without --slot-save-path" in m for m in st["lines"]) == 1
+    assert [i for t, m, i in st["logged"] if "--slot-save-path" in m] == [Icons.HEAD_FAIL]      # §4RW
 
 
 async def test_a_plan_failure_never_breaks_the_warmup(warm, monkeypatch):
@@ -906,7 +946,8 @@ async def test_the_boot_warmup_says_when_it_defers(warm):
     st["busy"] = True
     await _warm_with_file(agent, st, quiet=False)
     assert st["sent"] == 0
-    assert any("head restore deferred (the main slot is in use" in m for m in st["lines"])
+    assert any("head restore deferred — the main slot is in use" in m for m in st["lines"])
+    assert [i for t, m, i in st["logged"] if "deferred" in m] == [Icons.HEAD_DEFER]            # §4RW
 
 
 async def test_deferrals_in_a_row_show_once_on_screen(warm):
@@ -937,7 +978,7 @@ async def test_the_boot_warmup_says_when_a_park_fails(warm):
     st["park_ok"] = False
     await _warm_with_file(agent, st, quiet=False)
     assert st["sent"] == 0
-    assert any("head restore deferred (could not park the slot first" in m for m in st["lines"])
+    assert any("head restore deferred — could not park the slot first" in m for m in st["lines"])
 
 
 # ── §4RP: the slot kept for its conversation; the head back on a switch ──
@@ -1000,12 +1041,12 @@ async def test_another_conversations_first_call_gets_the_head_back(warm, monkeyp
     assert any("restored the head before another conversation's first call" in m for m in st["lines"])
 
 
-@pytest.mark.parametrize("case", ["same", "no_owner", "no_key", "busy", "bare_head", "unknown_slot", "off"])
+@pytest.mark.parametrize("case", ["same", "no_key", "busy", "bare_head", "unknown_slot", "off"])
 async def test_the_switch_does_nothing_when_it_would_not_help(warm, monkeypatch, case):
     agent, llm, st = warm
     await _warm_with_file(agent, st, quiet=True)
     st["order"].clear()
-    kw = {"same": {"key": "sess-a"}, "no_owner": {"owner": None}, "no_key": {"key": ""},
+    kw = {"same": {"key": "sess-a"}, "no_key": {"key": ""},
           "busy": {"busy": True}, "bare_head": {"slot": 28213}, "unknown_slot": {"slot": None},
           "off": {}}[case]
     _switch_env(agent, llm, st, monkeypatch, **kw)
@@ -1013,6 +1054,63 @@ async def test_the_switch_does_nothing_when_it_would_not_help(warm, monkeypatch,
         monkeypatch.delenv(H.ENV)
     await agent._slot_switch_before(_turn(st))
     assert st["order"] == []
+
+
+async def test_the_same_conversations_next_request_gets_the_head_back(warm, monkeypatch):
+    """§4RP-b, req 5a58a6ca: a follow-up's first message is relabelled, so
+    its prompt leaves the kept one just past the head — with the head's
+    checkpoint pushed out llama re-processed all 30k tokens (206 s)."""
+    from ghost_agent.utils.logging import request_id_context
+    agent, llm, st = warm
+    await _warm_with_file(agent, st, quiet=True)
+    st["order"].clear()
+    st["lines"].clear()
+    _switch_env(agent, llm, st, monkeypatch, key="sess-a")
+    llm._slot_request = "req-1"
+    tok = request_id_context.set("req-1")
+    try:
+        await agent._slot_switch_before(_turn(st))
+        assert st["order"] == []                       # the holding request's own calls keep it
+        request_id_context.set("req-2")
+        await agent._slot_switch_before(_turn(st))
+        assert st["order"] == ["restore"]
+        assert llm._slot_session is None and llm._slot_request is None
+        assert any("restored the head before this conversation's next request" in m for m in st["lines"])
+    finally:
+        request_id_context.reset(tok)
+
+
+@pytest.mark.parametrize("held_by", [None, ""])
+async def test_an_unknown_holding_request_keeps_the_slot(warm, monkeypatch, held_by):
+    from ghost_agent.utils.logging import request_id_context
+    agent, llm, st = warm
+    await _warm_with_file(agent, st, quiet=True)
+    st["order"].clear()
+    _switch_env(agent, llm, st, monkeypatch, key="sess-a")
+    llm._slot_request = held_by
+    tok = request_id_context.set("req-2")
+    try:
+        await agent._slot_switch_before(_turn(st))
+    finally:
+        request_id_context.reset(tok)
+    assert st["order"] == []
+
+
+async def test_a_failed_restore_for_the_next_request_names_it(warm, monkeypatch):
+    from ghost_agent.utils.logging import request_id_context
+    agent, llm, st = warm
+    await _warm_with_file(agent, st, quiet=True)
+    st["lines"].clear()
+    _switch_env(agent, llm, st, monkeypatch, key="sess-a")
+    llm._slot_request = "req-1"
+    monkeypatch.setattr(H, "restore", lambda base, d, key: (False, "Unable to restore", 0.1))
+    tok = request_id_context.set("req-2")
+    try:
+        await agent._slot_switch_before(_turn(st))
+    finally:
+        request_id_context.reset(tok)
+    assert llm._slot_session == "sess-a" and llm._slot_request == "req-1"
+    assert any("head restore before this conversation's next request failed" in m for m in st["lines"])
 
 
 async def test_an_unreadable_slot_skips_the_switch(warm, monkeypatch):
@@ -1051,22 +1149,6 @@ async def test_a_call_that_does_not_open_with_the_head_gets_no_restore(warm, mon
                                                   {"role": "user", "content": "hi"}]})
     assert st["order"] == []
     assert llm._slot_session == "sess-a"
-
-
-async def test_another_requests_draining_stream_skips_the_switch(warm, monkeypatch):
-    agent, llm, st = warm
-    await _warm_with_file(agent, st, quiet=True)
-    _switch_env(agent, llm, st, monkeypatch)
-    llm._main_streams_open = 1
-    await agent._slot_switch_before(_turn(st))
-    assert st["order"] == []
-    llm._main_streams_open = 0
-    llm.foreground_requests = 2                       # review r3: another request live too
-    await agent._slot_switch_before(_turn(st))
-    assert st["order"] == []
-    llm.foreground_requests = 1                       # only this request: the switch runs
-    await agent._slot_switch_before(_turn(st))
-    assert st["order"] == ["restore"]
 
 
 async def test_no_file_for_the_current_head_restores_nothing(warm, monkeypatch):
@@ -1197,6 +1279,7 @@ async def test_an_outside_call_that_does_not_leave_in_time_is_waited_behind(warm
     await agent._slot_switch_before(_turn(st))
     assert st["order"] == []
     assert any("an outside call is still on the main slot" in m for m in st["lines"])
+    assert [i for t, m, i in st["logged"] if "outside call" in m] == [Icons.HEAD_FAIL]        # §4RW
 
 
 @pytest.mark.parametrize("case", ["bare_head", "not_head_call", "other_stream"])
@@ -1381,3 +1464,848 @@ def test_an_end_after_an_agent_call_since_the_start_sets_no_mark():
     note_outside_call(llm, "start", "eva_world")
     note_outside_call(llm, "end", "eva_world")
     assert outside_slot_dirty(llm)
+
+
+# ── §4RU: the channel members' head, its own file ───────────────────────
+
+def _kmeta(d, key, kind, at, identity="id", n=8000):
+    (d / f"head-{key}.bin").write_bytes(b"state")
+    m = {"n_tokens": n, "identity": identity, "saved_at": at}
+    if kind:
+        m["kind"] = kind
+    (d / f"head-{key}.json").write_text(json.dumps(m))
+
+
+def test_a_save_names_its_kind(monkeypatch, tmp_path):
+    d = _dir(tmp_path)
+    monkeypatch.setattr(H, "_http", _llama_saves(d, 8000))
+    ok, _ = H.save(BASE, d, "m1", 8000, "id", H.MEMBER)
+    assert ok and json.loads((d / "head-m1.json").read_text())["kind"] == "member"
+    assert H.kind_of(d, "m1") == H.MEMBER and H.has_kind(d, H.MEMBER)
+
+
+def test_a_head_saved_before_kinds_is_the_owners(tmp_path):
+    d = _dir(tmp_path)
+    _kmeta(d, "old", None, 100)
+    assert H.kind_of(d, "old") == H.OWNER and not H.has_kind(d, H.MEMBER)
+
+
+def test_llama_start_restores_the_owners_head_never_the_members(tmp_path):
+    d = _dir(tmp_path)
+    _kmeta(d, "own", None, 100)
+    _kmeta(d, "mem", "member", 200)                  # newer, but the members'
+    assert H.newest_head_for(d, "id") == "own"
+    assert H.newest_head_for(d, "id", H.MEMBER) == "mem"
+
+
+def test_prune_keeps_each_kinds_newest(tmp_path):
+    d = _dir(tmp_path)
+    now = time.time()
+    _kmeta(d, "mem", "member", 1)
+    os.utime(d / "head-mem.bin", (now - 10_000,) * 2)  # oldest file of all
+    for i in range(4):
+        _kmeta(d, f"o{i}", None, i)
+        os.utime(d / f"head-o{i}.bin", (now - 100 * (4 - i),) * 2)
+    H.prune(d, keep=3)
+    names = sorted(p.name for p in d.glob("head-*.bin"))
+    assert names == ["head-mem.bin", "head-o1.bin", "head-o2.bin", "head-o3.bin"]
+
+
+class _RS:
+    """A request state with three tools, two of them the owner's."""
+    async def get_profile_str(self):
+        return "OWNER PROFILE"
+
+    def get_active_tool_defs(self, query):
+        return [{"type": "function", "function": {"name": n}}
+                for n in ("file_system", "web_search", "image_generation", "manage_projects")]
+
+
+async def test_the_members_head_has_the_placeholder_and_only_their_tools(warm):
+    from ghost_agent.core.agent import _MEMBER_ALLOWED_TOOLS, _MEMBER_PROFILE_PLACEHOLDER
+    agent, llm, st = warm
+    agent.context.args.native_tools = True
+    agent._warm_up_effort = lambda p: {**p, "effort": "low"}
+    owner, _, _ = await agent._head_payload(_RS())
+    member, _, msys = await agent._head_payload(_RS(), member=True)
+    assert "OWNER PROFILE" in owner["messages"][0]["content"] and owner["effort"] == "low"
+    assert _MEMBER_PROFILE_PLACEHOLDER in msys and "OWNER PROFILE" not in msys
+    assert [t["function"]["name"] for t in member["tools"]] == ["web_search", "image_generation"]
+    assert all(t["function"]["name"] in _MEMBER_ALLOWED_TOOLS for t in member["tools"])
+    assert "effort" not in member                    # a member's turn runs at the default
+
+
+@pytest.fixture
+def members(warm, monkeypatch):
+    """The owner's head saved; renders tell the two heads apart; saves keep
+    their kind; the request is a channel member's."""
+    from ghost_agent.core.agent import _MEMBER_PROFILE_PLACEHOLDER
+    from ghost_agent.utils.logging import requester_role_context, request_id_context
+    agent, llm, st = warm
+    monkeypatch.setattr(H, "render", lambda base, p: (
+        "MEMBERS" if _MEMBER_PROFILE_PLACEHOLDER in p["messages"][0]["content"] else "HEAD"))
+    st["kinds"] = []
+
+    def save(base, d, key, n, ident="", kind=H.OWNER):
+        st["saves"].append(n)
+        st["kinds"].append(kind)
+        _store(d, key, n)
+        return (True, f"{n} tokens, 0.5 GB")
+    monkeypatch.setattr(H, "save", save)
+    # the member park needs ≥5 s of the deadline (§4RU-r)
+    monkeypatch.setattr(L, "BEFORE_MAIN_DISPATCH_S", H.RESTORE_TIMEOUT_S + 2.0 + 30.0)
+    tokens = [requester_role_context.set("member"), request_id_context.set("slack-1")]
+    yield agent, llm, st
+    request_id_context.reset(tokens[1])
+    requester_role_context.reset(tokens[0])
+
+
+async def _members_file(agent, llm, st):
+    await agent.warm_up_main_prefix(quiet=True)          # the owner's head saved
+    hs = await agent._member_head_plan(llm)
+    _store(hs["dir"], hs["key"], 8000)
+    st["order"].clear()
+    st["restores"].clear()
+    st["lines"].clear()
+    return hs
+
+
+def _member_turn(hs, text="hello from a member"):
+    p = dict(hs["payload"])
+    p["messages"] = list(p["messages"]) + [{"role": "user", "content": text}]
+    return p
+
+
+async def test_a_members_first_call_gets_the_members_head_back(members, monkeypatch):
+    from ghost_agent.utils.logging import request_id_context
+    agent, llm, st = members
+    hs = await _members_file(agent, llm, st)
+    _switch_env(agent, llm, st, monkeypatch, slot=28213, owner="sess-a", key="slack-thread")
+    await agent._slot_switch_before(_member_turn(hs))
+    assert st["restores"] == [hs["key"]]
+    assert llm._slot_session == "sess-a"                 # the member never owns the slot
+    assert any("restored the members' head before a channel member's request" in m for m in st["lines"])
+    assert [i for t, m, i in st["logged"] if "members' head" in m] == [Icons.HEAD_RESTORE]     # §4RW
+    await agent._slot_switch_before(_member_turn(hs, "its second call"))
+    assert st["restores"] == [hs["key"]]                 # the request's later calls keep it
+    request_id_context.set("slack-2")
+    await agent._slot_switch_before(_member_turn(hs, "the next request"))
+    assert st["restores"] == [hs["key"], hs["key"]]
+
+
+@pytest.mark.parametrize("case", ["not_members_head", "holds_it", "busy", "off"])   # no_file: §4RW makes it
+async def test_the_members_restore_does_nothing_when_it_would_not_help(members, monkeypatch, case):
+    agent, llm, st = members
+    hs = await _members_file(agent, llm, st)
+    _switch_env(agent, llm, st, monkeypatch, slot=8000 if case == "holds_it" else 28213,
+                busy=case == "busy")
+    if case == "busy":
+        monkeypatch.setattr(L, "BEFORE_MAIN_DISPATCH_S", H.RESTORE_TIMEOUT_S + 3.0)   # give up fast
+    if case == "no_file":
+        H.discard(hs["dir"], hs["key"])
+    if case == "other_stream":
+        llm._main_streams_open = 1
+    if case == "off":
+        monkeypatch.delenv(H.ENV)
+    payload = _turn(st) if case == "not_members_head" else _member_turn(hs)
+    await agent._slot_switch_before(payload)
+    assert st["restores"] == [] and st["order"] == []
+
+
+async def test_after_a_members_turn_the_owners_call_gets_the_head_back_with_no_owner(warm, monkeypatch):
+    """§4RU: the head came back (no owner), then a member's turn replaced it —
+    the owner's next call must not re-process the 28k head."""
+    agent, llm, st = warm
+    await _warm_with_file(agent, st, quiet=True)
+    st["order"].clear()
+    _switch_env(agent, llm, st, monkeypatch, owner=None, key="sess-a")
+    llm._head_displaced = True
+    await agent._slot_switch_before(_turn(st))
+    assert st["order"] == ["restore"]
+
+
+@pytest.fixture
+def quiet_agent(members):
+    import datetime as _dt
+    agent, llm, st = members
+    agent.context.last_activity_time = _dt.datetime.now() - _dt.timedelta(seconds=3600)
+    llm._slot_session = None
+    llm._outside_slot_dirty = False
+    return members
+
+
+async def test_a_quiet_agent_makes_the_members_file_then_puts_the_owners_head_back(quiet_agent):
+    from ghost_agent.utils.logging import requester_role_context
+    agent, llm, st = quiet_agent
+    requester_role_context.set("")                        # the re-warm loop's context
+    await agent.warm_up_main_prefix(quiet=True)           # the owner's head saved
+    st["saves"].clear(); st["kinds"].clear(); st["restores"].clear()
+    agent._member_head_wanted = True
+    st["resp"] = _resp(8000, 0)
+    llm._head_displaced = True
+    assert await agent._member_head_refresh() is True
+    assert st["kw"]["task_label"] == "main-prefix-members"
+    from ghost_agent.core.agent import _MEMBER_PROFILE_PLACEHOLDER
+    assert _MEMBER_PROFILE_PLACEHOLDER in st["payload"]["messages"][0]["content"]
+    assert st["kinds"] == [H.MEMBER] and st["saves"] == [8000]
+    assert st["restores"] == [agent._head_plan_last["key"]]   # the owner's head, no park
+    assert llm._head_displaced is False
+    hs = await agent._member_head_plan(llm)
+    assert hs["have"]
+    assert await agent._member_head_refresh() is False    # made once
+
+
+@pytest.mark.parametrize("case", ["not_wanted", "recent_request", "request_live", "kept", "no_owner_file"])
+async def test_the_members_file_waits_for_a_quiet_agent(quiet_agent, case):
+    import datetime as _dt
+    from ghost_agent.utils.logging import requester_role_context
+    agent, llm, st = quiet_agent
+    requester_role_context.set("")
+    await agent.warm_up_main_prefix(quiet=True)
+    st["sent"] = 0
+    agent._member_head_wanted = case != "not_wanted"
+    if case == "recent_request":
+        agent.context.last_activity_time = _dt.datetime.now()
+    if case == "request_live":
+        llm.foreground_requests = 1
+    if case == "kept":
+        llm._slot_session = "sess-a"
+        llm._slot_session_used = time.monotonic()
+    if case == "no_owner_file":
+        H.discard(agent._head_plan_last["dir"], agent._head_plan_last["key"])
+    assert await agent._member_head_refresh() is False
+    assert st["sent"] == 0
+
+
+async def test_a_members_file_saved_before_is_kept_fresh_after_a_restart(quiet_agent, tmp_path):
+    from ghost_agent.utils.logging import requester_role_context
+    agent, llm, st = quiet_agent
+    requester_role_context.set("")
+    await agent.warm_up_main_prefix(quiet=True)
+    _kmeta(_dir(tmp_path), "oldmembers", "member", time.time() - 86400)   # a previous prompt's file
+    st["resp"] = _resp(8000, 0)
+    assert await agent._member_head_refresh() is True
+    assert st["kinds"][-1] == H.MEMBER
+
+
+async def test_a_refresh_that_a_request_beat_is_tried_again(quiet_agent):
+    from ghost_agent.utils.logging import requester_role_context
+    agent, llm, st = quiet_agent
+    requester_role_context.set("")
+    await agent.warm_up_main_prefix(quiet=True)
+    agent._member_head_wanted = True
+
+    async def deferred(payload, **kw):
+        raise L.BackgroundDeferred("a request started")
+    llm.chat_completion = deferred
+    assert await agent._member_head_refresh() is False
+    assert agent._member_head_tried is None
+
+
+async def test_a_request_during_the_members_prefill_is_tried_again(quiet_agent):
+    """Review: a request that came while the members' head was processed
+    skipped the save — it must not count as the one try for that key."""
+    from ghost_agent.utils.logging import requester_role_context
+    agent, llm, st = quiet_agent
+    requester_role_context.set("")
+    await agent.warm_up_main_prefix(quiet=True)
+    st["saves"].clear()
+    agent._member_head_wanted = True
+    real = llm.chat_completion
+
+    async def a_request_arrives(payload, **kw):
+        out = await real(payload, **kw)
+        llm.foreground_requests = 1
+        return out
+    llm.chat_completion = a_request_arrives
+    st["resp"] = _resp(8000, 0)
+    assert await agent._member_head_refresh() is True
+    assert st["saves"] == [] and agent._member_head_tried is None
+
+
+async def test_a_members_call_restores_its_head_over_an_outside_calls_state(members, monkeypatch):
+    agent, llm, st = members
+    hs = await _members_file(agent, llm, st)
+    _switch_env(agent, llm, st, monkeypatch, slot=3300, owner="sess-a", key="slack-thread")
+    llm._outside_slot_dirty = True
+    await agent._slot_switch_before(_member_turn(hs))
+    assert st["restores"] == [hs["key"]]
+
+
+async def test_a_draining_reply_or_a_queued_request_is_waited_out_not_a_reason_to_skip(warm, monkeypatch):
+    """§4RU-r (review 10-27): turns hold one lock, so the previous turn's reply
+    still draining and a request queued behind this one counted as "live" and
+    the switch gave up — the call then re-processed from token 0. Now the
+    switch waits for llama's slot to go idle and restores."""
+    agent, llm, st = warm
+    await _warm_with_file(agent, st, quiet=True)
+    st["order"].clear()
+    _switch_env(agent, llm, st, monkeypatch)
+    reads = []
+
+    def http(url, body=None, timeout=5.0):
+        reads.append(url)
+        return [{"is_processing": len(reads) < 3, "n_prompt_tokens": 38213}]
+    monkeypatch.setattr(H, "_http", http)
+    monkeypatch.setattr(L, "BEFORE_MAIN_DISPATCH_S", H.RESTORE_TIMEOUT_S + 10.0)   # room for two polls
+    llm._main_streams_open = 1
+    llm.foreground_requests = 3
+    await agent._slot_switch_before(_turn(st))
+    assert st["order"] == ["restore"] and len(reads) == 3
+
+
+async def test_a_call_outside_the_running_turn_gets_no_restore(warm, monkeypatch):
+    """The guard the counters stood for: a turn sits in its tool gap and a
+    call that is not that turn's must not swap the slot under it."""
+    from ghost_agent.utils.logging import request_id_context
+    agent, llm, st = warm
+    await _warm_with_file(agent, st, quiet=True)
+    st["order"].clear()
+    _switch_env(agent, llm, st, monkeypatch)
+    tok = request_id_context.set("outsider")
+    try:
+        async with agent._turn_lock("turn-1"):
+            await agent._slot_switch_before(_turn(st))
+            assert st["order"] == []
+            request_id_context.set("turn-1")          # the lock holder's own call
+            await agent._slot_switch_before(_turn(st))
+            assert st["order"] == ["restore"]
+    finally:
+        request_id_context.reset(tok)
+
+
+async def test_with_no_owner_the_requests_first_call_restores_once(warm, monkeypatch):
+    """Review 10-27: an unowned request (a probe, a scheduled task) ran on the
+    head and claimed nothing — the owner's next request found no owner and
+    re-processed from 0. Once per request: its later calls keep the slot."""
+    from ghost_agent.utils.logging import request_id_context
+    agent, llm, st = warm
+    await _warm_with_file(agent, st, quiet=True)
+    st["order"].clear()
+    _switch_env(agent, llm, st, monkeypatch, owner=None, key="sess-a")
+    tok = request_id_context.set("req-9")
+    try:
+        await agent._slot_switch_before(_turn(st))
+        await agent._slot_switch_before(_turn(st, "its second call"))
+    finally:
+        request_id_context.reset(tok)
+    assert st["order"] == ["restore"]
+
+
+def _with_tools(p):
+    p = dict(p)
+    p["tools"] = [{"type": "function", "function": {"name": n}} for n in ("web_search", "file_system")]
+    return p
+
+
+async def test_the_owner_on_slack_shares_the_tools_and_gets_the_head_back_once(warm, monkeypatch):
+    """Review 10-27, slack-be: the owner's Slack system text differs (public
+    profile), so the call never 'opened with the head' and re-processed 28.9k
+    tokens; on a restored head slack-de reused 27.7k (the tools come first)."""
+    from ghost_agent.utils.logging import request_id_context
+    agent, llm, st = warm
+    await _warm_with_file(agent, st, quiet=True)
+    head = _with_tools(st["payload"])
+    L.note_head_reference(llm, head)
+    st["order"].clear()
+    _switch_env(agent, llm, st, monkeypatch)
+    slack = dict(head)
+    slack["messages"] = [{"role": "system", "content": "a public-surface system text"},
+                         {"role": "user", "content": "hi from slack"}]
+    tok = request_id_context.set("slack-1")
+    try:
+        await agent._slot_switch_before(slack)
+        await agent._slot_switch_before(slack)
+    finally:
+        request_id_context.reset(tok)
+    assert st["order"] == ["restore"]
+
+
+async def test_a_call_with_another_tool_list_gets_no_restore(warm, monkeypatch):
+    agent, llm, st = warm
+    await _warm_with_file(agent, st, quiet=True)
+    L.note_head_reference(llm, _with_tools(st["payload"]))
+    st["order"].clear()
+    _switch_env(agent, llm, st, monkeypatch)
+    other = _turn(st)
+    other["messages"][0] = {"role": "system", "content": "another prompt"}
+    other["tools"] = [{"type": "function", "function": {"name": "x"}}]
+    await agent._slot_switch_before(other)
+    assert st["order"] == []
+
+
+async def test_a_llama_now_running_another_model_gets_no_restore(warm, monkeypatch):
+    """Review 10-27: the plan is a tick old; llama restarted on another model of
+    the same shape would take the old file's state silently."""
+    agent, llm, st = warm
+    await _warm_with_file(agent, st, quiet=True)
+    st["order"].clear()
+    _switch_env(agent, llm, st, monkeypatch)
+    monkeypatch.setattr(H, "server_identity", lambda base: "another-model")
+    await agent._slot_switch_before(_turn(st))
+    assert st["order"] == []
+
+
+async def test_an_old_members_file_no_longer_means_members_write(quiet_agent, tmp_path):
+    """Review 10-27: one old file made every prompt-changing deploy pay a
+    ~50 s members' prefill forever."""
+    from ghost_agent.core.agent import MEMBER_HEAD_RECENT_S
+    from ghost_agent.utils.logging import requester_role_context
+    agent, llm, st = quiet_agent
+    requester_role_context.set("")
+    await agent.warm_up_main_prefix(quiet=True)
+    st["sent"] = 0
+    _kmeta(_dir(tmp_path), "oldmembers", "member", time.time() - MEMBER_HEAD_RECENT_S - 60)
+    old = time.time() - MEMBER_HEAD_RECENT_S - 60
+    os.utime(_dir(tmp_path) / "head-oldmembers.json", (old, old))   # not used since either
+    assert await agent._member_head_refresh() is False and st["sent"] == 0
+
+
+async def test_a_member_restore_parks_the_slot_first_unless_it_holds_the_owners_head(members, monkeypatch):
+    """Review 10-27: before §4RU llama parked whatever the slot held when a
+    member's prompt arrived (a background job between calls resumed from it);
+    the restore must not drop it. The owner's bare head is on disk: no park."""
+    from ghost_agent.utils.logging import request_id_context
+    agent, llm, st = members
+    hs = await _members_file(agent, llm, st)
+    _switch_env(agent, llm, st, monkeypatch, slot=40000, owner="sess-a", key="slack-thread")
+    await agent._slot_switch_before(_member_turn(hs))
+    assert st["order"] == ["park", "restore"]
+    st["order"].clear()
+    request_id_context.set("slack-2")
+    _switch_env(agent, llm, st, monkeypatch, slot=28213, owner="sess-a", key="slack-thread")
+    await agent._slot_switch_before(_member_turn(hs))
+    assert st["order"] == ["restore"]
+
+
+async def test_a_failed_park_restores_nothing_for_a_member(members, monkeypatch):
+    agent, llm, st = members
+    hs = await _members_file(agent, llm, st)
+    _switch_env(agent, llm, st, monkeypatch, slot=40000, owner="sess-a", key="slack-thread")
+    st["park_ok"] = False
+    await agent._slot_switch_before(_member_turn(hs))
+    assert st["order"] == ["park"]
+
+
+async def test_the_loop_reaches_the_members_refresh_on_a_tick_where_nothing_ran(mock_context):
+    """Review 10-27: after member-only traffic every later tick skipped as
+    "nothing ran" before the refresh, so the members' file was never made."""
+    from ghost_agent.core.agent import GhostAgent
+    agent = GhostAgent(mock_context)
+    mock_context.llm_client = MagicMock(foreground_requests=0, _head_ref=None, _outside_slot_dirty=False)
+    refreshed = []
+
+    async def warm(quiet=False, displaced_by=""):
+        pass
+
+    async def refresh():
+        refreshed.append(1)
+        return False
+
+    async def metrics():
+        return (0, 500)                              # nothing moves
+
+    ticks = []
+
+    async def sleep(s):
+        ticks.append(s)
+        if len(ticks) > 3:
+            raise asyncio.CancelledError
+    agent.warm_up_main_prefix = warm
+    agent._member_head_refresh = refresh
+    with pytest.raises(asyncio.CancelledError):
+        await agent.rewarm_main_prefix_loop(period_s=180, sleep=sleep, metrics=metrics)
+    assert len(refreshed) == 3
+
+
+async def test_a_busy_slot_defers_a_fresh_restore_instead_of_prefilling(warm):
+    """Review 10-27: fresh/outside modes with a busy slot returned without
+    deferring, so the warm-up sent its full prefill."""
+    agent, llm, st = warm
+    await agent.warm_up_main_prefix(quiet=True)            # the file
+    st["sent"] = 0
+    st["order"].clear()
+    st["fresh"] = True
+    st["busy"] = True
+    await agent.warm_up_main_prefix(quiet=True)
+    assert st["sent"] == 0 and st["order"] == []
+
+
+async def test_a_restore_reply_that_timed_out_but_landed_is_not_called_a_failure(warm, monkeypatch):
+    """Review 10-27: 9 "head restore from disk failed (TimeoutError)" lines were
+    restores llama applied after the client gave up; the warm-up found the
+    head cached and no save happened."""
+    agent, llm, st = warm
+    await agent.warm_up_main_prefix(quiet=True)
+    st["lines"].clear()
+    st["order"].clear()
+    st["fresh"] = True
+    monkeypatch.setattr(H, "restore", lambda b, d, k: (st["order"].append("restore") or (False, "TimeoutError", 30.0)))
+    st["resp"] = _resp(28213, 28209)
+    await agent.warm_up_main_prefix(quiet=True)
+    assert "restore" in st["order"]
+    assert not any("failed" in m for m in st["lines"])
+
+
+def test_a_save_attempt_clears_stale_part_files(monkeypatch, tmp_path):
+    d = _dir(tmp_path)
+    old = d / "head-m1.part.bin"
+    old.write_bytes(b"x")
+    os.utime(old, (time.time() - H.STALE_PART_S - 10,) * 2)
+
+    def refused(url, body=None, timeout=5.0):
+        raise _http_error(500, "Unable to save")
+    monkeypatch.setattr(H, "_http", refused)
+    ok, _ = H.save(BASE, d, "k", 28213, "id")
+    assert not ok and not old.exists()
+
+
+async def test_after_a_model_change_the_members_save_does_not_restore_the_old_owner_file(quiet_agent):
+    """Review 10-27: the owner's plan is a tick old; after a llama restart on
+    another model it must not be restored."""
+    from ghost_agent.utils.logging import requester_role_context
+    agent, llm, st = quiet_agent
+    requester_role_context.set("")
+    await agent.warm_up_main_prefix(quiet=True)
+    agent._head_plan_last["identity"] = "the model before the restart"
+    agent._member_head_wanted = True
+    st["restores"].clear()
+    st["kinds"].clear()
+    st["resp"] = _resp(8000, 0)
+    assert await agent._member_head_refresh() is True
+    assert st["kinds"] == [H.MEMBER] and st["restores"] == []
+
+
+
+async def test_a_drained_turns_late_call_cannot_restore_under_the_turn_holding_the_lock(warm, monkeypatch):
+    """Round-2 review MAJOR: a streamed turn stays "running" while its reply
+    drains, after it released the lock; its late call (a forced-final retry)
+    must not restore the head under the next turn's tool gap."""
+    from ghost_agent.utils.logging import request_id_context
+    agent, llm, st = warm
+    await _warm_with_file(agent, st, quiet=True)
+    st["order"].clear()
+    _switch_env(agent, llm, st, monkeypatch)
+    async with agent._turn_lock("turn-B"):
+        tok = request_id_context.set("turn-A")           # the drained turn's call
+        try:
+            await agent._slot_switch_before(_turn(st))
+            assert st["order"] == []
+            request_id_context.set("turn-B")
+            await agent._slot_switch_before(_turn(st))
+            assert st["order"] == ["restore"]
+        finally:
+            request_id_context.reset(tok)
+    assert agent._turn_lock_rid is None
+
+
+async def test_another_requests_call_does_not_wipe_a_requests_once_record(warm, monkeypatch):
+    """Round-2 review MAJOR: the record held one request id per kind and was
+    written before the call was accepted — another request's call overwrote it
+    and the first request's next call restored over its own conversation."""
+    from ghost_agent.utils.logging import request_id_context
+    agent, llm, st = warm
+    await _warm_with_file(agent, st, quiet=True)
+    st["order"].clear()
+    _switch_env(agent, llm, st, monkeypatch, owner=None, key="sess-a")
+    tok = request_id_context.set("req-S")
+    try:
+        async with agent._turn_lock("req-S"):
+            await agent._slot_switch_before(_turn(st))       # restores once
+            request_id_context.set("req-other")              # refused: not the holder
+            await agent._slot_switch_before(_turn(st))
+            request_id_context.set("req-S")
+            await agent._slot_switch_before(_turn(st, "its next call"))
+    finally:
+        request_id_context.reset(tok)
+    assert st["order"] == ["restore"]
+
+
+async def test_an_unreadable_slots_endpoint_gives_up_after_a_few_reads(warm, monkeypatch):
+    """Round-2 review: a wedged or slot-less llama made the switch poll ~118 s
+    before every request's first call."""
+    from ghost_agent.core.agent import SWITCH_UNREAD_LIMIT
+    agent, llm, st = warm
+    await _warm_with_file(agent, st, quiet=True)
+    st["order"].clear()
+    _switch_env(agent, llm, st, monkeypatch)
+    monkeypatch.setattr(L, "BEFORE_MAIN_DISPATCH_S", 150.0)  # the real bound
+    reads = []
+
+    def unreadable(url, body=None, timeout=5.0):
+        reads.append(url)
+        raise OSError("no /slots")
+    monkeypatch.setattr(H, "_http", unreadable)
+    t0 = time.monotonic()
+    await agent._slot_switch_before(_turn(st))
+    assert st["order"] == [] and len(reads) == SWITCH_UNREAD_LIMIT
+    assert time.monotonic() - t0 < 5.0
+
+
+async def test_the_member_park_is_bounded_by_the_deadline(members, monkeypatch):
+    agent, llm, st = members
+    hs = await _members_file(agent, llm, st)
+    _switch_env(agent, llm, st, monkeypatch, slot=40000, owner="sess-a", key="slack-thread")
+    seen = []
+    monkeypatch.setattr(H, "park", lambda base, timeout=H.PARK_TIMEOUT_S: (
+        seen.append(timeout) or st["order"].append("park") or (True, "parked")))
+    monkeypatch.setattr(L, "BEFORE_MAIN_DISPATCH_S", H.RESTORE_TIMEOUT_S + 2.0 + 20.0)
+    await agent._slot_switch_before(_member_turn(hs))
+    assert seen and seen[0] <= 20.0 and st["order"] == ["park", "restore"]
+
+
+@pytest.mark.parametrize("detail,resp", [("HTTPError 500: Unable to restore", _resp(28213, 28209)),
+                                         ("TimeoutError: timed out", {"choices": []})])
+async def test_a_failed_restore_is_still_said_unless_a_timeout_landed(warm, monkeypatch, detail, resp):
+    """Round-2 review: "landed" needs a timeout AND a warm-up that found the
+    head resident — not a real failure served from llama's RAM cache, nor a
+    warm-up with no usage."""
+    agent, llm, st = warm
+    await agent.warm_up_main_prefix(quiet=True)
+    st["lines"].clear()
+    st["fresh"] = True
+    monkeypatch.setattr(H, "restore", lambda b, d, k: (False, detail, 1.0))
+    st["resp"] = resp
+    await agent.warm_up_main_prefix(quiet=True)
+    assert any("failed" in m for m in st["lines"])
+
+
+async def test_a_members_restore_keeps_the_file_recent(members, monkeypatch):
+    from ghost_agent.core.agent import MEMBER_HEAD_RECENT_S
+    agent, llm, st = members
+    hs = await _members_file(agent, llm, st)
+    meta = hs["dir"] / f"head-{hs['key']}.json"
+    m = json.loads(meta.read_text())
+    m.update(kind="member", saved_at=time.time() - MEMBER_HEAD_RECENT_S - 60)
+    meta.write_text(json.dumps(m))
+    os.utime(meta, (time.time() - MEMBER_HEAD_RECENT_S - 60,) * 2)
+    assert not H.has_kind(hs["dir"], H.MEMBER, within_s=MEMBER_HEAD_RECENT_S)
+    _switch_env(agent, llm, st, monkeypatch, slot=28213, owner="sess-a", key="slack-thread")
+    await agent._slot_switch_before(_member_turn(hs))
+    assert H.has_kind(hs["dir"], H.MEMBER, within_s=MEMBER_HEAD_RECENT_S)
+
+
+async def test_a_present_members_file_is_not_planned_again_every_tick(quiet_agent, monkeypatch):
+    from ghost_agent.utils.logging import requester_role_context
+    agent, llm, st = quiet_agent
+    requester_role_context.set("")
+    await agent.warm_up_main_prefix(quiet=True)
+    hs = await agent._member_head_plan(llm)
+    _store(hs["dir"], hs["key"], 8000)
+    agent._member_head_wanted = True
+    plans = []
+    real = agent._member_head_plan
+
+    async def counted(llm_):
+        plans.append(1)
+        return await real(llm_)
+    monkeypatch.setattr(agent, "_member_head_plan", counted)
+    assert await agent._member_head_refresh() is False
+    assert await agent._member_head_refresh() is False
+    assert len(plans) == 1
+
+
+
+async def test_a_slots_read_that_times_out_is_a_long_batch_not_a_dead_llama(warm, monkeypatch):
+    """Round-3 review: llama answers /slots only between batches and a 2048-token
+    batch on the 27B can outlast the 3 s read — timeouts must keep the switch
+    waiting (a give-up re-processes the 28k head)."""
+    agent, llm, st = warm
+    await _warm_with_file(agent, st, quiet=True)
+    st["order"].clear()
+    _switch_env(agent, llm, st, monkeypatch)
+    monkeypatch.setattr(L, "BEFORE_MAIN_DISPATCH_S", H.RESTORE_TIMEOUT_S + 10.0)
+    reads = []
+
+    def slow_batches(url, body=None, timeout=5.0):
+        reads.append(url)
+        if len(reads) <= 4:
+            raise TimeoutError("timed out")
+        return [{"is_processing": False, "n_prompt_tokens": 38213}]
+    monkeypatch.setattr(H, "_http", slow_batches)
+    await agent._slot_switch_before(_turn(st))
+    assert st["order"] == ["restore"]
+
+
+async def test_a_new_owner_head_replans_the_members_file_at_once(quiet_agent, monkeypatch):
+    """Round-3 review: a prompt or llama change makes new keys; the 30-min
+    recheck must not hide the members' new key."""
+    from ghost_agent.utils.logging import requester_role_context
+    agent, llm, st = quiet_agent
+    requester_role_context.set("")
+    await agent.warm_up_main_prefix(quiet=True)
+    agent._member_head_wanted = True
+    agent._member_head_seen = ("an older owner head", time.monotonic())
+    st["resp"] = _resp(8000, 0)
+    assert await agent._member_head_refresh() is True
+
+
+async def test_a_refused_member_call_does_not_take_the_requests_record(members, monkeypatch):
+    from ghost_agent.utils.logging import request_id_context
+    agent, llm, st = members
+    hs = await _members_file(agent, llm, st)
+    _switch_env(agent, llm, st, monkeypatch, slot=28213, owner="sess-a", key="slack-thread")
+    async with agent._turn_lock("slack-1"):
+        request_id_context.set("slack-late")             # not the holder: refused
+        await agent._slot_switch_before(_member_turn(hs))
+        assert agent.__dict__.get("_member_head_rid") != "slack-late"
+        request_id_context.set("slack-1")
+        await agent._slot_switch_before(_member_turn(hs))
+    assert st["restores"] == [hs["key"]]
+
+
+# ── §4RW: a level with no file starts from the nearest head; members save at first sight ──
+
+def _owned_by_server(d, key, n=28213, ident="id"):
+    (d / f"head-{key}.json").write_text(json.dumps({"n_tokens": n, "identity": ident,
+                                                   "kind": H.OWNER, "saved_at": time.time()}))
+
+
+async def test_a_level_with_no_file_starts_from_the_nearest_head_and_saves_its_own(warm):
+    """Live 10-27: the owner picked xhigh (28,251 tokens, no file) and the next
+    re-warm processed the whole head from token 0 (167 s)."""
+    agent, llm, st = warm
+    await agent.warm_up_main_prefix(quiet=True)                      # the medium head's file
+    hs = agent._head_plan_last
+    _owned_by_server(hs["dir"], hs["key"])
+    st["rendered"], st["slot"] = "HEAD at xhigh", 9000                # nobody's state in the slot
+    st["resp"] = _resp(28251, 27200)
+    st["restores"].clear(); st["saves"].clear(); st["logged"].clear(); st["sent"] = 0
+    await agent.warm_up_main_prefix(quiet=True)
+    new = agent._head_plan_last
+    assert new["key"] != hs["key"]
+    assert st["restores"] == [hs["key"]] and st["sent"] == 1
+    assert st["saves"] == [28251] and H.stored_tokens(new["dir"], new["key"]) == 28251
+    assert any(i == Icons.HEAD_RESTORE and "nearest saved head" in m for t, m, i in st["logged"])
+
+
+async def test_another_servers_head_is_not_a_start(warm):
+    agent, llm, st = warm
+    await agent.warm_up_main_prefix(quiet=True)
+    hs = agent._head_plan_last
+    _owned_by_server(hs["dir"], hs["key"], ident="another model")
+    st["rendered"], st["slot"] = "HEAD at xhigh", 9000
+    st["restores"].clear(); st["sent"] = 0
+    await agent.warm_up_main_prefix(quiet=True)
+    assert st["restores"] == [] and st["sent"] == 1                   # the prefill, as before
+
+
+async def test_the_switch_starts_from_the_nearest_head_when_this_one_has_none(warm, monkeypatch):
+    agent, llm, st = warm
+    await agent.warm_up_main_prefix(quiet=True)
+    hs = agent._head_plan_last
+    _owned_by_server(hs["dir"], hs["key"])
+    agent._head_plan_last = {**hs, "key": "no-file-yet", "have": False, "n_tokens": None,
+                             "prompt_n": 28251}
+    st["order"].clear(); st["restores"].clear()
+    _switch_env(agent, llm, st, monkeypatch, slot=40000, owner="sess-a")
+    st["slot"] = 40000
+    await agent._slot_switch_before(_turn(st))
+    assert st["restores"] == [hs["key"]]
+
+
+async def test_the_switch_leaves_the_head_a_rewarm_just_made(warm, monkeypatch):
+    """Review: the re-warm processed this head (no file: its save refused) —
+    the near file must not go over it."""
+    agent, llm, st = warm
+    await agent.warm_up_main_prefix(quiet=True)
+    hs = agent._head_plan_last
+    _owned_by_server(hs["dir"], hs["key"])
+    agent._head_plan_last = {**hs, "key": "no-file-yet", "have": False, "n_tokens": None,
+                             "prompt_n": 28251}
+    st["order"].clear(); st["restores"].clear()
+    _switch_env(agent, llm, st, monkeypatch, slot=28251, owner="sess-a")
+    st["slot"] = 28251
+    await agent._slot_switch_before(_turn(st))
+    assert st["restores"] == []
+
+
+def _member_http(st, prompt=8000, real=None):
+    real = real or H._http
+
+    def http(url, body=None, timeout=5.0):
+        if not url.endswith("/v1/chat/completions"):
+            return real(url, body, timeout)
+        st.setdefault("posted", []).append((url, body))
+        return _resp(prompt, 0)
+    return http
+
+
+async def test_a_members_first_request_with_no_file_saves_it_for_the_next(members, monkeypatch):
+    from ghost_agent.core import agent as A
+    from ghost_agent.utils.logging import request_id_context
+    agent, llm, st = members
+    monkeypatch.setattr(A, "MEMBER_HEAD_MAKE_MIN_S", 0.0)          # the fixture's short deadline
+    await agent.warm_up_main_prefix(quiet=True)                      # the owner's head only
+    _switch_env(agent, llm, st, monkeypatch, slot=28213, owner="sess-a", key="slack-thread")
+    hs = await agent._member_head_plan(llm)
+
+    async def idle(base, late, stop=None):
+        return True
+    monkeypatch.setattr(agent, "_slot_idle", idle)
+    monkeypatch.setattr(H, "_http", _member_http(st))
+    st["saves"].clear(); st["kinds"].clear(); st["restores"].clear(); st["logged"].clear()
+    await agent._slot_switch_before(_member_turn(hs))
+    url, body = st["posted"][0]
+    assert url == BASE + "/v1/chat/completions" and body["max_tokens"] == 1
+    assert body["messages"] == hs["payload"]["messages"]             # the members' head alone
+    assert st["saves"] == [8000] and st["kinds"] == [H.MEMBER] and st["restores"] == []
+    assert [i for t, m, i in st["logged"] if "members' head" in m] == [Icons.HEAD_SAVE]
+    request_id_context.set("slack-2")                                 # the next member request
+    await agent._slot_switch_before(_member_turn(hs, "the next request"))
+    assert st["restores"] == [hs["key"]] and len(st["posted"]) == 1
+
+
+@pytest.mark.parametrize("case", ["busy", "no_count", "save_refused", "no_time"])
+async def test_a_members_save_that_cannot_happen_leaves_the_call_as_before(members, monkeypatch, case):
+    from ghost_agent.core import agent as A
+    agent, llm, st = members
+    monkeypatch.setattr(A, "MEMBER_HEAD_MAKE_MIN_S", 1e6 if case == "no_time" else 0.0)
+    await agent.warm_up_main_prefix(quiet=True)
+    _switch_env(agent, llm, st, monkeypatch, slot=28213, owner="sess-a", key="slack-thread")
+    hs = await agent._member_head_plan(llm)
+
+    async def idle(base, late, stop=None):
+        return case != "busy"
+    monkeypatch.setattr(agent, "_slot_idle", idle)
+    monkeypatch.setattr(H, "_http", _member_http(st, prompt=0 if case == "no_count" else 8000))
+    if case == "save_refused":
+        monkeypatch.setattr(H, "save", lambda *a, **k: (False, "slot held 9000 tokens, expected 8000"))
+    st["saves"].clear(); st["logged"].clear()
+    await agent._slot_switch_before(_member_turn(hs))
+    assert H.stored_tokens(hs["dir"], hs["key"]) is None and st["restores"] == []
+    assert ("posted" in st) == (case not in ("busy", "no_time"))
+    assert [i for t, m, i in st["logged"] if "members' head" in m] == [Icons.HEAD_FAIL]
+
+
+async def test_the_members_prefill_never_replaces_an_unsaved_conversation(quiet_agent, monkeypatch):
+    """§4RW-e r3: a request that started during the conversation's save left
+    the record in place (or the save failed) — the members' prefill went on
+    and replaced a conversation that was not on disk."""
+    from ghost_agent.core import llm as L
+    from ghost_agent.utils.logging import requester_role_context
+    agent, llm, st = quiet_agent
+    requester_role_context.set("")
+    await agent.warm_up_main_prefix(quiet=True)
+    st["saves"].clear()
+    agent._member_head_wanted = True
+    st["resp"] = _resp(8000, 0)
+    llm._head_displaced = True
+    llm._slot_session, llm._slot_session_used = "sess-x", time.monotonic()
+    monkeypatch.setattr(L, "slot_kept", lambda llm, now=None: bool(llm._slot_session))
+    monkeypatch.setattr(L, "conv_keep_enabled", lambda: True)
+    shown = []
+
+    async def displace(llm, why, late=None, stop=None):
+        shown.append(why)
+        return False                                       # the conversation still holds the slot
+    agent._conv_displace = displace
+    sent = []
+    real = llm.chat_completion
+
+    async def spy(payload, **kw):
+        sent.append(kw.get("task_label"))
+        return await real(payload, **kw)
+    llm.chat_completion = spy
+    assert await agent._member_head_refresh() is False
+    assert shown and sent == [] and st["saves"] == []

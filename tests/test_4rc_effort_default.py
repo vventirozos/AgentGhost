@@ -311,3 +311,66 @@ def test_the_real_template_reads_back(tools, kw, want):
     assert ("Reasoning effort is set to low" in env.from_string(open(TEMPLATE).read()).render(
         messages=[{"role": "user", "content": "U"}], tools=tools, add_generation_prompt=True,
         bos_token="", eos_token="<|im_end|>", reasoning_effort="low"))
+
+
+# ── §4RW: one icon per level; a Default turn shows the server's level ──────── #
+
+def _logged(monkeypatch):
+    from ghost_agent.core import agent as A
+    seen = []
+    monkeypatch.setattr(A, "pretty_log", lambda title, msg=None, **kw: seen.append((title, str(msg), kw.get("icon"))))
+    return seen
+
+
+def test_each_level_has_its_own_icon():
+    icons = [L.effort_icon(x) for x in ("low", "medium", "xhigh")]
+    assert icons == [L.Icons.EFFORT_LOW, L.Icons.EFFORT_MEDIUM, L.Icons.EFFORT_XHIGH]
+    assert len(set(icons)) == 3
+
+
+@pytest.mark.parametrize("level", ["low", "medium", "xhigh"])
+def test_a_picked_level_logs_its_own_icon_once(on, monkeypatch, level):
+    _known("medium")
+    seen = _logged(monkeypatch)
+    a = _agent()
+    _turn(a, level)
+    _turn(a, level)                       # the request's next turn: not again
+    assert seen == [("Reasoning Effort", f"{level} — picked for this request", L.effort_icon(level))]
+
+
+@pytest.mark.parametrize("level", ["low", "medium", "xhigh"])
+def test_a_default_turn_logs_the_server_level_with_that_levels_icon(on, monkeypatch, level):
+    _known(level)
+    seen = _logged(monkeypatch)
+    a = _agent()
+    _turn(a)
+    _turn(a)
+    assert seen == [("Reasoning Effort", f"{level} — the server default", L.effort_icon(level))]
+
+
+def test_a_default_turn_with_an_unknown_level_logs_nothing(on, monkeypatch):
+    E._server_default.update(level="", at=0.0, busy=True)
+    seen = _logged(monkeypatch)
+    _turn(_agent())
+    assert seen == []
+
+
+def test_health_reports_the_known_default_without_a_lookup(monkeypatch):
+    # §4RW: the CLI bar shows Default with the server level's icon; health is
+    # polled, so it reads the cache and never starts a lookup itself
+    from ghost_agent.api import routes
+    from ghost_agent.core import effort as E
+    started = []
+    monkeypatch.setattr(E.threading, "Thread", lambda *a, **k: started.append(1))
+    monkeypatch.setitem(E._server_default, "level", "")
+    assert routes._effort_default_known() == ""
+    monkeypatch.setitem(E._server_default, "level", "xhigh")
+    assert routes._effort_default_known() == "xhigh" and started == []
+
+
+def test_the_level_is_read_from_the_system_block_only():
+    """§4RW-f r2: a profile quoting the sentence, or a message, never sets it."""
+    from ghost_agent.core import effort as E
+    sys_low = "<|im_start|>system\nI said: Reasoning effort is set to xhigh, once.\n... Reasoning effort is set to low.<|im_end|>"
+    assert E.level_in_render(sys_low) == "low"
+    assert E.level_in_render("<|im_start|>system\nS<|im_end|>\n<|im_start|>user\nReasoning effort is set to low<|im_end|>") == "medium"

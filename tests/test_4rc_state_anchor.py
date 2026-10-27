@@ -420,3 +420,157 @@ def test_the_turn_loop_uses_the_section_helpers():
     names = [n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
              and n.func.id in ("_state_sections", "_state_sections_pinned")]
     assert sorted(names) == ["_state_sections", "_state_sections_pinned"]
+
+
+# ── §4RW-d: the sandbox listing goes as its changes ──────────────────────────
+
+def _listing(*entries, capped=False):
+    body = "\n".join(f"  {e}" for e in entries)
+    more = "\n  ... [5 more files NOT shown (205 total). This listing is capped]" if capped else ""
+    return (f"CURRENT SANDBOX STATE:\nCURRENT SANDBOX DIRECTORY STRUCTURE:\n{len(entries)} entries under the "
+            f"workspace root (files, excluding dotfiles):\n{body}{more}\n\n(Use these filenames for all file tools)\n\n")
+
+
+_MANY = [f"old/f{i}.txt" for i in range(120)]
+
+
+def test_a_write_sends_the_new_entry_not_the_listing():
+    anchor, h = {}, _start()
+    _turn(h, _secs(sandbox_state=_listing(*_MANY)), anchor)
+    for n in (1, 2, 3):
+        _tool_turn(h, n)
+        r = _turn(h, _secs(sandbox_state=_listing(*_MANY, "s1.py  [def main()]")), anchor)
+        last = r[-1]["content"]
+        assert "Added:\n  s1.py  [def main()]" in last and "121 entries under" in last
+        assert "old/f7.txt" not in last and len(last) < 1000
+
+
+def test_changed_and_removed_entries_are_named():
+    anchor, h = {}, _start()
+    _turn(h, _secs(sandbox_state=_listing("a.py  [def x()]", "b.txt", *_MANY)), anchor)
+    _tool_turn(h, 1)
+    last = _turn(h, _secs(sandbox_state=_listing("a.py  [def x(), def y()]", *_MANY)), anchor)[-1]["content"]
+    assert "Changed:\n  a.py  [def x(), def y()]" in last and "Removed: `b.txt`" in last
+    assert "old/f7.txt" not in last
+
+
+@pytest.mark.parametrize("first,now", [
+    (_listing(*_MANY, capped=True), _listing(*_MANY, "n.py", capped=True)),   # a cap hides entries
+    ("CURRENT SANDBOX STATE:\nCURRENT SANDBOX DIRECTORY STRUCTURE:\n[Empty]\n\n", _listing("n.py")),
+], ids=["capped", "was-empty"])
+def test_no_trusted_diff_sends_the_listing_whole(first, now):
+    anchor, h = {}, _start()
+    _turn(h, _secs(sandbox_state=first), anchor)
+    _tool_turn(h, 1)
+    assert now.rstrip("\n") in _turn(h, _secs(sandbox_state=now), anchor)[-1]["content"]
+
+
+def test_only_the_sandbox_section_is_diffed():
+    assert A._state_changes({"briefing": _listing(*_MANY)},
+                            {"briefing": _listing(*_MANY, "n.py")}).count("old/f7.txt") == 1
+
+
+# ── §4RW-d review: real listings, collisions, cap on one side, roots ─────────
+
+def _real(tmp, names, cap=None, monkeypatch=None):
+    import asyncio
+    from ghost_agent.tools import file_system as fs
+    if cap is not None:
+        monkeypatch.setattr(fs, "_LIST_MAX_ENTRIES", cap)
+    for p in tmp.iterdir():
+        p.unlink()
+    for n, body in names.items():
+        (tmp / n).write_text(body)
+    return "CURRENT SANDBOX STATE:\n" + asyncio.run(fs.tool_list_files(tmp)) + "\n\n"
+
+
+_FILES = {f"f{i}.txt": "x" for i in range(40)}
+
+
+def test_a_real_listing_diffs_to_the_new_file(tmp_path):
+    base = _real(tmp_path, {**_FILES, "a.py": "def x():\n  pass\n"})
+    cur = _real(tmp_path, {**_FILES, "a.py": "def x():\n  pass\ndef y():\n  pass\n", "s1.py": "print(1)\n"})
+    d = A._listing_changes(base, cur)
+    assert "Added:\n  s1.py" in d and "Changed:\n  a.py  [def x(), def y()]" in d
+    assert "42 entries under" in d and "f7.txt" not in d
+
+
+def test_names_that_looked_alike_stay_apart(tmp_path):
+    # review: keyed on the stripped line before "  [", these were one entry and
+    # the deletion vanished; spaces at either end collided the same way
+    base = _real(tmp_path, {**_FILES, "x  [a.txt": "1", "x  [b.txt": "2", " a": "1", "a": "2"})
+    cur = _real(tmp_path, {**_FILES, "x  [b.txt": "2", "a": "2"})
+    d = A._listing_changes(base, cur)
+    assert "Removed: `x  [a.txt`, ` a`" in d or "Removed: ` a`, `x  [a.txt`" in d
+
+
+def test_a_listing_that_does_not_parse_to_its_count_goes_whole(tmp_path):
+    base = _real(tmp_path, {**_FILES, "a\n  b": "1"})          # a newline makes a fake entry
+    cur = _real(tmp_path, {**_FILES, "a\n  b": "1", "n.py": "1"})
+    assert A._listing_changes(base, cur) == ""
+
+
+def test_a_listing_that_crosses_the_cap_goes_whole(tmp_path, monkeypatch):
+    base = _real(tmp_path, _FILES, cap=40, monkeypatch=monkeypatch)
+    cur = _real(tmp_path, {**_FILES, "n.py": "1"}, cap=40, monkeypatch=monkeypatch)
+    assert "more files NOT shown" in cur and A._listing_changes(base, cur) == ""
+    assert A._listing_changes(cur, base) == ""
+
+
+def test_everything_deleted_goes_whole(tmp_path):
+    base = _real(tmp_path, _FILES)
+    cur = _real(tmp_path, {})
+    assert A._listing_changes(base, cur) == ""
+
+
+@pytest.mark.parametrize("bad", ["CURRENT SANDBOX STATE:\nError scanning sandbox: boom\n\n",
+                                 "CURRENT SANDBOX STATE:\n(not available for this channel)\n\n"])
+def test_no_listing_on_either_side_goes_whole(bad):
+    good = _listing(*_MANY)
+    assert A._listing_changes(bad, good) == "" and A._listing_changes(good, bad) == ""
+
+
+def test_the_diff_is_always_against_the_first_listing():
+    anchor, h = {}, _start()
+    _turn(h, _secs(sandbox_state=_listing(*_MANY)), anchor)
+    _tool_turn(h, 1)
+    _turn(h, _secs(sandbox_state=_listing(*_MANY, "tmp.py")), anchor)
+    _tool_turn(h, 2)
+    last = _turn(h, _secs(sandbox_state=_listing(*_MANY)), anchor)[-1]["content"]
+    assert A._STATE_NO_CHANGE in last                      # added then removed: nothing to say
+
+
+def test_another_project_lists_whole_and_retires_the_old_one():
+    anchor, h = {}, _start()
+    _turn(h, _secs(**{"sandbox_state:p1": _listing(*_MANY, "notes_old.md")}), anchor)
+    _tool_turn(h, 1)
+    last = _turn(h, _secs(**{"sandbox_state:p2": _listing(*_MANY, "new.py")}), anchor)[-1]["content"]
+    assert "Removed" not in last and "old/f7.txt" in last
+    assert '"CURRENT SANDBOX STATE:" section no longer applies' in last
+
+
+def test_the_state_block_keys_the_listing_by_project():
+    """Every sandbox_state section the turn loop appends is keyed by the
+    current project (an AST walk: a key without it diffs across a switch)."""
+    tree = ast.parse((ROOT / "src/ghost_agent/core/agent.py").read_text())
+    keys = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "append" and getattr(node.func.value, "id", "") == "_ds_parts"
+                and node.args and isinstance(node.args[0], ast.Tuple)):
+            k = node.args[0].elts[0]
+            head = k.values[0].value if isinstance(k, ast.JoinedStr) else getattr(k, "value", "")
+            if str(head).startswith("sandbox_state"):
+                keys.append(k)
+    assert len(keys) == 1 and isinstance(keys[0], ast.JoinedStr)
+    assert "current_project_id" in ast.unparse(keys[0])
+
+
+def test_a_project_keyed_listing_is_diffed():
+    """The live key is sandbox_state:<project> (mutant: an `==` test of the
+    bare name passed every other test and never diffed in production)."""
+    anchor, h = {}, _start()
+    _turn(h, _secs(**{"sandbox_state:p1": _listing(*_MANY)}), anchor)
+    _tool_turn(h, 1)
+    last = _turn(h, _secs(**{"sandbox_state:p1": _listing(*_MANY, "s1.py")}), anchor)[-1]["content"]
+    assert "Added:\n  s1.py" in last and "old/f7.txt" not in last

@@ -34,7 +34,6 @@
     "test_admissibility_1c.py": 4,
     "test_agent_metacog_per_tool.py": 5,
     "test_agent_stream_bg_fixes.py": 5,
-    "test_arch_perf_optimisations.py": 3,
     "test_atomic_io.py": 1,
     "test_audio_ingest.py": 8,
     "test_audit_4at_round3_fixes.py": 7,
@@ -78,7 +77,7 @@
     "test_execute_output_spill.py": 3,
     "test_execute_pipefail.py": 3,
     "test_failclosed_recovery.py": 2,
-    "test_feedback_stream_id_restamp.py": 5,
+    "test_feedback_stream_id_restamp.py": 3,
     "test_finalize_extraction.py": 3,
     "test_foreground_yield.py": 12,
     "test_futility_breaker_trio.py": 3,
@@ -218,5 +217,5 @@
     "test_workspace_cleanup_deletion_guards.py": 1,
     "test_workspace_tidy.py": 3
   },
-  "total_textual": 907
+  "total_textual": 902
 }

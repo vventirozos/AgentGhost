@@ -259,21 +259,21 @@ def test_every_line_carries_the_clock_where_the_tickers_still_parse_it(capsys):
     # between the tag and the icon: the uConsole/web tickers split on 2+ spaces,
     # want the tag at parts[1] and the delta right after the icon.
     import re
-    glog.pretty_log("main prefix warmup", "restored the head", icon="💽")
+    glog.pretty_log("head disk", "restored the head in 0.5s", icon=glog.Icons.HEAD_RESTORE)
     glog.pretty_log("Section", special_marker="SECTION_START", icon="🔹")
     out = [re.sub(r"\x1b\[[0-9;]*m", "", l) for l in capsys.readouterr().out.splitlines() if l.strip()]
     assert len(out) == 2
     for line in out:
         parts = [p.strip() for p in re.split(r"\s{2,}", line) if p.strip()]
         assert re.fullmatch(r"\d\d:\d\d:\d\d", parts[2]), parts
-        assert parts[3] in ("💽", "🔹")
-    assert parts_title(out[0]) == "main prefix warmup"
+        assert parts[3] in (glog.Icons.HEAD_RESTORE, "🔹")
+    assert parts_title(out[0]) == "head disk"
 
 
 def parts_title(line):
     import re
     parts = [p.strip() for p in re.split(r"\s{2,}", line) if p.strip()]
-    i = next(i for i, p in enumerate(parts) if "💽" in p) + 1
+    i = next(i for i, p in enumerate(parts) if glog.Icons.HEAD_RESTORE in p) + 1
     if re.match(r"^\+[\d.\s]*m?s$", parts[i]):          # the tickers' own delta rule
         i += 1
     return parts[i]

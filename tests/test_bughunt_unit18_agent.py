@@ -114,7 +114,6 @@ class TestPendingCorrectionScoping:
         agent = GhostAgent.__new__(GhostAgent)
         agent._pending_corrections = corrections
         agent._active_correction = ""
-        agent._correction_active_this_turn = False
         return agent
 
     def test_empty_conv_not_surfaced_into_unrelated_conversation(self):
@@ -123,14 +122,12 @@ class TestPendingCorrectionScoping:
         agent = self._agent([{"member": True, "note": "stale", "conv": "", "ts": time.monotonic()}])
         msgs = [{"role": "user", "content": "an unrelated question"}, {"role": "assistant", "content": "earlier answer"}, {"role": "user", "content": "next"}]
         agent._consume_pending_corrections(msgs, conv_fp="fpA")
-        assert agent._correction_active_this_turn is False
         assert agent._take_active_correction() == ""
 
     def test_matching_conv_surfaces(self):
         agent = self._agent([{"member": True, "note": "that was wrong", "conv": "fpA", "ts": time.monotonic()}])
         msgs = [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "earlier answer"}, {"role": "user", "content": "next"}]
         agent._consume_pending_corrections(msgs, conv_fp="fpA")
-        assert agent._correction_active_this_turn is True
         assert "that was wrong" in agent._take_active_correction()
 
     def test_stable_conv_fp_overrides_message_fingerprint(self):
@@ -145,17 +142,17 @@ class TestPendingCorrectionScoping:
         # With the stable fp threaded in → surfaces.
         a1 = self._agent([dict(corr[0])])
         a1._consume_pending_corrections(msgs, conv_fp="fpA")
-        assert a1._correction_active_this_turn is True
+        assert "correction" in a1._take_active_correction()
         # Without it (recomputing from these messages) → does NOT match.
         a2 = self._agent([dict(corr[0])])
         a2._consume_pending_corrections(msgs, conv_fp=None)
-        assert a2._correction_active_this_turn is False
+        assert a2._take_active_correction() == ""
 
     def test_nonmatching_conv_held_in_queue(self):
         agent = self._agent([{"member": True, "note": "other conv", "conv": "fpB", "ts": time.monotonic()}])
         msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "earlier answer"}, {"role": "user", "content": "next"}]
         agent._consume_pending_corrections(msgs, conv_fp="fpA")
-        assert agent._correction_active_this_turn is False
+        assert agent._take_active_correction() == ""
         # still queued for its own conversation
         assert any(c.get("conv") == "fpB" for c in agent._pending_corrections)
 

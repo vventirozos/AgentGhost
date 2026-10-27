@@ -611,7 +611,7 @@
     <li><code>SkillMemory.owner_rules()</code> returns the rows with <code>origin: owner_rule</code> (adopted with "learn rule N", or approved by the operator), verified and general, at most <code>OWNER_RULES_MAX</code> = 6.</li>
     <li>The agent renders them as <code>### OWNER RULES</code> in the per-request state block on every turn that may see the owner's private context (<code>_owner_rules_block</code>: not a member, not a public reply, not an isolated delegate, not the <code>no_lessons</code> arm).</li>
     <li>They are still <em>retrieved</em> as before, so retrieval credit, attribution and the planner's lesson list keep working; the block comes in addition (r1 review: dropping them from retrieval broke all three). A quarantined rule is not shown. The playbook read is cached by modification time. <code>owner_rules</code> passes the read-only wrapper, so replays and self-play see the rules too. The trigger and the rule are both defused.</li>
-    <li><strong>Known and left:</strong> the pure-greeting fast path ("good morning ghost") builds no state block, so it carries its own "do not mention internal state" line instead of the rules.</li>
+    <li><strong>Known and left:</strong> the pure-greeting fast path ("good morning ghost") builds no state block, so it carries its own "do not mention internal state" line instead of the rules. (Moot since §4RP-c: the fast path was removed and greetings take the full turn.)</li>
   </ul>
   <p>Pins: <code>tests/test_4na_lesson_reach.py</code>.</p>
   <h2 id="4nc">Only approved rules and dictation create lessons <span class="tag">2026-10-10 &sect;4NC</span></h2>

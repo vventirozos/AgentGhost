@@ -100,11 +100,33 @@ def test_only_a_requests_own_call_takes_the_slot():
     slot_session_context.set("sess-b")
     L.note_main_slot_prompt(c, _head("hi", tools=None, system="Greet."), "greeting fast path",
                             background=False)
-    assert c._slot_session is None                      # review r1 MAJOR: it replaced the head
+    assert c._slot_session == "sess-a"                  # §4RP-c: no label clears the owner any more
     L.note_main_slot_prompt(c, _head("q"), "stream", background=False)
     assert c._slot_session == "sess-b"
     L.release_slot_session(c)
     assert c._slot_session is None
+
+
+def test_the_owner_record_names_the_request_that_holds_the_slot():
+    """§4RP-b: the same conversation's next request is told apart from the
+    calls of the request that holds the slot."""
+    from ghost_agent.utils.logging import request_id_context
+    c = _bare_client()
+    L.note_head_reference(c, _head())
+    slot_session_context.set("sess-a")
+    tok = request_id_context.set("req-1")
+    try:
+        L.note_main_slot_prompt(c, _head("q"), "stream", background=False)
+        assert c._slot_request == "req-1"
+        request_id_context.set("req-2")
+        L.note_main_slot_prompt(c, _head("bg"), "deferred-verdict", background=True)
+        assert c._slot_request == "req-1"               # a background call owns nothing
+        L.note_main_slot_prompt(c, _head("q2"), "stream", background=False)
+        assert c._slot_request == "req-2"
+        L.release_slot_session(c)
+        assert c._slot_request is None
+    finally:
+        request_id_context.reset(tok)
 
 
 def test_a_call_without_the_head_leaves_the_owner():

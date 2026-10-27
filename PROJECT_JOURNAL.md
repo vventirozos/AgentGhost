@@ -56814,3 +56814,203 @@ Open: docs (interfaces.html still describes v1), install.txt for v2, full suite 
 **§4RT-c (2026-10-26 21:51, operator: "yes, leave it running overnight")** — HANDS-OFF RUN starts: no patches, no deploys, digest monitor stopped. Baseline at start: session 2026-10-26_214445, at (-35,-10,33) in her shaft, day 3, carries cobble ×40, tree ×24, stick ×12, pick_wood, **pick_stone** (crafted just before the start); mind goal = dig three blocks east along y=-10. Judge tomorrow ON THE RECORD (events.jsonl + journal): (1) anything beyond the wood→pickaxe→stone script, (2) goals she sets herself vs. micromanaging the body, (3) claims that match the world. If dull, the fix is the setup (reliable body skills; a reason to act), not Luanti.
 
 **§4RT-d (2026-10-26 ~22:15, operator: "remove minecraft" then "also delete v2 , it's not working..")** — EVA'S WORLD DELETED, both versions; the §4RT-c overnight run was cancelled before it produced a record. Removed: interface/externals/ai_minecraft (v1) and interface/externals/eva_world (v2); Mac launchd com.local.eva-world-mind + ~/.local/bin/eva-world + ~/Data/AI/.world_hub_key + the mind log; nova launchd com.local.eva-world-hub, ~/Data/AI/World (world, sessions, templates), ~/Data/AI/Luanti (§4RS feasibility), ~/Library/Application Support/minetest, the luanti cask (node/git kept). Tests: test_ai_minecraft.py + test_eva_world.py deleted; the agent-side §4RQ pins (health slot_keep_left_s, outside-call refusal/log line) kept as tests/test_outside_call_4rq.py. KEPT on purpose: the agent's §4RQ outside-call route + head bookkeeping (llm.py/agent.py/routes.py, live code; no client now) — removing it needs an agent restart, operator's call. Docs: interfaces.html section removed; llm/routes/logging say the client is gone. Gemma on nova unchanged. Ideas discussed for a next game (no decision): Pokémon via PyBoy, Diplomacy with Gemma opponents, RimWorld, Slay the Spire.
+
+### §4RP-b — a follow-up re-processed the whole 30k head (2026-10-26 late, operator: "look at request 5a58a6ca, the whole head was reloaded, why?" → "confirm the divergence first then build it")
+**Found.** 5a58a6ca ("so nothing special happening ?") = turn 2 of f2e73743's conversation; 206 s, `cached_tokens 0`; llama `f_sim 0.954, f_keep 0.862` (≈28,860 of 33,481 kept) yet progress 0.07 at 2,048 → re-processed from token 0 (179.7 s / 30,261 tokens). Two causes together:
+1. **Divergence just past the head, confirmed:** `_compose_injection` labels the first user message `[USER INSTRUCTION]` while it IS the request and `[CONVERSATION START …]` on every later request. The stable block reconstructed from source = 2,832 ch (matches the logged `stable-prefix len=2832`, tight budget) = 657 tokens → its end sits ≈ head + 648, exactly llama's match length. The dropped request-1 state block comes ~45 tokens later. So EVERY follow-up diverges ~650 tokens past the head.
+2. **No checkpoint there:** `--ctx-checkpoints 4`; f2e73743's turns erased 26,164 / 28,201 (head boundary) / 29,543; even a full prefill erases 28,201 at its end. A hybrid model with no checkpoint ≤ the divergence restarts at 0.
+3. `_slot_switch_before` skipped the 0.5 s head restore because the owner was the same conversation (`owner == key`). The `probe_model` calls were NOT the cause (turn 2 resumed from the RAM cache, 2,617 tokens).
+**Built.** `note_main_slot_prompt` records the request that owns the slot (`llm._slot_request`, cleared by `release_slot_session`); `_slot_switch_before` now restores the head for the same conversation's NEXT request too (holding request known and ≠ this one), with every existing refusal. Calls of the holding request keep the slot; an unknown holding request keeps the old behaviour. Log: "restored the head before this conversation's next request in Ns (it re-reads its part past the head)". Trade: request ≥3 might sometimes have resumed from a surviving checkpoint a few seconds cheaper; the restore bounds the cost at 0.5 s + the conversation past the head instead of up to ~180 s. Not changed: the label flip itself (model-facing text, §4KV) — operator's call.
+Tests: 4 new (test_4ro_head_saves ×3, test_4rp_slot_keep ×1); 155 pass in the two files; 6 hand mutants all killed. Docs: core/llm.html §4RP-b.
+
+### §4RP-c — the greeting fast path removed (2026-10-26 late, operator: "the greeting fast path is not doing anything special … maybe drop it?" → shown it was ~8 s vs 20–45 s full path and its slot cost was now small → "full removal let's have one less thing to worry about")
+Removed: `_handle_trivial_chat` (lite prompt, thinking off, 256 tokens), its dispatch in handle_chat and the loose `is_trivial_greeting` flag; `llm.EARLY_REWARM_LABELS` (the early re-warm is armed by background calls only) and the owner-clearing branch for that label; `_correction_active_this_turn` (read only by the fast path's guard). Kept: `_is_strict_trivial_chat` (memory skip §4QN, verifier skip, direct-answer routes); `_note_trivial_reply`/`is_trivial_reply`, the `labelable:false` frames and `_census_fast` — still used by owner commands (§4PY) and member post links (§4QE); the census reader's `fast` counter (old rows age out). Greetings now take the full turn: slower (~20–45 s vs ~8 s median), but one prompt on the slot, memory-free still (strict check), thumbs + trajectory now available.
+Tests: fast-path tests replaced by `test_a_greeting_takes_the_full_turn`, census/no-thumbs/early-rewarm/owner tests flipped to the new behaviour, correction-flag assertions moved to the staged banner; mutate_4pm N30 retargeted at the command reply, mutate_4qm Q1 at `is_conversational`. Docs: core/agent.html (section rewritten), core/llm.html §4RP-c, api/routes, interfaces/cli + web_server, memory/skills, logging table regenerated.
+§4RP-c verify pass: also removed `NON_THINKING_GENERAL_PARAMS` (its last caller was the fast path; pin test dropped); a source-text restamp test I had added was dropped (the ratchet forbids new text pins; test_4py/test_4qe pin the no-thumbs ids by behaviour); test_4mx and the reply-language test now pin that a greeting gets the FULL prompt; pin baseline re-locked (902 pins, −5; digest 5a3a779b…). Final suite: 26,264 tests, all green after the digest; lint OK.
+
+### §4RU — the channel members' head gets its own saved file (2026-10-27, operator: "is it possible to have a common head for owner and slack members without giving access to members to everything?" → shown a shared head is safe for ACCESS (dispatch allowlist `_member_tool_refusal`) but puts the owner's skill descriptions + unusable tools in member prompts and moves the profile out of the owner's system prompt → operator chose B: separate files)
+Member head = 6 allowlisted tools + SYSTEM_PROMPT with `_MEMBER_PROFILE_PLACEHOLDER` (~8k tokens, ~50 s to prefill; built text matched live slack-4a sys h=ad907695 / 23,928 chars). head_saves: meta `kind` (absent = owner), llama-start restores owner only, prune keeps 3 per kind. agent: `_head_payload(member=)` (warm-up builder extracted), `_member_head_plan`, `_member_head_before` (first member call per request that opens with the members' head → restore its file; switch refusals), `_member_head_refresh` (re-warm tick: wanted + quiet ≥ slot_keep_s + nothing live + owner file → prefill `main-prefix-members`, save kind member, restore owner head, clear displaced; one try per key, deferral retried). Also: the switch restores with NO owner when `_head_displaced` (member turn after a head restore left the owner's next call re-processing 28k until the tick).
+Tests: 21 new in tests/test_4ro_head_saves.py; 12 hand mutants all killed. Docs: llm.html #4ru, configuration.html.
+§4RU self-review: a request arriving during the members' prefill skipped the save but kept `_member_head_tried` = key → the file never made for that prompt; now reset. Member branch moved before the outside-call branch. 2 tests, 2 mutants killed (14 total).
+
+### §4RU-r — review of the whole head save/restore workflow (2026-10-27, operator: "review all the head export-restore … use fresh reviewers"; then "fix what they find … deploy")
+4 reviewers (owner lifecycle, members/file format, live logs, conversation scenarios). Logs: 5 owner re-processings since live; open one = slack-be (owner on Slack, public system text, 170 s). Fixed: tools-shared calls restore (`shares_head_tools`); switch waits for llama idle (`_restore_when_idle`, bound 40→150 s) and judges "another turn" by the turn registry (`_turn_holder_ok`) not fg>1/streams; no-owner restores once per request (`_switch_done` per kind); identity re-read before restore; member restore parks first unless owner bare head; members' refresh before the "nothing ran" skip + 14-day recency; fresh/outside busy → defer; timed-out-but-landed restore not "failed"; prune on every save; tests block real HTTP (my test had made head-m1.part.bin on live llama — deleted). Open (operator): keep window/park now protect nothing; profile/effort change → no file till 600 s idle; per-request memory in first message → long follow-ups re-read all.
+§4RU-r rounds 2–3 (fresh reviewers on my fixes): r2 2 MAJOR (a drained turn's late call counted as the running turn → `_turn_lock` records the lock holder; `_switch_done` overwritten by other requests → per rid, after accept) + 5 MINOR (unreadable /slots ~118 s, unbounded member park, "landed" too loose, recency = used, refresh replanning every tick); r3 1 MAJOR (the /slots give-up counted timeouts = long batches → only fast failures count) + test_4mu_speed pin moved to `_turn_lock` + member record accept-first + recheck keyed by owner head. 23 mutants across rounds, all killed.
+
+## §4RV — A long conversation's follow-up resumes where it ended (2026-10-27)
+
+**Trigger (operator):** "1. yes, remove - 2. agreed - 3. yes, long conversations shouldn't re-read everything past the head on every follow-up", then "go with this" on the plan (stable first message; checkpoint at the right point; keep the conversation across other calls; no keep timer; head files made in gaps). llama restarted by the operator with `--ctx-checkpoints 12 --cache-ram 2048`; macOS services trimmed (Spotlight off, 33 Apple agents disabled — they stop at the next login).
+**Finding that changed the plan:** llama b11669 `server-context.cpp` already checkpoints at the start of a chat prompt's LAST USER MESSAGE (`message_spans.last_user_message_pos()`, from the template) plus 4+n_ubatch and 4 tokens before the end (log: "1081 … progress 1.00" then +4 = 1085); `--checkpoint-min-step` is an eviction-thinning rule when the list is full, not a creation gate; restore picks the newest checkpoint with pos_max ≤ divergence; an image in the prompt disables checkpoints. Our last user message is the state block → the checkpoint is exactly where the next request leaves the prompt. So NO 1-token checkpoint call. What wasted it: (1) first message changed per request (memory, persona, workspace notes, think budget, label flip); (2) displacement (background calls, members, other conversations; RAM cache can't hold a conversation + 12 checkpoints); (3) §4RP-b restored the head on every follow-up.
+**Built (GHOST_CONV_KEEP=1, default off):** `_split_request_context` + `stable_label` (first message = tool header with a think-depth pointer + one label; the per-request parts open the state block as section `request_context`, needs GHOST_STATE_ANCHOR); `head_saves` kind `conv` (`conv_key`, `save(at_least=…)`, newest 3 kept); `_conv_save` (owner's call last on the slot + opened with head, once per state, ≥ head+1024 tokens) / `_conv_displace` before another conversation's or unowned call, a member's request (no RAM park), every background main call (`LLMClient.before_background_dispatch`, before rule 5 and in the background stream; `main-prefix*` excepted), gap work; `_conv_restore` before a request whose conversation doesn't own the slot (fallback: head); same conversation's next request restores nothing; `slot_kept` = owned, no window; tick restores the head only over an unowned slot, no RAM park; missing owner head / members' head made after GHOST_SLOT_KEEP_S idle, saving the conversation first. Fix during tests: a changed head has no file yet → `_conv_save` takes the newest owner head's size. Tests `tests/test_4rv_conv_keep.py` (34, incl. two requests rendered through the chat template: switch on → follow-up agrees with the previous prompt up to its state block; off → not). Docs llm.html #4rv, configuration.html.
+§4RV review r1 (two fresh readers): slot 4 MAJOR — off-path hook released the owner (rule 5 never fired); on without head saves held the slot forever; a waiting save could write B's state under A's key (no recheck, at_least); a background call landed in a new request after a long save — + MINOR claim-in-slot. Prompt 1 MAJOR — depth re-picked per turn (project opened mid-request) re-sent the whole request_context section every turn → separate rc_* sections + heading; MINOR pointer "at the end" false from turn 2; anchor-less on wrote useless files. Fixed: one gate (CONV_KEEP+HEAD_SAVES+STATE_ANCHOR), slot_kept-forever only with the hook, off = no-op, `_conv_lock` + `still_it` recheck after each wait, BackgroundDeferred when a request started during the hook, claim when the slot already holds the file. Text pins replaced by behavioural tests (ratchet); real handle_chat test: first user message identical across two requests (on) / differs (off). Not covered (doc'd): 500-message window and compression summary rewrite early history.
+§4RV review r2 (fresh reader on r1 fixes): 2 MAJOR — the post-hook BackgroundDeferred also fired for calls `_wait_for_foreground_clear` admits during an image wait (OFF path too); `_conv_displace` released after a refused save, cutting the conversation's next request out mid-request → stale-file restore. + MINOR save waits up to 60 s while a request queues; claim on a count alone. Fixed: hook returns worked; defer only if worked and fg grew; hook no-op with a live request; `_slot_idle(stop)`; release only if saved or unchanged and not stopped; `_conv_last_saved` gates the claim, restore skip_n=-1. Mutants: 34 across r0–r2, all killed (2 survivors → 2 new tests).
+§4RV review r3: no MAJOR; MINOR fixed (claim needs no main call since the save; _slot_idle unread resets; rule-5 log wording); accepted: one deferred background call if a whole request runs inside a save's idle wait. Mutants 36/36 killed.
+
+## §4RW — Head-save and reasoning-effort log lines: one icon per event; a head saves page (2026-10-27)
+Operator: "logs are used to monitor the agent. the log entries should be short, clean and easy to understand. each log entry icon … must be unique and aware of the context of the log line. 1. beautify logs for (head saves / restores) use different icons. 2. add a detailed page to the documentation about the head save-restore functionality. 3. when i change reasoning effort i want different icons for each level (low - med - xhigh) and the active icon should also represent the default."
+- Icons (utils/logging.py): HEAD_DISK 💽 split into HEAD_SAVE 💽, HEAD_RESTORE 📀, HEAD_DEFER 🕒, HEAD_FAIL 📛, CONV_SAVE 📼, CONV_RESTORE 🔙. BRAIN_EFFORT 🔋 split into EFFORT_LOW 🪫, EFFORT_MEDIUM 🔋, EFFORT_XHIGH 🔥, plus `effort_icon(level)`. All are wide-base, and the web (app.js ICON_CLASS, v=16.0) and ClockworkPi (turnstatus.py) maps carry them.
+- Head lines moved from "Main Prefix Warmup" / "Session Switch" to two titles: "Head Disk" and "Conversation". Their failures use 📛 instead of the generic 🔶. The text is shorter: token counts with separators, and the "slot held N tokens" and "with the check" asides dropped. "Session Switch" no longer exists as a title.
+- Effort: a picked level logs "<level> — picked for this request" with that level's icon. A Default owner turn now logs "<level> — the server default" once per request, with the icon of the level the server's --chat-template-kwargs gives (only when that level is known). The xhigh escalation lines use 🔥.
+- Docs:
+  - New docs/core/head_saves.html: the kinds, slot owner, when it saves, when it restores, follow-ups, a timeline, files and cleanup, settings, log lines, troubleshooting, limits, code map and history.
+  - Linked from reference.html, the core sidebars, llm.html (with a note on the history paragraphs), configuration.html and logging.html (#4rw plus icon catalog rows).
+  - The title table was regenerated.
+- Pins: icon/title assertions in tests/test_4ro_head_saves.py (the fixture now records title + icon) and tests/test_4rv_conv_keep.py. Effort icon tests are in tests/test_4rc_effort_default.py.
+- Live evidence (same day): the conversation restore ran on a real owner request. c6aa82ad restored 32,775 tokens in 0.8 s at 09:59:09, after the 09:52:41 save.
+- §4RW-b (same day). Operator: "the agent just re-processed 28k of cache, from 2 different requests from members, i also didn't see a record saving the head file". Then: "i thought that changing xhigh didn't change the head, also, i thought that once a member does a request it will be saved and recalled on the next slack request".
+  - Found:
+    - (1) No members' file had ever existed. It was made only in a 600 s gap after a member request since the agent's last boot, and the restarts plus 10 h without members never allowed it, so slack-a0 processed its 10k prompt (55 s).
+    - (2) The 28k was the owner head at xhigh. d585336f picked xhigh, and that head (28,251 tokens) had no file; the effort sentence is in the head, so each level is its own file. slack-a0 saved the conversation, the slot was unowned, and the next re-warm prefilled all of it from 0 (167 s). slack-12 waited behind it.
+    - (3) The save after that was skipped ("a request reached the main slot first") as a durable-only INFO line, so it was invisible.
+  - Fixed:
+    - A head with no file starts from the newest head of the same server (re-warm `_near`, switch fallback) and re-reads only the tail from that file's checkpoint (~1k tokens).
+    - A member's first call with no members' file processes the members' head alone (direct POST of the warm-up payload to llama, 1 token) and saves it before the call (`_member_head_make`).
+    - "head not saved" / "members' head not saved" are on-screen 📛 lines.
+    - A gap-only rule for a no-file head was built and dropped: the nearest-file start covers the live case, and it deferred the first quiet warm-ups the tests rely on.
+  - Pins: 4 tests (+3 parametrized) at the end of tests/test_4ro_head_saves.py.
+- §4RW-c (same day). The operator asked: "does this solution cover all possible scenarios between owner and members? run a review …"
+  - Four fresh reviewers: owner scenarios, owner↔member interleavings, concurrency, and a 3-day log replay. They found 7 MAJOR and ~10 MINOR. The operator approved the plan: "go ahead in that order, probe is ok".
+  - Fixed now:
+    - (1) The owner's reply that ended during a save's wait refreshed `_slot_session_used`, so `still_it` refused. `_conv_displace` then kept the owner record, and a member restore overwrote the slot. The owner's next request skipped every restore and started from token 0.
+      - `still_it` now checks the owner and "no call since its last", and does not need an unchanged `used`.
+      - `_conv_displace` releases whenever the owner is the same and no request started.
+      - Under conv keep, an owner record with `_head_displaced` no longer counts as holding the slot.
+    - (2) The member branch now saves the owner's conversation before its kind checks, so any member call on main saves it.
+    - (3) A conversation restore that timed out but landed is kept. The restore bound is max(30 s, 10 s/GB).
+  - MINOR fixes:
+    - prune orders by last use (.bin or touched .json), and KEEP_CONV is 6;
+    - the warm-up's head save is refused only if the slot moved on (not merely "a request is live");
+    - the switch's near fallback leaves a head the re-warm just processed (`prompt_n`);
+    - a conversation save needs 20 s of its deadline (CONV_SAVE_MIN_S);
+    - `_member_head_make` needs 60 s (MEMBER_HEAD_MAKE_MIN_S) and says so on screen.
+  - Pins: new tests in tests/test_4rv_conv_keep.py and tests/test_4ro_head_saves.py. 12 hand mutants were run, all killed.
+  - Next, in the agreed order:
+    - a live probe of a 6+-call request plus a follow-up (whether the checkpoint the follow-up needs survives);
+    - effort change inside a conversation;
+    - owner on Slack keeping its thread;
+    - background calls during an image wait.
+- §4RW-d (same day). The approved probe (8 one-call steps, then a no-tools follow-up). No checkpoint erase was logged in the 12-checkpoint run. T1 took 300 s and every tool turn re-processed ~3.5k tokens; the follow-up re-processed 8,356 tokens (59 s).
+  - Cause of the tool-turn cost: the "state block delta" was ~9.8k chars on every turn after the first write, where normal deltas are ~800. The sandbox listing is re-built after each write and no longer equals turn 1's. `_state_changes` sent it whole each turn: 8,577 chars, 134 entries on the owner workspace. This has been the case since §4RC (the 10-25 coding requests show the same ~10k deltas), so it is not a regression.
+  - Fix: `_listing_changes` sends the count line plus the added, changed and removed entries; turn 1's kept block holds the rest. The listing goes whole when no diff can be trusted (no entries in turn 1, 200-entry cap hit, diff not shorter). Pins: 5 tests in tests/test_4rc_state_anchor.py; 3 hand mutants, all killed.
+  - The follow-up's 8.4k tokens are the new request's whole state block (~25.8k chars, of which the listing is 8.6k), plus the previous request's history once its tool turns are dropped. That is by design; this fix does not change it.
+- §4RW-e (same day). The operator asked: "verify all your changes using fresh eye reviewers and when the current code is clean, proceed with 5,6,7". Three fresh reviewers looked at three areas: the state delta, head and conversation saves, and logs, clients and docs. Fixed:
+  - (MAJOR) 🔥 EFFORT_XHIGH was still an error glyph in both clients: a face spike, crimson, and a duplicate ICON_CLASS key whose later 'accent' entry won. The legacy 🔥 entries were removed (no Icons member used them). New test: no glyph mapped twice in either client. app.js and matrix_graph.js are now at v=16.1.
+  - (MAJOR) A reply stream whose agent-side end landed after `release_slot_session`, or after a newer main call opened, took the slot record back, so the owner's next request skipped its restore. `note_main_slot_prompt` now ignores a stream that opened before `_main_last_opened` or `_slot_released_at`.
+  - (MAJOR) The broken anchor head_saves.html → logging.html#4rw now resolves (`id="4rw"` on the catalog row).
+  - MINOR fixes:
+    - `head_saves.restore` touches the file on success, so pruning by last use counts restores.
+    - A conversation restore that timed out is posted once more when the slot is idle. `/slots` n_prompt_tokens follows the last completion, not a restore, so the old count check could not see a landing.
+    - `_conv_save` falls back to the last good plan (`_conv_plan_last`) when a tick's plan failed.
+    - A llama restart under a live agent clears the slot record: prompt_tokens_total fell, or the server has served nothing.
+    - A near-head restore in the switch now says "the nearest saved head".
+    - "session switch:" log text became "head disk:"; stale titles in llm.html were updated; the doc now lists the member-make deadline give-up and describes agent-restart behaviour truly.
+    - The listing diff is trusted only when the parsed entries match the listing's own count. Keys come from the raw line, with the signature split off only for `.py  [def|class`. The section is keyed `sandbox_state:<project>`, so a project switch sends the new listing whole.
+  - Not changed:
+    - `effort_icon`'s unknown-level fallback: unreachable, because `level_in_render` only matches low/medium/xhigh.
+    - Persisting the owner record and effort level across agent restarts, and saving the conversation in the SIGTERM drain: deferred, as before (costs time only; the drain budget needs measuring first).
+  - Operator request in the same round: the CLI's bottom bar shows the effort icon (🪫/🔋/🔥) before the level word. On Default it shows the server level's icon, from the new health field `reasoning_effort_default` (the cached value; health never starts a lookup).
+  - Pins: about 20 new tests. Hand mutants: 10 run, 3 survived the first pass (the project-keyed diff, the release signal on its own, and the stream's open time), all killed after new tests. Suite 26,340 passed, lint OK.
+- §4RW-e r2 (same day). A round-2 fresh reviewer of the round-1 fixes found 2 MAJOR, both inside those fixes:
+  - (1) The stale check compared a stream's open time with an unstreamed call's END time. A background call that finished after the owner's next stream opened made that stream's record look stale. Every main call now marks its DISPATCH (`mark_main_dispatch`: streams on open, unstreamed calls just before `_do_chat_completion` when they target main, outside calls at start) and passes it as `opened_at`. One slot runs calls in dispatch order, so the newest dispatch is what the slot holds. A call with no mark (a pool call that fell back to main) is not judged.
+  - (2) `_conv_displace` released after a successful save even when a request had started during it. That request's own call then read as stale and could not record the slot. It now keeps the record whenever `stop()` is true; the warm-up callers pass `_request_live_check`.
+  - MINOR:
+    - An outside call ending after an agent call was dispatched leaves no head mark.
+    - The conversation retry is posted only when the deadline allows its bound, and a second timeout is treated as a landing (the slot was idle, so llama is reading the file).
+    - The fallback plan checks `server_identity` before saving.
+    - `_forget_slot_owner` sets `_head_displaced_by`.
+  - Pins: 9 new tests. 10 mutants: 3 survived at first, then all killed. test_outside_call_4rq now backdates the dispatch mark together with the start. Suite 26,350 passed, lint OK.
+- §4RW-e r3 (same day). A round-3 reviewer of the dispatch-order mechanism found 2 more MAJOR and 5 MINOR in it:
+  - releases were timestamped after the restore or save they followed, not when it was posted;
+  - marks came before `_main_node_lock` and before retries;
+  - a mark that never reached llama hid the call that did;
+  - vision calls and pool fallbacks to main were never marked.
+  - Three rounds, each MAJOR inside the previous fix, so the mechanism was REVERTED: no `mark_main_dispatch`, no `_slot_released_at`, no early return in `note_main_slot_prompt`, and outside calls as before. llm.py's slot bookkeeping is back to its reviewed §4RP r2 form.
+  - Round 1's MAJOR (a reply that drains late through a slow client re-takes the slot record after a member's whole turn) is OPEN again, and rare. It costs a full re-read of that conversation, never a wrong answer.
+  - Idea for later: book a stream at the moment llama's last chunk arrives (inner generator exhausted, or the usage/timings frame) rather than in the outer `finally`. That is one point in one function, with no global clock.
+- Kept and fixed in this round:
+  - `_member_head_refresh` returns when the conversation still holds the slot after `_conv_displace` (unsaved, or a request started during the save).
+  - The fallback plan's identity check counts an unreadable `/props` as "same model". A model change restarts llama, and `_note_llama_restart` forgets the owner.
+  - The retry's idle wait is bounded by `late - bound`.
+  - Pins: 3 new tests, 3 mutants all killed; the tests of the reverted mechanism were removed. Suite 26,343 passed, lint OK.
+- §4RW-f (same day): operator item 5, an effort change inside a conversation. The effort sentence closes the system block, so a new level parts from the conversation in the slot ~28.2k tokens in, past its checkpoints, and llama re-read everything from token 0 (~170 s plus the conversation).
+  - Now:
+    - the switch restores the new level's head (its file, or the nearest head) and only the conversation is re-read;
+    - conversation files record the level their state was built at, and one saved at another level is left on disk (🧳 CONV_LEFT, new icon, both clients mapped, app.js and matrix_graph.js at v=16.2);
+    - Default counts as the server's level.
+  - A fresh review of the first cut found 1 MAJOR: a thinking-off owner turn renders the medium head whatever the pick, but the level was taken from `_main_effort_level`. It also found MINOR issues:
+    - "" ≠ "medium" while the default was unknown;
+    - the warm-up plan was labelled after its awaits;
+    - a re-plan inside a request rebuilt the tools and re-stamped tuned descriptions;
+    - a failed re-plan was retried on every call;
+    - the conversation's meta was read outside `_conv_lock`.
+  - Reworked so that levels come from what is rendered and sent:
+    - plan `effort` = `level_in_render(rendered)`;
+    - a call's level = `_call_level(payload)`: thinking off is medium, an explicit level is itself, Default is the known server level, and an unknown server level gives None, which moves nothing;
+    - the re-plan sets the level on `_head_payload_base` (the warm-up's level-free payload) and is tried once per (request, level);
+    - `_switch_done` is keyed by (kind, level);
+    - `_conv_restore(level=)` checks under the lock;
+    - the save's `extra` is omitted when the level is unknown.
+  - Residual: `_slot_level` is set at the switch, so a call cancelled before llama ran it counts. That costs one extra head restore.
+  - Pins: 15 tests in tests/test_4rv_conv_keep.py; 11 mutants, all killed; test_4rb's read-only effort enumeration gains known_server_default, level_in_render and LEVELS. Suite 26,362 passed, lint OK.
+- §4RW-f r2 (same day). A round-2 fresh review of the rework found 1 MAJOR and 3 MINOR.
+  - MAJOR: with `_switch_done` keyed by (kind, level), an A → B → A sequence in one request (xhigh, then the thinking-off loop-retry turn, then xhigh) found (head, xhigh) already done and re-read from token 0. Fix: the key is the kind again, and a moved level bypasses the gate.
+  - MINOR, fixed:
+    - `_call_level` applies `with_probe_effort` (an arm's level is set only at the send);
+    - `level_in_render` reads the system block only (text before the first `<|im_end|>`) and its LAST match.
+  - MINOR, residual and documented: llama restarted onto a level-free template under a live agent keeps the stale server default.
+  - Pins: 3 new tests, 4 mutants all killed.
+- §4RW-g (2026-10-27, item 7). Background calls during an image wait under conv keep.
+  - Before: `_wait_for_foreground_clear` let ONE background call in per render window. Under conv keep the slot holds the live request's conversation, and `_conv_before_background` skips while a request is live (returns False). So the admitted call replaced the conversation UNSAVED, and the turn's next call re-read all of it.
+  - Fix: the render window admits nothing while `conv_keep_enabled()`. Background calls wait for the request to end; the hook then saves the conversation first. With conv keep off, nothing changes.
+  - Pins: 3 tests in tests/test_bg_during_image_wait.py. Docs: core/llm.html foreground-wait table.
+  - REVERTED the same day, after a fresh review (MAJOR). Production runs the render look (`GHOST_RENDER_LOOK=1`) on the vision pool, which is the main server. It is the turn's own foreground call, so it replaces the conversation on every image turn anyway (the launcher notes +35 s per image turn). Holding the window therefore saved a re-prefill only on look-skipped turns, and it parked all background main work for the whole image turn. Code, tests and docs are back as they were.
+  - The real lever, NOT built: save the conversation before the look and restore it after (a disk restore takes 0.3–2 s, against a ~35 s re-prefill). It waits for the operator.
+- §4RW-g b (2026-10-27, operator "proceed"): save the conversation before a picture look, restore it after. BUILT.
+  - Live probe first (request "draw a red apple on a wooden table", probe header). The reply call after the render look re-read 30,112 tokens from token 0: 179 s (llama task 8185). The launcher's "+35 s" note is out of date.
+  - Two causes:
+    - the client called the switch hook only for calls marked main, and the look is `use_vision` (the vision pool is 127.0.0.1:8088, the main server), so nothing saved first;
+    - `_switch_done` already held "head" for the request (Turn 1's restore), so Turn 2 restored nothing.
+  - Fix:
+    - llm.py: `_pool_is_main_box` + `before_side_main_dispatch` (bounded, never fails the call) for a foreground call on a pool whose every node is the main server.
+    - agent.py `_side_call_before`: under conv keep, for an owner request holding the slot, on a call that is neither the head nor its tools: `_conv_save` ("this request's picture look"), owner kept, `_side_call_rid = rid`.
+    - `_slot_switch_before`: a head call of that rid with the slot displaced passes the once-per-request check, so `_conv_restore` (else a head restore) runs; the marker clears.
+  - Pins: tests/test_4rwg_side_call.py (18). Docs: core/head_saves.html#look.
+  - Review r1 (fresh eye): no CRITICAL or MAJOR, 4 MINOR. Suite: 15 failures, all in test_memory_reconcile_round5_4gj; the file passes alone (load-flaky).
+    - Fixed: a look that raised after it was sent left the marker set and the slot undisplaced, so the next call re-read from token 0. The side path now calls `note_main_slot_prompt` on any exception.
+    - Documented:
+      - a pool falling back to main is not covered;
+      - several looks in one image call make one save;
+      - the verifier's vision fallback pays a save in-turn.
+    - 4 mutants survived. 7 tests added (25 in the file); 6 mutants now all killed.
+    - Round 2 (fresh eye): no CRITICAL or MAJOR, 3 MINOR, accepted and documented. Any failed look counts as displacing the slot. If it never reached llama, that costs one extra ~1 s restore. If the save before it was also skipped, the conversation is re-read from the head. A member's failed look marks the slot too. One test renamed to say what it pins. Suite: 26,463 passed, lint OK.
+    - Deployed 14:26 (pid 97449), then again with skip-reason logging (pid 9627, ~14:40). The live apple probe still re-read 30,109 tokens (179 s); the log reads "conversation not saved before a side call on the main server: no conversation key".
+      - Probes get no conversation key by design (`_set_slot_session(None)` for probe and unowned ids), and neither do scheduled tasks. So a probe cannot exercise the owner path, and these requests still pay the full re-read after a look.
+      - The owner path is covered by the unit tests only, until the owner's first image turn under conv keep. Expected lines: "saved to disk before this request's picture look", then "restored from disk".
+      - Open option: for requests without a key, restore the head after the look (~0.5 s plus ~2k tokens re-read, against 179 s).
+- §4RW-g b (2026-10-27, operator "do it"): the head comes back after a look for requests without a key (probes, sched-/sub-/job-).
+  - `_side_call_before` with no key sets `_side_call_rid` (no save) and logs it at INFO.
+  - `_slot_switch_before` lets a keyless request through only for its head call after its own look (marker == rid, slot displaced). It never restores a conversation file (`key and` guard) and restores the head; the line says "this request after its own picture look … re-reads its part past the head".
+  - Pins: 5 tests (30 in the file); 5 mutants, all killed.
+  - Review (fresh eye): no CRITICAL or MAJOR, 1 MINOR, fixed. The keyless gate needed only the marker, so a marker left without a displacement (a look served elsewhere, or an earlier run of the same sched- id) restored the head over the request's own conversation. The gate now also needs `_head_displaced`. The fixture no longer seeds a `_switch_done` the real flow never writes; 1 pin added and its mutant is killed.
+  - Older, not from this change (noted): the owner's late-draining reply can claim the slot back after a keyless request's release. That is the open late-drain race.
+  - Suite: 11 failures, all in test_memory_reconcile_safety_4gj_r4; the file passes alone (the same load-flaky family as round5_4gj earlier today).
+  - Deployed 17:0x (pid 36215). Live apple probe:
+    - head restored in 0.8 s after the look; Turn 2 re-read 1,902 tokens in 13.7 s, instead of 30,109 tokens in 179 s;
+    - whole request 153 s, against 311–321 s before.
+    The owner path (save + conversation restore) still waits for a real owner image turn.
+- Flaky memory tests FIXED (2026-10-27). The cause: huggingface_hub fixes its cache path at its FIRST import. When a test that had pointed HOME at a temp dir was first to import it on an xdist worker, every later offline embedder load on that worker failed 3x and called sys.exit(1). A whole file of VectorMemory tests failed, a different file each run.
+  - Reproduced directly: freeze the cache under a temp HOME, then load, gives "couldn't find them in the cached files".
+  - Fix: tests/conftest.py pins HF_HOME and imports huggingface_hub.constants before any test module. Pin: tests/test_hf_cache_pinned.py, which fails without the fix.
+  - Suite: 26,469 passed, 0 failed, lint OK.
+- Late-drain race: checked in the logs (operator), no occurrence.
+  - Across 2,215 requests (10-07 to 10-27), no request started its first call before the previous one finished.
+  - All 14 re-prefills over 8k tokens since llama started (08:48) have other causes: effort-level work, keyless probes' whole state block, the apple probes, and slack-7e's look.
+  - Left OPEN by choice.
+- §4RW-g c (2026-10-27, operator "cover members' looks too"). Live slack-7e: the member's call after its render look re-read 16.6k tokens (94 s), because the members' head is restored once per request.
+  - `_side_call_before` now records `_member_side = (rid, time)` for a member request (no save).
+  - `_member_head_before` restores the members' head again when `_last_main_call_end` is after that time. Members' calls never open with the owner's head, so `_head_displaced` cannot be the signal.
+  - Pins: 5 tests (the old "member left alone" test was replaced); 6 mutants, all killed.
+  - Review (fresh eye): no CRITICAL or MAJOR, 3 MINOR, accepted.
+    - A look that raises before llama runs it still stamps the end time, which costs one members'-head restore plus re-reading the member's part (~40 s). That is still under the 94 s it prevents.
+    - Older gap: a background call let in during a member's render, with no look on main afterwards, is unmarked, so the next call re-reads everything.
+    - No client-level member test (the owner client test covers the same path).

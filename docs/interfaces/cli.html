@@ -226,7 +226,12 @@
     turn is not thread-safe) and redraws the prompt; the effort segment reads <code>self.effort</code>, so a
     <code>/effort</code> shows at once. The start-up banner is now the rule + hint line. Tests:
     <code>tests/test_ghost_cli.py::TestStatusToolbar</code>; <code>TestChrome</code>'s never-wrap / drop-order pins now
-    measure the status line directly.</li>
+    measure the status line directly.
+    <strong>§4RW-e (2026-10-27): the effort icon.</strong> The segment reads <code>effort 🪫 low</code>,
+    <code>effort 🔋 med</code> or <code>effort 🔥 x-high</code> — the agent's own <code>Icons.EFFORT_*</code>
+    (<code>EFFORT_ICONS</code>, pinned equal by a test). On Default it shows the icon of the server's own level
+    (<code>effort 🔥 default</code>), read from health's <code>reasoning_effort_default</code>; before the agent
+    has looked that level up it shows <code>effort default</code> with no icon.</li>
     <li><strong>The banner wrapped.</strong> Its rule was a hardcoded 52 columns and it
     assembled the full URL, the session id and <code>up 3h 20m</code> unconditionally — so it
     under-ran a wide window and spilled onto a second line in a narrow one.
@@ -341,7 +346,7 @@
 
 <h2 id="4ml">§4ML (2026-10-08)</h2>
 <ul>
-  <li>A reply the agent marks unlabelable (a quick greeting) shows no rating hint, and <code>/good</code> / <code>/bad</code> on it say why instead of retrying for 6 s.</li>
+  <li>A reply the agent marks unlabelable (an owner command the system answered) shows no rating hint, and <code>/good</code> / <code>/bad</code> on it say why instead of retrying for 6 s.</li>
   <li><code>/notify</code> during quiet hours says how many notices the agent is holding (the agent's response now carries <code>held</code>), or "no new notifications (quiet hours)". It reports "acknowledged" only when the ack succeeded.</li>
   <li><code>/cancel</code> stops whatever turn the agent is running, from any client, and now names the request it cancelled.</li>
   <li><code>ghost --probe</code> marks every turn <code>X-Ghost-Origin: probe</code>: it runs normally and never teaches.</li>

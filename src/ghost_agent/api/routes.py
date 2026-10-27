@@ -644,6 +644,14 @@ def _effort_enabled() -> bool:
         return False
 
 
+def _effort_default_known() -> str:
+    try:
+        from ..core.effort import known_server_default
+        return str(known_server_default() or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 @router.get("/api/health", dependencies=[Security(verify_api_key)])
 async def api_health(request: Request):
     """Runtime introspection for the operator + NetMon + the RSS supervisor
@@ -759,6 +767,7 @@ async def api_health(request: Request):
         "asyncio_tasks": live_tasks,
         "foreground_requests": getattr(llm, "foreground_requests", None),
         "reasoning_effort": _effort_enabled(),            # §4RB: the web UI shows its selector only then
+        "reasoning_effort_default": _effort_default_known(),   # §4RW: the CLI bar's Default icon
         "foreground_tasks": getattr(llm, "foreground_tasks", None),
         "biological_watchdog_alive": (bio_task is not None and not bio_task.done()),
         "memory_system_loaded": getattr(context, "memory_system", None) is not None,
@@ -1497,8 +1506,9 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                 else:
                     await _persist_session(content)
                     content = _member_copy(request, content)
-                    # A trivial-fast-path reply has NO trajectory (by
-                    # design), so no label can ever land on it: say so on
+                    # A reply the system answered without a model turn
+                    # (an owner command, a member's post link) has NO
+                    # trajectory, so no label can ever land on it: say so on
                     # the wire and the UI renders no thumbs (§4EX). `is
                     # True` — a MagicMock agent answers truthy to anything.
                     _unlabelable = (getattr(agent, "is_trivial_reply", None) is not None

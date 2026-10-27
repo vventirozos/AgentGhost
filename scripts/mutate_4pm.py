@@ -15,7 +15,7 @@ FC = "src/ghost_agent/core/failure_census.py"
 OS_ = "src/ghost_agent/core/owner_seeds.py"
 AG = "src/ghost_agent/core/agent.py"
 PINS = ["tests/test_4pm_observability.py", "tests/test_4pl_failure_census.py"]
-_FULL_PAT = r"failure_census\|owner_seeds\|judge_reactions\|_handle_trivial_chat"
+_FULL_PAT = r"failure_census\|owner_seeds\|judge_reactions\|_census_fast"
 
 MUT = [
     ("CONTROL no-op (must SURVIVE)", FC, "def _tname(t: dict) -> str:", "# ctl\ndef _tname(t: dict) -> str:"),
@@ -41,7 +41,7 @@ MUT = [
     ("N26 guard counts wrong tool", FC, "                     \"guards\": [n for n, c in zip(cnames, classes) if c == \"guard\"],", "                     \"guards\": [n for n, c in zip(cnames, classes) if c == \"failed\"],"),
     ("N27 no-tool judge writes tool cache", OS_, "    return Path(home_system) / \"selfplay\" / (REACTIONS_NOTOOL_FILENAME if no_tool else REACTIONS_FILENAME)", "    return Path(home_system) / \"selfplay\" / REACTIONS_FILENAME"),
     ("N28 no-tool judge judges tool turns", OS_, "bool(getattr(t, \"tool_calls\", None)) == no_tool:", "not getattr(t, \"tool_calls\", None):"),
-    ("N30 fast path writes nothing", AG, "                        await self._census_fast(req_id, fast_result[0])   # §4PM", "                        pass"),
+    ("N30 command reply writes nothing", AG, "                    await self._census_fast(req_id, _sys_reply, kind=\"command\")", "                    pass"),
     ("N5 designed stop is a failure", FC, "    if is_designed_stop(c):                 # before anything", "    if False:                 # before anything"),
     ("N7 live status ignored", FC, "    if st is not None:\n        # a live row", "    if False:\n        # a live row"),
     ("N18 fast rows out of window counted", FC, "            fast += cutoff < str(r.get(\"at\") or \"\")[:10] <= today.isoformat()", "            fast += 1"),

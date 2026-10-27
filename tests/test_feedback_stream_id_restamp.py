@@ -359,13 +359,6 @@ class TestAgentRemembersTrivialReplies:
         assert Agent.is_trivial_reply(ns, "keep") is True
         assert Agent.is_trivial_reply(ns, "r0") is False
 
-    def test_the_fast_path_return_notes_the_id(self):
-        src = (_ROOT / "src/ghost_agent/core/agent.py").read_text(encoding="utf-8")
-        i = src.index("fast_result = await self._handle_trivial_chat(")
-        window = src[i:i + 900]
-        assert "if fast_result is not None:" in window
-        assert window.index("self._note_trivial_reply(req_id)") < window.index("return fast_result")
-
 
 class TestStreamOpenaiExtra:
 

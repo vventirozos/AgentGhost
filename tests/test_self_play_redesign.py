@@ -11,10 +11,11 @@ are gone. What remains pins the main agent:
       raise to 16384 is only safe because the detector bounds collapse.
   #5  `stop=[...]` sequences in the tool-turn payload — hard stop on
       back-to-back tool_call.
-  plus the non-thinking general sampling profile and the guard that the
-  main tool turn never disables thinking. (The SYNTHETIC_CHALLENGE_PROMPT
-  worked-example pins and the unused NON_THINKING_REASONING_PARAMS went
-  with those constants in the post-§4NN tidy-up.)
+  plus the guard that the main tool turn never disables thinking. (The
+  SYNTHETIC_CHALLENGE_PROMPT worked-example pins and the unused
+  NON_THINKING_REASONING_PARAMS went with those constants in the post-§4NN
+  tidy-up; NON_THINKING_GENERAL_PARAMS went with its last caller, the
+  greeting fast path, §4RP-c.)
 """
 
 from pathlib import Path
@@ -141,18 +142,6 @@ class TestStopSequences:
 
 
 class TestNonThinkingSamplingProfiles:
-    def test_non_thinking_general_matches_model_card(self):
-        """Values quoted directly from the model card's General row in
-        the non-thinking-mode table."""
-        from ghost_agent.core.agent import NON_THINKING_GENERAL_PARAMS
-        assert NON_THINKING_GENERAL_PARAMS == {
-            "temperature": 0.7,
-            "top_p": 0.8,
-            "top_k": 20,
-            "min_p": 0,
-            "presence_penalty": 1.5,
-        }
-
     def test_thinking_mode_profiles_unchanged(self):
         """Regression guard: adding non-thinking profiles must not
         perturb the existing thinking-mode profiles that the main

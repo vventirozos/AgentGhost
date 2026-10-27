@@ -458,11 +458,14 @@ async def test_a_periodic_rewarm_that_finds_an_eviction_still_warns(warm_agent, 
 
 # ── 5. wiring ──────────────────────────────────────────────────────────
 
-def test_the_greeting_fast_path_names_its_call():
+def test_no_greeting_fast_path_is_left():
+    """§4RP-c: the greeting fast path (its own lite prompt on the main slot)
+    was removed; nothing labels a call with it any more."""
     from ghost_agent.core.agent import GhostAgent
     t = P.tree(GhostAgent)
     labels = [P.U(P.call_kw(c, "task_label")) for c in P.calls(t, "chat_completion")]
-    assert "'greeting fast path'" in labels
+    assert "'greeting fast path'" not in labels
+    assert not hasattr(L, "EARLY_REWARM_LABELS")
 
 
 def test_the_loop_waits_through_the_displacement_wait():
@@ -670,7 +673,7 @@ async def test_the_vision_judge_skips_quietly_on_a_park_that_ran_out(caplog, tmp
     ("deferred-verdict", True, True), ("stream", True, True),
     ("stream", False, False),                         # a member's / an owner's own turn: the 180 s tick
     ("unlabelled", False, False),
-    ("greeting fast path", False, True),              # the owner's greeting: the next message is near
+    ("greeting fast path", False, False),             # §4RP-c: no label arms it any more
 ])
 def test_only_calls_nobody_waits_for_arm_the_early_rewarm(label, bg, early):
     c = SimpleNamespace(foreground_requests=0, foreground_tasks=0)

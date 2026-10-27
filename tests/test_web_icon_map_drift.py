@@ -34,11 +34,16 @@ def _python_icon_glyphs():
     return glyphs
 
 
-def _js_icon_keys():
-    """The key set of app.js's ICON_CLASS object literal."""
+def _js_icon_key_list():
+    """The keys of app.js's ICON_CLASS object literal, repeats kept."""
     src = APP_JS.read_text(encoding="utf-8")
     block = src.split("const ICON_CLASS = {", 1)[1].split("};", 1)[0]
-    return {m.group(1) for m in re.finditer(r"'([^']+)':\s*'\w+'", block)}
+    return [m.group(1) for m in re.finditer(r"'([^']+)':\s*'\w+'", block)]
+
+
+def _js_icon_keys():
+    """The key set of app.js's ICON_CLASS object literal."""
+    return set(_js_icon_key_list())
 
 
 def test_every_emitted_glyph_is_classified():
@@ -56,3 +61,17 @@ def test_no_unreachable_vs16_keys():
     # U+FE0F — so any two-codepoint VS16 key in the map is permanently dead.
     dead = [k for k in _js_icon_keys() if "️" in k]
     assert not dead, f"unreachable VS16 keys in ICON_CLASS: {dead}"
+
+
+def test_no_glyph_is_mapped_twice():
+    # §4RW review: '🔥' was mapped 'think' (EFFORT_XHIGH) and, further down,
+    # 'accent' from an old meaning — the later key won, silently, in both clients.
+    import ast
+    import collections
+    js = collections.Counter(_js_icon_key_list())
+    ts = REPO / "interface" / "externals" / "clockwork_ghost" / "turnstatus.py"
+    node = next(n for n in ast.parse(ts.read_text(encoding="utf-8")).body
+                if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "ICON_CLASS")
+    py = collections.Counter(k.value for k in node.value.keys)
+    assert [k for k, c in js.items() if c > 1] == []
+    assert [k for k, c in py.items() if c > 1] == []

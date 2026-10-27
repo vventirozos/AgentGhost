@@ -10,6 +10,16 @@ import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, AsyncMock
 
+# ⚠ The Hugging Face cache path freezes at huggingface_hub's FIRST import,
+# from HOME/HF_HOME as they are then. Many tests point HOME at a temp dir;
+# when one of them was first to import it on a worker, every later embedder
+# load there looked in an empty temp cache, failed offline 3x and called
+# sys.exit(1) — a whole file of VectorMemory tests failed, a different file
+# per run (2026-10-27: round5_4gj, then safety_4gj_r4). Pinned here, before
+# any test module is imported, to the real cache.
+os.environ.setdefault("HF_HOME", os.path.join(os.path.expanduser("~"), ".cache", "huggingface"))
+import huggingface_hub.constants  # noqa: E402,F401  (freezes the cache path now)
+
 # ⚠ COLLECTION-TIME live-path isolation. Must run at MODULE level, before
 # any test module is imported — an autouse FIXTURE is too late for the two
 # ways this project actually reaches live files:

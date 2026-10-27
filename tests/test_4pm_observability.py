@@ -223,9 +223,9 @@ async def test_the_census_hook_passes_the_loops_rows(tmp_path, monkeypatch):
     assert r["classes"] == ["guard"] and r["task"]["outcome"] == "blocked"
 
 
-async def test_a_fast_path_greeting_leaves_a_census_row(tmp_path, monkeypatch):
-    """The trivial fast path writes no trajectory; before §4PM it left no
-    trace at all (32 such turns in 14 days were invisible)."""
+async def test_a_greeting_is_a_normal_turn_not_a_fast_row(tmp_path, monkeypatch):
+    """§4RP-c: the greeting fast path is gone — a "hi" writes no "fast" census
+    row and is not marked as a reply without a trajectory (thumbs stay)."""
     from ghost_agent.core.agent import GhostAgent
     from tests.helpers import make_context, FakeBgTasks
     monkeypatch.setenv("GHOST_HOME", str(tmp_path))
@@ -236,8 +236,8 @@ async def test_a_fast_path_greeting_leaves_a_census_row(tmp_path, monkeypatch):
         "choices": [{"message": {"role": "assistant", "content": "Hello!"}}]})
     await agent.handle_chat({"messages": [{"role": "user", "content": "hi"}]}, FakeBgTasks(),
                             request_id="web-4pm-4", requester_role="owner")
-    assert agent.is_trivial_reply("web-4pm-4")
-    assert [r for r in _rows(tmp_path) if r.get("kind") == "fast" and r["req_id"] == "web-4pm-4"]
+    assert not agent.is_trivial_reply("web-4pm-4")
+    assert not [r for r in _rows(tmp_path) if r.get("kind") == "fast"]
 
 
 # ── the report ──────────────────────────────────────────────────────────────

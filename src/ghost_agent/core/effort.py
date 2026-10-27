@@ -83,8 +83,11 @@ _server_default_lock = threading.Lock()
 def level_in_render(prompt: str) -> str:
     """The level a rendered prompt was made at: the template's sentence, or
     medium when it wrote none (the template's medium has no sentence)."""
-    m = _LEVEL_SENTENCE_RE.search(str(prompt or ""))
-    return m.group(1) if m else "medium"
+    # §4RW-f r2: the system block only (a profile could quote the sentence),
+    # and its last match — the template appends the sentence last
+    text = str(prompt or "").split("<|im_end|>", 1)[0]
+    found = _LEVEL_SENTENCE_RE.findall(text)
+    return found[-1] if found else "medium"
 
 
 def _render(base_url: str, timeout: float, kwargs=None) -> str:
@@ -130,6 +133,13 @@ def _refresh_in_thread(base_url: str) -> None:
     finally:
         with _server_default_lock:
             _server_default["busy"] = False
+
+
+def known_server_default() -> str:
+    """The last known server default, without starting a lookup ("" before
+    the first one) — for the health answer, which clients poll."""
+    with _server_default_lock:
+        return _server_default["level"]
 
 
 def server_default(base_url: str) -> str:

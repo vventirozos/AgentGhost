@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.head_saves — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Core</h3>
+    <a href="agent.html">agent</a>
+    <a href="agent_qwen.html">agent_qwen</a>
+    <a href="llm.html">llm</a>
+    <a class="current" href="head_saves.html">head_saves</a>
+    <a href="node_throughput.html">node_throughput</a>
+    <a href="planning.html">planning</a>
+    <a href="prompts.html">prompts</a>
+    <a href="bus.html">bus</a>
+    <a href="context_manager.html">context_manager</a>
+    <a href="dream.html">dream</a>
+    <a href="verifier.html">verifier</a>
+    <a href="workspace_model.html">workspace_model</a>
+    <a href="project_advancer.html">project_advancer</a>
+    <a href="project_safety.html">project_safety</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
+  <h1>Head saves: the model's memory of a prompt, kept on disk</h1>
+  <p class="subtitle"><code>core/head_saves.py</code> plus the slot bookkeeping in <code>core/agent.py</code> and <code>core/llm.py</code>. How the agent avoids re-reading the same 28,000 tokens every time something else used the model.</p>
+
+  <h2 id="why">Why it exists</h2>
+  <p>Every owner request opens with the same <strong>head</strong>: the tool definitions and the system message, about 28,213 tokens. Before the model can answer, llama-server has to process those tokens into its internal state (the KV cache plus the hybrid model's recurrent state). On the 27B main model that takes about <strong>166&nbsp;seconds</strong>.</p>
+  <p>llama-server runs one slot (<code>-np 1</code>). Whatever ran last owns that state. A background job, a channel member's message, a different conversation or a restart replaces it, and the next owner request would pay the 166&nbsp;s again. A long conversation is worse: everything past the head (often 5–40k more tokens) is lost too.</p>
+  <p>llama-server can <strong>write the slot's whole state to a file and read it back</strong> (<code>POST /slots/0?action=save|restore</code>). A save of the head takes about 0.7&nbsp;s and 1.7&nbsp;GB; a restore takes 0.4–0.8&nbsp;s. Head saves decide <em>what</em> to save, <em>when</em> to put it back, and <em>whose</em> the slot is in between.</p>
+  <p class="note">Correctness never depends on these files. llama compares the exact tokens of every prompt with what the slot holds and reuses only the matching prefix. A wrong or stale file costs time (the rest is re-processed), never a wrong answer.</p>
+
+  <h2 id="kinds">Three kinds of saved state</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Kind</th><th>What it holds</th><th>Size</th><th>Made</th><th>Put back</th><th>Kept</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Owner head</strong> (<code>owner</code>)</td><td>The owner's tools + system message</td><td>~1.7&nbsp;GB, 28k tokens</td><td>After a warm-up had to process the head, or when no file exists for the current head. A new level or profile starts from the newest saved head and re-reads only the tail</td><td>At llama start; on a re-warm tick over a slot nobody owns; before a request whose conversation is not in the slot</td><td>3 newest</td></tr>
+      <tr><td><strong>Members' head</strong> (<code>member</code>)</td><td>The channel members' 6 tools + the member system message</td><td>smaller: ~8k tokens</td><td>At the first member request that finds no file (§4RW), and in a quiet gap (idle ≥ 600&nbsp;s)</td><td>Before a channel member's request</td><td>3 newest</td></tr>
+      <tr><td><strong>Conversation</strong> (<code>conv</code>)</td><td>An owner conversation: the head <em>and</em> everything after it, with llama's checkpoints</td><td>2–4&nbsp;GB</td><td>Just before another call would replace it (needs <code>GHOST_CONV_KEEP=1</code>)</td><td>Before that conversation's next request</td><td>6 most recently used</td></tr>
+    </tbody>
+  </table></div>
+  <p>The owner and members' heads are different prompts because the tools render first and differ, and members must not see the owner's profile or skill descriptions (§4RU). They are kept apart on purpose.</p>
+
+  <h2 id="owner">Who owns the slot</h2>
+  <p>The agent keeps one record of the conversation that last used the slot (<code>llm._slot_session</code>, plus the request holding it in <code>llm._slot_request</code>). Every request carries a conversation key: the client's <code>session_id</code> (the web client mints a new one on <code>/clear</code>; Slack sends <code>slack:&lt;thread&gt;:&lt;user&gt;</code>), otherwise a fingerprint of the first message.</p>
+  <ul>
+    <li><strong>Who becomes the owner:</strong> an owner request's main call that opens with the head. Background calls, probes (<code>probe-*</code>), scheduled tasks (<code>sched-*</code>), job resumes (<code>sub-*</code>, <code>job-*</code>) and channel members never own the slot.</li>
+    <li><strong>How long it owns it:</strong> with <code>GHOST_CONV_KEEP=1</code>, until another call needs the slot. There is no timer: the conversation is saved to disk first, and only then is the slot given up.</li>
+    <li><strong>Without the conversation switch:</strong> ownership lasts <code>GHOST_SLOT_KEEP_S</code> (600&nbsp;s) after the last call, then the re-warm tick puts the head back (§4RP).</li>
+    <li>Every head restore clears the owner. The record lives in process memory, so an agent restart forgets it. After a restart the head comes back as usual.</li>
+    <li><strong>The record can outlive the state</strong> (§4RW review): the owner's reply can finish draining while another call takes the slot. When a call that does not open with the head ran since (<code>_head_displaced</code>), the owner's next request is treated as not holding the slot: its conversation file (or the head) is restored. A save that waited while the owner's own reply finished still saves: that is the same conversation.</li>
+  </ul>
+
+  <h2 id="save">When something is saved</h2>
+  <ol>
+    <li><strong>The owner head:</strong> after a warm-up that had to process the head from scratch, or when no file exists yet for this head. Only while no request or main-slot stream is live. llama writes a <code>.part</code> file, and it becomes the head only if llama saved exactly the warm-up's token count. A save that llama ran after a request had already taken the slot is thrown away.</li>
+    <li><strong>A head with no file yet</strong> (an effort level or profile never saved; §4RW): the warm-up first restores the newest head saved by this server (<code>newest_head_for</code>). The effort sentence closes the system block, so the two heads differ only in the tail. llama goes back to that file's checkpoint ~1,024 tokens before its end and re-reads from there, about 1k tokens instead of 28k. The new file is then saved. Live 2026-10-27: the owner picked xhigh, and without this the next re-warm processed all 28,251 tokens (167&nbsp;s) while a member's request waited.</li>
+    <li><strong>The members' head at a member's request</strong> (§4RW): when a member's first call finds no members' file, the agent first sends the members' head alone to llama (the warm-up's own payload, 1 token generated) and saves it as kind <code>member</code>. Then the call goes on from it. The request would have processed that head anyway, so the cost is the save (~1&nbsp;s), once. If the slot stays busy, less than 60&nbsp;s of the request's deadline is left (<code>MEMBER_HEAD_MAKE_MIN_S</code>), llama gives no token count, or the slot moved on, nothing is saved and the call processes the head as before. Before §4RW the file was made only in a quiet gap, after a member request since the agent's last boot, and that never happened on 2026-10-27.</li>
+    <li><strong>The members' head in a gap:</strong> at the start of a re-warm tick, once a member request has run since boot (or a members' file exists), only when nobody has sent anything for 600&nbsp;s and no conversation owns the slot. The tick processes the members' head (~50&nbsp;s), saves it, then restores the owner head straight away.</li>
+    <li><strong>A conversation</strong> (<code>GHOST_CONV_KEEP=1</code>): just before any of these would replace it:
+      <ul>
+        <li>a call of another conversation, or of a request that owns nothing (a probe, a scheduled task);</li>
+        <li>any call of a channel member's request on the main slot, whatever it opens with (§4RW review: before, only a call that opened with the members' head saved it);</li>
+        <li>any background main call (a deferred verdict, a replay, a sub-agent; <code>LLMClient.before_background_dispatch</code>);</li>
+        <li>gap work (the members' head refresh, a head with no file yet).</li>
+      </ul>
+      Saved only when the owner's call was the last one on the slot, only once per state, and only if it holds at least <code>CONV_MIN_PAST_TOKENS</code> (1,024) tokens past the head. Fewer tokens re-read faster than a save plus a restore.</li>
+  </ol>
+
+  <h2 id="restore">When something is restored</h2>
+  <ol>
+    <li><strong>At llama start.</strong> <code>bin/start-llama-server.sh</code> runs <code>head_saves.py --restore-on-start</code> in the background. It waits for <code>/health</code>, picks the newest owner head saved by the same model, build and chat template (<code>/props</code>), and restores it while llama has served nothing yet. This covers restarts, crashes, reboots and an agent that is down.</li>
+    <li><strong>Before a request's first main call</strong> (<code>_slot_switch_before</code>, through <code>llm.before_main_dispatch</code>):
+      <ul>
+        <li>its conversation has a file and is not in the slot → <strong>the conversation is restored</strong> and resumes at its last message;</li>
+        <li>no file, and the slot holds something else → <strong>the head is restored</strong>, and the request re-reads its part past the head;</li>
+        <li>the slot already holds this conversation → nothing happens.</li>
+      </ul>
+      The hook waits for llama's slot to go idle (polling <code>/slots</code>, up to <code>BEFORE_MAIN_DISPATCH_S</code>, 150&nbsp;s). A failure or timeout never fails the call: llama then re-processes from its nearest checkpoint.</li>
+    <li><strong>Before a channel member's request:</strong> the members' head is restored when the slot holds anything else (<code>_member_head_before</code>).</li>
+    <li><strong>On a re-warm tick:</strong> the head is restored over a slot that nobody owns. If the slot is busy, unreadable or a request is live, the tick sends nothing and retries later (<em>deferred</em>).</li>
+    <li><strong>After an outside call</strong> (a client outside the agent on the same slot, §4RQ): the next main call that opens with the head restores it.</li>
+  </ol>
+
+  <h3 id="effort">When the effort level changes (§4RW-f)</h3>
+  <p>The effort sentence closes the system block, so each level has its own head (28,213 tokens at medium, 28,251 at xhigh). A conversation built at one level leaves a prompt at another level about 28.2k tokens in. That is past every checkpoint the conversation has, so llama could only re-read it from token&nbsp;0 (~170&nbsp;s plus the conversation).</p>
+  <ul>
+    <li><strong>The same conversation at a new level.</strong> Its first call no longer counts as "the request that holds the slot". The agent makes the head plan for the new level, a template render that does not touch the slot. It then restores that level's head, or the nearest saved head when the level has no file yet. Only the conversation is re-read. The 📀 line names it: "restored the head before this conversation at xhigh effort … it re-reads its part past the head".</li>
+    <li><strong>A conversation file saved at another level</strong> is left on disk (🧳) and the head of this level is restored instead. Each conversation file records the level its state was built at, which is not the level of the request that displaced it.</li>
+    <li>Levels are read from what is rendered and sent, never from the last pick:
+      <ul>
+        <li>a head plan's level comes from its own render (<code>level_in_render</code>);</li>
+        <li>a call's level comes from its payload (<code>_call_level</code>);</li>
+        <li>a thinking-off turn (the report turn, the loop-retry turn) writes no sentence, so it is the medium head whatever the pick;</li>
+        <li>Default is the server's own level (<code>reasoning_effort_default</code>), so moving between Default and that level changes nothing;</li>
+        <li>while the server's level is unknown, nothing counts as moved and no file is refused, and a conversation saved then carries no level.</li>
+      </ul></li>
+    <li>The re-plan for a new level sets that level on the warm-up's own level-free payload. It renders it (no slot use) and is tried once per request and level. The once-per-request decision does not hold across a level change: xhigh, then a thinking-off turn (medium), then xhigh again in one request restores the head each time the level moves, and never twice at one level. A probe on an effort arm counts at the arm's level. The level of a head is read from its system block only, at its last match.</li>
+    <li>Not covered: llama restarted onto a template without levels while the agent keeps running with <code>GHOST_REASONING_EFFORT=1</code>. The agent keeps the old server level, and picked levels then look like changes. The launcher does not produce this combination.</li>
+    <li>Not covered: a call cancelled after the switch let it through (before llama ran it) still counts as the slot's level. The next call at the previous level then restores the head once more than needed.</li>
+  </ul>
+
+  <h3 id="look">A picture look inside a request (§4RW-g)</h3>
+  <p>The image tool looks at every render (<code>GHOST_RENDER_LOOK=1</code>), and so does <code>vision_analysis</code>. Both run on the vision pool, which is the main server (<code>http://127.0.0.1:8088</code>), so the look replaces the request's conversation in the slot.</p>
+  <ul>
+    <li><strong>Before:</strong> the client ran the switch only for calls marked main, so nothing saved the conversation. The request's next call then found its restore already decided for the request. Live probe (2026-10-27): the reply after the look re-read 30,112 tokens from token 0, which took 179&nbsp;s.</li>
+    <li><strong>Now:</strong>
+      <ul>
+        <li>The client calls <code>before_side_main_dispatch</code> for a foreground call whose pool's every node is the main server.</li>
+        <li>The agent (<code>_side_call_before</code>) saves the conversation when the request holds the slot, and keeps the owner.</li>
+        <li>The request's next call that opens with the head restores it (🔙 "restored from disk"), whatever the request decided before.</li>
+        <li>A conversation too short to save (under 1,024 tokens past the head) gets the head back instead ("before this request after its own picture look").</li>
+        <li>Each head call after a look restores again, and the next look saves again. Several looks inside one image call (the collage check, then the look) cost one save, because the first one already displaced the slot.</li>
+        <li><strong>A request without a conversation key</strong> (a probe, a scheduled task: <code>sched-</code>, <code>sub-</code>, <code>job-</code>) has nothing to save. Its next head call after the look gets the head back (📀 "restored the head before this request after its own picture look") and re-reads only its part past the head (§4RW-g b). Before: 30,109 tokens re-read from token 0, 179&nbsp;s.</li>
+        <li><strong>A channel member's look</strong> (§4RW-g c): members' turns are not saved, so nothing is saved. The member's next call gets the members' head back (📀 "restored the members' head before a channel member's request after its own picture look") and re-reads its own part. The members' head is otherwise restored once per request; after a look it is restored again, but only when a main-slot call ended after the look began (members' calls never open with the owner's head, so the displaced flag cannot tell). Live before: slack-7e's call after its look re-read 16.6k tokens, 94&nbsp;s.</li>
+        <li>A look that fails or times out counts as displacing the slot, so the next call still restores what was saved. When the failure came before llama ran it, that costs a ~1&nbsp;s restore of an intact slot; when the save before it was also skipped, the conversation is re-read from the head.</li>
+      </ul></li>
+    <li>Not covered:
+      <ul>
+        <li>a call marked main that does not open with the head (it goes through the switch, which keeps the request's own conversation as it is);</li>
+        <li>a worker or critic call that falls back to the main slot when its own pool is down (the pool is checked as configured, not as served);</li>
+        <li>cost: the visual verifier's pixel check falls back to the vision pool when the critic fails, and inside a live request it then pays a conversation save (seconds, up to tens under swap) before its verdict.</li>
+      </ul></li>
+  </ul>
+
+  <h2 id="follow-up">Why a follow-up does not re-read its conversation</h2>
+  <p>Restoring a conversation only helps if the next request's prompt starts exactly like the saved one. Two things make that true:</p>
+  <ul>
+    <li><strong>A stable first message</strong> (<code>GHOST_CONV_KEEP=1</code> with <code>GHOST_STATE_ANCHOR=1</code>). The first user message carries only the tool header and one fixed label. Everything that changes per request (memory recalled for it, the persona, workspace notes, the thinking depth) goes into the <code>&lt;system_state_update&gt;</code> block at the end of the prompt.</li>
+    <li><strong>llama's own checkpoint at the last user message.</strong> llama b11669 saves a checkpoint where the prompt's last user message starts, which for the agent is that state block: exactly where the next request's prompt departs from this one. With <code>--ctx-checkpoints 12</code> the checkpoint survives a request of a few tool turns.</li>
+  </ul>
+  <p>Measured live on 2026-10-27:</p>
+  <ul>
+    <li>A same-conversation follow-up reused about 28,880 tokens (f_keep 0.973) and processed only 806.</li>
+    <li>The owner's conversation <code>63f8b051</code> was saved (32,775 tokens, 2.85&nbsp;GB, 1.0&nbsp;s) when a probe needed the slot.</li>
+    <li>The owner's next request in that conversation restored it in 0.8&nbsp;s.</li>
+  </ul>
+
+  <h2 id="timeline">An example timeline</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Event</th><th>What the slot does</th><th>Log</th></tr></thead>
+    <tbody>
+      <tr><td>llama starts</td><td>The start helper restores the owner head (0.4&nbsp;s)</td><td><code>head-restore:</code> in llama-server.log</td></tr>
+      <tr><td>The owner asks in conversation A</td><td>A owns the slot; it grows past the head</td><td>—</td></tr>
+      <tr><td>A deferred verdict runs</td><td>A is saved first (~1&nbsp;s), then the verdict runs</td><td>📼 Conversation · saved to disk before a background '…' call</td></tr>
+      <tr><td>The owner opens conversation B</td><td>Nobody owns the slot; the head is restored for B</td><td>📀 Head Disk · restored the head before this request</td></tr>
+      <tr><td>The owner goes back to A</td><td>B is saved, then A is restored and resumes at its last message</td><td>📼 then 🔙 Conversation · restored from disk</td></tr>
+      <tr><td>A channel member writes</td><td>A is saved; the members' head is restored</td><td>📼 then 📀 Head Disk · restored the members' head</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="files">Files on disk and cleanup</h2>
+  <ul>
+    <li><strong>Directory:</strong> <code>$GHOST_HOME/system/head_saves</code> (<code>~/Data/AI/Data/system/head_saves</code>). It must also be llama's <code>--slot-save-path</code>; llama accepts only a file name, not a path.</li>
+    <li><strong>Names:</strong> <code>head-&lt;key&gt;.bin</code> (llama's state) and <code>head-&lt;key&gt;.json</code> (token count, size, kind, server identity, saved time).
+      <ul>
+        <li>A head key hashes the server identity (model file, build, chat template) and the head as llama renders it, so a profile, tool or effort change makes a new file.</li>
+        <li>A conversation key is <code>c</code> plus a hash of the server identity and the conversation key, so the same conversation always overwrites its own file.</li>
+      </ul></li>
+    <li><strong>Cleanup is by count, not by age.</strong> Every save first runs <code>prune()</code>, which keeps the 3 most recently used owner and members' heads and the 6 most recently used conversations, and deletes the rest. "Used" means saved, or restored (a restore touches the <code>.json</code>; §4RW review: by save time alone, a 4-conversation rotation deleted the file about to be restored). Unfinished <code>.part</code> files older than an hour are deleted too. Worst case on disk: three owner heads (~5&nbsp;GB), three smaller members' heads and six conversations (up to ~24&nbsp;GB), about 30&nbsp;GB.</li>
+    <li><strong>A restore does not delete its file.</strong> A conversation's file stays until 6 more recently used conversations push it out, however old it is.</li>
+    <li><strong>Restore time grows with the file:</strong> the client waits <code>max(30 s, 10 s per GB)</code> (<code>restore_timeout_s</code>). A conversation restore that still timed out is checked after llama goes idle: if the slot holds the file's token count, it landed and is kept, and the head is not restored over it.</li>
+    <li><strong>A conversation save needs 20&nbsp;s of its deadline</strong> (<code>CONV_SAVE_MIN_S</code>) or it is not posted, so a multi-GB write is never cut short and left as a <code>.part</code> file.</li>
+    <li><strong>Mismatches:</strong> a restore whose token count is not the saved one deletes the file. An error from llama keeps it, because the warm-up that follows re-processes and overwrites a bad file.</li>
+    <li>Files from another model, build or template are never restored (the key and identity differ), and the count rule removes them in time.</li>
+  </ul>
+
+  <h2 id="settings">Settings</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Setting</th><th>Where</th><th>Live value</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>GHOST_HEAD_SAVES</code></td><td>agent launcher</td><td>1</td><td>Owner and members' heads are saved and restored. Off: the head is re-processed after every displacement.</td></tr>
+      <tr><td><code>GHOST_CONV_KEEP</code></td><td>agent launcher</td><td>1</td><td>Conversations are saved before displacement and restored before their next request, and the first message is kept stable. Needs the two switches next to it.</td></tr>
+      <tr><td><code>GHOST_STATE_ANCHOR</code></td><td>agent launcher</td><td>1</td><td>The state block sits at a fixed place at the end; without it conversations could never match their file.</td></tr>
+      <tr><td><code>GHOST_SLOT_KEEP_S</code></td><td>agent launcher</td><td>600</td><td>The idle gap before gap work (members' head, a missing head file). Without <code>GHOST_CONV_KEEP</code>, also how long a conversation keeps the slot.</td></tr>
+      <tr><td><code>GHOST_MAIN_PREFIX_REWARM_S</code></td><td>agent launcher</td><td>—</td><td>The re-warm tick period; ≤&nbsp;0 turns the tick off (a deferred restore then falls back to a prefill).</td></tr>
+      <tr><td><code>--slot-save-path</code></td><td>llama launcher</td><td>head_saves dir</td><td>Without it the feature turns itself off with one 📛 line.</td></tr>
+      <tr><td><code>-np 1</code></td><td>llama launcher</td><td>1</td><td>One slot: everything above assumes it.</td></tr>
+      <tr><td><code>--ctx-checkpoints</code> / <code>--checkpoint-min-step</code></td><td>llama launcher</td><td>12 / 1024</td><td>How many checkpoints a conversation keeps; the one at the state block must survive a request.</td></tr>
+      <tr><td><code>--cache-ram</code></td><td>llama launcher</td><td>2048</td><td>llama's RAM cache (MB). Too small for a conversation with checkpoints, which is why conversations go to disk.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="logs">Log lines</h2>
+  <p>Each event has its own icon (§4RW). Head lines use the title <code>Head Disk</code>; conversation lines use <code>Conversation</code>. Saves of the owner and members' head go to the durable log only, because they are routine.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Icon</th><th>Title</th><th>Line</th><th>Means</th></tr></thead>
+    <tbody>
+      <tr><td>💽</td><td>Head Disk</td><td>saved the head (28213 tokens, 1.73 GB) — …</td><td>Owner head written (durable log only)</td></tr>
+      <tr><td>💽</td><td>Head Disk</td><td>saved the members' head before a channel member's request (8000 tokens, …, 50s to process) — the next member request restores it</td><td>A member's request made the missing members' file (on screen)</td></tr>
+      <tr><td>💽</td><td>Head Disk</td><td>saved the members' head (…, 50s to process) — …</td><td>Members' head written in a quiet gap (durable log only)</td></tr>
+      <tr><td>📀</td><td>Head Disk</td><td>restored the head [after a '&lt;label&gt;' call] in 0.4s (28,209 of 28,213 tokens cached)</td><td>A re-warm tick put the head back</td></tr>
+      <tr><td>📀</td><td>Head Disk</td><td>restored the nearest saved head (no file for this one yet) in 0.5s (27,200 of 28,251 tokens cached)</td><td>A new level or profile started from another head's file; its own file is saved next</td></tr>
+      <tr><td>📀</td><td>Head Disk</td><td>restored the head before this request in 0.9s — replaced 32,775 tokens of the previous conversation</td><td>A request's first call got the head back</td></tr>
+      <tr><td>📀</td><td>Head Disk</td><td>restored the members' head before a channel member's request in 0.5s (…)</td><td>A member's request got its head back</td></tr>
+      <tr><td>📀</td><td>Head Disk</td><td>restored the head over an outside call's state in 0.4s</td><td>After a client outside the agent used the slot</td></tr>
+      <tr><td>🕒</td><td>Head Disk</td><td>head restore deferred — &lt;why&gt;; the next re-warm tick retries</td><td>Nothing was sent; shown for a failed park, at boot, and every 5th deferral in a row</td></tr>
+      <tr><td>📼</td><td>Conversation</td><td>saved to disk before &lt;why&gt; in 1.0s (32775 tokens, 2.85 GB) — its next request restores it</td><td>A conversation was put away before another call</td></tr>
+      <tr><td>🔙</td><td>Conversation</td><td>restored from disk in 0.8s (32775 tokens) — it resumes at its last message</td><td>A conversation came back for its next request</td></tr>
+      <tr><td>🧳</td><td>Conversation</td><td>not restored — saved at medium effort, this request runs at xhigh; the head instead</td><td>The effort level changed since the conversation was saved (§4RW-f)</td></tr>
+      <tr><td>📛</td><td>Head Disk / Conversation</td><td>… restore failed (&lt;reason&gt;) — llama re-processes …</td><td>Something was not restored; the call still runs, only slower</td></tr>
+      <tr><td>📛</td><td>Head Disk</td><td>head not restored: an outside call is still on the main slot — …</td><td>The call waits behind the outside call and re-processes the head</td></tr>
+      <tr><td>📛</td><td>Head Disk</td><td>head not saved — a request reached the main slot first; the next quiet re-warm saves it</td><td>A warm-up's head was not kept; it will be processed again</td></tr>
+      <tr><td>📛</td><td>Head Disk</td><td>members' head not saved — … (the slot stayed busy, Ns left of the deadline, no token count); this request processes it as before</td><td>A member's request could not make the members' file</td></tr>
+      <tr><td>📛</td><td>Head Disk</td><td>head saves off: llama-server was started without --slot-save-path</td><td>The llama launcher lost its flag</td></tr>
+    </tbody>
+  </table></div>
+  <p>Diagnostic lines that need no action (a save skipped because a request arrived, a restore reply that timed out but landed) go to the durable log (<code>$GHOST_HOME/system/ghost-agent.log</code>) as plain INFO lines.</p>
+
+  <h2 id="troubleshooting">Troubleshooting</h2>
+  <ul>
+    <li><strong>A follow-up still re-read its whole conversation.</strong> Find the request in <code>llama-server.log</code> and compare <code>n_past</code>/f_keep with the prompt size. Usual causes:
+      <ul>
+        <li>an image in the prompt (llama makes no checkpoints then);</li>
+        <li>history rewritten (the 500-message window, or a compression summary once a conversation is over its budget);</li>
+        <li>a very long request that pushed the state-block checkpoint out of the 12 kept.</li>
+      </ul></li>
+    <li><strong>📛 restore failed (TimeoutError).</strong> Usually memory pressure: a 1.7–4&nbsp;GB read under swap. Check <code>vm_stat</code>/swap. The call still runs; it only re-processes.</li>
+    <li><strong>🕒 deferred, many ticks in a row.</strong> Something keeps the slot busy or unreadable (a long background stream, a stuck request). The line shows how many ticks in a row.</li>
+    <li><strong>The head is re-processed after every llama restart.</strong> Check that <code>--slot-save-path</code> points at the head_saves directory and that <code>head-restore:</code> appears in <code>llama-server.log</code>. A new model, build or template means the first warm-up has to make a new file.</li>
+    <li><strong>Disk use.</strong> <code>ls -la ~/Data/AI/Data/system/head_saves</code>; at most 3 files of each kind. Deleting them is always safe: the next warm-up re-processes the head and saves it again.</li>
+  </ul>
+
+  <h2 id="limits">What it does not cover</h2>
+  <ul>
+    <li>The owner record lives in process memory, and an agent restart does not save the conversation that held the slot. After a restart a conversation's next request restores its file as last saved, which may be some turns old: llama re-processes from where that file and the request part. The boot warm-up restores the server-default level's head, whatever level was last in use. (§4RW-e: llama restarting under a live agent clears the record — <code>prompt_tokens_total</code> fell, or llama has served nothing.)</li>
+    <li>"The slot holds the head" compares token counts, not tokens. A different prompt of the same length passes the check, and llama then re-processes from where they differ.</li>
+    <li>A profile or effort change has no head file until the owner has been idle 600&nbsp;s.</li>
+    <li>Two conversations taking turns each pay a save and a restore (~1–2&nbsp;s) on every switch.</li>
+  </ul>
+
+  <h2 id="code">Where the code is</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Piece</th><th>Code</th></tr></thead>
+    <tbody>
+      <tr><td>Save / restore / park / prune / keys / start helper</td><td><code>core/head_saves.py</code> (<code>save</code>, <code>restore</code>, <code>park</code>, <code>prune</code>, <code>conv_key</code>, <code>newest_head_for</code>, <code>--restore-on-start</code>)</td></tr>
+      <tr><td>Slot owner, keep rules, background hook</td><td><code>core/llm.py</code> (<code>note_main_slot_prompt</code>, <code>release_slot_session</code>, <code>slot_kept</code>, <code>conv_keep_enabled</code>, <code>_before_background_main</code>)</td></tr>
+      <tr><td>Switch before a request's call</td><td><code>core/agent.py</code> <code>_slot_switch_before</code>, <code>_restore_when_idle</code>, <code>_member_head_before</code>, <code>_outside_slot_restore</code></td></tr>
+      <tr><td>Conversations</td><td><code>core/agent.py</code> <code>_conv_save</code>, <code>_conv_displace</code>, <code>_conv_restore</code>, <code>_conv_before_background</code></td></tr>
+      <tr><td>Re-warm tick, deferral, members' head</td><td><code>core/agent.py</code> <code>warm_up_main_prefix</code>, <code>_head_restore_due</code>, <code>_head_defer</code>, <code>_head_save_after</code>, <code>_member_head_refresh</code></td></tr>
+      <tr><td>Stable first message</td><td><code>core/agent.py</code> <code>_split_request_context</code>, <code>_compose_injection(stable_label=…)</code></td></tr>
+      <tr><td>Tests</td><td><code>tests/test_4ro_head_saves.py</code>, <code>tests/test_4rp_slot_keep.py</code>, <code>tests/test_4rv_conv_keep.py</code>, <code>tests/test_outside_call_4rq.py</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="history">History</h2>
+  <p>The design notes, reviews and measurements for each step are in the <a href="llm.html">llm reference</a>:</p>
+  <ul>
+    <li><a href="llm.html#4ro">§4RO</a>: the head saved on disk.</li>
+    <li><a href="llm.html#4ro-r5">§4RO r5</a>: a restore that cannot happen sends nothing.</li>
+    <li><a href="llm.html#4rp">§4RP</a>: the slot belongs to a conversation.</li>
+    <li><a href="llm.html#4rp-b">§4RP-b</a>: the follow-up label flip.</li>
+    <li><a href="llm.html#4ru">§4RU</a>: the members' head.</li>
+    <li><a href="llm.html#4ru-r">§4RU-r</a>: a review of the whole flow.</li>
+    <li><a href="llm.html#4rv">§4RV</a>: conversations on disk and the stable first message.</li>
+    <li><a href="llm.html#4rq">§4RQ</a>: outside callers.</li>
+  </ul>
+  <p>Log icons: <a href="../logging.html#4rw">§4RW</a>.</p>
+</main>
+</body>
+</html>

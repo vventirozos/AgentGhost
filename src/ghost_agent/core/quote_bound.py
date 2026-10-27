@@ -578,7 +578,7 @@ def tool_contents(tools_run: Iterable, messages: Iterable = ()) -> List[str]:
 
 def strip_leftover_markers(text):
     """Safety net (§4OJ-b): a reply that left the turn without the check (the
-    greeting fast path, a cancelled turn's partial, a failed check) must never
+    system's own reply, a cancelled turn's partial, a failed check) must never
     show `[src: …]` to the user. Removes the markers, marks nothing, never
     touches code spans."""
     if not isinstance(text, str) or "[src:" not in text.lower():

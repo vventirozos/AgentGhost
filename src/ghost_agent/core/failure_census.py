@@ -155,8 +155,9 @@ def record_turn(req_id: str, reply: str, request: str, context_text: str, tools_
 
 
 def record_fast(req_id: str, reply: str, home=None, kind: str = "fast") -> bool:
-    """§4PM: a turn the trivial fast path answered (a greeting) writes no
-    trajectory by design — this row is the only trace that it happened.
+    """§4PM: a turn the trivial fast path answered (a greeting; the fast path
+    was removed §4RP-c, old rows still count) writes no trajectory by
+    design — this row is the only trace that it happened.
     §4PY: ``kind="command"`` — an owner command the system answered itself.
     Owner turns only; never raises."""
     try:
