@@ -343,6 +343,11 @@
         <td><span class="badge good">on</span></td>
       </tr>
       <tr>
+        <td><a href="core/head_saves.html"><strong>Head and conversation saves</strong></a></td>
+        <td>The ~28k-token prompt head and the conversation that holds the model's one slot are saved to disk. They come back in about a second instead of being re-read: after another conversation's turn, a channel member, an effort-level change, or a picture look, which the image tool runs on the main model. Live: the reply after a look went from 179&nbsp;s to 14&nbsp;s. Old files are cleaned up automatically.</td>
+        <td><span class="badge good">on</span> via the launcher: <code>GHOST_HEAD_SAVES=1</code>, <code>GHOST_CONV_KEEP=1</code></td>
+      </tr>
+      <tr>
         <td><a href="tools/memory_tools.html"><strong>Document Q&amp;A</strong></a></td>
         <td>PDFs, pages and recordings ingested into a searchable store, then questioned scoped to one document rather than to everything it knows.</td>
         <td><span class="badge good">on</span></td>

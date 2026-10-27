@@ -57014,3 +57014,4 @@ Operator: "logs are used to monitor the agent. the log entries should be short, 
     - A look that raises before llama runs it still stamps the end time, which costs one members'-head restore plus re-reading the member's part (~40 s). That is still under the 94 s it prevents.
     - Older gap: a background call let in during a member's render, with no look on main afterwards, is unmarked, so the next call re-reads everything.
     - No client-level member test (the owner client test covers the same path).
+  - Deployed 17:36 (pid 72195). Live check waits for a member's image request: expect "restored the members' head before a channel member's request after its own picture look".
