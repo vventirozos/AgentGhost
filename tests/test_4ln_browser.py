@@ -126,7 +126,7 @@ async def test_a_failed_navigate_leaves_the_page_it_was_asked_for(tmp_path, monk
         async def goto(self, url, wait_until=None):
             raise RuntimeError("Page.goto: Timeout 30000ms exceeded")
 
-    async def _ctx(profile_dir, proxy, timeout_ms, run):
+    async def _ctx(profile_dir, proxy, timeout_ms, run, **_kw):
         return await run(_Page())
     monkeypatch.setattr(R, "_with_context", _ctx)
     with pytest.raises(RuntimeError):

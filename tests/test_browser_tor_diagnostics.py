@@ -111,14 +111,12 @@ async def test_runner_failure_cause_is_logged_to_stream(tmp_path):
     assert "TimeoutError" in result
     assert "Timeout 30000ms exceeded" in result
 
-    # The operator's live stream (pretty_log WARNING) now names the cause,
-    # not just "runner exit 1".
-    warning_msgs = [
-        c.args[1] for c in mock_log.call_args_list
-        if len(c.args) > 1 and "runner exit" in str(c.args[1])
-    ]
-    assert warning_msgs, "expected a 'runner exit' warning to be logged"
-    assert any("TimeoutError" in m for m in warning_msgs)
+    # The operator's live stream names the cause, not just "runner exit 1".
+    # §4RX: a page that did not load is the site's doing — an INFO note.
+    notes = [c for c in mock_log.call_args_list if c.args and c.args[0] == "Browser Note"]
+    assert notes, "expected a 'Browser Note' line"
+    assert all(c.kwargs.get("level") == "INFO" for c in notes)
+    assert any("TimeoutError" in c.args[1] and "did not load in time" in c.args[1] for c in notes)
 
 
 @pytest.mark.asyncio

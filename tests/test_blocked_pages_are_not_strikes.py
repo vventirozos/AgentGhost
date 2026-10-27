@@ -120,6 +120,9 @@ async def test_blocked_pages_cost_no_strikes(agent):
         await agent.handle_chat(_REQ, background_tasks=MagicMock())
     lines = _strike_lines(pl)
     assert "Blocked Page" in lines
+    assert all(c.kwargs.get("level") == "INFO" for c in pl.call_args_list
+               if c.args and c.args[0] in ("Blocked Page", "Tool Note"))      # §4RX: the site's doing
+    assert not [c for c in pl.call_args_list if c.args and c.args[0] == "Tool Warning"]
     assert "Execution Fail" not in lines and "Transient Fail" not in lines and "Failure Cap" not in lines
 
 
@@ -130,7 +133,11 @@ async def test_a_real_browser_failure_still_strikes(agent):
     with patch("ghost_agent.core.agent.pretty_log") as pl:
         await agent.handle_chat(_REQ, background_tasks=MagicMock())
     lines = _strike_lines(pl)
-    assert "Transient Fail" in lines or "Execution Fail" in lines
+    # §4RX: a page that did not load is still a strike, logged as a note
+    notes = [c for c in pl.call_args_list
+             if c.args and c.args[0] == "Tool Note" and "temporary failure" in str(c.args[1])]
+    assert notes or "Execution Fail" in lines
+    assert all(c.kwargs.get("level") == "INFO" for c in notes)
     assert "Blocked Page" not in lines
 
 

@@ -1,5 +1,7 @@
-import * as matrixGraphFace from './matrix_graph.js?v=16.2';
+import * as matrixGraphFace from './matrix_graph.js?v=16.8';
 import { initEffortSelector, effortForPayload } from './effort.js?v=1.2';   // §4RB
+import { createTokenCounter } from './tokens.js?v=1.3';   // token counter under the buttons
+import { turnCaption } from './turn_caption.js?v=1.0';   // what the status line under the reply shows
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -138,6 +140,10 @@ function _historyKey(sid) {
 function localHistoryKeys() {
     return safeStorage.keys(HISTORY_KEY + ':');
 }
+// The token counter under the composer's buttons (tokens.js). Built here, after
+// safeStorage: a call above its `const` is a TDZ ReferenceError.
+const tokenCounter = createTokenCounter(document.getElementById('token-count'), safeStorage,
+    () => window.__ghostSessionId || storedSessionId());
 
 // ═══════════════════════════════════════════════════════════════
 //  Icon vocabulary — aligned 1:1 with src/ghost_agent/utils/logging.py
@@ -2680,6 +2686,9 @@ const TICKER_NOISE = new Set([
 ]);
 // Friendly phrasings for the most common step titles; anything not
 // listed falls back to the raw title (already short and readable).
+// The device client's caption tables (mirrored in clockwork turnstatus.py,
+// pinned equal there). The web caption reads turn_caption.js instead; the
+// noise set still drops plumbing titles before the face is fed.
 const TICKER_VERBS = {
     'worker compute': 'delegating to the worker node',
     'sandbox tree': 'scanning the workspace',
@@ -2697,6 +2706,7 @@ const TICKER_VERBS = {
     'vision': 'looking at an image',
     'delegate': 'delegating a subtask',
 };
+// What the turn status line SHOWS lives in turn_caption.js (2026-10-27).
 // What a ticker line means to the FACE (2026-09-11): a gait for the
 // step class, whether it is a tool call (a discrete kick), a memory
 // recall (a comet) or the verifier's verdict. Pure; executed under node.
@@ -2792,9 +2802,10 @@ function startTurnTicker(afterEl, startedAt) {
     tickerReqId = sameTurn ? tickerLastReqId : null;
     tickerSeen = [];
     tickerOwnRid = null;
-    turnStatusDescEl.textContent = sameTurn ? 'working…' : 'starting…';
+    // Nothing to show yet (operator 10-27): say it is thinking.
+    turnStatusDescEl.textContent = 'thinking…';
     turnStatusClockEl.textContent = _tickerClockText(tickerStart, Date.now());
-    turnStatusIconEl.textContent = '⏳';
+    turnStatusIconEl.textContent = '💭';
     // Re-parent under the waiting reply bubble (the element survives
     // detachment by /clear or history repaints — appendChild re-adopts
     // the same node wherever the current bubble lives).
@@ -2862,11 +2873,11 @@ function noteTickerLine(raw) {
     if (/^\+[\d.\s]*m?s$/.test(parts[ti] || '')) ti++;
     const title = (parts[ti] || '').toLowerCase().slice(0, 22).trim();
     if (!title || TICKER_NOISE.has(title)) return;
-    let desc = TICKER_VERBS[title] || title;
-    // Specificity when the line carries it ("reading a file · foo.py").
     const detail = parts.slice(ti + 1).join(' ').trim();
-    if (detail) desc += ` · ${detail.slice(0, 30)}${detail.length > 30 ? '…' : ''}`;
-    setTurnStatusDesc(desc, icon);
+    // Only what the user is meant to see (TURN_CAPTIONS); the face still
+    // reads every step it read before.
+    const cap = turnCaption(title, icon, detail);
+    if (cap) setTurnStatusDesc(cap.text, cap.icon);
     _feedFaceFromTicker(title, icon, detail);
 }
 
@@ -3003,6 +3014,7 @@ async function sendMessage(isResume = false) {
         chatLog.innerHTML = '';
         chatHistory = [];
         safeStorage.remove(_historyKey());
+        tokenCounter.forget();           // before the sessions rail mints the new id below
         // A surviving in-flight handle points at the OLD conversation —
         // left alone, the next reconcile would resurrect the cleared
         // transcript into the freshly minted session.
@@ -3052,6 +3064,7 @@ async function sendMessage(isResume = false) {
         currentSpeechHold = false;
         currentReqId = null;
         currentTurnUnlabelable = false;
+        tokenCounter.startTurn();        // the last turn's numbers are not this one's
         _turnVerdict = null;
         if (typeof activeFace.setPhase === 'function') activeFace.setPhase(null);
         if (typeof activeFace.setComposerGaze === 'function') activeFace.setComposerGaze(false);
@@ -3240,6 +3253,12 @@ async function sendMessage(isResume = false) {
                     // of it); what follows replaces it.
                     if (data.ghost && data.ghost.retract === true) {
                         _applyStreamRetract();
+                        continue;
+                    }
+                    // The turn's token totals (one frame before [DONE]): the
+                    // counter only — never reply text, speech or history.
+                    if (data.ghost && data.ghost.usage) {
+                        tokenCounter.note(data.ghost.usage);
                         continue;
                     }
 
@@ -5874,7 +5893,9 @@ window.GhostCore = {
         return _cancelAgentTurn(currentReqId, _lastSentUserText, hard);
     },
     getChatHistory: () => chatHistory,
-    setChatHistory: (h) => { chatHistory = Array.isArray(h) ? h : []; saveChatState(); },
+    // A session load sets the identity first, then the history: the token
+    // counter re-reads the (now current) session's totals here.
+    setChatHistory: (h) => { chatHistory = Array.isArray(h) ? h : []; saveChatState(); tokenCounter.render(); },
     // Wire-shape helpers for modules that fetch/compare server histories
     // (sessions.js): strip client-only label keys for comparison, and
     // preserve them across adoption. See toWireMessage/mergeClientLabelKeys.
@@ -5886,6 +5907,7 @@ window.GhostCore = {
         chatLog.innerHTML = '';
         chatHistory = [];
         safeStorage.remove(_historyKey());
+        tokenCounter.hide();             // a new chat: the next id has no count yet
         // Close the visualizer BEFORE revoking — it may be displaying one
         // of these blobs (session switches used to blank the open preview).
         closeRenderWindow();

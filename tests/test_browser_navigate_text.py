@@ -64,7 +64,7 @@ class _FakePage:
 def _install_fakes(ns, page):
     """Patch the runner's _with_context / sidecar / probe so ops run against
     the fake page with no real Chromium."""
-    async def fake_with_context(profile_dir, proxy, timeout_ms, op_fn):
+    async def fake_with_context(profile_dir, proxy, timeout_ms, op_fn, **_kw):
         return await op_fn(page)
 
     async def fake_probe(page):

@@ -368,6 +368,45 @@ footer#input-area-wrapper {
 }
 #effort-select option { background: var(--bg-color); color: var(--text-color); }
 #effort-select.hidden { display: none; }
+/* Token counter under the composer's buttons (2026-10-27, operator: "discreet").
+   Same grey as the idle effort icon, small tabular digits, one line; hidden
+   until the agent reports a turn's tokens (tokens.js). Not a control (no
+   hover state); selection off so a tap near Send selects nothing on iOS.
+   It keeps pointer events: its title (the cached part) is a desktop hover. */
+#token-count {
+    flex-shrink: 0;
+    align-self: center;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.02em;
+    color: rgba(255, 255, 255, 0.38);
+    white-space: nowrap;
+    -webkit-user-select: none;
+    user-select: none;
+    cursor: default;
+}
+/* Hidden keeps its line (operator 10-27: the whole input window resized
+   from empty to showing a count — "that resize looks weird"): the pill is
+   always sized for it, the text just isn't drawn. */
+#token-count.hidden { visibility: hidden; }
+/* Operator 10-27: "on the right side, under the buttons … similar in
+   mobile". The last flex item, a whole row, right-aligned — it ends under
+   Send on desktop and on the phone composer's controls row alike, and the
+   text field and buttons keep their places. */
+#token-count {
+    order: 1;
+    flex-basis: 100%;
+    text-align: right;
+    padding-right: 6px;
+    line-height: 1.2;
+    min-height: 1.2em;        /* an empty counter still holds its line */
+}
+@media (min-width: 481px) {
+    /* :has() for specificity: the base #input-area rule (gap: 16px) comes
+       later in this file */
+    #input-area:has(> #token-count) { flex-wrap: wrap; row-gap: 2px; }
+}
 #turn-status-clock {
     flex-shrink: 0;
     font-family: var(--font-mono);

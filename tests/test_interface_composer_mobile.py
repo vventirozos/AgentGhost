@@ -156,3 +156,104 @@ def test_on_a_phone_the_time_sits_under_the_text_and_the_first_line_is_whole(bro
         assert ag["fb"]["r"] <= ag["time"]["l"], ag
     finally:
         ctx.close()
+
+
+# ── Token counter beside the effort icon (2026-10-27, operator: "discreet,
+#    mobile (iphone safari) compatible, don't clutter the ui ... next to the
+#    effort button, under the input text"). Widest realistic text. ─────────
+
+_WIDEST = "↑~128k ↓12.3k"
+
+
+def _show_counter(page, text=_WIDEST):
+    page.evaluate("""(t) => { const e = document.getElementById('token-count');
+        e.textContent = t; e.classList.remove('hidden'); }""", text)
+    page.wait_for_timeout(600)          # #input-area has `transition: all 0.4s` (anything would animate)
+
+
+@pytest.mark.parametrize("width,height", [(320, 568), (360, 740), (375, 667), (390, 844), (430, 932)])
+def test_on_a_phone_the_counter_is_a_small_line_under_the_buttons_on_the_right(browser, width, height):
+    """Operator 10-27: "on the right side, under the buttons … similar in mobile"."""
+    ctx, page = _open(browser, width, height)
+    try:
+        before = _box(page, "input-area")
+        b0 = [_box(page, i) for i in CONTROLS]
+        _show_counter(page)
+        pill, field, cnt = _box(page, "input-area"), _box(page, "chat-input"), _text_box(page, "token-count")
+        b1 = [_box(page, i) for i in CONTROLS]
+        mic, eff, send = b1
+        _assert_under_the_buttons_on_the_right(before, pill, b0, b1, cnt, send)
+        assert all(abs(b["w"] - 40) < 1 for b in b1)                    # controls keep their size
+        assert all(b["top"] >= field["bottom"] - 1 for b in b1)         # the phone layout is intact
+    finally:
+        ctx.close()
+
+
+def _text_box(page, el_id):
+    """The rendered TEXT's box (the element spans the row; its text is right-aligned)."""
+    return page.evaluate("""(id) => { const rg = document.createRange();
+        rg.selectNodeContents(document.getElementById(id)); const r = rg.getBoundingClientRect();
+        return {left: r.left, right: r.right, top: r.top, bottom: r.bottom, w: r.width, h: r.height}; }""", el_id)
+
+
+def _assert_under_the_buttons_on_the_right(before, pill, b0, b1, cnt, send):
+    # nothing moves when a count appears (operator 10-27: the resize "looks
+    # weird") — the pill always holds the line
+    assert abs(pill["h"] - before["h"]) < 0.5 and abs(pill["top"] - before["top"]) < 0.5, (before, pill)
+    assert all(abs(a["left"] - b["left"]) < 0.5 and abs(a["top"] - b["top"]) < 0.5
+               for a, b in zip(b0, b1)), (b0, b1)
+    assert cnt["top"] >= max(b["bottom"] for b in b1) - 0.5, (b1, cnt)   # under, never over Send
+    assert send["right"] - 12 <= cnt["right"] <= send["right"] + 0.5, (send, cnt)   # ends under Send
+    assert cnt["h"] < 16, cnt                                             # one small line
+    assert cnt["bottom"] <= pill["bottom"] and cnt["left"] >= pill["left"]
+
+
+def test_the_counter_is_quiet_and_not_a_control(browser):
+    ctx, page = _open(browser, 390, 844)
+    try:
+        _show_counter(page)
+        st = page.evaluate("""(() => { const s = getComputedStyle(document.getElementById('token-count'));
+            return {fs: parseFloat(s.fontSize), us: s.webkitUserSelect || s.userSelect, color: s.color, ws: s.whiteSpace}; })()""")
+        assert st["fs"] <= 11.5 and st["us"] == "none" and st["ws"] == "nowrap", st
+        assert st["color"] == page.evaluate(
+            "getComputedStyle(document.getElementById('effort-wrap')).color"), st   # the effort icon's grey
+        page.evaluate("document.getElementById('token-count').classList.add('hidden')")
+        assert page.evaluate("getComputedStyle(document.getElementById('token-count')).visibility") == "hidden"
+    finally:
+        ctx.close()
+
+
+@pytest.mark.parametrize("width,height", [(1280, 800), (820, 1180)])
+def test_on_wider_screens_it_is_a_small_line_under_the_buttons_on_the_right(browser, width, height):
+    """Operator 10-27: "in desktop, put the token information on the right
+    side, under the buttons" — the text field's width untouched."""
+    ctx, page = _open(browser, width, height)
+    try:
+        before, field0 = _box(page, "input-area"), _box(page, "chat-input")
+        b0 = [_box(page, i) for i in CONTROLS]
+        _show_counter(page)
+        pill, field, cnt = _box(page, "input-area"), _box(page, "chat-input"), _text_box(page, "token-count")
+        b1 = [_box(page, i) for i in CONTROLS]
+        assert abs(field["w"] - field0["w"]) < 1 and abs(pill["w"] - before["w"]) < 1, (field0, field)
+        _assert_under_the_buttons_on_the_right(before, pill, b0, b1, cnt, b1[2])
+        # hoverable: its title (the cached part) is the desktop detail (review r2)
+        hit = page.evaluate("""(([x, y]) => document.elementFromPoint(x, y).id)""",
+                            [cnt["right"] - 4, (cnt["top"] + cnt["bottom"]) / 2])
+        assert hit == "token-count", hit
+    finally:
+        ctx.close()
+
+
+@pytest.mark.parametrize("width,height", [(1280, 800), (390, 844)])
+def test_an_empty_counter_still_holds_its_line(browser, width, height):
+    """Hidden = not drawn, still laid out: the pill is the same size empty
+    or with a count, and the empty line is a real ~13px row."""
+    ctx, page = _open(browser, width, height)
+    try:
+        e = _box(page, "token-count")
+        assert page.evaluate("getComputedStyle(document.getElementById('token-count')).visibility") == "hidden"
+        assert 10 < e["h"] < 16, e
+        if width > 480:
+            assert abs(_box(page, "input-area")["w"] - 750) < 1
+    finally:
+        ctx.close()

@@ -7845,6 +7845,7 @@ def _render_assistant_with_tool_calls(content: str, tool_calls: list,
 from ..utils.token_counter import estimate_tokens
 from ..tools.registry import get_available_tools, TOOL_DEFINITIONS, get_active_tool_definitions  # pylint: disable=unused-import  # §4NM: the planner was its last user here; ~58 tests still patch this module attribute
 from ..tools.outcome import ToolOutcome as _TO
+from ..tools.browser_support import browser_outcome_note as _browser_outcome_note  # §4RX
 
 #: knowledge_base actions that clear stored memory. `reset_all` deletes every
 #: id in the vector collection, resets the library index to `[]` and wipes the
@@ -24248,7 +24249,12 @@ class GhostAgent:
                         failure_was_partial = (
                             _outcome.status is _OutcomeStatus.PARTIAL)
                         last_error_preview = str_res.replace("Error:", "").strip()
-                        pretty_log("Tool Warning", f"{fname} -> {last_error_preview[:100]}", icon=Icons.WARN, level="WARNING")  # §LOG-5b
+                        _page_note = _browser_outcome_note(str_res) if fname == "browser" else ""
+                        if _page_note:                                    # §4RX: the page's doing, not a fault
+                            pretty_log("Tool Note", f"{fname}: {_page_note} -> {last_error_preview[:100]}",
+                                       icon=Icons.TOOL_BROWSER, level="INFO")
+                        else:
+                            pretty_log("Tool Warning", f"{fname} -> {last_error_preview[:100]}", icon=Icons.WARN, level="WARNING")  # §LOG-5b
 
                     elif fname in ["manage_tasks", "learn_skill", "update_profile"] and "SUCCESS" in str_res.upper():
                         if is_mutating: seen_tools.clear()
@@ -24639,10 +24645,11 @@ class GhostAgent:
                         # ledger. The result is still a declared failure
                         # (corpus label, no-progress window), and the hint
                         # already told the model to use a secondary source.
+                        # §4RX: the site's decision, not a fault — information (operator)
                         pretty_log("Blocked Page",
                                    f"{_fail_fname} — site refused the fetch (not a strike) -> "
                                    f"{last_error_preview[:100]}",
-                                   icon=Icons.WARN, level="WARNING")
+                                   icon=Icons.VERDICT_NOTE, level="INFO")
                         diagnostic_msg = format_failure_context(failure_text, failure_class)
                     elif failure_class == FailureClass.RETRYABLE:
                         transient_failure_count += 1
@@ -24650,11 +24657,24 @@ class GhostAgent:
                         # turn's primary "what broke" record, and at INFO
                         # they only got the 60-char budget, which cut the
                         # error preview mid-clause (WARN+ gets 240).
-                        pretty_log("Transient Fail", f"temporary failure {transient_failure_count} ({failure_match}) -> {last_error_preview[:100]}", icon=Icons.WARN, level="WARNING")
+                        _page_note = (_browser_outcome_note(failure_text)
+                                      if _fail_fname == "browser" else "")
+                        if _page_note:                                    # §4RX: same count, quieter line
+                            pretty_log("Tool Note", f"temporary failure {transient_failure_count} — browser: "
+                                       f"{_page_note} -> {last_error_preview[:100]}",
+                                       icon=Icons.TOOL_BROWSER, level="INFO")
+                        else:
+                            pretty_log("Transient Fail", f"temporary failure {transient_failure_count} ({failure_match}) -> {last_error_preview[:100]}", icon=Icons.WARN, level="WARNING")
                         diagnostic_msg = format_failure_context(failure_text, failure_class)
                     else:
                         execution_failure_count += 1
-                        pretty_log("Execution Fail", f"failure {execution_failure_count} — the turn stops at 6, or 8 counting temporary ones ({failure_class.value}) -> {last_error_preview[:150]}", icon=Icons.FAIL, level="WARNING")  # §LOG-5b; §4NV verify: no "Strike" jargon
+                        _page_note = (_browser_outcome_note(failure_text)
+                                      if _fail_fname == "browser" else "")
+                        if _page_note:                                    # §4RX review: same count, quieter line
+                            pretty_log("Tool Note", f"failure {execution_failure_count} — browser: {_page_note} "
+                                       f"-> {last_error_preview[:100]}", icon=Icons.TOOL_BROWSER, level="INFO")
+                        else:
+                            pretty_log("Execution Fail", f"failure {execution_failure_count} — the turn stops at 6, or 8 counting temporary ones ({failure_class.value}) -> {last_error_preview[:150]}", icon=Icons.FAIL, level="WARNING")  # §LOG-5b; §4NV verify: no "Strike" jargon
                         diagnostic_msg = format_failure_context(failure_text, failure_class)
                         # Detect the SAME structural failure recurring.
                         # At ≥3 repeats: freeze the success-decay (so the

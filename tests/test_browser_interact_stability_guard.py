@@ -124,7 +124,7 @@ _RUNNER_NS = _load_runner_namespace()
 
 
 async def _run_interact(op, page):
-    async def fake_with_context(profile_dir, proxy, timeout_ms, run):
+    async def fake_with_context(profile_dir, proxy, timeout_ms, run, **_kw):
         return await run(page)
 
     original = _RUNNER_NS["_with_context"]

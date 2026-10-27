@@ -51,7 +51,7 @@
     <thead><tr><th>Command</th><th>Backend</th></tr></thead>
     <tbody>
       <tr><td>chat (plain text)</td><td><code>POST /v1/chat/completions</code> (SSE stream, rendered live as rich Markdown; <code>session_id</code> persists the conversation server-side)</td></tr>
-      <tr><td><code>/sessions · /resume · /new · /clear</code></td><td><code>/api/sessions</code> CRUD — <code>/clear</code> rotates the session id (a local-only clear would lie: the server merges stored history back in)</td></tr>
+      <tr><td><code>/sessions · /resume · /new · /clear</code></td><td><code>/api/sessions</code> CRUD — <code>/clear</code> rotates the session id (a local-only clear would lie: the server merges stored history back in) and, on a terminal, clears the screen and redraws the start-up hint (2026-10-27)</td></tr>
       <tr><td><code>/good · /bad [why…]</code> (aliases <code>/+1 · /-1</code>)</td><td><code>POST /api/feedback</code> — human outcome label on a completed reply; see <a href="#rating">Rating</a></td></tr>
       <tr><td><code>/health · /turns · /cancel [hard]</code></td><td><code>/api/health</code>, <code>/api/turns</code>, <code>/api/turn/cancel</code></td></tr>
       <tr><td><code>/effort [default|low|med|xhigh]</code></td><td><code>X-Ghost-Effort</code> on every chat request (2026-10-24, §4RB): the web page's reasoning-effort selector for the terminal. Default (the start state) sends no header — the model server's own level. Bare <code>/effort</code> shows the level; aliases <code>medium</code>, <code>x-high</code>/<code>high</code> → xhigh, <code>auto</code>/<code>off</code> → Default. Setting a new level notes the cost (the whole prompt is re-processed once, ~3 min); either way <code>/api/health</code> is asked, and while it reports <code>reasoning_effort</code> not true the CLI says the level is ignored. One-shot: <code>ghost --effort xhigh -p …</code> (the REPL also starts at that level). The status line shows the level (<code>effort default</code> / <code>low</code> / <code>med</code> / <code>x-high</code>) only while the agent's switch is on, and it is the last optional segment dropped as the window narrows (after the session id and the host). Tests: <code>tests/test_ghost_cli.py::TestEffort</code>, <code>::TestEffortBanner</code>.</td></tr>
@@ -232,6 +232,17 @@
     (<code>EFFORT_ICONS</code>, pinned equal by a test). On Default it shows the icon of the server's own level
     (<code>effort 🔥 default</code>), read from health's <code>reasoning_effort_default</code>; before the agent
     has looked that level up it shows <code>effort default</code> with no icon.</li>
+    <li><strong>Token counter (2026-10-27, operator: "add token counters at the bottom"; then "just up and down, for context / generation").</strong> The status
+    line shows the last turn's <code>↑31.2k (28.0k cached) ↓840</code> — context (prompt) tokens, with how many the model
+    server served from its cache, and generated tokens, each summed over every model call the turn made (tool rounds
+    and the final answer). The numbers come from one <code>{"ghost": {"usage": …}}</code> frame the agent sends just before
+    the stream's <code>[DONE]</code> (see <a href="../api/routes.html">routes</a>); the CLI never prints it or adds it to the
+    history, and normalises its values on arrival so a malformed one cannot break a redraw. <code>~</code> after the arrow
+    marks a turn with a call that ended without its usage report (its context tokens are missing). Each turn clears
+    it first: a turn with no frame (an older agent, an error, a system-answered reply) shows nothing, never the
+    previous turn's numbers (review r1). <code>/clear</code>, <code>/new</code>, <code>/resume</code> and <code>/load</code> reset it. As the
+    window narrows it is dropped after the session id and the host, before the effort level. (A conversation total
+    was tried and removed the same day.) Tests: <code>tests/test_ghost_cli.py::TestTokenCounter</code>.</li>
     <li><strong>The banner wrapped.</strong> Its rule was a hardcoded 52 columns and it
     assembled the full URL, the session id and <code>up 3h 20m</code> unconditionally — so it
     under-ran a wide window and spilled onto a second line in a narrow one.

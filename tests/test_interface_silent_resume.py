@@ -264,8 +264,9 @@ def test_a_same_page_resume_gives_the_surviving_bubble_its_clock_back():
                " stopTurnTicker(); NOW += 30_000; ensureAgentBubbleForResume();"
                " [tickerTimer !== null, turnStatusClockEl.textContent, currentAgentMessageDiv === b,"
                "  tickerReqId, turnStatusDescEl.textContent]")
-    # the same bubble, its clock from the send, and its log corridor kept
-    assert got == [True, "0:50", True, "ab12cd34", "working…"]
+    # the same bubble, its clock from the send, and its log corridor kept;
+    # nothing captioned yet reads "thinking…" (operator 10-27; was "working…")
+    assert got == [True, "0:50", True, "ab12cd34", "thinking…"]
 
 
 def test_a_finished_reply_of_another_turn_is_not_reused_for_a_resume():

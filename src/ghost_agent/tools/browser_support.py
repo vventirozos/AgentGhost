@@ -3,6 +3,7 @@ under its post-extraction size gate. Every name is re-exported there."""
 import asyncio
 import json
 import re
+import shlex
 import time
 from typing import Dict
 from pathlib import Path
@@ -58,6 +59,105 @@ async def _exec_holding_lock(fn, *args, **kwargs):
 # blow the LLM context window, so we cap before returning. These caps
 # match `helper_fetch_url_content`'s 5 MB ceiling.
 
+#: §4RX (operator: "these are not mechanical errors, they shouldn't look like
+#: they are in the agent log"): a browser failure the SITE or PAGE decided —
+#: a slow page over Tor, a host that does not exist, a selector the page does
+#: not have. Ordered: the first match names it. Anything unmatched (a runner
+#: crash, a kill at the wall clock, a broken install, the sandbox down) stays a
+#: warning, because something on OUR side broke.
+_PAGE_OUTCOMES = (
+    (r"ERR_SOCKS_CONNECTION_FAILED", "Tor could not reach the host"),
+    (r"exceeded its \d+ ms budget|ran out of its \d+ ms total budget", "the page kept the browser past its budget"),
+    (r"Page\.goto: Timeout|ERR_TIMED_OUT|navigation timeout", "the page did not load in time"),
+    (r"did not match any element|not found within|never became clickable|waiting for locator",
+     "the page has no such element"),
+    (r"ERR_NAME_NOT_RESOLVED", "the host name does not resolve"),
+    (r"ERR_CONNECTION_(?:REFUSED|CLOSED|RESET)|ERR_EMPTY_RESPONSE", "the site dropped the connection"),
+    (r"ERR_HTTP2|ERR_SSL_PROTOCOL_ERROR|ERR_CERT", "the site's HTTPS failed"),
+    (r"ERR_ABORTED", "the address is a download, not a page"),
+    (r"ERR_BLOCKED_BY_CLIENT|redirected to a non-public address", "policy refused the address"),
+    (r"ERR_FILE_NOT_FOUND", "no such file"),
+    (r"Execution context was destroyed", "the page navigated away mid-read"),
+    (r"STATUS: PARTIAL", "some actions failed on the page"),
+    (r"STATUS: BLOCKED", "the site refused the page or has no such page"),
+)
+_MECHANICAL = re.compile(r"\(exit (?:124|137|143)\)|runner exit (?:124|137|143)|SANDBOX INFRA ERROR|headless_shell|"
+                         r"Executable doesn't exist|Could not write browser runner|sandbox execute failed|"
+                         r"TargetClosedError|Target (?:page, context or browser has been )?closed|Target crashed",
+                         re.I)
+_LOOPBACK = re.compile(r"\b(?:127\.0\.0\.1|localhost|\[::1\])\b", re.I)
+
+
+def browser_outcome_note(text: str) -> str:
+    """What the page or site did, when a browser failure is THAT and not a
+    fault of ours — "" when something mechanical broke (§4RX: those log as
+    INFO, these stay warnings)."""
+    # page CONTENT must not pick the class (review r2): the text blocks of a
+    # navigate/extract and an interact's TEXT:/VALUE: lines go; its ERR lines stay
+    t = re.split(r"--- PAGE TEXT|--- TEXT ---", str(text or ""), maxsplit=1)[0]
+    t = re.sub(r"(?m)^\s+(?:TEXT|VALUE): .*$", "", t)
+    if not t or _MECHANICAL.search(t):
+        return ""
+    for pat, note in _PAGE_OUTCOMES:
+        if re.search(pat, t, re.I):
+            if "Tor could not" in note:
+                # §4RX review: during a Tor outage EVERY host fails this way —
+                # only a recent clean load makes it the host's doing
+                from .host_memo import tor_recently_ok
+                return note if tor_recently_ok() else ""
+            if "dropped the connection" in note and _LOOPBACK.search(t):
+                return ""                                    # the user's own app is down: act on it
+            return note
+    return ""
+
+
+#: §4RX: what an exec must keep past the runner's clock — the runner's own
+#: 5 s grace plus Chromium's launch before the clock and close after it.
+#: Under the 30 s slack, so a normal call keeps its full total (review r2: a
+#: 30 s + 10 s cut made a 1-action interact's clock shorter than before §4RX
+#: and gave a call queued to 15–41 s a 1 s clock).
+_EXEC_MARGIN_S = 15
+
+
+def runner_cmd(filename, payload, operation, exec_s, runner_total_ms) -> str:
+    """The runner command for ONE exec of `exec_s` seconds (§4RX). An
+    interact's whole-sequence clock is sized to THIS exec's window, so a
+    retry or a queued call with less time left never outlives its exec
+    (review: the launch-race retry reused the first exec's total). The
+    per-action share never exceeds that total."""
+    if operation == "interact":
+        total = max(1000, min(int(runner_total_ms), (int(exec_s) - _EXEC_MARGIN_S) * 1000))
+        payload["total_timeout_ms"] = total
+        payload["timeout_ms"] = min(int(payload["timeout_ms"]), total)
+    return f"python3 -u {filename} {shlex.quote(json.dumps(payload))}"
+
+
+def _log_runner_failure(pretty_log, operation, exit_code, parsed, cause, host="") -> None:
+    """The operator's stream line for a failed runner (§4RX): what the page
+    or site did (slow over Tor, no such host, no such element) is
+    information, not a fault — only a mechanical failure keeps the warning.
+    `pretty_log` is the caller's, so the browser module stays the one seam."""
+    from ..utils.logging import Icons
+    note = browser_outcome_note(f"(exit {exit_code}) {parsed}")
+    if note:
+        pretty_log("Browser Note", f"{operation}{' ' + host if host else ''}: {note} — {cause}",
+                   icon=Icons.TOOL_BROWSER, level="INFO")
+    else:
+        pretty_log("Browser Failed", f"{operation}: runner exit {exit_code} — {cause}",
+                   icon=Icons.TOOL_BROWSER, level="WARNING")
+
+
+def budget_used_up_line(parsed: dict) -> str:
+    """§4RX: an interact whose total budget ran out mid-sequence — what ran
+    is real, what did not run is named."""
+    nr = int(parsed.get("not_run") or 0)
+    return (f"⚠ BUDGET USED UP: the sequence ran out of its {parsed.get('budget_ms')} ms total "
+            "budget during the last step listed below"
+            + (f"; the {nr} action{'s' if nr != 1 else ''} after it did NOT run" if nr else "")
+            + ". The steps above it ran and their results are real. Re-run only the missing "
+            "steps, or pass a larger timeout_ms (it is per action) if one step needs longer.")
+
+
 def _runner_failure_hint(err: str) -> str:
     """The advice for THIS failure (§4LN): every runner error used to carry
     one paragraph naming every failure mode — Tor timeouts, click chains and
@@ -90,6 +190,12 @@ def _runner_failure_hint(err: str) -> str:
     if "net::ERR_BLOCKED_BY_CLIENT" in e or "redirected to a non-public address" in e:
         parts.append("Policy refused that address (an internal, loopback or metadata host, possibly reached "
                      "by a redirect) — it cannot be read from here; use a different, public source.")
+    if "net::ERR_SOCKS_CONNECTION_FAILED" in e:            # §4RX: no route; 37 of 80 failures
+        parts.append("Tor could not connect to that host — over Tor this is how an address that does "
+                     "not exist fails (a guessed or misspelled domain), or a site that refuses Tor. Take "
+                     "the address from your search results; do not try spelling variants of it. If other "
+                     "sites load, the address is the problem; if EVERY site fails this way, Tor is down — "
+                     "say so instead of retrying.")
     if "net::ERR_NAME_NOT_RESOLVED" in e:
         parts.append("That host name does not resolve — check the address against your search results; "
                      "do not try spelling variants.")

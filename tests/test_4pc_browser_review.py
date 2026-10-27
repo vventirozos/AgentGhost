@@ -386,7 +386,7 @@ def test_op_interact_emits_the_implicit_goto_status(tmp_path, monkeypatch):
         async def goto(self, url, wait_until="load"): return _Resp()
         async def title(self): return "Not Found"
         async def wait_for_timeout(self, ms): pass
-    async def _ctx(profile_dir, proxy, timeout_ms, run): return await run(_Page())
+    async def _ctx(profile_dir, proxy, timeout_ms, run, **_kw): return await run(_Page())
     monkeypatch.setattr(R, "_with_context", _ctx)
     monkeypatch.setattr(R, "_write_last_url", lambda *a, **k: None)
     monkeypatch.setattr(R, "_resolve_url_or_error", lambda op, name: ("https://a.org/missing", False))
@@ -442,7 +442,7 @@ def _fake_page(text="hello world " * 10, links=("https://a.org/x", "https://b.or
 
 
 def _run_with_fake(monkeypatch, page):
-    async def _ctx(profile_dir, proxy, timeout_ms, run): return await run(page)
+    async def _ctx(profile_dir, proxy, timeout_ms, run, **_kw): return await run(page)
     monkeypatch.setattr(R, "_with_context", _ctx)
     monkeypatch.setattr(R, "_write_last_url", lambda *a, **k: None)
     async def _none(page): return {}

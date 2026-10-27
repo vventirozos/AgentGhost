@@ -127,7 +127,7 @@ async def _run_interact(op, page):
     `_with_context` in the runner's namespace so the call never
     touches Playwright — it just runs the inner `run` function
     directly on our fake page."""
-    async def fake_with_context(profile_dir, proxy, timeout_ms, run):
+    async def fake_with_context(profile_dir, proxy, timeout_ms, run, **_kw):
         return await run(page)
 
     original = _RUNNER_NS["_with_context"]

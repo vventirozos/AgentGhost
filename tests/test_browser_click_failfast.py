@@ -107,7 +107,7 @@ def _click_op(tmp_path, selector, timeout_ms=30000):
 
 
 async def _run_click(op, page):
-    async def fake_with_context(profile_dir, proxy, timeout_ms, run):
+    async def fake_with_context(profile_dir, proxy, timeout_ms, run, **_kw):
         return await run(page)
 
     original = _RUNNER_NS["_with_context"]

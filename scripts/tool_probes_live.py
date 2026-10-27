@@ -33,7 +33,7 @@ def tools_since(pos):
         f.seek(pos); txt = f.read().decode("utf-8", "replace")
     calls = re.findall(r"\[probe-[0-9a-f]+ [^\]]*\] tool call — ([a-z_]+)", txt)
     calls += re.findall(r"\[[0-9a-f]{8} [^\]]*\] tool call — ([a-z_]+)", txt)
-    fails = len(re.findall(r"\[(?:probe-)?[0-9a-f]+ [^\]]*\] (?:tool warning|tool error|transient fail)", txt))
+    fails = len(re.findall(r"\[(?:probe-)?[0-9a-f]+ [^\]]*\] (?:tool warning|tool error|transient fail|tool note)", txt))
     return calls, fails
 ITEMS = [
  ("file_system", f"Create a file named probe_{N}.txt in the workspace root containing exactly the text alpha{N}. Then read it back and reply with only the file's contents, nothing else.", rf"alpha{N}", ["file_system"]),

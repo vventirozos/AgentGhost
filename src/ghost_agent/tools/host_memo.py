@@ -31,7 +31,21 @@ _HOST_FAIL_STRIKES = 2
 #: §4PC: a site-level BLOCK (403 / bot challenge) is one strike — 0 of 24
 #: same-host re-hits after a challenge ever loaded; timeouts keep two
 _HOST_BLOCK_STRIKES = 1
-_HOST_FAIL_MARKERS = ("http2", "timeout", "timed out", "timed_out")
+#: §4RX: `socks_connection_failed` is how a clearnet host that does not exist
+#: (or refuses) fails over Tor — 37 in 11 days, never remembered, so one
+#: guessed domain was dialled 11 times. Tor-side, so it keeps the 1 h TTL.
+_HOST_FAIL_MARKERS = ("http2", "timeout", "timed out", "timed_out", "socks_connection_failed")
+#: §4RX review: when Tor cannot build circuits EVERY host fails with the same
+#: SOCKS error. A SOCKS strike therefore bans a host only when a clearnet page
+#: loaded between its failures (Tor worked while this host did not); the time
+#: of the last clean clearnet load also tells the log whether Tor is working.
+_LAST_CLEARNET_OK = [0.0]
+_TOR_OK_WINDOW_S = 600.0
+
+
+def tor_recently_ok(window: float = _TOR_OK_WINDOW_S) -> bool:
+    """A clearnet page loaded through the browser in the last `window` s."""
+    return _LAST_CLEARNET_OK[0] > 0 and (time.monotonic() - _LAST_CLEARNET_OK[0]) < window
 
 
 def _clearnet_host(url: str) -> str:
@@ -46,6 +60,8 @@ def _clearnet_host(url: str) -> str:
         return ""
     if not host or host.endswith(".onion") or host.endswith(".local") or host == "localhost":
         return ""
+    if "." not in host and ":" not in host:
+        return ""                                  # §4RX r2: a container / LAN name, never a Tor-reached site
     try:
         import ipaddress
         ip = ipaddress.ip_address(host)
@@ -89,16 +105,21 @@ def _mark_host_failed(url: str, cause: str) -> None:
             return
         kind = "block"
     elif ("page.goto" in lc or "net::err_" in lc) and any(m in lc for m in _HOST_FAIL_MARKERS):
-        kind = "timeout" if "http2" not in lc else "http2"
+        kind = "http2" if "http2" in lc else "timeout"     # socks: the short TTL too
     else:
         return
     ttl = _HOST_TIMEOUT_TTL if kind == "timeout" else _HOST_FAIL_TTL
     now = time.monotonic()
     rec = _HOST_FAILS.get(host)
+    # [count, last, cause, ttl, a clearnet load succeeded since the first
+    # failure, a strike landed after such a load, any strike was SOCKS (§4RX)]
+    socks = "socks_connection_failed" in lc
     if rec is None or (now - rec[1]) >= rec[3]:
-        _HOST_FAILS[host] = [1, now, c[:120], ttl]
+        _HOST_FAILS[host] = [1, now, c[:120], ttl, False, False, socks]
     else:
         rec[0], rec[1], rec[2], rec[3] = rec[0] + 1, now, c[:120], min(rec[3], ttl)
+        rec[5] = rec[5] or rec[4]
+        rec[6] = rec[6] or socks
     _cap(_HOST_FAILS, lambda h: _HOST_FAILS[h][1])
 
 
@@ -106,6 +127,9 @@ def _mark_host_ok(url: str) -> None:
     host = _clearnet_host(url)
     if host:
         _HOST_FAILS.pop(host, None)
+        _LAST_CLEARNET_OK[0] = time.monotonic()
+        for rec in _HOST_FAILS.values():                     # Tor works: later failures are the host's
+            rec[4] = True
 
 
 def _dead_host_notice(url: str):
@@ -119,6 +143,8 @@ def _dead_host_notice(url: str):
     need = _HOST_BLOCK_STRIKES if str(rec[2]).startswith("blocked:") else _HOST_FAIL_STRIKES
     if rec[0] < need:
         return None
+    if len(rec) > 6 and rec[6] and not rec[5]:
+        return None                                          # §4RX: a SOCKS strike could be Tor, not the host
     return (f"{host} failed {rec[0]} times in the last few hours ({rec[2][:80]}) — fetching it again "
             f"will fail the same way. Use a DIFFERENT source from your results; if none loads, "
             f"answer from what you have and say which pages could not be read.")

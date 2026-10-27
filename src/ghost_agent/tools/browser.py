@@ -89,7 +89,7 @@ _BROWSER_PROFILE_LOCK = asyncio.Lock()
 _MAX_INTERACT_ACTIONS = 60
 from .browser_support import (  # noqa: E402 — §4LN helpers, re-exported
     _exec_holding_lock, _overwrite_refusal,
-    _UNSEEN_SCREENSHOT_NOTE, _runner_failure_hint, _last_url_filename, _runner_first_url, interact_notes, no_effect_line, _note_shot)
+    _UNSEEN_SCREENSHOT_NOTE, _runner_failure_hint, budget_used_up_line, _log_runner_failure, runner_cmd, _last_url_filename, _runner_first_url, interact_notes, no_effect_line, _note_shot)
 _STEP_WAIT_KEYS = ("ms", "timeout_ms", "wait_for_hidden_ms", "settle_ms", "post_click_ms")
 
 
@@ -1047,7 +1047,7 @@ async def tool_browser(
                     pretty_log("Browser Skipped",
                                f"{_onion_host(new_step['url'])} is a "
                                f"known-dead hidden service (actions[{idx}])",
-                               icon=Icons.TOOL_BROWSER, level="WARNING")
+                               icon=Icons.TOOL_BROWSER, level="INFO")
                     return _err(_dead_step, hint=None)
             sanitised_actions.append(new_step)
 
@@ -1069,7 +1069,7 @@ async def tool_browser(
         pretty_log("Browser Skipped",
                    f"{_onion_host(_nav_url) or _clearnet_host(_nav_url)} skipped (dead, retired or failing) — "
                    f"told the model to try another result",
-                   icon=Icons.TOOL_BROWSER, level="WARNING")
+                   icon=Icons.TOOL_BROWSER, level="INFO")             # §4RX: a memo decision, not a fault
         return _err(_dead, hint=None)
 
     # ONE deadline for this call, retries included (§4GI round 3). Set
@@ -1136,10 +1136,6 @@ async def tool_browser(
 
     pretty_log("Browser", f"{operation} {url or selector or ''}".strip(), icon=Icons.TOOL_BROWSER)
 
-    cmd = (
-        f"python3 -u {_BROWSER_RUNNER_FILENAME} "
-        f"{shlex.quote(json.dumps(payload))}"
-    )
     # When project-scoped, run from /workspace/projects/<id> so the runner
     # (written into the scoped dir as `.browser_runner.py`) is found by its
     # relative name. Passed ONLY when set, so managers without a `workdir`
@@ -1171,6 +1167,7 @@ async def tool_browser(
                 return _err("the call's wall-clock budget was spent before the "
                             "browser could start (it was queued behind another "
                             "browser call) — retry as a fresh call", ran=False)
+            cmd = runner_cmd(_BROWSER_RUNNER_FILENAME, payload, operation, _first_t, _runner_total_ms)
             output, exit_code = await _exec_holding_lock(
                 sandbox_manager.execute, cmd,
                 timeout=_first_t,
@@ -1213,6 +1210,7 @@ async def tool_browser(
                        "remainder and returns exit 124)",
                        icon=Icons.RETRY, level="WARNING")
         else:
+            cmd = runner_cmd(_BROWSER_RUNNER_FILENAME, payload, operation, _retry_t, _runner_total_ms)
             try:
                 async with _BROWSER_PROFILE_LOCK:
                     output, exit_code = await _exec_holding_lock(
@@ -1333,8 +1331,7 @@ async def tool_browser(
         _cause = str(parsed).replace("\n", " ⏎ ")
         if len(_cause) > 300:
             _cause = _cause[:300] + "…"
-        pretty_log("Browser Failed", f"{operation}: runner exit {exit_code} — {_cause}",
-                   icon=Icons.TOOL_BROWSER, level="WARNING")
+        _log_runner_failure(pretty_log, operation, exit_code, parsed, _cause, _clearnet_host(_nav_url))   # §4RX
         # R3 MAJOR: was `url`. With an interact whose actions[0] is a
         # goto, the runner never dialled it, so a failure banned the
         # HEALTHY top-level host for 600s while the dead one went
@@ -1390,7 +1387,7 @@ async def tool_browser(
         _specific_route = _deterministic_error_route(str(parsed))
         _kill_note = ("the sandbox killed the runner at its wall-clock limit — the page kept the "
                       "browser busy; a retry of the same page will too. "
-                      if exit_code in (124, 137) else "")
+                      if exit_code in (124, 137, 143) else "")
         return _err(
             f"Runner failed (exit {exit_code}): {parsed}",
             ran=True,
@@ -1444,7 +1441,8 @@ async def tool_browser(
         header = (f"--- BROWSER RESULT ---\nSTATUS: BLOCKED ({_blocked})\nOP: {operation}"
                   f"\nHINT: {blocked_page_hint(_blocked, parsed.get('url') or _nav_url)}")
         _mark_host_failed(_nav_url, f"blocked: {_blocked}")      # the memo decides (host_level_block)
-    elif ok and operation in ("navigate", "extract_text", "click", "screenshot", "interact"):
+    elif ok and operation in ("navigate", "extract_text", "click", "screenshot", "interact") and not (
+            operation == "interact" and _interact_read_failed(parsed)):   # §4RX r2: an aborted goto proves nothing
         _mark_host_ok(_nav_url)                                  # §4PC: any clean load clears it
     if _nav_suggestion:
         header += f"\nNOTE: {_nav_suggestion}"
@@ -1605,6 +1603,8 @@ async def tool_browser(
                 "page would have just timed out one-by-one. Fix the URL "
                 "and retry the whole interact call."
             )
+        if parsed.get("budget_exhausted"):
+            lines.append(budget_used_up_line(parsed))                # §4RX
         if js_diag:
             # Surface uncaught exceptions / console errors collected across
             # the whole interact sequence — strip the leading newline the

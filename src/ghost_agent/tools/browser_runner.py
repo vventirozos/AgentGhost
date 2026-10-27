@@ -538,8 +538,14 @@ def _attach_diagnostics(page):
     return js_errors, console_msgs
 
 
-async def _with_context(profile_dir, proxy, timeout_ms, op_fn):
+async def _with_context(profile_dir, proxy, timeout_ms, op_fn, total_ms=None, on_timeout=None):
     """Open a persistent context, run op_fn(page), close cleanly.
+
+    ``total_ms`` is the whole op's wall clock when it differs from the
+    per-step ``timeout_ms`` (interact: the per-action share is
+    ``timeout_ms``, the sequence gets ``total_ms``). ``on_timeout(page,
+    budget_ms)`` may turn a budget overrun into a partial result instead
+    of an error; returning None keeps the error.
 
     Every op funnels through here, so this is also where we attach the
     console/pageerror diagnostics: any dict an op returns is augmented
@@ -600,19 +606,25 @@ async def _with_context(profile_dir, proxy, timeout_ms, op_fn):
             # a spinning getter kept the runner alive until `timeout -k`
             # killed it with no sentinel. The host's exec timeout is this
             # budget + 30 s, so a budget overrun is reported, not killed.
+            # §4RX: interact passes its TOTAL here — the per-action share
+            # used to be the clock for the whole sequence (21 actions got
+            # 27 s of a 570 s budget, live 43fe95a2/ff6c2096).
+            budget_ms = int(total_ms) if total_ms else int(timeout_ms)
             try:
-                result = await asyncio.wait_for(op_fn(page), timeout=max(1.0, timeout_ms / 1000.0 + 5.0))
+                result = await asyncio.wait_for(op_fn(page), timeout=max(1.0, budget_ms / 1000.0 + 5.0))
             except asyncio.TimeoutError:
-                # §4RI (request 43fe95a2): two interact calls timed out on a page
-                # with a 3.3 s boot animation; the model was never told that the
-                # budget is its own `timeout_ms` (divided per action for
-                # interact) and tried smaller selectors instead.
-                raise RuntimeError(
-                    f"the op exceeded its {int(timeout_ms)} ms budget — the page kept the browser busy "
-                    "(a slow load, a spinning script, or waits that add up); pass a larger timeout_ms "
-                    "(for interact it is split across the actions, so a page with a boot animation or "
-                    "a long wait needs more — e.g. timeout_ms=60000 — or fewer actions per call), "
-                    "or use a different source or a smaller selector")
+                result = on_timeout(page, budget_ms) if on_timeout else None
+                if result is None:
+                    # §4RI (request 43fe95a2): two interact calls timed out on a page
+                    # with a 3.3 s boot animation; the model was never told that the
+                    # budget is its own `timeout_ms` (divided per action for
+                    # interact) and tried smaller selectors instead.
+                    raise RuntimeError(
+                        f"the op exceeded its {budget_ms} ms budget — the page kept the browser busy "
+                        "(a slow load, a spinning script, or waits that add up); pass a larger timeout_ms "
+                        "(for interact it is split across the actions, so a page with a boot animation or "
+                        "a long wait needs more — e.g. timeout_ms=60000 — or fewer actions per call), "
+                        "or use a different source or a smaller selector")
             if _SSRF_VIOLATIONS:
                 raise RuntimeError(
                     "blocked: the page redirected to a non-public address "
@@ -1321,6 +1333,8 @@ async def op_interact(op):
     initial_wait_until = op.get("wait_until", "load")
 
     results = []
+    # §4RX: the step in flight, so a budget overrun keeps what already ran
+    progress = {"idx": None, "name": None, "initial_goto": None}
 
     async def run(page):
         initial_goto = None
@@ -1341,6 +1355,7 @@ async def op_interact(op):
                 except Exception:
                     _ititle = ""
                 initial_goto = {"status": (_iresp.status if _iresp else None), "url": page.url, "title": _ititle}
+                progress["initial_goto"] = initial_goto
             except Exception as e:
                 return {
                     "actions": [{
@@ -1356,6 +1371,7 @@ async def op_interact(op):
                 }
 
         for idx, step in enumerate(actions):
+            progress["idx"], progress["name"] = idx, (step.get("action") if isinstance(step, dict) else None)
             if not isinstance(step, dict):
                 results.append({
                     "index": idx, "action": None, "ok": False,
@@ -1662,6 +1678,7 @@ async def op_interact(op):
                 if stop_on_error:
                     break
 
+        progress["idx"] = len(actions)          # §4RX review: every step ran; only the snapshot is left
         # Final snapshot so the caller doesn't need a trailing no-op
         # action just to learn where the sequence landed.
         final_url = page.url
@@ -1685,7 +1702,45 @@ async def op_interact(op):
             **({"initial_goto": initial_goto} if initial_goto else {}),
         }
 
-    return await _with_context(op["profile_dir"], op.get("proxy"), op["timeout_ms"], run)
+    def budget_partial(page, budget_ms):
+        """§4RX: the total budget ran out mid-sequence — return the steps
+        that ran plus the one in flight, not a bare error. None (keep the
+        error) when no action had started: the page was never read."""
+        idx = progress["idx"]
+        if idx is None:
+            return None
+        # §4RX review: every step had run (the overrun hit the final snapshot)
+        # — that is a whole sequence, not a budget partial
+        in_flight = idx < len(actions)
+        if in_flight and not (results and results[-1].get("index") == idx):
+            # "timed out" keeps an in-flight evaluate out of §4RJ's "your
+            # script threw" bucket (review: it read STATUS: OK)
+            _maybe = (" — it may already have taken effect"
+                      if progress["name"] in ("click", "dblclick", "fill", "evaluate", "goto") else "")
+            results.append({
+                "index": idx, "action": progress["name"], "ok": False,
+                "error": (f"TimeoutError: timed out — the sequence ran out of its {budget_ms} ms "
+                          f"total budget during this step{_maybe}"),
+            })
+        final_url = page.url
+        if progress["name"] != "goto" or not in_flight:     # an in-flight goto already wrote the page it asked for (§4LN)
+            _write_last_url(op["profile_dir"], final_url)
+        aborted = bool(results and results[-1].get("aborted_sequence"))   # a goto abort keeps its banner
+        return {
+            "actions": results,
+            "final_url": final_url,
+            "final_title": "",
+            "used_last_url": used_fallback,
+            "aborted": aborted,
+            "abort_reason": "goto_failed" if aborted else None,
+            "budget_exhausted": in_flight,
+            "budget_ms": budget_ms,
+            "not_run": max(0, len(actions) - idx - 1),
+            **({"initial_goto": progress["initial_goto"]} if progress["initial_goto"] else {}),
+        }
+
+    return await _with_context(op["profile_dir"], op.get("proxy"), op["timeout_ms"], run,
+                               total_ms=op.get("total_timeout_ms"), on_timeout=budget_partial)
 
 
 OPS = {

@@ -183,7 +183,7 @@ class _Page:
 async def test_extract_text_and_screenshot_carry_the_document_status(tmp_path, monkeypatch):
     """FAILS IF: the runner throws the `page.goto` response away again — the
     formatter can only classify what it is shipped."""
-    async def _with_context(profile_dir, proxy, timeout_ms, run):
+    async def _with_context(profile_dir, proxy, timeout_ms, run, **_kw):
         return await run(_Page(403))
     monkeypatch.setattr(BR, "_with_context", _with_context)
     monkeypatch.setattr(BR, "_write_last_url", lambda *a, **k: None)

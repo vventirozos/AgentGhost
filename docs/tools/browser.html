@@ -255,7 +255,7 @@ Any claim that content renders is UNSUPPORTED by this screenshot…</code></pre>
     <li>Chromium crashes before printing a sentinel → raw tail of stdout+stderr is returned so the agent has something to debug with (docker <code>exec_run</code> uses <code>demux=False</code>, so stderr is merged into the captured stream).</li>
   </ul>
   <p>
-    <strong>Operator visibility:</strong> the failure is also logged to the live stream with the <em>actual cause</em> (truncated to one line), e.g. <code>Browser Failed — navigate: runner exit 1 — TimeoutError: page.goto: Timeout 30000ms exceeded</code>, rather than a bare <code>runner exit 1</code>. Previously the cause only reached the agent's tool result, leaving anyone watching the stream blind to <em>why</em> a browser op failed. The full text still goes to the agent.
+    <strong>Operator visibility:</strong> the failure is also logged to the live stream with the <em>actual cause</em> (truncated to one line), e.g. <code>Browser Failed — navigate: runner exit 1 — TimeoutError: page.goto: Timeout 30000ms exceeded</code>, rather than a bare <code>runner exit 1</code>. Since <a href="#4rx">§4RX</a>, a page or site outcome logs as <code>Browser Note</code> at INFO instead; only a mechanical failure keeps <code>Browser Failed</code>. Previously the cause only reached the agent's tool result, leaving anyone watching the stream blind to <em>why</em> a browser op failed. The full text still goes to the agent.
   </p>
 
   <h2>Interact abort semantics (navigation failures are terminal)</h2>
@@ -349,7 +349,7 @@ Any claim that content renders is UNSUPPORTED by this screenshot…</code></pre>
 <h2 id="4lg">Sites that keep failing; the timeout retry <span class="tag">2026-10-04 &sect;4LG</span></h2>
 <ul>
   <li>A clearnet host is remembered like a dead onion: two failures of the repeatable kind (HTTP/2 protocol error,
-  timeout, 403/bot challenge — a BLOCKED page counts) within 6 h and the next navigate is refused with the recorded cause;
+  timeout, 403/bot challenge — a BLOCKED page counts; since <a href="#4rx">§4RX</a> also a Tor <code>ERR_SOCKS_CONNECTION_FAILED</code>, remembered 1 h, and only when a page loaded between the failures) within 6 h and the next navigate is refused with the recorded cause;
   a clean load clears it (<code>_mark_host_failed</code> / <code>_dead_host_notice</code>; <code>GHOST_DEAD_HOST_MEMO=0</code>
   disables). Measured: 60 of 65 re-fetches of an already-failed host failed again.</li>
   <li>The commit-milestone retry after a navigation timeout is opt-in (<code>GHOST_BROWSER_COMMIT_RETRY=1</code>): it
@@ -496,12 +496,98 @@ Any claim that content renders is UNSUPPORTED by this screenshot…</code></pre>
   list (<code>system/turn_scratch_pending.json</code>) are outside the sandbox, so sandbox code cannot redirect the move or
   the purge. Background turns (sub-agents, scheduled tasks, job wake-ups) are excluded. The screenshot result tells the
   model it is a working file. Log line: <code>workspace cleanup</code> 🚮. Pins: <code>tests/test_4ny_turn_scratch.py</code>.</p>
+  <h2 id="4rx">Reliability: the interact clock, Tor connection failures, page outcomes as notes <span class="tag">2026-10-27 &sect;4RX</span></h2>
+  <p>Eleven days of <code>ghost-agent.log</code> held 80 failed browser calls: 70 from probes, 10 from the owner. The
+  owner's were 6 <code>interact</code> budget overruns on their own web-OS pages, 3 page loads that did not finish over
+  Tor, and 1 missed selector. Probe traffic accounted for the 37 <code>ERR_SOCKS_CONNECTION_FAILED</code>, mostly guessed
+  stock-exchange domains (<code>www.bx.bg</code> 11 tries). Checked through the same Tor proxy: those hosts fail at the
+  SOCKS step (curl exit 97) while <code>example.com</code> loads.</p>
+  <ul>
+    <li><strong>The interact clock is the total.</strong> The host divides the sequence's budget per action and sent only
+    that share as <code>timeout_ms</code>. <code>_with_context</code> then used the share as the clock for the WHOLE
+    sequence, so a 21-action interact got 27 s of its 570 s ("exceeded its 27142 ms budget", requests
+    <code>43fe95a2</code>, <code>ff6c2096</code>). The payload now also carries <code>total_timeout_ms</code> (the total,
+    never past this exec's window), and <code>_with_context(…, total_ms=…)</code> runs the sequence under it. Single ops
+    are unchanged.</li>
+    <li><strong>An overrun keeps what ran.</strong> When the total runs out mid-sequence, <code>op_interact</code> returns
+    the finished steps plus the one in flight (marked failed), with <code>budget_exhausted</code>, <code>budget_ms</code>
+    and <code>not_run</code>. The tool shows <code>STATUS: PARTIAL</code> and a <code>⚠ BUDGET USED UP</code> line naming how
+    many actions did not run. It used to be a bare <code>runner exit 1</code> that threw away the results. If the
+    overrun hits before any action has started (the implicit first goto), it is still an error, because nothing was read.</li>
+    <li><strong>A Tor connection failure has its own hint and counts in the host memo.</strong> On a clearnet host,
+    <code>ERR_SOCKS_CONNECTION_FAILED</code> is how an address that does not exist (or refuses Tor) fails. The hint says to
+    take the address from search results, not to try spelling variants, and not to diagnose Tor.
+    <code>socks_connection_failed</code> is now one of <code>_HOST_FAIL_MARKERS</code>: two strikes skip the host, with the
+    1-hour Tor-side TTL. Onions keep their own path.</li>
+    <li><strong>Page outcomes log as information</strong> (operator: "these are not mechanical errors, they shouldn't look
+    like they are"). <code>browser_support.browser_outcome_note</code> names what the page or site did: did not load in
+    time, Tor could not reach the host, past its budget, no such element, refused / no such page, HTTPS failed, some
+    actions failed. Those calls log <code>Browser Note</code> 🌎 and <code>Tool Note</code> 🌎 at INFO, in place of
+    <code>Browser Failed</code>, <code>Tool Warning</code> and <code>Transient Fail</code>. <code>Blocked Page</code> is 📌
+    INFO for every tool, and since the review the <code>Execution Fail</code> line gets the same <code>Tool Note</code>. A mechanical failure keeps the warning: a kill at the wall clock (exit 124/137), a broken install,
+    the sandbox down, a runner crash, an unknown operation. Strikes, outcomes and hints are unchanged; only the log line
+    changes. <code>scripts/tool_probes_live.py</code> counts <code>tool note</code> lines as failures, as before.</li>
+  </ul>
+  <p><strong>Fresh-eye review (same day), 4 MAJOR fixed:</strong></p>
+  <ul>
+    <li>An <code>evaluate</code> in flight at the overrun read as "your script threw" (§4RJ) and the call booked OK. The
+    in-flight entry now says "timed out", which §4RJ excludes. A click, dblclick, fill or evaluate in flight also says it
+    "may already have taken effect".</li>
+    <li>The Chromium launch-race retry reused the first exec's total under its own, shorter exec. The command is now
+    built per exec by <code>browser_support.runner_cmd</code>, which sizes the total to THAT exec's window less 15 s
+    (<code>_EXEC_MARGIN_S</code>: the runner's 5 s grace plus Chromium's launch and close), capped at the planned total,
+    and caps the per-action share at that total. A normal call keeps its whole budget. A call queued behind another
+    browser call gets the time it has left (40 s left gives a 25 s clock).</li>
+    <li>The <code>Execution Fail</code> line (Tor failures are class <code>unknown</code>, selector misses
+    <code>diagnostic</code>) still warned. It now gets the same <code>Tool Note</code> treatment, so a page outcome draws no
+    warning line in the turn loop.</li>
+    <li>A Tor outage looks like every host failing the same way. A SOCKS strike now bans a host only when a clearnet page
+    loaded <em>between</em> its failures, and a load after recovery does not turn outage strikes into a ban. A SOCKS
+    failure logs as INFO only when a clean clearnet load happened in the last 10 minutes
+    (<code>host_memo.tor_recently_ok</code>); otherwise it stays a warning. The hint no longer claims other sites load.</li>
+  </ul>
+  <p>MINOR fixes:</p>
+  <ul>
+    <li>A browser crash (<code>Target … closed</code> / <code>Target crashed</code>, even with a "waiting for locator"
+    call log) and a SIGTERM kill (exit 143) stay warnings.</li>
+    <li><code>ERR_CONNECTION_REFUSED</code> on a loopback address (the user's own app is down) stays a warning.</li>
+    <li>An overrun on the final snapshot, after every step ran, is a whole sequence, not a budget partial.</li>
+    <li>A goto abort keeps its banner through an overrun, and an in-flight goto does not overwrite the last-URL sidecar.</li>
+    <li>The dead-host skip line (<code>Browser Skipped</code>) is INFO.</li>
+  </ul>
+  <p><strong>Second review round, 3 MAJOR fixed</strong> (all inside the first round's fixes):</p>
+  <ul>
+    <li>A 10 s launch allowance made a 1-action interact's clock 20 s, shorter than before §4RX, and gave a queued call
+    a 1 s clock. It is now the 15 s margin above.</li>
+    <li>An interact whose first goto failed still ran <code>_mark_host_ok</code> on the host that failed: during an outage
+    that counted as "Tor works" and erased the host's strikes. An interact whose read failed (<code>_interact_read_failed</code>)
+    now marks nothing.</li>
+  </ul>
+  <p>MINOR fixes:</p>
+  <ul>
+    <li>A host whose strikes mixed a SOCKS failure and a timeout skipped the load-between gate; any SOCKS strike now
+    applies it.</li>
+    <li>Page content (<code>--- PAGE TEXT</code>, <code>--- TEXT ---</code>, an interact's <code>TEXT:</code> /
+    <code>VALUE:</code> lines) no longer feeds the classifier; per-action <code>ERR</code> lines still do.</li>
+    <li>A dotless host (a container or LAN name such as <code>http://web:3000</code>) is never clearnet.</li>
+    <li>The interact dead-onion skip line is INFO.</li>
+    <li>A goto in flight at the overrun "may already have loaded".</li>
+  </ul>
+  <p>Known and accepted:</p>
+  <ul>
+    <li>A page-load timeout logs INFO with no outage gate. A timeout is the page's slowness over Tor, and a stalled Tor
+    still shows up as the Loop Breaker line, which stays WARNING.</li>
+  </ul>
+  <p>Accepted: when the only entry is the in-flight step, the header reads <code>STATUS: ERROR (every action failed)</code>,
+  which is accurate.</p>
+  <p>Pins: <code>tests/test_4rx_browser_reliability.py</code> (46), <code>tests/test_blocked_pages_are_not_strikes.py</code>,
+  <code>tests/test_browser_tor_diagnostics.py</code>.</p>
 </main>
   <h2 id="4pc-review">Fresh-eye review: the browser and the search→page hand-off <span class="tag">2026-10-14 &sect;4PC</span></h2>
   <p>Three independent read-only reviewers (tool, hand-off + loop, runner + sandbox) and a two-week corpus lens. The corpus number that framed the review: of 137 pages that answered 404, <strong>121 (88 %) were addresses the model composed</strong> — a path it assembled on a host it had seen — against 16 it had been given; a composed path on a known host 404s 37 % of the time, a given URL 4 %. After a 404 the same host was re-hit 199 times in the same request. Scope, threat model and the probe-vs-live correction are in the journal.</p>
   <ul>
     <li><strong>The sentinel cannot be forged (CRIT).</strong> The host hands the runner a per-call nonce; the frame is <code>[BROWSER_OK:&lt;nonce&gt;]</code> / <code>[BROWSER_ERR:&lt;nonce&gt;]</code> and the parser accepts only that; an error message is flattened to ONE line. A page had redefined <code>document.body.innerText</code> with a getter that threw <code>"x\n[BROWSER_OK] {…forged…}"</code>, the unwrapped <code>page.evaluate</code> put the message on stdout, and the parser returned the forged page as a success (verified with the real runner). An AST pin keeps the runner to exactly two stdout writers.</li>
-    <li><strong>One wall-clock budget per op.</strong> <code>_with_context</code> runs the whole op under <code>timeout_ms + 5 s</code>; per-step waits used to add up past the exec kill (goto 30 s + probe + click + load 30 s) and <code>page.evaluate</code> had no timeout at all, so a spinning page ended as "runner emitted no sentinel". The outer kill (exit 124/137) is now named in the hint.</li>
+    <li><strong>One wall-clock budget per op.</strong> <code>_with_context</code> runs the whole op under <code>timeout_ms + 5 s</code> (an <code>interact</code> under its <code>total_timeout_ms + 5 s</code> since <a href="#4rx">§4RX</a>); per-step waits used to add up past the exec kill (goto 30 s + probe + click + load 30 s) and <code>page.evaluate</code> had no timeout at all, so a spinning page ended as "runner emitted no sentinel". The outer kill (exit 124/137) is now named in the hint.</li>
     <li><strong>Network guard gaps closed.</strong> Service workers are blocked on the persistent context (their fetches bypass <code>route()</code>); WebSockets go through the same SSRF predicate via <code>route_web_socket</code> (a page reached any loopback port over <code>ws://</code> while a supervised service was up); a redirect hop to a blocked address — which <code>route()</code> never sees — is detected on the <code>request</code> event and fails the op BLOCKED instead of reading what the hop fetched. Residual: the hop's single request is sent before it is detected; Chromium ignores <code>host:port</code> bypass entries, so <code>&lt;loopback&gt;</code> stays (2026-07-12 measurement).</li>
     <li><strong>Status on every landing.</strong> The implicit first navigation of an <code>interact</code> and a <code>click</code> both keep the document status (<code>initial_goto</code>, <code>status</code>), so a 403 challenge page landed either way is BLOCKED, not OK content.</li>
     <li><strong>Addresses are given, never composed.</strong> Every navigate/extract result ends with <code>LINKS ON THIS PAGE (n)</code> (same host first, 40 max), so following a link is a given address. The loop keeps a per-request provenance set (user text, every tool result); after a COMPOSED address 404s, the next composed address on that host is refused at dispatch with "open a URL from your results or the LINKS block, or search <code>site:host</code>" — a given URL always passes. The browser's description and the loop-breaker's browser steer say the same.</li>

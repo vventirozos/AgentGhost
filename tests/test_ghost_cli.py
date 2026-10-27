@@ -500,6 +500,23 @@ class TestRating:
         assert sent == []
         assert "nothing to rate yet" in out.getvalue()
 
+    def test_clear_wipes_the_screen_on_a_terminal(self, monkeypatch):
+        """/clear also clears the screen (operator 2026-10-27): the old
+        transcript left on screen read as the live conversation. Piped
+        output has no screen — nothing is wiped there."""
+        g, api, sent, out = self._make(monkeypatch)
+        cleared = []
+        monkeypatch.setattr(cli.console, "clear", lambda *a, **k: cleared.append(1))
+        monkeypatch.setattr(type(cli.console), "is_terminal",
+                            property(lambda self: True))
+        g.dispatch("/clear")
+        assert cleared == [1]
+        assert "context cleared" in out.getvalue()
+        monkeypatch.setattr(type(cli.console), "is_terminal",
+                            property(lambda self: False))
+        g.dispatch("/clear")
+        assert cleared == [1]
+
     def test_resume_drops_the_turn_refs(self, monkeypatch):
         """A stored history carries no request ids at all."""
         g, api, sent, _ = self._make(monkeypatch)
@@ -1614,3 +1631,96 @@ class TestStatusToolbar:
         assert stock.reverse is True                 # the world the rule exists for
         merged = merge_styles([default_ui_style(), cli.PROMPT_STYLE])
         assert merged.get_attrs_for_style_str("class:bottom-toolbar").reverse is False
+
+
+class TestTokenCounter:
+    """2026-10-27 (operator: "add token counters at the bottom"): the agent
+    sends one `ghost.usage` frame before [DONE]; the status line shows the
+    last turn's context ↑ and generation ↓ ("just up and down")."""
+
+    USAGE = ('data: {"id":"chatcmpl-r1","choices":[],"ghost":{"usage":'
+             '{"prompt_tokens":31234,"completion_tokens":840,'
+             '"cached_tokens":28000,"calls":3}}}')
+
+    def _g(self, monkeypatch):
+        monkeypatch.setattr(cli, "console", cli.Console(
+            file=io.StringIO(), force_terminal=True, width=70, height=24))
+        monkeypatch.setattr(cli.sys, "stdin", io.StringIO())
+        api = cli.GhostAPI("http://eva:8000", "k")
+        g = cli.GhostCLI(api)
+        monkeypatch.setattr(cli.shutil, "get_terminal_size",
+                            lambda fallback=(80, 24): os.terminal_size((160, 24)))
+        return g, api
+
+    def _turn(self, monkeypatch, g, api, usage=USAGE, text="hi"):
+        lines = [('data: {"choices":[{"delta":{"content":"%s"}}]}' % text).encode()]
+        if usage:
+            lines.append(usage.encode())
+        lines.append(b"data: [DONE]")
+        monkeypatch.setattr(api, "chat_stream", lambda *a, **kw: _FakeSSE(lines))
+        g.chat_turn("q")
+
+    @staticmethod
+    def _plain(ansi):
+        from prompt_toolkit.formatted_text import to_plain_text
+        return to_plain_text(ansi)
+
+    def test_tok_format(self):
+        assert [cli._tok(n) for n in (0, 840, 1000, 31234, 99_949, 99_999, 128_900)] == \
+            ["0", "840", "1.0k", "31.2k", "99.9k", "100k", "129k"]
+
+    def test_the_last_turn_shows_in_the_status_line(self, monkeypatch):
+        g, api = self._g(monkeypatch)
+        assert "↑" not in self._plain(g.status_toolbar())     # nothing yet
+        self._turn(monkeypatch, g, api)
+        line = self._plain(g.status_toolbar())
+        assert "↑31.2k (28.0k cached) ↓840" in line and "session" not in line, line
+
+    def test_a_turn_without_a_frame_drops_the_previous_turns_numbers(self, monkeypatch):
+        """Review r1 m3: an error / system answer / older agent left the
+        last turn's ↑↓ on screen as if they were this one's."""
+        g, api = self._g(monkeypatch)
+        self._turn(monkeypatch, g, api)
+        self._turn(monkeypatch, g, api, usage=None)
+        assert "↑" not in self._plain(g.status_toolbar())
+
+    def test_malformed_values_never_break_the_redraw(self, monkeypatch):
+        g, api = self._g(monkeypatch)
+        self._turn(monkeypatch, g, api, usage=(
+            'data: {"choices":[],"ghost":{"usage":{"prompt_tokens":"x",'
+            '"completion_tokens":7,"cached_tokens":"n/a","unmetered_calls":null}}}'))
+        assert "↑0 ↓7" in self._plain(g.status_toolbar())
+
+    def test_the_frame_is_not_reply_text(self, monkeypatch):
+        g, api = self._g(monkeypatch)
+        self._turn(monkeypatch, g, api)
+        assert g.history[-1] == {"role": "assistant", "content": "hi"}
+
+    def test_no_frame_keeps_the_counter_honest(self, monkeypatch):
+        """An agent without the frame (or an aborted turn) adds nothing —
+        no invented zero."""
+        g, api = self._g(monkeypatch)
+        self._turn(monkeypatch, g, api, usage=None)
+        assert g.turn_usage is None
+        assert "↑" not in self._plain(g.status_toolbar())
+
+    def test_unmetered_turn_is_marked_approximate(self, monkeypatch):
+        g, api = self._g(monkeypatch)
+        self._turn(monkeypatch, g, api, usage=(
+            'data: {"choices":[],"ghost":{"usage":{"prompt_tokens":100,'
+            '"completion_tokens":5,"unmetered_calls":1}}}'))
+        assert "↑~100" in self._plain(g.status_toolbar())
+
+    @pytest.mark.parametrize("cmd", ["/clear", "/new"])
+    def test_a_new_conversation_resets_the_counter(self, monkeypatch, cmd):
+        g, api = self._g(monkeypatch)
+        self._turn(monkeypatch, g, api)
+        g.dispatch(cmd)
+        assert g.turn_usage is None
+
+    def test_narrow_window_drops_the_counter_before_liveness(self, monkeypatch):
+        g, api = self._g(monkeypatch)
+        self._turn(monkeypatch, g, api)
+        g._probe_cache = cli.Text("● online", style="ok")
+        line = g._banner_line(40, g._probe_cache).plain
+        assert "online" in line and "ghost" in line and len(line) < 40

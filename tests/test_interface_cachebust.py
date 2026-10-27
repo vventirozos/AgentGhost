@@ -53,6 +53,8 @@ _CARRIER = {
     "app.js": "index.html",
     "matrix_graph.js": "app.js",
     "effort.js": "app.js",          # §4RB
+    "tokens.js": "app.js",          # token counter (2026-10-27)
+    "turn_caption.js": "app.js",    # turn status line allowlist (2026-10-27)
     "workspace.js": "app.js",
     "sessions.js": "workspace.js",
     "status.js": "workspace.js",
@@ -66,6 +68,8 @@ _ANCESTORS = {
     "app.js": [],
     "matrix_graph.js": ["app.js"],
     "effort.js": ["app.js"],
+    "tokens.js": ["app.js"],
+    "turn_caption.js": ["app.js"],
     "workspace.js": ["app.js"],
     "sessions.js": ["workspace.js", "app.js"],
     "status.js": ["workspace.js", "app.js"],

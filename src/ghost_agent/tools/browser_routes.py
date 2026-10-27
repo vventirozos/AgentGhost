@@ -7,8 +7,9 @@ one pin (`tests/test_browser_deterministic_routes.py`), which walks every
 row and checks the route reaches the failure hint.
 
 Keep entries to errors whose cause is the REQUEST itself, not the network:
-a SOCKS/connection error is a circuit's opinion and IS worth one retry
-(and the dead-onion memo already owns those).
+a SOCKS/connection error is owned by the memos instead: the dead-onion memo
+for onions, and since §4RX the clearnet host memo (two strikes, counted
+only when a page loaded between them, so a Tor outage bans nothing).
 """
 
 import re

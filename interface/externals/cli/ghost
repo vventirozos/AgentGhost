@@ -305,6 +305,14 @@ def _dur(seconds: float | None) -> str:
     return f"{s // 86400}d {s % 86400 // 3600}h"
 
 
+def _tok(n: int) -> str:
+    """Token count, compact: 840 · 31.2k · 129k."""
+    if n < 1000:
+        return str(n)
+    # 99,950+ would print "100.0k": whole thousands from there
+    return f"{n / 1000:.1f}k" if n < 99_950 else f"{round(n / 1000)}k"
+
+
 def _trim(text: Any, width: int) -> str:
     text = " ".join(_safe(text).split())
     return text if len(text) <= width else text[: width - 1] + "…"
@@ -545,7 +553,7 @@ class _TailCrop:
 
 
 HELP = """[bold]conversation[/]
-  [you]/clear[/]                 fresh context (new session — old one stays resumable)
+  [you]/clear[/]                 fresh context + clear screen (old session stays resumable)
   [you]/new[/] \\[title]           start a new, optionally titled, session
   [you]/sessions[/]              list server-side sessions   [dim]· /sessions rm <id> deletes[/]
   [you]/resume[/] <id>           continue a session (id prefix is enough)
@@ -799,6 +807,10 @@ class GhostCLI:
         # The pinned status line's liveness segment, refreshed off-thread
         # (see _start_status_refresh) so drawing it never waits on the network.
         self._probe_cache: Text | None = None
+        # Token counter (2026-10-27): the last turn's totals, from the
+        # agent's `ghost.usage` frame (None until one arrives). Reset with
+        # the turn refs.
+        self.turn_usage: dict | None = None
 
     # -- presentation ----------------------------------------------------
     def banner(self) -> None:
@@ -864,6 +876,9 @@ class GhostCLI:
         probe.append_text(self._probe() if probe_text is None else probe_text)
         optional = [[sep, (host, "mute")],
                     [sep, (self.session_id[:8], "faint")]]
+        tokens = self._token_segment()
+        if tokens:
+            optional.insert(0, [sep] + tokens)
         if self._effort_switch:
             icon = EFFORT_ICONS.get(self.effort or self._effort_default, "")
             optional.insert(0, [sep, ("effort ", "faint")]
@@ -873,6 +888,23 @@ class GhostCLI:
         return _fit_line(
             head=[("  👻 ghost", "bold ghost")],
             optional=optional, tail=probe, width=width)
+
+    def _token_segment(self) -> list:
+        """``↑31.2k (28.0k cached) ↓840`` — the last turn's context and
+        generation tokens, summed over every model call it made (operator
+        10-27: "just up and down, for context / generation"). ``~`` marks a
+        turn with a call that ended without its usage report (its context
+        tokens are missing). A turn that reported nothing shows nothing —
+        never the previous turn's numbers (r1 m3)."""
+        u = self.turn_usage
+        if not u:
+            return []
+        approx = "~" if u["approx"] else ""
+        parts = [(f"↑{approx}{_tok(u['prompt'])}", "mute")]
+        if u["cached"]:
+            parts.append((f" ({_tok(u['cached'])} cached)", "faint"))
+        parts.append((f" ↓{_tok(u['completion'])}", "mute"))
+        return parts
 
     def _hint_line(self, width: int) -> Text:
         return _fit_line(
@@ -926,6 +958,7 @@ class GhostCLI:
         self._turn_interrupted = ""    # cleared per turn; set on every exit
                                        # branch that leaves the reply partial
         self._turn_unlabelable = False  # §4ML: the agent said "no trajectory"
+        self.turn_usage = None         # this turn's frame, or nothing (r1 m3)
         printer = _StreamPrinter()
         held = None                    # §4KP: a list while the reply is held
         saw_done = False               # the stream's own terminal frame arrived
@@ -990,6 +1023,10 @@ class GhostCLI:
                     # becomes self.text (→ history, → /save).
                     if (obj.get("ghost") or {}).get("labelable") is False:
                         self._turn_unlabelable = True
+                    _usage = (obj.get("ghost") or {}).get("usage")
+                    if isinstance(_usage, dict):
+                        self._note_usage(_usage)
+                        continue
                     if (obj.get("ghost") or {}).get("retract") is True:
                         # §4MP: the agent dropped the text it streamed (a tool
                         # call followed, or the reply was rewritten). Printed
@@ -1032,6 +1069,19 @@ class GhostCLI:
             _release()
             _settle()
         return printer.text
+
+    def _note_usage(self, usage: dict) -> None:
+        """The agent's turn totals (one frame, just before [DONE]),
+        normalised here so a redraw never parses (r1 n6)."""
+        def num(key: str) -> int:
+            try:
+                return max(0, int(usage.get(key) or 0))
+            except (TypeError, ValueError, OverflowError):
+                return 0
+        u = {"prompt": num("prompt_tokens"), "completion": num("completion_tokens"),
+             "cached": num("cached_tokens"), "approx": num("unmetered_calls") > 0}
+        u["cached"] = min(u["cached"], u["prompt"])
+        self.turn_usage = u
 
     def _abort_turn(self, request_id: str) -> None:
         """Ctrl-C: we closed our socket, but turns are globally serialized on
@@ -1096,6 +1146,8 @@ class GhostCLI:
         the reused-bubble bug the web client carries a guard for."""
         self.turns.clear()
         self._rate_hinted = False
+        # The token counter belongs to the same conversation.
+        self.turn_usage = None
 
     def _rateable(self, nth: int) -> dict | None:
         """The Nth-newest rateable reply (1 = the last one), or None with a
@@ -1315,6 +1367,12 @@ class GhostCLI:
         self.history.clear()
         self._reset_turn_refs()
         self.session_id = uuid.uuid4().hex
+        # A cleared context gets a cleared screen too — the old transcript
+        # left on screen read as if it were still the conversation. Only
+        # on a terminal: piped output has no screen to wipe.
+        if console.is_terminal:
+            console.clear()
+            self.banner()
         self.notice(f"context cleared — new session {self.session_id[:8]} "
                     f"(/resume {old} brings the old one back)", "mute")
 

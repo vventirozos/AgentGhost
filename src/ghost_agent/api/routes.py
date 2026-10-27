@@ -420,6 +420,84 @@ def _restamp_sse_request_id(chunk, req_id: str):
     return result.encode("utf-8") if isinstance(chunk, (bytes, bytearray)) else result
 
 
+_SSE_DONE = b"data: [DONE]"
+_SSE_STAMPED_ID = re.compile(rb'"id"\s*:\s*"chatcmpl-([A-Za-z0-9_#-]{1,80})"')   # turns.py uniquifies as id#N
+
+
+def _turn_usage_frame(agent, req_id: str) -> bytes | None:
+    """One SSE frame with the turn's token totals (``ghost.usage``), or
+    None when unknown — an absent frame is honest, a zero is not (same rule
+    as the non-streaming ``usage`` block). Totals are summed across every
+    upstream call the turn made so far (tool rounds + final), the same
+    counter the trajectory books."""
+    try:
+        _llm = getattr(getattr(agent, "context", None), "llm_client", None)
+        u = _llm.usage_for(req_id) if (_llm is not None and req_id) else None
+        # isinstance + int(): a MagicMock client answers anything (see the
+        # non-streaming path) — real values only.
+        if not isinstance(u, dict) or not u:
+            return None
+        usage = {
+            "prompt_tokens": int(u.get("tokens_in") or 0),
+            "completion_tokens": int(u.get("tokens_out") or 0),
+            "cached_tokens": int(u.get("cached_tokens") or 0),
+            "calls": int(u.get("calls") or 0),
+        }
+        if int(u.get("unmetered_calls") or 0) > 0:       # §4KV: prompt tokens missing
+            usage["unmetered_calls"] = int(u.get("unmetered_calls") or 0)
+            usage["tokens_out_estimated"] = int(u.get("tokens_out_estimated") or 0)
+        frame = {"id": f"chatcmpl-{req_id}", "object": "chat.completion.chunk",
+                 "choices": [], "ghost": {"usage": usage}}
+        return f"data: {json.dumps(frame)}\n\n".encode("utf-8")
+    except Exception:  # noqa: BLE001 — accounting never breaks a reply
+        return None
+
+
+def _sse_done_at(chunk: bytes) -> int:
+    """Offset of a ``data: [DONE]`` FRAME in ``chunk``, else -1. Only at a
+    frame start (offset 0 or right after a blank line): the same text inside
+    a content delta (a reply about SSE) is JSON, where a newline is the two
+    characters ``\\n``, so it never follows a raw blank line (review r1 M1:
+    a bare substring search split such a frame and lost reply text)."""
+    if chunk.startswith(_SSE_DONE):
+        return 0
+    at = chunk.find(b"\n\n" + _SSE_DONE)
+    return at + 2 if at >= 0 else -1
+
+
+async def _with_turn_usage(gen, agent, request_id: str | None):
+    """Pass the stream through; just before its FIRST ``[DONE]`` frame add
+    one ``ghost.usage`` frame (2026-10-27, for the token counters). The
+    request id is the agent's own, read off the LAST restamped
+    ``chatcmpl-<id>`` frame — the turn registry may have uniquified a
+    colliding header id (``id#2``), and usage is booked under that one
+    (review r1 m2); the header's id only when no frame carried one.
+    Clients stop at the first ``[DONE]``, so a later one gets nothing."""
+    req_id = ""
+    sent = False
+    try:
+        async for chunk in gen:
+            if not sent and isinstance(chunk, (bytes, bytearray)):
+                at = _sse_done_at(chunk)
+                for m in _SSE_STAMPED_ID.finditer(chunk if at < 0 else chunk[:at]):
+                    req_id = m.group(1).decode("ascii")
+                if at >= 0:
+                    sent = True
+                    frame = _turn_usage_frame(agent, req_id or request_id or "")
+                    if frame is not None:
+                        if at:
+                            yield chunk[:at]
+                        yield frame
+                        chunk = chunk[at:]
+            yield chunk
+    finally:
+        # For a consumer that closes this generator explicitly. Starlette
+        # does not on a disconnect (review r1 m4): both generators are then
+        # finalized together, as the body alone was before; the foreground
+        # release is _BookedStreamingResponse's either way.
+        await gen.aclose()
+
+
 def _sse_delta_text(chunk) -> str:
     """Extract the assistant text from one SSE chunk the agent's streamer
     emitted (``data: {"choices":[{"delta":{"content": "..."}}]}``).
@@ -1568,8 +1646,11 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
         # generator, so that the release above has something to pair with
         # even when the generator is never entered.
         _mark_foreground(agent, +1)
+        _body = stream_generator()
+        if parse_requester_role(request.headers.get("X-Ghost-Requester")) != "member":
+            _body = _with_turn_usage(_body, agent, request_id)     # owner only
         return _BookedStreamingResponse(
-            stream_generator(), media_type="text/event-stream", headers=headers,
+            _body, media_type="text/event-stream", headers=headers,
             release=_release_foreground)
     
     # Non-streaming fallback. Any exception in handle_chat used to bubble

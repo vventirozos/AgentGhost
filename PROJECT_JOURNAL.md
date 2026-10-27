@@ -57015,3 +57015,42 @@ Operator: "logs are used to monitor the agent. the log entries should be short, 
     - Older gap: a background call let in during a member's render, with no look on main afterwards, is unmarked, so the next call re-reads everything.
     - No client-level member test (the owner client test covers the same path).
   - Deployed 17:36 (pid 72195). Live check waits for a member's image request: expect "restored the members' head before a channel member's request after its own picture look".
+
+## §4RX — Browser reliability: the interact clock, Tor connection failures, page outcomes as notes (2026-10-27)
+Operator: "the web browser tool sometimes gives errors and timeouts, find these in the logs" → "review the related tools, can we make this more reliable?" → "fix 1 and 2" → mid-fix: "since these are not mechanical errors, they shouldn't look like they are in the agent log, change their log entries to informational".
+- Census (`ghost-agent.log`, 10-16 → 10-27): 80 failed browser calls (one `browser failed` line each). 70 were probes and 10 the owner's: 6 interact budget overruns, 3 Tor page-load timeouts, 1 missed selector. The 37 `ERR_SOCKS_CONNECTION_FAILED` were all probe traffic, mostly guessed exchange domains (`www.bx.bg` 11 tries). Through the same Tor, those hosts fail at SOCKS (curl exit 97) while example.com loads.
+- 1. Bug: the interact clock was ONE action's share. The host divided the total per action and sent only the share. `_with_context` ran the whole sequence under `share + 5 s`, so 21 actions got 27 s of 570 s ("exceeded its 27142 ms budget", 43fe95a2 / ff6c2096).
+  - Fix: the payload now carries `total_timeout_ms` (set inside the lock from `_first_t`, so it never passes the exec window), and `_with_context(total_ms=…)` uses it.
+  - An overrun now returns the finished steps plus the step in flight (`budget_exhausted`, `not_run`). The result shows PARTIAL plus a "⚠ BUDGET USED UP" line.
+  - An overrun before any action has started is still an error.
+- 2. `ERR_SOCKS_CONNECTION_FAILED` had no hint and was not in `_HOST_FAIL_MARKERS`. It now has its own hint (take the address from results, no spelling variants, don't diagnose Tor) and counts two strikes with the 1 h TTL.
+- 3. Log lines: `browser_support.browser_outcome_note` classifies page/site outcomes. Those log as `Browser Note` / `Tool Note` 🌎 INFO, and `Blocked Page` is now 📌 INFO for all tools. Mechanical failures stay WARNING: exit 124/137, broken install, sandbox down, runner crash, unknown op.
+  - Over the log's 330 browser warning lines, 4 would stay WARNING. 2 of those are an artifact of the log's 100-character preview cut; live code reads the full result.
+  - `scripts/tool_probes_live.py` counts `tool note` as a failure.
+  - Strikes and outcomes are unchanged.
+- Pins: `tests/test_4rx_browser_reliability.py` (24). `test_blocked_pages_are_not_strikes.py` was updated (the strike is still checked, now through the Tool Note line). A spot mutation of each part (old clock, no partial, no socks marker, no banner) was killed by its own test.
+- Suite: 26,421 passed, 0 failed (3 `test_memory.py` setup errors were the known HF-cache flake; they pass alone); lint gate OK.
+  - The first run caught 10 test fakes of `_with_context` with a fixed 4-argument signature (now `**_kw`), the browser.py <1700-line pin (the log line and banner moved to `browser_support._log_runner_failure` / `budget_used_up_line`; the runner command is built once, inside the lock), and a case-sensitive classifier (now `re.I`).
+  - `test_browser_tor_diagnostics` now expects a page timeout to log `Browser Note` at INFO.
+  - Not deployed yet.
+- Fresh-eye review r1 (operator: "verify all your changes with fresh eye reviewers, if it comes back clean, deploy"). Two reviewers found 4 MAJOR, all fixed and pinned (37 tests):
+  - (a) An evaluate in flight at the overrun read as §4RJ's "your script threw" → STATUS OK. The entry now says "timed out".
+  - (b) The launch-race retry reused the first exec's total → `browser_support.runner_cmd` sizes the total per exec, with a 10 s launch allowance.
+  - (c) `Execution Fail` still warned for Tor failures (class unknown) and selector misses (diagnostic) → Tool Note.
+  - (d) A Tor outage would log INFO, say "other sites load" and ban healthy hosts. Now a SOCKS strike bans only when a clearnet load landed between the failures (rec[4]/rec[5]). The INFO note needs a clean load in the last 10 min (`tor_recently_ok`). The hint covers "every site fails = Tor down".
+  - MINOR fixed: Target closed/crashed and exit 143 stay WARNING; loopback ERR_CONNECTION_REFUSED stays WARNING; an overrun on the final snapshot is a whole sequence; the goto-abort banner is kept; an in-flight goto keeps the sidecar; `Browser Skipped` is INFO; the `browser_routes` docstring and the docs' "6 h" are corrected.
+  - Accepted: an in-flight-only result reads ERROR (every action failed).
+  - Spot mutations: 7 tried, 6 killed. The 7th (Target closed) did not apply because the sed missed; checked by hand, the case flips.
+- Fresh-eye review r2: 3 MAJOR, all inside r1's fixes, now fixed.
+  - (a, b) The 10 s launch allowance made a 1-action clock 20 s (shorter than before §4RX) and gave a call queued to 15–41 s a 1 s clock. Now `_EXEC_MARGIN_S = 15` (exec − 15 s, capped at the planned total), and the per-action share is capped at the total.
+  - (c) An aborted interact ran `_mark_host_ok` on the host that failed ("Tor works" during an outage; its strikes erased). It is now skipped when `_interact_read_failed`.
+  - MINOR fixed: mixed SOCKS + timeout strikes skipped the gate (rec[6] "any SOCKS"); page content (PAGE TEXT / TEXT / TEXT: / VALUE: lines) is out of the classifier, ERR lines in; dotless hosts are never clearnet; the interact onion "Browser Skipped" is INFO; an in-flight goto "may already have loaded".
+  - Accepted: timeouts log INFO with no outage gate (the Loop Breaker stays WARNING).
+  - 46 pins. Spot mutations: 8 of 8 killed. Two first looked like survivors, but the mutation hit the wrong occurrence or the test order was missing; both corrected.
+- Fresh-eye review r3: no CRITICAL or MAJOR, 4 MINOR left open as follow-ups.
+  - (1) `_exec_timeout_for` still issues 15–20 s execs, which give an interact 1–5 s. Skip below 20 s.
+  - (2) `_mark_host_ok` credits the FIRST goto's host using the LAST goto's result ([goto A→403, goto B ok] clears A's strike).
+  - (3) Multi-line interact TEXT:/VALUE: values: only the first line is stripped from the classifier (log level only).
+  - (4) Test gaps: a non-aborted failed last goto, the 15–20 s window, multi-line TEXT.
+- DEPLOYED 2026-10-27 (operator: "if it comes back clean, deploy"): gated on foreground_requests==0, then launchctl kill SIGTERM. Old pid 72195, new 99444; one agent process; /api/health ok; "system ready" count steady.
+- Not done (operator chose 1+2): keeping the text of a page that timed out. Open: two simultaneous browser calls in one turn hit a Chromium launch race (7 retries in the window).
