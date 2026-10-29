@@ -276,14 +276,61 @@ def _subprocess_env() -> Dict[str, str]:
     return {k: v for k, v in os.environ.items() if k in _ENV_KEEP}
 
 
+class _StoppedByUser(Exception):
+    pass
+
+
+def _communicate_stoppable(proc, timeout: float):
+    """`proc.communicate(timeout)` that a §4RZ step-5 owner tool stop ends
+    early (polled each second; retrying communicate loses no output). With
+    no stop bound it is the plain call."""
+    from ..utils import tool_stop
+    if tool_stop.current() is None:
+        return proc.communicate(timeout=timeout)
+    import time as _time
+    deadline = _time.monotonic() + timeout
+    while True:
+        if tool_stop.requested():
+            raise _StoppedByUser()
+        left = deadline - _time.monotonic()
+        if left <= 0:
+            raise subprocess.TimeoutExpired(proc.args, timeout)
+        try:
+            return proc.communicate(timeout=min(1.0, left))
+        except subprocess.TimeoutExpired:
+            continue
+
+
 def _run_subprocess(cmd: List[str], timeout: float, cwd: Optional[str]) -> Tuple[int, str, str]:
     """Run yt-dlp in its own session so a timeout kills the whole tree."""
     proc = subprocess.Popen(
         cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         stdin=subprocess.DEVNULL, start_new_session=True, env=_subprocess_env(),
     )
+    from ..utils import tool_stop as _ts
+    _armed = _ts.arm("knowledge_base")          # §4RZ step 5: a stop may still kill it
     try:
-        out, err = proc.communicate(timeout=timeout)
+        return _run_and_wait(proc, timeout)
+    finally:
+        _ts.disarm(_armed, "knowledge_base")
+
+
+def _run_and_wait(proc, timeout: float) -> Tuple[int, str, str]:
+    try:
+        out, err = _communicate_stoppable(proc, timeout)
+    except _StoppedByUser:
+        try:
+            os.killpg(proc.pid, 9)
+        except Exception:  # noqa: BLE001
+            proc.kill()
+        out, err = proc.communicate()
+        try:
+            from ..utils.tool_stop import note_killed
+            note_killed("knowledge_base")
+        except Exception:  # noqa: BLE001
+            pass
+        return 130, out.decode("utf-8", "replace"), (
+            err.decode("utf-8", "replace") + "\nERROR: stopped by the user")
     except subprocess.TimeoutExpired:
         try:
             os.killpg(proc.pid, 9)

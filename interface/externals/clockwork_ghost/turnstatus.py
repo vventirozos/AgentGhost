@@ -99,6 +99,7 @@ ICON_CLASS = {
     "🐚": "tool",
     "🧰": "tool",
     "📥": "tool",
+    "📨": "accent",     # QUEUED_MSG (§4RZ)
     "🎨": "tool",
     "📄": "tool",
     "🎮": "tool",

@@ -166,8 +166,9 @@ def test_recovery_and_llm_retry_strip_stream_flag():
     # Bounded window so the strip stays LOCAL to the recovery block; 6000
     # (was 4000) because the §4BC action-view comment in the recovery
     # region pushed the line to offset ~4100 (2026-08-12) — the mechanism
-    # itself is unchanged.
-    assert 'payload["stream"] = False' in _recov[:6000]
+    # itself is unchanged. 8000 (2026-10-28, §4RZ r3): the queued-row pick
+    # and budget in the same block pushed it past 6000.
+    assert 'payload["stream"] = False' in _recov[:8000]
     lc = inspect.getsource(llm_mod)
     assert "SSE body on a non-streaming call" in lc
 

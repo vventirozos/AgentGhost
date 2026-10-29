@@ -34,6 +34,8 @@ import re
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
+from .queued_messages import changed_mid_turn
+
 logger = logging.getLogger("GhostAgent")
 
 QUOTE_REL = "system/census/turns.jsonl"          # live rows: kind "quote" | "turn"
@@ -275,7 +277,7 @@ def detect(traj: dict, turn_row: Optional[dict], quote_rows: List[dict], verdict
                                       for q in quote_rows)
     else:
         out["quote_unverified"] = None
-    if ran:
+    if ran or changed_mid_turn(traj):              # §4RZ s4-r8: not graded — its request is not its ask
         for k in _NO_TOOL:
             out[k] = None
     elif turn_row is not None:                       # LIVE: the full context, recorded by the turn
@@ -757,9 +759,13 @@ def draw_gold(home=None, days: float = GOLD_EVERY_DAYS, n: int = GOLD_N,
         return {"error": f"a gold sample was already drawn for {today.isoformat()}: grade it, or remove both "
                          f"{d} and {keyp} to draw again"}
     turns, _ = _owner_turns(base / "system", _window(today - datetime.timedelta(days=1), days))
-    if not turns:
-        return {"error": "no delivered owner turns in the window — nothing to draw"}
-    pick = random.Random(today.isoformat()).sample(turns, min(n, len(turns)))
+    # §4RZ s4-r8: a changed turn is never drawn; it stays a later turn's
+    # earlier context (s4-r9: filtering `turns` hid it from the next turn)
+    gradable = [t for t in turns if not changed_mid_turn(t)]
+    if not gradable:
+        return {"error": "no delivered owner turns in the window — nothing to draw" if not turns else
+                "every delivered owner turn in the window changed mid-turn (never graded) — nothing to draw"}
+    pick = random.Random(today.isoformat()).sample(gradable, min(n, len(gradable)))
     # r3 M1: the grader saw neither the tool results nor the conversation, so
     # it graded tool-grounded and follow-up turns blind to what the reply
     # was based on — each packet now carries both
@@ -804,7 +810,7 @@ def draw_gold(home=None, days: float = GOLD_EVERY_DAYS, n: int = GOLD_N,
         shutil.rmtree(stage, ignore_errors=True)
         keyp.unlink(missing_ok=True)
         raise
-    return {"dir": str(d), "drawn": len(pick), "of": len(turns)}
+    return {"dir": str(d), "drawn": len(pick), "of": len(gradable)}
 
 
 def ingest_gold(grades_path, home=None, date: Optional[str] = None) -> dict:

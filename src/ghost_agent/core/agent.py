@@ -38,10 +38,17 @@ from .triggers import (
     looks_mutating_command,
 )
 from ..utils.logging import prompt_arm_context, prompt_arm as _prompt_arm_now   # §4MV
+from ..tools.memory import note_request_start as _note_request_start, note_request_end as _note_request_end   # §4RZ
+from .queued_messages import (added_line as _queued_added_line, current_ask as _queued_current_ask,
+                              constraints_note as _queued_constraints_note,  # §4RZ step 2
+                              begin_request as _queued_begin_request, end_request as _queued_end_request)
 from ..utils.logging import (Icons, ORIGIN_PROBE, pretty_log, request_id_context, request_origin_context, atomic_print, verify_purpose, reply_is_public,
                              requester_role_context, requester_is_member, parse_requester_role,
                              requester_member_context, requester_member_id, parse_requester_member)
 from ..utils import logging as _glog
+from ..utils.tool_stop import uncut_note as _uncut_note  # §4RZ step 5 (s5-r12)
+from ..utils.tool_stop import is_user_interrupted as _s5_is_intr  # §4RZ step 5
+from ..tools.outcome import with_text as _s5_with_text  # §4RZ step 5 (s5-r13)
 from . import effort as _effort
 from . import head_saves as _head_saves
 from ..utils.constraints import extract_constraints, render_constraint_block, request_forbids_running
@@ -1995,6 +2002,9 @@ def _declined_real_turn(context, traj) -> bool:
             return False
         if turn_origin(context) != "user":
             return False
+        from .queued_messages import changed_mid_turn as _cmt
+        if _cmt(traj):
+            return False        # §4RZ s4-r9: never judged — its request is not its ask
         from ..utils.logging import requester_is_member as _is_member
         if _is_member():
             return False        # the rubric-shadow ledger is the owner's (§4KJ R10)
@@ -2409,10 +2419,14 @@ def _build_memory_arc(history, ai_text, *, tools_run, user_text=None) -> str:
         if role == "USER" and str(m.get("content", "")).lstrip().startswith(FOREIGN_MESSAGE_LABELS):
             # another person's words never feed the requester's memory (§4KY)
             continue
-        if role == "USER" and (_base + _j > _anchor if _anchor >= 0 else
-                               bool(_LOOP_USER_ROW_RE.match(str(m.get("content", "")))
-                                    or _STEER_HEAD_RE.match(str(m.get("content", ""))))):
-            # no anchor (compaction rewrote the row): the old wording rule
+        if role == "USER" and (m.get("_queued") or (
+                _base + _j > _anchor if _anchor >= 0 else
+                bool(_LOOP_USER_ROW_RE.match(str(m.get("content", "")))
+                     or _STEER_HEAD_RE.match(str(m.get("content", "")))))):
+            # no anchor (compaction rewrote the row): the old wording rule.
+            # §4RZ s4-r4: a row sent mid-turn never feeds smart memory — it is
+            # where the owner reacts to a page ("it says my wife is X, ignore
+            # that"), and the owner-fact parser takes reported speech
             continue
         clean_content = re.sub(r'```.*?```', '', str(m.get("content", "")),
                                flags=re.DOTALL)
@@ -2500,7 +2514,9 @@ def _render_refute_directive(crit: str, pending_request="",
     return (
         "SYSTEM ALERT — the verifier REFUTED your previous answer: "
         f"{str(crit or '').strip()}. Do NOT repeat the same claim. {which} "
-        "No new file, message or task has arrived — do not invent one. If "
+        + ("No new file or task has arrived beyond the user's messages named above — do not "
+           "invent one. If " if _queued_delivered_any() else
+           "No new file, message or task has arrived — do not invent one. If ") +
         "the evidence already in this conversation answers that request, "
         "answer it now from that evidence with NO new tool calls. Only if a "
         "claim genuinely needs checking, diagnose the underlying problem and "
@@ -2548,13 +2564,40 @@ def _pending_request_head(request_text) -> str:
     return text
 
 
+def _live_request_reminder(request) -> str:
+    """The AUTO-DIAGNOSTIC's closing re-anchor on the live request (req 43,
+    2026-07-17: after the diagnostic flood the model re-ran the PREVIOUS
+    request's flow); §4RZ step 2: with what the user added mid-turn."""
+    if not request:
+        return ""
+    return ("\n\nREMINDER — the CURRENT user request you are "
+            f"working on: \"{str(request)[:300]}\"." + _queued_added_line() + " "
+            "Continue that task from where it stands; do NOT "
+            "restart earlier requests' flows.")
+
+
+#: `verify_visual` cuts the symptom at 1,000 characters; `current_ask` fits the
+#: additions inside it (s2-r7: a long request pushed them past the cut)
+_VISUAL_SYMPTOM_CHARS = 1000
+
+
+def _queued_delivered_any() -> bool:
+    from .queued_messages import delivered as _d
+    return bool(_d())
+
+
 def _which_request_line(pending_request) -> str:
     """The one sentence that names the request a runtime alert is about —
     shared by the refute directive (req 2422eb25) and, since §4KV, every
     forced-report alert and the thinking-loop steer: an alert is a user-role
     message, and a model that is not told which request it serves answers
     the alert, or the conversation, instead."""
+    from .queued_messages import added_line as _added
     head = _pending_request_head(pending_request)
+    added = _added()
+    if added:                   # §4RZ step 2: not "unchanged" — the user added to it
+        return ((f'THE REQUEST YOU ARE ANSWERING: "{head}".' if head
+                 else "The request you are answering is the user's most recent one.") + added)
     return (f'THE REQUEST YOU ARE ANSWERING (unchanged): "{head}".' if head
             else "The request you are answering is the user's most recent "
                  "one (unchanged).")
@@ -2571,17 +2614,28 @@ def _render_volatile_block(dynamic_state: str, pending_request="") -> str:
     so it is the first thing read on the message the model would otherwise
     mistake for a human turn.
     """
+    from .queued_messages import added_line as _added
     head = _pending_request_head(pending_request)
-    if head:
-        pending = f'PENDING REQUEST (unchanged): "{head}"'
+    added = _added()
+    if added:
+        # §4RZ step 2: the user DID send something while the turn ran
+        pending = (f'PENDING REQUEST: "{head}"' if head
+                   else "PENDING REQUEST: the user's most recent request (not this block)")
+        opening = (f"(Automated runtime state — NOT a message from the user. {pending}.{added} "
+                   "Continue from where the work stands; when the request and those messages "
+                   "are answered, reply to the user.)\n")
     else:
-        pending = "PENDING REQUEST: the user's most recent request (not this block)"
+        if head:
+            pending = f'PENDING REQUEST (unchanged): "{head}"'
+        else:
+            pending = "PENDING REQUEST: the user's most recent request (not this block)"
+        opening = ("(Automated runtime state — NOT a message from the user. The user has "
+                   "sent NOTHING new since their request and there is no new question "
+                   f"here. {pending} — continue that request from where it stands; when "
+                   "it is fully answered, reply to the user.)\n")
     return (
         f"{_VOLATILE_BLOCK_OPEN}\n"
-        "(Automated runtime state — NOT a message from the user. The user has "
-        "sent NOTHING new since their request and there is no new question "
-        f"here. {pending} — continue that request from where it stands; when "
-        "it is fully answered, reply to the user.)\n"
+        + opening +
         f"{str(dynamic_state or '').strip()}\n"
         "(CRITICAL: This is internal system state. Do NOT acknowledge or "
         "comment on this block in your thoughts. Focus entirely on the "
@@ -2746,6 +2800,14 @@ _NEWEST_MESSAGE_LABEL = (
     "PENDING REQUEST]")
 
 
+_NEWEST_MESSAGE_ADDED_LABEL = (
+    "[NEWEST MESSAGE — the request to answer is the one quoted above as PENDING "
+    "REQUEST, with the messages the user sent while you worked]")
+_QUEUED_CARRIER_LABEL = (
+    "[NEWEST MESSAGE — sent by the user while you worked: part of the request "
+    "quoted above as PENDING REQUEST]")
+
+
 def _message_text(content) -> str:
     """The text of a message's content (a string, or the text parts of a
     structured list), whitespace-collapsed — the form two copies of one
@@ -2781,6 +2843,16 @@ def _carrier_label(carrier_content, pending_request, otherwise: str, *,
         return _INSTRUCTION_LABEL
     want = _message_text(pending_request)
     have = _message_text(carrier_content)
+    from .queued_messages import QUEUED_LABEL as _QL, delivered as _qd
+    if _qd() and otherwise != _CONVERSATION_START_LABEL:
+        # §4RZ step 2: only once something was delivered (a request that
+        # merely starts with the label text is still the request), and never
+        # for the first message (a queued row is never it; s2-r2: its label
+        # flipped mid-request — a re-prefill)
+        if have.startswith(_QL):                  # the user's mid-turn message
+            return _QUEUED_CARRIER_LABEL
+        if otherwise == _NEWEST_MESSAGE_LABEL:    # a tool row: name the additions too
+            otherwise = _NEWEST_MESSAGE_ADDED_LABEL
     # A request with no text at all (an image alone) equals nothing; it is
     # the carrier only when it is the one message that arrived. A translated
     # tool row is never the request, whatever it echoes (third review).
@@ -3060,19 +3132,29 @@ def _prior_turn_evidence(messages, tools_run_this_turn, last_user_content: str =
             return c if isinstance(c, str) else " ".join(
                 x.get("text", "") for x in (c or []) if isinstance(x, dict) and x.get("type") == "text")
         real = str(last_user_content or "").strip()[:200]
+        _matched = False
         if real:
             # EXACT head, not containment (review §4IY): the AUTO-DIAGNOSTIC and repair steers
             # quote the request verbatim, and a short request is a substring of any directive
             for i in reversed(user_idx):
                 if str(_text_of(msgs[i].get("content")) or "").strip()[:200] == real:
                     last_user = i
+                    _matched = True
                     break
-        else:
-            # no hint (an image-only request): the newest user message that is not one of our steers
-            for i in reversed(user_idx):
-                if not _STEER_HEAD_RE.match(str(_text_of(msgs[i].get("content")) or "")):
-                    last_user = i
-                    break
+        if not _matched:
+            # no hint (an image-only request) or no row matched it (compaction
+            # rewrote it): the marked request row (§4RZ step 3), else the newest
+            # user message that is neither one of our steers nor one the user
+            # sent mid-turn (this turn's narration came back as prior evidence)
+            _marked = next((i for i in user_idx if msgs[i].get("_request")), None)
+            if _marked is not None:
+                last_user = _marked
+            else:
+                for i in reversed(user_idx):
+                    if not msgs[i].get("_queued") and \
+                            not _STEER_HEAD_RE.match(str(_text_of(msgs[i].get("content")) or "")):
+                        last_user = i
+                        break
         for m in reversed(msgs[:last_user] if last_user >= 0 else msgs):
             if not isinstance(m, dict) or m.get("role") not in ("tool", "assistant"):
                 continue
@@ -6885,7 +6967,17 @@ def loop_retry_is_no_think(messages, pending_request) -> bool:
     normally one generation. A reply the loop DISCARDS without recording
     (the checklist nudge appends only its reminder) is regenerated under
     the same switch: still no thinking, still tools on (second review)."""
-    steer = thinking_loop_answer_steer(pending_request)
+    # §4RZ step 2: the steer names what was delivered when it was built; a
+    # message drained since must not unmatch it (the no-think retry was lost)
+    from .queued_messages import delivered as _qd, set_delivered as _q_set
+    _now = _qd()
+    steers = []
+    for _k in range(len(_now) + 1):
+        _t = _q_set(_now[:_k])
+        try:
+            steers.append(thinking_loop_answer_steer(pending_request))
+        finally:
+            _queued_end_request(_t)
     seen = False
     for m in reversed(messages or []):
         if not isinstance(m, dict):
@@ -6893,7 +6985,7 @@ def loop_retry_is_no_think(messages, pending_request) -> bool:
         if m.get("role") != "user":
             return (seen and m.get("role") == "assistant"
                     and m.get("content") == _THINKING_ABORTED_NOTE)
-        if m.get("content") == steer:
+        if any(m.get("content") == _s for _s in steers):     # content may be a list
             seen = True
     return False
 
@@ -9052,6 +9144,105 @@ async def _timed_tool_coro(coro, sink: list, idx: int):
             pass
 
 
+def _close_unstarted(coro) -> None:
+    """Close a tool coroutine that a §4RZ step-5 stop keeps from starting,
+    and the coroutines it wraps (`_stoppable_call` → `_timed_tool_coro` → the
+    tool), so none is left "never awaited"."""
+    try:
+        fr = getattr(coro, "cr_frame", None)
+        inner = [v for v in (fr.f_locals.values() if fr is not None else ()) if asyncio.iscoroutine(v)]
+    except Exception:  # noqa: BLE001
+        inner = []
+    try:
+        coro.close()
+    except Exception:  # noqa: BLE001
+        pass
+    for v in inner:
+        _close_unstarted(v)
+
+
+async def _stoppable_call(idx: int, tool: str, coro, stop):
+    """§4RZ step 5: one batch call under the batch's stop. Never starts once
+    the stop is requested (an `_in_order` call still waiting on its
+    predecessor, a file call after the one in progress); binds the stop for
+    this call alone — its task and worker threads see it, the loop's own
+    context never does; notes when the call really ran."""
+    from ..utils import tool_stop as _ts
+    if stop.requested():
+        _close_unstarted(coro)
+        return _ts.Interrupted(False)
+    toks = _ts.bind_call(stop, idx)
+    stop.enter(idx, tool)
+    try:
+        return await coro
+    finally:
+        stop.leave(idx)
+        _ts.unbind_call(toks)
+
+
+def _fallback_head_key(content, looks_failed: bool) -> str:
+    """The empty-reply fallback's head for its last tool result: stopped by
+    the user (§4RZ step 5), still running, failed, or success. The OBJECT,
+    and the predicate that knows both UNRESOLVED producers —
+    `is_promoted_result` is execute-only text, so a still-running swarm await
+    was reported under the success head; a stopped call fell
+    through to the same success head (s5-r3)."""
+    try:
+        from ..utils.tool_stop import is_user_interrupted
+        if is_user_interrupted(content):
+            return "stopped"
+        from ..distill.outcome_heuristics import is_unresolved_tool_result
+        if is_unresolved_tool_result(content):
+            return "running"
+    except Exception:  # noqa: BLE001
+        pass
+    return "failed" if looks_failed else "success"
+
+
+async def _gather_stoppable(items, stop) -> list:
+    """`gather(*coros, return_exceptions=True)` over ``[(idx, coro)]`` that a
+    §4RZ step-5 tool stop can cut short: calls that finished keep their
+    results; the rest are cancelled and come back as `tool_stop.Interrupted`.
+    ``stop`` None (queued messages off) = exactly the plain gather."""
+    coros = [c for _, c in items]
+    if stop is None:
+        return await asyncio.gather(*coros, return_exceptions=True)
+    from ..utils import tool_stop as _ts
+    if stop.requested():                     # stopped before this group began
+        for c in coros:
+            _close_unstarted(c)
+        return [_ts.Interrupted(False) for _ in coros]
+    tasks = [asyncio.ensure_future(c) for c in coros]
+    stopped: set = set()
+    try:
+        pending = set(tasks)
+        while pending and not stop.requested():
+            _, pending = await asyncio.wait(pending, timeout=_ts.STOP_POLL_S)
+        if pending:
+            stopped = set(pending)
+            for t in pending:
+                t.cancel()
+            _, late = await asyncio.wait(pending, timeout=_ts.STOP_GRACE_S)
+            for t in late:                   # abandoned: still unwinding (a held lock)
+                t.add_done_callback(lambda f: f.cancelled() or f.exception())
+    except asyncio.CancelledError:           # the turn itself was cancelled: gather parity
+        for t in tasks:
+            t.cancel()
+        raise
+    out = []
+    for (idx, _), t in zip(items, tasks):
+        if t in stopped or not t.done() or stop.hit(idx):
+            # a call the stop reached is stopped, whatever it returned — one
+            # that swallowed its cancel, one killed inside the poll gap
+            # (its raw "stopped by the user" error), one that raised Cancelled
+            out.append(_ts.Interrupted(stop.started(idx)))
+        elif t.cancelled():
+            out.append(asyncio.CancelledError())
+        else:
+            out.append(t.exception() if t.exception() is not None else t.result())
+    return out
+
+
 class GhostContext:
     def __init__(self, args, sandbox_dir, memory_dir, tor_proxy):
         self.args = args
@@ -9618,9 +9809,13 @@ def _last_assistant_text(messages, user_text=None) -> str:
         want = str(user_text).strip()
         idx = max((i for i in users if _text(hist[i]).strip() == want), default=-1)
     if idx < 0:
+        # §4RZ step 3: the marked request row
+        idx = next((i for i in users if hist[i].get("_request")), -1)
+    if idx < 0:
         # no exact row (compaction rewrote it): the last row the USER wrote,
-        # never one the loop appended (r4)
-        idx = max((i for i in users if not _LOOP_USER_ROW_RE.match(_text(hist[i]))),
+        # never one the loop appended (r4), nor one sent mid-turn (§4RZ)
+        idx = max((i for i in users if not _LOOP_USER_ROW_RE.match(_text(hist[i]))
+                   and not hist[i].get("_queued")),
                   default=max(users, default=-1))
     prior = hist[:idx] if idx >= 0 else hist
     for m in reversed(prior):
@@ -10483,6 +10678,18 @@ _MISSING_SUBJECT_TAIL = "\n[subjects: "
 _USER_NAME_TOKEN_RE = re.compile(r"[^\W\d_]{3,}")
 
 
+def _request_with_added(first, req_id) -> str:
+    """§4RZ step 4: the request text plus what the user added mid-turn (by
+    request id — the recorders run after the turn's ContextVars reset). The
+    request alone when nothing was added."""
+    try:
+        from ..utils.provenance import added_user_messages
+        added = added_user_messages(str(req_id or ""))
+    except Exception:  # noqa: BLE001
+        added = []
+    return "\n".join([str(first or "")] + list(added)) if added else first
+
+
 def _users_own_texts(messages, last_user_content=None, limit: int = 4) -> List[str]:
     """The user's OWN recent messages (newest first): the current one, then
     earlier user rows — never a row the loop appended (SYSTEM ALERT …) nor
@@ -10495,6 +10702,8 @@ def _users_own_texts(messages, last_user_content=None, limit: int = 4) -> List[s
         if not isinstance(m, dict) or m.get("role") != "user":
             continue
         t = _msg_text(m)
+        if m.get("_queued"):
+            continue                         # §4RZ s4-r4: feeds a photo search's name — the request's words only
         if not t.strip() or _LOOP_USER_ROW_RE.match(t) or t in out:
             continue
         if any(lbl in t for lbl in FOREIGN_MESSAGE_LABELS):
@@ -11665,8 +11874,11 @@ class GhostAgent:
         # governing the CURRENT work — protected like the goal, yielding only
         # as a LAST RESORT (when nothing else can shrink), and then with a
         # marker that does not promise file re-reads for pasted content.
-        _newest_user = next((m for m in reversed(msgs)
-                             if m.get("role") == "user"), None)
+        # §4RZ r6: the marked request first (the newest user row can be a
+        # steer, an effort note or a queued message)
+        _newest_user = (next((m for m in msgs if m.get("_request")), None)
+                        or next((m for m in reversed(msgs)
+                                 if m.get("role") == "user"), None))
 
         _FILE_NOTE = ("re-read the specific region with start_line/end_line "
                       "if needed")
@@ -11851,7 +12063,7 @@ class GhostAgent:
             cand = None
             for m in msgs:
                 if (m.get("role") == "system" or m is _goal
-                        or m is _newest_user or id(m) in _refused):
+                        or m is _newest_user or m.get("_queued") or id(m) in _refused):
                     continue
                 sz = _max_cuttable(m)
                 if sz > 0 and (cand is None or sz > _max_cuttable(cand)):
@@ -11865,7 +12077,18 @@ class GhostAgent:
                     continue
                 _refused.add(id(cand))
                 continue
-            # last resort (A-F5a): only the protected messages remain big.
+            # last resort (A-F5a): only the protected messages remain big —
+            # first what the user sent while the turn ran (§4RZ r7: protected
+            # as the newest user row until the request was marked), cut as a
+            # paste, then the request, then the goal
+            _q_cut = max((m for m in msgs if m.get("_queued") and id(m) not in _refused
+                          and _max_cuttable(m) > 0), key=_max_cuttable, default=None)
+            if _q_cut is not None:
+                _before = _tok(_q_cut)
+                if _cut_message(_q_cut, _PASTE_NOTE) and _tok(_q_cut) < _before:
+                    continue
+                _refused.add(id(_q_cut))
+                continue
             if (_newest_user is not None and _newest_user is not _goal
                     and _max_cuttable(_newest_user) > 0
                     and id(_newest_user) not in _refused):
@@ -11917,6 +12140,11 @@ class GhostAgent:
                             if m.get("role") == "user"), None)
             if _goal_i is not None:
                 _keep.add(_goal_i)
+            # §4RZ r6: and the turn's request (handle_chat marks it)
+            _keep.update(i for i, m in enumerate(non_system_msgs) if m.get("_request"))
+            # §4RZ r8: and what the user sent while it ran (the tail cap
+            # bounds them, last resort) — the session books them as delivered
+            _keep.update(i for i, m in enumerate(non_system_msgs) if m.get("_queued"))
             # §4N R3 MINOR-1: `_goal_i or -1` treated goal-at-index-0 as
             # "no goal" (0 is falsy) → the pull-in guard below could never
             # fire on the commonest shape (goal at 0). Use an explicit
@@ -11978,6 +12206,48 @@ class GhostAgent:
         recent_context = non_system_msgs[recent_start:] # last ~3 turns intact
         _goal_in_recent = _goal_idx >= recent_start
         _goal_head = [] if _goal_in_recent else [original_goal]
+        # §4RZ r6: the turn's REQUEST (the row handle_chat marks) is kept like
+        # the goal — a follow-up request with a few tool steps sat in the
+        # middle and was summarised away, key and all (the overflow recovery
+        # then had no request to carry)
+        _req_idx = next((i for i, m in enumerate(non_system_msgs) if m.get("_request")), None)
+        _req_lifted = False
+        if _req_idx is not None and _req_idx != _goal_idx and _req_idx < recent_start:
+            _goal_head = _goal_head + [non_system_msgs[_req_idx]]
+            _req_lifted = True
+        # §4RZ r8: what the user sent while the turn ran is kept verbatim too
+        # (summarised — or dropped when the summariser failed — it stayed
+        # booked as delivered). r9: the newest, up to the overflow recovery's
+        # 8,000 characters (older ones go to the summary: uncuttable rows had
+        # pushed the goal into the centre cut), placed after the summary and
+        # anchors — just before the recent window, in order
+        # r10: each MEASURED as its head (4,000, as the recovery sends it), so
+        # the newest always fits; when the summariser fails the rest are kept
+        # too. s3-r7: the first row that does not fit STOPS the
+        # scan — skipping it kept an older row verbatim below a summary that
+        # held the newer correction, and the older one read as the newest. r11: the row itself is kept
+        # (cut here, its tail was lost for good — `messages` is replaced); the
+        # tail cap shortens it, with the paste note, only if the size needs it.
+        _q_all = [i for i in range(recent_start) if non_system_msgs[i].get("_queued")
+                  and i != _goal_idx and i != _req_idx]
+        _queued_idx, _q_left = [], 8000
+        for i in reversed(_q_all):
+            _q_len = min(4000, len(str(non_system_msgs[i].get("content") or "")))
+            if _q_len > _q_left:
+                break
+            _q_left -= _q_len
+            _queued_idx.insert(0, i)
+        _q_pos = {id(m): i for i, m in enumerate(non_system_msgs)}
+
+        def _with_queued(anchors, q_idx):
+            """r10: the anchors and kept queued rows in the order they were
+            written (a queued row after a LATER finding read as the newest
+            instruction); without queued rows, the anchors as before."""
+            if not q_idx:
+                return [row for _src, row in anchors]
+            items = [(_q_pos.get(id(src), -1), row) for src, row in anchors]
+            items += [(i, non_system_msgs[i]) for i in q_idx]
+            return [row for _i, row in sorted(items, key=lambda t: t[0])]
 
         # SEMANTIC CONTEXT ANCHORING: extract key findings from middle
         # turns before they get summarized away. These anchors survive
@@ -11994,53 +12264,93 @@ class GhostAgent:
         # (wherever it sits), not "index 0" — a pre-goal tool seed belongs in
         # the summary, the user instruction does not.
         _middle_pool = [m for i, m in enumerate(non_system_msgs[:recent_start])
-                        if i != _goal_idx]
-        _anchor_pairs = []  # (original message, compact anchor message)
-        for m in _middle_pool:
-            content = str(m.get("content", "")).lower()[:500]
-            is_tool = m.get("role") == "tool"
-            is_assistant_finding = m.get("role") == "assistant" and any(kw in content for kw in _anchor_keywords)
-            is_tool_error = is_tool and any(kw in content for kw in {"error:", "traceback", "exit code: 1", "failed"})
+                        if i != _goal_idx and i != _req_idx and i not in _queued_idx]
+        # s3-r9: nothing kept BELOW the summary may be older than a summarised
+        # user row — a row before the newest queued row that goes to the
+        # summariser is summarised too, never anchored or hoisted (an anchored
+        # "note: user wants A" read as newer than the summarised "instead B").
+        # Rows are summarised only when a queued row is; feature off, no cut.
+        _q_cut = max((i for i in _q_all if i not in _queued_idx), default=-1)
 
-            if is_assistant_finding or is_tool_error:
-                # Compact the anchor to save tokens
-                anchor_text = str(m.get("content", ""))[:800]
-                _anchor_pairs.append((m, {
-                    "role": m["role"],
-                    "content": f"[ANCHORED] {anchor_text}",
-                    **({"name": m["name"]} if "name" in m else {})
-                }))
+        def _pick_anchors(cut):
+            """(anchor sources, middle rows to summarise) — anchors only from
+            rows after position `cut`."""
+            _anchor_pairs = []  # (original message, compact anchor message)
+            for m in _middle_pool:
+                content = str(m.get("content", "")).lower()[:500]
+                if m.get("_summary"):
+                    # s3-r12: known by the KEY this prune sets, never by its text
+                    # (a tool row could start with the header; the tail cap cuts it)
+                    # s3-r8: an earlier summary goes back to the summariser, never
+                    # an anchor — anchored, it sat BELOW the new summary, so the
+                    # user's older "use A" in it read as newer than the "instead
+                    # use B" the new summary holds (and its tail past 800 was lost)
+                    continue
+                if _q_pos.get(id(m), -1) < cut:
+                    continue
+                is_tool = m.get("role") == "tool"
+                is_assistant_finding = m.get("role") == "assistant" and any(kw in content for kw in _anchor_keywords)
+                is_tool_error = is_tool and any(kw in content for kw in {"error:", "traceback", "exit code: 1", "failed"})
 
-        # § context R1 A-F3: the cap keeps the most RECENT anchors, and the
-        # overflow originals fall back to the middle pool for SUMMARIZATION.
-        # The old `[:4]` kept the chronologically FIRST four and dropped the
-        # rest from BOTH the anchors and the condense set — the newest
-        # findings vanished with no summary and no marker.
-        _kept_pairs = _anchor_pairs[-4:]
-        anchor_messages = [a for _, a in _kept_pairs]
-        anchored_originals = {id(m) for m, _ in _kept_pairs}
+                if is_assistant_finding or is_tool_error:
+                    # Compact the anchor to save tokens
+                    anchor_text = str(m.get("content", ""))[:800]
+                    _anchor_pairs.append((m, {
+                        "role": m["role"],
+                        "content": f"[ANCHORED] {anchor_text}",
+                        **({"name": m["name"]} if "name" in m else {})
+                    }))
 
-        # Legacy: always keep the most recent tool result from middle
-        recent_tool_anchor = None
-        for m in reversed(_middle_pool):
-            if m.get("role") == "tool" and id(m) not in anchored_originals:
-                recent_tool_anchor = m
-                break
+            # § context R1 A-F3: the cap keeps the most RECENT anchors, and the
+            # overflow originals fall back to the middle pool for SUMMARIZATION.
+            # The old `[:4]` kept the chronologically FIRST four and dropped the
+            # rest from BOTH the anchors and the condense set — the newest
+            # findings vanished with no summary and no marker.
+            _kept_pairs = _anchor_pairs[-4:]
+            anchored_originals = {id(m) for m, _ in _kept_pairs}
 
-        middle_messages = [
-            m for m in _middle_pool
-            if m is not recent_tool_anchor and id(m) not in anchored_originals
-        ]
+            # Legacy: always keep the most recent tool result from middle
+            recent_tool_anchor = None
+            for m in reversed(_middle_pool):
+                if m.get("role") == "tool" and id(m) not in anchored_originals:
+                    if _q_pos.get(id(m), -1) > cut:
+                        recent_tool_anchor = m
+                    break
 
+            middle = [
+                m for m in _middle_pool
+                if m is not recent_tool_anchor and id(m) not in anchored_originals
+            ]
+            return [(m, a) for m, a in _kept_pairs] + (
+                [(recent_tool_anchor, recent_tool_anchor)] if recent_tool_anchor else []), middle
+
+        _anchor_srcs, middle_messages = _pick_anchors(_q_cut)
+        # s3-r14: a failure row that carried nothing is an error, not history —
+        # a middle of only such rows is no transcript (the summariser was
+        # asked to summarise nothing and its "No transcript" became the summary)
+        middle_messages = [m for m in middle_messages
+                           if not (m.get("_summary") and not str(m.get("_summary_text") or "").strip())]
         if not middle_messages:
-            all_anchors = anchor_messages + ([recent_tool_anchor] if recent_tool_anchor else [])
             return self._cap_oversized_tail(
-                system_msgs + _goal_head + all_anchors + recent_context,
+                system_msgs + _goal_head + _with_queued(_anchor_srcs, _queued_idx) + recent_context,
                 max_tokens)
+        # §4KY: OTHER people's words in the owner's thread are never archived
+        # as the owner's — s3-r14: an earlier summary of them carries the mark
+        # (it is assistant-role: the label test alone missed it on a later prune)
+        from ..utils.logging import FOREIGN_MESSAGE_LABELS as _FML
+        _foreign_words = any(
+            (m.get("role") == "user" and str(m.get("content") or "").lstrip().startswith(_FML))
+            or (m.get("_summary") and m.get("_foreign")) for m in middle_messages)
 
         # Condense the middle messages using a fast LLM worker
         condense_prompt = "The following is the middle segment of a long conversational transcript between an AI Agent and a User. Summarize the key actions taken, facts learned, and the current state of progress. Be concise. DO NOT write code. ONLY output the summary.\n\nTRANSCRIPT:\n"
         for m in middle_messages:
+            if m.get("_summary"):
+                # s3-r13: an earlier summary is read from its KEY here too — the
+                # L2 ladder cuts a long row's content to ~800 chars between
+                # prunes, and the summariser lost the user's words in its middle.
+                condense_prompt += f"EARLIER SUMMARY:\n{str(m.get('_summary_text')).strip()}\n---\n"
+                continue
             content_val = m.get('content') or ""
             if isinstance(content_val, list):
                 text_parts = []
@@ -12062,6 +12372,9 @@ class GhostAgent:
         }
 
         summary = "[SYSTEM: PREVIOUS TURNS SUMMARIZED]\n\n"
+        _summarised = False
+        _carried = False          # s3-r10: a failure row that carries an earlier summary
+        _real_summary = ""        # s3-r12: the summary TEXT this row holds, kept as a key
         try:
             # FOREGROUND, not background: this summarizer is awaited INLINE
             # by the user's own turn (handle_chat calls _prune_context when
@@ -12070,12 +12383,17 @@ class GhostAgent:
             # deterministic stall up to the 600s ceiling before the turn
             # could continue. use_worker still offloads it when a pool exists.
             summary_data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=False, task_label="compaction")
-            summary += str(summary_data["choices"][0]["message"].get("content") or "No summary generated.")
+            _sum_txt = str(summary_data["choices"][0]["message"].get("content") or "")
+            if not _sum_txt.strip():
+                # §4RZ s3-r4/r5: a blank reply (a thinking model spent its
+                # tokens) is a FAILED summary — the failure path keeps every
+                # queued row, archives nothing, adds no note
+                raise ValueError("the summariser returned no text")
+            summary += _sum_txt
+            _summarised = True            # r11: a later error (the archive) is not a failed summary
+            _real_summary = _sum_txt.strip()
 
             from ..utils.helpers import get_utc_timestamp
-            from ..utils.logging import FOREIGN_MESSAGE_LABELS as _FML
-            _foreign_words = any(m.get("role") == "user" and str(m.get("content") or "").lstrip().startswith(_FML)
-                                 for m in middle_messages)
             if (self.context.memory_system and "Summarization unavailable" not in summary
                     and turn_may_teach(self.context)   # a member's or a probe's conversation is not archived into the owner's memory (R4; §4KW)
                     and not _foreign_words):   # …nor a summary of OTHER people's words in the owner's thread (§4KY)
@@ -12107,15 +12425,49 @@ class GhostAgent:
                 _arch_task.add_done_callback(_bg.discard)
         except Exception as e:
             logger.warning(f"Context summarization failed: {e}")
-            summary += f"(Summarization unavailable due to error, dropping old turns: {e})"
+            if not _summarised:
+                summary += f"(Summarization unavailable due to error, dropping old turns: {e})"
+                _queued_idx = _q_all      # r10: nothing summarised them — keep every one
+                # s3-r9: nothing was summarised, so no cut — the anchors as
+                # without queued rows; an earlier summary keeps its text here,
+                # at the summary's own place (dropped, the user's earlier
+                # messages folded into it were lost)
+                _anchor_srcs, _ = _pick_anchors(-1)
+                # s3-r11/r12: only real summary text, read from the earlier row's
+                # KEY (its content may be centre-cut or start like an error; a
+                # failure row's own error is never carried, so nothing chains)
+                _real_summary = "\n\n".join(
+                    str(m.get("_summary_text") or "").strip() for m in _middle_pool
+                    if m.get("_summary") and str(m.get("_summary_text") or "").strip())
+                if _real_summary:
+                    summary += "\n\nEarlier summary:\n" + _real_summary
+                    _carried = True
 
         # Insert the summary BEFORE the recent context (so the model reads
         # the fresh stuff last), re-attach anchored findings and the tool
         # result we hoisted out of the middle.
-        all_anchors = anchor_messages + ([recent_tool_anchor] if recent_tool_anchor else [])
+        # §4RZ step 3: with the request lifted out of the middle, the summary
+        # below it covers turns from BEFORE it as well as the steps already
+        # taken on it — said, so earlier turns do not read as newer than the
+        # request (the archived episode keeps the plain summary)
+        # (s3-r2: worded so it is never false — a second prune in the same
+        # turn summarises the first summary, so WHICH side a row came from is
+        # not known from its position; r1's per-side wording said "steps on
+        # this request" for earlier turns)
+        _summary_row = summary
+        if _req_lifted and (_summarised or _carried):     # s3-r10: the carried text is earlier turns too
+            _summary_row = summary.replace(
+                "[SYSTEM: PREVIOUS TURNS SUMMARIZED]\n\n",
+                "[SYSTEM: PREVIOUS TURNS SUMMARIZED]\n(This summarises earlier parts of the "
+                "conversation. They may include turns from before the user's request above, "
+                "not only work done on it. "
+                + ("The request above and the messages the user sent while you worked are what you are answering."
+                   if _queued_delivered_any() else "The request above is what you are answering.")
+                + ")\n\n", 1)   # s3-r7: the kept queued rows sit BELOW this row   # s3-r4: named only once one was delivered
         return self._cap_oversized_tail(
-            system_msgs + _goal_head + [{"role": "assistant", "content": summary}]
-            + all_anchors + recent_context,
+            system_msgs + _goal_head + [{"role": "assistant", "content": _summary_row, "_summary": True,
+                                         "_summary_text": _real_summary, "_foreign": _foreign_words}]
+            + _with_queued(_anchor_srcs, _queued_idx) + recent_context,
             max_tokens)
 
     # Common LLM hallucination patterns → canonical tool names.
@@ -16794,17 +17146,34 @@ class GhostAgent:
         # an ablation that exists to have no verdicts still has none.
         _shape = None
         _state = None
+        # §4RZ step 2 (s2-r4/r5): once the user sent messages mid-turn the
+        # request's mechanical constraints are no longer known — a later
+        # message may replace a cap, scope it to one part, or ask for more.
+        # Three rounds of merging the texts each misread one of those (first
+        # cap wins / newest wins / two-part rule / pasted logs), so the rules
+        # the REQUEST triggers (caps, JSON, exact phrase, number, reply
+        # language, "a source you actually read") stand down for such a turn.
+        # The checks that do not read the request keep running (r5 M1: with
+        # the judge off they are the only text verdict) and get the request
+        # with its additions: raw output asked for excuses a dump; a figure
+        # the user wrote is masked in narration (§4JI echo rule), so a reply
+        # that only repeats it reads as narration — as for the bare request.
+        _qd = _queued_delivered_any()
         if (verifier is not None
                 and getattr(verifier, "llm_client", None) is not None
                 and final_ai_content
                 and not self._is_strict_trivial_chat(lc)):
-            _shape = self._reply_shape_refutation(final_ai_content, last_user_content,
-                                                  tools_run_this_turn)
+            _ask = (_queued_current_ask(last_user_content or "", added_max=2000)
+                    if _qd else last_user_content)
+            _shape = self._reply_shape_refutation(final_ai_content, _ask,
+                                                  tools_run_this_turn,
+                                                  request_rules=not _qd)
             # §4FY: the turn's own STATE — the current request's mechanical
             # constraints and its retrieval record — under the same guard,
             # applied the same two ways as the shape check below.
             _state = self._turn_state_refutation(
-                final_ai_content, last_user_content, tools_run_this_turn)
+                final_ai_content, _ask, tools_run_this_turn,
+                request_rules=not _qd)
         # Flat early-return (not an `if (verifier is not None and ...)`
         # block) so the post-loop gate stays the single match for the
         # gate-strictness source check — and so a missing verifier /
@@ -16880,7 +17249,10 @@ class GhostAgent:
         # the active project is the OWNER's
         constraint_note = "" if requester_is_member() else self._active_constraint_note(
             request_text=last_user_content or "", project_id=project_id)
-        request_view = constraint_note + (last_user_content or "")
+        from .queued_messages import current_ask as _current_ask
+        # §4RZ step 2: the added messages survive the judge's request cut
+        request_view = constraint_note + _current_ask(
+            last_user_content or "", limit=max(0, JUDGE_REQUEST_CHARS - len(constraint_note)))
         v_result = None
         tool_output = str(last_tool.get("content", ""))[:4000]
         tool_name = str(last_tool.get("name", ""))[:80]
@@ -17171,7 +17543,7 @@ class GhostAgent:
                             _before_img, _likeness = self._likeness_evidence(
                                 tools_run_this_turn, _sbx, _before_img)
                         _vv = await verifier.verify_visual(
-                            symptom=last_user_content or "",
+                            symptom=_queued_current_ask(last_user_content or "", limit=_VISUAL_SYMPTOM_CHARS),
                             claim=_claim_src,
                             after_image=_after_img,
                             before_image=_before_img,
@@ -18434,7 +18806,9 @@ class GhostAgent:
         async def _gen(i: int):
             payload = {
                 "model": model,
-                "messages": list(messages) + [{
+                # the loop's own keys (`_request`, `_rendered`, `_queued`) stay home
+                "messages": [{k: v for k, v in m.items() if not str(k).startswith("_")}
+                             for m in messages if isinstance(m, dict)] + [{
                     "role": "user",
                     "content": (
                         "Produce your single best FINAL reply to the "
@@ -22761,6 +23135,30 @@ class GhostAgent:
                     final_ai_content = final_ai_content[:_pre_flush_final_len]
 
             if tool_tasks:
+                # queued messages: what is running, for the system's status answer
+                try:
+                    from .turns import get_turn_registry as _gtr_q
+                    _qt = _gtr_q(self).get(request_id_context.get())
+                    if _qt is not None:
+                        _qt.tools_now = [m[0] for t, m in zip(tool_tasks, tool_call_metadata) if t is not None]
+                        _qt.tools_since = time.time()
+                except Exception:  # noqa: BLE001
+                    _qt = None
+                # §4RZ step 5: the owner may stop this batch's running calls
+                # (POST /api/turn/interrupt); each call runs under it
+                # (`_stoppable_call`)
+                _tstop = None
+                _batch_all_stopped = False
+                _uncut_hits = set()        # §4RZ step 5: hit calls never cut (their tool message notes it)
+                if _qt is not None:
+                    try:
+                        from .queued_messages import enabled as _qm_enabled
+                        if _qm_enabled():
+                            from ..utils import tool_stop as _tsm
+                            _tstop = _tsm.ToolStop()
+                            _qt.tool_stop = _tstop
+                    except Exception:  # noqa: BLE001
+                        _tstop = None
                 # CRITICAL FIX: Run mutating tools (like file writes) BEFORE execution tools to prevent race conditions
                 results = [None] * len(tool_tasks)
 
@@ -22783,6 +23181,8 @@ class GhostAgent:
                     # destination; batch reads with no path). File calls are
                     # cheap; correctness first.
                     for i, c in mutation_coros:
+                        if _tstop is not None:     # §4RZ step 5: never cut a write; skip the rest
+                            c = _stoppable_call(i, "file_system", c, _tstop)
                         try:
                             results[i] = await c
                         except asyncio.CancelledError:
@@ -22796,7 +23196,8 @@ class GhostAgent:
                     if task is None:
                         continue  # batch-dedup placeholder, filled below
                     if meta[0] != "file_system":
-                        exec_coros.append((i, task))
+                        exec_coros.append((i, task if _tstop is None
+                                           else _stoppable_call(i, meta[0], task, _tstop)))
 
                 # §4LN: browser calls of one batch run in the order the model
                 # wrote them. They share one profile (a lock serialises them
@@ -22809,7 +23210,11 @@ class GhostAgent:
                 async def _in_order(prev_done, coro, my_done):
                     try:
                         if prev_done is not None:
-                            await prev_done.wait()
+                            try:
+                                await prev_done.wait()
+                            except asyncio.CancelledError:
+                                _close_unstarted(coro)     # never began: not "never awaited"
+                                raise
                         return await coro
                     finally:
                         my_done.set()
@@ -22855,12 +23260,11 @@ class GhostAgent:
                         for _sub in (_first, _second):
                             if not _sub:
                                 continue
-                            _sub_results = await asyncio.gather(
-                                *(t for _, t in _sub), return_exceptions=True)
+                            _sub_results = await _gather_stoppable(_sub, _tstop)
                             for (i, _), res in zip(_sub, _sub_results):
                                 results[i] = res
                     else:
-                        exec_results = await asyncio.gather(*(c[1] for c in exec_coros), return_exceptions=True)
+                        exec_results = await _gather_stoppable(exec_coros, _tstop)
                         for (i, _), res in zip(exec_coros, exec_results):
                             results[i] = res
 
@@ -22876,6 +23280,35 @@ class GhostAgent:
                         f"call(s) in one batch — executed once, result shared.",
                         icon=Icons.SKIP,
                     )
+                if _tstop is not None and _tstop.requested():
+                    # §4RZ step 5: what the model reads for a stopped call —
+                    # "stopped" only when its killer confirmed it; a worker
+                    # thread notices the stop at its next poll, after the
+                    # batch moved on, so wait for armed killers to settle
+                    _ran = [i for i, res in enumerate(results)
+                            if isinstance(res, _tsm.Interrupted) and res.started]
+                    await _tsm.settle(_tstop, _ran)
+                    for i, res in enumerate(results):
+                        if isinstance(res, _tsm.Interrupted):
+                            _fn = tool_call_metadata[i][0]
+                            results[i] = _tsm.interrupted_outcome(   # a batch-dedup copy: its original's kill
+                                _fn, started=res.started,
+                                killed=_tstop.killed(batch_dup_of.get(i, i) if batch_dup_of else i))
+                        elif _tstop.hit(batch_dup_of.get(i, i) if batch_dup_of else i):
+                            # reached but never cut (a file call): it finished or raised. The
+                            # model's tool message says the stop came; the RESULT stays as it
+                            # is (s5-r9..r12: a note in the result reached every copy of it —
+                            # the failure context, the outcome preview — and each strip missed
+                            # one); a dedup copy as its original
+                            _uncut_hits.add(i)
+                    pretty_log("Tool Interrupt", "the user stopped the running tool call(s); "
+                               "the turn goes on", icon=Icons.STOP)
+                    # an all-stopped batch is neither a success nor a failure (s5-r7)
+                    _batch_all_stopped = all(_tsm.is_user_interrupted(r) for r in results)
+                if _qt is not None:
+                    _qt.tools_done += len(_qt.tools_now)
+                    _qt.tools_now = []
+                    _qt.tool_stop = None
 
                 turn_has_failure = False
                 last_error_res = ""
@@ -23065,7 +23498,7 @@ class GhostAgent:
                                 _fremember_failure(getattr(self.context, "_fetch_memo", None), _fk2, str_res)
                         except Exception:  # noqa: BLE001
                             pass
-                    if fname == "file_system" and not _res_is_error:
+                    if fname == "file_system" and not _res_is_error and not _res_unresolved:
                         try:                                              # §4OG-3 (d): links in a written document
                             _lc_note = document_link_check_note(
                                 _recorded_args if isinstance(_recorded_args, dict) else {}, tools_run_this_turn)
@@ -23095,6 +23528,11 @@ class GhostAgent:
                     if _is_idem_setter and _outcome.may_record_as_applied:
                         executed_idempotent.add(a_hash)
                     from ..tools.tool_failure import is_argument_error
+                    try:
+                        from ..utils.tool_stop import is_user_interrupted as _is_intr
+                        _intr = _is_intr(_outcome)
+                    except Exception:  # noqa: BLE001
+                        _intr = False
                     op_outcomes.append({
                         "tool": fname,
                         # A refusal and a non-zero exit are not successes.
@@ -23107,11 +23545,15 @@ class GhostAgent:
                         # a different predicate three hundred lines below.
                         # `_res_is_error` already subsumes `_op_shell_failed`
                         # (it is one of its disjuncts), so no second term.
-                        "ok": not _res_is_error,
+                        "ok": not _res_is_error and not _intr,
+                        # §4RZ step 5: stopped by the user — neither done,
+                        # failed, nor "still running"
+                        "interrupted": _intr,
                         # the third state, so the summary can say "still
                         # running" instead of "SUCCEEDED"
                         "unresolved": (_outcome.status
-                                       is _OutcomeStatus.UNRESOLVED),
+                                       is _OutcomeStatus.UNRESOLVED
+                                       and not _intr),
                         # 140 chars cut the useful half off an argument
                         # error: the missing-parameter messages carry a
                         # worked call at the END, and in any turn that mixed
@@ -23310,7 +23752,7 @@ class GhostAgent:
                     # the steer lands right after the write — the
                     # earliest moment the model can still re-open
                     # the file and fix a violation cheaply.
-                    if (_constraint_steer_pending and not _res_is_error
+                    if (_constraint_steer_pending and not _res_is_error and not _intr
                             and fname == "file_system" and is_mutating):
                         _constraint_steer_pending = False
                         # Participant-role constraints get the
@@ -23345,6 +23787,8 @@ class GhostAgent:
                         if has_participant_constraint(
                                 _request_constraints):
                             _steer_txt += "\n\n" + PARTICIPANT_STEER
+                        if _queued_constraints_note():          # §4RZ s2-r7
+                            _steer_txt += "\n" + _queued_constraints_note()
                         messages.append({
                             "role": "user",
                             "content": _steer_txt,
@@ -23362,6 +23806,7 @@ class GhostAgent:
                     # for the incident this encodes). Counters live on
                     # request_state — per-request, no TurnState churn.
                     if (fname == "file_system" and is_mutating and not _res_is_error
+                            and not _intr                                       # §4RZ step 5: not written
                             and not _is_parts_continuation(_recorded_args)):     # §4RI
                         _churn = getattr(request_state, "_edit_churn", None)
                         # isinstance, not None-check: a mocked request_state
@@ -23420,7 +23865,7 @@ class GhostAgent:
                                 "verify before further edits",
                                 icon=Icons.WARN, level="WARNING",
                             )
-                    elif (fname in _EDIT_CHURN_VERIFY_TOOLS
+                    elif (fname in _EDIT_CHURN_VERIFY_TOOLS and not _intr      # §4RZ step 5: not a run
                             and not getattr(_outcome, "is_rejection", False)):
                         # §4OA (probe-oa-py): a run that FAILED is still a
                         # verification — debugging is mostly failing runs.
@@ -23442,7 +23887,7 @@ class GhostAgent:
                         # capped that later generation's max_tokens.
                         shield_payload = {
                             "model": model,
-                            "messages": [{"role": "user", "content": f"The user asked: '{last_user_content}'. Summarize this tool output. If it contains facts relevant to the user, extract them. If it is a script error, state the root cause. Output: {str_res[:15000]}"}],
+                            "messages": [{"role": "user", "content": f"The user asked: '{_queued_current_ask(last_user_content, added_max=2000)}'. Summarize this tool output. If it contains facts relevant to the user, extract them. If it is a script error, state the root cause. Output: {str_res[:15000]}"}],
                             "temperature": 0.0,
                             "max_tokens": 300
                         }
@@ -23637,10 +24082,22 @@ class GhostAgent:
                                     # (2026-09-13).
                                     call_args=_recorded_args,
                                     duration_s=_call_dur)}
-                    messages.append(tool_msg)
+                    # §4RZ step 5: the stop reached this uncut call. The MODEL's copy says
+                    # so: the turn's record (the empty-reply fallback quotes it to the user,
+                    # the verifier) keeps the real result (s5-r9..r13: a note in a shared
+                    # value reached every copy of it). The trajectory, rebuilt from
+                    # `messages`, records what the model saw, note included (s5-r14).
+                    messages.append(tool_msg if i not in _uncut_hits else
+                                    dict(tool_msg, content=_s5_with_text(
+                                        tool_msg["content"],
+                                        str(tool_msg["content"]) + _uncut_note(fname))))
+                    if i in _uncut_hits:   # an internal key, like `_synthetic`: the overflow recovery re-adds it
+                        tool_msg["_stop_note"] = _uncut_note(fname)
                     tools_run_this_turn.append(tool_msg)
                     # provenance: content from outside entered this request (§4MB)
                     try:
+                        if _intr:                       # §4RZ step 5 (s5-r7): a stopped call read nothing
+                            raise StopIteration
                         from ..utils.provenance import note_tool_result as _note_prov
                         _note_prov(fname, _recorded_args, ok=not _outcome.is_failure,
                                    extra_tools=((fname,) if getattr(
@@ -23775,7 +24232,10 @@ class GhostAgent:
                                         # command (sandbox/jobs.py) recorded
                                         # bare would read next turn as work
                                         # completed.
-                                        if _pf_promoted:
+                                        if _pf_promoted and _intr:
+                                            _cmd = (_cmd[:70]       # §4RZ step 5
+                                                    + " [stopped by the user]")
+                                        elif _pf_promoted:
                                             _cmd = (_cmd[:70]
                                                     + " [still running]")
                                         _wc.append(_cmd)
@@ -23834,7 +24294,9 @@ class GhostAgent:
                         _si = getattr(self.context, "_script_iter", None)
                         if isinstance(_si, dict) and fname:
                             _CODE_EXTS = (".py", ".sh", ".js", ".mjs", ".ts")
-                            if fname == "file_system" and is_mutating and ptarget and not _res_is_error:
+                            if _intr:
+                                pass                                 # §4RZ step 5 (s5-r6): stopped / NOT RUN is neither a write nor a run
+                            elif fname == "file_system" and is_mutating and ptarget and not _res_is_error:
                                 _bn = futility_key(ptarget)          # §4IG: probe6.py → probe.py
                                 if _bn.endswith(_CODE_EXTS):
                                     _rec = _si.setdefault(_bn, {"writes": 0, "runs": 0})
@@ -23972,7 +24434,7 @@ class GhostAgent:
                     except Exception:  # noqa: BLE001
                         pass
 
-                    if fname and not is_mutating and not _res_is_error:
+                    if fname and not is_mutating and not _res_is_error and not _intr:   # §4RZ step 5: nothing observed
                         # threshold=2 (was 3): the SECOND identical
                         # read is already zero-information — nudge
                         # immediately, abort on the third (chess
@@ -24122,11 +24584,17 @@ class GhostAgent:
                             if "STDOUT/STDERR:" in str_res:
                                 _ok_out = str_res.split(
                                     "STDOUT/STDERR:", 1)[1].strip().replace("\n", " ⏎ ")[:1500]
-                            pretty_log(
-                                "Execution Detached" if _pf_promoted
-                                else "Execution Ok",
-                                "exit 0" + (f" · {_ok_out}" if _ok_out else ""),
-                                icon=Icons.OK)
+                            if _pf_promoted and _intr:      # §4RZ step 5
+                                pretty_log("Execution Stopped",
+                                           "never started: the user stopped the batch"
+                                           if str(str_res).startswith("NOT RUN") else "the user stopped it",
+                                           icon=Icons.STOP)
+                            else:
+                                pretty_log(
+                                    "Execution Detached" if _pf_promoted
+                                    else "Execution Ok",
+                                    "exit 0" + (f" · {_ok_out}" if _ok_out else ""),
+                                    icon=Icons.OK)
 
                             # --- SIMULATION SHORT-CIRCUIT ---
                             # In self-play (read-only skill memory
@@ -24281,7 +24749,13 @@ class GhostAgent:
                     # the run (§4KM b). The owner's run — the experiment's
                     # trigger — is unchanged.
                     _sy_member = requester_is_member()
-                    for _sy_meta in tool_call_metadata:
+                    for _sy_i, _sy_meta in enumerate(tool_call_metadata):
+                        try:                                    # §4RZ step 5: a stopped search ran no search
+                            from ..utils.tool_stop import is_user_interrupted as _sy_intr
+                            if _sy_intr(results[_sy_i]):
+                                continue
+                        except Exception:  # noqa: BLE001
+                            pass
                         _sy_run = strikes.note_search_yield(
                             "web_search" if _sy_member and _sy_meta[0] == "darkweb_search"
                             else _sy_meta[0])
@@ -24784,12 +25258,7 @@ class GhostAgent:
                     # → this flood → three turns re-running the PREVIOUS
                     # request's "resume the project" flow before
                     # recovering). Restating the current request pins it.
-                    _anchor = (
-                        "\n\nREMINDER — the CURRENT user request you are "
-                        f"working on: \"{str(last_user_content)[:300]}\". "
-                        "Continue that task from where it stands; do NOT "
-                        "restart earlier requests' flows."
-                    ) if last_user_content else ""
+                    _anchor = _live_request_reminder(last_user_content)
                     messages.append({"role": "user", "content": f"AUTO-DIAGNOSTIC: {multi_op_summary}{diagnostic_msg}{fallback_hint}\n\n{sandbox_state}{_anchor}"})
 
                     total_fail = execution_failure_count + transient_failure_count
@@ -24866,7 +25335,8 @@ class GhostAgent:
                 else:
                     # Only reset transient failures on success; structural
                     # failures require consecutive successes to decay.
-                    transient_failure_count = 0
+                    if not _batch_all_stopped:      # §4RZ step 5: a stop is not a success
+                        transient_failure_count = 0
                     # Record a clean success. The ledger freezes decay once
                     # a SAME-failure loop is detected (otherwise an
                     # interleaved success — e.g. the auto sandbox-listing
@@ -24875,14 +25345,14 @@ class GhostAgent:
                     # consecutive clean successes mean a genuine pivot, so
                     # note_clean_success unfreezes it. Signature counts are
                     # kept, so the same failure re-freezes on recurrence.
-                    if strikes.note_clean_success():
+                    if not _batch_all_stopped and strikes.note_clean_success():
                         pretty_log(
                             "Loop Breaker",
                             "Strike decay unfrozen after 3 consecutive clean successes.",
                             icon=Icons.OK,
                         )
                     if execution_failure_count > 0 and not strikes.decay_frozen \
-                            and not binding_failure_count:
+                            and not binding_failure_count and not _batch_all_stopped:
                         execution_failure_count = max(0, execution_failure_count - 1)
 
                     # Terminal tool: `dream_mode` is a self-contained
@@ -24903,6 +25373,8 @@ class GhostAgent:
                     terminal_names = {"dream_mode"}
                     just_ran_terminal = any(
                         t.get("name") in terminal_names
+                        # §4RZ step 5 (s5-r5): a stopped dream is not "complete"
+                        and getattr(t.get("content"), "reason_code", None) != "user_interrupted"
                         for t in tools_run_this_turn[-len(results):]
                     )
                     if just_ran_terminal and not force_final_response:
@@ -25658,8 +26130,15 @@ class GhostAgent:
             _sw_constraints = (list(_exc_fn(last_user_content or ""))
                                + self._active_project_constraints(
                                    request_text=last_user_content or ""))
-            _enforced, _sw_dropped = enforce_start_with(
-                final_ai_content, _sw_constraints)
+            # §4RZ s2-r7/r8: the HOIST (it deletes text) reads only a stored
+            # project constraint once the user sent messages mid-turn — the
+            # request's own start-with deleted the part an addition asked
+            # for. The placement below stays: it deletes nothing, and runs
+            # only when the reply does open with the phrase (r8: clearing it
+            # buried an opening the model had honoured).
+            _sw_hoist = (_sw_constraints if not _queued_delivered_any()
+                         else self._active_project_constraints(request_text=last_user_content or ""))
+            _enforced, _sw_dropped = enforce_start_with(final_ai_content, _sw_hoist)
             if _sw_dropped:
                 pretty_log(
                     "Constraint Check",
@@ -25674,9 +26153,12 @@ class GhostAgent:
             # question, digests, deferred correction) insert BELOW the
             # mandated opening instead of re-burying it — the method was
             # enforcing and violating the same constraint in one pass.
-            _p = _psw_fn(_sw_constraints)
-            if _p and _rssw_fn(final_ai_content, _p):
-                _sw_active_phrase = _p
+            # s2-r9: placement is on when the reply opens with the hoist's
+            # phrase (after a delivery a stored project one) or with the
+            # request+project list's (the placement reads only on/off)
+            _sw_active_phrase = next(
+                (_p for _p in (_psw_fn(_sw_hoist), _psw_fn(_sw_constraints))
+                 if _p and _rssw_fn(final_ai_content, _p)), None)
         except Exception as _sw_exc:
             logger.debug("start-with enforcement skipped: %s", _sw_exc)
 
@@ -25708,9 +26190,10 @@ class GhostAgent:
         is_simulation = getattr(getattr(self.context, "skill_memory", None), "is_read_only", False) is True
         # §4PV: a turn that stopped to ask the user (clarify, confirm wait…)
         # is not a finished task — §4PS made those stops non-failures, which
-        # let an optimisation suggestion land under the open question.
-        _pp_asked_user = any(_designed_stop_result((t or {}).get('content'))
-                             for t in tools_run_this_turn)
+        # let an optimisation suggestion land under the open question
+        # (§4RZ: or a stopped tool).
+        _pp_asked_user = any(_designed_stop_result(_c) or _s5_is_intr(_c) for _c in
+                             ((t or {}).get('content') for t in tools_run_this_turn))
 
         if not is_simulation and tools_run_this_turn and heavy_tools_used and execution_failure_count == 0 and not last_was_failure and not _pp_asked_user and (not final_ai_content or len(final_ai_content) < 50):
             # Whether the optimization is part of the user-facing
@@ -25841,16 +26324,6 @@ class GhostAgent:
                     # the fallback reply state the one thing that is false,
                     # and hands the same sentence to the verifier as its
                     # evidence.
-                    try:
-                        # the OBJECT, and the predicate that knows both
-                        # UNRESOLVED producers — `is_promoted_result` is
-                        # execute-only text, so a still-running swarm await
-                        # was reported as "Process finished successfully."
-                        from ..distill.outcome_heuristics import (
-                            is_unresolved_tool_result as _ipr)
-                        _still_running = _ipr(fallback_tool.get("content", ""))
-                    except Exception:  # noqa: BLE001
-                        _still_running = False
                     # § finalize/stream R1 A-F1: the header must also check
                     # the ERROR shape. The ACTION view deliberately returns
                     # errored tools, and this banner only checked
@@ -25917,12 +26390,8 @@ class GhostAgent:
                                 ("Error:", "ERROR:", "SYSTEM ERROR",
                                  "Critical Tool Error"))
                     from .reply_shape_check import FALLBACK_HEADS, FALLBACK_OUTPUT_MARKER
-                    if _still_running:
-                        _head = FALLBACK_HEADS["running"]
-                    elif _looks_failed:
-                        _head = FALLBACK_HEADS["failed"]
-                    else:
-                        _head = FALLBACK_HEADS["success"]
+                    _head = FALLBACK_HEADS[_fallback_head_key(
+                        fallback_tool.get("content", ""), _looks_failed)]
                     final_ai_content = f"{_head}\n\n{FALLBACK_OUTPUT_MARKER}\n```text\n{preview}\n```"
 
         if not final_ai_content:
@@ -27729,6 +28198,19 @@ class GhostAgent:
                     last_user = next(
                         (m for m in _users if not _is_volatile_block(m)),
                         next(iter(_users), None))
+                    # §4RZ r5: the request is the row handle_chat marked
+                    # (`_request`), as rendered for the model. The text pick
+                    # above is the fallback when compaction replaced that row:
+                    # in the launcher's layout it took the pinned
+                    # <session_context> head, a tool result, a steer or the
+                    # first recovery's own alert — never the request (r4) — and
+                    # with queued rows it took a queued row (r3, r5).
+                    _q_rows = [m for m in messages if isinstance(m, dict) and m.get("_queued")]
+                    _req_row = next((m for m in reversed(messages)
+                                     if isinstance(m, dict) and m.get("_request")), None)
+                    if _req_row is not None:
+                        last_user = {"role": "user",
+                                     "content": _req_row.get("_rendered", _req_row.get("content", ""))}
 
                     recovery_msgs = list(system_msgs)
                     if last_user:
@@ -27762,6 +28244,10 @@ class GhostAgent:
                         # chat templates, turning a recoverable overflow
                         # into a hard failure.
                         _rt_content = _defuse_tool_text(str(real_tool.get("content", ""))[:1000]) + "\n... [EMERGENCY TRUNCATION] ..."
+                        # §4RZ step 5: the record row is plain; when the model's copy carried
+                        # the stop note, every rebuilt prompt carries it too (s5-r14; r15: keyed
+                        # on the record row itself — a tool_call_id can be "" or repeat)
+                        _rt_content += str(real_tool.get("_stop_note") or "")
                         recovery_msgs.append({
                             "role": "user",
                             "content": (
@@ -27769,6 +28255,22 @@ class GhostAgent:
                                 f"{_rt_content}\n</tool_response>"
                             ),
                         })
+
+                    # §4RZ: messages the user sent while this turn ran were booked as
+                    # read when drained — the recovery must carry them (the volatile
+                    # block rides the newest one, so the pick above skips it). The
+                    # newest first, within a budget, each cut one marked: this
+                    # retry is itself one prompt (r3: N rows x 4000 re-overflowed).
+                    _q_at, _q_sent, _q_left = len(recovery_msgs), [], 8000
+                    for _qr in reversed(_q_rows):
+                        _qc = str(_qr.get("content") or "")
+                        if len(_qc) > 4000:
+                            _qc = _qc[:4000] + "\n... [EMERGENCY TRUNCATION] ..."
+                        if len(_qc) > _q_left:
+                            break
+                        _q_left -= len(_qc)
+                        _q_sent.insert(0, {"role": "user", "content": _qc})
+                    recovery_msgs.extend(_q_sent)
 
                     recovery_msgs.append({"role": "user", "content": "SYSTEM ALERT: The conversation history was truncated to fit within context limits. Continue task. Assume previous context has been handled."})
 
@@ -27782,7 +28284,16 @@ class GhostAgent:
                     try:
                         payload["messages"] = recovery_msgs
                         payload["stream"] = False
-                        messages = recovery_msgs
+                        # the loop's own list keeps the queued rows' keys (the payload stays plain)
+                        messages = recovery_msgs[:_q_at] + _q_rows + recovery_msgs[_q_at + len(_q_sent):]
+                        if _req_row is not None and last_user:
+                            # the marked row, not its rendered copy: the key survives
+                            # into a second overflow, and the next build renders it
+                            # once (the copy carried the pinned head twice — r4)
+                            _kept = {k: v for k, v in _req_row.items() if k != "_rendered"}
+                            if isinstance(_kept.get("content"), str):
+                                _kept["content"] = recovery_msgs[len(system_msgs)]["content"]   # as sent (cut)
+                            messages[len(system_msgs)] = _kept
                         data = await self.context.llm_client.chat_completion(payload, use_coding=has_coding_intent)
                         if "choices" in data and len(data["choices"]) > 0:
                             msg = data["choices"][0]["message"]
@@ -28481,7 +28992,11 @@ class GhostAgent:
                 # SAME answer in the user's language. The streamed path
                 # cannot un-send a draft; there the same rule lands as a
                 # late turn-state verdict (`turn_state_check.reply_language`).
+                # §4RZ s2-r6: stands down once the user sent messages mid-turn,
+                # as its turn-state twin does (s2-r5) — an addition in another
+                # language forced a regeneration in the request's language
                 if (repair_round < self._MAX_VERIFIER_REPAIRS
+                        and not _queued_delivered_any()
                         and os.getenv("GHOST_REPLY_LANGUAGE_REPAIR", "1")
                         .strip().lower() not in ("0", "false", "no", "off")):
                     try:
@@ -29063,11 +29578,15 @@ class GhostAgent:
         # wedged turn is a restart. See core/turns.py.
         from .turns import get_turn_registry, TurnCancelled
         _turn_reg = get_turn_registry(self)
+        from ..utils.logging import request_kind as _rk
+        # a MEMBER turn is "member" even when probed: member turns have no inbox
+        _turn_kind = "member" if requester_is_member() else _rk(req_id)
         _active_turn = _turn_reg.register(
             req_id,
             preview=str((body.get("messages") or [{}])[-1].get("content") or "")
             if isinstance(body.get("messages"), list) else "",
             session_id=str(body.get("session_id") or ""),
+            kind=_turn_kind,                      # who an inbox post must be (queued messages)
         )
         # register() may uniquify the key on a client-req-id collision — adopt
         # the effective id so mark_running / is_cancelled / unregister all
@@ -29075,6 +29594,13 @@ class GhostAgent:
         req_id = _active_turn.req_id
         if req_id != request_id_context.get():
             request_id_context.set(req_id)          # §4OG-4 (g): every contextvar reader sees the uniquified id (reader C M2)
+        # §4RZ: a hold the user sends after THIS moment withdraws this
+        # request's yes — noted at REGISTRATION, before the turn lock, so a
+        # hold sent while it waits counts (r4) and an old one does not (r5)
+        _queued_scope = _queued_begin_request()      # §4RZ step 2: nothing delivered yet
+        _note_request_start(req_id, str(body.get("session_id") or ""), _turn_kind,
+                            text=((body.get("messages") or [{}])[-1] or {}).get("content")
+                            if isinstance(body.get("messages"), list) and body.get("messages") else None)
 
         # A STREAMED turn hands the caller a generator and returns; the actual
         # upstream final-generation streams while the caller drains it, AFTER
@@ -29203,6 +29729,18 @@ class GhostAgent:
                         self._note_trivial_reply(req_id)
                         return _post_reply, int(datetime.datetime.now().timestamp()), req_id
 
+                # §4RZ r5: the request row is known by a KEY (the overflow
+                # recovery guessed it from rendered text and carried a tool
+                # result, a steer or a queued row instead). Only the server
+                # marks rows: client-sent keys of this kind are dropped first.
+                for _m in messages:
+                    if isinstance(_m, dict):
+                        for _k in ("_queued", "_request", "_rendered", "_summary", "_summary_text", "_foreign"):
+                            _m.pop(_k, None)
+                _req_row = next((m for m in reversed(messages)
+                                 if isinstance(m, dict) and m.get("role") == "user"), None)
+                if _req_row is not None:
+                    _req_row["_request"] = True
                 last_user_content_raw = next((m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), "")
                 if isinstance(last_user_content_raw, list):
                     last_user_content = " ".join([i.get("text", "") for i in last_user_content_raw if isinstance(i, dict) and i.get("type") == "text"])
@@ -29949,6 +30487,10 @@ class GhostAgent:
                 # runaway simulation can't silently chew through 40 turns.
                 effective_max_turns = getattr(self, "max_turns_override", None) or 40
                 _budget_extended = False                     # §4OG-1 (k): once, while the build converges
+                from .queued_messages import (enabled as _queued_enabled, queued_row as _queued_row,
+                                              note_delivered as _queued_note_delivered)
+                _queued_on = _queued_enabled()
+                _delivered_rows = body["_queued_delivered"] = []     # §4RZ: read by the chat route's persist
                 turn = -1
                 while turn + 1 < effective_max_turns:
                     turn += 1
@@ -29960,6 +30502,7 @@ class GhostAgent:
                     # `hard=true` (task.cancel()) is for. See core/turns.py.
                     if _turn_reg.is_cancelled(req_id):
                         raise TurnCancelled(req_id, _active_turn.reason)
+                    _active_turn.step = turn
                     self._heartbeat() # Heartbeat
                     # Per-turn auto-repair bookkeeping: the verdict cache is
                     # only "fresh" for the post-loop gate if THIS turn reached
@@ -30617,7 +31160,10 @@ class GhostAgent:
                     # up with some random AI, YOU will play against me"
                     # first appears). Deterministic extraction, no LLM call.
                     if _request_constraint_block:
-                        _ds_parts.append(("request_constraints", _request_constraint_block + "\n\n"))
+                        # §4RZ s2-r7: once the user sent more, said to be the first message's
+                        _rc_note = _queued_constraints_note()
+                        _ds_parts.append(("request_constraints", _request_constraint_block
+                                          + ("\n" + _rc_note if _rc_note else "") + "\n\n"))
                     # (§4NN: the §4FD EVIDENCE CHECK steer rode the
                     # `evidence_gate` experiment arm, disabled since §4ND —
                     # it left with the experiments registry.)
@@ -30662,6 +31208,20 @@ class GhostAgent:
                     # dual-dialect nudge in intra-request history — 2026-08-01).
                     _render_native = bool(getattr(
                         getattr(self.context, "args", None), "native_tools", False))
+                    # Queued messages (§4RZ): what the user sent while the turn
+                    # ran is read HERE, after every exit of this step (strike cap,
+                    # force_stop, terminal tools) and before the rebuild — nothing
+                    # between here and the model call leaves the loop, so a
+                    # drained message is one the model reads.
+                    if _queued_on:
+                        for _q in _turn_reg.drain(req_id):
+                            messages.append(_queued_row(_q))
+                            _queued_note_delivered(_q["text"])      # step 2: every alert names it
+                            self._on_queued_delivery(_q["text"], req_id)  # step 4: the owner's own words
+                            _delivered_rows.append({"role": "user", "content": _q["text"]})
+                            pretty_log("Queued Message",
+                                       f"read at step {turn + 1}: {_q['text'][:80]!r}",
+                                       icon=Icons.QUEUED_MSG)
                     _effort_note = self._effort_note_due(          # §4RB: appended once, never moved
                         req_id, thinks=not ((is_final_generation and getattr(self.context, "_breaker_forced_final", False))
                                             or loop_retry_is_no_think(messages, last_user_content)))
@@ -30738,6 +31298,12 @@ class GhostAgent:
                                 req_messages.append({"role": "user", "content": content_val})
                         else:
                             req_messages.append({"role": m.get("role", "user"), "content": m.get("content", "")})
+                        if m.get("_request") and req_messages:
+                            # §4RZ r5: as rendered for the model (images as their
+                            # pointer or native), BEFORE the injected blocks — what
+                            # an overflow recovery carries as the request
+                            _rc = req_messages[-1].get("content")
+                            m["_rendered"] = list(_rc) if isinstance(_rc, list) else _rc
 
                     # Bundle ALL dynamic context
                     # ARCHITECTURAL OPTIMISATION #1: tool schemas now ride
@@ -30925,6 +31491,7 @@ class GhostAgent:
                     # (slack-3e…, 2026-09-24) — the query-only classifier
                     # cannot see the thread it sits in.
                     is_tool_turn = (not turn_is_conversational
+                                    or _queued_delivered_any()       # §4RZ step 4: the request was classified without it
                                     or _history_shows_tool_activity(messages)
                                     or self._conversation_ran_tools_recently(messages))
                     sampling_params = get_sampling_params(
@@ -31382,6 +31949,9 @@ class GhostAgent:
                     ) + (final_ai_content or "")
                     _turn_budget_exhausted = True
 
+                # §4RZ: no step boundary comes after the loop — a message posted
+                # during finalize is refused (the client sends it normally)
+                _turn_reg.close_inbox(req_id, _active_turn)
                 # #5 step 3: the finalization chain lives in _finalize_and_return
                 # (verbatim extraction; FinalizeState is read-only inputs — see the
                 # method docstring). Its return IS the old inline return.
@@ -31481,6 +32051,17 @@ class GhostAgent:
             raise
 
         finally:
+            # Queued messages: the loop is over — nothing more is read, even
+            # while a streamed final still drains. Pending ones → leftovers.
+            _turn_reg.close_inbox(req_id, _active_turn)
+            _note_request_end(req_id)            # §4RZ: no tool confirms after this
+            _queued_end_request(_queued_scope)
+            # §4RZ r6: the request mark lives for this turn only — the caller's
+            # message dicts go back without it (and without its rendered copy)
+            for _m in (body.get("messages") or []) if isinstance(body, dict) else []:
+                if isinstance(_m, dict):
+                    _m.pop("_request", None)
+                    _m.pop("_rendered", None)
             # Identity-checked: only evict OUR entry (req_id may collide with
             # a concurrent turn's client-supplied id — see TurnRegistry).
             # A streamed turn defers this to its stream wrapper's finally so the
@@ -31679,7 +32260,7 @@ class GhostAgent:
         return getattr(v, "reasoning", None) in cls._NO_CLAIM_REASONINGS
 
     def _reply_shape_refutation(self, final_ai_content: str, request_text: str = "",
-                                tools_run=None):
+                                tools_run=None, *, request_rules: bool = True):
         """A REFUTED verdict when the reply is not an answer by SHAPE (§4FN:
         `core/reply_shape_check`), or `None`. Never confirms. Computed for
         every turn that has a verifier attached — tool or not — because the
@@ -31703,8 +32284,10 @@ class GhostAgent:
             if not issues:
                 issues = refute_raw_tool_dump(claim, request_text or "", n_real_tools=count_real_tools(tools_run or []))
                 reasoning = "reply-shape check (raw tool output pasted as the answer)"
-            if not issues:
+            if not issues and request_rules:
                 # §4HY: a source "actually read" that no tool ever opened.
+                # The request TRIGGERS this rule, so it stands down with the
+                # other request rules once messages arrived mid-turn (§4RZ).
                 issues = refute_unread_source(claim, request_text or "", _names)
                 reasoning = "reply-shape check (a source cited as read was never opened)"
             if not issues:
@@ -31727,7 +32310,7 @@ class GhostAgent:
             return None
 
     def _turn_state_refutation(self, final_ai_content: str, request_text: str,
-                               tools_run=None):
+                               tools_run=None, *, request_rules: bool = True):
         """A REFUTED verdict when the reply contradicts the turn's own STATE
         (§4FY: `core/turn_state_check`), or `None`. Never confirms.
 
@@ -31745,7 +32328,8 @@ class GhostAgent:
             from .turn_state_check import refute_turn_state
             issues = refute_turn_state(request=request_text or "",
                                        reply=final_ai_content or "",
-                                       tools_run=tools_run)
+                                       tools_run=tools_run,
+                                       request_rules=request_rules)
             if not issues:
                 return None       # ⚠ NOT a pass — nothing to say
             from .verifier import VerifyResult, VerifyVerdict
@@ -32058,7 +32642,10 @@ class GhostAgent:
             # the visual arm below falls back as it always has, and caps
             return None, None
         before, likeness = self._likeness_evidence(tools_run, sbx, before)
-        vv = await verifier.verify_visual(symptom=last_user_content or "", claim=claim_src,
+        # §4RZ s2-r6: the picture is judged against the request AND what the
+        # user added mid-turn ("actually make it red" refuted a red image)
+        vv = await verifier.verify_visual(symptom=_queued_current_ask(last_user_content or "", limit=_VISUAL_SYMPTOM_CHARS),
+                                          claim=claim_src,
                                           after_image=after, before_image=before,
                                           likeness_subjects=likeness)
         return vv, after
@@ -32249,6 +32836,8 @@ class GhostAgent:
         """§4NF: the user-correction judge + the prior turn's relabel, off the
         reply's critical path. Never raises."""
         try:
+            if self._prior_turn_changed_mid_turn(messages):
+                return                  # §4RZ s4-r8: never promoted — its request is not its ask
             _contradicts = await self._adjudicate_correction(messages, last_user_content)
             if _contradicts is not None:
                 # §4MI: the judge's verdict was never logged — its yield (~0
@@ -32259,6 +32848,24 @@ class GhostAgent:
                 messages, last_user_content, contradicts=_contradicts)
         except Exception as e:  # noqa: BLE001 — bookkeeping never breaks anything
             logger.debug("user-correction promotion skipped: %s: %s", type(e).__name__, e)
+
+    def _prior_turn_changed_mid_turn(self, messages) -> bool:
+        """§4RZ s4-r8: the prior turn's trajectory (the correction cache, by
+        the prior reply's fingerprint) recorded mid-turn messages. On the next
+        turn its persisted mid-turn row is a plain user row, so a walk would
+        take it for the whole request."""
+        try:
+            from .queued_messages import changed_mid_turn
+            cache = getattr(self.context, "_recent_trajectories_for_correction", None)
+            if not cache:
+                return False
+            prev = next((m.get("content") for m in reversed(list(messages or [])[:-1])
+                         if isinstance(m, dict) and m.get("role") == "assistant"
+                         and isinstance(m.get("content"), str) and m.get("content").strip()), "")
+            fp = self._response_fingerprint(prev) if prev else None
+            return bool(fp) and changed_mid_turn(cache.get(fp))
+        except Exception:  # noqa: BLE001
+            return False
 
     def _maybe_promote_prior_turn_via_user_correction(
         self,
@@ -32364,6 +32971,9 @@ class GhostAgent:
         traj = cache.get(fp)
         if traj is None:
             return
+        from .queued_messages import changed_mid_turn as _cmt
+        if _cmt(traj):
+            return                              # §4RZ s4-r8: never promoted
         # Persist the correction. The sidecar is durable; the in-
         # memory mutation lets the immediate reflect_one() call see
         # the corrected outcome + failure_reason without re-reading
@@ -32511,6 +33121,8 @@ class GhostAgent:
         _stream_role = str(requester_role or "")
         _stream_member = str(requester_member_context.get() or "")   # §4QG
         _stream_arm = str(prompt_arm_context.get() or "")    # §4MV
+        from .queued_messages import delivered as _qd, set_delivered as _q_set
+        _stream_delivered = _qd()       # §4RZ step 2: the drain runs after handle_chat's finally
         try:                                                  # §4OJ-c: captured in the request's context
             from . import quote_bound as _qbs
             _qb_stream = _qbs.mode() == "append"
@@ -34234,10 +34846,12 @@ class GhostAgent:
             _role_tok = requester_role_context.set(_stream_role)
             _member_tok = requester_member_context.set(_stream_member)   # §4QG
             _arm_tok = prompt_arm_context.set(_stream_arm)          # §4MV
+            _q_tok = _q_set(_stream_delivered)
             try:
                 async for _chunk in stream_wrapper():
                     yield _chunk
             finally:
+                _queued_end_request(_q_tok)
                 try:
                     prompt_arm_context.reset(_arm_tok)
                     requester_member_context.reset(_member_tok)
@@ -34675,9 +35289,13 @@ class GhostAgent:
                     if c and (c == rr or c.startswith(rr[:200])
                               or rr.startswith(c[:200])):
                         boundary = i
+        if boundary == -1:  # §4RZ step 3: the marked request row
+            boundary = next((i for i, m in enumerate(msgs) if isinstance(m, dict)
+                             and m.get("role") == "user" and m.get("_request")), -1)
         if boundary == -1:  # fallback: last NON-synthetic user message
             for i, m in enumerate(msgs):
                 if isinstance(m, dict) and m.get("role") == "user" and \
+                        not m.get("_queued") and \
                         not GhostAgent._msg_text(m).lstrip().startswith(
                             GhostAgent._SYNTHETIC_USER_PREFIXES):
                     boundary = i
@@ -34886,6 +35504,27 @@ class GhostAgent:
         md = getattr(self.context, "memory_dir", None)
         return Path(md).parent if isinstance(md, (str, Path)) else None
 
+    def _on_queued_delivery(self, text, req_id) -> None:
+        """§4RZ step 4: a message the user sent mid-turn, once the model reads
+        it, is RECORDED for this request (census, trajectory, the fact
+        ledger's label, the project gate's "no") and a bare "no" withdraws
+        this conversation's live previews (it only ever withdraws). It opens
+        NO mechanical gate — owner facts, egress, keep / dictate, the notify
+        promise, the project BUILD fallback all read the request: s4-r1..r4
+        found each one opened on a mid-turn refusal or reported speech. The
+        model reads the message and acts on it. Never raises."""
+        t = str(text or "")
+        try:
+            from ..utils.provenance import note_added_user_message
+            note_added_user_message(t, req_id)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from ..tools.memory import retire_declined_previews as _rdp
+            _rdp(t)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _finish_turn_scratch(self, req_id, reply_text, user_text) -> None:
         """§4NY: queue the screenshots and throwaway test scripts this turn
         made only to check its work, unless the reply or the user names
@@ -34903,6 +35542,8 @@ class GhostAgent:
                     or _rid.startswith(("sub-", "sched-", "job-", "sim-", "bench-", "replay-"))):
                 _ts.drop_notes(req_id)
                 return
+            # §4RZ step 4: a file a mid-turn message names is the user's too
+            user_text = _request_with_added(user_text, _rid)
             out = _ts.finish_turn(str(req_id or ""), reply_text, user_text, root,
                                   self._turn_scratch_system_dir())
             if out["queued"]:
@@ -35114,6 +35755,7 @@ class GhostAgent:
         # poisoning reflection, frontier clustering, and PRM features.
         user_request = str(user_request or "")
         fallback_user_request = ""
+        _req_fallback = None
         for m in msgs:
             if not isinstance(m, dict):
                 continue
@@ -35126,12 +35768,15 @@ class GhostAgent:
                 )
             if role == "system" and not system_prompt:
                 system_prompt = str(content or "")
-            elif role == "user":
+            elif role == "user" and not m.get("_queued"):    # §4RZ step 3
                 fallback_user_request = str(content or "")
+                if m.get("_request"):
+                    _req_fallback = fallback_user_request
         if not user_request:
             # Legacy fallback (last user-role message) — only correct when
-            # the caller couldn't supply the real request.
-            user_request = fallback_user_request
+            # the caller couldn't supply the real request. §4RZ step 3: the
+            # marked request row first; a mid-turn message never.
+            user_request = _req_fallback if _req_fallback is not None else fallback_user_request
 
         # Reconstruct tool call pairs (extracted 2026-07-26 for testability).
         tool_calls = self._reconstruct_tool_calls(msgs)
@@ -35233,6 +35878,13 @@ class GhostAgent:
         # found a live trajectory with req_id nowhere in extra.
         if req_id:
             _extra["req_id"] = str(req_id)
+            try:                # §4RZ step 4: what the user added mid-turn (user_request stays the request)
+                from ..utils.provenance import added_user_messages as _added_um
+                _qtexts = _added_um(str(req_id), own=True)     # s4-r1: never a sub-agent's parent's
+                if _qtexts:
+                    _extra["queued_messages"] = [str(t)[:2000] for t in _qtexts]
+            except Exception:  # noqa: BLE001
+                pass
         # §4MI: the bound project (a hex id), so a LATE verdict can reach the
         # project's work_log — the streamed path passes verifier_backfill=None,
         # so every streamed turn's row said "completed" whatever the verifier

@@ -474,6 +474,8 @@ def content_egress_refusal(tool_name: str, args, context):
     owner's name and phone" or "open https://x/?u=<profile>" (§4MB)."""
     if tool_name not in CONTENT_GUARDED_TOOLS or not args:
         return None
+    # §4RZ s4-r3: the REQUEST alone — a literal/keyword presence test opens on
+    # a mid-turn REFUSAL ("don't send my files", "don't search for <name>")
     from ..utils.provenance import untrusted_seen, user_message
     src = untrusted_seen()
     if not src:

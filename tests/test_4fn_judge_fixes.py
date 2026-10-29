@@ -222,7 +222,17 @@ def test_the_finalize_fallback_and_the_check_share_one_literal():
     import inspect
     from ghost_agent.core import agent as agent_mod
     src = inspect.getsource(agent_mod)
-    assert 'FALLBACK_HEADS["success"]' in src and 'FALLBACK_HEADS["failed"]' in src and 'FALLBACK_HEADS["running"]' in src
+    # §4RZ step 5: the head KEY comes from `_fallback_head_key`; every key it
+    # can return must index the shared table (drive it, not grep it)
+    from ghost_agent.tools.outcome import ToolOutcome, OutcomeStatus
+    from ghost_agent.utils.tool_stop import interrupted_outcome
+    assert 'FALLBACK_HEADS[_fallback_head_key(' in src
+    keys = {agent_mod._fallback_head_key(c, f) for c, f in [
+        ("all good", False), ("Error: boom", True),
+        (ToolOutcome("job 3 running", status=OutcomeStatus.UNRESOLVED), False),
+        (interrupted_outcome("execute", started=True, killed=False), False)]}
+    assert keys == {"success", "failed", "running", "stopped"}
+    assert all(rsc.FALLBACK_HEADS[k] for k in keys)
     code = "\n".join(l for l in src.splitlines() if not l.strip().startswith("#"))
     assert code.count('"Process finished successfully."') == 0     # comments may quote it; code may not
     assert rsc.FALLBACK_HEADS["success"] == "Process finished successfully."

@@ -2309,3 +2309,227 @@ async def test_the_members_prefill_never_replaces_an_unsaved_conversation(quiet_
     llm.chat_completion = spy
     assert await agent._member_head_refresh() is False
     assert shown and sent == [] and st["saves"] == []
+
+
+# ── 10-27: the directory needs no upkeep ────────────────────────────────
+
+def test_prune_drops_saves_of_another_server_only_when_told_which_is_running(tmp_path):
+    d = _dir(tmp_path)
+    _meta(d, "mine", "id", 1)
+    _meta(d, "gone", "old-model", 2)
+    _store(d, "legacy")                              # a meta without an identity: kept
+    H.prune(d)
+    assert (d / "head-gone.bin").exists()            # no identity given: nothing judged
+    H.prune(d, identity="id")
+    names = sorted(p.name for p in d.glob("head-*.bin"))
+    assert names == ["head-legacy.bin", "head-mine.bin"]
+    assert not (d / "head-gone.json").exists()
+
+
+def test_prune_drops_stale_orphan_metas_and_tmp_files(tmp_path):
+    d = _dir(tmp_path)
+    old = time.time() - H.STALE_PART_S - 10
+    _store(d, "k")
+    (d / "head-nobin.json").write_text("{}")
+    (d / "head-k.json.tmp").write_text("{}")
+    (d / "head-fresh.json").write_text("{}")        # a save between its two writes: kept
+    for n in ("head-nobin.json", "head-k.json.tmp"):
+        os.utime(d / n, (old, old))
+    H.prune(d)
+    assert sorted(p.name for p in d.iterdir()) == ["head-fresh.json", "head-k.bin", "head-k.json"]
+
+
+def test_conversations_are_held_to_a_byte_budget_but_the_newest_stays(tmp_path, monkeypatch):
+    d = _dir(tmp_path)
+    now = time.time()
+    for i in range(3):
+        (d / f"head-c{i}.bin").write_bytes(b"x" * 100)
+        (d / f"head-c{i}.json").write_text(json.dumps({"n_tokens": 1, "kind": H.CONV}))
+        for n in (f"head-c{i}.bin", f"head-c{i}.json"):
+            os.utime(d / n, (now - 100 + i,) * 2)
+    _store(d, "owner")
+    monkeypatch.setattr(H, "CONV_BYTES_MAX", 250)
+    H.prune(d)
+    assert sorted(p.name for p in d.glob("head-*.bin")) == ["head-c1.bin", "head-c2.bin", "head-owner.bin"]
+    monkeypatch.setattr(H, "CONV_BYTES_MAX", 10)     # even one is over: the newest is kept
+    H.prune(d)
+    assert sorted(p.name for p in d.glob("head-*.bin")) == ["head-c2.bin", "head-owner.bin"]
+
+
+def test_llama_start_frees_the_saves_of_a_previous_model(monkeypatch, tmp_path):
+    d = _dir(tmp_path)
+    _meta(d, "k", _ident(), 1)
+    _meta(d, "was", "/old|b|x", 2)
+    _server(monkeypatch)
+    H.restore_on_start(BASE, d, sleep=lambda s: None)
+    assert (d / "head-k.bin").exists() and not (d / "head-was.bin").exists()
+
+
+def test_a_save_never_judges_identity_from_its_callers_plan(monkeypatch, tmp_path):
+    """Fresh-eye review 10-27: a plan read before a llama restart on another
+    model passed the OLD identity to save(); pruning by it wiped the running
+    server's owner head, members' head and conversations."""
+    d = _dir(tmp_path)
+    _meta(d, "new-owner", "NEW", 2)
+    _meta(d, "new-member", "NEW", 3)
+    monkeypatch.setattr(H, "_http", _llama_saves(d, 5))
+    ok, detail = H.save(BASE, d, "cstale", 5, identity="OLD", kind=H.CONV, at_least=True)
+    assert ok, detail
+    assert (d / "head-new-owner.bin").exists() and (d / "head-new-member.bin").exists()
+
+
+def test_the_byte_budget_counts_only_the_conversations_it_keeps(tmp_path, monkeypatch):
+    d = _dir(tmp_path)
+    now = time.time()
+    for i, (key, size) in enumerate([("old", 20), ("big", 90), ("new", 20)]):
+        (d / f"head-{key}.bin").write_bytes(b"x" * size)
+        (d / f"head-{key}.json").write_text(json.dumps({"n_tokens": 1, "kind": H.CONV}))
+        for n in (f"head-{key}.bin", f"head-{key}.json"):
+            os.utime(d / n, (now - 100 + i,) * 2)
+    monkeypatch.setattr(H, "CONV_BYTES_MAX", 100)
+    H.prune(d)
+    assert sorted(p.name for p in d.glob("head-*.bin")) == ["head-new.bin", "head-old.bin"]
+
+
+def test_a_file_vanishing_mid_prune_does_not_stop_the_part_sweep(tmp_path, monkeypatch):
+    d = _dir(tmp_path)
+    _store(d, "k")
+    (d / "head-x.part.bin").write_bytes(b"x")
+    old = time.time() - H.STALE_PART_S - 10
+    os.utime(d / "head-x.part.bin", (old, old))
+    real_kind = H.kind_of
+
+    def vanish(dd, key):                     # the other process deleted it meanwhile
+        (dd / f"head-{key}.bin").unlink()
+        (dd / f"head-{key}.json").unlink()
+        return real_kind(dd, key)
+    monkeypatch.setattr(H, "kind_of", vanish)
+    H.prune(d)
+    assert not (d / "head-x.part.bin").exists()
+
+
+def test_a_state_file_without_its_meta_never_takes_a_heads_place(tmp_path):
+    """Review r2: a .bin with no meta counted as an OWNER head (kind_of's
+    default) and pushed a real one out; it can never be restored."""
+    d = _dir(tmp_path)
+    now = time.time()
+    for i in range(3):
+        _store(d, f"o{i}")
+        for n in (f"head-o{i}.bin", f"head-o{i}.json"):
+            os.utime(d / n, (now - 100 + i,) * 2)
+    (d / "head-young.bin").write_bytes(b"x")          # a save between its two writes
+    (d / "head-dead.bin").write_bytes(b"x")
+    old = now - H.STALE_PART_S - 10
+    os.utime(d / "head-dead.bin", (old, old))
+    H.prune(d, keep=3)
+    names = sorted(p.name for p in d.glob("head-*.bin"))
+    assert names == ["head-o0.bin", "head-o1.bin", "head-o2.bin", "head-young.bin"]
+
+
+def test_a_save_whose_file_was_pruned_meanwhile_reports_failure(monkeypatch, tmp_path):
+    d = _dir(tmp_path)
+
+    def http(url, body=None, timeout=5.0):
+        (d / body["filename"]).write_bytes(b"state")
+        return {"n_saved": 5}
+    monkeypatch.setattr(H, "_http", http)
+    real = os.replace
+
+    def gone(src, dst):
+        if str(src).endswith(".part.bin"):
+            os.unlink(src)
+        return real(src, dst)
+    monkeypatch.setattr(H.os, "replace", gone)
+    ok, detail = H.save(BASE, d, "k", 5, "id")
+    assert not ok and "removed" in detail
+
+
+def test_pruning_a_key_never_takes_the_re_save_llama_is_writing(tmp_path, monkeypatch):
+    """Review r3: discard() also removed the key's .part.bin — a re-save of
+    a conversation dropped by count failed and the conversation was lost."""
+    d = _dir(tmp_path)
+    now = time.time()
+    for i in range(3):
+        (d / f"head-c{i}.bin").write_bytes(b"x")
+        (d / f"head-c{i}.json").write_text(json.dumps({"n_tokens": 1, "kind": H.CONV}))
+        for n in (f"head-c{i}.bin", f"head-c{i}.json"):
+            os.utime(d / n, (now - 100 + i,) * 2)
+    (d / "head-c0.part.bin").write_bytes(b"being written")
+    monkeypatch.setattr(H, "KEEP_CONV", 2)
+    H.prune(d)
+    assert not (d / "head-c0.bin").exists() and (d / "head-c0.part.bin").exists()
+
+
+def test_a_meta_that_cannot_be_written_fails_the_save_without_raising(monkeypatch, tmp_path):
+    d = _dir(tmp_path)
+    _store(d, "k", n=99)                               # the previous save of this key
+    monkeypatch.setattr(H, "_http", _llama_saves(d, 5))
+    (d / "head-k.json.tmp").mkdir()                    # stands in for a full disk
+    ok, detail = H.save(BASE, d, "k", 5, "id")
+    assert not ok and "meta not written" in detail
+    assert H.stored_tokens(d, "k") is None and not (d / "head-k.bin").exists()
+
+
+def test_llama_start_picks_the_head_saved_last_not_the_one_used_last(tmp_path):
+    """Operator 10-27: the most recently SAVED head is loaded after a llama
+    restart, even when an older one was restored (touched) more recently."""
+    d = _dir(tmp_path)
+    _meta(d, "saved-last", "id", 200)
+    _meta(d, "used-last", "id", 100)
+    H.touch(d, "used-last")
+    assert H.newest_head_for(d, "id") == "saved-last"
+
+
+def test_a_file_re_saved_while_the_prune_runs_is_left_for_the_next_one(tmp_path, monkeypatch):
+    """Review r4: the ranking was taken once; a conversation re-saved (now
+    the newest, bigger) mid-prune was judged by its old rank and deleted."""
+    d = _dir(tmp_path)
+    now = time.time()
+    for i, (key, size) in enumerate([("ck", 50), ("ca", 100)]):
+        (d / f"head-{key}.bin").write_bytes(b"x" * size)
+        (d / f"head-{key}.json").write_text(json.dumps({"n_tokens": 1, "kind": H.CONV}))
+        for n in (f"head-{key}.bin", f"head-{key}.json"):
+            os.utime(d / n, (now - 100 + i,) * 2)
+    monkeypatch.setattr(H, "CONV_BYTES_MAX", 240)
+    real = H.kind_of
+
+    def resave_mid_prune(dd, key):
+        if key == "ca":                              # the other thread's save of ck lands now
+            (dd / "head-ck.bin").write_bytes(b"x" * 150)
+            os.utime(dd / "head-ck.bin", (now + 5,) * 2)
+        return real(dd, key)
+    monkeypatch.setattr(H, "kind_of", resave_mid_prune)
+    H.prune(d)
+    assert (d / "head-ck.bin").exists() and (d / "head-ca.bin").exists()
+
+
+@pytest.mark.parametrize("reply", ["not json", ["a"], {"n_saved": "x"}, {"n_saved": 5, "timings": "?"}])
+def test_an_odd_llama_reply_never_raises_out_of_save(monkeypatch, tmp_path, reply):
+    d = _dir(tmp_path)
+
+    def http(url, body=None, timeout=5.0):
+        (d / body["filename"]).write_bytes(b"state")
+        return reply
+    monkeypatch.setattr(H, "_http", http)
+    ok, _ = H.save(BASE, d, "k", 5, "id")
+    assert ok == (reply == {"n_saved": 5, "timings": "?"})
+
+
+@pytest.mark.parametrize("reply", ["not json", ["a"]])
+def test_an_odd_llama_reply_never_raises_out_of_restore_nor_costs_the_file(monkeypatch, tmp_path, reply):
+    """Review r5: a non-object reply read as 0 tokens restored, and the
+    mismatch path deleted a good state file."""
+    d = _dir(tmp_path)
+    _store(d, "k")
+    monkeypatch.setattr(H, "_http", lambda *a, **k: reply)
+    ok, detail, _ = H.restore(BASE, d, "k")
+    assert not ok and "not the restore result" in detail
+    assert H.stored_tokens(d, "k") == 28213
+
+
+def test_a_non_numeric_restore_count_never_raises(monkeypatch, tmp_path):
+    d = _dir(tmp_path)
+    _store(d, "k")
+    monkeypatch.setattr(H, "_http", lambda *a, **k: {"n_restored": "x"})
+    ok, detail, _ = H.restore(BASE, d, "k")
+    assert not ok and "restored 0 tokens" in detail

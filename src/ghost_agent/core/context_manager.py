@@ -164,8 +164,12 @@ class ContextManager:
         # keep_full=2, L3 center-cut the current request itself (a hard
         # constraint at char 900 destroyed, reachable every turn via
         # compress_if_needed). Same identity rule as the goal.
-        newest_user_msg = next((m for m in reversed(conv_msgs)
-                                if m.get("role") == "user"), None)
+        # §4RZ r6: the turn's request is the row handle_chat MARKED — the
+        # newest user row is only a stand-in for it (a steer, an effort note or
+        # a queued message can be newer); the stand-in remains without a mark
+        newest_user_msg = (next((m for m in conv_msgs if m.get("_request")), None)
+                           or next((m for m in reversed(conv_msgs)
+                                    if m.get("role") == "user"), None))
         # §4OE-3: the ids of tool calls whose result is in and succeeded — a
         # 70 KB `write` argument stayed verbatim until the L4 prune (any
         # assistant message with a tool call was left whole); once the file
@@ -175,8 +179,11 @@ class ContextManager:
                          and str(m.get("content") or "").lstrip().startswith("SUCCESS")}
         compressed_old = []
         for msg in old_msgs:
-            if msg is goal_msg or msg is newest_user_msg:
-                compressed_old.append(msg)      # goal + current request are sacrosanct
+            if msg is goal_msg or msg is newest_user_msg or msg.get("_queued"):
+                # goal + current request are sacrosanct; so is what the user
+                # sent while the turn ran (§4RZ r7: protected as the newest
+                # user row until the request was marked)
+                compressed_old.append(msg)
                 continue
             msg = self._compact_written_args(msg, succeeded_ids)
             compressed = self._compress_message(msg, level)
@@ -408,8 +415,26 @@ class ContextManager:
                 break
 
         result = list(system_msgs)
-        if last_user:
-            result.append(last_user)
+        # §4RZ step 3: the newest user row can be a message the user sent
+        # mid-turn (or a loop steer) — keep the turn's REQUEST (the row
+        # handle_chat marks) and what the user sent while it ran (newest
+        # first, the summarising prune's 8,000-character budget, each row
+        # whole, stopping at the first that does not fit — s3-r7), in order,
+        # beside the newest user row. (Level 4 is not
+        # reached by the turn loop today — it calls with max_level=3 — but
+        # where it is, this list replaces the messages it was given.)
+        _users = [m for m in messages if m.get("role") == "user"]
+        _keep = {id(m) for m in _users if m.get("_request")}
+        _left = 8000
+        for m in reversed([m for m in _users if m.get("_queued")]):
+            _n = min(4000, len(str(m.get("content") or "")))
+            if _n > _left:
+                break
+            _left -= _n
+            _keep.add(id(m))
+        if last_user is not None:
+            _keep.add(id(last_user))
+        result += [m for m in _users if id(m) in _keep]
         if last_tool:
             # Truncate tool output in emergency
             content = last_tool.get("content", "")

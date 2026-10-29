@@ -134,6 +134,12 @@ def _empty_reason(name: str, args: Dict[str, Any], content: str,
     text = content or ""
     if is_error:
         return f"{name}: error"
+    try:  # §4RZ step 5: a call the user stopped (or that never ran) returned nothing
+        from ..utils.tool_stop import is_user_interrupted
+        if is_user_interrupted(text):
+            return f"{name}: stopped by the user"
+    except Exception:  # noqa: BLE001
+        pass
     # Tool-specific shapes first: a search tool's "ERROR: No search results
     # found" is an EMPTY result, and the more specific reason is the useful
     # one. The generic error prefix is the fallback at the end.

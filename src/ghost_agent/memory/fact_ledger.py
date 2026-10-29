@@ -89,8 +89,11 @@ def current_source(via: str = "", value=None, field=None) -> Dict[str, str]:
     try:
         from .lesson_scope import current_request
         from .attribution import owner_clause_for, cue_for_field
+        from ..utils.provenance import added_user_messages
         cue = cue_for_field(*(field or ("", ""))) if field else None
-        out["said"] = clip_said(owner_clause_for(str(value), "USER: " + str(current_request.get() or ""), cue=cue))
+        # §4RZ step 4: the clause can come from a message the user added mid-turn
+        _said = "\n".join("USER: " + t for t in [str(current_request.get() or "")] + added_user_messages())
+        out["said"] = clip_said(owner_clause_for(str(value), _said, cue=cue))
     except Exception:  # noqa: BLE001
         pass
     return out

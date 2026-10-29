@@ -42,7 +42,7 @@
          touch. -->
     <script defer src="/static/vendor/marked.min.js"></script>
     <script defer src="/static/vendor/purify.min.js"></script>
-    <link rel="stylesheet" href="/static/style.css?v=7.7">
+    <link rel="stylesheet" href="/static/style.css?v=7.8">
 </head>
 
 <body>
@@ -223,6 +223,8 @@
                 <span id="turn-status-desc"></span>
                 <span id="turn-status-icon"></span>
             </div>
+            <!-- §4RZ: messages handed back (not read, or maybe not read); Insert / Dismiss each -->
+            <div id="restore-tray" class="hidden" role="region" aria-live="polite" aria-label="Messages handed back"></div>
             <div id="input-area">
                 <textarea id="chat-input" placeholder="Enter message" rows="1"
                           aria-label="Message" enterkeyhint="send"></textarea>
@@ -274,6 +276,17 @@
                      reply's context ↑ and generation ↓ tokens, from the agent's usage frame
                      (tokens.js). Hidden until a turn reports one. -->
                 <span id="token-count" class="hidden" aria-live="off"></span>
+                <!-- §4RZ step 6a: stop the tool call the running turn is waiting on (the turn
+                     goes on). Shown while a chat turn runs; app.js toggles it. -->
+                <button id="interrupt-btn" class="hidden" type="button"
+                        title="Stop the running tool (the turn goes on)"
+                        aria-label="Stop the running tool">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                        stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <polygon points="5 4 15 12 5 20 5 4"></polygon>
+                        <line x1="19" y1="5" x2="19" y2="19"></line>
+                    </svg>
+                </button>
                 <button id="send-btn" aria-label="Send message">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                         stroke-linecap="round" stroke-linejoin="round">
@@ -359,7 +372,7 @@
 
     <div id="toast-stack" aria-live="polite"></div>
 
-    <script type="module" src="/static/app.js?v=16.8"></script>
+    <script type="module" src="/static/app.js?v=17.0"></script>
 </body>
 
 </html>

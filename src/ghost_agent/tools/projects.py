@@ -1281,6 +1281,7 @@ def _content_constraint_origin(constraint: str, origin: str) -> str:
             return origin
         from ..memory.attribution import _coverage, _words
         words = _words(constraint)
+        # §4RZ s4-r3: the request alone — word coverage is not negation-aware
         if words and _coverage(words, user_message()) >= 0.5:
             return origin
         return "auto"
@@ -1908,7 +1909,16 @@ def _create_not_requested(context) -> str:
     ask = str(getattr(context, "last_user_content", "") or "")
     if not ask.strip():
         return ""
-    if _NO_PROJECT_RE.search(ask):
+    # §4RZ step 4 (s4-r2): a "no project" the user sent mid-turn refuses
+    # too — and nothing added mid-turn REVERSES a "no" (s4-r1's newest-wins
+    # let "start with the tokenizer" — a build verb, not a word about a
+    # project — undo "don't create a project": the §4MM class)
+    try:
+        from ..utils.provenance import added_user_messages
+        _texts = [ask] + [str(t) for t in added_user_messages()]
+    except Exception:  # noqa: BLE001
+        _texts = [ask]
+    if any(_NO_PROJECT_RE.search(_t) for _t in _texts):
         return ("NOT created: the owner said not to create a project. Do the task directly in this "
                 "conversation now.")
     # this message, or the conversation's last few (r2: "call it Snake"

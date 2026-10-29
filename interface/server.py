@@ -2445,6 +2445,25 @@ async def turn_cancel_proxy(request: Request):
     interface's /api/chat/cancel only stops the proxy-side stream."""
     return await _proxy_agent_api(request, "POST", "/api/turn/cancel")
 
+# §4RZ step 6a: a message sent while this conversation's turn runs. The
+# agent answers the path (inject / cancel / status / queue); the page acts
+# on it. Status codes and bodies pass through unchanged.
+@app.post("/api/turn/inbox", dependencies=[Depends(verify_interface_key)])
+async def turn_inbox_proxy(request: Request):
+    return await _proxy_agent_api(request, "POST", "/api/turn/inbox")
+
+@app.post("/api/turn/inbox/leftovers", dependencies=[Depends(verify_interface_key)])
+async def turn_inbox_leftovers_proxy(request: Request):
+    """Messages the turn accepted but never read — the page sends them as
+    normal messages after the reply."""
+    return await _proxy_agent_api(request, "POST", "/api/turn/inbox/leftovers")
+
+@app.post("/api/turn/interrupt", dependencies=[Depends(verify_interface_key)])
+async def turn_interrupt_proxy(request: Request):
+    """Stop the running tool call(s) only; the turn goes on (200 / 404 no
+    running turn for this sender / 409 nothing running)."""
+    return await _proxy_agent_api(request, "POST", "/api/turn/interrupt")
+
 @app.get("/api/notifications/pending", dependencies=[Depends(verify_interface_key)])
 async def notifications_pending_proxy(request: Request):
     return await _proxy_agent_api(request, "GET", "/api/notifications/pending")

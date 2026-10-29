@@ -1,7 +1,7 @@
 {
   "app.js": {
-    "sha": "39867210fcc7d031",
-    "version": "16.8"
+    "sha": "d8a3bfc7d61d9645",
+    "version": "17.0"
   },
   "effort.js": {
     "sha": "40ad7b946907c142",
@@ -9,7 +9,7 @@
   },
   "matrix_graph.js": {
     "sha": "87535fb54d0a42a6",
-    "version": "16.8"
+    "version": "17.0"
   },
   "notifications.js": {
     "sha": "487030a97676874f",
@@ -28,8 +28,8 @@
     "version": "7.6"
   },
   "style.css": {
-    "sha": "e5111c365d0a8a66",
-    "version": "7.7"
+    "sha": "3681accc75f558da",
+    "version": "7.8"
   },
   "tokens.js": {
     "sha": "0aa668ae8d23cb93",

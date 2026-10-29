@@ -537,6 +537,48 @@ footer#input-area-wrapper {
     border-color: var(--error-color);
 }
 
+/* §4RZ step 6a: a message sent while a turn runs. Dim until the turn ends
+   (then it is an ordinary bubble); the label says what happens to it. */
+.message.user.queued {
+    opacity: 0.55;
+    border-style: dashed;
+    font-size: 0.78rem;
+}
+.message.user .queued-label {
+    display: block;
+    margin-top: 4px;
+    font-size: 0.62rem;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: rgba(255, 255, 255, 0.5);
+}
+/* the system's progress answer reads as a sentence, not a status chip */
+.message.system.queued-status {
+    text-transform: none;
+    letter-spacing: normal;
+}
+#interrupt-btn {
+    background: rgba(255, 255, 255, 0.05);
+    color: rgba(255, 255, 255, 0.8);
+    border: 1px solid var(--surface-border);
+    border-radius: 50%;
+    width: 40px;
+    height: 40px;
+    align-self: center;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+#interrupt-btn.hidden {
+    display: none;
+}
+#interrupt-btn:hover {
+    border-color: var(--error-color);
+    color: var(--error-color);
+}
+
 #send-btn.send-btn-cancel:hover {
     background: var(--error-color);
     color: #fff;
@@ -2873,3 +2915,13 @@ body.restoring .message { animation: none !important; }
         box-shadow: 0 0 14px rgba(194, 39, 69, 0.45);
     }
 }
+
+/* §4RZ r6a7: messages handed back, above the composer */
+#restore-tray { display: flex; flex-direction: column; gap: 4px; margin: 0 0 6px; max-height: 30vh; overflow-y: auto; }
+#restore-tray.hidden { display: none; }
+#restore-tray .restore-item { display: flex; align-items: center; gap: 8px; padding: 4px 8px;
+    border: 1px dashed currentColor; border-radius: 8px; opacity: 0.85; font-size: 0.9em; }
+#restore-tray .restore-text { flex: 1; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+#restore-tray button { background: none; border: 1px solid currentColor; border-radius: 6px;
+    color: inherit; padding: 2px 8px; cursor: pointer; font: inherit; }
+#restore-tray .restore-warn { font-size: 0.85em; opacity: 0.8; }

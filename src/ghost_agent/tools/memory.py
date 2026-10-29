@@ -235,6 +235,8 @@ def _names_an_entity(target: str) -> bool:
 def _current_request_text() -> str:
     try:
         from ..memory.lesson_scope import current_request
+        # §4RZ s4-r3: the request alone — this text also decides "the user
+        # DICTATED this lesson" (a keyword test a mid-turn note would open)
         return str(current_request.get() or "")
     except Exception:  # noqa: BLE001
         return ""
@@ -2134,6 +2136,7 @@ def _store_plan(plan: dict) -> str:
         plan.setdefault("conv", str(conversation_key_context.get() or ""))
     except Exception:  # noqa: BLE001
         plan.setdefault("conv", "")
+    plan.setdefault("mono", _t.monotonic())      # §4RZ s2-r4: compared with request starts
     with _PLANS_LOCK:
         now = _t.time()
         for k in [k for k, v in _FORGET_PLANS.items() if now - v["ts"] > _PLAN_TTL_S]:
@@ -2552,6 +2555,170 @@ def _not_the_user(rid: str) -> bool:
         return True
 
 
+#: §4RZ: a message from the OWNER that holds or refuses ("wait — keep
+#: project X", "stop"), sent while a turn of its conversation was running or
+#: waiting for the turn lock. conversation -> when it arrived: every owner
+#: request of that conversation that REGISTERED before it — the running one,
+#: one finishing, a "yes" queued behind it — can no longer confirm; a request
+#: sent after it is untouched. Time, not routing, decides (r5: routing to one
+#: turn missed the others). Only the owner can confirm (`_not_the_user`), so
+#: only owner holds and owner starts are kept. Monotonic clock. Bounded.
+_HOLDS: dict = {}
+_HOLDS_MAX = 64
+#: rid -> (conversation, registered at), noted when an OWNER turn registers
+_REQ_START: dict = {}
+_REQ_START_MAX = 256
+
+
+def note_queued_withdrawal(session_id: str, kind: str, text: str) -> bool:
+    """A message the user sent to conversation ``session_id`` while a turn
+    may be running or waiting, at the moment it is ACCEPTED (a confirm can run
+    before the model reads it): if it holds or refuses, it is noted with its
+    time. Returns whether it was."""
+    try:
+        import time as _t
+        from ..memory.profile import _fold
+        from ..core.queued_messages import is_stop_word
+        if not session_id or kind != "owner" or not (
+                _DENY_RE.search(_fold(str(text or ""))) or is_stop_word(text)):
+            return False                  # only the owner can confirm (`_not_the_user`);
+                                          # every stop word holds (r7: "σταμάτησε" did not)
+        with _PLANS_LOCK:
+            _key = str(session_id)
+            _HOLDS.pop(_key, None)        # a refreshed hold is the newest (r6: evicted first)
+            _HOLDS[_key] = _t.monotonic()
+            while len(_HOLDS) > _HOLDS_MAX:
+                _HOLDS.pop(next(iter(_HOLDS)))
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+#: §4RZ r7: messages a turn accepted but never read, handed back to the
+#: client to send as normal requests (leftovers, a stop's `undelivered`).
+#: (conversation, folded text) -> [when the inbox ACCEPTED it (monotonic),
+#: oldest first — one per hand-back of that text]. A request
+#: that re-sends one starts at that time, not at its own registration: a hold
+#: typed after the original still withdraws it. Backdating only ever removes
+#: authority; consumed by the first matching request. Bounded, 30 min.
+_HANDED_BACK: dict = {}
+_HANDED_BACK_MAX = 256
+_HANDED_BACK_TTL_S = 30 * 60
+
+
+def _handed_back_key(session_id: str, text) -> tuple:
+    # r8: folded (case/accents) and list content's text parts, as
+    # `_confirm_allowed` reads a yes ("Yes" re-sent as "yes" was not matched)
+    from ..memory.profile import _fold
+    if isinstance(text, list):
+        text = " ".join(str(p.get("text") or "") for p in text
+                        if isinstance(p, dict) and p.get("type") == "text")
+    return (str(session_id or ""), " ".join(_fold(str(text or "")).split()))
+
+
+def note_handed_back(session_id: str, kind: str, items) -> None:
+    """``items``: ``{"text", "ts"}`` dicts (``ts`` = wall-clock accept time,
+    as the inbox stamps it) handed back to an owner's client."""
+    try:
+        import time as _t
+        if kind != "owner" or not session_id:
+            return
+        now_m, now_w = _t.monotonic(), _t.time()
+        with _PLANS_LOCK:
+            for it in items or []:
+                try:                      # r8: one bad item never drops the rest
+                    key = _handed_back_key(session_id, it.get("text"))
+                    at = now_m - max(0.0, now_w - float(it.get("ts") or now_w))
+                except Exception:  # noqa: BLE001
+                    continue
+                # r8: a LIST per text, oldest first — "yes", "yes", "wait":
+                # each re-sent yes takes its own accept time (one entry per
+                # text let the second re-send confirm past the wait)
+                times = _HANDED_BACK.pop(key, [])
+                times.append(at)
+                _HANDED_BACK[key] = times
+            while sum(len(v) for v in _HANDED_BACK.values()) > _HANDED_BACK_MAX:
+                _oldest = next(iter(_HANDED_BACK))
+                _HANDED_BACK[_oldest].pop(0)
+                if not _HANDED_BACK[_oldest]:
+                    _HANDED_BACK.pop(_oldest)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def note_request_start(rid: str, session_id: str, kind: str, text=None) -> None:
+    """A turn registers (before it waits for the turn lock): a hold that
+    arrives after this moment withdraws its yes; one from before does not.
+    Only an owner turn of a real conversation is recorded — nothing else can
+    confirm or be held (r6: every sub-agent, member and Slack turn took a
+    slot and could evict a waiting yes's entry)."""
+    try:
+        import time as _t
+        with _PLANS_LOCK:
+            _REQ_START.pop(str(rid or ""), None)
+            if kind != "owner" or not session_id or str(session_id).startswith("slack:"):
+                return
+            start = _t.monotonic()
+            if isinstance(text, (str, list)):
+                # a handed-back message re-sent: it started when it was
+                # accepted (the oldest of that text's hand-backs is used up)
+                _key = _handed_back_key(session_id, text)
+                times = _HANDED_BACK.get(_key) or []
+                while times:
+                    at = times.pop(0)
+                    if start - at <= _HANDED_BACK_TTL_S:
+                        start = min(start, at)
+                        break
+                if not times:
+                    _HANDED_BACK.pop(_key, None)
+            _REQ_START[str(rid or "")] = (str(session_id), start)
+            while len(_REQ_START) > _REQ_START_MAX:
+                _REQ_START.pop(next(iter(_REQ_START)))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def note_request_end(rid: str) -> None:
+    """The turn is over: its entry goes (the bound is for live turns)."""
+    try:
+        with _PLANS_LOCK:
+            _REQ_START.pop(str(rid or ""), None)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _started_before_preview(rid: str, plan: dict) -> bool:
+    """§4RZ s2-r3: this request started (registered, or — re-sent from a
+    turn's hand-back — when the inbox first accepted it) BEFORE the preview
+    was stored: its yes cannot be about that preview (a mid-turn yes handed
+    back and re-sent confirmed a plan made after it was typed; a yes sent
+    while the preview's turn was still running, too). Owner requests only
+    (`_REQ_START`). Compared on the monotonic clock: the plan's `mono`
+    stamp (s2-r4) against the start; a plan without one falls back to its
+    wall-clock `ts` mapped onto the monotonic start."""
+    import time as _t
+    with _PLANS_LOCK:
+        start = _REQ_START.get(str(rid or ""))
+    if not start:
+        return False
+    try:
+        if plan.get("mono") is not None:         # s2-r4: one clock (a wall-clock step skewed it)
+            return float(plan["mono"]) > start[1]
+        made = float(plan.get("ts"))
+    except (TypeError, ValueError):
+        return False
+    return made > _t.time() - (_t.monotonic() - start[1])
+
+
+def _held_since_start(rid: str) -> bool:
+    with _PLANS_LOCK:
+        start = _REQ_START.get(str(rid or ""))
+        if not start:
+            return False
+        held = _HOLDS.get(start[0])
+    return held is not None and held >= start[1]
+
+
 def _confirm_allowed(plan: dict, selection=None):
     """The confirmation must come from the USER, in a LATER turn than the
     preview, and the preview must have been shown to the user: the model
@@ -2568,6 +2735,12 @@ def _confirm_allowed(plan: dict, selection=None):
         from ..core.receipt_marks import NOT_ANSWERED_YET as _NAY  # §4QO: one home for the literal
         return (_NAY + " — show them the list and wait for their reply; confirm in the "
                 "turn where they say yes")
+    if rid and _started_before_preview(rid, plan):
+        return ("the user sent this yes before that preview was shown to them — show them the "
+                "preview again and ask")
+    if rid and _held_since_start(rid):
+        return ("after the user first sent this message they sent one that holds or refuses (or "
+                "pressed Stop) — this yes no longer counts; show them the preview again and ask")
     if _not_the_user(rid):
         return "only the user can confirm a deletion, in their own turn"
     # …and the USER must have said yes (§4MB): a later owner turn whose
@@ -3832,7 +4005,7 @@ async def tool_learn_skill(task: str = None, mistake: str = None, solution: str 
     _src = untrusted_seen()
     if _src:
         from ..memory.skills import user_dictates_lesson
-        if not user_dictates_lesson(user_message()):
+        if not user_dictates_lesson(user_message()):      # §4RZ s4-r3: the request alone (a keyword gate)
             return ToolOutcome.rejected(content_refusal("the lesson", _src),
                                         world_changed=False, reason_code="untrusted_content")
 

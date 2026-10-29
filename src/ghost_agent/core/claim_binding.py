@@ -3113,14 +3113,21 @@ def class_checks(reply: str, evidence: str, context: str = "") -> List[ClassFind
                                 "machine noise in the reply: " + ", ".join(repr(m) for m in marks[:3])))
     try:
         from .turn_state_check import refute_turn_state
-        for rule, msg in refute_turn_state(request=ask, reply=str(reply or "")):
+        # §4RZ step 2 (s2-r5 m1): `ask` carries the user's mid-turn
+        # messages merged in, so the request rules stand down as on the
+        # turn-loop tier
+        from .queued_messages import delivered as _queued_delivered
+        for rule, msg in refute_turn_state(request=ask, reply=str(reply or ""),
+                                           request_rules=not _queued_delivered()):
             if rule != "empty_evidence":                 # tools_run is not visible here; see `evidence_all_failed`
                 out.append(ClassFinding("constraint", "refute", f"{rule}: {msg}"))
     except Exception:  # noqa: BLE001
         pass
     if evidence_all_failed(evidence):
         out.append(ClassFinding("evidence", "withhold", "every evidence block is a tool failure"))
-    off = reply_off_topic(reply, ask)
+    # §4RZ s2-r6: the topic is the user's words — not `current_ask`'s frame
+    from .queued_messages import without_frame as _without_frame
+    off = reply_off_topic(reply, _without_frame(ask))
     if off:
         out.append(ClassFinding("topic", "withhold", off))
     return out

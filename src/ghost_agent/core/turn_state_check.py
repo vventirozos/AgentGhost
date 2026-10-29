@@ -686,6 +686,14 @@ def _check_empty_evidence(body: str, rows: List[Dict[str, Any]]) -> Optional[str
             continue
         content = str(r.get("content") or "")
         if name == "browser":
+            try:  # §4RZ step 5: a stopped page load read nothing
+                from ..utils.tool_stop import is_user_interrupted
+                if is_user_interrupted(content):
+                    consulted += 1
+                    empties.append("browser: stopped by the user")
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
             args = r.get("arguments") if isinstance(r.get("arguments"), dict) else {}
             op = str(args.get("operation") or "").lower()
             if op in _BROWSER_ACTION_OPS:
@@ -757,9 +765,15 @@ def _check_reply_language(request: str, body: str) -> Optional[str]:
 
 
 def refute_turn_state(*, request: str, reply: str,
-                      tools_run: Optional[Iterable[Dict[str, Any]]] = None
+                      tools_run: Optional[Iterable[Dict[str, Any]]] = None,
+                      request_rules: bool = True,
                       ) -> List[Tuple[str, str]]:
     """``[(rule, issue), …]`` for every state contradiction in this turn.
+
+    ``request_rules=False`` (§4RZ step 2, s2-r5): the request's mechanical
+    constraints and the reply-language rule are not run — the user sent
+    messages mid-turn, so what the request constrains is no longer known.
+    The checks that do not read the request (empty evidence) still run.
 
     ⚠ AN EMPTY LIST MEANS "NOTHING TO SAY", NEVER "THE REPLY IS FINE".
     Every caller must treat it as no-verdict.
@@ -779,7 +793,7 @@ def refute_turn_state(*, request: str, reply: str,
         if not body:
             return []
         issues: List[Tuple[str, str]] = []
-        cons = mechanical_constraints(request)
+        cons = mechanical_constraints(request) if request_rules else []
         if cons and not _honest_inability(body):
             for c in cons:
                 msg = None
@@ -802,7 +816,7 @@ def refute_turn_state(*, request: str, reply: str,
         msg = _check_empty_evidence(body, _tool_rows(tools_run))
         if msg:
             issues.append(("empty_evidence", msg))
-        msg = _check_reply_language(request, body)
+        msg = _check_reply_language(request, body) if request_rules else None
         if msg:
             issues.append(("reply_language", msg))
         return issues

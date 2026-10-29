@@ -69,6 +69,18 @@ class ActiveTurn:
     task: Optional[asyncio.Task] = None
     _cancel: bool = False
     reason: str = ""
+    # Queued messages (core/queued_messages.py, 2026-10-28). `kind` is WHO
+    # the turn serves (owner / probe / member…) — an inbox post must match.
+    kind: str = ""
+    inbox: List[dict] = field(default_factory=list)
+    accepting: bool = True         # False once the loop has exited
+    # progress, for the system's answer to a status question
+    step: int = 0
+    tools_now: List[str] = field(default_factory=list)
+    tools_since: float = 0.0
+    tools_done: int = 0
+    # §4RZ step 5: the running batch's ToolStop (utils/tool_stop.py), or None
+    tool_stop: Optional[object] = None
 
     @property
     def age_s(self) -> float:
@@ -87,6 +99,9 @@ class ActiveTurn:
             "cancelled": self._cancel,
             "preview": self.preview,
             "session_id": self.session_id,
+            "step": self.step,
+            "tools_now": list(self.tools_now),
+            "queued_pending": len(self.inbox),
         }
 
 
@@ -96,14 +111,18 @@ class TurnRegistry:
     def __init__(self):
         self._turns: Dict[str, ActiveTurn] = {}
         self._lock = threading.Lock()
+        # session_id -> [(ts, text)]: queued messages a turn accepted but
+        # ended before reading; the client takes them and sends them normally
+        self._leftovers: Dict[str, List[dict]] = {}
 
     def register(self, req_id: str, *, preview: str = "",
-                 session_id: str = "") -> ActiveTurn:
+                 session_id: str = "", kind: str = "") -> ActiveTurn:
         base = str(req_id)
         turn = ActiveTurn(
             req_id=base,
             preview=" ".join(str(preview or "").split())[:120],
             session_id=str(session_id or ""),
+            kind=str(kind or ""),
         )
         try:
             turn.task = asyncio.current_task()
@@ -137,6 +156,7 @@ class TurnRegistry:
             if turn is not None and cur is not turn:
                 return
             self._turns.pop(str(req_id), None)
+            self._close_locked(cur)
 
     def mark_running(self, req_id: str) -> None:
         """Called once the turn has actually ACQUIRED the semaphore — before
@@ -183,6 +203,11 @@ class TurnRegistry:
                               else "no turn is currently running")}
         turn._cancel = True
         turn.reason = reason
+        with self._lock:                       # a stopped turn reads no more messages
+            turn.accepting = False
+            undelivered_items = [dict(m) for m in turn.inbox]
+            undelivered = [m["text"] for m in undelivered_items]
+            turn.inbox.clear()
         # A queued turn has no partial work and no boundary to reach —
         # killing it is strictly better than letting it start.
         do_hard = bool(hard) or not turn.running
@@ -194,7 +219,106 @@ class TurnRegistry:
             "mode": "hard" if do_hard else "cooperative",
             "was_running": turn.running,
             "age_s": round(turn.age_s, 1),
+            "undelivered": undelivered,
+            "undelivered_items": undelivered_items,      # with accept times (routes pop it)
         }
+
+    def interrupt_tools(self, req_id: str) -> List[str]:
+        """§4RZ step 5: stop the tool call(s) this running turn is waiting
+        on; the turn carries on. Returns the tools running when the stop was
+        sent ([] when none is running, or a stop was already sent for this
+        batch)."""
+        turn = self.get(req_id)
+        if turn is None or not turn.running or turn.cancelled:
+            return []
+        stop = turn.tool_stop
+        names = stop.running_tools() if stop is not None else []
+        if not names or not stop.request():
+            return []                    # nothing running: a finished call is never "stopped"
+        return names
+
+    # ---- queued messages (core/queued_messages.py) -------------------
+
+    def post(self, req_id: str, text: str) -> bool:
+        """Put a routed message in the turn's inbox. False when the turn is
+        gone, no longer accepting, or full — the caller sends it normally."""
+        from .queued_messages import MAX_PENDING, MAX_TEXT
+        with self._lock:
+            turn = self._turns.get(str(req_id))
+            if (turn is None or not turn.accepting or turn._cancel or len(turn.inbox) >= MAX_PENDING
+                    or len(str(text)) > MAX_TEXT):          # never cut: the router queues long text
+                return False
+            turn.inbox.append({"text": str(text), "ts": time.time()})
+            return True
+
+    def drain(self, req_id: str) -> List[dict]:
+        """The turn's pending messages, oldest first; the inbox is emptied."""
+        with self._lock:
+            turn = self._turns.get(str(req_id))
+            if turn is None or not turn.inbox:
+                return []
+            out = list(turn.inbox)
+            turn.inbox.clear()
+            return out
+
+    def close_inbox(self, req_id: str, turn: Optional["ActiveTurn"] = None) -> None:
+        """The loop has exited: no message can be read any more. Messages
+        still pending become the conversation's leftovers."""
+        with self._lock:
+            cur = turn if turn is not None else self._turns.get(str(req_id))
+            self._close_locked(cur)
+
+    def _close_locked(self, turn: Optional["ActiveTurn"]) -> None:
+        if turn is None:
+            return
+        turn.accepting = False
+        if turn.inbox and turn.session_id and not turn._cancel:
+            from .queued_messages import MAX_PENDING, LEFTOVER_MAX_SESSIONS
+            self._prune_leftovers_locked()
+            kept = self._leftovers.pop(turn.session_id, [])     # re-inserted: newest last
+            kept.extend(dict(m, kind=turn.kind) for m in turn.inbox)
+            self._leftovers[turn.session_id] = kept[-MAX_PENDING:]
+            while len(self._leftovers) > LEFTOVER_MAX_SESSIONS:
+                self._leftovers.pop(next(iter(self._leftovers)))
+        turn.inbox.clear()
+
+    def _prune_leftovers_locked(self) -> None:
+        from .queued_messages import LEFTOVER_TTL_S
+        cutoff = time.time() - LEFTOVER_TTL_S
+        for sid in list(self._leftovers):
+            fresh = [m for m in self._leftovers[sid] if m.get("ts", 0) >= cutoff]
+            if fresh:
+                self._leftovers[sid] = fresh
+            else:
+                self._leftovers.pop(sid)
+
+    def take_leftovers(self, session_id: str, *, kind: str) -> List[str]:
+        """The conversation's leftovers that THIS kind of sender posted;
+        others stay."""
+        return [m["text"] for m in self.take_leftover_items(session_id, kind=kind)]
+
+    def take_leftover_items(self, session_id: str, *, kind: str) -> List[dict]:
+        """As take_leftovers, with each message's accept time (``ts``)."""
+        with self._lock:
+            self._prune_leftovers_locked()
+            mine, rest = [], []
+            for m in self._leftovers.pop(str(session_id or ""), []):
+                (mine if m.get("kind") == kind else rest).append(m)
+            if rest:
+                self._leftovers[str(session_id)] = rest
+            return [dict(m) for m in mine]
+
+    def find_running(self, session_id: str, kind: str) -> Optional[ActiveTurn]:
+        """The running turn of this conversation for this kind of sender — by
+        session, never by `current()`. It may no longer accept messages (its
+        streamed final is draining): a stop word or a status question still
+        reaches it, and the router refuses an inject."""
+        if not session_id:
+            return None
+        with self._lock:
+            hits = [t for t in self._turns.values()
+                    if t.running and t.session_id == str(session_id) and t.kind == kind]
+        return max(hits, key=lambda t: t.started_at) if hits else None
 
 
 def get_turn_registry(agent) -> TurnRegistry:

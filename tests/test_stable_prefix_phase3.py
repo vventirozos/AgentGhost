@@ -207,7 +207,9 @@ class TestSourceInvariants:
 
     def test_bon_candidates_built_on_a_copy(self):
         src = inspect.getsource(GhostAgent._adaptive_bon_final)
-        assert '"messages": list(messages) + [{' in src
+        # §4RZ r6: still a copy (fresh dicts), now without the loop's own
+        # `_`-keys — tests/test_queued_messages.py pins the stripping
+        assert '"messages": [{k: v for k, v in m.items() if not str(k).startswith("_")}' in src
 
     def test_probe_lives_in_verifier_not_agent(self):
         src = inspect.getsource(GhostAgent.handle_chat) + inspect.getsource(GhostAgent._run_internal_turn)

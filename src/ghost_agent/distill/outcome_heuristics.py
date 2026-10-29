@@ -319,6 +319,12 @@ def is_unresolved_tool_result(result) -> bool:
     if _st is not None and str(getattr(_st, "value", _st)) == "unresolved":
         return True
     _t = str(result or "")
+    try:                     # §4RZ step 5: a stored stopped call (its status did not survive)
+        from ..utils.tool_stop import is_user_interrupted
+        if is_user_interrupted(_t):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
     # swarm's still-running branch, by TEXT: the offline seeder reads rows
     # from JSONL, where `ToolCall.result` is a plain `str` and no status
     # survives — so a status-only rule is dead on the data it exists for.

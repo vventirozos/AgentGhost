@@ -222,6 +222,11 @@ def replayable(traj) -> tuple:
         return False, "a follow-up: its conversation cannot be rebuilt"
     if _ACTION_VERB_RE.search(req):
         return False, "the request asks for an action"
+    from .queued_messages import changed_mid_turn
+    if changed_mid_turn(traj):
+        # §4RZ s4-r5: the owner changed the ask mid-turn — `user_request` alone
+        # is not what the turn answered.
+        return False, "the request changed mid-turn"
     for tc in getattr(traj, "tool_calls", None) or []:
         name = str(getattr(tc, "name", "") or "")
         if name not in READ_ONLY_TOOLS:

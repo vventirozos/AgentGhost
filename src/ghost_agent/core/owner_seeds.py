@@ -180,6 +180,7 @@ async def judge_reactions(collector, home_system, llm_client, model: str, *,
     §4PM ``no_tool=True``: the NO-TOOL turns instead, into their own cache
     (the failure census reads it; the replay seeds never do)."""
     from ..distill.reaction_judge import enabled, judge_prompt, parse_verdict
+    from .queued_messages import changed_mid_turn
     if not enabled() or collector is None or llm_client is None or home_system is None:
         return 0
     from ..memory.skills import iter_teachable
@@ -194,6 +195,8 @@ async def judge_reactions(collector, home_system, llm_client, model: str, *,
         if made >= cap:
             break
         if not tid or tid in cache or tid in used or bool(getattr(t, "tool_calls", None)) == no_tool:
+            continue
+        if changed_mid_turn(t):                         # §4RZ s4-r8: its request is not its ask
             continue
         try:
             r = await llm_client.chat_completion({

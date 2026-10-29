@@ -41,8 +41,16 @@ async def _exec_holding_lock(fn, *args, **kwargs):
     A hard cancel freed `_BROWSER_PROFILE_LOCK` at once while Chromium ran
     on in the container for up to the exec timeout, and the next call
     launched a second Chromium on the same profile — the crash this lock
-    exists to prevent (§4LN). Call it INSIDE `async with` the lock."""
-    fut = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
+    exists to prevent (§4LN). Call it INSIDE `async with` the lock.
+    §4RZ step 5: while it runs, an owner tool stop kills THIS runner — the
+    lock is held, so the only runner in the container is ours."""
+    box: dict = {}
+    _unregister = _register_runner_kill(fn, box)
+    from ..utils import tool_stop as _ts
+    if _ts.requested():                          # §4RZ step 5: never start a runner after a stop
+        _unregister()
+        raise asyncio.CancelledError()
+    fut = box["fut"] = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
     try:
         return await asyncio.shield(fut)
     except asyncio.CancelledError:
@@ -54,6 +62,56 @@ async def _exec_holding_lock(fn, *args, **kwargs):
             except BaseException:  # noqa: BLE001 — the cancel is what we re-raise
                 break
         raise
+    finally:
+        _unregister()
+
+
+#: the runner's exact argv head (`runner_cmd`), so nothing else matches (s5-r8:
+#: a substring grep also TERMed `pytest tests/test_browser_runner.py`, and its
+#: "k" booked a runner that had not started yet as stopped)
+_RUNNER_ARGV_HEAD = "python3 -u .browser_runner.py "
+_RUNNER_KILL_CMD = ("sh -c 'for p in /proc/[0-9]*; do a=$(tr \"\\000\" \" \" < $p/cmdline 2>/dev/null); "
+                    "case \"$a\" in \"" + _RUNNER_ARGV_HEAD + "\"*) kill -TERM ${p#/proc/} && echo k;; esac; "
+                    "done; true'")
+
+
+def _register_runner_kill(fn, box: dict):
+    """The kill for an owner tool stop, when one is bound and ``fn`` is a
+    sandbox manager's bound `execute`; armed until the call is over.
+    Returns its removal. ``box["fut"]``: the runner's thread, once started —
+    a runner just launched may not exist yet, so the kill retries until it
+    hits one or the runner returns."""
+    try:
+        from ..utils import tool_stop
+        stop = tool_stop.current()
+        mgr = getattr(fn, "__self__", None)
+        if stop is None or stop.requested() or mgr is None or not hasattr(mgr, "execute"):
+            return lambda: None         # stopped already: the caller never starts a runner
+    except Exception:  # noqa: BLE001
+        return lambda: None
+
+    def _kill():
+        import time as _time
+        for _ in range(_KILL_TRIES):
+            fut = box.get("fut")
+            if fut is not None and fut.done():
+                return
+            out, _code = mgr.execute(_RUNNER_KILL_CMD, timeout=15, quiet=True)
+            if "k" in str(out or "").split():
+                stop.note_killed(key)
+                return
+            _time.sleep(_KILL_RETRY_S)
+    key = tool_stop.call_key()
+    stop.arm(key)
+    remove = stop.on_stop(_kill)
+
+    def _unregister():
+        remove()
+        stop.disarm(key)
+    return _unregister
+
+
+_KILL_TRIES, _KILL_RETRY_S = 5, 1.0
 
 # Keep outputs reasonable — a single page's HTML can be 5+ MB and would
 # blow the LLM context window, so we cap before returning. These caps

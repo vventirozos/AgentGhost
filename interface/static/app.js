@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=16.8';
+import * as matrixGraphFace from './matrix_graph.js?v=17.0';
 import { initEffortSelector, effortForPayload } from './effort.js?v=1.2';   // §4RB
 import { createTokenCounter } from './tokens.js?v=1.3';   // token counter under the buttons
 import { turnCaption } from './turn_caption.js?v=1.0';   // what the status line under the reply shows
@@ -20,6 +20,8 @@ let activeFace = matrixGraphFace;
 const chatLog = document.getElementById('chat-log');
 const chatInput = document.getElementById('chat-input');
 const sendBtn = document.getElementById('send-btn');
+const interruptBtn = document.getElementById('interrupt-btn');   // §4RZ: stop the running tool only
+const restoreTray = document.getElementById('restore-tray');      // §4RZ r6a7: texts handed back
 const effortSelect = initEffortSelector(document, window);   // §4RB: hidden unless the agent says it is on
 const fullscreenBtn = document.getElementById('fullscreen-btn');
 const statusText = document.getElementById('status-text');
@@ -130,6 +132,8 @@ function persistSessionId(id) {
     } catch (e) { /* private mode */ }
     if (id) safeStorage.set(SESSION_ID_KEY, id);
     else safeStorage.remove(SESSION_ID_KEY);
+    // §4RZ r6a6: texts handed back for this session wait for it to be on screen
+    if (typeof _onSessionShown === 'function') setTimeout(_onSessionShown, 0);
 }
 // Local history is keyed by the session it belongs to; the bare legacy
 // key is read once (migration) and then removed.
@@ -208,6 +212,7 @@ const ICON_CLASS = {
     '🐚': 'tool',     // TOOL_SHELL
     '🧰': 'tool',     // TOOL_DISPATCH
     '📥': 'tool',     // TOOL_DOWN / Docker pull
+    '📨': 'accent',   // QUEUED_MSG — a message the user sent while the turn runs (§4RZ)
     '🎨': 'tool',     // IMAGE_GEN
     '📄': 'tool',     // REPORT_PDF
     '🎮': 'tool',     // GAME_MOVE
@@ -367,6 +372,21 @@ let currentTTSMutedLength = 0;
 // the in-flight handle carries it, so a reattach after the phone suspended the
 // page (or iOS reloaded it) keeps counting instead of restarting at 0:00.
 let currentTurnStartedAt = 0;
+// §4RZ step 6a — messages sent while a turn runs (see `_sendWhileBusy`).
+let _queuedInjects = [];        // [{text, div, seq, gen, sid, epoch}] accepted by a turn's inbox
+let _sendAfterTurn = [];        // [{text, div, seq, gen, sid, epoch}] sent normally once that turn ends
+let _queuedSeq = 0;
+let _inboxStopUndelivered = null;   // the inbox's stop word cancelled the turn: what it never read
+let _queuedFeatureOn = null;        // null until the agent answers; the tool button shows only on true
+let _turnGen = 0;                   // this page's turn generation
+const _turnInfo = new Map();        // gen -> {sid, epoch, startedAt, typed, ended, settled, outcome}
+let _convEpoch = 0;                 // moves on /clear (a new conversation with no session id)
+let _settleChain = Promise.resolve();   // settles run one at a time (leftovers are per SESSION)
+let _settlesPending = 0;            // no held message is sent while a settle is pending
+let _restoreUnsaved = null;         // [items] whose own localStorage key could not be written (sessionStorage; lazy)
+let _restoreSeq = 0;
+const _trayNoted = new Set();       // tray batches whose reason this page has said (once a session is bound)
+let _leftoversOwed = null;          // {sid: markedAt ms} a lost/failed turn still owes (localStorage; loaded lazily)
 
 const SEND_SVG = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>`;
 const CANCEL_SVG = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="9" y1="9" x2="15" y2="15"></line><line x1="15" y1="9" x2="9" y2="15"></line></svg>`;
@@ -392,12 +412,22 @@ function toggleSendButtonUI(isProcessing, stoppable = true) {
             // wrong. The markup's aria-label is the idle value.
             sendBtn.setAttribute('aria-label',
                 stoppable ? 'Stop the current turn' : 'Working — please wait');
+            // §4RZ: Enter sends to the running turn while a chat turn streams
+            if (stoppable && typeof chatInput !== 'undefined' && chatInput) {
+                chatInput.placeholder = 'Message the running turn';
+            }
         } else {
+            if (typeof chatInput !== 'undefined' && chatInput) chatInput.placeholder = 'Enter message';
             sendBtn.innerHTML = SEND_SVG;
             sendBtn.classList.remove('send-btn-cancel');
             sendBtn.disabled = false;
             sendBtn.setAttribute('aria-label', 'Send message');
         }
+    }
+    // §4RZ: the tool interrupt shows while a chat turn runs (not for an
+    // upload holding the flag), once the agent has answered as ON
+    if (typeof interruptBtn !== 'undefined' && interruptBtn) {
+        interruptBtn.classList.toggle('hidden', !(isProcessing && stoppable) || _queuedFeatureOn !== true);
     }
 }
 
@@ -1481,6 +1511,10 @@ function _truncateToUserTurn(idx, send) {
     }
     chatHistory = chatHistory.slice(0, at);
     saveChatState();
+    // §4RZ r6a8: a draft (say, text inserted from the tray) is not overwritten unseen
+    if (typeof _restoreToComposer === 'function' && String(chatInput.value).trim()) {
+        _restoreToComposer([chatInput.value], 'Your draft before Retry/Edit.');
+    }
     chatInput.value = text;
     chatInput.style.height = '';
     chatInput.dispatchEvent(new Event('input'));
@@ -1616,6 +1650,7 @@ function decorateMessageActions() {
     if (!chatLog) return;
     chatLog.querySelectorAll('.message.agent, .message.user').forEach(div => {
         if (div.classList.contains('thinking') || div.classList.contains('streaming')) return;
+        if (div.classList.contains('queued')) return;   // §4RZ: no history entry yet
         _ensureFeedbackRow(div);
         if (div.querySelector(':scope > .msg-actions')) return;
         const row = document.createElement('div');
@@ -2554,6 +2589,12 @@ async function reconcileFromSession(sid, handle) {
             currentAgentMessageDiv = null;
         }
         clearInflightHandle(handle);
+        // §4RZ r6a2: the recovery ended this page's lost turn (guarded: the
+        // recovery is also run on its own, extracted, by older suites)
+        if (typeof _settleLostTurns === 'function') {
+            _settleLostTurns();
+            _queueOwedLeftovers(true);    // the turn is over: close_inbox has run
+        }
         // r5: the turn is settled — a stale id let the network resume run
         // afterwards, 404 and post "could not be recovered" under "Recovered…"
         if (handle && handle.taskId && handle.taskId === currentTaskId) currentTaskId = null;
@@ -2640,6 +2681,11 @@ async function resumeOrReconcileInflightTurn() {
 // CLEAR the inline height so the `rows="1"` attribute regains control
 // — `height: auto` on an already-styled textarea computes from content
 // and doesn't reliably snap back to the one-row default.
+// §4RZ r6a7: the hand-back tray is shown at load and refreshed when another tab changes it
+setTimeout(_onSessionShown, 0);
+window.addEventListener('storage', (e) => {
+    if (e.key === null || e.key === _RESTORE_KEY || String(e.key).startsWith(_RESTORE_ITEM_PREFIX)) { try { _renderTray(); } catch (x) { /* storage */ } }
+});
 // Pre-turn posture (2026-09-11): the body leans toward the composer
 // while there is something typed in it.
 chatInput.addEventListener('blur', () => {
@@ -2959,7 +3005,16 @@ async function _resolveOwnTurnId(sentText) {
     return null;
 }
 
+// §4RZ: the agent's last answer is kept on the function (`lastAnswer`) for
+// its `undelivered` — the messages the turn never read.
+function _lastCancelUndelivered() {
+    const d = _cancelAgentTurn.lastAnswer;
+    _cancelAgentTurn.lastAnswer = null;
+    return (d && Array.isArray(d.undelivered)) ? d.undelivered : [];
+}
+
 async function _cancelAgentTurn(reqId, sentText, hard) {
+    _cancelAgentTurn.lastAnswer = null;
     const target = reqId || await _resolveOwnTurnId(sentText);
     if (!target) {
         // No bare-body fallback: cancelling "whatever is running" can hit an
@@ -2976,8 +3031,11 @@ async function _cancelAgentTurn(reqId, sentText, hard) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
+        // bounded (§4RZ r6a3): an unanswered cancel stalled the queued-message settle
+        signal: AbortSignal.timeout(15000),
     }).then(async (res) => {
         const data = await res.json().catch(() => ({}));
+        _cancelAgentTurn.lastAnswer = data;
         if (res.ok && data.cancelled) return true;
         // 404 = nothing to cancel, which is the benign case (the turn had
         // already finished). Anything else means the agent IS still working:
@@ -2997,9 +3055,679 @@ async function _cancelAgentTurn(reqId, sentText, hard) {
     });
 }
 
-async function sendMessage(isResume = false) {
-    const resuming = isResume === true;
+// ── Messages sent while a turn runs (§4RZ step 6a) ─────────────────────
+// Enter while this tab's chat turn streams posts the text to
+// /api/turn/inbox instead of /api/chat. The agent answers the path:
+//   inject — the turn reads it at its next step: a dim "queued" bubble;
+//   status — the system's progress answer, shown as a note, not a reply;
+//   cancel — a bare stop word stopped the turn: handled like Stop;
+//   queue  — the text never reached the agent: held, and sent after the
+//            turn only when it ended with a reply (a tab with no session id
+//            holds its text the same way).
+// The page does NOT attribute (review r6a4): it never decides which queued
+// messages the turn read. After a turn that had any, it adopts the agent's
+// session copy — the chat route stores exactly what was read, [u1, q1,
+// reply] — and the queued bubbles go. What the agent accepted but no turn
+// read (leftovers, a Stop's `undelivered`) is fetched only once the turn is
+// over and always goes back into the composer: never sent, never history.
+// Everything is keyed by the TURN it was sent into (`gen`): an inbox answer
+// can land after that turn ended, and a slow Stop can settle after the
+// next turn started.
+// (state: `_queuedInjects` … `_leftoversOwed`, declared with the turn state above)
+const INBOX_TIMEOUT_MS = 35000;     // the interface's own proxy gives up at 30 s
+// A Stop's cancel answer (`undelivered`) is waited for this long; then the
+// turn settles as 'unknown' (r6a3: a cancel that never answered stalled
+// every later settle).
+const STOP_SETTLE_TIMEOUT_MS = 20000;
+
+function _queuedSid() {
+    return window.__ghostSessionId || storedSessionId();
+}
+
+// Known on/off. The tool button shows only once the agent has answered as
+// ON (an inbox answer without the "off" reason, an interrupt answer), and
+// hides again when it says off — no reload needed either way.
+function _setQueuedFeature(on) {
+    _queuedFeatureOn = !!on;
+    if (typeof interruptBtn !== 'undefined' && interruptBtn) {
+        interruptBtn.classList.toggle('hidden',
+            !(_queuedFeatureOn && isProcessingRequest && currentChatController));
+    }
+}
+
+// A reply that is (or ends with) the agent's cancel note is not a clean end
+// (agent.py / routes.py: "_(Turn cancelled: <reason>.)_").
+const _CANCEL_NOTE_RE = /_\(Turn cancelled: [^\n]*\.\)_(?: No output was produced before the cancellation\.)?\s*$/;
+function _isCleanReply(text) {
+    return typeof text === 'string' && !!text.trim() && !_CANCEL_NOTE_RE.test(text);
+}
+
+function _isOffReason(reason) {
+    return /queued messages are off/i.test(String(reason || ''));
+}
+
+// A new turn (or a resume this page holds no live record of) gets a
+// generation. Leftovers still owed from an earlier turn are taken now: the
+// new turn has accepted nothing yet, so none of them can be its own.
+function _beginQueuedTurn() {
+    _settleLostTurns(true);    // r6a2: an older turn this page lost never blocks the new one
+    _queueOwedLeftovers(false);
+    _turnGen += 1;
+    _turnInfo.set(_turnGen, { sid: _queuedSid(), epoch: _convEpoch, startedAt: Date.now(),
+                              typed: [], ended: false, settled: false, outcome: null });
+    for (const g of Array.from(_turnInfo.keys())) {
+        if (g < _turnGen - 8) _turnInfo.delete(g);
+    }
+    return _turnGen;
+}
+
+// Every turn that never ended on this page (its stream was lost and a
+// recovery took over, or nothing did) settles as 'unknown' — except the one
+// streaming right now. A new turn starting does not settle them (a
+// recovery may still own the log, r6a5): their leftovers are owed, and
+// what was typed during them goes to the hand-back tray (never lost; a
+// duplicate there is acceptable, an auto-send is not).
+function _settleLostTurns(newTurn = false) {
+    for (const [g, info] of Array.from(_turnInfo.entries())) {
+        if (info.ended) continue;
+        if (!newTurn && g === _turnGen && isProcessingRequest) continue;
+        if (!newTurn) { _settleQueuedTurn(g, null, 'unknown'); continue; }
+        Object.assign(info, { ended: true, settled: true, outcome: 'unknown' });
+        if (info.sid && info.typed.length) _markOwed(info.sid);
+        const held = _sendAfterTurn.filter(it => it.gen === g);
+        _sendAfterTurn = _sendAfterTurn.filter(it => it.gen !== g);
+        for (const it of [..._queuedInjects.filter(q => q.gen === g), ...held]) if (it.div) it.div.remove();
+        _queuedInjects = _queuedInjects.filter(q => q.gen !== g);
+        const back = [...info.typed, ...held.map(it => it.text)];
+        _restoreToComposer(back, 'An earlier turn was lost; the agent may or may not have read these.', info.sid);
+    }
+}
+
+function _setQueuedLabel(div, label) {
+    let tag = div.querySelector(':scope > .queued-label');
+    if (!tag) {
+        tag = document.createElement('span');
+        tag.className = 'queued-label';
+        div.appendChild(tag);
+    }
+    tag.textContent = label;
+}
+
+// A user bubble for a message sent mid-turn, above the reply being streamed.
+function _queuedBubble(text, label) {
+    dismissEmptyStateHero();
+    const div = document.createElement('div');
+    div.className = 'message user queued';
+    div.dataset.ts = String(Date.now());
+    div.innerHTML = renderMarkdown(text);
+    _setQueuedLabel(div, label);
+    if (currentAgentMessageDiv && currentAgentMessageDiv.parentNode === chatLog) {
+        chatLog.insertBefore(div, currentAgentMessageDiv);
+    } else {
+        chatLog.appendChild(div);
+    }
+    scrollToBottomIfPinned();
+    return div;
+}
+
+// Hand texts back (r6a7): never into the composer by itself. They go into
+// a tray above the composer, per session, kept in localStorage for
+// RESTORE_TTL_MS; the tray shows the on-screen session's items only, each
+// with Insert (into the composer at the caret: the owner's own action) and
+// Dismiss. No dedup and no implicit pruning: a duplicate is acceptable, a
+// loss is not. Every write re-reads storage first, so tabs never overwrite
+// each other's items.
+const RESTORE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+// r6a10: ONE localStorage key per item. An add writes only its own key and
+// a removal removes only its own key, so no write ever rewrites another
+// tab's item (Chrome serves each renderer a cached copy of localStorage).
+const _RESTORE_ITEM_PREFIX = 'ghost.queued.restore.item.';
+const _RESTORE_KEY = 'ghost.queued.restore';                       // the pre-r6a10 single map (migrated)
+const _RESTORE_UNSAVED_KEY = 'ghost.queued.restore.unsaved';       // sessionStorage
+const _RESTORE_CONFIRMED_KEY = 'ghost.queued.restore.confirmed';   // ids localStorage has held (last 500)
+function _restoreId() {
+    try { if (crypto && typeof crypto.randomUUID === 'function') return crypto.randomUUID(); } catch (e) { /* old browser */ }
+    return `${Date.now()}-${Math.random().toString(36).slice(2)}-${++_restoreSeq}`;
+}
+function _restoreValid(it) {
+    return !!it && typeof it.text === 'string' && typeof it.id === 'string'
+        && typeof it.at === 'number' && Date.now() - it.at < RESTORE_TTL_MS;
+}
+function _confirmedIds() {
+    try { const v = JSON.parse(localStorage.getItem(_RESTORE_CONFIRMED_KEY) || '[]'); return Array.isArray(v) ? v : []; }
+    catch (e) { return []; }
+}
+// A duplicated tab copies sessionStorage: a copied unsaved item that
+// localStorage has held since (and may have lost to an Insert/Dismiss) is
+// dropped. Losing an entry to a racing write costs at most one duplicate.
+function _confirm(id) {
+    try {
+        const conf = [..._confirmedIds().filter(x => x !== id), id].slice(-500);
+        localStorage.setItem(_RESTORE_CONFIRMED_KEY, JSON.stringify(conf));
+    } catch (e) { /* a duplicated tab may show one item twice */ }
+}
+function _storedItems() {
+    const out = [];
+    try {
+        const keys = [];
+        for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i);
+            if (k && k.startsWith(_RESTORE_ITEM_PREFIX)) keys.push(k);
+        }
+        for (const k of keys) {
+            let it = null;
+            try { it = JSON.parse(localStorage.getItem(k)); } catch (e) { /* unreadable */ }
+            if (_restoreValid(it)) out.push(it);
+            else localStorage.removeItem(k);                     // expired or broken
+        }
+    } catch (e) { /* no storage */ }
+    return out.sort((x, y) => x.at - y.at);
+}
+function _unsavedList() {
+    if (_restoreUnsaved === null) {
+        let v = [];
+        try { v = JSON.parse(sessionStorage.getItem(_RESTORE_UNSAVED_KEY) || '[]'); } catch (e) { /* none */ }
+        _restoreUnsaved = (Array.isArray(v) ? v : []).filter(it => _restoreValid(it));
+    }
+    return _restoreUnsaved;
+}
+function _saveUnsaved() {             // true when sessionStorage holds the list
+    try {
+        if (_restoreUnsaved && _restoreUnsaved.length) sessionStorage.setItem(_RESTORE_UNSAVED_KEY, JSON.stringify(_restoreUnsaved));
+        else sessionStorage.removeItem(_RESTORE_UNSAVED_KEY);
+        return true;
+    } catch (e) { return false; }        // memory only
+}
+// Write one item under its own key; when localStorage refuses, it stays
+// with this tab (sessionStorage, so a reload keeps it) and is retried.
+// True when the item is kept durably (its own key, or sessionStorage).
+function _storeItem(it) {
+    try {
+        localStorage.setItem(_RESTORE_ITEM_PREFIX + it.id, JSON.stringify(it));
+    } catch (e) {
+        if (!_unsavedList().some(x => x.id === it.id)) _unsavedList().push(it);
+        return _saveUnsaved();
+    }
+    _restoreUnsaved = _unsavedList().filter(x => x.id !== it.id);
+    _saveUnsaved();
+    _confirm(it.id);
+    return true;
+}
+// r6a12: an old item without an id gets one derived from it (FNV-1a over
+// session, text, batch and its place in the old map), the same on every
+// run, so a migration that must be retried never copies it again. A
+// missing time is the migration time (r6a13): a re-run skips the item by
+// its id, so it is never copied, and its copy expires 7 days later.
+function _legacyId(sid, it, i) {
+    let h = 0x811c9dc5;
+    const src = JSON.stringify([sid, it.text, it.batch || '', i]);
+    for (let k = 0; k < src.length; k++) { h ^= src.charCodeAt(k); h = Math.imul(h, 0x01000193) >>> 0; }
+    return `legacy-${h.toString(16)}`;
+}
+function _migrateRestores() {
+    let old = null;
+    try { old = localStorage.getItem(_RESTORE_KEY); } catch (e) { return; }
+    if (old === null) return;
+    let v = {};
+    try { v = JSON.parse(old) || {}; } catch (e) { /* unreadable */ }
+    // r6a11: an id localStorage has held is migrated already, or was
+    // dismissed (an old-code tab may rewrite the map); an item with text is
+    // never dropped for its shape; the old key goes only once all are kept.
+    const seen = new Set(_confirmedIds());
+    let kept = true;
+    for (const k of Object.keys(v || {})) {
+        (Array.isArray(v[k]) ? v[k] : []).forEach((raw, i) => {
+            if (!raw || typeof raw.text !== 'string' || !raw.text.trim()) return;
+            const it = { ...raw, sid: k,
+                         id: typeof raw.id === 'string' && raw.id ? raw.id : _legacyId(k, raw, i),
+                         at: typeof raw.at === 'number' ? raw.at : Date.now() };
+            if (!it.batch) it.batch = it.id;
+            if (seen.has(it.id) || !_restoreValid(it)) return;
+            if (!_storeItem(it)) kept = false;
+        });
+    }
+    if (kept) { try { localStorage.removeItem(_RESTORE_KEY); } catch (e) { /* no storage */ } }
+}
+// {sid: [items]}: the stored items, plus this tab's unsaved ones.
+function _restoreMap() {
+    _migrateRestores();
+    // retry (storage may have room now); one localStorage held since was
+    // saved, and maybe dismissed, by another tab: not ours to bring back
+    const seen = new Set(_confirmedIds());
+    _restoreUnsaved = _unsavedList().filter(it => !seen.has(it.id));
+    _saveUnsaved();
+    for (const it of _unsavedList().slice()) _storeItem(it);
+    const out = {};
+    for (const it of [..._storedItems(), ..._unsavedList()]) {
+        (out[it.sid || ''] = out[it.sid || ''] || []).push(it);
+    }
+    return out;
+}
+
+function _restoreToComposer(texts, why, sid = _queuedSid()) {
+    const list = texts.filter(t => typeof t === 'string' && t.trim());
+    if (!list.length) return;
+    const batch = _restoreId();
+    for (const text of list) _storeItem({ id: _restoreId(), batch, sid: sid || '', text, why, at: Date.now() });
+    _renderTray();
+}
+
+function _trayRemove(id) {
+    const m = _restoreMap();
+    const it = [...(m[_queuedSid() || ''] || []), ...(m[''] || [])].find(x => x.id === id) || null;
+    try { localStorage.removeItem(_RESTORE_ITEM_PREFIX + id); } catch (e) { /* no storage */ }
+    _restoreUnsaved = _unsavedList().filter(x => x.id !== id);
+    _saveUnsaved();
+    _renderTray();
+    return it;
+}
+
+// Insert: the text goes into the composer at the caret, then leaves the tray.
+function _trayInsert(id) {
+    const it = _trayRemove(id);
+    if (!it) return;
+    const v = String(chatInput.value);
+    const a = typeof chatInput.selectionStart === 'number' ? chatInput.selectionStart : v.length;
+    const b = typeof chatInput.selectionEnd === 'number' ? chatInput.selectionEnd : a;
+    chatInput.value = v.slice(0, a) + it.text + v.slice(b);
+    if (typeof chatInput.setSelectionRange === 'function') {
+        try { chatInput.setSelectionRange(a + it.text.length, a + it.text.length); } catch (e) { /* not focusable */ }
+    }
+    try { chatInput.dispatchEvent(new Event('input')); chatInput.focus(); } catch (e) { /* stub */ }
+}
+
+// A session is on screen (load, switch): its tray, and its owed leftovers.
+function _onSessionShown() {
+    try { _renderTray(); _queueOwedLeftovers(false); } catch (e) { /* storage */ }
+}
+
+function _renderTray() {
+    if (typeof restoreTray === 'undefined' || !restoreTray) return;
+    const sid = _queuedSid() || '', m = _restoreMap();
+    // items kept before this tab had a session id show with every session (r6a8)
+    const items = [...(m[sid] || []), ...(sid ? (m[''] || []) : [])];
+    const unsaved = _unsavedList();
+    const here = new Set([sid, ...(sid ? [''] : [])]);
+    const elsewhere = unsaved.some(it => !here.has(it.sid || ''));
+    restoreTray.innerHTML = '';
+    restoreTray.classList.toggle('hidden', !items.length && !elsewhere);
+    const warn = (text) => {
+        const w = document.createElement('div');
+        w.className = 'restore-warn';
+        w.textContent = text;
+        restoreTray.appendChild(w);
+    };
+    if (unsaved.some(it => here.has(it.sid || ''))) {           // still not saved (also after a reload)
+        warn('Browser storage is full: these are kept only until this tab closes.');
+    }
+    if (elsewhere) warn('Other conversations have unsaved items: open them before closing this tab.');
+    const fresh = new Map();
+    for (const it of items) {
+        const row = document.createElement('div');
+        row.className = 'restore-item';
+        const text = document.createElement('span');
+        text.className = 'restore-text';
+        text.textContent = it.text;
+        const ins = document.createElement('button');
+        ins.className = 'restore-insert';
+        ins.textContent = 'Insert';
+        ins.onclick = () => _trayInsert(it.id);
+        const dis = document.createElement('button');
+        dis.className = 'restore-dismiss';
+        dis.textContent = 'Dismiss';
+        dis.onclick = () => _trayRemove(it.id);
+        row.appendChild(text); row.appendChild(ins); row.appendChild(dis);
+        restoreTray.appendChild(row);
+        if (sid && !_trayNoted.has(it.batch)) fresh.set(it.batch, { why: it.why, n: (fresh.get(it.batch) || { n: 0 }).n + 1 });
+    }
+    for (const [batch, { why, n }] of fresh) {
+        _trayNoted.add(batch);
+        addMessage('system', `${why} ${n === 1 ? 'Your message is' : `${n} messages are`} in the tray above the composer.`);
+    }
+}
+// Owed leftovers: {sid: markedAt}, kept across reloads (the page works
+// without storage). Cleared only when a fetch returns texts, when the old
+// turn is known closed (a recovery confirmed it, or a later clean turn on
+// that session ended), or after the agent's own TTL.
+const LEFTOVER_TTL_MS = 30 * 60 * 1000;          // the agent's LEFTOVER_TTL_S
+const _OWED_KEY = 'ghost.queued.leftoversOwed';
+function _owedMap() {
+    if (_leftoversOwed === null) {
+        _leftoversOwed = {};
+        try {
+            const v = JSON.parse(localStorage.getItem(_OWED_KEY) || '{}');
+            if (v && typeof v === 'object') for (const k of Object.keys(v)) if (typeof v[k] === 'number') _leftoversOwed[k] = v[k];
+        } catch (e) { /* no storage */ }
+    }
+    return _leftoversOwed;
+}
+function _saveOwed() {
+    try { localStorage.setItem(_OWED_KEY, JSON.stringify(_owedMap())); } catch (e) { /* no storage */ }
+}
+function _markOwed(sid) { if (sid) { _owedMap()[sid] = Date.now(); _saveOwed(); } }
+function _clearOwed(sid) { if (sid in _owedMap()) { delete _owedMap()[sid]; _saveOwed(); } }
+
+// The agent's leftovers for `sid`: texts, or null when the call failed.
+async function _fetchLeftovers(sid) {
+    try {
+        const res = await fetch('/api/turn/inbox/leftovers', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: sid }),
+            signal: AbortSignal.timeout(8000),
+        });
+        if (!res.ok) return null;
+        const d = await res.json().catch(() => null);
+        if (!d || !Array.isArray(d.messages)) return null;
+        return d.messages.filter(t => typeof t === 'string' && t.trim());
+    } catch (e) {
+        return null;
+    }
+}
+
+// Leftovers a lost (or failed) turn still owes — after any settle in
+// progress (they pop the same per-session store). `closed`: the old turn
+// is known to be over, so an empty answer settles the debt.
+function _queueOwedLeftovers(closed) {
+    _settleChain = _settleChain.then(() => _collectOwedLeftovers(closed)).catch(() => {});
+    return _settleChain;
+}
+
+async function _collectOwedLeftovers(closed, before = Infinity) {
+    const sid = _queuedSid();
+    const at = sid ? _owedMap()[sid] : undefined;
+    if (at === undefined) return;          // another session's debt waits for that session
+    const got = await _fetchLeftovers(sid);
+    if (got === null) return;              // still owed
+    _restoreToComposer(got, 'Not read by the agent in an earlier turn.', sid);
+    if (got.length || (closed && at < before) || Date.now() - at > LEFTOVER_TTL_MS) _clearOwed(sid);
+}
+
+// Adopt the agent's session copy (what the turn read is stored there), so
+// the next request is built from it. False when a turn owns the log now,
+// the conversation changed, or the copy could not be read.
+async function _resyncFromSession(sid) {
+    try {
+        const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}`,
+            { signal: AbortSignal.timeout(8000) });
+        if (!res.ok) return false;
+        const data = await res.json();
+        if (isProcessingRequest || _queuedSid() !== sid) return false;
+        const msgs = Array.isArray(data && data.messages) ? data.messages : [];
+        const adopted = msgs.length ? _reconcileWithLocal(msgs, chatHistory) : chatHistory;
+        if (msgs.length && _adoptionChanges(adopted, chatHistory)) {
+            chatHistory = _reattachLabelKeys(mergeClientLabelKeys(adopted), chatHistory);
+            renderHistoryToLog(chatHistory);
+            saveChatState();
+        }
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+// The inject rows shift the reply's index, so the index-based merge drops
+// its reqId: carry each lost one over by role + content (the last match).
+function _reattachLabelKeys(rows, local) {
+    const have = new Set(rows.map(r => r && r.reqId).filter(Boolean));
+    for (const loc of local) {
+        if (!loc || !loc.reqId || have.has(loc.reqId)) continue;
+        for (let i = rows.length - 1; i >= 0; i--) {
+            const r = rows[i];
+            if (!r || r.reqId || r.role !== loc.role || r.content !== loc.content) continue;
+            rows[i] = { ...r, reqId: loc.reqId };
+            for (const k of ['feedback', 'unlabelable', 'prefixLen']) if (loc[k]) rows[i][k] = loc[k];
+            have.add(loc.reqId);
+            break;
+        }
+    }
+    return rows;
+}
+
+// Re-align later from the agent's session copy (sessions.js retries while a turn runs).
+function _requestSessionResync() {
+    try {
+        window.GhostCore?.events?.dispatchEvent(new CustomEvent('turn-aborted'));
+    } catch (e) { /* workspace modules not loaded */ }
+}
+
+function _holdForAfterTurn(it) {
+    _setQueuedLabel(it.div, 'sends after this turn');
+    chatLog.appendChild(it.div);
+    _sendAfterTurn.push(it);
+    _drainSendAfterTurn();
+}
+
+async function _sendWhileBusy() {
     const text = chatInput.value.trim();
+    if (!text || text === '/clear') return;     // /clear needs an idle composer
+    chatInput.value = '';
+    chatInput.style.height = '';
+    const seq = ++_queuedSeq, gen = _turnGen, sid = _queuedSid(), epoch = _convEpoch;
+    const div = _queuedBubble(text, 'sending…');
+    const item = { text, div, seq, gen, sid, epoch };
+    if (!sid) { _holdForAfterTurn(item); return; }   // no inbox without a session id
+    let data = null;
+    try {
+        const res = await fetch('/api/turn/inbox', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: sid, text }),
+            signal: AbortSignal.timeout(INBOX_TIMEOUT_MS),
+        });
+        if (res.ok) data = await res.json().catch(() => null);
+    } catch (e) { data = null; }
+    const path = data && typeof data.path === 'string' ? data.path : null;
+    if (path) _setQueuedFeature(!_isOffReason(data.reason));
+    const info = _turnInfo.get(gen) || null;
+    if (path === 'queue' && _isOffReason(data.reason)) {
+        // OFF (the production default): the old page — nothing is sent on
+        // its own while a turn runs; the text waits in the composer.
+        div.remove();
+        _restoreToComposer([text], 'Messages to a running turn are off on this agent; send it when the turn ends.', sid);
+        return;
+    }
+    if (!path) {
+        // No answer: the agent may have accepted it — never sent on its own.
+        div.remove();
+        _restoreToComposer([text], 'Could not reach the running turn (it may have the message).', sid);
+        return;
+    }
+    if (path === 'status') {
+        div.remove();
+        const note = addMessage('system', String(data.reply || 'The turn is still running.'));
+        if (note) note.classList.add('queued-status');
+        return;
+    }
+    if (path === 'cancel') {
+        div.remove();
+        const undelivered = Array.isArray(data.undelivered) ? data.undelivered : [];
+        if (gen === _turnGen && info && !info.ended && isProcessingRequest && currentChatController) {
+            _inboxStopUndelivered = undelivered;      // read by the Stop path
+            currentChatController.abort();
+            toggleSendButtonUI(false);
+        } else if (info && !info.settled) {
+            // the page lost this turn's stream, or it is settling: settle it
+            // as stopped (r6a2)
+            _settleQueuedTurn(gen, Promise.resolve(undelivered), 'stopped');
+        } else {
+            _restoreToComposer(undelivered, 'The turn stopped before reading them.', sid);
+        }
+        return;
+    }
+    if (path === 'inject') {
+        if (info && info.settled) {
+            // Accepted after this page settled the turn: whether it is read
+            // or left over shows on the agent's side — the session copy, or
+            // the tray once the leftovers are taken. Never history here.
+            // r6a8: to the tray too (a duplicate is fine), never only a debt
+            _markOwed(sid);
+            div.remove();
+            _restoreToComposer([text], 'The turn ended as this was sent; the agent may or may not have read it.', sid);
+            _requestSessionResync();
+            return;
+        }
+        _setQueuedLabel(div, 'queued — read at the next step');
+        _queuedInjects.push(item);
+        if (info) info.typed.push(text);
+        return;
+    }
+    _holdForAfterTurn(item);                     // queue: never reached the agent
+}
+
+// After a turn. `mode`: 'done' (it ended with a reply), 'ended' (it ended
+// without one), 'stopped', or 'unknown' (this page lost it). Marked at once;
+// the work runs after any earlier settle (leftovers are per SESSION).
+function _settleQueuedTurn(gen, undeliveredP, mode) {
+    const info = _turnInfo.get(gen) || null;
+    // a turn settled 'unknown' stays unknown (r6a3)
+    if (info && info.outcome === 'unknown' && (mode === 'done' || mode === 'ended')) mode = 'unknown';
+    if (info) {
+        info.ended = true;
+        info.settled = false;
+        info.outcome = mode;
+    }
+    _settlesPending += 1;
+    const p = _settleChain
+        .then(() => _settleQueuedTurnNow(info, gen, undeliveredP, mode))
+        .catch((e) => { console.warn('queued messages: settle failed', e); if (info) info.settled = true; })
+        .then(() => { _settlesPending -= 1; _drainSendAfterTurn(); });
+    _settleChain = p;
+    return p;
+}
+
+async function _settleQueuedTurnNow(info, gen, undeliveredP, mode) {
+    let undelivered = [];
+    if (undeliveredP) {
+        const TIMED_OUT = {};
+        let timer = null;
+        const late = new Promise((r) => { timer = setTimeout(() => r(TIMED_OUT), STOP_SETTLE_TIMEOUT_MS); });
+        let got;
+        try { got = await Promise.race([undeliveredP, late]); } catch (e) { got = []; }
+        clearTimeout(timer);
+        if (got === TIMED_OUT) {
+            mode = 'unknown';                 // no answer from the cancel
+            if (info) info.outcome = 'unknown';
+        } else {
+            undelivered = Array.isArray(got) ? got : [];
+        }
+    }
+    const sid = info ? info.sid : _queuedSid();
+    const mine = (it) => it.gen === gen;
+    const typed = info ? info.typed : _queuedInjects.filter(mine).map(it => it.text);
+    const clean = mode === 'done';
+    // Leftovers only once the turn is over, into that session's tray; a
+    // lost turn owes them.
+    let leftovers = [];
+    let failed = false;
+    const owedAt = sid ? _owedMap()[sid] : undefined;
+    if (sid && (typed.length || (clean && owedAt !== undefined))) {
+        if (mode === 'unknown') {
+            if (typed.length) _markOwed(sid);
+        } else {
+            const got = await _fetchLeftovers(sid);
+            if (got === null) { _markOwed(sid); failed = true; } else {
+                leftovers = got;
+                // a clean end closes every older turn of this session
+                if (got.length || (clean && owedAt !== undefined && owedAt < ((info && info.startedAt) || Infinity))) _clearOwed(sid);
+            }
+        }
+    }
+    // History is the agent's session copy; this page never writes queued
+    // rows. Adopted after a clean turn; otherwise the rail realigns later.
+    if (sid && typed.length && !(clean && await _resyncFromSession(sid))) _requestSessionResync();
+    for (const it of _queuedInjects.filter(mine)) if (it.div) it.div.remove();
+    _queuedInjects = _queuedInjects.filter(it => !mine(it));
+    // A clean turn's injects are trusted to the session copy. Any other
+    // ending: every text accepted during it comes back (r6a7: no "visibly
+    // held" check — a duplicate is acceptable, a loss is not).
+    _restoreToComposer([...undelivered, ...leftovers],
+        mode === 'stopped' ? 'Stopped: not read by the agent.' : 'Not read by the agent.', sid);
+    if (!clean || failed) _restoreToComposer(typed, 'The agent may or may not have read these.', sid);
+    if (failed) {
+        addMessage('system', 'Could not fetch the messages the agent did not read; '
+            + 'they come back when the next turn starts.');
+    }
+    if (info) info.settled = true;
+}
+
+// One held text at a time, as a normal turn; its own end drains the next.
+// Sent only with positive evidence: the turn it was typed in ended with a
+// reply, and the conversation is the same. Otherwise to the tray.
+function _drainSendAfterTurn() {
+    if (_settlesPending > 0) return;              // the settle drains when it is done
+    for (;;) {
+        // the first whose turn has settled: one stuck turn never blocks the rest.
+        // Restoring to the composer is safe mid-turn; sending is not.
+        const i = _sendAfterTurn.findIndex((q) => {
+            const qi = _turnInfo.get(q.gen);
+            return (!qi || qi.settled) && (!isProcessingRequest || !qi || qi.outcome !== 'done');
+        });
+        if (i < 0) return;
+        const it = _sendAfterTurn.splice(i, 1)[0];
+        if (it.div) it.div.remove();
+        const info = _turnInfo.get(it.gen) || null;
+        if (!info || info.outcome !== 'done') {
+            _restoreToComposer([it.text], info && info.outcome === 'stopped'
+                ? 'Stopped, so nothing more was sent.'
+                : 'The turn did not end with a reply, so nothing more was sent.', it.sid);
+            continue;
+        }
+        if (it.epoch !== _convEpoch || (it.sid || null) !== (_queuedSid() || null)) {
+            _restoreToComposer([it.text], 'The conversation changed before this was sent.', it.sid);
+            continue;
+        }
+        sendMessage(false, it.text);
+        return;
+    }
+}
+
+// Stop the running tool call(s) only; the turn goes on.
+async function interruptRunningTool() {
+    const sid = _queuedSid();
+    if (!sid) {
+        addMessage('system', 'This tab has no session id, so it cannot name its turn.');
+        return;
+    }
+    if (interruptBtn) interruptBtn.disabled = true;     // one request at a time
+    try {
+        const res = await fetch('/api/turn/interrupt', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: sid }),
+            signal: AbortSignal.timeout(INBOX_TIMEOUT_MS),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+            _setQueuedFeature(true);
+            const names = Array.isArray(data.interrupted) ? data.interrupted : [];
+            addMessage('system', `Stopped ${names.join(', ') || 'the running tool'}; the turn goes on.`);
+        } else if (res.status === 409) {
+            _setQueuedFeature(true);
+            addMessage('system', 'Nothing running: no tool call to stop.');
+        } else if (res.status === 404) {
+            const off = _isOffReason(data.reason);
+            if (off) _setQueuedFeature(false);
+            addMessage('system', off
+                ? 'Stopping a tool is off on this agent.'
+                : 'No running turn of this conversation.');
+        } else {
+            addMessage('system', `Could not stop the tool (${data.detail || data.error
+                || ('HTTP ' + res.status)}).`);
+        }
+    } catch (e) {
+        addMessage('system', `Could not reach the agent to stop the tool (${(e && e.message) || e}).`);
+    } finally {
+        if (interruptBtn) interruptBtn.disabled = false;
+    }
+}
+
+async function sendMessage(isResume = false, queuedText = null) {
+    const resuming = isResume === true;
+    // §4RZ: a message held for after the turn (or handed back unread) is
+    // sent as itself; the composer keeps whatever is being typed.
+    const fromQueue = typeof queuedText === 'string';
+    const text = (fromQueue ? queuedText : chatInput.value).trim();
     if (!resuming && (!text || isProcessingRequest)) return;
     // A resume must not stack on a turn either: the legacy same-page
     // auto-resume (resumeOnVisible) and the persisted-handle path can
@@ -3008,6 +3736,7 @@ async function sendMessage(isResume = false) {
     if (resuming && isProcessingRequest) return;
 
     if (text === '/clear' && !resuming) {
+        _convEpoch += 1;                 // §4RZ: nothing held is sent into the new conversation
         chatInput.value = '';
         chatInput.style.height = '';
         _endRecoveryForNewTurn(true);   // §4PR r4: a running poll would rebuild a placeholder
@@ -3052,8 +3781,10 @@ async function sendMessage(isResume = false) {
         // in one line (its placeholder dangled with dots forever).
         _autoOpenedImgSrcs.clear();   // a new turn may auto-open its images
         _endRecoveryForNewTurn();
-        chatInput.value = '';
-        chatInput.style.height = ''; // Clear inline height → rows="1" takes over
+        if (!fromQueue) {
+            chatInput.value = '';
+            chatInput.style.height = ''; // Clear inline height → rows="1" takes over
+        }
         const _userDiv = addMessage('user', text);
         
         currentTaskId = null;
@@ -3071,6 +3802,7 @@ async function sendMessage(isResume = false) {
 
         chatHistory.push({ role: "user", content: text });
         _stampHistoryIndex(_userDiv, chatHistory.length - 1);
+        _beginQueuedTurn();              // §4RZ: this turn's generation
         // Remembered for Stop: with sessions disabled there is no session id
         // to match a turn on, and the turn registry's `preview` is derived
         // from exactly this text (R3 lens B).
@@ -3124,6 +3856,17 @@ async function sendMessage(isResume = false) {
     if (ws && ws.readyState === WebSocket.OPEN) {
         setConnectionState('busy', 'PROCESSING…');
     }
+    // §4RZ: set on a Stop — resolves to the messages the turn never read
+    let _stopUndeliveredP = null;
+    // §4RZ: the turn may still run on the agent (a resume or a session
+    // recovery takes it over): its queued messages are settled when it ends
+    let _turnStillLive = false;
+    // §4RZ: how the turn ended, for what was held until after it ('done' =
+    // a reply arrived; 'unknown' = this page cannot tell)
+    let _turnOutcome = 'ended';
+    // a resume this page holds no live record of (a reload) gets a fresh one
+    if (resuming && !(_turnInfo.get(_turnGen) && !_turnInfo.get(_turnGen).ended)) _beginQueuedTurn();
+    const _myGen = _turnGen;
     try {
         // Deliberately omit `model`: the agent validates a supplied model
         // name against its single configured model and returns 404
@@ -3383,9 +4126,14 @@ async function sendMessage(isResume = false) {
             // A reply that was ALL reasoning (<think> with no text after
             // it) never revealed the bubble: say so instead of leaving the
             // dots animating on a finished turn.
-            if (_revealAgentBubble(currentAgentMessageDiv)) {
+            const _onlyReasoned = _revealAgentBubble(currentAgentMessageDiv);
+            if (_onlyReasoned) {
                 currentAgentMessageDiv.textContent = "No reply text (the model only reasoned).";
             }
+            // §4RZ r6a5/r6a6: positive evidence for sending held texts — a
+            // clean end with reply text (reasoning alone is not a reply)
+            if (!_onlyReasoned && streamSawDone && !streamHadError && typeof _isCleanReply === 'function'
+                    && _isCleanReply(chatHistory[chatHistory.length - 1].content)) _turnOutcome = 'done';
             // Stamp only alongside a history entry that carries the id —
             // a "No response" bubble with live thumbs would take labels
             // that can never persist (no matching entry to latch onto).
@@ -3430,17 +4178,32 @@ async function sendMessage(isResume = false) {
             // turn via /api/turns — never a blind "whatever is running"
             // cancel (review R1 M8 / R2 lens B). The ids are captured
             // NOW: the fields below are reset before the promise settles.
+            // §4RZ: what the turn never read comes back with the cancel
+            // (`undelivered`); a stop word sent to the inbox already has it,
+            // and that turn is already cancelled — only the relay is left to
+            // tear down (a second agent cancel could 404 and warn that
+            // nothing was cancelled).
+            const _byInbox = _inboxStopUndelivered !== null;
+            const _inboxUnd = _inboxStopUndelivered || [];
+            _inboxStopUndelivered = null;
+            const _und = (v) => (v && Array.isArray(v.undelivered) ? v.undelivered : []);
             const _rid = currentReqId, _txt = _lastSentUserText;
-            if (currentTaskId) {
-                fetch(`/api/chat/cancel/${currentTaskId}`, { method: 'POST' })
+            if (currentTaskId && !_byInbox) {
+                _stopUndeliveredP = fetch(`/api/chat/cancel/${currentTaskId}`,
+                                          { method: 'POST', signal: AbortSignal.timeout(15000) })
                     .then(r => r.json().catch(() => ({})))
                     .then(d => {
-                        if (d && d.agent && d.agent.cancelled === true) return;
-                        return _cancelAgentTurn(_rid, _txt);
+                        if (d && d.agent && d.agent.cancelled === true) return _und(d.agent);
+                        return _cancelAgentTurn(_rid, _txt).then(_lastCancelUndelivered);
                     })
-                    .catch(() => _cancelAgentTurn(_rid, _txt));
+                    .catch(() => _cancelAgentTurn(_rid, _txt).then(_lastCancelUndelivered));
+            } else if (!_byInbox) {
+                _stopUndeliveredP = _cancelAgentTurn(_rid, _txt).then(_lastCancelUndelivered);
             } else {
-                _cancelAgentTurn(_rid, _txt);
+                if (currentTaskId) {
+                    fetch(`/api/chat/cancel/${currentTaskId}`, { method: 'POST' }).catch(() => {});
+                }
+                _stopUndeliveredP = Promise.resolve(_inboxUnd);
             }
             if (!resuming && currentAccumulatedContent === "" && currentAgentMessageDiv) currentAgentMessageDiv.remove();
             if (currentAccumulatedContent !== "") {
@@ -3469,6 +4232,7 @@ async function sendMessage(isResume = false) {
                 window.GhostCore?.events?.dispatchEvent(new CustomEvent('turn-aborted'));
             } catch (err) { /* workspace modules not loaded */ }
         } else {
+            _turnOutcome = 'unknown';    // §4RZ: a failed request — the page cannot tell how the turn ended
             if (currentThinkingInterval) { clearInterval(currentThinkingInterval); currentThinkingInterval = null; }
             
             const errMsg = e.message.toLowerCase();
@@ -3491,7 +4255,7 @@ async function sendMessage(isResume = false) {
                 // proxy produced an endless silent 1s retry loop behind a
                 // permanent thinking bubble.
                 const _resumeAttempt = () => {
-                    if (!currentTaskId) return;          // already resumed
+                    if (!currentTaskId) { _settleLostTurns(); return; }   // resumed, or a recovery took it (§4RZ r6a2)
                     if (isProcessingRequest) return;     // the latch's job
                     // §4PR r4: a recovery already owns this turn (the
                     // visibility path found its stream gone); a resume here
@@ -3499,6 +4263,10 @@ async function sendMessage(isResume = false) {
                     // re-ran a turn the agent had finished
                     if (reconcilePollTimer || _reconcileRunning) return;
                     if (_netResumeTries >= 3) {
+                        // §4RZ: this page lost the turn — its queued messages
+                        // are settled as unknown (the session copy shows
+                        // them), never swept into the next turn
+                        _settleQueuedTurn(_myGen, null, 'unknown');
                         addMessage('system',
                             '⚠ Lost the connection to this turn and could ' +
                             'not reattach after 3 tries. The turn may still ' +
@@ -3516,6 +4284,7 @@ async function sendMessage(isResume = false) {
                     _netResumeTries += 1;
                     sendMessage(true);
                 };
+                _turnStillLive = true;
                 if (document.visibilityState === 'visible') {
                     setTimeout(_resumeAttempt, 1000);
                 } else {
@@ -3547,6 +4316,8 @@ async function sendMessage(isResume = false) {
                     const _rh = readInflightHandle();
                     currentTaskId = null;
                     if (_rsid) {
+                        _turnStillLive = true;
+                        _settleQueuedTurn(_myGen, null, 'unknown');   // §4RZ: the recovery owns the turn now
                         setTimeout(() => reconcileFromSession(_rsid, _rh), 0);   // after `finally`
                     } else {
                         addRetryableSystemMessage(`Network Error: ${_m}`);
@@ -3632,6 +4403,16 @@ async function sendMessage(isResume = false) {
         try {
             window.GhostCore?.events?.dispatchEvent(new CustomEvent('turn-complete'));
         } catch (e) { /* workspace modules not loaded */ }
+        // §4RZ: the messages sent while it ran — read ones become history,
+        // unread ones are sent next (after a Stop: to the tray)
+        if (_inboxStopUndelivered !== null && _stopUndeliveredP === null) {
+            // the stop word landed after the stream had already ended
+            _stopUndeliveredP = Promise.resolve(_inboxStopUndelivered);
+        }
+        _inboxStopUndelivered = null;
+        if (!_turnStillLive) {
+            _settleQueuedTurn(_myGen, _stopUndeliveredP, _stopUndeliveredP !== null ? 'stopped' : _turnOutcome);
+        }
     }
 }
 
@@ -3642,6 +4423,8 @@ function sendTypedMessage() {
     isTTSActive = false;
     sendMessage();
 }
+
+if (interruptBtn) interruptBtn.addEventListener('click', () => { interruptRunningTool(); });
 
 sendBtn.addEventListener('click', () => {
     if (isProcessingRequest && currentChatController) {
@@ -3662,6 +4445,8 @@ chatInput.addEventListener('keydown', (e) => {
         e.preventDefault();
         if (!isProcessingRequest) {
             sendTypedMessage();
+        } else if (currentChatController) {
+            _sendWhileBusy();       // §4RZ: to the running turn's inbox
         }
         return;
     }

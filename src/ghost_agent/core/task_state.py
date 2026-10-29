@@ -53,6 +53,10 @@ RATE_FLOOR_TOK_S = 5.0
 REPORT_RETRY_FACTOR = 1.5
 
 
+
+#: §4RZ step 5: a file call the user's stop never ran (or stopped) wrote nothing
+_STOPPED_HEADS = ("NOT RUN: the user interrupted", "INTERRUPTED BY THE USER:")
+
 def note_reply_seconds(req_id: Any, seconds: float) -> None:
     """Record a reply's wall time; the longest one sizes the report reserve."""
     rid = str(req_id or "")
@@ -214,8 +218,8 @@ def edit_sides(tools_run) -> dict:
             continue
         _head = str(t.get("content") or "").lstrip()[:40]
         if error_line(t.get("content") or "", tool="file_system") or _head.startswith(
-                ("REJECTED", "REFUSED", "Error", "ERROR", "SYSTEM")):
-            continue                                    # a refused mutation changed nothing
+                ("REJECTED", "REFUSED", "Error", "ERROR", "SYSTEM") + _STOPPED_HEADS):
+            continue                                    # a refused (or §4RZ not-run) mutation changed nothing
         p = str(a.get("path") or a.get("filename") or "")
         if not _CODE_EXT_RE.search(p):
             continue
@@ -296,7 +300,7 @@ def untested_pages(tools_run) -> List[str]:
             continue
         if n != "file_system":
             continue
-        if error_line(body, tool=n) or body.lstrip()[:40].startswith(("REJECTED", "REFUSED", "Error", "ERROR", "SYSTEM")):
+        if error_line(body, tool=n) or body.lstrip()[:40].startswith(("REJECTED", "REFUSED", "Error", "ERROR", "SYSTEM") + _STOPPED_HEADS):
             continue                                           # a refused / failed call changed nothing
         p = _page_key(a.get("path") or a.get("filename") or "")
         if op in ("delete",):

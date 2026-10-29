@@ -328,10 +328,41 @@
   <code>crop</code>/<code>ellipsis</code> overflow modes keep the TOP lines, the wrong end for
   chat), and the <code>Live</code> is <code>transient</code>; when the stream settles the full
   reply is printed once, at the current terminal width. The region stays repaintable at any
-  reply length, so the glitch is structurally impossible, and an abort/error mid-stream still
+  reply length, and an abort/error mid-stream still
   leaves the partial reply on screen (the settled print rides <code>_settle()</code> /
   <code>_finish()</code>, reached from every exit path). Applies to both the interactive loop
   (<code>stream_reply</code>) and one-shot mode (<code>one_shot</code>).</p>
+  <h3>Pane narrowed mid-stream <span class="tag">2026-10-28</span></h3>
+  <p>The tail crop did not cover a <strong>width</strong> change. Operator report: in the tmux
+  CLI pane the last paragraph of a reply repeated 9 times. rich erases the previous live frame
+  by moving up one row per rendered <em>line</em>; when the pane narrows (window drag, tmux
+  zoom, a smaller client attaching) the terminal reflows each line onto more rows, the count
+  falls short, and every refresh leaves the frame's top row behind. Reproduced in tmux by
+  shrinking the window one column per chunk while the reply's last paragraph streamed (10
+  copies). Fix, CLI only:</p>
+  <ul>
+    <li><code>_ReflowLiveRender</code> (installed on the stream's <code>Live</code> by
+    <code>_reflow_safe</code>) records each live line's cell length and erases
+    <code>Σ ceil(cells / current width)</code> rows — at an unchanged width exactly rich's
+    count. It assumes a reflowing terminal (tmux, iTerm2, Terminal.app, Ghostty, kitty,
+    WezTerm). If a rich upgrade moves the private <code>_live_render</code> attribute, the
+    stream falls back to rich's own behaviour.</li>
+    <li><code>_TailCrop</code> drops each line's trailing pad (<code>_rstrip_line</code>;
+    background-coloured fill such as a code block's is kept), so a full-width line no longer
+    wraps when the pane narrows by one column.</li>
+  </ul>
+  <p>The row count alone fixed a single resize but not a drag (130→90 in 4-column steps still
+  left 4–7 copies). Cause, measured: tmux reflows the pane at once but reports the new size to
+  the program at most every ~250 ms during a series of resizes (a 126→98 drag never reported
+  118 or 110; an isolated resize arrives in 2 ms), and the <code>ssh -t</code> hop in
+  <code>eva.tmux</code> adds its own delay. An erase computed in that gap counts at the old
+  width. So <code>_ReflowLiveRender</code> also <strong>blanks the live tail</strong> once it
+  sees a width change, until the width has held for <code>RESIZE_QUIET_S</code> (0.5 s): an
+  empty frame has no rows to miscount, and the text reappears when the resizing stops.</p>
+  <p>Verified in a real tmux pane, replaying the reported reply (copies of its last paragraph,
+  old → new): one-column drag 130→120: 11 → 1; jump 130→90: 2 → 1; drags 130→90 in 4/8-column
+  steps at four speeds: 6–20 → 1 each; widening drags 90→130 lose no text either way; no
+  resize: 1 → 1.</p>
 
   <h2>Images in the terminal — removed (2026-10-11)</h2>
   <p>The CLI used to draw images a reply referenced (<code>![…](file.png)</code>) below the
@@ -349,7 +380,9 @@
   → <code>scheme://netloc</code>), header key wiring, env-vs-file key precedence, and the stream-render path against a faked
   SSE stream (<code>_TailCrop</code> pass-through vs. tail-crop; transient Live + no
   <code>vertical_overflow</code> regression guard; settled full print incl. the
-  partial-reply-on-error case). Live network paths are exercised manually
+  partial-reply-on-error case; <code>TestReflowLiveRender</code> for the erase-row count at
+  unchanged/narrowed/widened widths, the blank-while-resizing window, the pad strip and the
+  fallback). Live network paths are exercised manually
   (upload, download, the stream against the running agent).</p>
   <h2 id="4kp-hold">A reply flagged <code>reasoning_unparsed</code> <span class="tag">2026-09-29 &sect;4KP</span></h2>
   <p>When the agent's final stream carries no reasoning channel with thinking on, it sends an empty-delta frame with <code>{"ghost": {"reasoning_unparsed": true}}</code>: the reply's opening may be reasoning that ends in an orphan <code>&lt;/think&gt;</code>. A terminal cannot take printed text back, so both the REPL (<code>stream_reply</code>) and the one-shot path hold such a reply and print it only after the stream's own <code>[DONE]</code> with no error (an abort, an error frame or a stream that just ends prints nothing of it) through <code>strip_orphan_think_close</code> &mdash; a copy of the agent's <code>_strip_orphan_think_close</code>, pinned to it by the §4KO parity table. An unflagged reply streams exactly as before.</p>

@@ -196,6 +196,110 @@ class TestTailCrop:
             cli._TailCrop(Text("\n".join(f"L{i}" for i in range(30)))), 10)
         assert lines == [f"L{i}" for i in range(22, 30)]
 
+    def test_live_lines_carry_no_trailing_pad(self):
+        """rich pads every line to the console width; a full-width line wraps
+        onto a second row as soon as the pane narrows by one column."""
+        buf = io.StringIO()
+        con = cli.Console(file=buf, width=40, height=20, color_system=None,
+                          force_terminal=True)
+        con.print(cli._TailCrop(cli.Markdown("short line")), end="")
+        assert buf.getvalue() == "short line"
+
+    def test_background_fill_is_kept(self):
+        from rich.segment import Segment
+        from rich.style import Style
+        fill = Style(bgcolor="red")
+        line = [Segment("code", fill), Segment("      ", fill)]
+        assert cli._rstrip_line(line) == line
+        assert cli._rstrip_line([Segment("text   "), Segment("   ")]) == [Segment("text")]
+
+
+class TestReflowLiveRender:
+    """Operator report 2026-10-28: in the tmux CLI pane the reply's last
+    paragraph repeated 9 times — the pane narrowed mid-stream, the terminal
+    reflowed the live frame onto more rows, and rich's cursor-up count (one
+    per LINE) left the frame's top row behind on every refresh. The erase
+    must count the ROWS the frame covers at the width the terminal has NOW."""
+
+    class _Con:
+        def __init__(self, width):
+            self.size = type("S", (), {"width": width})()
+
+    def _rendered(self, lines, width=40):
+        from rich.text import Text
+        r = cli._ReflowLiveRender(Text("\n".join(lines)))
+        con = cli.Console(file=io.StringIO(), width=width, height=20,
+                          color_system=None)
+        con.print(cli._TailCrop(r))       # renders r → records its shape
+        return r
+
+    @staticmethod
+    def _ups(control):
+        return str(control).count("\x1b[1A")
+
+    def test_unchanged_width_matches_rich(self):
+        r = self._rendered(["a" * 30, "b" * 10, "c"])
+        rich_r = cli.LiveRender("")
+        rich_r._shape = r._shape
+        r._console = self._Con(40)
+        assert str(r.position_cursor()) == str(rich_r.position_cursor())
+        assert str(r.restore_cursor()) == str(rich_r.restore_cursor())
+
+    def test_narrowed_pane_erases_the_reflowed_rows(self):
+        r = self._rendered(["a" * 30, "b" * 10])
+        r._console = self._Con(20)       # 30 cells → 2 rows, 10 → 1
+        assert self._ups(r.position_cursor()) == 2
+        assert self._ups(r.restore_cursor()) == 3
+
+    def test_widened_pane_never_counts_below_one_row_per_line(self):
+        r = self._rendered(["a" * 30, "b" * 10, ""])
+        r._console = self._Con(200)
+        assert self._ups(r.position_cursor()) == 2
+
+    def test_width_change_blanks_the_tail_until_it_holds(self, monkeypatch):
+        """During a drag the readable width lags the screen (tmux reports
+        it at most every ~250 ms), so any count would be stale: the tail
+        draws nothing until the width has held for RESIZE_QUIET_S."""
+        from rich.text import Text
+        clock = [100.0]
+        monkeypatch.setattr(cli.time, "monotonic", lambda: clock[0])
+        r = cli._ReflowLiveRender(Text("x" * 30))
+
+        def draw(width):
+            out = io.StringIO()
+            cli.Console(file=out, width=width, height=20,
+                        color_system=None).print(r, end="")
+            return out.getvalue()
+
+        assert "x" in draw(40) and r.last_render_height == 1
+        clock[0] += 0.1
+        assert draw(36) == "" and r.last_render_height == 0
+        assert str(r.position_cursor()) == ""        # nothing left to erase
+        clock[0] += cli.RESIZE_QUIET_S - 0.05
+        assert draw(36) == ""                         # still settling
+        clock[0] += 0.1
+        assert "x" in draw(36) and r.last_render_height == 1
+
+    def test_nothing_rendered_moves_nothing(self):
+        r = cli._ReflowLiveRender("")
+        assert str(r.position_cursor()) == "" and str(r.restore_cursor()) == ""
+
+    def test_stream_printer_installs_it(self, monkeypatch):
+        monkeypatch.setattr(cli, "console", cli.Console(
+            file=io.StringIO(), force_terminal=True, width=60, height=24))
+        pr = cli._StreamPrinter()
+        pr.feed("hello")
+        try:
+            assert isinstance(pr.live._live_render, cli._ReflowLiveRender)
+        finally:
+            pr.settle()
+
+    def test_unknown_live_internals_fall_back(self):
+        class Bare:
+            pass
+        b = Bare()
+        assert cli._reflow_safe(b) is b and not hasattr(b, "_live_render")
+
 
 class _FakeSSE:
     """Minimal stand-in for a streaming requests.Response."""

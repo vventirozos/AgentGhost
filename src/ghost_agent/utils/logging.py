@@ -357,6 +357,23 @@ def spawn_task(coro):
 _BG_TASKS: set = set()
 
 
+def _without_tool_stop(coro):
+    """§4RZ step 5: background work spawned inside a tool call never inherits
+    that call's stop (s5-r2: a sibling's stop killed a delegate's later
+    sandbox jobs and browser calls). Only when a stop is bound."""
+    try:
+        from .tool_stop import bind_call, current
+        if current() is None or not asyncio.iscoroutine(coro):
+            return coro
+    except Exception:  # noqa: BLE001
+        return coro
+
+    async def _run():
+        bind_call(None, None)               # this task's own context copy
+        return await coro
+    return _run()
+
+
 def spawn_bg(coro, *, name: str = "bg"):
     """The one fire-and-forget primitive. Composes the three guarantees the
     four ad-hoc conventions each had only some of:
@@ -373,7 +390,7 @@ def spawn_bg(coro, *, name: str = "bg"):
     updates, graph extraction — anything that must not block a turn but whose
     silent death would be a real loss. Returns the Task.
     """
-    task = spawn_task(coro)
+    task = spawn_task(_without_tool_stop(coro))
     if not hasattr(task, "add_done_callback"):
         # NOT `is None` — duck-typed on the one method the registry needs.
         # A `spawn_task` that ran the coroutine INLINE, or a test double
@@ -883,6 +900,7 @@ class Icons:
     TOOL_FILE_S  = "🔍"
     TOOL_FILE_I  = "👀"
     TOOL_DOWN    = "📥"   # download / incoming (wide-base; was ⬇️)
+    QUEUED_MSG   = "📨"   # a message the user sent while a turn runs (§4RZ)
     TOOL_BROWSER = "🌎"   # headless browser automation (distinct from shell 🐚)
     TOOL_DARKWEB = "🧅"   # dark-web (.onion) search over Tor (onion = 🧅, distinct from clearnet 🌐)
     IMAGE_GEN    = "🎨"

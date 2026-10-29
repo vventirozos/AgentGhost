@@ -1132,6 +1132,9 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
             },
             status_code=400,
         )
+    # §4RZ: the agent writes the queued messages a turn READ here; a client
+    # value would be stored as history (forged rows) or crash the persist
+    body.pop("_queued_delivered", None)
 
     # ---- request validation (HTTP boundary) ---------------------------
     # Stops three classes of garbage from reaching `agent.handle_chat`:
@@ -1376,13 +1379,16 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
         # later replay repeated the same turn (R2 lens C).
         if _sess_store is None or not _session_id:
             return
-        if not _new_msgs and not str(assistant_text or "").strip():
+        # queued messages the turn READ belong before its reply: [u1, q1, a]
+        # (the route pops a client's value; only the agent writes this list)
+        _turn_msgs = list(_new_msgs) + list(body.get("_queued_delivered") or [])
+        if not _turn_msgs and not str(assistant_text or "").strip():
             return
         try:
             # `append_turn` writes and fsyncs — on the loop it stalled every
             # other request for the duration of a disk sync (§4GJ round 3).
             await _store_call(_sess_store.append_turn, str(_session_id),
-                              _new_msgs, str(assistant_text or ""), prefix_len)
+                              _turn_msgs, str(assistant_text or ""), prefix_len)
         except Exception:  # noqa: BLE001 — a persist failure never breaks the reply
             _log_internal_error("session append")
 
@@ -2829,12 +2835,160 @@ async def turn_cancel(request: Request):
     except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
         body = {}
     from ..core.turns import get_turn_registry
-    result = get_turn_registry(agent).cancel(
-        body.get("request_id") or None,
-        hard=bool(body.get("hard", False)),
-    )
+    _reg = get_turn_registry(agent)
+    _rid = body.get("request_id") or None
+    _turn = _reg.get(_rid) if _rid else _reg.current()
+    result = _reg.cancel(_rid, hard=bool(body.get("hard", False)))
+    if _turn is not None and result.get("cancelled"):
+        # r8: pressing Stop holds like typing "stop" — a yes registered
+        # before it (handed back, or waiting on the turn lock) cannot
+        # confirm. Only ever removes authority; owner turns only.
+        from ..tools.memory import note_queued_withdrawal
+        note_queued_withdrawal(_turn.session_id, _turn.kind, "stop")
+    _note_handed_back(_turn, result)
     return JSONResponse(result, status_code=200 if result.get("cancelled")
                         else 404)
+
+
+def _note_handed_back(turn, result: dict) -> None:
+    """Queued messages a cancelled turn never read go back to the client to
+    send as normal requests: re-sent, each starts when the inbox ACCEPTED it,
+    so a hold typed after it still withdraws it (§4RZ r7). The accept times
+    stay server-side."""
+    items = result.pop("undelivered_items", None) or []
+    if turn is not None and items:
+        from ..tools.memory import note_handed_back
+        note_handed_back(turn.session_id, turn.kind, items)
+
+
+def _inbox_sender(request) -> str:
+    """The kind of sender a queued-message POST declares — the same headers
+    the chat route reads. Unlike /api/turn/cancel the inbox checks WHO posts:
+    a member's message never lands in a turn (§4KJ; member turns have no
+    inbox, Slack is left as it is)."""
+    _h = request.headers
+    if parse_requester_role(_h.get("X-Ghost-Requester")) == "member":
+        return "member"                 # before probe, as the turn registers (agent.handle_chat)
+    if (_h.get("X-Ghost-Origin") or "").strip().lower() == ORIGIN_PROBE:
+        return "probe"
+    return "owner"
+
+
+@router.post("/api/turn/inbox", dependencies=[Security(verify_api_key)])
+async def turn_inbox(request: Request):
+    """A message sent while this conversation's turn is running.
+
+    Body: ``{"session_id": "...", "text": "..."}``. The reply names the path
+    (core/queued_messages.py): ``inject`` (read at the turn's next step),
+    ``cancel`` (the turn was stopped; ``undelivered`` = messages it never
+    read), ``status`` (``reply`` = the system's answer) or ``queue`` (send
+    it as a normal message — ``reason`` says why)."""
+    agent = get_agent(request)
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+        body = {}
+    from ..core import queued_messages as qm
+    if not qm.enabled():
+        return JSONResponse({"path": qm.PATH_QUEUE, "reason": "queued messages are off"})
+    from ..core.turns import get_turn_registry
+    reg = get_turn_registry(agent)
+    session_id = str(body.get("session_id") or "")
+    if is_conversation_key_only(session_id):
+        session_id = ""                 # Slack conversations have no inbox (Slack stays as it is)
+    text = str(body.get("text") or "").strip()
+    kind = _inbox_sender(request)
+    turn = reg.find_running(session_id, kind)
+    path, reason = qm.route(text, turn, session_id=session_id, kind=kind)
+    out = {"path": path}
+    if session_id:
+        # a hold ("wait", "stop", "no") withdraws the yes of EVERY request of
+        # this conversation that registered before it — running, finishing,
+        # or queued behind the lock — at the moment it is ACCEPTED, whatever
+        # the path: the model may confirm before it reads anything, and a
+        # cooperative stop does not interrupt a running tool batch. By time,
+        # not by which turn the route found (§4RZ r5).
+        from ..tools.memory import note_queued_withdrawal
+        note_queued_withdrawal(session_id, kind, text)
+    if path == qm.PATH_CANCEL:
+        res = reg.cancel(turn.req_id)
+        _note_handed_back(turn, res)
+        out.update(request_id=turn.req_id, undelivered=res.get("undelivered", []))
+    elif path == qm.PATH_STATUS:
+        out.update(request_id=turn.req_id, reply=qm.status_reply(turn))
+    elif path == qm.PATH_INJECT:
+        if reg.post(turn.req_id, text):
+            out.update(request_id=turn.req_id)
+        else:
+            path, reason = qm.PATH_QUEUE, "the turn is finishing"
+            out = {"path": path}
+    if reason:
+        out["reason"] = reason
+    pretty_log("Queued Message",
+               f"[{str(getattr(turn, 'req_id', '') or '-')[:8]}] {path}"
+               + (f" ({reason})" if reason else ""), icon=Icons.QUEUED_MSG)
+    return JSONResponse(out)
+
+
+@router.post("/api/turn/interrupt", dependencies=[Security(verify_api_key)])
+async def turn_interrupt(request: Request):
+    """§4RZ step 5: stop the tool call(s) this conversation's turn is running
+    right now; the turn goes on and the model reads that the user stopped
+    them. Body: ``{"session_id": "..."}``. The sender is checked like the
+    inbox (same conversation, same kind; members and Slack never).
+    200 ``{"request_id", "interrupted": [tool names]}``; 404 no running turn
+    of this sender; 409 no tool is running, a stop was already sent, or the turn is
+    being cancelled."""
+    agent = get_agent(request)
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+        body = {}
+    from ..core import queued_messages as qm
+    if not qm.enabled():
+        return JSONResponse({"interrupted": [], "reason": "queued messages are off"}, status_code=404)
+    from ..core.turns import get_turn_registry
+    reg = get_turn_registry(agent)
+    session_id = str(body.get("session_id") or "")
+    if is_conversation_key_only(session_id):
+        session_id = ""                 # Slack conversations have no inbox (Slack stays as it is)
+    kind = _inbox_sender(request)
+    turn = reg.find_running(session_id, kind)
+    if not qm.same_sender(turn, session_id=session_id, kind=kind):
+        return JSONResponse({"interrupted": [], "reason": "no running turn for this sender"},
+                            status_code=404)
+    names = reg.interrupt_tools(turn.req_id)
+    pretty_log("Tool Interrupt", f"[{turn.req_id[:8]}] "
+               + (", ".join(names) if names else "no tool running"), icon=Icons.STOP)
+    if not names:
+        return JSONResponse({"request_id": turn.req_id, "interrupted": [],
+                             "reason": "no tool is running"}, status_code=409)
+    return JSONResponse({"request_id": turn.req_id, "interrupted": names})
+
+
+@router.post("/api/turn/inbox/leftovers", dependencies=[Security(verify_api_key)])
+async def turn_inbox_leftovers(request: Request):
+    """Messages the turn accepted but ended before reading — the client
+    sends them as normal messages. Body: ``{"session_id": "..."}``."""
+    agent = get_agent(request)
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+        body = {}
+    from ..core.turns import get_turn_registry
+    sid = str(body.get("session_id") or "")
+    kind = _inbox_sender(request)
+    items = [] if is_conversation_key_only(sid) else get_turn_registry(agent).take_leftover_items(
+        sid, kind=kind)
+    from ..tools.memory import note_handed_back
+    note_handed_back(sid, kind, items)       # re-sent, they start when accepted (§4RZ r7)
+    return JSONResponse({"messages": [m["text"] for m in items]})
 
 
 @router.post("/api/feedback", dependencies=[Security(verify_api_key)])

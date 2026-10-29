@@ -154,6 +154,12 @@ def _exec_ok(tool: dict) -> Optional[bool]:
     if st == "unresolved":
         return None
     try:
+        from ..utils.tool_stop import is_user_interrupted
+        if is_user_interrupted(text):        # a stored row: its status is gone
+            return None
+    except Exception:  # noqa: BLE001
+        pass
+    try:
         from ..tools.tool_failure import exec_exit_code, result_is_failure
         code = exec_exit_code(text)
         if code is not None:
@@ -239,12 +245,22 @@ def _browser_keys(tool: dict, args: dict) -> set:
     return keys
 
 
-def _browser_ok(tool: dict) -> bool:
+def _browser_ok(tool: dict) -> Optional[bool]:
+    """True/False for a page load; None for one that did not finish (§4RZ
+    step 5: the user stopped it, or it never ran) — not a run at all."""
     c = tool.get("content")
     st = str(getattr(getattr(c, "status", None), "value", "") or "")
     if st in ("failed", "rejected"):
         return False
     text = str(c or "")
+    if st == "unresolved":
+        return None
+    try:
+        from ..utils.tool_stop import is_user_interrupted
+        if is_user_interrupted(text):        # a stored row: its status is gone
+            return None
+    except Exception:  # noqa: BLE001
+        pass
     m = re.match(r"\A\s*--- BROWSER RESULT ---[ \t]*\r?\nSTATUS:[ \t]*([A-Z]+)", text)
     if m:
         return m.group(1) == "OK"
@@ -291,6 +307,8 @@ def code_evidence(tools_run: Optional[list]) -> dict:
             if not keys:
                 continue
             ok = _browser_ok(t)
+            if ok is None:
+                continue
             for k, rec in led.items():
                 if k in keys:
                     rec["run_idx"], rec["run_ok"] = i, ok

@@ -55,6 +55,10 @@ CONV = "conv"
 #: §4RV: conversation files kept (each ~2-4 GB: the KV of the whole conversation
 #: plus up to --ctx-checkpoints checkpoints of ~150 MB)
 KEEP_CONV = 6     # §4RW review: 3 lost a 4-conversation rotation
+#: 10-27: conversations also have a byte budget — the count alone let 6 files
+#: grow with the conversation (196k context: ~10 GB each near the end); the
+#: newest conversation is always kept
+CONV_BYTES_MAX = 24 << 30
 SLOT_ID = 0
 #: r1: short — llama defers a restore while the slot is busy; giving up cancels it.
 #: 10-26: 10 s timed out 3× while the Mac was short of memory (normal reads
@@ -224,8 +228,10 @@ def has_kind(d: Path, kind: str, within_s: Optional[float] = None) -> bool:
     return False
 
 
-def discard(d: Path, key: str) -> None:
-    for name in (_bin(key), _meta(key), _part(key)):
+def discard(d: Path, key: str, keep_part: bool = False) -> None:
+    """``keep_part``: prune's use — a .part may be a re-save of this key that
+    llama is writing right now (review r3); the stale-.part sweep takes old ones."""
+    for name in (_bin(key), _meta(key)) + (() if keep_part else (_part(key),)):
         try:
             (d / name).unlink()
         except FileNotFoundError:
@@ -294,6 +300,16 @@ def park(base: str, timeout: float = PARK_TIMEOUT_S) -> Tuple[bool, str]:
         return (False, _error_text(e))
 
 
+def _count(r: Any, field: str) -> int:
+    """A count from llama's reply; 0 when the reply is not the JSON object
+    expected (review r4: a string or list reply raised out of save/restore,
+    and the llama-start helper died with a traceback)."""
+    try:
+        return int((r if isinstance(r, dict) else {}).get(field) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def restore_timeout_s(d: Path, key: str) -> float:
     """§4RW review: the restore's bound grows with the file — 30 s was sized
     for the 1.7 GB head; a 6 GB conversation read under swap passed it, and
@@ -322,7 +338,10 @@ def restore(base: str, d: Path, key: str) -> Tuple[bool, str, float]:
         _note_unsupported(base, e, text)
         return (False, text, time.monotonic() - t0)
     dt = time.monotonic() - t0
-    n = int((r or {}).get("n_restored") or 0)
+    if not isinstance(r, dict):
+        # review r5: an odd reply says nothing about the file — keep it
+        return (False, f"llama answered {type(r).__name__}, not the restore result", dt)
+    n = _count(r, "n_restored")
     if n != expected:
         discard(d, key)
         return (False, f"restored {n} tokens, saved head has {expected}", dt)
@@ -350,7 +369,8 @@ def save(base: str, d: Path, key: str, expected_n: int, identity: str = "",
         text = _error_text(e)
         _note_unsupported(base, e, text)
         return (False, text)
-    n = int((r or {}).get("n_saved") or 0)
+    n = _count(r, "n_saved")
+    r = r if isinstance(r, dict) else {}
     part = d / _part(key)
     if n < expected_n if at_least else n != expected_n:
         try:
@@ -360,44 +380,110 @@ def save(base: str, d: Path, key: str, expected_n: int, identity: str = "",
         return (False, f"slot held {n} tokens, expected {expected_n}")
     if not part.is_file():
         return (False, f"llama saved outside {d} — its --slot-save-path must be this directory")
-    os.replace(part, d / _bin(key))
-    meta = {"n_tokens": n, "bytes": int((r or {}).get("n_written") or 0),
-            "save_ms": ((r or {}).get("timings") or {}).get("save_ms"),
+    try:
+        os.replace(part, d / _bin(key))
+    except FileNotFoundError:            # the llama-start helper's prune took it meanwhile
+        return (False, "the saved file was removed before it was kept")
+    except OSError as e:
+        return (False, f"the saved file was not kept: {type(e).__name__}: {e}")
+    meta = {"n_tokens": n, "bytes": _count(r, "n_written"),
+            "save_ms": (r.get("timings") if isinstance(r.get("timings"), dict) else {}).get("save_ms"),
             "identity": identity, "saved_at": time.time(), "kind": kind, **(extra or {})}
     tmp = d / (_meta(key) + ".tmp")
-    tmp.write_text(json.dumps(meta))
-    os.replace(tmp, d / _meta(key))
+    try:
+        tmp.write_text(json.dumps(meta))
+        os.replace(tmp, d / _meta(key))
+    except OSError as e:
+        # review r3 (a full disk): the new state beside the OLD meta would
+        # restore as a token mismatch — drop both, report, never raise
+        discard(d, key)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return (False, f"meta not written: {type(e).__name__}: {e}")
+    # never prune(identity=…) here: a caller's identity can be a plan's, read
+    # before a llama restart on another model (fresh-eye review 10-27) — it
+    # would discard the running server's files; llama start judges identity
     prune(d)
     return (True, f"{n} tokens, {meta['bytes'] / 1e9:.2f} GB")
 
 
-def prune(d: Path, keep: int = KEEP) -> None:
+def prune(d: Path, keep: int = KEEP, identity: str = "") -> None:
     """Keep the ``keep`` newest heads of each kind (§4RU: owner effort
     changes never push out the members' head; §4RV: conversations keep
-    ``KEEP_CONV``); drop stale .part files. Touches only this module's own
-    file names."""
+    ``KEEP_CONV`` within ``CONV_BYTES_MAX``); drop stale .part files. Touches
+    only this module's own file names.
+
+    10-27 (operator: "this directory should be maintenance free"): given the
+    running server's ``identity`` — only one just read from its /props, never
+    a cached plan's — a save made on another model, build or template is
+    dropped: its key can never be asked for again, yet it held a place in its
+    kind's count until newer saves pushed it out. A meta whose state file is
+    gone and a stale ``.json.tmp`` are dropped too. One file vanishing under
+    us (the agent and the llama-start helper both prune) skips that file only."""
     try:
+        now = time.time()
+        if identity:
+            for m in d.glob("head-*.json"):
+                other = meta_field(d, m.name[len("head-"):-len(".json")], "identity")
+                if other and other != identity:
+                    discard(d, m.name[len("head-"):-len(".json")], keep_part=True)
+        for m in list(d.glob("head-*.json")) + list(d.glob("head-*.json.tmp")):
+            try:
+                orphan = m.name.endswith(".json") and not (d / (m.name[:-len(".json")] + ".bin")).exists()
+                if (orphan or m.name.endswith(".tmp")) and now - m.stat().st_mtime > STALE_PART_S:
+                    m.unlink()
+            except Exception:  # noqa: BLE001
+                continue
+
         def _last_use(p):
             # §4RW review: saved (.bin) or used (`touch` on the .json) — by the
             # save time alone a restored conversation counted as old and went first
             try:
                 return max(p.stat().st_mtime, p.with_suffix(".json").stat().st_mtime)
             except Exception:  # noqa: BLE001
-                return p.stat().st_mtime
-        heads = sorted((p for p in d.glob("head-*.bin")
-                        if not p.name.endswith(".part.bin")),
-                       key=_last_use, reverse=True)
-        seen: dict = {}
-        for p in heads:
-            key = p.name[len("head-"):-len(".bin")]
-            kind = kind_of(d, key)
-            seen[kind] = seen.get(kind, 0) + 1
-            if seen[kind] > (KEEP_CONV if kind == CONV else keep):
-                discard(d, key)
-        now = time.time()
+                try:
+                    return p.stat().st_mtime
+                except OSError:
+                    return 0.0
+        ranked = sorted(((_last_use(p), p) for p in d.glob("head-*.bin")
+                         if not p.name.endswith(".part.bin")),
+                        key=lambda t: t[0], reverse=True)
+        kept: dict = {}
+        conv_bytes = 0          # of the conversations kept so far, newest first
+        for used_at, p in ranked:
+            if _last_use(p) != used_at:
+                # review r4: saved or used again since the ranking (a re-save
+                # by another thread or process) — the next prune judges it
+                continue
+            try:
+                key = p.name[len("head-"):-len(".bin")]
+                size = p.stat().st_size
+                if not (d / _meta(key)).exists():
+                    # review r2: a state file without its meta can never be
+                    # restored, yet counted as an OWNER head (kind_of's
+                    # default) — a fresh one is a save between its two writes
+                    if now - p.stat().st_mtime > STALE_PART_S:
+                        discard(d, key, keep_part=True)
+                    continue
+                kind = kind_of(d, key)
+            except OSError:
+                continue
+            n = kept.get(kind, 0)
+            if (n >= (KEEP_CONV if kind == CONV else keep)
+                    or (kind == CONV and n >= 1 and conv_bytes + size > CONV_BYTES_MAX)):
+                discard(d, key, keep_part=True)   # a dropped big one leaves room for an older, smaller one
+                continue
+            kept[kind] = n + 1
+            if kind == CONV:
+                conv_bytes += size
         for p in d.glob("head-*.part.bin"):
-            if now - p.stat().st_mtime > STALE_PART_S:
-                p.unlink()
+            try:
+                if now - p.stat().st_mtime > STALE_PART_S:
+                    p.unlink()
+            except OSError:
+                continue
     except Exception:  # noqa: BLE001
         pass
 
@@ -411,7 +497,9 @@ def prune(d: Path, keep: int = KEEP) -> None:
 
 def newest_head_for(d: Path, identity: str, kind: str = OWNER) -> Optional[str]:
     """Key of the most recently saved head of ``kind`` made on this server
-    identity (§4RU: llama-start puts the owner's back, never the members')."""
+    identity (§4RU: llama-start puts the owner's back, never the members').
+    By SAVE time, not last use (operator 10-27: "after a llama restart the
+    most recently saved head should be loaded not the most recently used")."""
     best_key: Optional[str] = None
     best_at = float("-inf")
     for meta in d.glob("head-*.json"):
@@ -449,6 +537,7 @@ def restore_on_start(base: str, d: Path, wait_s: float = 600.0, sleep=time.sleep
         ident = server_identity(base)
     except Exception as e:  # noqa: BLE001
         return f"cannot read /props ({_error_text(e)}) — nothing restored"
+    prune(d, identity=ident)        # 10-27: a model/build change frees the old saves here
     key = newest_head_for(d, ident)
     if key is None:
         return "no saved head for this model/build/template — the agent's warm-up will process it"

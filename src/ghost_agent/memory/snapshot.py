@@ -23,7 +23,9 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
+import stat
 import sqlite3
 import time
 from pathlib import Path
@@ -32,8 +34,13 @@ from typing import Optional
 logger = logging.getLogger("GhostAgent")
 
 KEEP = 7
-#: regenerable or not the agent's state — left out of every snapshot
-_SKIP_DIRS = {"eval", "bench", "tokenizer", "llm_recordings", "backups", "__pycache__"}
+#: regenerable or not the agent's state — left out of every snapshot.
+#: `head_saves` holds llama-server KV-cache slot files (~6 GB each): a cache,
+#: not a store — 18 of a 23 GB backups folder on 2026-10-27. `scratch_trash`
+#: holds MODEL-written sandbox files kept 7 days with their modes (§4NY): one
+#: chmod 000 file there failed every snapshot for a week (review r6)
+_SKIP_DIRS = {"eval", "bench", "tokenizer", "llm_recordings", "backups", "head_saves",
+              "scratch_trash", "__pycache__"}
 _SKIP_FILES = {"ghost-agent.log", "ghost-agent.log.1"}
 _SQLITE_SUFFIXES = (".db", ".sqlite3")
 
@@ -138,6 +145,11 @@ def verify_snapshot(snap: Path) -> list:
     finds itself."""
     problems = []
     for db in sorted(snap.rglob("*")):
+        # review r4: the sandbox is MODEL-WRITABLE — a text file named
+        # `notes.db` (or a project db half-written while copied) refused
+        # every snapshot of the stores; sandbox files are copied, not judged
+        if db.relative_to(snap).parts[:1] == ("sandbox",):
+            continue
         if db.suffix in _SQLITE_SUFFIXES and db.is_file():
             try:
                 with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as c:
@@ -184,9 +196,14 @@ def _verify_chroma(memory_copy: Path) -> list:
                 got["embeddings"] += list(g.get("embeddings") if g.get("embeddings") is not None else [])
             ids, embs = got.get("ids") or [], got.get("embeddings")
             embs = [] if embs is None else list(embs)
+            # 10-28: k=10 failed a sound store ("1 of 20"): 16 of 8421 live
+            # vectors missed their own top-10 — and top-100 — yet were rank 0
+            # at distance 0 from k=200 (HNSW nodes the greedy search reaches
+            # only with a wide ef). k=n searches the whole index (1.4 s for 20
+            # at 8.4k), so only a vector ABSENT from the index fails.
             missed = 0
             for i, e in zip(ids, embs):
-                hit = col.query(query_embeddings=[list(e)], n_results=min(n, 10))
+                hit = col.query(query_embeddings=[list(e)], n_results=n, include=["distances"])
                 if i not in ((hit.get("ids") or [[]])[0]):
                     missed += 1
             return [f"chroma: {missed} of {len(ids)} sampled vectors do not find themselves"] if missed else []
@@ -194,20 +211,102 @@ def _verify_chroma(memory_copy: Path) -> list:
             return [f"chroma: {type(e).__name__}: {e}"]
 
 
+#: a snapshot folder's name (`take_snapshot`): `<UTC stamp>-<tag>[-n]`
+_SNAP_NAME = re.compile(r"^\d{8}T\d{6}Z-")
+#: review r2: a tag is one plain name part — `x.partial` was pruned as
+#: unfinished, `a/b` nested out of reach, `../` wrote outside backups/
+_TAG = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+
+
+def _rmtree(p: Path) -> bool:
+    """Delete ``p`` whole; True when it is gone.
+
+    10-27: the sandbox copy keeps the sandbox's modes, and a read-only project
+    folder (`48e0373aaab3`) made `rmtree(ignore_errors=True)` fail on every old
+    snapshot without a word — it took the writable top level (MANIFEST.json
+    with it) and left the rest, which no later prune counted again: 29
+    snapshots against KEEP=7. Our own copies, so a failed entry is made
+    writable (its folder too, never ``p``'s own parent — the backups folder)
+    and retried."""
+    top = os.path.abspath(str(p))
+
+    def _retry(func, path, _exc):
+        if not os.path.lexists(path):   # review r3: another prune took it — re-deleting recursed forever
+            return
+        for q in ((path,) if os.path.abspath(path) == top else (os.path.dirname(path), path)):
+            try:
+                st = os.lstat(q)
+                if stat.S_ISLNK(st.st_mode):      # never through a link to outside the copy
+                    continue
+                os.chmod(q, st.st_mode | stat.S_IWUSR | stat.S_IRUSR | stat.S_IXUSR)
+            except OSError:
+                pass
+        try:
+            if func in (os.rmdir, os.unlink, os.remove):
+                func(path)
+            else:
+                # review 10-27: an unreadable folder fails in os.open/os.scandir,
+                # which cannot be re-called bare — delete it, now readable, whole
+                shutil.rmtree(path, onerror=_retry)
+        except FileNotFoundError:       # review r2: another prune removed it meanwhile
+            pass
+    try:
+        shutil.rmtree(p, onerror=_retry)
+    except Exception as e:  # noqa: BLE001 — a prune must never fail a published snapshot
+        logger.warning("snapshot %s could not be removed: %s", p.name, e)
+    return not os.path.lexists(p)
+
+
+def _retire(p: Path) -> bool:
+    """Delete a published snapshot: renamed to ``<name>.partial`` FIRST, so a
+    delete that fails half-way (MANIFEST.json gone, the rest left) is retried
+    by the daily `.partial` sweep instead of stranded (review r2). True when
+    it is gone; False when another prune got there first or it is left."""
+    gone = p.with_name(p.name + ".partial")
+    try:
+        os.rename(p, gone)
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        logger.warning("snapshot %s could not be removed: %s", p.name, e)
+        return False
+    return _rmtree(gone)
+
+
+def _ours(p: Path, partial: bool) -> bool:
+    """A complete snapshot folder (``partial=False``) or a `.partial` older
+    than a day (``partial=True``) of `take_snapshot`'s naming — never a link.
+    Review r2: one odd entry (no x bit, renamed away meanwhile) raised out of
+    the scan and failed a snapshot that was already published."""
+    try:
+        if (not _SNAP_NAME.match(p.name) or p.name.endswith(".partial") != partial
+                or p.is_symlink() or not p.is_dir()):
+            return False
+        if partial:
+            return time.time() - p.stat().st_mtime > 86400
+        return (p / "MANIFEST.json").exists()
+    except OSError:
+        return False
+
+
 def prune_snapshots(dest_root: Path, keep: int = KEEP) -> list:
     """Delete all but the newest ``keep`` COMPLETE snapshots, and any stale
-    `.partial` older than a day. Returns what was removed."""
+    `.partial` older than a day. Returns what was removed.
+
+    Only snapshot-named real folders with a MANIFEST.json count (review
+    10-27: a link or a `zz…` folder sorted "newest" and pushed real ones
+    out). A stamp-named folder WITHOUT one is never touched: repair scripts
+    keep their own backups here under the same names
+    (`<stamp>-4qn/memory/fact_ledger.db`)."""
     removed = []
     if not dest_root.is_dir():
         return removed
-    done = sorted((p for p in dest_root.iterdir() if p.is_dir() and not p.name.endswith(".partial")
-                   and (p / "MANIFEST.json").exists()), key=lambda p: p.name)
+    done = sorted((p for p in dest_root.iterdir() if _ours(p, False)), key=lambda p: p.name)
     for p in done[:-keep] if keep > 0 else done:
-        shutil.rmtree(p, ignore_errors=True)
-        removed.append(p.name)
-    for p in dest_root.glob("*.partial"):
-        if time.time() - p.stat().st_mtime > 86400:
-            shutil.rmtree(p, ignore_errors=True)
+        if _retire(p):
+            removed.append(p.name)
+    for p in [q for q in dest_root.iterdir() if _ours(q, True)]:
+        if _rmtree(p):
             removed.append(p.name)
     return removed
 
@@ -215,8 +314,9 @@ def prune_snapshots(dest_root: Path, keep: int = KEEP) -> list:
 def latest_snapshot(dest_root: Path) -> Optional[Path]:
     if not dest_root.is_dir():
         return None
-    done = sorted(p for p in dest_root.iterdir() if p.is_dir() and (p / "MANIFEST.json").exists()
-                  and not p.name.endswith(".partial"))
+    # review r4: the same test as prune — a `zz…` folder with a manifest read
+    # as the newest (no daily snapshot due), a folder without x raised
+    done = sorted(p for p in dest_root.iterdir() if _ours(p, False))
     return done[-1] if done else None
 
 
@@ -260,17 +360,36 @@ def take_snapshot(home: Path, dest_root: Optional[Path] = None, tag: str = "auto
     """Copy, verify, publish, prune. Returns
     ``{"ok", "path", "bytes", "files", "problems", "seconds", "pruned"}``."""
     t0 = time.time()
+    if not _TAG.fullmatch(str(tag)):     # review r5: `$` let "auto\n" through
+        return {"ok": False, "path": None, "files": 0, "bytes": 0, "seconds": 0.0,
+                "problems": [f"bad tag {tag!r}: letters, digits, '-' and '_' only"]}
     system = Path(home) / "system"
     dest_root = Path(dest_root) if dest_root else system / "backups"
     base = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + f"-{tag}"
-    dest_root.mkdir(parents=True, exist_ok=True)
     # §4MS: unique within the second — two snapshots in one second (a
     # cleanup re-run) collided and the second publish failed (ENOTEMPTY)
+    # review r3: the name is RESERVED (an exclusive mkdir of its .partial) —
+    # an exists() check let two processes in one second share one .partial;
+    # r5: checked again AFTER the reservation — another process can publish
+    # the name between the first check and the mkdir
     name, _n = base, 1
-    while (dest_root / name).exists() or (dest_root / f"{name}.partial").exists():
-        _n += 1
-        name = f"{base}-{_n}"
-    part = dest_root / f"{name}.partial"
+    try:
+        dest_root.mkdir(parents=True, exist_ok=True)
+        while True:
+            part = dest_root / f"{name}.partial"
+            if not (dest_root / name).exists():
+                try:
+                    part.mkdir()
+                    if not (dest_root / name).exists():
+                        break
+                    part.rmdir()
+                except FileExistsError:
+                    pass
+            _n += 1
+            name = f"{base}-{_n}"
+    except OSError as e:                 # r5: a read-only or full backups folder
+        return {"ok": False, "path": None, "files": 0, "bytes": 0, "seconds": round(time.time() - t0, 1),
+                "problems": [f"{type(e).__name__}: {e}"]}
     try:
         manifest = _copy_tree(system, part)
         manifest += _copy_sandbox(Path(home) / "sandbox", part / "sandbox")
@@ -278,20 +397,32 @@ def take_snapshot(home: Path, dest_root: Optional[Path] = None, tag: str = "auto
     except Exception as e:  # noqa: BLE001
         # r2: a raise (ENOSPC, a locked db, a permission) left ~185 MB of
         # .partial behind on EVERY attempt — clean up and say why
-        shutil.rmtree(part, ignore_errors=True)
+        _rmtree(part)
         return {"ok": False, "path": None, "files": 0, "bytes": 0,
                 "problems": [f"{type(e).__name__}: {e}"], "seconds": round(time.time() - t0, 1)}
     out = {"ok": not problems, "path": None, "files": len(manifest),
            "bytes": sum(m["bytes"] for m in manifest), "problems": problems}
     if problems:
         logger.warning("snapshot %s NOT published — %s", name, "; ".join(problems[:3]))
-        shutil.rmtree(part, ignore_errors=True)
+        _rmtree(part)
     else:
-        (part / "MANIFEST.json").write_text(json.dumps(
-            {"created": name, "home": str(home), "files": manifest}, indent=1), encoding="utf-8")
         final = dest_root / name
-        os.replace(part, final)
+        try:
+            # review r4: a full disk here raised out of take_snapshot (and the
+            # scripts that call it directly) and left the .partial behind
+            (part / "MANIFEST.json").write_text(json.dumps(
+                {"created": name, "home": str(home), "files": manifest}, indent=1), encoding="utf-8")
+            os.replace(part, final)
+        except OSError as e:            # a full disk, or its name published meanwhile
+            _rmtree(part)
+            out.update(ok=False, problems=[f"publish failed: {type(e).__name__}: {e}"])
+            out["seconds"] = round(time.time() - t0, 1)
+            return out
         out["path"] = str(final)
-        out["pruned"] = prune_snapshots(dest_root, keep)
+        try:
+            out["pruned"] = prune_snapshots(dest_root, keep)
+        except Exception as e:  # noqa: BLE001 — published is published
+            logger.warning("snapshot prune failed: %s", e)
+            out["pruned"] = []
     out["seconds"] = round(time.time() - t0, 1)
     return out

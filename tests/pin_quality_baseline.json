@@ -19,7 +19,7 @@
     "test_4fd_provenance.py": 2,
     "test_4fg_coding_loop.py": 2,
     "test_4fm_prefix_rewarm.py": 1,
-    "test_4fn_judge_fixes.py": 9,
+    "test_4fn_judge_fixes.py": 7,
     "test_4fx_tool_head_diet_retired.py": 1,
     "test_4fy_turn_state_check.py": 4,
     "test_4gi_api_routes.py": 3,
@@ -217,5 +217,5 @@
     "test_workspace_cleanup_deletion_guards.py": 1,
     "test_workspace_tidy.py": 3
   },
-  "total_textual": 902
+  "total_textual": 900
 }

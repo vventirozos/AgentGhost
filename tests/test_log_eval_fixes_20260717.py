@@ -166,8 +166,12 @@ class TestSourcePins:
         idx = _AGENT_SRC.find('f"AUTO-DIAGNOSTIC: {multi_op_summary}')
         assert idx != -1
         window = _AGENT_SRC[idx - 2000:idx]
-        assert "REMINDER — the CURRENT user request" in window
-        assert "do NOT" in window and "restart earlier requests" in window
+        # §4RZ step 2: the reminder is built by `_live_request_reminder`
+        assert "_live_request_reminder(last_user_content)" in window
+        from ghost_agent.core.agent import _live_request_reminder
+        r = _live_request_reminder("fix the build")
+        assert "REMINDER — the CURRENT user request" in r and '"fix the build"' in r
+        assert "do NOT" in r and "restart earlier requests" in r
 
     def test_native_repair_logs_raw_snapshot(self):
         assert "_raw_tc_snapshot" in _AGENT_SRC

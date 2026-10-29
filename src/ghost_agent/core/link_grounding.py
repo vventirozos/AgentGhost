@@ -206,11 +206,20 @@ def unfetched_links(text: str, fetched: Iterable[str]) -> List[str]:
 def haystack_from(messages: Iterable, tool_texts: Iterable[str] = (), snippet_ids=()) -> str:
     """Everything the conversation SAW: every non-assistant message's text,
     every tool call's arguments, and the assistant's answers to EARLIER
-    requests (a follow-up may repeat a link it gave before). The assistant
-    text after the last user message — the reply being checked — is left
-    out, so an invented link cannot vouch for itself."""
+    requests that sit before the turn's request row (a follow-up may repeat
+    a link it gave before). The TEXT of every assistant-role row after the
+    request — this turn's narration and reply, and the assistant-role
+    summary/anchor rows a prune places there — is left out (its tool-call
+    arguments stay), so an invented link cannot vouch for itself (§4RZ step
+    3: an earlier answer carried only by such a summary is left out with
+    it). Tool rows count wherever they sit, except a failed browser result
+    and a search snippet named in ``snippet_ids``."""
     msgs = [m for m in (messages or []) if isinstance(m, dict)]
-    last_user = max((i for i, m in enumerate(msgs) if m.get("role") == "user"), default=-1)
+    # §4RZ step 3: the reply being checked starts after the REQUEST — this
+    # turn's narration before a message the user sent mid-turn (or before a
+    # loop steer) is the reply's own voice, not something the request saw
+    from .queued_messages import request_row_index
+    last_user = request_row_index(msgs)
     # §4LN: a browser call that FAILED (404, refused, blocked, runner error)
     # did not see its URL — its arguments and its result text are not
     # evidence that the page exists. They vouched for an invented URL that
@@ -225,6 +234,9 @@ def haystack_from(messages: Iterable, tool_texts: Iterable[str] = (), snippet_id
                     fn = tc.get("function") or {}
                     parts.append(str(fn.get("arguments") or ""))
             if i > last_user:
+                # (s3-r2: the summary/anchor rows after a lifted request stay
+                # out too — they copy this turn's narration, and a text prefix
+                # is one the model can write)
                 continue
         if m.get("role") == "tool" and _failed_browser_result(m.get("content")):
             continue

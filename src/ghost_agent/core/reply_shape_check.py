@@ -49,6 +49,10 @@ FALLBACK_HEADS = {
     "failed": ("The last command FAILED — the output below "
                "is its error result, not a success."),
     "success": "Process finished successfully.",
+    # §4RZ step 5: the user stopped the last tool call — not a success,
+    # not a failure, not still running
+    "stopped": ("The user stopped the last tool call; "
+                "its result is not available."),
     # §4GH: the forced-final fallback — an honest non-answer, and refuted as
     # one. Lives here so the shape check follows any rewording.
     "no_answer": ("I ran out of this turn's budget before writing an answer, "
@@ -191,7 +195,7 @@ def refute_raw_tool_dump(reply: str, request: str = "", n_real_tools=None) -> Li
     if request and _raw_requested(str(request)):
         return []
     head_txt = m.group(0).strip().strip("`").strip()
-    if head_txt in (FALLBACK_HEADS["success"], FALLBACK_HEADS["failed"], FALLBACK_HEADS["running"]) and not _DUMP_BODY_RE.search(text):
+    if head_txt in (FALLBACK_HEADS["success"], FALLBACK_HEADS["failed"], FALLBACK_HEADS["running"], FALLBACK_HEADS["stopped"]) and not _DUMP_BODY_RE.search(text):
         return []                          # a sentence the model wrote, not the fallback (no tool framing follows)
     head = m.group(0).strip().strip("`").strip()
     return [f"the reply is raw tool output pasted as the answer (it opens with "

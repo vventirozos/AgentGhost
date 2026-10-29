@@ -323,6 +323,40 @@ def valid_job_id(job_id) -> bool:
     return bool(_ID_RE.match(str(job_id or "")))
 
 
+
+def _tool_stop_requested() -> bool:
+    """§4RZ step 5: the batch this run belongs to was stopped by the owner
+    (the ContextVar crosses `asyncio.to_thread`; unbound = never)."""
+    try:
+        from ..utils.tool_stop import requested
+        return requested()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _tool_stop_arm(tool: str):
+    try:
+        from ..utils.tool_stop import arm
+        return arm(tool)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _tool_stop_disarm(stop, tool: str) -> None:
+    try:
+        from ..utils.tool_stop import disarm
+        disarm(stop, tool)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _tool_stop_note_killed(tool: str = "") -> None:
+    try:
+        from ..utils.tool_stop import note_killed
+        note_killed(tool)
+    except Exception:  # noqa: BLE001
+        pass
+
 class SandboxJobSupervisor:
     """Promote, track, and reap detached long-running sandbox commands.
 
@@ -1345,11 +1379,15 @@ class SandboxJobSupervisor:
             # abandonment, a socket error on the read). Outside the guard,
             # that leaves a live process with no row, no TTL and no reaper.
             launcher_pid = self._launch(jid, dict(exec_kwargs or {}))
-            return self._supervise(jid, cmd, launcher_pid, budget=budget,
-                                   window=window, workdir=wd, label=label,
-                                   project_id=project_id,
-                                   cleanup_paths=cleanup_paths,
-                                   identity=identity)
+            _armed = _tool_stop_arm("execute")     # §4RZ step 5: a stop may still kill it
+            try:
+                return self._supervise(jid, cmd, launcher_pid, budget=budget,
+                                       window=window, workdir=wd, label=label,
+                                       project_id=project_id,
+                                       cleanup_paths=cleanup_paths,
+                                       identity=identity)
+            finally:
+                _tool_stop_disarm(_armed, "execute")
         except BaseException:
             # ⚠ BaseException, NOT Exception (§4BW CRITICAL-2). This guard's
             # whole job is "kill the detached process on any exit from the
@@ -1429,6 +1467,13 @@ class SandboxJobSupervisor:
                     level="WARNING", icon=Icons.STOP)
                 return self._kill_and_return(jid, pid, 124,
                                              cleanup_paths=cleanup_paths)
+            if _tool_stop_requested():
+                # §4RZ step 5: the owner stopped this call; the turn goes on
+                pid = pid or self._read_pid(jid) or launcher_pid
+                pretty_log("Job Stopped", f"{jid} stopped by the user mid-run: {str(cmd)[:70]}",
+                           icon=Icons.STOP)
+                return self._kill_and_return(jid, pid, 130, cleanup_paths=cleanup_paths,
+                                             on_killed=lambda: _tool_stop_note_killed("execute"))
             if now - started >= budget:
                 break
             if now >= next_probe:
@@ -1560,12 +1605,14 @@ class SandboxJobSupervisor:
                                         cleanup_paths=cleanup_paths)
         return self._read_log(jid), 0, entry
 
-    def _kill_and_return(self, jid: str, pid, code: int, cleanup_paths=None):
+    def _kill_and_return(self, jid: str, pid, code: int, cleanup_paths=None, on_killed=None):
         """Kill the job and return its output. The log is dropped ONLY when
         the kill is confirmed — a surviving process is still writing to it,
         and deleting an open file leaves it writing to an unlinked inode
-        nobody can read."""
+        nobody can read. ``on_killed`` runs only on a confirmed kill."""
         killed = self._kill_pgroup(pid)
+        if killed and on_killed is not None:
+            on_killed()
         out = self._read_log(jid)
         self._cleanup_files(jid, drop_log=killed,
                             entry={"cleanup_paths": cleanup_paths})

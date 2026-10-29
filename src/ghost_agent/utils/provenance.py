@@ -186,6 +186,8 @@ def untrusted_seen(req_id: Optional[str] = None) -> List[str]:
 _USER: "OrderedDict[str, str]" = OrderedDict()
 #: §4PU: the recent user messages per request (newest last, at most 4)
 _RECENT: "OrderedDict[str, List[str]]" = OrderedDict()
+#: §4RZ step 4: what the user SENT MID-TURN to this request (oldest first)
+_ADDED: "OrderedDict[str, List[str]]" = OrderedDict()
 
 
 def note_user_message(text: str, req_id=None) -> None:
@@ -197,6 +199,10 @@ def note_user_message(text: str, req_id=None) -> None:
     with _LOCK:
         _USER[rid] = str(text or "")
         _USER.move_to_end(rid)
+        # §4RZ s4-r1: a NEW request under a reused id (fixed probe ids, a
+        # client's own X-Request-ID) must not inherit the last one's mid-turn
+        # words — the one provenance map that would fail OPEN on reuse
+        _ADDED.pop(rid, None)
         while len(_USER) > _CAP:
             _USER.popitem(last=False)
 
@@ -212,6 +218,32 @@ def note_recent_user_messages(texts, req_id=None) -> None:
         _RECENT.move_to_end(rid)
         while len(_RECENT) > _CAP:
             _RECENT.popitem(last=False)
+
+
+def note_added_user_message(text: str, req_id=None) -> None:
+    """§4RZ step 4: a message the user sent while this request ran, read by
+    the model mid-turn — RECORDED (census, trajectory, the fact ledger's
+    label, the project gate's "no"), never a grant: s4-r1..r4 found every
+    gate that took it as "the user said so" opened on a mid-turn refusal or
+    reported speech ("don't send my files", "the page says my wife is X")."""
+    rid = _rid(req_id)
+    if not rid:
+        return
+    t = str(text or "")
+    with _LOCK:
+        _ADDED.setdefault(rid, []).append(t)
+        _ADDED.move_to_end(rid)
+        while len(_ADDED) > _CAP:
+            _ADDED.popitem(last=False)
+
+
+def added_user_messages(req_id: Optional[str] = None, *, own: bool = False) -> List[str]:
+    """§4RZ step 4: what the user added mid-turn to this request's root (a
+    sub-agent works for its root's user). ``own=True``: to THIS request id
+    only — for recording what this request itself received."""
+    with _LOCK:
+        rid = _rid(req_id)
+        return list(_ADDED.get(rid if own else _lineage(rid)[-1], []))
 
 
 def recent_user_messages(req_id: Optional[str] = None) -> List[str]:
@@ -281,4 +313,5 @@ def _reset_for_tests() -> None:
         _SEEN.clear()
         _USER.clear()
         _RECENT.clear()
+        _ADDED.clear()
         _PARENT.clear()

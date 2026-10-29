@@ -33,7 +33,6 @@ tiny Playwright runner script.
 import asyncio
 import json
 import logging
-import shlex
 from pathlib import Path
 import os
 import re
@@ -1241,11 +1240,10 @@ async def tool_browser(
                    "(weakest milestone; slow Tor exit suspected)",
                    icon=Icons.RETRY, level="WARNING")
         retry_payload = dict(payload, wait_until="commit")
-        retry_cmd = (
-            f"python3 -u {_BROWSER_RUNNER_FILENAME} "
-            f"{shlex.quote(json.dumps(retry_payload))}"
-        )
         _retry_t = _exec_timeout_for(_deadline, subprocess_timeout)
+        # the shared builder: the §4RZ stop kills the runner by this exact head
+        retry_cmd = runner_cmd(_BROWSER_RUNNER_FILENAME, retry_payload, operation,
+                               _retry_t or 0, _runner_total_ms)
         if not _retry_t:
             pretty_log("Browser Retry",
                        "skipped the commit-milestone retry — the call's "

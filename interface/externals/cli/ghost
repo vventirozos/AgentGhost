@@ -28,6 +28,11 @@ agent's real feature surface:
   turn server-side (releasing the global turn lock) instead of merely
   closing our socket while the agent keeps working. ``/turns`` shows
   what's running or queued; ``/cancel [hard]`` unwedges a stuck turn.
+* **Typing while a turn runs** (§4RZ) — the reply streams on a thread
+  under a live prompt; Enter posts the line to ``/api/turn/inbox`` (added
+  to the running turn, answered as a status, a stop, or held and sent after
+  the reply); ``/interrupt`` stops the running tool. GHOST_CLI_BUSY_PROMPT=0
+  restores the old blocking stream.
 * **Operations** — ``/health`` (runtime introspection), ``/effort``
   (reasoning effort for your messages, as the web page's selector), ``/notify``
   (pending autonomous-activity notifications, watermark-acked),
@@ -44,6 +49,8 @@ raw text when piped, rendered when stdout is a terminal.
 from __future__ import annotations
 
 import argparse
+import collections
+import contextlib
 import copy
 import io
 import json
@@ -72,19 +79,22 @@ if not os.environ.get("GHOST_CLI_WARN"):
 
 import requests
 from prompt_toolkit import PromptSession
-from prompt_toolkit.formatted_text import ANSI
+from prompt_toolkit.formatted_text import ANSI, to_formatted_text
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import NestedCompleter, PathCompleter
 from prompt_toolkit.shortcuts import CompleteStyle
 from prompt_toolkit.history import FileHistory
-from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.key_binding import KeyBindings, merge_key_bindings
+from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
 from rich.console import Console, ConsoleOptions, RenderResult
+from rich.control import Control
 from rich.live import Live
+from rich.live_render import LiveRender
 from rich.markdown import Markdown
 from rich.padding import Padding
 from rich.prompt import Confirm
-from rich.segment import Segment
+from rich.segment import ControlType, Segment
 from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
@@ -199,6 +209,7 @@ COMPLETER = NestedCompleter.from_nested_dict({
     "/health": None, "/turns": None,
     "/effort": {"default": None, "low": None, "med": None, "xhigh": None},
     "/cancel": {"hard": None},
+    "/interrupt": None,
     "/notify": None,
     "/memory": {"fix": None, "rm": None},
     "/upload": PathCompleter(expanduser=True),
@@ -251,6 +262,25 @@ EFFORT_ICONS = {"low": "🪫", "medium": "🔋", "xhigh": "🔥"}
 #: multiplies it: with _json's default (10, 60) the four attempts could
 #: freeze the prompt for 4x70s + 6.5s ≈ 287s against a hung agent.
 RATE_TIMEOUT = (5, 10)
+#: §4RZ: the inbox / interrupt / leftovers calls are tiny and the operator
+#: is waiting on them (a busy-prompt Enter, or the end of a reply), so a hung
+#: agent may cost seconds, never a minute.
+INBOX_TIMEOUT = (3, 5)
+#: The leftovers take: the agent hands each leftover out ONCE, as it answers,
+#: so a read that times out loses them — give the read room.
+LEFTOVERS_TIMEOUT = (3, 30)
+#: The cancel sent by a stop from the busy prompt. Ctrl-C is held while it
+#: runs (see _sigint_deferred), so it must be short: the default (10, 60)
+#: left Ctrl-C dead for over a minute exactly when the agent was hung.
+CANCEL_TIMEOUT = (3, 10)
+#: How long a stop from the busy prompt waits for the stream thread to wind
+#: down after its socket is shut. It is a daemon and muted, so a slow one is
+#: abandoned rather than waited for.
+STOP_JOIN_S = 2.0
+#: Busy-prompt redraw clock: the spinner frame and the live tail.
+BUSY_REFRESH_S = 0.1
+#: rich's "dots" spinner (what console.status draws on the classic path).
+SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 #: How many turn refs to keep. Ratings target recent replies; this only
 #: bounds a long REPL session's memory.
 RATE_HISTORY = 50
@@ -434,18 +464,34 @@ class _StreamPrinter:
     exceed the screen (so only the UNFINISHED block may live there —
     it is naturally small; _TailCrop guards the rare giant one)."""
 
-    def __init__(self) -> None:
+    def __init__(self, tail: Any = None, muted: Any = None,
+                 lock: Any = None) -> None:
         self.text = ""
         self.upto = 0
         self.live: Live | None = None
+        # §4RZ 6b (busy prompt): ``tail`` takes the still-open block instead
+        # of a rich Live — prompt_toolkit draws it above the live prompt, so
+        # no Live ever runs under patch_stdout. ``muted`` (a callable) stops
+        # all output once the turn was stopped from the prompt; ``lock``
+        # makes a feed and that stop's snapshot of text/upto atomic.
+        # Unset, the printer behaves exactly as before.
+        self.tail = tail
+        self.muted = muted or (lambda: False)
+        self._lock = lock or contextlib.nullcontext()
 
     def feed(self, chunk: str) -> None:
+        with self._lock:
+            self._feed(chunk)
+
+    def _feed(self, chunk: str) -> None:
         # THE choke point for the rendered path: everything the agent says
         # becomes terminal output here, and self.text is what the caller
         # keeps as history / hands to /save. Sanitizing at the call sites
         # instead would leave the guard one refactor away from being
         # bypassed by a new one.
         self.text += _safe(chunk)
+        if self.muted():
+            return
         fp = _flush_point(self.text, self.upto)
         if fp > self.upto:
             segment = self.text[self.upto:fp]
@@ -454,10 +500,14 @@ class _StreamPrinter:
                 console.print()   # inter-block spacing rich would have added
             self.upto = fp
         pending = self.text[self.upto:]
+        if self.tail is not None:
+            self.tail(pending if pending.strip() else "")
+            return
         if pending.strip():
             if self.live is None:
                 self.live = Live(console=console, refresh_per_second=12,
                                  transient=True)
+                _reflow_safe(self.live)
                 self.live.start()
             # _LazyMarkdown, not Markdown: parsing here re-parsed the whole
             # pending region on EVERY chunk, and when a reply has no blank
@@ -472,13 +522,18 @@ class _StreamPrinter:
     def settle(self) -> None:
         """Stop the live tail and print whatever block was still open —
         idempotent, safe from error/abort paths."""
-        if self.live is not None:
-            self.live.stop()
-            self.live = None
-        rest = self.text[self.upto:]
-        self.upto = len(self.text)
-        if rest.strip():
-            console.print(_reply_block(rest))
+        with self._lock:
+            if self.live is not None:
+                self.live.stop()
+                self.live = None
+            if self.tail is not None:
+                self.tail("")
+            if self.muted():
+                return            # the stop that muted us printed the rest
+            rest = self.text[self.upto:]
+            self.upto = len(self.text)
+            if rest.strip():
+                console.print(_reply_block(rest))
 
 
 def _reply_block(markup: str) -> Padding:
@@ -549,7 +604,355 @@ class _TailCrop:
         for i, line in enumerate(lines):
             if i:
                 yield new_line
-            yield from line
+            yield from _rstrip_line(line)
+
+
+def _rstrip_line(line: list) -> list:
+    """A rendered line without its trailing pad. rich pads every line to the
+    full console width; a line exactly as wide as the terminal wraps onto a
+    second row the moment the pane narrows by ONE column, so the live tail
+    keeps only the cells that carry text. Padding with a background colour
+    (a code block's fill) is kept — stripping it would be visible."""
+    segs = list(line)
+    while segs and not segs[-1].control and not segs[-1].text.strip() \
+            and not (segs[-1].style and segs[-1].style.bgcolor):
+        segs.pop()
+    if segs and not segs[-1].control \
+            and not (segs[-1].style and segs[-1].style.bgcolor):
+        last = segs[-1]
+        segs[-1] = Segment(last.text.rstrip(), last.style, last.control)
+    return segs
+
+
+#: How long the width must hold before the live tail is drawn again after a
+#: resize: tmux's ~250 ms report coalescing plus an ssh hop.
+RESIZE_QUIET_S = 0.5
+
+
+class _ReflowLiveRender(LiveRender):
+    """rich's LiveRender, erasing the previous frame by the ROWS it covers
+    NOW rather than the lines it had when drawn.
+
+    rich moves the cursor up once per rendered line. When the pane narrows
+    mid-stream (window drag, tmux zoom, a smaller client attaching) the
+    terminal reflows each line onto ceil(cells / width) rows, the cursor-up
+    count falls short, and every refresh leaves the frame's top row behind —
+    operator report 2026-10-28: the reply's last paragraph repeated 9 times
+    in the tmux CLI pane (reproduced by shrinking a tmux window one column
+    per chunk). Assumes a reflowing terminal (tmux, iTerm2, Terminal.app,
+    Ghostty, kitty, WezTerm all are); at an unchanged width the count is
+    exactly rich's.
+
+    The width the CLI can read LAGS the screen during a drag: tmux reflows
+    the pane at once but reports the new size to the program at most every
+    ~250 ms (measured: 118 and 110 never reported during a 126→98 drag; an
+    isolated resize arrives in 2 ms), and ssh adds its own delay. Any erase
+    computed in that gap counts at the old width. So once a width change is
+    seen, the live tail stays EMPTY until the width has held for
+    RESIZE_QUIET_S — an empty frame has no rows to miscount, and the text
+    reappears when the resizing stops."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._cells: list[int] = []
+        self._console: Console | None = None
+        self._width: int | None = None
+        self._quiet_until = 0.0
+
+    def __rich_console__(self, console: Console,
+                         options: ConsoleOptions) -> RenderResult:
+        self._console = console
+        now = time.monotonic()
+        width = options.size.width
+        if self._width is not None and width != self._width:
+            self._quiet_until = now + RESIZE_QUIET_S
+        self._width = width
+        if now < self._quiet_until:
+            self._shape, self._cells = None, []
+            return
+        segs = list(super().__rich_console__(console, options))
+        self._cells = [Segment.get_line_length(line)
+                       for line in Segment.split_lines(segs)]
+        yield from segs
+
+    def _rows(self) -> int:
+        """Rows the last frame covers at the terminal's current width."""
+        if self._shape is None or not self._shape[1]:
+            return 0
+        width = self._console.size.width if self._console else 0
+        if width <= 0 or len(self._cells) != self._shape[1]:
+            return self._shape[1]
+        return sum(max(1, -(-n // width)) for n in self._cells)
+
+    def position_cursor(self) -> Control:
+        rows = self._rows()
+        if not rows:
+            return Control()
+        return Control(ControlType.CARRIAGE_RETURN,
+                       (ControlType.ERASE_IN_LINE, 2),
+                       *(((ControlType.CURSOR_UP, 1),
+                          (ControlType.ERASE_IN_LINE, 2)) * (rows - 1)))
+
+    def restore_cursor(self) -> Control:
+        rows = self._rows()
+        if not rows:
+            return Control()
+        return Control(ControlType.CARRIAGE_RETURN,
+                       *((ControlType.CURSOR_UP, 1),
+                         (ControlType.ERASE_IN_LINE, 2)) * rows)
+
+
+def _reflow_safe(live: Live) -> Live:
+    """Give a Live the resize-safe renderer (see _ReflowLiveRender). rich
+    keeps it in a private attribute; if a rich upgrade moves it, the stream
+    keeps rich's own behaviour rather than failing."""
+    old = getattr(live, "_live_render", None)
+    if isinstance(old, LiveRender):
+        live._live_render = _ReflowLiveRender(
+            old.renderable, old.style, old.vertical_overflow)
+    return live
+
+
+def _never_sent(exc: BaseException) -> bool:
+    """True only when the request surely never reached the agent: the
+    connection was refused or timed out while connecting. A read timeout,
+    a reset mid-answer or anything else may come AFTER the agent acted
+    (review r2: a slow inbox answer was injected AND re-sent)."""
+    if isinstance(exc, requests.exceptions.ConnectTimeout):
+        return True
+    if not isinstance(exc, requests.exceptions.ConnectionError):
+        return False
+    from urllib3.exceptions import ConnectTimeoutError, NewConnectionError
+    reason = getattr(exc.args[0], "reason", None) if exc.args else None
+    return isinstance(reason, (NewConnectionError, ConnectTimeoutError)) \
+        or isinstance(exc.args[0] if exc.args else None,
+                      (NewConnectionError, ConnectTimeoutError))
+
+
+#: How the agent ENDS the reply of a turn stopped cooperatively — by anyone
+#: (core/agent.py, the TurnCancelled handler: "<partial>\n\n_(Turn cancelled:
+#: <reason>.)_", or the note + " No output was produced before the
+#: cancellation."). Anchored to the end: a reply that merely quotes the note
+#: was not stopped (review r4). A HARD stop instead retracts the streamed
+#: text and ends with [DONE] and no reply.
+_STOPPED_NOTE_RE = re.compile(
+    r"_\(Turn cancelled: [^\n]*?\.\)_"
+    r"(?: No output was produced before the cancellation\.)?\Z")
+
+
+#: The agent's own stop and hold words, COPIED (the CLI imports nothing
+#: from src; tests/test_4rz_cli.py pins them equal to the source):
+#: core/queued_messages._STOP_RE (the whole message stops a turn) and
+#: tools/memory._DENY_RE (a message that holds or refuses). Matched on
+#: memory/profile._fold text (casefold, accents stripped).
+_STOP_RE = re.compile(r"(?:stop|cancel|abort|σταματα|σταματησε|ακυρο|ακυρωσε)[\s.!]*")
+_DENY_RE = re.compile(
+    r"(?<!\w)(?:no|nope|cancel|stop|wait|hold\s+on|abort|"
+    r"οχι|μην|μη|ακυρο|ακυρωσε|σταματα|περιμενε)(?!\w)", re.IGNORECASE)
+
+
+def _fold(text: Any) -> str:
+    import unicodedata
+    t = unicodedata.normalize("NFD", str(text or "").casefold())
+    return "".join(ch for ch in t if not unicodedata.combining(ch))
+
+
+def _is_hold_word(text: str) -> bool:
+    """A stop or a hold ("stop", "wait", "no", "σταμάτα"…): sent later as
+    a new request it would mean something else — it is never held for
+    sending (review r5: typed before the turn registered, it came back as a
+    fresh turn)."""
+    f = _fold(text)
+    return bool(_STOP_RE.fullmatch(f.strip()) or _DENY_RE.search(f))
+
+
+class _Ended:
+    """Busy-prompt result: the turn ended; ``text`` is the unsent draft."""
+    def __init__(self, text: str = ""):
+        self.text = text
+
+
+class _Abort(_Ended):
+    """Busy-prompt result: Ctrl-C — stop the turn; ``text`` is the draft."""
+
+
+def _shut_socket(resp: Any) -> None:
+    """Wake a thread blocked reading ``resp``: shutdown() makes its recv
+    return at once (close() from another thread may not). Best effort —
+    urllib3 1.x and 2.x keep the socket in different places."""
+    import socket
+    raw = getattr(resp, "raw", None)
+    for get in (lambda: raw.connection.sock, lambda: raw._connection.sock,
+                lambda: raw._fp.fp.raw._sock):
+        try:
+            sock = get()
+        except Exception:                          # noqa: BLE001 — probing
+            continue
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            return
+
+
+class _BusyView:
+    """What the stream thread and the busy prompt share (§4RZ step 6b).
+
+    The reply streams on a background thread; the main thread runs a live
+    prompt under ``patch_stdout`` so the operator can type mid-turn.
+    Completed blocks still print with ``console.print`` (patch_stdout puts
+    them above the prompt). The still-open block and the spinner are NOT a
+    rich Live here: a Live erases its frame by cursor-up counts, and under
+    patch_stdout the prompt is erased and redrawn between its frames, so
+    those counts would hit the prompt. They are drawn by prompt_toolkit
+    instead, as the prompt's message (``message``), which it erases and
+    redraws itself; the busy session erases its whole frame when it exits,
+    so the tail never lands in scrollback."""
+
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.done = threading.Event()
+        self.detached = False          # stopped from the prompt: worker muted
+        self.waiting = False           # spinner up (no token yet)
+        self.tail = ""
+        self.printer: _StreamPrinter | None = None
+        self.resp: Any = None
+        self.app: Any = None           # the busy prompt's Application
+        self.spinner = _BusySpinner(self)
+        self._width: int | None = None
+        self._quiet_until = 0.0
+        self._cache: tuple = (None, "")
+
+    # -- worker side -------------------------------------------------------
+    def new_printer(self) -> _StreamPrinter:
+        p = _StreamPrinter(tail=self.set_tail, muted=self.is_detached,
+                           lock=self.lock)
+        self.printer = p
+        return p
+
+    def is_detached(self) -> bool:
+        return self.detached
+
+    def set_tail(self, text: str) -> None:
+        self.tail = text
+        self.invalidate()
+
+    def note(self, msg: str, style: str = "notice") -> None:
+        with self.lock:
+            if not self.detached:
+                GhostCLI.notice(msg, style)
+
+    def invalidate(self) -> None:
+        app = self.app
+        if app is not None and getattr(app, "is_running", False):
+            try:
+                app.invalidate()       # thread-safe in prompt_toolkit
+            except Exception:          # noqa: BLE001 — a redraw is optional
+                pass
+
+    def finish(self) -> None:
+        """The stream ended: end the busy prompt (it keeps the draft)."""
+        self.done.set()
+        app = self.app
+        loop = getattr(app, "loop", None) if app is not None else None
+        if loop is not None:
+            try:
+                loop.call_soon_threadsafe(self.exit_if_done)
+            except RuntimeError:       # that run's loop already closed
+                pass
+        # A prompt not yet running sees `done` in its pre_run, and the
+        # message re-checks it every BUSY_REFRESH_S as the last resort.
+
+    # -- prompt side ---------------------------------------------------------
+    def exit_if_done(self) -> None:
+        app = self.app
+        if not self.done.is_set() or app is None:
+            return
+        # The busy PromptSession (and its app) is shared by every turn. A
+        # stream thread that outlived its stop finishes LATE, while the next
+        # turn's prompt runs: only the view that owns the current run may
+        # end it (review r1: a straggler ended turn 2's prompt).
+        if getattr(app, "ghost_busy_owner", self) is not self:
+            return
+        try:
+            if app.is_running and not app.future.done():
+                app.exit(result=_Ended(app.current_buffer.text))
+        except Exception:              # noqa: BLE001 — already exiting
+            pass
+
+    def detach(self) -> tuple[str, str]:
+        """Stop from the prompt: mute the worker, wake it, and return
+        (reply text so far, the part of it not printed yet)."""
+        with self.lock:
+            self.detached = True
+            p = self.printer
+            text, rest = (p.text, p.text[p.upto:]) if p is not None else ("", "")
+            self.tail, self.waiting = "", False
+        if self.resp is not None:
+            _shut_socket(self.resp)
+        return text, rest
+
+    def _tail_ansi(self) -> str:
+        size = shutil.get_terminal_size((80, 24))
+        now = time.monotonic()
+        # The resize lesson (_ReflowLiveRender): the width reported here
+        # lags the screen during a drag, so the tail goes blank until the
+        # width has held RESIZE_QUIET_S.
+        if self._width is not None and size.columns != self._width:
+            self._quiet_until = now + RESIZE_QUIET_S
+        self._width = size.columns
+        pending = self.tail
+        if not pending.strip() or now < self._quiet_until:
+            return ""
+        key = (pending, size.columns, size.lines)
+        if self._cache[0] == key:
+            return self._cache[1]
+        buf = io.StringIO()
+        Console(file=buf, force_terminal=True,
+                color_system=console.color_system or "truecolor",
+                width=max(20, size.columns - 1), height=max(8, size.lines),
+                theme=THEME, highlight=False,
+                ).print(_TailCrop(_LazyMarkdown(pending)))
+        self._cache = (key, buf.getvalue())
+        return self._cache[1]
+
+    def message(self) -> list:
+        """The busy prompt's message: the live tail or the spinner, a blank
+        line, then the prompt glyph. Called on every redraw."""
+        if self.done.is_set():
+            try:
+                from prompt_toolkit.application.current import get_app
+                get_app().loop.call_soon(self.exit_if_done)
+            except Exception:          # noqa: BLE001
+                pass
+        frags: list = []
+        tail = self._tail_ansi()
+        if tail:
+            frags.extend(to_formatted_text(ANSI(tail)))
+        elif self.waiting:
+            i = int(time.monotonic() / 0.08) % len(SPINNER_FRAMES)
+            frags.extend([(f"fg:{PALETTE['ghost']}", SPINNER_FRAMES[i]),
+                          (f"fg:{PALETTE['faint']}", " thinking…\n")])
+        if frags:
+            frags.append(("", "\n"))
+        frags.append(("class:p", PROMPT_GLYPH))
+        return frags
+
+
+class _BusySpinner:
+    """console.status's start/stop, drawn by the busy prompt's message."""
+
+    def __init__(self, view: _BusyView):
+        self.view = view
+
+    def start(self) -> None:
+        self.view.waiting = True
+        self.view.invalidate()
+
+    def stop(self) -> None:
+        self.view.waiting = False
+        self.view.invalidate()
 
 
 HELP = """[bold]conversation[/]
@@ -569,6 +972,7 @@ HELP = """[bold]conversation[/]
   [you]/turns[/]                 in-flight + queued turns
   [you]/effort[/] \\[level]        reasoning effort: default|low|med|xhigh [dim](bare = show)[/]
   [you]/cancel[/] \\[hard]         cancel the turn the agent is running — any client's (hard = force-release)
+  [you]/interrupt[/]             stop the tool this conversation's turn is running; the turn goes on
   [you]/notify[/]                show + ack pending autonomous-activity notifications
   [you]/memory fix[/] "old" "new"  correct one vector-memory fragment
   [you]/memory rm[/] "text"        delete one vector-memory fragment
@@ -585,7 +989,9 @@ HELP = """[bold]conversation[/]
 replies render as Markdown with highlighted code · images are not drawn
 in the terminal — /download <name> fetches one to open it locally
 Ctrl-C aborts a reply and cancels the turn on the agent; at an idle
-prompt it just clears the line — Ctrl-D exits[/]"""
+prompt it just clears the line — Ctrl-D exits
+while a reply streams you can type: Enter adds the message to the running
+turn (or holds it and sends it after the reply); "stop" stops the turn[/]"""
 
 
 class GhostAPI:
@@ -691,9 +1097,33 @@ class GhostAPI:
         return self._json("GET", "/api/turns")
 
     def cancel_turn(self, request_id: str | None = None,
-                    hard: bool = False) -> tuple[int, Any]:
+                    hard: bool = False, timeout: tuple = (10, 60)) -> tuple[int, Any]:
         return self._json("POST", "/api/turn/cancel",
-                          body={"request_id": request_id, "hard": hard})
+                          body={"request_id": request_id, "hard": hard},
+                          timeout=timeout)
+
+    # -- §4RZ queued messages (a message sent while a turn runs) -------------
+    def turn_inbox(self, session_id: str, text: str) -> tuple[int, Any]:
+        """A message typed while this conversation's turn runs → ``{"path":
+        "inject"|"cancel"|"status"|"queue", ...}`` (the agent routes it)."""
+        return self._json("POST", "/api/turn/inbox",
+                          body={"session_id": session_id, "text": text},
+                          timeout=INBOX_TIMEOUT)
+
+    def turn_interrupt(self, session_id: str) -> tuple[int, Any]:
+        """Stop the tool(s) the turn is running; the turn goes on. 200 /
+        404 (no running turn for this sender, or the feature is off) / 409
+        (no tool running)."""
+        return self._json("POST", "/api/turn/interrupt",
+                          body={"session_id": session_id},
+                          timeout=INBOX_TIMEOUT)
+
+    def inbox_leftovers(self, session_id: str) -> tuple[int, Any]:
+        """Messages a turn accepted but never read → ``{"messages": [...]}``;
+        the client sends them as normal messages."""
+        return self._json("POST", "/api/turn/inbox/leftovers",
+                          body={"session_id": session_id},
+                          timeout=LEFTOVERS_TIMEOUT)
 
     def feedback(self, request_id: str, signal: str, note: str = "",
                  source: str = FEEDBACK_SOURCE) -> tuple[int, Any]:
@@ -811,6 +1241,35 @@ class GhostCLI:
         # agent's `ghost.usage` frame (None until one arrives). Reset with
         # the turn refs.
         self.turn_usage: dict | None = None
+        # §4RZ 6b — messages typed while a turn runs. _held: this turn's
+        # messages the inbox did not take (queued path, feature off, network
+        # error); _outbox: what the REPL sends, in order, before its next
+        # prompt (leftovers, then the held ones). The next prompt starts with
+        # _restored (messages a stop handed back, oldest first) and then
+        # _draft (what the operator was typing) — see _take_draft.
+        self._held: list[str] = []
+        self._outbox: collections.deque[str] = collections.deque()
+        self._restored: list[str] = []
+        self._draft = ""
+        # This turn's lines in typing order, and those the inbox accepted
+        # (inject) — see _abort_turn / _after_busy_turn.
+        self._typed: list[str] = []
+        self._injected: list[str] = []
+        # This turn's ACCEPTED typings not yet back in the prompt, in typing
+        # order: (text, accepted by an EARLIER turn). Server lists are matched
+        # onto these one for one; nothing else is ever deduplicated (r10).
+        self._open: list[tuple[str, bool]] = []
+        # Leftovers the agent handed out and the line a turn is sending are
+        # kept HERE, never only in a local, until the restore or send that
+        # consumes them has committed (review r12): see _salvage.
+        self._fresh: list[str] = []
+        self._sending: tuple[str, dict, bool] | None = None
+        # The busy turn's ONE deferring SIGINT handler box (review r12).
+        self._sig: dict | None = None
+        self._streamed = {"any": False, "refused": False}
+        self._turn_clean = False
+        self._turn_stopped = False
+        self._busy_session: PromptSession | None = None
 
     # -- presentation ----------------------------------------------------
     def banner(self) -> None:
@@ -947,21 +1406,30 @@ class GhostCLI:
         self.notice(f"✖ HTTP {status}: {self.api.error_of(data)}", "err")
 
     # -- chat turn ---------------------------------------------------------
-    def stream_reply(self, request_id: str) -> str:
+    def stream_reply(self, request_id: str, busy: _BusyView | None = None) -> str:
         """POST the history and render the streamed reply live as Markdown.
         Returns its text (possibly partial, if aborted) so the caller can
-        keep context."""
-        status_spin = console.status(Text("thinking…", style="faint"),
-                                     spinner="dots")
+        keep context.
+
+        ``busy`` (§4RZ 6b): this runs on the stream thread under the busy
+        prompt — the spinner and the open block go to the prompt's message,
+        and a stop from the prompt mutes everything this prints."""
+        if busy is None:
+            status_spin = console.status(Text("thinking…", style="faint"),
+                                         spinner="dots")
+            note, new_printer = self.notice, _StreamPrinter
+        else:
+            status_spin, note, new_printer = busy.spinner, busy.note, busy.new_printer
         status_spin.start()
         waiting = True                 # spinner up, no token yet
         self._turn_interrupted = ""    # cleared per turn; set on every exit
                                        # branch that leaves the reply partial
         self._turn_unlabelable = False  # §4ML: the agent said "no trajectory"
         self.turn_usage = None         # this turn's frame, or nothing (r1 m3)
-        printer = _StreamPrinter()
+        printer = new_printer()
         held = None                    # §4KP: a list while the reply is held
         saw_done = False               # the stream's own terminal frame arrived
+        saw_retract = False            # a hard stop's shape: retract, then no reply
 
         def _release() -> None:
             nonlocal held, waiting
@@ -990,16 +1458,21 @@ class GhostCLI:
         try:
             with self.api.chat_stream(self.history, self.session_id,
                                       request_id, self.effort) as resp:
+                if busy is not None:
+                    busy.resp = resp
                 if resp.status_code != 200:
                     _settle()
+                    self._streamed["refused"] = True
                     self._turn_interrupted = "error"
                     try:
                         detail = self.api.error_of(resp.json())
                     except ValueError:
                         detail = (resp.text or "").strip()[:300]
-                    self.notice(f"✖ HTTP {resp.status_code}: {detail}", "err")
+                    note(f"✖ HTTP {resp.status_code}: {detail}", "err")
                     return ""
                 for raw in resp.iter_lines():
+                    if busy is not None and busy.detached:
+                        break             # stopped from the busy prompt
                     if not raw:
                         continue
                     line = raw.decode("utf-8", "replace")
@@ -1013,10 +1486,13 @@ class GhostCLI:
                         obj = json.loads(data)
                     except json.JSONDecodeError:
                         continue
+                    if (set(obj.get("ghost") or {}) - {"usage", "labelable"}
+                            or (obj.get("choices") or [{}])[0].get("delta", {}).get("content")):
+                        self._streamed["any"] = True   # the turn ran (r16)
                     if obj.get("error"):
                         _settle()
                         self._turn_interrupted = "error"
-                        self.notice(f"✖ {self.api.error_of(obj)}", "err")
+                        note(f"✖ {self.api.error_of(obj)}", "err")
                         break
                     # Control-char stripping lives in _StreamPrinter.feed —
                     # the single point where reply text becomes output and
@@ -1031,12 +1507,13 @@ class GhostCLI:
                         # §4MP: the agent dropped the text it streamed (a tool
                         # call followed, or the reply was rewritten). Printed
                         # lines cannot be taken back: mark it, start again.
+                        saw_retract = True
                         if held is not None:
                             held.clear()
                         elif printer.text:
                             printer.settle()
-                            self.notice("↺ revised — the reply continues below", "mute")
-                            printer = _StreamPrinter()
+                            note("↺ revised — the reply continues below", "mute")
+                            printer = new_printer()
                         continue
                     if (obj.get("ghost") or {}).get("reasoning_unparsed") is True and held is None:
                         held = []
@@ -1058,16 +1535,30 @@ class GhostCLI:
         except requests.exceptions.ConnectionError:
             _settle()
             self._turn_interrupted = "error"
-            self.notice("✖ cannot reach the agent — is it running?", "err")
+            note("✖ cannot reach the agent — is it running?", "err")
         except Exception as e:                     # noqa: BLE001 — surface anything
             _settle()
             self._turn_interrupted = "error"
-            self.notice(f"✖ {type(e).__name__}: {e}", "err")
+            note(f"✖ {type(e).__name__}: {e}", "err")
         finally:
             if self._turn_interrupted or not saw_done:
                 held = None            # §4KP: never the unfiltered reasoning of a cut reply
             _release()
             _settle()
+        # §4RZ r3: stopped on the agent (by another client, or /cancel) — the
+        # stream ends normally; only the reply says so. Read by the busy
+        # prompt's after-turn step alone (nothing else changes on this flag).
+        # A clean reply with no text (tool- or image-only) is NOT a stop: only
+        # a retract followed by no reply is (review r4).
+        self._turn_stopped = bool(
+            saw_done and not self._turn_interrupted
+            and ((saw_retract and not printer.text.strip())
+                 or _STOPPED_NOTE_RE.search(printer.text.rstrip())))
+        # POSITIVE evidence the turn ended normally (operator rule, r5): the
+        # stream's own end, a non-empty reply, no stop signal. Only then is
+        # anything sent on its own after the reply.
+        self._turn_clean = bool(saw_done and not self._turn_interrupted
+                                and printer.text.strip() and not self._turn_stopped)
         return printer.text
 
     def _note_usage(self, usage: dict) -> None:
@@ -1083,39 +1574,782 @@ class GhostCLI:
         u["cached"] = min(u["cached"], u["prompt"])
         self.turn_usage = u
 
-    def _abort_turn(self, request_id: str) -> None:
+    def _abort_turn(self, request_id: str, *, timeout: tuple | None = None,
+                    restore: bool = False, started: bool = True) -> None:
         """Ctrl-C: we closed our socket, but turns are globally serialized on
         the agent — an abandoned turn would keep working AND keep the lock.
-        Cancel it server-side (cooperatively) via the turn registry."""
-        try:
-            status, data = self.api.cancel_turn(request_id=request_id)
+        Cancel it server-side (cooperatively) via the turn registry.
+
+        ``restore`` (busy prompt only): messages the turn accepted and never
+        read come back into the prompt. The classic path keeps the old
+        behaviour exactly: it never posts to the inbox, so anything there
+        came from ANOTHER client on this session and is not this prompt's.
+
+        ``started`` False: nothing had streamed yet, so a "no such turn"
+        answer may mean the agent had not registered it yet (review r15)."""
+        answer: tuple | None = None
+        # Each step of answered() runs once (r16): a KeyboardInterrupt that
+        # lands inside it re-enters it from the except branch.
+        done = {"said": False, "back": False}
+
+        def answered() -> None:
+            if self._sig is not None:
+                self._sig["raise"] = False  # answered: the wait is over (r14)
+            status, data = answer
             if status == 200 and isinstance(data, dict) and data.get("cancelled"):
-                self.notice("⛔ aborted — agent turn cancelled", "mute")
+                if not done["said"]:
+                    self.notice("⛔ aborted — agent turn cancelled", "mute")
+                    done["said"] = True
+                if restore and not done["back"]:
+                    # restore-first, booked on the same line; then claim
+                    back = self._restore_to_prompt(data.get("undelivered")); done["back"] = True  # noqa: E702
+                    self._claim(back)
+            elif done["said"]:
+                return
+            elif not started:
+                self.notice("⛔ the agent had no running turn to cancel — it may "
+                            "not have registered it yet and may still run it; "
+                            "/turns to check before resending", "mute")
             else:
                 self.notice("⛔ aborted (turn already finished)", "mute")
-        except requests.RequestException:
-            self.notice("⛔ aborted locally — couldn't reach the agent "
-                        "to cancel; /turns to check, /cancel to retry", "mute")
+            done["said"] = True
+
+        try:
+            kw = {"timeout": timeout} if timeout else {}
+            answer = self.api.cancel_turn(request_id=request_id, **kw)
+            answered()
+        except requests.RequestException as e:
+            if restore and _never_sent(e):
+                # Never reached the agent: the turn runs on, and what it
+                # accepted it still reads, or hands back as leftovers.
+                self.notice("⛔ aborted locally — couldn't reach the agent, so "
+                            "the turn was NOT cancelled; /turns to check, "
+                            "/cancel to retry", "mute")
+            elif restore:
+                self.notice("⛔ the agent did not answer the cancel — the turn "
+                            "may or may not be cancelled; /turns to check, "
+                            "/cancel to retry", "mute")
+                self._restore_unknown()
+            else:
+                self.notice("⛔ aborted locally — couldn't reach the agent "
+                            "to cancel; /turns to check, /cancel to retry", "mute")
         except KeyboardInterrupt:
             # An impatient SECOND Ctrl-C, landing while we post the cancel.
             # It used to escape here and unwind the whole REPL — the
             # self-inflicted double-interrupt. The turn may still hold the
             # global lock, so say so, but keep the session.
+            if answer is not None:          # the answer is in hand: use it (r15)
+                answered()
+                return
             self.notice("⛔ cancel not confirmed — the turn may still be "
                         "running; /turns to check, /cancel to retry", "mute")
+            if restore:
+                self._restore_unknown()
 
-    def chat_turn(self, line: str) -> None:
-        self.history.append({"role": "user", "content": line})
-        request_id = uuid.uuid4().hex[:16]
-        console.print()
-        reply = self.stream_reply(request_id)
+    def _restore_unknown(self, earlier_only: bool = False) -> None:
+        """Accepted typings that no answer accounted for (a lost or empty
+        cancel answer — another client's cancel may have emptied the inbox
+        into ITS answer — or an earlier turn this client cannot see end):
+        the CLI cannot tell which were read. Name them all and put them back
+        (review r3: lost silently). ``earlier_only``: only those accepted by
+        an earlier turn (review r10)."""
+        texts = [t for t, e in self._open if e or not earlier_only]
+        texts = self._restore_to_prompt(texts)   # first: an interrupt can't lose them
+        self._open = [(t, e) for t, e in self._open if earlier_only and not e]
+        if not texts:
+            return
+        names = "; ".join(f"«{_trim(t, 50)}»" for t in texts)
+        self.notice(f"sent during the turn — the agent may or may not have read "
+                    f"{'them' if len(texts) > 1 else 'it'}; back in the prompt: "
+                    f"{names}", "notice")
+
+    def _hand_back(self, texts: Any) -> None:
+        """A server list straight into the prompt: restored FIRST, then
+        claimed, so an interrupt in between costs at most a duplicate, never
+        a text (review r11 nit)."""
+        self._claim(self._restore_to_prompt(texts))
+
+    def _claim_one(self, text: str) -> bool:
+        """Mark the first open accepted typing with this text as back."""
+        for i, (t, _) in enumerate(self._open):
+            if t == text:
+                del self._open[i]
+                return True
+        return False
+
+    def _claim(self, texts: Any) -> list[str]:
+        """A server list (undelivered, leftovers): matched one for one onto
+        this turn's accepted typings, which are then back. EVERY text is
+        returned to be restored, matched or not — a duplicate is acceptable,
+        a loss is not (review r10: another client's identical "ok")."""
+        texts = [str(t) for t in (texts or []) if str(t).strip()]
+        for t in texts:
+            self._claim_one(t)
+        return texts
+
+    def _in_typing_order(self, items: list[str]) -> list[str]:
+        """This turn's items sorted by when they were typed; a text typed
+        twice gets each occurrence's own index (review r4). Items not typed
+        this turn (another client's, an earlier turn's) come first."""
+        slots: dict[str, list[int]] = {}
+        for i, t in enumerate(self._typed):
+            slots.setdefault(t, []).append(i)
+        keyed = [(slots[t].pop(0) if slots.get(t) else -1, n, t)
+                 for n, t in enumerate(items)]
+        return [t for _, _, t in sorted(keyed)]
+
+    # -- §4RZ 6b: typing while a turn runs --------------------------------
+    def _busy_enabled(self) -> bool:
+        """The busy prompt runs only in the interactive REPL on a terminal.
+        GHOST_CLI_BUSY_PROMPT=0 restores the classic path (the reply streams
+        on the main thread, nothing can be typed until it ends)."""
+        if os.environ.get("GHOST_CLI_BUSY_PROMPT", "1").strip() == "0":
+            return False
+        return (self.prompt_session is not None and sys.stdin.isatty()
+                and console.is_terminal)
+
+    def _busy_stdout(self) -> Any:
+        return patch_stdout(raw=True)
+
+    def _turn_api(self) -> GhostAPI:
+        """The stream thread's own client: one requests.Session shared with
+        the main thread's inbox posts is not thread-safe."""
+        api = copy.copy(self.api)
+        api.http = requests.Session()
+        api.http.headers.update(self.api.http.headers)
+        return api
+
+    def _busy_prompt(self, view: _BusyView, draft: str) -> Any:
+        """One busy-prompt read → the typed line, None (Ctrl-D, ignored),
+        _Ended (the turn ended) or _Abort (Ctrl-C)."""
+        if self._busy_session is None:
+            kb = KeyBindings()
+
+            @kb.add("c-c")
+            @kb.add("<sigint>")             # a SIGINT in a cooked-mode window
+            def _(event):                   # Ctrl-C → stop the turn (r13: same
+                event.app.exit(result=_Abort(event.app.current_buffer.text))  # path)
+
+            @kb.add("c-d")
+            def _(event):                   # Ctrl-D mid-turn: not an exit
+                pass
+
+            hist = self.prompt_session.history if self.prompt_session else None
+            self._busy_session = PromptSession(
+                key_bindings=merge_key_bindings([bindings, kb]),
+                style=PROMPT_STYLE, completer=COMPLETER, history=hist,
+                auto_suggest=AutoSuggestFromHistory(),
+                reserve_space_for_menu=0,
+                complete_style=CompleteStyle.READLINE_LIKE,
+                complete_while_typing=False,
+                bottom_toolbar=self.status_toolbar,
+                refresh_interval=BUSY_REFRESH_S,
+                # The frame holds the live tail: erased on exit, or every
+                # Enter would leave a copy of the tail in scrollback.
+                erase_when_done=True,
+                placeholder=[(f"fg:{PALETTE['faint']}",
+                              "type to add to this request · /interrupt stops "
+                              "a tool · Ctrl-C stops the turn")],
+            )
+            # Every chunk invalidates, and each redraw renders the open block
+            # (a table with no blank line IS the whole reply): cap it at rich
+            # Live's 12/s, the clock _LazyMarkdown was measured against.
+            self._busy_session.app.min_redraw_interval = 1 / 12
+        view.app = self._busy_session.app
+        view.app.ghost_busy_owner = view    # see _BusyView.exit_if_done
+        return self._busy_session.prompt(view.message, default=draft,
+                                         pre_run=view.exit_if_done)
+
+    def _hold(self, text: str, why: str = "") -> None:
+        # A stop/hold word typed this turn (``_typed`` includes this line)
+        # also holds back every line typed after it: sent ahead of it, they
+        # would undo the "wait" (review r6).
+        if any(_is_hold_word(t) for t in self._typed) or _is_hold_word(text):
+            self._restore_to_prompt([text])
+            self.notice(f"not sent: {_trim(text, 60)} — the turn did not take it"
+                        + (f" ({why})" if why else "") + ", and after a stop or "
+                        "a hold nothing is sent on its own; it is back in the "
+                        "prompt after the reply", "dim")
+            return
+        self._held.append(text)
+        self.notice(f"held: {_trim(text, 60)} — sent after this reply"
+                    + (f" ({why})" if why else ""), "dim")
+
+    def _restore_to_prompt(self, texts: Any) -> list[str]:
+        """Unsent messages go back into the next prompt, oldest first, in
+        front of whatever draft is already there. Returns what was added.
+        No deduplication here: an accepted typing comes back once because
+        it leaves ``_open`` when restored (_claim, _restore_unknown)."""
+        added = [str(t) for t in (texts or []) if str(t).strip()]
+        self._restored.extend(added)
+        return added
+
+    def _take_draft(self, keep: bool = False) -> str:
+        """The next prompt's starting text (and clear it): handed-back
+        messages first, oldest first, then the operator's own draft.
+        ``keep``: leave them on self — the busy prompt commits them only
+        once the prompt is done with them (review r12)."""
+        if self._restored:                  # said once, where they reappear
+            n = len(self._restored)
+            self.notice(f"{n} unsent message{'s' if n != 1 else ''} "
+                        f"back in the prompt", "mute")
+        parts = self._restored + ([self._draft] if self._draft else [])
+        if not keep:
+            self._restored, self._draft = [], ""
+        return "\n".join(parts)
+
+    @contextlib.contextmanager
+    def _sigint_deferred(self, escalate: bool = False):
+        """ONE deferring SIGINT handler for the whole busy turn (review r12):
+        the outermost call — chat_turn's — installs it, so a Ctrl-C never
+        raises anywhere in the turn; it is counted (``n``, ``hit``) and the
+        stream loop and the settle read it at their decision points: a stop.
+        A nested call only opens a scope on the same box:
+        ``escalate`` — a blocking network wait (an inbox post, the
+        leftovers take) that a SECOND Ctrl-C inside it gives up (raises);
+        ``box["raise"] = True`` — a wait any Ctrl-C ends (the stop's join
+        and cancel). Off the main thread (signals can only be handled
+        there) it defers nothing."""
+        import signal
+        box = self._sig
+        if box is not None:                 # nested: a scope, not a handler
+            prev = box["esc"]
+            if escalate:
+                box["esc"] = box["n"]
+            try:
+                yield box
+            finally:
+                box["esc"] = prev
+            return
+        box = {"hit": False, "n": 0, "raise": False,
+               "esc": 0 if escalate else None}
+
+        def _note(signum, frame):
+            box["n"] += 1
+            box["hit"] = True
+            if box["raise"] or (box["esc"] is not None
+                                and box["n"] - box["esc"] >= 2):
+                raise KeyboardInterrupt
+
+        try:
+            old = signal.signal(signal.SIGINT, _note)
+        except ValueError:                  # not the main thread
+            yield box
+            return
+        self._sig = box
+        try:
+            yield box
+        finally:
+            self._sig = None
+            signal.signal(signal.SIGINT, old)
+
+    def _busy_line(self, line: str, sig: dict | None = None,
+                   rid: str = "") -> tuple[str, Any]:
+        """Route one line typed while the turn runs → (action, payload):
+        ("", None) handled · ("draft", text) back into the prompt ·
+        ("cancel", undelivered) the inbox stopped the turn."""
+        if line.startswith("/"):
+            if line.split()[0].lower() == "/interrupt":
+                self.cmd_interrupt()
+                return "", None
+            # Commands change the conversation the turn is answering
+            # (/clear, /resume, /good…): they wait for the reply.
+            self.notice("commands run after the reply — it is back in the "
+                        "prompt", "mute")
+            return "draft", line
+        self._typed.append(line)
+        # Only the POST itself may be given up by a second Ctrl-C (``sig``,
+        # from the caller's deferral): once its answer is in, the line is
+        # booked (held / injected / put back) with Ctrl-C held, so it can
+        # never be booked AND put back by the caller (review r3 nit a).
+        if sig is not None:
+            sig["esc"] = sig["n"]           # this POST: a 2nd Ctrl-C gives up
+        try:
+            status, data = self.api.turn_inbox(self.session_id, line)
+        except requests.RequestException as e:
+            if sig is not None:
+                sig["esc"] = None
+            if _never_sent(e):
+                self._hold(line, "couldn't reach the agent")
+            else:
+                # It may have been delivered (and read by the turn): never
+                # sent again on its own — back into the prompt instead.
+                self._restore_to_prompt([line])
+                self.notice(f"the agent did not answer — it may have received "
+                            f"this; it is back in the prompt after the reply: "
+                            f"{_trim(line, 60)}", "dim")
+            return "", None
+        if sig is not None:
+            sig["esc"] = None
+        if status == 404 or (status == 200 and isinstance(data, dict)
+                              and data.get("path") == "queue"
+                              and str(data.get("reason") or "").startswith(
+                                  "queued messages are off")):
+            # No inbox (the feature is off, or an older agent): the old CLI
+            # never sent anything typed mid-turn, and a "stop" or "wait"
+            # sent as a fresh request after the reply means something else.
+            # It comes back into the prompt for the operator to send.
+            self._restore_to_prompt([line])
+            self.notice(f"kept: {_trim(line, 60)} — the agent takes no "
+                        f"messages mid-turn (queued messages are off); it is "
+                        f"back in the prompt after the reply", "dim")
+            return "", None
+        if status != 200 or not isinstance(data, dict):
+            self._hold(line, f"HTTP {status}")
+            return "", None
+        path = data.get("path")
+        other = str(data.get("request_id") or "")
+        own = re.sub(r"#\d+\Z", "", other)    # register() renames a reused id
+        if rid and other and not own.endswith(rid) and path in ("inject", "status", "cancel"):
+            # The agent routes by conversation to its latest RUNNING turn: an
+            # earlier turn still finishing while this one waits on the lock
+            # (review r6). The answer is not about this turn.
+            if path == "cancel":
+                # The stop word is echoed and this turn cancelled (never put
+                # back: Enter would send "stop" as a message). The earlier
+                # turn's unread lines are named; one already sent as a
+                # message here or in the turn before is dropped (r7).
+                sent = [ln for m in self.history[-3:] if m.get("role") == "user"
+                        for ln in str(m.get("content") or "").split("\n")]
+                unread = []
+                for t in data.get("undelivered") or []:
+                    if self._claim_one(str(t)) or t in self._typed:
+                        unread.append(str(t))   # typed HERE: never dropped (r9)
+                    elif t in sent:
+                        sent.remove(t)          # one-for-one
+                    elif str(t).strip():
+                        unread.append(str(t))
+                self.notice(f"that stop reached an earlier turn still finishing "
+                            f"({_safe(other)[:8]}) — stopping this turn as well", "mute")
+                unread = self._restore_to_prompt(unread)
+                if unread:
+                    self.notice("the earlier turn's unread messages, back in the "
+                                "prompt: " + ", ".join(f"«{_trim(t, 60)}»"
+                                                       for t in unread), "dim")
+                return "stop-own", line
+            if path == "inject":            # accepted: never offered twice
+                # ...unless that turn's end is not seen from here (r10).
+                self._open.append((line, True))
+                self.notice(f"the earlier turn ({_safe(other)[:8]}), still "
+                            f"finishing, received it and may act on it: "
+                            f"{_trim(line, 60)}", "dim")
+                return "", None
+            self._restore_to_prompt([line])
+            self.notice(f"that was answered by an earlier turn still finishing "
+                        f"({_safe(other)[:8]}), not this one — back in the prompt "
+                        f"after the reply: {_trim(line, 60)}", "dim")
+            return "", None
+        if path == "inject":
+            self._injected.append(line)
+            self._open.append((line, False))
+            self.notice(f"queued: {_trim(line, 200)}", "dim")
+        elif path == "status":
+            console.print(Text.assemble(
+                (" " * GUTTER + PROMPT_GLYPH, "you"), (_trim(line, 200), "")))
+            self.notice(f"↳ {_safe(data.get('reply') or '(no status)')}", "mute")
+        elif path == "cancel":                # echoed after the partial reply
+            return "cancel", (line, list(data.get("undelivered") or []))
+        else:                               # "queue", or a path we don't know
+            self._hold(line, _safe(data.get("reason") or ""))
+        return "", None
+
+    def _stream_busy(self, request_id: str) -> str:
+        """The reply streams on a thread; the main thread keeps a live
+        prompt (see _BusyView). Returns the reply text, like stream_reply."""
+        view = _BusyView()
+        # Per-turn state was reset by chat_turn BEFORE anything could escape
+        # (_reset_turn) — and before this copy: the worker must never start
+        # from the last turn's verdict (review r6).
+        worker = copy.copy(self)            # turn state lands on the copy
+        worker.api = self._turn_api()
+        box: dict[str, Any] = {}
+
+        def _run() -> None:
+            try:
+                box["reply"] = worker.stream_reply(request_id, busy=view)
+            except BaseException as e:      # noqa: BLE001 — reported below
+                box["error"] = e
+            finally:
+                view.finish()
+
+        thread = threading.Thread(target=_run, name="ghost-stream", daemon=True)
+        # The draft stays on self until the prompt is done with it (r12).
+        shown = len(self._restored)
+        draft = self._take_draft(keep=True)
+        stop: tuple[str, Any] | None = None
+        # chat_turn's ONE deferring handler (a stand-in off the main thread).
+        sig = self._sig or {"hit": False, "n": 0, "raise": False, "esc": None}
+        with self._busy_stdout():
+            if sig["hit"]:
+                # A Ctrl-C counted before the request left (r13): it never
+                # goes — chat_turn's _unsend puts the line back.
+                return ""
+            thread.start(); self._sending = None  # noqa: E702 — sent: one line, no gap
+            while not view.done.is_set():
+                inflight = ""                   # a typed line not yet handled
+                if sig["hit"]:                  # a Ctrl-C between prompts
+                    stop = ("ctrl-c", None)
+                    break
+                try:
+                    res = self._busy_prompt(view, draft)
+                    draft = ""
+                    if isinstance(res, _Abort):
+                        draft, stop = res.text, ("ctrl-c", None)
+                        break
+                    if isinstance(res, _Ended):
+                        draft = res.text
+                        if view.done.is_set():
+                            break
+                        continue        # never another turn's end (defensive)
+                    if res is None or not res.strip():
+                        continue
+                    inflight = res.strip()
+                    # Ctrl-C during the post is held until it answers, so
+                    # the line is never lost (it was delivered, held, or is
+                    # put back), and then it stops the turn. A SECOND Ctrl-C
+                    # gives up the wait (the line goes back to the prompt).
+                    try:
+                        action, payload = self._busy_line(inflight, self._sig,
+                                                          request_id)
+                    finally:
+                        if self._sig is not None:
+                            self._sig["esc"] = None  # the scope ends here
+                    inflight = ""
+                    if action == "draft":
+                        draft = payload
+                    if action == "cancel":
+                        stop = ("inbox", payload)
+                        break
+                    if action == "stop-own":
+                        stop = ("own", payload)     # cancel THIS turn by its id
+                        break
+                    if sig["hit"]:
+                        stop = ("ctrl-c", None)
+                        break
+                except (KeyboardInterrupt, EOFError):
+                    # Ctrl-C outside the prompt's raw mode (around an inbox
+                    # post), or stdin closed mid-turn: the same stop — the
+                    # turn must not keep running on the agent. A line typed
+                    # but not handled goes back into the prompt.
+                    if inflight:
+                        self._restore_to_prompt([inflight])
+                    stop = ("ctrl-c", None)
+                    break
+            # Commit in ONE statement: what was shown is the prompt's now.
+            self._restored, self._draft = self._restored[shown:], draft
+            if stop is None:
+                while thread.is_alive() and not sig["hit"]:
+                    thread.join(0.2)        # a Ctrl-C is counted, not raised
+                if thread.is_alive():
+                    stop = ("ctrl-c", None)
+            if stop is None:
+                self._turn_interrupted = worker._turn_interrupted
+                self._turn_unlabelable = getattr(worker, "_turn_unlabelable", False)
+                self._turn_stopped = getattr(worker, "_turn_stopped", False)
+                # Anything that escaped stream_reply means the turn did not
+                # end normally, whatever the worker had set.
+                self._turn_clean = ("error" not in box
+                                    and getattr(worker, "_turn_clean", False))
+                self.turn_usage = worker.turn_usage
+                if "error" in box:
+                    self.notice(f"✖ {type(box['error']).__name__}: "
+                                f"{box['error']}", "err")
+                return box.get("reply", "")
+            # Stopped from the prompt: the Ctrl-C path. Mute the worker,
+            # wake it, keep what streamed so far. A second Ctrl-C here is
+            # held: the cancel on the agent must always be sent.
+            # A Ctrl-C here is counted by the turn's handler; "raise" opens
+            # the waits it may end (the join, the cancel).
+            text, rest = view.detach()  # held: never left half-done
+            sig["raise"] = True         # from here a Ctrl-C ends a WAIT
+            try:
+                thread.join(STOP_JOIN_S)
+            except KeyboardInterrupt:
+                pass                    # stop waiting; the cancel still goes
+            finally:
+                sig["raise"] = False    # never left set past its wait (r13)
+            if rest.strip():
+                console.print(_reply_block(rest))
+            self._turn_interrupted = "cancelled"
+            self._turn_unlabelable = False
+            self.turn_usage = None
+            if stop[0] in ("ctrl-c", "own"):
+                if stop[0] == "own":    # the stop word, echoed once
+                    console.print(Text.assemble(
+                        (" " * GUTTER + PROMPT_GLYPH, "you"),
+                        (_trim(stop[1], 200), "")))
+                sig["raise"] = True     # _abort_turn: "cancel not confirmed"
+                try:
+                    self._abort_turn(request_id, timeout=CANCEL_TIMEOUT,
+                                     restore=True,
+                                     started=self._streamed["any"])
+                except KeyboardInterrupt:   # landed outside its try
+                    sig["raise"] = False    # the wait is over: count again
+                    self.notice("⛔ cancel not confirmed — the turn may still "
+                                "be running; /turns to check, /cancel to retry",
+                                "mute")
+                    self._restore_unknown()
+                finally:
+                    sig["raise"] = False    # never left set past its wait (r13)
+            else:                       # the inbox already stopped it
+                said, undelivered = stop[1]
+                console.print(Text.assemble(
+                    (" " * GUTTER + PROMPT_GLYPH, "you"), (_trim(said, 200), "")))
+                self.notice("⛔ stopped — agent turn cancelled", "mute")
+                self._hand_back(undelivered)
+            return text
+
+    def _after_busy_turn(self, escaped: bool = False, asked: bool = True) -> None:
+        """Leftovers (accepted, never read) and held messages: sent as
+        normal messages after a finished reply; after a stopped one they go
+        back into the prompt instead — the operator said stop.
+
+        ``escaped``: the turn's own code was left by an exception (a Ctrl-C
+        right as the reply ended): an unclean end (review r11). ``asked``
+        False: no request left, so there is no turn to ask leftovers of —
+        no POST, no notice about it (r14); the rest settles as unclean.
+
+        Runs inside chat_turn's deferring handler; everything it works on
+        stays on self (_held, _fresh, _open) until the restore that consumes
+        it has committed, so chat_turn's _salvage finds it should anything
+        escape (review r12)."""
+        gave_up = unreachable = answered = False
+        status, data = 0, None
+        # The agent hands leftovers out once, so an answer cut off would lose
+        # them; a second Ctrl-C gives up the wait (esc) only during the POST.
+        with self._sigint_deferred(escalate=True) as sig:
+            try:
+                if asked:
+                    status, data = self.api.inbox_leftovers(self.session_id)
+                else:
+                    status = None
+            except requests.RequestException as e:
+                unreachable = _never_sent(e)
+                gave_up = not unreachable
+            except KeyboardInterrupt:       # a second Ctrl-C: stop waiting
+                gave_up = True
+            sig["esc"] = None               # the answer is in: book it whole
+            if status == 200 and isinstance(data, dict):
+                answered = True             # only this counts (review r6)
+                # RULE (r4): a leftover — accepted by the agent but read by
+                # no turn — is NEVER sent on its own; it goes back into the
+                # prompt, named. Kept on self at once; matched FIRST, so the
+                # accepted typing it is does not come back twice.
+                self._fresh = [str(m) for m in (data.get("messages") or [])
+                               if str(m).strip()]
+                self._claim(self._fresh)
+            self._settle(sig, escaped, answered, gave_up, unreachable, status)
+
+    def _settle(self, sig: dict, escaped: bool, answered: bool, gave_up: bool,
+                unreachable: bool, status: int | None) -> None:
+        """_after_busy_turn's decision, with Ctrl-C held by the caller.
+        Reads _held / _fresh / _open on self and clears them only after the
+        statement that puts them in the prompt or the outbox (review r12)."""
+        fresh, held = list(self._fresh), list(self._held)
+        if unreachable:
+            # Leftovers are kept per conversation: honest about where they
+            # can come back (review r3: /new, /clear, /resume leave them).
+            self.notice("couldn't fetch messages sent during the turn (agent "
+                        "unreachable) — the agent keeps them for 30 min, and "
+                        "they come back only after a later reply in THIS "
+                        "conversation", "mute")
+        if gave_up:
+            # The agent hands leftovers out as it answers: an answer that
+            # never arrived may have taken them. Never silent.
+            self.notice("messages sent during the turn may not have been read "
+                        "— the agent did not answer; see /turns", "notice")
+        elif not answered and not unreachable and status is not None:
+            self.notice(f"messages sent during the turn may not have been read "
+                        f"— the agent answered HTTP {status}; see /turns", "notice")
+        # RULE (operator, review r5): sending anything on its own needs
+        # POSITIVE evidence — the turn ended normally with a non-empty reply
+        # and no stop signal. Any other ending (an empty reply, with or
+        # without a retract — a hard stop of a turn that streamed nothing
+        # sends only [DONE]; a stop seen here or elsewhere; an error; a lost
+        # stream; a Ctrl-C or a lost answer just now) puts back everything
+        # typed during the turn that is not known to be read.
+        clean = self._turn_clean and not sig["hit"] and answered and not escaped
+        if self._turn_stopped:
+            self.notice("the turn was stopped on the agent — nothing typed "
+                        "during it is sent on its own", "mute")
+        elif (not clean and not self._turn_interrupted and answered
+              and not sig["hit"] and (held or self._injected or self._outbox)):
+            self.notice("the turn ended without a reply — nothing typed during "
+                        "it is sent on its own", "mute")
+        # Every accepted typing no answer accounted for is named and put
+        # back. Even an answered cancel proves nothing: another client's
+        # cancel may have emptied the inbox into ITS answer (review r6). A
+        # line the agent did read may come back ("may or may not have read").
+        # After a clean end only those an EARLIER turn accepted (r10): its
+        # end is not seen from here.
+        self._restore_unknown(earlier_only=clean)
+        if fresh:
+            names = "; ".join(f"«{_trim(t, 50)}»" for t in fresh)
+            self.notice(f"not read by the agent — back in the prompt: {names}",
+                        "notice")
+        if clean and held and any(_is_hold_word(t) for t in self._typed):
+            # DECISION (r8, operator: "a stop or hold sent later means
+            # something else"): a stop/hold typed this turn keeps EVERY held
+            # line of the turn, before it as well as after it.
+            names = "; ".join(f"«{_trim(t, 50)}»" for t in held)
+            self.notice(f"not sent — a stop or hold was typed during the turn; "
+                        f"back in the prompt: {names}", "notice")
+            self._restored += held          # ordered with the rest below
+            self._held = held = []          # consumed: in the prompt
+        clean = clean and not sig["hit"]    # a Ctrl-C while settling: a stop
+        if not clean:
+            # Everything comes back into the prompt, in typing order: held
+            # messages still waiting from earlier turns, then this turn's.
+            self._restored = list(self._outbox) + self._in_typing_order(
+                self._restored + fresh + held)
+            self._outbox.clear()
+        else:
+            self._restored = self._in_typing_order(self._restored + fresh)
+            self._outbox.extend(held)
+        # Committed above (a gap here costs a duplicate, never a line).
+        self._held, self._fresh, self._open = [], [], []
+
+    def _reset_turn(self) -> None:
+        """Per-turn state, reset at the START of the protected span, before
+        anything can escape (review r12: an escape before the old reset
+        put a clean turn's read lines back)."""
+        self._typed, self._injected, self._open, self._fresh = [], [], [], []
+        self._turn_interrupted, self._turn_stopped, self._turn_clean = "", False, False
+        # Shared with the stream worker (copy.copy keeps the dict): "any"
+        # once the stream delivered ANY content — text, reasoning, retract,
+        # tool status (r16: the one source of truth for "started");
+        # "refused" when the agent answered the chat POST with an error status.
+        self._streamed = {"any": False, "refused": False}
+
+    def _unsend(self) -> None:
+        """The line chat_turn was sending never left (an escape before the
+        request): out of history — else the next turn sends it as context —
+        and back into the prompt, first (review r12)."""
+        if self._sending is None:
+            return
+        line, entry, outbox = self._sending
+        if self.history and self.history[-1] is entry:
+            self.history.pop()
+        if outbox:                          # back at the head of its queue (r13)
+            self._outbox.appendleft(line); self._sending = None  # noqa: E702
+        else:
+            self._restored.insert(0, line); self._sending = None  # noqa: E702
+
+    def _salvage(self) -> None:
+        """An escape left the turn half-settled: everything still on self
+        comes back into the prompt, named — never lost, never sent, nothing
+        carried into the next turn (reviews r11, r12)."""
+        self._unsend()
+        salvage = [t for t, _ in self._open] + self._fresh + self._held
+        self._restored = list(self._outbox) + self._in_typing_order(
+            self._restored + salvage)
+        self._outbox.clear()
+        self._open, self._fresh, self._held = [], [], []
+        if salvage:                         # restored first: a print can't lose it
+            self.notice("interrupted — not sent; back in the prompt: "
+                        + "; ".join(f"«{_trim(t, 50)}»" for t in salvage), "notice")
+
+    def _send_outbox(self) -> None:
+        """Send the next held message as a normal turn (from chat())."""
+        text = self._outbox[0]              # popped by chat_turn, protected
+        console.print(Text.assemble((PROMPT_GLYPH, "you"), (_safe(text), ""),
+                                    ("   · sent after the reply", "faint")))
+        self.chat_turn(text, outbox=True)
+
+    def cmd_interrupt(self) -> None:
+        """/interrupt — stop the tool this conversation's turn is running;
+        the turn goes on (§4RZ step 5)."""
+        try:
+            status, data = self.api.turn_interrupt(self.session_id)
+        except requests.RequestException as e:
+            return self.notice(f"✖ {type(e).__name__}: cannot reach the agent", "err")
+        data = data if isinstance(data, dict) else {}
+        if status == 200:
+            names = ", ".join(_safe(n) for n in (data.get("interrupted") or [])) or "the tool"
+            self.notice(f"⏹ stopped {names} — the turn goes on", "mute")
+        elif status == 409:
+            self.notice("nothing running — no tool to stop", "mute")
+        elif status == 404:
+            if "off" in str(data.get("reason") or ""):
+                self.notice("the agent's queued messages are off "
+                            "(GHOST_QUEUED_MESSAGES) — /cancel stops the whole turn",
+                            "mute")
+            else:
+                self.notice("no running turn in this conversation", "mute")
+        else:
+            self.fail(status, data)
+
+    def chat_turn(self, line: str, outbox: bool = False) -> None:
+        """One turn. ``outbox``: ``line`` is _outbox[0], popped here only
+        once it sits in the _sending slot (review r12).
+
+        Busy prompt: the WHOLE turn — from the pop and the history append
+        through _after_busy_turn — runs inside ONE deferring SIGINT handler
+        (review r12): a Ctrl-C there is a stop, never an exception. The
+        state it moves stays on self, and _salvage puts it back should
+        anything still escape. A line whose request never left is taken out
+        of history and put back into the prompt (_unsend), in both modes."""
+        busy = self._busy_enabled()
+        if not busy:
+            return self._classic_turn(line, outbox)
+        with self._sigint_deferred():       # the ONE handler for the turn
+            settled = False
+            try:
+                self._reset_turn()
+                self._send_slot(line, outbox)
+                request_id = uuid.uuid4().hex[:16]
+                escaped = True
+                try:
+                    console.print()
+                    reply = self._stream_busy(request_id)
+                    if not reply and (self._turn_interrupted or self._turn_stopped):
+                        # A stop before any reply text: _finish_turn drops the
+                        # line from history, so it comes back here, named — it
+                        # may or may not have reached the agent (review r15).
+                        self._restored.insert(0, line)
+                        self.notice(
+                            f"back in the prompt — the agent did not take it: "
+                            f"«{_trim(line, 60)}»" if self._streamed["refused"] else
+                            f"back in the prompt — the agent may or may not have "
+                            f"received it: «{_trim(line, 60)}»", "mute")
+                    self._finish_turn(line, request_id, reply)
+                    escaped = False
+                finally:
+                    left = self._sending is None    # did the request leave?
+                    if not left and not escaped:    # a counted Ctrl-C (r14)
+                        self.notice(f"⛔ stopped — not sent: «{_trim(line, 60)}»",
+                                    "mute")
+                    self._unsend()          # no-op once the request left
+                    self._after_busy_turn(escaped=escaped, asked=left)
+                    settled = True
+            finally:
+                if not settled:
+                    self._salvage()
+
+    def _send_slot(self, line: str, outbox: bool) -> None:
+        """The line goes into the _sending slot and history in one step
+        each: an escape after either is undone by _unsend."""
+        entry = {"role": "user", "content": line}
+        self._sending = (self._outbox.popleft() if outbox else line, entry, outbox)
+        self.history.append(entry)
+
+    def _classic_turn(self, line: str, outbox: bool) -> None:
+        """GHOST_CLI_BUSY_PROMPT=0: the old blocking stream, Ctrl-C as
+        before; only the unsent-line undo is shared (review r12)."""
+        try:
+            self._send_slot(line, outbox)
+            request_id = uuid.uuid4().hex[:16]
+            console.print()
+            self._sending = None; reply = self.stream_reply(request_id)  # noqa: E702
+            self._finish_turn(line, request_id, reply)
+        finally:
+            self._unsend()
+
+    def _finish_turn(self, line: str, request_id: str, reply: str) -> None:
         console.print()
         if reply:
-            # BOOKKEEPING BEFORE RENDERING. Image fetches are up to 4 serial
-            # round-trips with 130s timeouts, and a Ctrl-C in that window used
-            # to escape chat_turn — costing the REPL, the assistant message,
-            # and the turn's rateability, for a reply the agent had already
-            # finished and the server had already stored.
+            # BOOKKEEPING FIRST: the assistant message and the turn's rateable
+            # ref are recorded before anything else can be interrupted.
             self.history.append({"role": "assistant", "content": reply})
             # Keep the request_id — it is the ONLY handle a 👍/👎 has on
             # this turn's trajectory (the agent stamps X-Request-ID as the
@@ -1740,6 +2974,8 @@ class GhostCLI:
                     self.cmd_effort(args)
                 case "/cancel":
                     self.cmd_cancel(hard=args[:1] == ["hard"])
+                case "/interrupt":
+                    self.cmd_interrupt()
                 case "/notify":
                     self.cmd_notify()
                 case "/memory" if args:
@@ -1802,8 +3038,23 @@ class GhostCLI:
         self._start_status_refresh()
         self.banner()
         while True:
+            if self._outbox:                # §4RZ: held messages, in order
+                try:
+                    self._send_outbox()
+                except KeyboardInterrupt:
+                    # Ctrl-C stops the queue: what is left goes back into
+                    # the prompt, never dropped (review r3 nit b).
+                    console.print(Text("⛔ interrupted", style="mute"))
+                    self._restored[:0] = list(self._outbox)
+                    self._outbox.clear()
+                continue
             try:
-                line = self.prompt_session.prompt([("class:p", PROMPT_GLYPH)])
+                draft = self._take_draft()
+                if draft:                   # unsent text back in the prompt
+                    line = self.prompt_session.prompt(
+                        [("class:p", PROMPT_GLYPH)], default=draft)
+                else:
+                    line = self.prompt_session.prompt([("class:p", PROMPT_GLYPH)])
             except EOFError:
                 break
             except KeyboardInterrupt:
@@ -1822,7 +3073,7 @@ class GhostCLI:
             except KeyboardInterrupt:
                 # Last line of defence for an interrupt raised somewhere a
                 # command didn't expect one. Individual paths handle their
-                # own (see _abort_turn, chat_turn's image render).
+                # own (see _abort_turn; a busy turn holds Ctrl-C, _salvage).
                 console.print(Text("⛔ interrupted", style="mute"))
         console.print(Text("👋 disconnected", style="dim"))
 

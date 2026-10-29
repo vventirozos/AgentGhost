@@ -265,6 +265,11 @@ def _home_with_stores(tmp_path):
     (mem / "composed_skills.json.bak").write_text("[]")                  # a plain .bak too
     (sysd / "eval").mkdir()
     (sysd / "eval" / "big.bin").write_bytes(b"0" * 1000)                 # regenerable: left out
+    (sysd / "head_saves").mkdir()
+    (sysd / "head_saves" / "slot.bin").write_bytes(b"0" * 1000)          # KV cache: left out
+    (sysd / "scratch_trash" / "20261027" / "req").mkdir(parents=True)
+    (sysd / "scratch_trash" / "20261027" / "req" / "test_x.py").write_text("x")
+    os.chmod(sysd / "scratch_trash" / "20261027" / "req" / "test_x.py", 0o000)   # model trash: left out
     (sysd / "autonomous_activity.jsonl").write_text('{"a": 1}\n')
     import chromadb
     from chromadb.config import Settings
@@ -297,6 +302,8 @@ def test_a_snapshot_pairs_chroma_with_its_segment_and_is_verified(tmp_path):
     assert "chroma.sqlite3" in names and "episodic_memory.db" in names and "user_profile.json" in names
     assert any(p.is_dir() and p.name.count("-") == 4 for p in (snap / "memory").iterdir())   # the segment
     assert "skills_playbook.json.pre-4mk.bak" not in names and "big.bin" not in names
+    assert "head_saves" not in names and "slot.bin" not in names
+    assert "scratch_trash" not in names and "test_x.py" not in names
     assert "composed_skills.json.bak" not in names
     assert verify_snapshot(snap) == []
     assert json.loads((snap / "MANIFEST.json").read_text())["files"]
@@ -310,6 +317,52 @@ def test_a_snapshot_that_fails_verification_is_never_published(tmp_path, monkeyp
     assert res["ok"] is False and res["path"] is None
     assert list((tmp_path / "snaps").iterdir()) == []                     # no .partial left, nothing "complete"
     assert S.latest_snapshot(tmp_path / "snaps") is None
+
+
+def _fake_chroma(monkeypatch, self_rank):
+    """A chroma whose query returns each vector at ``self_rank`` (None =
+    never) among ``n_results`` neighbours — an approximate index."""
+    import chromadb
+
+    class _Col:
+        def count(self):
+            return 500
+
+        def get(self, limit, offset, include):
+            return {"ids": [f"v{offset}"], "embeddings": [[float(offset)]]}
+
+        def query(self, query_embeddings, n_results, include=None):
+            me = f"v{int(query_embeddings[0][0])}"
+            ids = [f"other{j}" for j in range(n_results)]
+            if self_rank is not None and self_rank < n_results:
+                ids[self_rank] = me
+            return {"ids": [ids]}
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        def get_collection(self, name):
+            return _Col()
+
+    monkeypatch.setattr(chromadb, "PersistentClient", _Client)
+
+
+def test_chroma_check_tolerates_an_approximate_top_10_miss(tmp_path, monkeypatch):
+    """Fails at k=10 (and k=100): the live store (10-28) had 16/8421 vectors
+    outside their own top-100 but rank 0 from k=200, and a sound snapshot
+    was refused ("1 of 20 sampled vectors do not find themselves")."""
+    from ghost_agent.memory.snapshot import _verify_chroma
+    (tmp_path / "chroma.sqlite3").write_bytes(b"")
+    _fake_chroma(monkeypatch, self_rank=150)
+    assert _verify_chroma(tmp_path) == []
+
+
+def test_chroma_check_still_fails_a_vector_missing_from_the_index(tmp_path, monkeypatch):
+    from ghost_agent.memory.snapshot import _verify_chroma
+    (tmp_path / "chroma.sqlite3").write_bytes(b"")
+    _fake_chroma(monkeypatch, self_rank=None)
+    assert _verify_chroma(tmp_path) == ["chroma: 20 of 20 sampled vectors do not find themselves"]
 
 
 def test_a_restored_snapshot_opens_and_finds_its_vectors(tmp_path):
@@ -337,6 +390,311 @@ def test_snapshots_are_bounded(tmp_path):
         (d / "MANIFEST.json").write_text("{}")
     removed = prune_snapshots(root, keep=7)
     assert len(removed) == 3 and sorted(p.name for p in root.iterdir())[0] == "20261003T000000Z-auto"
+
+
+def _read_only_snapshot(root, name, with_manifest=True):
+    d = root / name
+    proj = d / "sandbox" / "projects" / "p1" / "static"
+    proj.mkdir(parents=True)
+    (proj / "index.html").write_text("x")
+    if with_manifest:
+        (d / "MANIFEST.json").write_text("{}")
+    os.chmod(proj / "index.html", 0o444)                   # a read-only project, as copied
+    os.chmod(proj, 0o555)
+    os.chmod(proj.parent, 0o555)
+    return d
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the modes")
+def test_a_snapshot_with_a_read_only_project_is_pruned_whole(tmp_path):
+    """Fails on the 10-27 code: rmtree(ignore_errors=True) took MANIFEST.json
+    and left the read-only project — 29 snapshots against KEEP=7."""
+    from ghost_agent.memory.snapshot import prune_snapshots
+    root = tmp_path / "snaps"
+    for i in range(3):
+        _read_only_snapshot(root, f"2026100{i}T000000Z-auto")
+    removed = prune_snapshots(root, keep=1)
+    assert removed == ["20261000T000000Z-auto", "20261001T000000Z-auto"]
+    assert sorted(p.name for p in root.iterdir()) == ["20261002T000000Z-auto"]
+
+
+def test_a_repair_backup_in_the_backups_folder_is_never_pruned(tmp_path):
+    """Review 10-27: fact_ledger_attribute_4qn.py keeps `<stamp>-4qn/memory/
+    fact_ledger.db` here with no MANIFEST.json; a sweep of manifest-less
+    stamp-named folders deleted it."""
+    from ghost_agent.memory.snapshot import prune_snapshots
+    root = tmp_path / "snaps"
+    rep = root / "20261001T000000Z-4qn" / "memory"
+    rep.mkdir(parents=True)
+    (rep / "fact_ledger.db").write_text("x")
+    t = __import__("time").time() - 9 * 86400
+    os.utime(rep.parent, (t, t))
+    for i in range(3):
+        d = root / f"2026100{i + 2}T000000Z-auto"
+        d.mkdir()
+        (d / "MANIFEST.json").write_text("{}")
+    assert prune_snapshots(root, keep=1) == ["20261002T000000Z-auto", "20261003T000000Z-auto"]
+    assert (rep / "fact_ledger.db").exists()
+
+
+def test_only_real_snapshot_folders_count_toward_keep(tmp_path):
+    from ghost_agent.memory.snapshot import prune_snapshots
+    root = tmp_path / "snaps"
+    for name in ("20261001T000000Z-auto", "20261002T000000Z-auto", "zz-other"):
+        (root / name).mkdir(parents=True)
+        (root / name / "MANIFEST.json").write_text("{}")
+    os.symlink(root / "20261001T000000Z-auto", root / "zz-link")
+    assert prune_snapshots(root, keep=1) == ["20261001T000000Z-auto"]
+    assert (root / "20261002T000000Z-auto").exists() and (root / "zz-other").exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the modes")
+def test_an_unreadable_folder_is_deleted_and_the_backups_folder_keeps_its_mode(tmp_path):
+    from ghost_agent.memory.snapshot import _rmtree
+    root = tmp_path / "snaps"
+    d = root / "20261001T000000Z-auto"
+    (d / "locked" / "inner").mkdir(parents=True)
+    (d / "locked" / "inner" / "f").write_text("x")
+    os.chmod(d / "locked", 0o300)                       # no read: rmtree's os.open fails
+    assert _rmtree(d) and not d.exists()
+    e = root / "20261002T000000Z-auto"
+    e.mkdir()
+    os.chmod(root, 0o555)                              # the top-level rmdir fails
+    try:
+        assert not _rmtree(e)
+        assert (root.stat().st_mode & 0o777) == 0o555   # the backups folder was not chmodded
+    finally:
+        os.chmod(root, 0o755)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the modes")
+def test_an_odd_entry_never_fails_the_prune(tmp_path):
+    """Review r2: a stamp-named folder without its x bit raised out of the
+    scan, after the snapshot was published."""
+    from ghost_agent.memory.snapshot import prune_snapshots
+    root = tmp_path / "snaps"
+    odd = root / "20261001T000000Z-odd"
+    odd.mkdir(parents=True)
+    for i in range(3):
+        d = root / f"2026100{i + 2}T000000Z-auto"
+        d.mkdir()
+        (d / "MANIFEST.json").write_text("{}")
+    os.chmod(odd, 0o600)
+    try:
+        assert prune_snapshots(root, keep=1) == ["20261002T000000Z-auto", "20261003T000000Z-auto"]
+    finally:
+        os.chmod(odd, 0o755)
+
+
+def test_only_our_stale_partials_are_swept(tmp_path):
+    from ghost_agent.memory.snapshot import prune_snapshots
+    root = tmp_path / "snaps"
+    ours, other = root / "20261001T000000Z-auto.partial", root / "notes.partial"
+    for d in (ours, other):
+        d.mkdir(parents=True)
+    t = __import__("time").time() - 2 * 86400
+    for d in (ours, other):
+        os.utime(d, (t, t))
+    assert prune_snapshots(root) == ["20261001T000000Z-auto.partial"]
+    assert other.exists()
+
+
+@pytest.mark.parametrize("tag", ["x.partial", "a/b", "../out", ""])
+def test_a_tag_that_is_not_one_plain_name_is_refused(tmp_path, tag):
+    from ghost_agent.memory.snapshot import take_snapshot
+    res = take_snapshot(tmp_path / "home", tmp_path / "snaps", tag)
+    assert not res["ok"] and "bad tag" in res["problems"][0]
+    assert not (tmp_path / "snaps").exists() and not (tmp_path / "out").exists()
+
+
+def test_a_delete_that_fails_half_way_is_retried_as_a_partial(tmp_path, monkeypatch):
+    """Review r2: MANIFEST.json gone and the rest left = a folder no prune
+    counted again; deleted under a .partial name, the daily sweep retries it."""
+    from ghost_agent.memory import snapshot as S
+    root = tmp_path / "snaps"
+    for i in range(2):
+        d = root / f"2026100{i}T000000Z-auto"
+        (d / "sandbox").mkdir(parents=True)
+        (d / "MANIFEST.json").write_text("{}")
+
+    def half(p):
+        (Path(p) / "MANIFEST.json").unlink()
+        return False
+    monkeypatch.setattr(S, "_rmtree", half)
+    assert S.prune_snapshots(root, keep=1) == []
+    assert sorted(p.name for p in root.iterdir()) == ["20261000T000000Z-auto.partial",
+                                                      "20261001T000000Z-auto"]
+
+
+def test_a_prune_racing_another_prune_counts_the_others_deletes_as_done(tmp_path, monkeypatch):
+    """Review r2: the retry re-ran a delete the other prune had already
+    done, raised ENOENT and gave the snapshot up with a false warning."""
+    from ghost_agent.memory.snapshot import _rmtree
+    d = tmp_path / "snap"
+    (d / "a").mkdir(parents=True)
+    (d / "a" / "f").write_text("x")
+    real = os.unlink
+
+    def other_prune_first(path, *a, **k):     # gone a moment before our own unlink
+        real(path, *a, **k)
+        raise FileNotFoundError(path)
+    monkeypatch.setattr(os, "unlink", other_prune_first)
+    assert _rmtree(d) and not d.exists()
+
+
+def test_a_fresh_partial_survives_a_prune(tmp_path):
+    """A snapshot in progress in another process is never swept."""
+    from ghost_agent.memory.snapshot import prune_snapshots
+    root = tmp_path / "snaps"
+    (root / "20261001T000000Z-auto.partial").mkdir(parents=True)
+    assert prune_snapshots(root) == [] and (root / "20261001T000000Z-auto.partial").exists()
+
+
+def test_a_name_is_reserved_so_two_snapshots_in_one_second_never_share_a_partial(tmp_path, monkeypatch):
+    """Review r3: an exists() check let two processes copy into one .partial;
+    the second publish crashed with ENOTEMPTY."""
+    from ghost_agent.memory import snapshot as S
+    home = tmp_path / "home"
+    (home / "system").mkdir(parents=True)
+    (home / "system" / "a.json").write_text("{}")
+    root = tmp_path / "snaps"
+    monkeypatch.setattr(S.time, "strftime", lambda *a: "20261001T000000Z")
+    seen = []
+    real = S._copy_tree
+
+    def copy(system, out):
+        seen.append(out.name)
+        if len(seen) == 1:                     # the other process starts in the same second
+            seen.append(S.take_snapshot(home, root, "manual")["path"])
+        return real(system, out)
+    monkeypatch.setattr(S, "_copy_tree", copy)
+    res = S.take_snapshot(home, root, "manual")
+    assert res["ok"], res
+    assert seen[0] == "20261001T000000Z-manual.partial" and seen[1] == "20261001T000000Z-manual-2.partial"
+    assert sorted(p.name for p in root.iterdir()) == ["20261001T000000Z-manual", "20261001T000000Z-manual-2"]
+
+
+def test_a_tree_another_prune_removed_ends_the_delete_without_recursing(tmp_path, monkeypatch):
+    from ghost_agent.memory import snapshot as S
+    d = tmp_path / "snap"
+    (d / "a").mkdir(parents=True)
+    real = S.shutil.rmtree
+    warned = []
+    monkeypatch.setattr(S.logger, "warning", lambda *a: warned.append(a))
+
+    def rmtree(path, onerror=None, **k):
+        if str(path) == str(d / "a"):          # gone a moment before our own pass reached it
+            return onerror(os.lstat, str(path), None)
+        if str(path) == str(d):
+            real(d / "a")
+            onerror(os.lstat, str(d / "a"), None)
+            return real(path)
+        return real(path, onerror=onerror, **k)
+    monkeypatch.setattr(S.shutil, "rmtree", rmtree)
+    assert S._rmtree(d) and not warned
+
+
+def test_a_bogus_database_in_the_sandbox_never_refuses_the_snapshot(tmp_path):
+    """Review r4: the model can write `notes.db` as text; integrity_check on
+    the sandbox copy refused every daily snapshot of the stores."""
+    from ghost_agent.memory.snapshot import take_snapshot
+    home = tmp_path / "home"
+    (home / "system").mkdir(parents=True)
+    (home / "system" / "a.json").write_text("{}")
+    (home / "sandbox" / "p").mkdir(parents=True)
+    (home / "sandbox" / "p" / "notes.db").write_text("not a database")
+    res = take_snapshot(home, tmp_path / "snaps", "t")
+    assert res["ok"], res
+    assert (Path(res["path"]) / "sandbox" / "p" / "notes.db").exists()      # still copied
+
+
+def test_a_manifest_that_cannot_be_written_fails_the_snapshot_without_raising(tmp_path, monkeypatch):
+    from ghost_agent.memory import snapshot as S
+    home = tmp_path / "home"
+    (home / "system").mkdir(parents=True)
+    (home / "system" / "a.json").write_text("{}")
+    real = Path.write_text
+
+    def full(self, *a, **k):
+        if self.name == "MANIFEST.json":
+            raise OSError(28, "No space left on device")
+        return real(self, *a, **k)
+    monkeypatch.setattr(Path, "write_text", full)
+    res = S.take_snapshot(home, tmp_path / "snaps", "t")
+    assert not res["ok"] and "No space left" in res["problems"][0]
+    assert list((tmp_path / "snaps").iterdir()) == []
+
+
+def test_latest_snapshot_sees_only_what_prune_counts(tmp_path):
+    from ghost_agent.memory.snapshot import latest_snapshot
+    root = tmp_path / "snaps"
+    for name in ("20261001T000000Z-auto", "zz-other"):
+        (root / name).mkdir(parents=True)
+        (root / name / "MANIFEST.json").write_text("{}")
+    odd = root / "20261009T000000Z-odd"
+    odd.mkdir()
+    os.chmod(odd, 0o600)
+    try:
+        assert latest_snapshot(root).name == "20261001T000000Z-auto"
+    finally:
+        os.chmod(odd, 0o755)
+
+
+def test_a_name_published_between_the_check_and_the_reservation_is_skipped(tmp_path, monkeypatch):
+    """Review r5: the other process published X after our exists() check;
+    our mkdir of X.partial succeeded and the publish failed (ENOTEMPTY)."""
+    from ghost_agent.memory import snapshot as S
+    home = tmp_path / "home"
+    (home / "system").mkdir(parents=True)
+    (home / "system" / "a.json").write_text("{}")
+    root = tmp_path / "snaps"
+    root.mkdir()
+    monkeypatch.setattr(S.time, "strftime", lambda *a: "20261001T000000Z")
+    real = Path.mkdir
+    other = root / "20261001T000000Z-manual"
+
+    def mkdir(self, *a, **k):
+        if self.name == "20261001T000000Z-manual.partial" and not other.exists():
+            real(other)                               # the other publish lands now
+            (other / "MANIFEST.json").write_text("{}")
+        return real(self, *a, **k)
+    monkeypatch.setattr(Path, "mkdir", mkdir)
+    res = S.take_snapshot(home, root, "manual")
+    assert res["ok"], res
+    assert res["path"].endswith("20261001T000000Z-manual-2")
+    assert sorted(p.name for p in root.iterdir()) == ["20261001T000000Z-manual", "20261001T000000Z-manual-2"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the modes")
+def test_a_backups_folder_that_cannot_be_written_fails_the_snapshot_without_raising(tmp_path):
+    from ghost_agent.memory.snapshot import take_snapshot
+    root = tmp_path / "snaps"
+    root.mkdir()
+    os.chmod(root, 0o555)
+    try:
+        res = take_snapshot(tmp_path / "home", root, "t")
+    finally:
+        os.chmod(root, 0o755)
+    assert not res["ok"] and "PermissionError" in res["problems"][0]
+
+
+def test_a_tag_with_a_trailing_newline_is_refused(tmp_path):
+    from ghost_agent.memory.snapshot import take_snapshot
+    res = take_snapshot(tmp_path / "home", tmp_path / "snaps", "auto\n")
+    assert not res["ok"] and "bad tag" in res["problems"][0]
+
+
+def test_a_failed_snapshot_delete_never_chmods_through_a_link(tmp_path):
+    from ghost_agent.memory.snapshot import _rmtree
+    outside = tmp_path / "host.txt"
+    outside.write_text("x")
+    os.chmod(outside, 0o444)
+    d = tmp_path / "snap"
+    (d / "ro").mkdir(parents=True)
+    os.symlink(outside, d / "ro" / "link")
+    os.chmod(d / "ro", 0o555)
+    assert _rmtree(d)
+    assert outside.exists() and (outside.stat().st_mode & 0o777) == 0o444
 
 
 def test_the_dream_takes_a_snapshot_at_most_daily(tmp_path, monkeypatch):
@@ -407,7 +765,7 @@ def test_a_snapshot_that_raises_leaves_nothing_behind(tmp_path, monkeypatch):
     from ghost_agent.memory import snapshot as S
     home = tmp_path / "home"
     (home / "system").mkdir(parents=True)
-    monkeypatch.setattr(S, "_copy_tree", lambda system, out: (out.mkdir(parents=True),
+    monkeypatch.setattr(S, "_copy_tree", lambda system, out: (out.mkdir(parents=True, exist_ok=True),
                                                                (_ for _ in ()).throw(OSError(28, "No space left"))))
     res = S.take_snapshot(home, tmp_path / "snaps", "t")
     assert res["ok"] is False and "No space left" in res["problems"][0]

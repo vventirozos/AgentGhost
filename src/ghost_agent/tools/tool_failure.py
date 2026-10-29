@@ -544,7 +544,12 @@ def summarize_multi_op_outcomes(op_outcomes) -> str:
     # model "this DID take effect — do NOT retry it" about work that had not
     # happened yet, in the one message that calls itself AUTHORITATIVE.
     running_ops = [o for o in op_outcomes if o.get("unresolved")]
-    op_outcomes = [o for o in op_outcomes if not o.get("unresolved")]
+    # §4RZ step 5: stopped by the user — not done, not failed, not running
+    stopped_ops = [o for o in op_outcomes if o.get("interrupted")]
+    op_outcomes = [o for o in op_outcomes if not o.get("unresolved") and not o.get("interrupted")]
+    stopped = ("  STOPPED BY THE USER (not done — do NOT report these as done; run them "
+               "again only if the user asks): "
+               + "; ".join(str(o.get("tool", "?")) for o in stopped_ops) + "\n") if stopped_ops else ""
     ok_ops = [o for o in op_outcomes if o.get("ok")]
     failed_ops = [o for o in op_outcomes if not o.get("ok")]
     # A turn carrying in-flight work is worth summarising even when the
@@ -558,7 +563,7 @@ def summarize_multi_op_outcomes(op_outcomes) -> str:
                 f"RUNNING, {len(op_outcomes)} finished.\n"
                 f"  STILL RUNNING (no verdict yet — do NOT re-dispatch, and "
                 f"do NOT report these as done): {_r}\n"
-                f"  FINISHED: {_done}\n\n")
+                f"  FINISHED: {_done}\n{stopped}\n")
     # Only worth a summary when the turn was MIXED — a uniform all-fail turn
     # is served fine by the normal diagnostic.
     if not ok_ops or not failed_ops:
@@ -587,6 +592,7 @@ def summarize_multi_op_outcomes(op_outcomes) -> str:
         f"  SUCCEEDED: {succeeded}\n"
         f"  FAILED: {failed}\n"
         f"{running}"
+        f"{stopped}"
         "The successful operations DID take effect — do NOT retry them or "
         "report them as failed. This live outcome is AUTHORITATIVE over any "
         "prior context, memory, or system-state hint. Report exactly what "
